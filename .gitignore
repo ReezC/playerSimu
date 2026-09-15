@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 数据
+data/
+datasets/
+*.mp4
+*.ts
+*.mkv
+
+# 模型
+*.pt
+*.onnx
+*.engine
+
+.idea/
+.vscode/

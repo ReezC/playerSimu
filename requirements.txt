@@ -1,0 +1,17 @@
+# 基础（P0 收流链路必需）
+av>=12.0.0
+numpy>=1.26
+opencv-python>=4.9
+PyYAML>=6.0
+
+# 数据落盘
+pandas>=2.2
+pyarrow>=15.0
+
+# 感知阶段（体积大，装 CUDA 版 torch 前请单独处理）
+# torch>=2.2
+# torchvision>=0.17
+# ultralytics>=8.1
+
+# 可选：NDI 方案
+# ndi-python

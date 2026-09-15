@@ -1,0 +1,34 @@
+# ---- 链路配置 ----
+# A 机（仿真机 / 推流端）
+a_host: "192.168.1.8"
+# B 机（工作机 / 本机的 IP），A 机 OBS 推流目标
+b_host: "192.168.1.2"
+
+stream:
+  protocol: "udp"        # udp | srt | rtsp
+  port: 5000
+  # B 机监听 URL（PyAV 直接用）
+  url: "udp://@:5000?fifo_size=1000000&overrun_nonfatal=1"
+  width: 1280
+  height: 720
+  fps: 60
+
+# ---- 双机时钟同步 ----
+clock_sync:
+  server_port: 5001      # A 机上运行 tools/clock_server.py 监听此 UDP 端口
+  samples: 200           # 采样次数
+  interval_ms: 10        # 采样间隔
+
+# ---- 屏幕时间码探针（用于测端到端延迟）----
+probe:
+  enabled: true
+  x: 100                 # A 机屏幕上探针窗口左上角坐标
+  y: 8
+  cell: 16               # 每个 bit 方块边长（px）
+  gap: 2                 # 方块间距（px）
+  bits: 40               # 时间戳位宽（毫秒）
+
+# ---- 路径 ----
+paths:
+  record_dir: "data/recordings"
+  dataset_dir: "data/datasets"
