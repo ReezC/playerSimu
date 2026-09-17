@@ -8,7 +8,7 @@ stream:
   protocol: "udp"        # udp | srt | rtsp
   port: 5000
   # B 机监听 URL（PyAV 直接用）
-  url: "udp://@:5000?fifo_size=1000000&overrun_nonfatal=1"
+  url: "udp://0.0.0.0:5000"
   width: 1280
   height: 720
   fps: 60
@@ -22,10 +22,10 @@ clock_sync:
 # ---- 屏幕时间码探针（用于测端到端延迟）----
 probe:
   enabled: true
-  x: 100                 # A 机屏幕上探针窗口左上角坐标
-  y: 8
-  cell: 16               # 每个 bit 方块边长（px）
-  gap: 2                 # 方块间距（px）
+  x: 153                 # A 机屏幕上探针窗口左上角坐标
+  y: 27
+  cell: 18               # 每个 bit 方块边长（px）
+  gap: 2.25                 # 方块间距（px）
   bits: 40               # 时间戳位宽（毫秒）
 
 # ---- 路径 ----

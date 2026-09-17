@@ -10,6 +10,7 @@ import argparse
 import statistics
 import sys
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -52,6 +53,8 @@ def main() -> int:
                     help="延迟有效上限 ms，超出视为异常丢弃（离线回放自测时调大）")
     ap.add_argument("--report", type=float, default=2.0, help="统计打印间隔(秒)")
     ap.add_argument("--seconds", type=float, default=0.0, help="运行时长(秒)，0=不限（Ctrl+C 停）")
+    ap.add_argument("--diag", type=str, default=None,
+                    help="诊断：存一张叠加图（绿=配置位置，红=自动定位），值为输出路径")
     args = ap.parse_args()
 
     cfg_probe = bool(get("probe", "enabled", True))
@@ -100,21 +103,65 @@ def main() -> int:
                     if d is not None and d < args.max_delay:
                         delays.append(d)
 
-            if args.show:
+            if args.show or (args.diag and n == 1):
                 vis = cv2.cvtColor(f.image, cv2.COLOR_RGB2BGR)
                 if use_probe:
-                    cv2.rectangle(vis, (px - 2, py - 2),
-                                  (px + (2 + bits) * (cell + gap) + 2, py + cell + 4),
-                                  (0, 255, 0), 1)
+                    # 坐标必须取整：gap 配的是 2.25（浮点），
+                    # 直接参与运算会让坐标变成 float，cv2 不接受
+                    # （报 Can't parse 'pt2'. Sequence item ... wrong type）。
+                    bx1 = int(round(px + (2 + bits) * (cell + gap) + 2))
+                    by2 = int(round(py + cell + 4))
+                    cv2.rectangle(vis, (int(round(px)) - 2, int(round(py)) - 2),
+                                  (bx1, by2), (0, 255, 0), 1)
+
+                    if args.diag and n == 1:
+                        # 绿框 = 配置里写的 probe.x/y；红框 = 自动搜索找到的位置。
+                        # 两者一叠就能看出配置偏了多少、往哪偏。光看绿框歪不歪
+                        # 说不清是配置错了还是画面整体有位移。
+                        from tools.probe_auto import locate
+
+                        r = locate(gray, int(cell), float(gap), int(bits))
+                        if r:
+                            _c, ax, ay = r
+                            cv2.rectangle(vis, (int(ax) - 2, int(ay) - 2),
+                                          (int(round(ax + (2 + bits) * (cell + gap) + 2)),
+                                           int(round(ay + cell + 4))), (0, 0, 255), 1)
+                            print(f"[diag] 自动定位 x={ax} y={ay} | "
+                                  f"配置 x={px} y={py} | "
+                                  f"偏差 dx={ax - int(px)} dy={ay - int(py)}")
+                        else:
+                            print("[diag] 自动定位失败：这一帧里没搜到探针")
+
+                        # 画个十字标出配置原点，方便核对
+                        ox, oy = int(round(px)), int(round(py))
+                        cv2.line(vis, (ox - 12, oy), (ox + 12, oy), (255, 0, 255), 1)
+                        cv2.line(vis, (ox, oy - 12), (ox, oy + 12), (255, 0, 255), 1)
+                        cv2.putText(vis, f"cfg({px},{py})", (ox + 6, oy + 34),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+
                     if delays:
                         cv2.putText(vis, f"lat {delays[-1]:.1f}ms", (10, 30),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                     else:
                         cv2.putText(vis, "no probe", (10, 30),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                cv2.imshow("probe_recv", vis)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+
+                if args.diag and n == 1:
+                    # 走 imwrite 编码而不是 cv2.imwrite：OpenCV 在中文路径下
+                    # 会静默失败（返回 False 不抛异常），存出来的图根本不存在。
+                    ok, buf = cv2.imencode(".png", vis)
+                    if ok:
+                        path = Path(args.diag)
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_bytes(buf.tobytes())
+                        print(f"[diag] 已保存 {path}")
+                    else:
+                        print("[diag] 编码失败")
+
+                if args.show:
+                    cv2.imshow("probe_recv", vis)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
 
             if args.seconds > 0 and (time.perf_counter() - t_start) >= args.seconds:
                 break

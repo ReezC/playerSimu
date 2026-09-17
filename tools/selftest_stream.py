@@ -85,8 +85,11 @@ def main() -> int:
 
             if args.show:
                 vis = cv2.cvtColor(f.image, cv2.COLOR_RGB2BGR)
-                cv2.rectangle(vis, (px - 2, py - 2),
-                              (px + (2 + bits) * (cell + gap) + 2, py + cell + 4), (0, 255, 0), 1)
+                # 取整：gap 是 2.25（浮点），不取整 cv2 不接受浮点坐标
+                bx1 = int(round(px + (2 + bits) * (cell + gap) + 2))
+                by2 = int(round(py + cell + 4))
+                cv2.rectangle(vis, (int(round(px)) - 2, int(round(py)) - 2),
+                              (bx1, by2), (0, 255, 0), 1)
                 cv2.putText(vis, f"frames {n} probe {'OK' if ts_a is not None else 'MISS'}",
                             (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 cv2.imshow("selftest_stream", vis)

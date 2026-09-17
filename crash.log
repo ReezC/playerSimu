@@ -1,0 +1,82 @@
+
+=== 启动 2026-09-17 01:20:37 ===
+
+=== 未捕获异常 2026-09-17 01:21:47 ===
+Traceback (most recent call last):
+  File "E:\MyPrograms\playerSimu\gui\main_window.py", line 447, in _on_progress
+    self.progress.setFormat("%s   %p%%" % text if total else text)
+TypeError: not enough arguments for format string
+
+=== 启动 2026-09-17 01:23:58 ===
+
+=== 启动 2026-09-17 01:30:07 ===
+
+=== 启动 2026-09-17 01:56:24 ===
+
+=== 启动 2026-09-17 02:01:16 ===
+
+=== 启动 2026-09-17 02:32:18 ===
+Windows fatal exception: access violation
+
+Current thread 0x0000be2c (most recent call first):
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\site-packages\torch\__init__.py", line 261 in _load_dll_libraries
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\site-packages\torch\__init__.py", line 285 in <module>
+  File "<frozen importlib._bootstrap>", line 241 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 883 in exec_module
+  File "<frozen importlib._bootstrap>", line 688 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1006 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1027 in _find_and_load
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\site-packages\ultralytics\utils\__init__.py", line 26 in <module>
+  File "<frozen importlib._bootstrap>", line 241 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 883 in exec_module
+  File "<frozen importlib._bootstrap>", line 688 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1006 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1027 in _find_and_load
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\site-packages\ultralytics\__init__.py", line 14 in <module>
+  File "<frozen importlib._bootstrap>", line 241 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 883 in exec_module
+  File "<frozen importlib._bootstrap>", line 688 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1006 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1027 in _find_and_load
+  File "E:\MyPrograms\playerSimu\perception\train.py", line 103 in run_train
+  File "E:\MyPrograms\playerSimu\gui\worker.py", line 77 in run
+
+Thread 0x00009a8c (most recent call first):
+  File "E:\MyPrograms\playerSimu\gui\app.py", line 75 in main
+  File "E:\MyPrograms\playerSimu\gui\app.py", line 79 in <module>
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 86 in _run_code
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 196 in _run_module_as_main
+
+=== 启动 2026-09-17 02:35:16 ===
+
+=== 启动 2026-09-17 02:37:06 ===
+
+=== 启动 2026-09-17 02:38:37 ===
+
+=== 启动 2026-09-17 08:53:26 ===
+
+=== 启动 2026-09-17 08:54:21 ===
+
+=== 启动 2026-09-17 08:57:27 ===
+
+=== 启动 2026-09-17 21:39:16 ===
+
+=== 启动 2026-09-17 22:08:03 ===
+
+=== 启动 2026-09-17 22:14:15 ===
+
+=== 启动 2026-09-17 22:22:33 ===
+
+=== 启动 2026-09-17 22:27:53 ===
+
+=== 启动 2026-09-17 22:33:19 ===
+
+=== 启动 2026-09-17 23:23:36 ===
+
+=== 启动 2026-09-17 23:28:06 ===
+
+=== 启动 2026-09-17 23:32:21 ===
+
+=== 启动 2026-09-17 23:38:08 ===
+
+=== 启动 2026-09-17 23:41:37 ===

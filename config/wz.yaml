@@ -1,0 +1,4 @@
+wz_dir: E:\冒险岛online075\冒险岛online
+probe_exe: E:\MyPrograms\RippleRogue\MapleNecrocer\WzProbe\bin\Release\net8.0\WzProbe.exe
+maps_json: datasets/maps.json
+sprite_dir: datasets/sprites/mob

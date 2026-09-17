@@ -61,8 +61,10 @@ def main() -> int:
         # 屏幕时间码探针（编码当前毫秒时间戳）
         ts_ms = now_ms()
         for k, v in enumerate(encode_bits(ts_ms, bits)):
-            rx = px + k * (cell + gap)
-            cv2.rectangle(img, (rx, py), (rx + cell, py + cell),
+            # 取整：gap 是 2.25（浮点），不取整 cv2 不接受浮点坐标
+            rx = int(round(px + k * (cell + gap)))
+            ry, rc = int(round(py)), int(round(cell))
+            cv2.rectangle(img, (rx, ry), (rx + rc, ry + rc),
                           (255, 255, 255) if v else (0, 0, 0), -1)
 
         vf = av.VideoFrame.from_ndarray(img, format="rgb24")

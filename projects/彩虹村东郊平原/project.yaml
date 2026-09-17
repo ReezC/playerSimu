@@ -1,0 +1,52 @@
+name: 001020000彩虹村东郊平原
+map_id: '001020000'
+mobs:
+- '0130100'
+- '0130101'
+- '0210100'
+- '1210100'
+scale: 1.4
+scale_at:
+  width: 1920
+  height: 1080
+  mob: '0130100'
+  confidence: high
+calib:
+  min_scale: 0.4
+  max_scale: 2.4
+  step: 0.1
+  sample: 5
+notes: ''
+capture:
+  source: file
+  file: E:/MyPrograms/playerSimu/data/recordings/2026-09-17 00-44-49.mp4
+  url: udp://0.0.0.0:5000
+  fps: 5.0
+  stride: 6
+  seconds: 120.0
+  dedup: 0.02
+  limit: 0
+  clean: true
+label:
+  thresh: 0.9
+  min_distinct: 0.06
+  per_mob: 20
+  max_peaks: 3
+  downscale: 1
+  region: null
+dataset:
+  val_ratio: 0.2
+  min_boxes: 1
+  quality: 92
+train:
+  model: yolo26n.pt
+  epochs: 120
+  imgsz: 960
+  batch: 8
+  device: '0'
+  patience: 40
+mob_names:
+- 木妖
+- 红蜗牛
+- 绿水灵
+- 猪猪

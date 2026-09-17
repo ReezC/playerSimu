@@ -1,0 +1,13 @@
+{
+  "frames": 331,
+  "boxes": 1443,
+  "from_model": 331,
+  "boxes_from_model": 1443,
+  "protected": 61,
+  "kept_orig": 0,
+  "boxes_kept": 0,
+  "cleared": 0,
+  "median_boxes": 4.0,
+  "conf_thr": 0.6,
+  "weights": "E:\\MyPrograms\\playerSimu\\projects\\彩虹村东郊平原\\models\\mob_v1.pt"
+}

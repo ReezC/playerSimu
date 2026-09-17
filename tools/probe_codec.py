@@ -59,33 +59,42 @@ def bits_to_ms(seq: list[int], bits: int = DEFAULT_BITS) -> int | None:
     return v
 
 
-def read_bits(gray, x: int, y: int, cell: int, gap: int, bits: int = DEFAULT_BITS) -> list[int]:
+def read_bits(gray, x, y, cell, gap, bits: int = DEFAULT_BITS) -> list[int]:
     """从灰度图中采样方块序列。
 
     gray : HxW 灰度图 (numpy uint8)
     x, y : 第一个方块左上角坐标
-    """
-    import numpy as np
 
+    **所有下标都必须取整**：gap 在 config 里配的是 2.25（不是整数），
+    浮点数直接拿去切片会抛
+    TypeError: slice indices must be integers or None or have an __index__ method。
+    编码侧（probe_gen）不会暴露这个问题 —— tkinter 的 geometry() 接受浮点字符串。
+    """
     n = 2 + bits
     h, w = gray.shape[:2]
     out: list[int] = []
     half = max(1, cell // 4)
 
+    x0i, yi, celli = int(round(x)), int(round(y)), int(round(cell))
+    gapf = float(gap)
+
     for i in range(n):
-        cx = x + i * (cell + gap) + cell // 2
-        cy = y + cell // 2
+        cx = int(round(x0i + i * (celli + gapf) + celli // 2))
+        cy = int(round(yi + celli // 2))
         if cy >= h or cx >= w:
             out.append(0)
             continue
         y0, y1 = max(0, cy - half), min(h, cy + half)
-        x0, x1 = max(0, cx - half), min(w, cx + half)
-        patch = gray[y0:y1, x0:x1]
+        xa, xb = max(0, cx - half), min(w, cx + half)
+        patch = gray[y0:y1, xa:xb]
+        if patch.size == 0:
+            out.append(0)
+            continue
         out.append(1 if float(patch.mean()) > 128.0 else 0)
     return out
 
 
-def decode_ms(gray, x: int, y: int, cell: int, gap: int, bits: int = DEFAULT_BITS) -> int | None:
+def decode_ms(gray, x, y, cell, gap, bits: int = DEFAULT_BITS) -> int | None:
     return bits_to_ms(read_bits(gray, x, y, cell, gap, bits), bits)
 
 

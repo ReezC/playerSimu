@@ -1,0 +1,18 @@
+Traceback (most recent call last):
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "E:\MyPrograms\playerSimu\tools\push_clip.py", line 100, in <module>
+    sys.exit(main())
+  File "E:\MyPrograms\playerSimu\tools\push_clip.py", line 82, in main
+    out.mux(packet)
+  File "av/container/output.py", line 555, in av.container.output.OutputContainer.mux
+    self.mux_one(packets)
+  File "av/container/output.py", line 579, in av.container.output.OutputContainer.mux_one
+    self.err_check(ret)
+  File "av/container/core.py", line 369, in av.container.core.Container.err_check
+    return err_check(value, filename=self.name)
+  File "av/error.py", line 412, in av.error.err_check
+    raise cls(code, message, filename, log)
+av.error.ArgumentError: Invalid argument: '<none>' returned 22
