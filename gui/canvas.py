@@ -22,13 +22,23 @@ MIN_SIZE = 8       # 框的最小边长
 class BBoxItem(QGraphicsRectItem):
     """一个可移动 / 可缩放的标注框。"""
 
-    def __init__(self, x, y, w, h):
+    # 类别 → 框颜色（和 data.yaml 的 class 对齐）
+    COLORS = {
+        0: ("#4285f4", (66, 133, 244)),    # player 蓝
+        1: ("#34a853", (52, 168, 83)),      # mob 绿
+        2: ("#fbbc04", (251, 188, 4)),      # drop 黄
+        3: ("#ea4335", (234, 67, 53)),      # npc 红
+    }
+
+    def __init__(self, x, y, w, h, cls=1):
         super().__init__(0, 0, w, h)
         self.setPos(x, y)
+        self.cls = cls
 
+        hex_, rgb = self.COLORS.get(cls, self.COLORS[1])
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
-        self.setPen(QPen(QColor("#34a853"), 2))
-        self.setBrush(QBrush(QColor(52, 168, 83, 36)))
+        self.setPen(QPen(QColor(hex_), 2))
+        self.setBrush(QBrush(QColor(*rgb, 36)))
         self.setZValue(10)
 
         self._mode = None
@@ -159,6 +169,7 @@ class ImageCanvas(QGraphicsView):
         self.pix_item = None
         self.boxes = []
         self.editable = True
+        self.current_cls = 1      # 新建框的默认类别（1=怪物，0=玩家）
 
         self._draw_start = None
         self._rubber = None
@@ -183,8 +194,9 @@ class ImageCanvas(QGraphicsView):
         self.scene_.setSceneRect(0, 0, w, h)
 
         self.editable = editable
-        for x, y, bw, bh in boxes:
-            self.add_box(x, y, bw, bh)
+        for box in boxes:
+            cls, x, y, bw, bh = box
+            self.add_box(x, y, bw, bh, cls)
 
         if fit:
             self.fitInView(self.scene_.sceneRect(), Qt.KeepAspectRatio)
@@ -197,20 +209,20 @@ class ImageCanvas(QGraphicsView):
 
     # ---------------- 框操作 ----------------
 
-    def add_box(self, x, y, w, h):
-        it = BBoxItem(x, y, w, h)
+    def add_box(self, x, y, w, h, cls=1):
+        it = BBoxItem(x, y, w, h, cls)
         it.setEnabled(self.editable)
         self.scene_.addItem(it)
         self.boxes.append(it)
         return it
 
     def get_boxes(self):
-        """返回 [(x, y, w, h), ...]，像素坐标。"""
+        """返回 [(cls, x, y, w, h), ...]，像素坐标。"""
         out = []
         for it in self.boxes:
             r = it.rect()
             p = it.pos()
-            out.append((p.x(), p.y(), r.width(), r.height()))
+            out.append((it.cls, p.x(), p.y(), r.width(), r.height()))
         return out
 
     def count(self):
@@ -304,7 +316,7 @@ class ImageCanvas(QGraphicsView):
             self._draw_start = None
 
             if r.width() >= MIN_SIZE and r.height() >= MIN_SIZE:
-                self.add_box(r.x(), r.y(), r.width(), r.height())
+                self.add_box(r.x(), r.y(), r.width(), r.height(), self.current_cls)
                 self.boxes_changed.emit()
             e.accept()
             return

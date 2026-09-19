@@ -24,7 +24,13 @@ import time
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
-BOX_COLOR = (60, 220, 60)
+# 类别 → 框颜色（BGR，和 data.yaml 的 class 对齐）
+BOX_COLORS = {
+    0: (255, 128, 0),    # player 蓝
+    1: (60, 220, 60),    # mob 绿
+    2: (0, 255, 255),    # drop 黄
+    3: (0, 0, 255),      # npc 红
+}
 
 
 class _LatestSlot:
@@ -121,7 +127,8 @@ class LiveThread(QThread):
         model = YOLO(weights)
 
         # BGR 直出，省一次颜色转换
-        src = PyAVSource(url, decode_format="bgr24")
+        src = PyAVSource(url, decode_format="bgr24",
+                         container_format=self._p.get("format"))
         src.open()
 
         # 读线程独立于推理：它拼命读，积压的旧帧在槽位里被直接覆盖丢掉。
@@ -177,6 +184,15 @@ class LiveThread(QThread):
         delays = []
         probe_miss = 0
         if probe_on:
+            # 自动对时：offset 会随 Windows NTP 漂移，后台线程里重新对一次，
+            # 失败就沿用 params 传进来的旧值。
+            try:
+                from tools.clock_sync import sync_offset
+                off = sync_offset(save=True, quiet=True)
+                if off is not None:
+                    offset_ms = off
+            except Exception:
+                pass
             try:
                 from tools.probe_codec import decode_ms, resolve_delay_ms
             except Exception as e:
@@ -196,9 +212,10 @@ class LiveThread(QThread):
                 if last_mono is not None:
                     gaps.append((f.t_recv_mono - last_mono) * 1000.0)
                 last_mono = f.t_recv_mono
+                vis = f.image          # BGR（decode_format="bgr24" 直出）
 
                 if probe_on:
-                    # f.image 是 BGR（decode_format 指定的），转灰度解码
+                    # f.image 是 BGR，转灰度解码
                     gray = cv2.cvtColor(vis, cv2.COLOR_BGR2GRAY)
                     ts_a = decode_ms(gray, px, py, cell, gap, bits)
                     if ts_a is None:
@@ -225,16 +242,21 @@ class LiveThread(QThread):
                 if boxes is not None and len(boxes):
                     xyxy = boxes.xyxy.cpu().numpy()
                     cfs = boxes.conf.cpu().numpy()
-                    for (x1, y1, x2, y2), c in zip(xyxy, cfs):
+                    try:
+                        clss = boxes.cls.cpu().numpy().astype(int)
+                    except Exception:
+                        clss = [1] * len(cfs)
+                    for (x1, y1, x2, y2), c, cls in zip(xyxy, cfs, clss):
                         k += 1
                         if not draw:
                             continue
                         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                        cv2.rectangle(vis, (x1, y1), (x2, y2), BOX_COLOR, 2)
+                        color = BOX_COLORS.get(int(cls), BOX_COLORS[1])
+                        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
                         ty = y1 - 5 if y1 > 14 else y1 + 16
                         cv2.putText(vis, "%.2f" % c, (x1 + 2, ty),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                    BOX_COLOR, 1, cv2.LINE_AA)
+                                    color, 1, cv2.LINE_AA)
                 n_boxes = k
 
                 now = time.perf_counter()

@@ -59,6 +59,51 @@ def measure(host: str, port: int, samples: int, interval_ms: int, timeout: float
     return recs
 
 
+def sync_offset(host=None, port=None, samples=None, interval_ms=None,
+                save=True, quiet=False):
+    """自动对时：探测 A 机 clock_server 并返回 offset（毫秒）。
+
+    失败（A 机没跑 clock_server / 网络不通）返回 None，不抛异常。
+
+    **快速失败**：先发一个 PING 探测，0.6s 内不回就直接放弃，
+    避免 A 机没跑时钟服务时干等几十秒（200 样本 × 0.5s 超时）。
+    """
+    host = host or get("a_host")
+    port = port or get("clock_sync", "server_port", 5001)
+    if samples is None:
+        samples = get("clock_sync", "samples", 200)
+    if interval_ms is None:
+        interval_ms = get("clock_sync", "interval_ms", 10)
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.settimeout(0.6)
+    try:
+        probe.sendto(b"PING,-1", (host, port))
+        probe.recvfrom(1024)
+    except socket.timeout:
+        if not quiet:
+            print("[clock_sync] A 机 clock_server 无响应，跳过自动对时", flush=True)
+        return None
+    finally:
+        probe.close()
+
+    recs = measure(host, port, samples, interval_ms)
+    if not recs:
+        return None
+    recs.sort(key=lambda r: r[0])
+    best = recs[: max(1, len(recs) // 10)]
+    offset = statistics.fmean([o for _, o in best])
+
+    if save:
+        (ROOT / "config" / "clock_offset.txt").write_text(
+            f"{offset:.6f}\n", encoding="utf-8")
+    if not quiet:
+        jitter = statistics.pstdev([o for _, o in best]) if len(best) > 1 else 0.0
+        print(f"[clock_sync] 自动对时 offset={offset:.3f}ms (jitter={jitter:.3f}ms)",
+              flush=True)
+    return offset
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", type=str, default=None, help="A 机 IP")

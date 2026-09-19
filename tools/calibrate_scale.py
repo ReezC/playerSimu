@@ -284,6 +284,172 @@ def run_calibrate(params, ctx=None):
     }
 
 
+def run_calibrate_player(params, ctx=None):
+    """标定玩家 scale：玩家站姿模板多尺度匹配。
+
+    和 run_calibrate 同一套原理，只是模板换成玩家站姿帧。
+    params: frames, player_id, player_root, min_scale, max_scale, step, sample
+    returns: {scale, confidence, summary, ...}
+    """
+    ctx = ctx or TaskContext()
+
+    frames_dir = Path(params["frames"])
+    all_frames = sorted(frames_dir.glob("*.png"))
+    if not all_frames:
+        raise FileNotFoundError("画面目录里没有 png：%s\n请先完成 ② 采集" % frames_dir)
+
+    player_id = (params.get("player_id") or "").strip()
+    if not player_id:
+        raise ValueError("没有指定玩家 —— 请先在 ① 识别目标选项 里选角色")
+
+    player_root = Path(params.get("player_root", "datasets/sprites/player"))
+    pd = player_root / player_id
+    if not pd.is_dir():
+        raise FileNotFoundError("找不到玩家模板目录: %s" % pd)
+
+    min_s = float(params.get("min_scale", 0.4))
+    max_s = float(params.get("max_scale", 2.4))
+    step = float(params.get("step", 0.1))
+    sample = max(1, int(params.get("sample", 5)))
+
+    tpls = []
+    for f in sorted(pd.glob("*stand*.png")):
+        t = _trim(imread(f, cv2.IMREAD_UNCHANGED))
+        if t is not None:
+            b, al = t
+            tpls.append((f.stem, b, al))
+            # 镜像一份 —— 模板可能都是朝左的，玩家朝右时也匹配得到
+            tpls.append((f.stem + "@L", cv2.flip(b, 1), cv2.flip(al, 1)))
+    if not tpls:
+        raise RuntimeError("玩家模板目录里没有 stand 帧: %s" % pd)
+
+    n = min(sample, len(all_frames))
+    if n == 1:
+        frames = [all_frames[0]]
+    else:
+        idxs = [int(round(i * (len(all_frames) - 1) / (n - 1))) for i in range(n)]
+        frames = [all_frames[i] for i in sorted(set(idxs))]
+
+    scales = []
+    s = min_s
+    while s <= max_s + 1e-9:
+        scales.append(round(s, 4))
+        s += step
+
+    ctx.log("玩家 %s   模板 %d 个   扫 scale %.2f~%.2f（%d 档）"
+            % (player_id, len(tpls), min_s, max_s, len(scales)))
+    ctx.log("采样 %d 帧" % len(frames))
+    ctx.log("")
+
+    results = []
+    total = len(frames) * len(tpls) * len(scales)
+    done = 0
+    t0 = time.perf_counter()
+
+    for fi, fp in enumerate(frames):
+        img = imread(fp)          # BGR，直接匹配（不要 cvtColor）
+        if img is None:
+            continue
+        for name, b, al in tpls:
+            for sc in scales:
+                if ctx.canceled():
+                    ctx.log("已取消", "warn")
+                    return {"summary": "已取消"}
+                h = max(8, int(round(b.shape[0] * sc)))
+                w = max(8, int(round(b.shape[1] * sc)))
+                if h >= img.shape[0] or w >= img.shape[1]:
+                    done += 1
+                    continue
+                interp = cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR
+                t = cv2.resize(b, (w, h), interpolation=interp)
+                m = (cv2.resize(al, (w, h), interpolation=interp) > 128)
+                m = m.astype(np.uint8) * 255
+                try:
+                    r = cv2.matchTemplate(img, t, cv2.TM_CCORR_NORMED, mask=m)
+                except Exception:
+                    done += 1
+                    continue
+                r = np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
+                peak = float(r.max())
+                distinct = peak - float(np.percentile(r, 99.5))
+                _, _, _, ml = cv2.minMaxLoc(r)
+                results.append((distinct, peak, name, sc,
+                                (ml[0], ml[1]), w, h, fp.name))
+                done += 1
+            if done % 40 == 0:
+                ctx.progress(done, total, "已匹配 %d" % done)
+        ctx.progress(done, total, "第 %d/%d 帧" % (fi + 1, len(frames)))
+        ctx.log("  [%d/%d] %s  用时 %.0fs"
+                % (fi + 1, len(frames), fp.name, time.perf_counter() - t0))
+
+    if not results:
+        raise RuntimeError("没有产生任何有效匹配 —— 检查画面里有没有玩家")
+
+    results.sort(key=lambda r: -r[0])
+    distinct, peak, name, sc, loc, w, h, fname = results[0]
+
+    strong = [r for r in results if r[0] >= distinct * 0.4]
+    spread = float(np.std([r[3] for r in strong])) if len(strong) > 1 else 0.0
+
+    if distinct >= 0.05 and spread < 0.2:
+        conf = "high"
+    elif distinct >= 0.03:
+        conf = "low"
+    else:
+        conf = "fail"
+
+    ctx.log("")
+    ctx.log("── 玩家标定结果 ──", "ok" if conf == "high" else "warn")
+    ctx.log("  最佳尺度 %.3f（区分度 %.4f，峰值 %.4f）" % (sc, distinct, peak))
+    ctx.log("  来自 %s 的 %s，尺寸 %d×%d，位置 %s" % (fname, name, w, h, loc))
+    if conf == "high":
+        ctx.log("  判定：可信", "ok")
+    elif conf == "low":
+        ctx.log("  判定：勉强可用", "warn")
+    else:
+        ctx.log("  判定：不可信 —— 画面里可能没有玩家，或姿态不符", "error")
+
+    summary = "玩家尺度 %.3f（%s）" % (
+        sc, {"high": "可信", "low": "存疑", "fail": "失败"}[conf])
+    ctx.progress(total, total, summary)
+    return {
+        "scale": float(sc),
+        "confidence": conf,
+        "distinct": float(distinct),
+        "peak": float(peak),
+        "player": player_id,
+        "summary": summary,
+    }
+
+
+def run_calibrate_combined(params, ctx=None):
+    """标定怪物 + 玩家两个 scale，一次任务跑完。"""
+    mob_res = run_calibrate(params["mob"], ctx)
+
+    ctx.log("")
+    ctx.log("—— 玩家尺度标定 ——", "info")
+    player_res = None
+    player_err = None
+    try:
+        player_res = run_calibrate_player(params["player"], ctx)
+    except Exception as e:
+        player_err = "%s: %s" % (type(e).__name__, e)
+        ctx.log("玩家标定失败（怪物标定结果已保留）：%s" % player_err, "warn")
+
+    summary = mob_res.get("summary", "")
+    if player_res is not None:
+        summary += "  ·  " + player_res.get("summary", "")
+    elif player_err:
+        summary += "  ·  玩家标定失败"
+
+    return {
+        "mob": mob_res,
+        "player": player_res,
+        "player_error": player_err,
+        "summary": summary,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--frames", required=True, help="画面目录")

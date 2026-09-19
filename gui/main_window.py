@@ -24,12 +24,13 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QFileDialog, QHBoxLayout, QInputDialog,
                              QLabel, QMainWindow, QMessageBox, QPlainTextEdit,
                              QProgressBar, QPushButton, QScrollArea, QSizePolicy,
-                             QSplitter, QStackedWidget, QToolBar, QVBoxLayout,
-                             QWidget)
+                             QSplitter, QStackedWidget, QTabWidget, QToolBar,
+                             QVBoxLayout, QWidget)
 
 from gui import theme
 from gui.export_dialog import ExportDialog
 from gui.live_panel import LivePanel
+from gui.player_panel import PlayerPanel
 from gui.settings_dialog import SettingsDialog
 from gui.widgets import NoWheelComboBox
 from gui.project import Project, sanitize
@@ -60,6 +61,7 @@ QPushButton { padding: 4px 10px; }
 PAGE_REVIEW = 1     # 质检台在主视区里的固定页号
 PAGE_VERIFY = 2     # 验证结果浏览器的固定页号
 PAGE_LIVE = 3       # 实时预览（收流 + 推理）的固定页号
+PAGE_PLAYER = 4     # 角色匹配验证结果的固定页号
 
 
 class InfoPage(QWidget):
@@ -90,6 +92,54 @@ class InfoPage(QWidget):
 
     def set_body(self, text):
         self.lbl_body.setText(text)
+
+
+class PlayerMatchPage(QWidget):
+    """角色匹配验证结果页：画面 + 说明文字。
+
+    匹配验证的结果直接显示在主视区，不在角色模板页里再开一个画面窗口。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._pm = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(6)
+
+        self.lbl_title = QLabel("角色匹配验证")
+        self.lbl_title.setStyleSheet("font-weight: 600; color: #202124;")
+        lay.addWidget(self.lbl_title)
+
+        self.lbl_text = QLabel("（点「角色模板 → 匹配验证」后这里显示结果）")
+        self.lbl_text.setStyleSheet("color:#5f6368;")
+        self.lbl_text.setWordWrap(True)
+        lay.addWidget(self.lbl_text)
+
+        self.view = QLabel()
+        self.view.setAlignment(Qt.AlignCenter)
+        self.view.setMinimumHeight(300)
+        self.view.setStyleSheet(
+            "background:#202124; color:#9aa0a6; border:1px solid #dadce0;")
+        lay.addWidget(self.view, 1)
+
+    def set_result(self, pm, text):
+        self.lbl_text.setText(text)
+        self._pm = pm
+        if pm is not None:
+            self._apply()
+        else:
+            self.view.setText("（无结果画面）")
+
+    def _apply(self):
+        if self._pm is not None:
+            self.view.setPixmap(self._pm.scaled(
+                self.view.size(), Qt.KeepAspectRatio, Qt.FastTransformation))
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._apply()
 
 
 class MainWindow(QMainWindow):
@@ -132,7 +182,7 @@ class MainWindow(QMainWindow):
 
         split = QSplitter(Qt.Horizontal)
         split.addWidget(self._build_viewer())
-        split.addWidget(self._build_cards())
+        split.addWidget(self._build_right_tabs())
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
         split.setSizes([900, 520])
@@ -169,15 +219,6 @@ class MainWindow(QMainWindow):
         btn_wz.setToolTip("解析 Map.wz 生成地图清单 —— ① 地图卡片的下拉列表从这里来")
         btn_wz.clicked.connect(self._on_export)
         lay.addWidget(btn_wz)
-
-        sep2 = QLabel("│")
-        sep2.setStyleSheet("color: #dadce0;")
-        lay.addWidget(sep2)
-
-        self.btn_qa = QPushButton("质检台")
-        self.btn_qa.setToolTip("翻看 ⑤ 的标注：筛选异常帧、修正错框 —— 判断框得准不准")
-        self.btn_qa.clicked.connect(self._show_review)
-        lay.addWidget(self.btn_qa)
 
         sep3 = QLabel("│")
         sep3.setStyleSheet("color: #dadce0;")
@@ -228,7 +269,11 @@ class MainWindow(QMainWindow):
         self.live_panel = LivePanel()
         self.viewer.addWidget(self.live_panel)
 
-        self.viewer_pages = {}      # card.key -> 动态页页号（从 4 起）
+        # 角色匹配验证结果固定在 index 4
+        self.player_view = PlayerMatchPage()
+        self.viewer.addWidget(self.player_view)
+
+        self.viewer_pages = {}      # card.key -> 动态页页号（从 5 起）
         return self.viewer
 
     def _placeholder(self, title, body):
@@ -260,6 +305,16 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(scroll)
         return host
+
+    def _build_right_tabs(self):
+        """右侧：模型训练流程 + 决策参数，两个页签。"""
+        tabs = QTabWidget()
+        tabs.addTab(self._build_cards(), "模型训练")
+        self.player_panel = PlayerPanel()
+        self.player_panel.verify_started.connect(self._on_player_verify_started)
+        self.player_panel.verify_result.connect(self._on_player_verify)
+        tabs.addTab(self.player_panel, "决策参数")
+        return tabs
 
     def _build_log(self):
         self.txt_log = QPlainTextEdit()
@@ -410,15 +465,15 @@ class MainWindow(QMainWindow):
                 c.refresh()
         self.log("① 地图卡片的下拉列表已刷新", "ok")
 
-    def _show_review(self):
-        """切到质检台。标注还在跑也可以看，已经生成的图会先列出来。"""
-        if self.project is None:
-            QMessageBox.warning(self, "提示", "请先打开一个项目")
-            return
+    def _on_player_verify_started(self):
+        """点「匹配验证」→ 主视区切到角色匹配页，先显示进行中。"""
+        self.player_view.set_result(None, "连流抓帧 + 匹配中…")
+        self.viewer.setCurrentIndex(PAGE_PLAYER)
 
-        self.review.bind(self.project)
-        self.viewer.setCurrentIndex(PAGE_REVIEW)
-        self.log("质检台：%d 张可视化图" % self.review.items.__len__())
+    def _on_player_verify(self, pm, text):
+        """匹配验证出结果 → 主视区显示画面 + 说明。"""
+        self.player_view.set_result(pm, text)
+        self.viewer.setCurrentIndex(PAGE_PLAYER)
 
     # ══════════════════════════════════════════════════
     # 运行任务
@@ -608,8 +663,8 @@ class MainWindow(QMainWindow):
         self.viewer_pages[card.key] = self.viewer.count() - 1
 
     def _clear_pages(self):
-        """清掉动态详情页，保留欢迎页、质检台、验证结果浏览器、实时预览。"""
-        while self.viewer.count() > 4:
+        """清掉动态详情页，保留欢迎页、质检台、验证结果浏览器、实时预览、角色匹配。"""
+        while self.viewer.count() > 5:
             w = self.viewer.widget(self.viewer.count() - 1)
             self.viewer.removeWidget(w)
             w.deleteLater()
@@ -640,6 +695,8 @@ class MainWindow(QMainWindow):
         # Qt 不会给警告，而是直接 abort —— 表现是关窗口时程序无征兆闪退。
         if self.live_panel.thread is not None:
             self.live_panel.shutdown()
+        if self.player_panel.thread is not None:
+            self.player_panel.shutdown()
 
         if self.task is not None and self.task.isRunning():
             r = QMessageBox.question(self, "确认退出", "有任务正在运行，确定要退出吗？",

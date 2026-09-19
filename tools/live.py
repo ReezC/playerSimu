@@ -48,6 +48,13 @@ def locate_probe(gray, cell, gap, bits, y_search=60, x_search=600):
 
 
 def load_offset_ms():
+    try:
+        from tools.clock_sync import sync_offset
+        off = sync_offset(save=True)
+        if off is not None:
+            return off
+    except Exception:
+        pass
     p = ROOT / "config" / "clock_offset.txt"
     if p.exists():
         try:
@@ -67,6 +74,8 @@ def pct(vals, q):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", type=str, default=None)
+    ap.add_argument("--format", type=str, default=None,
+                    help="强制输入格式（如 mjpeg）。默认读 config stream.format")
     ap.add_argument("--show", action="store_true")
     ap.add_argument("--seconds", type=float, default=0.0)
     ap.add_argument("--report", type=float, default=2.0)
@@ -80,7 +89,8 @@ def main() -> int:
     px, py = get("probe", "x", 100), get("probe", "y", 8)
     offset_ms = load_offset_ms()
 
-    src = PyAVSource(args.url or get("stream", "url"))
+    src = PyAVSource(args.url or get("stream", "url"),
+                     container_format=args.format or get("stream", "format", None))
     src.open()
     print("[live] source=%s  clock_offset=%.3fms  cell=%d gap=%d bits=%d"
           % (args.url or get("stream", "url"), offset_ms, cell, gap, bits), flush=True)

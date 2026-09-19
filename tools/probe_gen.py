@@ -22,9 +22,10 @@ def main() -> int:
     ap.add_argument("--cell", type=float, default=None)
     ap.add_argument("--gap", type=float, default=None)
     ap.add_argument("--fps", type=int, default=60, help="重绘频率")
-    ap.add_argument("--out-scale", type=float, default=1.0,
-                    help="流分辨率 / 屏幕分辨率。A 机 2560x1440 全屏而输出 1920x1080 时填 0.75；"
-                         "探针会按 1/scale 放大绘制，缩放后正好与 B 机配置一致")
+    ap.add_argument("--out-scale", type=float, default=None,
+                    help="流分辨率 / 屏幕分辨率。默认读 config/link.yaml 的 probe.out_scale；"
+                         "A 机 2560x1440 全屏而输出 1920x1080 时为 0.75。"
+                         "探针会按 1/scale 放大绘制，缩放后正好与配置值一致")
     args = ap.parse_args()
 
     x = args.x if args.x is not None else get("probe", "x", 100)
@@ -44,7 +45,8 @@ def main() -> int:
     #
     # 所以在屏幕上按 1/scale 放大绘制，缩放之后正好等于配置值，
     # B 机一行都不用改。
-    s = args.out_scale
+    # 优先用命令行，其次读配置 —— 分辨率是机器的固定属性，填一次就不该再记
+    s = args.out_scale if args.out_scale is not None else get("probe", "out_scale", 1.0)
     if s and s > 0 and abs(s - 1.0) > 1e-6:
         print(f"[probe_gen] 输出缩放 {s}：配置({x},{y}) cell={cell} "
               f"-> 屏幕需画在 ({x / s:.1f},{y / s:.1f}) cell={cell / s:.2f}")

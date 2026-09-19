@@ -179,6 +179,18 @@ def work(fp_str):
     cfg = _W["cfg"]
     fp = Path(fp_str)
 
+    out_path = Path(cfg["out"]) / (fp.stem + ".txt")
+    # 断点续标：这帧已有怪物框（class 1）就跳过 —— 不覆盖，保留玩家框。
+    # 每帧的 txt 按类记录「标过没有」：class 1 = 怪物已标，class 0 = 玩家已标。
+    if out_path.exists():
+        try:
+            text = out_path.read_text(encoding="utf-8")
+            if any(ln.split() and ln.split()[0] == "1"
+                   for ln in text.splitlines()):
+                return None
+        except Exception:
+            pass
+
     full = imread(fp)
     if full is None:
         return None
@@ -239,10 +251,16 @@ def work(fp_str):
     out_dir = Path(cfg["out"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    txt = "\n".join("%d %.6f %.6f %.6f %.6f" % (
+    new_lines = ["%d %.6f %.6f %.6f %.6f" % (
         CLASS_MOB, (x + w / 2) / W, (y + h / 2) / H, w / W, h / H)
-        for _, x, y, w, h, _ in kept)
-    (out_dir / (fp.stem + ".txt")).write_text(txt, encoding="utf-8")
+        for _, x, y, w, h, _ in kept]
+    # 追加怪物框（保留已有内容，比如玩家框 class 0），不覆盖
+    existing = out_path.read_text(encoding="utf-8") if out_path.exists() else ""
+    if existing.strip():
+        out_path.write_text(existing.rstrip("\n") + "\n" + "\n".join(new_lines) + "\n",
+                            encoding="utf-8")
+    else:
+        out_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
     if cfg["vis"]:
         for _, x, y, w, h, _ in kept:

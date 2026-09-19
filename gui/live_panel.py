@@ -11,6 +11,8 @@ from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (QCheckBox, QFormLayout, QHBoxLayout, QLabel,
                              QLineEdit, QPushButton, QVBoxLayout, QWidget)
 
+import numpy as np
+
 from gui.live_thread import LiveThread
 from gui.widgets import NoWheelDoubleSpinBox, NoWheelSpinBox
 from tools.config import ROOT, get
@@ -19,11 +21,17 @@ from tools.config import ROOT, get
 def _bgr_to_pixmap(img):
     """numpy BGR → QPixmap。
 
-    必须 copy()：QImage 只引用那段内存，不持有所有权。numpy 数组一旦被回收，
-    界面拿到的就是野指针 —— 表现是花屏或者直接崩。
+    三个坑（都是真实踩过的）：
+      1. 必须 copy()：QImage 只引用那段内存不持有所有权，numpy 数组一回收，
+         界面拿到野指针 → 花屏或崩溃。
+      2. to_ndarray(bgr24) 返回的帧带行 padding（非连续，stride 比 3*w 大），
+         QImage 按 3*w 读会整幅错位 —— 先 ascontiguousarray 去掉 padding。
+      3. numpy 的 .data 在新版返回 memoryview，PyQt5 的 QImage 不认它，
+         要用 tobytes() 拿 bytes 再构造。
     """
+    img = np.ascontiguousarray(img)
     h, w, ch = img.shape
-    qimg = QImage(img.data, w, h, ch * w, QImage.Format_BGR888)
+    qimg = QImage(img.tobytes(), w, h, img.strides[0], QImage.Format_BGR888)
     return QPixmap.fromImage(qimg.copy())
 
 
@@ -141,10 +149,14 @@ class LivePanel(QWidget):
             self.ed_weights.setText("")
             return
 
-        got = sorted(project.dir_of("models").glob("*.pt"))
+        # 按修改时间取最新的模型（detect_v1 比旧的 mob_v1 新）。
+        # 不能按文件名排序：detect_v1 < mob_v1，got[-1] 会选中旧的单类模型。
+        got = sorted(project.dir_of("models").glob("*.pt"),
+                     key=lambda p: p.stat().st_mtime, reverse=True)
         if not got:
-            got = sorted(project.dir_of("runs").glob("**/weights/best.pt"))
-        self.ed_weights.setText(str(got[-1]) if got else "")
+            got = sorted(project.dir_of("runs").glob("**/weights/best.pt"),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
+        self.ed_weights.setText(str(got[0]) if got else "")
 
     @staticmethod
     def _load_offset_ms():
@@ -173,6 +185,7 @@ class LivePanel(QWidget):
 
         self.thread = LiveThread({
             "url": url,
+            "format": get("stream", "format", None),
             "weights": w,
             "conf": self.sp_conf.value(),
             "imgsz": self.sp_imgsz.value(),

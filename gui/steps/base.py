@@ -51,6 +51,7 @@ class StepCard(QFrame):
 
         self.project = None
         self.widgets = {}       # key -> (widget, kind)
+        self._extra = {}        # key -> 额外控件（如 path 的浏览按钮），隐藏整行时用
         self.state = "idle"
 
         self.setObjectName("StepCard")
@@ -86,6 +87,13 @@ class StepCard(QFrame):
         head.addWidget(self.state_text)
         root.addLayout(head)
 
+        # --- hint：说明小字，紧跟标题，比放卡片底部更好读 ---
+        if self.hint:
+            note = QLabel(self.hint)
+            note.setStyleSheet("color: #80868b;")
+            note.setWordWrap(True)
+            root.addWidget(note)
+
         # --- body：参数区 ---
         self.form = QFormLayout()
         self.form.setContentsMargins(0, 2, 0, 2)
@@ -113,12 +121,6 @@ class StepCard(QFrame):
         foot.addWidget(self.btn_run)
 
         root.addLayout(foot)
-
-        if self.hint:
-            note = QLabel(self.hint)
-            note.setStyleSheet("color: #80868b;")
-            note.setWordWrap(True)
-            root.addWidget(note)
 
     # ---------------- 状态 ----------------
 
@@ -181,12 +183,30 @@ class StepCard(QFrame):
             row.addWidget(btn)
             form.addRow(label, row)
             self.widgets[key] = (w, kind)
+            self._extra[key] = btn
             return w
         else:
             w = QLineEdit(str(default or ""))
         form.addRow(label, w)
         self.widgets[key] = (w, kind)
         return w
+
+    def set_row_visible(self, key, on):
+        """隐藏/显示一行（label + 控件 + 可能的额外按钮）。
+
+        给「按来源切换参数」这类场景用 —— 比 setEnabled 更彻底，
+        不相关的参数直接藏掉，界面干净。
+        """
+        w, _kind = self.widgets.get(key, (None, None))
+        if w is None:
+            return
+        w.setVisible(bool(on))
+        lbl = self.form.labelForField(w)
+        if lbl is not None:
+            lbl.setVisible(bool(on))
+        extra = self._extra.get(key)
+        if extra is not None:
+            extra.setVisible(bool(on))
 
     def _pick_path(self, key, line, filt, mode="file"):
         start = line.text() or ""

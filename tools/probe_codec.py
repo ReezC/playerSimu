@@ -65,22 +65,30 @@ def read_bits(gray, x, y, cell, gap, bits: int = DEFAULT_BITS) -> list[int]:
     gray : HxW 灰度图 (numpy uint8)
     x, y : 第一个方块左上角坐标
 
-    **所有下标都必须取整**：gap 在 config 里配的是 2.25（不是整数），
-    浮点数直接拿去切片会抛
-    TypeError: slice indices must be integers or None or have an __index__ method。
-    编码侧（probe_gen）不会暴露这个问题 —— tkinter 的 geometry() 接受浮点字符串。
+    **cell 支持浮点，且必须支持** —— 用整数取整会累积出致命漂移：
+        当屏幕分辨率与推流分辨率不一致（如 2560x1440 推 1920x1080，
+        缩放 0.75），画面里的方块只有 13.5px。若按 int(round(cell))=14
+        计算，41 个方块累计偏 20px（超过一个方块宽），后半段全部采错。
+
+    **但切片下标仍必须是整数**：浮点直接拿去切会抛
+        TypeError: slice indices must be integers or None or have an __index__ method
+    gap 在 config 里配的就是 2.25，所以这里统一在算完坐标后再取整。
     """
     n = 2 + bits
     h, w = gray.shape[:2]
     out: list[int] = []
-    half = max(1, cell // 4)
 
-    x0i, yi, celli = int(round(x)), int(round(y)), int(round(cell))
+    cellf = float(cell)
     gapf = float(gap)
+    xf, yf = float(x), float(y)
+
+    # 采样窗口取方块中心附近的一小块。用 /2.0 而不是 //2：
+    # // 对浮点返回浮点，混进切片就崩。
+    half = max(1, int(cellf // 4))
+    cy = int(round(yf + cellf / 2.0))
 
     for i in range(n):
-        cx = int(round(x0i + i * (celli + gapf) + celli // 2))
-        cy = int(round(yi + celli // 2))
+        cx = int(round(xf + i * (cellf + gapf) + cellf / 2.0))
         if cy >= h or cx >= w:
             out.append(0)
             continue

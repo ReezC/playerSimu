@@ -33,8 +33,8 @@ class MapCard(StepCard):
     """
 
     def __init__(self):
-        super().__init__(1, "map", "地图 / 怪种",
-                         hint="地图从下拉列表选，列表来自工具栏「WZ 导出」。选完自动生效")
+        super().__init__(1, "map", "识别目标选项",
+                         hint="选地图确定要识别的怪，选角色确定要识别的玩家。选完自动生效")
         self._pool = []       # 全量地图缓存，不受筛选影响
         self._shown = []      # 当前筛选后展示的
         self._loading = False
@@ -69,12 +69,48 @@ class MapCard(StepCard):
         self.widgets["map_filter"][0].textChanged.connect(self._refill)
         self.widgets["only_mob"][0].stateChanged.connect(self._refill)
 
+        # ---- 角色（玩家模板）选择 ----
+        self.cmb_player = NoWheelComboBox()
+        self.cmb_player.setMinimumWidth(240)
+        self.cmb_player.currentIndexChanged.connect(self._on_player_picked)
+        self.widgets["player_id"] = (self.cmb_player, "combo")
+        form.addRow("角色", self.cmb_player)
+
+        self.lbl_player = QLabel("—")
+        self.lbl_player.setStyleSheet("color:#80868b;")
+        form.addRow("", self.lbl_player)
+
     # ---------------- 列表 ----------------
 
     def reload_maps(self):
         """重读地图清单（工具栏导出完成后要刷一次）。"""
         self._pool = wzexport.list_maps(only_with_mob=False, keyword="")
         self._refill()
+
+    PLAYER_ROOT = Path("datasets/sprites/player")
+
+    def reload_players(self):
+        """读角色模板目录，填角色下拉。"""
+        self.cmb_player.blockSignals(True)
+        self.cmb_player.clear()
+        if self.PLAYER_ROOT.is_dir():
+            for p in sorted(self.PLAYER_ROOT.iterdir()):
+                if p.is_dir() and list(p.glob("*.png")):
+                    # 必须传 userData：combo 的 value() 读 currentData，
+                    # 不传的话选什么都取到 None
+                    self.cmb_player.addItem(p.name, p.name)
+        self.cmb_player.blockSignals(False)
+
+    def _on_player_picked(self, _idx=None):
+        if self._loading or self.project is None:
+            return
+        pid = self.value("player_id")
+        if not pid:
+            return
+        self.project.set("player_id", pid)
+        self.project.save()
+        n = len(list((self.PLAYER_ROOT / pid).glob("*.png")))
+        self.lbl_player.setText("模板 %d 帧" % n)
 
     def _refill(self):
         self._shown = wzexport.list_maps(only_with_mob=self.value("only_mob"),
@@ -142,6 +178,15 @@ class MapCard(StepCard):
             self._shown = wzexport.list_maps(only_with_mob=self.value("only_mob"))
             self._fill_combo()
             self.set_value("map_id", p.get("map_id"))
+            self.reload_players()
+            pid = p.get("player_id")
+            if not pid and self.cmb_player.count() > 0:
+                # 项目里没存过玩家：默认选第一个（下拉框本已默认选中第一项，
+                # 但 blockSignals 挡住了信号，没写回 project）
+                pid = self.cmb_player.itemData(0)
+                p.set("player_id", pid)
+                p.save()
+            self.set_value("player_id", pid)
         finally:
             self._loading = False
 
@@ -156,16 +201,21 @@ class MapCard(StepCard):
             p.set("mob_names", m["mob_names"])
 
     def summarize(self, p):
+        parts = []
         mid = p.get("map_id") or ""
-        if not mid:
-            return "未选择地图"
-        return self._describe(mid, p.get("mobs") or [], p.get("mob_names") or [])
+        parts.append(self._describe(mid, p.get("mobs") or [], p.get("mob_names") or [])
+                     if mid else "未选地图")
+        pid = p.get("player_id") or ""
+        parts.append("角色: %s" % pid if pid else "未选角色")
+        return "   ·   ".join(parts)
 
     def detect_state(self, p):
         if not p.get("map_id"):
             return ("idle", "未选")
         if not (p.get("mobs") or []):
             return ("warn", "该图无怪")
+        if not p.get("player_id"):
+            return ("warn", "未选角色")
         return ("done", "已选")
 
     @staticmethod
@@ -191,6 +241,8 @@ class MapCard(StepCard):
             return False, "请先从下拉列表选择一张地图"
         if not (p.get("mobs") or []):
             return False, "该地图没有怪物记录，请换一张有怪的地图"
+        if not self.value("player_id"):
+            return False, "请选择要识别的角色（玩家模板）"
         return True, ""
 
     def make_task(self, p):
@@ -231,17 +283,20 @@ class CaptureCard(StepCard):
         self.lbl_win.setStyleSheet("color:#80868b;")
         row.addWidget(self.lbl_win, 1)
 
-        b = QPushButton("刷新")
-        b.setFixedWidth(56)
-        b.clicked.connect(self.reload_windows)
-        row.addWidget(b)
+        self.btn_win_refresh = QPushButton("刷新")
+        self.btn_win_refresh.setFixedWidth(56)
+        self.btn_win_refresh.clicked.connect(self.reload_windows)
+        row.addWidget(self.btn_win_refresh)
 
-        b = QPushButton("预览")
-        b.setFixedWidth(56)
-        b.setToolTip("抓一帧看看选中的窗口对不对")
-        b.clicked.connect(self.preview_window)
-        row.addWidget(b)
+        self.btn_win_preview = QPushButton("预览")
+        self.btn_win_preview.setFixedWidth(56)
+        self.btn_win_preview.setToolTip("抓一帧看看选中的窗口对不对")
+        self.btn_win_preview.clicked.connect(self.preview_window)
+        row.addWidget(self.btn_win_preview)
         form.addRow("", row)
+
+        # 刷新/预览行在切换来源时要整体隐藏，单独存一份引用
+        self._win_extras = [self.lbl_win, self.btn_win_refresh, self.btn_win_preview]
 
         self.field(form, "url", "流地址", "str", "udp://0.0.0.0:5000")
         self.field(form, "fps", "抓帧频率", "float", 5.0,
@@ -261,22 +316,25 @@ class CaptureCard(StepCard):
         self._on_source("window")     # 初始状态（此时还没绑定项目）
 
     def _on_source(self, txt):
-        """按来源切换可用参数，避免用户改了不生效的参数。"""
+        """按来源切换参数：不相关的整行藏掉，界面只留当前来源要填的。"""
         is_file = (txt == "file")
         is_win = (txt == "window")
         is_stream = (txt == "stream")
 
         for k, on in (("file", is_file),
                       ("stride", is_file),
+                      ("clean", is_file),
                       ("win_rect", is_win),
                       ("fps", is_win),
                       ("seconds", is_win or is_stream),
-                      ("url", is_stream)):
-            if k in self.widgets:
-                self.widgets[k][0].setEnabled(on)
+                      ("url", is_stream),
+                      ("dedup", True),
+                      ("limit", True)):
+            self.set_row_visible(k, on)
 
-        self.cmb_win.setVisible(is_win)
-        self.lbl_win.setVisible(is_win)
+        # 刷新/预览行没注册 key，单独控制
+        for w in self._win_extras:
+            w.setVisible(is_win)
 
         if is_win and self.cmb_win.count() == 0:
             self.reload_windows()
@@ -528,17 +586,27 @@ class CalibCard(StepCard):
         return True, ""
 
     def make_task(self, p):
-        from tools.calibrate_scale import run_calibrate
+        from tools.calibrate_scale import run_calibrate_combined
 
         sec = p.sec("calib")
-        return run_calibrate, {
-            "frames": str(p.frames),
-            "sprites": str(wzexport.sprite_dir_path()),
-            "mobs": p.get("mobs") or [],
-            "min_scale": sec.get("min_scale", 0.4),
-            "max_scale": sec.get("max_scale", 2.4),
-            "step": sec.get("step", 0.1),
-            "sample": sec.get("sample", 5),
+        return run_calibrate_combined, {
+            "mob": {
+                "frames": str(p.frames),
+                "sprites": str(wzexport.sprite_dir_path()),
+                "mobs": p.get("mobs") or [],
+                "min_scale": sec.get("min_scale", 0.4),
+                "max_scale": sec.get("max_scale", 2.4),
+                "step": sec.get("step", 0.1),
+                "sample": sec.get("sample", 5),
+            },
+            "player": {
+                "frames": str(p.frames),
+                "player_id": p.get("player_id") or "",
+                "min_scale": sec.get("min_scale", 0.4),
+                "max_scale": sec.get("max_scale", 2.4),
+                "step": sec.get("step", 0.1),
+                "sample": sec.get("sample", 5),
+            },
         }
 
     def on_result(self, res):
@@ -547,18 +615,27 @@ class CalibCard(StepCard):
         if p is None or not isinstance(res, dict):
             return
 
-        sc = res.get("scale")
-        if not sc:
-            return
-
         w, h = self._frame_size()
-        p.set("scale", round(float(sc), 4))
-        p.set("scale_at", {
-            "width": w,
-            "height": h,
-            "mob": res.get("mob"),
-            "confidence": res.get("confidence"),
-        })
+
+        mob = res.get("mob") or {}
+        if mob.get("scale"):
+            p.set("scale", round(float(mob["scale"]), 4))
+            p.set("scale_at", {
+                "width": w,
+                "height": h,
+                "mob": mob.get("mob"),
+                "confidence": mob.get("confidence"),
+            })
+
+        player = res.get("player") or {}
+        if player.get("scale"):
+            p.set("player_scale", round(float(player["scale"]), 4))
+            p.set("player_scale_at", {
+                "width": w,
+                "height": h,
+                "confidence": player.get("confidence"),
+            })
+
         p.save()
 
 
@@ -594,14 +671,32 @@ class LabelCard(StepCard):
         self.field(form, "max_peaks", "每模板峰数", "int", 4, minimum=1, maximum=20)
         self.field(form, "downscale", "降采样", "int", 1, minimum=1, maximum=4)
 
+        # ---- 玩家标注参数（模板匹配，class 0）----
+        # 玩家 scale 由 ③ 标定尺度自动测，这里只读展示，不让手填
+        self.lbl_player_scale = QLabel("—（先跑 ③ 标定）")
+        self.lbl_player_scale.setStyleSheet("color:#5f6368;")
+        form.addRow("玩家 scale", self.lbl_player_scale)
+
+        self.field(form, "player_thresh", "玩家阈值", "float", 0.78,
+                   minimum=0.0, maximum=1.0, decimals=2, step=0.01)
+
     def load_from_project(self, p):
         sec = p.sec("label")
-        for k in ("thresh", "min_distinct", "per_mob", "max_peaks", "downscale"):
+        for k in ("thresh", "min_distinct", "per_mob", "max_peaks", "downscale",
+                  "player_thresh"):
             self.set_value(k, sec.get(k))
 
     def sync(self, p):
         p.sec("label").update(
-            self.values(["thresh", "min_distinct", "per_mob", "max_peaks", "downscale"]))
+            self.values(["thresh", "min_distinct", "per_mob", "max_peaks", "downscale",
+                         "player_thresh"]))
+
+    def refresh(self, force=False):
+        super().refresh(force)
+        if self.project is not None:
+            ps = self.project.get("player_scale")
+            self.lbl_player_scale.setText(
+                ("%.3f" % ps) if ps else "—（先跑 ③ 标定）")
 
     # ---------------- 摘要 ----------------
 
@@ -617,29 +712,34 @@ class LabelCard(StepCard):
             return None
 
     def summarize(self, p):
-        st = self._read_stats(p)
-        if not st:
-            n = p.snapshot()["labels_auto"]
-            return "尚未标注" if not n else "%d 帧（无统计）" % n
-
-        return ("%d 帧 / %d 框 · 空帧 %d（%.0f%%）· 框 %.0fpx"
-                % (st.get("frames", 0), st.get("boxes", 0),
-                   st.get("zero_frames", 0),
-                   100.0 * st.get("zero_frames", 0) / max(1, st.get("frames", 1)),
-                   st.get("size_median", 0)))
+        from gui import labelio
+        prog = labelio.label_progress(p)
+        total = prog["total"]
+        if not total:
+            return "尚未标注"
+        return ("已标怪物 %d 帧（%.0f%%）· 已标角色 %d 帧（%.0f%%）"
+                % (prog["mob"], 100.0 * prog["mob"] / total,
+                   prog["player"], 100.0 * prog["player"] / total))
 
     def detect_state(self, p):
-        n = sum(1 for _ in p.dir_of("labels_auto").glob("*.txt"))
-        if not n:
+        from gui import labelio
+        prog = labelio.label_progress(p)
+        total = prog["total"]
+        if not total:
             return ("idle", "")
 
-        st = self._read_stats(p)
-        if st:
-            frames = st.get("frames", 0) or 1
-            # 过半帧空 → 多半是 scale 或模板有问题，标黄让人别急着往下走
-            if st.get("zero_frames", 0) > frames * 0.5:
-                return ("warn", "过半帧无检出")
-        return ("done", "%d 帧" % n)
+        mob_pct = 100.0 * prog["mob"] / total
+        player_pct = 100.0 * prog["player"] / total
+
+        if prog["mob"] == 0 and prog["player"] == 0:
+            return ("idle", "")
+
+        # 任何一类没标满 100% → 都不是完成态，标黄并给出各自进度
+        if prog["mob"] < total or prog["player"] < total:
+            return ("warn", "未标满：怪物 %.0f%% · 角色 %.0f%%"
+                    % (mob_pct, player_pct))
+
+        return ("done", "怪物 100% · 角色 100%")
 
     def check_deps(self, p):
         if p.snapshot()["frames"] == 0:
@@ -654,22 +754,36 @@ class LabelCard(StepCard):
         return True, ""
 
     def make_task(self, p):
-        from tools.detect_mobs import run_detect
+        from tools.detect_player import run_detect_combined
 
         sec = p.sec("label")
-        return run_detect, {
-            "mobs": p.get("mobs") or [],
-            "sprites": str(wzexport.sprite_dir_path()),
-            "frames": str(p.frames),
-            "out": str(p.dir_of("labels_auto")),
-            "vis_dir": str(p.vis),
-            "scale": p.get("scale", 1.12),
-            "downscale": sec.get("downscale", 1),
-            "thresh": sec.get("thresh", 0.90),
-            "min_distinct": sec.get("min_distinct", 0.06),
-            "per_mob": sec.get("per_mob", 20),
-            "max_peaks": sec.get("max_peaks", 4),
-            "vis": True,
+        player_id = p.get("player_id") or ""
+        return run_detect_combined, {
+            # 先怪物（class 1），写 labels_auto
+            "mob": {
+                "mobs": p.get("mobs") or [],
+                "sprites": str(wzexport.sprite_dir_path()),
+                "frames": str(p.frames),
+                "out": str(p.dir_of("labels_auto")),
+                "vis_dir": str(p.vis),
+                "scale": p.get("scale", 1.12),
+                "downscale": sec.get("downscale", 1),
+                "thresh": sec.get("thresh", 0.90),
+                "min_distinct": sec.get("min_distinct", 0.06),
+                "per_mob": sec.get("per_mob", 20),
+                "max_peaks": sec.get("max_peaks", 4),
+                "vis": True,
+            },
+            # 后玩家（class 0），追加到 labels_auto
+            "player": {
+                "frames": str(p.frames),
+                "out": str(p.dir_of("labels_auto")),
+                "player_id": player_id,
+                "scale": p.get("player_scale", 1.0),
+                "thresh": sec.get("player_thresh", 0.78),
+                "vis": True,
+                "vis_dir": str(p.vis) + "_player",
+            },
         }
 
 
@@ -864,7 +978,7 @@ class TrainCard(StepCard):
             "patience": sec.get("patience", 40),
             # 输出落在项目里，不是全局 runs/ —— 项目要能整个拷走
             "project_dir": str(p.dir_of("runs")),
-            "name": "mob_v1",
+            "name": "detect_v1",
             "copy_to": str(p.dir_of("models")),
         }
 

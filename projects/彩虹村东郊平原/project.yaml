@@ -34,6 +34,8 @@ label:
   max_peaks: 3
   downscale: 1
   region: null
+  player_scale: 1.4
+  player_thresh: 0.7
 dataset:
   val_ratio: 0.2
   min_boxes: 1
@@ -50,3 +52,4 @@ mob_names:
 - 红蜗牛
 - 绿水灵
 - 猪猪
+player_id: 珠缨

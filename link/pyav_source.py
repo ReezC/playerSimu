@@ -23,8 +23,19 @@ LOW_LATENCY_OPTIONS = {
     "analyzeduration": "1000000",
     "probesize": "1000000",
     # UDP 读缓冲。小一点让积压更快暴露、更早丢弃；太大反而成了隐藏的延迟源。
-    "fifo_size": "131072",
-    "rtbufsize": "524288",
+    #
+    # 131072 曾经是这里的问题：实测端到端延迟稳定在 665ms 且不随时间增长，
+    # 说明不是"越积越多"，而是一条固定深度的缓冲管道。按常见码率折算，
+    # 131KB 相当于 2Mbps 下 524ms / 4Mbps 下 262ms 的排队量 —— 量级对得上。
+    #
+    # 调小到 32768（2Mbps 下约 130ms）。代价是突发丢包时更容易溢出丢弃，
+    # 表现为画面花屏或 miss 上升；如果出现，就回退到 65536 折中。
+    "fifo_size": "32768",
+    # socket 层接收缓冲（SO_RCVBUF）。默认 64KB 甚至更大，是 kernel 层
+    # 的隐藏积压点 —— 数据到得比应用读得快时，先堆在这里，再进 fifo。
+    # 和 fifo 一样设小，让积压更快暴露、更早丢弃。
+    "buffer_size": "32768",
+    "rtbufsize": "262144",
     "overrun_nonfatal": "1",
 }
 
@@ -43,17 +54,24 @@ class PyAVSource(FrameSource):
     """
 
     def __init__(self, url, options=None, decode_format="rgb24",
-                 decode_all=False, skip_nonref=False):
+                 decode_all=False, skip_nonref=False, container_format=None):
         """
         skip_nonref: 只解参考帧（I/P），跳过 B 帧等非参考帧。
             能显著减轻解码负担，但帧率会掉到 GOP 内的参考帧数量
             （推流端 -g 60 时大约还剩 30fps）。延迟敏感、又跑不动解码时值得开。
+
+        container_format: 强制指定输入格式，对应 av.open(format=...)。
+            **裸流必须指定** —— 例如 ffmpeg 用 `-f mjpeg` 推出来的流
+            没有容器头（既不是 mpegts 也不是 mp4），PyAV 的自动探测会失败：
+                InvalidDataError: Invalid data found when processing input
+            这时传 container_format="mjpeg" 就能正常打开。
         """
         self.url = url
         self.options = {**LOW_LATENCY_OPTIONS, **(options or {})}
         self.decode_format = decode_format
         self.decode_all = decode_all
         self.skip_nonref = skip_nonref
+        self.container_format = container_format
 
         self._container = None
         self._stream = None
@@ -68,7 +86,9 @@ class PyAVSource(FrameSource):
         self._meta = {}
 
     def open(self):
-        self._container = av.open(self.url, mode="r", options=self.options)
+        # format=None 时 PyAV 走自动探测；裸流（如 -f mjpeg 推出来的）必须显式给
+        self._container = av.open(self.url, mode="r", options=self.options,
+                                  format=self.container_format)
 
         streams = self._container.streams.video
         if not streams:
@@ -79,7 +99,30 @@ class PyAVSource(FrameSource):
             )
 
         self._stream = streams[0]
-        self._stream.thread_type = "AUTO"
+
+        # 解码线程：FRAME 并行，但**把预取量钉死在 2 帧**。
+        #
+        # 三种取值实测对比（1080p60、16 核）：
+        #
+        #   "AUTO"  帧级并行 + 按核数预取（16 帧 ≈ 267ms 固定缓冲）。
+        #           症状：延迟恒定在 655ms，不随积压变化 —— 正是固定
+        #           深度缓冲的特征。注意这一层**不受 fflags/max_delay/
+        #           reorder_queue_size 影响**，那些管的是容器层，
+        #           管不到编解码器内部的预取队列。
+        #
+        #   "NONE"  单线程，预取缓冲消失（延迟从恒定值变成一路上降），
+        #           但 1080p60 每帧只有 16.7ms 预算，单核解不过来：
+        #           实测 fps 只有 7，积压把延迟冲到 2 秒再慢慢追。
+        #
+        #   "FRAME" + thread_count=2  折中：保留并行解码能力，
+        #           预取仅 2 帧（约 33ms）。这是低延迟直播的常用配法。
+        self._stream.thread_type = "FRAME"
+        try:
+            self._stream.codec_context.thread_count = 2
+        except Exception:
+            # 老版本 PyAV 可能没有这个属性，退回 AUTO 也不致命
+            self._stream.thread_type = "AUTO"
+
         if self.skip_nonref:
             self._stream.codec_context.skip_frame = "NONREF"
 

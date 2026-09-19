@@ -36,6 +36,7 @@ class ReviewPanel(QWidget):
                ("只看多框（疑似误检）", "many"),
                ("有新框出现（疑似误检）", "new"),
                ("有旧框消失（疑似漏检）", "lost"),
+               ("只看玩家框丢失", "player_missing"),
                ("只看人工改过", "manual"))
 
     MANY_THRESHOLD = 8      # 一帧超过这么多框，多半是误检
@@ -107,6 +108,13 @@ class ReviewPanel(QWidget):
         self.lbl_status = QLabel("—")
         self.lbl_status.setStyleSheet("color: #5f6368;")
         ops.addWidget(self.lbl_status, 1)
+
+        ops.addWidget(QLabel("新建框"))
+        self.cmb_cls = NoWheelComboBox()
+        self.cmb_cls.addItem("怪物", 1)
+        self.cmb_cls.addItem("玩家", 0)
+        self.cmb_cls.currentIndexChanged.connect(self._on_cls_changed)
+        ops.addWidget(self.cmb_cls)
 
         hint = QLabel("空白拖=建框　框边拖=缩放　Del=删框　滚轮=缩放　中键拖=平移　双击=适应")
         hint.setStyleSheet("color: #80868b;")
@@ -200,6 +208,10 @@ class ReviewPanel(QWidget):
                 continue
             if mode == "lost" and n_lost <= 0:
                 continue
+            if mode == "player_missing":
+                by_cls = labelio.count_by_class(self.project, stem)
+                if by_cls.get(labelio.CLASS_PLAYER, 0) > 0:
+                    continue
 
             self.items.append((stem, n, manual, n_new, n_lost))
 
@@ -280,6 +292,10 @@ class ReviewPanel(QWidget):
     def _on_boxes_changed(self):
         self._dirty = True
         self._set_status("有未保存的修改（翻页会自动保存）")
+
+    def _on_cls_changed(self):
+        self.canvas.current_cls = self.cmb_cls.currentData()
+        self._set_status("新建框类别：%s" % self.cmb_cls.currentText())
 
     def _delete_selected(self):
         n = self.canvas.remove_selected()

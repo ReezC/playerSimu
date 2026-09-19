@@ -23,14 +23,23 @@ from tools.probe_codec import decode_ms, resolve_delay_ms
 def load_offset_ms(cli_offset: float | None) -> float:
     if cli_offset is not None:
         return cli_offset
+    # 自动对时：Windows 墙钟 NTP 漂移会让 offset 几分钟内偏上百毫秒，
+    # 用旧值算出的延迟会差一个系统误差。启动时重新对时一次，失败才回退文件。
+    try:
+        from tools.clock_sync import sync_offset
+        off = sync_offset(save=True)
+        if off is not None:
+            return off
+    except Exception:
+        pass
     p = ROOT / "config" / "clock_offset.txt"
     if p.exists():
         try:
             return float(p.read_text(encoding="utf-8").strip())
         except Exception:
             pass
-    print("[probe_recv] 未找到时钟偏移，延迟统计不可用。"
-          "请先运行 `python -m tools.clock_sync --host <A机IP> --save`")
+    print("[probe_recv] 无法对时也找不到时钟偏移，延迟统计不可用。"
+          "请确认 A 机 clock_server 已启动")
     return 0.0
 
 
@@ -46,6 +55,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", type=str, default=None)
     ap.add_argument("--file", type=str, default=None, help="离线回放文件（与 --url 二选一）")
+    ap.add_argument("--format", type=str, default=None,
+                    help="强制输入格式。裸流必须指定 —— "
+                         "ffmpeg 用 -f mjpeg 推的流没有容器头，自动探测会失败")
     ap.add_argument("--show", action="store_true")
     ap.add_argument("--probe", action="store_true", default=None, help="启用屏幕时间码解码")
     ap.add_argument("--offset", type=float, default=None, help="时钟偏移 ms（t_A = t_B + offset）")
@@ -66,16 +78,34 @@ def main() -> int:
     if args.file:
         src = FileSource(args.file, realtime=True)
     else:
-        src = PyAVSource(args.url or get("stream", "url"))
+        src = PyAVSource(args.url or get("stream", "url"),
+                         container_format=args.format)
 
     src.open()
     w, h = src.size or (0, 0)
+
+    # 探针参数**不再按流分辨率缩放**。
+    #
+    # config/link.yaml 里的 x/y/cell/gap 是「流画面里的像素值」，由 A 机
+    # probe_gen 的 out_scale 保证缩放后正好等于这个尺寸。所以这里直接用，
+    # 不缩放。
+    #
+    # 之前那套「流宽 != 1920 就 ×比例缩放」的逻辑是给临时实验用的
+    # （去掉 A 机 scale 后流变 2560），现在流分辨率固定为 1366x768，
+    # 保留缩放反而会误伤：1366 会被 ×0.711，把 18px 方块压成 12.8px，
+    # 探针直接失效。
+    EXPECT_W = 1366
+    if w and abs(w - EXPECT_W) > 1:
+        print(f"[probe_recv] ⚠ 流宽 {w} 与配置预期 {EXPECT_W} 不同，"
+              f"探针参数可能不匹配（需调整 out_scale 或 cell）")
+
     print(f"[probe_recv] source={args.file or src.url} {w}x{h} fps={src.fps}")
     print(f"[probe_recv] probe={'on' if use_probe else 'off'} offset={offset_ms:.3f}ms "
-          f"region=({px},{py}) cell={cell}")
+          f"region=({px:.1f},{py:.1f}) cell={cell:.2f} gap={gap:.2f}")
 
     gaps: list[float] = []
     delays: list[float] = []
+    reads: list[float] = []      # src.read() 单帧耗时，用来判断"是否已有积压"
     miss = 0
     n = 0
     last_mono = None
@@ -84,10 +114,20 @@ def main() -> int:
 
     try:
         while True:
+            # 单独计时 read()：这是判断"延迟在 A 机还是 B 机"的关键。
+            #
+            #   read() ≈ 16.7ms（一帧周期）-> B 机在实时等帧，数据一到就走，
+            #                                延迟全部发生在 A 机侧；
+            #   read() ≈ 0~2ms            -> 帧早就堆在 B 机内存里了，
+            #                                说明 B 机内部还有一层深缓冲
+            #                                （而这一层不在我们改过的参数里）。
+            _t0 = time.perf_counter()
             f = src.read()
+            _t1 = time.perf_counter()
             if f is None:
                 break
             n += 1
+            reads.append((_t1 - _t0) * 1000.0)
 
             if last_mono is not None:
                 gaps.append((f.t_recv_mono - last_mono) * 1000.0)
@@ -173,6 +213,9 @@ def main() -> int:
                 if gaps:
                     line += (f" | gap p50={pct(gaps,.5):6.2f} p95={pct(gaps,.95):6.2f} "
                              f"max={max(gaps):7.2f}ms")
+                if reads:
+                    line += (f" | read p50={pct(reads,.5):5.1f} "
+                             f"p95={pct(reads,.95):6.1f}ms")
                 if delays:
                     line += (f" | lat p50={pct(delays,.5):6.1f} p95={pct(delays,.95):6.1f} "
                              f"p99={pct(delays,.99):6.1f}ms miss={miss}")
