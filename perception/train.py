@@ -54,6 +54,10 @@ def _pick_metric(metrics, *names):
     return None
 
 
+class _TrainCanceled(Exception):
+    """训练被用户取消时在 epoch 回调里抛出，用于中断 model.train()。"""
+
+
 def run_train(params, ctx=None):
     """训练。
 
@@ -129,6 +133,11 @@ def run_train(params, ctx=None):
         ctx.log("epoch %3d/%-3d   P %s  R %s   mAP50 %s   mAP50-95 %s"
                 % (e, total, _fmt(p), _fmt(r), _fmt(m50), _fmt(m95)))
 
+        # 每个 epoch 结束检查取消 —— model.train() 是阻塞的，
+        # 不在这里中断就得等它跑完全部 epoch。
+        if ctx.canceled():
+            raise _TrainCanceled()
+
     def on_train_end(trainer):
         sd = getattr(trainer, "save_dir", None)
         if sd:
@@ -140,20 +149,24 @@ def run_train(params, ctx=None):
     model.add_callback("on_fit_epoch_end", on_epoch_end)
     model.add_callback("on_train_end", on_train_end)
 
-    model.train(
-        data=str(data),
-        epochs=epochs,
-        imgsz=imgsz,
-        batch=batch,
-        device=device,
-        patience=patience,
-        project=str(project_dir),
-        name=name,
-        exist_ok=True,
-        plots=True,
-        val=True,
-        verbose=False,
-    )
+    try:
+        model.train(
+            data=str(data),
+            epochs=epochs,
+            imgsz=imgsz,
+            batch=batch,
+            device=device,
+            patience=patience,
+            project=str(project_dir),
+            name=name,
+            exist_ok=True,
+            plots=True,
+            val=True,
+            verbose=False,
+        )
+    except _TrainCanceled:
+        ctx.log("已取消训练", "warn")
+        return {"summary": "已取消"}
 
     dt = time.perf_counter() - t0
 

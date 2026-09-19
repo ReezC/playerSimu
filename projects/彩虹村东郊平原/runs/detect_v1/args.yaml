@@ -2,7 +2,7 @@ task: detect
 mode: train
 model: yolo26n.pt
 data: E:\MyPrograms\playerSimu\projects\彩虹村东郊平原\dataset\data.yaml
-epochs: 120
+epochs: 200
 time: null
 patience: 40
 batch: 8

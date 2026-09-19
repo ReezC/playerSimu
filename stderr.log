@@ -55197,3 +55197,31 @@ TypeError: arguments did not match any overloaded call:
   QImage(fileName: str, format: typing.Optional[str] = None): argument 1 has unexpected type 'memoryview'
   QImage(a0: QImage): argument 1 has unexpected type 'memoryview'
   QImage(variant: Any): too many arguments
+Traceback (most recent call last):
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "E:\MyPrograms\playerSimu\gui\app.py", line 137, in <module>
+    sys.exit(main())
+  File "E:\MyPrograms\playerSimu\gui\app.py", line 123, in main
+    from gui.main_window import MainWindow
+  File "E:\MyPrograms\playerSimu\gui\main_window.py", line 37, in <module>
+    from gui.review import ReviewPanel
+  File "E:\MyPrograms\playerSimu\gui\review.py", line 23, in <module>
+    from PyQt5.QtCore import QSizePolicy, Qt
+ImportError: cannot import name 'QSizePolicy' from 'PyQt5.QtCore' (C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\site-packages\PyQt5\QtCore.pyd)
+Traceback (most recent call last):
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "E:\MyPrograms\playerSimu\gui\app.py", line 137, in <module>
+    sys.exit(main())
+  File "E:\MyPrograms\playerSimu\gui\app.py", line 123, in main
+    from gui.main_window import MainWindow
+  File "E:\MyPrograms\playerSimu\gui\main_window.py", line 37, in <module>
+    from gui.review import ReviewPanel
+  File "E:\MyPrograms\playerSimu\gui\review.py", line 23, in <module>
+    from PyQt5.QtCore import QSizePolicy, Qt
+ImportError: cannot import name 'QSizePolicy' from 'PyQt5.QtCore' (C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\site-packages\PyQt5\QtCore.pyd)

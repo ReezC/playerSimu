@@ -92,17 +92,76 @@ def list_windows_sorted():
 # ══════════════════════════════════════════════════════════════
 # 抓取
 # ══════════════════════════════════════════════════════════════
+def grab_rect_fast(rect):
+    """win32 BitBlt 抓屏，返回 BGR ndarray。
+
+    **为什么不用 PIL ImageGrab**：ImageGrab 抓 1920x1080 要 60ms+，
+    实时窗口识别只能跑到 15fps，设 60fps 也白搭。BitBlt 约 20ms，
+    能到 48fps（1366x768 约 80fps）。坐标体系和 ImageGrab(all_screens=True)
+    一致，都是虚拟屏幕坐标。
+    """
+    import win32con
+    import win32gui
+    import win32ui
+
+    x, y, w, h = (int(v) for v in rect)
+    if w <= 0 or h <= 0:
+        raise ValueError("矩形无效: %s" % (rect,))
+
+    hwnd = win32gui.GetDesktopWindow()
+    hdc = win32gui.GetWindowDC(hwnd)
+    mfc_dc = save_dc = bmp = None
+    try:
+        mfc_dc = win32ui.CreateDCFromHandle(hdc)
+        save_dc = mfc_dc.CreateCompatibleDC()
+        bmp = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(mfc_dc, w, h)
+        save_dc.SelectObject(bmp)
+        save_dc.BitBlt((0, 0), (w, h), mfc_dc, (x, y), win32con.SRCCOPY)
+        bmpstr = bmp.GetBitmapBits(True)
+        # GetBitmapBits 返回 BGRA、top-down（实测和 PIL 像素一致，无需翻转）
+        img = np.frombuffer(bmpstr, dtype="uint8").reshape(h, w, 4)[:, :, :3]
+        return np.ascontiguousarray(img)
+    finally:
+        for obj in (bmp, save_dc, mfc_dc):
+            if obj is not None:
+                try:
+                    if hasattr(obj, "GetHandle"):
+                        win32gui.DeleteObject(obj.GetHandle())
+                    else:
+                        obj.DeleteDC()
+                except Exception:
+                    pass
+        win32gui.ReleaseDC(hwnd, hdc)
+
+
+def virtual_screen():
+    """虚拟屏幕（所有显示器合并）边界 (x, y, w, h)，屏幕坐标。
+
+    多显示器时 x/y 可能为负（左边/上边的显示器）。框选区域和抓屏都用
+    这套坐标，才能跨显示器一致。
+    """
+    import ctypes
+
+    u = ctypes.windll.user32
+    return (u.GetSystemMetrics(76), u.GetSystemMetrics(77),   # SM_X/YVIRTUALSCREEN
+            u.GetSystemMetrics(78), u.GetSystemMetrics(79))   # SM_CX/CYVIRTUALSCREEN
+
+
 def grab_rect(rect):
     """抓屏幕上指定的矩形，返回 BGR ndarray。
 
-    all_screens=True 支持多显示器（窗口可能不在主屏上）。
+    优先 win32 BitBlt（快），失败回退 PIL ImageGrab。
     """
     x, y, w, h = (int(v) for v in rect)
     if w <= 0 or h <= 0:
         raise ValueError("矩形无效: %s" % (rect,))
 
-    img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
-    return np.array(img)[:, :, ::-1].copy()      # PIL 是 RGB，OpenCV 要 BGR
+    try:
+        return grab_rect_fast(rect)
+    except Exception:
+        img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
+        return np.array(img)[:, :, ::-1].copy()      # PIL 是 RGB，OpenCV 要 BGR
 
 
 # ══════════════════════════════════════════════════════════════

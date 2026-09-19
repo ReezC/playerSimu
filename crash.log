@@ -61801,3 +61801,89 @@ TypeError: arguments did not match any overloaded call:
 === 启动 2026-09-19 13:38:36 ===
 
 === 启动 2026-09-19 13:44:55 ===
+
+=== 启动 2026-09-19 14:22:30 ===
+
+=== 启动 2026-09-19 14:30:20 ===
+
+=== 启动 2026-09-19 15:13:25 ===
+
+=== 启动 2026-09-19 15:18:15 ===
+
+=== 启动 2026-09-19 15:21:32 ===
+
+=== 启动 2026-09-19 15:25:17 ===
+
+=== 启动 2026-09-19 15:32:10 ===
+
+=== 启动 2026-09-19 15:33:48 ===
+
+=== 启动 2026-09-19 15:40:40 ===
+
+=== 启动 2026-09-19 15:59:47 ===
+
+=== 未捕获异常 2026-09-19 15:59:49 ===
+Traceback (most recent call last):
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "E:\MyPrograms\playerSimu\gui\app.py", line 137, in <module>
+    sys.exit(main())
+  File "E:\MyPrograms\playerSimu\gui\app.py", line 123, in main
+    from gui.main_window import MainWindow
+  File "E:\MyPrograms\playerSimu\gui\main_window.py", line 37, in <module>
+    from gui.review import ReviewPanel
+  File "E:\MyPrograms\playerSimu\gui\review.py", line 23, in <module>
+    from PyQt5.QtCore import QSizePolicy, Qt
+ImportError: cannot import name 'QSizePolicy' from 'PyQt5.QtCore' (C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\site-packages\PyQt5\QtCore.pyd)
+
+=== 启动 2026-09-19 16:00:11 ===
+
+=== 未捕获异常 2026-09-19 16:00:11 ===
+Traceback (most recent call last):
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "E:\MyPrograms\playerSimu\gui\app.py", line 137, in <module>
+    sys.exit(main())
+  File "E:\MyPrograms\playerSimu\gui\app.py", line 123, in main
+    from gui.main_window import MainWindow
+  File "E:\MyPrograms\playerSimu\gui\main_window.py", line 37, in <module>
+    from gui.review import ReviewPanel
+  File "E:\MyPrograms\playerSimu\gui\review.py", line 23, in <module>
+    from PyQt5.QtCore import QSizePolicy, Qt
+ImportError: cannot import name 'QSizePolicy' from 'PyQt5.QtCore' (C:\Users\Locker\AppData\Local\Programs\Python\Python310\lib\site-packages\PyQt5\QtCore.pyd)
+
+=== 启动 2026-09-19 16:03:27 ===
+
+=== 启动 2026-09-19 16:08:57 ===
+
+=== 启动 2026-09-19 16:33:21 ===
+
+=== 启动 2026-09-19 16:46:01 ===
+
+=== 启动 2026-09-19 17:15:17 ===
+
+=== 启动 2026-09-19 17:22:03 ===
+
+=== 启动 2026-09-19 17:31:47 ===
+
+=== 启动 2026-09-19 17:50:58 ===
+
+=== 启动 2026-09-19 18:54:57 ===
+
+=== 启动 2026-09-19 18:59:57 ===
+
+=== 启动 2026-09-19 19:12:47 ===
+
+=== 启动 2026-09-19 19:42:53 ===
+
+=== 启动 2026-09-19 19:50:06 ===
+
+=== 启动 2026-09-19 19:59:33 ===
+
+=== 启动 2026-09-19 20:13:12 ===
+
+=== 启动 2026-09-19 20:18:11 ===

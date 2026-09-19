@@ -42,7 +42,7 @@ dataset:
   quality: 92
 train:
   model: yolo26n.pt
-  epochs: 120
+  epochs: 200
   imgsz: 960
   batch: 8
   device: '0'
@@ -53,3 +53,8 @@ mob_names:
 - 绿水灵
 - 猪猪
 player_id: 珠缨
+player_scale: 1.4
+player_scale_at:
+  width: 1920
+  height: 1080
+  confidence: high

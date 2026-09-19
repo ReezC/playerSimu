@@ -50,8 +50,11 @@ class PlayerLocator:
                                     "请把 WZ 合成的角色动作帧放到这里，"
                                     "结构为 {角色id}/{角色id}-{动作}-{帧号}.png" % d)
         for f in sorted(d.glob("*.png")):
-            if self.filter_prefix and self.filter_prefix not in f.stem:
-                continue
+            if self.filter_prefix:
+                # 支持逗号分隔的多个动作前缀，如 "stand,walk"（匹配含 stand 或 walk 的）
+                prefixes = [p.strip() for p in self.filter_prefix.split(",") if p.strip()]
+                if prefixes and not any(p in f.stem for p in prefixes):
+                    continue
             t = self._load_tpl(f)
             if t:
                 b, m = t

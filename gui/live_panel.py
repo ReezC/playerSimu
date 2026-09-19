@@ -9,12 +9,13 @@
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (QCheckBox, QFormLayout, QHBoxLayout, QLabel,
-                             QLineEdit, QPushButton, QVBoxLayout, QWidget)
+                             QLineEdit, QPushButton, QSizePolicy, QVBoxLayout,
+                             QWidget)
 
 import numpy as np
 
 from gui.live_thread import LiveThread
-from gui.widgets import NoWheelDoubleSpinBox, NoWheelSpinBox
+from gui.widgets import NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox
 from tools.config import ROOT, get
 
 
@@ -41,6 +42,7 @@ class LivePanel(QWidget):
         self.project = None
         self.thread = None
         self._last_pix = None
+        self._rect = None       # 本地窗口模式下框选的区域 (x, y, w, h)
         self._build()
 
     # ---------------- 界面 ----------------
@@ -64,10 +66,27 @@ class LivePanel(QWidget):
         bar.addWidget(self.btn_stop)
 
         bar.addSpacing(10)
-        bar.addWidget(QLabel("源"))
+        bar.addWidget(QLabel("来源"))
+        self.cmb_source = NoWheelComboBox()
+        self.cmb_source.addItem("收流", "stream")
+        self.cmb_source.addItem("本地窗口", "window")
+        self.cmb_source.currentIndexChanged.connect(self._on_source)
+        bar.addWidget(self.cmb_source)
+
+        # 收流：UDP/RTSP 地址
         self.ed_url = QLineEdit(get("stream", "url", "udp://0.0.0.0:5000"))
         self.ed_url.setMinimumWidth(220)
         bar.addWidget(self.ed_url, 1)
+
+        # 本地窗口：全屏框选区域
+        self.btn_pick_rect = QPushButton("框选区域")
+        self.btn_pick_rect.setToolTip("全屏拖拽框选要识别的屏幕区域")
+        self.btn_pick_rect.clicked.connect(self._pick_rect)
+        bar.addWidget(self.btn_pick_rect)
+
+        self.lbl_rect = QLabel("（未选）")
+        self.lbl_rect.setStyleSheet("color:#80868b;")
+        bar.addWidget(self.lbl_rect, 1)
 
         root.addLayout(bar)
 
@@ -100,6 +119,15 @@ class LivePanel(QWidget):
         self.ed_device.setFixedWidth(50)
         row.addWidget(self.ed_device)
 
+        # 本地窗口：抓帧频率
+        self.lbl_capfps = QLabel("抓帧fps")
+        self.sp_capfps = NoWheelSpinBox()
+        self.sp_capfps.setRange(1, 60)
+        self.sp_capfps.setValue(60)
+        self.sp_capfps.setToolTip("本地窗口每秒抓几帧去推理。\n窗口画面本身可能只有 60fps，抓太高浪费，\n15~30 对角色/怪物识别通常足够。")
+        row.addWidget(self.lbl_capfps)
+        row.addWidget(self.sp_capfps)
+
         self.ck_draw = QCheckBox("画框")
         self.ck_draw.setChecked(True)
         row.addWidget(self.ck_draw)
@@ -120,6 +148,9 @@ class LivePanel(QWidget):
         self.view = QLabel("（点「开始」后这里显示实时画面）")
         self.view.setAlignment(Qt.AlignCenter)
         self.view.setMinimumHeight(300)
+        # 忽略内容（pixmap）的 sizeHint：否则每帧 setPixmap 会改变 QLabel 的
+        # 建议尺寸，传导到 QSplitter，主视区宽度跟着抖、把右侧卡片压来压去。
+        self.view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.view.setStyleSheet(
             "background:#202124; color:#9aa0a6; border:1px solid #dadce0;")
         root.addWidget(self.view, 1)
@@ -130,12 +161,33 @@ class LivePanel(QWidget):
         root.addWidget(self.lbl_stats)
 
         self.lbl_hint = QLabel(
-            "收流 fps = 链路给到的输入速度 ｜ 处理 fps = 我们实际跑完的帧率（低于收流就会丢帧）｜ "
+            "输入 fps = 来源给到的速度（收流=链路，窗口=抓帧频率）｜ 处理 fps = 我们实际跑完的帧率（低于输入就会丢帧）｜ "
             "丢帧 = 为了不积压延迟而主动丢掉的帧数（正常，实时系统宁可丢帧也不排队）｜\n"
             "推理 ms = 模型耗时，要跑 60fps 得 ≤16ms ｜ 显示 fps = 界面刷新，故意低于推理，不参与性能判断")
         self.lbl_hint.setStyleSheet("color:#80868b;")
         self.lbl_hint.setWordWrap(True)
         root.addWidget(self.lbl_hint)
+
+        self._on_source()     # 初始可见性：默认收流模式
+
+    # ---------------- 来源切换 ----------------
+
+    def _on_source(self, _idx=None):
+        is_stream = self.cmb_source.currentData() == "stream"
+        is_win = not is_stream
+        self.ed_url.setVisible(is_stream)
+        self.btn_pick_rect.setVisible(is_win)
+        self.lbl_rect.setVisible(is_win)
+        self.lbl_capfps.setVisible(is_win)
+        self.sp_capfps.setVisible(is_win)
+
+    def _pick_rect(self):
+        from gui.region_selector import select_region
+        rect = select_region(self)
+        if rect is None:
+            return
+        self._rect = rect
+        self.lbl_rect.setText("%d,%d  %d×%d" % rect)
 
     # ---------------- 项目 ----------------
 
@@ -178,28 +230,46 @@ class LivePanel(QWidget):
             self.lbl_stats.setText("没有可用的模型权重 —— 请先完成 ⑦ 训练")
             return
 
-        url = self.ed_url.text().strip()
-        if not url:
-            self.lbl_stats.setText("请填写收流地址")
-            return
-
-        self.thread = LiveThread({
-            "url": url,
-            "format": get("stream", "format", None),
+        source = self.cmb_source.currentData()
+        common = {
             "weights": w,
             "conf": self.sp_conf.value(),
             "imgsz": self.sp_imgsz.value(),
             "device": self.ed_device.text().strip() or "0",
             "draw": self.ck_draw.isChecked(),
             "show_fps": 30.0,
-            "probe": self.ck_probe.isChecked(),
-            "probe_x": get("probe", "x", 100),
-            "probe_y": get("probe", "y", 8),
-            "probe_cell": get("probe", "cell", 16),
-            "probe_gap": get("probe", "gap", 2),
-            "probe_bits": get("probe", "bits", 40),
-            "clock_offset_ms": self._load_offset_ms(),
-        })
+        }
+
+        if source == "window":
+            rect = self._rect
+            if not rect:
+                self.lbl_stats.setText("请先点「框选区域」拖拽选择屏幕区域")
+                return
+            self.thread = LiveThread({
+                **common,
+                "source": "window",
+                "rect": rect,
+                "capture_fps": self.sp_capfps.value(),
+                "probe": False,      # 本地窗口没有跨机传输延迟
+            })
+        else:
+            url = self.ed_url.text().strip()
+            if not url:
+                self.lbl_stats.setText("请填写收流地址")
+                return
+            self.thread = LiveThread({
+                **common,
+                "source": "stream",
+                "url": url,
+                "format": get("stream", "format", None),
+                "probe": self.ck_probe.isChecked(),
+                "probe_x": get("probe", "x", 100),
+                "probe_y": get("probe", "y", 8),
+                "probe_cell": get("probe", "cell", 16),
+                "probe_gap": get("probe", "gap", 2),
+                "probe_bits": get("probe", "bits", 40),
+                "clock_offset_ms": self._load_offset_ms(),
+            })
         self.thread.frame_ready.connect(self._on_frame)
         self.thread.stats_ready.connect(self._on_stats)
         self.thread.failed.connect(self._on_failed)
@@ -261,7 +331,7 @@ class LivePanel(QWidget):
         else:
             d_txt = "端到端延迟  ——  （未启用探针）"
         self.lbl_stats.setText(
-            "%s ｜ 收流 %5.1f fps ｜ 处理 %5.1f fps ｜ 丢帧 %d ｜ 推理 %5.1f ms ｜ "
+            "%s ｜ 输入 %5.1f fps ｜ 处理 %5.1f fps ｜ 丢帧 %d ｜ 推理 %5.1f ms ｜ "
             "显示 %4.1f fps ｜ 检出 %d ｜ %d×%d"
             % (d_txt, s.get("recv_fps", 0), s.get("proc_fps", 0),
                s.get("dropped", 0), s.get("infer_ms", 0), s.get("show_fps", 0),

@@ -30,8 +30,59 @@ from core.imgio import imread, imwrite
 CLASS_NAMES = ["player", "mob", "drop", "npc"]
 
 
+def _merge_label_lines(stem, label_dirs):
+    """对一帧按「类」合并多层标注，返回合并后的 YOLO 行列表（或 None）。
+
+    每类独立找「最高优先级里含该类」的目录，取该目录里该类的**全部**框。
+    不同类可以来自不同层：
+
+        怪物框（class 1）: labels → labels_iter → labels_auto
+        角色框（class 0）: labels → labels_iter → labels_auto
+
+    这样不会因为某一层缺某一类就整类丢失。典型场景：labels_iter 是旧模型
+    迭代产物，只有怪物框没有角色框 —— 若按整帧优先，角色框会被它顶掉，
+    只剩怪物的标注把「角色」这一类活活吞了。按类合并后，角色框自动回退到
+    labels_auto 补齐。
+    """
+    per_dir = []  # [(dir, lines)]，保持 label_dirs 传入的优先级顺序
+    for d in label_dirs:
+        cand = Path(d) / (stem + ".txt")
+        if not cand.exists():
+            continue
+        try:
+            lines = [ln for ln in cand.read_text(encoding="utf-8").splitlines()
+                     if ln.strip()]
+        except Exception:
+            continue
+        if lines:
+            per_dir.append((d, lines))
+
+    if not per_dir:
+        return None
+
+    all_cls = set()
+    for _d, lines in per_dir:
+        for ln in lines:
+            parts = ln.split()
+            if parts:
+                try:
+                    all_cls.add(int(parts[0]))
+                except ValueError:
+                    pass
+
+    merged = []
+    for cls in sorted(all_cls):
+        for _d, lines in per_dir:
+            cls_lines = [ln for ln in lines
+                         if ln.split() and ln.split()[0] == str(cls)]
+            if cls_lines:
+                merged.extend(cls_lines)
+                break
+    return merged
+
+
 def _collect_pairs(frames_dir, label_dirs, min_boxes):
-    """收集 (图, 标注) 对。label_dirs 按优先级排列，先命中的胜出。
+    """收集 (图, 合并标注文本) 对。label_dirs 按优先级排列，合并按类进行。
 
     返回 (pairs, 缺标注数, 框数不足数)。
     """
@@ -39,28 +90,14 @@ def _collect_pairs(frames_dir, label_dirs, min_boxes):
     no_label = empty = 0
 
     for f in sorted(Path(frames_dir).glob("*.png")):
-        lf = None
-        for d in label_dirs:
-            cand = Path(d) / (f.stem + ".txt")
-            if cand.exists():
-                lf = cand
-                break
-
-        if lf is None:
+        merged = _merge_label_lines(f.stem, label_dirs)
+        if merged is None:
             no_label += 1
             continue
-
-        try:
-            n = sum(1 for x in lf.read_text(encoding="utf-8").splitlines() if x.strip())
-        except Exception:
-            no_label += 1
-            continue
-
-        if n < min_boxes:
+        if len(merged) < min_boxes:
             empty += 1
             continue
-
-        pairs.append((f, lf))
+        pairs.append((f, merged))
 
     return pairs, no_label, empty
 
@@ -184,7 +221,7 @@ def run_dataset(params, ctx=None):
         ldir.mkdir(parents=True, exist_ok=True)
 
         ok = 0
-        for f, lf in items:
+        for f, lines in items:
             # 必须走 imgio：cv2.imread 遇到中文路径（项目名就是中文地图名）
             # 会静默返回 None，结果是一堆图凭空消失，还不报错。
             img = imread(f)
@@ -204,7 +241,9 @@ def run_dataset(params, ctx=None):
                 }
 
             imwrite(idir / (f.stem + ".jpg"), img, quality=quality)
-            shutil.copy2(str(lf), str(ldir / (f.stem + ".txt")))
+            # 写合并后的标注（按类合并，不再是复制单份原始文件）
+            (ldir / (f.stem + ".txt")).write_text(
+                "\n".join(lines) + "\n", encoding="utf-8")
             ok += 1
             done += 1
 

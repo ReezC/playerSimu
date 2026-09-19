@@ -21,6 +21,24 @@ from gui.widgets import NoWheelComboBox
 from .base import StepCard
 
 
+def _latest_mtime(paths):
+    """一组路径（文件或目录）的最新修改时间（秒），无则 0。
+
+    用于「上游变更 → 下游产物过期」判断：人工修正标注后，
+    数据集 / 训练 / 验证 / 迭代这些下游产物就该退回未处理状态。
+    """
+    t = 0.0
+    for p in paths:
+        p = Path(p)
+        if p.is_file():
+            t = max(t, p.stat().st_mtime)
+        elif p.is_dir():
+            for f in p.rglob("*"):
+                if f.is_file():
+                    t = max(t, f.stat().st_mtime)
+    return t
+
+
 # ══════════════════════════════════════════════════════════════
 # ① 地图 / 怪种
 # ══════════════════════════════════════════════════════════════
@@ -886,8 +904,13 @@ class DatasetCard(StepCard):
         return "train %d / val %d" % (tr, va)
 
     def detect_state(self, p):
-        if not (p.dataset / "data.yaml").exists():
+        y = p.dataset / "data.yaml"
+        if not y.exists():
             return ("idle", "")
+        # 人工修正标注后（labels 比数据集新），数据集过期，退回未处理
+        up = [p.dir_of("labels"), p.dir_of("labels_iter"), p.dir_of("labels_auto")]
+        if _latest_mtime(up) > y.stat().st_mtime:
+            return ("warn", "标注已更新")
         tr = sum(1 for _ in (p.dataset / "images" / "train").glob("*.jpg"))
         if not tr:
             return ("fail", "训练集为空")
@@ -955,8 +978,13 @@ class TrainCard(StepCard):
         return "best.pt %s%s" % (best[0].parent.parent.name, extra)
 
     def detect_state(self, p):
-        if not list(p.dir_of("runs").glob("**/weights/best.pt")):
+        best = sorted(p.dir_of("runs").glob("**/weights/best.pt"))
+        if not best:
             return ("idle", "")
+        # 数据集比模型新 → 模型过期，退回未处理
+        y = p.dataset / "data.yaml"
+        if y.exists() and y.stat().st_mtime > best[-1].stat().st_mtime:
+            return ("warn", "数据集已更新")
         return ("done", "已训练")
 
     def check_deps(self, p):
@@ -1071,7 +1099,13 @@ class VerifyCard(StepCard):
 
     def detect_state(self, p):
         n = sum(1 for _ in p.dir_of("verify").glob("*.jpg"))
-        return ("done", "%d 张" % n) if n else ("idle", "")
+        if not n:
+            return ("idle", "")
+        # 模型比验证结果新 → 验证过期
+        w = self._weights(p)
+        if w and Path(w).stat().st_mtime > _latest_mtime([p.dir_of("verify")]):
+            return ("warn", "模型已更新")
+        return ("done", "%d 张" % n)
 
     def check_deps(self, p):
         if not self._weights(p):
@@ -1186,7 +1220,13 @@ class IterateCard(StepCard):
 
     def detect_state(self, p):
         n = sum(1 for _ in p.dir_of("labels_iter").glob("*.txt"))
-        return ("done", "%d 帧" % n) if n else ("idle", "")
+        if not n:
+            return ("idle", "")
+        # 模型比迭代产物新 → 迭代过期
+        w = self._weights(p)
+        if w and Path(w).stat().st_mtime > _latest_mtime([p.dir_of("labels_iter")]):
+            return ("warn", "模型已更新")
+        return ("done", "%d 帧" % n)
 
     def check_deps(self, p):
         if not self._weights(p):

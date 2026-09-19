@@ -24,6 +24,8 @@ import time
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
+from tools.config import get
+
 # 类别 → 框颜色（BGR，和 data.yaml 的 class 对齐）
 BOX_COLORS = {
     0: (255, 128, 0),    # player 蓝
@@ -113,40 +115,107 @@ class LiveThread(QThread):
     def _run(self):
         import cv2
 
-        from link import PyAVSource
-
-        url = self._p["url"]
+        url = self._p.get("url", "")
         conf = float(self._p.get("conf", 0.30))
         imgsz = int(self._p.get("imgsz", 960))
         device = str(self._p.get("device", "0"))
         weights = self._p.get("weights") or ""
         draw = bool(self._p.get("draw", True))
         show_fps = max(1.0, float(self._p.get("show_fps", 30.0)))
+        source = self._p.get("source", "stream")
 
         from ultralytics import YOLO
         model = YOLO(weights)
 
-        # BGR 直出，省一次颜色转换
-        src = PyAVSource(url, decode_format="bgr24",
-                         container_format=self._p.get("format"))
-        src.open()
+        # 决策：找怪打。agent 跨帧持有按键状态，这里只建一次；
+        # settings 是全局单例，和「决策参数」页签共享。
+        from decision.agent import CombatAgent, settings as decision_settings
+        from perception.tracker import MobTracker
+        from perception.world_state import WorldState
+
+        # 远程键盘：agent 跑在控制机，按键发到游戏机的 Pro Micro（config 的 kbd 段控制）。
+        # 联调通过后把 kbd.enabled 设成 true 即生效。
+        if get("kbd", "enabled", False):
+            from decision.input import use_network
+            use_network(get("kbd", "host"), int(get("kbd", "port", 9000)),
+                        get("kbd", "cert", "remote_kbd/certs/cert.pem"))
+
+        agent = CombatAgent(decision_settings)
+        mob_tracker = MobTracker()   # 给怪稳定 id，供目标锁定 CD 跨帧匹配
 
         # 读线程独立于推理：它拼命读，积压的旧帧在槽位里被直接覆盖丢掉。
         # 这样无论推理多慢，看到的都是最新画面，延迟不会累积。
+        #
+        # 两种来源共用同一个 slot + 推理主循环，只有 reader 的取帧方式不同：
+        #   stream —— PyAVSource 收流（阻塞读，按序解）
+        #   window —— wincap.grab_rect 循环抓本地窗口区域
         slot = _LatestSlot()
         reader_done = threading.Event()
 
-        def _reader():
-            try:
-                while not self._stop.is_set() and not reader_done.is_set():
-                    f = src.read()
-                    if f is None:
-                        break
-                    slot.put(f)
-            except Exception:
-                pass
-            finally:
-                reader_done.set()
+        src = None
+        size_ref = [None]      # (w, h)，第一帧后填，给统计条显示分辨率
+        fps_ref = [0.0]
+
+        if source == "window":
+            from core import wincap
+            from link.frame import Frame
+
+            rect = self._p.get("rect")
+            if isinstance(rect, str):
+                rect = tuple(int(v) for v in rect.split(","))
+            rect = tuple(int(v) for v in rect)
+            if len(rect) != 4 or rect[2] <= 0 or rect[3] <= 0:
+                self.failed.emit("窗口区域无效：%s" % (rect,))
+                return
+
+            capture_fps = max(1.0, float(self._p.get("capture_fps", 15.0)))
+            interval = 1.0 / capture_fps
+            fps_ref[0] = capture_fps
+            frame_id = [0]
+
+            def _reader():
+                try:
+                    while not self._stop.is_set() and not reader_done.is_set():
+                        t0 = time.perf_counter()
+                        img = wincap.grab_rect(rect)
+                        frame_id[0] += 1
+                        if size_ref[0] is None:
+                            size_ref[0] = (img.shape[1], img.shape[0])
+                        slot.put(Frame(
+                            image=img, frame_id=frame_id[0],
+                            t_recv_wall=time.time(),
+                            t_recv_mono=time.perf_counter()))
+                        d = interval - (time.perf_counter() - t0)
+                        if d > 0:
+                            time.sleep(d)
+                except Exception as e:
+                    if not self._stop.is_set():
+                        self.failed.emit("窗口抓帧失败：%s" % e)
+                finally:
+                    reader_done.set()
+        else:
+            from link import PyAVSource
+
+            # BGR 直出，省一次颜色转换
+            src = PyAVSource(url, decode_format="bgr24",
+                             container_format=self._p.get("format"))
+            src.open()
+            size_ref[0] = src.size
+            fps_ref[0] = src.fps or 0.0
+
+            def _reader():
+                try:
+                    while not self._stop.is_set() and not reader_done.is_set():
+                        f = src.read()
+                        if f is None:
+                            break
+                        if size_ref[0] is None:
+                            size_ref[0] = (f.image.shape[1], f.image.shape[0])
+                        slot.put(f)
+                except Exception:
+                    pass
+                finally:
+                    reader_done.set()
 
         reader = threading.Thread(target=_reader, daemon=True)
         reader.start()
@@ -173,7 +242,8 @@ class LiveThread(QThread):
         #   探针是唯一可靠的基准：它是**画在画面里的绝对时刻**，
         #   跟着画面一起被采集编码传输，B 机解出来和本地时钟一比就是真实延迟。
         #   前提是 B 机做过时钟同步（tools.clock_sync --host <A机IP> --save）。
-        probe_on = bool(self._p.get("probe", False))
+        # 本地窗口抓取没有跨机传输，探针测的延迟无意义，强制关闭
+        probe_on = bool(self._p.get("probe", False)) and source == "stream"
         px = int(self._p.get("probe_x", 100))
         py = int(self._p.get("probe_y", 8))
         cell = int(self._p.get("probe_cell", 16))
@@ -239,6 +309,8 @@ class LiveThread(QThread):
 
                 k = 0
                 boxes = getattr(res, "boxes", None)
+                player_box = None
+                mob_dets = []   # [(x1, y1, x2, y2, conf), ...] 给 MobTracker
                 if boxes is not None and len(boxes):
                     xyxy = boxes.xyxy.cpu().numpy()
                     cfs = boxes.conf.cpu().numpy()
@@ -248,16 +320,69 @@ class LiveThread(QThread):
                         clss = [1] * len(cfs)
                     for (x1, y1, x2, y2), c, cls in zip(xyxy, cfs, clss):
                         k += 1
+                        # 决策用：收集玩家（class 0）/ 怪物（class 1）框，
+                        # 和是否画框无关。
+                        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                        ic = int(cls)
+                        if ic == 0:
+                            if player_box is None or c > player_box[2]:
+                                player_box = (cx, cy, c)
+                        elif ic == 1:
+                            mob_dets.append((x1, y1, x2, y2, c))
                         if not draw:
                             continue
                         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                        color = BOX_COLORS.get(int(cls), BOX_COLORS[1])
+                        color = BOX_COLORS.get(ic, BOX_COLORS[1])
                         cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
                         ty = y1 - 5 if y1 > 14 else y1 + 16
                         cv2.putText(vis, "%.2f" % c, (x1 + 2, ty),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                                     color, 1, cv2.LINE_AA)
                 n_boxes = k
+
+                # ---- 决策：找怪打 ----
+                ws = WorldState()
+                if player_box is not None:
+                    ws.player.x, ws.player.y = player_box[0], player_box[1]
+                    ws.player.found = True
+                # 用 MobTracker 追踪，得到跨帧稳定的 id（目标锁定 CD 靠它匹配）
+                ws.mobs = mob_tracker.update(mob_dets)
+                action = agent.tick(ws)
+
+                if draw:
+                    st = action.get("state", "?")
+                    label = "决策:%s" % st
+                    if st == "chase":
+                        label += " -> 怪%d dist=%.0f" % (action.get("target", 0),
+                                                        action.get("dist", 0.0))
+                    cv2.putText(vis, label, (10, 28),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                (255, 255, 255), 2, cv2.LINE_AA)
+
+                    # 攻击距离可视化：从玩家中心朝「朝向」方向延伸的水平线。
+                    # 朝向默认朝右，最后一次按 ←/→ 会重置朝向。
+                    if player_box is not None:
+                        px, py = int(player_box[0]), int(player_box[1])
+                        ad = max(1, int(decision_settings.attack_dist))
+                        facing = action.get("facing", 1)
+                        x2 = px + ad if facing > 0 else px - ad
+                        yellow = (0, 255, 255)   # BGR 黄色
+                        cv2.line(vis, (px, py), (x2, py), yellow, 2)
+                        cv2.circle(vis, (px, py), 4, yellow, -1)
+                        cv2.line(vis, (x2, py - 8), (x2, py + 8), yellow, 2)
+
+                    # 锁定目标怪：框标红（加粗），方便观测
+                    tid = action.get("target")
+                    if tid is not None:
+                        for m in ws.mobs:
+                            if m.id == tid:
+                                tx1 = int(m.x - m.w / 2)
+                                ty1 = int(m.y - m.h / 2)
+                                tx2 = int(m.x + m.w / 2)
+                                ty2 = int(m.y + m.h / 2)
+                                cv2.rectangle(vis, (tx1, ty1), (tx2, ty2),
+                                              (0, 0, 255), 3)
+                                break
 
                 now = time.perf_counter()
 
@@ -288,15 +413,20 @@ class LiveThread(QThread):
                         "gap_p95": (sorted(gaps_recent)[int(len(gaps_recent) * 0.95)]
                                     if gaps_recent else 0.0),
                         "bad": getattr(src, "bad_packets", 0),
-                        "size": src.size,
-                        "fps_src": src.fps,
+                        "size": size_ref[0] or (0, 0),
+                        "fps_src": fps_ref[0],
                     })
                     t_last_stat = now
 
         finally:
             reader_done.set()
             try:
-                src.close()
+                agent.shutdown()     # 释放所有按键，避免游戏里键一直按着
             except Exception:
                 pass
+            if src is not None:
+                try:
+                    src.close()
+                except Exception:
+                    pass
             reader.join(timeout=1.0)

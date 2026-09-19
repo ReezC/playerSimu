@@ -9,9 +9,8 @@ stream:
   port: 5000
   # B 机监听 URL（PyAV 直接用）
   url: "udp://0.0.0.0:5000"
-  format: "mjpeg"        # 输入容器格式。ffmpeg -f mjpeg 推的是裸流（无容器头），
-                         # 必须显式指定，否则自动探测 InvalidDataError。
-                         # 换 mpegts/h264 时把整行删掉或改为 "" 走自动探测。
+  format: "mpegts"       # 输入容器格式。h264 推流用 mpegts 容器。
+                         # mjpeg 裸流时改成 "mjpeg"（否则自动探测 InvalidDataError）。
   width: 1366
   height: 768
   fps: 60
@@ -51,6 +50,15 @@ probe:
   #   = 1366 / 1706.67 ≈ 0.8004
   # 若 A 机分辨率/DPI 变了，改这个值，B 机 re-solve 一次即可。
   out_scale: 0.8004
+
+# ---- 远程键盘（控制机 agent → 游戏机 Pro Micro 硬件键盘）----
+kbd:
+  enabled: false          # true 后 agent 按键走远程 Pro Micro（否则本地 SendInput）
+  host: "192.168.1.8"     # 游戏机（relay 跑在这）的 IP，默认同 a_host
+  port: 9000
+  cert: "remote_kbd/certs/cert.pem"
+  # 以下只在游戏机跑 relay 时用（agent 不用）：
+  serial: "COM3"          # 游戏机上 Pro Micro 的串口号，改成实际的
 
 # ---- 路径 ----
 paths:

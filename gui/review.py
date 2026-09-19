@@ -23,7 +23,7 @@ import json
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (QHBoxLayout, QLabel, QMessageBox, QPushButton,
-                             QVBoxLayout, QWidget)
+                             QSizePolicy, QVBoxLayout, QWidget)
 
 from gui import labelio
 from gui.canvas import ImageCanvas
@@ -107,6 +107,9 @@ class ReviewPanel(QWidget):
 
         self.lbl_status = QLabel("—")
         self.lbl_status.setStyleSheet("color: #5f6368;")
+        # 状态文字切帧时长短会变，若按文字撑宽，会顶到 QSplitter 挤压右边配置区。
+        # Ignored 让它不参与宽度计算，文字过长就自然裁剪。
+        self.lbl_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         ops.addWidget(self.lbl_status, 1)
 
         ops.addWidget(QLabel("新建框"))

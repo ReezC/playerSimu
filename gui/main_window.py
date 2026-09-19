@@ -166,6 +166,11 @@ class MainWindow(QMainWindow):
         self.log("工作台已就绪。先「新建」或「打开」一个项目。", "ok")
         self.log("项目根目录: %s" % PROJECTS_DIR)
 
+        # 全局热键：任何窗口聚焦时都能开关自动打怪。键 = 决策参数里
+        # 「开关自动」的映射（默认 F11），改了映射会动态重新注册。
+        self._hotkey_id = 1
+        self._register_auto_hotkey()
+
     # ══════════════════════════════════════════════════
     # 构建界面
     # ══════════════════════════════════════════════════
@@ -186,6 +191,8 @@ class MainWindow(QMainWindow):
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
         split.setSizes([900, 520])
+        split.setCollapsible(0, False)
+        split.setCollapsible(1, False)
         root.addWidget(split, 1)
 
         root.addWidget(self._build_log(), 0)
@@ -248,6 +255,9 @@ class MainWindow(QMainWindow):
 
     def _build_viewer(self):
         self.viewer = QStackedWidget()
+        # 忽略 sizeHint：QStackedWidget 的 sizeHint 是所有页的最大 sizeHint，
+        # 实时页每帧刷新会带动它变化，传导到 QSplitter 就会挤压右侧卡片。
+        self.viewer.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.viewer.addWidget(self._placeholder(
             "主视区",
             "这里会显示当前步骤的产物：\n\n"
@@ -313,7 +323,13 @@ class MainWindow(QMainWindow):
         self.player_panel = PlayerPanel()
         self.player_panel.verify_started.connect(self._on_player_verify_started)
         self.player_panel.verify_result.connect(self._on_player_verify)
+        self.player_panel.auto_key_changed.connect(self._on_auto_key_changed)
         tabs.addTab(self.player_panel, "决策参数")
+        # 最小宽度兜底：主视区尺寸波动时不把配置区挤没
+        tabs.setMinimumWidth(460)
+        # 忽略 sizeHint：卡片状态文字更新会改变 sizeHint，传导到 QSplitter
+        # 会让右侧宽度跟着抖。固定按 minimumWidth + stretch 分配即可。
+        tabs.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         return tabs
 
     def _build_log(self):
@@ -706,4 +722,32 @@ class MainWindow(QMainWindow):
                 return
             self.task.cancel()
             self.task.wait(5000)
+
+        # 注销 F11 全局热键，避免残留占着系统快捷键
+        from decision import hotkey as _hotkey
+        _hotkey.unregister(int(self.winId()), self._hotkey_id)
         e.accept()
+
+    def _register_auto_hotkey(self):
+        """按「开关自动」映射动态注册全局热键。"""
+        from decision import hotkey as _hotkey
+        from decision.agent import settings
+        from decision.input import resolve_vk
+        vk = resolve_vk(settings.keymap.get("auto", "f11"))
+        if vk is None:
+            self.log("「开关自动」映射的键无效，全局热键未注册", "warn")
+            return
+        _hotkey.unregister(int(self.winId()), self._hotkey_id)
+        if not _hotkey.register(int(self.winId()), self._hotkey_id, vk):
+            self.log("全局热键注册失败（可能已被其他程序占用）", "warn")
+
+    def _on_auto_key_changed(self, key):
+        self._register_auto_hotkey()
+
+    def nativeEvent(self, eventType, message):
+        """接收系统级 WM_HOTKEY 全局热键，任何窗口聚焦都能触发。"""
+        from decision import hotkey as _hotkey
+        if _hotkey.is_hotkey(message, self._hotkey_id):
+            self.player_panel.toggle_auto()
+            return True, 0
+        return super().nativeEvent(eventType, message)
