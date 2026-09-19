@@ -50,18 +50,27 @@ def bridge(conn, ser):
             pass
 
 
-def wait_ready(ser, timeout=3.0):
-    """等固件上电打印 READY（可选，方便确认串口连对了）。"""
-    line = b""
+def ping(ser, timeout=2.0):
+    """主动验证：发一条无副作用指令，等 Pro Micro 回 DONE。
+
+    不用 READY 判活：32U4 打开串口会复位，READY 只在 setup 打一次，
+    常常在复位/重枚举期间就漏掉了。主动发指令看回执才可靠。
+    """
+    try:
+        ser.reset_input_buffer()
+        ser.write(b"RELEASEALL\n")
+    except Exception:
+        return False
+    buf = b""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        chunk = ser.read(1)
-        if chunk:
-            line += chunk
-            if chunk == b"\n":
-                print("[relay] firmware:", line.decode(errors="replace").strip())
-                return
-    print("[relay] warning: 未收到固件 READY，检查串口号/固件")
+        try:
+            buf += ser.read(64)
+        except Exception:
+            break
+        if b"DONE" in buf:
+            return True
+    return False
 
 
 def main():
@@ -75,9 +84,19 @@ def main():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(args.cert, args.key)
 
-    ser = serial.Serial(args.serial, 115200, timeout=0.2)
+    ser = serial.Serial(args.serial, 115200, timeout=0.3)
+    ser.dtr = False          # 关键：禁用 DTR，避免打开串口触发 32U4 复位
+    ser.rts = False
     print(f"[relay] serial {args.serial} open")
-    wait_ready(ser)
+    time.sleep(0.5)
+
+    if ping(ser):
+        print("[relay] Pro Micro 在线，串口通信正常")
+    else:
+        print("[relay] warning: Pro Micro 无响应 —— 逐项检查：")
+        print("  1) 固件是否真烧进 Pro Micro（板子/端口选对了吗）")
+        print("  2) 板子频率是否 8MHz（选错会导致 USB 异常）")
+        print("  3) 串口号是否正确")
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
