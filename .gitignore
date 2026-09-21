@@ -13,11 +13,6 @@ datasets/
 *.zip
 *.7z
 
-# 模型
-*.pt
-*.onnx
-*.engine
-
 .idea/
 .vscode/
 
@@ -27,7 +22,6 @@ projects/*/frames/
 projects/*/vis/
 projects/*/vis_player/
 projects/*/calib/
-projects/*/models/
 projects/*/runs/
 projects/*/dataset/images/
 projects/*/dataset_old/
