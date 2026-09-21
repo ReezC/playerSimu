@@ -1,0 +1,40 @@
+name: 地图识别
+map_id: ''
+mobs: []
+scale: null
+mob_scales: {}
+scale_at: {}
+calib:
+  min_scale: 0.4
+  max_scale: 2.4
+  step: 0.1
+  sample: 5
+notes: ''
+capture:
+  source: window
+  file: ''
+  url: udp://0.0.0.0:5000
+  fps: 5.0
+  stride: 6
+  seconds: 120.0
+  dedup: 0.01
+  limit: 0
+  clean: true
+label:
+  thresh: 0.9
+  min_distinct: 0.06
+  per_mob: 20
+  max_peaks: 3
+  downscale: 1
+  region: null
+dataset:
+  val_ratio: 0.2
+  min_boxes: 1
+  quality: 92
+train:
+  model: yolo26n.pt
+  epochs: 120
+  imgsz: 960
+  batch: 8
+  device: '0'
+  patience: 40

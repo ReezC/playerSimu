@@ -30,33 +30,57 @@ class PlatformDetector:
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         # 草坪色域；饱和度下限会排掉灰色背景和白色 UI。
         mask = cv2.inRange(hsv, (25, 45, 35), (100, 255, 255))
-        # 横向 opening 删除树干/角色等短小绿色块，closing 补草坪上的小间隙。
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
+        # 不能直接用绿色轮廓的矩形：树冠会和草坪一样绿，还可能横向很长。
+        # 改为逐行找「草的顶边」，再要求其正下方有连续棕/暗色土层。只有这两个
+        # 条件同时成立才是可站立平台，树叶、UI 和怪物均不会通过土层验证。
         out = []
-        for c in contours:
-            x, y, cw, ch = cv2.boundingRect(c)
-            if cw < self.min_width or cw < ch * 3:
-                continue
-            # 顶部附近必须有足够多的绿色像素，避免把整片灌木的外框误作平台。
-            band = mask[y:min(y + max(2, min(5, ch)), mask.shape[0]), x:x + cw]
-            density = float(np.count_nonzero(band)) / max(1, band.size)
-            if density < 0.30:
-                continue
-            out.append((float(x), float(x + cw), float(y + top), min(1.0, density)))
-        # 同一平台可能被细小纹理切成相邻轮廓；先合并再输出一条顶边。
+        # 土层在此游戏画面中既偏黄棕，也明显比天空/树冠暗；V 上限不能放到
+        # 亮绿树冠，否则它下面的阴影会重新把整片背景放行。
+        soil = cv2.inRange(hsv, (0, 40, 20), (45, 255, 150)) > 0
+        join = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 1))
+        for y in range(0, max(0, mask.shape[0] - 30)):
+            # 草边有锯齿/小缺口，因此在相邻三行取并集，再只横向补小缝。
+            row = np.any(mask[y:y + 3] > 0, axis=0).astype(np.uint8) * 255
+            row = cv2.morphologyEx(row.reshape(1, -1), cv2.MORPH_CLOSE, join)[0] > 0
+            edges = np.diff(np.r_[False, row, False].astype(np.int8))
+            starts, ends = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+            for x1, x2 in zip(starts, ends):
+                if x2 - x1 < self.min_width:
+                    continue
+                grass = mask[y:y + 4, x1:x2] > 0
+                dirt = soil[y + 5:y + 30, x1:x2]
+                grass_density = float(grass.mean()) if grass.size else 0.0
+                dirt_density = float(dirt.mean()) if dirt.size else 0.0
+                # 平台草皮在横向上是连续的；背景草丛虽可能同色，但在一行中
+                # 会留下大量空隙。较高的覆盖率可排掉这种“拼起来的长线”。
+                if grass_density >= 0.55 and dirt_density >= 0.35:
+                    out.append((float(x1), float(x2), float(y + top),
+                                min(1.0, 0.5 * grass_density + 0.5 * dirt_density)))
+        # 同一草皮会在相邻数行各产出一次，也会被角色/道具切成数段；先在
+        # 同一高度合并相邻段，再去掉被更长候选覆盖的短段。
         out.sort(key=lambda p: (p[2], p[0]))
         merged = []
         for x1, x2, y, conf in out:
-            if merged and abs(y - merged[-1][2]) <= 5 and x1 <= merged[-1][1] + 18:
-                ox1, ox2, oy, oc = merged[-1]
-                merged[-1] = (min(ox1, x1), max(ox2, x2), min(oy, y), max(oc, conf))
-            else:
+            joined = False
+            for i, (ox1, ox2, oy, oc) in enumerate(merged):
+                if abs(y - oy) <= 5 and x1 <= ox2 + 30 and x2 >= ox1 - 30:
+                    merged[i] = (min(x1, ox1), max(x2, ox2), min(y, oy), max(conf, oc))
+                    joined = True
+                    break
+            if not joined:
                 merged.append((x1, x2, y, conf))
-        return merged
+        kept = []
+        for cand in sorted(merged, key=lambda p: p[1] - p[0], reverse=True):
+            x1, x2, y, _conf = cand
+            covered = False
+            for ox1, ox2, oy, _oc in kept:
+                overlap = max(0.0, min(x2, ox2) - max(x1, ox1))
+                if abs(y - oy) <= 28 and overlap / max(1.0, x2 - x1) >= 0.70:
+                    covered = True
+                    break
+            if not covered:
+                kept.append(cand)
+        return sorted(kept, key=lambda p: (p[2], p[0]))
 
 
 class PlatformTracker:

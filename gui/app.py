@@ -29,9 +29,10 @@ import ctypes as _ctypes
 for _dll in ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
              "vcruntime140.dll", "vcruntime140_1.dll"):
     try:
-        _ctypes.CDLL(_dll)
-    except OSError:
-        pass
+        h = _ctypes.CDLL(_dll)
+        print("OK  ", _dll, h)
+    except OSError as e:
+        print("FAIL", _dll, e)
 
 from PyQt5.QtCore import Qt                      # noqa: E402
 from PyQt5.QtWidgets import QApplication          # noqa: E402

@@ -24,7 +24,7 @@ calib:
 notes: ''
 capture:
   source: file
-  file: E:/MyPrograms/playerSimu/datasets/records/9月21日.mp4
+  file: D:/WeChat/xwechat_files/wxid_2r52bp91jwqc22_7a4b/msg/video/2026-09/3050c270cfb3852942349b9cbd943fc6.mp4
   url: udp://0.0.0.0:5000
   fps: 5.0
   stride: 70
