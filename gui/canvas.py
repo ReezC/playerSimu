@@ -11,7 +11,7 @@
 """
 
 from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal
-from PyQt5.QtGui import QBrush, QColor, QPainter, QPen
+from PyQt5.QtGui import QBrush, QColor, QKeySequence, QPainter, QPen
 from PyQt5.QtWidgets import (QGraphicsItem, QGraphicsRectItem,
                              QGraphicsScene, QGraphicsSimpleTextItem,
                              QGraphicsView)
@@ -72,6 +72,7 @@ class BBoxItem(QGraphicsRectItem):
         self._orig_rect = None
         self._orig_pos = None
         self.on_changed = None   # 拖动/缩放后由画布注入的回调
+        self.on_press = None     # 拖动/缩放开始前由画布注入的回调（撤销记录用）
 
     # ---------------- 光标形状 ----------------
 
@@ -127,6 +128,8 @@ class BBoxItem(QGraphicsRectItem):
         self._orig_pos = QPointF(self.pos())
 
         self.setSelected(True)
+        if self.on_press:
+            self.on_press()   # 拖动开始，通知画布记录撤销快照
         e.accept()
 
     def mouseMoveEvent(self, e):
@@ -189,6 +192,10 @@ class ImageCanvas(QGraphicsView):
     """
 
     boxes_changed = pyqtSignal()
+    before_change = pyqtSignal()     # 破坏性操作前发（撤销记录快照）
+    copy_requested = pyqtSignal()    # Ctrl+C
+    paste_requested = pyqtSignal()   # Ctrl+V
+    undo_requested = pyqtSignal()    # Ctrl+Z
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -251,6 +258,7 @@ class ImageCanvas(QGraphicsView):
         it = BBoxItem(x, y, w, h, cls, manual, colors or self._colors)
         it.setEnabled(self.editable)
         it.on_changed = self.boxes_changed.emit
+        it.on_press = self.before_change.emit   # 拖动前记录撤销快照
         self.scene_.addItem(it)
         self.boxes.append(it)
         return it
@@ -264,6 +272,24 @@ class ImageCanvas(QGraphicsView):
             out.append((it.cls, p.x(), p.y(), r.width(), r.height(), it.manual))
         return out
 
+    def get_selected_boxes(self):
+        """返回选中框的 [(cls, x, y, w, h, manual)]（复制用）。"""
+        out = []
+        for it in self.boxes:
+            if it.isSelected():
+                r = it.rect()
+                p = it.pos()
+                out.append((it.cls, p.x(), p.y(), r.width(), r.height(), it.manual))
+        return out
+
+    def replace_boxes(self, boxes):
+        """清掉现有框，用 boxes 重建（撤销/粘贴恢复用）。"""
+        for it in list(self.boxes):
+            self.scene_.removeItem(it)
+        self.boxes = []
+        for cls, x, y, w, h, manual in boxes:
+            self.add_box(x, y, w, h, cls, manual)
+
     def count(self):
         return len(self.boxes)
 
@@ -271,10 +297,13 @@ class ImageCanvas(QGraphicsView):
         n = 0
         for it in list(self.boxes):
             if it.isSelected():
-                self.scene_.removeItem(it)
-                self.boxes.remove(it)
                 n += 1
         if n:
+            self.before_change.emit()   # 删除前记录撤销快照
+            for it in list(self.boxes):
+                if it.isSelected():
+                    self.scene_.removeItem(it)
+                    self.boxes.remove(it)
             self.boxes_changed.emit()
         return n
 
@@ -356,6 +385,7 @@ class ImageCanvas(QGraphicsView):
             self._draw_start = None
 
             if r.width() >= MIN_SIZE and r.height() >= MIN_SIZE:
+                self.before_change.emit()   # 加框前记录撤销快照
                 self.add_box(r.x(), r.y(), r.width(), r.height(),
                              self.current_cls, manual=True)
                 self.boxes_changed.emit()
@@ -375,6 +405,18 @@ class ImageCanvas(QGraphicsView):
         e.accept()
 
     def keyPressEvent(self, e):
+        if e.matches(QKeySequence.Copy) and self.editable:
+            self.copy_requested.emit()
+            e.accept()
+            return
+        if e.matches(QKeySequence.Paste) and self.editable:
+            self.paste_requested.emit()
+            e.accept()
+            return
+        if e.matches(QKeySequence.Undo) and self.editable:
+            self.undo_requested.emit()
+            e.accept()
+            return
         if e.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self.editable:
             self.remove_selected()
             e.accept()
