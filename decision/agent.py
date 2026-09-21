@@ -409,6 +409,28 @@ class CombatAgent:
             out.append(m)
         return out
 
+    @staticmethod
+    def _same_platform_mobs(mobs, player, platforms):
+        """平台已识别时，只保留和玩家站在同一顶边的怪。
+
+        没有平台感知结果时完全退化为旧行为，避免短暂视觉失检导致 Agent 停摆。
+        这是「先只在一个平台找怪打」的实际边界：不会因为楼上/楼下怪物的
+        水平距离很近而向错误方向追击，更不会在未做跳跃标定时自行跨平台。
+        """
+        pid = player.current_platform_id
+        if pid is None:
+            return mobs
+        current = next((p for p in platforms if p.id == pid), None)
+        if current is None:
+            return mobs
+        out = []
+        for m in mobs:
+            mob_bottom = m.y + m.h / 2.0
+            tolerance = max(36.0, m.h * 1.5)
+            if current.x1 <= m.x <= current.x2 and abs(mob_bottom - current.y) <= tolerance:
+                out.append(m)
+        return out
+
     def tick(self, ws):
         """跑一帧决策。ws: WorldState。返回动作描述 dict（调试/展示）。"""
         s = self.settings
@@ -468,6 +490,7 @@ class CombatAgent:
 
         # 按视野矩形过滤怪物（视野外的怪不参与决策）
         mobs = self._filter_mobs(ws.mobs, ws.player, ws)
+        mobs = self._same_platform_mobs(mobs, ws.player, ws.platforms)
 
         # 自动喝药 / 自动喂宠：独立于打怪，即使没怪也执行
         self._drink_potions(ws, now)

@@ -35,6 +35,35 @@ class Player:
     state: str = "idle"     # idle / move / attack / hit（先留 idle，后续补）
     found: bool = False     # 本帧是否成功定位到玩家
     bottom: float = 0.0     # 玩家框底部 y（画面坐标），平地巡逻高度过滤用
+    w: float = 0.0          # 玩家框宽（画面坐标）
+    h: float = 0.0          # 玩家框高
+    vx: float = 0.0         # 屏幕速度（px/s，由连续帧估计）
+    vy: float = 0.0
+    grounded: bool = False
+    jumping: bool = False
+    falling: bool = False
+    current_platform_id: int | None = None
+
+
+@dataclass
+class Platform:
+    """可站立平台的碰撞顶边，而不是平台整块的视觉矩形。"""
+    id: int
+    x1: float
+    x2: float
+    y: float
+    conf: float = 0.0
+    age: int = 0
+
+
+@dataclass
+class JumpPrediction:
+    """玩家处于下落阶段时，对本次落点的纯视觉预测。"""
+    target_platform_id: int
+    landing_x: float
+    landing_y: float
+    landing_time: float
+    reachable: bool
 
 
 @dataclass
@@ -45,3 +74,5 @@ class WorldState:
     height: int = 0        # 画面高
     mobs: list = field(default_factory=list)
     player: Player = field(default_factory=Player)
+    platforms: list = field(default_factory=list)
+    jump_prediction: JumpPrediction | None = None
