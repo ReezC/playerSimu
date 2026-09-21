@@ -782,7 +782,31 @@ class LabelCard(StepCard):
 
     def _emit_run(self, target):
         self._label_target = target
+        if not self._confirm_relabel(target):
+            return
         self.run_clicked.emit(self)
+
+    def _confirm_relabel(self, target):
+        """标过的情况下弹二次确认。重标只覆盖自动框，人工修正会保留。"""
+        p = self.project
+        if p is None:
+            return True
+
+        from gui import labelio
+        prog = labelio.label_progress(p)
+        key = "mob" if target == "mob" else "player"
+        if prog.get(key, 0) == 0:
+            return True   # 这类还没标过，直接跑
+
+        name = "怪物" if target == "mob" else "玩家"
+        r = QMessageBox.question(
+            self, "确认重新标注",
+            "已标过 %s（%d 帧）。\n\n"
+            "重新标注会重新生成自动标注框，\n"
+            "人工修正的框会保留（不会被覆盖）。\n\n"
+            "确定要重标吗？" % (name, prog[key]),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        return r == QMessageBox.Yes
 
     def set_busy(self, busy):
         super().set_busy(busy)

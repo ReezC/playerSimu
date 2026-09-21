@@ -25,14 +25,21 @@ import time
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from tools.config import get
+from gui import theme
 
-# 类别 → 框颜色（BGR，和 data.yaml 的 class 对齐）
-BOX_COLORS = {
-    0: (255, 128, 0),    # player 蓝
-    1: (60, 220, 60),    # mob 绿
-    2: (0, 255, 255),    # drop 黄
-    3: (0, 0, 255),      # npc 红
-}
+# 类别编号 → 显示名（和 data.yaml 的 class 对齐）
+CLASS_NAMES = {0: "玩家", 1: "怪物", 2: "掉落", 3: "NPC"}
+
+# 类别 → 框颜色（BGR，和 data.yaml 的 class 对齐）。
+# 玩家/怪物颜色从设置读（theme.load_vis），drop/npc 用固定默认。
+def _box_colors():
+    vis = theme.load_vis()
+    return {
+        0: theme.hex_to_bgr(vis["player_color"]),   # player
+        1: theme.hex_to_bgr(vis["mob_color"]),      # mob
+        2: (0, 255, 255),                           # drop 黄
+        3: (0, 0, 255),                             # npc 红
+    }
 
 
 def _bar_fill_ratio(mask):
@@ -164,6 +171,7 @@ class LiveThread(QThread):
     stats_ready = pyqtSignal(dict)
     potions_ready = pyqtSignal(float, float)   # (hp, mp) 比例 0~1
     failed = pyqtSignal(str)
+    stream_status = pyqtSignal(str)      # waiting / connected / no_stream
 
     def __init__(self, params, parent=None):
         super().__init__(parent)
@@ -178,6 +186,46 @@ class LiveThread(QThread):
 
     def stopped(self):
         return self._stop.is_set()
+
+    def _wait_stream_packet(self, url, timeout=5.0):
+        """UDP 探针：判断推流端是否真的在发流（不依赖 PyAV）。
+
+        解析 url 里的端口，bind 收包。收到第一个包就返回 True（释放端口给
+        PyAV）；超时没收到返回 False。非 UDP（rtsp/srt）跳过探针。
+        """
+        if not (url or "").startswith("udp"):
+            return True   # 非 UDP，交给 PyAV 自己处理
+
+        import re
+        import socket
+
+        port = 5000
+        m = re.search(r":(\d+)/?$", url)
+        if m:
+            port = int(m.group(1))
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("0.0.0.0", port))
+        except OSError:
+            s.close()
+            return True   # 端口被占用（可能有别的实例在收流），跳过探针直接 open
+
+        s.settimeout(0.5)
+        t0 = time.perf_counter()
+        try:
+            while not self._stop.is_set():
+                if time.perf_counter() - t0 >= timeout:
+                    return False
+                try:
+                    s.recvfrom(65535)
+                    return True
+                except socket.timeout:
+                    continue
+            return False
+        finally:
+            s.close()
 
     # ---------------- 主循环 ----------------
 
@@ -226,6 +274,15 @@ class LiveThread(QThread):
         _last_player = [None]       # 上一帧玩家框 (cx, cy, bottom, conf)，漏检时兜底
         _vision_box = [None]        # 视野矩形 (left, top, right, bottom)，3s 更新一次
         _vision_last = [0.0]        # 上次更新时间
+
+        # 可视化配置（开始实时预览时读一次；改设置后重开实时预览才生效）
+        _vis_cfg = theme.load_vis()
+        _cls_colors = _box_colors()
+        _lock_color = theme.hex_to_bgr(_vis_cfg["lock_color"])
+        _attack_color = theme.hex_to_bgr(_vis_cfg["attack_color"])
+        _min_attack_color = theme.hex_to_bgr(_vis_cfg["min_attack_color"])
+        _vision_color = theme.hex_to_bgr(_vis_cfg["vision_color"])
+        _vision_width = int(_vis_cfg["vision_width"])
 
         # 读线程独立于推理：它拼命读，积压的旧帧在槽位里被直接覆盖丢掉。
         # 这样无论推理多慢，看到的都是最新画面，延迟不会累积。
@@ -281,17 +338,37 @@ class LiveThread(QThread):
         else:
             from link import PyAVSource
 
+            # 先探一下 A 机到底推没推流（UDP 探针），避免 open() 无限黑屏等流
+            self.stream_status.emit("waiting")
+            if not self._wait_stream_packet(url):
+                if self._stop.is_set():
+                    return
+                self.stream_status.emit("no_stream")
+                self.failed.emit(
+                    "没收到流 —— A 机没在推流？检查 OBS 是否在推、"
+                    "URL/IP/端口、B 机防火墙是否放行 UDP")
+                return
+
             # BGR 直出，省一次颜色转换
             src = PyAVSource(url, decode_format="bgr24",
                              container_format=self._p.get("format"))
-            src.open()
+            try:
+                src.open()
+            except Exception as e:
+                self.stream_status.emit("no_stream")
+                self.failed.emit("收到包但打不开流：%s" % e)
+                return
+            self.stream_status.emit("connected")
             size_ref[0] = src.size
             fps_ref[0] = src.fps or 0.0
 
             def _reader():
                 try:
                     while not self._stop.is_set() and not reader_done.is_set():
-                        f = src.read()
+                        try:
+                            f = src.read()
+                        except TimeoutError:
+                            continue   # 暂时没帧（udp 超时），继续等，能及时响应停止
                         if f is None:
                             break
                         if size_ref[0] is None:
@@ -434,11 +511,12 @@ class LiveThread(QThread):
                             if draw:
                                 x1i, y1i, x2i, y2i = int(x1), int(y1), int(x2), int(y2)
                                 cv2.rectangle(vis, (x1i, y1i), (x2i, y2i),
-                                              BOX_COLORS[0], 2)
+                                              _cls_colors[0], 2)
                                 ty = y1i - 5 if y1i > 14 else y1i + 16
-                                cv2.putText(vis, "%.2f" % c, (x1i + 2, ty),
+                                cv2.putText(vis, "%s %.2f" % (CLASS_NAMES[0], c),
+                                            (x1i + 2, ty),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                            BOX_COLORS[0], 1, cv2.LINE_AA)
+                                            _cls_colors[0], 1, cv2.LINE_AA)
                         elif ic == 1:
                             mob_dets.append((x1, y1, x2, y2, c))
                             # 怪物绿框不在这里画：移到后面用 ws.mobs（含防抖幽灵目标）
@@ -516,8 +594,8 @@ class LiveThread(QThread):
                         max_ad = max(1, int(decision_settings.attack_dist))
                         min_ad = max(0, int(decision_settings.min_attack_dist))
                         max_x = px + dirn * max_ad
-                        yellow = (0, 255, 255)   # BGR 黄色
-                        orange = (0, 165, 255)   # BGR 橙色
+                        yellow = _attack_color        # 最大攻击距离线颜色
+                        orange = _min_attack_color    # 最小攻击距离/规避范围线颜色
                         if min_ad > 0:
                             min_x = px + dirn * min_ad
                             cv2.line(vis, (px, py), (min_x, py), orange, 2)
@@ -538,13 +616,17 @@ class LiveThread(QThread):
                         vtop = max(0, min(vtop, vis.shape[0] - 1))
                         vbottom = max(0, min(vbottom, vis.shape[0] - 1))
                         if decision_settings.vision_top >= 0:
-                            _draw_dashed_line(vis, vtop, (60, 60, 60), x0=vleft, x1=vright)
+                            _draw_dashed_line(vis, vtop, _vision_color,
+                                              thickness=_vision_width, x0=vleft, x1=vright)
                         if decision_settings.vision_bottom >= 0:
-                            _draw_dashed_line(vis, vbottom, (60, 60, 60), x0=vleft, x1=vright)
+                            _draw_dashed_line(vis, vbottom, _vision_color,
+                                              thickness=_vision_width, x0=vleft, x1=vright)
                         if decision_settings.vision_left >= 0:
-                            _draw_dashed_vline(vis, vleft, (60, 60, 60), y0=vtop, y1=vbottom)
+                            _draw_dashed_vline(vis, vleft, _vision_color,
+                                               thickness=_vision_width, y0=vtop, y1=vbottom)
                         if decision_settings.vision_right >= 0:
-                            _draw_dashed_vline(vis, vright, (60, 60, 60), y0=vtop, y1=vbottom)
+                            _draw_dashed_vline(vis, vright, _vision_color,
+                                               thickness=_vision_width, y0=vtop, y1=vbottom)
 
                     # 怪物绿框：用 ws.mobs（含防抖幽灵目标），漏检后延迟防抖时间才消失
                     for m in ws.mobs:
@@ -552,11 +634,12 @@ class LiveThread(QThread):
                         gy1 = int(m.y - m.h / 2)
                         gx2 = int(m.x + m.w / 2)
                         gy2 = int(m.y + m.h / 2)
-                        cv2.rectangle(vis, (gx1, gy1), (gx2, gy2), BOX_COLORS[1], 2)
+                        cv2.rectangle(vis, (gx1, gy1), (gx2, gy2), _cls_colors[1], 2)
                         gty = gy1 - 5 if gy1 > 14 else gy1 + 16
-                        cv2.putText(vis, "%.2f" % m.conf, (gx1 + 2, gty),
+                        cv2.putText(vis, "%s %.2f" % (CLASS_NAMES[1], m.conf),
+                                    (gx1 + 2, gty),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                    BOX_COLORS[1], 1, cv2.LINE_AA)
+                                    _cls_colors[1], 1, cv2.LINE_AA)
 
                     # 锁定目标怪：框标红（加粗），方便观测
                     tid = action.get("target")
@@ -568,7 +651,7 @@ class LiveThread(QThread):
                                 tx2 = int(m.x + m.w / 2)
                                 ty2 = int(m.y + m.h / 2)
                                 cv2.rectangle(vis, (tx1, ty1), (tx2, ty2),
-                                              (0, 0, 255), 3)
+                                              _lock_color, 3)
                                 break
 
                 now = time.perf_counter()
@@ -611,9 +694,11 @@ class LiveThread(QThread):
                 agent.shutdown()     # 释放所有按键，避免游戏里键一直按着
             except Exception:
                 pass
+            # 先等 reader 退出（read 有 udp 超时，最多 2 秒就能响应），再 close ——
+            # 反过来 close 会和阻塞中的 read 抢 ffmpeg 上下文导致死锁，表现为「正在停止」卡住。
+            reader.join(timeout=3.0)
             if src is not None:
                 try:
                     src.close()
                 except Exception:
                     pass
-            reader.join(timeout=1.0)

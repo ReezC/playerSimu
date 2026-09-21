@@ -87,7 +87,13 @@ class PyAVSource(FrameSource):
 
     def open(self):
         # format=None 时 PyAV 走自动探测；裸流（如 -f mjpeg 推出来的）必须显式给
-        self._container = av.open(self.url, mode="r", options=self.options,
+        url = self.url
+        # UDP 加超时：否则 A 机停止推流后 recv 会无限阻塞，stop() 时 close 和
+        # read 抢同一个 ffmpeg 上下文直接死锁。timeout 单位是微秒（2 秒）。
+        if url.startswith("udp") and "timeout=" not in url:
+            sep = "&" if "?" in url else "?"
+            url = url + sep + "timeout=2000000"
+        self._container = av.open(url, mode="r", options=self.options,
                                   format=self.container_format)
 
         streams = self._container.streams.video
@@ -151,8 +157,9 @@ class PyAVSource(FrameSource):
             except StopIteration:
                 return None
             except Exception:
-                self._bad_packets += 1
-                continue
+                # next 拿不到包（udp 超时 / 读取错误）= 暂时没帧，抛给调用方，
+                # 让它有机会检查停止标志。坏包是拿到 packet 后 decode 失败，走下面分支。
+                raise TimeoutError()
 
             if packet.size == 0:
                 continue

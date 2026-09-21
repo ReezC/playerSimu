@@ -37,26 +37,84 @@ def clamp(v):
     return max(MIN_SIZE, min(MAX_SIZE, v))
 
 
-def load_size():
-    """读配置里的字号；文件不存在或损坏时退回默认值。"""
+# 可视化默认值（颜色用 RGB hex；vision_width 是视野线宽，像素）
+VIS_DEFAULTS = {
+    "mob_color": "#34a853",       # 怪物框 绿
+    "player_color": "#4285f4",    # 玩家框 蓝
+    "lock_color": "#ff0000",      # 锁定目标框 红
+    "attack_color": "#f9ab00",    # 最大攻击距离线 黄
+    "min_attack_color": "#ffa500",  # 最小攻击距离 / 规避范围线 橙
+    "vision_color": "#5f6368",    # 视野线 深灰
+    "vision_width": 1,            # 视野线宽
+}
+
+_VIS_COLOR_KEYS = ("mob_color", "player_color", "lock_color",
+                   "attack_color", "min_attack_color", "vision_color")
+
+
+def _load():
     try:
         with open(CFG, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        return clamp(data.get("font_size", DEFAULT_SIZE))
+            return yaml.safe_load(f) or {}
     except Exception:
-        return DEFAULT_SIZE
+        return {}
+
+
+def _save(data):
+    try:
+        CFG.parent.mkdir(parents=True, exist_ok=True)
+        with open(CFG, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, allow_unicode=True)
+    except Exception:
+        pass
+
+
+def load_size():
+    """读配置里的字号；文件不存在或损坏时退回默认值。"""
+    return clamp(_load().get("font_size", DEFAULT_SIZE))
 
 
 def save_size(v):
     """保存字号，返回实际生效的值（可能被夹到允许范围内）。"""
     v = clamp(v)
-    try:
-        CFG.parent.mkdir(parents=True, exist_ok=True)
-        with open(CFG, "w", encoding="utf-8") as f:
-            yaml.safe_dump({"font_size": v}, f, allow_unicode=True)
-    except Exception:
-        pass
+    data = _load()
+    data["font_size"] = v
+    _save(data)
     return v
+
+
+def _valid_color(v):
+    return (isinstance(v, str) and v.startswith("#") and len(v) == 7
+            and all(c in "0123456789abcdefABCDEF" for c in v[1:]))
+
+
+def load_vis():
+    """读可视化配置，返回 dict（颜色 + 线宽，含默认值兜底）。"""
+    vis = _load().get("vis") or {}
+    out = dict(VIS_DEFAULTS)
+    for k in _VIS_COLOR_KEYS:
+        if _valid_color(vis.get(k)):
+            out[k] = vis[k]
+    try:
+        out["vision_width"] = max(1, min(10, int(vis.get("vision_width", 1))))
+    except (TypeError, ValueError):
+        out["vision_width"] = 1
+    return out
+
+
+def save_vis(cfg):
+    """保存可视化配置。cfg 为 {key: value} 的子集。"""
+    data = _load()
+    vis = dict((data.get("vis") or {}))
+    vis.update(cfg)
+    data["vis"] = vis
+    _save(data)
+
+
+def hex_to_bgr(hexstr):
+    """'#rrggbb' → (b, g, r)，供 cv2 绘制用。"""
+    hexstr = hexstr.lstrip("#")
+    return (int(hexstr[4:6], 16), int(hexstr[2:4], 16), int(hexstr[0:2], 16))
 
 
 def apply(app, size=None):

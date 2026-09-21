@@ -9,6 +9,9 @@ datasets/
 *.mp4
 *.ts
 *.mkv
+*.rar
+*.zip
+*.7z
 
 # 模型
 *.pt
@@ -18,19 +21,16 @@ datasets/
 .idea/
 .vscode/
 
-# 项目数据产物（采集/标注/训练中间产物，体积大且可再生，不进 git）
+# 项目图片/训练产物素材（体积大且可再生，不进 git）。
+# 标注（labels*/、dataset/labels/ 的 txt）和配置（yaml/json）都进 git。
 projects/*/frames/
-projects/*/labels/
-projects/*/labels_auto/
-projects/*/labels_backup/
-projects/*/labels_iter/
 projects/*/vis/
 projects/*/vis_player/
 projects/*/calib/
-projects/*/dataset/
-projects/*/dataset_old/
 projects/*/models/
 projects/*/runs/
+projects/*/dataset/images/
+projects/*/dataset_old/
 projects/*/verify/
 projects/*/测试集/
 

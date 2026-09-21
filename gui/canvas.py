@@ -13,33 +13,59 @@
 from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor, QPainter, QPen
 from PyQt5.QtWidgets import (QGraphicsItem, QGraphicsRectItem,
-                             QGraphicsScene, QGraphicsView)
+                             QGraphicsScene, QGraphicsSimpleTextItem,
+                             QGraphicsView)
+
+from gui import theme
 
 HANDLE = 10        # 控制点判定半径（图片像素）
 MIN_SIZE = 8       # 框的最小边长
+
+# 类别编号 → 显示名（和 data.yaml 的 class 对齐）
+CLASS_NAMES = {0: "玩家", 1: "怪物", 2: "掉落", 3: "NPC"}
+
+
+def _box_colors():
+    """质检台框颜色：玩家/怪物从可视化设置读，drop/npc 用默认。
+
+    返回 {cls: (hex_str, (r, g, b))}。
+    """
+    vis = theme.load_vis()
+
+    def hx(hexstr):
+        return hexstr, (int(hexstr[1:3], 16), int(hexstr[3:5], 16),
+                        int(hexstr[5:7], 16))
+
+    return {
+        0: hx(vis["player_color"]),
+        1: hx(vis["mob_color"]),
+        2: ("#fbbc04", (251, 188, 4)),
+        3: ("#ea4335", (234, 67, 53)),
+    }
 
 
 class BBoxItem(QGraphicsRectItem):
     """一个可移动 / 可缩放的标注框。"""
 
-    # 类别 → 框颜色（和 data.yaml 的 class 对齐）
-    COLORS = {
-        0: ("#4285f4", (66, 133, 244)),    # player 蓝
-        1: ("#34a853", (52, 168, 83)),      # mob 绿
-        2: ("#fbbc04", (251, 188, 4)),      # drop 黄
-        3: ("#ea4335", (234, 67, 53)),      # npc 红
-    }
-
-    def __init__(self, x, y, w, h, cls=1):
+    def __init__(self, x, y, w, h, cls=1, manual=False, colors=None):
         super().__init__(0, 0, w, h)
         self.setPos(x, y)
         self.cls = cls
+        self.manual = manual   # 是否人工框（新建/修改过 = 人工，重标时保留）
+        self._colors = colors or _box_colors()
 
-        hex_, rgb = self.COLORS.get(cls, self.COLORS[1])
+        hex_, rgb = self._colors.get(cls, self._colors[1])
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
-        self.setPen(QPen(QColor(hex_), 2))
+        self.setPen(QPen(QColor(hex_), 3 if manual else 2))
         self.setBrush(QBrush(QColor(*rgb, 36)))
         self.setZValue(10)
+
+        # 类名标签：贴在框左上角上方
+        self.label = QGraphicsSimpleTextItem(
+            CLASS_NAMES.get(cls, str(cls)), self)
+        self.label.setBrush(QBrush(QColor(hex_)))
+        self.label.setZValue(1)
+        self.label.setPos(-1, -18)
 
         self._mode = None
         self._press_scene = None
@@ -141,6 +167,9 @@ class BBoxItem(QGraphicsRectItem):
         # 位置或尺寸真的变了才通知 —— 否则点一下（没拖动）也会标记为已修改
         if self._orig_pos is not None:
             if self.pos() != self._orig_pos or self.rect() != self._orig_rect:
+                self.manual = True   # 被拖动/缩放过的框，视为人工框
+                hex_ = self._colors.get(self.cls, self._colors[1])[0]
+                self.setPen(QPen(QColor(hex_), 3))   # 人工框加粗
                 if self.on_changed:
                     self.on_changed()
         super().mouseReleaseEvent(e)
@@ -176,6 +205,7 @@ class ImageCanvas(QGraphicsView):
         self.boxes = []
         self.editable = True
         self.current_cls = 1      # 新建框的默认类别（1=怪物，0=玩家）
+        self._colors = _box_colors()   # 框颜色缓存（load 时刷新）
 
         self._draw_start = None
         self._rubber = None
@@ -200,9 +230,11 @@ class ImageCanvas(QGraphicsView):
         self.scene_.setSceneRect(0, 0, w, h)
 
         self.editable = editable
+        self._colors = _box_colors()   # 读一次可视化配置，所有框共用
         for box in boxes:
-            cls, x, y, bw, bh = box
-            self.add_box(x, y, bw, bh, cls)
+            cls, x, y, bw, bh = box[0], box[1], box[2], box[3], box[4]
+            manual = box[5] if len(box) > 5 else False
+            self.add_box(x, y, bw, bh, cls, manual, self._colors)
 
         if fit:
             self.fitInView(self.scene_.sceneRect(), Qt.KeepAspectRatio)
@@ -215,8 +247,8 @@ class ImageCanvas(QGraphicsView):
 
     # ---------------- 框操作 ----------------
 
-    def add_box(self, x, y, w, h, cls=1):
-        it = BBoxItem(x, y, w, h, cls)
+    def add_box(self, x, y, w, h, cls=1, manual=False, colors=None):
+        it = BBoxItem(x, y, w, h, cls, manual, colors or self._colors)
         it.setEnabled(self.editable)
         it.on_changed = self.boxes_changed.emit
         self.scene_.addItem(it)
@@ -224,12 +256,12 @@ class ImageCanvas(QGraphicsView):
         return it
 
     def get_boxes(self):
-        """返回 [(cls, x, y, w, h), ...]，像素坐标。"""
+        """返回 [(cls, x, y, w, h, manual), ...]，像素坐标。"""
         out = []
         for it in self.boxes:
             r = it.rect()
             p = it.pos()
-            out.append((it.cls, p.x(), p.y(), r.width(), r.height()))
+            out.append((it.cls, p.x(), p.y(), r.width(), r.height(), it.manual))
         return out
 
     def count(self):
@@ -279,7 +311,8 @@ class ImageCanvas(QGraphicsView):
             if item is None or item is self.pix_item:
                 self._draw_start = self.mapToScene(e.pos())
                 self._rubber = QGraphicsRectItem()
-                self._rubber.setPen(QPen(QColor("#fbbc04"), 2, Qt.DashLine))
+                hex_, _rgb = self._colors.get(self.current_cls, self._colors[1])
+                self._rubber.setPen(QPen(QColor(hex_), 2, Qt.DashLine))
                 self._rubber.setZValue(20)
                 self.scene_.addItem(self._rubber)
                 e.accept()
@@ -323,7 +356,8 @@ class ImageCanvas(QGraphicsView):
             self._draw_start = None
 
             if r.width() >= MIN_SIZE and r.height() >= MIN_SIZE:
-                self.add_box(r.x(), r.y(), r.width(), r.height(), self.current_cls)
+                self.add_box(r.x(), r.y(), r.width(), r.height(),
+                             self.current_cls, manual=True)
                 self.boxes_changed.emit()
             e.accept()
             return

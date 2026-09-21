@@ -4,7 +4,7 @@ mobs:
 - '3210800'
 - '3230100'
 - '5130102'
-scale: 1.405
+scale: 1.406
 mob_scales: {}
 scale_at:
   width: 1920
@@ -52,7 +52,7 @@ mob_names:
 - 猴子
 - 风独眼兽
 - 黑石头人
-player_scale: 1.405
+player_scale: 1.406
 player_scale_at:
   width: 1920
   height: 1080

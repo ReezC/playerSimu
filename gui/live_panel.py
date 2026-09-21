@@ -67,6 +67,11 @@ class LivePanel(QWidget):
         self.btn_stop.clicked.connect(self.stop)
         bar.addWidget(self.btn_stop)
 
+        # 流状态灯：等待推流 / 已连接 / 无流
+        self.lbl_stream = QLabel("—")
+        self.lbl_stream.setStyleSheet("color:#80868b; font-weight:600;")
+        bar.addWidget(self.lbl_stream)
+
         bar.addSpacing(10)
         bar.addWidget(QLabel("来源"))
         self.cmb_source = NoWheelComboBox()
@@ -224,8 +229,10 @@ class LivePanel(QWidget):
     # ---------------- 起停 ----------------
 
     def start(self):
+        # 旧线程可能还在后台退出（已 stop），直接丢弃引用重开
         if self.thread is not None:
-            return
+            self.thread.stop()
+            self.thread = None
 
         w = self.ed_weights.text().strip()
         if not w:
@@ -276,21 +283,27 @@ class LivePanel(QWidget):
         self.thread.stats_ready.connect(self._on_stats)
         self.thread.potions_ready.connect(self.potions_ready)
         self.thread.failed.connect(self._on_failed)
-        self.thread.finished.connect(self._on_finished)
+        self.thread.stream_status.connect(self._on_stream_status)
+        self.thread.finished.connect(
+            lambda _t=self.thread: self._on_finished(_t))
         self.thread.start()
 
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        self.lbl_stream.setText("—")
+        self.lbl_stream.setStyleSheet("color:#80868b; font-weight:600;")
         self.lbl_stats.setText("正在启动（首次会加载模型，几秒）…")
 
     def stop(self):
         if self.thread is None:
             return
         self.thread.stop()
-        # 不在这里 wait()：线程可能在等一帧（收流阻塞），wait 会把界面也卡住。
-        # 让它自己在后台退出，finished 信号回来再收拾。
+        # 立即停止：UI 马上恢复，不等线程退出（线程在后台自己收尾）。
         self.btn_stop.setEnabled(False)
-        self.lbl_stats.setText("正在停止…")
+        self.btn_start.setEnabled(True)
+        self.lbl_stats.setText("已停止")
+        self.lbl_stream.setText("—")
+        self.lbl_stream.setStyleSheet("color:#80868b; font-weight:600;")
 
     def shutdown(self):
         """窗口关闭时调用：等线程真正退出，避免 QThread 被销毁时报错。"""
@@ -340,12 +353,28 @@ class LivePanel(QWidget):
                s.get("dropped", 0), s.get("infer_ms", 0), s.get("show_fps", 0),
                s.get("boxes", 0), w, h))
 
+    def _on_stream_status(self, status):
+        if status == "waiting":
+            self.lbl_stream.setText("等待推流…")
+            self.lbl_stream.setStyleSheet("color:#b06000; font-weight:600;")
+        elif status == "connected":
+            self.lbl_stream.setText("已连接")
+            self.lbl_stream.setStyleSheet("color:#137333; font-weight:600;")
+        elif status == "no_stream":
+            self.lbl_stream.setText("无流")
+            self.lbl_stream.setStyleSheet("color:#c5221f; font-weight:600;")
+
     def _on_failed(self, msg):
         self.lbl_stats.setText("失败：%s" % msg)
 
-    def _on_finished(self):
+    def _on_finished(self, t=None):
+        # 只清理「当前线程」；若用户已重开新线程，旧线程退出不该动新线程的引用
+        if t is not None and self.thread is not t:
+            return
         self.thread = None
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         if not self.lbl_stats.text().startswith("失败"):
             self.lbl_stats.setText("已停止")
+            self.lbl_stream.setText("—")
+            self.lbl_stream.setStyleSheet("color:#80868b; font-weight:600;")

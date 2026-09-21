@@ -2,11 +2,11 @@
 
 **数据分三层**（这是刻意的，不是多余的目录）：
 
-    labels_auto/     自动标注的原始结果，**只读**，任何情况下都不改它
-    labels/          人工修正后的结果
-    labels_backup/   每次保存人工修正前的旧版本
+    labels_auto/     自动标注框（每次自动标注生成/更新，质检台删自动框时同步更新）
+    labels/          人工框（质检台新增/拖动过的框，重标时保留、不被覆盖）
+    labels_backup/   每次保存人工框前的旧版本
 
-读取时优先用 `labels/`，没有才回退 `labels_auto/`。
+读取时**按框合并**：人工框优先，自动框里和人工框 IoU 过高的丢弃。
 
 **类别编号**（和 dataset/data.yaml 的 names 对齐）：
 
@@ -16,7 +16,7 @@
     3 = npc      NPC
 
 标注文件是 YOLO 格式：`cls cx cy w h`（归一化坐标）。
-框在内存里统一是 `(cls, x, y, w, h)`（像素坐标），cls 在前面。
+框在内存里统一是 `(cls, x, y, w, h, manual)`（像素坐标），manual 标记是否人工。
 """
 from pathlib import Path
 
@@ -32,48 +32,88 @@ def _files(project, stem):
             project.dir_of("labels") / (stem + ".txt"))
 
 
-def load_boxes(project, stem, img_w, img_h):
-    """读一帧的标注，返回 [(cls, x, y, w, h)]，像素坐标。
+def _xywh_iou(a, b):
+    """两个 (x, y, w, h) 框的 IoU。"""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
+    iy = max(0.0, min(ay + ah, by + bh) - max(ay, by))
+    inter = ix * iy
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
 
-    有人工修正就用人工的，否则用自动的。
+
+def _merged_raw(project, stem):
+    """合并 labels_auto 与 labels 的原始行，返回 [(cls, x, y, w, h, manual)]（归一化左上角坐标）。
+
+    自动框若和某个人工框 IoU 过高则丢弃 —— 人工框已覆盖该区域。
     """
-    auto, manual = _files(project, stem)
-    f = manual if manual.exists() else auto
+    auto, manual_path = _files(project, stem)
 
-    if not f.exists():
-        return []
-
-    try:
-        text = f.read_text(encoding="utf-8")
-    except Exception:
-        return []
-
-    out = []
-    for ln in text.splitlines():
-        parts = ln.split()
-        if len(parts) < 5:
-            continue
+    def _read(path, manual):
+        if not path.exists():
+            return []
         try:
-            cls = int(parts[0])
-            cx, cy, bw, bh = (float(v) for v in parts[1:5])
-        except ValueError:
-            continue
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            return []
+        out = []
+        for ln in text.splitlines():
+            parts = ln.split()
+            if len(parts) < 5:
+                continue
+            try:
+                cls = int(parts[0])
+                cx, cy, bw, bh = (float(v) for v in parts[1:5])
+            except ValueError:
+                continue
+            out.append((cls, cx - bw / 2.0, cy - bh / 2.0, bw, bh, manual))
+        return out
 
-        w = bw * img_w
-        h = bh * img_h
-        out.append((cls, cx * img_w - w / 2.0, cy * img_h - h / 2.0, w, h))
+    manual_boxes = _read(manual_path, True)
+    auto_boxes = _read(auto, False)
 
+    kept_auto = [b for b in auto_boxes
+                 if not any(_xywh_iou(b[1:5], m[1:5]) > 0.5
+                            for m in manual_boxes)]
+    return kept_auto + manual_boxes
+
+
+def load_boxes(project, stem, img_w, img_h):
+    """读一帧的标注，返回 [(cls, x, y, w, h, manual)]，像素坐标。
+
+    合并 labels_auto（自动框，manual=False）与 labels（人工框，manual=True）。
+    """
+    out = []
+    for cls, x, y, w, h, manual in _merged_raw(project, stem):
+        out.append((cls, x * img_w, y * img_h, w * img_w, h * img_h, manual))
     return out
 
 
 def save_boxes(project, stem, boxes, img_w, img_h):
-    """写人工修正结果。boxes: [(cls, x, y, w, h)]，像素坐标。
+    """写编辑结果。boxes: [(cls, x, y, w, h, manual)]，像素坐标。
 
-    写之前先把旧版本挪进 labels_backup/。
+    人工框（manual=True）写 labels/，自动框（manual=False）写 labels_auto/。
+    写 labels/ 前先把旧版本挪进 labels_backup/。返回人工框数。
     """
     _auto, manual = _files(project, stem)
     manual.parent.mkdir(parents=True, exist_ok=True)
 
+    def _fmt(box):
+        cls, x, y, w, h, _m = box
+        cx = (x + w / 2.0) / img_w
+        cy = (y + h / 2.0) / img_h
+        return "%d %.6f %.6f %.6f %.6f" % (cls, cx, cy, w / img_w, h / img_h)
+
+    manual_boxes = [b for b in boxes if len(b) > 5 and b[5]]
+    auto_boxes = [b for b in boxes if not (len(b) > 5 and b[5])]
+
+    # 自动框写 labels_auto（含删除的自动框 —— 编辑后自动部分以此为准）
+    auto_text = "\n".join(_fmt(b) for b in auto_boxes)
+    _auto.parent.mkdir(parents=True, exist_ok=True)
+    _auto.write_text((auto_text + "\n") if auto_text else "\n", encoding="utf-8")
+
+    # 人工框写 labels/（先备份旧的）
     if manual.exists():
         bak = project.dir_of("labels_backup") / (stem + ".txt")
         try:
@@ -81,16 +121,17 @@ def save_boxes(project, stem, boxes, img_w, img_h):
         except Exception:
             pass
 
-    lines = []
-    for box in boxes:
-        cls, x, y, w, h = box
-        cx = (x + w / 2.0) / img_w
-        cy = (y + h / 2.0) / img_h
-        lines.append("%d %.6f %.6f %.6f %.6f"
-                     % (cls, cx, cy, w / img_w, h / img_h))
+    if manual_boxes:
+        manual.write_text("\n".join(_fmt(b) for b in manual_boxes) + "\n",
+                          encoding="utf-8")
+    else:
+        if manual.exists():
+            try:
+                manual.unlink()
+            except Exception:
+                pass
 
-    manual.write_text("\n".join(lines), encoding="utf-8")
-    return len(lines)
+    return len(manual_boxes)
 
 
 def revert_frame(project, stem):
@@ -135,49 +176,19 @@ def delete_frame(project, stem):
 
 
 def count_boxes(project, stem):
-    """只要框数，不做坐标换算（列表筛选时批量调用，要快）。
-
-    返回 (总框数, 是否人工)。
-    """
-    auto, manual = _files(project, stem)
-    f = manual if manual.exists() else auto
-    if not f.exists():
-        return 0, False
-
-    try:
-        text = f.read_text(encoding="utf-8")
-    except Exception:
-        return 0, manual.exists()
-
-    n = sum(1 for x in text.splitlines() if x.strip())
-    return n, manual.exists()
+    """只要框数，返回 (总框数, 是否含人工)。合并统计（自动 + 人工，去重）。"""
+    raw = _merged_raw(project, stem)
+    return len(raw), any(b[5] for b in raw)
 
 
 def count_by_class(project, stem):
     """按类别统计框数，返回 {cls: n}。
 
-    给「玩家框丢失」这类筛选用 —— 只关心某一类有没有，不用换算坐标。
+    给「玩家框丢失」这类筛选用 —— 只关心某一类有没有。合并统计。
     """
-    auto, manual = _files(project, stem)
-    f = manual if manual.exists() else auto
-    if not f.exists():
-        return {}
-
-    try:
-        text = f.read_text(encoding="utf-8")
-    except Exception:
-        return {}
-
     out = {}
-    for ln in text.splitlines():
-        parts = ln.split()
-        if len(parts) < 5:
-            continue
-        try:
-            cls = int(parts[0])
-        except ValueError:
-            continue
-        out[cls] = out.get(cls, 0) + 1
+    for b in _merged_raw(project, stem):
+        out[b[0]] = out.get(b[0], 0) + 1
     return out
 
 
@@ -258,9 +269,9 @@ def match_boxes(prev, cur, iou_thr=0.30):
     p_by_cls = {}
     c_by_cls = {}
     for i, box in enumerate(prev):
-        p_by_cls.setdefault(box[0], []).append((i, box[1:]))
+        p_by_cls.setdefault(box[0], []).append((i, box[1:5]))
     for j, box in enumerate(cur):
-        c_by_cls.setdefault(box[0], []).append((j, box[1:]))
+        c_by_cls.setdefault(box[0], []).append((j, box[1:5]))
 
     new_all, lost_all = [], []
     for cls in set(p_by_cls) | set(c_by_cls):

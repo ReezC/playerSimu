@@ -5,7 +5,8 @@
 """
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import (QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
+from PyQt5.QtWidgets import (QColorDialog, QDialog, QDialogButtonBox,
+                             QFormLayout, QHBoxLayout, QLabel, QPushButton,
                              QSlider, QSpinBox, QVBoxLayout)
 
 from decision.agent import settings
@@ -75,6 +76,37 @@ class SettingsDialog(QDialog):
         self.sp_timeout.setValue(int(settings.facing_timeout_min))
         root.addWidget(self.sp_timeout)
 
+        # ---- 可视化 ----
+        root.addSpacing(6)
+        lbl_vis = QLabel("可视化（实时预览）")
+        lbl_vis.setStyleSheet("font-weight: 600;")
+        root.addWidget(lbl_vis)
+
+        note_vis = QLabel("实时预览里框和线条的颜色。保存后重新开始实时预览生效。")
+        note_vis.setStyleSheet("color: #5f6368;")
+        note_vis.setWordWrap(True)
+        root.addWidget(note_vis)
+
+        self._vis = theme.load_vis()
+        vf = QFormLayout()
+        vf.setLabelAlignment(Qt.AlignLeft)
+        self._color_btns = {}
+        for key, label in (("mob_color", "怪物框颜色"),
+                           ("player_color", "玩家框颜色"),
+                           ("lock_color", "锁定框颜色"),
+                           ("attack_color", "最大攻击距离线颜色"),
+                           ("min_attack_color", "最小攻击距离线颜色"),
+                           ("vision_color", "视野线颜色")):
+            self._color_btns[key] = self._color_btn(self._vis[key])
+            vf.addRow(label, self._color_btns[key])
+
+        self.sp_vision_width = QSpinBox()
+        self.sp_vision_width.setRange(1, 10)
+        self.sp_vision_width.setSuffix(" px")
+        self.sp_vision_width.setValue(int(self._vis["vision_width"]))
+        vf.addRow("视野线宽度", self.sp_vision_width)
+        root.addLayout(vf)
+
         # ---- 按钮 ----
         box = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -100,6 +132,28 @@ class SettingsDialog(QDialog):
         else:
             self.lbl_note.setText("和当前一样。")
 
+    def _color_btn(self, color):
+        """一个显示当前颜色、点击弹颜色选择器的按钮。"""
+        btn = QPushButton(color)
+        btn.setFixedWidth(110)
+        btn._color = color
+        btn.setStyleSheet(
+            "QPushButton { background: %s; color: #202124; border: 1px solid #dadce0;"
+            " border-radius: 4px; padding: 4px 8px; }" % color)
+        btn.clicked.connect(lambda: self._pick_color(btn))
+        return btn
+
+    def _pick_color(self, btn):
+        from PyQt5.QtGui import QColor
+        c = QColorDialog.getColor(QColor(btn._color), self, "选择颜色")
+        if c.isValid():
+            btn._color = c.name()
+            btn.setText(c.name())
+            btn.setStyleSheet(
+                "QPushButton { background: %s; color: #202124;"
+                " border: 1px solid #dadce0; border-radius: 4px; padding: 4px 8px; }"
+                % c.name())
+
     def _accept(self):
         v = self.slider.value()
         if v != self._orig:
@@ -111,4 +165,8 @@ class SettingsDialog(QDialog):
         if t != settings.facing_timeout_min:
             settings.facing_timeout_min = t
             settings.save()
+        # 可视化
+        vis_cfg = {k: b._color for k, b in self._color_btns.items()}
+        vis_cfg["vision_width"] = self.sp_vision_width.value()
+        theme.save_vis(vis_cfg)
         self.accept()

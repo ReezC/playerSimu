@@ -194,6 +194,47 @@ def nms(dets):
     return keep
 
 
+def _iou_xywh(a, b):
+    """两个 (x, y, w, h) 框的 IoU。"""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
+    iy = max(0.0, min(ay + ah, by + bh) - max(ay, by))
+    inter = ix * iy
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _read_manual_mobs(cfg, stem, W, H):
+    """读人工修正目录里该帧的人工怪物框（class 1），返回 [(x, y, w, h)] 像素坐标。
+
+    重标怪物时用来判断「新框和人工框是否太近」—— 太近就跳过，不覆盖人工修正。
+    """
+    manual_dir = cfg.get("manual_dir")
+    if not manual_dir:
+        return []
+    path = Path(manual_dir) / (stem + ".txt")
+    if not path.exists():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return []
+    out = []
+    for ln in text.splitlines():
+        parts = ln.split()
+        if len(parts) < 5 or parts[0] != str(CLASS_MOB):
+            continue
+        try:
+            cx, cy, bw, bh = (float(v) for v in parts[1:5])
+        except ValueError:
+            continue
+        w = bw * W
+        h = bh * H
+        out.append((cx * W - w / 2.0, cy * H - h / 2.0, w, h))
+    return out
+
+
 # ══════════════════════════════════════════════════════════════
 # 进程池 worker（不能碰 ctx —— 它跑在子进程里）
 # ══════════════════════════════════════════════════════════════
@@ -269,6 +310,12 @@ def work(fp_str):
               max(0, ml[0] - w // 2):ml[0] + w // 2 + 1] = 0.0
 
     kept = nms(dets)
+
+    # 重标怪只补非人工的框：新框和人工怪物框 IoU 过高就跳过，不覆盖人工修正
+    manual_boxes = _read_manual_mobs(cfg, fp.stem, W, H)
+    if manual_boxes:
+        kept = [d for d in kept
+                if not any(_iou_xywh(d[1:5], m) > 0.5 for m in manual_boxes)]
 
     out_dir = Path(cfg["out"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -434,6 +481,7 @@ def run_detect(params, ctx=None):
         "peaks": peaks,
         "per_mob": per_mob,
         "out": str(out),
+        "manual_dir": str(out.parent / "labels"),   # 人工修正目录，重标时保留其怪物框
         "vis": vis,
         "vis_dir": vis_dir,
         "region": region,
