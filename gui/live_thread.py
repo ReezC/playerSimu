@@ -213,9 +213,14 @@ class LiveThread(QThread):
         from decision.agent import CombatAgent, settings as decision_settings
         from perception.tracker import MobTracker
         from perception.world_state import WorldState
+        from perception.platforms import PlatformTracker, PlayerMotionTracker
 
         agent = CombatAgent(decision_settings)
         mob_tracker = MobTracker()   # 给怪稳定 id，供目标锁定 CD 跨帧匹配
+        # 平台和玩家运动状态是 WorldState 的一部分，不交给 YOLO：平台顶边用
+        # 轻量图像处理每帧更新，玩家速度则由连续框的位置估计。
+        platform_tracker = PlatformTracker()
+        player_motion = PlayerMotionTracker()
 
         from core import wincap
         # HP/MP 条**独立抓取**：它们可能在实时帧框选范围之外（比如只框了
@@ -429,7 +434,7 @@ class LiveThread(QThread):
                         ic = int(cls)
                         if ic == 0:
                             if player_box is None or c > player_box[3]:
-                                player_box = (cx, cy, y2, c)   # 带框底部 y
+                                player_box = (cx, cy, y2, c, x2 - x1, y2 - y1)   # 中心、底边、置信度、尺寸
                             # 玩家蓝框（原始检测，漏检由 _last_player 兜底）
                             if draw:
                                 x1i, y1i, x2i, y2i = int(x1), int(y1), int(x2), int(y2)
@@ -451,11 +456,14 @@ class LiveThread(QThread):
                 else:
                     _last_player[0] = player_box
 
-                ws = WorldState()
+                ws = WorldState(frame_id=f.frame_id, ts=f.t_recv_mono,
+                                width=vis.shape[1], height=vis.shape[0])
                 if player_box is not None:
                     ws.player.x, ws.player.y = player_box[0], player_box[1]
                     ws.player.bottom = player_box[2]
+                    ws.player.w, ws.player.h = player_box[4], player_box[5]
                     ws.player.found = True
+                ws.platforms = platform_tracker.update(vis, f.t_recv_mono)
                 # 读 HP/MP 条：独立抓取（屏幕坐标直接 grab_rect），不依赖实时
                 # 帧范围，限流 0.2s。
                 if time.perf_counter() - _pot_last[0] >= 0.2:
@@ -489,6 +497,8 @@ class LiveThread(QThread):
                 mob_tracker.debounce_ms = decision_settings.debounce_ms
                 # 用 MobTracker 追踪，得到跨帧稳定的 id（目标锁定 CD 靠它匹配）
                 ws.mobs = mob_tracker.update(mob_dets)
+                ws.jump_prediction = player_motion.update(ws.player, ws.platforms,
+                                                          f.t_recv_mono)
                 action = agent.tick(ws)
 
                 # 把识别到的血/蓝比例推给 UI（限流 0.3s，避免刷屏）
@@ -497,6 +507,20 @@ class LiveThread(QThread):
                     self.potions_ready.emit(ws.player.hp, ws.player.mp)
 
                 if draw:
+                    # 平台顶边：青色实线；编号稳定于 PlatformTracker，便于排查地图
+                    # 滚动/局部重检时的关联。当前平台额外画白色。
+                    for p in ws.platforms:
+                        color = (255, 255, 255) if p.id == ws.player.current_platform_id else (255, 255, 0)
+                        cv2.line(vis, (int(p.x1), int(p.y)), (int(p.x2), int(p.y)), color, 2)
+                        cv2.putText(vis, "P%d" % p.id, (int(p.x1), max(14, int(p.y) - 5)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+                    if ws.jump_prediction is not None:
+                        jp = ws.jump_prediction
+                        cv2.circle(vis, (int(jp.landing_x), int(jp.landing_y)), 5, (255, 0, 255), -1)
+                        cv2.putText(vis, "land P%d %.0fms" % (jp.target_platform_id,
+                                    jp.landing_time * 1000),
+                                    (int(jp.landing_x) + 6, int(jp.landing_y) - 7),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
                     st = action.get("state", "?")
                     label = "决策:%s" % st
                     if st == "chase":
@@ -596,6 +620,7 @@ class LiveThread(QThread):
                         "probe_miss": probe_miss,
                         "show_fps": n_show / el if el > 0 else 0.0,
                         "boxes": n_boxes,
+                        "platforms": len(ws.platforms),
                         "frames": n,
                         "gap_p95": (sorted(gaps_recent)[int(len(gaps_recent) * 0.95)]
                                     if gaps_recent else 0.0),

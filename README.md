@@ -10,9 +10,9 @@
 ```
 A机: 仿真环境 ──OBS/UDP/SRT──> B机: FrameSource
                                       ↓
-                              YOLO + Tracker
+                              YOLO + Tracker + Platform Vision
                                       ↓
-                              World State
+                       World State（玩家速度/腾空/平台顶边/落点）
                                       ↓
                               HFSM Decision (Intent)
                                       ↓
@@ -46,3 +46,14 @@ python -m tools.probe_recv --show
 - `tools/` — 自检、对时、录制、延迟探针
 - `eval/` — 离线评估与反作弊研究
 - `config/` — 配置
+
+## 平台视觉与决策边界
+
+实时线程会用 HSV 颜色筛选与水平形态学从每帧提取平台碰撞顶边，输出
+`Platform(id, x1, x2, y)`；`PlatformTracker` 负责保持跨帧 ID。玩家检测框的连续
+位置会补齐 `vx`、`vy`、`grounded`、`jumping`、`falling`、`current_platform_id`，下落时
+还会给出 `jump_prediction`（当前速度下的预测落点）。这些字段都在 `WorldState` 中。
+
+当前 CombatAgent 会在已识别出当前平台时，仅选择同一平台上的怪物；平台短暂失检时
+自动退化到原有的视野过滤逻辑。跨平台起跳不会自动下发，必须先用实机视频标定跳跃
+初速度和空中修正，避免把尚未校准的视觉预测变成按键动作。
