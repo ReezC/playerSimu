@@ -191,6 +191,36 @@ def format_label(mid, name, region, mob_names, n_mob):
     return "   ".join(parts)
 
 
+def build_mob_name_map():
+    """从地图清单收集「怪 id → 名称」映射（同名取第一个非空值）。
+
+    精灵库的 meta.tsv 里没有怪物名，名字只散落在 maps.json 各条地图记录里，
+    这里统一收一遍，供「确认要识别怪物」弹窗显示用。
+    """
+    idx = load_index()
+    name_map = {}
+    if not idx:
+        return name_map
+    for m in idx.get("maps", []):
+        mobs = m.get("mobs") or []
+        names = m.get("mob_names") or []
+        for i, mid in enumerate(mobs):
+            if mid not in name_map and i < len(names) and names[i]:
+                name_map[mid] = names[i]
+    return name_map
+
+
+def list_sprite_mobs():
+    """列出精灵库里所有有 stand 帧的怪 id（排序，供手动选怪用）。"""
+    root = sprite_dir_path()
+    out = []
+    if root.is_dir():
+        for d in root.iterdir():
+            if d.is_dir() and list(d.glob("stand_*.png")):
+                out.append(d.name)
+    return sorted(out)
+
+
 # ══════════════════════════════════════════════════════════════
 # 导出
 # ══════════════════════════════════════════════════════════════

@@ -113,8 +113,24 @@ def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
+    # Windows 任务栏图标：显式绑定 AppUserModelID，否则 pythonw 启动时
+    # 任务栏会显示 python 的图标而不是我们设置的图标。
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "playerSimu.workbench")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setApplicationName("playerSimu 数据集工作台")
+
+    # 应用图标：MapleNecrocer 图标去掉红色通道（见 gui/icon.ico）
+    from PyQt5.QtGui import QIcon
+    _icon = ROOT / "gui" / "icon.ico"
+    if _icon.exists():
+        app.setWindowIcon(QIcon(str(_icon)))
 
     # 应用保存的界面字号（在窗口创建之前，这样一开就是设置好的大小）
     from gui import theme
@@ -122,6 +138,8 @@ def main():
 
     from gui.main_window import MainWindow
     win = MainWindow()
+    if _icon.exists():
+        win.setWindowIcon(QIcon(str(_icon)))
 
     if len(sys.argv) > 1:
         try:

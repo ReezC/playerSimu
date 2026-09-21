@@ -1,13 +1,14 @@
-"""设置弹窗：目前只调界面字号。
+"""设置弹窗：界面字号 + 朝向超时。
 
 字号改动**立即生效**，不需要重启 —— 底层是 QApplication.setFont()，
-所有没写死字号的控件都会跟随。
+所有没写死字号的控件都会跟随。朝向超时是决策参数，点确定后写入 decision.json。
 """
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
-                             QSlider, QVBoxLayout)
+                             QSlider, QSpinBox, QVBoxLayout)
 
+from decision.agent import settings
 from gui import theme
 
 
@@ -57,6 +58,23 @@ class SettingsDialog(QDialog):
         self.lbl_note.setWordWrap(True)
         root.addWidget(self.lbl_note)
 
+        # ---- 朝向超时 ----
+        root.addSpacing(6)
+        lbl_to = QLabel("朝向无变化停止自动")
+        lbl_to.setStyleSheet("font-weight: 600;")
+        root.addWidget(lbl_to)
+
+        note_to = QLabel("角色朝向超过该时长没变化，自动停止（0 = 禁用）。")
+        note_to.setStyleSheet("color: #5f6368;")
+        note_to.setWordWrap(True)
+        root.addWidget(note_to)
+
+        self.sp_timeout = QSpinBox()
+        self.sp_timeout.setRange(0, 1440)
+        self.sp_timeout.setSuffix(" min")
+        self.sp_timeout.setValue(int(settings.facing_timeout_min))
+        root.addWidget(self.sp_timeout)
+
         # ---- 按钮 ----
         box = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -88,4 +106,9 @@ class SettingsDialog(QDialog):
             theme.save_size(v)
             from PyQt5.QtWidgets import QApplication
             theme.apply(QApplication.instance(), v)
+        # 朝向超时
+        t = self.sp_timeout.value()
+        if t != settings.facing_timeout_min:
+            settings.facing_timeout_min = t
+            settings.save()
         self.accept()

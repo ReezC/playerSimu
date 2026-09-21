@@ -15,10 +15,10 @@ CLI:
         --out projects/x/labels_auto --scale 1.0
 """
 import argparse
+import multiprocessing as mp
 import os
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -36,7 +36,8 @@ def init_worker(cfg):
     _W["cfg"] = cfg
     _W["loc"] = PlayerLocator(
         cfg["player_id"], root=cfg["player_root"], scale=cfg["scale"],
-        threshold=cfg["thresh"], filter_prefix=cfg.get("filter_prefix", "stand"))
+        threshold=cfg["thresh"], filter_prefix=cfg.get("filter_prefix"),
+        frame_scales=cfg.get("frame_scales", {}))
 
 
 def work(fp_str):
@@ -44,16 +45,6 @@ def work(fp_str):
     fp = Path(fp_str)
 
     out = Path(cfg["out"]) / (fp.stem + ".txt")
-    # 断点续标：这帧已有玩家框（class 0）就跳过 —— 重跑时不会重复追加。
-    # 怪物框（class 1）不受影响，玩家标注只负责补 class 0。
-    if out.exists():
-        try:
-            text = out.read_text(encoding="utf-8")
-            if any(ln.split() and ln.split()[0] == "0"
-                   for ln in text.splitlines()):
-                return None
-        except Exception:
-            pass
 
     full = imread(fp)
     if full is None:
@@ -63,25 +54,28 @@ def work(fp_str):
     # imread 已经返回 BGR（cv2.imdecode），不要再 cvtColor ——
     # 之前多转了一次 RGB2BGR，把橙发转成蓝发，模板在颜色错乱的图上匹配不上。
     r = _W["loc"].locate(full)         # 全图匹配（玩家可能在角落）
-    if r is None:
-        return None
 
-    cx, cy, bw, bh, score, _name = r
-    line = "%d %.6f %.6f %.6f %.6f" % (
-        CLASS_PLAYER, cx / w, cy / h, bw / w, bh / h)
-
-    # 追加到已有标注（怪物框在前，玩家框在后），不覆盖
+    # 玩家框（class 0）一律重写，不做「断点续标」：重新采集后旧 txt 里
+    # 残留的 class 0 框位置是错的，若按「已有 class 0 就跳过」会整批跳过，
+    # 造成「命中 0 帧」的假象。怪物框（class 1）原样保留。
     existing = out.read_text(encoding="utf-8") if out.exists() else ""
-    if existing.strip():
-        out.write_text(existing.rstrip("\n") + "\n" + line + "\n",
-                       encoding="utf-8")
-    else:
-        out.write_text(line + "\n", encoding="utf-8")
+    keep = [ln for ln in existing.splitlines()
+            if ln.split() and ln.split()[0] != str(CLASS_PLAYER)]
+
+    score = None
+    if r is not None:
+        cx, cy, bw, bh, score, _name = r
+        keep.append("%d %.6f %.6f %.6f %.6f" % (
+            CLASS_PLAYER, cx / w, cy / h, bw / w, bh / h))
+
+    out.write_text(("\n".join(keep) + "\n") if keep else "\n", encoding="utf-8")
 
     if cfg["vis"]:
-        x1, y1 = int(cx - bw / 2), int(cy - bh / 2)
-        cv2.rectangle(full, (x1, y1), (x1 + int(bw), y1 + int(bh)),
-                      (255, 128, 0), 2)      # 蓝色（BGR），区别于怪物的绿
+        if r is not None:
+            x1, y1 = int(cx - bw / 2), int(cy - bh / 2)
+            cv2.rectangle(full, (x1, y1), (x1 + int(bw), y1 + int(bh)),
+                          (255, 128, 0), 2)   # 蓝色（BGR），区别于怪物的绿
+        # 没命中也重画一帧（无框原图），覆盖旧的可视化图
         imwrite(Path(cfg["vis_dir"]) / (fp.stem + ".jpg"), full, quality=82)
 
     return score
@@ -120,17 +114,26 @@ def run_detect_player(params, ctx=None):
         "player_root": params.get("player_root", "datasets/sprites/player"),
         "scale": float(params.get("scale", 1.0)),
         "thresh": float(params.get("thresh", 0.78)),
-        "filter_prefix": params.get("filter_prefix", "stand"),
+        "filter_prefix": params.get("filter_prefix"),   # None = 加载所有动作帧
+        "frame_scales": params.get("frame_scales") or {},  # {player_id:帧stem -> scale}
         "out": str(out),
         "vis": bool(params.get("vis", True)),
         "vis_dir": params.get("vis_dir") or str(out.parent / "vis"),
     }
 
+    # 重新采集后帧数变少时，清掉帧号超界的旧标注/可视化（同 detect_mobs）
+    from tools.detect_mobs import clean_stale_outputs
+    removed = clean_stale_outputs(str(out), cfg["vis_dir"], len(frames))
+    if removed:
+        ctx.log("清理上次残留 %d 个文件（帧号超出本次 %d 帧）" % (removed, len(frames)))
+
     # 主进程先验一次模板能不能加载，避免开了几十个进程才发现模板空
+    ctx.progress(0, 0, "加载玩家模板…")
     from perception.player_locator import PlayerLocator
     loc = PlayerLocator(pid, root=cfg["player_root"], scale=cfg["scale"],
                         threshold=cfg["thresh"],
-                        filter_prefix=cfg["filter_prefix"])
+                        filter_prefix=cfg["filter_prefix"],
+                        frame_scales=cfg["frame_scales"])
     if loc.template_count == 0:
         raise RuntimeError("玩家模板为空：%s/%s" % (cfg["player_root"], pid))
 
@@ -164,9 +167,17 @@ def run_detect_player(params, ctx=None):
             init_worker(cfg)
             ok = consume(work(str(f)) for f in frames)
         else:
-            with ProcessPoolExecutor(max_workers=workers, initializer=init_worker,
-                                     initargs=(cfg,)) as ex:
-                ok = consume(ex.map(work, [str(f) for f in frames], chunksize=2))
+            pool = mp.Pool(workers, initializer=init_worker, initargs=(cfg,))
+            try:
+                ok = consume(pool.imap(work, [str(f) for f in frames], chunksize=2))
+            except Exception:
+                pool.terminate()   # 出错也立即终止子进程
+                raise
+            if ok:
+                pool.close()
+            else:
+                pool.terminate()   # 取消：立即终止，不等正在跑的帧
+            pool.join()
     except Exception as e:
         raise RuntimeError("玩家标注失败: %s: %s" % (type(e).__name__, e))
 
@@ -196,6 +207,31 @@ def run_detect_player(params, ctx=None):
     }
 
 
+class _OffsetCtx:
+    """把子任务的进度映射到「帧 × 类」的统一进度条。
+
+    自动标注 = 怪物 + 玩家两段，共 N 帧 × 2 类 = 2N 个单元。
+    怪物段占 [0, N]，玩家段占 [N, 2N]，每完成一帧的一类 = 完成本帧的一半。
+    """
+
+    def __init__(self, ctx, offset, unit_total):
+        self._ctx = ctx
+        self._offset = offset
+        self._unit_total = unit_total
+
+    def log(self, msg, level="info"):
+        self._ctx.log(msg, level)
+
+    def canceled(self):
+        return self._ctx.canceled()
+
+    def progress(self, cur, total=0, text=""):
+        if total > 0:
+            self._ctx.progress(self._offset + int(cur), self._unit_total, text)
+        else:
+            self._ctx.progress(0, 0, text)
+
+
 def run_detect_combined(params, ctx=None):
     """自动标注：怪物 + 玩家，一次任务跑完两类。
 
@@ -209,15 +245,21 @@ def run_detect_combined(params, ctx=None):
     from tools.detect_mobs import run_detect
 
     ctx = ctx or TaskContext()
+
+    frames_dir = Path(params["mob"]["frames"])
+    n_frames = len(sorted(frames_dir.glob("*.png")))
+    unit_total = 2 * max(1, n_frames)
+
     ctx.log("—— 第 1 步：怪物标注 ——", "info")
-    mob_res = run_detect(params["mob"], ctx)
+    mob_res = run_detect(params["mob"], _OffsetCtx(ctx, 0, unit_total))
 
     ctx.log("")
     ctx.log("—— 第 2 步：玩家标注 ——", "info")
     player_res = None
     player_err = None
     try:
-        player_res = run_detect_player(params["player"], ctx)
+        player_res = run_detect_player(params["player"],
+                                       _OffsetCtx(ctx, n_frames, unit_total))
     except Exception as e:
         # 玩家标注失败不要整体抛错 —— 怪物标注已经完成并落盘，
         # 抛错会把整个任务标成失败，让人误以为怪物也白跑了。

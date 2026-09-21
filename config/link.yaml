@@ -53,7 +53,7 @@ probe:
 
 # ---- 远程键盘（控制机 agent → 游戏机 Pro Micro 硬件键盘）----
 kbd:
-  enabled: false          # true 后 agent 按键走远程 Pro Micro（否则本地 SendInput）
+  enabled: true           # true 后 agent 按键走远程 Pro Micro（否则本地 SendInput）
   host: "192.168.1.8"     # 游戏机（relay 跑在这）的 IP，默认同 a_host
   port: 9000
   cert: "remote_kbd/certs/cert.pem"

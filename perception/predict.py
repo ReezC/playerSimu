@@ -91,7 +91,9 @@ def run_predict(params, ctx=None):
     except ImportError:
         raise RuntimeError("没有装 ultralytics。\n请执行：pip install ultralytics")
 
+    ctx.progress(0, 0, "加载模型…")
     model = YOLO(str(weights))
+    ctx.progress(0, len(frames), "开始推理")
 
     t0 = time.perf_counter()
     counts = []          # 每帧框数

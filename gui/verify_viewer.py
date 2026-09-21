@@ -28,6 +28,7 @@ class VerifyViewer(QWidget):
         for text, delta in (("◀", -1), ("▶", 1)):
             b = QPushButton(text)
             b.setFixedWidth(36)
+            b.setStyleSheet("padding: 2px 4px;")
             b.clicked.connect(lambda _, d=delta: self.step(d))
             bar.addWidget(b)
             if delta < 0:

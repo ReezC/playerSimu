@@ -45,6 +45,7 @@ class BBoxItem(QGraphicsRectItem):
         self._press_scene = None
         self._orig_rect = None
         self._orig_pos = None
+        self.on_changed = None   # 拖动/缩放后由画布注入的回调
 
     # ---------------- 光标形状 ----------------
 
@@ -137,6 +138,11 @@ class BBoxItem(QGraphicsRectItem):
 
     def mouseReleaseEvent(self, e):
         self._mode = None
+        # 位置或尺寸真的变了才通知 —— 否则点一下（没拖动）也会标记为已修改
+        if self._orig_pos is not None:
+            if self.pos() != self._orig_pos or self.rect() != self._orig_rect:
+                if self.on_changed:
+                    self.on_changed()
         super().mouseReleaseEvent(e)
 
 
@@ -212,6 +218,7 @@ class ImageCanvas(QGraphicsView):
     def add_box(self, x, y, w, h, cls=1):
         it = BBoxItem(x, y, w, h, cls)
         it.setEnabled(self.editable)
+        it.on_changed = self.boxes_changed.emit
         self.scene_.addItem(it)
         self.boxes.append(it)
         return it

@@ -12,8 +12,8 @@ from pathlib import Path
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtWidgets import (QDialog, QHBoxLayout, QLabel, QMessageBox,
-                             QPushButton, QVBoxLayout)
+from PyQt5.QtWidgets import (QCheckBox, QDialog, QDoubleSpinBox, QHBoxLayout,
+                             QLabel, QMessageBox, QPushButton, QVBoxLayout)
 
 from core import wincap, wzexport
 from gui.widgets import NoWheelComboBox
@@ -87,6 +87,12 @@ class MapCard(StepCard):
         self.widgets["map_filter"][0].textChanged.connect(self._refill)
         self.widgets["only_mob"][0].stateChanged.connect(self._refill)
 
+        # ---- 确认要识别的怪物 ----
+        self.btn_pick_mobs = QPushButton("确认要识别怪物")
+        self.btn_pick_mobs.setToolTip("打开弹窗，手动增删这张图要识别的怪物")
+        self.btn_pick_mobs.clicked.connect(self._pick_mobs)
+        form.addRow("怪物", self.btn_pick_mobs)
+
         # ---- 角色（玩家模板）选择 ----
         self.cmb_player = NoWheelComboBox()
         self.cmb_player.setMinimumWidth(240)
@@ -94,9 +100,17 @@ class MapCard(StepCard):
         self.widgets["player_id"] = (self.cmb_player, "combo")
         form.addRow("角色", self.cmb_player)
 
+        prow = QHBoxLayout()
+        prow.setSpacing(4)
         self.lbl_player = QLabel("—")
         self.lbl_player.setStyleSheet("color:#80868b;")
-        form.addRow("", self.lbl_player)
+        prow.addWidget(self.lbl_player, 1)
+        btn_refresh_player = QPushButton("刷新列表")
+        btn_refresh_player.setFixedWidth(76)
+        btn_refresh_player.setToolTip("重新扫描角色模板目录（导出新角色后点这里）")
+        btn_refresh_player.clicked.connect(self._refresh_players)
+        prow.addWidget(btn_refresh_player)
+        form.addRow("", prow)
 
     # ---------------- 列表 ----------------
 
@@ -118,6 +132,15 @@ class MapCard(StepCard):
                     # 不传的话选什么都取到 None
                     self.cmb_player.addItem(p.name, p.name)
         self.cmb_player.blockSignals(False)
+
+    def _refresh_players(self):
+        """刷新角色下拉，并尽量恢复当前选中项。"""
+        cur = self.value("player_id")
+        self.reload_players()
+        if cur:
+            idx = self.cmb_player.findData(cur)
+            if idx >= 0:
+                self.cmb_player.setCurrentIndex(idx)
 
     def _on_player_picked(self, _idx=None):
         if self._loading or self.project is None:
@@ -185,6 +208,21 @@ class MapCard(StepCard):
         self.project.set("mob_names", m["mob_names"])
         self.project.save()
         self.set_result(self._describe(mid, m["mobs"], m["mob_names"]))
+
+    def _pick_mobs(self):
+        """打开「确认要识别怪物」弹窗，手动增删这张图要处理的怪。"""
+        if self.project is None:
+            return
+        from gui.mob_picker import MobPickDialog
+
+        dlg = MobPickDialog(self.project.get("mobs") or [], self)
+        if dlg.exec_():
+            new = dlg.result_mobs()
+            name_map = wzexport.build_mob_name_map()
+            self.project.set("mobs", new)
+            self.project.set("mob_names", [name_map.get(m, "") for m in new])
+            self.project.save()
+            self.refresh()
 
     # ---------------- 项目交互 ----------------
 
@@ -322,8 +360,11 @@ class CaptureCard(StepCard):
         self.field(form, "stride", "抽帧间隔", "int", 6, minimum=1, maximum=1000)
         self.field(form, "seconds", "时长(秒)", "float", 120.0,
                    minimum=0, maximum=36000, decimals=0, step=30)
-        self.field(form, "dedup", "去重阈值", "float", 0.06,
-                   minimum=0.0, maximum=1.0, decimals=3, step=0.01)
+        w = self.field(form, "dedup", "去重阈值", "float", 0.01,
+                       minimum=0.0, maximum=1.0, decimals=3, step=0.005)
+        w.setToolTip("相似帧去重：缩略图里亮度差超过 8 的像素占比（0~1）小于它就跳过。\n"
+                     "0 = 不去重；值越大去重越激进。\n"
+                     "完全静止≈0；待机动画/角色移动会明显高于它，用 0.01 能保留这些帧。")
         self.field(form, "limit", "最多张数", "int", 0, minimum=0, maximum=1000000)
 
         w = self.field(form, "clean", "重抽前清空", "bool", True)
@@ -494,24 +535,93 @@ class CalibCard(StepCard):
     def __init__(self):
         super().__init__(3, "calib", "标定尺度",
                          hint="量出画面里精灵的实际大小。改过分辨率或窗口大小后要重标")
+        self.btn_run.setVisible(False)   # 无自动标定任务，纯手动
 
     def build_params(self, form):
         self.lbl_res = QLabel("—")
         self.lbl_res.setStyleSheet("")
         form.addRow("画面", self.lbl_res)
 
-        self.lbl_state = QLabel("—")
-        self.lbl_state.setWordWrap(True)
-        form.addRow("状态", self.lbl_state)
+        self.lbl_mob_state = QLabel("—")
+        self.lbl_mob_state.setWordWrap(True)
+        form.addRow("怪物状态", self.lbl_mob_state)
 
-        # 扫描范围只影响标定过程本身，标定失败时可以调大范围
-        self.field(form, "min_scale", "扫描下限", "float", 0.4,
-                   minimum=0.05, maximum=8.0, decimals=2, step=0.05)
-        self.field(form, "max_scale", "扫描上限", "float", 2.4,
-                   minimum=0.1, maximum=8.0, decimals=2, step=0.1)
-        self.field(form, "step", "扫描步长", "float", 0.10,
-                   minimum=0.01, maximum=1.0, decimals=2, step=0.01)
-        self.field(form, "sample", "采样帧数", "int", 5, minimum=1, maximum=50)
+        self.lbl_player_state = QLabel("—")
+        self.lbl_player_state.setWordWrap(True)
+        form.addRow("玩家状态", self.lbl_player_state)
+
+        # ---- 一键设置尺度：所有精灵统一基准 ----
+        note = QLabel("给所有怪物/玩家统一设一个尺度基准（之后可在手动标定里逐怪微调）。")
+        note.setStyleSheet("color: #80868b;")
+        note.setWordWrap(True)
+        form.addRow(note)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.sp_apply_all = QDoubleSpinBox()
+        self.sp_apply_all.setRange(0.05, 8.0)
+        self.sp_apply_all.setDecimals(3)
+        self.sp_apply_all.setSingleStep(0.05)
+        self.sp_apply_all.setValue(1.0)
+        self.sp_apply_all.setSuffix("×")
+        row.addWidget(self.sp_apply_all, 1)
+        btn_apply = QPushButton("一键设置尺度")
+        btn_apply.setToolTip("把所有怪物/玩家的尺度基准统一设为这个值，并清空逐怪覆盖")
+        btn_apply.clicked.connect(self._apply_all_scale)
+        row.addWidget(btn_apply)
+        form.addRow("尺度基准", row)
+
+        # ---- 手动目测标定 ----
+        btn_manual = QPushButton("手动目测标定")
+        btn_manual.setToolTip("在画面上叠加模板，手动拖动 + 调缩放对齐，目测确定尺度")
+        btn_manual.clicked.connect(self._manual_calib)
+        form.addRow("手动标定", btn_manual)
+
+    def _manual_calib(self):
+        """打开手动目测标定弹窗，把目测的缩放写回项目。"""
+        if self.project is None:
+            return
+        p = self.project
+        from gui.calib_manual import CalibManualDialog
+
+        dlg = CalibManualDialog(p.get("mobs") or [], p.get("player_id") or "",
+                                p.frames, p.get("mob_scales") or {},
+                                p.get("scale") or 1.41,
+                                p.get("player_scale") or 1.41, self)
+        if dlg.exec_():
+            scale = round(dlg.scale_value(), 3)
+            target = dlg.result_target()
+            mid = dlg.result_mob()       # 怪 id 或玩家 id
+            frame = dlg.result_frame()   # 帧 stem
+            w, h = self._frame_size()
+            # 帧级尺度：每个帧独立，写 mob_scales["id:帧stem"]
+            mob_scales = dict(p.get("mob_scales") or {})
+            if mid and frame:
+                mob_scales["%s:%s" % (mid, frame)] = scale
+            p.set("mob_scales", mob_scales)
+            if target == "player":
+                p.set("player_scale_at", {"width": w, "height": h,
+                                          "confidence": "manual"})
+            else:
+                p.set("scale_at", {"width": w, "height": h,
+                                   "mob": mid, "confidence": "manual"})
+            p.save()
+            self.refresh()
+
+    def _apply_all_scale(self):
+        """一键设置尺度：所有怪物/玩家统一用这个尺度基准，并清空逐怪覆盖。"""
+        if self.project is None:
+            return
+        p = self.project
+        v = round(self.sp_apply_all.value(), 3)
+        w, h = self._frame_size()
+        p.set("scale", v)
+        p.set("player_scale", v)
+        p.set("mob_scales", {})
+        p.set("scale_at", {"width": w, "height": h, "confidence": "manual"})
+        p.set("player_scale_at", {"width": w, "height": h, "confidence": "manual"})
+        p.save()
+        self.refresh()
 
     # ---------------- 画面信息 ----------------
 
@@ -530,16 +640,16 @@ class CalibCard(StepCard):
         except Exception:
             return 0, 0
 
-    def _state(self):
-        """返回 (状态文字, 颜色, 补充说明)。"""
+    def _one_state(self, scale_key, at_key):
+        """单个目标（怪或人）的标定状态，返回 (文字, 颜色, 说明)。"""
         p = self.project
         if p is None:
             return "—", "#5f6368", ""
 
-        at = p.get("scale_at") or {}
+        at = p.get(at_key) or {}
 
-        if not p.get("scale"):
-            return "未标定", "#b06000", "点「运行」实测一次"
+        if not p.get(scale_key):
+            return "未标定", "#b06000", "点「手动目测标定」实测一次"
 
         if not at:
             return "已标定", "#137333", ""
@@ -559,102 +669,56 @@ class CalibCard(StepCard):
 
         return "已标定", "#137333", ""
 
+    def _mob_state(self):
+        return self._one_state("scale", "scale_at")
+
+    def _player_state(self):
+        return self._one_state("player_scale", "player_scale_at")
+
     def refresh(self, force=False):
         super().refresh(force)
 
         w, h = self._frame_size()
         self.lbl_res.setText("%d × %d" % (w, h) if w else "—（还没有画面）")
 
-        text, color, note = self._state()
-        self.lbl_state.setText(text + ("　" + note if note else ""))
-        self.lbl_state.setStyleSheet("color: %s;" % color)
+        text, color, note = self._mob_state()
+        self.lbl_mob_state.setText(text + ("　" + note if note else ""))
+        self.lbl_mob_state.setStyleSheet("color: %s;" % color)
+
+        text, color, note = self._player_state()
+        self.lbl_player_state.setText(text + ("　" + note if note else ""))
+        self.lbl_player_state.setStyleSheet("color: %s;" % color)
+
+        # 尺度基准输入框回填为当前全局怪物尺度 —— 否则重启后显示默认值，
+        # 用户会误以为之前设的基准丢了（其实 scale 已落盘，只是输入框没同步）
+        if self.project is not None:
+            base = self.project.get("scale")
+            self.sp_apply_all.blockSignals(True)
+            self.sp_apply_all.setValue(float(base) if base else 1.41)
+            self.sp_apply_all.blockSignals(False)
 
     # ---------------- 项目交互 ----------------
 
-    _KEYS = ("min_scale", "max_scale", "step", "sample")
-
-    def load_from_project(self, p):
-        sec = p.sec("calib")
-        for k in self._KEYS:
-            self.set_value(k, sec.get(k))
-
-    def sync(self, p):
-        p.sec("calib").update(self.values(self._KEYS))
-
     def summarize(self, p):
-        text, _, note = self._state()
-        return text + ("　" + note if note else "")
+        mt, _, mn = self._mob_state()
+        pt, _, pn = self._player_state()
+        parts = ["怪:" + mt + ("　" + mn if mn else ""),
+                 "人:" + pt + ("　" + pn if pn else "")]
+        return "  ·  ".join(parts)
 
     def detect_state(self, p):
-        # _state() 已经把文字和颜色算好了，这里只需把颜色映射回状态名，
-        # 免得同一套判据写两遍、改一处漏一处。
-        text, color, _note = self._state()
-        st = {"#137333": "done", "#b06000": "warn",
-              "#c5221f": "fail"}.get(color, "idle")
-        return (st, text)
-
-    def check_deps(self, p):
-        if p.snapshot()["frames"] == 0:
-            return False, "还没有画面，请先完成 ② 采集"
-        if not (p.get("mobs") or []):
-            return False, ("还没确定怪种 —— 标定要知道画面里可能出现哪些怪，"
-                           "请先完成 ① 地图")
-        if not wzexport.sprite_dir_path().is_dir():
-            return False, "精灵库不存在：%s" % wzexport.sprite_dir_path()
-        return True, ""
-
-    def make_task(self, p):
-        from tools.calibrate_scale import run_calibrate_combined
-
-        sec = p.sec("calib")
-        return run_calibrate_combined, {
-            "mob": {
-                "frames": str(p.frames),
-                "sprites": str(wzexport.sprite_dir_path()),
-                "mobs": p.get("mobs") or [],
-                "min_scale": sec.get("min_scale", 0.4),
-                "max_scale": sec.get("max_scale", 2.4),
-                "step": sec.get("step", 0.1),
-                "sample": sec.get("sample", 5),
-            },
-            "player": {
-                "frames": str(p.frames),
-                "player_id": p.get("player_id") or "",
-                "min_scale": sec.get("min_scale", 0.4),
-                "max_scale": sec.get("max_scale", 2.4),
-                "step": sec.get("step", 0.1),
-                "sample": sec.get("sample", 5),
-            },
-        }
-
-    def on_result(self, res):
-        """把标定结果写回项目，并记下当时的画面尺寸（用来判断要不要重标）。"""
-        p = self.project
-        if p is None or not isinstance(res, dict):
-            return
-
-        w, h = self._frame_size()
-
-        mob = res.get("mob") or {}
-        if mob.get("scale"):
-            p.set("scale", round(float(mob["scale"]), 4))
-            p.set("scale_at", {
-                "width": w,
-                "height": h,
-                "mob": mob.get("mob"),
-                "confidence": mob.get("confidence"),
-            })
-
-        player = res.get("player") or {}
-        if player.get("scale"):
-            p.set("player_scale", round(float(player["scale"]), 4))
-            p.set("player_scale_at", {
-                "width": w,
-                "height": h,
-                "confidence": player.get("confidence"),
-            })
-
-        p.save()
+        # 怪、人两个状态分别算，再合并成卡片总状态：
+        # 任一 fail → fail；任一 warn（未标定/存疑/需重标）→ warn；都 done → done。
+        mt, mc, _mn = self._mob_state()
+        pt, pc, _pn = self._player_state()
+        cs = {mc, pc}
+        if "#c5221f" in cs:
+            st = "fail"
+        elif "#b06000" in cs:
+            st = "warn"
+        else:
+            st = "done"
+        return (st, "怪:%s 人:%s" % (mt, pt))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -668,9 +732,62 @@ class LabelCard(StepCard):
     漏标只是少几个样本，靠训练后的泛化能力补回来。
     """
 
+    _BTN = ("QPushButton { background:#1a73e8; color:#ffffff; border:none;"
+            " border-radius:5px; font-weight:600; padding:6px 14px; }"
+            "QPushButton:hover { background:#4285f4; }"
+            "QPushButton:disabled { background:#dadce0; color:#ffffff; }")
+
     def __init__(self):
         super().__init__(4, "label", "自动标注",
                          hint="用 WZ 精灵做模板匹配。阈值越高越准，召回越低")
+        self._label_target = "mob"   # mob / player
+        self._yolo_player = {}       # 权重路径 -> 所属项目玩家角色
+
+        # 通用「运行」按钮换成两个主标注按钮。
+        self.btn_run.hide()
+        foot = self.layout().itemAt(self.layout().count() - 1).layout()
+        self.btn_label_mob = QPushButton("标注怪物")
+        self.btn_label_mob.setStyleSheet(self._BTN)
+        self.btn_label_mob.clicked.connect(lambda: self._emit_run("mob"))
+        self.btn_label_player = QPushButton("标注玩家")
+        self.btn_label_player.setStyleSheet(self._BTN)
+        self.btn_label_player.clicked.connect(lambda: self._emit_run("player"))
+        foot.addWidget(self.btn_label_mob)
+        foot.addWidget(self.btn_label_player)
+
+        # ---- YOLO 辅助开关 + 权重（在标注按钮下方）----
+        aux = QHBoxLayout()
+        aux.setSpacing(6)
+        self.ck_yolo_mob = QCheckBox("YOLO 辅助怪物")
+        self.ck_yolo_mob.setToolTip("勾选后，「标注怪物」会额外用其它项目模型补怪物框")
+        self.ck_yolo_mob.toggled.connect(self._on_yolo_toggle)
+        aux.addWidget(self.ck_yolo_mob)
+        self.ck_yolo_player = QCheckBox("YOLO 辅助玩家")
+        self.ck_yolo_player.setToolTip("勾选后，「标注玩家」会额外用角色一致的模型补玩家框")
+        self.ck_yolo_player.toggled.connect(self._on_yolo_toggle)
+        aux.addWidget(self.ck_yolo_player)
+        self.lbl_yolo_weight = QLabel("辅助权重")
+        aux.addWidget(self.lbl_yolo_weight)
+        self.cmb_yolo = NoWheelComboBox()
+        self.cmb_yolo.setMaxVisibleItems(12)
+        aux.addWidget(self.cmb_yolo, 1)
+        self.layout().addLayout(aux)
+        self.lbl_yolo_weight.setVisible(False)
+        self.cmb_yolo.setVisible(False)
+
+    def _on_yolo_toggle(self):
+        show = self.ck_yolo_mob.isChecked() or self.ck_yolo_player.isChecked()
+        self.lbl_yolo_weight.setVisible(show)
+        self.cmb_yolo.setVisible(show)
+
+    def _emit_run(self, target):
+        self._label_target = target
+        self.run_clicked.emit(self)
+
+    def set_busy(self, busy):
+        super().set_busy(busy)
+        self.btn_label_mob.setEnabled(not busy)
+        self.btn_label_player.setEnabled(not busy)
 
     def build_params(self, form):
         self.field(form, "thresh", "匹配阈值", "float", 0.90,
@@ -715,6 +832,28 @@ class LabelCard(StepCard):
             ps = self.project.get("player_scale")
             self.lbl_player_scale.setText(
                 ("%.3f" % ps) if ps else "—（先跑 ③ 标定）")
+        self._fill_yolo_weights()
+
+    def _fill_yolo_weights(self):
+        """填充 YOLO 辅助的权重下拉（列出所有项目训练好的模型）。"""
+        from tools.yolo_augment import list_weights
+        cur = self.cmb_yolo.currentData()
+        self._yolo_player = {}
+        self.cmb_yolo.blockSignals(True)
+        self.cmb_yolo.clear()
+        wlist = list_weights()
+        if not wlist:
+            self.cmb_yolo.addItem("（还没有训练好的模型）", None)
+        else:
+            for label, path, pid in wlist:
+                self._yolo_player[path] = pid
+                tail = (" · 玩家:%s" % pid) if pid else ""
+                self.cmb_yolo.addItem(label + tail, path)
+        if cur is not None:
+            i = self.cmb_yolo.findData(cur)
+            if i >= 0:
+                self.cmb_yolo.setCurrentIndex(i)
+        self.cmb_yolo.blockSignals(False)
 
     # ---------------- 摘要 ----------------
 
@@ -762,6 +901,22 @@ class LabelCard(StepCard):
     def check_deps(self, p):
         if p.snapshot()["frames"] == 0:
             return False, "还没有画面，请先完成 ② 采集"
+        if self._label_target == "player":
+            if not (p.get("player_id") or "").strip():
+                return False, "还没选择角色，请先完成 ① 地图"
+            if not p.get("player_scale"):
+                return False, "玩家还没标定尺度，请先完成 ③ 标定尺度"
+            if self.ck_yolo_player.isChecked():
+                w = self.cmb_yolo.currentData()
+                if not w:
+                    return False, "还没有训练好的模型 —— 先在其它项目完成 ⑦ 训练"
+                wpid = self._yolo_player.get(w, "")
+                pid = (p.get("player_id") or "").strip()
+                if wpid != pid:
+                    return False, ("模型角色「%s」≠ 当前角色「%s」，辅助玩家会误标，"
+                                   "请选一个角色一致的模型"
+                                   % (wpid or "（无）", pid or "（无）"))
+            return True, ""
         if not (p.get("mobs") or []):
             return False, "还没确定怪种，请先完成 ① 地图"
         if not wzexport.sprite_dir_path().is_dir():
@@ -769,22 +924,54 @@ class LabelCard(StepCard):
                            "需要用 WzProbe dump-mob 导出，"
                            "或修改 config/wz.yaml 的 sprite_dir"
                            % wzexport.sprite_dir_path())
+        if self.ck_yolo_mob.isChecked() and not self.cmb_yolo.currentData():
+            return False, "还没有训练好的模型 —— 先在其它项目完成 ⑦ 训练"
         return True, ""
 
     def make_task(self, p):
-        from tools.detect_player import run_detect_combined
-
         sec = p.sec("label")
-        player_id = p.get("player_id") or ""
-        return run_detect_combined, {
-            # 先怪物（class 1），写 labels_auto
-            "mob": {
+
+        if self._label_target == "player":
+            from tools.yolo_augment import run_detect_player_augmented
+            params = {
+                "detect": {
+                    "frames": str(p.frames),
+                    "out": str(p.dir_of("labels_auto")),
+                    "player_id": p.get("player_id") or "",
+                    "scale": p.get("player_scale", 1.0),
+                    "frame_scales": p.get("mob_scales") or {},
+                    "thresh": sec.get("player_thresh", 0.78),
+                    "vis": True,
+                    "vis_dir": str(p.vis) + "_player",
+                },
+            }
+            if self.ck_yolo_player.isChecked():
+                w = self.cmb_yolo.currentData()
+                if not w:
+                    raise ValueError("还没有训练好的模型，先在其它项目完成 ⑦ 训练")
+                params["augment"] = {
+                    "weights": w,
+                    "frames": str(p.frames),
+                    "out": str(p.dir_of("labels_auto")),
+                    "mode": "player",
+                    "player_id": p.get("player_id") or "",
+                    "weights_player_id": self._yolo_player.get(w, ""),
+                    "conf": 0.40,
+                    "imgsz": p.sec("train").get("imgsz", 960),
+                    "device": p.sec("train").get("device", "0"),
+                }
+            return run_detect_player_augmented, params
+
+        from tools.yolo_augment import run_detect_mob_augmented
+        params = {
+            "detect": {
                 "mobs": p.get("mobs") or [],
                 "sprites": str(wzexport.sprite_dir_path()),
                 "frames": str(p.frames),
                 "out": str(p.dir_of("labels_auto")),
                 "vis_dir": str(p.vis),
-                "scale": p.get("scale", 1.12),
+                "scale": p.get("scale") or 1.12,
+                "mob_scales": p.get("mob_scales") or {},
                 "downscale": sec.get("downscale", 1),
                 "thresh": sec.get("thresh", 0.90),
                 "min_distinct": sec.get("min_distinct", 0.06),
@@ -792,17 +979,21 @@ class LabelCard(StepCard):
                 "max_peaks": sec.get("max_peaks", 4),
                 "vis": True,
             },
-            # 后玩家（class 0），追加到 labels_auto
-            "player": {
+        }
+        if self.ck_yolo_mob.isChecked():
+            w = self.cmb_yolo.currentData()
+            if not w:
+                raise ValueError("还没有训练好的模型，先在其它项目完成 ⑦ 训练")
+            params["augment"] = {
+                "weights": w,
                 "frames": str(p.frames),
                 "out": str(p.dir_of("labels_auto")),
-                "player_id": player_id,
-                "scale": p.get("player_scale", 1.0),
-                "thresh": sec.get("player_thresh", 0.78),
-                "vis": True,
-                "vis_dir": str(p.vis) + "_player",
-            },
-        }
+                "mode": "mob",
+                "conf": 0.40,
+                "imgsz": p.sec("train").get("imgsz", 960),
+                "device": p.sec("train").get("device", "0"),
+            }
+        return run_detect_mob_augmented, params
 
 
 # ══════════════════════════════════════════════════════════════

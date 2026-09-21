@@ -34,8 +34,11 @@ DEFAULTS = {
     "map_id": "",
     "mobs": [],          # 本图出现的怪种 id 列表
     # ③ 标定结果。这是**内部中间量**：取决于游戏分辨率、窗口大小、推流缩放，
-    # 用户既算不出来也用不上，界面上不显示它。
-    "scale": 1.12,
+    # 用户既算不出来也用不上，界面上不显示它。None = 还没标定。
+    "scale": None,
+    # 逐怪/逐动作的尺度覆盖：{mob_id: scale, "mob_id:action": scale}。
+    # 手动目测标定时写入，标注时按「怪+动作 → 怪 → scale」三级回退。
+    "mob_scales": {},
     # 标定时的画面信息，用来判断"画面变了吗、要不要重标"
     "scale_at": {},       # {width, height, mob, confidence}
     "calib": {           # ③ 标定的扫描范围
@@ -52,7 +55,7 @@ DEFAULTS = {
         "fps": 5.0,           # 窗口捕获频率
         "stride": 6,          # 文件抽帧间隔
         "seconds": 120.0,
-        "dedup": 0.06,        # 实测：低于 0.06 基本滤不掉任何东西
+        "dedup": 0.01,        # 变化像素比例阈值：低于它视为重复帧
         "limit": 0,
         "clean": True,        # 重抽前清空旧帧，避免新旧混合
     },
@@ -145,8 +148,10 @@ class Project:
             self.save()
 
     def sec(self, name):
-        """取一个配置段（capture / label / dataset / train）。"""
-        return self.data.get(name, {})
+        """取一个配置段；不存在则创建（返回 self.data 里的引用，改它能被 save 保存）。"""
+        if name not in self.data:
+            self.data[name] = {}
+        return self.data[name]
 
     def dir_of(self, name):
         d = self.root / name

@@ -1,0 +1,59 @@
+name: 森林迷宫III
+map_id: '105040303'
+mobs:
+- '3210800'
+- '3230100'
+- '5130102'
+scale: 1.405
+mob_scales: {}
+scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
+calib:
+  min_scale: 0.05
+  max_scale: 0.85
+  step: 0.04
+  sample: 8
+notes: ''
+capture:
+  source: file
+  file: D:/Media/record/mxd/2026-09-20 22-08-39.mp4
+  url: udp://0.0.0.0:5000
+  fps: 5.0
+  stride: 80
+  seconds: 120.0
+  dedup: 0.01
+  limit: 500
+  clean: true
+label:
+  thresh: 0.85
+  min_distinct: 0.06
+  per_mob: 20
+  max_peaks: 3
+  downscale: 2
+  region: null
+  player_thresh: 0.78
+dataset:
+  val_ratio: 0.2
+  min_boxes: 1
+  quality: 92
+train:
+  model: yolo26n.pt
+  epochs: 120
+  imgsz: 960
+  batch: 8
+  device: '0'
+  patience: 40
+player_id: 数值策划
+verify: {}
+iterate: {}
+mob_names:
+- 猴子
+- 风独眼兽
+- 黑石头人
+player_scale: 1.405
+player_scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual

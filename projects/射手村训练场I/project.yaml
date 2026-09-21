@@ -1,0 +1,70 @@
+name: 001020000彩虹村东郊平原
+map_id: '104040000'
+mobs:
+- '0100101'
+- '0120100'
+- '0130100'
+- '0130101'
+- '0210100'
+- '1110100'
+- '1210102'
+scale: 1.406
+mob_scales:
+  0100101:hit1_0: 1.406
+scale_at:
+  width: 1920
+  height: 1080
+  mob: '0100101'
+  confidence: manual
+calib:
+  min_scale: 0.4
+  max_scale: 2.4
+  step: 0.1
+  sample: 5
+notes: ''
+capture:
+  source: file
+  file: E:/MyPrograms/playerSimu/datasets/records/9月21日.mp4
+  url: udp://0.0.0.0:5000
+  fps: 5.0
+  stride: 70
+  seconds: 120.0
+  dedup: 0.02
+  limit: 150
+  clean: true
+label:
+  thresh: 0.85
+  min_distinct: 0.06
+  per_mob: 20
+  max_peaks: 3
+  downscale: 1
+  region: null
+  player_scale: 1.4
+  player_thresh: 0.6
+dataset:
+  val_ratio: 0.2
+  min_boxes: 1
+  quality: 92
+train:
+  model: yolo26n.pt
+  epochs: 200
+  imgsz: 960
+  batch: 8
+  device: '0'
+  patience: 40
+mob_names:
+- 蓝蜗牛
+- 蘑菇仔
+- 木妖
+- 红蜗牛
+- 绿水灵
+- 绿蘑菇
+- 花蘑菇
+player_id: 珠缨
+player_scale: 1.406
+player_scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
+verify: {}
+iterate: {}

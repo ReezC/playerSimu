@@ -117,6 +117,11 @@ class StepCard(QFrame):
         foot.addWidget(self.btn_view)
 
         self.btn_run = QPushButton("运行")
+        self.btn_run.setStyleSheet(
+            "QPushButton { background:#1a73e8; color:#ffffff; border:none;"
+            " border-radius:5px; font-weight:600; padding:6px 16px; }"
+            "QPushButton:hover { background:#4285f4; }"
+            "QPushButton:disabled { background:#dadce0; color:#ffffff; }")
         self.btn_run.clicked.connect(lambda: self.run_clicked.emit(self))
         foot.addWidget(self.btn_run)
 
@@ -177,6 +182,7 @@ class StepCard(QFrame):
             row.addWidget(w, 1)
             btn = QPushButton("浏览")
             btn.setFixedWidth(52)
+            btn.setStyleSheet("padding: 2px 6px;")
             # mode="dir" 时选目录而不是文件
             btn.clicked.connect(lambda: self._pick_path(
                 key, w, kw.get("filter", ""), kw.get("mode", "file")))

@@ -9,6 +9,7 @@ GUI:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -20,6 +21,33 @@ from core.context import ConsoleContext, TaskContext
 from core.imgio import imwrite
 
 
+def _clean_project_labels(out_dir):
+    """重抽帧时，同项目里的旧标注产物全部作废（画面全变了）。
+
+    只清标注相关目录（人工修正 / 自动标注 / 备份 / 可视化 / 迭代），
+    标定对比图（calib/）保留。只有 out_dir 的父目录是项目根
+    （有 project.yaml）时才清理 —— 避免 CLI 抽帧到任意目录误删文件。
+    """
+    root = Path(out_dir).parent
+    if not (root / "project.yaml").exists():
+        return 0
+
+    n = 0
+    for name in ("labels", "labels_backup", "labels_auto",
+                 "labels_iter", "vis", "vis_player"):
+        d = root / name
+        if not d.is_dir():
+            continue
+        for f in d.iterdir():
+            if f.is_file():
+                try:
+                    os.remove(str(f))
+                    n += 1
+                except OSError:
+                    pass
+    return n
+
+
 def run_extract(params, ctx=None):
     """核心抽帧逻辑。
 
@@ -27,7 +55,7 @@ def run_extract(params, ctx=None):
         file    录制文件路径
         out     输出目录
         stride  每 N 帧抽一张
-        dedup   相似帧去重阈值(0~1)，0 = 不去重
+        dedup   相似帧去重阈值(0~1)：亮度差超过 8 的像素占比小于它就跳过，0 = 不去重
         limit   最多保存张数，0 = 不限
         prefix  文件名前缀
     """
@@ -57,6 +85,11 @@ def run_extract(params, ctx=None):
             except Exception:
                 pass
         old = []
+        # 画面重抽后，同项目里旧的人工/自动标注也全部作废（对应的是旧画面），
+        # 否则质检台「人工优先」会读到错位的旧标注，看起来像「框没了」。
+        removed = _clean_project_labels(out_dir)
+        if removed:
+            ctx.log("同时清空旧标注产物 %d 个文件（画面已重抽）" % removed)
 
     if old:
         ctx.log("输出目录已有 %d 张同名文件，将被覆盖" % len(old), "warn")
@@ -92,6 +125,11 @@ def run_extract(params, ctx=None):
                 break
 
             total += 1
+            # 进度条放 continue 之前：stride 倍数的帧会被 continue 跳过，
+            # 放后面的话触发条件永远落在被跳过的帧上，进度条就完全不更新。
+            if total_frames and total % max(1, stride * 10) == 0:
+                ctx.progress(total, total_frames, "已保存 %d 张" % saved)
+
             if i % stride != 0:
                 continue
             if limit and saved >= limit:
@@ -103,16 +141,19 @@ def run_extract(params, ctx=None):
             if dedup > 0:
                 small = cv2.cvtColor(cv2.resize(bgr, (80, 45)),
                                      cv2.COLOR_BGR2GRAY).astype(np.float32)
-                if last is not None and float(np.abs(small - last).mean()) / 255.0 < dedup:
-                    skipped += 1
-                    continue
+                if last is not None:
+                    # 去重用「变化像素比例」而不是「平均像素差」：
+                    # 大片不变背景会把小范围变化（待机动画/角色移动）稀释到
+                    # 平均差里几乎测不出，导致大量有效帧被当成重复帧误删。
+                    diff = np.abs(small - last)
+                    changed = float(np.count_nonzero(diff > 8.0)) / float(diff.size)
+                    if changed < dedup:
+                        skipped += 1
+                        continue
                 last = small
 
             imwrite(out_dir / ("%s_%05d.png" % (prefix, saved)), bgr)
             saved += 1
-
-            if total_frames and total % max(1, stride * 10) == 0:
-                ctx.progress(total, total_frames, "已保存 %d 张" % saved)
 
     finally:
         container.close()
@@ -156,8 +197,8 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--prefix", type=str, default="frame")
     ap.add_argument("--dedup", type=float, default=0.0,
-                    help="相似帧去重阈值(0~1)。与上一张已保存帧的平均像素差小于它就跳过；"
-                         "画面静止时 0.02 能滤掉绝大部分重复帧")
+                    help="相似帧去重阈值(0~1)：缩略图里亮度差超过 8 的像素占比小于它就跳过。"
+                         "完全静止≈0；待机动画/角色移动会明显高于它，用 0.01 能保留这些帧")
     args = ap.parse_args()
 
     try:

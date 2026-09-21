@@ -13,10 +13,11 @@ GUI:
 
 import argparse
 import json
+import multiprocessing as mp
 import os
+import re
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -136,11 +137,38 @@ def load_templates(root, mob_ids, max_per_mob=0):
             if b.shape[0] < 20 or b.shape[1] < 20:
                 continue
 
-            out.append((mid, b, al))
+            frame = f.stem   # 帧 stem（如 stand_0），供 per-帧 scale 查表
+            out.append((mid, frame, b, al))
             # 怪会朝左右两个方向，镜像多一份模板，召回明显更好
-            out.append((mid, cv2.flip(b, 1), cv2.flip(al, 1)))
+            out.append((mid, frame, cv2.flip(b, 1), cv2.flip(al, 1)))
 
     return out
+
+
+def clean_stale_outputs(out_dir, vis_dir, keep_n):
+    """清掉帧号 >= keep_n 的残留标注/可视化，返回删除个数。
+
+    重新采集后帧数往往变少（如 500→109），labels_auto/vis 里会留下旧
+    采集的 txt/jpg。它们不会被本次运行覆盖（帧号对不上），却会被质检台
+    当成有效帧显示 —— 旧尺度的零框残留会造成「运行中翻帧全是空框」的
+    假象，也会混进数据集构建。
+    """
+    n = 0
+    for d in (out_dir, vis_dir):
+        if not d:
+            continue
+        d = Path(d)
+        if not d.is_dir():
+            continue
+        for f in d.iterdir():
+            m = re.fullmatch(r"frame_(\d+)\.(?:txt|jpg)", f.name)
+            if m and int(m.group(1)) >= keep_n:
+                try:
+                    os.remove(str(f))
+                    n += 1
+                except OSError:
+                    pass
+    return n
 
 
 # ══════════════════════════════════════════════════════════════
@@ -180,16 +208,6 @@ def work(fp_str):
     fp = Path(fp_str)
 
     out_path = Path(cfg["out"]) / (fp.stem + ".txt")
-    # 断点续标：这帧已有怪物框（class 1）就跳过 —— 不覆盖，保留玩家框。
-    # 每帧的 txt 按类记录「标过没有」：class 1 = 怪物已标，class 0 = 玩家已标。
-    if out_path.exists():
-        try:
-            text = out_path.read_text(encoding="utf-8")
-            if any(ln.split() and ln.split()[0] == "1"
-                   for ln in text.splitlines()):
-                return None
-        except Exception:
-            pass
 
     full = imread(fp)
     if full is None:
@@ -209,42 +227,46 @@ def work(fp_str):
                          interpolation=cv2.INTER_AREA)
 
     dets = []
+    mob_scales = cfg.get("mob_scales", {})
+    default_scale = cfg.get("scale", 1.12)
 
-    for mid, b, al in _W["tpl"]:
-        for sc in cfg["scales"]:
-            h = int(round(b.shape[0] * sc / ds))
-            w = int(round(b.shape[1] * sc / ds))
-            if h < 8 or w < 8 or h >= img.shape[0] or w >= img.shape[1]:
-                continue
+    for mid, frame, b, al in _W["tpl"]:
+        # 尺度按「怪+帧 → 怪 → 全局默认」三级查找，支持逐帧微调
+        sc = mob_scales.get("%s:%s" % (mid, frame),
+                            mob_scales.get(mid, default_scale))
+        h = int(round(b.shape[0] * sc / ds))
+        w = int(round(b.shape[1] * sc / ds))
+        if h < 8 or w < 8 or h >= img.shape[0] or w >= img.shape[1]:
+            continue
 
-            t = cv2.resize(b, (w, h), interpolation=cv2.INTER_AREA)
-            m = (cv2.resize(al, (w, h), interpolation=cv2.INTER_AREA) > 128)
-            m = m.astype(np.uint8) * 255
+        t = cv2.resize(b, (w, h), interpolation=cv2.INTER_AREA)
+        m = (cv2.resize(al, (w, h), interpolation=cv2.INTER_AREA) > 128)
+        m = m.astype(np.uint8) * 255
 
-            try:
-                r = cv2.matchTemplate(img, t, cv2.TM_CCORR_NORMED, mask=m)
-            except Exception:
-                continue
+        try:
+            r = cv2.matchTemplate(img, t, cv2.TM_CCORR_NORMED, mask=m)
+        except Exception:
+            continue
 
-            r = np.nan_to_num(r)
-            if r.max() < cfg["thr"]:
-                continue
+        r = np.nan_to_num(r)
+        if r.max() < cfg["thr"]:
+            continue
 
-            # 区分度判据：峰值必须显著高于该响应图的背景水平。
-            # 只看绝对分数会在画面各处产生海量假匹配。
-            p = float(np.percentile(r, 99.5))
+        # 区分度判据：峰值必须显著高于该响应图的背景水平。
+        # 只看绝对分数会在画面各处产生海量假匹配。
+        p = float(np.percentile(r, 99.5))
 
-            for _ in range(cfg["peaks"]):
-                _, mx, _, ml = cv2.minMaxLoc(r)
-                if mx < cfg["thr"] or mx - p < cfg["dist"]:
-                    break
+        for _ in range(cfg["peaks"]):
+            _, mx, _, ml = cv2.minMaxLoc(r)
+            if mx < cfg["thr"] or mx - p < cfg["dist"]:
+                break
 
-                dets.append((float(mx), ml[0] * ds + ox, ml[1] * ds + oy,
-                             w * ds, h * ds, mid))
+            dets.append((float(mx), ml[0] * ds + ox, ml[1] * ds + oy,
+                         w * ds, h * ds, mid))
 
-                # 抹掉该峰邻域，避免同一只怪被反复计入
-                r[max(0, ml[1] - h // 2):ml[1] + h // 2 + 1,
-                  max(0, ml[0] - w // 2):ml[0] + w // 2 + 1] = 0.0
+            # 抹掉该峰邻域，避免同一只怪被反复计入
+            r[max(0, ml[1] - h // 2):ml[1] + h // 2 + 1,
+              max(0, ml[0] - w // 2):ml[0] + w // 2 + 1] = 0.0
 
     kept = nms(dets)
 
@@ -254,13 +276,13 @@ def work(fp_str):
     new_lines = ["%d %.6f %.6f %.6f %.6f" % (
         CLASS_MOB, (x + w / 2) / W, (y + h / 2) / H, w / W, h / H)
         for _, x, y, w, h, _ in kept]
-    # 追加怪物框（保留已有内容，比如玩家框 class 0），不覆盖
+    # 覆盖怪物框（class 1），保留玩家框（class 0）—— 改尺度重标时不留旧怪物框
     existing = out_path.read_text(encoding="utf-8") if out_path.exists() else ""
-    if existing.strip():
-        out_path.write_text(existing.rstrip("\n") + "\n" + "\n".join(new_lines) + "\n",
-                            encoding="utf-8")
-    else:
-        out_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    keep = [ln for ln in existing.splitlines()
+            if ln.split() and ln.split()[0] != str(CLASS_MOB)]
+    lines = keep + new_lines
+    out_path.write_text(("\n".join(lines) + "\n") if lines else "\n",
+                        encoding="utf-8")
 
     if cfg["vis"]:
         for _, x, y, w, h, _ in kept:
@@ -392,11 +414,21 @@ def run_detect(params, ctx=None):
     vis = bool(params.get("vis", True))
     vis_dir = params.get("vis_dir") or str(out.parent / "vis_map")
 
+    # 上次采集可能帧数更多，先清掉帧号超界的旧标注/可视化，防止旧尺度的
+    # 零框残留混进本次结果（质检台显示和数据集构建都会被污染）
+    removed = clean_stale_outputs(str(out), vis_dir, len(frames))
+    if removed:
+        ctx.log("清理上次残留 %d 个文件（帧号超出本次 %d 帧）" % (removed, len(frames)))
+
+    mob_scales = params.get("mob_scales") or {}
+    if not isinstance(mob_scales, dict):
+        mob_scales = {}
     cfg = {
         "sprites": sprites,
         "mobs": mobs,
         "ds": ds,
-        "scales": [float(params.get("scale", 1.12))],
+        "scale": float(params.get("scale", 1.12)),
+        "mob_scales": mob_scales,   # {mob_id: scale, "mob_id:action": scale}
         "thr": thr,
         "dist": dist,
         "peaks": peaks,
@@ -407,6 +439,7 @@ def run_detect(params, ctx=None):
         "region": region,
     }
 
+    ctx.progress(0, 0, "加载怪物模板…")
     n_tpl = len(load_templates(Path(sprites), mobs, per_mob))
     if n_tpl == 0:
         raise RuntimeError(
@@ -415,7 +448,7 @@ def run_detect(params, ctx=None):
             % ", ".join(mobs[:8]))
 
     ctx.log("模板 %d 个（%d 种怪，含镜像）" % (n_tpl, len(mobs)))
-    ctx.log("画面 %d 张   尺度 %.3f   降采样 %d" % (len(frames), cfg["scales"][0], ds))
+    ctx.log("画面 %d 张   默认尺度 %.3f   降采样 %d" % (len(frames), cfg["scale"], ds))
     ctx.log("阈值 %.2f   区分度 %.3f   每模板峰数 %d" % (thr, dist, peaks))
     if region:
         ctx.log("搜索区域 %s" % (region,))
@@ -451,9 +484,17 @@ def run_detect(params, ctx=None):
             init_worker(cfg)
             ok = consume(work(str(f)) for f in frames)
         else:
-            with ProcessPoolExecutor(max_workers=workers, initializer=init_worker,
-                                     initargs=(cfg,)) as ex:
-                ok = consume(ex.map(work, [str(f) for f in frames], chunksize=2))
+            pool = mp.Pool(workers, initializer=init_worker, initargs=(cfg,))
+            try:
+                ok = consume(pool.imap(work, [str(f) for f in frames], chunksize=2))
+            except Exception:
+                pool.terminate()   # 出错也立即终止子进程
+                raise
+            if ok:
+                pool.close()
+            else:
+                pool.terminate()   # 取消：立即终止，不等正在跑的帧
+            pool.join()
     except Exception as e:
         raise RuntimeError("标注失败: %s: %s" % (type(e).__name__, e))
 

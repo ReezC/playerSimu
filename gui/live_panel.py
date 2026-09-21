@@ -6,7 +6,7 @@
     · 显示三个分开的速度指标
 """
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (QCheckBox, QFormLayout, QHBoxLayout, QLabel,
                              QLineEdit, QPushButton, QSizePolicy, QVBoxLayout,
@@ -37,6 +37,8 @@ def _bgr_to_pixmap(img):
 
 
 class LivePanel(QWidget):
+    potions_ready = pyqtSignal(float, float)   # (hp, mp) 比例，转发给决策参数页
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.project = None
@@ -272,6 +274,7 @@ class LivePanel(QWidget):
             })
         self.thread.frame_ready.connect(self._on_frame)
         self.thread.stats_ready.connect(self._on_stats)
+        self.thread.potions_ready.connect(self.potions_ready)
         self.thread.failed.connect(self._on_failed)
         self.thread.finished.connect(self._on_finished)
         self.thread.start()

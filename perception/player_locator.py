@@ -33,11 +33,12 @@ class PlayerLocator:
     """
 
     def __init__(self, player_id, root=None, scale=1.25, threshold=0.78,
-                 filter_prefix=None):
+                 filter_prefix=None, frame_scales=None):
         self.player_id = player_id
         self.scale = float(scale)
         self.threshold = float(threshold)
         self.filter_prefix = filter_prefix   # 只加载文件名含此子串的模板（如 "stand"）
+        self.frame_scales = dict(frame_scales or {})   # {player_id:帧stem -> scale}
         self._templates = []       # [(name, bgr, mask), ...]
         self._load(root or DEFAULT_ROOT)
 
@@ -104,8 +105,11 @@ class PlayerLocator:
 
         best = None
         for name, tb, tm in self._templates:
-            tw = max(8, int(round(tb.shape[1] * self.scale)))
-            th = max(8, int(round(tb.shape[0] * self.scale)))
+            # 帧级尺度：去掉 @L 镜像后缀，按 {player_id:帧stem} 查，否则用全局 scale
+            stem = name.split("@")[0]
+            sc = self.frame_scales.get("%s:%s" % (self.player_id, stem), self.scale)
+            tw = max(8, int(round(tb.shape[1] * sc)))
+            th = max(8, int(round(tb.shape[0] * sc)))
             if tw >= sw or th >= sh:
                 continue
             tbb = cv2.resize(tb, (tw, th), interpolation=cv2.INTER_AREA)

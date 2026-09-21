@@ -117,7 +117,9 @@ def run_relabel(params, ctx=None):
     except ImportError:
         raise RuntimeError("没有装 ultralytics。\n请执行：pip install ultralytics")
 
+    ctx.progress(0, 0, "加载模型…")
     model = YOLO(str(weights))
+    ctx.progress(0, len(frames), "开始推理")
 
     t0 = time.perf_counter()
     n_protected = n_from_model = n_kept = n_cleared = 0

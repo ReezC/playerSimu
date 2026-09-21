@@ -44,6 +44,11 @@ def bridge(conn, ser):
         pass
     finally:
         stop.set()
+        # 连接断开时清空所有按住的键，防止「释放包丢失」导致卡键
+        try:
+            ser.write(b"RELEASEALL\n")
+        except Exception:
+            pass
         try:
             conn.close()
         except Exception:

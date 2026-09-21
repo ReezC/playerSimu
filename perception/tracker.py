@@ -7,6 +7,8 @@
     横版 ARPG 的怪移动慢（一帧几个像素），IoU 匹配简单够用，还好调试。
     以后怪跑得快、漏检多、id 乱跳再升级。
 """
+import time
+
 from perception.world_state import Mob
 
 
@@ -36,6 +38,8 @@ class MobTracker:
     def __init__(self, min_iou=0.3, max_age=15):
         self.min_iou = min_iou
         self.max_age = max_age
+        self.debounce_conf = 0.0    # 防抖置信度：高于它的框消失后保留位置
+        self.debounce_ms = 0.0      # 防抖时间（毫秒）
         self._tracks = []       # 每条是 dict，字段见 _new_track
         self._next_id = 1
 
@@ -44,11 +48,13 @@ class MobTracker:
         return {
             "id": tid, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
             "conf": conf, "missed": 0, "age": 1, "vx": 0.0, "vy": 0.0,
+            "last_seen": time.monotonic(),
         }
 
     def update(self, detections):
         used = [False] * len(detections)
         out = []
+        now = time.monotonic()
 
         # 1) 贪心匹配：每个轨迹找当前帧里 IoU 最大的框
         for t in self._tracks:
@@ -74,8 +80,14 @@ class MobTracker:
                     x1, y1, x2, y2, cf
                 t["missed"] = 0
                 t["age"] += 1
+                t["last_seen"] = now
                 out.append(self._to_mob(t))
-            # 没匹配到 → 本帧漏检，不输出（下面统一清理超龄轨迹）
+            elif (t["conf"] >= self.debounce_conf
+                  and (now - t["last_seen"]) * 1000.0 <= self.debounce_ms):
+                # 漏检但高置信度 + 防抖时间内：保留消失前的位置（幽灵目标），
+                # 让决策层不因短暂漏检丢目标；下一帧若在该框范围扫出 IoU
+                # 匹配的新框，会正常更新位置。
+                out.append(self._to_mob(t))
 
         # 2) 未匹配的检测框 → 新轨迹
         for i, d in enumerate(detections):
@@ -86,8 +98,13 @@ class MobTracker:
                 self._next_id += 1
                 out.append(self._to_mob(self._tracks[-1]))
 
-        # 3) 清理长期漏检的轨迹
-        self._tracks = [t for t in self._tracks if t["missed"] <= self.max_age]
+        # 3) 清理长期漏检的轨迹。
+        # 用时间戳（和防抖同单位）：漏检时间超过「防抖时间 + 500ms 缓冲」才清理。
+        # 不能用 max_age 帧数 —— 帧数 × fps 随帧率变，高帧率时防抖还没到期
+        # 轨迹就被清掉了（防抖 1000ms ≈ 27 帧，但 max_age=15 帧 ≈ 0.5s 就清理）。
+        keep_ms = self.debounce_ms + 500.0
+        self._tracks = [t for t in self._tracks
+                        if (now - t["last_seen"]) * 1000.0 <= keep_ms]
 
         return out
 

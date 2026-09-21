@@ -17,3 +17,27 @@ datasets/
 
 .idea/
 .vscode/
+
+# 项目数据产物（采集/标注/训练中间产物，体积大且可再生，不进 git）
+projects/*/frames/
+projects/*/labels/
+projects/*/labels_auto/
+projects/*/labels_backup/
+projects/*/labels_iter/
+projects/*/vis/
+projects/*/vis_player/
+projects/*/calib/
+projects/*/dataset/
+projects/*/dataset_old/
+projects/*/models/
+projects/*/runs/
+projects/*/verify/
+projects/*/测试集/
+
+# 缓存 / 日志
+*.cache
+*.log
+*.err
+
+# 工具本地数据
+.codebuddy/

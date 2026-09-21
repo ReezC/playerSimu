@@ -109,7 +109,9 @@ def run_train(params, ctx=None):
         raise RuntimeError(
             "没有装 ultralytics。\n请执行：pip install ultralytics")
 
+    ctx.progress(0, 0, "加载模型（首次可能下载权重）…")
     model = YOLO(model_name)
+    ctx.progress(0, epochs, "开始训练")
 
     t0 = time.perf_counter()
     best_holder = {}

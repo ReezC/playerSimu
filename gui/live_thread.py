@@ -35,6 +35,80 @@ BOX_COLORS = {
 }
 
 
+def _bar_fill_ratio(mask):
+    """血条从左往右填充：血量 = 填充到的右边界 ÷ 条宽（0~1）。
+
+    比「颜色像素占比」准——占比会被刻度线、数字、边框、渐变高光稀释
+    （满蓝也只到 92% 就是这么来的）。列扫描只看填充到的位置，杂质无关。
+    每列 30% 以上是填充色才算「填充列」，抗单行噪声。
+    """
+    import numpy as np
+    if mask is None or mask.size == 0:
+        return 0.0
+    col_cnt = (mask > 0).sum(axis=0)
+    filled = col_cnt >= mask.shape[0] * 0.3
+    xs = np.nonzero(filled)[0]
+    if len(xs) == 0:
+        return 0.0
+    return float(xs[-1] + 1) / mask.shape[1]
+
+
+def _draw_dashed_line(img, y, color, dash_len=10, gap=6, thickness=1, x0=0, x1=None):
+    """画一条水平虚线（y 固定）。x0~x1 指定范围，x1=None 表示到右边缘。"""
+    h, w = img.shape[:2]
+    if y < 0 or y >= h:
+        return
+    if x1 is None:
+        x1 = w - 1
+    x0 = max(0, min(x0, w - 1))
+    x1 = max(0, min(x1, w - 1))
+    x = x0
+    while x <= x1:
+        import cv2
+        cv2.line(img, (x, y), (min(x + dash_len, x1), y), color, thickness)
+        x += dash_len + gap
+
+
+def _draw_dashed_vline(img, x, color, dash_len=10, gap=6, thickness=1, y0=0, y1=None):
+    """画一条纵向虚线（x 固定）。y0~y1 指定范围，y1=None 表示到底部。"""
+    h, w = img.shape[:2]
+    if x < 0 or x >= w:
+        return
+    if y1 is None:
+        y1 = h - 1
+    y0 = max(0, min(y0, h - 1))
+    y1 = max(0, min(y1, h - 1))
+    y = y0
+    while y <= y1:
+        import cv2
+        cv2.line(img, (x, y), (x, min(y + dash_len, y1)), color, thickness)
+        y += dash_len + gap
+
+
+def _vision_box_for(vis, player_box, s):
+    """计算视野矩形 (left, top, right, bottom)（画面坐标 int，裁剪到画面内）。
+
+    基准点 = 角色中心 或 画面中心（vision_center），叠加 x/y 偏移，
+    再向上下左右扩展 vision_* 像素。某方向 <0 视为不限制（到画面边缘）。
+    """
+    h, w = vis.shape[:2]
+    if s.vision_center or player_box is None:
+        cx, cy = w / 2.0, h / 2.0
+    else:
+        cx, cy = player_box[0], player_box[1]
+    cx += s.vision_off_x
+    cy += s.vision_off_y
+    left = int(cx - s.vision_left) if s.vision_left >= 0 else 0
+    top = int(cy - s.vision_top) if s.vision_top >= 0 else 0
+    right = int(cx + s.vision_right) if s.vision_right >= 0 else w
+    bottom = int(cy + s.vision_bottom) if s.vision_bottom >= 0 else h
+    left = max(0, min(left, w))
+    right = max(0, min(right, w))
+    top = max(0, min(top, h))
+    bottom = max(0, min(bottom, h))
+    return left, top, right, bottom
+
+
 class _LatestSlot:
     """只保留最新一帧的槽位。
 
@@ -88,12 +162,14 @@ class _LatestSlot:
 class LiveThread(QThread):
     frame_ready = pyqtSignal(object)     # numpy BGR 图（已画好框）
     stats_ready = pyqtSignal(dict)
+    potions_ready = pyqtSignal(float, float)   # (hp, mp) 比例 0~1
     failed = pyqtSignal(str)
 
     def __init__(self, params, parent=None):
         super().__init__(parent)
         self._p = dict(params)
         self._stop = threading.Event()
+        self._last_potions = 0.0
 
     # ---------------- 控制 ----------------
 
@@ -123,25 +199,33 @@ class LiveThread(QThread):
         draw = bool(self._p.get("draw", True))
         show_fps = max(1.0, float(self._p.get("show_fps", 30.0)))
         source = self._p.get("source", "stream")
+        origin_x = 0      # 画面原点（屏幕坐标）：窗口模式下是框选区域左上角，
+        origin_y = 0      # HP/MP 条框选的屏幕坐标要减去它转成画面内坐标
 
         from ultralytics import YOLO
         model = YOLO(weights)
 
         # 决策：找怪打。agent 跨帧持有按键状态，这里只建一次；
         # settings 是全局单例，和「决策参数」页签共享。
+        # 注意：输入设备后端（本地/Pro Micro）由 player_panel 切换时设置，
+        # 这里不再重复 use_network —— 否则会二次连接、旧连接泄漏、还可能
+        # 因 relay 暂时不可达把已建好的连接回退成本地。
         from decision.agent import CombatAgent, settings as decision_settings
         from perception.tracker import MobTracker
         from perception.world_state import WorldState
 
-        # 远程键盘：agent 跑在控制机，按键发到游戏机的 Pro Micro（config 的 kbd 段控制）。
-        # 联调通过后把 kbd.enabled 设成 true 即生效。
-        if get("kbd", "enabled", False):
-            from decision.input import use_network
-            use_network(get("kbd", "host"), int(get("kbd", "port", 9000)),
-                        get("kbd", "cert", "remote_kbd/certs/cert.pem"))
-
         agent = CombatAgent(decision_settings)
         mob_tracker = MobTracker()   # 给怪稳定 id，供目标锁定 CD 跨帧匹配
+
+        from core import wincap
+        # HP/MP 条**独立抓取**：它们可能在实时帧框选范围之外（比如只框了
+        # 游戏上半屏，HP/MP 条在屏幕更下方），从实时帧里截会越界读不到。
+        # 按屏幕坐标直接 grab_rect，限流 0.2s 一次（grab_rect 有开销）。
+        _pot_last = [0.0]
+        _pot_vals = [1.0, 1.0]      # (hp, mp) 比例缓存
+        _last_player = [None]       # 上一帧玩家框 (cx, cy, bottom, conf)，漏检时兜底
+        _vision_box = [None]        # 视野矩形 (left, top, right, bottom)，3s 更新一次
+        _vision_last = [0.0]        # 上次更新时间
 
         # 读线程独立于推理：它拼命读，积压的旧帧在槽位里被直接覆盖丢掉。
         # 这样无论推理多慢，看到的都是最新画面，延迟不会累积。
@@ -167,6 +251,7 @@ class LiveThread(QThread):
             if len(rect) != 4 or rect[2] <= 0 or rect[3] <= 0:
                 self.failed.emit("窗口区域无效：%s" % (rect,))
                 return
+            origin_x, origin_y = rect[0], rect[1]   # 画面内坐标 = 屏幕坐标 - 原点
 
             capture_fps = max(1.0, float(self._p.get("capture_fps", 15.0)))
             interval = 1.0 / capture_fps
@@ -299,8 +384,23 @@ class LiveThread(QThread):
                             if len(delays) > 120:
                                 del delays[0]
 
+                # 视野矩形：裁剪推理区域到视野范围（视野外不推理，省性能）。
+                crop_top = 0
+                crop_left = 0
+                infer_img = vis
+                if time.perf_counter() - _vision_last[0] >= 3.0:
+                    _vision_last[0] = time.perf_counter()
+                    _vision_box[0] = _vision_box_for(vis, _last_player[0],
+                                                     decision_settings)
+                if _vision_box[0] is not None:
+                    vleft, vtop, vright, vbottom = _vision_box[0]
+                    if vright > vleft and vbottom > vtop:
+                        infer_img = vis[vtop:vbottom, vleft:vright]
+                        crop_top = vtop
+                        crop_left = vleft
+
                 t0 = time.perf_counter()
-                res = model.predict(vis, conf=conf, imgsz=imgsz,
+                res = model.predict(infer_img, conf=conf, imgsz=imgsz,
                                     device=device, verbose=False)[0]
                 dt_ms = (time.perf_counter() - t0) * 1000.0
                 infer_ms.append(dt_ms)
@@ -320,34 +420,81 @@ class LiveThread(QThread):
                         clss = [1] * len(cfs)
                     for (x1, y1, x2, y2), c, cls in zip(xyxy, cfs, clss):
                         k += 1
-                        # 决策用：收集玩家（class 0）/ 怪物（class 1）框，
-                        # 和是否画框无关。
+                        # 裁剪区域的坐标加回偏移，恢复成画面坐标
+                        x1 += crop_left
+                        x2 += crop_left
+                        y1 += crop_top
+                        y2 += crop_top
                         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
                         ic = int(cls)
                         if ic == 0:
-                            if player_box is None or c > player_box[2]:
-                                player_box = (cx, cy, c)
+                            if player_box is None or c > player_box[3]:
+                                player_box = (cx, cy, y2, c)   # 带框底部 y
+                            # 玩家蓝框（原始检测，漏检由 _last_player 兜底）
+                            if draw:
+                                x1i, y1i, x2i, y2i = int(x1), int(y1), int(x2), int(y2)
+                                cv2.rectangle(vis, (x1i, y1i), (x2i, y2i),
+                                              BOX_COLORS[0], 2)
+                                ty = y1i - 5 if y1i > 14 else y1i + 16
+                                cv2.putText(vis, "%.2f" % c, (x1i + 2, ty),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                            BOX_COLORS[0], 1, cv2.LINE_AA)
                         elif ic == 1:
                             mob_dets.append((x1, y1, x2, y2, c))
-                        if not draw:
-                            continue
-                        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                        color = BOX_COLORS.get(ic, BOX_COLORS[1])
-                        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-                        ty = y1 - 5 if y1 > 14 else y1 + 16
-                        cv2.putText(vis, "%.2f" % c, (x1 + 2, ty),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                    color, 1, cv2.LINE_AA)
+                            # 怪物绿框不在这里画：移到后面用 ws.mobs（含防抖幽灵目标）
                 n_boxes = k
 
                 # ---- 决策：找怪打 ----
+                # 玩家框（蓝框）短暂消失时，用上一帧位置兜底，避免 agent 丢失玩家
+                if player_box is None:
+                    player_box = _last_player[0]
+                else:
+                    _last_player[0] = player_box
+
                 ws = WorldState()
                 if player_box is not None:
                     ws.player.x, ws.player.y = player_box[0], player_box[1]
+                    ws.player.bottom = player_box[2]
                     ws.player.found = True
+                # 读 HP/MP 条：独立抓取（屏幕坐标直接 grab_rect），不依赖实时
+                # 帧范围，限流 0.2s。
+                if time.perf_counter() - _pot_last[0] >= 0.2:
+                    _pot_last[0] = time.perf_counter()
+                    if decision_settings.hp_bar:
+                        try:
+                            r = wincap.grab_rect(tuple(int(v) for v in decision_settings.hp_bar))
+                            if r is not None and r.size:
+                                low, high = decision_settings.hp_color or ((0, 0, 100), (90, 90, 255))
+                                m = cv2.inRange(r, tuple(low), tuple(high))
+                                ratio = _bar_fill_ratio(m)
+                                if ratio > 0.0:   # 0% = 丢失/抖动，保持上次值
+                                    _pot_vals[0] = ratio
+                        except Exception:
+                            pass
+                    if decision_settings.mp_bar:
+                        try:
+                            r = wincap.grab_rect(tuple(int(v) for v in decision_settings.mp_bar))
+                            if r is not None and r.size:
+                                low, high = decision_settings.mp_color or ((100, 0, 0), (255, 90, 90))
+                                m = cv2.inRange(r, tuple(low), tuple(high))
+                                ratio = _bar_fill_ratio(m)
+                                if ratio > 0.0:
+                                    _pot_vals[1] = ratio
+                        except Exception:
+                            pass
+                ws.player.hp = _pot_vals[0]
+                ws.player.mp = _pot_vals[1]
+                # 同步防抖参数（每帧读 settings，改了即时生效）
+                mob_tracker.debounce_conf = decision_settings.debounce_conf
+                mob_tracker.debounce_ms = decision_settings.debounce_ms
                 # 用 MobTracker 追踪，得到跨帧稳定的 id（目标锁定 CD 靠它匹配）
                 ws.mobs = mob_tracker.update(mob_dets)
                 action = agent.tick(ws)
+
+                # 把识别到的血/蓝比例推给 UI（限流 0.3s，避免刷屏）
+                if time.perf_counter() - self._last_potions >= 0.3:
+                    self._last_potions = time.perf_counter()
+                    self.potions_ready.emit(ws.player.hp, ws.player.mp)
 
                 if draw:
                     st = action.get("state", "?")
@@ -359,17 +506,57 @@ class LiveThread(QThread):
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                                 (255, 255, 255), 2, cv2.LINE_AA)
 
-                    # 攻击距离可视化：从玩家中心朝「朝向」方向延伸的水平线。
-                    # 朝向默认朝右，最后一次按 ←/→ 会重置朝向。
+                    # 攻击距离可视化：
+                    #   角色 → 最小攻击距离：橙色线（太近的规避范围）
+                    #   最小 → 最大攻击距离：黄色线（可攻击范围）
                     if player_box is not None:
                         px, py = int(player_box[0]), int(player_box[1])
-                        ad = max(1, int(decision_settings.attack_dist))
                         facing = action.get("facing", 1)
-                        x2 = px + ad if facing > 0 else px - ad
+                        dirn = 1 if facing > 0 else -1
+                        max_ad = max(1, int(decision_settings.attack_dist))
+                        min_ad = max(0, int(decision_settings.min_attack_dist))
+                        max_x = px + dirn * max_ad
                         yellow = (0, 255, 255)   # BGR 黄色
-                        cv2.line(vis, (px, py), (x2, py), yellow, 2)
+                        orange = (0, 165, 255)   # BGR 橙色
+                        if min_ad > 0:
+                            min_x = px + dirn * min_ad
+                            cv2.line(vis, (px, py), (min_x, py), orange, 2)
+                            cv2.line(vis, (min_x, py), (max_x, py), yellow, 2)
+                            # 最小攻击距离处加橙色小刻度
+                            cv2.line(vis, (min_x, py - 8), (min_x, py + 8), orange, 2)
+                        else:
+                            cv2.line(vis, (px, py), (max_x, py), yellow, 2)
                         cv2.circle(vis, (px, py), 4, yellow, -1)
-                        cv2.line(vis, (x2, py - 8), (x2, py + 8), yellow, 2)
+                        cv2.line(vis, (max_x, py - 8), (max_x, py + 8), yellow, 2)
+
+                    # 视野矩形：黑色虚线画出上下左右四条边。
+                    # 某方向 <0（不限制）则该边不画。
+                    if _vision_box[0] is not None:
+                        vleft, vtop, vright, vbottom = _vision_box[0]
+                        vleft = max(0, min(vleft, vis.shape[1] - 1))
+                        vright = max(0, min(vright, vis.shape[1] - 1))
+                        vtop = max(0, min(vtop, vis.shape[0] - 1))
+                        vbottom = max(0, min(vbottom, vis.shape[0] - 1))
+                        if decision_settings.vision_top >= 0:
+                            _draw_dashed_line(vis, vtop, (60, 60, 60), x0=vleft, x1=vright)
+                        if decision_settings.vision_bottom >= 0:
+                            _draw_dashed_line(vis, vbottom, (60, 60, 60), x0=vleft, x1=vright)
+                        if decision_settings.vision_left >= 0:
+                            _draw_dashed_vline(vis, vleft, (60, 60, 60), y0=vtop, y1=vbottom)
+                        if decision_settings.vision_right >= 0:
+                            _draw_dashed_vline(vis, vright, (60, 60, 60), y0=vtop, y1=vbottom)
+
+                    # 怪物绿框：用 ws.mobs（含防抖幽灵目标），漏检后延迟防抖时间才消失
+                    for m in ws.mobs:
+                        gx1 = int(m.x - m.w / 2)
+                        gy1 = int(m.y - m.h / 2)
+                        gx2 = int(m.x + m.w / 2)
+                        gy2 = int(m.y + m.h / 2)
+                        cv2.rectangle(vis, (gx1, gy1), (gx2, gy2), BOX_COLORS[1], 2)
+                        gty = gy1 - 5 if gy1 > 14 else gy1 + 16
+                        cv2.putText(vis, "%.2f" % m.conf, (gx1 + 2, gty),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                    BOX_COLORS[1], 1, cv2.LINE_AA)
 
                     # 锁定目标怪：框标红（加粗），方便观测
                     tid = action.get("target")

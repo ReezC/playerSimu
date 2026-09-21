@@ -162,6 +162,7 @@ def run_dataset(params, ctx=None):
                 % (d, sum(1 for _ in d.glob("*.txt")),
                    "优先" if i == 0 else "回退"))
 
+    ctx.progress(0, 0, "扫描帧与标注…")
     pairs, no_label, empty = _collect_pairs(frames_dir, existing, min_boxes)
     ctx.log("")
     ctx.log("可用 %d 对   缺标注 %d   框数不足 %d" % (len(pairs), no_label, empty))

@@ -34,11 +34,14 @@ class Player:
     mp: float = 1.0         # 0~1
     state: str = "idle"     # idle / move / attack / hit（先留 idle，后续补）
     found: bool = False     # 本帧是否成功定位到玩家
+    bottom: float = 0.0     # 玩家框底部 y（画面坐标），平地巡逻高度过滤用
 
 
 @dataclass
 class WorldState:
     frame_id: int = 0
     ts: float = 0.0
+    width: int = 0         # 画面宽（「基于画面中心」的视野计算用）
+    height: int = 0        # 画面高
     mobs: list = field(default_factory=list)
     player: Player = field(default_factory=Player)

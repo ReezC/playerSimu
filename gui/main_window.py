@@ -21,11 +21,12 @@ import time
 from pathlib import Path
 
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (QFileDialog, QHBoxLayout, QInputDialog,
                              QLabel, QMainWindow, QMessageBox, QPlainTextEdit,
-                             QProgressBar, QPushButton, QScrollArea, QSizePolicy,
-                             QSplitter, QStackedWidget, QTabWidget, QToolBar,
-                             QVBoxLayout, QWidget)
+                             QProgressBar, QPushButton, QScrollArea, QShortcut,
+                             QSizePolicy, QSplitter, QStackedWidget, QTabWidget,
+                             QToolBar, QVBoxLayout, QWidget)
 
 from gui import theme
 from gui.export_dialog import ExportDialog
@@ -43,18 +44,131 @@ ROOT = Path(__file__).resolve().parent.parent
 PROJECTS_DIR = ROOT / "projects"
 
 QSS = """
-QMainWindow, QWidget#Central { background: #f1f3f4; }
+/* ===== 基础 ===== */
+QMainWindow, QWidget#Central { background: #f0f2f5; }
+QWidget { color: #202124; }
+
+/* ===== 卡片 ===== */
 QFrame#StepCard {
     background: #ffffff;
-    border: 1px solid #dadce0;
-    border-radius: 6px;
+    border: 1px solid #e2e5ea;
+    border-radius: 8px;
 }
-QFrame#StepCard QLabel { color: #202124; }
+QFrame#StepCard:hover { border-color: #c9cdd4; }
+
+/* ===== 分组框 ===== */
+QGroupBox {
+    background: #ffffff;
+    border: 1px solid #e2e5ea;
+    border-radius: 8px;
+    margin-top: 14px;
+    font-weight: 600;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 4px;
+    color: #5f6368;
+}
+
+/* ===== 按钮 ===== */
+QPushButton {
+    background: #ffffff;
+    border: 1px solid #dadce0;
+    border-radius: 5px;
+    padding: 4px 10px;
+    color: #202124;
+}
+QPushButton:hover { background: #f8f9fa; border-color: #c9cdd4; }
+QPushButton:pressed { background: #f1f3f4; }
+QPushButton:disabled { background: #f8f9fa; color: #9aa0a6; border-color: #e2e5ea; }
+
+/* ===== 输入框 ===== */
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+    background: #ffffff;
+    border: 1px solid #dadce0;
+    border-radius: 5px;
+    padding: 4px 8px;
+    min-height: 20px;
+}
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+    border: 1px solid #4285f4;
+}
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {
+    background: #f8f9fa; color: #9aa0a6;
+}
+QComboBox::drop-down { border: none; width: 20px; }
+QComboBox QAbstractItemView {
+    background: #ffffff; border: 1px solid #dadce0;
+    selection-background-color: #e8f0fe; selection-color: #202124;
+}
+
+/* ===== Tab ===== */
+QTabWidget::pane {
+    border: 1px solid #e2e5ea;
+    border-radius: 6px;
+    background: #ffffff;
+    top: -1px;
+}
+QTabBar::tab {
+    background: transparent;
+    padding: 8px 18px;
+    color: #5f6368;
+    border-bottom: 2px solid transparent;
+    margin-right: 2px;
+}
+QTabBar::tab:selected {
+    color: #1a73e8;
+    border-bottom: 2px solid #1a73e8;
+    font-weight: 600;
+}
+QTabBar::tab:hover:!selected { color: #202124; }
+
+/* ===== 滚动条 ===== */
+QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: #c9cdd4; border-radius: 5px; min-height: 30px; }
+QScrollBar::handle:vertical:hover { background: #a8adb6; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 0; }
+QScrollBar::handle:horizontal { background: #c9cdd4; border-radius: 5px; min-width: 30px; }
+QScrollBar::handle:horizontal:hover { background: #a8adb6; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+
+/* ===== 进度条 ===== */
+QProgressBar {
+    background: #e2e5ea;
+    border: none;
+    border-radius: 5px;
+    height: 14px;
+    text-align: center;
+    color: #202124;
+}
+QProgressBar::chunk { background: #4285f4; border-radius: 5px; }
+
+/* ===== 滑块 ===== */
+QSlider::groove:horizontal {
+    background: #e2e5ea; height: 4px; border-radius: 2px;
+}
+QSlider::handle:horizontal {
+    background: #4285f4; width: 14px; height: 14px;
+    margin: -5px 0; border-radius: 7px;
+}
+QSlider::handle:horizontal:hover { background: #1a73e8; }
+
+/* ===== 日志 ===== */
 QPlainTextEdit#Log {
     background: #202124; color: #e8eaed;
-    border: none; font-family: Consolas, monospace;
+    border: 1px solid #3c4043; border-radius: 6px;
+    font-family: Consolas, monospace;
 }
-QPushButton { padding: 4px 10px; }
+
+/* ===== 提示 ===== */
+QToolTip {
+    background: #202124; color: #e8eaed;
+    border: 1px solid #3c4043; padding: 4px 8px;
+    border-radius: 4px;
+}
 """
 
 
@@ -169,6 +283,7 @@ class MainWindow(QMainWindow):
         # 全局热键：任何窗口聚焦时都能开关自动打怪。键 = 决策参数里
         # 「开关自动」的映射（默认 F11），改了映射会动态重新注册。
         self._hotkey_id = 1
+        self._auto_shortcut = None   # 全局热键注册失败时的窗口内快捷键降级
         self._register_auto_hotkey()
 
     # ══════════════════════════════════════════════════
@@ -324,6 +439,8 @@ class MainWindow(QMainWindow):
         self.player_panel.verify_started.connect(self._on_player_verify_started)
         self.player_panel.verify_result.connect(self._on_player_verify)
         self.player_panel.auto_key_changed.connect(self._on_auto_key_changed)
+        # 实时推理识别出的血/蓝比例 → 决策参数页可视化
+        self.live_panel.potions_ready.connect(self.player_panel._on_potions)
         tabs.addTab(self.player_panel, "决策参数")
         # 最小宽度兜底：主视区尺寸波动时不把配置区挤没
         tabs.setMinimumWidth(460)
@@ -729,17 +846,30 @@ class MainWindow(QMainWindow):
         e.accept()
 
     def _register_auto_hotkey(self):
-        """按「开关自动」映射动态注册全局热键。"""
+        """按「开关自动」映射动态注册全局热键；失败降级为窗口内快捷键。"""
         from decision import hotkey as _hotkey
         from decision.agent import settings
         from decision.input import resolve_vk
-        vk = resolve_vk(settings.keymap.get("auto", "f11"))
+        key_name = settings.keymap.get("auto", "f11")
+        vk = resolve_vk(key_name)
         if vk is None:
             self.log("「开关自动」映射的键无效，全局热键未注册", "warn")
             return
         _hotkey.unregister(int(self.winId()), self._hotkey_id)
-        if not _hotkey.register(int(self.winId()), self._hotkey_id, vk):
-            self.log("全局热键注册失败（可能已被其他程序占用）", "warn")
+        if _hotkey.register(int(self.winId()), self._hotkey_id, vk):
+            # 注册成功：禁用降级用的窗口内快捷键（如果有）
+            if self._auto_shortcut is not None:
+                self._auto_shortcut.setEnabled(False)
+            return
+        # 注册失败（多半是另一个本程序实例已占用这个全局热键）：
+        # 降级为窗口内快捷键，保证本窗口聚焦时仍能用同一键开关自动。
+        if self._auto_shortcut is None:
+            self._auto_shortcut = QShortcut(QKeySequence(key_name), self)
+            self._auto_shortcut.activated.connect(self.player_panel.toggle_auto)
+        else:
+            self._auto_shortcut.setKey(QKeySequence(key_name))
+        self._auto_shortcut.setEnabled(True)
+        self.log("全局热键被占用（可能是另一个本程序实例），已降级为窗口内快捷键", "info")
 
     def _on_auto_key_changed(self, key):
         self._register_auto_hotkey()

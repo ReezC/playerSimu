@@ -34,15 +34,23 @@ from core.context import ConsoleContext, TaskContext
 from core.imgio import imread
 
 
-def find_stand_frames(mob_root, limit, only=None):
-    """每只怪只取 stand 的第一帧作为模板。"""
+def find_stand_frames(mob_root, limit=0, only=None):
+    """每只怪只取 stand 的第一帧作为模板。
+
+    only:
+        None      —— 全部怪（按目录名排序，受 limit 截断）
+        str/set   —— 只取这些 id（精确查找，**不受 limit 截断**）
+    """
     out = []
     root = Path(mob_root)
+    want = None
+    if only:
+        want = {only} if isinstance(only, str) else set(only)
 
     for d in sorted(root.iterdir()):
         if not d.is_dir():
             continue
-        if only and d.name != only:
+        if want is not None and d.name not in want:
             continue
 
         stands = sorted(d.glob("stand_*.png"))
@@ -50,7 +58,7 @@ def find_stand_frames(mob_root, limit, only=None):
             continue
 
         out.append((d.name, stands[0]))
-        if limit and len(out) >= limit:
+        if want is None and limit and len(out) >= limit:
             break
 
     return out
@@ -82,6 +90,95 @@ def _trim(tpl):
         return None
 
     return b, al
+
+
+def _top_quantile(r, q=0.995):
+    """快速高分位数（np.partition，比 np.percentile 快 2~3 倍）。
+    用于「区分度 = 峰值 − 高分位数」，精度足够。"""
+    flat = r.ravel()
+    k = int(flat.size * q)
+    if k >= flat.size:
+        k = flat.size - 1
+    if k < 0:
+        k = 0
+    return float(np.partition(flat, k)[k])
+
+
+def _make_scales(lo, hi, step):
+    """生成从 lo 到 hi（含）的尺度列表，每个值 round 到 4 位。"""
+    scales = []
+    s = lo
+    while s <= hi + 1e-9:
+        scales.append(round(s, 4))
+        s += step
+    return scales
+
+
+def _match_round(frames, tpls, scales, region, ctx):
+    """对 (帧 × 模板 × 尺度) 做一轮模板匹配。
+
+    返回 results 列表（元素：(distinct, peak, id, scale, loc, w, h, fname)）；
+    用户取消时返回 None。tpls 元素为 (id, bgr, alpha)，对怪物/玩家通用。
+    """
+    results = []
+    total = len(frames) * len(tpls) * len(scales)
+    done = 0
+    t0 = time.perf_counter()
+
+    for fi, fp in enumerate(frames):
+        img = imread(fp)
+        if img is None:
+            ctx.log("读不到 %s" % fp.name, "warn")
+            done += len(tpls) * len(scales)
+            continue
+
+        full = img
+        ox = oy = 0
+        if region:
+            ox, oy, rw, rh = region
+            img = full[oy:oy + rh, ox:ox + rw]
+
+        for tid, b, al in tpls:
+            for sc in scales:
+                if ctx.canceled():
+                    ctx.log("已取消", "warn")
+                    return None
+
+                h = max(8, int(round(b.shape[0] * sc)))
+                w = max(8, int(round(b.shape[1] * sc)))
+                if h >= img.shape[0] or w >= img.shape[1]:
+                    done += 1
+                    continue
+
+                interp = cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR
+                t = cv2.resize(b, (w, h), interpolation=interp)
+                m = (cv2.resize(al, (w, h), interpolation=interp) > 128)
+                m = m.astype(np.uint8) * 255
+
+                try:
+                    r = cv2.matchTemplate(img, t, cv2.TM_CCORR_NORMED, mask=m)
+                except Exception:
+                    done += 1
+                    continue
+
+                r = np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
+                peak = float(r.max())
+                # 区分度 = 峰值 − 高分位数。到处都是高分说明这个模板没有辨识力
+                distinct = peak - _top_quantile(r)
+                _, _, _, ml = cv2.minMaxLoc(r)
+
+                results.append((distinct, peak, tid, sc,
+                                (ml[0] + ox, ml[1] + oy), w, h, fp.name))
+                done += 1
+
+            if done % 40 == 0:
+                ctx.progress(done, total, "已匹配 %d" % done)
+
+        ctx.progress(done, total, "第 %d/%d 帧" % (fi + 1, len(frames)))
+        ctx.log("  [%d/%d] %s  用时 %.0fs"
+                % (fi + 1, len(frames), fp.name, time.perf_counter() - t0))
+
+    return results
 
 
 def run_calibrate(params, ctx=None):
@@ -132,15 +229,18 @@ def run_calibrate(params, ctx=None):
 
     # 候选模板
     mobs = [str(m).strip() for m in (params.get("mobs") or []) if str(m).strip()]
-    cand = find_stand_frames(sprites, max_mobs)
     if mobs:
-        want = set(mobs)
-        cand = [c for c in cand if c[0] in want]
-        if not cand:
+        # 指定了怪种就精确按 id 查，不受 max_mobs 截断 —— 否则 id 排序靠后的
+        # 怪会被 max_mobs 截掉，误报「找不到」。
+        cand = find_stand_frames(sprites, 0, only=mobs)
+        missing = sorted(set(mobs) - {c[0] for c in cand})
+        if missing:
             raise RuntimeError(
                 "精灵库里找不到这些怪：%s\n"
-                "（检查 config/wz.yaml 的 sprite_dir，以及怪种 ID 是否补足 7 位）"
-                % ", ".join(mobs[:8]))
+                "（sprite_dir = %s；这些 id 要么没有目录，要么目录里没有 stand_*.png）"
+                % (", ".join(missing), sprites))
+    else:
+        cand = find_stand_frames(sprites, max_mobs)
 
     tpls = []
     for mob_id, path in cand:
@@ -149,79 +249,41 @@ def run_calibrate(params, ctx=None):
             tpls.append((mob_id, t[0], t[1]))
 
     if not tpls:
-        raise RuntimeError("没有可用模板 —— 精灵库里这些怪都没有 stand 帧")
+        raise RuntimeError("没有可用模板 —— 精灵库里这些怪都没有可用的 stand 帧")
 
-    scales = []
-    s = min_s
-    while s <= max_s + 1e-9:
-        scales.append(round(s, 4))
-        s += step
+    coarse = _make_scales(min_s, max_s, step)
 
     ctx.log("采样画面 %d 帧" % len(frames))
     ctx.log("候选怪种 %d 个（用 stand 首帧作模板）" % len(tpls))
-    ctx.log("扫描尺度 %.2f ~ %.2f，步长 %.3f（%d 档）" % (min_s, max_s, step, len(scales)))
+    ctx.log("粗扫尺度 %.2f ~ %.2f，步长 %.3f（%d 档）" % (min_s, max_s, step, len(coarse)))
     if region:
         ctx.log("搜索区域 %s" % (region,))
-    ctx.log("共 %d 次匹配" % (len(frames) * len(tpls) * len(scales)))
+    ctx.log("共 %d 次匹配" % (len(frames) * len(tpls) * len(coarse)))
     ctx.log("")
 
-    results = []
-    total = len(frames) * len(tpls) * len(scales)
-    done = 0
-    t0 = time.perf_counter()
+    total = len(frames) * len(tpls) * len(coarse)
+    results = _match_round(frames, tpls, coarse, region, ctx)
+    if results is None:
+        return {"summary": "已取消"}
 
-    for fi, fp in enumerate(frames):
-        img = imread(fp)
-        if img is None:
-            ctx.log("读不到 %s" % fp.name, "warn")
-            done += len(tpls) * len(scales)
-            continue
-
-        full = img
-        ox = oy = 0
-        if region:
-            ox, oy, rw, rh = region
-            img = full[oy:oy + rh, ox:ox + rw]
-
-        for mob_id, b, al in tpls:
-            for sc in scales:
-                if ctx.canceled():
-                    ctx.log("已取消", "warn")
-                    return {"summary": "已取消"}
-
-                h = max(8, int(round(b.shape[0] * sc)))
-                w = max(8, int(round(b.shape[1] * sc)))
-                if h >= img.shape[0] or w >= img.shape[1]:
-                    done += 1
-                    continue
-
-                interp = cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR
-                t = cv2.resize(b, (w, h), interpolation=interp)
-                m = (cv2.resize(al, (w, h), interpolation=interp) > 128)
-                m = m.astype(np.uint8) * 255
-
-                try:
-                    r = cv2.matchTemplate(img, t, cv2.TM_CCORR_NORMED, mask=m)
-                except Exception:
-                    done += 1
-                    continue
-
-                r = np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
-                peak = float(r.max())
-                # 区分度 = 峰值 − 高分位数。到处都是高分说明这个模板没有辨识力
-                distinct = peak - float(np.percentile(r, 99.5))
-                _, _, _, ml = cv2.minMaxLoc(r)
-
-                results.append((distinct, peak, mob_id, sc,
-                                (ml[0] + ox, ml[1] + oy), w, h, fp.name))
-                done += 1
-
-            if done % 40 == 0:
-                ctx.progress(done, total, "已匹配 %d" % done)
-
-        ctx.progress(done, total, "第 %d/%d 帧" % (fi + 1, len(frames)))
-        ctx.log("  [%d/%d] %s  用时 %.0fs"
-                % (fi + 1, len(frames), fp.name, time.perf_counter() - t0))
+    # 自动精扫：在粗扫最佳尺度附近，用更细步长重扫一遍。精扫候选集中在
+    # 真尺度附近，尺度离散度（spread）会被压下来、区分度更锐利，判据更可信。
+    if params.get("auto", True) and results:
+        results.sort(key=lambda r: -r[0])
+        sc0 = results[0][3]
+        fine_step = max(0.01, step / 4.0)
+        lo = max(min_s, sc0 - step * 2)
+        hi = min(max_s, sc0 + step * 2)
+        fine = [s for s in _make_scales(lo, hi, fine_step) if s not in set(coarse)]
+        if fine:
+            ctx.log("")
+            ctx.log("自动精扫 %.3f ~ %.3f，步长 %.3f（%d 档）"
+                    % (lo, hi, fine_step, len(fine)))
+            total += len(frames) * len(tpls) * len(fine)
+            extra = _match_round(frames, tpls, fine, region, ctx)
+            if extra is None:
+                return {"summary": "已取消"}
+            results.extend(extra)
 
     if not results:
         raise RuntimeError("没有产生任何有效匹配 —— 检查画面对不对")
@@ -266,7 +328,7 @@ def run_calibrate(params, ctx=None):
 
     ctx.progress(total, total, summary)
     return {
-        "scale": float(sc),
+        "scale": round(float(sc), 3),
         "distinct": float(distinct),
         "peak": float(peak),
         "mob": mob_id,
@@ -330,57 +392,38 @@ def run_calibrate_player(params, ctx=None):
         idxs = [int(round(i * (len(all_frames) - 1) / (n - 1))) for i in range(n)]
         frames = [all_frames[i] for i in sorted(set(idxs))]
 
-    scales = []
-    s = min_s
-    while s <= max_s + 1e-9:
-        scales.append(round(s, 4))
-        s += step
+    coarse = _make_scales(min_s, max_s, step)
 
-    ctx.log("玩家 %s   模板 %d 个   扫 scale %.2f~%.2f（%d 档）"
-            % (player_id, len(tpls), min_s, max_s, len(scales)))
+    ctx.log("玩家 %s   模板 %d 个   粗扫 scale %.2f~%.2f（%d 档）"
+            % (player_id, len(tpls), min_s, max_s, len(coarse)))
     ctx.log("采样 %d 帧" % len(frames))
     ctx.log("")
 
-    results = []
-    total = len(frames) * len(tpls) * len(scales)
-    done = 0
-    t0 = time.perf_counter()
+    total = len(frames) * len(tpls) * len(coarse)
+    # 玩家标定是第二段，先把进度条切过来，别让进度条停在怪物标定的 100% 造成「卡住」错觉
+    ctx.progress(0, total, "玩家尺度标定…")
 
-    for fi, fp in enumerate(frames):
-        img = imread(fp)          # BGR，直接匹配（不要 cvtColor）
-        if img is None:
-            continue
-        for name, b, al in tpls:
-            for sc in scales:
-                if ctx.canceled():
-                    ctx.log("已取消", "warn")
-                    return {"summary": "已取消"}
-                h = max(8, int(round(b.shape[0] * sc)))
-                w = max(8, int(round(b.shape[1] * sc)))
-                if h >= img.shape[0] or w >= img.shape[1]:
-                    done += 1
-                    continue
-                interp = cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR
-                t = cv2.resize(b, (w, h), interpolation=interp)
-                m = (cv2.resize(al, (w, h), interpolation=interp) > 128)
-                m = m.astype(np.uint8) * 255
-                try:
-                    r = cv2.matchTemplate(img, t, cv2.TM_CCORR_NORMED, mask=m)
-                except Exception:
-                    done += 1
-                    continue
-                r = np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
-                peak = float(r.max())
-                distinct = peak - float(np.percentile(r, 99.5))
-                _, _, _, ml = cv2.minMaxLoc(r)
-                results.append((distinct, peak, name, sc,
-                                (ml[0], ml[1]), w, h, fp.name))
-                done += 1
-            if done % 40 == 0:
-                ctx.progress(done, total, "已匹配 %d" % done)
-        ctx.progress(done, total, "第 %d/%d 帧" % (fi + 1, len(frames)))
-        ctx.log("  [%d/%d] %s  用时 %.0fs"
-                % (fi + 1, len(frames), fp.name, time.perf_counter() - t0))
+    results = _match_round(frames, tpls, coarse, None, ctx)
+    if results is None:
+        return {"summary": "已取消"}
+
+    # 自动精扫：同怪物标定，在粗扫最佳尺度附近用更细步长重扫。
+    if params.get("auto", True) and results:
+        results.sort(key=lambda r: -r[0])
+        sc0 = results[0][3]
+        fine_step = max(0.01, step / 4.0)
+        lo = max(min_s, sc0 - step * 2)
+        hi = min(max_s, sc0 + step * 2)
+        fine = [s for s in _make_scales(lo, hi, fine_step) if s not in set(coarse)]
+        if fine:
+            ctx.log("")
+            ctx.log("自动精扫 %.3f ~ %.3f，步长 %.3f（%d 档）"
+                    % (lo, hi, fine_step, len(fine)))
+            total += len(frames) * len(tpls) * len(fine)
+            extra = _match_round(frames, tpls, fine, None, ctx)
+            if extra is None:
+                return {"summary": "已取消"}
+            results.extend(extra)
 
     if not results:
         raise RuntimeError("没有产生任何有效匹配 —— 检查画面里有没有玩家")
@@ -413,7 +456,7 @@ def run_calibrate_player(params, ctx=None):
         sc, {"high": "可信", "low": "存疑", "fail": "失败"}[conf])
     ctx.progress(total, total, summary)
     return {
-        "scale": float(sc),
+        "scale": round(float(sc), 3),
         "confidence": conf,
         "distinct": float(distinct),
         "peak": float(peak),

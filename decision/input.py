@@ -16,6 +16,8 @@ _VK = {
     "left": 0x25, "right": 0x27, "up": 0x26, "down": 0x28,
     "ctrl": 0x11, "alt": 0x12, "shift": 0x10,
     "enter": 0x0D, "space": 0x20, "esc": 0x1B, "tab": 0x09,
+    "del": 0x2E, "insert": 0x2D, "home": 0x24, "end": 0x23,
+    "pageup": 0x21, "pagedown": 0x22,
 }
 _VK.update({"f%d" % i: 0x70 + i - 1 for i in range(1, 13)})
 _VK.update({chr(c): c for c in range(ord("A"), ord("Z") + 1)})   # a~z
@@ -26,6 +28,8 @@ DISPLAY = {
     "left": "←", "right": "→", "up": "↑", "down": "↓",
     "ctrl": "Ctrl", "alt": "Alt", "shift": "Shift",
     "space": "空格", "enter": "回车", "esc": "Esc", "tab": "Tab",
+    "del": "Del", "insert": "Ins", "home": "Home", "end": "End",
+    "pageup": "PgUp", "pagedown": "PgDn",
 }
 DISPLAY.update({"f%d" % i: "F%d" % i for i in range(1, 13)})
 DISPLAY.update({chr(c): chr(c).upper() for c in range(ord("A"), ord("Z") + 1)})
@@ -39,13 +43,18 @@ CHOICES = ["left", "right", "up", "down", "ctrl", "alt", "shift", "space"] + \
 
 # 默认键位
 DEFAULT_KEYMAP = {
-    "auto": "f10",      # 开关自动
+    "auto": "f11",      # 开关自动
     "left": "left",     # 移动←
     "right": "right",   # 移动→
     "up": "up",         # 移动↑
     "down": "down",     # 移动↓
     "attack": "ctrl",   # 输出（攻击）
     "jump": "alt",      # 跳跃
+    "hp_pot": None,     # 补血（自动喝药）
+    "mp_pot": None,     # 补蓝（自动喝药）
+    "feed_pet": None,   # 喂宠
+    "shop": None,       # 商城
+    "enter": "enter",   # 回车
 }
 
 
@@ -156,6 +165,8 @@ _CMD_KEY = {
     "left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN",
     "ctrl": "CTRL", "alt": "ALT", "shift": "SHIFT",
     "enter": "ENTER", "space": "SPACE", "esc": "ESC", "tab": "TAB",
+    "del": "DEL", "insert": "INSERT", "home": "HOME", "end": "END",
+    "pageup": "PAGEUP", "pagedown": "PAGEDOWN",
 }
 _CMD_KEY.update({"f%d" % i: "F%d" % i for i in range(1, 13)})
 
@@ -182,6 +193,16 @@ def use_network(host, port, cafile):
 
 
 def use_local():
-    """切回本地 SendInput。"""
+    """切回本地 SendInput，并关闭远程连接（socket 不泄漏）。"""
     global _remote
+    if _remote is not None:
+        try:
+            _remote.close()
+        except Exception:
+            pass
     _remote = None
+
+
+def shutdown():
+    """关闭远程键盘连接（如果存在），停止指令传输。GUI 关闭时调用。"""
+    use_local()
