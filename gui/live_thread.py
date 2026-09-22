@@ -670,42 +670,48 @@ class LiveThread(QThread):
                     #   角色 → 最小攻击距离：橙色线（太近的规避范围）
                     #   最小 → 最大攻击距离：黄色线（可攻击范围）
                     if player_box is not None:
-                        px, py = int(player_box[0]), int(player_box[1])
+                        cx, cy = int(player_box[0]), int(player_box[1])
+                        bw = player_box[4]
                         facing = action.get("facing", 1)
                         dirn = 1 if facing > 0 else -1
                         max_ad = max(1, int(decision_settings.attack_dist))
                         min_ad = max(0, int(decision_settings.min_attack_dist))
-                        max_x = px + dirn * max_ad
+                        # 攻击距离/追击起跳从玩家框的「朝向边缘」起算，和 agent 的
+                        # _edge_dist 判定（框边缘到框边缘）保持一致，否则可视化距离
+                        # 会以中心为基准、判定以边缘为基准，出现「还没碰到框就跳」。
+                        # OpenCV 5 的 line/arrowedLine 不接受 float 坐标，必须取整。
+                        ex = int(cx + dirn * (bw / 2.0))
+                        max_x = ex + dirn * max_ad
                         yellow = _attack_color        # 最大攻击距离线颜色
                         orange = _min_attack_color    # 最小攻击距离/规避范围线颜色
                         if min_ad > 0:
-                            min_x = px + dirn * min_ad
-                            cv2.line(vis, (px, py), (min_x, py), orange, 2)
-                            cv2.line(vis, (min_x, py), (max_x, py), yellow, 2)
+                            min_x = ex + dirn * min_ad
+                            cv2.line(vis, (ex, cy), (min_x, cy), orange, 2)
+                            cv2.line(vis, (min_x, cy), (max_x, cy), yellow, 2)
                             # 最小攻击距离处加橙色小刻度
-                            cv2.line(vis, (min_x, py - 8), (min_x, py + 8), orange, 2)
+                            cv2.line(vis, (min_x, cy - 8), (min_x, cy + 8), orange, 2)
                         else:
-                            cv2.line(vis, (px, py), (max_x, py), yellow, 2)
-                        cv2.circle(vis, (px, py), 4, yellow, -1)
-                        cv2.line(vis, (max_x, py - 8), (max_x, py + 8), yellow, 2)
+                            cv2.line(vis, (ex, cy), (max_x, cy), yellow, 2)
+                        cv2.circle(vis, (cx, cy), 4, yellow, -1)
+                        cv2.line(vis, (max_x, cy - 8), (max_x, cy + 8), yellow, 2)
 
                         # 追击起跳距离：接在最大攻击距离前方，绿色线段 + 竖向刻度
                         cjd = max(0, int(decision_settings.chase_jump_dist))
                         if cjd > 0:
                             jump_x = max_x + dirn * cjd
                             green = (0, 200, 0)
-                            cv2.line(vis, (max_x, py), (jump_x, py), green, 2)
-                            cv2.line(vis, (jump_x, py - 8), (jump_x, py + 8), green, 2)
+                            cv2.line(vis, (max_x, cy), (jump_x, cy), green, 2)
+                            cv2.line(vis, (jump_x, cy - 8), (jump_x, cy + 8), green, 2)
 
                         # 扫平台倾向朝向箭头：位于攻击距离上方，指向朝向方向，
                         # 尾巴延长至背后锁定距离（back_range）
                         if decision_settings.strategy == "sweep":
                             back_range = max(0, int(decision_settings.back_range))
                             arrow_len = max(6, int(max_ad * 0.4))   # 比较短
-                            arrow_y = py - 18                        # 攻击距离上方
+                            arrow_y = cy - 18                        # 攻击距离上方
                             cv2.arrowedLine(vis,
-                                            (px - dirn * back_range, arrow_y),
-                                            (px + dirn * arrow_len, arrow_y),
+                                            (ex - dirn * back_range, arrow_y),
+                                            (ex + dirn * arrow_len, arrow_y),
                                             yellow, 3, tipLength=0.35)
 
                     # 视野矩形：黑色虚线画出上下左右四条边。
