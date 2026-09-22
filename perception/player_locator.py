@@ -82,11 +82,14 @@ class PlayerLocator:
 
     # ---------------- 定位 ----------------
 
-    def locate(self, bgr, search_rect=None):
+    def locate(self, bgr, search_rect=None, downscale=1.0):
         """在一帧 BGR 图里定位玩家。
 
         search_rect: (x, y, w, h) 限定搜索区域（画面坐标），None = 全图。
             横版 ARPG 玩家在画面中央附近，限定区域能把耗时降一个量级。
+        downscale: 匹配前把搜索图和模板同比例缩小（如 0.5）。模板匹配耗时
+            和面积正相关，0.5 能再降约 4 倍；坐标/尺寸会乘回原尺度。
+            玩家模板通常几十个（多动作 × 镜像），这是实时帧率的主要瓶颈。
         返回 (cx, cy, w, h, score, name) —— cx/cy 是框中心（**画面坐标**，
         即使限定区域也会加回偏移），w/h 是框尺寸；找不到返回 None。
         """
@@ -103,14 +106,20 @@ class PlayerLocator:
             sw, sh = w, h
             canvas = bgr
 
+        ds = max(0.25, min(1.0, float(downscale)))
+        if ds < 1.0:
+            canvas = cv2.resize(
+                canvas, (max(1, int(sw * ds)), max(1, int(sh * ds))),
+                interpolation=cv2.INTER_AREA)
+
         best = None
         for name, tb, tm in self._templates:
             # 帧级尺度：去掉 @L 镜像后缀，按 {player_id:帧stem} 查，否则用全局 scale
             stem = name.split("@")[0]
             sc = self.frame_scales.get("%s:%s" % (self.player_id, stem), self.scale)
-            tw = max(8, int(round(tb.shape[1] * sc)))
-            th = max(8, int(round(tb.shape[0] * sc)))
-            if tw >= sw or th >= sh:
+            tw = max(2, int(round(tb.shape[1] * sc * ds)))
+            th = max(2, int(round(tb.shape[0] * sc * ds)))
+            if tw >= canvas.shape[1] or th >= canvas.shape[0]:
                 continue
             tbb = cv2.resize(tb, (tw, th), interpolation=cv2.INTER_AREA)
             tmm = cv2.resize(tm, (tw, th), interpolation=cv2.INTER_NEAREST)
@@ -121,7 +130,8 @@ class PlayerLocator:
             r = np.nan_to_num(r)
             _, mx, _, ml = cv2.minMaxLoc(r)
             if best is None or mx > best[0]:
-                best = (float(mx), ml[0], ml[1], tw, th, name)
+                # 坐标与尺寸乘回原尺度（匹配是在 downscale 后的图上做的）
+                best = (float(mx), ml[0] / ds, ml[1] / ds, tw / ds, th / ds, name)
 
         if best is None or best[0] < self.threshold:
             return None

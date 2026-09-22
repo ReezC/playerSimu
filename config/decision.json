@@ -1,9 +1,10 @@
 {
-  "attack_dist": 90.0,
+  "attack_dist": 50.0,
   "min_attack_dist": 0,
+  "chase_jump_dist": 20,
   "evade_type": "jump",
   "jump_interval": 0,
-  "jump_random_prob": 0.05,
+  "jump_random_prob": 0.1,
   "back_jump_seq": [
     {
       "type": "down",
@@ -11,7 +12,7 @@
     },
     {
       "type": "delay",
-      "ms": 100
+      "ms": 800
     },
     {
       "type": "down",
@@ -19,7 +20,7 @@
     },
     {
       "type": "delay",
-      "ms": 50
+      "ms": 20
     },
     {
       "type": "up",
@@ -34,12 +35,12 @@
       "key": "forward"
     },
     {
-      "type": "down",
-      "key": "attack"
+      "type": "delay",
+      "ms": 150
     },
     {
-      "type": "delay",
-      "ms": 30
+      "type": "down",
+      "key": "attack"
     },
     {
       "type": "up",
@@ -50,17 +51,38 @@
       "key": "forward"
     }
   ],
+  "output_seq": [
+    {
+      "type": "down",
+      "key": "jump",
+      "prob": 10,
+      "then": [
+        {
+          "type": "up",
+          "key": "jump"
+        }
+      ]
+    },
+    {
+      "type": "down",
+      "key": "attack"
+    },
+    {
+      "type": "up",
+      "key": "attack"
+    }
+  ],
   "keymap": {
     "auto": "f11",
     "left": "left",
     "right": "right",
     "up": "up",
     "down": "down",
-    "attack": "f",
+    "attack": "t",
     "jump": "D",
     "hp_pot": "g",
-    "mp_pot": "t",
-    "feed_pet": "del",
+    "mp_pot": null,
+    "feed_pet": "pagedown",
     "shop": null,
     "enter": "enter"
   },
@@ -71,9 +93,11 @@
   "input_device": "local",
   "input_delay": [
     0,
-    100
+    50
   ],
-  "attack_cd": 300,
+  "attack_cd": 200,
+  "attack_lock_debounce_ms": 300,
+  "player_debounce_dist": 200,
   "hp_bar": [
     -2002,
     1050,
@@ -110,31 +134,75 @@
       84
     ]
   ],
-  "hp_threshold": 4,
-  "mp_threshold": 10,
-  "pot_cd": 2000,
+  "hp_threshold": 30,
+  "mp_threshold": 7,
+  "pot_cd": 1500,
   "auto_hp_pot": true,
   "auto_mp_pot": false,
-  "strategy": "patrol",
+  "strategy": "sweep",
   "vision_top": 200,
   "vision_bottom": 200,
-  "vision_left": 200,
-  "vision_right": 200,
+  "vision_left": -1,
+  "vision_right": -1,
   "vision_center": false,
   "vision_off_x": 0,
   "vision_off_y": 0,
-  "sweep_turn_cd": 3000,
-  "turn_debounce_ms": 0,
-  "back_range": 150,
-  "debounce_conf": 0.9,
-  "debounce_ms": 1000,
+  "sweep_turn_cd": 1000,
+  "back_range": 100,
+  "route_enabled": false,
+  "debounce_conf": 0.45,
+  "debounce_ms": 2000,
   "auto_feed_pet": true,
-  "feed_interval_min": 12,
-  "feed_interval_max": 16,
+  "feed_interval_min": 6,
+  "feed_interval_max": 8,
+  "custom_timers": [
+    {
+      "name": "自动攻击药水",
+      "seq": [
+        {
+          "type": "down",
+          "key": "攻击药水"
+        },
+        {
+          "type": "delay",
+          "ms": 10
+        },
+        {
+          "type": "up",
+          "key": "攻击药水"
+        }
+      ],
+      "interval": [
+        3,
+        3
+      ]
+    },
+    {
+      "name": "自动回避药水",
+      "interval": [
+        3,
+        3
+      ],
+      "seq": [
+        {
+          "key": "attack",
+          "type": "down"
+        },
+        {
+          "key": "attack",
+          "type": "up"
+        }
+      ]
+    }
+  ],
   "facing_timeout_min": 2,
   "anti_afk_enabled": false,
   "anti_afk_min": 30,
   "anti_afk_max": 40,
   "anti_afk_seq": [],
-  "custom_keys": {}
+  "custom_keys": {
+    "攻击药水": "grave",
+    "回避药水": "5",
+    "隐身术": "a"
+  }
 }

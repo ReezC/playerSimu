@@ -46,8 +46,15 @@ train:
   device: '0'
   patience: 40
 player_id: 数值策划
-verify: {}
-iterate: {}
+verify:
+  source: E:/MyPrograms/playerSimu/projects/森林迷宫III/测试集
+  conf: 0.5
+  imgsz: 960
+  limit: 10
+iterate:
+  conf: 0.6
+  keep_empty: true
+  limit: 0
 mob_names:
 - 猴子
 - 风独眼兽

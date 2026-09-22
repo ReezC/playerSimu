@@ -23,6 +23,9 @@ class Mob:
     vx: float = 0.0    # 屏幕速度（px/帧，追踪得到）
     vy: float = 0.0
     age: int = 0       # 连续被追踪到的帧数
+    platform_id: int | None = None   # 所在平台/楼层（fh），由感知层算好
+    reachable: bool = True           # 是否与玩家当前 fh 连接（可达），由感知层算好
+    missed: int = 0                  # 连续漏检帧数（>0 = 防抖保留的幽灵框）
 
 
 @dataclass

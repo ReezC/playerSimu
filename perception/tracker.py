@@ -119,4 +119,9 @@ class MobTracker:
             vx=t["vx"],
             vy=t["vy"],
             age=t["age"],
+            missed=t["missed"],
         )
+
+    def kill(self, mob_id):
+        """立即消除某个轨迹（防抖幽灵框被攻击时调用，避免持续空放技能）。"""
+        self._tracks = [t for t in self._tracks if t["id"] != mob_id]

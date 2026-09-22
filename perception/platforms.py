@@ -154,3 +154,48 @@ class PlayerMotionTracker:
             return None
         landing_t, p, landing_x = best
         return JumpPrediction(p.id, landing_x, p.y, landing_t, True)
+
+
+def relate_terrain(mobs, player, platforms):
+    """给每只怪打上所在平台 id（fh），并标记是否与玩家当前平台连接。
+
+    这是「地形关系识别」，属于感知层：Agent 只消费 ``mob.reachable``，
+    不再自己做「怪是否和玩家同平台」的几何判断。
+
+    当前阶段「连接」= 同一平台顶边；将来做跳跃标定后可扩展为「相邻可
+    走通平台」，Agent 侧无需改动。
+    """
+    pid = player.current_platform_id
+    if pid is None:
+        # 玩家当前平台未知 → 退化旧行为：全部视为可达
+        for m in mobs:
+            m.platform_id = None
+            m.reachable = True
+        return
+
+    current = next((p for p in platforms if p.id == pid), None)
+    if current is None:
+        for m in mobs:
+            m.platform_id = None
+            m.reachable = True
+        return
+
+    for m in mobs:
+        mob_bottom = m.y + m.h / 2.0
+        tolerance = max(36.0, m.h * 1.5)
+
+        # 站在玩家当前平台顶边 → 直接可达
+        if current.x1 <= m.x <= current.x2 and abs(mob_bottom - current.y) <= tolerance:
+            m.platform_id = pid
+            m.reachable = True
+            continue
+
+        # 找怪实际所在平台（fh）
+        m.platform_id = None
+        for p in platforms:
+            if p.x1 <= m.x <= p.x2 and abs(mob_bottom - p.y) <= tolerance:
+                m.platform_id = p.id
+                break
+
+        # 连接 = 与玩家同一平台（当前阶段）
+        m.reachable = (m.platform_id == pid)

@@ -89,10 +89,12 @@ class PyAVSource(FrameSource):
         # format=None 时 PyAV 走自动探测；裸流（如 -f mjpeg 推出来的）必须显式给
         url = self.url
         # UDP 加超时：否则 A 机停止推流后 recv 会无限阻塞，stop() 时 close 和
-        # read 抢同一个 ffmpeg 上下文直接死锁。timeout 单位是微秒（2 秒）。
+        # read 抢同一个 ffmpeg 上下文直接死锁。timeout 单位是微秒（5 秒）。
+        # 不能太短：探针可能已抢先收掉流开头的 PAT/PMT，open 要等下一个关键包，
+        # 太短会在探测成功前就超时失败。
         if url.startswith("udp") and "timeout=" not in url:
             sep = "&" if "?" in url else "?"
-            url = url + sep + "timeout=2000000"
+            url = url + sep + "timeout=5000000"
         self._container = av.open(url, mode="r", options=self.options,
                                   format=self.container_format)
 

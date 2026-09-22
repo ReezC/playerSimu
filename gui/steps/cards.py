@@ -1167,13 +1167,31 @@ class TrainCard(StepCard):
 
     def build_params(self, form):
         self.field(form, "model", "基础权重", "str", "yolo26n.pt")
+        self.widgets["model"][0].setToolTip(
+            "预训练模型，决定速度和精度。\n"
+            "n 最小最快（数据少/显存小选它），s/m/l/x 越来越准也越来越慢。\n"
+            "本地没有会自动联网下载。")
+
         self.field(form, "epochs", "轮数", "int", 120, minimum=1, maximum=5000)
+        self.widgets["epochs"][0].setToolTip(
+            "训练多少轮。数据几百张时 100~200 轮通常够。\n"
+            "设大了没关系 —— 连续 40 轮不涨会自动早停。")
+
         self.field(form, "imgsz", "输入尺寸", "int", 960, minimum=320, maximum=2048)
+        self.widgets["imgsz"][0].setToolTip(
+            "训练时把画面缩放到多大再喂网络。\n"
+            "目标越小、画面越精细，尺寸要越大（960 适合 100px 级目标）。\n"
+            "越大越吃显存。")
+
         self.field(form, "batch", "批大小", "int", 8, minimum=1, maximum=128)
+        self.widgets["batch"][0].setToolTip(
+            "每步喂几张图。显存越大能开越大，训练越稳。\n"
+            "报显存不足（OOM）就调小，比如 4 或 2。")
+
         self.field(form, "device", "设备", "str", "0")
         self.widgets["device"][0].setToolTip(
             "0 = 第一块 GPU，cpu = 用 CPU（会很慢）。\n"
-            "权重文件不在本地时会自动下载，需要联网。")
+            "多卡时写 0,1 或 0,1,2。")
 
     def load_from_project(self, p):
         sec = p.sec("train")

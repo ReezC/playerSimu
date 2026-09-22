@@ -18,6 +18,7 @@ _VK = {
     "enter": 0x0D, "space": 0x20, "esc": 0x1B, "tab": 0x09,
     "del": 0x2E, "insert": 0x2D, "home": 0x24, "end": 0x23,
     "pageup": 0x21, "pagedown": 0x22,
+    "grave": 0xC0,   # ` / ~（反引号键，VK_OEM_3）
 }
 _VK.update({"f%d" % i: 0x70 + i - 1 for i in range(1, 13)})
 _VK.update({chr(c): c for c in range(ord("A"), ord("Z") + 1)})   # a~z
@@ -30,6 +31,7 @@ DISPLAY = {
     "space": "空格", "enter": "回车", "esc": "Esc", "tab": "Tab",
     "del": "Del", "insert": "Ins", "home": "Home", "end": "End",
     "pageup": "PgUp", "pagedown": "PgDn",
+    "grave": "~",
 }
 DISPLAY.update({"f%d" % i: "F%d" % i for i in range(1, 13)})
 DISPLAY.update({chr(c): chr(c).upper() for c in range(ord("A"), ord("Z") + 1)})
@@ -66,7 +68,12 @@ def resolve_vk(key):
     """键名 → VK 码；不认识返回 None。"""
     if isinstance(key, int):
         return key
-    return _VK.get(str(key).lower())
+    n = str(key).lower()
+    vk = _VK.get(n)
+    if vk is None:
+        # 字母键在 _VK 里存的是大写（'A'~'Z'），小写查不到时回退大写
+        vk = _VK.get(n.upper())
+    return vk
 
 
 # ---- SendInput ----
@@ -167,6 +174,7 @@ _CMD_KEY = {
     "enter": "ENTER", "space": "SPACE", "esc": "ESC", "tab": "TAB",
     "del": "DEL", "insert": "INSERT", "home": "HOME", "end": "END",
     "pageup": "PAGEUP", "pagedown": "PAGEDOWN",
+    "grave": "GRAVE",
 }
 _CMD_KEY.update({"f%d" % i: "F%d" % i for i in range(1, 13)})
 

@@ -16,7 +16,7 @@ import numpy as np
 
 from gui.live_thread import LiveThread
 from gui.widgets import NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox
-from tools.config import ROOT, get
+from tools.config import ROOT, get, load_live, save_live
 
 
 def _bgr_to_pixmap(img):
@@ -61,6 +61,12 @@ class LivePanel(QWidget):
         self.btn_start = QPushButton("▶ 开始")
         self.btn_start.clicked.connect(self.start)
         bar.addWidget(self.btn_start)
+
+        self.btn_infer = QPushButton("▶ 开始推理")
+        self.btn_infer.setEnabled(False)
+        self.btn_infer.setToolTip("先点「开始」收画面，再点这里开启 YOLO 识别与决策")
+        self.btn_infer.clicked.connect(self.start_infer)
+        bar.addWidget(self.btn_infer)
 
         self.btn_stop = QPushButton("■ 停止")
         self.btn_stop.setEnabled(False)
@@ -107,22 +113,34 @@ class LivePanel(QWidget):
         self.ed_weights.setMinimumWidth(200)
         row.addWidget(self.ed_weights, 1)
 
-        row.addWidget(QLabel("conf"))
-        self.sp_conf = NoWheelDoubleSpinBox()
-        self.sp_conf.setRange(0.0, 1.0)
-        self.sp_conf.setDecimals(2)
-        self.sp_conf.setSingleStep(0.05)
-        self.sp_conf.setValue(0.30)
-        row.addWidget(self.sp_conf)
+        _live = load_live()
+
+        row.addWidget(QLabel("怪conf"))
+        self.sp_conf_mob = NoWheelDoubleSpinBox()
+        self.sp_conf_mob.setRange(0.0, 1.0)
+        self.sp_conf_mob.setDecimals(2)
+        self.sp_conf_mob.setSingleStep(0.05)
+        self.sp_conf_mob.setValue(float(_live.get("conf_mob", 0.30)))
+        self.sp_conf_mob.valueChanged.connect(self._save_live_params)
+        row.addWidget(self.sp_conf_mob)
+
+        row.addWidget(QLabel("玩家conf"))
+        self.sp_conf_player = NoWheelDoubleSpinBox()
+        self.sp_conf_player.setRange(0.0, 1.0)
+        self.sp_conf_player.setDecimals(2)
+        self.sp_conf_player.setSingleStep(0.05)
+        self.sp_conf_player.setValue(float(_live.get("conf_player", 0.50)))
+        self.sp_conf_player.valueChanged.connect(self._save_live_params)
+        row.addWidget(self.sp_conf_player)
 
         row.addWidget(QLabel("imgsz"))
         self.sp_imgsz = NoWheelSpinBox()
         self.sp_imgsz.setRange(320, 2048)
-        self.sp_imgsz.setValue(960)
+        self.sp_imgsz.setValue(int(_live.get("imgsz", 960)))
         row.addWidget(self.sp_imgsz)
 
         row.addWidget(QLabel("设备"))
-        self.ed_device = QLineEdit("0")
+        self.ed_device = QLineEdit(str(_live.get("device", "0")))
         self.ed_device.setFixedWidth(50)
         row.addWidget(self.ed_device)
 
@@ -130,13 +148,13 @@ class LivePanel(QWidget):
         self.lbl_capfps = QLabel("抓帧fps")
         self.sp_capfps = NoWheelSpinBox()
         self.sp_capfps.setRange(1, 60)
-        self.sp_capfps.setValue(60)
+        self.sp_capfps.setValue(int(_live.get("capture_fps", 60)))
         self.sp_capfps.setToolTip("本地窗口每秒抓几帧去推理。\n窗口画面本身可能只有 60fps，抓太高浪费，\n15~30 对角色/怪物识别通常足够。")
         row.addWidget(self.lbl_capfps)
         row.addWidget(self.sp_capfps)
 
         self.ck_draw = QCheckBox("画框")
-        self.ck_draw.setChecked(True)
+        self.ck_draw.setChecked(bool(_live.get("draw", True)))
         row.addWidget(self.ck_draw)
 
         self.ck_probe = QCheckBox("延迟探针")
@@ -228,6 +246,20 @@ class LivePanel(QWidget):
 
     # ---------------- 起停 ----------------
 
+    def _save_live_params(self, *_):
+        """conf 改动实时写 config，让运行中的实时预览立即生效（其余参数下次启动生效）。"""
+        try:
+            save_live({
+                "conf_mob": self.sp_conf_mob.value(),
+                "conf_player": self.sp_conf_player.value(),
+                "imgsz": self.sp_imgsz.value(),
+                "device": self.ed_device.text().strip() or "0",
+                "capture_fps": self.sp_capfps.value(),
+                "draw": self.ck_draw.isChecked(),
+            })
+        except Exception:
+            pass
+
     def start(self):
         # 旧线程可能还在后台退出（已 stop），直接丢弃引用重开
         if self.thread is not None:
@@ -240,13 +272,32 @@ class LivePanel(QWidget):
             return
 
         source = self.cmb_source.currentData()
+
+        # 玩家也走 YOLO（每个玩家独占一个类，当前固定 class 0）。
+        # 多玩家时把 player_id → class 映射做成可配置项（见 live_thread.PLAYER_CLASS_MAP）。
+        pid = ""
+        if self.project is not None:
+            pid = self.project.get("player_id") or ""
+
+        # 保存实时参数，下次开 GUI 不用再调
+        save_live({
+            "conf_mob": self.sp_conf_mob.value(),
+            "conf_player": self.sp_conf_player.value(),
+            "imgsz": self.sp_imgsz.value(),
+            "device": self.ed_device.text().strip() or "0",
+            "capture_fps": self.sp_capfps.value(),
+            "draw": self.ck_draw.isChecked(),
+        })
+
         common = {
             "weights": w,
-            "conf": self.sp_conf.value(),
+            "conf_mob": self.sp_conf_mob.value(),
+            "conf_player": self.sp_conf_player.value(),
             "imgsz": self.sp_imgsz.value(),
             "device": self.ed_device.text().strip() or "0",
             "draw": self.ck_draw.isChecked(),
             "show_fps": 30.0,
+            "player_id": pid,
         }
 
         if source == "window":
@@ -289,10 +340,19 @@ class LivePanel(QWidget):
         self.thread.start()
 
         self.btn_start.setEnabled(False)
+        self.btn_infer.setEnabled(True)
         self.btn_stop.setEnabled(True)
         self.lbl_stream.setText("—")
         self.lbl_stream.setStyleSheet("color:#80868b; font-weight:600;")
-        self.lbl_stats.setText("正在启动（首次会加载模型，几秒）…")
+        self.lbl_stats.setText("正在收画面…（点「开始推理」开启识别）")
+
+    def start_infer(self):
+        """在已收画面的基础上开启推理（YOLO + 决策 + 画框）。"""
+        if self.thread is None:
+            return
+        self.thread.set_infer(True)
+        self.btn_infer.setEnabled(False)
+        self.lbl_stats.setText("推理已开启（首次会加载模型，几秒）…")
 
     def stop(self):
         if self.thread is None:
@@ -301,6 +361,7 @@ class LivePanel(QWidget):
         # 立即停止：UI 马上恢复，不等线程退出（线程在后台自己收尾）。
         self.btn_stop.setEnabled(False)
         self.btn_start.setEnabled(True)
+        self.btn_infer.setEnabled(False)
         self.lbl_stats.setText("已停止")
         self.lbl_stream.setText("—")
         self.lbl_stream.setStyleSheet("color:#80868b; font-weight:600;")
@@ -374,6 +435,7 @@ class LivePanel(QWidget):
         self.thread = None
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self.btn_infer.setEnabled(False)
         if not self.lbl_stats.text().startswith("失败"):
             self.lbl_stats.setText("已停止")
             self.lbl_stream.setText("—")

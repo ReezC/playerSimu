@@ -30,7 +30,7 @@ from core.imgio import imread, imwrite
 CLASS_NAMES = ["player", "mob", "drop", "npc"]
 
 
-def _merge_label_lines(stem, label_dirs):
+def _merge_label_lines(stem, label_dirs, drop_classes=()):
     """对一帧按「类」合并多层标注，返回合并后的 YOLO 行列表（或 None）。
 
     每类独立找「最高优先级里含该类」的目录，取该目录里该类的**全部**框。
@@ -43,6 +43,8 @@ def _merge_label_lines(stem, label_dirs):
     迭代产物，只有怪物框没有角色框 —— 若按整帧优先，角色框会被它顶掉，
     只剩怪物的标注把「角色」这一类活活吞了。按类合并后，角色框自动回退到
     labels_auto 补齐。
+
+    drop_classes：要丢弃的类（默认丢弃 player，玩家走模板匹配不进训练）。
     """
     per_dir = []  # [(dir, lines)]，保持 label_dirs 传入的优先级顺序
     for d in label_dirs:
@@ -78,10 +80,14 @@ def _merge_label_lines(stem, label_dirs):
             if cls_lines:
                 merged.extend(cls_lines)
                 break
+
+    if drop_classes:
+        merged = [ln for ln in merged
+                  if not (ln.split() and int(ln.split()[0]) in drop_classes)]
     return merged
 
 
-def _collect_pairs(frames_dir, label_dirs, min_boxes):
+def _collect_pairs(frames_dir, label_dirs, min_boxes, drop_classes=()):
     """收集 (图, 合并标注文本) 对。label_dirs 按优先级排列，合并按类进行。
 
     返回 (pairs, 缺标注数, 框数不足数)。
@@ -90,7 +96,7 @@ def _collect_pairs(frames_dir, label_dirs, min_boxes):
     no_label = empty = 0
 
     for f in sorted(Path(frames_dir).glob("*.png")):
-        merged = _merge_label_lines(f.stem, label_dirs)
+        merged = _merge_label_lines(f.stem, label_dirs, drop_classes)
         if merged is None:
             no_label += 1
             continue
@@ -155,6 +161,9 @@ def run_dataset(params, ctx=None):
     quality = int(params.get("quality", 92))
     seed = int(params.get("seed", 42))
     names = params.get("class_names") or CLASS_NAMES
+    # 玩家（class 0）也进训练：玩家已改为 YOLO 统一识别（每个玩家独占一个类）。
+    # 不再默认丢弃 player；要丢的类通过 drop_classes 显式指定。
+    drop_classes = set(int(c) for c in (params.get("drop_classes") or []))
 
     ctx.log("画面 %s" % frames_dir)
     for i, d in enumerate(existing):
@@ -163,7 +172,8 @@ def run_dataset(params, ctx=None):
                    "优先" if i == 0 else "回退"))
 
     ctx.progress(0, 0, "扫描帧与标注…")
-    pairs, no_label, empty = _collect_pairs(frames_dir, existing, min_boxes)
+    pairs, no_label, empty = _collect_pairs(frames_dir, existing, min_boxes,
+                                            drop_classes)
     ctx.log("")
     ctx.log("可用 %d 对   缺标注 %d   框数不足 %d" % (len(pairs), no_label, empty))
 
@@ -175,6 +185,21 @@ def run_dataset(params, ctx=None):
     if empty and min_boxes > 0:
         ctx.log("（框数不足的帧被丢弃。这些多半是漏检，留着等于教模型"
                 "「这里没有怪」，所以宁可不要）", "warn")
+
+    # 统计实际出现的类别：data.yaml 只声明有数据的类。否则 drop/npc 这类
+    # 从未标注的类会占着类别、拉低 mAP，还会让模型把目标误判到这些空类上。
+    used_cls = set()
+    for _f, lines in pairs:
+        for ln in lines:
+            parts = ln.split()
+            if parts and parts[0].lstrip("-").isdigit():
+                used_cls.add(int(parts[0]))
+    sorted_cls = sorted(used_cls)
+    remap = {old: i for i, old in enumerate(sorted_cls)}   # 旧 id -> 连续新 id
+    names = [names[old] for old in sorted_cls if 0 <= old < len(names)]
+    if not names:
+        names = [str(old) for old in sorted_cls]
+    ctx.log("实际类别 %s -> %s" % (sorted_cls, names))
 
     random.seed(seed)
     random.shuffle(pairs)
@@ -242,9 +267,21 @@ def run_dataset(params, ctx=None):
                 }
 
             imwrite(idir / (f.stem + ".jpg"), img, quality=quality)
-            # 写合并后的标注（按类合并，不再是复制单份原始文件）
+            # 写合并后的标注（按类合并，不再是复制单份原始文件）。
+            # 类别 id 重映射到连续（data.yaml 只声明有数据的类）。
+            if remap:
+                out_lines = []
+                for ln in lines:
+                    parts = ln.split()
+                    if parts and parts[0].lstrip("-").isdigit():
+                        parts[0] = str(remap.get(int(parts[0]), int(parts[0])))
+                        out_lines.append(" ".join(parts))
+                    else:
+                        out_lines.append(ln)
+            else:
+                out_lines = lines
             (ldir / (f.stem + ".txt")).write_text(
-                "\n".join(lines) + "\n", encoding="utf-8")
+                "\n".join(out_lines) + "\n", encoding="utf-8")
             ok += 1
             done += 1
 
