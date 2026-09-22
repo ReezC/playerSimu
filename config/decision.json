@@ -90,7 +90,7 @@
     1500,
     2500
   ],
-  "input_device": "local",
+  "input_device": "remote",
   "input_delay": [
     0,
     50
@@ -179,23 +179,25 @@
     },
     {
       "name": "自动回避药水",
+      "seq": [
+        {
+          "type": "down",
+          "key": "attack"
+        },
+        {
+          "type": "up",
+          "key": "attack"
+        }
+      ],
       "interval": [
         3,
         3
-      ],
-      "seq": [
-        {
-          "key": "attack",
-          "type": "down"
-        },
-        {
-          "key": "attack",
-          "type": "up"
-        }
       ]
     }
   ],
   "facing_timeout_min": 2,
+  "player_lost_timeout_min": 3,
+  "resetall_interval": 60,
   "anti_afk_enabled": false,
   "anti_afk_min": 30,
   "anti_afk_max": 40,

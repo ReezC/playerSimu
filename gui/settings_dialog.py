@@ -93,6 +93,23 @@ class SettingsDialog(QDialog):
         self.sp_player_lost.setValue(int(settings.player_lost_timeout_min))
         root.addWidget(self.sp_player_lost)
 
+        # ---- 定时清空按键 ----
+        root.addSpacing(6)
+        lbl_reset = QLabel("定时清空按键（防卡键）")
+        lbl_reset.setStyleSheet("font-weight: 600;")
+        root.addWidget(lbl_reset)
+
+        note_reset = QLabel("每隔该秒数向 Pro Micro 发一次 RELEASEALL，清空可能卡住的键（0 = 禁用）。")
+        note_reset.setStyleSheet("color: #5f6368;")
+        note_reset.setWordWrap(True)
+        root.addWidget(note_reset)
+
+        self.sp_resetall = QSpinBox()
+        self.sp_resetall.setRange(0, 3600)
+        self.sp_resetall.setSuffix(" s")
+        self.sp_resetall.setValue(int(settings.resetall_interval))
+        root.addWidget(self.sp_resetall)
+
         # ---- 可视化 ----
         root.addSpacing(6)
         lbl_vis = QLabel("可视化（实时预览）")
@@ -186,6 +203,11 @@ class SettingsDialog(QDialog):
         t2 = self.sp_player_lost.value()
         if t2 != settings.player_lost_timeout_min:
             settings.player_lost_timeout_min = t2
+            settings.save()
+        # 定时清空按键
+        t3 = self.sp_resetall.value()
+        if t3 != settings.resetall_interval:
+            settings.resetall_interval = t3
             settings.save()
         # 可视化
         vis_cfg = {k: b._color for k, b in self._color_btns.items()}

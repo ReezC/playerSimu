@@ -101,6 +101,7 @@ class DecisionSettings:
         self.custom_timer_next = {}      # {name: next_monotonic}，运行时状态，不持久化
         self.facing_timeout_min = 10     # 朝向无变化超时（分钟）：超过就停止自动，0=禁用
         self.player_lost_timeout_min = 3 # 找不到玩家超时（分钟）：超过就停止自动，0=禁用
+        self.resetall_interval = 60      # 定时 RELEASEALL（秒）：清空固件侧按键防卡键，0=禁用
         self.anti_afk_enabled = False   # 防掉线开关
         self.anti_afk_min = 5           # 防掉线触发时间下限（分钟）
         self.anti_afk_max = 10          # 防掉线触发时间上限（分钟）
@@ -153,6 +154,7 @@ class DecisionSettings:
                 "custom_timers": self.custom_timers,
                 "facing_timeout_min": self.facing_timeout_min,
                 "player_lost_timeout_min": self.player_lost_timeout_min,
+                "resetall_interval": self.resetall_interval,
                 "anti_afk_enabled": self.anti_afk_enabled,
                 "anti_afk_min": self.anti_afk_min,
                 "anti_afk_max": self.anti_afk_max,
@@ -225,6 +227,7 @@ class DecisionSettings:
         self.custom_timers = self._load_timers(data.get("custom_timers"))
         self.facing_timeout_min = int(data.get("facing_timeout_min", 10))
         self.player_lost_timeout_min = int(data.get("player_lost_timeout_min", 3))
+        self.resetall_interval = int(data.get("resetall_interval", 60))
         self.anti_afk_enabled = bool(data.get("anti_afk_enabled", False))
         self.anti_afk_min = int(data.get("anti_afk_min", 5))
         self.anti_afk_max = int(data.get("anti_afk_max", 10))
@@ -350,6 +353,7 @@ class CombatAgent:
         self._kill_mobs = set()     # 要立即消除的防抖幽灵框 id（攻击幽灵框时记录，避免空放技能）
         self._next_evade = 0.0      # 下次规避动作（跳）的时刻
         self._next_chase_jump = 0.0 # 下次追击起跳的时刻
+        self._next_resetall = 0.0   # 下次定时 RELEASEALL 的时刻
         self._pending_attack = None # 待发的输出键时刻（跳规避：跳键后 interval 发输出）
         self._no_target_since = None  # 朝向没目标的起始时刻（换朝向防抖用）
         self._back_ctx = None       # 回身输出序列上下文 [seq, phase, next, held, sub_stack]
@@ -694,6 +698,19 @@ class CombatAgent:
 
         now = time.monotonic()
 
+        # 定时 RELEASEALL：防长时间运行后固件侧按键卡住。发完清空本地按键状态，
+        # 下一帧会重新按需要的键（清空后 keys.set 会重新发 PRESS）。
+        reset_iv = max(0.0, float(s.resetall_interval))
+        if reset_iv > 0 and now >= self._next_resetall:
+            from decision import input as dinput
+            dinput.release_all_remote()
+            self.keys.clear()
+            self._back_ctx = None
+            self._output_ctx = None
+            self._afk_ctx = None
+            self._timer_states.clear()
+            self._next_resetall = now + reset_iv
+
         # 不依赖玩家定位的定时行为：到点就执行（喂宠 / 自定义定时）
         self._feed_pet(now)
         self._custom_timers(now)
@@ -833,6 +850,14 @@ class CombatAgent:
                 self.keys.release_all()
                 return {"state": "idle", "reason": "无怪"}
 
+        # 发键前再检查一次自动开关：主线程可能在这一帧决策中途把自动关掉并
+        # 兜底释放了按键。若这里照常发键，会和主线程的释放竞争，导致移动键
+        # 刚被释放又被按下，表现为「关掉自动还在左右走」。
+        if not s.enabled:
+            self._release_combat_keys()
+            self.state = "idle"
+            return {"state": "idle", "reason": "未开启"}
+
         self.keys.set(keys)
 
         # 输出行为：攻击 / 跳规避 / 回身输出（按 self.state）
@@ -951,11 +976,16 @@ class CombatAgent:
 
     def _release_combat_keys(self):
         """释放打怪相关按键：KeyState + 回身输出/输出/防掉线序列。
-        定时行为（custom_timers）的序列不在这里释放——它们不依赖玩家定位。"""
+        定时行为（custom_timers）的序列不在这里释放——它们不依赖玩家定位。
+        释放后把序列上下文置空，避免下一帧重复发 RELEASE、也避免下次开自动
+        时从旧序列中间继续导致按键状态错乱。"""
         self.keys.release_all()
         self._release_ctx(self._back_ctx)
         self._release_ctx(self._output_ctx)
         self._release_ctx(self._afk_ctx)
+        self._back_ctx = None
+        self._output_ctx = None
+        self._afk_ctx = None
 
     def _release_held_keys(self):
         """释放所有还按着的键：KeyState 的 + 序列（回身输出/防掉线/定时行为）残留的。"""

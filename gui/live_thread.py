@@ -532,15 +532,6 @@ class LiveThread(QThread):
                         bw = x2 - x1
                         bh = y2 - y1
                         player_box = (cx, cy, cy + bh / 2.0, c, bw, bh)
-                        if draw:
-                            x1i, y1i, x2i, y2i = int(x1), int(y1), int(x2), int(y2)
-                            cv2.rectangle(vis, (x1i, y1i), (x2i, y2i),
-                                          _cls_colors[0], 2)
-                            ty = y1i - 5 if y1i > 14 else y1i + 16
-                            cv2.putText(vis, "%s %.2f" % (CLASS_NAMES[0], c),
-                                        (x1i + 2, ty),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                        _cls_colors[0], 1, cv2.LINE_AA)
                     n_boxes = k
 
                     # ---- 决策：找怪打 ----
@@ -557,6 +548,20 @@ class LiveThread(QThread):
                         player_box = _last_player[0]
                     else:
                         _last_player[0] = player_box
+
+                    # 绘制玩家蓝框：用防抖/兜底后的 player_box，保证和攻击距离线、
+                    # 扫平台倾向箭头画在同一位置（否则蓝框画原始检出、线条画防抖后位置会漂移）
+                    if player_box is not None and draw:
+                        _cx, _cy, _bot, _c, _bw, _bh = player_box
+                        _x1i = int(_cx - _bw / 2); _y1i = int(_cy - _bh / 2)
+                        _x2i = int(_cx + _bw / 2); _y2i = int(_cy + _bh / 2)
+                        cv2.rectangle(vis, (_x1i, _y1i), (_x2i, _y2i),
+                                      _cls_colors[0], 2)
+                        _ty = _y1i - 5 if _y1i > 14 else _y1i + 16
+                        cv2.putText(vis, "%s %.2f" % (CLASS_NAMES[0], _c),
+                                    (_x1i + 2, _ty),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                    _cls_colors[0], 1, cv2.LINE_AA)
 
                     ws = WorldState(frame_id=f.frame_id, ts=f.t_recv_mono,
                                     width=vis.shape[1], height=vis.shape[0])

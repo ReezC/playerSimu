@@ -163,6 +163,11 @@ class KeyState:
     def release_all(self):
         self.set(set())
 
+    def clear(self):
+        """只清空按键状态、不发 key_up。配合固件 RELEASEALL 使用：
+        固件侧已一次性释放所有键，本地只需同步状态，下一帧重新按需要的键。"""
+        self._pressed = set()
+
 
 # ---- 远程后端（agent 跑在控制机，通过 TLS 把按键发到游戏机的 Pro Micro）----
 # 默认 _remote=None 走本地 SendInput；调用 use_network() 后切到远程硬件键盘。
@@ -191,6 +196,12 @@ def _send_remote(line):
             _remote.send(line)
         except Exception:
             pass
+
+
+def release_all_remote():
+    """发 RELEASEALL 到固件，一次性清空固件侧所有按住的键（防长时间运行卡键）。"""
+    if _remote is not None:
+        _send_remote("RELEASEALL")
 
 
 def use_network(host, port, cafile):
