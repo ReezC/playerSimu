@@ -48,6 +48,8 @@ class ReviewPanel(QWidget):
         self.items = []         # [(stem, 框数, 是否人工, 上一帧框数)]，上一帧为 -1 表示无
         self.index = 0
         self._dirty = False
+        self._undo = []         # 撤销栈 [(stem, snapshot), ...]，snapshot 是操作前框列表
+        self._clipboard = []    # 复制的框 [(cls, x, y, w, h, manual), ...]
 
         self._build()
 
@@ -100,6 +102,10 @@ class ReviewPanel(QWidget):
         # ---- 画布 ----
         self.canvas = ImageCanvas()
         self.canvas.boxes_changed.connect(self._on_boxes_changed)
+        self.canvas.before_change.connect(self._on_before_change)
+        self.canvas.copy_requested.connect(self._copy)
+        self.canvas.paste_requested.connect(self._paste)
+        self.canvas.undo_requested.connect(self._undo_edit)
         root.addWidget(self.canvas, 1)
 
         # ---- 操作区 ----
@@ -120,11 +126,14 @@ class ReviewPanel(QWidget):
         self.cmb_cls.currentIndexChanged.connect(self._on_cls_changed)
         ops.addWidget(self.cmb_cls)
 
-        hint = QLabel("空白拖=建框　框边拖=缩放　Del=删框　滚轮=缩放　中键拖=平移　双击=适应")
+        hint = QLabel("空白拖=建框　框边拖=缩放　Del=删框　Ctrl+C/V/Z=复制/粘贴/撤销　滚轮=缩放　中键拖=平移　双击=适应")
         hint.setStyleSheet("color: #80868b;")
         ops.addWidget(hint)
 
         for text, slot, tip in (
+                ("复制", self._copy, "复制选中的框（Ctrl+C）"),
+                ("粘贴", self._paste, "粘贴剪贴板里的框（Ctrl+V）"),
+                ("撤销", self._undo_edit, "撤销上一次编辑（Ctrl+Z）"),
                 ("删选中框", self._delete_selected, "删除选中的框（也可按 Del）"),
                 ("恢复自动", self._revert, "丢掉人工修改，回到自动标注的结果"),
                 ("剔除整帧", self._drop_frame, "这张图不参与训练 —— 删除它所有相关文件"),
@@ -167,6 +176,7 @@ class ReviewPanel(QWidget):
 
     def reload(self):
         self._save_current()        # 保住当前帧的改动再重建列表
+        self._undo = []             # 帧列表重建后，旧撤销快照失效
 
         self.items = []
         self.index = 0
@@ -296,6 +306,52 @@ class ReviewPanel(QWidget):
     def _on_boxes_changed(self):
         self._dirty = True
         self._set_status("有未保存的修改（翻页会自动保存）")
+
+    def _on_before_change(self):
+        """破坏性操作（加框/删框/拖动）前记录撤销快照。"""
+        if self.project is None or not self.items:
+            return
+        stem = self.items[self.index][0]
+        self._undo.append((stem, self.canvas.get_boxes()))
+        if len(self._undo) > 100:
+            del self._undo[0]
+
+    def _copy(self):
+        sel = self.canvas.get_selected_boxes()
+        if not sel:
+            self._set_status("没有选中的框 —— 先点一下框再复制")
+            return
+        self._clipboard = sel
+        self._set_status("已复制 %d 个框" % len(sel), ok=True)
+
+    def _paste(self):
+        if not self._clipboard:
+            self._set_status("剪贴板为空 —— 先复制框")
+            return
+        if self.project is None or not self.items:
+            return
+        self.canvas.before_change.emit()   # 记录撤销快照
+        for cls, x, y, w, h, manual in self._clipboard:
+            # 偏移 12px，避免和原框完全重叠看不清
+            self.canvas.add_box(x + 12, y + 12, w, h, cls, True)
+        self.canvas.boxes_changed.emit()
+        self._set_status("已粘贴 %d 个框" % len(self._clipboard), ok=True)
+
+    def _undo_edit(self):
+        if not self._undo:
+            self._set_status("没有可撤销的操作")
+            return
+        stem, snap = self._undo.pop()
+        # 撤销的可能不是当前帧（复制后切到别的帧粘贴），先跳到对应帧
+        idx = next((i for i, it in enumerate(self.items) if it[0] == stem), None)
+        if idx is not None and idx != self.index:
+            self._save_current()
+            self.index = idx
+            self._update_pos()
+            self._load_current()
+        self.canvas.replace_boxes(snap)
+        self._dirty = True
+        self._set_status("已撤销", ok=True)
 
     def _on_cls_changed(self):
         self.canvas.current_cls = self.cmb_cls.currentData()
