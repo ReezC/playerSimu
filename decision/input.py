@@ -18,6 +18,7 @@ _VK = {
     "enter": 0x0D, "space": 0x20, "esc": 0x1B, "tab": 0x09,
     "del": 0x2E, "insert": 0x2D, "home": 0x24, "end": 0x23,
     "pageup": 0x21, "pagedown": 0x22,
+    "grave": 0xC0,   # ` / ~（反引号键，VK_OEM_3）
 }
 _VK.update({"f%d" % i: 0x70 + i - 1 for i in range(1, 13)})
 _VK.update({chr(c): c for c in range(ord("A"), ord("Z") + 1)})   # a~z
@@ -30,6 +31,7 @@ DISPLAY = {
     "space": "空格", "enter": "回车", "esc": "Esc", "tab": "Tab",
     "del": "Del", "insert": "Ins", "home": "Home", "end": "End",
     "pageup": "PgUp", "pagedown": "PgDn",
+    "grave": "~",
 }
 DISPLAY.update({"f%d" % i: "F%d" % i for i in range(1, 13)})
 DISPLAY.update({chr(c): chr(c).upper() for c in range(ord("A"), ord("Z") + 1)})
@@ -66,7 +68,12 @@ def resolve_vk(key):
     """键名 → VK 码；不认识返回 None。"""
     if isinstance(key, int):
         return key
-    return _VK.get(str(key).lower())
+    n = str(key).lower()
+    vk = _VK.get(n)
+    if vk is None:
+        # 字母键在 _VK 里存的是大写（'A'~'Z'），小写查不到时回退大写
+        vk = _VK.get(n.upper())
+    return vk
 
 
 # ---- SendInput ----
@@ -156,6 +163,11 @@ class KeyState:
     def release_all(self):
         self.set(set())
 
+    def clear(self):
+        """只清空按键状态、不发 key_up。配合固件 RELEASEALL 使用：
+        固件侧已一次性释放所有键，本地只需同步状态，下一帧重新按需要的键。"""
+        self._pressed = set()
+
 
 # ---- 远程后端（agent 跑在控制机，通过 TLS 把按键发到游戏机的 Pro Micro）----
 # 默认 _remote=None 走本地 SendInput；调用 use_network() 后切到远程硬件键盘。
@@ -167,6 +179,7 @@ _CMD_KEY = {
     "enter": "ENTER", "space": "SPACE", "esc": "ESC", "tab": "TAB",
     "del": "DEL", "insert": "INSERT", "home": "HOME", "end": "END",
     "pageup": "PAGEUP", "pagedown": "PAGEDOWN",
+    "grave": "GRAVE",
 }
 _CMD_KEY.update({"f%d" % i: "F%d" % i for i in range(1, 13)})
 
@@ -183,6 +196,12 @@ def _send_remote(line):
             _remote.send(line)
         except Exception:
             pass
+
+
+def release_all_remote():
+    """发 RELEASEALL 到固件，一次性清空固件侧所有按住的键（防长时间运行卡键）。"""
+    if _remote is not None:
+        _send_remote("RELEASEALL")
 
 
 def use_network(host, port, cafile):

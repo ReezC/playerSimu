@@ -32,6 +32,7 @@ from gui import theme
 from gui.export_dialog import ExportDialog
 from gui.live_panel import LivePanel
 from gui.player_panel import PlayerPanel
+from gui.route_panel import RoutePanel
 from gui.settings_dialog import SettingsDialog
 from gui.widgets import NoWheelComboBox
 from gui.project import Project, sanitize
@@ -432,7 +433,7 @@ class MainWindow(QMainWindow):
         return host
 
     def _build_right_tabs(self):
-        """右侧：模型训练流程 + 决策参数，两个页签。"""
+        """右侧：模型训练流程 + 决策参数 + 路线识别，三个页签。"""
         tabs = QTabWidget()
         tabs.addTab(self._build_cards(), "模型训练")
         self.player_panel = PlayerPanel()
@@ -442,6 +443,8 @@ class MainWindow(QMainWindow):
         # 实时推理识别出的血/蓝比例 → 决策参数页可视化
         self.live_panel.potions_ready.connect(self.player_panel._on_potions)
         tabs.addTab(self.player_panel, "决策参数")
+        self.route_panel = RoutePanel()
+        tabs.addTab(self.route_panel, "路线识别")
         # 最小宽度兜底：主视区尺寸波动时不把配置区挤没
         tabs.setMinimumWidth(460)
         # 忽略 sizeHint：卡片状态文字更新会改变 sizeHint，传导到 QSplitter

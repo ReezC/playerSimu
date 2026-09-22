@@ -273,7 +273,7 @@ class ReviewPanel(QWidget):
             diff = "   ·   新增 %d / 消失 %d" % (n_new, n_lost)
 
         self._set_status("%s   ·   %d 个框%s%s   ·   %d×%d"
-                         % (stem, len(boxes),
+                         % (path.name, len(boxes),
                             "（人工）" if manual else "",
                             diff, w, h))
 

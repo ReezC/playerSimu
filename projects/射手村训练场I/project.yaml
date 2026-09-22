@@ -66,5 +66,9 @@ player_scale_at:
   width: 1920
   height: 1080
   confidence: manual
-verify: {}
+verify:
+  source: E:/MyPrograms/playerSimu/projects/射手村训练场I/测试集
+  conf: 0.3
+  imgsz: 960
+  limit: 0
 iterate: {}

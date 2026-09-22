@@ -1,0 +1,140 @@
+{
+  "attack_dist": 400.0,
+  "min_attack_dist": 100,
+  "evade_type": "jump",
+  "jump_interval": 0,
+  "jump_random_prob": 0.05,
+  "back_jump_seq": [
+    {
+      "type": "down",
+      "key": "back"
+    },
+    {
+      "type": "delay",
+      "ms": 800
+    },
+    {
+      "type": "down",
+      "key": "jump"
+    },
+    {
+      "type": "delay",
+      "ms": 20
+    },
+    {
+      "type": "up",
+      "key": "back"
+    },
+    {
+      "type": "up",
+      "key": "jump"
+    },
+    {
+      "type": "down",
+      "key": "forward"
+    },
+    {
+      "type": "delay",
+      "ms": 150
+    },
+    {
+      "type": "down",
+      "key": "attack"
+    },
+    {
+      "type": "up",
+      "key": "attack"
+    },
+    {
+      "type": "up",
+      "key": "forward"
+    }
+  ],
+  "keymap": {
+    "auto": "f11",
+    "left": "left",
+    "right": "right",
+    "up": "up",
+    "down": "down",
+    "attack": "f",
+    "jump": "D",
+    "hp_pot": "g",
+    "mp_pot": "t",
+    "feed_pet": "del",
+    "shop": null,
+    "enter": "enter"
+  },
+  "target_cd": [
+    1500,
+    2500
+  ],
+  "input_device": "local",
+  "input_delay": [
+    0,
+    100
+  ],
+  "attack_cd": 300,
+  "hp_bar": [
+    -2002,
+    1050,
+    193,
+    20
+  ],
+  "mp_bar": [
+    -1804,
+    1051,
+    192,
+    20
+  ],
+  "hp_color": [
+    [
+      0,
+      0,
+      137
+    ],
+    [
+      94,
+      96,
+      255
+    ]
+  ],
+  "mp_color": [
+    [
+      140,
+      60,
+      0
+    ],
+    [
+      255,
+      180,
+      84
+    ]
+  ],
+  "hp_threshold": 4,
+  "mp_threshold": 10,
+  "pot_cd": 2000,
+  "auto_hp_pot": true,
+  "auto_mp_pot": false,
+  "strategy": "sweep",
+  "vision_top": 200,
+  "vision_bottom": 200,
+  "vision_left": -1,
+  "vision_right": -1,
+  "vision_center": false,
+  "vision_off_x": 0,
+  "vision_off_y": 0,
+  "sweep_turn_cd": 3000,
+  "back_range": 150,
+  "route_enabled": false,
+  "debounce_conf": 0.7,
+  "debounce_ms": 1000,
+  "auto_feed_pet": true,
+  "feed_interval_min": 12,
+  "feed_interval_max": 16,
+  "facing_timeout_min": 2,
+  "anti_afk_enabled": false,
+  "anti_afk_min": 30,
+  "anti_afk_max": 40,
+  "anti_afk_seq": [],
+  "custom_keys": {}
+}

@@ -28,8 +28,21 @@ import numpy as np
 
 from core.context import ConsoleContext, TaskContext
 from core.imgio import imread, imwrite
+from gui import theme
 
-BOX_COLOR = (60, 220, 60)       # BGR
+# 类别编号 → 显示名（和 data.yaml 的 class 对齐，与实时预览/质检台一致）
+CLASS_NAMES = {0: "玩家", 1: "怪物", 2: "掉落", 3: "NPC"}
+
+
+def _cls_colors():
+    """类别 → BGR 颜色，和实时预览/质检台统一（玩家/怪物从可视化设置读）。"""
+    vis = theme.load_vis()
+    return {
+        0: theme.hex_to_bgr(vis["player_color"]),   # 玩家 蓝
+        1: theme.hex_to_bgr(vis["mob_color"]),      # 怪物 绿
+        2: (0, 255, 255),                           # 掉落 黄
+        3: (0, 0, 255),                             # NPC 红
+    }
 
 
 def _pct(arr, q):
@@ -125,13 +138,19 @@ def run_predict(params, ctx=None):
         if boxes is not None and len(boxes):
             xyxy = boxes.xyxy.cpu().numpy()
             cfs = boxes.conf.cpu().numpy()
-            for (x1, y1, x2, y2), c in zip(xyxy, cfs):
+            try:
+                clss = boxes.cls.cpu().numpy().astype(int)
+            except Exception:
+                clss = [1] * len(cfs)
+            colors = _cls_colors()
+            for (x1, y1, x2, y2), c, cls in zip(xyxy, cfs, clss):
                 x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                cv2.rectangle(img, (x1, y1), (x2, y2), BOX_COLOR, 2)
-                # 置信度标在框上方，越界就挪到框内
+                color = colors.get(int(cls), (60, 220, 60))
+                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+                # 类别名 + 置信度标在框上方，越界就挪到框内
                 ty = y1 - 5 if y1 > 14 else y1 + 16
-                cv2.putText(img, "%.2f" % c, (x1 + 2, ty),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, BOX_COLOR, 1,
+                cv2.putText(img, "%s %.2f" % (CLASS_NAMES.get(int(cls), str(int(cls))), c),
+                            (x1 + 2, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1,
                             cv2.LINE_AA)
                 confs.append(float(c))
                 k += 1
@@ -200,7 +219,7 @@ def run_predict(params, ctx=None):
                 % (stats["zero_frames"], n), "warn")
     elif confs and stats["conf_p10"] < 0.4:
         ctx.log("有一成以上的框置信度低于 0.4 —— 模型对这些目标不太确定，"
-                "建议看看可视化图里是哪一类", "warn")
+                "打开可视化图看看是哪一类：%s" % out, "warn")
 
     return {
         "frames": n,

@@ -24,11 +24,16 @@ import time
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
-from tools.config import get
+from tools.config import get, load_live
 from gui import theme
 
 # 类别编号 → 显示名（和 data.yaml 的 class 对齐）
 CLASS_NAMES = {0: "玩家", 1: "怪物", 2: "掉落", 3: "NPC"}
+
+# player_id → YOLO class id 映射（玩家也走 YOLO，每个玩家独占一个类）。
+# 当前单玩家固定 class 0；未来多玩家时扩展成 {"角色A": 0, "角色B": 2, ...}，
+# 标注按此映射打类，实时只取当前 player_id 对应的类。默认 "" → 0。
+PLAYER_CLASS_MAP = {"": 0}
 
 # 类别 → 框颜色（BGR，和 data.yaml 的 class 对齐）。
 # 玩家/怪物颜色从设置读（theme.load_vis），drop/npc 用固定默认。
@@ -177,6 +182,7 @@ class LiveThread(QThread):
         super().__init__(parent)
         self._p = dict(params)
         self._stop = threading.Event()
+        self._infer = threading.Event()   # 推理开关：默认关，先只收画面
         self._last_potions = 0.0
 
     # ---------------- 控制 ----------------
@@ -187,45 +193,12 @@ class LiveThread(QThread):
     def stopped(self):
         return self._stop.is_set()
 
-    def _wait_stream_packet(self, url, timeout=5.0):
-        """UDP 探针：判断推流端是否真的在发流（不依赖 PyAV）。
-
-        解析 url 里的端口，bind 收包。收到第一个包就返回 True（释放端口给
-        PyAV）；超时没收到返回 False。非 UDP（rtsp/srt）跳过探针。
-        """
-        if not (url or "").startswith("udp"):
-            return True   # 非 UDP，交给 PyAV 自己处理
-
-        import re
-        import socket
-
-        port = 5000
-        m = re.search(r":(\d+)/?$", url)
-        if m:
-            port = int(m.group(1))
-
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind(("0.0.0.0", port))
-        except OSError:
-            s.close()
-            return True   # 端口被占用（可能有别的实例在收流），跳过探针直接 open
-
-        s.settimeout(0.5)
-        t0 = time.perf_counter()
-        try:
-            while not self._stop.is_set():
-                if time.perf_counter() - t0 >= timeout:
-                    return False
-                try:
-                    s.recvfrom(65535)
-                    return True
-                except socket.timeout:
-                    continue
-            return False
-        finally:
-            s.close()
+    def set_infer(self, enabled):
+        """开启/关闭推理。开启后主循环才跑 YOLO + 决策 + 画框。"""
+        if enabled:
+            self._infer.set()
+        else:
+            self._infer.clear()
 
     # ---------------- 主循环 ----------------
 
@@ -240,7 +213,11 @@ class LiveThread(QThread):
         import cv2
 
         url = self._p.get("url", "")
-        conf = float(self._p.get("conf", 0.30))
+        # 怪物/玩家置信度分开配：推理时用两者的较小值（保证两类的低分框都
+        # 进结果），后处理再按各自阈值过滤 —— 一次推理，不额外耗性能。
+        conf_mob = float(self._p.get("conf_mob", 0.30))
+        conf_player = float(self._p.get("conf_player", 0.50))
+        conf = min(conf_mob, conf_player)
         imgsz = int(self._p.get("imgsz", 960))
         device = str(self._p.get("device", "0"))
         weights = self._p.get("weights") or ""
@@ -251,7 +228,7 @@ class LiveThread(QThread):
         origin_y = 0      # HP/MP 条框选的屏幕坐标要减去它转成画面内坐标
 
         from ultralytics import YOLO
-        model = YOLO(weights)
+        model = None       # 懒加载：首次「开始推理」才加载，收画面阶段不加载
 
         # 决策：找怪打。agent 跨帧持有按键状态，这里只建一次；
         # settings 是全局单例，和「决策参数」页签共享。
@@ -261,7 +238,8 @@ class LiveThread(QThread):
         from decision.agent import CombatAgent, settings as decision_settings
         from perception.tracker import MobTracker
         from perception.world_state import WorldState
-        from perception.platforms import PlatformTracker, PlayerMotionTracker
+        from perception.platforms import (PlatformTracker, PlayerMotionTracker,
+                                          relate_terrain)
 
         agent = CombatAgent(decision_settings)
         mob_tracker = MobTracker()   # 给怪稳定 id，供目标锁定 CD 跨帧匹配
@@ -269,6 +247,13 @@ class LiveThread(QThread):
         # 轻量图像处理每帧更新，玩家速度则由连续框的位置估计。
         platform_tracker = PlatformTracker()
         player_motion = PlayerMotionTracker()
+
+        # 玩家也走 YOLO（不再是模板匹配）。每个玩家独占一个 YOLO 类，实时
+        # 只取当前 player_id 对应的类；当前固定 class 0，多玩家时扩展
+        # PLAYER_CLASS_MAP。
+        _pid = self._p.get("player_id") or ""
+        _player_class = int(self._p.get("player_class",
+                                        PLAYER_CLASS_MAP.get(_pid, 0)) or 0)
 
         from core import wincap
         # HP/MP 条**独立抓取**：它们可能在实时帧框选范围之外（比如只框了
@@ -280,7 +265,7 @@ class LiveThread(QThread):
         _vision_box = [None]        # 视野矩形 (left, top, right, bottom)，3s 更新一次
         _vision_last = [0.0]        # 上次更新时间
 
-        # 可视化配置（开始实时预览时读一次；改设置后重开实时预览才生效）
+        # 可视化配置：定期重读（颜色改了实时生效，不用重开实时预览）
         _vis_cfg = theme.load_vis()
         _cls_colors = _box_colors()
         _lock_color = theme.hex_to_bgr(_vis_cfg["lock_color"])
@@ -288,6 +273,7 @@ class LiveThread(QThread):
         _min_attack_color = theme.hex_to_bgr(_vis_cfg["min_attack_color"])
         _vision_color = theme.hex_to_bgr(_vis_cfg["vision_color"])
         _vision_width = int(_vis_cfg["vision_width"])
+        _vis_refresh_last = 0.0
 
         # 读线程独立于推理：它拼命读，积压的旧帧在槽位里被直接覆盖丢掉。
         # 这样无论推理多慢，看到的都是最新画面，延迟不会累积。
@@ -343,25 +329,25 @@ class LiveThread(QThread):
         else:
             from link import PyAVSource
 
-            # 先探一下 A 机到底推没推流（UDP 探针），避免 open() 无限黑屏等流
+            # 直接 open：udp 有 timeout（5 秒），A 没推流时 open 会超时抛 I/O error，
+            # 不会无限黑屏。用 open 的错误类型区分「没推流」和「收到包但解码失败」。
             self.stream_status.emit("waiting")
-            if not self._wait_stream_packet(url):
-                if self._stop.is_set():
-                    return
-                self.stream_status.emit("no_stream")
-                self.failed.emit(
-                    "没收到流 —— A 机没在推流？检查 OBS 是否在推、"
-                    "URL/IP/端口、B 机防火墙是否放行 UDP")
-                return
-
             # BGR 直出，省一次颜色转换
             src = PyAVSource(url, decode_format="bgr24",
                              container_format=self._p.get("format"))
             try:
                 src.open()
             except Exception as e:
+                if self._stop.is_set():
+                    return
                 self.stream_status.emit("no_stream")
-                self.failed.emit("收到包但打不开流：%s" % e)
+                msg = str(e).lower()
+                if "timed out" in msg or "etimedout" in msg or "i/o error" in msg:
+                    self.failed.emit(
+                        "没收到流 —— A 机没在推流？检查 OBS 是否在推、"
+                        "URL/IP/端口、B 机防火墙是否放行 UDP")
+                else:
+                    self.failed.emit("收到包但打不开流：%s" % e)
                 return
             self.stream_status.emit("connected")
             size_ref[0] = src.size
@@ -451,6 +437,31 @@ class LiveThread(QThread):
                 last_mono = f.t_recv_mono
                 vis = f.image          # BGR（decode_format="bgr24" 直出）
 
+                # 定期重读可视化配置：标记颜色/线宽改了实时生效
+                if time.perf_counter() - _vis_refresh_last >= 1.0:
+                    _vis_refresh_last = time.perf_counter()
+                    _vis_cfg = theme.load_vis()
+                    _cls_colors = {
+                        0: theme.hex_to_bgr(_vis_cfg["player_color"]),
+                        1: theme.hex_to_bgr(_vis_cfg["mob_color"]),
+                        2: (0, 255, 255),
+                        3: (0, 0, 255),
+                    }
+                    _lock_color = theme.hex_to_bgr(_vis_cfg["lock_color"])
+                    _attack_color = theme.hex_to_bgr(_vis_cfg["attack_color"])
+                    _min_attack_color = theme.hex_to_bgr(_vis_cfg["min_attack_color"])
+                    _vision_color = theme.hex_to_bgr(_vis_cfg["vision_color"])
+                    _vision_width = int(_vis_cfg["vision_width"])
+                    # conf 也实时生效：重读 config/live.yaml（UI 改动会即时写入）
+                    try:
+                        _live = load_live()
+                        if "conf_mob" in _live:
+                            conf_mob = float(_live["conf_mob"])
+                            conf_player = float(_live["conf_player"])
+                            conf = min(conf_mob, conf_player)
+                    except Exception:
+                        pass
+
                 if probe_on:
                     # f.image 是 BGR，转灰度解码
                     gray = cv2.cvtColor(vis, cv2.COLOR_BGR2GRAY)
@@ -466,125 +477,170 @@ class LiveThread(QThread):
                             if len(delays) > 120:
                                 del delays[0]
 
-                # 视野矩形：裁剪推理区域到视野范围（视野外不推理，省性能）。
-                crop_top = 0
-                crop_left = 0
-                infer_img = vis
-                if time.perf_counter() - _vision_last[0] >= 3.0:
-                    _vision_last[0] = time.perf_counter()
-                    _vision_box[0] = _vision_box_for(vis, _last_player[0],
-                                                     decision_settings)
-                if _vision_box[0] is not None:
-                    vleft, vtop, vright, vbottom = _vision_box[0]
-                    if vright > vleft and vbottom > vtop:
-                        infer_img = vis[vtop:vbottom, vleft:vright]
-                        crop_top = vtop
-                        crop_left = vleft
+                # ---- 推理（由「开始推理」开关控制）----
+                if self._infer.is_set():
+                    if model is None:
+                        # 首次开推理才加载模型（收画面阶段不加载，秒出纯画面）
+                        model = YOLO(weights)
 
-                t0 = time.perf_counter()
-                res = model.predict(infer_img, conf=conf, imgsz=imgsz,
-                                    device=device, verbose=False)[0]
-                dt_ms = (time.perf_counter() - t0) * 1000.0
-                infer_ms.append(dt_ms)
-                if len(infer_ms) > 60:
-                    del infer_ms[0]
+                    # 视野框：只用于画虚线 + 决策层过滤（agent._filter_mobs），
+                    # 不裁剪推理区域 —— 检测走全图，玩家和怪都从全图出。
+                    if time.perf_counter() - _vision_last[0] >= 3.0:
+                        _vision_last[0] = time.perf_counter()
+                        _vision_box[0] = _vision_box_for(vis, _last_player[0],
+                                                         decision_settings)
 
-                k = 0
-                boxes = getattr(res, "boxes", None)
-                player_box = None
-                mob_dets = []   # [(x1, y1, x2, y2, conf), ...] 给 MobTracker
-                if boxes is not None and len(boxes):
-                    xyxy = boxes.xyxy.cpu().numpy()
-                    cfs = boxes.conf.cpu().numpy()
-                    try:
-                        clss = boxes.cls.cpu().numpy().astype(int)
-                    except Exception:
-                        clss = [1] * len(cfs)
-                    for (x1, y1, x2, y2), c, cls in zip(xyxy, cfs, clss):
-                        k += 1
-                        # 裁剪区域的坐标加回偏移，恢复成画面坐标
-                        x1 += crop_left
-                        x2 += crop_left
-                        y1 += crop_top
-                        y2 += crop_top
-                        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-                        ic = int(cls)
-                        if ic == 0:
-                            if player_box is None or c > player_box[3]:
-                                player_box = (cx, cy, y2, c, x2 - x1, y2 - y1)   # 中心、底边、置信度、尺寸
-                            # 玩家蓝框（原始检测，漏检由 _last_player 兜底）
-                            if draw:
-                                x1i, y1i, x2i, y2i = int(x1), int(y1), int(x2), int(y2)
-                                cv2.rectangle(vis, (x1i, y1i), (x2i, y2i),
-                                              _cls_colors[0], 2)
-                                ty = y1i - 5 if y1i > 14 else y1i + 16
-                                cv2.putText(vis, "%s %.2f" % (CLASS_NAMES[0], c),
-                                            (x1i + 2, ty),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                            _cls_colors[0], 1, cv2.LINE_AA)
-                        elif ic == 1:
-                            mob_dets.append((x1, y1, x2, y2, c))
-                            # 怪物绿框不在这里画：移到后面用 ws.mobs（含防抖幽灵目标）
-                n_boxes = k
+                    # ---- 一次全图推理：玩家（class 0）+ 怪（class 1）----
+                    t0 = time.perf_counter()
+                    res = model.predict(vis, conf=conf, imgsz=imgsz,
+                                        device=device, verbose=False)[0]
+                    infer_ms.append((time.perf_counter() - t0) * 1000.0)
+                    if len(infer_ms) > 60:
+                        del infer_ms[0]
 
-                # ---- 决策：找怪打 ----
-                # 玩家框（蓝框）短暂消失时，用上一帧位置兜底，避免 agent 丢失玩家
-                if player_box is None:
-                    player_box = _last_player[0]
+                    k = 0
+                    mob_dets = []       # [(x1, y1, x2, y2, conf), ...] 给 MobTracker
+                    player_cand = None  # (x1, y1, x2, y2, conf)，YOLO 检出的玩家框
+                    boxes = getattr(res, "boxes", None)
+                    if boxes is not None and len(boxes):
+                        xyxy = boxes.xyxy.cpu().numpy()
+                        cfs = boxes.conf.cpu().numpy()
+                        try:
+                            clss = boxes.cls.cpu().numpy().astype(int)
+                        except Exception:
+                            clss = [1] * len(cfs)
+                        for (x1, y1, x2, y2), c, cls in zip(xyxy, cfs, clss):
+                            if int(cls) == 1:
+                                if c < conf_mob:
+                                    continue
+                                k += 1
+                                mob_dets.append((x1, y1, x2, y2, c))
+                            elif int(cls) == _player_class:
+                                if c < conf_player:
+                                    continue
+                                # 画面里通常只有一个玩家，取置信度最高的那个框
+                                if player_cand is None or c > player_cand[4]:
+                                    player_cand = (x1, y1, x2, y2, c)
+                            # drop/npc（class 2/3）暂不参与决策
+
+                    # ---- 玩家定位：YOLO 检出 ----
+                    player_box = None
+                    if player_cand is not None:
+                        x1, y1, x2, y2, c = player_cand
+                        cx = (x1 + x2) / 2.0
+                        cy = (y1 + y2) / 2.0
+                        bw = x2 - x1
+                        bh = y2 - y1
+                        player_box = (cx, cy, cy + bh / 2.0, c, bw, bh)
+                    n_boxes = k
+
+                    # ---- 决策：找怪打 ----
+                    # 玩家识别防抖：检出框中心跳变超过防抖距离视为误检，沿用上一帧位置
+                    pdd = max(0.0, float(decision_settings.player_debounce_dist))
+                    if player_box is not None and _last_player[0] is not None and pdd > 0:
+                        dx = player_box[0] - _last_player[0][0]
+                        dy = player_box[1] - _last_player[0][1]
+                        if (dx * dx + dy * dy) ** 0.5 > pdd:
+                            player_box = _last_player[0]   # 跳变过大，用上一帧
+
+                    # 玩家框（蓝框）短暂消失时，用上一帧位置兜底，避免 agent 丢失玩家
+                    if player_box is None:
+                        player_box = _last_player[0]
+                    else:
+                        _last_player[0] = player_box
+
+                    # 绘制玩家蓝框：用防抖/兜底后的 player_box，保证和攻击距离线、
+                    # 扫平台倾向箭头画在同一位置（否则蓝框画原始检出、线条画防抖后位置会漂移）
+                    if player_box is not None and draw:
+                        _cx, _cy, _bot, _c, _bw, _bh = player_box
+                        _x1i = int(_cx - _bw / 2); _y1i = int(_cy - _bh / 2)
+                        _x2i = int(_cx + _bw / 2); _y2i = int(_cy + _bh / 2)
+                        cv2.rectangle(vis, (_x1i, _y1i), (_x2i, _y2i),
+                                      _cls_colors[0], 2)
+                        _ty = _y1i - 5 if _y1i > 14 else _y1i + 16
+                        cv2.putText(vis, "%s %.2f" % (CLASS_NAMES[0], _c),
+                                    (_x1i + 2, _ty),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                    _cls_colors[0], 1, cv2.LINE_AA)
+
+                    ws = WorldState(frame_id=f.frame_id, ts=f.t_recv_mono,
+                                    width=vis.shape[1], height=vis.shape[0])
+                    if player_box is not None:
+                        ws.player.x, ws.player.y = player_box[0], player_box[1]
+                        ws.player.bottom = player_box[2]
+                        ws.player.w, ws.player.h = player_box[4], player_box[5]
+                        ws.player.found = True
+                    # 路线识别（平台识别/跳跃预测）开关：关掉就跳过，省掉每帧图像处理
+                    if decision_settings.route_enabled:
+                        ws.platforms = platform_tracker.update(vis, f.t_recv_mono)
+                    else:
+                        ws.platforms = []
+                    # 读 HP/MP 条：独立抓取（屏幕坐标直接 grab_rect），不依赖实时
+                    # 帧范围，限流 0.5s（血蓝变化不需要太频繁，grab_rect 有开销）。
+                    if time.perf_counter() - _pot_last[0] >= 0.5:
+                        _pot_last[0] = time.perf_counter()
+                        if decision_settings.hp_bar:
+                            try:
+                                r = wincap.grab_rect(tuple(int(v) for v in decision_settings.hp_bar))
+                                if r is not None and r.size:
+                                    low, high = decision_settings.hp_color or ((0, 0, 100), (90, 90, 255))
+                                    m = cv2.inRange(r, tuple(low), tuple(high))
+                                    ratio = _bar_fill_ratio(m)
+                                    if ratio > 0.0:   # 0% = 丢失/抖动，保持上次值
+                                        _pot_vals[0] = ratio
+                            except Exception:
+                                pass
+                        if decision_settings.mp_bar:
+                            try:
+                                r = wincap.grab_rect(tuple(int(v) for v in decision_settings.mp_bar))
+                                if r is not None and r.size:
+                                    low, high = decision_settings.mp_color or ((100, 0, 0), (255, 90, 90))
+                                    m = cv2.inRange(r, tuple(low), tuple(high))
+                                    ratio = _bar_fill_ratio(m)
+                                    if ratio > 0.0:
+                                        _pot_vals[1] = ratio
+                            except Exception:
+                                pass
+                    ws.player.hp = _pot_vals[0]
+                    ws.player.mp = _pot_vals[1]
+                    # 同步防抖参数（每帧读 settings，改了即时生效）
+                    mob_tracker.debounce_conf = decision_settings.debounce_conf
+                    mob_tracker.debounce_ms = decision_settings.debounce_ms
+                    # 用 MobTracker 追踪，得到跨帧稳定的 id（目标锁定 CD 靠它匹配）
+                    ws.mobs = mob_tracker.update(mob_dets)
+                    if decision_settings.route_enabled:
+                        ws.jump_prediction = player_motion.update(
+                            ws.player, ws.platforms, f.t_recv_mono)
+                    else:
+                        ws.jump_prediction = None
+                    # 地形关系识别（感知层）：给每只怪打上所在平台 + 是否与玩家
+                    # 当前平台连接。Agent 只消费 mob.reachable，不做几何运算。
+                    relate_terrain(ws.mobs, ws.player, ws.platforms)
+                    action = agent.tick(ws)
+                    # 攻击了防抖幽灵框 → 立即消除该轨迹，避免持续空放技能
+                    kill_mob = action.get("kill_mob") if action else None
+                    if kill_mob is not None:
+                        mob_tracker.kill(kill_mob)
+
+                    # 把识别到的血/蓝比例推给 UI（限流 0.3s，避免刷屏）
+                    if time.perf_counter() - self._last_potions >= 0.3:
+                        self._last_potions = time.perf_counter()
+                        self.potions_ready.emit(ws.player.hp, ws.player.mp)
                 else:
-                    _last_player[0] = player_box
+                    # 纯画面：不推理、不画框、不做决策。ws 给个空壳供统计用。
+                    ws = WorldState(frame_id=f.frame_id, ts=f.t_recv_mono,
+                                    width=vis.shape[1], height=vis.shape[0])
+                    n_boxes = 0
+                    action = None
 
-                ws = WorldState(frame_id=f.frame_id, ts=f.t_recv_mono,
-                                width=vis.shape[1], height=vis.shape[0])
-                if player_box is not None:
-                    ws.player.x, ws.player.y = player_box[0], player_box[1]
-                    ws.player.bottom = player_box[2]
-                    ws.player.w, ws.player.h = player_box[4], player_box[5]
-                    ws.player.found = True
-                ws.platforms = platform_tracker.update(vis, f.t_recv_mono)
-                # 读 HP/MP 条：独立抓取（屏幕坐标直接 grab_rect），不依赖实时
-                # 帧范围，限流 0.2s。
-                if time.perf_counter() - _pot_last[0] >= 0.2:
-                    _pot_last[0] = time.perf_counter()
-                    if decision_settings.hp_bar:
-                        try:
-                            r = wincap.grab_rect(tuple(int(v) for v in decision_settings.hp_bar))
-                            if r is not None and r.size:
-                                low, high = decision_settings.hp_color or ((0, 0, 100), (90, 90, 255))
-                                m = cv2.inRange(r, tuple(low), tuple(high))
-                                ratio = _bar_fill_ratio(m)
-                                if ratio > 0.0:   # 0% = 丢失/抖动，保持上次值
-                                    _pot_vals[0] = ratio
-                        except Exception:
-                            pass
-                    if decision_settings.mp_bar:
-                        try:
-                            r = wincap.grab_rect(tuple(int(v) for v in decision_settings.mp_bar))
-                            if r is not None and r.size:
-                                low, high = decision_settings.mp_color or ((100, 0, 0), (255, 90, 90))
-                                m = cv2.inRange(r, tuple(low), tuple(high))
-                                ratio = _bar_fill_ratio(m)
-                                if ratio > 0.0:
-                                    _pot_vals[1] = ratio
-                        except Exception:
-                            pass
-                ws.player.hp = _pot_vals[0]
-                ws.player.mp = _pot_vals[1]
-                # 同步防抖参数（每帧读 settings，改了即时生效）
-                mob_tracker.debounce_conf = decision_settings.debounce_conf
-                mob_tracker.debounce_ms = decision_settings.debounce_ms
-                # 用 MobTracker 追踪，得到跨帧稳定的 id（目标锁定 CD 靠它匹配）
-                ws.mobs = mob_tracker.update(mob_dets)
-                ws.jump_prediction = player_motion.update(ws.player, ws.platforms,
-                                                          f.t_recv_mono)
-                action = agent.tick(ws)
+                # 显示限流判断提前：只在「要显示的这一帧」画框，不显示的帧不白画
+                now = time.perf_counter()
+                should_show = now - t_last_show >= show_interval
+                if should_show:
+                    t_last_show = now
+                    n_show += 1
 
-                # 把识别到的血/蓝比例推给 UI（限流 0.3s，避免刷屏）
-                if time.perf_counter() - self._last_potions >= 0.3:
-                    self._last_potions = time.perf_counter()
-                    self.potions_ready.emit(ws.player.hp, ws.player.mp)
-
-                if draw:
+                if should_show and draw and self._infer.is_set():
                     # 平台顶边：青色实线；编号稳定于 PlatformTracker，便于排查地图
                     # 滚动/局部重检时的关联。当前平台额外画白色。
                     for p in ws.platforms:
@@ -601,8 +657,10 @@ class LiveThread(QThread):
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
                     st = action.get("state", "?")
                     label = "决策:%s" % st
-                    if st == "chase":
-                        label += " -> 怪%d dist=%.0f" % (action.get("target", 0),
+                    t_id = action.get("target")
+                    if st == "chase" and t_id is not None:
+                        # 巡逻分支（无锁定目标）也是 chase 态，此时没有怪号可显示
+                        label += " -> 怪%d dist=%.0f" % (t_id,
                                                         action.get("dist", 0.0))
                     cv2.putText(vis, label, (10, 28),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7,
@@ -612,24 +670,49 @@ class LiveThread(QThread):
                     #   角色 → 最小攻击距离：橙色线（太近的规避范围）
                     #   最小 → 最大攻击距离：黄色线（可攻击范围）
                     if player_box is not None:
-                        px, py = int(player_box[0]), int(player_box[1])
+                        cx, cy = int(player_box[0]), int(player_box[1])
+                        bw = player_box[4]
                         facing = action.get("facing", 1)
                         dirn = 1 if facing > 0 else -1
                         max_ad = max(1, int(decision_settings.attack_dist))
                         min_ad = max(0, int(decision_settings.min_attack_dist))
-                        max_x = px + dirn * max_ad
+                        # 攻击距离/追击起跳从玩家框的「朝向边缘」起算，和 agent 的
+                        # _edge_dist 判定（框边缘到框边缘）保持一致，否则可视化距离
+                        # 会以中心为基准、判定以边缘为基准，出现「还没碰到框就跳」。
+                        # OpenCV 5 的 line/arrowedLine 不接受 float 坐标，必须取整。
+                        ex = int(cx + dirn * (bw / 2.0))
+                        max_x = ex + dirn * max_ad
                         yellow = _attack_color        # 最大攻击距离线颜色
                         orange = _min_attack_color    # 最小攻击距离/规避范围线颜色
                         if min_ad > 0:
-                            min_x = px + dirn * min_ad
-                            cv2.line(vis, (px, py), (min_x, py), orange, 2)
-                            cv2.line(vis, (min_x, py), (max_x, py), yellow, 2)
+                            min_x = ex + dirn * min_ad
+                            cv2.line(vis, (ex, cy), (min_x, cy), orange, 2)
+                            cv2.line(vis, (min_x, cy), (max_x, cy), yellow, 2)
                             # 最小攻击距离处加橙色小刻度
-                            cv2.line(vis, (min_x, py - 8), (min_x, py + 8), orange, 2)
+                            cv2.line(vis, (min_x, cy - 8), (min_x, cy + 8), orange, 2)
                         else:
-                            cv2.line(vis, (px, py), (max_x, py), yellow, 2)
-                        cv2.circle(vis, (px, py), 4, yellow, -1)
-                        cv2.line(vis, (max_x, py - 8), (max_x, py + 8), yellow, 2)
+                            cv2.line(vis, (ex, cy), (max_x, cy), yellow, 2)
+                        cv2.circle(vis, (cx, cy), 4, yellow, -1)
+                        cv2.line(vis, (max_x, cy - 8), (max_x, cy + 8), yellow, 2)
+
+                        # 追击起跳距离：接在最大攻击距离前方，绿色线段 + 竖向刻度
+                        cjd = max(0, int(decision_settings.chase_jump_dist))
+                        if cjd > 0:
+                            jump_x = max_x + dirn * cjd
+                            green = (0, 200, 0)
+                            cv2.line(vis, (max_x, cy), (jump_x, cy), green, 2)
+                            cv2.line(vis, (jump_x, cy - 8), (jump_x, cy + 8), green, 2)
+
+                        # 扫平台倾向朝向箭头：位于攻击距离上方，指向朝向方向，
+                        # 尾巴延长至背后锁定距离（back_range）
+                        if decision_settings.strategy == "sweep":
+                            back_range = max(0, int(decision_settings.back_range))
+                            arrow_len = max(6, int(max_ad * 0.4))   # 比较短
+                            arrow_y = cy - 18                        # 攻击距离上方
+                            cv2.arrowedLine(vis,
+                                            (ex - dirn * back_range, arrow_y),
+                                            (ex + dirn * arrow_len, arrow_y),
+                                            yellow, 3, tipLength=0.35)
 
                     # 视野矩形：黑色虚线画出上下左右四条边。
                     # 某方向 <0（不限制）则该边不画。
@@ -678,13 +761,9 @@ class LiveThread(QThread):
                                               _lock_color, 3)
                                 break
 
-                now = time.perf_counter()
-
                 # 显示限流：到点了才推一帧。emit 是队列信号，不阻塞推理，
                 # 所以推理始终按自己的速度跑。
-                if now - t_last_show >= show_interval:
-                    t_last_show = now
-                    n_show += 1
+                if should_show:
                     self.frame_ready.emit(vis)
 
                 if now - t_last_stat >= 0.5:

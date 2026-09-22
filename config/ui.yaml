@@ -1,6 +1,6 @@
 font_size: 11
 vis:
-  attack_color: '#f9ab00'
+  attack_color: '#ffff00'
   lock_color: '#ff0000'
   min_attack_color: '#ff691e'
   mob_color: '#ff6788'

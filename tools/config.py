@@ -5,6 +5,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = ROOT / "config" / "link.yaml"
+LIVE_CONFIG = ROOT / "config" / "live.yaml"   # 实时预览参数（独立文件，避免重写 link.yaml 丢注释）
 
 _cache: dict[str, Any] | None = None
 
@@ -29,6 +30,20 @@ def get(section: str, key: str | None = None, default=None):
     if key is None:
         return sec
     return sec.get(key, default)
+
+
+def load_live() -> dict[str, Any]:
+    """读实时预览参数（config/live.yaml），不存在返回空 dict。"""
+    if LIVE_CONFIG.exists():
+        with open(LIVE_CONFIG, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def save_live(cfg: dict[str, Any]):
+    """写实时预览参数到 config/live.yaml。"""
+    with open(LIVE_CONFIG, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
 
 
 def record_dir() -> Path:
