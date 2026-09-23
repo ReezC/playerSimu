@@ -135,6 +135,10 @@
   "anti_afk_enabled": false,
   "anti_afk_min": 30,
   "anti_afk_max": 40,
-  "anti_afk_seq": [],
+  "anti_afk_type": "hidden_rest",
+  "anti_afk_enter_seq": [],
+  "anti_afk_exit_seq": [],
+  "anti_afk_rest_min": 10,
+  "anti_afk_rest_max": 20,
   "custom_keys": {}
 }

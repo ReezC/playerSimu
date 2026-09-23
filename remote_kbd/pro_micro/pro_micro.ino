@@ -15,6 +15,7 @@
 // 键名：单字符(字母/数字) 或 LEFT/RIGHT/UP/DOWN/SPACE/ENTER/ESC/TAB/CTRL/SHIFT/ALT/F1..F12 等
 
 #include <Keyboard.h>
+#include <Mouse.h>
 
 #define MAX_HELD 6
 int held[MAX_HELD];
@@ -23,6 +24,7 @@ int heldCount = 0;
 void setup() {
   Serial.begin(115200);
   Keyboard.begin();
+  Mouse.begin();
   randomSeed(analogRead(A0));
   Serial.println("READY");
 }
@@ -45,10 +47,12 @@ int keyToCode(String k) {
   if (k == "LEFT") return KEY_LEFT_ARROW;
   if (k == "RIGHT") return KEY_RIGHT_ARROW;
   if (k == "DEL") return KEY_DELETE;
+  if (k == "INSERT") return KEY_INSERT;
   if (k == "HOME") return KEY_HOME;
   if (k == "END") return KEY_END;
   if (k == "PGUP") return KEY_PAGE_UP;
   if (k == "PGDN") return KEY_PAGE_DOWN;
+  if (k == "GRAVE") return '`';   // 反引号键（` / ~）
   if (k == "CTRL") return KEY_LEFT_CTRL;
   if (k == "SHIFT") return KEY_LEFT_SHIFT;
   if (k == "ALT") return KEY_LEFT_ALT;
@@ -124,6 +128,41 @@ void loop() {
   }
   else if (head == "RELEASEALL") {
     releaseAll();
+    Serial.println("DONE");
+  }
+  else if (head == "MOVE") {
+    int dx = token(cmd, 1).toInt();
+    int dy = token(cmd, 2).toInt();
+    Mouse.move(dx, dy, 0);
+    Serial.println("DONE");
+  }
+  else if (head == "CLICK") {
+    String btn = token(cmd, 1);
+    btn.toUpperCase();
+    if (btn == "RIGHT") Mouse.click(MOUSE_RIGHT);
+    else if (btn == "MIDDLE") Mouse.click(MOUSE_MIDDLE);
+    else Mouse.click(MOUSE_LEFT);
+    Serial.println("DONE");
+  }
+  else if (head == "SCROLL") {
+    int n = token(cmd, 1).toInt();
+    Mouse.move(0, 0, n);
+    Serial.println("DONE");
+  }
+  else if (head == "PRESSM") {
+    String btn = token(cmd, 1);
+    btn.toUpperCase();
+    if (btn == "RIGHT") Mouse.press(MOUSE_RIGHT);
+    else if (btn == "MIDDLE") Mouse.press(MOUSE_MIDDLE);
+    else Mouse.press(MOUSE_LEFT);
+    Serial.println("DONE");
+  }
+  else if (head == "RELEASEM") {
+    String btn = token(cmd, 1);
+    btn.toUpperCase();
+    if (btn == "RIGHT") Mouse.release(MOUSE_RIGHT);
+    else if (btn == "MIDDLE") Mouse.release(MOUSE_MIDDLE);
+    else Mouse.release(MOUSE_LEFT);
     Serial.println("DONE");
   }
   else if (head == "TAP") {

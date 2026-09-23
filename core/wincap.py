@@ -148,18 +148,65 @@ def virtual_screen():
             u.GetSystemMetrics(78), u.GetSystemMetrics(79))   # SM_CX/CYVIRTUALSCREEN
 
 
-def grab_rect(rect):
+def rect_to_ratio(rect):
+    """屏幕绝对坐标 (x, y, w, h) → 相对虚拟屏幕的比例 [nx, ny, nw, nh]（0~1）。
+
+    用比例存储，屏幕分辨率 / 显示器布局变化后仍能正确定位（如 HP/MP 条区域）。
+    """
+    vx, vy, vw, vh = virtual_screen()
+    x, y, w, h = (float(v) for v in rect)
+    return [round((x - vx) / vw, 6), round((y - vy) / vh, 6),
+            round(w / vw, 6), round(h / vh, 6)]
+
+
+def rect_from_ratio(ratio):
+    """相对虚拟屏幕的比例 [nx, ny, nw, nh] → 屏幕绝对坐标 (x, y, w, h)。"""
+    vx, vy, vw, vh = virtual_screen()
+    nx, ny, nw, nh = (float(v) for v in ratio)
+    return (int(vx + nx * vw), int(vy + ny * vh), int(nw * vw), int(nh * vh))
+
+
+def resolve_rect(v):
+    """兼容解析区域：新格式比例 [nx,ny,nw,nh]（值都在 0~1）反算成绝对坐标；
+    旧格式绝对坐标 [x,y,w,h] 原样返回。"""
+    if not isinstance(v, (list, tuple)) or len(v) != 4:
+        return None
+    try:
+        nums = [float(n) for n in v]
+    except Exception:
+        return None
+    if all(0.0 <= n <= 1.0 for n in nums):
+        return rect_from_ratio(nums)
+    return [int(n) for n in nums]
+
+
+def grab_rect(rect, use_wgc=True):
     """抓屏幕上指定的矩形，返回 BGR ndarray。
 
-    优先 win32 BitBlt（快），失败回退 PIL ImageGrab。
+    优先 WGC（DWM 合成层，不经过 GDI BitBlt），失败回退 win32 BitBlt，
+    再失败回退 PIL ImageGrab。use_wgc=False 时跳过 WGC（抓整个虚拟屏幕等
+    跨窗口场景，WGC 单窗口采集会 clamp 错）。
     """
     x, y, w, h = (int(v) for v in rect)
     if w <= 0 or h <= 0:
         raise ValueError("矩形无效: %s" % (rect,))
 
+    # 1) WGC：走 DWM 合成层，反作弊更难检测，且能抓被遮挡窗口
+    if use_wgc:
+        try:
+            from core import wgc_capture
+            if wgc_capture.available():
+                img = wgc_capture.grab_rect(rect)
+                if img is not None:
+                    return img
+        except Exception:
+            pass
+
+    # 2) win32 BitBlt（快）
     try:
         return grab_rect_fast(rect)
     except Exception:
+        # 3) PIL ImageGrab（最慢，兜底）
         img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
         return np.array(img)[:, :, ::-1].copy()      # PIL 是 RGB，OpenCV 要 BGR
 

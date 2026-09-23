@@ -16,9 +16,12 @@ _VK = {
     "left": 0x25, "right": 0x27, "up": 0x26, "down": 0x28,
     "ctrl": 0x11, "alt": 0x12, "shift": 0x10,
     "enter": 0x0D, "space": 0x20, "esc": 0x1B, "tab": 0x09,
-    "del": 0x2E, "insert": 0x2D, "home": 0x24, "end": 0x23,
+    "backspace": 0x08, "del": 0x2E, "insert": 0x2D, "home": 0x24, "end": 0x23,
     "pageup": 0x21, "pagedown": 0x22,
     "grave": 0xC0,   # ` / ~（反引号键，VK_OEM_3）
+    # 标点符号键（VK_OEM_*，手动输入 / 自定义按键要用）
+    ",": 0xBC, ".": 0xBE, "/": 0xBF, ";": 0xBA, "'": 0xDE,
+    "[": 0xDB, "]": 0xDD, "\\": 0xDC, "-": 0xBD, "=": 0xBB,
 }
 _VK.update({"f%d" % i: 0x70 + i - 1 for i in range(1, 13)})
 _VK.update({chr(c): c for c in range(ord("A"), ord("Z") + 1)})   # a~z
@@ -41,7 +44,8 @@ DISPLAY.update({str(i): str(i) for i in range(10)})
 CHOICES = ["left", "right", "up", "down", "ctrl", "alt", "shift", "space"] + \
           ["f%d" % i for i in range(1, 13)] + \
           [chr(c) for c in range(ord("A"), ord("Z") + 1)] + \
-          [str(i) for i in range(10)]
+          [str(i) for i in range(10)] + \
+          [",", ".", "/", ";", "'", "[", "]", "\\", "-", "=", "grave"]
 
 # 默认键位
 DEFAULT_KEYMAP = {
@@ -177,8 +181,9 @@ _CMD_KEY = {
     "left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN",
     "ctrl": "CTRL", "alt": "ALT", "shift": "SHIFT",
     "enter": "ENTER", "space": "SPACE", "esc": "ESC", "tab": "TAB",
+    "backspace": "BACKSPACE",
     "del": "DEL", "insert": "INSERT", "home": "HOME", "end": "END",
-    "pageup": "PAGEUP", "pagedown": "PAGEDOWN",
+    "pageup": "PGUP", "pagedown": "PGDN",
     "grave": "GRAVE",
 }
 _CMD_KEY.update({"f%d" % i: "F%d" % i for i in range(1, 13)})
@@ -204,15 +209,48 @@ def release_all_remote():
         _send_remote("RELEASEALL")
 
 
-def use_network(host, port, cafile):
-    """切到网络后端（agent 在控制机时，启动阶段调用一次）。"""
-    global _remote
-    from remote_kbd.kbd_client import KbdClient
-    _remote = KbdClient(host, port, cafile)
+# ---- 鼠标（远程模式：由 Pro Micro 固件作为硬件 HID 鼠标输出，同键盘一样走固件）----
+def mouse_move(dx, dy):
+    """相对移动鼠标：dx/dy 像素（正数向右/向下）。"""
+    if _remote is not None:
+        _send_remote("MOVE %d %d" % (int(dx), int(dy)))
 
 
-def use_local():
-    """切回本地 SendInput，并关闭远程连接（socket 不泄漏）。"""
+def mouse_click(btn="left"):
+    """点击鼠标：left / right / middle。"""
+    if _remote is not None:
+        _send_remote("CLICK " + str(btn).upper())
+
+
+def mouse_press(btn="left"):
+    """按住鼠标按钮不松开。"""
+    if _remote is not None:
+        _send_remote("PRESSM " + str(btn).upper())
+
+
+def mouse_release(btn="left"):
+    """松开鼠标按钮。"""
+    if _remote is not None:
+        _send_remote("RELEASEM " + str(btn).upper())
+
+
+def mouse_scroll(n):
+    """滚轮：正数向上、负数向下。"""
+    if _remote is not None:
+        _send_remote("SCROLL %d" % int(n))
+
+
+def mouse_available():
+    """鼠标控制是否可用：只有 ProMicro 后端（远程 / 本地串口）能输出硬件鼠标。
+
+    本地 SendInput 模式不实现鼠标 —— 本机鼠标正用于操作界面，
+    再让程序模拟鼠标会和人手打架。
+    """
+    return _remote is not None
+
+
+def _drop_remote():
+    """关闭当前远程/串口后端（socket / 串口不泄漏），切到别的后端前调用。"""
     global _remote
     if _remote is not None:
         try:
@@ -220,6 +258,39 @@ def use_local():
         except Exception:
             pass
     _remote = None
+
+
+def use_network(host, port, cafile):
+    """切到网络后端（agent 在控制机时，启动阶段调用一次）。"""
+    global _remote
+    _drop_remote()
+    from remote_kbd.kbd_client import KbdClient
+    _remote = KbdClient(host, port, cafile)
+
+
+def use_serial(port):
+    """切到本地直连 Pro Micro（USB CDC 串口），无需 relay。
+
+    port 为空或打开失败时，自动扫描 Arduino/SparkFun 串口（换 USB 口不用改配置）。
+    """
+    global _remote
+    _drop_remote()
+    from remote_kbd.serial_kbd import SerialKbd, find_pro_micro_port
+    if port:
+        try:
+            _remote = SerialKbd(port)
+            return
+        except Exception:
+            pass   # 配置的串口打不开，走自动发现
+    found = find_pro_micro_port()
+    if found is None:
+        raise RuntimeError("找不到 Pro Micro 串口（确认已插入，或检查 config/link.yaml 的 serial_local）")
+    _remote = SerialKbd(found)
+
+
+def use_local():
+    """切回本地 SendInput，并关闭远程连接（socket / 串口不泄漏）。"""
+    _drop_remote()
 
 
 def shutdown():

@@ -17,7 +17,8 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
                              QSlider, QVBoxLayout, QWidget)
 
 from decision import input as dinput
-from decision.agent import settings
+from decision.agent import ANTI_AFK_TYPES, load_rect, load_saved, settings
+from gui.touchpad import TouchPad
 
 # 键盘映射的每一行：(key, 标签, 默认键名)
 # 注意："auto" 就是「开启自动」按钮的快捷键，默认 F11，和按钮/全局热键是同一个东西。
@@ -54,8 +55,8 @@ for _i in range(10):
     _QT_TO_NAME[getattr(Qt, "Key_%d" % _i)] = str(_i)
 
 
-def _sample_bar_color(rect):
-    """截取框选区域，采样血条「填充色」，返回 [[B,G,R],[B,G,R]]；失败返回 None。
+def _sample_bar_color(img):
+    """从一张 BGR 图里采样血条「填充色」，返回 [[B,G,R],[B,G,R]]；失败返回 None。
 
     关键：血条上通常有白色数字文本（如 "224/366"）和灰色背景——按亮度采样
     会采到文字而不是填充色（实际踩过）。所以**优先取有彩色的像素**（HSV
@@ -63,12 +64,7 @@ def _sample_bar_color(rect):
     """
     import cv2
     import numpy as np
-    from core import wincap
 
-    try:
-        img = wincap.grab_rect(rect)
-    except Exception:
-        return None
     if img is None or img.size == 0:
         return None
 
@@ -102,6 +98,7 @@ class PlayerPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.thread = None
+        self.project = None
         self._build()
         self.device_connected.connect(self._on_device_connected)
         self._sync_from_settings()
@@ -123,20 +120,23 @@ class PlayerPanel(QWidget):
         scroll.setWidget(content)
 
         root = QVBoxLayout(content)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
 
         title = QLabel("决策参数")
         title.setStyleSheet("font-weight: 600; font-size: 14px; color: #202124;")
         root.addWidget(title)
 
-        # ---- 按钮组 ----
+        # ---- 按钮组（并排一行，省垂直空间）----
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(8)
+
         self.btn_auto = QPushButton("开启自动（F11）")
         self.btn_auto.setCheckable(True)
         self.btn_auto.setMinimumHeight(34)
         self.btn_auto.setToolTip("开始/停止自动打怪。也可用 F11 快捷键开关。")
         self.btn_auto.clicked.connect(self._toggle_auto)
-        root.addWidget(self.btn_auto)
+        ctrl_row.addWidget(self.btn_auto)
 
         self.btn_manual = QPushButton("开启手动输入")
         self.btn_manual.setCheckable(True)
@@ -145,7 +145,58 @@ class PlayerPanel(QWidget):
             "开启后，本机键盘的按键会实时转发到游戏（手动接管控制）。\n"
             "和自动打怪互斥：开启手动输入会先关掉自动。")
         self.btn_manual.clicked.connect(self._toggle_manual)
-        root.addWidget(self.btn_manual)
+        ctrl_row.addWidget(self.btn_manual)
+
+        root.addLayout(ctrl_row)
+
+        # ---- 鼠标控制（触控板 + 左右键）----
+        # 鼠标指着触控板 + 按住 Ctrl → 滑动鼠标，位移按灵敏度映射发给远程鼠标；
+        # 左右键按住 = 按下不放（支持拖拽）。只对 ProMicro 生效。
+        # 布局：触控板在左，右侧一列（上：左右键，下：灵敏度）。
+        mouse_row = QHBoxLayout()
+        mouse_row.setSpacing(10)
+        self.touchpad = TouchPad()
+        mouse_row.addWidget(self.touchpad)
+
+        self.btn_mouse_l = QPushButton("左键")
+        self.btn_mouse_r = QPushButton("右键")
+        for b in (self.btn_mouse_l, self.btn_mouse_r):
+            b.setMinimumHeight(28)
+            b.setToolTip("按住 = 鼠标按下不放（可拖拽），松开 = 弹起")
+        self.btn_mouse_l.pressed.connect(lambda: dinput.mouse_press("left"))
+        self.btn_mouse_l.released.connect(lambda: dinput.mouse_release("left"))
+        self.btn_mouse_r.pressed.connect(lambda: dinput.mouse_press("right"))
+        self.btn_mouse_r.released.connect(lambda: dinput.mouse_release("right"))
+
+        self.sp_mouse_speed = self._spin(0.1, 10.0, 1.0, 2)
+        self.sp_mouse_speed.setSingleStep(0.1)
+        self.sp_mouse_speed.setToolTip(
+            "灵敏度：本地鼠标位移 × 该比例 = 远程鼠标位移（1.0 = 1:1）。")
+        self.sp_mouse_speed.valueChanged.connect(self._on_mouse_speed)
+
+        right_col = QVBoxLayout()
+        right_col.setSpacing(6)
+        mbtn_row = QHBoxLayout()
+        mbtn_row.setSpacing(6)
+        mbtn_row.addWidget(self.btn_mouse_l)
+        mbtn_row.addWidget(self.btn_mouse_r)
+        right_col.addLayout(mbtn_row)
+        spd_row = QHBoxLayout()
+        spd_row.setSpacing(4)
+        spd_row.addWidget(QLabel("灵敏度"))
+        spd_row.addWidget(self.sp_mouse_speed)
+        spd_row.addStretch(1)
+        right_col.addLayout(spd_row)
+        right_col.addStretch(1)
+        mouse_row.addLayout(right_col, 1)
+        root.addLayout(mouse_row)
+
+        # 触控板位移的余数累积（小位移不丢：0.3px 攒到 1px 才发）
+        self._pad_rem = [0.0, 0.0]
+        self.touchpad.moved.connect(self._on_pad_moved)
+        # 触控模式（按住 Ctrl）下的点击 / 滚轮也转发给远程鼠标
+        self.touchpad.clicked.connect(dinput.mouse_click)
+        self.touchpad.scrolled.connect(dinput.mouse_scroll)
 
         self.lbl_state = QLabel("当前：未开启")
         self.lbl_state.setStyleSheet("color: #80868b;")
@@ -156,9 +207,13 @@ class PlayerPanel(QWidget):
         top_form.setLabelAlignment(Qt.AlignLeft)
 
         self.cmb_device = QComboBox()
-        self.cmb_device.addItem("本地", "local")
-        self.cmb_device.addItem("Pro Micro", "remote")
-        self.cmb_device.setToolTip("本地：本机键盘模拟；Pro Micro：远程硬件键盘（更隐蔽）。")
+        self.cmb_device.addItem("本地(仅测试)", "local")
+        self.cmb_device.addItem("ProMicro(远程)", "remote")
+        self.cmb_device.addItem("ProMicro(本地)", "serial")
+        self.cmb_device.setToolTip(
+            "本地(仅测试)：本机键盘模拟（SendInput）；\n"
+            "ProMicro(远程)：网络连游戏机的 Pro Micro 硬件键盘；\n"
+            "ProMicro(本地)：本机 USB 直连 Pro Micro，无需 relay。")
         self.cmb_device.currentIndexChanged.connect(self._on_input_device)
         top_form.addRow("输入设备", self.cmb_device)
 
@@ -186,37 +241,41 @@ class PlayerPanel(QWidget):
         self.sp_attack_lock_db.valueChanged.connect(self._on_attack_lock_db)
         top_form.addRow("输出后锁定防抖(ms)", self.sp_attack_lock_db)
 
-        # 玩家识别防抖距离（像素）：玩家框中心跳变超过此距离则沿用上一帧位置
-        self.sp_player_debounce = self._spin(0, 2000, 150, 0)
-        self.sp_player_debounce.setToolTip("玩家框位置跳变超过这个距离就沿用上一帧，防误识别。")
-        self.sp_player_debounce.valueChanged.connect(self._on_player_debounce)
-        top_form.addRow("玩家识别防抖距离", self.sp_player_debounce)
+        # 玩家追踪阈值（像素）：新玩家框离预测位置超此距离就不认（防跟错）。
+        self.sp_track_jump = self._spin(0, 2000, 150, 0)
+        self.sp_track_jump.setToolTip(
+            "玩家追踪阈值（像素）：新检出的玩家框离「预测位置」超过这个距离就不认，\n"
+            "防止跟错到别的玩家身上。\n"
+            "调大更宽容（跟丢少，但可能被别的玩家抢锁）；调小更严格。\n"
+            "帧率掉帧时一帧里位移变大，可能需要放宽。")
+        self.sp_track_jump.valueChanged.connect(self._on_track_jump)
+        top_form.addRow("玩家追踪阈值", self.sp_track_jump)
 
         root.addLayout(top_form)
 
-        # ---- 参数模板 ----
-        tpl = QGroupBox("参数模板")
-        tf = QHBoxLayout(tpl)
+        # ---- 参数模板（轻量一行，不套 groupbox：只有两个按钮，边框标题纯占地方）----
+        tpl_row = QHBoxLayout()
+        tpl_row.setSpacing(8)
         btn_save_tpl = QPushButton("保存模板")
         btn_save_tpl.setToolTip("把当前所有决策参数存成模板。")
         btn_save_tpl.clicked.connect(self._save_template)
         btn_load_tpl = QPushButton("加载模板")
         btn_load_tpl.setToolTip("从模板载入决策参数。")
         btn_load_tpl.clicked.connect(self._load_template)
-        tf.addWidget(btn_save_tpl)
-        tf.addWidget(btn_load_tpl)
-        tf.addStretch(1)
-        root.addWidget(tpl)
+        tpl_row.addWidget(btn_save_tpl)
+        tpl_row.addWidget(btn_load_tpl)
+        tpl_row.addStretch(1)
+        root.addLayout(tpl_row)
 
-        # ---- 视野组 ----
+        # ---- 视野组（2 列网格：6 项 → 3 行，省一半垂直空间）----
         vision_grp = QGroupBox("视野")
-        vf = QFormLayout(vision_grp)
-        vf.setLabelAlignment(Qt.AlignLeft)
+        vg = QVBoxLayout(vision_grp)
+        vg.setSpacing(6)
 
         self.ck_vision_center = QCheckBox("基于画面中心")
         self.ck_vision_center.setToolTip("勾选：以画面屏幕中心为视野中心；\n不勾：以角色位置为中心。")
         self.ck_vision_center.stateChanged.connect(self._on_vision)
-        vf.addRow("", self.ck_vision_center)
+        vg.addWidget(self.ck_vision_center)
 
         self.sp_vision_top = self._spin(-1, 2000, 200, 0)
         self.sp_vision_bottom = self._spin(-1, 2000, 200, 0)
@@ -227,21 +286,43 @@ class PlayerPanel(QWidget):
             _sp.setToolTip("该方向的视野范围（像素）。设为 -1 表示该方向不限制。")
             _sp.valueChanged.connect(self._on_vision)
 
-        vf.addRow("向上视野", self.sp_vision_top)
-        vf.addRow("向下视野", self.sp_vision_bottom)
-        vf.addRow("向左视野", self.sp_vision_left)
-        vf.addRow("向右视野", self.sp_vision_right)
-        self._lbl_vision_left = vf.labelForField(self.sp_vision_left)
-        self._lbl_vision_right = vf.labelForField(self.sp_vision_right)
-
         self.sp_vision_off_x = self._spin(-2000, 2000, 0, 0)
         self.sp_vision_off_y = self._spin(-2000, 2000, 0, 0)
         self.sp_vision_off_x.setToolTip("视野框基于中心在 x 方向的偏移（像素）。")
         self.sp_vision_off_y.setToolTip("视野框基于中心在 y 方向的偏移（像素）。")
         self.sp_vision_off_x.valueChanged.connect(self._on_vision)
         self.sp_vision_off_y.valueChanged.connect(self._on_vision)
-        vf.addRow("x偏移", self.sp_vision_off_x)
-        vf.addRow("y偏移", self.sp_vision_off_y)
+
+        vgrid = QGridLayout()
+        vgrid.setHorizontalSpacing(10)
+        vgrid.setVerticalSpacing(6)
+
+        def _vcell(text, widget):
+            """一行「标签 + 输入框」，标签定宽对齐。返回 (layout, label)。
+
+            宽度按最长的动态标签「向前(左)视野」定，否则切换中心/角色模式时
+            文字会被截断。"""
+            h = QHBoxLayout()
+            h.setSpacing(6)
+            lbl = QLabel(text)
+            lbl.setFixedWidth(82)
+            h.addWidget(lbl)
+            h.addWidget(widget, 1)
+            return h, lbl
+
+        cell, _ = _vcell("向上视野", self.sp_vision_top)
+        vgrid.addLayout(cell, 0, 0)
+        cell, _ = _vcell("向下视野", self.sp_vision_bottom)
+        vgrid.addLayout(cell, 0, 1)
+        cell, self._lbl_vision_left = _vcell("向左视野", self.sp_vision_left)
+        vgrid.addLayout(cell, 1, 0)
+        cell, self._lbl_vision_right = _vcell("向右视野", self.sp_vision_right)
+        vgrid.addLayout(cell, 1, 1)
+        cell, _ = _vcell("x偏移", self.sp_vision_off_x)
+        vgrid.addLayout(cell, 2, 0)
+        cell, _ = _vcell("y偏移", self.sp_vision_off_y)
+        vgrid.addLayout(cell, 2, 1)
+        vg.addLayout(vgrid)
 
         root.addWidget(vision_grp)
 
@@ -250,9 +331,12 @@ class PlayerPanel(QWidget):
         bf = QFormLayout(battle)
         bf.setLabelAlignment(Qt.AlignLeft)
 
-        # 输出行为 CD（毫秒）：输出行为序列走完后的节奏 = CD + 随机延迟
+        # 输出行为 CD（毫秒）：两次输出之间的最小间隔（从上次输出时刻起算）
         self.sp_attack_cd = self._spin(0, 10000, 0, 0)
-        self.sp_attack_cd.setToolTip("两次攻击之间的最小间隔（毫秒），越小打得越快。")
+        self.sp_attack_cd.setToolTip(
+            "两次输出之间的最小间隔（毫秒），从上次输出那一刻起算，越小打得越快。\n"
+            "实际间隔 = 本值 + 随机延迟；输出行为序列本身更长时以序列为准。\n"
+            "（主循环一帧只推进一步序列，帧率低时序列耗时会按帧向上取整）")
         self.sp_attack_cd.valueChanged.connect(self._on_attack_cd)
         bf.addRow("输出行为CD(ms)", self.sp_attack_cd)
 
@@ -266,13 +350,30 @@ class PlayerPanel(QWidget):
         self.sp_min_attack.valueChanged.connect(self._on_min_attack)
         bf.addRow("最小攻击距离", self.sp_min_attack)
 
-        self.sp_chase_jump = self._spin(-1, 2000, -1, 0)
-        self.sp_chase_jump.setToolTip(
-            "追击起跳距离：chase 状态下，锁定目标位于\n"
-            "最大攻击距离 ~ 再向前这么多距离 的范围内就按跳追击。\n"
-            "<=0 表示不启用。")
-        self.sp_chase_jump.valueChanged.connect(self._on_chase_jump)
-        bf.addRow("追击起跳距离", self.sp_chase_jump)
+        self.ck_chase_jump = QCheckBox("启用")
+        self.ck_chase_jump.setToolTip(
+            "追击起跳：攻击范围内没有其他怪时，锁定目标落在起跳区间内就按跳。\n"
+            "范围内还有其他怪则不跳 —— 先打那些，跳会打断输出。\n"
+            "区间 = [最大攻击距离 + min, 最大攻击距离 + max]，\n"
+            "min/max 都是相对最大攻击距离的偏移：\n"
+            "  0 ~ 50  → 纯外侧（还差一点够不着时跳）\n"
+            "  -30 ~ 0 → 纯内侧（已进范围但偏远时跳）\n"
+            "  -30 ~ 50 → 跨攻击距离两侧")
+        self.ck_chase_jump.stateChanged.connect(self._on_chase_jump)
+        self.sp_chase_jump_min = self._spin(-2000, 2000, 0, 0)
+        self.sp_chase_jump_min.setToolTip("起跳区间下限：相对最大攻击距离的偏移（可为负）。")
+        self.sp_chase_jump_min.valueChanged.connect(self._on_chase_jump)
+        self.sp_chase_jump_max = self._spin(-2000, 2000, 50, 0)
+        self.sp_chase_jump_max.setToolTip("起跳区间上限：相对最大攻击距离的偏移。")
+        self.sp_chase_jump_max.valueChanged.connect(self._on_chase_jump)
+        cj_row = QHBoxLayout()
+        cj_row.setSpacing(4)
+        cj_row.addWidget(self.ck_chase_jump)
+        cj_row.addWidget(self.sp_chase_jump_min)
+        cj_row.addWidget(QLabel("~"))
+        cj_row.addWidget(self.sp_chase_jump_max)
+        cj_row.addStretch(1)
+        bf.addRow("追击起跳", cj_row)
 
         # 规避策略（仅最小攻击距离 > 0 时显示）
         evade_grp = QGroupBox("规避策略")
@@ -341,95 +442,6 @@ class PlayerPanel(QWidget):
         bf.addRow("", self.btn_edit_output)
 
         root.addWidget(battle)
-
-        # ---- 策略参数组 ----
-        strategy_grp = QGroupBox("策略参数")
-        sf = QFormLayout(strategy_grp)
-        sf.setLabelAlignment(Qt.AlignLeft)
-
-        # 策略类型
-        self.cmb_strategy = QComboBox()
-        self.cmb_strategy.addItem("平地巡逻", "patrol")
-        self.cmb_strategy.addItem("扫平台", "sweep")
-        self.cmb_strategy.currentIndexChanged.connect(self._on_strategy)
-        self.cmb_strategy.setToolTip(
-            "平地巡逻：锁定全部怪，就近优先。\n"
-            "扫平台：优先朝向方向，背后一定距离内的怪按就近锁定；\n"
-            "当前朝向没怪持续一段时间就换向。")
-        sf.addRow("策略类型", self.cmb_strategy)
-
-        self.lbl_strategy_note = QLabel("")
-        self.lbl_strategy_note.setStyleSheet("color: #80868b;")
-        self.lbl_strategy_note.setWordWrap(True)
-        sf.addRow("", self.lbl_strategy_note)
-
-        # 换朝向延迟（仅「扫平台」策略用）：当前朝向没怪持续此时间才换
-        self.sp_turn_cd = self._spin(0, 10000, 1000, 0)
-        self.sp_turn_cd.valueChanged.connect(self._on_turn_cd)
-        self.sp_turn_cd.setToolTip(
-            "当前朝向没怪持续此时间（毫秒）才换朝向。\n"
-            "防止某帧漏检/抖动导致频繁换向。")
-        sf.addRow("换朝向延迟(ms)", self.sp_turn_cd)
-        self._lbl_turn_cd = sf.labelForField(self.sp_turn_cd)
-
-        # 背后锁定距离（仅「扫平台」策略用）
-        self.sp_back_range = self._spin(0, 2000, 100, 0)
-        self.sp_back_range.valueChanged.connect(self._on_back_range)
-        self.sp_back_range.setToolTip(
-            "允许锁定背后此距离（像素）内的怪。\n"
-            "扫平台优先朝向方向，但背后很近的怪也会被就近锁定。")
-        sf.addRow("背后锁定距离", self.sp_back_range)
-        self._lbl_back_range = sf.labelForField(self.sp_back_range)
-
-        root.addWidget(strategy_grp)
-
-        # ---- 键盘映射组 ----
-        grp = QGroupBox("键盘映射")
-        grid = QGridLayout(grp)
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(6)
-
-        self._key_buttons = {}
-        self._listening_key = None
-        self._listening_custom = None   # 正在监听的自定义按键名
-        COLS = 2      # 每行排 2 组，横向铺开省空间
-        for i, (key, label, default) in enumerate(KEY_ROWS):
-            btn = QPushButton()
-            btn.setFixedWidth(120)
-            btn.clicked.connect(lambda _c, k=key: self._start_listen(k))
-            self._key_buttons[key] = btn
-
-            rm = QPushButton("移除")
-            rm.setFixedWidth(48)
-            rm.setStyleSheet("padding: 2px 6px;")
-            rm.setToolTip("清空这个键的映射")
-            rm.clicked.connect(lambda _c, k=key: self._remove_key(k))
-
-            cell = QHBoxLayout()
-            cell.setSpacing(6)
-            lbl = QLabel(label)
-            lbl.setFixedWidth(56)
-            cell.addWidget(lbl)
-            cell.addWidget(btn)
-            cell.addWidget(rm)
-            cell.addStretch(1)
-
-            r, c = divmod(i, COLS)
-            grid.addLayout(cell, r, c)
-
-        root.addWidget(grp)
-
-        # ---- 自定义按键组 ----
-        custom_grp = QGroupBox("自定义按键")
-        cv = QVBoxLayout(custom_grp)
-        self._custom_list = QVBoxLayout()
-        self._custom_list.setSpacing(4)
-        cv.addLayout(self._custom_list)
-        btn_add_custom = QPushButton("＋ 添加自定义按键")
-        btn_add_custom.setToolTip("新增一个自定义按键，可在行为序列里使用。")
-        btn_add_custom.clicked.connect(self._add_custom_key)
-        cv.addWidget(btn_add_custom)
-        root.addWidget(custom_grp)
 
         # ---- 自动喝药组 ----
         pot = QGroupBox("自动喝药")
@@ -522,10 +534,10 @@ class PlayerPanel(QWidget):
         pg.addRow("", feed_row)
 
         # 喂宠间隔：随机区间 [下限, 上限]（分钟）
-        self.sp_feed_interval_min = self._spin(1, 600, 5, 0)
-        self.sp_feed_interval_max = self._spin(1, 600, 10, 0)
-        self.sp_feed_interval_min.setToolTip("每隔随机 N~M 分钟喂一次宠物。")
-        self.sp_feed_interval_max.setToolTip("每隔随机 N~M 分钟喂一次宠物。")
+        self.sp_feed_interval_min = self._spin(0.1, 600, 5, 1, 0.1)
+        self.sp_feed_interval_max = self._spin(0.1, 600, 10, 1, 0.1)
+        self.sp_feed_interval_min.setToolTip("每隔随机 N~M 分钟喂一次宠物（支持小数，如 1.5）。")
+        self.sp_feed_interval_max.setToolTip("每隔随机 N~M 分钟喂一次宠物（支持小数，如 1.5）。")
         self.sp_feed_interval_min.valueChanged.connect(self._on_feed_interval)
         self.sp_feed_interval_max.valueChanged.connect(self._on_feed_interval)
         feed_iv_row = QHBoxLayout()
@@ -537,6 +549,95 @@ class PlayerPanel(QWidget):
         self._pot_form = pg
 
         root.addWidget(pot)
+
+        # ---- 策略参数组 ----
+        strategy_grp = QGroupBox("策略参数")
+        sf = QFormLayout(strategy_grp)
+        sf.setLabelAlignment(Qt.AlignLeft)
+
+        # 策略类型
+        self.cmb_strategy = QComboBox()
+        self.cmb_strategy.addItem("平地巡逻", "patrol")
+        self.cmb_strategy.addItem("扫平台", "sweep")
+        self.cmb_strategy.currentIndexChanged.connect(self._on_strategy)
+        self.cmb_strategy.setToolTip(
+            "平地巡逻：锁定全部怪，就近优先。\n"
+            "扫平台：优先朝向方向，背后一定距离内的怪按就近锁定；\n"
+            "当前朝向没怪持续一段时间就换向。")
+        sf.addRow("策略类型", self.cmb_strategy)
+
+        self.lbl_strategy_note = QLabel("")
+        self.lbl_strategy_note.setStyleSheet("color: #80868b;")
+        self.lbl_strategy_note.setWordWrap(True)
+        sf.addRow("", self.lbl_strategy_note)
+
+        # 换朝向延迟（仅「扫平台」策略用）：当前朝向没怪持续此时间才换
+        self.sp_turn_cd = self._spin(0, 10000, 1000, 0)
+        self.sp_turn_cd.valueChanged.connect(self._on_turn_cd)
+        self.sp_turn_cd.setToolTip(
+            "当前朝向没怪持续此时间（毫秒）才换朝向。\n"
+            "防止某帧漏检/抖动导致频繁换向。")
+        sf.addRow("换朝向延迟(ms)", self.sp_turn_cd)
+        self._lbl_turn_cd = sf.labelForField(self.sp_turn_cd)
+
+        # 背后锁定距离（仅「扫平台」策略用）
+        self.sp_back_range = self._spin(0, 2000, 100, 0)
+        self.sp_back_range.valueChanged.connect(self._on_back_range)
+        self.sp_back_range.setToolTip(
+            "允许锁定背后此距离（像素）内的怪。\n"
+            "扫平台优先朝向方向，但背后很近的怪也会被就近锁定。")
+        sf.addRow("背后锁定距离", self.sp_back_range)
+        self._lbl_back_range = sf.labelForField(self.sp_back_range)
+
+        root.addWidget(strategy_grp)
+
+        # ---- 键盘映射组 ----
+        grp = QGroupBox("键盘映射")
+        grid = QGridLayout(grp)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(6)
+
+        self._key_buttons = {}
+        self._listening_key = None
+        self._listening_custom = None   # 正在监听的自定义按键名
+        COLS = 2      # 每行排 2 组，横向铺开省空间
+        for i, (key, label, default) in enumerate(KEY_ROWS):
+            btn = QPushButton()
+            btn.setFixedWidth(100)
+            btn.clicked.connect(lambda _c, k=key: self._start_listen(k))
+            self._key_buttons[key] = btn
+
+            rm = QPushButton("移除")
+            rm.setFixedWidth(42)
+            rm.setStyleSheet("padding: 2px 6px;")
+            rm.setToolTip("清空这个键的映射")
+            rm.clicked.connect(lambda _c, k=key: self._remove_key(k))
+
+            cell = QHBoxLayout()
+            cell.setSpacing(6)
+            lbl = QLabel(label)
+            lbl.setFixedWidth(52)
+            cell.addWidget(lbl)
+            cell.addWidget(btn)
+            cell.addWidget(rm)
+            cell.addStretch(1)
+
+            r, c = divmod(i, COLS)
+            grid.addLayout(cell, r, c)
+
+        root.addWidget(grp)
+
+        # ---- 自定义按键组 ----
+        custom_grp = QGroupBox("自定义按键")
+        cv = QVBoxLayout(custom_grp)
+        self._custom_list = QVBoxLayout()
+        self._custom_list.setSpacing(4)
+        cv.addLayout(self._custom_list)
+        btn_add_custom = QPushButton("＋ 添加自定义按键")
+        btn_add_custom.setToolTip("新增一个自定义按键，可在行为序列里使用。")
+        btn_add_custom.clicked.connect(self._add_custom_key)
+        cv.addWidget(btn_add_custom)
+        root.addWidget(custom_grp)
 
         # ---- 自定义定时行为组 ----
         timer_grp = QGroupBox("自定义定时行为")
@@ -556,15 +657,33 @@ class PlayerPanel(QWidget):
         afk = QGroupBox("防掉线")
         af = QFormLayout(afk)
 
+        # 手动结束休息：休息期间角色在隐身里，需要人工提前拉回来时用。
+        # 只在真的休息中才可点（状态由实时线程写 settings.rest_state，这里轮询）。
+        # 右边紧跟休息状态/倒计时，同一行放省垂直空间。
+        self.btn_end_rest = QPushButton("手动结束休息")
+        self.btn_end_rest.setToolTip(
+            "休息中点了立刻结束休息：执行「退出隐身行为」，然后恢复正常打怪。\n"
+            "没在休息时不可点。")
+        self.btn_end_rest.setEnabled(False)
+        self.btn_end_rest.clicked.connect(self._on_end_rest)
+
+        self.lbl_rest = QLabel("")
+        self.lbl_rest.setStyleSheet("color: #80868b;")
+        rest_row = QHBoxLayout()
+        rest_row.setSpacing(8)
+        rest_row.addWidget(self.btn_end_rest)
+        rest_row.addWidget(self.lbl_rest, 1)
+        af.addRow("", rest_row)
+
         self.ck_afk = QCheckBox("自动防掉线")
-        self.ck_afk.setToolTip("定时执行一套动作，防挂机掉线。")
+        self.ck_afk.setToolTip("定时执行防掉线行为（目前：隐身休息）。")
         self.ck_afk.stateChanged.connect(self._on_anti_afk)
         af.addRow("", self.ck_afk)
 
-        self.sp_afk_min = self._spin(1, 600, 5, 0)
-        self.sp_afk_max = self._spin(1, 600, 10, 0)
-        self.sp_afk_min.setToolTip("每隔随机 N~M 分钟执行一次防掉线动作。")
-        self.sp_afk_max.setToolTip("每隔随机 N~M 分钟执行一次防掉线动作。")
+        self.sp_afk_min = self._spin(0.1, 600, 5, 1, 0.1)
+        self.sp_afk_max = self._spin(0.1, 600, 10, 1, 0.1)
+        self.sp_afk_min.setToolTip("每隔随机 N~M 分钟触发一次防掉线（支持小数，如 1.5）。")
+        self.sp_afk_max.setToolTip("每隔随机 N~M 分钟触发一次防掉线（支持小数，如 1.5）。")
         self.sp_afk_min.valueChanged.connect(self._on_afk_time)
         self.sp_afk_max.valueChanged.connect(self._on_afk_time)
         afk_iv_row = QHBoxLayout()
@@ -573,11 +692,45 @@ class PlayerPanel(QWidget):
         afk_iv_row.addWidget(self.sp_afk_max)
         af.addRow("触发时间(min)", afk_iv_row)
 
-        self.btn_edit_afk = QPushButton("编辑防掉线行为")
-        self.btn_edit_afk.setToolTip("配置防掉线时执行的动作序列。")
-        self.btn_edit_afk.setStyleSheet(self._BTN_EDIT_SEQ)
-        self.btn_edit_afk.clicked.connect(self._edit_anti_afk_seq)
-        af.addRow("行为", self.btn_edit_afk)
+        # 行为类型：不同类型展开不同的参数子组（目前只有「隐身休息」）
+        self.cmb_afk_type = QComboBox()
+        for tid, tname in ANTI_AFK_TYPES:
+            self.cmb_afk_type.addItem(tname, tid)
+        self.cmb_afk_type.setToolTip("防掉线触发时做什么。")
+        self.cmb_afk_type.currentIndexChanged.connect(self._on_afk_type)
+        af.addRow("行为类型", self.cmb_afk_type)
+
+        # 隐身休息子组：触发时间到 → 等攻击范围内的怪清空 → 执行进入隐身 →
+        # 休息随机时长 → 执行退出隐身 → 继续打怪
+        self._afk_hidden = QGroupBox("隐身休息")
+        hf = QFormLayout(self._afk_hidden)
+        hf.setLabelAlignment(Qt.AlignLeft)
+
+        self.btn_afk_enter = QPushButton("编辑进入隐身行为")
+        self.btn_afk_enter.setToolTip("进隐身时执行的动作序列（例如按隐身术快捷键）。")
+        self.btn_afk_enter.setStyleSheet(self._BTN_EDIT_SEQ)
+        self.btn_afk_enter.clicked.connect(lambda: self._edit_afk_seq("enter"))
+        hf.addRow("进入隐身", self.btn_afk_enter)
+
+        self.btn_afk_exit = QPushButton("编辑退出隐身行为")
+        self.btn_afk_exit.setToolTip("退出隐身时执行的动作序列。")
+        self.btn_afk_exit.setStyleSheet(self._BTN_EDIT_SEQ)
+        self.btn_afk_exit.clicked.connect(lambda: self._edit_afk_seq("exit"))
+        hf.addRow("退出隐身", self.btn_afk_exit)
+
+        self.sp_rest_min = self._spin(0.1, 600, 10, 1, 0.1)
+        self.sp_rest_max = self._spin(0.1, 600, 20, 1, 0.1)
+        self.sp_rest_min.setToolTip("隐身休息随机 N~M 分钟（支持小数，如 7.5）。")
+        self.sp_rest_max.setToolTip("隐身休息随机 N~M 分钟（支持小数，如 7.5）。")
+        self.sp_rest_min.valueChanged.connect(self._on_afk_rest_time)
+        self.sp_rest_max.valueChanged.connect(self._on_afk_rest_time)
+        rest_iv_row = QHBoxLayout()
+        rest_iv_row.addWidget(self.sp_rest_min)
+        rest_iv_row.addWidget(QLabel("~"))
+        rest_iv_row.addWidget(self.sp_rest_max)
+        hf.addRow("休息时长(min)", rest_iv_row)
+
+        af.addRow(self._afk_hidden)
 
         root.addWidget(afk)
         root.addStretch(1)
@@ -602,11 +755,13 @@ class PlayerPanel(QWidget):
     # ---------------- 控件构造 ----------------
 
     @staticmethod
-    def _spin(lo, hi, val, decimals):
+    def _spin(lo, hi, val, decimals, step=None):
         from gui.widgets import NoWheelDoubleSpinBox
         w = NoWheelDoubleSpinBox()
         w.setRange(lo, hi)
         w.setDecimals(decimals)
+        if step is not None:      # 小数位下默认步进 1.0 太粗（5.0 直接跳 6.0）
+            w.setSingleStep(step)
         w.setValue(val)
         return w
 
@@ -644,6 +799,31 @@ class PlayerPanel(QWidget):
         self.btn_manual.setText("停止手动输入" if on else "开启手动输入")
         self.btn_manual.setStyleSheet(self._BTN_MANUAL_ON if on else self._BTN_MANUAL_OFF)
 
+    # ---------------- 鼠标控制（摇杆 + 左右键） ----------------
+
+    def _on_pad_moved(self, dx, dy):
+        """触控板原始位移 → 乘灵敏度 + 余数累积 → 发远程鼠标移动。"""
+        spd = max(0.01, float(settings.mouse_speed))
+        self._pad_rem[0] += dx * spd
+        self._pad_rem[1] += dy * spd
+        mx = int(self._pad_rem[0])
+        my = int(self._pad_rem[1])
+        self._pad_rem[0] -= mx
+        self._pad_rem[1] -= my
+        if mx or my:
+            dinput.mouse_move(mx, my)
+
+    def _on_mouse_speed(self, _val=None):
+        settings.mouse_speed = float(self.sp_mouse_speed.value())
+        settings.save()
+
+    def _refresh_mouse_ui(self):
+        """鼠标控制只对 ProMicro 生效；本地模式禁用（本机鼠标要操作界面）。"""
+        ok = dinput.mouse_available()
+        for w in (self.btn_mouse_l, self.btn_mouse_r, self.sp_mouse_speed):
+            w.setEnabled(ok)
+        self.touchpad.set_capture_enabled(ok)
+
     def _force_release_all(self):
         """关闭自动时，立即对所有映射键发 key_up（RELEASE），不等 agent 下一帧。
 
@@ -652,6 +832,10 @@ class PlayerPanel(QWidget):
         映射键；对未按下的键发 RELEASE 无害（固件/SendInput 都忽略）。
         """
         from decision import input as dinput
+        # 远程模式：发一条 RELEASEALL 让固件清空所有按键，比逐键 RELEASE 可靠，
+        # 能救回「RELEASE 丢失导致卡键」的情况
+        dinput.release_all_remote()
+        # 逐键兜底（本地 SendInput + 远程补充）
         keys = set(settings.keymap.values()) | set(settings.custom_keys.values())
         for key in keys:
             if key:
@@ -687,9 +871,60 @@ class PlayerPanel(QWidget):
         self.lbl_state.setText("当前：自动打怪运行中" if on else "当前：未开启")
 
     def _poll_auto_state(self):
-        """定时把 settings.enabled 同步到开关 UI（agent 后台停自动时也能反映）。"""
+        """定时把 settings.enabled 同步到开关 UI（agent 后台停自动时也能反映）。
+
+        顺带刷新休息状态：rest_state 由实时线程里的 agent 写，只能轮询。
+        """
         if self.btn_auto.isChecked() != settings.enabled:
             self._refresh_auto_ui()
+        resting = bool(settings.rest_state)
+        self.btn_end_rest.setEnabled(resting)
+        self.lbl_rest.setText(self._rest_text())
+        # 休息状态优先判断：能进休息就说明自动必然是开着的，反过来写会出现
+        # 「休息中」却显示「未开启」的自相矛盾。
+        if resting:
+            self.lbl_state.setText("当前：隐身休息中")
+        elif settings.enabled:
+            self.lbl_state.setText("当前：自动打怪运行中")
+        else:
+            self.lbl_state.setText("当前：未开启")
+
+    @staticmethod
+    def _rest_text():
+        """休息状态文字：当前阶段 / 休息剩余时间 / 下次休息倒计时。
+
+        数据都由实时线程里的 agent 写（rest_state / rest_until_monotonic /
+        next_afk_monotonic / rest_pending），这里只读不算；用 time.monotonic
+        算剩余是因为两侧同进程、同一时钟源。
+        """
+        import time
+
+        def left(until):
+            """「　剩余 M:SS」后缀；没有计时基准（<=0）时返回空串。"""
+            if until <= 0:
+                return ""
+            sec = max(0, int(until - time.monotonic()))
+            return "　剩余 %d:%02d" % (sec // 60, sec % 60)
+
+        st = settings.rest_state
+        # 休息时长从「开始进入隐身」起算，所以这个阶段剩余时间也已经在走了
+        if st == "afk_enter":
+            return "进入隐身…" + left(settings.rest_until_monotonic)
+        if st == "afk_rest":
+            return "休息中" + left(settings.rest_until_monotonic)
+        if st == "afk_exit":
+            return "退出隐身…"
+        # 到点了但攻击范围内还有怪：卡在这一步时最容易被误认为「坏了」
+        if settings.rest_pending:
+            return "待休息：等清空攻击范围内的怪"
+        nxt = settings.next_afk_monotonic
+        if nxt > 0:
+            return "下次休息" + left(nxt)
+        return "未休息"
+
+    def _on_end_rest(self):
+        """手动结束休息：置一次性请求，agent 下一帧转去执行「退出隐身行为」再恢复打怪。"""
+        settings.rest_abort = True
 
     def _on_attack_dist(self, val):
         settings.attack_dist = float(val)
@@ -700,9 +935,18 @@ class PlayerPanel(QWidget):
         settings.save()
         self._refresh_evade_ui()
 
-    def _on_chase_jump(self, val):
-        settings.chase_jump_dist = int(val)
+    def _on_chase_jump(self, _val=None):
+        settings.chase_jump_enabled = bool(self.ck_chase_jump.isChecked())
+        settings.chase_jump_min = int(self.sp_chase_jump_min.value())
+        settings.chase_jump_max = int(self.sp_chase_jump_max.value())
         settings.save()
+        self._refresh_chase_jump_ui()
+
+    def _refresh_chase_jump_ui(self):
+        """开关关掉时把两个距离框灰掉。"""
+        on = self.ck_chase_jump.isChecked()
+        self.sp_chase_jump_min.setEnabled(on)
+        self.sp_chase_jump_max.setEnabled(on)
 
     def _on_evade_type(self, _idx=None):
         settings.evade_type = self.cmb_evade.currentData()
@@ -738,18 +982,36 @@ class PlayerPanel(QWidget):
         settings.save()
 
     def _on_afk_time(self, _val=None):
-        settings.anti_afk_min = int(self.sp_afk_min.value())
-        settings.anti_afk_max = int(self.sp_afk_max.value())
+        settings.anti_afk_min = float(self.sp_afk_min.value())
+        settings.anti_afk_max = float(self.sp_afk_max.value())
         if settings.anti_afk_max < settings.anti_afk_min:
             settings.anti_afk_max = settings.anti_afk_min
         settings.save()
 
-    def _edit_anti_afk_seq(self):
-        """打开防掉线行为编辑器。"""
+    def _on_afk_type(self, _idx=None):
+        settings.anti_afk_type = self.cmb_afk_type.currentData() or ANTI_AFK_TYPES[0][0]
+        settings.save()
+        self._refresh_afk_ui()
+
+    def _on_afk_rest_time(self, _val=None):
+        settings.anti_afk_rest_min = float(self.sp_rest_min.value())
+        settings.anti_afk_rest_max = float(self.sp_rest_max.value())
+        if settings.anti_afk_rest_max < settings.anti_afk_rest_min:
+            settings.anti_afk_rest_max = settings.anti_afk_rest_min
+        settings.save()
+
+    def _refresh_afk_ui(self):
+        """按行为类型显示对应的参数子组。"""
+        self._afk_hidden.setVisible(settings.anti_afk_type == "hidden_rest")
+
+    def _edit_afk_seq(self, which):
+        """打开「进入隐身」/「退出隐身」的行为编辑器。"""
         from gui.seq_editor import SeqEditorDialog
-        dlg = SeqEditorDialog(settings.anti_afk_seq, self, title="防掉线行为编辑器")
+        attr = "anti_afk_enter_seq" if which == "enter" else "anti_afk_exit_seq"
+        title = ("进入隐身" if which == "enter" else "退出隐身") + "行为编辑器"
+        dlg = SeqEditorDialog(getattr(settings, attr) or [], self, title=title)
         if dlg.exec_():
-            settings.anti_afk_seq = dlg.seq()
+            setattr(settings, attr, dlg.seq())
             settings.save()
 
     def _refresh_evade_ui(self):
@@ -784,8 +1046,8 @@ class PlayerPanel(QWidget):
         settings.attack_lock_debounce_ms = int(val)
         settings.save()
 
-    def _on_player_debounce(self, val):
-        settings.player_debounce_dist = int(val)
+    def _on_track_jump(self, val):
+        settings.player_track_jump = int(val)
         settings.save()
 
     def _on_hp_threshold(self, val):
@@ -924,7 +1186,8 @@ class PlayerPanel(QWidget):
             row.setSpacing(6)
             lbl_name = QLabel(name)
             lbl_name.setFixedWidth(90)
-            lbl_iv = QLabel("%d~%dmin" % (lo, hi))
+            # %g：整数不显示小数点（5 而不是 5.0），小数原样显示（7.5）
+            lbl_iv = QLabel("%g~%gmin" % (lo, hi))
             lbl_iv.setFixedWidth(80)
             lbl_cd = QLabel("")
             lbl_cd.setStyleSheet("color:#80868b;")
@@ -989,28 +1252,85 @@ class PlayerPanel(QWidget):
         self._refresh_timers()
 
     def _on_feed_interval(self, _val=None):
-        settings.feed_interval_min = int(self.sp_feed_interval_min.value())
-        settings.feed_interval_max = int(self.sp_feed_interval_max.value())
+        settings.feed_interval_min = float(self.sp_feed_interval_min.value())
+        settings.feed_interval_max = float(self.sp_feed_interval_max.value())
         if settings.feed_interval_max < settings.feed_interval_min:
             settings.feed_interval_max = settings.feed_interval_min
         settings.save()
 
     def _pick_bar(self, kind):
-        """框选 HP/MP 条区域，并采样该条的填充色。"""
-        from gui.region_selector import select_region
-        rect = select_region(self)
+        """在实时画面上框选 HP/MP 条区域，并采样该条的填充色。"""
+        from gui.region_selector import select_region_on_image
+        frame = None
+        lp = getattr(self, "live_panel", None)
+        if lp is not None:
+            frame = lp.current_frame()
+        if frame is None:
+            QMessageBox.information(
+                self, "提示", "请先在「实时」页开始预览、看到画面后，再框选 HP/MP 条")
+            return
+        rect = select_region_on_image(frame, self)
         if rect is None:
             return
-        color = _sample_bar_color(rect)
+        x, y, rw, rh = rect
+        region = frame[y:y + rh, x:x + rw]
+        color = _sample_bar_color(region)
+        # 存「画面比例」（相对画面帧），收流/窗口分辨率变化自动适配
+        h, w = frame.shape[:2]
+        ratio = [round(x / w, 6), round(y / h, 6),
+                 round(rw / w, 6), round(rh / h, 6)]
         if kind == "hp":
-            settings.hp_bar = list(rect)
+            settings.hp_bar = ratio
             settings.hp_color = color
-            self.lbl_hp_bar.setText("%d,%d  %dx%d" % rect)
         else:
-            settings.mp_bar = list(rect)
+            settings.mp_bar = ratio
             settings.mp_color = color
-            self.lbl_mp_bar.setText("%d,%d  %dx%d" % rect)
         settings.save()
+        # 按项目保存：写进当前项目的 project.yaml。没打开项目时只落全局，
+        # 下次开项目仍能从全局兜底读到。
+        if self.project is not None:
+            bars = dict(self.project.get("bars") or {})
+            bars[kind] = ratio
+            bars[kind + "_color"] = color
+            self.project.set("bars", bars, save=True)
+        self._sync_bar_ui()
+
+    # ---------------- HP/MP 条（按项目保存） ----------------
+
+    def bind(self, project):
+        """切换项目：载入该项目的 HP/MP 条框选结果。
+
+        项目存过就用项目的；没存过回退到 config/decision.json 里的全局值
+        （= 最后一次框选 / 加载模板的位置）—— 同一套游戏 UI 通常通用，
+        一律清空会逼着每个项目都重框一次。
+        """
+        self.project = project
+        proj = (project.get("bars") if project is not None else None) or {}
+        fallback = load_saved()      # 直接读文件，天然跟着最新一次 save()
+
+        def pick(key, saved_key):
+            return proj.get(key) or fallback.get(saved_key)
+
+        settings.hp_bar = load_rect(pick("hp", "hp_bar"))
+        settings.hp_color = pick("hp_color", "hp_color")
+        settings.mp_bar = load_rect(pick("mp", "mp_bar"))
+        settings.mp_color = pick("mp_color", "mp_color")
+        self._sync_bar_ui()
+
+    def _sync_bar_ui(self):
+        """按 settings 里的 HP/MP 条刷新标签文案、可见性和填充色。"""
+        # 归一化：全零 / 零尺寸框当成「没框」—— [0,0,0,0] 是非空列表（真值），
+        # 不处理会显示成一条空进度条。
+        settings.hp_bar = load_rect(settings.hp_bar)
+        settings.mp_bar = load_rect(settings.mp_bar)
+        for rect, lbl in ((settings.hp_bar, self.lbl_hp_bar),
+                          (settings.mp_bar, self.lbl_mp_bar)):
+            if rect:
+                nx, ny, nw, nh = rect
+                lbl.setText("x%.0f%% y%.0f%%  %.0f%%×%.0f%%"
+                            % (nx * 100, ny * 100, nw * 100, nh * 100))
+            else:
+                lbl.setText("未选")
         self._refresh_bar_visibility()
         self._apply_bar_chunk_color()
 
@@ -1046,15 +1366,15 @@ class PlayerPanel(QWidget):
         self._apply_input_device(dev)
 
     def _apply_input_device(self, dev):
-        """切换输入设备：本地 SendInput 或远程 Pro Micro（后台异步连接）。"""
+        """切换输入设备：本地 SendInput / 远程 Pro Micro / 本地 Pro Micro（后台异步连接）。"""
         from decision import input as dinput
+        import threading
         if dev == "remote":
             from tools.config import get
             host = get("kbd", "host")
             port = int(get("kbd", "port", 9000))
             cert = get("kbd", "cert", "remote_kbd/certs/cert.pem")
-            self.lbl_device_state.setText("正在连接 Pro Micro…")
-            import threading
+            self.lbl_device_state.setText("正在连接 ProMicro(远程)…")
             def _do_connect():
                 try:
                     dinput.use_network(host, port, cert)
@@ -1063,14 +1383,30 @@ class PlayerPanel(QWidget):
                     dinput.use_local()
                     self.device_connected.emit("fail")
             threading.Thread(target=_do_connect, daemon=True).start()
+        elif dev == "serial":
+            from tools.config import get
+            ser_port = get("kbd", "serial_local", "COM5")
+            self.lbl_device_state.setText("正在连接 ProMicro(本地)…")
+            def _do_connect():
+                try:
+                    dinput.use_serial(ser_port)
+                    self.device_connected.emit("ok")
+                except Exception:
+                    dinput.use_local()
+                    self.device_connected.emit("fail")
+            threading.Thread(target=_do_connect, daemon=True).start()
         else:
             dinput.use_local()
             self.lbl_device_state.setText("本地键盘")
+        self._refresh_mouse_ui()
 
     def _on_device_connected(self, result):
         """Pro Micro 连接结果回调（后台线程 → 主线程）。"""
         if result == "ok":
-            self.lbl_device_state.setText("已连接 Pro Micro")
+            if settings.input_device == "serial":
+                self.lbl_device_state.setText("已连接 ProMicro(本地)")
+            else:
+                self.lbl_device_state.setText("已连接 ProMicro(远程)")
         else:
             settings.input_device = "local"
             settings.save()
@@ -1080,6 +1416,7 @@ class PlayerPanel(QWidget):
             if idx >= 0:
                 self.cmb_device.setCurrentIndex(idx)
             self.cmb_device.blockSignals(False)
+        self._refresh_mouse_ui()
 
     # ---------------- 键盘映射（按键监听） ----------------
 
@@ -1200,8 +1537,8 @@ class PlayerPanel(QWidget):
             return
         physical = settings.custom_keys.pop(old_name)
         settings.custom_keys[new_name] = physical
-        # 同步行为序列（回身输出/防掉线）里对该键的引用
-        for attr in ("back_jump_seq", "anti_afk_seq"):
+        # 同步行为序列（回身输出/进入隐身/退出隐身）里对该键的引用
+        for attr in ("back_jump_seq", "anti_afk_enter_seq", "anti_afk_exit_seq"):
             seq = getattr(settings, attr, None) or []
             for e in seq:
                 if isinstance(e, dict) and e.get("key") == old_name:
@@ -1271,9 +1608,15 @@ class PlayerPanel(QWidget):
         self.sp_min_attack.setValue(settings.min_attack_dist)
         self.sp_min_attack.blockSignals(False)
 
-        self.sp_chase_jump.blockSignals(True)
-        self.sp_chase_jump.setValue(settings.chase_jump_dist)
-        self.sp_chase_jump.blockSignals(False)
+        self.ck_chase_jump.blockSignals(True)
+        self.ck_chase_jump.setChecked(bool(settings.chase_jump_enabled))
+        self.ck_chase_jump.blockSignals(False)
+        for sp, v in ((self.sp_chase_jump_min, settings.chase_jump_min),
+                      (self.sp_chase_jump_max, settings.chase_jump_max)):
+            sp.blockSignals(True)
+            sp.setValue(int(v))
+            sp.blockSignals(False)
+        self._refresh_chase_jump_ui()
 
         self.cmb_evade.blockSignals(True)
         _idx = self.cmb_evade.findData(settings.evade_type)
@@ -1317,9 +1660,9 @@ class PlayerPanel(QWidget):
         self.sp_attack_lock_db.setValue(settings.attack_lock_debounce_ms)
         self.sp_attack_lock_db.blockSignals(False)
 
-        self.sp_player_debounce.blockSignals(True)
-        self.sp_player_debounce.setValue(settings.player_debounce_dist)
-        self.sp_player_debounce.blockSignals(False)
+        self.sp_track_jump.blockSignals(True)
+        self.sp_track_jump.setValue(settings.player_track_jump)
+        self.sp_track_jump.blockSignals(False)
 
         self.sl_hp.blockSignals(True)
         self.sl_hp.setValue(settings.hp_threshold)
@@ -1424,12 +1767,23 @@ class PlayerPanel(QWidget):
         self.sp_afk_max.setValue(settings.anti_afk_max)
         self.sp_afk_max.blockSignals(False)
 
-        if settings.hp_bar:
-            self.lbl_hp_bar.setText("%d,%d  %dx%d" % tuple(settings.hp_bar))
-        if settings.mp_bar:
-            self.lbl_mp_bar.setText("%d,%d  %dx%d" % tuple(settings.mp_bar))
-        self._refresh_bar_visibility()
-        self._apply_bar_chunk_color()
+        self.cmb_afk_type.blockSignals(True)
+        ai = self.cmb_afk_type.findData(settings.anti_afk_type)
+        self.cmb_afk_type.setCurrentIndex(max(0, ai))
+        self.cmb_afk_type.blockSignals(False)
+
+        self.sp_rest_min.blockSignals(True)
+        self.sp_rest_min.setValue(settings.anti_afk_rest_min)
+        self.sp_rest_min.blockSignals(False)
+
+        self.sp_rest_max.blockSignals(True)
+        self.sp_rest_max.setValue(settings.anti_afk_rest_max)
+        self.sp_rest_max.blockSignals(False)
+
+        self._refresh_afk_ui()
+
+        # HP/MP 条：先显示全局值；打开项目后由 bind() 用项目里存的覆盖
+        self._sync_bar_ui()
 
         dev = settings.input_device
         self.cmb_device.blockSignals(True)
@@ -1437,6 +1791,10 @@ class PlayerPanel(QWidget):
         if idx >= 0:
             self.cmb_device.setCurrentIndex(idx)
         self.cmb_device.blockSignals(False)
+
+        self.sp_mouse_speed.blockSignals(True)
+        self.sp_mouse_speed.setValue(float(settings.mouse_speed))
+        self.sp_mouse_speed.blockSignals(False)
         self._apply_input_device(dev)
 
         self._refresh_auto_ui()

@@ -440,6 +440,8 @@ class MainWindow(QMainWindow):
         self.player_panel.verify_started.connect(self._on_player_verify_started)
         self.player_panel.verify_result.connect(self._on_player_verify)
         self.player_panel.auto_key_changed.connect(self._on_auto_key_changed)
+        # HP/MP 条框选要在实时预览画面上做，给它实时页引用
+        self.player_panel.live_panel = self.live_panel
         # 实时推理识别出的血/蓝比例 → 决策参数页可视化
         self.live_panel.potions_ready.connect(self.player_panel._on_potions)
         tabs.addTab(self.player_panel, "决策参数")
@@ -540,6 +542,8 @@ class MainWindow(QMainWindow):
             c.bind(self.project)
         self.review.bind(self.project)
         self.live_panel.bind(self.project)
+        # HP/MP 条框选结果存在 project.yaml 里，切项目要跟着换
+        self.player_panel.bind(self.project)
         self.lbl_status.setText("未选择项目" if self.project is None else
                                 self.lbl_status.text())
 

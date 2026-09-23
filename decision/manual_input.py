@@ -30,6 +30,7 @@ _KEY_MAP = {
     keyboard.Key.space: "space",
     keyboard.Key.esc: "esc",
     keyboard.Key.tab: "tab",
+    keyboard.Key.backspace: "backspace",
     keyboard.Key.delete: "del",
     keyboard.Key.insert: "insert",
     keyboard.Key.home: "home",

@@ -1,7 +1,10 @@
 {
-  "attack_dist": 50.0,
+  "attack_dist": 40.0,
   "min_attack_dist": 0,
-  "chase_jump_dist": 20,
+  "chase_jump_enabled": true,
+  "chase_jump_min": -10,
+  "chase_jump_max": 5,
+  "mouse_speed": 1.0,
   "evade_type": "jump",
   "jump_interval": 0,
   "jump_random_prob": 0.1,
@@ -96,45 +99,45 @@
     50
   ],
   "attack_cd": 200,
-  "attack_lock_debounce_ms": 300,
-  "player_debounce_dist": 200,
+  "attack_lock_debounce_ms": 1000,
+  "player_track_jump": 200,
   "hp_bar": [
-    -2002,
-    1050,
-    193,
-    20
+    0.341142,
+    0.971354,
+    0.120791,
+    0.022135
   ],
   "mp_bar": [
-    -1804,
-    1051,
-    192,
-    20
+    0.462665,
+    0.970052,
+    0.122987,
+    0.02474
   ],
   "hp_color": [
     [
       0,
       0,
-      137
+      135
     ],
     [
-      94,
-      96,
+      89,
+      91,
       255
     ]
   ],
   "mp_color": [
     [
-      140,
-      60,
+      136,
+      81,
       0
     ],
     [
       255,
-      180,
-      84
+      201,
+      102
     ]
   ],
-  "hp_threshold": 30,
+  "hp_threshold": 35,
   "mp_threshold": 7,
   "pot_cd": 1500,
   "auto_hp_pot": true,
@@ -148,7 +151,7 @@
   "vision_off_x": 0,
   "vision_off_y": 0,
   "sweep_turn_cd": 1000,
-  "back_range": 100,
+  "back_range": 200,
   "route_enabled": false,
   "debounce_conf": 0.45,
   "debounce_ms": 2000,
@@ -156,27 +159,6 @@
   "feed_interval_min": 6,
   "feed_interval_max": 8,
   "custom_timers": [
-    {
-      "name": "自动攻击药水",
-      "seq": [
-        {
-          "type": "down",
-          "key": "攻击药水"
-        },
-        {
-          "type": "delay",
-          "ms": 10
-        },
-        {
-          "type": "up",
-          "key": "攻击药水"
-        }
-      ],
-      "interval": [
-        3,
-        3
-      ]
-    },
     {
       "name": "自动回避药水",
       "seq": [
@@ -198,13 +180,84 @@
   "facing_timeout_min": 2,
   "player_lost_timeout_min": 3,
   "resetall_interval": 60,
-  "anti_afk_enabled": false,
-  "anti_afk_min": 30,
-  "anti_afk_max": 40,
-  "anti_afk_seq": [],
+  "anti_afk_enabled": true,
+  "anti_afk_type": "hidden_rest",
+  "anti_afk_min": 25,
+  "anti_afk_max": 35,
+  "anti_afk_enter_seq": [
+    {
+      "type": "down",
+      "key": "隐身术"
+    },
+    {
+      "type": "up",
+      "key": "隐身术"
+    },
+    {
+      "type": "delay",
+      "ms": 1000
+    },
+    {
+      "type": "down",
+      "key": "隐身术"
+    },
+    {
+      "type": "up",
+      "key": "隐身术"
+    },
+    {
+      "type": "delay",
+      "ms": 1000
+    },
+    {
+      "type": "down",
+      "key": "隐身术"
+    },
+    {
+      "type": "up",
+      "key": "隐身术"
+    }
+  ],
+  "anti_afk_exit_seq": [
+    {
+      "type": "down",
+      "key": "普攻"
+    },
+    {
+      "type": "up",
+      "key": "普攻"
+    },
+    {
+      "type": "delay",
+      "ms": 1000
+    },
+    {
+      "type": "down",
+      "key": "普攻"
+    },
+    {
+      "type": "up",
+      "key": "普攻"
+    },
+    {
+      "type": "delay",
+      "ms": 1000
+    },
+    {
+      "type": "down",
+      "key": "普攻"
+    },
+    {
+      "type": "up",
+      "key": "普攻"
+    }
+  ],
+  "anti_afk_rest_min": 2,
+  "anti_afk_rest_max": 3,
   "custom_keys": {
     "攻击药水": "grave",
     "回避药水": "5",
-    "隐身术": "a"
+    "隐身术": "a",
+    "普攻": "f"
   }
 }

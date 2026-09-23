@@ -1,5 +1,5 @@
 conf_mob: 0.3
-conf_player: 0.6
+conf_player: 0.7
 imgsz: 800
 device: '0'
 capture_fps: 60

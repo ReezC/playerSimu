@@ -21,7 +21,7 @@ def _bgr_to_pixmap(img):
 
 
 class RegionSelector(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, image=None):
         super().__init__(parent)
         self.setWindowFlags(Qt.FramelessWindowHint
                             | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -31,17 +31,24 @@ class RegionSelector(QDialog):
         self._origin = None
         self._current = None
 
-        vx, vy, vw, vh = wincap.virtual_screen()
-        self._vx, self._vy = vx, vy
+        if image is not None:
+            # 在给定参考图（BGR）上框选：坐标相对这张图
+            self._vx, self._vy = 0, 0
+            self._pix = _bgr_to_pixmap(image)
+            vw, vh = image.shape[1], image.shape[0]
+        else:
+            vx, vy, vw, vh = wincap.virtual_screen()
+            self._vx, self._vy = vx, vy
 
-        try:
-            full = wincap.grab_rect((vx, vy, vw, vh))
-            self._pix = _bgr_to_pixmap(full)
-        except Exception:
-            self._pix = QPixmap(vw, vh)
-            self._pix.fill(QColor("#000000"))
+            try:
+                # 抓整个虚拟屏幕（跨窗口）：WGC 只能抓单个窗口，这里走 BitBlt
+                full = wincap.grab_rect((vx, vy, vw, vh), use_wgc=False)
+                self._pix = _bgr_to_pixmap(full)
+            except Exception:
+                self._pix = QPixmap(vw, vh)
+                self._pix.fill(QColor("#000000"))
 
-        self.setGeometry(vx, vy, vw, vh)
+        self.setGeometry(self._vx, self._vy, vw, vh)
 
     # ---------------- 绘制 ----------------
 
@@ -110,6 +117,14 @@ class RegionSelector(QDialog):
 def select_region(parent=None):
     """弹框选区，返回 (x, y, w, h) 屏幕坐标；取消返回 None。"""
     sel = RegionSelector(parent)
+    if sel.exec_() == QDialog.Accepted:
+        return sel.result_rect()
+    return None
+
+
+def select_region_on_image(image, parent=None):
+    """在给定参考图（BGR）上框选，返回 (x, y, w, h) 相对该图的坐标；取消返回 None。"""
+    sel = RegionSelector(parent, image=image)
     if sel.exec_() == QDialog.Accepted:
         return sel.result_rect()
     return None

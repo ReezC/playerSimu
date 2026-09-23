@@ -24,8 +24,12 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QBrush, QColor
 from PyQt5.QtWidgets import (QDialog, QFormLayout, QHBoxLayout, QInputDialog,
                              QLabel, QLineEdit, QMenu, QMessageBox, QPushButton,
-                             QSpinBox, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+                             QTreeWidget, QTreeWidgetItem, QVBoxLayout,
                              QWidget)
+
+# 行为序列里「额外延迟」的上限（毫秒）= 24 小时。
+# 原来卡在 100000（100 秒），想配分钟级的等待根本填不进去。
+MAX_DELAY_MS = 86400000
 
 # 可选的键（显示名 → 序列键名）。back/forward 是特殊键，执行时按朝向解析。
 SEQ_KEYS = [
@@ -249,8 +253,9 @@ class SeqEditorWidget(QWidget):
         self._insert({"type": "up", "key": key})
 
     def _add_delay(self):
-        ms, ok = QInputDialog.getInt(self, "额外延迟", "延迟毫秒数：",
-                                     200, 0, 100000, 10)
+        ms, ok = QInputDialog.getInt(
+            self, "额外延迟", "延迟毫秒数（1000 = 1 秒，60000 = 1 分钟）：",
+            200, 0, MAX_DELAY_MS, 10)
         if not ok:
             return
         self._insert({"type": "delay", "ms": ms})
@@ -399,11 +404,17 @@ class TimerEditDialog(QDialog):
         form.setLabelAlignment(Qt.AlignLeft)
         self.ed_name = QLineEdit()
         self.ed_name.setPlaceholderText("例如：自动喊话")
-        self.sp_lo = QSpinBox()
-        self.sp_lo.setRange(1, 600)
+        # 分钟支持小数：用 DoubleSpinBox（和参数面板同一套，滚轮不误触）
+        from gui.widgets import NoWheelDoubleSpinBox
+        self.sp_lo = NoWheelDoubleSpinBox()
+        self.sp_lo.setRange(0.1, 600)
+        self.sp_lo.setDecimals(1)
+        self.sp_lo.setSingleStep(0.1)
         self.sp_lo.setSuffix(" 分钟")
-        self.sp_hi = QSpinBox()
-        self.sp_hi.setRange(1, 600)
+        self.sp_hi = NoWheelDoubleSpinBox()
+        self.sp_hi.setRange(0.1, 600)
+        self.sp_hi.setDecimals(1)
+        self.sp_hi.setSingleStep(0.1)
         self.sp_hi.setSuffix(" 分钟")
         form.addRow("行为名", self.ed_name)
         form.addRow("触发下限", self.sp_lo)

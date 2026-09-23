@@ -125,3 +125,85 @@ class MobTracker:
     def kill(self, mob_id):
         """立即消除某个轨迹（防抖幽灵框被攻击时调用，避免持续空放技能）。"""
         self._tracks = [t for t in self._tracks if t["id"] != mob_id]
+
+
+class PlayerTracker:
+    """跟住「我」：在每帧 YOLO 的玩家框里挑出操作者那个。
+
+    不依赖外观（不需要「其他玩家」类）。YOLO 只给出「所有玩家框」，谁是自己
+    得靠**位置连续性**判断：
+
+      · 未锁定（开局 / 跟丢后）→ 取置信度最高的框锁定
+      · 已锁定 → 每帧选「离预测位置最近、且不超过 max_jump」的候选
+        （预测位置 = 上一帧位置 + 速度外推，速度做指数平滑）
+      · 漏检 → 用速度外推补一个框，连续漏检超过 max_missed 帧就判定跟丢，
+        解锁退回未锁定（下一帧重新按置信度锁）
+
+    这样别的玩家从旁边经过时不会被「抢锁」（只要他离预测位置更远），
+    比「每帧取置信度最高」稳得多。
+
+    cands 形如 [(x1, y1, x2, y2, conf), ...]（画面坐标 xyxy）。
+    返回 player_box = (cx, cy, bottom, conf, bw, bh)，和 live_thread 原格式一致；
+    无框返回 None。
+    """
+
+    def __init__(self, max_jump=150.0, max_missed=10, smooth=0.6):
+        self.max_jump = float(max_jump)     # 位置突变阈值（像素）：超过就认为不是「我」
+        self.max_missed = int(max_missed)   # 连续漏检多少帧放弃锁定
+        self.smooth = float(smooth)         # 速度平滑系数（0~1，越大越平滑）
+        self._box = None                    # 当前锁定框 (cx, cy, bottom, conf, bw, bh)
+        self._vx = 0.0
+        self._vy = 0.0
+        self._missed = 0
+
+    @property
+    def locked(self):
+        return self._box is not None
+
+    @staticmethod
+    def _cand_to_box(c):
+        x1, y1, x2, y2, conf = c
+        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0, y2, conf, x2 - x1, y2 - y1)
+
+    def update(self, cands):
+        """喂本帧的玩家候选框，返回跟住的 player_box（或 None）。"""
+        if self._box is None:
+            # 未锁定：取置信度最高的（开局 / 跟丢后重新锁）
+            if not cands:
+                return None
+            self._box = self._cand_to_box(max(cands, key=lambda c: c[4]))
+            self._vx = self._vy = 0.0
+            self._missed = 0
+            return self._box
+
+        px = self._box[0] + self._vx   # 预测位置（位置 + 速度外推）
+        py = self._box[1] + self._vy
+
+        best, best_d = None, None
+        for c in cands:
+            cx = (c[0] + c[2]) / 2.0
+            cy = (c[1] + c[3]) / 2.0
+            d = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
+            if d > self.max_jump:
+                continue               # 太远：不是「我」（可能是别人经过 / 已传送）
+            if best_d is None or d < best_d:
+                best_d, best = d, c
+
+        if best is not None:
+            nb = self._cand_to_box(best)
+            a = self.smooth
+            self._vx = a * self._vx + (1 - a) * (nb[0] - self._box[0])
+            self._vy = a * self._vy + (1 - a) * (nb[1] - self._box[1])
+            self._box = nb
+            self._missed = 0
+            return nb
+
+        # 没匹配到 / 本帧没候选：外推一个框，累计漏检
+        self._missed += 1
+        if self._missed > self.max_missed:
+            self._box = None           # 跟丢：解锁，下一帧重新按置信度锁
+            self._vx = self._vy = 0.0
+            return None
+        cx, cy, bottom, conf, bw, bh = self._box
+        self._box = (px, py, bottom + (py - cy), conf, bw, bh)
+        return self._box

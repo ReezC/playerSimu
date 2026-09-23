@@ -44,6 +44,7 @@ class LivePanel(QWidget):
         self.project = None
         self.thread = None
         self._last_pix = None
+        self._last_bgr = None   # 最近一帧画面（BGR），供 HP/MP 条在画面上框选
         self._rect = None       # 本地窗口模式下框选的区域 (x, y, w, h)
         self._build()
 
@@ -358,7 +359,12 @@ class LivePanel(QWidget):
         if self.thread is None:
             return
         self.thread.stop()
-        # 立即停止：UI 马上恢复，不等线程退出（线程在后台自己收尾）。
+        # 等线程真正退出（内部要 join reader、关闭流 socket）再恢复「开始」。
+        # 不等的话，快速「停止→开始」时旧线程的 UDP socket 还没释放，
+        # 新线程 bind 端口会报 Errno 10048（端口被占用）。
+        self.lbl_stats.setText("正在停止…（等收流线程释放端口）")
+        self.thread.wait(5000)
+        self.thread = None
         self.btn_stop.setEnabled(False)
         self.btn_start.setEnabled(True)
         self.btn_infer.setEnabled(False)
@@ -379,7 +385,12 @@ class LivePanel(QWidget):
     def _on_frame(self, img):
         pm = _bgr_to_pixmap(img)
         self._last_pix = pm
+        self._last_bgr = img
         self._render()
+
+    def current_frame(self):
+        """返回最近一帧画面（BGR ndarray）；还没有画面时返回 None。"""
+        return self._last_bgr
 
     def _render(self):
         if self._last_pix is None:

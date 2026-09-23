@@ -18,6 +18,7 @@
     「人工修过的集」和「没修过的集」训出来的模型差别。
 """
 
+import copy
 import time
 from pathlib import Path
 
@@ -47,6 +48,10 @@ DEFAULTS = {
         "step": 0.10,
         "sample": 5,     # 采样几帧做标定（单帧可能正好没有目标）
     },
+    # HP/MP 条框选结果（相对画面的比例 [nx, ny, nw, nh]，分辨率变化自动适配）。
+    # 存项目里 —— 不同项目可能用了不同的游戏 UI 布局；项目没存过的回退用
+    # config/decision.json 的全局值（= 上次框选的位置）。
+    "bars": {},
     "notes": "",
     "capture": {
         "source": "window",   # window | file | stream
@@ -87,13 +92,22 @@ DEFAULTS = {
 
 
 def _deep_merge(base: dict, over: dict) -> dict:
-    """递归合并，保证旧项目文件缺字段时能补上默认值。"""
-    out = dict(base)
+    """递归合并：以 base（模块级 DEFAULTS）为底，用 over 覆盖。
+
+    返回**全新对象**（base 深拷贝，over 的取值也深拷贝）。
+
+    这里必须深拷贝：原来只做 `dict(base)` 浅拷贝，凡是 over 里没有的嵌套
+    dict/list 都会和 DEFAULTS 共享同一个对象。而 cards.py 里到处是
+    `project.sec("train").update(...)` 这种原地修改 —— 一改就写穿到
+    DEFAULTS，污染之后新建 / 打开的所有项目（表现为「新项目莫名继承了
+    上一个项目调过的参数」）。旧版本的 project.yaml 缺新加的键，最容易中招。
+    """
+    out = copy.deepcopy(base)
     for k, v in (over or {}).items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = _deep_merge(out[k], v)
         else:
-            out[k] = v
+            out[k] = copy.deepcopy(v)
     return out
 
 

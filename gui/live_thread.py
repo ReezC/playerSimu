@@ -65,6 +65,28 @@ def _bar_fill_ratio(mask):
     return float(xs[-1] + 1) / mask.shape[1]
 
 
+def _crop_ratio(frame, ratio):
+    """按「画面比例」[nx, ny, nw, nh]（0~1）从画面帧截取区域；越界/无效返回 None。
+
+    HP/MP 条现在存的是相对画面的比例；旧版的屏幕绝对坐标（如负的 x）不是比例，
+    这里返回 None，需要重新在画面上框选一次。
+    """
+    if not isinstance(ratio, (list, tuple)) or len(ratio) != 4:
+        return None
+    h, w = frame.shape[:2]
+    try:
+        nx, ny, nw, nh = (float(v) for v in ratio)
+    except Exception:
+        return None
+    if not all(0.0 <= v <= 1.0 for v in (nx, ny, nw, nh)):
+        return None
+    x = int(nx * w); y = int(ny * h)
+    rw = max(1, int(nw * w)); rh = max(1, int(nh * h))
+    if x < 0 or y < 0 or x + rw > w or y + rh > h:
+        return None
+    return frame[y:y + rh, x:x + rw]
+
+
 def _draw_dashed_line(img, y, color, dash_len=10, gap=6, thickness=1, x0=0, x1=None):
     """画一条水平虚线（y 固定）。x0~x1 指定范围，x1=None 表示到右边缘。"""
     h, w = img.shape[:2]
@@ -236,13 +258,14 @@ class LiveThread(QThread):
         # 这里不再重复 use_network —— 否则会二次连接、旧连接泄漏、还可能
         # 因 relay 暂时不可达把已建好的连接回退成本地。
         from decision.agent import CombatAgent, settings as decision_settings
-        from perception.tracker import MobTracker
+        from perception.tracker import MobTracker, PlayerTracker
         from perception.world_state import WorldState
         from perception.platforms import (PlatformTracker, PlayerMotionTracker,
                                           relate_terrain)
 
         agent = CombatAgent(decision_settings)
         mob_tracker = MobTracker()   # 给怪稳定 id，供目标锁定 CD 跨帧匹配
+        player_tracker = PlayerTracker()   # 跟住「我」：位置连续性，别把别人认成自己
         # 平台和玩家运动状态是 WorldState 的一部分，不交给 YOLO：平台顶边用
         # 轻量图像处理每帧更新，玩家速度则由连续框的位置估计。
         platform_tracker = PlatformTracker()
@@ -255,10 +278,8 @@ class LiveThread(QThread):
         _player_class = int(self._p.get("player_class",
                                         PLAYER_CLASS_MAP.get(_pid, 0)) or 0)
 
-        from core import wincap
-        # HP/MP 条**独立抓取**：它们可能在实时帧框选范围之外（比如只框了
-        # 游戏上半屏，HP/MP 条在屏幕更下方），从实时帧里截会越界读不到。
-        # 按屏幕坐标直接 grab_rect，限流 0.2s 一次（grab_rect 有开销）。
+        # HP/MP 条识别：从实时帧 vis 里按「画面比例」裁出血条区域，再颜色过滤
+        # + 列扫描算填充比例，不额外抓屏。限流 0.1s（识别本身 <1ms，限流只为抑制抖动）。
         _pot_last = [0.0]
         _pot_vals = [1.0, 1.0]      # (hp, mp) 比例缓存
         _last_player = [None]       # 上一帧玩家框 (cx, cy, bottom, conf)，漏检时兜底
@@ -500,7 +521,7 @@ class LiveThread(QThread):
 
                     k = 0
                     mob_dets = []       # [(x1, y1, x2, y2, conf), ...] 给 MobTracker
-                    player_cand = None  # (x1, y1, x2, y2, conf)，YOLO 检出的玩家框
+                    player_cands = []   # [(x1, y1, x2, y2, conf), ...] 交给 PlayerTracker
                     boxes = getattr(res, "boxes", None)
                     if boxes is not None and len(boxes):
                         xyxy = boxes.xyxy.cpu().numpy()
@@ -518,39 +539,27 @@ class LiveThread(QThread):
                             elif int(cls) == _player_class:
                                 if c < conf_player:
                                     continue
-                                # 画面里通常只有一个玩家，取置信度最高的那个框
-                                if player_cand is None or c > player_cand[4]:
-                                    player_cand = (x1, y1, x2, y2, c)
+                                # 收集所有玩家候选，交给 PlayerTracker 挑出「我」
+                                player_cands.append((x1, y1, x2, y2, c))
                             # drop/npc（class 2/3）暂不参与决策
 
-                    # ---- 玩家定位：YOLO 检出 ----
-                    player_box = None
-                    if player_cand is not None:
-                        x1, y1, x2, y2, c = player_cand
-                        cx = (x1 + x2) / 2.0
-                        cy = (y1 + y2) / 2.0
-                        bw = x2 - x1
-                        bh = y2 - y1
-                        player_box = (cx, cy, cy + bh / 2.0, c, bw, bh)
+                    # ---- 玩家定位：YOLO 候选 → PlayerTracker 跟住「我」 ----
+                    # 用位置连续性（离预测位置最近）挑出操作者的框，避免「画面里多个
+                    # 玩家时取置信度最高的、把别人当成自己」；漏检用速度外推补框，
+                    # 连续跟丢才解锁重锁。max_jump 就是「玩家追踪阈值」参数。
+                    player_tracker.max_jump = max(
+                        1.0, float(decision_settings.player_track_jump))
+                    player_box = player_tracker.update(player_cands)
                     n_boxes = k
 
                     # ---- 决策：找怪打 ----
-                    # 玩家识别防抖：检出框中心跳变超过防抖距离视为误检，沿用上一帧位置
-                    pdd = max(0.0, float(decision_settings.player_debounce_dist))
-                    if player_box is not None and _last_player[0] is not None and pdd > 0:
-                        dx = player_box[0] - _last_player[0][0]
-                        dy = player_box[1] - _last_player[0][1]
-                        if (dx * dx + dy * dy) ** 0.5 > pdd:
-                            player_box = _last_player[0]   # 跳变过大，用上一帧
-
-                    # 玩家框（蓝框）短暂消失时，用上一帧位置兜底，避免 agent 丢失玩家
-                    if player_box is None:
-                        player_box = _last_player[0]
-                    else:
+                    if player_box is not None:
                         _last_player[0] = player_box
+                    else:
+                        player_box = _last_player[0]   # 完全跟丢时用上一帧兜底
 
-                    # 绘制玩家蓝框：用防抖/兜底后的 player_box，保证和攻击距离线、
-                    # 扫平台倾向箭头画在同一位置（否则蓝框画原始检出、线条画防抖后位置会漂移）
+                    # 绘制玩家蓝框：用追踪/兜底后的 player_box，保证和攻击距离线、
+                    # 扫平台倾向箭头画在同一位置（否则蓝框画原始检出、线条画追踪后位置会漂移）
                     if player_box is not None and draw:
                         _cx, _cy, _bot, _c, _bw, _bh = player_box
                         _x1i = int(_cx - _bw / 2); _y1i = int(_cy - _bh / 2)
@@ -575,13 +584,13 @@ class LiveThread(QThread):
                         ws.platforms = platform_tracker.update(vis, f.t_recv_mono)
                     else:
                         ws.platforms = []
-                    # 读 HP/MP 条：独立抓取（屏幕坐标直接 grab_rect），不依赖实时
-                    # 帧范围，限流 0.5s（血蓝变化不需要太频繁，grab_rect 有开销）。
-                    if time.perf_counter() - _pot_last[0] >= 0.5:
+                    # 读 HP/MP 条：从当前画面帧 vis 里按「画面比例」截取（不再抓本机屏幕），
+                    # 限流 0.1s。收流/窗口两种模式都从 vis 截，游戏机上不再有抓屏行为。
+                    if time.perf_counter() - _pot_last[0] >= 0.1:
                         _pot_last[0] = time.perf_counter()
                         if decision_settings.hp_bar:
                             try:
-                                r = wincap.grab_rect(tuple(int(v) for v in decision_settings.hp_bar))
+                                r = _crop_ratio(vis, decision_settings.hp_bar)
                                 if r is not None and r.size:
                                     low, high = decision_settings.hp_color or ((0, 0, 100), (90, 90, 255))
                                     m = cv2.inRange(r, tuple(low), tuple(high))
@@ -592,7 +601,7 @@ class LiveThread(QThread):
                                 pass
                         if decision_settings.mp_bar:
                             try:
-                                r = wincap.grab_rect(tuple(int(v) for v in decision_settings.mp_bar))
+                                r = _crop_ratio(vis, decision_settings.mp_bar)
                                 if r is not None and r.size:
                                     low, high = decision_settings.mp_color or ((100, 0, 0), (255, 90, 90))
                                     m = cv2.inRange(r, tuple(low), tuple(high))
@@ -617,13 +626,12 @@ class LiveThread(QThread):
                     # 当前平台连接。Agent 只消费 mob.reachable，不做几何运算。
                     relate_terrain(ws.mobs, ws.player, ws.platforms)
                     action = agent.tick(ws)
-                    # 攻击了防抖幽灵框 → 立即消除该轨迹，避免持续空放技能
-                    kill_mob = action.get("kill_mob") if action else None
-                    if kill_mob is not None:
-                        mob_tracker.kill(kill_mob)
+                    # 输出行为命中了防抖幽灵框 → 一次性消除这些轨迹，避免持续空放技能
+                    for _mid in ((action or {}).get("kill_mobs") or []):
+                        mob_tracker.kill(_mid)
 
-                    # 把识别到的血/蓝比例推给 UI（限流 0.3s，避免刷屏）
-                    if time.perf_counter() - self._last_potions >= 0.3:
+                    # 把识别到的血/蓝比例推给 UI（限流 0.1s，跟识别节奏一致）
+                    if time.perf_counter() - self._last_potions >= 0.1:
                         self._last_potions = time.perf_counter()
                         self.potions_ready.emit(ws.player.hp, ws.player.mp)
                 else:
@@ -695,13 +703,20 @@ class LiveThread(QThread):
                         cv2.circle(vis, (cx, cy), 4, yellow, -1)
                         cv2.line(vis, (max_x, cy - 8), (max_x, cy + 8), yellow, 2)
 
-                        # 追击起跳距离：接在最大攻击距离前方，绿色线段 + 竖向刻度
-                        cjd = max(0, int(decision_settings.chase_jump_dist))
-                        if cjd > 0:
-                            jump_x = max_x + dirn * cjd
-                            green = (0, 200, 0)
-                            cv2.line(vis, (max_x, cy), (jump_x, cy), green, 2)
-                            cv2.line(vis, (jump_x, cy - 8), (jump_x, cy + 8), green, 2)
+                        # 追击起跳区间：绿色线段（以最大攻击距离为基准偏移 min~max）
+                        if decision_settings.chase_jump_enabled:
+                            jlo = int(decision_settings.chase_jump_min)
+                            jhi = int(decision_settings.chase_jump_max)
+                            if jlo > jhi:
+                                jlo, jhi = jhi, jlo
+                            if jlo != jhi:
+                                jx1 = max_x + dirn * jlo
+                                jx2 = max_x + dirn * jhi
+                                # 内侧部分会和黄色攻击线段重叠，下移几像素错开
+                                jy = cy + 6 if jlo < 0 else cy
+                                green = (0, 200, 0)
+                                cv2.line(vis, (jx1, jy), (jx2, jy), green, 2)
+                                cv2.line(vis, (jx2, jy - 8), (jx2, jy + 8), green, 2)
 
                         # 扫平台倾向朝向箭头：位于攻击距离上方，指向朝向方向，
                         # 尾巴延长至背后锁定距离（back_range）

@@ -51,6 +51,10 @@ DEFAULT_OUTPUT_SEQ = [
 ]
 
 
+# 防掉线行为类型：(id, 显示名)。目前只实现「隐身休息」，后续可在此扩展。
+ANTI_AFK_TYPES = [("hidden_rest", "隐身休息")]
+
+
 class DecisionSettings:
     """决策参数（UI 写，决策线程读），改动后持久化到 config/decision.json。"""
 
@@ -58,7 +62,10 @@ class DecisionSettings:
         self.enabled = False
         self.attack_dist = 80.0     # 最大攻击距离（画面像素），小于它就打
         self.min_attack_dist = 0    # 最小攻击距离（像素），>0 时启用规避
-        self.chase_jump_dist = -1   # 追击起跳距离（像素）：chase 时目标在此范围外延就跳；<=0 无效
+        self.chase_jump_enabled = False  # 追击起跳开关
+        self.chase_jump_min = 0     # 追击起跳区间下限（相对最大攻击距离的偏移，像素）
+        self.chase_jump_max = 50    # 追击起跳区间上限（同样是相对最大攻击距离的偏移）
+        self.mouse_speed = 1.0      # 触控板灵敏度：本地鼠标位移 → 远程鼠标位移的比例（1.0 = 1:1）
         self.evade_type = "jump"    # 规避类型："jump" 跳 / "back" 后退
         self.jump_interval = 200    # 跳间隔（毫秒）：跳键和输出键之间的间隔
         self.jump_random_prob = 0.1 # 乱跳几率（0~1）：正常攻击时随机跳+输出的概率
@@ -66,11 +73,13 @@ class DecisionSettings:
         self.output_seq = [dict(e) for e in DEFAULT_OUTPUT_SEQ]        # 输出行为序列（attack 状态执行）
         self.keymap = dict(DEFAULT_KEYMAP)
         self.target_cd = [500, 1000]  # 目标切换 CD [min, max]（毫秒）
-        self.input_device = "local"   # 输入设备："local" 本机 / "remote" Pro Micro
+        self.input_device = "local"   # 输入设备："local" 本机 / "remote" Pro Micro 远程 / "serial" Pro Micro 本地
         self.input_delay = [70, 130]  # 随机输入延迟 [min, max]（毫秒），按键之间
-        self.attack_cd = 0          # 输出行为 CD（毫秒）：攻击/跳输出/反向跳回身等行为的节奏 = CD + 随机延迟
+        # 输出行为 CD（毫秒）：两次输出之间的**最小间隔**，从上次输出时刻起算
+        # （实际间隔 = CD + 随机延迟；输出序列自身更长时以序列为准）
+        self.attack_cd = 0
         self.attack_lock_debounce_ms = 300  # 输出后锁定防抖（毫秒）：这段时间内 attack 目标保持锁定，不切换到攻击范围内其他框
-        self.player_debounce_dist = 150     # 玩家识别防抖距离（像素）：玩家框中心跳变超过此距离则沿用上一帧位置
+        self.player_track_jump = 150        # 玩家追踪阈值（像素）：新玩家框离预测位置超此距离就不认（防跟错）
         self.hp_bar = None          # HP 条区域 (x, y, w, h) 或 None
         self.mp_bar = None          # MP 条区域 (x, y, w, h) 或 None
         self.hp_color = None        # HP 填充色范围 [[B,G,R],[B,G,R]] 或 None（默认红）
@@ -103,9 +112,20 @@ class DecisionSettings:
         self.player_lost_timeout_min = 3 # 找不到玩家超时（分钟）：超过就停止自动，0=禁用
         self.resetall_interval = 60      # 定时 RELEASEALL（秒）：清空固件侧按键防卡键，0=禁用
         self.anti_afk_enabled = False   # 防掉线开关
+        self.anti_afk_type = "hidden_rest"  # 防掉线行为类型，见 ANTI_AFK_TYPES
         self.anti_afk_min = 5           # 防掉线触发时间下限（分钟）
         self.anti_afk_max = 10          # 防掉线触发时间上限（分钟）
-        self.anti_afk_seq = []          # 防掉线行为序列（down/up/delay）
+        # 「隐身休息」类型的参数：进入/退出隐身各一套行为序列，中间休息随机时长。
+        self.anti_afk_enter_seq = []    # 进入隐身行为序列（down/up/delay）
+        self.anti_afk_exit_seq = []     # 退出隐身行为序列
+        self.anti_afk_rest_min = 10     # 休息时长下限（分钟）
+        self.anti_afk_rest_max = 20     # 休息时长上限（分钟）
+        # 以下是运行时状态，不持久化（to_dict 不导出）：
+        self.rest_abort = False         # UI 置 True 请求「手动结束休息」，agent 消费后清掉
+        self.rest_state = ""            # 当前休息阶段（"" / afk_enter / afk_rest / afk_exit），UI 只读
+        self.rest_until_monotonic = 0.0 # 本次休息的结束时刻（time.monotonic），UI 读它算倒计时
+        self.next_afk_monotonic = 0.0   # 下次防掉线触发时刻（0 = 未排期 / 防掉线关着）
+        self.rest_pending = False       # 已到触发时间，等攻击范围内的怪清空（「待休息」）
         self.custom_keys = {}           # 自定义按键：{键名: 物理键名}，键名自动命名（custom1...）
 
     def set_key(self, name, key):
@@ -115,7 +135,10 @@ class DecisionSettings:
         """导出所有决策参数（不含运行时状态 enabled / feed_next_monotonic）。"""
         return {"attack_dist": self.attack_dist,
                 "min_attack_dist": self.min_attack_dist,
-                "chase_jump_dist": self.chase_jump_dist,
+                "chase_jump_enabled": self.chase_jump_enabled,
+                "chase_jump_min": self.chase_jump_min,
+                "chase_jump_max": self.chase_jump_max,
+                "mouse_speed": self.mouse_speed,
                 "evade_type": self.evade_type,
                 "jump_interval": self.jump_interval,
                 "jump_random_prob": self.jump_random_prob,
@@ -127,7 +150,7 @@ class DecisionSettings:
                 "input_delay": self.input_delay,
                 "attack_cd": self.attack_cd,
                 "attack_lock_debounce_ms": self.attack_lock_debounce_ms,
-                "player_debounce_dist": self.player_debounce_dist,
+                "player_track_jump": self.player_track_jump,
                 "hp_bar": self.hp_bar, "mp_bar": self.mp_bar,
                 "hp_color": self.hp_color, "mp_color": self.mp_color,
                 "hp_threshold": self.hp_threshold,
@@ -156,9 +179,13 @@ class DecisionSettings:
                 "player_lost_timeout_min": self.player_lost_timeout_min,
                 "resetall_interval": self.resetall_interval,
                 "anti_afk_enabled": self.anti_afk_enabled,
+                "anti_afk_type": self.anti_afk_type,
                 "anti_afk_min": self.anti_afk_min,
                 "anti_afk_max": self.anti_afk_max,
-                "anti_afk_seq": self.anti_afk_seq,
+                "anti_afk_enter_seq": self.anti_afk_enter_seq,
+                "anti_afk_exit_seq": self.anti_afk_exit_seq,
+                "anti_afk_rest_min": self.anti_afk_rest_min,
+                "anti_afk_rest_max": self.anti_afk_rest_max,
                 "custom_keys": self.custom_keys}
 
     def save(self):
@@ -175,7 +202,10 @@ class DecisionSettings:
         data = data or {}
         self.attack_dist = float(data.get("attack_dist", 80.0))
         self.min_attack_dist = int(data.get("min_attack_dist", 0))
-        self.chase_jump_dist = int(data.get("chase_jump_dist", -1))
+        self.chase_jump_enabled = bool(data.get("chase_jump_enabled", False))
+        self.chase_jump_min = int(data.get("chase_jump_min", 0))
+        self.chase_jump_max = int(data.get("chase_jump_max", 50))
+        self.mouse_speed = float(data.get("mouse_speed", 1.0))
         self.evade_type = data.get("evade_type", "jump")
         self.jump_interval = int(data.get("jump_interval", 200))
         self.jump_random_prob = float(data.get("jump_random_prob", 0.1))
@@ -189,16 +219,18 @@ class DecisionSettings:
         if isinstance(cd, (list, tuple)) and len(cd) == 2:
             self.target_cd = [int(cd[0]), int(cd[1])]
         dev = data.get("input_device")
-        if dev in ("local", "remote"):
+        if dev in ("local", "remote", "serial"):
             self.input_device = dev
         dly = data.get("input_delay")
         if isinstance(dly, (list, tuple)) and len(dly) == 2:
             self.input_delay = [int(dly[0]), int(dly[1])]
         self.attack_cd = int(data.get("attack_cd", 0))
         self.attack_lock_debounce_ms = int(data.get("attack_lock_debounce_ms", 300))
-        self.player_debounce_dist = int(data.get("player_debounce_dist", 150))
-        self.hp_bar = self._load_rect(data.get("hp_bar"))
-        self.mp_bar = self._load_rect(data.get("mp_bar"))
+        # 旧键 player_debounce_dist 兼容读一次（改名前的配置 / 模板里是这个）
+        self.player_track_jump = int(data.get(
+            "player_track_jump", data.get("player_debounce_dist", 150)))
+        self.hp_bar = load_rect(data.get("hp_bar"))
+        self.mp_bar = load_rect(data.get("mp_bar"))
         self.hp_color = self._load_color(data.get("hp_color"))
         self.mp_color = self._load_color(data.get("mp_color"))
         self.hp_threshold = int(data.get("hp_threshold", 30))
@@ -220,20 +252,29 @@ class DecisionSettings:
         self.debounce_conf = float(data.get("debounce_conf", 0.5))
         self.debounce_ms = int(data.get("debounce_ms", 300))
         self.auto_feed_pet = bool(data.get("auto_feed_pet", False))
-        self.feed_interval_min = int(data.get("feed_interval_min", 5))
-        self.feed_interval_max = int(data.get("feed_interval_max", 10))
+        # 分钟类参数统一用 float：UI 支持小数（如 7.5 分钟）
+        self.feed_interval_min = float(data.get("feed_interval_min", 5))
+        self.feed_interval_max = float(data.get("feed_interval_max", 10))
         if self.feed_interval_max < self.feed_interval_min:
             self.feed_interval_max = self.feed_interval_min
         self.custom_timers = self._load_timers(data.get("custom_timers"))
-        self.facing_timeout_min = int(data.get("facing_timeout_min", 10))
-        self.player_lost_timeout_min = int(data.get("player_lost_timeout_min", 3))
+        self.facing_timeout_min = float(data.get("facing_timeout_min", 10))
+        self.player_lost_timeout_min = float(data.get("player_lost_timeout_min", 3))
         self.resetall_interval = int(data.get("resetall_interval", 60))
         self.anti_afk_enabled = bool(data.get("anti_afk_enabled", False))
-        self.anti_afk_min = int(data.get("anti_afk_min", 5))
-        self.anti_afk_max = int(data.get("anti_afk_max", 10))
+        atype = str(data.get("anti_afk_type") or "")
+        self.anti_afk_type = (atype if any(atype == t for t, _ in ANTI_AFK_TYPES)
+                              else ANTI_AFK_TYPES[0][0])
+        self.anti_afk_min = float(data.get("anti_afk_min", 5))
+        self.anti_afk_max = float(data.get("anti_afk_max", 10))
         if self.anti_afk_max < self.anti_afk_min:
             self.anti_afk_max = self.anti_afk_min
-        self.anti_afk_seq = self._load_seq(data.get("anti_afk_seq"), [])
+        self.anti_afk_enter_seq = self._load_seq(data.get("anti_afk_enter_seq"), [])
+        self.anti_afk_exit_seq = self._load_seq(data.get("anti_afk_exit_seq"), [])
+        self.anti_afk_rest_min = float(data.get("anti_afk_rest_min", 10))
+        self.anti_afk_rest_max = float(data.get("anti_afk_rest_max", 20))
+        if self.anti_afk_rest_max < self.anti_afk_rest_min:
+            self.anti_afk_rest_max = self.anti_afk_rest_min
         ck = data.get("custom_keys") or {}
         if isinstance(ck, dict):
             self.custom_keys = {str(k): (v if isinstance(v, str) or v is None else None)
@@ -257,12 +298,6 @@ class DecisionSettings:
                     return [low, high]
             except Exception:
                 pass
-        return None
-
-    @staticmethod
-    def _load_rect(v):
-        if isinstance(v, (list, tuple)) and len(v) == 4:
-            return [int(v[0]), int(v[1]), int(v[2]), int(v[3])]
         return None
 
     @staticmethod
@@ -322,8 +357,8 @@ class DecisionSettings:
             if not isinstance(iv, (list, tuple)) or len(iv) != 2:
                 continue
             try:
-                lo = max(0, int(iv[0]))
-                hi = max(lo, int(iv[1]))
+                lo = max(0.0, float(iv[0]))
+                hi = max(lo, float(iv[1]))
             except Exception:
                 continue
             out.append({"name": name, "seq": seq, "interval": [lo, hi]})
@@ -358,9 +393,13 @@ class CombatAgent:
         self._no_target_since = None  # 朝向没目标的起始时刻（换朝向防抖用）
         self._back_ctx = None       # 回身输出序列上下文 [seq, phase, next, held, sub_stack]
         self._output_ctx = None     # 输出行为序列上下文
+        self._sweep_hold = False    # 扫平台：输出已触发 → 停朝倾向朝向移动，直到范围内清空
         self._next_afk = 0.0        # 下次防掉线触发时刻
         self._was_afk_enabled = False  # 防掉线开关上一次状态（上升沿检测）
-        self._afk_ctx = None        # 防掉线序列上下文
+        self._afk_ctx = None        # 当前防掉线阶段的序列上下文（进入/退出隐身）
+        self._rest_pending = False  # 已到防掉线触发时间，等攻击范围内的怪清空
+        self._rest_last_tick = 0.0  # 上次推进「暂停计时器」的时刻
+        self._rest_until = 0.0      # 本次休息的结束时刻
 
     @staticmethod
     def _edge_dist(m, player):
@@ -389,6 +428,41 @@ class CombatAgent:
                 best = d
                 target = m
         return target, best
+
+    def _in_chase_jump_range(self, dist):
+        """追击起跳判定：边缘距离 dist 是否落在起跳区间内。
+
+        区间 = [最大攻击距离 + min, 最大攻击距离 + max]：
+          min/max 都是相对「最大攻击距离」的偏移；
+          都为正 → 纯外侧；都为负 → 纯内侧；一负一正 → 跨攻击距离两侧。
+        """
+        s = self.settings
+        lo, hi = float(s.chase_jump_min), float(s.chase_jump_max)
+        if lo > hi:
+            lo, hi = hi, lo   # 容错：填反了也能用
+        ad = float(s.attack_dist)
+        return ad + lo <= dist <= ad + hi
+
+    def _maybe_chase_jump(self, dist, now, others=0):
+        """追击起跳（带节流）：dist 落在起跳区间内就按跳。
+
+        **前提：攻击范围内没有其他怪**（others = 范围内除当前目标外的怪数量）。
+        有其他怪时不跳 —— 先打那些更划算，跳会打断输出、还可能把自己跳出攻击距离。
+        目标自己在范围内不影响：那就是「纯内侧」那种情形（已进范围但偏远，跳一下够着）。
+        """
+        s = self.settings
+        if not s.chase_jump_enabled or now < self._next_chase_jump:
+            return
+        if others > 0:
+            return
+        if not self._in_chase_jump_range(dist):
+            return
+        jump_key = s.keymap.get("jump")
+        if not jump_key:
+            return
+        tap(jump_key, self._attack_duration)
+        attack_cd_s = max(0.0, float(s.attack_cd)) / 1000.0
+        self._next_chase_jump = now + max(0.3, attack_cd_s + self._random_input_delay())
 
     def set_facing(self, f):
         """设置朝向；朝向真的变了就重置「朝向无变化」超时计时。"""
@@ -429,43 +503,47 @@ class CombatAgent:
         序列走完返回 None（完成时释放本层 held 键）。
         """
         seq, phase, next_ts, held, sub_stack = ctx
-        # 子栈优先：先执行 then 子序列
-        if sub_stack:
-            sub = self._run_seq(now, sub_stack[-1])
-            if sub is None:
-                sub_stack.pop()
-            else:
+        while True:
+            # 子栈优先：先执行 then 子序列
+            if sub_stack:
+                sub = self._run_seq(now, sub_stack[-1])
+                if sub is None:
+                    sub_stack.pop()   # 子序列跑完：同一帧继续父序列，不白占一帧
+                    continue
                 sub_stack[-1] = sub
-            return ctx
-        if now < next_ts:
-            return ctx
-        if not seq or phase >= len(seq):
-            self._release_held_set(held)
-            return None
-        elem = seq[phase]
-        phase += 1
-        # 执行几率：默认 100%；未命中则跳过本元素（下一帧执行下一个）
-        prob = elem.get("prob", 100)
-        if prob < 100 and random.random() * 100 >= prob:
+                return ctx
+            if now < next_ts:
+                return ctx
+            if not seq or phase >= len(seq):
+                self._release_held_set(held)
+                return None
+            elem = seq[phase]
+            phase += 1
+            # 执行几率：默认 100%；未命中则跳过本元素。
+            # 跳过的元素不产生任何输入，也就不该占用一个 tick —— 同一帧里接着看
+            # 下一个。否则「10% 几率的跳」在 90% 的情况下白吃一个 tick（15fps 下
+            # 66.7ms），把输出间隔拉长，而它明明什么都没发。
+            prob = elem.get("prob", 100)
+            if prob < 100 and random.random() * 100 >= prob:
+                continue
+            if elem["type"] == "delay":
+                next_ts = now + max(0, int(elem.get("ms", 0))) / 1000.0
+            else:
+                key = self._resolve_seq_key(elem.get("key"))
+                if key:
+                    if elem["type"] == "down":
+                        key_down(key)
+                        held.add(key)
+                        if key == self.settings.keymap.get("attack"):
+                            self._last_output = now
+                    else:
+                        key_up(key)
+                        held.discard(key)
+                next_ts = now + self._random_input_delay()
+            then = elem.get("then")
+            if isinstance(then, list) and then:
+                sub_stack.append([then, 0, 0.0, set(), []])
             return [seq, phase, next_ts, held, sub_stack]
-        if elem["type"] == "delay":
-            next_ts = now + max(0, int(elem.get("ms", 0))) / 1000.0
-        else:
-            key = self._resolve_seq_key(elem.get("key"))
-            if key:
-                if elem["type"] == "down":
-                    key_down(key)
-                    held.add(key)
-                    if key == self.settings.keymap.get("attack"):
-                        self._last_output = now
-                else:
-                    key_up(key)
-                    held.discard(key)
-            next_ts = now + self._random_input_delay()
-        then = elem.get("then")
-        if isinstance(then, list) and then:
-            sub_stack.append([then, 0, 0.0, set(), []])
-        return [seq, phase, next_ts, held, sub_stack]
 
     def _release_ctx(self, ctx):
         """释放上下文里所有按下的键（含 then 子序列栈）。"""
@@ -590,8 +668,17 @@ class CombatAgent:
                 state = "attack"
 
         if state == "attack":
-            # 攻击时按住朝向目标的方向键：角色转向慢，确保面向目标、攻击打得到
-            self._steer(target.x - px, keys)
+            if s.strategy == "sweep" and self._sweep_hold:
+                # 扫平台：输出已经触发过 → 松开朝倾向朝向的移动键，站着打。
+                # 只同步内部朝向、不按键 —— 按了方向键就会一边走一边打，角色会
+                # 从怪身上走过去；走出去后攻击范围内没框了，又回头走 → 来回抖。
+                if target.x > px:
+                    self.set_facing(1)
+                elif target.x < px:
+                    self.set_facing(-1)
+            else:
+                # 攻击时按住朝向目标的方向键：角色转向慢，确保面向目标、攻击打得到
+                self._steer(target.x - px, keys)
 
         self._set_state(state)
         return keys
@@ -628,26 +715,68 @@ class CombatAgent:
                 self._target_until = 0.0
         return target, best
 
-    def _output_actions(self, now, target):
+    def _reap_ghost_mobs(self, target, mobs, ws):
+        """输出行为触发的防呆：把「攻击范围内的防抖幽灵框」标记为待消除。
+
+        背景：MobTracker 会为短暂漏检的高置信度框保留位置（missed > 0 = 幽灵框），
+        决策层不至于因一帧漏检丢目标。但对幽灵框继续输出就是空放技能（怪其实
+        已经消失）。所以一旦进入输出，就把当前目标、以及攻击范围内（最小攻击
+        距离 ~ 最大攻击距离）的所有幽灵框都记进 _kill_mobs；上层（live_thread）
+        每帧取一个调 mob_tracker.kill() 立即消除该轨迹。
+
+        为什么不止当前目标：只消当前那个的话，范围内的其他幽灵框下一帧会顶上
+        来当目标，继续空放；一次性清掉更干脆。
+        """
+        if target is not None and getattr(target, "missed", 0) > 0:
+            self._kill_mobs.add(target.id)
+        s = self.settings
+        lo = max(0.0, float(s.min_attack_dist))
+        hi = float(s.attack_dist)
+        for m in mobs:
+            if (getattr(m, "missed", 0) > 0
+                    and lo <= self._edge_dist(m, ws.player) <= hi):
+                self._kill_mobs.add(m.id)
+
+    def _next_output_ts(self, now, cd):
+        """下一次输出动作的最早时刻（monotonic）。
+
+        以「上次输出时刻」(_last_output) 为锚点，而不是「序列走完的时刻」：
+        序列从输出键按下到整条走完还有一段时间（后续元素的按键间隔 + 主循环
+        tick 粒度），原来用 `now + cd` 会把这部分**叠加**在 CD 之上 —— 实测
+        3 元素序列、15fps、CD=200ms 时，两次输出隔了 400ms（多出 3 个 tick）。
+
+        改成从 _last_output 起算后，attack_cd 就是「两次输出之间的最小间隔」，
+        序列自身的耗时被 CD 吸收；序列比 CD 长时以序列为准（max 里的 now），
+        绝不会让两轮序列重叠。末尾再叠一点随机延迟做人工化抖动。
+        """
+        return max(now, self._last_output + cd) + self._random_input_delay()
+
+    def _output_actions(self, now, target, mobs, ws):
         """按当前状态输出动作：attack 连点 / evade_jump 跳+输出 / evade_back_jump 序列。"""
         s = self.settings
         attack_cd = max(0.0, float(s.attack_cd)) / 1000.0
         attack_key = s.keymap["attack"]
 
+        # 输出行为触发的防呆：攻击范围内的防抖幽灵框标记待消除（各输出状态通用，
+        # 规避时也在输出，同样会空放）
+        self._reap_ghost_mobs(target, mobs, ws)
+
         if self.state == "attack":
-            # 执行输出行为序列（output_seq），走完等 attack_cd 再循环
+            # 执行输出行为序列（output_seq），走完按 attack_cd 排下一轮
             if self._output_ctx is None:
                 self._output_ctx = [s.output_seq, 0, 0.0, set(), []]
             r = self._run_seq(now, self._output_ctx)
             if r is None:
-                self._output_ctx = [s.output_seq, 0,
-                                    now + attack_cd + self._random_input_delay(),
-                                    set(), []]
+                due = self._next_output_ts(now, attack_cd)
+                self._output_ctx = [s.output_seq, 0, due, set(), []]
+                # due 已经过了（序列本身比 CD + 随机延迟还长）→ 同一帧直接起步，
+                # 否则这一帧纯空转，等于给输出间隔白加一个 tick。
+                if due <= now:
+                    r = self._run_seq(now, self._output_ctx)
+                    if r is not None:
+                        self._output_ctx = r
             else:
                 self._output_ctx = r
-            # 攻击的是防抖幽灵框（漏检保留的）：立即消除，避免持续空放技能
-            if target is not None and getattr(target, "missed", 0) > 0:
-                self._kill_mobs.add(target.id)
         else:
             # 离开攻击状态：重置输出序列 + 松开残留键
             self._release_ctx(self._output_ctx)
@@ -672,11 +801,25 @@ class CombatAgent:
             r = self._run_seq(now, self._back_ctx)
             if r is None:
                 # 序列走完：循环重来（回身输出是循环行为）
-                self._back_ctx = [s.back_jump_seq, 0,
-                                  now + attack_cd + self._random_input_delay(),
-                                  set(), []]
+                due = self._next_output_ts(now, attack_cd)
+                self._back_ctx = [s.back_jump_seq, 0, due, set(), []]
+                if due <= now:            # CD 已过 → 同一帧起步，不白占一帧
+                    r = self._run_seq(now, self._back_ctx)
+                    if r is not None:
+                        self._back_ctx = r
             else:
                 self._back_ctx = r
+
+    def _take_kill_mobs(self):
+        """取出并清空待消除的幽灵框 id 列表（tick 各返回路径统一带上）。
+
+        一帧全清：不只当前目标，攻击范围内的防抖幽灵框都在这批里。
+        """
+        if not self._kill_mobs:
+            return []
+        out = sorted(self._kill_mobs)
+        self._kill_mobs.clear()
+        return out
 
     def tick(self, ws):
         """跑一帧决策。ws: WorldState。返回动作描述 dict（调试/展示）。"""
@@ -694,9 +837,46 @@ class CombatAgent:
             # 否则停自动时若正处于序列中间，序列按下的键会卡住继续生效。
             self._release_held_keys()
             self.state = "idle"
-            return {"state": "idle", "reason": "未开启"}
+            self._rest_pending = False   # 停自动一并取消「待休息」，重新开启后重新计时
+            s.rest_state = ""            # 停自动也清掉休息状态（UI 按钮跟着变灰）
+            s.rest_abort = False
+            s.rest_until_monotonic = 0.0
+            s.rest_pending = False
+            s.next_afk_monotonic = 0.0
+            return {"state": "idle", "reason": "未开启",
+                    "kill_mobs": self._take_kill_mobs()}
 
         now = time.monotonic()
+
+        # 防掉线-隐身休息：休息流程独占本帧 —— 不走 RELEASEALL / 喂宠 / 自定义定时
+        # （计时器由 _run_rest → _pause_timers 冻住），也不做任何战斗动作。
+        #
+        # 唯一例外是**自动喝药**：隐身不等于安全（隐身到期、被范围技能扫到、
+        # 血本来就没满），血量掉了照样要补。注意正常路径里喝药在「定位到玩家」
+        # 之后才跑，而休息时角色是隐身的、很可能定位不到，所以这里必须显式补一次。
+        if self.state in ("afk_enter", "afk_rest", "afk_exit"):
+            if not s.anti_afk_enabled:
+                # 休息途中关掉防掉线：立刻退出休息，别把角色留在隐身里
+                self._release_ctx(self._afk_ctx)
+                self._afk_ctx = None
+                self._finish_rest(now)
+            else:
+                # 手动「结束休息」：不能直接跳回打怪 —— 角色还在隐身里，
+                # 半截的进入隐身序列也可能按着键。所以松掉当前序列、转去执行
+                # 退出隐身行为，走完再由 _finish_rest 收尾。已经在退出阶段就忽略。
+                if s.rest_abort and self.state != "afk_exit":
+                    s.rest_abort = False
+                    self._release_ctx(self._afk_ctx)
+                    self._afk_ctx = None
+                    self.state = "afk_exit"
+                self._run_rest(now)
+                self._drink_potions(ws, now)
+                return {"state": self.state, "reason": "隐身休息", "target": None,
+                        "dx": 0, "dist": 0, "keys": [], "facing": self.facing,
+                        "kill_mobs": self._take_kill_mobs()}
+        else:
+            # 不在休息中：丢掉过期的「结束休息」请求，否则下一次休息一开始就会被它结束掉
+            s.rest_abort = False
 
         # 定时 RELEASEALL：防长时间运行后固件侧按键卡住。发完清空本地按键状态，
         # 下一帧会重新按需要的键（清空后 keys.set 会重新发 PRESS）。
@@ -725,11 +905,13 @@ class CombatAgent:
                     s.enabled = False
                     self._release_combat_keys()
                     self.state = "idle"
-                    return {"state": "idle", "reason": "长时间未定位到玩家，已停止自动"}
+                    return {"state": "idle", "reason": "长时间未定位到玩家，已停止自动",
+                            "kill_mobs": self._take_kill_mobs()}
             # 没定位到玩家：释放打怪相关按键，但保留定时行为序列（它们不依赖玩家）
             self._release_combat_keys()
             self.state = "idle"
-            return {"state": "idle", "reason": "未定位玩家"}
+            return {"state": "idle", "reason": "未定位玩家",
+                    "kill_mobs": self._take_kill_mobs()}
 
         # 定位到玩家：重置找不到玩家计时
         self._player_lost_since = None
@@ -741,27 +923,23 @@ class CombatAgent:
             s.enabled = False
             self.keys.release_all()
             self.state = "idle"
-            return {"state": "idle", "reason": "朝向长时间未变化，已停止自动"}
+            return {"state": "idle", "reason": "朝向长时间未变化，已停止自动",
+                    "kill_mobs": self._take_kill_mobs()}
 
-        # 防掉线：开关上升沿随机一个下次触发时间；到点进入防掉线状态执行行为序列。
+        # 防掉线：开关上升沿随机一个下次触发时间；到点只标记「待休息」，
+        # 真正进入隐身要等攻击范围内的怪清空（见下面 in_range 之后）。
         if s.anti_afk_enabled:
             if not self._was_afk_enabled:
-                lo = max(0.0, float(s.anti_afk_min))
-                hi = max(lo, float(s.anti_afk_max))
-                self._next_afk = now + random.uniform(lo, hi) * 60.0
-            if self.state != "afk" and now >= self._next_afk:
-                self.state = "afk"
-                self._afk_ctx = None
-            if self.state == "afk":
-                self._run_afk(now)
-                return {"state": self.state, "target": None, "dx": 0, "dist": 0,
-                        "keys": [], "facing": self.facing}
-        elif self.state == "afk":
-            # 关掉防掉线：退出状态，松开残留键
-            self._release_ctx(self._afk_ctx)
-            self._afk_ctx = None
-            self.state = "idle"
+                self._next_afk = now + self._random_afk_interval()
+            if now >= self._next_afk:
+                self._rest_pending = True
+        else:
+            self._rest_pending = False
+            self._next_afk = 0.0        # 关掉防掉线：清排期，UI 不显示倒计时
         self._was_afk_enabled = s.anti_afk_enabled
+        # 回读给 UI：下次休息倒计时 + 是否在等清怪
+        s.next_afk_monotonic = self._next_afk
+        s.rest_pending = self._rest_pending
 
         px = ws.player.x
 
@@ -779,6 +957,19 @@ class CombatAgent:
         # attack 最高优先级：只要前方攻击范围内有框，就进入攻击（或规避）
         in_range = self._in_range(mobs, ws)
 
+        # 防掉线-隐身休息：已到触发时间，且攻击范围内的怪已清空 → 开始进入隐身
+        if self._rest_pending and not in_range:
+            self._rest_pending = False
+            # 同步清掉 UI 的两个排期量：这一帧之后就进入休息了（休息门禁会提前
+            # return），不会再有人写它们，留着就是过期值。
+            s.rest_pending = False
+            s.next_afk_monotonic = 0.0
+            self._begin_rest(now)
+            self._run_rest(now)
+            return {"state": self.state, "reason": "进入隐身休息", "target": None,
+                    "dx": 0, "dist": 0, "keys": [], "facing": self.facing,
+                    "kill_mobs": self._take_kill_mobs()}
+
         if in_range:
             # attack 最高优先级：攻击范围内有框就攻击。
             # 输出后锁定防抖：这段时间内 attack 目标保持锁定，不切换到范围内其他框。
@@ -794,22 +985,24 @@ class CombatAgent:
             self._target_until = now + self._random_target_cd()
             self._no_target_since = None
             keys = self._attack_state(target, best, mobs, ws)
+            # 扫平台「打完停下」：本帧已进入 attack 状态（输出行为在跑）→ 下一帧起
+            # 不再朝倾向朝向移动，一直站到攻击范围内清空（下面 else 分支解除）。
+            # CD 期间也保持停下：范围内还有怪就不该往前走。
+            self._sweep_hold = (s.strategy == "sweep" and self.state == "attack")
+            # 追击起跳（内侧）：范围内只有目标这一只时可以跳（已进范围但偏远，跳一下
+            # 够得着）；范围内还有别的怪就不跳 —— 先打那些，跳会打断输出、还可能
+            # 把自己跳出攻击距离。others 就是「范围内除目标外的怪数量」。
+            self._maybe_chase_jump(best, now, others=len(in_range) - 1)
         else:
             # 前方攻击范围内没框
+            self._sweep_hold = False    # 清空 → 恢复朝倾向朝向移动
             target, best = self._locked_target(candidates, ws, now)
             keys = set()
             if target is not None:
                 # 有锁定目标（sweep 背后怪 / patrol 最近怪）：朝它走
                 self._steer(target.x - px, keys)
-                # 追击起跳：锁定目标在 [attack_dist, attack_dist + chase_jump_dist] 就跳
-                cjd = max(0.0, float(s.chase_jump_dist))
-                if (cjd > 0 and s.attack_dist <= best <= s.attack_dist + cjd
-                        and now >= self._next_chase_jump):
-                    jump_key = s.keymap.get("jump")
-                    if jump_key:
-                        tap(jump_key, self._attack_duration)
-                        attack_cd_s = max(0.0, float(s.attack_cd)) / 1000.0
-                        self._next_chase_jump = now + max(0.3, attack_cd_s + self._random_input_delay())
+                # 追击起跳：本分支攻击范围内本来就是空的，不存在「其他怪」，前提天然满足
+                self._maybe_chase_jump(best, now)
                 self._set_state("chase")
             elif s.strategy == "sweep":
                 # 扫平台巡逻：无背后怪，朝倾向朝向走（不锁定、无红框）。
@@ -818,14 +1011,13 @@ class CombatAgent:
                 self.set_facing(self._patrol_dir)
                 keys.add(s.keymap["right"] if self._patrol_dir > 0 else s.keymap["left"])
                 self._set_state("chase")
-                # 追击起跳：向倾向方向移动时，追击起跳范围内有怪（即使未锁定）也按跳
-                cjd = max(0.0, float(s.chase_jump_dist))
-                if cjd > 0 and now >= self._next_chase_jump:
+                # 追击起跳：向倾向方向移动时，起跳区间内有怪（即使未锁定）也按跳
+                if s.chase_jump_enabled and now >= self._next_chase_jump:
                     jump_key = s.keymap.get("jump")
                     if jump_key:
                         hit = next((m for m in mobs
                                     if (m.x - px) * self._patrol_dir >= 0
-                                    and s.attack_dist <= self._edge_dist(m, ws.player) <= s.attack_dist + cjd),
+                                    and self._in_chase_jump_range(self._edge_dist(m, ws.player))),
                                    None)
                         if hit is not None:
                             tap(jump_key, self._attack_duration)
@@ -848,7 +1040,8 @@ class CombatAgent:
                 # 平地巡逻：无怪，idle
                 self._set_state("idle")
                 self.keys.release_all()
-                return {"state": "idle", "reason": "无怪"}
+                return {"state": "idle", "reason": "无怪",
+                        "kill_mobs": self._take_kill_mobs()}
 
         # 发键前再检查一次自动开关：主线程可能在这一帧决策中途把自动关掉并
         # 兜底释放了按键。若这里照常发键，会和主线程的释放竞争，导致移动键
@@ -856,35 +1049,121 @@ class CombatAgent:
         if not s.enabled:
             self._release_combat_keys()
             self.state = "idle"
-            return {"state": "idle", "reason": "未开启"}
+            return {"state": "idle", "reason": "未开启",
+                    "kill_mobs": self._take_kill_mobs()}
 
         self.keys.set(keys)
 
         # 输出行为：攻击 / 跳规避 / 回身输出（按 self.state）
-        self._output_actions(now, target)
+        self._output_actions(now, target, mobs, ws)
 
-        kill_mob = self._kill_mobs.pop() if self._kill_mobs else None
         tid = target.id if target is not None else None
         dx = round((target.x - px) if target is not None else 0.0, 1)
         return {"state": self.state, "target": tid, "dx": dx,
                 "dist": round(best, 1),
                 "keys": sorted(keys), "facing": self.facing,
-                "kill_mob": kill_mob}
+                "kill_mobs": self._take_kill_mobs()}
 
-    def _run_afk(self, now):
-        """防掉线状态：执行行为序列。走完退出，并随机下一次触发时间。"""
+    def _random_afk_interval(self):
+        """随机一个下次防掉线触发间隔（秒）。"""
         s = self.settings
-        if self._afk_ctx is None:
-            self._afk_ctx = [s.anti_afk_seq, 0, 0.0, set(), []]
-        r = self._run_seq(now, self._afk_ctx)
-        if r is None:
-            self._afk_ctx = None
-            self.state = "idle"
-            lo = max(0.0, float(s.anti_afk_min))
-            hi = max(lo, float(s.anti_afk_max))
-            self._next_afk = now + random.uniform(lo, hi) * 60.0
-        else:
-            self._afk_ctx = r
+        lo = max(0.0, float(s.anti_afk_min))
+        hi = max(lo, float(s.anti_afk_max))
+        return random.uniform(lo, hi) * 60.0
+
+    def _random_rest_interval(self):
+        """随机一个本次休息时长（秒）。"""
+        s = self.settings
+        lo = max(0.0, float(s.anti_afk_rest_min))
+        hi = max(lo, float(s.anti_afk_rest_max))
+        return random.uniform(lo, hi) * 60.0
+
+    def _begin_rest(self, now):
+        """进入隐身休息：先彻底停下战斗 —— 松掉所有按着的键（含定时行为序列
+        执行到一半残留的），否则休息期间角色还在走/还在打。
+
+        休息时长从这里（进入隐身行为的**开始**）起算，不是等进入隐身走完才算 ——
+        否则进入隐身的耗时会被白送给休息时间（用户期望从开始算）。
+        """
+        self._release_held_keys()
+        self.keys.release_all()
+        self.state = "afk_enter"
+        self._afk_ctx = None
+        self._rest_last_tick = now
+        self._rest_until = now + self._random_rest_interval()
+
+    def _run_rest(self, now):
+        """隐身休息状态机：执行进入隐身行为 → 休息倒计时 → 执行退出隐身行为。"""
+        s = self.settings
+        self._pause_timers(now)
+        if self.state == "afk_enter":
+            if self._afk_ctx is None:
+                self._afk_ctx = [s.anti_afk_enter_seq, 0, 0.0, set(), []]
+            r = self._run_seq(now, self._afk_ctx)
+            if r is None:
+                self._afk_ctx = None
+                self.state = "afk_rest"     # 剩余时长在 _begin_rest 就算好了
+            else:
+                self._afk_ctx = r
+        elif self.state == "afk_rest":
+            if now >= self._rest_until:
+                self.state = "afk_exit"
+                self._afk_ctx = None
+        elif self.state == "afk_exit":
+            if self._afk_ctx is None:
+                self._afk_ctx = [s.anti_afk_exit_seq, 0, 0.0, set(), []]
+            r = self._run_seq(now, self._afk_ctx)
+            if r is None:
+                self._afk_ctx = None
+                self._finish_rest(now)
+            else:
+                self._afk_ctx = r
+        # 回读给 UI（「手动结束休息」按钮的可用性 + 休息倒计时）：写在状态迁移之后，
+        # 否则会慢一帧。退出走完时 _finish_rest 已把 rest_state 置空，这里不能再写成 "idle"。
+        s.rest_state = self.state if self.state.startswith("afk_") else ""
+        # 进入隐身的阶段剩余时间也已经在走了（休息从那一刻起算），一起回读
+        s.rest_until_monotonic = (self._rest_until
+                                  if self.state in ("afk_enter", "afk_rest") else 0.0)
+
+    def _finish_rest(self, now):
+        """退出隐身休息，恢复正常战斗，并随机下一次触发时间。"""
+        self.state = "idle"
+        self._rest_pending = False
+        self._rest_last_tick = 0.0
+        self._rest_until = 0.0
+        self.settings.rest_state = ""
+        self.settings.rest_abort = False
+        self.settings.rest_until_monotonic = 0.0
+        self.settings.rest_pending = False
+        # 休息期间没有战斗，朝向 / 玩家丢失这两个超时监控必须重新起算 ——
+        # 否则休息时长一旦超过 facing_timeout_min（默认 10 分钟，模板里才 2 分钟），
+        # 恢复的第一帧就会被判「朝向长时间未变化」直接停自动。
+        self._last_facing_change = now
+        self._player_lost_since = None
+        self._next_afk = now + self._random_afk_interval()
+        self.settings.next_afk_monotonic = self._next_afk   # UI 立刻能显示下次倒计时
+
+    def _pause_timers(self, now):
+        """暂停喂宠 / 自定义定时行为的计时器：把「下次触发时刻」随流逝时间一起往后推。
+
+        效果 = 计时器冻住（剩余时间不变），UI 上的倒计时也自然停住。
+        用增量推进而不是「休息结束时一次性补回」：休息途中关掉防掉线、异常退出，
+        都不会把暂停时长算错。
+        """
+        s = self.settings
+        last = self._rest_last_tick
+        self._rest_last_tick = now
+        if last <= 0:
+            return
+        delta = now - last
+        if delta <= 0:
+            return
+        if self._next_feed > 0:
+            self._next_feed += delta
+            s.feed_next_monotonic = self._next_feed
+        for k, v in list(s.custom_timer_next.items()):
+            if v > 0:
+                s.custom_timer_next[k] = v + delta
 
     def _feed_pet(self, now):
         """自动喂宠：勾选后每隔 feed_cd 按一次喂宠键。
@@ -986,6 +1265,7 @@ class CombatAgent:
         self._back_ctx = None
         self._output_ctx = None
         self._afk_ctx = None
+        self._sweep_hold = False    # 中止战斗：清掉「打完停下」标记，别带到下一轮
 
     def _release_held_keys(self):
         """释放所有还按着的键：KeyState 的 + 序列（回身输出/防掉线/定时行为）残留的。"""
@@ -995,6 +1275,10 @@ class CombatAgent:
         self._timer_states.clear()
 
     def shutdown(self):
+        from decision import input as dinput
+        # 远程模式：发一次 RELEASEALL，让固件一次性清空所有按键（比逐键 RELEASE 可靠，
+        # 能救回「某条 RELEASE 丢失导致卡键」的情况）
+        dinput.release_all_remote()
         self._release_held_keys()
         # 兜底：无条件释放所有映射键（功能键 + 自定义按键）。KeyState 的
         # release_all 只释放「它记得按下的键」，若某次 RELEASE 命令在网络里丢了、
@@ -1008,6 +1292,39 @@ class CombatAgent:
                 except Exception:
                     pass
         self.state = "idle"
+        self.settings.rest_state = ""
+        self.settings.rest_abort = False
+        self.settings.rest_until_monotonic = 0.0
+        self.settings.rest_pending = False
+        self.settings.next_afk_monotonic = 0.0
+
+
+def load_rect(v):
+    """HP/MP 条区域 [nx, ny, nw, nh] —— 存的是**相对画面的比例**（0~1）。
+
+    必须保留小数：曾经用 int(v) 读回，0.125 被截成 0，重开 GUI 就全变成
+    [0,0,0,0]（HP/MP 条凭空消失）。零尺寸也当成「没框」。
+    """
+    if isinstance(v, (list, tuple)) and len(v) == 4:
+        try:
+            r = [float(x) for x in v]
+        except Exception:
+            return None
+        if r[2] > 0 and r[3] > 0:
+            return r
+    return None
+
+
+def load_saved() -> dict:
+    """读 config/decision.json 的原始内容（纯读，不动内存里的 settings 单例）。
+
+    给「按项目保存」那类配置做全局兜底用 —— 文件里是最后一次 save() 的结果，
+    所以天然跟着最新改动走，不会有内存快照过期的问题。
+    """
+    try:
+        return json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 # 全局决策设置（单例）：GUI 主线程写，实时推理线程读。

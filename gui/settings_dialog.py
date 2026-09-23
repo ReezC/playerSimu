@@ -70,10 +70,14 @@ class SettingsDialog(QDialog):
         note_to.setWordWrap(True)
         root.addWidget(note_to)
 
-        self.sp_timeout = QSpinBox()
-        self.sp_timeout.setRange(0, 1440)
+        # 分钟支持小数：用 DoubleSpinBox（0 = 禁用，所以下限仍是 0）
+        from gui.widgets import NoWheelDoubleSpinBox
+        self.sp_timeout = NoWheelDoubleSpinBox()
+        self.sp_timeout.setRange(0.0, 1440.0)
+        self.sp_timeout.setDecimals(1)
+        self.sp_timeout.setSingleStep(0.5)
         self.sp_timeout.setSuffix(" min")
-        self.sp_timeout.setValue(int(settings.facing_timeout_min))
+        self.sp_timeout.setValue(float(settings.facing_timeout_min))
         root.addWidget(self.sp_timeout)
 
         # ---- 找不到玩家超时 ----
@@ -87,10 +91,12 @@ class SettingsDialog(QDialog):
         note_lost.setWordWrap(True)
         root.addWidget(note_lost)
 
-        self.sp_player_lost = QSpinBox()
-        self.sp_player_lost.setRange(0, 1440)
+        self.sp_player_lost = NoWheelDoubleSpinBox()
+        self.sp_player_lost.setRange(0.0, 1440.0)
+        self.sp_player_lost.setDecimals(1)
+        self.sp_player_lost.setSingleStep(0.5)
         self.sp_player_lost.setSuffix(" min")
-        self.sp_player_lost.setValue(int(settings.player_lost_timeout_min))
+        self.sp_player_lost.setValue(float(settings.player_lost_timeout_min))
         root.addWidget(self.sp_player_lost)
 
         # ---- 定时清空按键 ----
