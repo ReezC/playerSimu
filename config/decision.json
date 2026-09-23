@@ -156,8 +156,8 @@
   "debounce_conf": 0.45,
   "debounce_ms": 2000,
   "auto_feed_pet": true,
-  "feed_interval_min": 6,
-  "feed_interval_max": 8,
+  "feed_interval_min": 6.0,
+  "feed_interval_max": 8.0,
   "custom_timers": [
     {
       "name": "自动回避药水",
@@ -172,18 +172,18 @@
         }
       ],
       "interval": [
-        3,
-        3
+        3.0,
+        3.0
       ]
     }
   ],
-  "facing_timeout_min": 2,
-  "player_lost_timeout_min": 3,
+  "facing_timeout_min": 2.0,
+  "player_lost_timeout_min": 3.0,
   "resetall_interval": 60,
   "anti_afk_enabled": true,
   "anti_afk_type": "hidden_rest",
-  "anti_afk_min": 25,
-  "anti_afk_max": 35,
+  "anti_afk_min": 25.0,
+  "anti_afk_max": 35.0,
   "anti_afk_enter_seq": [
     {
       "type": "down",
@@ -252,8 +252,8 @@
       "key": "普攻"
     }
   ],
-  "anti_afk_rest_min": 2,
-  "anti_afk_rest_max": 3,
+  "anti_afk_rest_min": 2.0,
+  "anti_afk_rest_max": 3.0,
   "custom_keys": {
     "攻击药水": "grave",
     "回避药水": "5",
