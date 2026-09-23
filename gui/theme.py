@@ -19,6 +19,8 @@ from pathlib import Path
 
 import yaml
 
+from perception import classes   # 类别表（唯一定义处）：框颜色按它生成
+
 FAMILY = "Microsoft YaHei UI"
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -37,19 +39,32 @@ def clamp(v):
     return max(MIN_SIZE, min(MAX_SIZE, v))
 
 
-# 可视化默认值（颜色用 RGB hex；vision_width 是视野线宽，像素）
-VIS_DEFAULTS = {
-    "mob_color": "#34a853",       # 怪物框 绿
-    "player_color": "#4285f4",    # 玩家框 蓝
-    "lock_color": "#ff0000",      # 锁定目标框 红
-    "attack_color": "#f9ab00",    # 最大攻击距离线 黄
-    "min_attack_color": "#ffa500",  # 最小攻击距离 / 规避范围线 橙
-    "vision_color": "#5f6368",    # 视野线 深灰
-    "vision_width": 1,            # 视野线宽
-}
+# ---- 框颜色：**每个类别一条**，键名 = 类别英文名 + "_color" ----
+#
+# 直接从类别表（perception/classes.py）生成，所以「设置里能改的颜色」永远等于
+# 「存在的类别」—— 以后加一个类别，设置里自动多一行，不会漏掉某一类的框色。
+CLASS_COLOR_KEYS = tuple(c[1] + "_color" for c in classes.CLASSES)
 
-_VIS_COLOR_KEYS = ("mob_color", "player_color", "lock_color",
-                   "attack_color", "min_attack_color", "vision_color")
+
+def _class_color_defaults():
+    """类别框颜色的默认值（RGB hex）—— 就是类别表（perception/classes.py）的最后一列。"""
+    return {en: classes.bgr_to_hex(bgr)
+            for _cid, en, _zh, bgr in classes.CLASSES if bgr}
+
+
+# 可视化默认值（颜色用 RGB hex；vision_width 是视野线宽，像素）
+VIS_DEFAULTS = dict(
+    {"%s_color" % en: v for en, v in _class_color_defaults().items()},
+    lock_color="#ff0000",         # 锁定目标框 红
+    attack_color="#f9ab00",       # 最大攻击距离线 黄
+    min_attack_color="#ffa500",   # 最小攻击距离 / 规避范围线 橙
+    vision_color="#5f6368",       # 视野线 深灰
+    vision_width=1,               # 视野线宽
+)
+
+#: 参与「颜色合法性校验」的键：类别框色 + 辅助线色（vision_width 是数值，不在内）
+_VIS_COLOR_KEYS = CLASS_COLOR_KEYS + ("lock_color", "attack_color",
+                                      "min_attack_color", "vision_color")
 
 
 def _load():
@@ -109,6 +124,21 @@ def save_vis(cfg):
     vis.update(cfg)
     data["vis"] = vis
     _save(data)
+
+
+def class_colors():
+    """{类别 id: (b, g, r)} —— 画框用。**每个类别**的颜色都能在设置里改。
+
+    load_vis() 保证类别框色的键都存在（缺的用默认值补），所以这里直接取。
+    """
+    vis = load_vis()
+    return {cid: hex_to_bgr(vis["%s_color" % en])
+            for cid, en, _zh, _bgr in classes.CLASSES}
+
+
+def class_color(cls):
+    """单个类别的框色 (b, g, r)。给命令行工具这类只画一种框的调用方。"""
+    return class_colors().get(cls, (255, 255, 255))
 
 
 def hex_to_bgr(hexstr):

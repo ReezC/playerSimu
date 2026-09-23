@@ -18,8 +18,6 @@
 否则编辑时会和已有框重叠，看不出哪个是自己在拖。
 """
 
-import json
-
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (QHBoxLayout, QLabel, QMessageBox, QPushButton,
@@ -31,12 +29,17 @@ from gui.widgets import NoWheelComboBox, NoWheelSlider
 
 
 class ReviewPanel(QWidget):
+    # 筛选项就这几条，都是**只看产物本身就能判断**的：
+    #     空帧 / 多框 / 玩家框数量不对（0 个或 ≥2 个）  ← 看一帧的框数与类别
+    #     未经人工修改 / 人工改过                      ← 看 labels/ 里有没有这帧
+    #
+    # **已移除「有新框出现 / 有旧框消失」**：它们靠相邻帧 IoU 配对来推断误检/漏检，
+    # 而目标一直在动，配出来的「新增/消失」很容易是伪影，反而把人引到没问题的帧上。
     FILTERS = (("全部", "all"),
                ("只看空帧（疑似漏检）", "zero"),
                ("只看多框（疑似误检）", "many"),
-               ("有新框出现（疑似误检）", "new"),
-               ("有旧框消失（疑似漏检）", "lost"),
-               ("只看玩家框丢失", "player_missing"),
+               ("只看玩家框丢失或重复", "player_count_bad"),
+               ("只看未经人工修改", "auto_only"),
                ("只看人工改过", "manual"))
 
     MANY_THRESHOLD = 8      # 一帧超过这么多框，多半是误检
@@ -108,28 +111,32 @@ class ReviewPanel(QWidget):
         self.canvas.undo_requested.connect(self._undo_edit)
         root.addWidget(self.canvas, 1)
 
-        # ---- 操作区 ----
+        # ---- 本帧信息行（独占一行）----
+        # 「这一帧有什么」是质检时一直在看的东西：帧名 / 各类框数 / 是否人工改过 /
+        # 与上一帧比多了少了。以前它和一堆按钮挤在同一行，被 Ignored 策略裁得只剩
+        # 半截 —— 所以单独给一行，宽度随便让它占。
+        self.lbl_frame = QLabel("—")
+        self.lbl_frame.setStyleSheet("color: #202124;")
+        self.lbl_frame.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_frame.setMinimumWidth(0)
+        root.addWidget(self.lbl_frame)
+
+        # ---- 编辑行：新建框类型 + 编辑按钮 + 最近一次操作的反馈 ----
         ops = QHBoxLayout()
         ops.setSpacing(6)
 
-        self.lbl_status = QLabel("—")
-        self.lbl_status.setStyleSheet("color: #5f6368;")
-        # 状态文字切帧时长短会变，若按文字撑宽，会顶到 QSplitter 挤压右边配置区。
-        # Ignored 让它不参与宽度计算，文字过长就自然裁剪。
-        self.lbl_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        ops.addWidget(self.lbl_status, 1)
-
         ops.addWidget(QLabel("新建框"))
         self.cmb_cls = NoWheelComboBox()
-        self.cmb_cls.addItem("怪物", 1)
-        self.cmb_cls.addItem("玩家", 0)
+        # 顺序按常用度：怪物最常用（自动标注也产它），玩家次之 —— 而**按住 Ctrl
+        # 拖出来的一律是玩家框**（不用来回切下拉框，见下面那行提示）。
+        # 「其他玩家」只人工标（自动标注不产这个类，见 perception/classes.py）。
+        for _cls in (labelio.CLASS_MOB, labelio.CLASS_PLAYER,
+                     labelio.CLASS_OTHER_PLAYER):
+            self.cmb_cls.addItem(labelio.label(_cls), _cls)
         self.cmb_cls.currentIndexChanged.connect(self._on_cls_changed)
         ops.addWidget(self.cmb_cls)
 
-        hint = QLabel("空白拖=建框　框边拖=缩放　Del=删框　Ctrl+C/V/Z=复制/粘贴/撤销　滚轮=缩放　中键拖=平移　双击=适应")
-        hint.setStyleSheet("color: #80868b;")
-        ops.addWidget(hint)
-
+        ops.addSpacing(10)
         for text, slot, tip in (
                 ("复制", self._copy, "复制选中的框（Ctrl+C）"),
                 ("粘贴", self._paste, "粘贴剪贴板里的框（Ctrl+V）"),
@@ -143,7 +150,22 @@ class ReviewPanel(QWidget):
             b.clicked.connect(slot)
             ops.addWidget(b)
 
+        # 最近一次操作的反馈（「已保存 / 有未保存的修改 / 已恢复…」）跟在按钮右边：
+        # 它和「本帧有什么」是两件事，别再混进上面那行里。
+        self.lbl_status = QLabel("")
+        self.lbl_status.setStyleSheet("color: #5f6368;")
+        self.lbl_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        ops.addWidget(self.lbl_status, 1)
+
         root.addLayout(ops)
+
+        # ---- 操作提示：只留「手上要用的」，快捷键细节放按钮 tooltip，别挤成一长条 ----
+        hint = QLabel("空白拖=建框（按住 Ctrl 拖 = 玩家框）　框边拖=缩放　"
+                      "Del=删框　滚轮=缩放　中键拖=平移　双击=适应窗口")
+        hint.setStyleSheet("color: #80868b;")
+        hint.setToolTip("复制 / 粘贴 / 撤销：Ctrl+C / Ctrl+V / Ctrl+Z（也可用上面的按钮）\n"
+                        "按住 Ctrl 拖空白处 = 按「玩家」类建框，松开 Ctrl 后回到下拉框选的类")
+        root.addWidget(hint)
 
     # ══════════════════════════════════════════════════
     # 数据
@@ -151,28 +173,6 @@ class ReviewPanel(QWidget):
     def bind(self, project):
         self.project = project
         self.reload()
-
-    def _img_size(self):
-        """画面尺寸。相邻帧对比要换算像素坐标，但逐帧解图太慢 ——
-        先看 ④ 落盘的 stats.json，没有再退回读第一张图。"""
-        if self.project is None:
-            return 0, 0
-
-        f = self.project.dir_of("labels_auto") / "stats.json"
-        try:
-            with open(f, "r", encoding="utf-8") as fh:
-                sz = json.load(fh).get("img_size") or []
-            if len(sz) == 2 and sz[0] and sz[1]:
-                return int(sz[0]), int(sz[1])
-        except Exception:
-            pass
-
-        first = next(iter(sorted(self.project.frames.glob("*.png"))), None)
-        if first is not None:
-            pm = QPixmap(str(first))
-            if not pm.isNull():
-                return pm.width(), pm.height()
-        return 0, 0
 
     def reload(self):
         self._save_current()        # 保住当前帧的改动再重建列表
@@ -183,19 +183,12 @@ class ReviewPanel(QWidget):
 
         if self.project is None:
             self.canvas.load(QPixmap(), [])
-            self.lbl_status.setText("未选择项目")
+            self.lbl_frame.setText("未选择项目")
+            self.lbl_status.setText("")
             self._update_pos()
             return
 
         mode = self.cmb_filter.currentData()
-        need_match = mode in ("new", "lost")
-
-        # 画面尺寸所有帧都一样，优先从 stats.json 读，免得逐帧解图
-        w, h = self._img_size() if need_match else (0, 0)
-
-        # 相邻帧对比必须基于**完整序列**，不能只比较筛选后的结果 ——
-        # 否则"上一帧"会跳到几十帧之前，配出来的对是无意义的。
-        prev_boxes = None
         total = 0
 
         for f in sorted(self.project.frames.glob("*.png")):
@@ -203,45 +196,32 @@ class ReviewPanel(QWidget):
             total += 1
             n, manual = labelio.count_boxes(self.project, stem)
 
-            # -1 = 没有上一帧可比（第一帧）
-            n_new = n_lost = -1
-            if need_match and w and h:
-                cur = labelio.load_boxes(self.project, stem, w, h)
-                if prev_boxes is not None:
-                    new_ids, lost_ids = labelio.match_boxes(prev_boxes, cur)
-                    n_new, n_lost = len(new_ids), len(lost_ids)
-                prev_boxes = cur
-
             if mode == "zero" and n != 0:
                 continue
             if mode == "many" and n < self.MANY_THRESHOLD:
                 continue
+            if mode == "auto_only" and manual:
+                continue
             if mode == "manual" and not manual:
                 continue
-            if mode == "new" and n_new <= 0:
-                continue
-            if mode == "lost" and n_lost <= 0:
-                continue
-            if mode == "player_missing":
+            if mode == "player_count_bad":
+                # 一帧**恰好 1 个**玩家框才算正常：
+                #     0 个  = 丢失（被遮挡 / 走出视野 / 阈值太高）
+                #     ≥2 个 = 重复或误标（同一角色被检出两次，或把别人标成了玩家）
+                # 两种都值得看一眼，所以判据是「不等于 1」，不是「等于 0」。
                 by_cls = labelio.count_by_class(self.project, stem)
-                if by_cls.get(labelio.CLASS_PLAYER, 0) > 0:
+                if by_cls.get(labelio.CLASS_PLAYER, 0) == 1:
                     continue
 
-            self.items.append((stem, n, manual, n_new, n_lost))
+            self.items.append((stem, n, manual))
 
         if not self.items:
             self.canvas.load(QPixmap(), [])
             if not total:
                 msg = "项目里还没有画面 —— 先跑 ② 采集"
-            elif not need_match:
-                msg = "没有符合条件的帧（项目共 %d 帧）" % total
-            elif not (w and h):
-                msg = "拿不到画面尺寸，无法做相邻帧对比"
             else:
-                what = "新出现的框" if mode == "new" else "消失的框"
-                msg = ("相邻帧之间没有%s（项目共 %d 帧）—— "
-                       "说明标注在时间上是连贯的" % (what, total))
-            self.lbl_status.setText(msg)
+                msg = "没有符合条件的帧（项目共 %d 帧）" % total
+            self.lbl_frame.setText(msg)
 
         self._update_pos()
         self._load_current()
@@ -251,12 +231,12 @@ class ReviewPanel(QWidget):
             self._dirty = False
             return
 
-        stem, n, manual, n_new, n_lost = self.items[self.index]
+        stem, n, manual = self.items[self.index]
         path = self.project.frames / (stem + ".png")
 
         pm = QPixmap(str(path))
         if pm.isNull():
-            self.lbl_status.setText("读不到 %s" % path.name)
+            self.lbl_frame.setText("读不到 %s" % path.name)
             self._dirty = False
             return
 
@@ -266,16 +246,19 @@ class ReviewPanel(QWidget):
         self.canvas.load(pm, boxes, editable=True, fit=True)
         self._dirty = False
 
-        # 与上一帧的配对结果是质检最关键的线索：
-        # 新框冒出多半是误检，旧框消失多半是漏检（怪被打 / 被遮挡 / 走到边缘）。
-        diff = ""
-        if n_new >= 0:
-            diff = "   ·   新增 %d / 消失 %d" % (n_new, n_lost)
+        # ---- 本帧信息（独占一行，见 _build 的说明）----
+        counts = labelio.count_by_class(self.project, stem)
+        order = labelio.ORDER
+        # 基数只列「玩家 / 怪物」，其余类别**有才列** —— 否则一行五个 0 很吵
+        shown = order[:2] + [c for c in order[2:] if counts.get(c)]
+        by_cls = " · ".join("%s %d" % (labelio.label(c), counts.get(c, 0))
+                            for c in shown)
 
-        self._set_status("%s   ·   %d 个框%s%s   ·   %d×%d"
-                         % (path.name, len(boxes),
-                            "（人工）" if manual else "",
-                            diff, w, h))
+        self.lbl_frame.setText("%s　%s%s"
+                               % (path.name, by_cls,
+                                  "　（人工改过）" if manual else ""))
+        self.lbl_frame.setToolTip("画面 %d×%d，本帧共 %d 个框" % (w, h, len(boxes)))
+        self.lbl_status.setText("")      # 翻帧后清掉上一帧的操作反馈
 
     def _save_current(self):
         """把当前帧的改动写回 labels/。
@@ -294,9 +277,11 @@ class ReviewPanel(QWidget):
         boxes = self.canvas.get_boxes()
         n = labelio.save_boxes(self.project, stem, boxes, w, h)
 
-        # 保留原有的配对结果 —— 它描述的是时间序列上的邻帧，不随人工修改而变
-        old = self.items[self.index]
-        self.items[self.index] = (stem, len(boxes), True, old[3], old[4])
+        # 「人工改过」以**落盘为准**：save_boxes 返回人工框数，只有写得下
+        # labels/<stem>.txt 才 >0。不能无条件写 True —— 比如「把自动框全删了」
+        # 这种编辑不产生人工框，标 True 的话列表说已改、磁盘说没改，
+        # 一重载就悄悄变回去，「只看未经人工修改」会忽进忽出。
+        self.items[self.index] = (stem, len(boxes), bool(n))
         self._dirty = False
         self._set_status("已保存 %s（%d 个框）" % (stem, n), ok=True)
 
@@ -368,7 +353,7 @@ class ReviewPanel(QWidget):
         if not self.items:
             return
 
-        stem, _n, manual, _new, _lost = self.items[self.index]
+        stem, _n, manual = self.items[self.index]
         if not manual:
             QMessageBox.information(self, "无需恢复", "这一帧没有人工修改过")
             return
@@ -394,6 +379,9 @@ class ReviewPanel(QWidget):
             return
 
         n = labelio.delete_frame(self.project, stem)
+        # 处理台账里也把它划掉：图都没了，选帧弹窗不该再列它（否则勾上会报
+        # 「选中的帧找不到」）。台账的键是各标注目标（mob/player），一并清。
+        labelio.unmark_processed(self.project.dir_of("labels_auto"), [stem])
         self._dirty = False
         self.items.pop(self.index)
         self.index = max(0, min(self.index, len(self.items) - 1))

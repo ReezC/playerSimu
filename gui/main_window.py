@@ -44,6 +44,11 @@ from gui.worker import TaskThread, safe_slot
 ROOT = Path(__file__).resolve().parent.parent
 PROJECTS_DIR = ROOT / "projects"
 
+# 应用名（也是窗口标题的基础部分）。放在这里而不是 app.py：窗口标题要拼上
+# 项目名（见 MainWindow._update_title），而 QApplication 的 applicationName
+# 也用同一个字符串 —— 定义两处早晚会不一致。
+APP_NAME = "playerSimu 数据集工作台"
+
 QSS = """
 /* ===== 基础 ===== */
 QMainWindow, QWidget#Central { background: #f0f2f5; }
@@ -263,10 +268,10 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("playerSimu 数据集工作台")
         self.resize(1460, 920)
 
         self.project = None
+        self._update_title()        # 还没有项目 → 只有基础标题
         self.task = None
         self.current_card = None
         self.cards = []
@@ -537,15 +542,62 @@ class MainWindow(QMainWindow):
             self.cmb_project.setCurrentIndex(idx)
             self.cmb_project.blockSignals(False)
 
+    def _update_title(self):
+        """窗口标题 = 「项目名-」+ 基础标题。
+
+        为什么不只写固定的应用名：同时开几个项目的窗口时，任务栏/Alt+Tab 里
+        一排「playerSimu 数据集工作台」根本分不清哪个是哪个。
+        没有项目时保持基础标题（别留个空的「-playerSimu…」）。
+        """
+        base = APP_NAME
+        name = self.project.root.name if self.project is not None else ""
+        self.setWindowTitle("%s-%s" % (name, base) if name else base)
+
+    def _bind_decision_params(self, project):
+        """把决策参数切到当前项目那一份（**必须在各面板 bind 之前**跑）。
+
+        顺序为什么关键：面板（决策参数页、路线识别页）在 bind 时是从 settings
+        读值回填控件的 —— 先换参数再回填，控件才显示当前项目的值。
+
+        项目里还没存过（老项目 / 新建项目）就用 config/decision.json 那份播种，
+        并**当场写进项目**（打开即固化）：
+          · 辛苦调出来的参数不该因为换了存法就丢（那份就是它此前一直在用的）；
+          · 固化之后各项目互不影响 —— 若只在内存里播种，没改过的项目每次打开
+            都会重新从全局播种，等于跟着「最近动过的那个项目」漂，很难解释。
+        """
+        from decision.agent import load_saved, set_save_hook, settings
+
+        if project is None:
+            # 没项目：参数落回全局那份（界面照样能改，只是不归属任何项目）
+            set_save_hook(None)
+            settings.from_dict(load_saved() or {})
+            return
+
+        data = project.get("decision")
+        if not isinstance(data, dict) or not data:
+            settings.from_dict(load_saved() or {})       # 全局那份先应用到内存
+            # 存**整份**（缺的键由 from_dict 的默认值补齐）—— 项目文件一打开就是
+            # 完整的一份，手工翻/手工改都看得全，不用去猜哪些键是默认值。
+            project.set("decision", settings.to_dict(), save=True)
+        else:
+            settings.from_dict(data)
+        set_save_hook(lambda d, p=project: (p.set("decision", d), p.save()))
+
     def _bind_cards(self):
+        # 先换决策参数，再让各面板回填控件（它们从 settings 读数）
+        self._bind_decision_params(self.project)
         for c in self.cards:
             c.bind(self.project)
         self.review.bind(self.project)
         self.live_panel.bind(self.project)
         # HP/MP 条框选结果存在 project.yaml 里，切项目要跟着换
         self.player_panel.bind(self.project)
+        # 路线识别的开关也是一个决策参数（route_enabled），跟着项目刷新
+        self.route_panel.bind(self.project)
         self.lbl_status.setText("未选择项目" if self.project is None else
                                 self.lbl_status.text())
+        # 标题跟着项目走（切项目 / 新建 / 打开都走这里）
+        self._update_title()
 
     def _new_project(self):
         name, ok = QInputDialog.getText(self, "新建项目", "项目名（建议：地图名或地图ID）")
@@ -760,7 +812,12 @@ class MainWindow(QMainWindow):
     def _cancel(self):
         if self.task is not None:
             self.task.cancel()
-            self.log("已请求取消，等待当前步骤结束…", "warn")
+            # 点了要**当场有反应**，否则用户会以为没点上而反复点。任务本身不一定
+            # 立刻停 —— 模型/模板加载这类步骤拦不住，得等它返回（各阶段的检查点
+            # 见 tools/ 里的 ctx.canceled()）。
+            self.btn_cancel.setEnabled(False)
+            self.progress.setFormat("取消中…")
+            self.log("已请求取消：正在收尾（模型/模板加载这类步骤要等它返回）", "warn")
 
     # ══════════════════════════════════════════════════
     # 主视区

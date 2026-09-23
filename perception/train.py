@@ -13,6 +13,7 @@ GUI:
 """
 
 import argparse
+import json
 import shutil
 import sys
 import time
@@ -97,6 +98,15 @@ def run_train(params, ctx=None):
                 % model_name, "warn")
 
     ctx.log("基础权重 %s" % model_name)
+    # 上一版权重就在手边时提一句：加数据重训有两种都合理的做法 —— 从基础权重整个
+    # 重学一遍，或在上一版上继续微调。别糊里糊涂就用了默认的那个名字。
+    try:
+        _prev = sorted(Path(copy_to).glob("*.pt")) if copy_to else []
+    except Exception:
+        _prev = []
+    if _prev and Path(model_name).name not in {q.name for q in _prev}:
+        ctx.log("上一版权重 %s —— 想接着微调就把「基础权重」填它"
+                % _prev[-1].as_posix())
     ctx.log("数据     %s" % data.as_posix())
     ctx.log("轮数 %d   尺寸 %d   批 %d   设备 %s"
             % (epochs, imgsz, batch, device))
@@ -204,6 +214,28 @@ def run_train(params, ctx=None):
         }
     except Exception:
         pass
+
+    # 这一轮的结果落一份 run.json。⑦ 的卡片要显示「历次版本」就靠它 ——
+    # runs/ 里其实也有 ultralytics 写的 results.csv，但那得反解它的列名
+    # （各版本会变），而且没法顺带说明这版是用什么基础权重、多少轮训出来的。
+    run_info = {
+        "name": name,
+        "base": model_name,
+        "epochs": epochs,
+        "imgsz": imgsz,
+        "batch": batch,
+        "device": device,
+        "seconds": dt,
+        "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "metrics": final,
+    }
+    try:
+        (save_dir / "run.json").write_text(
+            json.dumps(run_info, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8")
+    except Exception as e:
+        # 只影响卡片显示，不影响权重本身 —— 别让它把整次训练判成失败
+        ctx.log("写 run.json 失败（训练结果不受影响）：%s" % e, "warn")
 
     ctx.log("")
     ctx.log("── 训练完成 ──", "ok")

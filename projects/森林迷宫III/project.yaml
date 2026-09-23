@@ -43,14 +43,14 @@ bars:
 notes: ''
 capture:
   source: file
-  file: D:/Media/record/mxd/2026-09-20 22-08-39.mp4
+  file: D:/Media/record/mxd/9月23日底层.mp4
   url: udp://0.0.0.0:5000
   fps: 5.0
-  stride: 80
+  stride: 60
   seconds: 120.0
   dedup: 0.01
   limit: 500
-  clean: true
+  clean: false
 label:
   thresh: 0.85
   min_distinct: 0.06

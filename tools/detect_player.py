@@ -23,10 +23,12 @@ from pathlib import Path
 
 import cv2
 
-from core.context import ConsoleContext, TaskContext
+from core.context import ConsoleContext, TaskContext, cancelable
 from core.imgio import imread, imwrite
+# 可视化框颜色跟「设置 → 可视化」走（gui.theme 不 import PyQt5，子进程可用）
+from gui.theme import class_color
 
-CLASS_PLAYER = 0
+CLASS_PLAYER = 0    # 类别表见 perception/classes.py（id 固定，别在本地另立一份）
 _W = {}
 
 
@@ -74,7 +76,7 @@ def work(fp_str):
         if r is not None:
             x1, y1 = int(cx - bw / 2), int(cy - bh / 2)
             cv2.rectangle(full, (x1, y1), (x1 + int(bw), y1 + int(bh)),
-                          (255, 128, 0), 2)   # 蓝色（BGR），区别于怪物的绿
+                          cfg.get("box_color") or class_color(CLASS_PLAYER), 2)
         # 没命中也重画一帧（无框原图），覆盖旧的可视化图
         imwrite(Path(cfg["vis_dir"]) / (fp.stem + ".jpg"), full, quality=82)
 
@@ -97,10 +99,26 @@ def run_detect_player(params, ctx=None):
     """
     ctx = ctx or TaskContext()
 
+    # 同 detect_mobs：进来先看有没有被取消，别为已取消的任务白加载一遍模板
+    if ctx.canceled():
+        ctx.log("已取消（还没开始）", "warn")
+        return {"summary": "已取消", "frames": 0, "hits": 0}
+
     frames_dir = Path(params["frames"])
     frames = sorted(frames_dir.glob("*.png"))
     if not frames:
         raise FileNotFoundError("画面目录里没有 png：%s" % frames_dir)
+
+    n_all = len(frames)
+    # 只处理选中的帧（「选帧弹窗」给的；None / 空 = 全部）。
+    # n_all 必须在过滤前取 —— 同 detect_mobs：清理残留按总帧数判断。
+    only = {str(s) for s in (params.get("only") or [])}
+    if only:
+        frames = [f for f in frames if f.stem in only]
+        if not frames:
+            raise ValueError("选中的帧在画面目录里一个都找不到（选了 %d 个）"
+                             % len(only))
+        ctx.log("只处理选中的 %d 帧（画面共 %d 张）" % (len(frames), n_all))
 
     pid = (params.get("player_id") or "").strip()
     if not pid:
@@ -119,13 +137,15 @@ def run_detect_player(params, ctx=None):
         "out": str(out),
         "vis": bool(params.get("vis", True)),
         "vis_dir": params.get("vis_dir") or str(out.parent / "vis"),
+        # 可视化框颜色：用设置里配的玩家框颜色（主进程取一次，别让每个子进程读配置）
+        "box_color": class_color(CLASS_PLAYER),
     }
 
     # 重新采集后帧数变少时，清掉帧号超界的旧标注/可视化（同 detect_mobs）
     from tools.detect_mobs import clean_stale_outputs
-    removed = clean_stale_outputs(str(out), cfg["vis_dir"], len(frames))
+    removed = clean_stale_outputs(str(out), cfg["vis_dir"], n_all)
     if removed:
-        ctx.log("清理上次残留 %d 个文件（帧号超出本次 %d 帧）" % (removed, len(frames)))
+        ctx.log("清理上次残留 %d 个文件（帧号超出已有的 %d 帧）" % (removed, n_all))
 
     # 主进程先验一次模板能不能加载，避免开了几十个进程才发现模板空
     ctx.progress(0, 0, "加载玩家模板…")
@@ -150,26 +170,28 @@ def run_detect_player(params, ctx=None):
     n = len(frames)
 
     def consume(iterator):
+        """收结果。取消由外层 cancelable() 掐断（说明见 core/context.py）。"""
         nonlocal hit
         for i, r in enumerate(iterator, 1):
-            if ctx.canceled():
-                return False
             if r is not None:
                 hit += 1
             if i % 20 == 0 or i == n:
                 ctx.progress(i, n, "已定位玩家 %d 帧" % hit)
                 ctx.log("  [%d/%d]  命中 %d  用时 %.0fs"
                         % (i, n, hit, time.perf_counter() - t0))
-        return True
+        # 收完了，还是被取消掐断了 —— 后者不能去记台账（见 detect_mobs 同名函数）
+        return not ctx.canceled()
 
     try:
         if workers <= 1:
             init_worker(cfg)
-            ok = consume(work(str(f)) for f in frames)
+            ok = consume(cancelable((work(str(f)) for f in frames), ctx))
         else:
             pool = mp.Pool(workers, initializer=init_worker, initargs=(cfg,))
             try:
-                ok = consume(pool.imap(work, [str(f) for f in frames], chunksize=2))
+                # cancelable：预热期间也能响应取消（池子还没出结果时 for 会死等）
+                ok = consume(cancelable(
+                    pool.imap(work, [str(f) for f in frames], chunksize=2), ctx))
             except Exception:
                 pool.terminate()   # 出错也立即终止子进程
                 raise
@@ -187,6 +209,13 @@ def run_detect_player(params, ctx=None):
         ctx.log("已取消", "warn")
         return {"summary": "已取消", "frames": n, "hits": hit}
 
+    # 台账：记下这一轮「玩家标注跑过哪些帧」（选帧弹窗靠它显示已处理/未处理）
+    try:
+        from gui import labelio
+        labelio.mark_processed(out, "player", [f.stem for f in frames])
+    except Exception:
+        pass
+
     ctx.log("")
     ctx.log("── 玩家标注完成 ──", "ok")
     ctx.log("  画面 %d 张 / 命中玩家 %d 帧（%.0f%%）"
@@ -196,7 +225,7 @@ def run_detect_player(params, ctx=None):
         ctx.log("一帧都没命中玩家 —— 检查 scale/阈值，或画面里没有玩家", "warn")
     elif hit < n * 0.5:
         ctx.log("命中率偏低（%d/%d）—— 玩家在角落/被遮挡时会漏，"
-                "质检台可用「玩家框丢失」筛选补" % (hit, n), "warn")
+                "质检台可用「玩家框丢失或重复」筛选补" % (hit, n), "warn")
     ctx.log("")
 
     return {
@@ -252,6 +281,12 @@ def run_detect_combined(params, ctx=None):
 
     ctx.log("—— 第 1 步：怪物标注 ——", "info")
     mob_res = run_detect(params["mob"], _OffsetCtx(ctx, 0, unit_total))
+
+    # 第 1 步被取消了就别接着跑第 2 步 —— 否则点取消之后还要再等一整趟玩家标注
+    if ctx.canceled():
+        ctx.log("已取消，跳过玩家标注", "warn")
+        return {"summary": "已取消", "mob": mob_res, "player": None,
+                "player_error": None}
 
     ctx.log("")
     ctx.log("—— 第 2 步：玩家标注 ——", "info")

@@ -17,8 +17,19 @@ import serial
 
 
 def bridge(conn, ser):
-    """双向桥：TCP -> 串口，串口 -> TCP。"""
+    """双向桥：TCP -> 串口，串口 -> TCP。
+
+    **两个写方向都设了超时，这是必须的。** 以前没有超时：只要有一头对方不读，
+    写就会**永久阻塞**在那个线程里 —— 串口->TCP 卡住后这个线程再也不读串口，
+    Pro Micro 的 Serial.println 跟着阻塞，固件就不再处理任何指令（包括
+    RELEASEALL），整条链死透且**不会自愈**，只能断开重连。用户看到的「无限
+    左走、停自动无效、只能关 GUI」就是这条链死透了。
+
+    设了超时之后：写卡住 → 抛异常 → 退出桥循环 → 关连接等下一个客户端，
+    链自己恢复（断开时还会补一条 RELEASEALL 松开卡住的键）。
+    """
     stop = threading.Event()
+    conn.settimeout(5.0)          # 客户端不读时别永久阻塞
 
     def ser_to_tcp():
         while not stop.is_set():
@@ -89,7 +100,7 @@ def main():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(args.cert, args.key)
 
-    ser = serial.Serial(args.serial, 115200, timeout=0.3)
+    ser = serial.Serial(args.serial, 115200, timeout=0.3, write_timeout=1.0)
     ser.dtr = False          # 关键：禁用 DTR，避免打开串口触发 32U4 复位
     ser.rts = False
     print(f"[relay] serial {args.serial} open")

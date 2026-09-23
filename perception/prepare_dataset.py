@@ -19,6 +19,7 @@ GUI:
 """
 
 import argparse
+import json
 import random
 import shutil
 import sys
@@ -26,8 +27,21 @@ from pathlib import Path
 
 from core.context import ConsoleContext, TaskContext
 from core.imgio import imread, imwrite
+from perception import classes
 
-CLASS_NAMES = ["player", "mob", "drop", "npc"]
+# 类别表在 perception/classes.py 统一定义；这里用「按 id 索引的英文名列表」，
+# 并且**整份写进 data.yaml**（含暂时没数据的类别，理由见下面「座位号」那段）。
+CLASS_NAMES = classes.EN_LIST
+
+
+def _cls_names(ids):
+    """类别号 → 能直接看懂的文字，例如 `1 怪物、4 其他玩家`（给日志用）。
+
+    只打数字（[2, 3]）没人看得懂 —— 类别表在 perception/classes.py，这里不另抄
+    一份名字，直接问它要。
+    """
+    got = ["%s %s" % (c, classes.label(c)) for c in sorted(ids)]
+    return "、".join(got) if got else "（无）"
 
 
 def _merge_label_lines(stem, label_dirs, drop_classes=()):
@@ -122,6 +136,47 @@ def _count_boxes(label_dirs, split):
     return n
 
 
+# ---------------------------------------------------------------- train/val 划分
+#
+# **划分必须固定下来**。每次构建都重新随机的话，加了新素材之后**同一批旧帧会换边**：
+# 两次训练的 val 不是同一批图，mAP 的差值里就混进了「换了考卷」的成分 —— 你没法
+# 判断「加了数据到底有没有变好」，而那正是重训时要看的东西。
+#
+# 规则：
+#     · 老帧沿用上一次的归属（读数据集目录里的 split.json）；
+#     · 新帧按 val_ratio 补进 val，把比例拉回目标；
+#     · 归属随数据集一起落盘，下次构建接着用。
+SPLIT_NAME = "split.json"
+
+
+def _read_split(out_dir):
+    """读上一次的划分 → {帧名: "train"/"val"}；文件不在或坏了都当空的。"""
+    try:
+        d = json.loads((Path(out_dir) / SPLIT_NAME).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    got = {}
+    for key in ("train", "val"):
+        for s in (d.get(key) or []):
+            got[str(s)] = key
+    return got
+
+
+def _assign_split(stems, old, val_ratio, seed):
+    """决定哪些帧进 val：老帧原样不动，新帧按比例补。返回 val 的帧名集合。"""
+    val = {s for s in stems if old.get(s) == "val"}
+    fresh = [s for s in stems if s not in old]
+    n_val = int(round(len(stems) * float(val_ratio)))
+    # 至少留 1 张 val、1 张 train：ultralytics 对空 val 集只会给个难懂的报错
+    n_val = max(1, min(n_val, max(1, len(stems) - 1)))
+    need = max(0, n_val - len(val))
+    if need and fresh:
+        rnd = random.Random(seed)
+        rnd.shuffle(fresh)          # 只打乱新帧，老帧的归属不受影响
+        val.update(fresh[:need])
+    return val
+
+
 def run_dataset(params, ctx=None):
     """整理数据集。
 
@@ -186,24 +241,49 @@ def run_dataset(params, ctx=None):
         ctx.log("（框数不足的帧被丢弃。这些多半是漏检，留着等于教模型"
                 "「这里没有怪」，所以宁可不要）", "warn")
 
-    # 统计实际出现的类别：data.yaml 只声明有数据的类。否则 drop/npc 这类
-    # 从未标注的类会占着类别、拉低 mAP，还会让模型把目标误判到这些空类上。
+    # **类别 id 不重映射**：data.yaml 固定声明类别表里的**全部**类别（含暂时没有
+    # 数据的），标注行里的 id 原样保留。
+    # 类别号是**座位号**，不是「这次有哪几类就排哪几号」：
+    #     0 玩家 / 1 怪物 / 2 掉落 / 3 NPC / 4 其他玩家   （表在 perception/classes.py）
+    #
+    # 程序里到处按号认类：实时识别、自动标注、迭代自训练都写着「1 号 = 怪物」这种
+    # 判断。所以哪怕「掉落」「NPC」这次一个框都没有，它们的号也必须留着 ——
+    # 一旦改成「有数据才声明、顺着重排」，号的含义就会变（怪物变成 0 号），
+    # 程序会把怪当成自己操作的那个角色，而且**不报错、照常画框**，极难发现。
+    #
+    # 代价也是不对称的：空类别几乎不花钱（只是训练评分时多摊一个永远为 0 的项），
+    # 号错位是灾难。所以宁可用前者买后者的保险。
     used_cls = set()
     for _f, lines in pairs:
         for ln in lines:
             parts = ln.split()
             if parts and parts[0].lstrip("-").isdigit():
                 used_cls.add(int(parts[0]))
-    sorted_cls = sorted(used_cls)
-    remap = {old: i for i, old in enumerate(sorted_cls)}   # 旧 id -> 连续新 id
-    names = [names[old] for old in sorted_cls if 0 <= old < len(names)]
-    if not names:
-        names = [str(old) for old in sorted_cls]
-    ctx.log("实际类别 %s -> %s" % (sorted_cls, names))
+    missing = [c for c in classes.ORDER if c not in used_cls]
+    ctx.log("这批标注用到的类别：%s" % _cls_names(used_cls))
+    ctx.log("data.yaml 按类别表写全：%s" % _cls_names(classes.ORDER))
+    if missing:
+        # 用普通信息级别，不用 warn —— 这是正常情况，黄字会让人以为出了问题。
+        # 也不用 markdown 星号：日志面板不渲染，会原样把星号显示出来。
+        ctx.log("  这次没有数据的类别：%s —— 空着占号，不是出错"
+                % _cls_names(missing))
+        ctx.log("  （以后标了直接进数据集，不用重标旧数据、不用改任何设置；"
+                "模型要再训一次，那是因为多了新内容，不是因为号变了）")
 
-    random.seed(seed)
-    random.shuffle(pairs)
-    n_val = max(1, int(len(pairs) * val_ratio))
+    # ---- train/val 划分：老帧沿用上次的边，新帧按比例补（见 SPLIT_NAME 那段说明）----
+    old_split = _read_split(out) if out.exists() else {}
+    stems = [f.stem for f, _lines in pairs]
+    val_stems = _assign_split(stems, old_split, val_ratio, seed)
+    _kept = sum(1 for s in stems if s in old_split)
+    _fresh = len(stems) - _kept
+    if not _kept:
+        ctx.log("划分：首次构建，%d 张按 %.0f%% 随机分 train/val（之后会固定下来）"
+                % (_fresh, val_ratio * 100))
+    elif _fresh:
+        ctx.log("划分：旧帧 %d 张**沿用上次的边**，新帧 %d 张按 %.0f%% 补进 val"
+                % (_kept, _fresh, val_ratio * 100))
+    else:
+        ctx.log("划分：沿用上次，%d 张的归属原样不变" % _kept)
 
     # 清掉上一次的产物。不清的话旧图会混进新数据集，而且是**静默的** ——
     # train 数量看起来变多了，实际混了过期样本，训练结果没法解释。
@@ -235,7 +315,10 @@ def run_dataset(params, ctx=None):
             out_bak = None
 
     written = {}
-    splits = (("val", pairs[:n_val]), ("train", pairs[n_val:]))
+    # 按名字分堆（堆内顺序仍按帧号，方便和文件列表对照）
+    val_pairs = [pr for pr in pairs if pr[0].stem in val_stems]
+    train_pairs = [pr for pr in pairs if pr[0].stem not in val_stems]
+    splits = (("val", val_pairs), ("train", train_pairs))
 
     total_all = sum(len(items) for _n, items in splits)
     done = 0
@@ -268,20 +351,9 @@ def run_dataset(params, ctx=None):
 
             imwrite(idir / (f.stem + ".jpg"), img, quality=quality)
             # 写合并后的标注（按类合并，不再是复制单份原始文件）。
-            # 类别 id 重映射到连续（data.yaml 只声明有数据的类）。
-            if remap:
-                out_lines = []
-                for ln in lines:
-                    parts = ln.split()
-                    if parts and parts[0].lstrip("-").isdigit():
-                        parts[0] = str(remap.get(int(parts[0]), int(parts[0])))
-                        out_lines.append(" ".join(parts))
-                    else:
-                        out_lines.append(ln)
-            else:
-                out_lines = lines
+            # 类别 id 原样保留 —— 不重映射，见上面「类别 id 不重映射」那段。
             (ldir / (f.stem + ".txt")).write_text(
-                "\n".join(out_lines) + "\n", encoding="utf-8")
+                "\n".join(lines) + "\n", encoding="utf-8")
             ok += 1
             done += 1
 
@@ -298,6 +370,26 @@ def run_dataset(params, ctx=None):
                  + "".join("  %d: %s\n" % (i, n) for i, n in enumerate(names)))
 
     (out / "data.yaml").write_text(yaml_text, encoding="utf-8")
+    # 同时落一份机器可读的类别表（id ↔ 英文名 ↔ 中文名）：给人工排查、给「运行时
+    # 按名字对齐类别」用。**顺序必须与 data.yaml 的 names 一致**（同一份来源）。
+    (out / "classes.json").write_text(
+        json.dumps({"source": "perception/classes.py",
+                    "classes": [{"id": c[0], "en": c[1], "zh": c[2]}
+                                for c in classes.CLASSES]},
+                   ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8")
+    ctx.log("classes.json -> %s" % (out / "classes.json").as_posix())
+
+    # 划分也落盘：下次构建（尤其是**追加素材**后重训）旧帧不会换边，
+    # 两次训练的 val 才是同一批图，mAP 才可比。
+    (out / SPLIT_NAME).write_text(
+        json.dumps({"val": sorted(val_stems),
+                    "train": sorted(s for s in stems if s not in val_stems),
+                    "val_ratio": round(float(val_ratio), 4),
+                    "seed": int(seed)},
+                   ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8")
+    ctx.log("划分已记在 %s（下次构建旧帧不换边）" % SPLIT_NAME)
 
     boxes = _count_boxes([out / "labels"], "train") + _count_boxes([out / "labels"], "val")
 

@@ -27,6 +27,8 @@ from PyQt5.QtWidgets import (QDialog, QFormLayout, QHBoxLayout, QInputDialog,
                              QTreeWidget, QTreeWidgetItem, QVBoxLayout,
                              QWidget)
 
+from gui.widgets import NoWheelDoubleSpinBox   # 必须模块级：控件在 __init__ 里建
+
 # 行为序列里「额外延迟」的上限（毫秒）= 24 小时。
 # 原来卡在 100000（100 秒），想配分钟级的等待根本填不进去。
 MAX_DELAY_MS = 86400000
@@ -405,7 +407,6 @@ class TimerEditDialog(QDialog):
         self.ed_name = QLineEdit()
         self.ed_name.setPlaceholderText("例如：自动喊话")
         # 分钟支持小数：用 DoubleSpinBox（和参数面板同一套，滚轮不误触）
-        from gui.widgets import NoWheelDoubleSpinBox
         self.sp_lo = NoWheelDoubleSpinBox()
         self.sp_lo.setRange(0.1, 600)
         self.sp_lo.setDecimals(1)

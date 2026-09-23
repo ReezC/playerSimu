@@ -36,16 +36,23 @@ pip install -r requirements.txt
 python -m tools.probe_recv --show
 ```
 
+A 机（被控机）那边：
+
+```powershell
+pip install -r deploy/requirements.txt     # 只有 PyQt5 + pyserial + PyYAML
+python -m deploy.app                       # 对时 / 探针 / 键盘中继 / 推流，一键起
+```
+
 ## 目录
 
 - `link/` — 收流：统一 `FrameSource`（PyAV-UDP/SRT、文件回放）
 - `perception/` — YOLO 训练、推理、追踪、World State
 - `decision/` — HFSM + Utility AI
-- `control/` — Actuator 抽象 + 指令协议
-- `telemetry/` — 延迟标定与指标采集
 - `tools/` — 自检、对时、录制、延迟探针
-- `eval/` — 离线评估与反作弊研究
-- `config/` — 配置
+- `gui/` — B 机：数据集工作台（GUI）
+- `deploy/` — A 机：被控机部署台（GUI；配置在 `config/deploy.json`）
+- `remote_kbd/` — A 机键盘中继 + Pro Micro 固件
+- `config/` — 配置（`link.yaml` 双机共用）
 
 ## 平台视觉与决策边界
 

@@ -17,31 +17,23 @@ from PyQt5.QtWidgets import (QGraphicsItem, QGraphicsRectItem,
                              QGraphicsView)
 
 from gui import theme
+from perception.classes import (CLASS_MOB, CLASS_PLAYER, ZH_NAMES, bgr_to_hex,
+                                bgr_to_rgb)
 
 HANDLE = 10        # 控制点判定半径（图片像素）
 MIN_SIZE = 8       # 框的最小边长
 
-# 类别编号 → 显示名（和 data.yaml 的 class 对齐）
-CLASS_NAMES = {0: "玩家", 1: "怪物", 2: "掉落", 3: "NPC"}
+# 类别名/颜色都来自 perception/classes.py（唯一定义处）—— 类别清单只在那里维护
+CLASS_NAMES = ZH_NAMES
 
 
 def _box_colors():
-    """质检台框颜色：玩家/怪物从可视化设置读，drop/npc 用默认。
+    """质检台框颜色：{cls: (hex_str, (r, g, b))}。
 
-    返回 {cls: (hex_str, (r, g, b))}。
+    **每个类别的颜色都在设置里可改**（theme.class_colors 统一从 config/ui.yaml 读）。
     """
-    vis = theme.load_vis()
-
-    def hx(hexstr):
-        return hexstr, (int(hexstr[1:3], 16), int(hexstr[3:5], 16),
-                        int(hexstr[5:7], 16))
-
-    return {
-        0: hx(vis["player_color"]),
-        1: hx(vis["mob_color"]),
-        2: ("#fbbc04", (251, 188, 4)),
-        3: ("#ea4335", (234, 67, 53)),
-    }
+    return {cls: (bgr_to_hex(bgr), bgr_to_rgb(bgr))
+            for cls, bgr in theme.class_colors().items()}
 
 
 class BBoxItem(QGraphicsRectItem):
@@ -211,11 +203,12 @@ class ImageCanvas(QGraphicsView):
         self.pix_item = None
         self.boxes = []
         self.editable = True
-        self.current_cls = 1      # 新建框的默认类别（1=怪物，0=玩家）
+        self.current_cls = CLASS_MOB   # 新建框的默认类别（下拉框选的）
         self._colors = _box_colors()   # 框颜色缓存（load 时刷新）
 
         self._draw_start = None
         self._rubber = None
+        self._draw_cls = None     # 正在拉的框用哪个类（按下时定，Ctrl 会临时改）
 
         self._panning = False
         self._pan_start = None
@@ -334,13 +327,19 @@ class ImageCanvas(QGraphicsView):
             e.accept()
             return
 
-        # 空白处按下 = 开始拉新框（不用切换工具，符合直觉）
+        # 空白处按下 = 开始拉新框（不用切换工具，符合直觉）。
+        # **按住 Ctrl = 这一框按「玩家」画**：质检时玩家框少但要准，为了它来回切
+        # 下拉框很烦；按 Ctrl 画完就回到下拉框里选的类别，不用切回去。
         if e.button() == Qt.LeftButton and self.editable and self.pix_item is not None:
             item = self.itemAt(e.pos())
             if item is None or item is self.pix_item:
+                self._draw_cls = (CLASS_PLAYER
+                                  if (e.modifiers() & Qt.ControlModifier)
+                                  else self.current_cls)
                 self._draw_start = self.mapToScene(e.pos())
                 self._rubber = QGraphicsRectItem()
-                hex_, _rgb = self._colors.get(self.current_cls, self._colors[1])
+                hex_, _rgb = self._colors.get(self._draw_cls,
+                                              self._colors[CLASS_MOB])
                 self._rubber.setPen(QPen(QColor(hex_), 2, Qt.DashLine))
                 self._rubber.setZValue(20)
                 self.scene_.addItem(self._rubber)
@@ -386,9 +385,12 @@ class ImageCanvas(QGraphicsView):
 
             if r.width() >= MIN_SIZE and r.height() >= MIN_SIZE:
                 self.before_change.emit()   # 加框前记录撤销快照
+                # 类别按按下那一刻定的（Ctrl 按住时是玩家，见 mousePressEvent）
                 self.add_box(r.x(), r.y(), r.width(), r.height(),
-                             self.current_cls, manual=True)
+                             self._draw_cls if self._draw_cls is not None
+                             else self.current_cls, manual=True)
                 self.boxes_changed.emit()
+            self._draw_cls = None
             e.accept()
             return
 

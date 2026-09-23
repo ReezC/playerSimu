@@ -48,6 +48,19 @@ def _clean_project_labels(out_dir):
     return n
 
 
+def _next_index(out_dir, prefix):
+    """下一个可用帧号 = 已有最大号 + 1。
+
+    给「追加素材」用：不清空时接着已有编号往下写，旧帧和旧标注都不动。
+    """
+    mx = -1
+    for f in out_dir.glob(prefix + "_*.png"):
+        tail = f.stem[len(prefix) + 1:]
+        if tail.isdigit():
+            mx = max(mx, int(tail))
+    return mx + 1
+
+
 def run_extract(params, ctx=None):
     """核心抽帧逻辑。
 
@@ -74,10 +87,15 @@ def run_extract(params, ctx=None):
     prefix = params.get("prefix", "frame")
 
     old = list(out_dir.glob(prefix + "_*.png"))
+    clean = bool(params.get("clean", False))
 
-    # 重抽时清空旧帧。编号是从 0 覆盖写的，新视频比旧的短就会留下尾巴，
-    # 那些帧会被后续的标定/标注当成「这次的画面」，悄悄污染数据集。
-    if old and bool(params.get("clean", False)):
+    # 「重抽前清空」勾上 = 重来（旧帧 + 旧标注一起清）；
+    # 不勾 = **追加素材**：编号接在已有最大帧号之后续写，旧帧、旧标注原样不动。
+    #
+    # **为什么不能只靠「不清空」**：原来编号固定从 0 写（frame_00000.png…），
+    # 不清空时新素材会把旧帧**覆盖**掉 —— 帧名还在、画面却换了，而旧标注仍挂在
+    # 这个帧名上，标注与画面错位，而且是静默的（比清空更糟：清空是明着丢）。
+    if old and clean:
         ctx.log("清空输出目录里 %d 张旧的 %s_*.png" % (len(old), prefix))
         for f in old:
             try:
@@ -91,8 +109,11 @@ def run_extract(params, ctx=None):
         if removed:
             ctx.log("同时清空旧标注产物 %d 个文件（画面已重抽）" % removed)
 
-    if old:
-        ctx.log("输出目录已有 %d 张同名文件，将被覆盖" % len(old), "warn")
+    # 起始编号：清空过 / 目录本来就空 → 0；否则接在已有最大帧号之后（追加）
+    idx = 0 if (clean or not old) else _next_index(out_dir, prefix)
+    if idx:
+        ctx.log("追加素材：目录已有 %d 张，本次从 %s_%05d.png 接着编号"
+                % (len(old), prefix, idx), "ok")
 
     ctx.log("打开 %s（%.1f MB）" % (src.name, src.stat().st_size / 1048576.0))
 
@@ -152,19 +173,22 @@ def run_extract(params, ctx=None):
                         continue
                 last = small
 
-            imwrite(out_dir / ("%s_%05d.png" % (prefix, saved)), bgr)
+            imwrite(out_dir / ("%s_%05d.png" % (prefix, idx)), bgr)
+            idx += 1
             saved += 1
 
     finally:
         container.close()
 
-    # 编号从 0 开始覆盖写。新视频比旧素材短的话，目录里会残留上次抽的帧 ——
-    # 那些帧会被后面的标定/标注当成「这次的画面」，悄悄污染数据集。
-    leftover = len(list(out_dir.glob(prefix + "*.png"))) - saved
-    if leftover > 0:
+    # 追加模式下「目录里比本次多的」就是原有素材，正常；重抽模式下还有多的才是残留。
+    total_png = len(list(out_dir.glob(prefix + "*.png")))
+    if not clean and idx > saved:
+        ctx.log("追加完成：目录共 %d 张 png（原有 %d + 本次 %d）"
+                % (total_png, idx - saved, saved), "ok")
+    elif total_png > saved:
         ctx.log("注意：目录里共有 %d 张 png，本次只写了 %d 张，"
-                "其余 %d 张是上次残留 —— 建议先清空 frames 再抽"
-                % (saved + leftover, saved, leftover), "warn")
+                "其余 %d 张是上次残留 —— 建议先勾「重抽前清空」再抽"
+                % (total_png, saved, total_png - saved), "warn")
 
     summary = "解码 %d 帧 -> 保存 %d 张" % (total, saved)
     if dedup > 0:

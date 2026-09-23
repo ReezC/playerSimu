@@ -18,13 +18,16 @@
 标注文件是 YOLO 格式：`cls cx cy w h`（归一化坐标）。
 框在内存里统一是 `(cls, x, y, w, h, manual)`（像素坐标），manual 标记是否人工。
 """
+import json
+import time
 from pathlib import Path
 
-CLASS_PLAYER = 0
-CLASS_MOB = 1
-CLASS_DROP = 2
-CLASS_NPC = 3
-CLASS_NAMES = {0: "player", 1: "mob", 2: "drop", 3: "npc"}
+# 类别表的唯一定义处是 perception/classes.py（id / 英文名 / 中文名 / 颜色都在那），
+# 这里只转发，保持既有的名字 —— 别处（质检台、实时预览、验证、数据集导出）都从
+# 这里或那里取，加类别时只用改那一个文件。
+from perception.classes import (CLASS_DROP, CLASS_MOB, CLASS_NPC,
+                                CLASS_OTHER_PLAYER, CLASS_PLAYER,
+                                EN_NAMES as CLASS_NAMES, ORDER, ZH_NAMES, label)
 
 
 def _files(project, stem):
@@ -181,15 +184,95 @@ def count_boxes(project, stem):
     return len(raw), any(b[5] for b in raw)
 
 
+def frame_summary(project, stem):
+    """一帧的概况：(按类的框数, 是否含人工框)。
+
+    选帧弹窗要给每帧列一行（「怪 3 · 玩 1   已处理」），逐项调 count_boxes /
+    count_by_class 会把同一帧读好几遍盘 —— 这里一次读完给全。
+    """
+    counts = {}
+    manual = False
+    for b in _merged_raw(project, stem):
+        counts[b[0]] = counts.get(b[0], 0) + 1
+        manual = manual or bool(b[5])
+    return counts, manual
+
+
 def count_by_class(project, stem):
     """按类别统计框数，返回 {cls: n}。
 
-    给「玩家框丢失」这类筛选用 —— 只关心某一类有没有。合并统计。
+    给质检台的「玩家框丢失或重复」这类筛选用 —— 那边关心的是**数量**（恰好 1 个
+    才算正常），所以这里返回计数而不是布尔。labels/ 与 labels_auto/ 合并统计。
     """
     out = {}
     for b in _merged_raw(project, stem):
         out[b[0]] = out.get(b[0], 0) + 1
     return out
+
+
+# ---------------------------------------------------------------- 处理台账
+#
+# 「这一帧的某类标注跑过没有」光看标注文件在不在是判断不了的：
+#   1. 怪物 pass 和玩家 pass 写的是**同一个 txt**（各覆盖自己那一类、保留另一类）；
+#   2. 零框的帧也会写一个空文件（见 tools/detect_mobs.py 的落盘处）。
+# 所以另存一份台账：labels_auto/_state.json
+#
+#     {"mob":    {"frames": ["frame_00000", ...], "last_run": "2026-09-23 21:40"},
+#      "player": {"frames": [...], "last_run": "..."}}
+#
+# **只记「跑过哪些帧」，不记框数** —— 框数随时能从标注文件读（count_by_class），
+# 台账便不跟着编辑动作变，少一处会不同步的地方。
+STATE_NAME = "_state.json"
+
+
+def state_path(labels_dir):
+    return Path(labels_dir) / STATE_NAME
+
+
+def read_state(labels_dir):
+    """读处理台账；文件不存在或坏了都当空的。"""
+    try:
+        with open(state_path(labels_dir), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def processed_set(labels_dir, target):
+    """某一类标注「跑过」的帧名集合。"""
+    return set((read_state(labels_dir).get(target) or {}).get("frames") or [])
+
+
+def mark_processed(labels_dir, target, stems):
+    """把一批帧记成「target 这类标注跑过了」（与已有台账取并集后落盘）。"""
+    d = read_state(labels_dir)
+    cur = set((d.get(target) or {}).get("frames") or [])
+    cur |= {str(s) for s in stems}
+    d[target] = {"frames": sorted(cur),
+                 "last_run": time.strftime("%Y-%m-%d %H:%M")}
+    _write_state(labels_dir, d)
+
+
+def unmark_processed(labels_dir, stems):
+    """帧被剔除（图都删了）时，把它从**所有**类的台账里删掉。"""
+    gone = {str(s) for s in stems}
+    d = read_state(labels_dir)
+    for v in d.values():
+        if not isinstance(v, dict):
+            continue
+        v["frames"] = [s for s in (v.get("frames") or []) if s not in gone]
+    _write_state(labels_dir, d)
+
+
+def _write_state(labels_dir, d):
+    try:
+        p = state_path(labels_dir)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(d, ensure_ascii=False, indent=2) + "\n",
+                     encoding="utf-8")
+    except Exception:
+        pass
 
 
 def label_progress(project):
@@ -207,77 +290,3 @@ def label_progress(project):
         if by_cls.get(CLASS_PLAYER, 0) > 0:
             player += 1
     return {"mob": mob, "player": player, "total": total}
-
-
-# ══════════════════════════════════════════════════════════════
-# 相邻帧对比：新框出现 / 旧框消失
-# ══════════════════════════════════════════════════════════════
-def _iou(a, b):
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    ix = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
-    iy = max(0.0, min(ay + ah, by + bh) - max(ay, by))
-    inter = ix * iy
-    union = aw * ah + bw * bh - inter
-    return inter / union if union > 0 else 0.0
-
-
-def _match_group(prev_grp, cur_grp, iou_thr):
-    """同类别的一组框做 IoU 配对。入参是 [(原下标, (x,y,w,h))]。
-
-    返回 (new_ids, lost_ids)，下标是**原框在 prev/cur 里的下标**。
-    """
-    pairs = []
-    for pi, a in prev_grp:
-        for pj, b in cur_grp:
-            v = _iou(a, b)
-            if v >= iou_thr:
-                pairs.append((v, pi, pj))
-
-    pairs.sort(key=lambda t: -t[0])     # 相似度最高的先配，贪心即可
-
-    used_p, used_c = set(), set()
-    for _v, pi, pj in pairs:
-        if pi in used_p or pj in used_c:
-            continue                    # 一对一配对，避免一个框被抢两次
-        used_p.add(pi)
-        used_c.add(pj)
-
-    new_ids = [pj for _pi, pj in cur_grp if pj not in used_c]
-    lost_ids = [pi for pi, _a in prev_grp if pi not in used_p]
-    return new_ids, lost_ids
-
-
-def match_boxes(prev, cur, iou_thr=0.30):
-    """把相邻两帧的框按 IoU 配对，返回 (新增的当前框下标, 消失的上一帧框下标)。
-
-    prev/cur 是 [(cls, x, y, w, h)]。**只在同类别之间配对** ——
-    玩家框和怪框不互配，否则配出来的"新增/消失"是错的。
-
-    **为什么不直接比框数**：
-        上一帧 4 个框、这一帧也是 4 个，数量没变 —— 但可能是
-        「旧的消失 1 个 + 新的冒出 1 个」。比数量会把这帧整帧漏掉。
-
-    **为什么用 IoU 而不是位置相等**：
-        怪在走，同一只怪相邻两帧能差十几个像素。
-    """
-    if not prev:
-        return list(range(len(cur))), []
-    if not cur:
-        return [], list(range(len(prev)))
-
-    p_by_cls = {}
-    c_by_cls = {}
-    for i, box in enumerate(prev):
-        p_by_cls.setdefault(box[0], []).append((i, box[1:5]))
-    for j, box in enumerate(cur):
-        c_by_cls.setdefault(box[0], []).append((j, box[1:5]))
-
-    new_all, lost_all = [], []
-    for cls in set(p_by_cls) | set(c_by_cls):
-        new_ids, lost_ids = _match_group(p_by_cls.get(cls, []),
-                                         c_by_cls.get(cls, []), iou_thr)
-        new_all.extend(new_ids)
-        lost_all.extend(lost_ids)
-
-    return sorted(new_all), sorted(lost_all)

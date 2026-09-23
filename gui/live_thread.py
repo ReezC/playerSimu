@@ -26,25 +26,18 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 from tools.config import get, load_live
 from gui import theme
-
-# 类别编号 → 显示名（和 data.yaml 的 class 对齐）
-CLASS_NAMES = {0: "玩家", 1: "怪物", 2: "掉落", 3: "NPC"}
+from perception.classes import (CLASS_MOB, CLASS_OTHER_PLAYER, CLASS_PLAYER,
+                                ZH_NAMES as CLASS_NAMES)
 
 # player_id → YOLO class id 映射（玩家也走 YOLO，每个玩家独占一个类）。
-# 当前单玩家固定 class 0；未来多玩家时扩展成 {"角色A": 0, "角色B": 2, ...}，
-# 标注按此映射打类，实时只取当前 player_id 对应的类。默认 "" → 0。
-PLAYER_CLASS_MAP = {"": 0}
+# 当前单玩家固定 class 0；未来多玩家时扩展成 {"角色A": 0, "角色B": 4, ...}
+# （4 是「其他玩家」类，见 perception/classes.py —— 别再拿 2，那是 drop）。
+PLAYER_CLASS_MAP = {"": CLASS_PLAYER}
 
-# 类别 → 框颜色（BGR，和 data.yaml 的 class 对齐）。
-# 玩家/怪物颜色从设置读（theme.load_vis），drop/npc 用固定默认。
+# 类别 → 框颜色（BGR）。**每个类别的颜色都能在设置里改**（theme.class_colors
+# 统一从 config/ui.yaml 的 vis 段读）；类别清单本身在 perception/classes.py 定义。
 def _box_colors():
-    vis = theme.load_vis()
-    return {
-        0: theme.hex_to_bgr(vis["player_color"]),   # player
-        1: theme.hex_to_bgr(vis["mob_color"]),      # mob
-        2: (0, 255, 255),                           # drop 黄
-        3: (0, 0, 255),                             # npc 红
-    }
+    return theme.class_colors()
 
 
 def _bar_fill_ratio(mask):
@@ -258,6 +251,8 @@ class LiveThread(QThread):
         # 这里不再重复 use_network —— 否则会二次连接、旧连接泄漏、还可能
         # 因 relay 暂时不可达把已建好的连接回退成本地。
         from decision.agent import CombatAgent, settings as decision_settings
+        from decision.input import tap as _tap
+        from decision.reconnect import Reconnector
         from perception.tracker import MobTracker, PlayerTracker
         from perception.world_state import WorldState
         from perception.platforms import (PlatformTracker, PlayerMotionTracker,
@@ -266,6 +261,8 @@ class LiveThread(QThread):
         agent = CombatAgent(decision_settings)
         mob_tracker = MobTracker()   # 给怪稳定 id，供目标锁定 CD 跨帧匹配
         player_tracker = PlayerTracker()   # 跟住「我」：位置连续性，别把别人认成自己
+        # 断线重连状态机（判界面 → 停自动 → 按 Enter/点鼠标走回游戏）
+        reconnector = Reconnector(decision_settings)
         # 平台和玩家运动状态是 WorldState 的一部分，不交给 YOLO：平台顶边用
         # 轻量图像处理每帧更新，玩家速度则由连续框的位置估计。
         platform_tracker = PlatformTracker()
@@ -277,6 +274,9 @@ class LiveThread(QThread):
         _pid = self._p.get("player_id") or ""
         _player_class = int(self._p.get("player_class",
                                         PLAYER_CLASS_MAP.get(_pid, 0)) or 0)
+        # 怪物类 id：默认按类别表（perception/classes.py）；模型加载后会改成以
+        # **模型自己声明的类别名**为准，见下面 YOLO(weights) 那一段。
+        _mob_class = CLASS_MOB
 
         # HP/MP 条识别：从实时帧 vis 里按「画面比例」裁出血条区域，再颜色过滤
         # + 列扫描算填充比例，不额外抓屏。限流 0.1s（识别本身 <1ms，限流只为抑制抖动）。
@@ -444,12 +444,26 @@ class LiveThread(QThread):
                 probe_on = False
                 decode_ms = resolve_delay_ms = None
 
+        # 时序拍的最小间隔：序列到点时主循环至少按这个粒度醒来一次（见 agent 的
+        # TIMING_TICK）。序列计时走本机绝对时钟，这个粒度对 CD/delay 足够。
+        from decision.agent import TIMING_TICK as _timing_tick
+        ws = None            # 上一次的世界状态：时序拍不读它，只做兜底
+
         try:
             while not self._stop.is_set():
-                f = slot.take(0.5)
+                # 等「下一帧」或「下一个序列到点时刻」，谁先到就干谁 ——
+                # 序列里存的是绝对到点时刻，原来只有抓到一帧才检查「到点没」，
+                # 于是输出CD/delay/跳间隔全被量化到 1/capture_fps。现在到点就醒。
+                timeout = 0.5
+                deadline = agent.next_deadline()
+                if deadline is not None:
+                    timeout = min(timeout,
+                                  max(_timing_tick, deadline - time.perf_counter()))
+                f = slot.take(timeout)
                 if f is None:
                     if reader_done.is_set():
                         break          # 流结束了
+                    agent.tick_timing(ws)   # 时序拍：只发「到点该发」的，不做画面决策
                     continue           # 只是暂时没新帧，继续等
                 n += 1
 
@@ -462,12 +476,17 @@ class LiveThread(QThread):
                 if time.perf_counter() - _vis_refresh_last >= 1.0:
                     _vis_refresh_last = time.perf_counter()
                     _vis_cfg = theme.load_vis()
-                    _cls_colors = {
-                        0: theme.hex_to_bgr(_vis_cfg["player_color"]),
-                        1: theme.hex_to_bgr(_vis_cfg["mob_color"]),
-                        2: (0, 255, 255),
-                        3: (0, 0, 255),
-                    }
+                    _cls_colors = theme.class_colors()
+                    # 画框/标签按**实际解析出来的**类 id 取（权重可能在别处训、
+                    # 顺序和我们不同），取不到就回退到类别表里的默认项。
+                    _p_color = _cls_colors.get(_player_class,
+                                               _cls_colors[CLASS_PLAYER])
+                    _m_color = _cls_colors.get(_mob_class,
+                                               _cls_colors[CLASS_MOB])
+                    _p_label = CLASS_NAMES.get(_player_class,
+                                               CLASS_NAMES[CLASS_PLAYER])
+                    _m_label = CLASS_NAMES.get(_mob_class,
+                                               CLASS_NAMES[CLASS_MOB])
                     _lock_color = theme.hex_to_bgr(_vis_cfg["lock_color"])
                     _attack_color = theme.hex_to_bgr(_vis_cfg["attack_color"])
                     _min_attack_color = theme.hex_to_bgr(_vis_cfg["min_attack_color"])
@@ -503,6 +522,15 @@ class LiveThread(QThread):
                     if model is None:
                         # 首次开推理才加载模型（收画面阶段不加载，秒出纯画面）
                         model = YOLO(weights)
+                        # 类别 id 以**模型自己声明的类别名**为准：类别表给的是我们
+                        # 训练时的顺序，但权重可能是别处训的 —— 按名字对齐，怎么都
+                        # 不会张冠李戴；认不出来就沿用类别表里的 id。
+                        _by_name = {str(n).lower(): int(i) for i, n
+                                    in (getattr(model, "names", None) or {}).items()}
+                        if "player" in _by_name:
+                            _player_class = _by_name["player"]
+                        if "mob" in _by_name:
+                            _mob_class = _by_name["mob"]
 
                     # 视野框：只用于画虚线 + 决策层过滤（agent._filter_mobs），
                     # 不裁剪推理区域 —— 检测走全图，玩家和怪都从全图出。
@@ -531,7 +559,7 @@ class LiveThread(QThread):
                         except Exception:
                             clss = [1] * len(cfs)
                         for (x1, y1, x2, y2), c, cls in zip(xyxy, cfs, clss):
-                            if int(cls) == 1:
+                            if int(cls) == _mob_class:
                                 if c < conf_mob:
                                     continue
                                 k += 1
@@ -541,7 +569,11 @@ class LiveThread(QThread):
                                     continue
                                 # 收集所有玩家候选，交给 PlayerTracker 挑出「我」
                                 player_cands.append((x1, y1, x2, y2, c))
-                            # drop/npc（class 2/3）暂不参与决策
+                            # 其余类别都不进决策，但照常画框（颜色见类别表）：
+                            #   掉落 / NPC    一直是忽略的；
+                            #   其他玩家      忽略（混进 mobs 会去打人，混进玩家候选
+                            #                 会认错自己）—— 它的价值是「别的玩家
+                            #                 不再被误当怪」，决策暂时不需要它。
 
                     # ---- 玩家定位：YOLO 候选 → PlayerTracker 跟住「我」 ----
                     # 用位置连续性（离预测位置最近）挑出操作者的框，避免「画面里多个
@@ -551,6 +583,16 @@ class LiveThread(QThread):
                         1.0, float(decision_settings.player_track_jump))
                     player_box = player_tracker.update(player_cands)
                     n_boxes = k
+
+                    # ---- 断线判断 / 自动重连 ----
+                    # 必须放在**画框之前**：此刻 vis 还是干净帧。下面会往 vis 上
+                    # 画玩家蓝框、平台线……画过的帧会干扰 UI 模板匹配。
+                    # 注意 player_found 要用追踪器刚返回的结果，不能用下面那个
+                    # 「跟丢时拿上一帧兜底」的 player_box —— 那玩意永远不为 None。
+                    _act = reconnector.update(vis, player_box is not None,
+                                              time.perf_counter())
+                    if _act and _act.get("act") == "tap":
+                        _tap(_act["key"])
 
                     # ---- 决策：找怪打 ----
                     if player_box is not None:
@@ -565,12 +607,12 @@ class LiveThread(QThread):
                         _x1i = int(_cx - _bw / 2); _y1i = int(_cy - _bh / 2)
                         _x2i = int(_cx + _bw / 2); _y2i = int(_cy + _bh / 2)
                         cv2.rectangle(vis, (_x1i, _y1i), (_x2i, _y2i),
-                                      _cls_colors[0], 2)
+                                      _p_color, 2)
                         _ty = _y1i - 5 if _y1i > 14 else _y1i + 16
-                        cv2.putText(vis, "%s %.2f" % (CLASS_NAMES[0], _c),
+                        cv2.putText(vis, "%s %.2f" % (_p_label, _c),
                                     (_x1i + 2, _ty),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                    _cls_colors[0], 1, cv2.LINE_AA)
+                                    _p_color, 1, cv2.LINE_AA)
 
                     ws = WorldState(frame_id=f.frame_id, ts=f.t_recv_mono,
                                     width=vis.shape[1], height=vis.shape[0])
@@ -675,20 +717,19 @@ class LiveThread(QThread):
                                 (255, 255, 255), 2, cv2.LINE_AA)
 
                     # 攻击距离可视化：
-                    #   角色 → 最小攻击距离：橙色线（太近的规避范围）
+                    #   角色中心 → 最小攻击距离：橙色线（太近的规避范围）
                     #   最小 → 最大攻击距离：黄色线（可攻击范围）
                     if player_box is not None:
                         cx, cy = int(player_box[0]), int(player_box[1])
-                        bw = player_box[4]
                         facing = action.get("facing", 1)
                         dirn = 1 if facing > 0 else -1
                         max_ad = max(1, int(decision_settings.attack_dist))
                         min_ad = max(0, int(decision_settings.min_attack_dist))
-                        # 攻击距离/追击起跳从玩家框的「朝向边缘」起算，和 agent 的
-                        # _edge_dist 判定（框边缘到框边缘）保持一致，否则可视化距离
-                        # 会以中心为基准、判定以边缘为基准，出现「还没碰到框就跳」。
+                        # 起算点 = **角色中心**（ex = cx），和 agent 的 _center_dist
+                        # 口径一致（中心 → 怪框最近的边）。画在朝向边缘就会差半个
+                        # 框宽：怪框碰到黄线时其实还没进攻击范围，看着像坏掉。
                         # OpenCV 5 的 line/arrowedLine 不接受 float 坐标，必须取整。
-                        ex = int(cx + dirn * (bw / 2.0))
+                        ex = cx
                         max_x = ex + dirn * max_ad
                         yellow = _attack_color        # 最大攻击距离线颜色
                         orange = _min_attack_color    # 最小攻击距离/规避范围线颜色
@@ -719,7 +760,8 @@ class LiveThread(QThread):
                                 cv2.line(vis, (jx2, jy - 8), (jx2, jy + 8), green, 2)
 
                         # 扫平台倾向朝向箭头：位于攻击距离上方，指向朝向方向，
-                        # 尾巴延长至背后锁定距离（back_range）
+                        # 尾巴延长至背后锁定距离（back_range）。back_range 也是
+                        # 从角色中心量的（见 agent._candidates），起点同样取 ex。
                         if decision_settings.strategy == "sweep":
                             back_range = max(0, int(decision_settings.back_range))
                             arrow_len = max(6, int(max_ad * 0.4))   # 比较短
@@ -756,12 +798,12 @@ class LiveThread(QThread):
                         gy1 = int(m.y - m.h / 2)
                         gx2 = int(m.x + m.w / 2)
                         gy2 = int(m.y + m.h / 2)
-                        cv2.rectangle(vis, (gx1, gy1), (gx2, gy2), _cls_colors[1], 2)
+                        cv2.rectangle(vis, (gx1, gy1), (gx2, gy2), _m_color, 2)
                         gty = gy1 - 5 if gy1 > 14 else gy1 + 16
-                        cv2.putText(vis, "%s %.2f" % (CLASS_NAMES[1], m.conf),
+                        cv2.putText(vis, "%s %.2f" % (_m_label, m.conf),
                                     (gx1 + 2, gty),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                    _cls_colors[1], 1, cv2.LINE_AA)
+                                    _m_color, 1, cv2.LINE_AA)
 
                     # 锁定目标怪：框标红（加粗），方便观测
                     tid = action.get("target")
@@ -804,6 +846,8 @@ class LiveThread(QThread):
                         "bad": getattr(src, "bad_packets", 0),
                         "size": size_ref[0] or (0, 0),
                         "fps_src": fps_ref[0],
+                        # 断线重连状态文字（reconnect.py 写，空串 = 没在重连）
+                        "reconnect": getattr(decision_settings, "reconnect_note", ""),
                     })
                     t_last_stat = now
 

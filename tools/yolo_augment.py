@@ -25,7 +25,7 @@ from pathlib import Path
 
 from core.context import ConsoleContext, TaskContext
 
-CLASS_MOB = 1
+CLASS_MOB = 1       # 类别表见 perception/classes.py（id 固定，别在本地另立一份）
 CLASS_PLAYER = 0
 OVERLAP_THR = 0.3     # 和已有框的 IoU 超过它就认为重复，丢弃
 
@@ -157,6 +157,15 @@ def run_yolo_augment(params, ctx=None):
     if limit:
         frames = frames[:limit]
 
+    # 只辅助选中的帧（和模板匹配那一趟用同一份清单）—— 不然用户只勾了几帧，
+    # 辅助却把没勾的帧也改了标注，等于白选。
+    only = {str(s) for s in (params.get("only") or [])}
+    if only:
+        frames = [f for f in frames if f.stem in only]
+        if not frames:
+            raise ValueError("选中的帧在画面目录里一个都找不到（选了 %d 个）"
+                             % len(only))
+
     out = Path(params["out"])
     out.mkdir(parents=True, exist_ok=True)
 
@@ -183,6 +192,13 @@ def run_yolo_augment(params, ctx=None):
         ctx.log("置信度 %.2f   只合并 class 1（怪物）" % conf)
     ctx.log("输出       %s" % out)
     ctx.log("")
+
+    # 轮到这个阶段时任务可能已经被取消了 —— 别为一个已取消的任务去加载模型：
+    # YOLO(...) 首次加载要几秒到几十秒（还要初始化 CUDA），这一下拦不住。
+    if ctx.canceled():
+        ctx.log("已取消，跳过 YOLO 辅助", "warn")
+        return {"frames": 0, "boxes_added": 0, "frames_merged": 0, "mode": mode,
+                "seconds": 0.0, "weights": str(weights), "summary": "已取消"}
 
     try:
         from ultralytics import YOLO
@@ -281,6 +297,11 @@ def run_detect_mob_augmented(params, ctx=None):
     res = run_detect(params["detect"], ctx)
     aug = params.get("augment")
     if aug:
+        # **取消最容易被当成失效的地方**：模板匹配那步已经被取消了，这里却接着跑
+        # YOLO —— 用户点完取消还要再等模型加载 + 第一帧推理，看起来就是没反应。
+        if ctx.canceled():
+            ctx.log("已取消，跳过 YOLO 辅助", "warn")
+            return res
         ctx.log("")
         ctx.log("—— YOLO 辅助怪物 ——", "info")
         res["augment"] = run_yolo_augment(aug, ctx)
@@ -299,6 +320,9 @@ def run_detect_player_augmented(params, ctx=None):
     res = run_detect_player(params["detect"], ctx)
     aug = params.get("augment")
     if aug:
+        if ctx.canceled():       # 同 run_detect_mob_augmented：别让取消白等一轮 YOLO
+            ctx.log("已取消，跳过 YOLO 辅助", "warn")
+            return res
         ctx.log("")
         ctx.log("—— YOLO 辅助玩家 ——", "info")
         res["augment"] = run_yolo_augment(aug, ctx)

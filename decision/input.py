@@ -47,6 +47,21 @@ CHOICES = ["left", "right", "up", "down", "ctrl", "alt", "shift", "space"] + \
           [str(i) for i in range(10)] + \
           [",", ".", "/", ";", "'", "[", "]", "\\", "-", "=", "grave"]
 
+# 本机操作键：**硬编码，永不发给游戏**。
+#   F10 = 触控板触控模式开关（gui/touchpad.py）
+#   F11 = 开关自动（默认热键；全局热键注册以外的地方也不该发它）
+#   F12 = 预留（调试 / 截图之类）
+# 拦在所有发送路径的最里面 —— 决策层、手动输入、断线重连都从 key_down/key_up/tap
+# 出去，所以在这里拦一次就够。不拦的话：按一下本地开关，游戏里会跟着触发一次
+# （最典型的是「按住 Ctrl 用触控板」——Ctrl 是默认攻击键，一按就打出去了）。
+LOCAL_ONLY = ("f10", "f11", "f12")
+
+
+def is_local_only(name):
+    """是本机操作键吗（是的话，任何发送路径都不该把它发出去）。"""
+    return str(name).lower() in LOCAL_ONLY
+
+
 # 默认键位
 DEFAULT_KEYMAP = {
     "auto": "f11",      # 开关自动
@@ -114,17 +129,25 @@ def _send(vk, up=False):
 
 
 def key_down(name):
+    if is_local_only(name):
+        return      # 本机操作键（F10~F12）：永不发给游戏，见 LOCAL_ONLY
     if _remote is not None:
         _send_remote("PRESS " + _remote_key(name))
         return
+    if _blocked:
+        return      # 通道断了又没接上：宁可什么都不发，也别打到控制机上（见 _blocked）
     vk = resolve_vk(name)
     if vk is not None:
         _send(vk, False)
 
 
 def key_up(name):
+    if is_local_only(name):
+        return      # 同上：本机操作键的松开也不发（否则游戏侧会收到一个孤儿 RELEASE）
     if _remote is not None:
         _send_remote("RELEASE " + _remote_key(name))
+        return
+    if _blocked:
         return
     vk = resolve_vk(name)
     if vk is not None:
@@ -133,8 +156,12 @@ def key_up(name):
 
 def tap(name, duration=0.06):
     """点按一下（按下 → 松开）。给「开关自动」这类瞬发键用。"""
+    if is_local_only(name):
+        return      # 同上：本机操作键不点
     if _remote is not None:
         _send_remote("TAP %s %d" % (_remote_key(name), int(duration * 1000)))
+        return
+    if _blocked:
         return
     vk = resolve_vk(name)
     if vk is None:
@@ -176,6 +203,12 @@ class KeyState:
 # ---- 远程后端（agent 跑在控制机，通过 TLS 把按键发到游戏机的 Pro Micro）----
 # 默认 _remote=None 走本地 SendInput；调用 use_network() 后切到远程硬件键盘。
 _remote = None
+# 连接参数记下来，「重连通道」要用（见 reconnect_remote）
+_cfg = None
+# 通道断了又接不上时置 True：这时**绝不能**退化成本机 SendInput ——
+# 控制机正是人在用的机器，把游戏按键打到本机上是会出事的（比如往别的窗口里打字）。
+# 断开期间宁可什么都不发，等重连成功再恢复。
+_blocked = False
 
 _CMD_KEY = {
     "left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN",
@@ -196,11 +229,80 @@ def _remote_key(name):
 
 
 def _send_remote(line):
-    if _remote is not None:
-        try:
-            _remote.send(line)
-        except Exception:
-            pass
+    """发一条远程指令。返回 True/False（False 或不返回都表示这条没发出去）。
+
+    以前这里 `except: pass` 把失败全吞了 —— 通道死了上层一点感觉都没有，
+    还在不停发。表现就是「停自动没用、手动也没用，只能关 GUI」。
+    """
+    if _remote is None:
+        return False
+    try:
+        return bool(_remote.send(line))
+    except Exception:
+        return False
+
+
+# 发过指令后，超过这么久收不到固件回执就判定链路卡死（秒）。
+# 固件对每条指令都会回 DONE/ERR，所以「静默」是可靠的死链信号。
+REPLY_SILENCE_LIMIT = 5.0
+
+
+def link_health():
+    """指令通道当前状态：{"backend", "ok", "err", "fails", "silent"}。
+
+    backend: "local"（本机 SendInput）/ "remote"（网络 Pro Micro）/
+             "serial"（直连）/ "blocked"（断了又接不上，已停止发送）。
+
+    ok 同时对「发送有没有报错」和「固件还有没有回执」两件事下判断 ——
+    后者能抓到 relay 卡在串口写上这种「发送成功、实际什么都没发生」的情况。
+    """
+    if _remote is None:
+        return {"backend": "blocked" if _blocked else "local",
+                "ok": not _blocked, "err": "", "fails": 0, "silent": 0.0}
+    kind = _cfg[0] if _cfg else "remote"
+    send_ok = bool(getattr(_remote, "ok", True))
+    silent = 0.0
+    try:
+        silent = float(_remote.silent_for())
+    except Exception:
+        pass
+    quiet_ok = silent < REPLY_SILENCE_LIMIT
+    err = str(getattr(_remote, "last_err", ""))
+    if not quiet_ok and not err:
+        err = "发指令后 %.0f 秒没收到固件回执（链路卡死）" % silent
+    return {"backend": kind,
+            "ok": send_ok and quiet_ok,
+            "err": err,
+            "fails": int(getattr(_remote, "fails", 0)),
+            "silent": silent}
+
+
+def reconnect_remote():
+    """丢掉当前连接重开。返回 True = 重开后通道可用。
+
+    **为什么重连能解开卡键**：relay 在客户端断开时会往串口直接写一条 RELEASEALL
+    （`remote_kbd/relay.py` 的 bridge() 里的 finally）。也就是说「断开」这个动作
+    本身就是一次硬复位 —— 而且它**不依赖我们这边的 TCP 通道是否还通**。
+    这正是上次「关掉 GUI」能让卡住的键松开的原因：那一下是 relay 替我们松的。
+
+    重连失败**不会**退化成本机 SendInput（那会把按键打到控制机上），而是进入
+    _blocked：什么都不发，等下次重连成功。
+    """
+    global _remote, _blocked
+    if _remote is None or _cfg is None:
+        _blocked = False
+        return True
+    kind = _cfg[0]
+    try:
+        if kind == "remote":
+            use_network(_cfg[1], _cfg[2], _cfg[3])
+        else:
+            use_serial(_cfg[1])
+        return True
+    except Exception:
+        _drop_remote()
+        _blocked = True
+        return False
 
 
 def release_all_remote():
@@ -262,10 +364,12 @@ def _drop_remote():
 
 def use_network(host, port, cafile):
     """切到网络后端（agent 在控制机时，启动阶段调用一次）。"""
-    global _remote
+    global _remote, _cfg, _blocked
     _drop_remote()
     from remote_kbd.kbd_client import KbdClient
     _remote = KbdClient(host, port, cafile)
+    _cfg = ("remote", host, port, cafile)   # 记下来给 reconnect_remote 用
+    _blocked = False
 
 
 def use_serial(port):
@@ -273,12 +377,14 @@ def use_serial(port):
 
     port 为空或打开失败时，自动扫描 Arduino/SparkFun 串口（换 USB 口不用改配置）。
     """
-    global _remote
+    global _remote, _cfg, _blocked
     _drop_remote()
     from remote_kbd.serial_kbd import SerialKbd, find_pro_micro_port
     if port:
         try:
             _remote = SerialKbd(port)
+            _cfg = ("serial", port)
+            _blocked = False
             return
         except Exception:
             pass   # 配置的串口打不开，走自动发现
@@ -286,11 +392,15 @@ def use_serial(port):
     if found is None:
         raise RuntimeError("找不到 Pro Micro 串口（确认已插入，或检查 config/link.yaml 的 serial_local）")
     _remote = SerialKbd(found)
+    _cfg = ("serial", found)
+    _blocked = False
 
 
 def use_local():
     """切回本地 SendInput，并关闭远程连接（socket / 串口不泄漏）。"""
+    global _blocked
     _drop_remote()
+    _blocked = False
 
 
 def shutdown():

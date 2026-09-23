@@ -23,7 +23,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-CLASS_MOB = 1
+CLASS_MOB = 1   # 类别表见 perception/classes.py（id 固定，别在本地另立一份）
 
 
 def load_sprites(root: Path, limit_frames: int, verbose=True):

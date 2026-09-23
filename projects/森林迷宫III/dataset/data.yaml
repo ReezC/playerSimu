@@ -4,3 +4,6 @@ val: images/val
 names:
   0: player
   1: mob
+  2: drop
+  3: npc
+  4: other_player

@@ -36,6 +36,8 @@ for _dll in ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
 from PyQt5.QtCore import Qt                      # noqa: E402
 from PyQt5.QtWidgets import QApplication          # noqa: E402
 
+from gui.widgets import install_wheel_guard       # noqa: E402
+
 # 项目根加入 sys.path，这样从任意工作目录启动都能 import tools / link / core
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -124,7 +126,14 @@ def main():
             pass
 
     app = QApplication(sys.argv)
-    app.setApplicationName("playerSimu 数据集工作台")
+    # 和窗口标题用同一个名字（定义在 gui/main_window.py，那边要拼上项目名）
+    from gui.main_window import APP_NAME
+    app.setApplicationName(APP_NAME)
+
+    # 滚轮不许改参数（数字框/下拉框/滑块/标签栏）。装在应用级是故意的：
+    # 靠「每个控件记得用 NoWheel* 子类」已经漏了十几处，必须有个兜底。
+    # 详见 docs/UI规范.md。
+    install_wheel_guard(app)
 
     # 应用图标：MapleNecrocer 图标去掉红色通道（见 gui/icon.ico）
     from PyQt5.QtGui import QIcon

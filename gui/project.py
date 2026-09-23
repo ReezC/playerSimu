@@ -52,6 +52,11 @@ DEFAULTS = {
     # 存项目里 —— 不同项目可能用了不同的游戏 UI 布局；项目没存过的回退用
     # config/decision.json 的全局值（= 上次框选的位置）。
     "bars": {},
+    # 整份决策参数（DecisionSettings.to_dict() 的结果，几十个键）：**按项目各存一份**。
+    # 换项目就换一套（攻击距离、序列、定时行为、防掉线……都跟着项目走）。
+    # 空的 = 这个项目还没存过：打开时用 config/decision.json 那份播种并当场写回来，
+    # 之后各项目互不影响（见 MainWindow._bind_decision_params）。
+    "decision": {},
     "notes": "",
     "capture": {
         "source": "window",   # window | file | stream

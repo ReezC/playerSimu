@@ -156,7 +156,13 @@ def run_relabel(params, ctx=None):
         lines = []
         boxes = getattr(r, "boxes", None)
         if boxes is not None and len(boxes):
-            for cx, cy, w, h in boxes.xywhn.cpu().numpy():
+            clss = boxes.cls.cpu().numpy().astype(int)
+            for (cx, cy, w, h), c in zip(boxes.xywhn.cpu().numpy(), clss):
+                # 只收怪物框：这条路是给「自动补怪物标注」用的，把别的类（比如
+                # 「其他玩家」）也写成 class 1 就是错标 —— 那种标注会污染训练集。
+                # 其他类的标注由人工标（见 gui/review.py 的类别下拉）。
+                if int(c) != CLASS_MOB:
+                    continue
                 lines.append("%d %.6f %.6f %.6f %.6f"
                              % (CLASS_MOB, cx, cy, w, h))
 

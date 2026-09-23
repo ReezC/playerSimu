@@ -2,11 +2,16 @@
 
 决策逻辑在 decision/agent.py，实时推理循环驱动它。这里只负责：
     · 开关自动（按钮 + F11）
+    · 触控板 / 鼠标左右键 / 灵敏度 / 输入设备（「操控」组，本地 F10 开关触控模式）
     · 攻击距离
     · 键盘映射（7 个键）
 
-所有改动直接写进全局 settings（decision.agent.settings），实时线程每帧
-读到最新值，无需重启。
+F10 / F11 / F12 是**本机操作键**：只在本窗口起作用，永不转发给游戏
+（见 decision/input.py 的 LOCAL_ONLY）。
+
+所有改动直接写进 settings 单例（decision.agent.settings），实时线程每帧读到
+最新值，无需重启。**这份参数按项目各存一份**：主窗口打开项目时注册保存钩子，
+每次 save() 就整份写回该项目的 project.yaml（见 MainWindow._bind_decision_params）。
 """
 
 from PyQt5.QtCore import Qt, QEvent, QTimer, pyqtSignal
@@ -18,6 +23,10 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
 
 from decision import input as dinput
 from decision.agent import ANTI_AFK_TYPES, load_rect, load_saved, settings
+# NoWheel* 必须模块级导入：控件在 _build() 里建，懒导入到不了那儿。
+# （详见 docs/UI规范.md：滚轮不许改参数）
+from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,
+                         NoWheelSlider, NoWheelSpinBox, forward_wheel)
 from gui.touchpad import TouchPad
 
 # 键盘映射的每一行：(key, 标签, 默认键名)
@@ -106,28 +115,28 @@ class PlayerPanel(QWidget):
     # ---------------- 界面 ----------------
 
     def _build(self):
-        # 外层：QScrollArea 包裹内容 —— 参数太多时可垂直滚动，不再撑大主窗口
+        # 版面分两段：上面「操控」组常驻不滚动，下面 QScrollArea 装其余参数。
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setContentsMargins(10, 8, 10, 0)
+        outer.setSpacing(6)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        outer.addWidget(scroll)
 
-        content = QWidget()
-        scroll.setWidget(content)
+        # 「操控」组压在滚动内容上方，边框要和滚动内容左右对齐：
+        # 滚动内容会被右边的滚动条往左挤 sb_w 像素，所以组这边也要补同样的
+        # 右边距（含内容自己的 pad），否则两个 groupbox 的边框一宽一窄。
+        pad = 10
+        sb_w = scroll.verticalScrollBar().sizeHint().width()
 
-        root = QVBoxLayout(content)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(8)
-
-        title = QLabel("决策参数")
-        title.setStyleSheet("font-weight: 600; font-size: 14px; color: #202124;")
-        root.addWidget(title)
-
-        # ---- 按钮组（并排一行，省垂直空间）----
+        # ---- 置顶常驻区（放在滚动区**外面**，不参与滚动）----
+        # 上半：开启自动 / 开启手动输入 —— 最常用的两个开关，滚没了最难受。
+        # 下半：「操控」组（触控板 / 左右键 / 灵敏度 / 输入设备+状态 / 重置指令通道）。
+        # 「以「操控」组的下边界为基准在本页面置顶」= 这一整块的下边界就是滚动区的
+        # 上边界：开关和这一组始终可见、可交互 —— 卡键、掉设备这类事往往正是滚到
+        # 一半才发现的，那时候够不着就很别扭。
         ctrl_row = QHBoxLayout()
         ctrl_row.setSpacing(8)
 
@@ -142,22 +151,38 @@ class PlayerPanel(QWidget):
         self.btn_manual.setCheckable(True)
         self.btn_manual.setMinimumHeight(34)
         self.btn_manual.setToolTip(
-            "开启后，本机键盘的按键会实时转发到游戏（手动接管控制）。\n"
-            "和自动打怪互斥：开启手动输入会先关掉自动。")
+            "开启后，本机键盘的按键会实时转发到游戏（手动插手）。\n"
+            "**不会**关掉自动，可以和自动同时开着。\n"
+            "两边抢同一个键时：你松开的那个键固件也就松了，但决策层会在下一帧\n"
+            "重新把它按回去（每次手动按键都会让决策层重同步一次）。\n"
+            "\n"
+            "触控板用**本地按 F10**开 / 关（不是按住 Ctrl —— Ctrl 是默认攻击键，\n"
+            "按住它用触控板会让角色打出去）。F10 / F11 / F12 是本机操作键，\n"
+            "永不转发给游戏。")
         self.btn_manual.clicked.connect(self._toggle_manual)
         ctrl_row.addWidget(self.btn_manual)
 
-        root.addLayout(ctrl_row)
+        ctrl_grp = QGroupBox("操控")
+        cg = QHBoxLayout(ctrl_grp)
+        cg.setSpacing(10)
 
-        # ---- 鼠标控制（触控板 + 左右键）----
-        # 鼠标指着触控板 + 按住 Ctrl → 滑动鼠标，位移按灵敏度映射发给远程鼠标；
-        # 左右键按住 = 按下不放（支持拖拽）。只对 ProMicro 生效。
-        # 布局：触控板在左，右侧一列（上：左右键，下：灵敏度）。
-        mouse_row = QHBoxLayout()
-        mouse_row.setSpacing(10)
+        # 左：触控板（TouchPad 固定 210x132）
         self.touchpad = TouchPad()
-        mouse_row.addWidget(self.touchpad)
+        cg.addWidget(self.touchpad)
 
+        # 触控板位移的余数累积（小位移不丢：0.3px 攒到 1px 才发）
+        self._pad_rem = [0.0, 0.0]
+        self.touchpad.moved.connect(self._on_pad_moved)
+        # 触控模式（本地按 F10 开 / 关，见 eventFilter）下的点击 / 滚轮也转发给远程鼠标
+        self.touchpad.clicked.connect(dinput.mouse_click)
+        self.touchpad.scrolled.connect(dinput.mouse_scroll)
+
+        # 右：一列，全部压进触控板的纵向范围（4 行 ≈ 122px ≤ 触控板 132px）。
+        # 本地按 F10 开触控模式 → 在板子上滑动，位移按灵敏度映射发给远程鼠标。
+        right_col = QVBoxLayout()
+        right_col.setSpacing(6)
+
+        # （1）左右键：按住 = 按下不放（支持拖拽），松开 = 弹起。只对 ProMicro 生效。
         self.btn_mouse_l = QPushButton("左键")
         self.btn_mouse_r = QPushButton("右键")
         for b in (self.btn_mouse_l, self.btn_mouse_r):
@@ -167,46 +192,29 @@ class PlayerPanel(QWidget):
         self.btn_mouse_l.released.connect(lambda: dinput.mouse_release("left"))
         self.btn_mouse_r.pressed.connect(lambda: dinput.mouse_press("right"))
         self.btn_mouse_r.released.connect(lambda: dinput.mouse_release("right"))
+        mbtn_row = QHBoxLayout()
+        mbtn_row.setSpacing(6)
+        mbtn_row.addWidget(self.btn_mouse_l)
+        mbtn_row.addWidget(self.btn_mouse_r)
+        mbtn_row.addStretch(1)
+        right_col.addLayout(mbtn_row)
 
+        # （2）灵敏度：本地鼠标位移 × 该比例 = 远程鼠标位移
         self.sp_mouse_speed = self._spin(0.1, 10.0, 1.0, 2)
         self.sp_mouse_speed.setSingleStep(0.1)
         self.sp_mouse_speed.setToolTip(
             "灵敏度：本地鼠标位移 × 该比例 = 远程鼠标位移（1.0 = 1:1）。")
         self.sp_mouse_speed.valueChanged.connect(self._on_mouse_speed)
-
-        right_col = QVBoxLayout()
-        right_col.setSpacing(6)
-        mbtn_row = QHBoxLayout()
-        mbtn_row.setSpacing(6)
-        mbtn_row.addWidget(self.btn_mouse_l)
-        mbtn_row.addWidget(self.btn_mouse_r)
-        right_col.addLayout(mbtn_row)
         spd_row = QHBoxLayout()
-        spd_row.setSpacing(4)
+        spd_row.setSpacing(6)
         spd_row.addWidget(QLabel("灵敏度"))
         spd_row.addWidget(self.sp_mouse_speed)
         spd_row.addStretch(1)
         right_col.addLayout(spd_row)
-        right_col.addStretch(1)
-        mouse_row.addLayout(right_col, 1)
-        root.addLayout(mouse_row)
 
-        # 触控板位移的余数累积（小位移不丢：0.3px 攒到 1px 才发）
-        self._pad_rem = [0.0, 0.0]
-        self.touchpad.moved.connect(self._on_pad_moved)
-        # 触控模式（按住 Ctrl）下的点击 / 滚轮也转发给远程鼠标
-        self.touchpad.clicked.connect(dinput.mouse_click)
-        self.touchpad.scrolled.connect(dinput.mouse_scroll)
-
-        self.lbl_state = QLabel("当前：未开启")
-        self.lbl_state.setStyleSheet("color: #80868b;")
-        root.addWidget(self.lbl_state)
-
-        # ---- 输入设备（置顶）----
-        top_form = QFormLayout()
-        top_form.setLabelAlignment(Qt.AlignLeft)
-
-        self.cmb_device = QComboBox()
+        # （3）输入设备 + 重置指令通道：同一行 —— 一个是「走哪条通道」，
+        #      一个是「通道卡住时的逃生口」，放一起才好找。
+        self.cmb_device = NoWheelComboBox()
         self.cmb_device.addItem("本地(仅测试)", "local")
         self.cmb_device.addItem("ProMicro(远程)", "remote")
         self.cmb_device.addItem("ProMicro(本地)", "serial")
@@ -215,11 +223,76 @@ class PlayerPanel(QWidget):
             "ProMicro(远程)：网络连游戏机的 Pro Micro 硬件键盘；\n"
             "ProMicro(本地)：本机 USB 直连 Pro Micro，无需 relay。")
         self.cmb_device.currentIndexChanged.connect(self._on_input_device)
-        top_form.addRow("输入设备", self.cmb_device)
 
+        # 重置指令通道：卡键 / 按键发不出去时的逃生口。
+        # 自动关着也能用 —— 卡键往往正是「发现卡了去关自动」之后才发现的。
+        self.btn_reset_link = QPushButton("重置指令通道")
+        self.btn_reset_link.setToolTip(
+            "按键卡住（角色自己一直走 / 一直攻击）或按键发不出去时点这里。\n"
+            "① 重连远程通道 —— 连接断开时 relay 会直接往固件写一条 RELEASEALL，\n"
+            "   把卡住的键一次松开（这条路不依赖我们的网络还通不通）；\n"
+            "② 再补发一轮 RELEASEALL + 所有映射键的 RELEASE；\n"
+            "③ 让决策层重同步按键状态（否则它以为键还按着，之后不再补发）。")
+        self.btn_reset_link.clicked.connect(self._reset_link)
+        dev_row = QHBoxLayout()
+        dev_row.setSpacing(6)
+        dev_row.addWidget(QLabel("输入设备"))
+        dev_row.addWidget(self.cmb_device)
+        dev_row.addWidget(self.btn_reset_link)
+        dev_row.addStretch(1)
+        right_col.addLayout(dev_row)
+
+        # （4）设备状态：这几个字最长（「通道仍不通：…（已停止发指令…）」），
+        #      单独一行并允许换行，免得把这一行撑宽、连带触控板那一行的宽度。
         self.lbl_device_state = QLabel("本地键盘")
         self.lbl_device_state.setStyleSheet("color: #80868b;")
-        top_form.addRow("", self.lbl_device_state)
+        self.lbl_device_state.setWordWrap(True)
+        right_col.addWidget(self.lbl_device_state)
+
+        right_col.addStretch(1)
+        cg.addLayout(right_col, 1)
+
+        # 常驻块外面套一层：纵向两行（开关行 + 操控组），右侧补出
+        # 「滚动条 + 内容边距」，让边框和滚动内容对齐
+        top_bar = QWidget()
+        tb = QVBoxLayout(top_bar)
+        tb.setContentsMargins(0, 0, sb_w + pad, 0)
+        tb.setSpacing(6)
+        tb.addLayout(ctrl_row)
+        tb.addWidget(ctrl_grp)
+        # 这一整块在滚动区外面，往上找不到滚动区 —— 指个路，指针停在这里时
+        # 滚轮仍然滚下面的参数（详见 gui/widgets.py 的 forward_wheel）。
+        top_bar._wheel_target = scroll
+        # 块里大多是「不吃滚轮」的普通控件（按钮、空白、状态文字）：它们不处理
+        # 滚轮，事件会一路冒到 top_bar —— 在这里接住，滚轮才真的哪儿都能滚
+        # （点完「开启自动」手不用挪就能继续滚页面）。
+        self._top_bar = top_bar
+        top_bar.installEventFilter(self)
+
+        outer.addWidget(top_bar)
+        outer.addWidget(scroll, 1)      # 剩余高度全给滚动区
+
+        content = QWidget()
+        scroll.setWidget(content)
+
+        root = QVBoxLayout(content)
+        # 左右边距交给外层（outer 的 10px），这样「操控」组的左边框和滚动内容
+        # 完全对齐；右边留 pad，与组那边补的 sb_w + pad 对上。
+        root.setContentsMargins(0, 8, pad, pad)
+        root.setSpacing(8)
+
+        title = QLabel("决策参数")
+        title.setStyleSheet("font-weight: 600; font-size: 14px; color: #202124;")
+        root.addWidget(title)
+
+        # 开启自动 / 开启手动输入已挪到滚动区外面（见上面常驻块）
+        self.lbl_state = QLabel("当前：未开启")
+        self.lbl_state.setStyleSheet("color: #80868b;")
+        root.addWidget(self.lbl_state)
+
+        # ---- 其余参数（输入设备 / 状态 / 重置指令通道已挪进上面的「操控」组）----
+        top_form = QFormLayout()
+        top_form.setLabelAlignment(Qt.AlignLeft)
 
         # 随机输入延迟 [min, max]（毫秒）：点按类按键之间的随机间隔
         self.sp_delay_min = self._spin(0, 1000, 70, 0)
@@ -341,12 +414,35 @@ class PlayerPanel(QWidget):
         bf.addRow("输出行为CD(ms)", self.sp_attack_cd)
 
         self.sp_attack = self._spin(0, 2000, 80, 0)
-        self.sp_attack.setToolTip("怪离玩家多近才开始攻击（按框边缘距离算，只朝前方）。")
+        self.sp_attack.setToolTip(
+            "怪离角色多近才开始攻击（只算前方）。\n"
+            "距离从角色中心点量到怪框最近的边，不是从玩家框的边缘起算。")
         self.sp_attack.valueChanged.connect(self._on_attack_dist)
         bf.addRow("最大攻击距离", self.sp_attack)
 
+        # 最小切换朝向时间（毫秒）：换向后方向键至少按住这么久
+        self.sp_min_turn_hold = self._spin(0, 3000, 0, 0)
+        self.sp_min_turn_hold.setToolTip(
+            "换朝向时，方向键至少要按住这么久（毫秒）。0 = 不约束。\n"
+            "按下去立刻就松开的话，角色的转身动作可能还没做完 —— 这时候打出去\n"
+            "的方向是错的。这段按住时间只能被「又换一次朝向」打断。")
+        self.sp_min_turn_hold.valueChanged.connect(self._on_turn_params)
+        bf.addRow("最小切换朝向时间(ms)", self.sp_min_turn_hold)
+
+        # 转向后输出延迟（毫秒）：换向后推迟这么久才开始输出
+        self.sp_turn_output_delay = self._spin(0, 3000, 0, 0)
+        self.sp_turn_output_delay.setToolTip(
+            "换朝向后，输出行为要额外推迟这么久（毫秒）才开始。0 = 不延迟。\n"
+            "和上面那条配合用：那条保证方向键按住够久，这条保证输出等转身做完。\n"
+            "已经在跑的输出序列不会被掐断（半截掐断会留下按着的键），\n"
+            "只把「新开一轮输出」往后推。")
+        self.sp_turn_output_delay.valueChanged.connect(self._on_turn_params)
+        bf.addRow("转向后输出延迟(ms)", self.sp_turn_output_delay)
+
         self.sp_min_attack = self._spin(0, 2000, 0, 0)
-        self.sp_min_attack.setToolTip("怪贴脸到此距离内就触发规避（跳/后退）。设 0 表示不规避。")
+        self.sp_min_attack.setToolTip(
+            "怪贴脸到此距离内就触发规避（跳/后退）。设 0 表示不规避。\n"
+            "口径同最大攻击距离：角色中心点 → 怪框最近的边。")
         self.sp_min_attack.valueChanged.connect(self._on_min_attack)
         bf.addRow("最小攻击距离", self.sp_min_attack)
 
@@ -379,7 +475,7 @@ class PlayerPanel(QWidget):
         evade_grp = QGroupBox("规避策略")
         ef = QFormLayout(evade_grp)
         ef.setLabelAlignment(Qt.AlignLeft)
-        self.cmb_evade = QComboBox()
+        self.cmb_evade = NoWheelComboBox()
         self.cmb_evade.addItem("跳", "jump")
         self.cmb_evade.addItem("后退", "back")
         self.cmb_evade.setToolTip("怪贴脸时的应对方式：跳起来打 / 往后退。")
@@ -471,7 +567,7 @@ class PlayerPanel(QWidget):
         self.ck_auto_hp = QCheckBox("自动补血")
         self.ck_auto_hp.setToolTip("勾选后血量低于阈值自动喝药。")
         self.ck_auto_hp.stateChanged.connect(self._on_auto_hp)
-        self.sl_hp = QSlider(Qt.Horizontal)
+        self.sl_hp = NoWheelSlider(Qt.Horizontal)
         self.sl_hp.setRange(0, 100)
         self.sl_hp.setValue(30)
         self.sl_hp.setToolTip("血量低于此百分比就喝药。")
@@ -487,7 +583,7 @@ class PlayerPanel(QWidget):
         self.ck_auto_mp = QCheckBox("自动补蓝")
         self.ck_auto_mp.setToolTip("勾选后蓝量低于阈值自动喝药。")
         self.ck_auto_mp.stateChanged.connect(self._on_auto_mp)
-        self.sl_mp = QSlider(Qt.Horizontal)
+        self.sl_mp = NoWheelSlider(Qt.Horizontal)
         self.sl_mp.setRange(0, 100)
         self.sl_mp.setValue(20)
         self.sl_mp.setToolTip("蓝量低于此百分比就喝药。")
@@ -556,7 +652,7 @@ class PlayerPanel(QWidget):
         sf.setLabelAlignment(Qt.AlignLeft)
 
         # 策略类型
-        self.cmb_strategy = QComboBox()
+        self.cmb_strategy = NoWheelComboBox()
         self.cmb_strategy.addItem("平地巡逻", "patrol")
         self.cmb_strategy.addItem("扫平台", "sweep")
         self.cmb_strategy.currentIndexChanged.connect(self._on_strategy)
@@ -657,9 +753,22 @@ class PlayerPanel(QWidget):
         afk = QGroupBox("防掉线")
         af = QFormLayout(afk)
 
-        # 手动结束休息：休息期间角色在隐身里，需要人工提前拉回来时用。
-        # 只在真的休息中才可点（状态由实时线程写 settings.rest_state，这里轮询）。
-        # 右边紧跟休息状态/倒计时，同一行放省垂直空间。
+        # 手动进入/结束休息：立刻休息一次、或休息中提前拉回来。
+        # 左右顺序 = 一次休息的时间顺序（先进后出）。两个按钮都只看实时线程写的
+        # 状态（_poll_auto_state 轮询刷新），自己不做判断。
+        # 右边紧跟休息状态/倒计时，同一行放省垂直空间（实测三个控件合计约 500px，
+        # 面板 612px，放得下）。
+        self.btn_start_rest = QPushButton("手动进入休息")
+        self.btn_start_rest.setToolTip(
+            "立刻按「隐身休息」流程休息一次：\n"
+            "  进入隐身行为 → 歇完（防掉线里设的休息时长）→ 退出隐身行为 → 继续打怪，\n"
+            "  并按防掉线的间隔重新排下一次自动休息。\n"
+            "和自动防掉线走**同一条流程**：攻击范围内还有怪时会先等它们清空\n"
+            "（状态显示「待休息：等清空攻击范围内的怪」），免得正打着怪突然站住。\n"
+            "自动关着、防掉线没开、或已经在休息时不可点。")
+        self.btn_start_rest.setEnabled(False)
+        self.btn_start_rest.clicked.connect(self._on_start_rest)
+
         self.btn_end_rest = QPushButton("手动结束休息")
         self.btn_end_rest.setToolTip(
             "休息中点了立刻结束休息：执行「退出隐身行为」，然后恢复正常打怪。\n"
@@ -671,6 +780,7 @@ class PlayerPanel(QWidget):
         self.lbl_rest.setStyleSheet("color: #80868b;")
         rest_row = QHBoxLayout()
         rest_row.setSpacing(8)
+        rest_row.addWidget(self.btn_start_rest)
         rest_row.addWidget(self.btn_end_rest)
         rest_row.addWidget(self.lbl_rest, 1)
         af.addRow("", rest_row)
@@ -693,7 +803,7 @@ class PlayerPanel(QWidget):
         af.addRow("触发时间(min)", afk_iv_row)
 
         # 行为类型：不同类型展开不同的参数子组（目前只有「隐身休息」）
-        self.cmb_afk_type = QComboBox()
+        self.cmb_afk_type = NoWheelComboBox()
         for tid, tname in ANTI_AFK_TYPES:
             self.cmb_afk_type.addItem(tname, tid)
         self.cmb_afk_type.setToolTip("防掉线触发时做什么。")
@@ -756,7 +866,6 @@ class PlayerPanel(QWidget):
 
     @staticmethod
     def _spin(lo, hi, val, decimals, step=None):
-        from gui.widgets import NoWheelDoubleSpinBox
         w = NoWheelDoubleSpinBox()
         w.setRange(lo, hi)
         w.setDecimals(decimals)
@@ -778,10 +887,8 @@ class PlayerPanel(QWidget):
         from decision import manual_input
         on = self.btn_manual.isChecked()
         if on:
-            # 手动接管：先关掉自动，避免两边按键打架
-            if settings.enabled:
-                self.btn_auto.setChecked(False)
-                self._toggle_auto()
+            # 注意：**不动自动**。手动输入可以和自动同时开着（抢同一个键的问题
+            # 由 manual_input 的「按键状态重同步」兜着，见那个模块的文档）。
             try:
                 manual_input.start()
             except Exception as e:
@@ -823,6 +930,35 @@ class PlayerPanel(QWidget):
         for w in (self.btn_mouse_l, self.btn_mouse_r, self.sp_mouse_speed):
             w.setEnabled(ok)
         self.touchpad.set_capture_enabled(ok)
+
+    def _reset_link(self):
+        """手动重置指令通道：卡键 / 发不出指令时的逃生口（见按钮 tooltip）。"""
+        from decision import input as dinput
+        h = dinput.link_health()
+        backend = h.get("backend")
+        reconnected = False
+        if backend in ("remote", "serial"):
+            if not h.get("ok", True):
+                self.lbl_device_state.setText("通道异常（%s），正在重连…" % (h.get("err") or "? "))
+            else:
+                self.lbl_device_state.setText("正在重连通道…")
+            self.lbl_device_state.setStyleSheet("color: #b06000;")
+            QApplication.processEvents()          # 先把上面这句画出来，重连会阻塞一下
+            # 无条件重连：链路「看起来正常」但实际已经冻住的情况（relay 卡在串口
+            # 写上）只有断开这一下能解，断开时 relay 会给固件发 RELEASEALL。
+            reconnected = dinput.reconnect_remote()
+        self._force_release_all()
+        settings.input_resync = True              # 让决策层也清掉本地按键状态
+        h2 = dinput.link_health()
+        if h2.get("ok", True):
+            self.lbl_device_state.setText("已重连通道并释放按键" if reconnected
+                                          else "已释放所有按键")
+            self.lbl_device_state.setStyleSheet("color: #137333;")
+        else:
+            self.lbl_device_state.setText(
+                "通道仍不通：%s（已停止发指令，不会再乱按键）"
+                % (h2.get("err") or "原因未知"))
+            self.lbl_device_state.setStyleSheet("color: #c5221f;")
 
     def _force_release_all(self):
         """关闭自动时，立即对所有映射键发 key_up（RELEASE），不等 agent 下一帧。
@@ -875,19 +1011,34 @@ class PlayerPanel(QWidget):
 
         顺带刷新休息状态：rest_state 由实时线程里的 agent 写，只能轮询。
         """
+        # 兜底：面板被藏起来时不该还占着鼠标。hideEvent 管切页签那条路，
+        # 这里再兜一层（父级被整体隐藏之类不会走我们的 hideEvent）。
+        if self.touchpad.active and not self.isVisible():
+            self.touchpad.set_active(False)
         if self.btn_auto.isChecked() != settings.enabled:
             self._refresh_auto_ui()
         resting = bool(settings.rest_state)
         self.btn_end_rest.setEnabled(resting)
+        # 「手动进入休息」：自动开着 + 防掉线开着 + 没在休息 + 没在等清怪。
+        # 已经在「待休息」时再点没意义（本来就是等清怪），禁掉更清楚。
+        self.btn_start_rest.setEnabled(
+            bool(settings.enabled) and bool(settings.anti_afk_enabled)
+            and not resting and not settings.rest_pending)
         self.lbl_rest.setText(self._rest_text())
         # 休息状态优先判断：能进休息就说明自动必然是开着的，反过来写会出现
         # 「休息中」却显示「未开启」的自相矛盾。
         if resting:
-            self.lbl_state.setText("当前：隐身休息中")
+            txt = "当前：隐身休息中"
         elif settings.enabled:
-            self.lbl_state.setText("当前：自动打怪运行中")
+            txt = "当前：自动打怪运行中"
         else:
-            self.lbl_state.setText("当前：未开启")
+            txt = "当前：未开启"
+        from decision import manual_input
+        if manual_input.active():
+            txt += "（手动输入中）"     # 现在两者可以同时开着，要说清楚
+        if self.touchpad.active:
+            txt += "（触控模式中）"     # 板子会变蓝，但滚到别处时就看不见了
+        self.lbl_state.setText(txt)
 
     @staticmethod
     def _rest_text():
@@ -921,6 +1072,15 @@ class PlayerPanel(QWidget):
         if nxt > 0:
             return "下次休息" + left(nxt)
         return "未休息"
+
+    def _on_start_rest(self):
+        """手动进入休息：置一次性请求，agent 下一帧标记「待休息」。
+
+        这里**不直接改** rest_pending —— 那是 agent 的运行时状态，界面只读不写；
+        而且请求要能被「停自动 / 关掉防掉线」干净地丢掉，那由 agent 负责。
+        """
+        settings.rest_request = True
+        self.lbl_rest.setText("已请求休息：等清空攻击范围内的怪…")
 
     def _on_end_rest(self):
         """手动结束休息：置一次性请求，agent 下一帧转去执行「退出隐身行为」再恢复打怪。"""
@@ -1048,6 +1208,12 @@ class PlayerPanel(QWidget):
 
     def _on_track_jump(self, val):
         settings.player_track_jump = int(val)
+        settings.save()
+
+    def _on_turn_params(self, _val=None):
+        """换向相关的两个时间参数一起写（同一组，一个处理器够了）。"""
+        settings.min_turn_hold_ms = int(self.sp_min_turn_hold.value())
+        settings.turn_output_delay_ms = int(self.sp_turn_output_delay.value())
         settings.save()
 
     def _on_hp_threshold(self, val):
@@ -1298,9 +1464,13 @@ class PlayerPanel(QWidget):
     # ---------------- HP/MP 条（按项目保存） ----------------
 
     def bind(self, project):
-        """切换项目：载入该项目的 HP/MP 条框选结果。
+        """切换项目：刷新控件显示 + 载入该项目的 HP/MP 条框选结果。
 
-        项目存过就用项目的；没存过回退到 config/decision.json 里的全局值
+        **决策参数本身（整份）由主窗口在更早的时候换好**（见
+        MainWindow._bind_decision_params，按项目存在 project.yaml 的 decision 段），
+        这里只负责把换完之后的 settings 回填到界面上。
+
+        HP/MP 条：项目存过就用项目的；没存过回退到 config/decision.json 里的全局值
         （= 最后一次框选 / 加载模板的位置）—— 同一套游戏 UI 通常通用，
         一律清空会逼着每个项目都重框一次。
         """
@@ -1316,6 +1486,8 @@ class PlayerPanel(QWidget):
         settings.mp_bar = load_rect(pick("mp", "mp_bar"))
         settings.mp_color = pick("mp_color", "mp_color")
         self._sync_bar_ui()
+        # 决策参数已经换成当前项目那份了，把控件重新回填一遍（切项目必走）
+        self._sync_from_settings()
 
     def _sync_bar_ui(self):
         """按 settings 里的 HP/MP 条刷新标签文案、可见性和填充色。"""
@@ -1582,10 +1754,44 @@ class PlayerPanel(QWidget):
         触发按钮、往输入框打字 —— 开启手动输入后一律屏蔽，让键盘只去游戏。
         「开关自动」的 F11 是系统级全局热键（WM_HOTKEY），不走这里，不受影响。
         """
+        # 本地 F10：开 / 关触控板的触控模式。必须放在「手动输入吃掉键盘」**之前** ——
+        # 两者经常同时开着，而 F10 恰恰是给手动操作配的。这里也顺手吃掉 F10 的
+        # 按下和松开（不给界面、也不给游戏；F10 在本机操作键名单里，见 input.py）。
+        if ev.type() in (QEvent.KeyPress, QEvent.KeyRelease) and ev.key() == Qt.Key_F10:
+            if ev.type() == QEvent.KeyPress and not ev.isAutoRepeat():
+                self.touchpad.toggle()
+            return True
+
+        # 触控模式用 grabMouse 独占鼠标：窗口失去焦点（切到别的程序 / 最小化）时
+        # 自动关掉，否则回来时指针一沾到板子就继续发远程鼠标指令、点击变成游戏里的
+        # 点击，看着像界面卡死。面板被藏起来（切页签）走的是 hideEvent。
+        if ev.type() in (QEvent.ApplicationDeactivate, QEvent.WindowDeactivate):
+            if self.touchpad.active:
+                self.touchpad.set_active(False)
+            return False
+
         from decision import manual_input
         if manual_input.active() and ev.type() in (QEvent.KeyPress, QEvent.KeyRelease):
             return True
+        # 置顶常驻块（开启自动 + 「操控」组）在滚动区外面，块里不吃滚轮的控件
+        # 会把事件冒到这里 —— 转给下面的滚动区，指针停在这一块上时页面照样滚。
+        if ev.type() == QEvent.Wheel and obj is getattr(self, "_top_bar", None):
+            if forward_wheel(ev, obj):
+                ev.accept()
+                return True
+            return False
         return super().eventFilter(obj, ev)
+
+    def hideEvent(self, ev):
+        """面板被藏起来（切到别的页签）：关掉触控板的触控模式。
+
+        触控模式用 grabMouse 独占鼠标，留着它切走的话：指针一沾到板子就继续发
+        远程鼠标指令、点击变成游戏里的点击，看着像界面卡死 —— 而板子那点蓝色
+        提示也在别的页签上，看不见。宁可你切回来重新按 F10。
+        """
+        if self.touchpad.active:
+            self.touchpad.set_active(False)
+        super().hideEvent(ev)
 
     def keyPressEvent(self, ev):
         """监听态下捕获按键；Esc 取消，其余键作为新映射。"""
@@ -1663,6 +1869,14 @@ class PlayerPanel(QWidget):
         self.sp_track_jump.blockSignals(True)
         self.sp_track_jump.setValue(settings.player_track_jump)
         self.sp_track_jump.blockSignals(False)
+
+        self.sp_min_turn_hold.blockSignals(True)
+        self.sp_min_turn_hold.setValue(settings.min_turn_hold_ms)
+        self.sp_min_turn_hold.blockSignals(False)
+
+        self.sp_turn_output_delay.blockSignals(True)
+        self.sp_turn_output_delay.setValue(settings.turn_output_delay_ms)
+        self.sp_turn_output_delay.blockSignals(False)
 
         self.sl_hp.blockSignals(True)
         self.sl_hp.setValue(settings.hp_threshold)

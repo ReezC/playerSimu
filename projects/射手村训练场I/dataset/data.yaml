@@ -1,6 +1,0 @@
-path: E:/MyPrograms/playerSimu/projects/射手村训练场I/dataset
-train: images/train
-val: images/val
-names:
-  0: player
-  1: mob

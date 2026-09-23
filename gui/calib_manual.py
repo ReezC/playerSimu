@@ -20,6 +20,8 @@ from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
 
 from core import wzexport
 from core.imgio import imread   # 支持中文路径，cv2.imread 遇中文会静默失败
+from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,
+                         NoWheelSlider)
 
 SLIDER_MIN = 200    # 0.200
 SLIDER_MAX = 4000   # 4.000
@@ -127,20 +129,20 @@ class CalibManualDialog(QDialog):
         top = QHBoxLayout()
         top.setSpacing(6)
         top.addWidget(QLabel("标定目标"))
-        self.cmb_target = QComboBox()
+        self.cmb_target = NoWheelComboBox()
         self.cmb_target.addItem("怪物", "mob")
         self.cmb_target.addItem("玩家", "player")
         self.cmb_target.currentIndexChanged.connect(self._on_target)
         top.addWidget(self.cmb_target)
 
         top.addWidget(QLabel("模板"))
-        self.cmb_tpl = QComboBox()
+        self.cmb_tpl = NoWheelComboBox()
         self.cmb_tpl.setMaxVisibleItems(20)
         self.cmb_tpl.currentIndexChanged.connect(self._reload_template)
         top.addWidget(self.cmb_tpl, 1)
 
         top.addWidget(QLabel("画面帧"))
-        self.cmb_frame = QComboBox()
+        self.cmb_frame = NoWheelComboBox()
         self.cmb_frame.setMaxVisibleItems(20)
         self.cmb_frame.currentIndexChanged.connect(self._reload_frame)
         top.addWidget(self.cmb_frame, 1)
@@ -158,12 +160,12 @@ class CalibManualDialog(QDialog):
         row = QHBoxLayout()
         row.setSpacing(8)
         row.addWidget(QLabel("缩放"))
-        self.sld = QSlider(Qt.Horizontal)
+        self.sld = NoWheelSlider(Qt.Horizontal)
         self.sld.setRange(SLIDER_MIN, SLIDER_MAX)
         self.sld.setValue(int(round(self._scale * 100)))
         self.sld.valueChanged.connect(self._on_slider)
         row.addWidget(self.sld, 1)
-        self.sp_scale = QDoubleSpinBox()
+        self.sp_scale = NoWheelDoubleSpinBox()
         self.sp_scale.setRange(0.05, 8.0)
         self.sp_scale.setDecimals(3)
         self.sp_scale.setSingleStep(0.01)

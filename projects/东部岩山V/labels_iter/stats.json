@@ -1,0 +1,13 @@
+{
+  "frames": 16,
+  "boxes": 134,
+  "from_model": 16,
+  "boxes_from_model": 134,
+  "protected": 183,
+  "kept_orig": 0,
+  "boxes_kept": 0,
+  "cleared": 0,
+  "median_boxes": 9.0,
+  "conf_thr": 0.6,
+  "weights": "E:\\MyPrograms\\playerSimu\\projects\\东部岩山V\\models\\detect_v2.pt"
+}

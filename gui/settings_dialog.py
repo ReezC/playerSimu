@@ -1,16 +1,22 @@
-"""设置弹窗：界面字号 + 朝向超时。
+"""设置弹窗：界面字号 + 各种「停止自动」条件 + 断线自动重连。
 
 字号改动**立即生效**，不需要重启 —— 底层是 QApplication.setFont()，
-所有没写死字号的控件都会跟随。朝向超时是决策参数，点确定后写入 decision.json。
+所有没写死字号的控件都会跟随。其余都是决策参数：点确定后写回**当前项目**
+（没打开项目时写 config/decision.json，见 decision/agent.py 的 set_save_hook）。
 """
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import (QColorDialog, QDialog, QDialogButtonBox,
+from PyQt5.QtWidgets import (QCheckBox, QColorDialog, QDialog, QDialogButtonBox,
                              QFormLayout, QHBoxLayout, QLabel, QPushButton,
                              QSlider, QSpinBox, QVBoxLayout)
 
 from decision.agent import settings
 from gui import theme
+from perception import classes
+# NoWheel* 必须模块级导入：控件在 __init__ 里建，方法里的懒导入到不了那儿。
+# （详见 docs/UI规范.md：滚轮不许改参数）
+from gui.widgets import (NoWheelDoubleSpinBox, NoWheelSlider,
+                         NoWheelSpinBox)
 
 
 class SettingsDialog(QDialog):
@@ -34,7 +40,7 @@ class SettingsDialog(QDialog):
         head.addWidget(self.lbl_val)
         root.addLayout(head)
 
-        self.slider = QSlider(Qt.Horizontal)
+        self.slider = NoWheelSlider(Qt.Horizontal)
         self.slider.setRange(theme.MIN_SIZE, theme.MAX_SIZE)
         self.slider.setSingleStep(1)
         self.slider.setTickInterval(1)
@@ -71,7 +77,6 @@ class SettingsDialog(QDialog):
         root.addWidget(note_to)
 
         # 分钟支持小数：用 DoubleSpinBox（0 = 禁用，所以下限仍是 0）
-        from gui.widgets import NoWheelDoubleSpinBox
         self.sp_timeout = NoWheelDoubleSpinBox()
         self.sp_timeout.setRange(0.0, 1440.0)
         self.sp_timeout.setDecimals(1)
@@ -99,6 +104,25 @@ class SettingsDialog(QDialog):
         self.sp_player_lost.setValue(float(settings.player_lost_timeout_min))
         root.addWidget(self.sp_player_lost)
 
+        # ---- 断线自动重连 ----
+        root.addSpacing(6)
+        lbl_rc = QLabel("断线自动重连")
+        lbl_rc.setStyleSheet("font-weight: 600;")
+        root.addWidget(lbl_rc)
+
+        note_rc = QLabel(
+            "玩家框丢失后自动判别界面（断线提示框 / 登录 / 选频道 / 排队 / 选角），"
+            "确认是断线就**停止自动**并按步骤走回游戏，回到游戏后恢复自动。\n"
+            "鼠标点服务器 / 点频道还没接（要先做鼠标标定），走到那一步会停下并提示。\n"
+            "做判断用模板锚点，不读文字、不训模型。")
+        note_rc.setStyleSheet("color: #5f6368;")
+        note_rc.setWordWrap(True)
+        root.addWidget(note_rc)
+
+        self.ck_reconnect = QCheckBox("检测到断线后自动重连")
+        self.ck_reconnect.setChecked(bool(settings.reconnect_enabled))
+        root.addWidget(self.ck_reconnect)
+
         # ---- 定时清空按键 ----
         root.addSpacing(6)
         lbl_reset = QLabel("定时清空按键（防卡键）")
@@ -110,7 +134,7 @@ class SettingsDialog(QDialog):
         note_reset.setWordWrap(True)
         root.addWidget(note_reset)
 
-        self.sp_resetall = QSpinBox()
+        self.sp_resetall = NoWheelSpinBox()
         self.sp_resetall.setRange(0, 3600)
         self.sp_resetall.setSuffix(" s")
         self.sp_resetall.setValue(int(settings.resetall_interval))
@@ -122,7 +146,9 @@ class SettingsDialog(QDialog):
         lbl_vis.setStyleSheet("font-weight: 600;")
         root.addWidget(lbl_vis)
 
-        note_vis = QLabel("实时预览里框和线条的颜色。保存后重新开始实时预览生效。")
+        note_vis = QLabel(
+            "实时预览 / 质检台 / 推理结果里，每个类别的框颜色和辅助线颜色。\n"
+            "点确定立刻生效（实时预览每秒重读一次配置，不用重开）。")
         note_vis.setStyleSheet("color: #5f6368;")
         note_vis.setWordWrap(True)
         root.addWidget(note_vis)
@@ -131,16 +157,27 @@ class SettingsDialog(QDialog):
         vf = QFormLayout()
         vf.setLabelAlignment(Qt.AlignLeft)
         self._color_btns = {}
-        for key, label in (("mob_color", "怪物框颜色"),
-                           ("player_color", "玩家框颜色"),
-                           ("lock_color", "锁定框颜色"),
-                           ("attack_color", "最大攻击距离线颜色"),
-                           ("min_attack_color", "最小攻击距离线颜色"),
-                           ("vision_color", "视野线颜色")):
-            self._color_btns[key] = self._color_btn(self._vis[key])
-            vf.addRow(label, self._color_btns[key])
 
-        self.sp_vision_width = QSpinBox()
+        def add_row(label, key, tip=""):
+            btn = self._color_btn(self._vis[key])
+            if tip:
+                btn.setToolTip(tip)
+            self._color_btns[key] = btn
+            vf.addRow(label, btn)
+
+        # 类别框颜色**按类别表生成**：有几个类别就有几行，以后加类别这里自动多一行，
+        # 不会出现「新类别没地方改颜色」。配置键 = 英文名 + "_color"（见 gui/theme.py）。
+        for cid, en, zh, _bgr in classes.CLASSES:
+            add_row("%s框颜色" % zh, "%s_color" % en,
+                    "类别 %d（%s）—— 检测框颜色" % (cid, en))
+
+        # 下面几条不是类别，是辅助线与标记
+        add_row("锁定框颜色", "lock_color", "锁定的那个攻击目标")
+        add_row("最大攻击距离线颜色", "attack_color", "")
+        add_row("最小攻击距离线颜色", "min_attack_color", "规避范围")
+        add_row("视野线颜色", "vision_color", "")
+
+        self.sp_vision_width = NoWheelSpinBox()
         self.sp_vision_width.setRange(1, 10)
         self.sp_vision_width.setSuffix(" px")
         self.sp_vision_width.setValue(int(self._vis["vision_width"]))
@@ -209,6 +246,11 @@ class SettingsDialog(QDialog):
         t2 = self.sp_player_lost.value()
         if t2 != settings.player_lost_timeout_min:
             settings.player_lost_timeout_min = t2
+            settings.save()
+        # 断线自动重连
+        rc = self.ck_reconnect.isChecked()
+        if rc != bool(settings.reconnect_enabled):
+            settings.reconnect_enabled = rc
             settings.save()
         # 定时清空按键
         t3 = self.sp_resetall.value()

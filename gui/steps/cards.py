@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (QCheckBox, QDialog, QDoubleSpinBox, QHBoxLayout,
                              QLabel, QMessageBox, QPushButton, QVBoxLayout)
 
 from core import wincap, wzexport
-from gui.widgets import NoWheelComboBox
+from gui.widgets import NoWheelComboBox, NoWheelDoubleSpinBox
 
 from .base import StepCard
 
@@ -558,7 +558,7 @@ class CalibCard(StepCard):
 
         row = QHBoxLayout()
         row.setSpacing(6)
-        self.sp_apply_all = QDoubleSpinBox()
+        self.sp_apply_all = NoWheelDoubleSpinBox()
         self.sp_apply_all.setRange(0.05, 8.0)
         self.sp_apply_all.setDecimals(3)
         self.sp_apply_all.setSingleStep(0.05)
@@ -742,6 +742,8 @@ class LabelCard(StepCard):
                          hint="用 WZ 精灵做模板匹配。阈值越高越准，召回越低")
         self._label_target = "mob"   # mob / player
         self._yolo_player = {}       # 权重路径 -> 所属项目玩家角色
+        # 选帧弹窗的结果：{"mob": [帧名…] / None, "player": …}，None = 不筛（全选）
+        self._only = {}
 
         # 通用「运行」按钮换成两个主标注按钮。
         self.btn_run.hide()
@@ -784,7 +786,31 @@ class LabelCard(StepCard):
         self._label_target = target
         if not self._confirm_relabel(target):
             return
+        # 选帧：默认全选（重标场景就是全部重跑一遍）。只补没跑过的，用弹窗里的
+        # 「只选未处理」—— 配合抽帧「取消勾选重抽前清空 = 追加素材」，新加的帧
+        # 正好都在「未处理」里。
+        ok, picked = self._pick_frames(target)
+        if not ok:
+            return                      # 用户取消
+        self._only[target] = picked     # None = 全选（不筛）
         self.run_clicked.emit(self)
+
+    def _pick_frames(self, target):
+        """弹选帧窗。返回 (是否继续, 帧名列表 或 None=全选)。"""
+        p = self.project
+        if p is None:
+            return True, None           # 没项目就不筛，交给后面的依赖检查去报错
+        from gui.frame_picker import FramePickDialog
+        dlg = FramePickDialog(self.window(), p, target)
+        if dlg.exec_() != QDialog.Accepted:
+            return False, None
+        stems = dlg.selected_stems()
+        if not stems:
+            QMessageBox.information(self, "一帧都没选", "至少要选一帧，否则没什么可标注的。")
+            return False, None
+        if len(stems) == len(dlg.stems):
+            return True, None           # 全选 → 不筛，和以前的行为完全一致
+        return True, stems
 
     def _confirm_relabel(self, target):
         """标过的情况下弹二次确认。重标只覆盖自动框，人工修正会保留。"""
@@ -799,12 +825,17 @@ class LabelCard(StepCard):
             return True   # 这类还没标过，直接跑
 
         name = "怪物" if target == "mob" else "玩家"
+        # 这里只负责「提醒你这一类标过了」，**不是**问「要不要全部重标」——
+        # 范围在下一步的选帧窗里定（默认全选）。所以文案必须点出下一步，
+        # 否则点「否」的人以为没别的选择了，其实他要的是「只补几帧」。
         r = QMessageBox.question(
             self, "确认重新标注",
             "已标过 %s（%d 帧）。\n\n"
             "重新标注会重新生成自动标注框，\n"
             "人工修正的框会保留（不会被覆盖）。\n\n"
-            "确定要重标吗？" % (name, prog[key]),
+            "点「是」之后还会让你选要处理哪些帧：\n"
+            "默认全选（= 全部重标），只想补几帧就在那一步挑。\n\n"
+            "继续吗？" % (name, prog[key]),
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         return r == QMessageBox.Yes
 
@@ -984,6 +1015,12 @@ class LabelCard(StepCard):
                     "imgsz": p.sec("train").get("imgsz", 960),
                     "device": p.sec("train").get("device", "0"),
                 }
+            # 选帧：只处理勾中的帧（[] = 全选不筛）。augment 也要一起筛 ——
+            # 否则「YOLO 辅助」会去改没勾的帧的标注，用户的选择就白做了。
+            _only = self._only.get("player") or []
+            params["detect"]["only"] = _only
+            if "augment" in params:
+                params["augment"]["only"] = _only
             return run_detect_player_augmented, params
 
         from tools.yolo_augment import run_detect_mob_augmented
@@ -1017,6 +1054,11 @@ class LabelCard(StepCard):
                 "imgsz": p.sec("train").get("imgsz", 960),
                 "device": p.sec("train").get("device", "0"),
             }
+        # 选帧：只处理勾中的帧（[] = 全选不筛）；augment 同步筛，理由同玩家分支
+        _only = self._only.get("mob") or []
+        params["detect"]["only"] = _only
+        if "augment" in params:
+            params["augment"]["only"] = _only
         return run_detect_mob_augmented, params
 
 
@@ -1159,6 +1201,105 @@ class DatasetCard(StepCard):
 
 
 # ══════════════════════════════════════════════════════════════
+# 模型版本（⑦ 训练 / ⑧ 验证 / ⑨ 迭代 共用）
+# ══════════════════════════════════════════════════════════════
+#
+# ⑦ 给每次训练起名 detect_vN（见 TrainCard._next_run_name），还往运行目录里写
+# 一份 run.json（见 perception/train.py）。所以「第几版、跑出多少 mAP」是可以
+# 从产物里客观读出来的 —— 下面这几个函数专门读它：
+#     · ⑦ 显示历次版本的指标，并和上一版比一下；
+#     · ⑧ 让你直接挑某一版去验证，换版本对比效果；
+#     · ⑨ 用最新那版做迭代。
+#
+# **不要按路径字符串排序取最后一个**：detect_v10.pt < detect_v9.pt，版本一多
+# 就会静默挑错模型（v10 出来了还在用 v9）。一律按版本号排。
+
+
+def _ver_of(name):
+    """`detect_v3` → 3；不是这个格式返回 None。"""
+    tail = str(name).rsplit("v", 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+
+def _read_json(path):
+    """读一份 json；不在、坏了、不是预期结构都返回 None（调用方自己回退）。"""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _run_dirs(project):
+    """项目里训过的版本 [(版本号, 名字, run 目录, run.json 内容)]，新的在前。"""
+    got = []
+    for d in project.dir_of("runs").glob("detect_v*"):
+        if not (d / "weights" / "best.pt").exists():
+            continue
+        v = _ver_of(d.name)
+        got.append((v if v is not None else -1, d.name, d,
+                    _read_json(d / "run.json")))
+    got.sort(key=lambda it: (-it[0], it[1]))
+    return got
+
+
+def _model_files(project):
+    """可以拿去推理的权重 [(名字, 路径, 版本号, run.json 内容)]，新的在前。
+
+    两个来源：归档到 models/ 的（正式产物，实时层用的就是它）+ runs/ 里还没
+    归档的 best.pt。同名以 models/ 里的为准（那份才是归档产物）。
+    名字解析不出版本号的（手工塞进来的权重）排在后面，但仍然可选。
+    """
+    got = {}
+    runs = project.dir_of("runs")
+    for d in runs.glob("detect_v*"):
+        b = d / "weights" / "best.pt"
+        if b.exists():
+            got[d.name] = (b, _read_json(d / "run.json"))
+    for f in project.dir_of("models").glob("*.pt"):
+        got[f.stem] = (f, _read_json(runs / f.stem / "run.json"))
+
+    def key(it):
+        try:
+            mt = it[1].stat().st_mtime
+        except OSError:
+            mt = 0.0
+        return (1 if it[2] is not None else 0, it[2] or 0, mt)
+
+    items = [(name, path, _ver_of(name), info)
+             for name, (path, info) in got.items()]
+    items.sort(key=key, reverse=True)
+    return items
+
+
+def _newest_weights(project):
+    """最新那版的权重路径（一版都没有就返回空串）。"""
+    items = _model_files(project)
+    return str(items[0][1]) if items else ""
+
+
+def _fmt3(v):
+    """指标格式化：取不到就「—」，别在卡片上显示 None。"""
+    try:
+        return "%.3f" % float(v)
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _ver_label(path):
+    """权重路径 → 版本名：`models/detect_v3.pt` 和
+    `runs/detect_v3/weights/best.pt` 都得到 `detect_v3`。
+
+    （production 侧同规则的 `_wlabel` 在 perception/predict.py —— 那边写历史、
+    这边读产物，各自留一份免得让界面去 import 推理模块。）
+    """
+    p = Path(str(path or ""))
+    if p.stem == "best" and p.parent.name == "weights":
+        return p.parent.parent.name
+    return p.stem or "?"
+
+
+# ══════════════════════════════════════════════════════════════
 # ⑦ 训练
 # ══════════════════════════════════════════════════════════════
 class TrainCard(StepCard):
@@ -1203,20 +1344,70 @@ class TrainCard(StepCard):
             self.values(["model", "epochs", "imgsz", "batch", "device"]))
 
     def summarize(self, p):
-        best = list(p.dir_of("runs").glob("**/weights/best.pt"))
-        if not best:
+        """最新一版的指标 + 历次版本 mAP50（全部从产物读，不靠记忆）。"""
+        vs = _run_dirs(p)
+        if not vs:
             return "未训练"
-        model = list(p.dir_of("models").glob("*.pt"))
-        extra = "   ·   已归档 %s" % model[0].name if model else ""
-        return "best.pt %s%s" % (best[0].parent.parent.name, extra)
+        _v, name, _d, info = vs[0]
+        m = (info or {}).get("metrics") or {}
+        line1 = ("%s · mAP50 %s · mAP50-95 %s · %s 轮"
+                 % (name, _fmt3(m.get("map50")), _fmt3(m.get("map")),
+                    (info or {}).get("epochs", "?")))
+        # 加数据/调参重训，最想知道的就是「比上一版有没有变好」
+        if len(vs) > 1:
+            pm = (vs[1][3] or {}).get("metrics") or {}
+            if m.get("map50") is not None and pm.get("map50") is not None:
+                line1 += "（比 %s %+.3f）" % (vs[1][1], m["map50"] - pm["map50"])
+        return line1 + "\n历次 mAP50：%s" % " · ".join(self._hist_bits(vs))
+
+    @staticmethod
+    def _hist_bits(vs, keep=4):
+        """「v3 0.871 · v2 0.842 …」——版本多了只列最近几版，免得卡片撑爆。"""
+        bits = []
+        for _v, name, _d, info in vs[:keep]:
+            m50 = ((info or {}).get("metrics") or {}).get("map50")
+            bits.append("%s %s" % (name, _fmt3(m50)))
+        if len(vs) > keep:
+            bits.append("…（共 %d 版）" % len(vs))
+        return bits
+
+    def _history_text(self, p):
+        """鼠标停在这张卡片的结果上时显示完整对照表。"""
+        vs = _run_dirs(p)
+        if not vs:
+            return ""
+        rows = ["历次训练（新 → 旧）：", ""]
+        for _v, name, d, info in vs:
+            m = (info or {}).get("metrics") or {}
+            if m.get("map50") is None:
+                rows.append("%-11s 没有 run.json，指标看 %s/results.csv"
+                            % (name, d.as_posix()))
+                continue
+            rows.append("%-11s mAP50 %s   mAP50-95 %s   P %s   R %s   %s 轮   %s"
+                        % (name, _fmt3(m.get("map50")), _fmt3(m.get("map")),
+                           _fmt3(m.get("precision")), _fmt3(m.get("recall")),
+                           (info or {}).get("epochs", "?"),
+                           (info or {}).get("finished_at", "")))
+            if (info or {}).get("base"):
+                rows.append("%-11s   基础权重 %s" % ("", info["base"]))
+        rows.append("")
+        rows.append("val 集是固定的（dataset/split.json），所以两版 mAP 可比；"
+                    "但画面同源，别当真实效果看。")
+        return "\n".join(rows)
+
+    def refresh(self, force=False):
+        super().refresh(force)
+        self.result.setToolTip(
+            self._history_text(self.project) if self.project else "")
 
     def detect_state(self, p):
-        best = sorted(p.dir_of("runs").glob("**/weights/best.pt"))
-        if not best:
+        vs = _run_dirs(p)
+        if not vs:
             return ("idle", "")
-        # 数据集比模型新 → 模型过期，退回未处理
+        # 数据集比模型新 → 模型过期，退回未处理（比的是**最新那版**）
         y = p.dataset / "data.yaml"
-        if y.exists() and y.stat().st_mtime > best[-1].stat().st_mtime:
+        best = vs[0][2] / "weights" / "best.pt"
+        if y.exists() and y.stat().st_mtime > best.stat().st_mtime:
             return ("warn", "数据集已更新")
         return ("done", "已训练")
 
@@ -1224,6 +1415,28 @@ class TrainCard(StepCard):
         if not (p.dataset / "data.yaml").exists():
             return False, "缺少数据集，请先完成 ⑥ 数据集"
         return True, ""
+
+    def _next_run_name(self, p):
+        """下一个不撞车的运行名：detect_v1 / detect_v2 / …
+
+        **为什么要版本化**：原来固定写死 detect_v1 且 `exist_ok=True` —— 重训一次，
+        上一版的 `runs/detect_v1/` 和 `models/detect_v1.pt` 就被**静默覆盖**，
+        等于没有历史。而「加了数据到底有没有变好」全靠新旧两版能摆在一起比。
+        （实时层是按 mtime 取最新权重，所以新名字会自动被用上，别处不用改。）
+        """
+        used = set()
+        for d in p.dir_of("runs").glob("detect_v*"):
+            v = _ver_of(d.name)
+            if v is not None:
+                used.add(v)
+        for f in p.dir_of("models").glob("detect_v*.pt"):
+            v = _ver_of(f.stem)
+            if v is not None:
+                used.add(v)
+        n = 1
+        while n in used:
+            n += 1
+        return "detect_v%d" % n
 
     def make_task(self, p):
         from perception.train import run_train
@@ -1239,7 +1452,7 @@ class TrainCard(StepCard):
             "patience": sec.get("patience", 40),
             # 输出落在项目里，不是全局 runs/ —— 项目要能整个拷走
             "project_dir": str(p.dir_of("runs")),
-            "name": "detect_v1",
+            "name": self._next_run_name(p),     # 不覆盖上一版，留下可对比的历史
             "copy_to": str(p.dir_of("models")),
         }
 
@@ -1266,6 +1479,16 @@ class VerifyCard(StepCard):
         self.btn_view.setText("查看结果")
 
     def build_params(self, form):
+        # 模型版本放第一位：这张卡片的一半用途就是**换版本对比效果**。
+        # 候选项运行时才填（见 _fill_models），因为每训一次就多一版。
+        self.field(form, "model", "模型版本", "combo")
+        self.widgets["model"][0].setToolTip(
+            "用哪一版模型跑这次验证。默认「最新」= 版本号最大的那版（也就是实时层\n"
+            "在用的那版）。\n"
+            "想比较版本效果：同一批画面分别选 detect_v2 / detect_v3 各跑一次，\n"
+            "卡片摘要会把两次的「有检出」并排列出来。\n"
+            "选项里附的 mAP50 是那一版在 val 上的成绩（来自训练时写的 run.json）。")
+
         self.field(form, "source", "画面目录", "path", "", mode="dir")
         self.widgets["source"][0].setToolTip(
             "验证要指向**训练分布之外**的画面（新录的视频、MapleNecrocer 截图等）。\n"
@@ -1281,7 +1504,7 @@ class VerifyCard(StepCard):
 
     # ---------------- 项目交互 ----------------
 
-    _KEYS = ("source", "conf", "imgsz", "limit")
+    _KEYS = ("model", "source", "conf", "imgsz", "limit")
 
     def load_from_project(self, p):
         sec = p.sec("verify")
@@ -1290,6 +1513,10 @@ class VerifyCard(StepCard):
         # 不默认 frames：验证的意义就是"跳出训练分布"，
         # 默认指向训练帧等于鼓励用户白验一次。
         self.set_value("source", sec.get("source") or "")
+        # 版本下拉必须**先填候选项**再 set_value —— combo 是按 userData 匹配的，
+        # 列表还空着的话，存着的版本名会找不到，静默退回第一项。
+        self._fill_models(p)
+        self.set_value("model", sec.get("model") or "")
 
     def sync(self, p):
         p.sec("verify").update(self.values(self._KEYS))
@@ -1299,15 +1526,53 @@ class VerifyCard(StepCard):
         # 有结果图才显示「查看结果」，否则点开是空面板
         has = bool(self.project) and bool(list(self.project.dir_of("verify").glob("*.jpg")))
         self.btn_view.setVisible(has)
+        # 刚训完新版本时下拉要立刻能选（主窗口跑完任务会统一 refresh 所有卡片）
+        self._fill_models(self.project)
+        self.result.setToolTip(self._history_text(self.project))
 
-    @staticmethod
-    def _weights(p):
-        """优先用归档到 models/ 的，没有再回退 runs/ 里的 best.pt。"""
-        got = sorted(p.dir_of("models").glob("*.pt"))
-        if got:
-            return str(got[-1])
-        best = sorted(p.dir_of("runs").glob("**/weights/best.pt"))
-        return str(best[-1]) if best else ""
+    def _fill_models(self, p):
+        """重填版本下拉：「最新」+ 每一版（带上它在 val 上的 mAP50，供比较）。
+
+        显示文字给人看，真正取值走 userData = 版本名。
+        当前选中的那版要保住 —— refresh 会被频繁调用，不能一刷新就跳回最新。
+        """
+        if p is None or "model" not in self.widgets:
+            return
+        cmb = self.widgets["model"][0]
+        cur = cmb.currentData()
+        items = _model_files(p)
+        cmb.blockSignals(True)
+        cmb.clear()
+        if not items:
+            cmb.addItem("（还没有训练好的模型）", "")
+        else:
+            for i, (name, _path, ver, info) in enumerate(items):
+                m50 = ((info or {}).get("metrics") or {}).get("map50")
+                tag = "最新" if i == 0 else (
+                    "v%d" % ver if ver is not None else "外部权重")
+                if m50 is None:
+                    cmb.addItem("%s   （无 mAP 记录 · %s）" % (name, tag), name)
+                else:
+                    cmb.addItem("%s   mAP50 %.3f   （%s）" % (name, m50, tag), name)
+            cmb.insertItem(0, "最新（自动 → %s）" % items[0][0], "")
+        i = cmb.findData(cur)
+        cmb.setCurrentIndex(i if i >= 0 else 0)
+        cmb.blockSignals(False)
+
+    def _weights(self, p):
+        """本次要用的权重：下拉选中的那一版；「最新」= 版本号最大的那版。
+
+        不按路径字符串取最后一个：detect_v10.pt < detect_v9.pt，版本一多就会
+        静默挑错模型。选中的那版没了（换项目 / 被删）也退回最新，别让运行直接失败。
+        """
+        items = _model_files(p)
+        if not items:
+            return ""
+        want = self.value("model") if "model" in self.widgets else ""
+        for name, path, _ver, _info in items:
+            if name == want:
+                return str(path)
+        return str(items[0][1])
 
     @staticmethod
     def _read_stats(p):
@@ -1320,15 +1585,76 @@ class VerifyCard(StepCard):
         except Exception:
             return None
 
+    # ---------------- 历次验证：换版本对比 ----------------
+
+    @staticmethod
+    def _history(p):
+        """历次验证记录（perception/predict.py 每跑一次追加一条）。"""
+        if p is None:
+            return []
+        got = _read_json(p.dir_of("verify") / "history.json")
+        return got if isinstance(got, list) else []
+
+    def _last_label(self, p, st):
+        """这次结果是哪一版跑的：以 stats.json 里记的权重为准（它就是本次产物）。
+
+        不能直接拿历史最后一条 —— 老产物没写历史，历史又可能被手改过；
+        stats.json 是这次跑出来顺手记的，最可靠。
+        """
+        lbl = _ver_label(st.get("weights")) if st.get("weights") else ""
+        if lbl and lbl != "?":
+            return lbl
+        h = self._history(p)
+        return (h[-1].get("weights") or "") if h else ""
+
+    def _compare_line(self, p, st):
+        """同一批画面上各版本「有检出」的对比（新 → 旧，最多 4 次）。
+
+        **只在同一个画面目录里比**：换了目录，帧数、怪物密度都不一样，摆在一起
+        看反而误导，所以按 source 过滤。也**不加涨跌箭头** —— 有检出变高不等于
+        变好（误检也会让它涨），得连着图看。
+        """
+        h = [r for r in self._history(p) if r.get("source") == st.get("source")]
+        if len(h) < 2:
+            return ""
+        bits = []
+        for r in h[-4:][::-1]:
+            n = r.get("frames", 0) or 1
+            bits.append("%s %.0f%%" % (r.get("weights") or "?",
+                                       100.0 * (r.get("frames_with", 0) or 0) / n))
+        return "同批画面：%s（新 → 旧）" % " · ".join(bits)
+
+    def _history_text(self, p):
+        """鼠标停在这张卡片的结果上时显示完整对照表。"""
+        h = self._history(p)
+        if not h:
+            return ""
+        rows = ["历次验证（新 → 旧）。「有检出」= 至少检出一个框的帧占比。", ""]
+        for r in h[-10:][::-1]:
+            n = r.get("frames", 0) or 1
+            rows.append("%-11s %4d 帧  %5d 框   有检出 %3.0f%%   空帧 %3d   %s"
+                        % (r.get("weights") or "?", r.get("frames", 0),
+                           r.get("boxes", 0),
+                           100.0 * (r.get("frames_with", 0) or 0) / n,
+                           r.get("zero_frames", 0), r.get("at", "")))
+            rows.append("%-11s   画面目录 %s（置信度 %.2f）"
+                        % ("", r.get("source") or "?", r.get("conf_thr") or 0))
+        rows.append("")
+        rows.append("摘要行里的对比只统计同一个画面目录的几次；换了目录不参与比较。")
+        return "\n".join(rows)
+
     def summarize(self, p):
         st = self._read_stats(p)
         if not st:
             return "未验证"
         n = st.get("frames", 0) or 1
-        return ("%d 帧 / %d 框 · 有检出 %.0f%% · 空帧 %d"
-                % (st.get("frames", 0), st.get("boxes", 0),
-                   100.0 * st.get("frames_with", 0) / n,
-                   st.get("zero_frames", 0)))
+        lbl = self._last_label(p, st)
+        head = ("%s%d 帧 / %d 框 · 有检出 %.0f%% · 空帧 %d"
+                % (lbl + " · " if lbl else "", st.get("frames", 0),
+                   st.get("boxes", 0),
+                   100.0 * st.get("frames_with", 0) / n, st.get("zero_frames", 0)))
+        cmp_line = self._compare_line(p, st)
+        return head + ("\n" + cmp_line if cmp_line else "")
 
     def detect_state(self, p):
         n = sum(1 for _ in p.dir_of("verify").glob("*.jpg"))
@@ -1425,11 +1751,9 @@ class IterateCard(StepCard):
 
     @staticmethod
     def _weights(p):
-        got = sorted(p.dir_of("models").glob("*.pt"))
-        if got:
-            return str(got[-1])
-        best = sorted(p.dir_of("runs").glob("**/weights/best.pt"))
-        return str(best[-1]) if best else ""
+        """用最新的那版权重。按版本号取，不按路径字符串 —— `detect_v10.pt` <
+        `detect_v9.pt`，字符串排序会让 v10 出来之后还在用 v9（详见模块顶部）。"""
+        return _newest_weights(p)
 
     @staticmethod
     def _read_stats(p):

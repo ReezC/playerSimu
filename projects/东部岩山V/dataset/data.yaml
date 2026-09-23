@@ -1,0 +1,9 @@
+path: E:/MyPrograms/playerSimu/projects/东部岩山V/dataset
+train: images/train
+val: images/val
+names:
+  0: player
+  1: mob
+  2: drop
+  3: npc
+  4: other_player

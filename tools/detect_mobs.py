@@ -23,10 +23,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from core.context import ConsoleContext, TaskContext
+from core.context import ConsoleContext, TaskContext, cancelable
 from core.imgio import imread, imwrite
+# 可视化框颜色：跟「设置 → 可视化」里配的走（gui/theme 只依赖 yaml + 类别表，
+# 不 import PyQt5，所以子进程里 import 它也不会拖进 Qt）
+from gui.theme import class_color
 
-CLASS_MOB = 1
+CLASS_MOB = 1   # 类别表见 perception/classes.py（id 固定，别在本地另立一份）
 _W = {}
 
 
@@ -332,8 +335,9 @@ def work(fp_str):
                         encoding="utf-8")
 
     if cfg["vis"]:
+        color = cfg.get("box_color") or class_color(CLASS_MOB)
         for _, x, y, w, h, _ in kept:
-            cv2.rectangle(full, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.rectangle(full, (x, y), (x + w, y + h), color, 2)
         imwrite(Path(cfg["vis_dir"]) / (fp.stem + ".jpg"), full, quality=82)
 
     return len(dets), len(kept)
@@ -421,6 +425,12 @@ def run_detect(params, ctx=None):
     """
     ctx = ctx or TaskContext()
 
+    # 进来先看一眼有没有被取消：这一趟开头要清理残留 + 加载模板（读几百张精灵），
+    # 为一个已经取消的任务白做一遍，看上去就是「点了取消没反应」。
+    if ctx.canceled():
+        ctx.log("已取消（还没开始）", "warn")
+        return {"summary": "已取消", "frames": 0, "detections": 0}
+
     frames_dir = Path(params["frames"])
     frames = sorted(frames_dir.glob("*.png"))
     if not frames:
@@ -429,6 +439,18 @@ def run_detect(params, ctx=None):
     limit = int(params.get("limit", 0) or 0)
     if limit:
         frames = frames[:limit]
+
+    n_all = len(frames)
+    # 只处理选中的帧（「选帧弹窗」给的；None / 空 = 全部）。
+    # **n_all 必须在过滤前取**：下面的「清理帧号超界的残留」是按总帧数判断的，
+    # 用过滤后的数量会把没选中的那些帧的标注当成残留删掉 —— 那是真丢数据。
+    only = {str(s) for s in (params.get("only") or [])}
+    if only:
+        frames = [f for f in frames if f.stem in only]
+        if not frames:
+            raise ValueError("选中的帧在画面目录里一个都找不到（选了 %d 个）"
+                             % len(only))
+        ctx.log("只处理选中的 %d 帧（画面共 %d 张）" % (len(frames), n_all))
 
     mobs = [str(m).strip() for m in (params.get("mobs") or []) if str(m).strip()]
     if not mobs:
@@ -463,9 +485,9 @@ def run_detect(params, ctx=None):
 
     # 上次采集可能帧数更多，先清掉帧号超界的旧标注/可视化，防止旧尺度的
     # 零框残留混进本次结果（质检台显示和数据集构建都会被污染）
-    removed = clean_stale_outputs(str(out), vis_dir, len(frames))
+    removed = clean_stale_outputs(str(out), vis_dir, n_all)
     if removed:
-        ctx.log("清理上次残留 %d 个文件（帧号超出本次 %d 帧）" % (removed, len(frames)))
+        ctx.log("清理上次残留 %d 个文件（帧号超出已有的 %d 帧）" % (removed, n_all))
 
     mob_scales = params.get("mob_scales") or {}
     if not isinstance(mob_scales, dict):
@@ -485,6 +507,10 @@ def run_detect(params, ctx=None):
         "vis": vis,
         "vis_dir": vis_dir,
         "region": region,
+        # 可视化框颜色：用设置里配的怪物框颜色（跟着「设置 → 可视化」走，
+        # 和实时预览/质检台同一份）。在**主进程**取一次放进 cfg，
+        # 免得每个子进程都去读一遍配置文件。
+        "box_color": class_color(CLASS_MOB),
     }
 
     ctx.progress(0, 0, "加载怪物模板…")
@@ -512,10 +538,13 @@ def run_detect(params, ctx=None):
     n = len(frames)
 
     def consume(iterator):
+        """收结果。取消由外层 cancelable() 负责掐断（见 core/context.py）。
+
+        这里不再自己等结果 —— 直接 `for` 会在 worker 预热期间死等（十几秒），
+        那段时间读不到取消。
+        """
         nonlocal total, frames_with
         for i, r in enumerate(iterator, 1):
-            if ctx.canceled():
-                return False
             if r:
                 _, kept = r
                 total += kept
@@ -525,16 +554,20 @@ def run_detect(params, ctx=None):
                 ctx.progress(i, n, "已检出 %d 框" % total)
                 ctx.log("  [%d/%d]  检出 %d  用时 %.0fs"
                         % (i, n, total, time.perf_counter() - t0))
-        return True
+        # 迭代结束可能是收完了，也可能是被 cancelable 掐断 —— 要如实区分，
+        # 否则会走去 collect_stats / 记台账：未处理的帧会被标成「已处理」。
+        return not ctx.canceled()
 
     try:
         if workers <= 1:
             init_worker(cfg)
-            ok = consume(work(str(f)) for f in frames)
+            ok = consume(cancelable((work(str(f)) for f in frames), ctx))
         else:
             pool = mp.Pool(workers, initializer=init_worker, initargs=(cfg,))
             try:
-                ok = consume(pool.imap(work, [str(f) for f in frames], chunksize=2))
+                # cancelable：预热期间也能响应取消（池子还没出结果时 for 会死等）
+                ok = consume(cancelable(
+                    pool.imap(work, [str(f) for f in frames], chunksize=2), ctx))
             except Exception:
                 pool.terminate()   # 出错也立即终止子进程
                 raise
@@ -558,6 +591,14 @@ def run_detect(params, ctx=None):
     try:
         with open(out / "stats.json", "w", encoding="utf-8") as f:
             json.dump(stats, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    # 台账：记下这一轮「怪物标注跑过哪些帧」——选帧弹窗靠它显示已处理/未处理。
+    # 取消（ok=False）时不记：那一轮的标注是半截的，宁可让它显示成未处理。
+    try:
+        from gui import labelio
+        labelio.mark_processed(out, "mob", [f.stem for f in frames])
     except Exception:
         pass
 

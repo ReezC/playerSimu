@@ -418,10 +418,13 @@ class LivePanel(QWidget):
             d_txt = "端到端延迟  ——  （探针未解出，共 %d 帧）" % s.get("probe_miss", 0)
         else:
             d_txt = "端到端延迟  ——  （未启用探针）"
+        # 断线重连在做的事放在最前面 —— 这时候帧率数字意义不大，状态才是要紧的
+        note = (s.get("reconnect") or "").strip()
+        head = "【%s】 " % note if note else ""
         self.lbl_stats.setText(
-            "%s ｜ 输入 %5.1f fps ｜ 处理 %5.1f fps ｜ 丢帧 %d ｜ 推理 %5.1f ms ｜ "
+            "%s%s ｜ 输入 %5.1f fps ｜ 处理 %5.1f fps ｜ 丢帧 %d ｜ 推理 %5.1f ms ｜ "
             "显示 %4.1f fps ｜ 检出 %d ｜ %d×%d"
-            % (d_txt, s.get("recv_fps", 0), s.get("proc_fps", 0),
+            % (head, d_txt, s.get("recv_fps", 0), s.get("proc_fps", 0),
                s.get("dropped", 0), s.get("infer_ms", 0), s.get("show_fps", 0),
                s.get("boxes", 0), w, h))
 

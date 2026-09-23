@@ -17,12 +17,29 @@ CPython 下对 float/bool/引用 的简单赋值是原子的（GIL 保证不崩�
 
 import json
 import random
+import threading
 import time
 from pathlib import Path
 
 from decision.input import DEFAULT_KEYMAP, KeyState, key_down, key_up, tap
 
+# 决策参数的落点。**默认是按项目存的**（projects/<项目>/project.yaml 的 decision 段，
+# 由界面打开项目时注册钩子，见下面的 set_save_hook）；这个文件只在两种时候用：
+#   · 没打开项目时 —— 界面照样能改参数，就落在这里；
+#   · 项目里还没有 decision 段时（老项目 / 新建项目）—— 用它当**初始值**播种，
+#     这样辛苦调出来的那套参数不会因为「换了个存法」而丢。
 _SETTINGS_FILE = Path(__file__).resolve().parent.parent / "config" / "decision.json"
+
+#: 保存钩子：界面打开项目时注册，save() 会顺便把这份参数写回那个项目。
+#: **为什么用钩子而不是让 decision/ 认识「项目」**：decision/ 不该依赖 gui/，
+#: 而项目对象是界面侧的东西；这里只要能拿到一个 dict 就够了。
+_save_hook = None
+
+
+def set_save_hook(fn):
+    """注册/取消「保存时写回项目」的钩子（fn(dict) 或 None）。"""
+    global _save_hook
+    _save_hook = fn
 
 # 回身输出（反向跳回身）的默认行为序列。
 # 每个元素是 dict：
@@ -54,14 +71,26 @@ DEFAULT_OUTPUT_SEQ = [
 # 防掉线行为类型：(id, 显示名)。目前只实现「隐身休息」，后续可在此扩展。
 ANTI_AFK_TYPES = [("hidden_rest", "隐身休息")]
 
+# 时序拍的最小间隔（秒）：主循环按 `next_deadline()` 精确唤醒，但**至少**隔这么久
+# 才醒一次（避免到点时刻已过时忙等）。序列计时走本机绝对时钟，10 毫秒的粒度对
+# 输出CD / delay / 跳间隔足够（抓帧节拍是 66.7 毫秒，两者差一个数量级）。
+TIMING_TICK = 0.01
+
 
 class DecisionSettings:
-    """决策参数（UI 写，决策线程读），改动后持久化到 config/decision.json。"""
+    """决策参数（UI 写，决策线程读）。
+
+    **按项目存**：界面打开项目时把这份参数整份存进该项目的 project.yaml
+    （`decision:` 段），换项目就换一套；没打开项目时落回 config/decision.json。
+    细节见文件顶部 `_SETTINGS_FILE` 与 `set_save_hook` 的说明。
+    """
 
     def __init__(self):
+        # 自动打怪开关：**不持久化** —— 每次启动都从「关」开始，
+        # 免得「一开机就自己打怪」。由按钮/F11/断线重连流程改。
         self.enabled = False
-        self.attack_dist = 80.0     # 最大攻击距离（画面像素），小于它就打
-        self.min_attack_dist = 0    # 最小攻击距离（像素），>0 时启用规避
+        self.attack_dist = 80.0     # 最大攻击距离（像素，从角色中心量到怪框最近的边）
+        self.min_attack_dist = 0    # 最小攻击距离（同口径），>0 时启用规避
         self.chase_jump_enabled = False  # 追击起跳开关
         self.chase_jump_min = 0     # 追击起跳区间下限（相对最大攻击距离的偏移，像素）
         self.chase_jump_max = 50    # 追击起跳区间上限（同样是相对最大攻击距离的偏移）
@@ -79,6 +108,14 @@ class DecisionSettings:
         # （实际间隔 = CD + 随机延迟；输出序列自身更长时以序列为准）
         self.attack_cd = 0
         self.attack_lock_debounce_ms = 300  # 输出后锁定防抖（毫秒）：这段时间内 attack 目标保持锁定，不切换到攻击范围内其他框
+        # 最小切换朝向时间（毫秒）：换向后方向键至少按住这么久。按下去立刻松开的话，
+        # 角色的转身动作可能还没做完 —— 这时候输出会打向**错误的方向**（用户实测）。
+        # 这段按住时间只能被「又换一次朝向」打断（那是新的一次换向，重新计时）。
+        # 0 = 不约束（保持老行为）。
+        self.min_turn_hold_ms = 0
+        # 转向后输出延迟（毫秒）：换向后推迟这么久才开始输出。和上面那条配合用 ——
+        # 前者保证方向键按住够久，后者保证输出等转身做完。0 = 不延迟。
+        self.turn_output_delay_ms = 0
         self.player_track_jump = 150        # 玩家追踪阈值（像素）：新玩家框离预测位置超此距离就不认（防跟错）
         self.hp_bar = None          # HP 条区域 (x, y, w, h) 或 None
         self.mp_bar = None          # MP 条区域 (x, y, w, h) 或 None
@@ -120,13 +157,28 @@ class DecisionSettings:
         self.anti_afk_exit_seq = []     # 退出隐身行为序列
         self.anti_afk_rest_min = 10     # 休息时长下限（分钟）
         self.anti_afk_rest_max = 20     # 休息时长上限（分钟）
+        # ---- 断线自动重连（decision/reconnect.py）----
+        self.reconnect_enabled = False        # 断线自动重连开关
+        # 玩家框丢多久之后开始探界面（0 = 立刻）。默认 0：断线提示框只显示
+        # 两三秒，等 5 秒再探就错过它了，客户端会一直卡在提示框上等人按确定。
+        # 探一次只要 ~4ms，不需要为省这点开销推迟。
+        self.reconnect_probe_after_lost_sec = 0.0
+        self.reconnect_step_timeout_ms = 3000      # 每步等「界面变化」的超时
+        self.reconnect_queue_timeout_ms = 180000   # 排队弹窗专用超时（长）
+        self.reconnect_max_retry = 3               # 同一步最多重试几次
+        self.reconnect_resume_auto = True          # 回到游戏后自动恢复自动打怪
         # 以下是运行时状态，不持久化（to_dict 不导出）：
         self.rest_abort = False         # UI 置 True 请求「手动结束休息」，agent 消费后清掉
+        self.rest_request = False       # UI 置 True 请求「手动进入休息」，agent 消费后清掉
         self.rest_state = ""            # 当前休息阶段（"" / afk_enter / afk_rest / afk_exit），UI 只读
         self.rest_until_monotonic = 0.0 # 本次休息的结束时刻（time.monotonic），UI 读它算倒计时
         self.next_afk_monotonic = 0.0   # 下次防掉线触发时刻（0 = 未排期 / 防掉线关着）
         self.rest_pending = False       # 已到触发时间，等攻击范围内的怪清空（「待休息」）
         self.custom_keys = {}           # 自定义按键：{键名: 物理键名}，键名自动命名（custom1...）
+        self.reconnect_note = ""        # 重连状态文字（reconnect.py 写，UI 只读）
+        self.input_link_ok = True       # 指令通道是否健康（agent 的周期体检写，UI 只读）
+        self.input_link_err = ""        # 通道不健康的原因（上面那个为 False 时才有值）
+        self.input_resync = False       # UI/手动输入置 True 请求「重同步按键状态」，agent 消费后清掉
 
     def set_key(self, name, key):
         self.keymap[name] = key
@@ -150,6 +202,8 @@ class DecisionSettings:
                 "input_delay": self.input_delay,
                 "attack_cd": self.attack_cd,
                 "attack_lock_debounce_ms": self.attack_lock_debounce_ms,
+                "min_turn_hold_ms": self.min_turn_hold_ms,
+                "turn_output_delay_ms": self.turn_output_delay_ms,
                 "player_track_jump": self.player_track_jump,
                 "hp_bar": self.hp_bar, "mp_bar": self.mp_bar,
                 "hp_color": self.hp_color, "mp_color": self.mp_color,
@@ -186,16 +240,32 @@ class DecisionSettings:
                 "anti_afk_exit_seq": self.anti_afk_exit_seq,
                 "anti_afk_rest_min": self.anti_afk_rest_min,
                 "anti_afk_rest_max": self.anti_afk_rest_max,
+                "reconnect_enabled": self.reconnect_enabled,
+                "reconnect_probe_after_lost_sec": self.reconnect_probe_after_lost_sec,
+                "reconnect_step_timeout_ms": self.reconnect_step_timeout_ms,
+                "reconnect_queue_timeout_ms": self.reconnect_queue_timeout_ms,
+                "reconnect_max_retry": self.reconnect_max_retry,
+                "reconnect_resume_auto": self.reconnect_resume_auto,
                 "custom_keys": self.custom_keys}
 
     def save(self):
-        """落盘。enabled 不存 —— 自动开关是运行时状态，重启后总是关闭。"""
+        """落盘：写回当前项目 + 全局那份（分工见文件顶部 _SETTINGS_FILE 的说明）。
+
+        enabled 不存 —— 自动开关是运行时状态，重启后总是关闭。
+        两处写失败都不抛：参数存不下去是坏事，但不能连界面一起炸。
+        """
+        data = self.to_dict()
         try:
             _SETTINGS_FILE.write_text(
-                json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
+                json.dumps(data, ensure_ascii=False, indent=2),
                 encoding="utf-8")
         except Exception:
             pass
+        if _save_hook is not None:
+            try:
+                _save_hook(data)
+            except Exception:
+                pass
 
     def from_dict(self, data):
         """从 dict 恢复所有决策参数（参数模板加载也走这里）。"""
@@ -226,6 +296,8 @@ class DecisionSettings:
             self.input_delay = [int(dly[0]), int(dly[1])]
         self.attack_cd = int(data.get("attack_cd", 0))
         self.attack_lock_debounce_ms = int(data.get("attack_lock_debounce_ms", 300))
+        self.min_turn_hold_ms = int(data.get("min_turn_hold_ms", 0))
+        self.turn_output_delay_ms = int(data.get("turn_output_delay_ms", 0))
         # 旧键 player_debounce_dist 兼容读一次（改名前的配置 / 模板里是这个）
         self.player_track_jump = int(data.get(
             "player_track_jump", data.get("player_debounce_dist", 150)))
@@ -275,6 +347,15 @@ class DecisionSettings:
         self.anti_afk_rest_max = float(data.get("anti_afk_rest_max", 20))
         if self.anti_afk_rest_max < self.anti_afk_rest_min:
             self.anti_afk_rest_max = self.anti_afk_rest_min
+        # 断线自动重连
+        self.reconnect_enabled = bool(data.get("reconnect_enabled", False))
+        self.reconnect_probe_after_lost_sec = float(
+            data.get("reconnect_probe_after_lost_sec", 0.0))
+        self.reconnect_step_timeout_ms = int(data.get("reconnect_step_timeout_ms", 3000))
+        self.reconnect_queue_timeout_ms = int(
+            data.get("reconnect_queue_timeout_ms", 180000))
+        self.reconnect_max_retry = int(data.get("reconnect_max_retry", 3))
+        self.reconnect_resume_auto = bool(data.get("reconnect_resume_auto", True))
         ck = data.get("custom_keys") or {}
         if isinstance(ck, dict):
             self.custom_keys = {str(k): (v if isinstance(v, str) or v is None else None)
@@ -373,10 +454,12 @@ class CombatAgent:
         self.facing = 1             # 朝向：+1 右（默认）/ -1 左，由最后按的方向键决定
         self._patrol_dir = 1        # 扫平台倾向朝向（巡逻主方向）：打背后怪不改变它
         self._last_facing_change = time.monotonic()  # 朝向最后一次变化的时刻（超时监控用）
+        self._turn_at = 0.0         # 最近一次换向的时刻（最小按住时间 / 转向后输出延迟用）
         self._player_lost_since = None  # 找不到玩家的起始时刻（monotonic），定位到就重置
         self._was_enabled = False   # 上一次 enabled 状态（检测开启自动的上升沿）
         self._deadzone = 6.0        # |dx| 小于它就停，避免左右抖
-        self._last_output = 0.0     # 最近一次输出行为（攻击）的时刻（monotonic）
+        self._last_output = 0.0     # 最近一次**输出行为**的开始时刻（monotonic），
+                                    # 输出CD 与「输出后锁定防抖」都以它为锚点
         self._attack_duration = 0.03  # 每次点按攻击键的按住时长（秒）
         self._target_id = None      # 当前锁定的目标 id
         self._target_until = 0.0    # 锁定到期时间（monotonic）
@@ -394,6 +477,8 @@ class CombatAgent:
         self._back_ctx = None       # 回身输出序列上下文 [seq, phase, next, held, sub_stack]
         self._output_ctx = None     # 输出行为序列上下文
         self._sweep_hold = False    # 扫平台：输出已触发 → 停朝倾向朝向移动，直到范围内清空
+        self._link_checked = 0.0    # 上次指令通道体检时刻
+        self._link_retry = 0.0      # 上次尝试重连通道的时刻（避免狂重连）
         self._next_afk = 0.0        # 下次防掉线触发时刻
         self._was_afk_enabled = False  # 防掉线开关上一次状态（上升沿检测）
         self._afk_ctx = None        # 当前防掉线阶段的序列上下文（进入/退出隐身）
@@ -402,35 +487,40 @@ class CombatAgent:
         self._rest_until = 0.0      # 本次休息的结束时刻
 
     @staticmethod
-    def _edge_dist(m, player):
-        """玩家框到怪框的水平边缘距离（像素）；0 表示两框水平已接触/重叠。
+    def _center_dist(m, player):
+        """**角色中心点**到怪框最近边缘的水平距离（像素）；0 = 怪框已盖住角色中心。
 
-        攻击是水平方向的，用框边缘而非中心点：只要怪框边缘进入玩家
-        框边缘 + attack_dist 的范围就算够得着，避免大框目标被中心点
-        欧氏距离误判成「太远」。
+        起算点用角色中心，不用玩家框的朝向边缘：够不够得着是看角色，而玩家框是
+        贴图框（宽度随动作变），拿它的边缘起算，同一只怪的距离会跟着框宽漂。
+        终点仍取怪框最近的边 —— 大框目标（龙）不必再靠近半个框宽才算够得着。
+        只算水平：横版先只做水平方向找怪打（见模块开头）。
+
+        这个距离是**共用口径**：攻击判定 / 最近怪 / 最小距离规避 / 追击起跳 /
+        背后锁定 全走它，实时预览画的攻击距离线也按它起算（gui/live_thread.py）。
         """
-        p_left = player.x - player.w / 2.0
-        p_right = player.x + player.w / 2.0
         m_left = m.x - m.w / 2.0
         m_right = m.x + m.w / 2.0
-        if m_right < p_left:
-            return p_left - m_right   # 怪完全在玩家左侧
-        if m_left > p_right:
-            return m_left - p_right   # 怪完全在玩家右侧
-        return 0.0                    # 水平重叠 → 边缘已接触
+        if m_right < player.x:
+            return player.x - m_right   # 怪完全在中心左侧
+        if m_left > player.x:
+            return m_left - player.x    # 怪完全在中心右侧
+        return 0.0                      # 怪框跨过中心 → 贴身
 
     def _nearest(self, mobs, player):
-        """找最近的怪（框边缘水平距离），返回 (target, dist)；没怪返回 (None, None)。"""
+        """找最近的怪（角色中心 → 怪框边缘的水平距离），返回 (target, dist)。
+
+        没怪返回 (None, None)。
+        """
         target, best = None, None
         for m in mobs:
-            d = self._edge_dist(m, player)
+            d = self._center_dist(m, player)
             if best is None or d < best:
                 best = d
                 target = m
         return target, best
 
     def _in_chase_jump_range(self, dist):
-        """追击起跳判定：边缘距离 dist 是否落在起跳区间内。
+        """追击起跳判定：距离 dist（角色中心 → 怪框边缘）是否落在起跳区间内。
 
         区间 = [最大攻击距离 + min, 最大攻击距离 + max]：
           min/max 都是相对「最大攻击距离」的偏移；
@@ -465,10 +555,12 @@ class CombatAgent:
         self._next_chase_jump = now + max(0.3, attack_cd_s + self._random_input_delay())
 
     def set_facing(self, f):
-        """设置朝向；朝向真的变了就重置「朝向无变化」超时计时。"""
+        """设置朝向；朝向真的变了就重置「朝向无变化」超时计时 + 记下换向时刻。"""
         if f != self.facing:
             self.facing = f
-            self._last_facing_change = time.monotonic()
+            now = time.monotonic()
+            self._last_facing_change = now   # 朝向无变化超时监控用
+            self._turn_at = now              # 转向后输出延迟 / 最小按住时间用
 
     def _steer(self, dx, keys):
         """朝目标方向走：按对应方向键并更新朝向。dx=0 不动。"""
@@ -478,6 +570,33 @@ class CombatAgent:
         elif dx < 0:
             keys.add(self.settings.keymap["left"])
             self.set_facing(-1)
+
+    def _hold_turn(self, keys, now):
+        """换向后，方向键至少按住「最小切换朝向时间」——返回要真正发出去的键。
+
+        为什么：换方向的键按下去立刻就松，角色的转身动作可能还没做完，这时候
+        输出会打向**错误的方向**。所以转向期间只做一件事：**不许松开方向键**。
+
+        「该按住的时间只能被换朝向打断」—— 所以这里**不**阻止换向：
+        又按了另一个方向时，`set_facing` 已经把计时重置成新的一轮（那一刻新方向的
+        键也在 keys 里），这里只处理「这一帧决策里没有方向键、但按住时间还没到」
+        的情况，把当前朝向对应的方向键补回去。
+
+        0 = 关闭（不干预，保持老行为）。
+        """
+        s = self.settings
+        hold = max(0.0, float(s.min_turn_hold_ms)) / 1000.0
+        if hold <= 0 or now - self._turn_at >= hold:
+            return keys
+        km = s.keymap
+        dirs = {km.get("left"), km.get("right"), km.get("up"), km.get("down")}
+        dirs.discard(None)
+        if keys & dirs:
+            return keys          # 本来就在按方向键（含刚换的那个方向）→ 不用管
+        key = km.get("right") if self.facing > 0 else km.get("left")
+        if not key:
+            return keys
+        return set(keys) | {key}
 
     def _resolve_seq_key(self, name):
         """序列里的键名 → 实际物理键名。
@@ -495,12 +614,17 @@ class CombatAgent:
         v = self.settings.custom_keys.get(name)
         return v if v else name
 
-    def _run_seq(self, now, ctx):
+    def _run_seq(self, now, ctx, output=False):
         """执行序列上下文一步，支持「触发后执行」的嵌套子序列。
 
         ctx = [seq, phase, next_ts, held, sub_stack]；sub_stack 是 then
         子序列的栈（list of ctx），执行时优先栈顶。返回更新后的 ctx；
         序列走完返回 None（完成时释放本层 held 键）。
+
+        output=True 表示这是**输出行为**（攻击输出 / 回身输出）：开跑时会给
+        「上次输出时刻」打点，供输出CD（`_next_output_ts`）与输出后锁定防抖用。
+        其它序列（进入/退出隐身、自定义定时行为）不算输出行为 —— 它们只有在
+        碰巧按到攻击键时才算一次「外部输出」。
         """
         seq, phase, next_ts, held, sub_stack = ctx
         while True:
@@ -519,6 +643,13 @@ class CombatAgent:
                 return None
             elem = seq[phase]
             phase += 1
+            # **输出行为从这一刻开始计时**：输出CD 记的是「输出行为」之间的间隔，
+            # 与这一轮按了哪些键无关。层级是 攻击状态 > 输出行为 > 输出按键 ——
+            # 原来只在按下攻击键时打点，序列里没有攻击键（只放技能键 / 只放跳）时
+            # 输出CD就完全失效（实测退化成背靠背、只剩序列自身耗时）。
+            # 概率没命中的元素也算开始：它确实占用了这一轮。
+            if output and phase == 1:
+                self._last_output = now
             # 执行几率：默认 100%；未命中则跳过本元素。
             # 跳过的元素不产生任何输入，也就不该占用一个 tick —— 同一帧里接着看
             # 下一个。否则「10% 几率的跳」在 90% 的情况下白吃一个 tick（15fps 下
@@ -534,7 +665,9 @@ class CombatAgent:
                     if elem["type"] == "down":
                         key_down(key)
                         held.add(key)
-                        if key == self.settings.keymap.get("attack"):
+                        # 非输出序列（定时行为之类）按了攻击键，也算一次「外部输出」，
+                        # 让战斗输出避开它；输出序列自己已经在开跑时打过点了。
+                        if not output and key == self.settings.keymap.get("attack"):
                             self._last_output = now
                     else:
                         key_up(key)
@@ -553,6 +686,20 @@ class CombatAgent:
         self._release_held_set(held)
         for sub in sub_stack:
             self._release_ctx(sub)
+
+    def _clear_ctx_held(self, ctx):
+        """只作废上下文记的「按着哪些键」，**保留进度**（phase / next_ts / 序列本身）。
+
+        定期 RELEASEALL 之后用：固件侧那批键已经被一次性松掉了，本地这份记录随之
+        作废（和 `keys.clear()` 一个道理 —— 不补发 RELEASE，因为已经松了）；但
+        「序列走到第几步、下一次什么时候发」是本机的进度，跟 RELEASEALL 无关，
+        必须留着 —— 否则序列会从头重来（进入隐身里那个长 delay 永远走不完）。
+        """
+        if not ctx:
+            return
+        ctx[3].clear()
+        for sub in ctx[4]:
+            self._clear_ctx_held(sub)
 
     @staticmethod
     def _release_held_set(held):
@@ -629,7 +776,7 @@ class CombatAgent:
         return mobs
 
     def _in_range(self, mobs, ws):
-        """朝向前方、攻击范围内的框（边缘距离 <= attack_dist），按距离升序。
+        """朝向前方、攻击范围内的框（角色中心 → 怪框边缘 <= attack_dist），按距离升序。
 
         攻击只朝前方：背后的框即使水平距离近也不算在攻击范围内，走 chase 转身。
         """
@@ -637,8 +784,8 @@ class CombatAgent:
         px = ws.player.x
         return sorted([m for m in mobs
                        if (m.x - px) * self.facing >= 0
-                       and self._edge_dist(m, ws.player) <= ad],
-                      key=lambda m: self._edge_dist(m, ws.player))
+                       and self._center_dist(m, ws.player) <= ad],
+                      key=lambda m: self._center_dist(m, ws.player))
 
     def _attack_state(self, target, best, mobs, ws):
         """攻击范围内有框时的状态选择（attack / 规避贴脸）。返回 keys。"""
@@ -649,7 +796,7 @@ class CombatAgent:
 
         target_too_close = (min_dist > 0 and best < min_dist)
         any_too_close = (min_dist > 0 and
-                         any(self._edge_dist(m, ws.player) < min_dist for m in mobs))
+                         any(self._center_dist(m, ws.player) < min_dist for m in mobs))
 
         if s.evade_type == "jump":
             if target_too_close:
@@ -702,7 +849,7 @@ class CombatAgent:
                     break
 
         if target is not None and now < self._target_until:
-            best = self._edge_dist(target, ws.player)
+            best = self._center_dist(target, ws.player)
             self._no_target_since = None
         else:
             target, best = self._nearest(lockable, ws.player)
@@ -734,13 +881,70 @@ class CombatAgent:
         hi = float(s.attack_dist)
         for m in mobs:
             if (getattr(m, "missed", 0) > 0
-                    and lo <= self._edge_dist(m, ws.player) <= hi):
+                    and lo <= self._center_dist(m, ws.player) <= hi):
                 self._kill_mobs.add(m.id)
+
+    def _run_output_ctx(self, now, ctx, seq, cd):
+        """推进一条输出序列（攻击输出 / 回身输出）；跑完按输出CD排下一轮。
+
+        决策拍（`tick`）和时序拍（`tick` 的 timing_only）都调它 —— 两边的推进逻辑
+        必须一模一样，否则「什么时候发下一步」会按下发路径分叉。
+        """
+        r = self._run_seq(now, ctx, output=True)
+        if r is not None:
+            return r
+        due = self._next_output_ts(now, cd)
+        nxt = [seq, 0, due, set(), []]
+        if due <= now:
+            # 序列本身比 CD + 随机延迟还长 → 同一帧直接起步，不白等一个 tick
+            r = self._run_seq(now, nxt, output=True)
+            if r is not None:
+                return r
+        return nxt
+
+    def _advance_running_seqs(self, now):
+        """只推进「已经在跑」的输出序列（该不该起新的、跑哪条，由决策拍按状态决定）。"""
+        s = self.settings
+        cd = max(0.0, float(s.attack_cd)) / 1000.0
+        if self._output_ctx is not None and self.state == "attack":
+            self._output_ctx = self._run_output_ctx(now, self._output_ctx,
+                                                    s.output_seq, cd)
+        if self._back_ctx is not None and self.state == "evade_back_jump":
+            self._back_ctx = self._run_output_ctx(now, self._back_ctx,
+                                                  s.back_jump_seq, cd)
+
+    def next_deadline(self):
+        """下一个「到点该发」的时刻（monotonic）；没有任何序列在跑时返回 None。
+
+        主循环用它决定这一轮等多久：到点就醒来跑一次时序拍（`tick_timing`），
+        序列计时因此不再被抓帧节拍量化。
+
+        只看序列上下文（输出 / 回身输出 / 进入退出隐身 / 自定义定时行为）——
+        防掉线排期、喂宠这些是分钟级的，精度要求低，跟着画面帧走就够，
+        不值得为它们把主循环叫醒。
+        """
+        times = []
+        for ctx in (self._output_ctx, self._back_ctx, self._afk_ctx):
+            if ctx is not None:
+                times.append(ctx[2])
+        for st in self._timer_states.values():
+            if st is not None:
+                times.append(st[2])
+        return min(times) if times else None
+
+    def tick_timing(self, ws=None):
+        """时序拍：把「已经排好期、到点该发」的东西发出去（不依赖画面帧）。
+
+        见 `tick` 的 timing_only 参数。ws 只是为了兜底（这一路不读世界状态）。
+        """
+        return self.tick(ws, timing_only=True)
 
     def _next_output_ts(self, now, cd):
         """下一次输出动作的最早时刻（monotonic）。
 
-        以「上次输出时刻」(_last_output) 为锚点，而不是「序列走完的时刻」：
+        以「上次**输出行为**的开始时刻」(_last_output) 为锚点，而不是「序列走完的
+        时刻」、也不是「某个输出按键按下的时刻」—— 层级是 攻击状态 > 输出行为 >
+        输出按键，输出CD 属于中间那一层（见 `_run_seq` 的 output 参数）。
         序列从输出键按下到整条走完还有一段时间（后续元素的按键间隔 + 主循环
         tick 粒度），原来用 `now + cd` 会把这部分**叠加**在 CD 之上 —— 实测
         3 元素序列、15fps、CD=200ms 时，两次输出隔了 400ms（多出 3 个 tick）。
@@ -761,22 +965,27 @@ class CombatAgent:
         # 规避时也在输出，同样会空放）
         self._reap_ghost_mobs(target, mobs, ws)
 
+        # 转向后输出延迟：刚换完朝向时角色的转身动作还没做完，这时候打出去的方向
+        # 是错的。所以**新开一轮输出**要往后推；已经在跑的序列让它跑完（半截掐断
+        # 会留下按着的键）。
+        turn_wait = ((now - self._turn_at)
+                     < max(0.0, float(s.turn_output_delay_ms)) / 1000.0)
+
         if self.state == "attack":
             # 执行输出行为序列（output_seq），走完按 attack_cd 排下一轮
-            if self._output_ctx is None:
-                self._output_ctx = [s.output_seq, 0, 0.0, set(), []]
-            r = self._run_seq(now, self._output_ctx)
-            if r is None:
-                due = self._next_output_ts(now, attack_cd)
-                self._output_ctx = [s.output_seq, 0, due, set(), []]
-                # due 已经过了（序列本身比 CD + 随机延迟还长）→ 同一帧直接起步，
-                # 否则这一帧纯空转，等于给输出间隔白加一个 tick。
-                if due <= now:
-                    r = self._run_seq(now, self._output_ctx)
-                    if r is not None:
-                        self._output_ctx = r
-            else:
-                self._output_ctx = r
+            if self._output_ctx is None and not turn_wait:
+                # **进攻击状态也要走输出CD排期**：不能一进范围就立刻开一轮，否则
+                # 状态在攻击/追击之间抖一下（目标丢一帧又回来）就会比 CD 密。
+                # 和另外两处（序列走完、回身输出）用同一个排期函数 —— CD 已经过时
+                # （比如刚从追击/待机过来）它会返回「现在 + 随机延迟」，一样是立刻打，
+                # 不会变迟钝。
+                self._output_ctx = [s.output_seq, 0,
+                                    self._next_output_ts(now, attack_cd), set(), []]
+            # _output_ctx 还是 None = 刚转向、这一帧先不输出（序列一旦开跑就让它跑完，
+            # 半截掐断会留下按着的键）
+            if self._output_ctx is not None:
+                self._output_ctx = self._run_output_ctx(now, self._output_ctx,
+                                                        s.output_seq, attack_cd)
         else:
             # 离开攻击状态：重置输出序列 + 松开残留键
             self._release_ctx(self._output_ctx)
@@ -790,25 +999,23 @@ class CombatAgent:
                     tap(jump_key, self._attack_duration)
                 self._pending_attack = now + interval
                 self._next_evade = now + interval + attack_cd + self._random_input_delay()
-            if self._pending_attack is not None and now >= self._pending_attack:
+            if (self._pending_attack is not None and now >= self._pending_attack
+                    and not turn_wait):
+                # 输出这一下也受「转向后输出延迟」约束：跳可以先跳（是位移，
+                # 不吃朝向），但攻击键要等转身做完，否则打向错误的方向。
+                # 没到点就继续挂着 _pending_attack，下一帧再补。
                 tap(attack_key, self._attack_duration)
                 self._last_output = now
                 self._pending_attack = None
 
         if self.state == "evade_back_jump":
-            if self._back_ctx is None:
+            if self._back_ctx is None and not turn_wait:
                 self._back_ctx = [s.back_jump_seq, 0, 0.0, set(), []]
-            r = self._run_seq(now, self._back_ctx)
-            if r is None:
-                # 序列走完：循环重来（回身输出是循环行为）
-                due = self._next_output_ts(now, attack_cd)
-                self._back_ctx = [s.back_jump_seq, 0, due, set(), []]
-                if due <= now:            # CD 已过 → 同一帧起步，不白占一帧
-                    r = self._run_seq(now, self._back_ctx)
-                    if r is not None:
-                        self._back_ctx = r
-            else:
-                self._back_ctx = r
+            if self._back_ctx is None:
+                return                   # 刚转向：先不输出（回身输出同样吃朝向）
+            # 序列走完由 _run_output_ctx 按输出CD排下一轮（回身输出是循环行为）
+            self._back_ctx = self._run_output_ctx(now, self._back_ctx,
+                                                  s.back_jump_seq, attack_cd)
 
     def _take_kill_mobs(self):
         """取出并清空待消除的幽灵框 id 列表（tick 各返回路径统一带上）。
@@ -821,8 +1028,93 @@ class CombatAgent:
         self._kill_mobs.clear()
         return out
 
-    def tick(self, ws):
-        """跑一帧决策。ws: WorldState。返回动作描述 dict（调试/展示）。"""
+    def _periodic_reset(self, now, s):
+        """定期体检指令通道 + 清一次固件侧按键（防卡键）。停自动之后也要跑。
+
+        卡键有两个来源，要分开对付：
+
+        1. **某条 RELEASE 在路上丢了** → 固件还按着，而我们本地以为已经松开、
+           之后再也不会补发（`_release_held_keys` 只释放「它记得按下的键」）。
+           这种靠定期 RELEASEALL 兜底 —— 固件一次性清空，不依赖我们记没记住。
+        2. **通道整个死了** → 后面所有命令（包括我们自己补发的 RELEASEALL）
+           都到不了，还会一直假装发成功。这种必须**重连**：断开这个动作会让
+           relay 往串口直接写一条 RELEASEALL（见 remote_kbd/relay.py），
+           那条路不依赖我们的 TCP 还通不通。上次「只能关 GUI 才好」就是因为
+           GUI 关闭时连接断了、relay 替我们松的键。
+
+        放在 tick 的最前面（`if not s.enabled` 早退之前）：人发现卡了第一反应
+        就是关自动，如果关自动就不跑这个，自愈机制在真正需要它时正好是关着的。
+        """
+        from decision import input as dinput
+        # ---- 0. 按键状态重同步请求（「重置指令通道」按钮 / 手动输入按了键）----
+        # 只清本地按键状态、**不发 RELEASE**，两个原因：
+        #   · 清掉之后下一帧 keys.set 会重新发 PRESS（固件 addHeld 会去重，不会重复按）
+        #   · 手动输入每按一个键都会请求一次，发 RELEASE 会让自动正按着的移动键
+        #     一格一格闪断
+        # 序列上下文故意不在这里清：清掉而不释放，序列里按着的键就卡住了。
+        # 序列的收尾交给定期 RELEASEALL（它先发 RELEASEALL 再清上下文）。
+        if s.input_resync:
+            s.input_resync = False
+            self.keys.clear()
+        # ---- 1. 通道体检：10 秒一次。很便宜，就是看一眼上次发送的结果。----
+        if now - self._link_checked >= 10.0:
+            self._link_checked = now
+            h = dinput.link_health()
+            ok = bool(h.get("ok", True))
+            s.input_link_ok = ok
+            s.input_link_err = "" if ok else ("%s %s" % (h.get("backend", ""),
+                                                        h.get("err", ""))).strip()
+            # 不健康就重连。重连会阻塞（建连有超时），所以丢到后台线程 ——
+            # 决策循环不能被一次网络重试卡住几秒。
+            if not ok and now - self._link_retry >= 10.0:
+                self._link_retry = now
+                threading.Thread(target=dinput.reconnect_remote, daemon=True).start()
+        # ---- 2. 定期 RELEASEALL ----
+        iv = max(0.0, float(s.resetall_interval))
+        if iv <= 0 or now < self._next_resetall:
+            return
+        self._next_resetall = now + iv
+        # 手动输入开着 → 跳过这次。手动输入现在允许和自动同时开，RELEASEALL 会把
+        # 人正按着的手动键一起松掉。跳过是一整个周期（不是每帧重试）。
+        try:
+            from decision import manual_input
+            if manual_input.active():
+                return
+        except Exception:
+            pass
+        dinput.release_all_remote()
+        self.keys.clear()
+        # **本机规划的行为序列一律保留进度**，只作废它们记的「按着哪些键」：
+        #     _output_ctx     输出行为序列（攻击连点 / 跳输出，自己按 CD 排下一轮）
+        #     _back_ctx       回身输出序列（循环行为）
+        #     _afk_ctx        进入 / 退出隐身（里面可能有很长的 delay）
+        #     _timer_states   自定义定时行为
+        # RELEASEALL 松的是固件侧按着的键；「走到第几步、下次什么时候发」是本机
+        # 记的进度，和它无关。原来把这些上下文一起清掉，等于每 resetall_interval
+        # 秒让所有序列从头重来：长 delay 永远走不完、前面的动作被反复重放、
+        # 输出序列还会无视 CD 立刻重打一轮。
+        for ctx in (self._output_ctx, self._back_ctx, self._afk_ctx):
+            self._clear_ctx_held(ctx)
+        for st in self._timer_states.values():
+            self._clear_ctx_held(st)
+
+    def tick(self, ws, timing_only=False):
+        """跑一帧决策；`timing_only=True` 时只跑一次「时序拍」。
+
+        **两种拍子的分工**（同一条线程，主循环按需调用）
+            决策拍 `tick(ws)`   每帧一次：选目标 / 移动 / 状态机 / 喝药 / 排防掉线 ——
+                                这些依赖世界状态。它同时也会推进序列（不变）。
+            时序拍 `tick_timing()` 只在「等下一帧超时且序列到点」时跑：把已经排好期
+                                的动作发出去 —— 序列元素、休息状态机、喂宠、定时行为。
+                                不做任何画面相关决策（选目标/移动/喝药都不在这里）。
+
+        **为什么要分**：序列里存的是**绝对到点时刻**（`next_ts = now + delay`），
+        但原来只有抓到一帧时才检查「到点没」→ 到点被推迟到下一帧，输出CD、delay、
+        跳间隔全被量化成 1/capture_fps（15fps → 66.7ms）。计时本来就该走本机绝对
+        时钟，所以由主循环按 `next_deadline()` 精确唤醒。
+
+        ws: WorldState（时序拍不读它，但为了兜底仍要求传上一次的世界状态）。
+        """
         s = self.settings
 
         # 开启自动的上升沿：重置朝向监控计时。否则关掉自动后隔很久再开，
@@ -831,8 +1123,18 @@ class CombatAgent:
             self._last_facing_change = time.monotonic()
             self._player_lost_since = None   # 重新开启自动：重置找不到玩家计时
         self._was_enabled = s.enabled
+        now = time.monotonic()
+
+        # 通道自愈 + 定时 RELEASEALL。**必须放在下面 `if not s.enabled` 早退之前**：
+        # 卡键最常见的时刻恰恰是「发现卡了 → 去关自动」之后。如果关自动就不发，
+        # 这个自愈机制在真正需要它的时候正好是关着的 —— 之前就踩了这个坑：
+        # 一关自动就再也救不回来，只能关 GUI（那一下是 relay 在连接断开时
+        # 替我们发的 RELEASEALL 救的，见 decision/input.py 的 reconnect_remote）。
+        self._periodic_reset(now, s)
 
         if not s.enabled:
+            if timing_only:
+                return None      # 停自动的收尾由决策拍做（这里做的事都是幂等的，不必重复跑）
             # 释放所有按着的键：不仅 KeyState，还有序列（回身输出/防掉线/定时）残留的，
             # 否则停自动时若正处于序列中间，序列按下的键会卡住继续生效。
             self._release_held_keys()
@@ -840,13 +1142,12 @@ class CombatAgent:
             self._rest_pending = False   # 停自动一并取消「待休息」，重新开启后重新计时
             s.rest_state = ""            # 停自动也清掉休息状态（UI 按钮跟着变灰）
             s.rest_abort = False
+            s.rest_request = False       # 停自动也丢掉「手动休息」的请求
             s.rest_until_monotonic = 0.0
             s.rest_pending = False
             s.next_afk_monotonic = 0.0
             return {"state": "idle", "reason": "未开启",
                     "kill_mobs": self._take_kill_mobs()}
-
-        now = time.monotonic()
 
         # 防掉线-隐身休息：休息流程独占本帧 —— 不走 RELEASEALL / 喂宠 / 自定义定时
         # （计时器由 _run_rest → _pause_timers 冻住），也不做任何战斗动作。
@@ -870,6 +1171,8 @@ class CombatAgent:
                     self._afk_ctx = None
                     self.state = "afk_exit"
                 self._run_rest(now)
+                if timing_only:
+                    return None      # 休息期间不做战斗动作，也不读世界状态
                 self._drink_potions(ws, now)
                 return {"state": self.state, "reason": "隐身休息", "target": None,
                         "dx": 0, "dist": 0, "keys": [], "facing": self.facing,
@@ -878,22 +1181,15 @@ class CombatAgent:
             # 不在休息中：丢掉过期的「结束休息」请求，否则下一次休息一开始就会被它结束掉
             s.rest_abort = False
 
-        # 定时 RELEASEALL：防长时间运行后固件侧按键卡住。发完清空本地按键状态，
-        # 下一帧会重新按需要的键（清空后 keys.set 会重新发 PRESS）。
-        reset_iv = max(0.0, float(s.resetall_interval))
-        if reset_iv > 0 and now >= self._next_resetall:
-            from decision import input as dinput
-            dinput.release_all_remote()
-            self.keys.clear()
-            self._back_ctx = None
-            self._output_ctx = None
-            self._afk_ctx = None
-            self._timer_states.clear()
-            self._next_resetall = now + reset_iv
-
         # 不依赖玩家定位的定时行为：到点就执行（喂宠 / 自定义定时）
         self._feed_pet(now)
         self._custom_timers(now)
+
+        if timing_only:
+            # 时序拍到这儿就够：剩下的全要世界状态（选目标 / 移动 / 喝药 / 排防掉线）。
+            # 序列只推进「已经在跑」的那些 —— 该不该起新序列由决策拍按状态决定。
+            self._advance_running_seqs(now)
+            return None
 
         if not ws.player.found:
             # 找不到玩家超时：连续超时就停止自动
@@ -931,9 +1227,17 @@ class CombatAgent:
         if s.anti_afk_enabled:
             if not self._was_afk_enabled:
                 self._next_afk = now + self._random_afk_interval()
+            # 手动「进入休息」：同样只标记待休息，不走后门 —— 也要等攻击范围内的
+            # 怪清空才真的进隐身，否则正打着怪突然站住挨打。
+            if s.rest_request:
+                s.rest_request = False
+                self._rest_pending = True
             if now >= self._next_afk:
                 self._rest_pending = True
         else:
+            # 防掉线关着：手动休息没有意义（进入/退出隐身序列就是防掉线的配置，
+            # 而且休息分支在防掉线关掉时会立刻退出休息），请求丢掉
+            s.rest_request = False
             self._rest_pending = False
             self._next_afk = 0.0        # 关掉防掉线：清排期，UI 不显示倒计时
         self._was_afk_enabled = s.anti_afk_enabled
@@ -980,7 +1284,7 @@ class CombatAgent:
                     target = in_range[0]
             else:
                 target = in_range[0]
-            best = self._edge_dist(target, ws.player)
+            best = self._center_dist(target, ws.player)
             self._target_id = target.id
             self._target_until = now + self._random_target_cd()
             self._no_target_since = None
@@ -1017,7 +1321,7 @@ class CombatAgent:
                     if jump_key:
                         hit = next((m for m in mobs
                                     if (m.x - px) * self._patrol_dir >= 0
-                                    and self._in_chase_jump_range(self._edge_dist(m, ws.player))),
+                                    and self._in_chase_jump_range(self._center_dist(m, ws.player))),
                                    None)
                         if hit is not None:
                             tap(jump_key, self._attack_duration)
@@ -1052,6 +1356,9 @@ class CombatAgent:
             return {"state": "idle", "reason": "未开启",
                     "kill_mobs": self._take_kill_mobs()}
 
+        # 最小切换朝向时间：换向后方向键至少按住这么久（决策里没有方向键时补回来）。
+        # 放在发键之前 —— 这里返回的才是真正要发出去的键，也一并回读给 UI。
+        keys = self._hold_turn(keys, now)
         self.keys.set(keys)
 
         # 输出行为：攻击 / 跳规避 / 回身输出（按 self.state）
@@ -1097,14 +1404,24 @@ class CombatAgent:
         s = self.settings
         self._pause_timers(now)
         if self.state == "afk_enter":
-            if self._afk_ctx is None:
-                self._afk_ctx = [s.anti_afk_enter_seq, 0, 0.0, set(), []]
-            r = self._run_seq(now, self._afk_ctx)
-            if r is None:
+            # 休息时长到了，而进入隐身的序列还没走完 → **把剩下的进入行为丢掉**，
+            # 直接去执行退出隐身。进入隐身可能很长（含 delay、含连招），等它演完
+            # 休息时间早就超了；用户要的是「到点就退」，不是「把进入演完再退」。
+            # 注意休息时长是从**进入动作开始那一刻**起算的（见 _begin_rest）。
+            if now >= self._rest_until:
+                # 松掉进入序列按到一半、还没松开的键，否则会卡着那个键去执行退出
+                self._release_ctx(self._afk_ctx)
                 self._afk_ctx = None
-                self.state = "afk_rest"     # 剩余时长在 _begin_rest 就算好了
+                self.state = "afk_exit"
             else:
-                self._afk_ctx = r
+                if self._afk_ctx is None:
+                    self._afk_ctx = [s.anti_afk_enter_seq, 0, 0.0, set(), []]
+                r = self._run_seq(now, self._afk_ctx)
+                if r is None:
+                    self._afk_ctx = None
+                    self.state = "afk_rest"     # 剩余时长在 _begin_rest 就算好了
+                else:
+                    self._afk_ctx = r
         elif self.state == "afk_rest":
             if now >= self._rest_until:
                 self.state = "afk_exit"
@@ -1318,8 +1635,10 @@ def load_rect(v):
 def load_saved() -> dict:
     """读 config/decision.json 的原始内容（纯读，不动内存里的 settings 单例）。
 
-    给「按项目保存」那类配置做全局兜底用 —— 文件里是最后一次 save() 的结果，
-    所以天然跟着最新改动走，不会有内存快照过期的问题。
+    用途是「全局兜底」：文件里是最后一次 save() 的结果（= 最近动过的那套参数），
+    所以天然跟着最新改动走，不会有内存快照过期的问题。两个地方用它：
+      · 打开一个还没存过 decision 段的项目时 —— 用它播种，别让用户白调一遍；
+      · HP/MP 条这类「项目优先、全局兜底」的配置（见 gui/player_panel.py）。
     """
     try:
         return json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))

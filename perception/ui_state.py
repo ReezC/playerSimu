@@ -12,8 +12,9 @@
     要求**登记的全部锚点都命中**才认这个界面。都没命中 = 未知界面，返回 None。
 
 **优先级**
-    断线提示框是盖在登录界面**上面**的浮层，两个界面会同时可见 ——
-    所以按「浮层优先」判定：先 login_err，再 login。
+    这几个界面是**层层叠着**的：断线提示框盖在登录界面上、频道面板盖在服务器
+    列表上、排队弹窗又盖在频道面板上 —— 同一个瞬间会有多层可见。所以按
+    「浮层优先」判定：先 login_err，再 queue / channel_panel / channel_list…
 
 **选锚点的三条硬规矩**（都是踩过 / 量过才定的）
     1. **不含账号等用户数据**。第一版拿整个登录木牌当锚点，里面带着账号
@@ -57,15 +58,48 @@ MATCH_SCALE = 0.5
 # 其余界面上的最高分 <= 0.67，0.80 卡在中间，两边都留了余量。
 THRESHOLD = 0.80
 
-# 界面 id
-UI_LOGIN = "login"          # 登录界面（登录木牌可见，等按「连接」）
-UI_LOGIN_ERR = "login_err"  # 断线提示框「与服务器连接发生错误」浮在上面
+# 搜索范围：只允许锚点在登记位置附近偏移这么多像素（@1920x1080）再找。
+# UI 是固定布局，给一点余量足够；把搜索限制在小窗口里比整帧扫快 ~20 倍
+# （实测 7 个锚点整帧扫 100 ms/次，窗口扫约 7 ms/次），顺带也压低了误命中。
+SEARCH_MARGIN = 60
 
-# 判定优先级：浮层在前 —— 提示框出现时登录界面的锚点也可能命中，先报提示框
-PRIORITY = (UI_LOGIN_ERR, UI_LOGIN)
+# 界面 id
+UI_LOGIN = "login"              # 登录界面（登录木牌可见，等按「连接」）
+UI_LOGIN_ERR = "login_err"      # 断线提示框「与服务器连接发生错误」浮在上面
+UI_CHANNEL_LIST = "channel_list"    # 选择频道：服务器列表（频道面板还没弹出来）
+UI_CHANNEL_PANEL = "channel_panel"  # 选择频道：频道面板已弹出（盖在列表上）
+UI_QUEUE = "queue"                  # 排队弹窗（盖在频道面板上）
+UI_CHAR_SELECT = "char_select"      # 选择角色
+
+# 界面中文名（状态提示 / 日志用）
+UI_NAMES = {
+    UI_LOGIN: "登录界面",
+    UI_LOGIN_ERR: "断线提示框",
+    UI_CHANNEL_LIST: "选择频道（服务器列表）",
+    UI_CHANNEL_PANEL: "选择频道（频道面板）",
+    UI_QUEUE: "排队弹窗",
+    UI_CHAR_SELECT: "选择角色",
+}
+
+# 判定优先级：**浮层在前**。这几个界面是层层叠着的 ——
+# 排队弹窗盖在频道面板上、频道面板盖在服务器列表上、断线提示框盖在登录界面上，
+# 所以必须让「更靠上的那层」先判，否则下层的锚点先命中就报错了层。
+PRIORITY = (UI_LOGIN_ERR, UI_QUEUE, UI_CHANNEL_PANEL, UI_CHANNEL_LIST,
+            UI_CHAR_SELECT, UI_LOGIN)
 
 # 锚点表：界面 id -> [(模板名, 裁剪矩形(x, y, w, h) @1920x1080, 源帧秒数, 说明)]
-# 加新界面（选频道 / 选角 …）先在这里登记，再跑 tools/make_ui_templates.py 生成图。
+# 加新界面先在这里登记，再跑 tools/make_ui_templates.py 生成图。
+#
+# 矩形都是**实测**调出来的（不是目测）：对整段素材每 0.25s 采一帧，要求
+# 「自己那段时间内的分数 >= 0.99，其它所有帧 < 0.80」。实测命中区间：
+#     channel_title      11.75 ~ 18.50   （整个选频道界面，含面板/排队期间）
+#     channel_panel_top  12.50 ~ 18.50   （频道面板弹出期间）
+#     queue_text         16.00 ~ 18.25   （排队弹窗期间）
+#     char_title         18.75 ~ 19.75   （选角界面）
+#     login_connect       3.25 ~  5.25
+#     login_err_text      0.00 ~  2.50
+# 时间轴上的真实切换点（逐帧变化强度测出来的）：12.50s 面板弹出、16.00s 排队
+# 弹窗（同时全屏压暗）、18.75s 切到选角、20.00s 淡出进加载。
 ANCHORS = {
     UI_LOGIN: [
         ("login_connect", (1085, 505, 135, 70), 4.5, "登录木牌上的「连接」按钮"),
@@ -74,6 +108,31 @@ ANCHORS = {
     UI_LOGIN_ERR: [
         ("login_err_text", (748, 386, 245, 62), 0.2,
          "提示框里「红圈图标 + 与服务器连接发生错误」那一条"),
+    ],
+    # 「选择频道」和「选择角色」的标题在**同一位置、同一块深红标牌**上，只靠文字
+    # 区分。这里必须**只裁文字、不含红底**：带着红底时背景占了相关性的大头，
+    # 实测「选择频道」的模板打在选角界面上仍有 0.82（阈值 0.80）→ 误判成选频道。
+    # 只裁文字后：自帧 1.00，对方界面上 0.64，余量足够。
+    UI_CHANNEL_LIST: [
+        ("channel_title", (38, 64, 120, 32), 12.0, "「选择频道」四个字（只裁文字，不含深红底）"),
+    ],
+    # 面板顶条：左边「蓝蜗牛」大标题 + 右边「到选择的世界去」。
+    # 故意用**一条宽的**而不是两个小锚点：宽条被鼠标指针挡住一小块也还能匹配上，
+    # 而「多个锚点全中」的规则下，任何一个小锚点被挡住整个界面就判不出来。
+    # 实战：自帧 1.00，其它界面 ≤ 0.58。
+    UI_CHANNEL_PANEL: [
+        ("channel_panel_top", (700, 380, 620, 50), 15.0,
+         "频道面板顶条（「蓝蜗牛」大标题 + 「到选择的世界去」按钮）"),
+    ],
+    # 弹窗里**避开人数**（「11 名」会变），只用两处固定文案：
+    # 实测真帧 ≥ 0.995，其它界面 ≤ 0.67。
+    UI_QUEUE: [
+        ("queue_waiting", (866, 460, 158, 62), 17.0,
+         "弹窗里两行固定文案「当前世界人数较多 / 正在排队进入游戏」"),
+        ("queue_cancel", (926, 572, 72, 52), 17.0, "「取消」按钮（连边框一起裁）"),
+    ],
+    UI_CHAR_SELECT: [
+        ("char_title", (38, 64, 120, 32), 19.5, "「选择角色」四个字（只裁文字，不含深红底）"),
     ],
 }
 
@@ -139,13 +198,28 @@ def prepare(frame):
     return cv2.resize(frame, (want_w, want_h), interpolation=interp)
 
 
-def _score(img, tpl):
-    """模板匹配的最高分（0~1）。模板比图大时返回 -1（不匹配）。"""
+def _score(img, tpl, rect=None, margin=SEARCH_MARGIN):
+    """模板匹配的最高分（0~1）。模板比图大时返回 -1（不匹配）。
+
+    rect 给了就只在「登记位置 ± margin」的小窗口里找（快很多，见 SEARCH_MARGIN）；
+    传 None 则整帧扫（排查用）。
+    """
     ih, iw = img.shape[:2]
     th, tw = tpl.shape[:2]
     if th > ih or tw > iw:
         return -1.0
-    res = cv2.matchTemplate(img, tpl, cv2.TM_CCOEFF_NORMED)
+    roi = img
+    if rect is not None:
+        x, y, w, h = rect
+        m = int(margin * MATCH_SCALE)
+        x0 = max(0, int(x * MATCH_SCALE) - m)
+        y0 = max(0, int(y * MATCH_SCALE) - m)
+        x1 = min(iw, int((x + w) * MATCH_SCALE) + m)
+        y1 = min(ih, int((y + h) * MATCH_SCALE) + m)
+        if x1 - x0 < tw or y1 - y0 < th:
+            return -1.0
+        roi = img[y0:y1, x0:x1]
+    res = cv2.matchTemplate(roi, tpl, cv2.TM_CCOEFF_NORMED)
     return float(np.nanmax(res))
 
 
@@ -156,9 +230,9 @@ def scores(frame):
     """
     img = prepare(frame)
     per = {}
-    for _ui, name, _r, _t, _d in anchor_rects():
+    for _ui, name, rect, _t, _d in anchor_rects():
         tpl = load_template(name)
-        per[name] = -1.0 if tpl is None else _score(img, tpl)
+        per[name] = -1.0 if tpl is None else _score(img, tpl, rect)
     hit = {}
     for ui, anchors in ANCHORS.items():
         names = [n for n, _r, _t, _d in anchors if load_template(n) is not None]
@@ -167,21 +241,22 @@ def scores(frame):
 
 
 def detect(frame, threshold=THRESHOLD):
-    """判定当前界面。返回界面 id（UI_LOGIN / UI_LOGIN_ERR）或 None（未知）。
+    """判定当前界面。返回界面 id（UI_* 之一）或 None（未知）。
 
     frame: BGR ndarray（抓屏或收流拿到的整帧画面）。
 
     注意「未知」不等于「在游戏里」：登录界面收起登录木牌后的「连接中」
     阶段（素材里 5.5~11.5s）也是只有背景、判不出来，它同样返回 None。
+    所以调用方不能把 None 当成「已经回到游戏」——要靠别的信号（玩家框）判断。
     """
     if frame is None or getattr(frame, "size", 0) == 0:
         return None
     img = prepare(frame)
     for ui in PRIORITY:
         anchors = ANCHORS.get(ui) or []
-        names = [n for n, _r, _t, _d in anchors if load_template(n) is not None]
-        if not names:
+        ready = [(n, r) for n, r, _t, _d in anchors if load_template(n) is not None]
+        if not ready:
             continue
-        if all(_score(img, load_template(n)) >= threshold for n in names):
+        if all(_score(img, load_template(n), r) >= threshold for n, r in ready):
             return ui
     return None

@@ -1,0 +1,10 @@
+# A 机（被控机）部署台的最小依赖。
+#
+# A 机不需要 B 机那一整套（av / opencv / torch / ultralytics）——
+# 它只负责：对时、画时间码探针、转发按键、把桌面推出去。
+#
+#     pip install -r deploy/requirements.txt
+#
+PyQt5>=5.15
+pyserial>=3.5
+PyYAML>=6.0

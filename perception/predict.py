@@ -29,20 +29,55 @@ import numpy as np
 from core.context import ConsoleContext, TaskContext
 from core.imgio import imread, imwrite
 from gui import theme
+from perception.classes import ZH_NAMES
 
-# 类别编号 → 显示名（和 data.yaml 的 class 对齐，与实时预览/质检台一致）
-CLASS_NAMES = {0: "玩家", 1: "怪物", 2: "掉落", 3: "NPC"}
+# 类别名来自 perception/classes.py；颜色来自可视化设置（与实时预览、质检台同一份）
+CLASS_NAMES = ZH_NAMES
 
 
 def _cls_colors():
-    """类别 → BGR 颜色，和实时预览/质检台统一（玩家/怪物从可视化设置读）。"""
-    vis = theme.load_vis()
-    return {
-        0: theme.hex_to_bgr(vis["player_color"]),   # 玩家 蓝
-        1: theme.hex_to_bgr(vis["mob_color"]),      # 怪物 绿
-        2: (0, 255, 255),                           # 掉落 黄
-        3: (0, 0, 255),                             # NPC 红
-    }
+    """类别 → BGR 颜色，和实时预览/质检台统一（每个类别的颜色都能在设置里改）。"""
+    return theme.class_colors()
+
+
+HISTORY = "history.json"
+
+
+def _wlabel(path):
+    """权重路径 → 好认的版本名：`models/detect_v3.pt` 和
+    `runs/detect_v3/weights/best.pt` 都得到 `detect_v3`。"""
+    p = Path(str(path or ""))
+    if p.stem == "best" and p.parent.name == "weights":
+        return p.parent.parent.name
+    return p.stem or "?"
+
+
+def _append_history(out, stats):
+    """把这次验证的结果追加到 out/history.json。
+
+    **为什么值得单独存一份**：验证的用途就是拿同一批画面试不同版本的模型，
+    但输出目录是公用的、图片每次都被覆盖 —— 只看得到最后一次的数字，
+    上一版是多少全靠记忆。存个小历史，卡片就能把几次摆在一起比。
+    """
+    f = Path(out) / HISTORY
+    try:
+        hist = json.loads(f.read_text(encoding="utf-8"))
+        if not isinstance(hist, list):
+            hist = []
+    except Exception:
+        hist = []
+    rec = {k: stats.get(k) for k in
+           ("frames", "boxes", "frames_with", "zero_frames", "median_boxes",
+            "conf_median", "source", "conf_thr")}
+    rec["weights"] = _wlabel(stats.get("weights"))
+    rec["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    hist.append(rec)
+    try:
+        # 只留最近 50 次：这是给人看的对照表，不是审计日志
+        f.write_text(json.dumps(hist[-50:], ensure_ascii=False, indent=2) + "\n",
+                     encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _pct(arr, q):
@@ -190,9 +225,11 @@ def run_predict(params, ctx=None):
             json.dump(stats, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+    _append_history(out, stats)
 
     ctx.log("")
     ctx.log("── 验证完成 ──", "ok")
+    ctx.log("  模型 %s" % _wlabel(stats.get("weights")))
     ctx.log("  画面 %d 张 / 检出 %d 框 / 有检出 %d 帧（%.0f%%）"
             % (n, n_boxes, n_with, 100.0 * n_with / max(1, n)))
     if counts:
