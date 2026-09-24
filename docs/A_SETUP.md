@@ -16,6 +16,10 @@
 
 装依赖（在**仓库根**做一次）：
 
+**省事的做法**：把整个仓库拷到 A 机，在仓库根**双击「被控机部署台（装环境）.bat」** ——
+它会找 Python、建 `venv`、装这三个包、验证导入，最后把还差的东西一次列出来。
+（等价的命令行在下面，脚本起不来或想看每一步时用。）
+
 ```powershell
 # 1) 建一个 venv 并装依赖
 python -m venv .venv
@@ -25,6 +29,9 @@ python -m venv .venv
 # 2) 启动（双击仓库根的「被控机部署台.bat」也行）
 .venv\Scripts\python -m deploy.app
 ```
+
+**前置**：A 机要有 Python 3.10+（`winget install -e --id Python.Python.3.10`，
+或官网安装包勾上「Add python.exe to PATH」）。装环境的脚本会检查这一条。
 
 **依赖装进哪个解释器**：装进「启动部署台的那个」就够了 —— 四个服务都由部署台用
 **同一个**解释器拉起（`deploy/services.py` 的 `python_exe()` = `sys.executable`）。
