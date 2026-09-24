@@ -1100,11 +1100,17 @@ class PlayerPanel(QWidget):
         和实时线程抢连接），界面上点「重置指令通道」即可。
         """
         h = dinput.link_health()
-        key = (h.get("backend"), bool(h.get("ok", True)), str(h.get("err") or ""))
+        backend, ok = h.get("backend"), bool(h.get("ok", True))
+        # 坏着就**持续**重试（节流在 _auto_reconnect_link 里，5 秒一次）。
+        # **不能只在「状态变化」那一下试一次**：第一次赶巧失败（relay 正忙、
+        # 板子还在重枚举）就再也不试了 —— 界面永远红着、指令一条都发不出去，
+        # 表现就是「远程输出全无效」。这是我上一版写错的地方。
+        if backend in ("remote", "serial") and not ok:
+            self._auto_reconnect_link()
+        key = (backend, ok, str(h.get("err") or ""))
         if key == getattr(self, "_link_key", None):
             return                      # 状态没变就别每 500ms 重写控件
         self._link_key = key
-        backend, ok = h.get("backend"), bool(h.get("ok", True))
         if backend in ("remote", "serial"):
             if ok:
                 self.lbl_device_state.setText(
@@ -1116,7 +1122,6 @@ class PlayerPanel(QWidget):
                     "指令发不出去：%s\n（正在自动重连；也可点「重置指令通道」）"
                     % (h.get("err") or "链路无回执"))
                 self.lbl_device_state.setStyleSheet("color: #c5221f;")
-                self._auto_reconnect_link()
         elif backend == "blocked":
             self.lbl_device_state.setText(
                 "通道断了又没接上（已停止发指令）—— 正在自动重连")

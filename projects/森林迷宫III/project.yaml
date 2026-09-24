@@ -46,7 +46,7 @@ decision:
   chase_jump_enabled: true
   chase_jump_min: -10
   chase_jump_max: 5
-  mouse_speed: 1.8000000000000005
+  mouse_speed: 1.9
   evade_type: jump
   jump_interval: 0
   jump_random_prob: 0.1

@@ -19,6 +19,10 @@ class KbdClient:
         ctx.check_hostname = False          # 自签证书不校主机名
         raw = socket.create_connection((host, port), timeout=timeout)
         self._sock = ctx.wrap_socket(raw, server_hostname=host)
+        # **超时只在这里设一次**：原来 send() 每次都调 settimeout(2.0)，而读线程
+        # 同时在这个 socket 上 recv —— 多线程改同一个 socket 的超时会打乱正在进行的
+        # 收发（TLS 层尤其敏感）。收发都用 2 秒，读线程本来就把超时当「空闲」处理。
+        self._sock.settimeout(2.0)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._dirty = False      # 上一条可能只发出去半行（超时中断）→ 下一条要重新对齐
@@ -52,7 +56,6 @@ class KbdClient:
         data = (line + "\n").encode()
         with self._lock:
             try:
-                self._sock.settimeout(2.0)
                 if self._dirty:
                     data = b"\n" + data     # 切掉对端残留的半行
                 self._sock.sendall(data)

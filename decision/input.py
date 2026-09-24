@@ -8,6 +8,7 @@ GetAsyncKeyState 有效（大多数 ARPG）；个别用 DirectInput 读扫描码
 """
 
 import ctypes
+import threading
 import time
 from ctypes import wintypes
 
@@ -212,6 +213,13 @@ _cfg = None
 # 断开期间宁可什么都不发，等重连成功再恢复。
 _blocked = False
 
+# 换后端（连 / 断 / 重连）**必须串行**：这几件事都是「先关旧的、再建新的」。
+# 两个线程同时做就会出现「一边正在 TLS 握手，另一边把那个 socket 关掉」——
+# 表现是 relay 侧刷「客户端在 TLS 握手阶段断开」（实测踩过：手动的「重置指令通道」
+# 和界面上新加的自动重连撞在一起）。用 RLock：reconnect_remote 内部要调
+# use_network（同一线程重入），普通 Lock 会把自己锁死。
+_link_rlock = threading.RLock()
+
 _CMD_KEY = {
     "left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN",
     "ctrl": "CTRL", "alt": "ALT", "shift": "SHIFT",
@@ -304,20 +312,21 @@ def reconnect_remote():
     _blocked：什么都不发，等下次重连成功。
     """
     global _remote, _blocked
-    if _remote is None or _cfg is None:
-        _blocked = False
-        return True
-    kind = _cfg[0]
-    try:
-        if kind == "remote":
-            use_network(_cfg[1], _cfg[2], _cfg[3])
-        else:
-            use_serial(_cfg[1])
-        return True
-    except Exception:
-        _drop_remote()
-        _blocked = True
-        return False
+    with _link_rlock:               # 与其它换后端的调用串行（见 _link_rlock 说明）
+        if _remote is None or _cfg is None:
+            _blocked = False
+            return True
+        kind = _cfg[0]
+        try:
+            if kind == "remote":
+                use_network(_cfg[1], _cfg[2], _cfg[3])
+            else:
+                use_serial(_cfg[1])
+            return True
+        except Exception:
+            _drop_remote()
+            _blocked = True
+            return False
 
 
 def release_all_remote():
@@ -405,13 +414,18 @@ def _drop_remote():
 
 
 def use_network(host, port, cafile):
-    """切到网络后端（agent 在控制机时，启动阶段调用一次）。"""
+    """切到网络后端（agent 在控制机时，启动阶段调用一次）。
+
+    拿锁期间会做完整的 TLS 握手（可能要几秒）—— 这是故意的：握手和「关旧连接」
+    必须互斥，否则会互相打断（见 _link_rlock 的说明）。
+    """
     global _remote, _cfg, _blocked
-    _drop_remote()
-    from remote_kbd.kbd_client import KbdClient
-    _remote = KbdClient(host, port, cafile)
-    _cfg = ("remote", host, port, cafile)   # 记下来给 reconnect_remote 用
-    _blocked = False
+    with _link_rlock:
+        _drop_remote()
+        from remote_kbd.kbd_client import KbdClient
+        _remote = KbdClient(host, port, cafile)
+        _cfg = ("remote", host, port, cafile)   # 记下来给 reconnect_remote 用
+        _blocked = False
 
 
 def use_serial(port):
@@ -420,29 +434,31 @@ def use_serial(port):
     port 为空或打开失败时，自动扫描 Arduino/SparkFun 串口（换 USB 口不用改配置）。
     """
     global _remote, _cfg, _blocked
-    _drop_remote()
-    from remote_kbd.serial_kbd import SerialKbd, find_pro_micro_port
-    if port:
-        try:
-            _remote = SerialKbd(port)
-            _cfg = ("serial", port)
-            _blocked = False
-            return
-        except Exception:
-            pass   # 配置的串口打不开，走自动发现
-    found = find_pro_micro_port()
-    if found is None:
-        raise RuntimeError("找不到 Pro Micro 串口（确认已插入，或检查 config/link.yaml 的 serial_local）")
-    _remote = SerialKbd(found)
-    _cfg = ("serial", found)
-    _blocked = False
+    with _link_rlock:
+        _drop_remote()
+        from remote_kbd.serial_kbd import SerialKbd, find_pro_micro_port
+        if port:
+            try:
+                _remote = SerialKbd(port)
+                _cfg = ("serial", port)
+                _blocked = False
+                return
+            except Exception:
+                pass   # 配置的串口打不开，走自动发现
+        found = find_pro_micro_port()
+        if found is None:
+            raise RuntimeError("找不到 Pro Micro 串口（确认已插入，或检查 config/link.yaml 的 serial_local）")
+        _remote = SerialKbd(found)
+        _cfg = ("serial", found)
+        _blocked = False
 
 
 def use_local():
     """切回本地 SendInput，并关闭远程连接（socket / 串口不泄漏）。"""
     global _blocked
-    _drop_remote()
-    _blocked = False
+    with _link_rlock:
+        _drop_remote()
+        _blocked = False
 
 
 def shutdown():

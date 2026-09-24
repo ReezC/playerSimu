@@ -130,7 +130,20 @@ class SerialLink:
     def read(self, n):
         with self._lock:
             try:
-                return self._ser.read(n)
+                # **非阻塞读**：先问驱动有多少字节，没有就立刻返回。
+                #
+                # 绝不能占着锁去 read() —— read 在没数据时会**阻塞到 timeout
+                # （0.3 秒）**，而写路径用的是同一把锁，于是：
+                #   · 主线程写一条指令要排队最长 0.3 秒 → 鼠标延迟暴涨
+                #   · RLock 不保证公平，读线程循环抢锁能把写**饿死** →
+                #     B 侧 2 秒发送超时 → PRESS 白丢
+                #   · 现象就是「连接是通的（RELEASEALL 挤进去了），但按键全无效、
+                #     鼠标延迟巨大、A 机光标一直一点点地爬」
+                #   （实测踩过；改动前读写互不相关，是我加锁时带进来的。）
+                waiting = self._ser.in_waiting
+                if not waiting:
+                    return b""
+                return self._ser.read(min(n, waiting))
             except Exception as e:
                 trace("serial read error: %s" % e)
                 self.reopen("read")
@@ -184,6 +197,9 @@ def bridge(conn, link):
                     conn.sendall(data)
                 except Exception:
                     break
+            else:
+                # 没数据：让出 CPU（read 现在是非阻塞的，不然这里会空转满核）
+                time.sleep(0.002)
 
     t = threading.Thread(target=ser_to_tcp, daemon=True)
     t.start()
@@ -290,7 +306,12 @@ def main():
         try:
             tls = ctx.wrap_socket(conn, server_side=True)
         except Exception as e:
-            print(f"[relay] TLS handshake failed: {e}")
+            # 握手阶段对端就走了：多数情况是 B 侧「重连」的中间态（它撤掉了刚建的
+            # 连接，或两个重连撞在一起）—— 偶发一条不用管，relay 会继续等下一个。
+            # **持续刷屏**才是问题（B 侧在反复重连、一次都没成），那时要查：
+            # 证书/端口、以及 B 侧那行状态栏写的原因。
+            print(f"[relay] 客户端在 TLS 握手阶段断开（{e}）"
+                  f" —— 偶发可忽略；一直刷就是 B 侧连不上")
             conn.close()
             continue
         print(f"[relay] client {addr[0]} connected")
