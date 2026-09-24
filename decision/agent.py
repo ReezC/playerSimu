@@ -19,6 +19,7 @@ import random
 import threading
 import time
 
+from core import perf
 from decision.input import DEFAULT_KEYMAP, KeyState, key_down, key_up, tap
 
 # 决策参数的落点：**只按项目存** —— projects/<项目>/project.yaml 的 decision 段，
@@ -552,6 +553,7 @@ class CombatAgent:
         if not jump_key:
             return
         tap(jump_key, self._attack_duration)
+        perf.count("jump")
         attack_cd_s = max(0.0, float(s.attack_cd)) / 1000.0
         self._next_chase_jump = now + max(0.3, attack_cd_s + self._random_input_delay())
 
@@ -666,6 +668,11 @@ class CombatAgent:
                     if elem["type"] == "down":
                         key_down(key)
                         held.add(key)
+                        if output:
+                            # 性能口径：从「取到这一帧」到「输出键真的按下去」隔了多久
+                            # —— 本机处理 + 排期等待的总和。推理尖刺、排期拖后都会
+                            # 直接体现在这里（控制质量的关键量，见 core/perf.py）。
+                            perf.since_frame("out_key_ms")
                         # 非输出序列（定时行为之类）按了攻击键，也算一次「外部输出」，
                         # 让战斗输出避开它；输出序列自己已经在开跑时打过点了。
                         if not output and key == self.settings.keymap.get("attack"):
@@ -839,6 +846,7 @@ class CombatAgent:
             self._release_ctx(self._back_ctx)
             self._back_ctx = None
         self.state = new_state
+        perf.count("st_" + str(new_state))      # 状态分布：抖动（攻击↔追击）一眼可见
 
     def _locked_target(self, lockable, ws, now):
         """chase 用的锁定目标：target_cd 机制，无抢锁。返回 (target, best)。"""
@@ -885,7 +893,7 @@ class CombatAgent:
                     and lo <= self._center_dist(m, ws.player) <= hi):
                 self._kill_mobs.add(m.id)
 
-    def _run_output_ctx(self, now, ctx, seq, cd):
+    def _run_output_ctx(self, now, ctx, seq, cd, tag="out"):
         """推进一条输出序列（攻击输出 / 回身输出）；跑完按输出CD排下一轮。
 
         决策拍（`tick`）和时序拍（`tick` 的 timing_only）都调它 —— 两边的推进逻辑
@@ -895,6 +903,11 @@ class CombatAgent:
         if r is not None:
             return r
         due = self._next_output_ts(now, cd)
+        # 打点：两轮输出之间实际隔了多久（上一轮开始 → 这一轮开始）。**这里**才是
+        # 「重新排期」的唯一位置，「CD=0 为什么不立即输出」看这个分布就有答案。
+        if self._last_output > 0.0:
+            perf.sample(tag + "_gap_ms", (now - self._last_output) * 1000.0)
+        perf.count(tag + "_round")
         nxt = [seq, 0, due, set(), []]
         if due <= now:
             # 序列本身比 CD + 随机延迟还长 → 同一帧直接起步，不白等一个 tick
@@ -912,7 +925,7 @@ class CombatAgent:
                                                     s.output_seq, cd)
         if self._back_ctx is not None and self.state == "evade_back_jump":
             self._back_ctx = self._run_output_ctx(now, self._back_ctx,
-                                                  s.back_jump_seq, cd)
+                                                  s.back_jump_seq, cd, tag="back")
 
     def next_deadline(self):
         """下一个「到点该发」的时刻（monotonic）；没有任何序列在跑时返回 None。
@@ -998,6 +1011,7 @@ class CombatAgent:
             if now >= self._next_evade:
                 if jump_key:
                     tap(jump_key, self._attack_duration)
+                    perf.count("jump")
                 self._pending_attack = now + interval
                 self._next_evade = now + interval + attack_cd + self._random_input_delay()
             if (self._pending_attack is not None and now >= self._pending_attack
@@ -1006,6 +1020,7 @@ class CombatAgent:
                 # 不吃朝向），但攻击键要等转身做完，否则打向错误的方向。
                 # 没到点就继续挂着 _pending_attack，下一帧再补。
                 tap(attack_key, self._attack_duration)
+                perf.count("out_evade")
                 self._last_output = now
                 self._pending_attack = None
 
@@ -1016,7 +1031,8 @@ class CombatAgent:
                 return                   # 刚转向：先不输出（回身输出同样吃朝向）
             # 序列走完由 _run_output_ctx 按输出CD排下一轮（回身输出是循环行为）
             self._back_ctx = self._run_output_ctx(now, self._back_ctx,
-                                                  s.back_jump_seq, attack_cd)
+                                                  s.back_jump_seq, attack_cd,
+                                                  tag="back")
 
     def _take_kill_mobs(self):
         """取出并清空待消除的幽灵框 id 列表（tick 各返回路径统一带上）。
@@ -1317,6 +1333,12 @@ class CombatAgent:
                 # 追击起跳：本分支攻击范围内本来就是空的，不存在「其他怪」，前提天然满足
                 self._maybe_chase_jump(best, now, edge=jump_edge)
                 self._set_state("chase")
+                # 打点：追的目标离多远、以及它是不是「幽灵框」（missed>0，即已经
+                # 漏检、靠防抖保留着位置的框）。chase_ghost 占追击时间越多，说明
+                # debounce_ms 保留太久 —— 角色正朝一个已经消失的框走过去。
+                perf.sample("chase_dist", best or 0.0)
+                if getattr(target, "missed", 0) > 0:
+                    perf.count("chase_ghost")
             elif s.strategy == "sweep":
                 # 扫平台巡逻：无背后怪，朝倾向朝向走（不锁定、无红框）。
                 # 物理朝向先拉回倾向朝向（可能刚转身打过背后怪），再朝它走。

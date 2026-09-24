@@ -302,12 +302,23 @@ class LiveThread(QThread):
         # 两种来源共用同一个 slot + 推理主循环，只有 reader 的取帧方式不同：
         #   stream —— PyAVSource 收流（阻塞读，按序解）
         #   window —— wincap.grab_rect 循环抓本地窗口区域
+        # 性能打点：关键路径的耗时留在仓库根 perf.log 里，事后直接看，不用现场加
+        # print（开销见 core/perf.py 的说明：常开也只有纳秒级 + 每 30 秒一次落盘）。
+        # 开关在「设置 → 性能日志」（存 config/live.yaml 的 perf_log），不在这里。
+        from core import perf
+        perf.configure(bool(self._p.get("perf_log", True)))
+
         slot = _LatestSlot()
         reader_done = threading.Event()
 
         src = None
         size_ref = [None]      # (w, h)，第一帧后填，给统计条显示分辨率
         fps_ref = [0.0]
+        # 帧预算（秒）= 输入帧间隔。**两个来源都必须赋值**，别只在窗口分支里定义 ——
+        # 之前只在 window 分支算 `interval`，推流模式下主循环引用它就
+        # UnboundLocalError（点「开始推理」必炸）。推流用流的 fps，窗口用抓帧 fps；
+        # 拿不到 fps 就置 0，表示「不知道预算」，此时不统计超预算（宁可不报，别误报）。
+        budget = 0.0
 
         if source == "window":
             from core import wincap
@@ -325,6 +336,7 @@ class LiveThread(QThread):
             capture_fps = max(1.0, float(self._p.get("capture_fps", 15.0)))
             interval = 1.0 / capture_fps
             fps_ref[0] = capture_fps
+            budget = interval
             frame_id = [0]
 
             def _reader():
@@ -373,6 +385,7 @@ class LiveThread(QThread):
             self.stream_status.emit("connected")
             size_ref[0] = src.size
             fps_ref[0] = src.fps or 0.0
+            budget = 1.0 / fps_ref[0] if fps_ref[0] else 0.0
 
             def _reader():
                 try:
@@ -391,6 +404,15 @@ class LiveThread(QThread):
                 finally:
                     reader_done.set()
 
+        # 段头注记：同样的毫秒数，在不同预算/设备/分辨率下含义完全不同，
+        # 日志自己把条件带上，事后评估才不用猜。**放在两个分支之后** —— 推流模式下
+        # fps 要等 open() 才知道，写在分支里会漏掉（当初就漏了）。
+        perf.note("budget_ms", round(budget * 1000.0, 1) if budget else "未知")
+        perf.note("fps", round(fps_ref[0], 1) if fps_ref[0] else "未知")
+        perf.note("source", source)
+        perf.note("imgsz", self._p.get("imgsz", 640))
+        perf.note("device", self._p.get("device", ""))
+
         reader = threading.Thread(target=_reader, daemon=True)
         reader.start()
 
@@ -405,6 +427,9 @@ class LiveThread(QThread):
         infer_ms = []
         gaps = []
         last_mono = None
+        # 上一次统计窗口的 [收帧数, 处理数, 丢弃数]，用来算**窗口内**的速率
+        # （累计平均会把「刚刚开始恶化」抹平）
+        _prev = [0, 0, 0]
 
         # 端到端延迟：解码 A 机屏幕上的时间码探针。
         #
@@ -418,11 +443,35 @@ class LiveThread(QThread):
         #   前提是 B 机做过时钟同步（tools.clock_sync --host <A机IP> --save）。
         # 本地窗口抓取没有跨机传输，探针测的延迟无意义，强制关闭
         probe_on = bool(self._p.get("probe", False)) and source == "stream"
-        px = int(self._p.get("probe_x", 100))
-        py = int(self._p.get("probe_y", 8))
-        cell = int(self._p.get("probe_cell", 16))
-        gap = float(self._p.get("probe_gap", 2))
+        # 回退几何：link.yaml 里的绝对像素（没有人工标定时用）
+        probe_px = (float(self._p.get("probe_x", 100)),
+                    float(self._p.get("probe_y", 8)),
+                    float(self._p.get("probe_cell", 16)),
+                    float(self._p.get("probe_gap", 2)))
         bits = int(self._p.get("probe_bits", 40))
+
+        # 探针几何：**优先用人工框选的结果**（config/probe_calib.json，存的是画面
+        # 比例），没有才回退到上面的像素值。比例版换流分辨率/窗口大小都不用重标。
+        # 每秒重读一次 —— 在界面上框选完不用重开预览就能生效。
+        _calib = [0.0, None]        # [上次重读时刻, 标定值]
+        _calib_src = [None]         # 上一次记进 perf 注记的来源
+
+        def _probe_geom(shape):
+            now = time.perf_counter()
+            if now - _calib[0] >= 1.0:
+                _calib[0] = now
+                try:
+                    _calib[1] = probe_codec.load_calib()
+                except Exception:
+                    _calib[1] = None
+                src = "人工标定" if _calib[1] else "配置值"
+                if _calib_src[0] != src:
+                    _calib_src[0] = src
+                    perf.note("probe", src)     # 段头能看到这一段的几何是哪来的
+            cal = _calib[1]
+            if cal:
+                return probe_codec.calib_to_px(cal, shape)
+            return probe_px
         offset_ms = float(self._p.get("clock_offset_ms", 0.0) or 0.0)
 
         delays = []
@@ -438,6 +487,7 @@ class LiveThread(QThread):
             except Exception:
                 pass
             try:
+                from tools import probe_codec
                 from tools.probe_codec import decode_ms, resolve_delay_ms
             except Exception as e:
                 self.failed.emit("探针解码模块不可用: %s" % e)
@@ -463,15 +513,22 @@ class LiveThread(QThread):
                 if f is None:
                     if reader_done.is_set():
                         break          # 流结束了
+                    _t = time.perf_counter()
                     agent.tick_timing(ws)   # 时序拍：只发「到点该发」的，不做画面决策
+                    perf.ms("timing_ms", _t)
+                    perf.count("timing_calls")
                     continue           # 只是暂时没新帧，继续等
                 n += 1
 
                 if last_mono is not None:
-                    gaps.append((f.t_recv_mono - last_mono) * 1000.0)
+                    _gap = (f.t_recv_mono - last_mono) * 1000.0
+                    gaps.append(_gap)
+                    perf.sample("gap_ms", _gap)
                     if len(gaps) > 60:      # 下面只用得到最近 60 个（见 stats_ready）
                         del gaps[0]
                 last_mono = f.t_recv_mono
+                _t_pipe = time.perf_counter()   # 「收到这一帧 → 决策完」的总耗时
+                perf.frame_arrived(_t_pipe)     # 记下这帧被取走的时刻（算 out_key_ms）
                 vis = f.image          # BGR（decode_format="bgr24" 直出）
 
                 # 定期重读可视化配置：标记颜色/线宽改了实时生效
@@ -507,10 +564,20 @@ class LiveThread(QThread):
                 if probe_on:
                     # f.image 是 BGR，转灰度解码
                     gray = cv2.cvtColor(vis, cv2.COLOR_BGR2GRAY)
+                    # 几何每帧现算：人工标定是比例，要按当前画面尺寸换算
+                    # （read_bits 支持浮点 cell，所以不必取整）
+                    px, py, cell, gap = _probe_geom(gray.shape)
                     ts_a = decode_ms(gray, px, py, cell, gap, bits)
                     if ts_a is None:
                         probe_miss += 1
+                        # 探针解不出来也要留痕：端到端延迟是「控制质量的真指标」，
+                        # 但它一旦解码失败，日志里只剩少数样本，读出来会**偏小**，
+                        # 看着像「延迟变好了」—— 那是假象（实测踩过：段内样本
+                        # 1433→161，中位同步从 35ms 掉到 12ms）。把 miss/ok 记下来，
+                        # 报告里一比就知道这个数能不能信。
+                        perf.count("probe_miss")
                     else:
+                        perf.count("probe_ok")
                         d = resolve_delay_ms(
                             (f.t_recv_wall + offset_ms / 1000.0) * 1000.0, ts_a)
                         # 超过 5 秒视为解码错误（而不是真的有 5 秒延迟）
@@ -518,6 +585,12 @@ class LiveThread(QThread):
                             delays.append(d)
                             if len(delays) > 120:
                                 del delays[0]
+                            # 端到端延迟（A 机屏幕时间码 → 本机解码）才是最该盯的
+                            # 性能指标，以前只在界面显示中位数、不进日志。
+                            perf.sample("e2e_probe_ms", d)
+                        else:
+                            # 解出来了但数值离谱（>5 秒）= 解错了一位数字，不算样本
+                            perf.count("probe_reject")
 
                 # ---- 推理（由「开始推理」开关控制）----
                 if self._infer.is_set():
@@ -546,6 +619,7 @@ class LiveThread(QThread):
                     res = model.predict(vis, conf=conf, imgsz=imgsz,
                                         device=device, verbose=False)[0]
                     infer_ms.append((time.perf_counter() - t0) * 1000.0)
+                    perf.ms("infer_ms", t0)
                     if len(infer_ms) > 60:
                         del infer_ms[0]
 
@@ -669,7 +743,16 @@ class LiveThread(QThread):
                     # 地形关系识别（感知层）：给每只怪打上所在平台 + 是否与玩家
                     # 当前平台连接。Agent 只消费 mob.reachable，不做几何运算。
                     relate_terrain(ws.mobs, ws.player, ws.platforms)
+                    _t = time.perf_counter()
                     action = agent.tick(ws)
+                    perf.ms("agent_ms", _t)
+                    _pipe = (time.perf_counter() - _t_pipe) * 1000.0
+                    perf.sample("pipe_ms", _pipe)   # 收到帧 → 决策完（含推理/追踪）
+                    # 帧预算 = 输入帧间隔。处理时间超过预算就意味着这帧「做不完」，
+                    # 下一帧已经在路上 —— 这是实时性风险的第一手信号，单看中位看不出来。
+                    # 预算未知（fps 拿不到）时不统计：宁可不报，也别误报。
+                    if budget > 0 and _pipe > budget * 1000.0:
+                        perf.count("over_budget")
                     # 输出行为命中了防抖幽灵框 → 一次性消除这些轨迹，避免持续空放技能
                     for _mid in ((action or {}).get("kill_mobs") or []):
                         mob_tracker.kill(_mid)
@@ -692,6 +775,7 @@ class LiveThread(QThread):
                     t_last_show = now
                     n_show += 1
 
+                _t_draw = time.perf_counter()
                 if should_show and draw and self._infer.is_set():
                     # 平台顶边：青色实线；编号稳定于 PlatformTracker，便于排查地图
                     # 滚动/局部重检时的关联。当前平台额外画白色。
@@ -820,12 +904,27 @@ class LiveThread(QThread):
                                               _lock_color, 3)
                                 break
 
+                # 画框耗时：没画框的帧这里接近 0（大部分帧是不画的），
+                # 所以看 p95 / 最大才是真实开销。
+                perf.ms("draw_ms", _t_draw)
+
                 # 显示限流：到点了才推一帧。emit 是队列信号，不阻塞推理，
                 # 所以推理始终按自己的速度跑。
                 if should_show:
                     self.frame_ready.emit(vis)
 
                 if now - t_last_stat >= 0.5:
+                    # 吞吐/丢弃/负载：recv 是链路能给的输入速度，proc 是我们真处理
+                    # 掉的；两者差距 + drop 增量 = 「实时性已经在丢」的第一手证据。
+                    win = now - t_last_stat
+                    if win > 0:
+                        perf.sample("recv_fps", (slot.put_count - _prev[0]) / win)
+                        perf.sample("proc_fps", (n - _prev[1]) / win)
+                    if slot.dropped > _prev[2]:
+                        perf.count("drop", slot.dropped - _prev[2])
+                    _prev[0], _prev[1], _prev[2] = slot.put_count, n, slot.dropped
+                    perf.sample("boxes", float(n_boxes))   # 每帧的框数 = 负载
+                    perf.flush()        # 到点（默认 30 秒）落一段到 perf.log
                     el = now - t_start
                     gaps_recent = gaps[-60:]
                     self.stats_ready.emit({

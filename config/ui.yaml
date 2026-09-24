@@ -1,9 +1,12 @@
 font_size: 11
 vis:
   attack_color: '#ffff00'
+  drop_color: '#ffff00'
   lock_color: '#ff0000'
   min_attack_color: '#ff691e'
   mob_color: '#ff6788'
+  npc_color: '#ff0000'
+  other_player_color: '#ff00ff'
   player_color: '#4285f4'
   vision_color: '#5f6368'
   vision_width: 1

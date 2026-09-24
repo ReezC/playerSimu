@@ -15,10 +15,11 @@
 拿不到某项（非 Windows / 系统调用失败）就显示「—」，不影响其他项。
 """
 
-import ctypes
 import gc
 import threading
 import time
+
+from core import perf
 
 _START = time.monotonic()
 _last = None            # 上一次快照（同一进程内前后对比用）
@@ -26,57 +27,10 @@ _last = None            # 上一次快照（同一进程内前后对比用）
 #: 各项超过这些变化量就提示一句（不是判死，只是让你别忽略）
 _LIMITS = {"rss_mb": 50.0, "handles": 50, "threads": 2, "gc_objects": 5000}
 
-
-def _procs():
-    """(当前进程伪句柄, kernel32, psapi)。ctypes 的签名必须显式声明 ——
-    `GetCurrentProcess()` 返回的伪句柄是 -1，默认 c_int 会把它截成
-    0xFFFFFFFF，和真正的 INVALID_HANDLE_VALUE 不是一个值，调用会直接失败。"""
-    k32 = ctypes.windll.kernel32
-    k32.GetCurrentProcess.restype = ctypes.c_void_p
-    return k32.GetCurrentProcess(), k32, ctypes.windll.psapi
-
-
-def _rss_mb():
-    """当前进程常驻内存（MB）；拿不到返回 None。"""
-    try:
-        class _PMC(ctypes.Structure):
-            _fields_ = [("cb", ctypes.c_ulong),
-                        ("PageFaultCount", ctypes.c_ulong),
-                        ("PeakWorkingSetSize", ctypes.c_size_t),
-                        ("WorkingSetSize", ctypes.c_size_t),
-                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                        ("PagefileUsage", ctypes.c_size_t),
-                        ("PeakPagefileUsage", ctypes.c_size_t)]
-
-        h, _k32, psapi = _procs()
-        psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
-                                              ctypes.c_ulong]
-        psapi.GetProcessMemoryInfo.restype = ctypes.c_int
-        pmc = _PMC()
-        pmc.cb = ctypes.sizeof(pmc)
-        if not psapi.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
-            return None
-        return pmc.WorkingSetSize / (1024.0 * 1024.0)
-    except Exception:
-        return None
-
-
-def _handles():
-    """进程当前的内核句柄数（socket / 文件 / 线程漏关都记在这）。"""
-    try:
-        h, k32, _psapi = _procs()
-        k32.GetProcessHandleCount.argtypes = [ctypes.c_void_p,
-                                             ctypes.POINTER(ctypes.c_ulong)]
-        k32.GetProcessHandleCount.restype = ctypes.c_int
-        n = ctypes.c_ulong()
-        if not k32.GetProcessHandleCount(h, ctypes.byref(n)):
-            return None
-        return int(n.value)
-    except Exception:
-        return None
+# RSS / 句柄的取法只有一份实现（core/perf.py）—— 那边每段落盘时也自动采一次，
+# 这里只是手动点按钮时用同一份。以前这里是复制的一份 ctypes 代码。
+_rss_mb = perf.rss_mb
+_handles = perf.handles
 
 
 def snapshot():

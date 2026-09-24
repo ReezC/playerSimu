@@ -9,8 +9,8 @@
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (QCheckBox, QFormLayout, QHBoxLayout, QLabel,
-                             QLineEdit, QPushButton, QSizePolicy, QVBoxLayout,
-                             QWidget)
+                             QLineEdit, QMessageBox, QPushButton, QSizePolicy,
+                             QVBoxLayout, QWidget)
 
 import numpy as np
 
@@ -167,8 +167,28 @@ class LivePanel(QWidget):
             "不启用时延迟显示为 ——，因为 pts 推算只能反映网络抖动，测不出真实延迟。")
         row.addWidget(self.ck_probe)
 
+        # 探针几何：人工框选（秒级、当场验证）—— 「调完探针大小，收流位置全靠猜」的解药。
+        # 与 HP/MP 条同一套框选交互（在实时画面上拖矩形），但换算不同：
+        # 方块带是 n = 2+bits 个等大等距方块，头两个是固定标记（白、黑），
+        # 所以框完能**当场解码验证**；解不出就不保存（宁可不改，也别改坏）。
+        self.btn_probe_box = QPushButton("框选探针")
+        self.btn_probe_box.setToolTip(
+            "在实时画面上框住整条时间码方块带（含最左边那个常亮的白块）。\n"
+            "框完当场解码验证：解得出时间码才保存。\n"
+            "存进 config/probe_calib.json，存的是**画面比例** —— 换分辨率/窗口不用重标；\n"
+            "保存后每秒自动生效，不用重开预览。解不出会提示检查什么，且不修改任何配置。")
+        self.btn_probe_box.clicked.connect(self._pick_probe)
+        row.addWidget(self.btn_probe_box)
+
         row.addStretch(1)
         root.addLayout(row)
+
+        # 探针几何一行：现在用的是哪套（人工标定 / 配置值）、具体数值是多少。
+        # 有这一行就不用再靠猜 —— 改完立刻看得见。
+        self.lbl_probe = QLabel()
+        self.lbl_probe.setStyleSheet("color:#5f6368;")
+        self._refresh_probe_label()
+        root.addWidget(self.lbl_probe)
 
         # ---- 画面 ----
         self.view = QLabel("（点「开始」后这里显示实时画面）")
@@ -206,6 +226,97 @@ class LivePanel(QWidget):
         self.lbl_rect.setVisible(is_win)
         self.lbl_capfps.setVisible(is_win)
         self.sp_capfps.setVisible(is_win)
+
+    # ---------------- 探针几何（人工框选标定） ----------------
+
+    def _probe_label_text(self):
+        """当前探针几何 + 来源，一行说完。"""
+        from tools import probe_codec
+        bits = int(get("probe", "bits", 40))
+        cal = probe_codec.load_calib()
+        if cal:
+            if self._last_bgr is not None:
+                h, w = self._last_bgr.shape[:2]
+                x, y, cell, gap = probe_codec.calib_to_px(cal, (h, w))
+                return ("探针：人工标定  x=%.0f y=%.0f cell=%.1f gap=%.1f bits=%d"
+                        "（按当前画面 %d×%d 换算）" % (x, y, cell, gap, bits, w, h))
+            return ("探针：人工标定（画面比例 x=%.4f y=%.4f cell=%.4fW gap=%.4fW bits=%d）"
+                    % (cal["x_ratio"], cal["y_ratio"], cal["cell_ratio"],
+                       cal["gap_ratio"], bits))
+        return ("探针：用 link.yaml 的配置值  x=%s y=%s cell=%s gap=%s bits=%d"
+                "　（位置不对就点「框选探针」）"
+                % (get("probe", "x", 100), get("probe", "y", 8),
+                   get("probe", "cell", 16), get("probe", "gap", 2), bits))
+
+    def _refresh_probe_label(self, extra=""):
+        self.lbl_probe.setText(self._probe_label_text() + extra)
+
+    def _pick_probe(self):
+        """在实时画面上框选探针方块带 → 当场解码验证 → 通过才保存标定。
+
+        **为什么必须验证**：这是 40 位码，差一个方块宽度就整个错位，而错位采样
+        也能解出一个「合法」的 40 位数（看着完全正常）。所以判据是「解出来的时刻
+        接近现在」（见 probe_codec.ts_plausible）。解不出就什么都不改。
+        """
+        from gui.region_selector import select_region_on_image
+        from tools import probe_codec
+
+        frame = self.current_frame()
+        if frame is None:
+            QMessageBox.information(
+                self, "提示",
+                "请先在「实时」页开始预览、看到画面（含 A 机的探针方块带）之后再框选。")
+            return
+        rect = select_region_on_image(frame, self)
+        if rect is None:
+            return
+
+        import cv2
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        bits = int(get("probe", "bits", 40))
+        # 没对过时的机器上，「接近此刻」这条判据用不了（差多少全看钟差），
+        # 这时退一步：能解出合法码就先标上，并明确告诉用户去对时。
+        offset_ok = (ROOT / "config" / "clock_offset.txt").exists()
+        geo = probe_codec.solve_from_rect(gray, rect, bits, strict=offset_ok,
+                                          gap_hint=get("probe", "gap", 2))
+        if geo is None:
+            QMessageBox.warning(
+                self, "没解出时间码",
+                "框选里没能解出时间码，所以**没有保存**（宁可不改，也别改坏）。\n\n"
+                "按顺序检查：\n"
+                "  1. A 机是不是在跑  python -m tools.probe_gen\n"
+                "  2. 要框住**整条方块带**：包括最左边那个常亮的白块，"
+                "和它后面那个常黑的块（头两个是编码的起始标记）\n"
+                "  3. 方块要够大：cell ≥ 16px（太小的话 40 位时间戳会被压缩磨掉）\n"
+                "  4. bits 要和 A 机一致（现在是 %d）\n"
+                "  5. 画面里那条带子如果发虚/被 UI 压住，先在 A 机挪开探针再标" % bits)
+            return
+
+        dx, dy, dcell = geo["snap"]
+        probe_codec.save_calib(geo, frame.shape, bits)
+        h, w = frame.shape[:2]
+        tail = ("　自动对齐修正 dx=%+d dy=%+d dcell=%+d" % (dx, dy, dcell)
+                if (dx or dy or dcell) else "")
+        if geo["plausible"]:
+            extra = "　✓ 解出 ts=%d ms，与本地时刻相符" % geo["ts"]
+            head = "✓ 标定成功"
+            body = ("解出的时间码是 %d ms（A 机当天时刻），与本地时刻相符 —— 对准了。"
+                    % geo["ts"])
+        else:
+            extra = "　⚠ 解出 ts=%d ms，但对不上本地时刻" % geo["ts"]
+            head = "✓ 已标出位置（还没对时）"
+            body = ("在框选附近解出了时间码 %d ms，几何应该是对的；但它和本地时刻对不上，"
+                    "说明**双机还没对时** ——\n"
+                    "跑一次：python -m tools.clock_sync --host <A机IP> --save"
+                    % geo["ts"])
+        self._refresh_probe_label(extra)
+        QMessageBox.information(
+            self, head,
+            body + "\n\n"
+            "几何：x=%.1f y=%.1f cell=%.2f gap=%.2f bits=%d%s\n"
+            "画面 %d×%d；存的是比例，换分辨率不用重标。\n"
+            "每秒自动生效，不用重开预览。"
+            % (geo["x"], geo["y"], geo["cell"], geo["gap"], bits, tail, w, h))
 
     def _pick_rect(self):
         from gui.region_selector import select_region
@@ -288,6 +399,7 @@ class LivePanel(QWidget):
             "device": self.ed_device.text().strip() or "0",
             "capture_fps": self.sp_capfps.value(),
             "draw": self.ck_draw.isChecked(),
+            "perf_log": bool(load_live().get("perf_log", True)),
         })
 
         common = {
@@ -297,6 +409,7 @@ class LivePanel(QWidget):
             "imgsz": self.sp_imgsz.value(),
             "device": self.ed_device.text().strip() or "0",
             "draw": self.ck_draw.isChecked(),
+            "perf_log": bool(load_live().get("perf_log", True)),
             "show_fps": 30.0,
             "player_id": pid,
         }

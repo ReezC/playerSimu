@@ -1,5 +1,5 @@
 {
-  "attack_dist": 40.0,
+  "attack_dist": 80.0,
   "min_attack_dist": 0,
   "chase_jump_enabled": true,
   "chase_jump_min": -10,
@@ -57,17 +57,6 @@
   "output_seq": [
     {
       "type": "down",
-      "key": "jump",
-      "prob": 10,
-      "then": [
-        {
-          "type": "up",
-          "key": "jump"
-        }
-      ]
-    },
-    {
-      "type": "down",
       "key": "attack"
     },
     {
@@ -93,12 +82,12 @@
     1500,
     2500
   ],
-  "input_device": "local",
+  "input_device": "remote",
   "input_delay": [
     0,
-    50
+    30
   ],
-  "attack_cd": 800,
+  "attack_cd": 300,
   "attack_lock_debounce_ms": 1000,
   "min_turn_hold_ms": 1000,
   "turn_output_delay_ms": 200,
@@ -152,14 +141,14 @@
   "vision_center": true,
   "vision_off_x": 0,
   "vision_off_y": 0,
-  "sweep_turn_cd": 1000,
-  "back_range": 200,
+  "sweep_turn_cd": 500,
+  "back_range": 150,
   "route_enabled": false,
-  "debounce_conf": 0.45,
+  "debounce_conf": 0.6,
   "debounce_ms": 2000,
   "auto_feed_pet": true,
-  "feed_interval_min": 6.0,
-  "feed_interval_max": 8.0,
+  "feed_interval_min": 10.0,
+  "feed_interval_max": 15.0,
   "custom_timers": [
     {
       "name": "自动回避药水",
@@ -196,7 +185,7 @@
       ]
     }
   ],
-  "facing_timeout_min": 2.0,
+  "facing_timeout_min": 0.0,
   "player_lost_timeout_min": 3.0,
   "resetall_interval": 60,
   "anti_afk_enabled": true,

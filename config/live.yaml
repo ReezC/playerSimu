@@ -1,6 +1,7 @@
-conf_mob: 0.5
+conf_mob: 0.35
 conf_player: 0.7
 imgsz: 800
 device: '0'
 capture_fps: 60
 draw: true
+perf_log: false

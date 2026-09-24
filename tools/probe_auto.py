@@ -13,28 +13,8 @@ import numpy as np
 
 from link import PyAVSource
 from tools.config import get
-from tools.probe_codec import DEFAULT_BITS, bits_to_ms, decode_ms, now_ms
-
-
-def ts_plausible(ts, minutes=10.0):
-    """解出的时间戳是否"接近此刻"（当天毫秒，跨午夜按环形算）。
-
-    **这是最强的一条判据**，也是前面几轮一直缺的。
-
-    错位采样同样能解出"合法"的 40 位数 —— 它落在 [0, 86400000) 之内，
-    看着完全正常（实测得到过 14543、1301503、40353791 等等）。
-    但那个值本质是随机数，**落在"当前时刻附近"的概率极低**。
-
-    容差不能放大：曾经用 3 小时，结果在凌晨测试时（ts 本身才 219 万毫秒）
-    等于把大半个值域都算成"合理"，错位解照样放行。
-    双机时钟同步后差距应在毫秒级，10 分钟余量足够覆盖时钟漂移。
-    """
-    if ts is None:
-        return False
-    now = now_ms()
-    d = abs(ts - now)
-    d = min(d, 86400000 - d)          # 跨午夜：两边的差要按环形算
-    return d < minutes * 60 * 1000
+from tools.probe_codec import (DEFAULT_BITS, bits_to_ms, decode_ms, now_ms,
+                               ts_plausible)
 
 
 def locate(gray, cell, gap, bits=DEFAULT_BITS, y_search=80, x_search=1400):

@@ -176,8 +176,12 @@ class PlayerPanel(QWidget):
         # 触控板位移的余数累积（小位移不丢：0.3px 攒到 1px 才发）
         self._pad_rem = [0.0, 0.0]
         self.touchpad.moved.connect(self._on_pad_moved)
-        # 触控模式（本地按 F10 开 / 关，见 eventFilter）下的点击 / 滚轮也转发给远程鼠标
+        # 触控模式（本地按 F10 开 / 关，见 eventFilter）下的点击 / 拖拽 / 滚轮都转发给远程鼠标：
+        #   点一下就松 → clicked → 固件原子 CLICK；
+        #   按住并滑动 → pressed/released → 固件 PRESSM/RELEASEM（拖窗口、框选）。
         self.touchpad.clicked.connect(dinput.mouse_click)
+        self.touchpad.pressed.connect(dinput.mouse_press)
+        self.touchpad.released.connect(dinput.mouse_release)
         self.touchpad.scrolled.connect(dinput.mouse_scroll)
 
         # 右：一列，全部压进触控板的纵向范围（4 行 ≈ 122px ≤ 触控板 132px）。

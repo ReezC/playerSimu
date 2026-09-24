@@ -11,6 +11,8 @@ import ctypes
 import time
 from ctypes import wintypes
 
+from core import perf
+
 # ---- 键名 → 虚拟键码 ----
 _VK = {
     "left": 0x25, "right": 0x27, "up": 0x26, "down": 0x28,
@@ -236,10 +238,23 @@ def _send_remote(line):
     """
     if _remote is None:
         return False
+    _t = time.perf_counter()
     try:
-        return bool(_remote.send(line))
+        ok = bool(_remote.send(line))
     except Exception:
-        return False
+        ok = False
+    # 打点：一次发键在通道上花了多久（远程是 socket / 串口写，链路卡住时这里最先变大）
+    perf.ms("send_ms", _t)
+    if ok:
+        perf.count("send")
+    else:
+        perf.count("send_fail")
+        # 失败按指令名分开计（fail_PRESS / fail_RELEASEALL / fail_TAP…）：
+        # 「所有指令都在丢」和「某一条特定指令在丢」是完全不同的问题
+        # —— 后者往往是固件正卡在某个 delay 里没读串口。
+        head = (str(line).split() or ["?"])[0][:10]
+        perf.count("fail_" + head)
+    return ok
 
 
 # 发过指令后，超过这么久收不到固件回执就判定链路卡死（秒）。
@@ -340,6 +355,33 @@ def mouse_scroll(n):
     """滚轮：正数向上、负数向下。"""
     if _remote is not None:
         _send_remote("SCROLL %d" % int(n))
+
+
+def mouse_drag(dx, dy, btn="left", steps=8):
+    """拖拽：按下 -> 分段移动 -> 松开。**交给固件一条指令原子完成**。
+
+    **为什么不在这里发 PRESSM / MOVE×n / RELEASEM 三条**：中途串口或 TLS 断一次，
+    那条 RELEASEM 就永远到不了 —— 左键会一直按着（只能拔板子，或者关掉界面让
+    relay 替我们松）。合成一条发过去，最坏后果只是「这次拖拽没发生」，
+    不会留下按住的键。
+
+    steps：移动分几段（固件侧 1~40，段间隔几毫秒）。**必须分段** ——
+    瞬移式的拖拽游戏看不到中间位置，不会被当成拖动。
+
+    **发送失败补一发 RELEASEM**：`_send_remote` 返回 False 说明这条没发出去，
+    但它也可能是「发出去了一半才断」，固件那边已经按下了。宁可多松一次
+    （松一个没按的键无害），也别留一个按住的左键。
+
+    注：这是给**程序化拖拽**（脚本 / 重连流程 / 一次性的拖到位）用的。
+    触控板上那种跟着手指走的拖拽是**人机交互**，必须按住期间连续发 MOVE，
+    所以那边仍然用 mouse_press / mouse_move / mouse_release 三件套。
+    """
+    if _remote is None:
+        return
+    n = max(1, min(40, int(steps)))
+    if not _send_remote("DRAG %s %d %d %d"
+                        % (str(btn).upper(), int(dx), int(dy), n)):
+        mouse_release(btn)
 
 
 def mouse_available():

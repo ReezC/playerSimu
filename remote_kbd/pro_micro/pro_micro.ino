@@ -6,12 +6,18 @@
 // 指令（每条以换行结束）：
 //   PRESS key        按下不放（移动）
 //   RELEASE key      松开
-//   RELEASEALL       松开所有键
+//   RELEASEALL       松开所有键 + 三个鼠标按钮（拖拽卡住时的兜底）
 //   TAP key ms       点按（按下 -> 等 ms -> 松开）
 //   FIX key interval count      固定间隔连按
 //   RND key min max count       随机间隔连按
 //   HOLD key ms      长按
 //   COMBO k1 k2 ms   两键同按
+//   MOVE dx dy       鼠标相对移动（自动分块，给大数也对）
+//   CLICK btn        鼠标点击（LEFT/RIGHT/MIDDLE，缺省 LEFT）
+//   PRESSM btn       按住鼠标按钮
+//   RELEASEM btn     松开鼠标按钮
+//   SCROLL n         滚轮（正数向上、负数向下）
+//   DRAG btn dx dy [steps]  拖拽：按下 -> 分 steps 段移动 -> 松开，**一条指令原子完成**
 // 键名：单字符(字母/数字) 或 LEFT/RIGHT/UP/DOWN/SPACE/ENTER/ESC/TAB/CTRL/SHIFT/ALT/F1..F12 等
 
 #include <Keyboard.h>
@@ -103,9 +109,45 @@ bool removeHeld(int c) {
   return false;
 }
 
+// 鼠标按钮名 -> Mouse 按钮码。CLICK / PRESSM / RELEASEM / DRAG 四处共用一份判定，
+// 免得以后加按钮类型时漏掉某一处（那样「按下去的那个」和「松开时那个」就对不上了）。
+int mouseBtnCode(String b) {
+  b.toUpperCase();
+  if (b == "RIGHT") return MOUSE_RIGHT;
+  if (b == "MIDDLE") return MOUSE_MIDDLE;
+  return MOUSE_LEFT;
+}
+
+// 一次相对移动。**必须分块**：Mouse.move() 的入参是 signed char（±127），
+// 直接把 4000 传进去会被截成 -96 —— 方向都反了。撞角归零（MOVE -4000 -4000）
+// 和长距离拖拽都靠这里才走得对。
+#define MOUSE_STEP_MAX 120
+void mouseMoveChunked(long dx, long dy) {
+  while (dx != 0 || dy != 0) {
+    int sx = (int)constrain(dx, -MOUSE_STEP_MAX, MOUSE_STEP_MAX);
+    int sy = (int)constrain(dy, -MOUSE_STEP_MAX, MOUSE_STEP_MAX);
+    Mouse.move(sx, sy, 0);
+    dx -= sx;
+    dy -= sy;
+  }
+}
+
+// 拖拽时每段之间等多久（毫秒）。等一会儿游戏才看得到中间位置 ——
+// 瞬移式的拖拽游戏不认。
+#define DRAG_STEP_MS 4
+
+//: 拖拽最多分几段。上限是给「别把串口读循环堵太久」用的（40 * 4ms = 160ms）。
+#define DRAG_MAX_STEPS 40
+
 void releaseAll() {
   for (int i = 0; i < heldCount; i++) Keyboard.release(held[i]);
   heldCount = 0;
+  // 鼠标按钮也要松：拖拽（触控板按住拖 / 界面的「左键」按钮）中途程序崩了、
+  // 或触控模式被关掉时，那个按钮会留在按下状态。键盘有 RELEASEALL 兜底，
+  // 鼠标原来没有 —— 只能拔板子。固件是最终兜底，清零要放这里。
+  Mouse.release(MOUSE_LEFT);
+  Mouse.release(MOUSE_RIGHT);
+  Mouse.release(MOUSE_MIDDLE);
 }
 
 void loop() {
@@ -131,17 +173,11 @@ void loop() {
     Serial.println("DONE");
   }
   else if (head == "MOVE") {
-    int dx = token(cmd, 1).toInt();
-    int dy = token(cmd, 2).toInt();
-    Mouse.move(dx, dy, 0);
+    mouseMoveChunked(token(cmd, 1).toInt(), token(cmd, 2).toInt());
     Serial.println("DONE");
   }
   else if (head == "CLICK") {
-    String btn = token(cmd, 1);
-    btn.toUpperCase();
-    if (btn == "RIGHT") Mouse.click(MOUSE_RIGHT);
-    else if (btn == "MIDDLE") Mouse.click(MOUSE_MIDDLE);
-    else Mouse.click(MOUSE_LEFT);
+    Mouse.click(mouseBtnCode(token(cmd, 1)));
     Serial.println("DONE");
   }
   else if (head == "SCROLL") {
@@ -150,19 +186,36 @@ void loop() {
     Serial.println("DONE");
   }
   else if (head == "PRESSM") {
-    String btn = token(cmd, 1);
-    btn.toUpperCase();
-    if (btn == "RIGHT") Mouse.press(MOUSE_RIGHT);
-    else if (btn == "MIDDLE") Mouse.press(MOUSE_MIDDLE);
-    else Mouse.press(MOUSE_LEFT);
+    Mouse.press(mouseBtnCode(token(cmd, 1)));
     Serial.println("DONE");
   }
   else if (head == "RELEASEM") {
-    String btn = token(cmd, 1);
-    btn.toUpperCase();
-    if (btn == "RIGHT") Mouse.release(MOUSE_RIGHT);
-    else if (btn == "MIDDLE") Mouse.release(MOUSE_MIDDLE);
-    else Mouse.release(MOUSE_LEFT);
+    Mouse.release(mouseBtnCode(token(cmd, 1)));
+    Serial.println("DONE");
+  }
+  else if (head == "DRAG") {
+    // 按下 -> 分 steps 段移动 -> 松开，**在固件里一次做完**。
+    // 上位机只发这一条，所以中途串口/TLS 断线最多让这次拖拽「没发生」，
+    // 不会留下一个按住的左键（那种情况只能拔板子）。
+    // 这里 delay() 期间不收新指令（串口缓冲会积压）—— 所以段数有上限
+    // （DRAG_MAX_STEPS * DRAG_STEP_MS ≈ 160ms，够用又不至于把读循环堵死）。
+    int btn = mouseBtnCode(token(cmd, 1));
+    long dx = token(cmd, 2).toInt();
+    long dy = token(cmd, 3).toInt();
+    int steps = token(cmd, 4).toInt();
+    if (steps < 1) steps = 1;
+    if (steps > DRAG_MAX_STEPS) steps = DRAG_MAX_STEPS;
+    Mouse.press(btn);
+    long px = 0, py = 0;
+    for (int i = 1; i <= steps; i++) {
+      long tx = dx * i / steps;
+      long ty = dy * i / steps;
+      mouseMoveChunked(tx - px, ty - py);   // 每段自己再按 ±127 分块
+      px = tx;
+      py = ty;
+      delay(DRAG_STEP_MS);
+    }
+    Mouse.release(btn);
     Serial.println("DONE");
   }
   else if (head == "TAP") {
