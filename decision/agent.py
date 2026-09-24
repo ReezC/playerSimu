@@ -15,20 +15,21 @@ CPython 下对 float/bool/引用 的简单赋值是原子的（GIL 保证不崩�
 读到旧值顶多延迟一帧生效，可接受 —— 不为此上锁。
 """
 
-import json
 import random
 import threading
 import time
-from pathlib import Path
 
 from decision.input import DEFAULT_KEYMAP, KeyState, key_down, key_up, tap
 
-# 决策参数的落点。**默认是按项目存的**（projects/<项目>/project.yaml 的 decision 段，
-# 由界面打开项目时注册钩子，见下面的 set_save_hook）；这个文件只在两种时候用：
-#   · 没打开项目时 —— 界面照样能改参数，就落在这里；
-#   · 项目里还没有 decision 段时（老项目 / 新建项目）—— 用它当**初始值**播种，
-#     这样辛苦调出来的那套参数不会因为「换了个存法」而丢。
-_SETTINGS_FILE = Path(__file__).resolve().parent.parent / "config" / "decision.json"
+# 决策参数的落点：**只按项目存** —— projects/<项目>/project.yaml 的 decision 段，
+# 由界面打开项目时注册钩子写回（见下面的 set_save_hook）。
+#
+# config/decision.json 是**旧版**的全局存法，已退役：代码不再读、也不再写它
+# （文件留着当档，想搬参数就用参数面板的「加载模板」指到它）。它当年的问题是
+# 「谁改参数就被谁覆盖」，于是打开一个还没存过参数的项目会拿到**最后一次改过参数
+# 的那个项目**那套 —— 看着就像「一开就是另一个项目的参数」。
+# 现在没打开项目时，用的是**最近打开的那个项目**那份（见 gui/project.py 的
+# last_opened / gui/main_window.py 的 _bind_decision_params）。
 
 #: 保存钩子：界面打开项目时注册，save() 会顺便把这份参数写回那个项目。
 #: **为什么用钩子而不是让 decision/ 认识「项目」**：decision/ 不该依赖 gui/，
@@ -80,9 +81,10 @@ TIMING_TICK = 0.01
 class DecisionSettings:
     """决策参数（UI 写，决策线程读）。
 
-    **按项目存**：界面打开项目时把这份参数整份存进该项目的 project.yaml
-    （`decision:` 段），换项目就换一套；没打开项目时落回 config/decision.json。
-    细节见文件顶部 `_SETTINGS_FILE` 与 `set_save_hook` 的说明。
+    **只按项目存**：界面打开项目时注册钩子，save() 就把这份参数整份写进该项目的
+    project.yaml（`decision:` 段），换项目就换一套。没打开项目时参数取自
+    **最近打开的那个项目**（只读不写）；没有那个项目时用这里的默认值。
+    细节见文件顶部那段说明与 `set_save_hook`。
     """
 
     def __init__(self):
@@ -249,18 +251,16 @@ class DecisionSettings:
                 "custom_keys": self.custom_keys}
 
     def save(self):
-        """落盘：写回当前项目 + 全局那份（分工见文件顶部 _SETTINGS_FILE 的说明）。
+        """落盘：整份写回**当前项目**（钩子由界面注册，见 set_save_hook）。
+
+        **没注册钩子（没打开项目）时什么都不写**：那种情况下界面上的改动只活在
+        内存里（实时预览照样立刻生效），一打开项目就被项目的值覆盖。
+        参数必须有个明确的归属，不然又回到「不知道这份是谁的」。
 
         enabled 不存 —— 自动开关是运行时状态，重启后总是关闭。
-        两处写失败都不抛：参数存不下去是坏事，但不能连界面一起炸。
+        写失败不抛：参数存不下去是坏事，但不能连界面一起炸。
         """
         data = self.to_dict()
-        try:
-            _SETTINGS_FILE.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2),
-                encoding="utf-8")
-        except Exception:
-            pass
         if _save_hook is not None:
             try:
                 _save_hook(data)
@@ -360,13 +360,6 @@ class DecisionSettings:
         if isinstance(ck, dict):
             self.custom_keys = {str(k): (v if isinstance(v, str) or v is None else None)
                                 for k, v in ck.items()}
-
-    def load(self):
-        """从 config/decision.json 读回上次的决策参数。"""
-        try:
-            self.from_dict(json.loads(_SETTINGS_FILE.read_text(encoding="utf-8")))
-        except Exception:
-            pass
 
     @staticmethod
     def _load_color(v):
@@ -470,7 +463,8 @@ class CombatAgent:
         self._timer_states = {}      # 自定义定时行为执行中序列状态：{name: [phase, next_ts, held]}
         self._kill_mobs = set()     # 要立即消除的防抖幽灵框 id（攻击幽灵框时记录，避免空放技能）
         self._next_evade = 0.0      # 下次规避动作（跳）的时刻
-        self._next_chase_jump = 0.0 # 下次追击起跳的时刻
+        self._next_chase_jump = 0.0 # 下次追击起跳的时刻（全局节流，只在沿抖动时兜底）
+        self._band_had = False      # 上一拍起跳范围内有没有怪（用来判「从无到有」的沿）
         self._next_resetall = 0.0   # 下次定时 RELEASEALL 的时刻
         self._pending_attack = None # 待发的输出键时刻（跳规避：跳键后 interval 发输出）
         self._no_target_since = None  # 朝向没目标的起始时刻（换朝向防抖用）
@@ -533,17 +527,24 @@ class CombatAgent:
         ad = float(s.attack_dist)
         return ad + lo <= dist <= ad + hi
 
-    def _maybe_chase_jump(self, dist, now, others=0):
-        """追击起跳（带节流）：dist 落在起跳区间内就按跳。
+    def _maybe_chase_jump(self, dist, now, edge=False):
+        """追击起跳：**只在「起跳范围内从无怪变成有怪」那一拍**才按跳。
 
-        **前提：攻击范围内没有其他怪**（others = 范围内除当前目标外的怪数量）。
-        有其他怪时不跳 —— 先打那些更划算，跳会打断输出、还可能把自己跳出攻击距离。
-        目标自己在范围内不影响：那就是「纯内侧」那种情形（已进范围但偏远，跳一下够着）。
+        两个条件，缺一不可：
+          · `edge`（由 tick 每拍算好，见那边的说明）—— 起跳范围刚由「无怪」变成
+            「有怪」的那一拍。所以同一只怪一直挂在区间里**不会反复跳**：它只在刚
+            进来那一下有跳的资格；
+          · **攻击范围内没有怪** —— 有得打就先打，跳会打断输出、还可能把自己跳出
+            攻击距离。这一条由调用点的位置保证：两个调用点都在「攻击范围为空」
+            那个分支里（tick 的说明里写了）。
+
+        `_next_chase_jump` 这个全局节流保留：万一起跳区间边缘抖动（怪正好压在边界
+        上来回），沿会反复出现，靠它兜住别连跳。
         """
         s = self.settings
-        if not s.chase_jump_enabled or now < self._next_chase_jump:
+        if not s.chase_jump_enabled or not edge:
             return
-        if others > 0:
+        if now < self._next_chase_jump:
             return
         if not self._in_chase_jump_range(dist):
             return
@@ -1252,6 +1253,16 @@ class CombatAgent:
         # 地形关系（怪是否与玩家当前平台连接）已由感知层算好，这里只消费结果
         mobs = [m for m in mobs if m.reachable]
 
+        # 追击起跳的**上升沿**：起跳范围内「从无怪变成有怪」的那一拍才有跳的资格。
+        # 一只怪一直挂在范围内 → 只有进来的那一拍是沿，之后不再触发 —— 这就是
+        # 「同一只怪不会一直跳」。放在这里每拍算一次，不塞进某个分支：下面两处
+        # 起跳（chase / sweep）共用同一个沿，行为不会随分支而变。
+        # 另有一条前提在调用点上：**攻击范围内有怪就不跳**（先打那些）。
+        _band = [m for m in mobs
+                 if self._in_chase_jump_range(self._center_dist(m, ws.player))]
+        jump_edge = bool(_band) and not self._band_had
+        self._band_had = bool(_band)
+
         # 自动喝药：依赖玩家定位（读血/蓝），定位到玩家后才执行
         self._drink_potions(ws, now)
 
@@ -1293,10 +1304,8 @@ class CombatAgent:
             # 不再朝倾向朝向移动，一直站到攻击范围内清空（下面 else 分支解除）。
             # CD 期间也保持停下：范围内还有怪就不该往前走。
             self._sweep_hold = (s.strategy == "sweep" and self.state == "attack")
-            # 追击起跳（内侧）：范围内只有目标这一只时可以跳（已进范围但偏远，跳一下
-            # 够得着）；范围内还有别的怪就不跳 —— 先打那些，跳会打断输出、还可能
-            # 把自己跳出攻击距离。others 就是「范围内除目标外的怪数量」。
-            self._maybe_chase_jump(best, now, others=len(in_range) - 1)
+            # 这里**不**起跳：攻击范围内有怪就先打。追击起跳只在下面那个
+            # 「攻击范围为空」的分支里发生（见 _maybe_chase_jump 的说明）。
         else:
             # 前方攻击范围内没框
             self._sweep_hold = False    # 清空 → 恢复朝倾向朝向移动
@@ -1306,7 +1315,7 @@ class CombatAgent:
                 # 有锁定目标（sweep 背后怪 / patrol 最近怪）：朝它走
                 self._steer(target.x - px, keys)
                 # 追击起跳：本分支攻击范围内本来就是空的，不存在「其他怪」，前提天然满足
-                self._maybe_chase_jump(best, now)
+                self._maybe_chase_jump(best, now, edge=jump_edge)
                 self._set_state("chase")
             elif s.strategy == "sweep":
                 # 扫平台巡逻：无背后怪，朝倾向朝向走（不锁定、无红框）。
@@ -1315,18 +1324,15 @@ class CombatAgent:
                 self.set_facing(self._patrol_dir)
                 keys.add(s.keymap["right"] if self._patrol_dir > 0 else s.keymap["left"])
                 self._set_state("chase")
-                # 追击起跳：向倾向方向移动时，起跳区间内有怪（即使未锁定）也按跳
-                if s.chase_jump_enabled and now >= self._next_chase_jump:
-                    jump_key = s.keymap.get("jump")
-                    if jump_key:
-                        hit = next((m for m in mobs
-                                    if (m.x - px) * self._patrol_dir >= 0
-                                    and self._in_chase_jump_range(self._center_dist(m, ws.player))),
-                                   None)
-                        if hit is not None:
-                            tap(jump_key, self._attack_duration)
-                            attack_cd_s = max(0.0, float(s.attack_cd)) / 1000.0
-                            self._next_chase_jump = now + max(0.3, attack_cd_s + self._random_input_delay())
+                # 追击起跳：向倾向方向移动时，起跳区间内有怪（即使未锁定）也可以跳
+                if jump_edge:
+                    hit = next((m for m in mobs
+                                if (m.x - px) * self._patrol_dir >= 0
+                                and self._in_chase_jump_range(self._center_dist(m, ws.player))),
+                               None)
+                    if hit is not None:
+                        self._maybe_chase_jump(self._center_dist(hit, ws.player),
+                                               now, edge=jump_edge)
                 # 换向：倾向朝向方向没怪持续 sweep_turn_cd 才换向。
                 # 主方向有怪（哪怕是远处、还没进攻击范围）就不换向，保持朝它走。
                 front_has_mob = any((m.x - px) * self._patrol_dir >= 0 for m in mobs)
@@ -1632,21 +1638,9 @@ def load_rect(v):
     return None
 
 
-def load_saved() -> dict:
-    """读 config/decision.json 的原始内容（纯读，不动内存里的 settings 单例）。
-
-    用途是「全局兜底」：文件里是最后一次 save() 的结果（= 最近动过的那套参数），
-    所以天然跟着最新改动走，不会有内存快照过期的问题。两个地方用它：
-      · 打开一个还没存过 decision 段的项目时 —— 用它播种，别让用户白调一遍；
-      · HP/MP 条这类「项目优先、全局兜底」的配置（见 gui/player_panel.py）。
-    """
-    try:
-        return json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
 # 全局决策设置（单例）：GUI 主线程写，实时推理线程读。
 # 用单例让「决策参数」页签和「实时」页共享同一份配置，不用层层传引用。
+# **启动时不 load**：已经没有「全局那份」可读了 —— 界面起来后由
+# gui/main_window.py 的 _bind_decision_params 决定用哪个项目的参数
+# （没打开项目时用最近打开的那个；再没有就是这里的默认值）。
 settings = DecisionSettings()
-settings.load()     # 启动时读回上次保存的决策参数

@@ -2,7 +2,7 @@
 
 字号改动**立即生效**，不需要重启 —— 底层是 QApplication.setFont()，
 所有没写死字号的控件都会跟随。其余都是决策参数：点确定后写回**当前项目**
-（没打开项目时写 config/decision.json，见 decision/agent.py 的 set_save_hook）。
+（没打开项目时不落盘，只改内存 —— 见 decision/agent.py 的 set_save_hook）。
 """
 
 from PyQt5.QtCore import Qt

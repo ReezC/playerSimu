@@ -1,8 +1,8 @@
 {
-  "attack_dist": 400.0,
-  "min_attack_dist": 50,
+  "attack_dist": 80.0,
+  "min_attack_dist": 0,
   "chase_jump_enabled": true,
-  "chase_jump_min": -30,
+  "chase_jump_min": -10,
   "chase_jump_max": 5,
   "mouse_speed": 1.8000000000000005,
   "evade_type": "jump",
@@ -81,7 +81,7 @@
     "right": "right",
     "up": "up",
     "down": "down",
-    "attack": "s",
+    "attack": "t",
     "jump": "D",
     "hp_pot": "g",
     "mp_pot": null,
@@ -93,12 +93,12 @@
     1500,
     2500
   ],
-  "input_device": "serial",
+  "input_device": "remote",
   "input_delay": [
     0,
     50
   ],
-  "attack_cd": 200,
+  "attack_cd": 800,
   "attack_lock_debounce_ms": 1000,
   "min_turn_hold_ms": 1000,
   "turn_output_delay_ms": 200,
@@ -160,11 +160,46 @@
   "auto_feed_pet": true,
   "feed_interval_min": 6.0,
   "feed_interval_max": 8.0,
-  "custom_timers": [],
+  "custom_timers": [
+    {
+      "name": "自动回避药水",
+      "seq": [
+        {
+          "type": "down",
+          "key": "回避药水"
+        },
+        {
+          "type": "up",
+          "key": "回避药水"
+        }
+      ],
+      "interval": [
+        3.0,
+        3.0
+      ]
+    },
+    {
+      "name": "无语表情",
+      "seq": [
+        {
+          "type": "down",
+          "key": "表情_无语"
+        },
+        {
+          "type": "up",
+          "key": "表情_无语"
+        }
+      ],
+      "interval": [
+        5.0,
+        10.0
+      ]
+    }
+  ],
   "facing_timeout_min": 2.0,
   "player_lost_timeout_min": 3.0,
   "resetall_interval": 60,
-  "anti_afk_enabled": false,
+  "anti_afk_enabled": true,
   "anti_afk_type": "hidden_rest",
   "anti_afk_min": 25.0,
   "anti_afk_max": 30.0,

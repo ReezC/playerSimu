@@ -19,6 +19,7 @@
 """
 
 import copy
+import json
 import time
 from pathlib import Path
 
@@ -50,12 +51,13 @@ DEFAULTS = {
     },
     # HP/MP 条框选结果（相对画面的比例 [nx, ny, nw, nh]，分辨率变化自动适配）。
     # 存项目里 —— 不同项目可能用了不同的游戏 UI 布局；项目没存过的回退用
-    # config/decision.json 的全局值（= 上次框选的位置）。
+    # **最近打开的那个项目**的（= 你上一次框选的位置，见 last_opened）。
     "bars": {},
     # 整份决策参数（DecisionSettings.to_dict() 的结果，几十个键）：**按项目各存一份**。
-    # 换项目就换一套（攻击距离、序列、定时行为、防掉线……都跟着项目走）。
-    # 空的 = 这个项目还没存过：打开时用 config/decision.json 那份播种并当场写回来，
-    # 之后各项目互不影响（见 MainWindow._bind_decision_params）。
+    # 换项目就换一套（攻击距离、序列、定时行为、防掉线……都跟着项目走）—— 这也是
+    # 「一开项目就是另一个项目的参数」这个老毛病的解药：参数只认项目，没有全局副本。
+    # 空的 = 这个项目还没存过：打开时拿**最近打开的那个项目**那份播种并当场写回来
+    # （省得键位/序列/血条重配一遍），之后各项目互不影响。
     "decision": {},
     "notes": "",
     "capture": {
@@ -222,3 +224,48 @@ def sanitize(name: str) -> str:
     for c in bad:
         name = name.replace(c, "_")
     return name.strip().strip(".") or ("project_" + time.strftime("%Y%m%d_%H%M%S"))
+
+
+# ══════════════════════════════════════════════════════════════
+# 最近打开的项目（工作台自己的状态）
+# ══════════════════════════════════════════════════════════════
+#
+# **为什么要记住它**：决策参数只按项目存了，那「还没打开项目」的时候用谁的？
+# 用「最近打开的那个」：参数面板一进来就是你上次调好的那套，而不是一份飘忽的
+# 全局副本（旧版 config/decision.json 就是那么干的 —— 谁改参数就被谁覆盖，
+# 于是新项目一打开常常是另一个项目的参数）。
+#
+# 存在仓库 config/ 下，不存在项目里：这是**界面自己的**状态，与项目内容无关；
+# 放进项目里会跟着项目一起被拷到别的机器，语义就乱了。
+SESSION_FILE = Path(__file__).resolve().parent.parent / "config" / "session.json"
+
+
+def remember_open(root):
+    """记下「最近打开的项目」—— 打开 / 新建项目成功后调用。"""
+    try:
+        SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SESSION_FILE.write_text(
+            json.dumps({"last_project": str(Path(root).resolve())},
+                       ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8")
+    except Exception:
+        pass      # 记不住只会退化成「没有最近项目」，不该影响打开项目本身
+
+
+def last_opened():
+    """最近打开的那个项目（Project 或 None）。
+
+    项目被删 / 改名 / 文件坏了都返回 None，调用方一律当「没有最近项目」处理
+    （用默认值），不要因为一个陈旧的路径就报错。
+    """
+    try:
+        data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+        root = (data or {}).get("last_project")
+    except Exception:
+        return None
+    if not root:
+        return None
+    try:
+        return Project.open(root)
+    except Exception:
+        return None

@@ -10,8 +10,10 @@ F10 / F11 / F12 是**本机操作键**：只在本窗口起作用，永不转发
 （见 decision/input.py 的 LOCAL_ONLY）。
 
 所有改动直接写进 settings 单例（decision.agent.settings），实时线程每帧读到
-最新值，无需重启。**这份参数按项目各存一份**：主窗口打开项目时注册保存钩子，
-每次 save() 就整份写回该项目的 project.yaml（见 MainWindow._bind_decision_params）。
+最新值，无需重启。**这份参数只按项目存**：主窗口打开项目时注册保存钩子，每次
+save() 就整份写回该项目的 project.yaml（见 MainWindow._bind_decision_params）。
+没打开项目时参数取自**最近打开的那个项目**（只读不落盘）：界面照样能调、实时
+生效，但一打开项目就被项目的值覆盖 —— 参数必须有明确归属。
 """
 
 from PyQt5.QtCore import Qt, QEvent, QTimer, pyqtSignal
@@ -22,7 +24,8 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
                              QSlider, QVBoxLayout, QWidget)
 
 from decision import input as dinput
-from decision.agent import ANTI_AFK_TYPES, load_rect, load_saved, settings
+from decision.agent import ANTI_AFK_TYPES, load_rect, settings
+from gui.project import last_opened
 # NoWheel* 必须模块级导入：控件在 _build() 里建，懒导入到不了那儿。
 # （详见 docs/UI规范.md：滚轮不许改参数）
 from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,
@@ -234,11 +237,22 @@ class PlayerPanel(QWidget):
             "② 再补发一轮 RELEASEALL + 所有映射键的 RELEASE；\n"
             "③ 让决策层重同步按键状态（否则它以为键还按着，之后不再补发）。")
         self.btn_reset_link.clicked.connect(self._reset_link)
+
+        # 稳定性自检：长时间开自动之后，看内存 / 句柄 / 线程有没有在涨。
+        self.btn_stability = QPushButton("稳定性自检")
+        self.btn_stability.setToolTip(
+            "长时间开着自动之后点一下：看常驻内存 / 内核句柄数 / 线程数 / Python\n"
+            "对象数有没有持续上涨 —— 泄漏不会报错，只会让程序越跑越慢。\n"
+            "第一次点是记基线，隔十几分钟再点一次才看得出趋势。\n"
+            "只读、毫秒级，开关着自动都能点。")
+        self.btn_stability.clicked.connect(self._stability_check)
+
         dev_row = QHBoxLayout()
         dev_row.setSpacing(6)
         dev_row.addWidget(QLabel("输入设备"))
         dev_row.addWidget(self.cmb_device)
         dev_row.addWidget(self.btn_reset_link)
+        dev_row.addWidget(self.btn_stability)
         dev_row.addStretch(1)
         right_col.addLayout(dev_row)
 
@@ -448,8 +462,9 @@ class PlayerPanel(QWidget):
 
         self.ck_chase_jump = QCheckBox("启用")
         self.ck_chase_jump.setToolTip(
-            "追击起跳：攻击范围内没有其他怪时，锁定目标落在起跳区间内就按跳。\n"
-            "范围内还有其他怪则不跳 —— 先打那些，跳会打断输出。\n"
+            "追击起跳：起跳范围内「从无怪变成有怪」的那一拍才跳一次。\n"
+            "所以同一只怪一直挂在区间里不会反复跳（它只在刚进来时跳一下）。\n"
+            "若攻击范围内还有其他怪则不跳 —— 先打那些，跳会打断输出。\n"
             "区间 = [最大攻击距离 + min, 最大攻击距离 + max]，\n"
             "min/max 都是相对最大攻击距离的偏移：\n"
             "  0 ~ 50  → 纯外侧（还差一点够不着时跳）\n"
@@ -930,6 +945,29 @@ class PlayerPanel(QWidget):
         for w in (self.btn_mouse_l, self.btn_mouse_r, self.sp_mouse_speed):
             w.setEnabled(ok)
         self.touchpad.set_capture_enabled(ok)
+
+    def _stability_check(self):
+        """稳定性自检：报内存 / 句柄 / 线程 / Python 对象，并和上次比。
+
+        数值落在「详情」里（点开看）；上面只放需要留意的行 —— 没有就明说
+        「没有异常增长」，别让人以为要看一堆数字。
+        """
+        from gui import stability
+        text, warn, first = stability.check()
+        box = QMessageBox(self)
+        box.setWindowTitle("稳定性自检")
+        box.setIcon(QMessageBox.Warning if warn else QMessageBox.Information)
+        if warn:
+            box.setText("发现值得留意的地方：\n\n" + "\n".join(warn))
+        elif first:
+            box.setText("已记下基线（详情里是当前值）。\n\n"
+                        "隔十几分钟再点一次，就能看出各项涨没涨。")
+        else:
+            box.setText("没有发现异常增长。\n\n"
+                        "一次涨完然后走平是正常的（模型预热、缓存）；"
+                        "各项持续单调上涨才是泄漏 —— 隔十几分钟再点一次对照。")
+        box.setDetailedText(text)
+        box.exec_()
 
     def _reset_link(self):
         """手动重置指令通道：卡键 / 发不出指令时的逃生口（见按钮 tooltip）。"""
@@ -1470,13 +1508,15 @@ class PlayerPanel(QWidget):
         MainWindow._bind_decision_params，按项目存在 project.yaml 的 decision 段），
         这里只负责把换完之后的 settings 回填到界面上。
 
-        HP/MP 条：项目存过就用项目的；没存过回退到 config/decision.json 里的全局值
-        （= 最后一次框选 / 加载模板的位置）—— 同一套游戏 UI 通常通用，
-        一律清空会逼着每个项目都重框一次。
+        HP/MP 条：项目存过就用项目的；没存过回退到**最近打开的那个项目**那份
+        （= 你上一次框选 / 加载模板的位置）—— 同一套游戏 UI 通常通用，
+        一律清空会逼着每个项目都重框一次。顺序上「最近打开的项目」是主窗口在
+        本函数**之后**才更新的，所以这里拿到的正是上一个项目那套。
         """
         self.project = project
         proj = (project.get("bars") if project is not None else None) or {}
-        fallback = load_saved()      # 直接读文件，天然跟着最新一次 save()
+        prev = last_opened()
+        fallback = (prev.get("bars") if prev is not None else None) or {}
 
         def pick(key, saved_key):
             return proj.get(key) or fallback.get(saved_key)

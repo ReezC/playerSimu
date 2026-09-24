@@ -469,6 +469,8 @@ class LiveThread(QThread):
 
                 if last_mono is not None:
                     gaps.append((f.t_recv_mono - last_mono) * 1000.0)
+                    if len(gaps) > 60:      # 下面只用得到最近 60 个（见 stats_ready）
+                        del gaps[0]
                 last_mono = f.t_recv_mono
                 vis = f.image          # BGR（decode_format="bgr24" 直出）
 

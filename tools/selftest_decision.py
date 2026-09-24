@@ -8,10 +8,10 @@
 跑法：
     python -m tools.selftest_decision        # 全过返回 0，有失败返回 1
 
-**不会碰 config/decision.json**
-    · `DecisionSettings.save` 被换成空操作；
+**不碰任何真实的参数文件**
+    · `DecisionSettings.save` 被换成空操作（也就不会写回项目）；
     · 决策层用独立的 settings 实例（不 load 也不 save）；
-    · 界面层只读全局配置、不改任何值。
+    · 界面层只读配置、不改任何值。
 """
 
 import os

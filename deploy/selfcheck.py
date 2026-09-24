@@ -128,6 +128,8 @@ def check_host(cfg, timeout_ms=800):
         return [ok("B 机 %s 可达" % host, "RTT %s" % ms)]
     return [warn("B 机 %s 不通" % host,
                  "推流会发出去但 B 机收不到。检查：B 机开机了？同网段？\n"
+                 "A 机自己的 IP 和它同网段吗（ipconfig /all；"
+                 "169.254.x.x = 没拿到 IP）？\n"
                  "B 机防火墙放行了 UDP %s？" % cfg.get("port"))]
 
 

@@ -12,12 +12,46 @@
 
 ## 1.5 部署台（GUI，推荐）
 
-上面这些命令（**对时 / 探针 / 键盘中继 / 推流**）都做成了按钮，装在 A 机上直接跑：
+上面这些命令（**对时 / 探针 / 键盘中继 / 推流**）都做成了按钮，装在 A 机上直接跑。
+
+装依赖（在**仓库根**做一次）：
 
 ```powershell
-pip install -r deploy/requirements.txt      # 只有 PyQt5 + pyserial + PyYAML
-python -m deploy.app                        # 或双击仓库根的「被控机部署台.bat」
+# 1) 建一个 venv 并装依赖
+python -m venv .venv
+.venv\Scripts\python -m pip install -U pip
+.venv\Scripts\pip install -r deploy\requirements.txt   # 只有 PyQt5 + pyserial + PyYAML
+
+# 2) 启动（双击仓库根的「被控机部署台.bat」也行）
+.venv\Scripts\python -m deploy.app
 ```
+
+**依赖装进哪个解释器**：装进「启动部署台的那个」就够了 —— 四个服务都由部署台用
+**同一个**解释器拉起（`deploy/services.py` 的 `python_exe()` = `sys.executable`）。
+用 venv 还顺带解决另一件事：`被控机部署台.bat` 会**优先**用 `.venv\Scripts\pythonw.exe`，
+不会撞上系统里那个没装 PyQt5 的 python。
+
+**装这些就够了**：根目录的 `requirements.txt`（av / opencv / torch 那套）是 B 机的；
+`remote_kbd/requirements.txt` 里的 `cryptography` 只在**重新生成 TLS 证书**时才要
+（证书已随仓库放在 `remote_kbd/certs/`）。
+
+pip 之外还要的：
+
+| 要什么 | 谁需要 | 怎么来 |
+|---|---|---|
+| **ffmpeg** | 推流 | `winget install --id Gyan.FFmpeg -e`；没 N 卡就把推流的编码器改成 `libx264` |
+| `tkinter` | 探针窗口（标准库） | 精简安装包可能没带；缺了会在探针卡片的日志里看到 `No module named 'tkinter'` |
+| **OBS** | 只在走 §4 的 OBS 推流时 | 用部署台的推流卡片则不需要 |
+| **Pro Micro 固件** | 键盘中继 | Arduino IDE 烧 `remote_kbd/pro_micro/pro_micro.ino` |
+| 放行入站 UDP 5001 | 对时服务 | 见 §1 |
+
+装完点界面里的**环境自检**，它一次查完：ffmpeg / 有没有 NVENC / 串口能不能枚举 /
+B 机通不通 / TLS 证书在不在 / 参数和 `config/link.yaml` 对不对得上。
+
+**起不来时怎么查**：「被控机部署台.bat」会先检查上面这三个包，缺了会直接说装哪条
+命令；界面自己起不来（例如 Qt 出问题）会**弹一个错误框**并把完整堆栈写进仓库根的
+`deploy_crash.log`。想看原始报错就用带控制台的方式跑：`python -m deploy.app`
+（或双击「被控机部署台（调试）.bat」）。
 
 界面里有什么：
 
@@ -131,3 +165,53 @@ ffmpeg -f gdigrab -framerate 60 -video_size 1280x720 -i desktop ^
 - [ ] 仿真环境：数据集导出模式（批量出 `png + YOLO txt`）
 - [ ] WZ 资源解析：怪物/角色/地图/技能 sprite → 引擎素材
 - [ ] `HID Bridge`：监听 TCP，把 B 机指令转发给 Pro Micro（硬件到货后）
+
+---
+
+## 附：挂机久了推流自己断（本机到 B 机「网络不可达」）
+
+**现象**：ffmpeg 报 `Error number -10051`（Windows 的 `WSAENETUNREACH` = 网络不可达），
+而且通常是**挂了一段时间**才报。
+
+**怎么读这个错**：它是**本机**的路由错误，不是 B 机拒绝你。所以分两种情况：
+
+- **一启动就报** → 网段/路由没配通：查 A 机自己的 IP 是不是和 B 机同网段
+  （`ipconfig /all`；`169.254.x.x` = 没拿到 IP）、B 机现在的 IP 还是配置里那个吗；
+  确实不同网段就改 `config/link.yaml` 的 `b_host`，再点部署台的「按 link.yaml 填」。
+- **挂了一阵才报** → 配置本来是对的，是**运行中途路由丢了**。挂机时没人碰键鼠，
+  最常见的就是下面这三条。
+
+先确认：
+
+```powershell
+powercfg /a        # 看有没有启用「待机 / 现代待机（S0）」
+```
+
+事件查看器 → Windows 日志 → 系统：找 **Kernel-Power 42**（进入睡眠）/ NDIS 相关事件（网卡断开）。
+
+再关掉这些（**管理员** PowerShell，`-ac` = 接通电源的档位）：
+
+```powershell
+powercfg /change standby-timeout-ac 0      # 永不睡眠（这条最关键）
+powercfg /change hibernate-timeout-ac 0    # 永不休眠
+powercfg /change disk-timeout-ac 0         # 硬盘不停转
+powercfg /change monitor-timeout-ac 0      # 显示器不关 —— 关屏会让采集画面变黑
+
+# 关「USB 选择性暂停」（USB 网卡 / 采集设备）
+powercfg /setacvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
+powercfg /setactive SCHEME_CURRENT
+```
+
+网卡省电（设备管理器 → 网络适配器 → 属性 → 电源管理 → 取消「允许计算机关闭此设备
+以节约电源」），或者用 PowerShell：
+
+```powershell
+Get-NetAdapter                                        # 先看网卡叫什么
+Disable-NetAdapterPowerManagement -Name "以太网"       # 名字换成你自己的
+```
+
+笔记本还要管电池档位和合盖：`powercfg /change standby-timeout-dc 0`；
+控制面板 → 电源选项 → 选择关闭盖子的功能 → 都选「不采取任何操作」。
+
+**另外**：Windows 更新自动重启、驱动重装也会让流中断 —— 报错前如果有重启记录，
+那是另一回事（事件查看器里 `Kernel-Boot` / `WindowsUpdateClient`）。

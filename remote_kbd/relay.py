@@ -47,7 +47,14 @@ def bridge(conn, ser):
     t.start()
     try:
         while True:
-            data = conn.recv(4096)
+            try:
+                data = conn.recv(4096)
+            except socket.timeout:
+                # 空闲超时**不等于**断开：自动打怪停下来的时候（隐身休息几分钟）
+                # B 机一个键都不发，原来的写法会直接落到下面的 except 把链路关掉 ——
+                # 表现是「休息完一按键就发不出去 / 反复重连」。这段时间只是没事干，
+                # 继续等就是了。（超时本身仍有用：sendall 也受这个 5s 限制。）
+                continue
             if not data:
                 break
             ser.write(data)

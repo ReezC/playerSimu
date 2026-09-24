@@ -36,9 +36,14 @@ def find_pro_micro_port():
 
 
 class SerialKbd:
-    def __init__(self, port, baudrate=115200, timeout=0.3):
+    def __init__(self, port, baudrate=115200, timeout=0.3, write_timeout=1.0):
         import serial
-        self._ser = serial.Serial(port, baudrate, timeout=timeout)
+        # write_timeout 必须有：固件不读的时候 write/flush 会**永久阻塞**，而这是
+        # 跑在决策线程里的 —— 一次卡住就是「自动还在跑，但一个键都发不出去」，
+        # 而且永远不会自愈。relay 那边早就设了 1.0，本地直连这份漏了。
+        # 超时会抛 SerialTimeoutException，被 send() 的 except 接住当成发送失败。
+        self._ser = serial.Serial(port, baudrate, timeout=timeout,
+                                  write_timeout=write_timeout)
         self._ser.dtr = False   # 关键：禁用 DTR，避免打开串口触发 32U4 复位
         self._ser.rts = False
         time.sleep(0.5)          # 等 Pro Micro 稳定（打开串口可能已触发一次复位）

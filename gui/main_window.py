@@ -35,7 +35,7 @@ from gui.player_panel import PlayerPanel
 from gui.route_panel import RoutePanel
 from gui.settings_dialog import SettingsDialog
 from gui.widgets import NoWheelComboBox
-from gui.project import Project, sanitize
+from gui.project import Project, last_opened, remember_open, sanitize
 from gui.review import ReviewPanel
 from gui.steps import ALL_CARDS, CIRCLED
 from gui.verify_viewer import VerifyViewer
@@ -285,6 +285,11 @@ class MainWindow(QMainWindow):
 
         self.log("工作台已就绪。先「新建」或「打开」一个项目。", "ok")
         self.log("项目根目录: %s" % PROJECTS_DIR)
+
+        # 启动也要绑一次决策参数：没有项目时用的是「最近打开的那个项目」那份，
+        # 不绑的话参数面板显示默认值，连下面注册的全局热键都会用默认 F11，
+        # 而不是那个项目里映射的键。
+        self._bind_cards()
 
         # 全局热键：任何窗口聚焦时都能开关自动打怪。键 = 决策参数里
         # 「开关自动」的映射（默认 F11），改了映射会动态重新注册。
@@ -542,6 +547,10 @@ class MainWindow(QMainWindow):
             self.cmb_project.setCurrentIndex(idx)
             self.cmb_project.blockSignals(False)
 
+        # **最后**才记「最近打开的项目」：上面的 _bind_cards 要用**上一个**最近项目
+        # 当播种源（新建项目沿用上一套参数），提前记下的话播种源就变成它自己了。
+        remember_open(self.project.root)
+
     def _update_title(self):
         """窗口标题 = 「项目名-」+ 基础标题。
 
@@ -557,25 +566,36 @@ class MainWindow(QMainWindow):
         """把决策参数切到当前项目那一份（**必须在各面板 bind 之前**跑）。
 
         顺序为什么关键：面板（决策参数页、路线识别页）在 bind 时是从 settings
-        读值回填控件的 —— 先换参数再回填，控件才显示当前项目的值。
+        读值回填控件的 —— 先换参数再回填，控件才显示当前项目的值。同样地，
+        「最近打开的项目」是在**换完之后**才更新的（见 open_project 末尾），
+        否则播种源会变成刚打开的这个项目自己。
 
-        项目里还没存过（老项目 / 新建项目）就用 config/decision.json 那份播种，
-        并**当场写进项目**（打开即固化）：
-          · 辛苦调出来的参数不该因为换了存法就丢（那份就是它此前一直在用的）；
-          · 固化之后各项目互不影响 —— 若只在内存里播种，没改过的项目每次打开
-            都会重新从全局播种，等于跟着「最近动过的那个项目」漂，很难解释。
+        三条规则（对应「参数只认项目」这件事）：
+          · 有项目且存过 decision 段 —— 用它自己的；
+          · 有项目但没存过（新建 / 老项目）—— 用**最近打开的那个项目**那份播种
+            并当场固化。键位映射、行为序列、血蓝条这些东西各图通用，让每个新项目
+            都重配一遍不合理；固化之后它就有自己的一份，之后互不影响；
+          · 没打开项目 —— 读**最近打开的那个项目**那份，**只读**：界面照样能改
+            （实时预览立刻生效），但没有归属、不落盘（save() 没有钩子就什么都不写），
+            一打开项目就被项目的值覆盖。
         """
-        from decision.agent import load_saved, set_save_hook, settings
+        from decision.agent import set_save_hook, settings
 
         if project is None:
-            # 没项目：参数落回全局那份（界面照样能改，只是不归属任何项目）
             set_save_hook(None)
-            settings.from_dict(load_saved() or {})
+            src = last_opened()
+            settings.from_dict((src.get("decision") if src is not None else None) or {})
             return
 
         data = project.get("decision")
         if not isinstance(data, dict) or not data:
-            settings.from_dict(load_saved() or {})       # 全局那份先应用到内存
+            src = last_opened()
+            # 最近项目正好就是这个项目（比如它上次打开时被清空了 decision）→ 只能
+            # 落到默认值，别拿它自己那份空字典当种子。
+            seed = None
+            if src is not None and src.root != project.root:
+                seed = src.get("decision")
+            settings.from_dict(seed or {})
             # 存**整份**（缺的键由 from_dict 的默认值补齐）—— 项目文件一打开就是
             # 完整的一份，手工翻/手工改都看得全，不用去猜哪些键是默认值。
             project.set("decision", settings.to_dict(), save=True)

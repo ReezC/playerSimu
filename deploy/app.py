@@ -24,20 +24,74 @@ import time
 import traceback
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QFont
-from PyQt5.QtWidgets import (QApplication, QCheckBox, QFileDialog, QFrame,
-                             QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-                             QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
-                             QScrollArea, QSizePolicy, QSplitter, QVBoxLayout,
-                             QWidget)
-
+# ─────────────────────────────────────────────────────────────────────
+# 这一段必须排在**依赖导入之前**：依赖没装时（A 机上最常见 —— 没跑过
+# pip install -r deploy/requirements.txt）模块级的 import PyQt5 会直接抛异常，
+# 而 pythonw 没有控制台，那份 traceback 打给 None 就没了，末尾
+# `if __name__ == "__main__"` 那段根本到不了 —— 不弹框、不写日志，
+# 表现还是「双击没反应」。所以错误上报先定义好，并包住下面那些导入。
+# ─────────────────────────────────────────────────────────────────────
 from deploy import config as dcfg
-from deploy import selfcheck, services
-from deploy.runner import Proc
-from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox)
 
 APP_NAME = "playerSimu 部署台"
+CRASH_LOG = dcfg.ROOT / "deploy_crash.log"
+
+# 已经报过一次错了（写日志 + 弹框）。异常往外抛之后还会过 sys.excepthook，
+# 没有这个标记那份堆栈会被写两遍。
+_reported = False
+
+
+def _report_startup_error():
+    """出错就留证据 + 弹框，**绝不静默退出**。
+
+    **为什么非要弹框**：这个界面是用 pythonw 起的（为了不留黑窗），一旦在窗口
+    出现之前就挂了，用户看到的就是「双击没反应」—— 排查时间全耗在「不知道哪错了」
+    上（依赖没装、sys.stderr 是 None 的老坑、Qt 起不来……都归它管）。
+
+    用 ctypes 弹而不是 QMessageBox：崩在 QApplication 起来之前时 Qt 还不能用。
+    这里自己也不许再抛，否则就白写了。
+    """
+    global _reported
+    tb = traceback.format_exc()
+    try:
+        with open(CRASH_LOG, "a", encoding="utf-8") as fh:
+            fh.write("\n=== 启动失败 %s ===\n%s\n"
+                     % (time.strftime("%Y-%m-%d %H:%M:%S"), tb))
+    except Exception:
+        pass
+    _reported = True
+    if sys.stderr is not None:
+        sys.stderr.write(tb)
+
+    head = tb.strip().splitlines()[-1] if tb.strip() else "未知错误"
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "部署台启动失败：\n\n%s\n\n完整堆栈已写进：\n%s" % (head, CRASH_LOG),
+            APP_NAME, 0x10)          # MB_ICONERROR
+    except Exception:
+        pass
+
+
+try:
+    from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+    from PyQt5.QtGui import QFont
+    from PyQt5.QtWidgets import (QApplication, QCheckBox, QFileDialog, QFrame,
+                                 QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+                                 QMainWindow, QMessageBox, QPlainTextEdit,
+                                 QPushButton, QScrollArea, QSizePolicy,
+                                 QSplitter, QVBoxLayout, QWidget)
+
+    from deploy import selfcheck, services
+    from deploy.runner import Proc
+    from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,
+                             NoWheelSpinBox)
+except Exception:
+    # 最常见的就是 PyQt5 / PyYAML / pyserial 没装（见 deploy/requirements.txt）——
+    # 让上面那个框把话说清楚，别让人对着一个不会出现的窗口发呆。
+    _report_startup_error()
+    raise
 
 # 每个服务一色：日志行、状态点、卡片左边框都用它。选的是深色底上看得清的中等饱和度。
 SERVICE_COLOR = {
@@ -589,6 +643,7 @@ class DeployWindow(QMainWindow):
         self.procs = {}
         self.cards = {}
         self._stopping = set()
+        self._hinted = set()        # 已跟过的「错误翻译」，同一条只跟一次
 
         self.sig_line.connect(self._on_line)
         self.sig_exit.connect(self._on_exit)
@@ -789,6 +844,25 @@ class DeployWindow(QMainWindow):
 
     # ---------------- 启停 ----------------
 
+    def _check_host_before_push(self, cfg):
+        """起推流前 ping 一次 B 机，先说一句人话。
+
+        ffmpeg 碰到「本机到 B 机没有路由」只会报 `Error number -10051`，光看那行
+        看不出是网络问题（翻译表见 services.explain）。**只提示不拦**：ICMP 有可能
+        被防火墙挡住，ping 不通不代表 UDP 发不出去 —— 拦下来反而会挡住能通的情况。
+        B 机开着时 ping 是毫秒级，只有它不可达时才会等那 ~0.8 秒。
+        """
+        try:
+            rows = selfcheck.check_host(cfg)
+        except Exception:
+            return
+        for it in rows:
+            if it.get("level") == "ok":
+                self.log("ui", "推流前检查：%s" % it["title"])
+            else:
+                self.log("ui", "推流前检查：%s —— %s"
+                         % (it["title"], (it.get("detail") or "").splitlines()[0]))
+
     def _start_one(self, key, quiet=False):
         cfg = self.cfg[key]
         hint = services.missing_hint(key, cfg)
@@ -799,6 +873,9 @@ class DeployWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "先补一下", hint)
             return False
+
+        if key == "push":
+            self._check_host_before_push(cfg)
 
         cmd = services.build_cmd(key, cfg)
         proc = Proc(key, cmd, cwd=dcfg.ROOT,
@@ -865,7 +942,13 @@ class DeployWindow(QMainWindow):
         elif code in (3221225786, -1073741510):     # CTRL_BREAK / Ctrl+C 的退出码
             self.log(key, "已停止")
         else:
-            self.log(key, "意外退出（code %s）—— 上面几行是它的最后输出" % code)
+            # 把「跑了多久」也写上：一启动就挂 vs 挂了几小时才挂，是完全不同的两类
+            # 问题（前者多为配置，后者多为掉线/省电，见 services.explain 的翻译表）。
+            proc = self.procs.get(key)
+            started = getattr(proc, "started_at", 0.0)
+            ran = ("，已运行 %s" % _fmt_dur(time.time() - started)) if started else ""
+            self.log(key, "意外退出（code %s%s）—— 上面几行是它的最后输出"
+                     % (code, ran))
         # 不用手动清 proc：Proc.running() 走 Popen.poll()，进程退出后自然为假，
         # 清掉 proc 反而会让「再启动」少一个可查的对象。
         self._refresh_states()
@@ -873,6 +956,13 @@ class DeployWindow(QMainWindow):
     def log(self, key, text):
         for line in str(text).splitlines() or [""]:
             self.log_pane.append(key, line)
+        # 已知错误特征 → 跟一句人话。放在唯一的日志入口，服务和界面消息都过这里；
+        # 同一条翻译只跟一次，免得 ffmpeg 把同一个错重复报三遍就刷三遍解释。
+        hint = services.explain(text)
+        if hint and hint not in self._hinted:
+            self._hinted.add(hint)
+            for ln in hint.splitlines():
+                self.log_pane.append("ui", ln)
 
     # ---------------- 自检 ----------------
 
@@ -946,13 +1036,6 @@ class DeployWindow(QMainWindow):
         e.accept()
 
 
-CRASH_LOG = dcfg.ROOT / "deploy_crash.log"
-
-# 已经报过一次错了（写日志 + 弹框）。异常往外抛之后还会过 sys.excepthook，
-# 没有这个标记那份堆栈会被写两遍。
-_reported = False
-
-
 def _install_crash_handlers():
     """让崩溃留下证据，并且**绝不影响启动**。
 
@@ -988,38 +1071,14 @@ def _install_crash_handlers():
     sys.excepthook = hook
 
 
-def _report_startup_error():
-    """启动失败时别一声不响：写成日志 + 弹个框。
-
-    **为什么非要弹框**：这个界面是用 pythonw 起的（为了不留黑窗），一旦在窗口
-    出现之前就挂了，用户看到的就是「双击没反应」—— 上次 faulthandler 那次事故
-    就是这样，全耗在「不知道哪错了」上。
-
-    用 ctypes 弹而不是 QMessageBox：崩在 QApplication 起来之前时 Qt 还不能用。
-    这里自己也不许再抛，否则就白写了。
-    """
-    global _reported
-    tb = traceback.format_exc()
-    try:
-        with open(CRASH_LOG, "a", encoding="utf-8") as fh:
-            fh.write("\n=== 启动失败 %s ===\n%s\n"
-                     % (time.strftime("%Y-%m-%d %H:%M:%S"), tb))
-    except Exception:
-        pass
-    _reported = True
-    if sys.stderr is not None:
-        sys.stderr.write(tb)
-
-    head = tb.strip().splitlines()[-1] if tb.strip() else "未知错误"
-    try:
-        import ctypes
-        ctypes.windll.user32.MessageBoxW(
-            None,
-            "部署台启动失败：\n\n%s\n\n完整堆栈已写进：\n%s"
-            % (head, CRASH_LOG),
-            APP_NAME, 0x10)          # MB_ICONERROR
-    except Exception:
-        pass
+def _fmt_dur(sec):
+    """秒数 → 「2 时 5 分 / 3 分 12 秒 / 45 秒」（日志里用，别给一堆小数）。"""
+    sec = max(0, int(sec))
+    if sec >= 3600:
+        return "%d 时 %d 分" % (sec // 3600, (sec % 3600) // 60)
+    if sec >= 60:
+        return "%d 分 %d 秒" % (sec // 60, sec % 60)
+    return "%d 秒" % sec
 
 
 def main():

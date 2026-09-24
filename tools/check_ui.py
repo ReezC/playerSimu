@@ -10,6 +10,7 @@
 退出码：有 ERROR 返回 1，否则 0（可以直接挂到提交前检查）。
 """
 import argparse
+import ast
 import io
 import os
 import re
@@ -69,20 +70,50 @@ def check_raw_widgets(errors):
                           "        %s" % (rel(p), i, m.group(1), suggested, ln.strip()))
 
 
+def _imports_with_scope(node, inside=False):
+    """递归收集 import 节点，并标明它是否落在**函数/类体**里。
+
+    `try:` / `if:` 不算 —— 它们不产生局部名字，只是模块级的普通语句。
+    这条区分很关键：deploy/app.py 用模块级 `try:` 包住依赖导入（装不上时
+    要先弹个错误框，而不是让 pythonw 静默退出），不该被当成违规。
+    """
+    for child in ast.iter_child_nodes(node):
+        deeper = inside or isinstance(child, (ast.FunctionDef,
+                                              ast.AsyncFunctionDef,
+                                              ast.ClassDef))
+        if isinstance(child, (ast.Import, ast.ImportFrom)):
+            yield child, inside
+        yield from _imports_with_scope(child, deeper)
+
+
+def _imports_widgets(node):
+    if isinstance(node, ast.ImportFrom):
+        return (node.module or "").startswith("gui.widgets")
+    return any(a.name.startswith("gui.widgets") for a in node.names)
+
+
 def check_widgets_import_scope(errors):
     """gui.widgets 的导入必须在模块级。
 
     写在方法/类体里会变成「局部名字」：构造函数在它之前用到 NoWheel* 就会
     UnboundLocalError（本仓库已经这样炸过一次）。
+
+    判据取 AST 上的**祖先里有没有 函数/类**，而不是「这一行有没有缩进」——
+    后者连模块级 `try:` 里的 import 也会报（那是误报，见 _imports_with_scope）。
     """
     for p in iter_scanned():
-        for i, ln in enumerate(read(p).splitlines(), 1):
-            if "import" not in ln or "gui.widgets" not in ln:
-                continue
-            if ln.startswith((" ", "\t")):
+        src = read(p)
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        lines = src.splitlines()
+        for node, inside in _imports_with_scope(tree):
+            if inside and _imports_widgets(node):
                 errors.append("%s:%d  gui.widgets 的导入被写进了函数/类体，"
                               "请挪到模块顶部\n        %s"
-                              % (rel(p), i, ln.strip()))
+                              % (rel(p), node.lineno,
+                                 lines[node.lineno - 1].strip()))
 
 
 def check_settings_sync(warnings):

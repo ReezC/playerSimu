@@ -283,6 +283,42 @@ def release_all(serial_port):
             pass
 
 
+#: 已知错误特征 → 一句人话。特征按**小写**子串匹配（一条命中就够）。
+#:
+#: 为什么要在我们这边翻：ffmpeg 只会给「Error number -10051」这种，要去查
+#: Windows 错误码表才知道那是 WSAENETUNREACH（网络不可达）—— 而这类错最长见的
+#: 原因就那几条（网段不对 / 没拿到 IP / B 机改了 IP），直接写出来省一轮排查。
+_ERROR_HINTS = (
+    (("-10051", "network is unreachable", "no route to host", "-10065"),
+     "本机到 B 机没有路由（-10051 = Windows 网络不可达）—— 这是本机的路由错误，"
+     "不是 B 机拒绝你。看它是「一启动就报」还是「挂了一阵才报」：\n"
+     "  · 一启动就报 = 网段/路由没配通：① A 机自己的 IP 是否和 B 机同网段"
+     "（ipconfig /all；169.254.x.x = 没拿到 IP）；② ping B 机；③ B 机现在的 IP "
+     "还是配置里那个吗；④ 不同网段就改 config/link.yaml 的 b_host，再点「按 link.yaml 填」。\n"
+     "  · 挂了一阵才报 = 配置本来是对的、运行中途路由丢了：最常见是系统睡眠/"
+     "现代待机、网卡省电、USB 或 Wi-Fi 网卡掉线（挂机时没人碰键鼠最容易触发）。"
+     "查 powercfg /a，按 docs/A_SETUP.md 末尾那节把睡眠/硬盘/显示器/网卡省电全关掉。"),
+    (("-10013", "permission denied"),
+     "被拒绝（-10013）：多半是本机防火墙 / 安全软件拦了出站 UDP。"),
+    (("cannot load nvcuda", "no capable devices",
+      "unknown encoder 'h264_nvenc'", "error while opening encoder"),
+     "显卡编码起不来：把推流的「编码器」改成 libx264（720p 以内够用），"
+     "或确认 N 卡驱动 / 是不是被别的进程占满了编码器会话。"),
+)
+
+
+def explain(text):
+    """把已知的错误特征翻成一句人话；没有对应特征返回空串。
+
+    纯函数、不读配置 —— 便于直接拿来测（见 tools/ 里的自检思路）。
+    """
+    low = str(text or "").lower()
+    for marks, hint in _ERROR_HINTS:
+        if any(m in low for m in marks):
+            return hint
+    return ""
+
+
 def missing_hint(key, cfg):
     """启动前能一眼看出来的问题，返回提示文字；没问题返回空串。
 

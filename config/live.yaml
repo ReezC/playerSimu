@@ -1,4 +1,4 @@
-conf_mob: 0.3
+conf_mob: 0.5
 conf_player: 0.7
 imgsz: 800
 device: '0'
