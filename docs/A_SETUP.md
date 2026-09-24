@@ -49,7 +49,7 @@ pip 之外还要的：
 | **ffmpeg** | 推流 | `winget install --id Gyan.FFmpeg -e`；没 N 卡就把推流的编码器改成 `libx264` |
 | `tkinter` | 探针窗口（标准库） | 精简安装包可能没带；缺了会在探针卡片的日志里看到 `No module named 'tkinter'` |
 | **OBS** | 只在走 §4 的 OBS 推流时 | 用部署台的推流卡片则不需要 |
-| **Pro Micro 固件** | 键盘中继 | Arduino IDE 烧 `remote_kbd/pro_micro/pro_micro.ino` |
+| **Pro Micro 固件** | 键盘中继 | Arduino IDE 烧 `remote_kbd/pro_micro/pro_micro.ino` —— **烧之前先在部署台停掉「键盘中继」**！否则板子重新枚举时，中继手里的串口句柄会失效，可能直接原生崩掉（`0xC0000005`），表现是「界面还显示连接成功，但手动输入和鼠标都传不过去」 |
 | 放行入站 UDP 5001 | 对时服务 | 见 §1 |
 
 装完点界面里的**环境自检**，它一次查完：ffmpeg / 有没有 NVENC / 串口能不能枚举 /

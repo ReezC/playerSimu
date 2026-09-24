@@ -16,6 +16,8 @@ save() 就整份写回该项目的 project.yaml（见 MainWindow._bind_decision_
 生效，但一打开项目就被项目的值覆盖 —— 参数必须有明确归属。
 """
 
+import time
+
 from PyQt5.QtCore import Qt, QEvent, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
                              QFormLayout, QFrame, QGridLayout, QGroupBox,
@@ -1081,6 +1083,79 @@ class PlayerPanel(QWidget):
         if self.touchpad.active:
             txt += "（触控模式中）"     # 板子会变蓝，但滚到别处时就看不见了
         self.lbl_state.setText(txt)
+        self._poll_link_health()
+
+    def _poll_link_health(self):
+        """定时核对**指令通道**的真实健康度。
+
+        **为什么必须有这一层**：设备状态那行原来只在「连接成功」那一刻写一次，
+        之后再也不更新 —— 于是 relay 崩了（本仓库真实踩过：原生崩溃
+        0xC0000005，进程当场消失）、串口掉了、链路卡死了，界面上照旧写着
+        「已连接 ProMicro(远程)」，而实际上一条指令都发不出去。
+        现在每 500ms 对一次账，不正常就标红说明原因。
+
+        判据来自 `dinput.link_health()`：既看「发送有没有报错」，也看
+        「发出去后 5 秒内有没有固件回执」—— 后者能抓到「发送看着成功、
+        实际谁也没收到」的情况。恢复动作不在这里做（重连会阻塞、也可能
+        和实时线程抢连接），界面上点「重置指令通道」即可。
+        """
+        h = dinput.link_health()
+        key = (h.get("backend"), bool(h.get("ok", True)), str(h.get("err") or ""))
+        if key == getattr(self, "_link_key", None):
+            return                      # 状态没变就别每 500ms 重写控件
+        self._link_key = key
+        backend, ok = h.get("backend"), bool(h.get("ok", True))
+        if backend in ("remote", "serial"):
+            if ok:
+                self.lbl_device_state.setText(
+                    "已连接 ProMicro(本地)" if settings.input_device == "serial"
+                    else "已连接 ProMicro(远程)")
+                self.lbl_device_state.setStyleSheet("color: #137333;")
+            else:
+                self.lbl_device_state.setText(
+                    "指令发不出去：%s\n（正在自动重连；也可点「重置指令通道」）"
+                    % (h.get("err") or "链路无回执"))
+                self.lbl_device_state.setStyleSheet("color: #c5221f;")
+                self._auto_reconnect_link()
+        elif backend == "blocked":
+            self.lbl_device_state.setText(
+                "通道断了又没接上（已停止发指令）—— 正在自动重连")
+            self.lbl_device_state.setStyleSheet("color: #c5221f;")
+            self._auto_reconnect_link()
+        else:
+            self.lbl_device_state.setText("本地键盘")
+            self.lbl_device_state.setStyleSheet("color: #80868b;")
+
+    def _auto_reconnect_link(self):
+        """链路坏了自动重连：后台线程做，最多 5 秒一次。
+
+        **为什么现在敢自动做**：以前只有手动按钮 —— 结果是 relay 一崩或一重启，
+        B 机就一直红着、什么都发不出去，得人去点一下（实测踩过：A 机 relay 挂掉后
+        界面还写着「已连接」，现在它会变红并自己重连）。
+
+        放后台线程是为了不卡界面；重连本身是安全的：断开那一下 relay 会补一条
+        RELEASEALL 松开按住的键（见 decision/input.py 的 reconnect_remote）。
+        手动按钮保留 —— 自动重连失败时它还在。
+        """
+        now = time.monotonic()
+        if getattr(self, "_link_rc_busy", False):
+            return
+        if now - getattr(self, "_link_rc_at", 0.0) < 5.0:
+            return
+        self._link_rc_at = now
+        self._link_rc_busy = True
+
+        import threading
+
+        def _do():
+            try:
+                dinput.reconnect_remote()
+            except Exception:
+                pass
+            finally:
+                self._link_rc_busy = False
+
+        threading.Thread(target=_do, daemon=True, name="link-reconnect").start()
 
     @staticmethod
     def _rest_text():

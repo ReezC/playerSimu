@@ -77,7 +77,7 @@ decision:
   target_cd:
   - 1500
   - 2500
-  input_device: serial
+  input_device: local
   input_delay:
   - 0
   - 50
@@ -86,30 +86,10 @@ decision:
   min_turn_hold_ms: 1000
   turn_output_delay_ms: 200
   player_track_jump: 200
-  hp_bar:
-  - 0.341142
-  - 0.971354
-  - 0.120791
-  - 0.022135
-  mp_bar:
-  - 0.462665
-  - 0.970052
-  - 0.122987
-  - 0.02474
-  hp_color:
-  - - 0
-    - 0
-    - 135
-  - - 89
-    - 91
-    - 255
-  mp_color:
-  - - 136
-    - 81
-    - 0
-  - - 255
-    - 201
-    - 102
+  hp_bar: null
+  mp_bar: null
+  hp_color: null
+  mp_color: null
   hp_threshold: 30
   mp_threshold: 7
   pot_cd: 1500

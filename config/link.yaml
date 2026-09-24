@@ -63,7 +63,7 @@ kbd:
   port: 9000
   cert: "remote_kbd/certs/cert.pem"
   # 以下只在游戏机跑 relay 时用（agent 不用）：
-  serial: "COM3"          # 游戏机上 Pro Micro 的串口号，改成实际的
+  serial: "COM4"          # 游戏机上 Pro Micro 的串口号，改成实际的
   # 本地直连 Pro Micro（ProMicro(本地) 输入设备）用：
   serial_local: "COM7"    # 本机 Pro Micro 的串口号，改成实际的
 

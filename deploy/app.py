@@ -16,6 +16,8 @@
     想手工排查时直接复制出去跑。
 """
 
+from collections import deque
+
 import faulthandler
 import html
 import sys
@@ -547,9 +549,15 @@ class LogPane(QWidget):
 
     ERROR_WORDS = ("error", "traceback", "failed", "失败", "错误", "拒绝", "无法")
 
+    #: 保留多少行历史（和 txt 的 maximumBlockCount 一致）。筛选切换要能重排，
+    #: 所以必须自己留一份缓冲 —— 只靠控件里的内容做不到「切回来还能看见」。
+    HISTORY = 4000
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.filter = "all"
+        # (时间戳/占位, 服务 key, 该行文本, 颜色)。筛选切换时按它重排。
+        self._buf = deque(maxlen=self.HISTORY)
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(6)
@@ -590,30 +598,65 @@ class LogPane(QWidget):
 
     def _on_filter(self, _i):
         self.filter = self.cmb.currentData()
+        self._rerender()
+
+    def _visible(self, key):
+        """这一条在当前筛选下该不该显示。
+
+        「界面消息」（ui）永远显示 —— 它说的是启停/自检结果，筛掉会让人以为
+        界面没反应。
+        """
+        return self.filter == "all" or key in ("ui", self.filter)
 
     def append(self, key, text):
-        if self.filter != "all" and key not in ("ui", self.filter):
-            return
         color = SERVICE_COLOR.get(key, UI_COLOR)
         low = str(text).lower()
         if any(w in low for w in self.ERROR_WORDS):
             color = "#f28b82"
         stamp = time.strftime("%H:%M:%S")
         pad = "&nbsp;" * len(stamp)
+        lines = str(text).splitlines() or [""]
+        show = self._visible(key)
+        for i, line in enumerate(lines):
+            item = (stamp if i == 0 else pad, key, line, color)
+            self._buf.append(item)          # 历史都留着（有上限）
+            if show:
+                self._write(*item)
+        if show:
+            sb = self.txt.verticalScrollBar()
+            sb.setValue(sb.maximum())
+
+    def _write(self, prefix, key, line, color):
+        """把一条写进控件（与筛选无关，重排时也用它）。"""
         tag = "" if key == "ui" else (
             '<span style="color:%s">[%s]</span> '
             % (SERVICE_COLOR.get(key, UI_COLOR), html.escape(services.TITLE[key][:2])))
-        lines = str(text).splitlines() or [""]
-        for i, line in enumerate(lines):
-            prefix = stamp if i == 0 else pad
-            self.txt.appendHtml(
-                '<span style="color:#9aa0a6">%s</span> %s'
-                '<span style="color:%s">%s</span>'
-                % (prefix, tag, color, html.escape(line)))
+        self.txt.appendHtml(
+            '<span style="color:#9aa0a6">%s</span> %s'
+            '<span style="color:%s">%s</span>'
+            % (prefix, tag, color, html.escape(line)))
+
+    def _rerender(self):
+        """按当前筛选把历史重排一遍。
+
+        **必须留一份缓冲**：原来筛选只判断「新来的行」，切到别的服务时已经显示的
+        内容不动、被挡下的历史也补不回来 —— 表现是「换了筛选看着没生效」，
+        而且**切到 A 服务时 B 服务的历史被永久丢掉**（切过去只剩空白），
+        排查问题时最需要的那段日志正好没了。
+        """
+        self.txt.setUpdatesEnabled(False)
+        try:
+            self.txt.clear()
+            for item in self._buf:
+                if self._visible(item[1]):
+                    self._write(*item)
+        finally:
+            self.txt.setUpdatesEnabled(True)
         sb = self.txt.verticalScrollBar()
         sb.setValue(sb.maximum())
 
     def clear(self):
+        self._buf.clear()
         self.txt.clear()
 
     def save(self):

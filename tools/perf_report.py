@@ -171,7 +171,10 @@ def main(argv=None):
         n, m = d.get("n"), d.get("mean")
         return n * m if (n and m is not None) else None
 
+    # send / send_fail 是**指令通道**的收发次数：失败率一涨就是链路（relay/串口）出问题，
+    # 比看界面那行字可靠 —— 界面只在「连接那一刻」写过字的时候会骗人。
     for name in ("over_budget", "drop", "timing_calls", "out_round",
+                 "send", "send_fail",
                  "probe_ok", "probe_miss", "probe_reject"):
         tot = [v for v in (_tot(s, name) for s in segs) if v is not None]
         if not tot:
