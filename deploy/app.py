@@ -967,6 +967,76 @@ class DeployWindow(QMainWindow):
         bar.addAction(act_set)
         self.act_settings = act_set
 
+        # 「证书…」：证书挂在「键盘中继」卡片的"证书"那一格上，但现场两次都找不到
+        # （人在找"证书相关的入口"，不会去翻某张卡片的第三行）—— 所以给个显眼入口，
+        # 内容与卡片上那个按钮**同一份实现**（_cert_summary / _gen_cert）。
+        act_cert = QAction("证书…", self)
+        act_cert.setToolTip(
+            "看证书现状：卡片里指的那两个文件在不在、能不能被 TLS 加载\n"
+            "（relay 就是这么加载的）、以及**和另一台是不是同一份**。\n"
+            "要换新的一对也在这里 —— 生成完必须把 cert.pem 拷到控制机（B）覆盖同路径，\n"
+            "私钥 key.pem 只留在这台机器。")
+        act_cert.triggered.connect(self._on_cert)
+        bar.addAction(act_cert)
+        self.act_cert = act_cert
+
+    def _cert_summary(self):
+        """证书现状（多行文本）：卡片指的路径、在不在、配对、"与另一台是否一致"。
+
+        给工具栏「证书…」和用例共用 —— 免得两处各拼一遍（拼法一漂移，就会出现
+        "界面上说没问题、自检说有问题"这种最费时间的分歧）。
+
+        **看卡片里指的那两个文件**，不是默认目录：relay 真正加载的是它们
+        （`--cert/--key` 由卡片拼出来）。只报默认目录会给出"看着都在、其实
+        relay 加载的是另一个文件"的假安心。
+        """
+        from remote_kbd import gen_cert as gc
+        from tools import config_sync
+
+        kbd = self.cfg.get("kbd") or {}
+        paths = {}
+        for label, key in (("cert.pem", "cert"), ("key.pem", "key")):
+            rel = str(kbd.get(key) or "").strip()
+            p = Path(rel) if rel else (gc.out_dir() / label)
+            if rel and not p.is_absolute():
+                p = dcfg.ROOT / p
+            paths[label] = p
+        cert_p, key_p = paths["cert.pem"], paths["key.pem"]
+
+        lines = ["证书（键盘卡片里指的那两个，relay 加载的就是它们）："]
+        for label, p in (("cert.pem", cert_p), ("key.pem", key_p)):
+            lines.append("  %-9s %s  %s"
+                         % (label, "在" if p.exists() else "**不在**", p))
+        if cert_p.exists() and key_p.exists():
+            try:
+                import ssl
+
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(str(cert_p), str(key_p))
+                lines.append("配对：TLS 能加载（relay 就是这么用的）")
+            except Exception as e:                   # noqa: BLE001
+                lines.append("配对：**加载失败** —— %s: %s" % (type(e).__name__, e))
+        rows = config_sync.check()
+        lines.append("与另一台：%s"
+                     % (rows[0]["detail"].splitlines()[0] if rows
+                        else "（读不到部署清单）"))
+        return "\n".join(lines)
+
+    def _on_cert(self):
+        """工具栏「证书…」：证书现状 + 一键生成（证书的事都在这一个入口里）。"""
+        box = QMessageBox(self)
+        box.setWindowTitle("证书")
+        box.setText(self._cert_summary())
+        box.setInformativeText(
+            "要换新的一对：点「生成新的一对…」—— 生成后**必须**把 cert.pem 拷到\n"
+            "控制机（B）的同路径覆盖；私钥 key.pem 只留在这台机器（B 从不读它）。\n"
+            "拷完重启「键盘中继」，再在 B 跑 python -m tools.selftest_link 验证。")
+        btn_gen = box.addButton("生成新的一对…", QMessageBox.AcceptRole)
+        box.addButton("关闭", QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() is btn_gen:
+            self._gen_cert()
+
     def _on_settings(self):
         """打开设置弹窗。"""
         try:

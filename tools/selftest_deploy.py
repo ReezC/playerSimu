@@ -573,6 +573,33 @@ def t_bat_files_are_ascii():
           "启动器的依赖预检没走 deploy/deps.py（清单会各写一份，迟早又漏）")
 
 
+def t_cert_entry_is_findable():
+    """证书入口要**显眼**：工具栏「证书…」必须在，且点开能说清现状。
+
+    实测（2026-09-25）：证书一开始只挂在键盘卡片第三行那个小按钮上，现场两次都
+    找不到 —— 人在找"证书相关的入口"，而不会去翻某张卡片的第三行。所以工具栏也要有，
+    内容与卡片上那个共用同一份实现（`_cert_summary` / `_gen_cert`）。
+    """
+    import unittest.mock as mock
+
+    from PyQt5.QtWidgets import QApplication, QMessageBox
+    from deploy.app import DeployWindow
+
+    app = QApplication.instance() or QApplication([])
+    win = DeployWindow()
+    try:
+        check(hasattr(win, "act_cert") and win.act_cert.text() == "证书…",
+              "工具栏上没有「证书…」入口")
+        text = win._cert_summary()
+        for want in ("cert.pem", "key.pem", "配对", "与另一台"):
+            check(want in text, "证书现状里少了 %r：\n%s" % (want, text))
+        # 点开它：只是个对话框，不该抛，也不该顺手把证书换掉
+        with mock.patch.object(QMessageBox, "exec_", return_value=0):
+            win._on_cert()
+    finally:
+        win.close()
+
+
 def t_deps_all_importable():
     """A 机运行所需的模块，在**跑这个用例的机器上**必须都能 import。
 
@@ -637,6 +664,7 @@ TESTS = (
     ("批处理文件必须是纯 ASCII", t_bat_files_are_ascii),
     ("A 机运行依赖齐全（清单只有一处）", t_deps_all_importable),
     ("生成的证书能被 TLS 加载", t_gen_cert_pair_loads),
+    ("证书入口显眼（工具栏「证书…」）", t_cert_entry_is_findable),
 )
 
 

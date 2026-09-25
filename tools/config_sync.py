@@ -93,6 +93,18 @@ LOCAL = (
 )
 
 
+#: 每个文件"往哪个方向拷"。**默认是"从源那一侧拷过来"，但证书反过来** ——
+#: 它是 A 机（relay 服务端）出示的那一份，B 只是拿它当 cafile 去校验。
+#: 不说清方向的后果实测过：A 换了新证书，B 看到"和清单不一致"，
+#: 于是照提示"从源拷贝"—— 拷反了，键盘更连不上。
+HINTS = {
+    "remote_kbd/certs/cert.pem":
+        "cert.pem 的方向**和其它文件相反**：以 **A 机**那份为准（relay 是服务端）。\n"
+        "    把 A 机的 remote_kbd\\certs\\cert.pem 拷到 B 覆盖（只拷这一个，\n"
+        "    key.pem 不拷）→ 重启 A 的「键盘中继」→ 在 B 跑 python -m tools.selftest_link 验证。",
+}
+
+
 def tracked():
     """进清单的文件（MUST + SOFT）→ ((相对路径, 为什么), ...)。"""
     return tuple(MUST) + tuple(SOFT)
@@ -174,10 +186,16 @@ def check(root=ROOT, manifest=None):
 
     where = "清单写于 %s（%s）" % (data.get("when", "?"), data.get("host", "?"))
     if hard:
+        # 每个"必须一致"的文件，**拷贝方向可能不一样** —— 一句话说清往哪拷，
+        # 免得两边互相等（或者拷反了，越弄越乱）。
+        hints = [HINTS[r.split("：")[0]] for r in hard
+                 if r.split("：")[0] in HINTS]
         return [{"level": "bad", "title": title,
-                 "detail": "**和另一台不一致**（%s）：\n  %s\n"
-                           "把源那一侧的文件拷过来即可（别在这边手改 —— "
-                           "下次部署又会被覆盖）。" % (where, "\n  ".join(hard))}]
+                 "detail": "**和另一台不一致**（%s）：\n  %s\n%s"
+                           % (where, "\n  ".join(hard),
+                              ("\n" + "\n".join(hints)) if hints
+                              else "\n把源那一侧的文件拷过来即可（别在这边手改 —— "
+                                   "下次部署又会被覆盖）。")}]
     if soft:
         return [{"level": "warn", "title": title,
                  "detail": "共用文件一致；只有偏好类不同（%s）：\n  %s"
