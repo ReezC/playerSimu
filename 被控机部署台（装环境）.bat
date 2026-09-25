@@ -1,5 +1,7 @@
 @echo off
-rem Install the A-machine deploy console environment: venv + PyQt5/pyserial/PyYAML.
+rem Install the A-machine deploy console environment:
+rem venv + PyQt5/pyserial/PyYAML + cryptography (the last one only for
+rem remote_kbd/gen_cert.py; relay/kbd_client use the stdlib ssl).
 rem
 rem ASCII-only on purpose. cmd.exe reads .bat with the system ANSI codepage, so
 rem non-ASCII comments get mis-decoded and can turn into stray commands (this
@@ -49,7 +51,7 @@ if exist "%VENV%\Scripts\python.exe" (
 )
 set "VPY=%VENV%\Scripts\python.exe"
 
-rem ---- 3. deps: PyQt5 + pyserial + PyYAML ------------------------------------
+rem ---- 3. deps: PyQt5 + pyserial + PyYAML + cryptography ---------------------
 echo [3/4] upgrading pip ...
 "%VPY%" -m pip install -U pip
 echo [3/4] installing deploy\requirements.txt ...

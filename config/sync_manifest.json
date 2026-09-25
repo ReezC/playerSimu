@@ -1,11 +1,10 @@
 {
-  "when": "2026-09-25 22:40:18",
+  "when": "2026-09-25 22:50:26",
   "host": "LockersHome",
   "files": {
     "config/link.yaml": "7cea5285a9b3562bdb0c9aeab1ddbcfec1ce4f03f01df23869b04ed418d81f64",
     "config/push_presets.json": "d3bb57a7d329a84167704df1c3b76aaeb83a92df1d41a5a8badf4447d5c595b7",
     "remote_kbd/certs/cert.pem": "ba9c87ea7745114bf1203ff55c57cd2ca0601d9b3e17fc441ced785d50205bf8",
-    "remote_kbd/certs/key.pem": "f58346e236b148fda7f1b1e65529bfcbb7ff058af0779387fedebdeffebe4eaa",
     "tools/sweep_link.py": "fccdf0f3b141b70ef1775cb9627e5e18bb00ffbe514f9fc7e0ac28d5177f2cb2",
     "tools/push_presets.py": "ba2e4c6e19592f552a46b233e5b3db723a8b18074bc5e9589bc13be636d53f56",
     "tools/probe_codec.py": "8d100f9906136a870b20d43c65d2c336c7b322d49ba634723cad0169a18d4f6b",

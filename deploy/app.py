@@ -289,6 +289,21 @@ class ServiceCard(QFrame):
             row_box.addWidget(btn)
             holder = QWidget()
             holder.setLayout(row_box)
+        elif spec["kind"] == "cert":
+            # 证书这一格多一个「生成证书…」：A 机的原则是不敲命令，
+            # 而"生成证书"有个只做一半就很坑的分支（见 _gen_cert）。
+            row_box = QHBoxLayout()
+            row_box.setSpacing(4)
+            row_box.addWidget(widget, 1)
+            btn = QPushButton("生成证书…")
+            btn.setFixedWidth(76)
+            btn.setToolTip("一次生成一对自签证书（cert.pem + key.pem）并填进这里，\n"
+                           "然后告诉你该把 cert.pem 拷到控制机哪一份、私钥为什么不用拷。\n"
+                           "已经有证书时会先问一句（重新生成会让控制机那份作废）。")
+            btn.clicked.connect(lambda _c: self._gen_cert())
+            row_box.addWidget(btn)
+            holder = QWidget()
+            holder.setLayout(row_box)
 
         form.addWidget(holder, row, 1)
         form.setColumnStretch(1, 1)
@@ -402,12 +417,58 @@ class ServiceCard(QFrame):
             self, "选择文件", line.text() or str(dcfg.ROOT),
             spec.get("filt", "所有文件 (*)"))
         if path:
-            # 能转成相对仓库根的路径就转 —— 配置换机器/换目录后还能用
-            try:
-                path = str(Path(path).relative_to(dcfg.ROOT))
-            except ValueError:
-                pass
-            line.setText(path)
+            line.setText(_rel_to_root(path))
+
+    def _gen_cert(self):
+        """「生成证书…」：一次点完 —— 生成一对、填进卡片、把"下一步"说清。
+
+        为什么值得做成按钮：A 机的原则是**不敲命令**（见本文件开头）。而这件事有个
+        "只做一半就很坑"的分支：私钥留在 A、cert.pem 必须拷到控制机 —— 少这一步键盘
+        就是断的，而现象只是 relay 日志里一直刷 TLS 握手失败（很难联想到证书）。
+
+        **已有一对时先问一句**：重新生成会让控制机手里那份 cert.pem 立刻作废 ——
+        不能点一下就悄悄作废一个正在用的配对。
+        """
+        from remote_kbd import gen_cert as gc
+
+        have = [p for p in (gc.out_dir() / "cert.pem", gc.out_dir() / "key.pem")
+                if p.exists()]
+        if have:
+            r = QMessageBox.question(
+                self, "重新生成证书？",
+                "已经有一对证书了：\n  %s\n\n"
+                "重新生成会让它**作废** —— 控制机（B）手里那份 cert.pem 立刻对不上，\n"
+                "键盘会连不上，必须把新的 cert.pem 重新拷过去。\n\n确定要重新生成吗？"
+                % "\n  ".join(str(p) for p in have),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if r != QMessageBox.Yes:
+                return
+        try:
+            cert_p, key_p = gc.generate()
+            # 按 relay 的用法验一次：生成成功 ≠ 这对能被 TLS 用（文件写坏了也算"生成成功"）
+            import ssl
+
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(str(cert_p), str(key_p))
+        except Exception as e:                       # noqa: BLE001
+            self.log("kbd", "生成证书失败：%s: %s" % (type(e).__name__, e))
+            QMessageBox.warning(self, "生成失败", "%s: %s" % (type(e).__name__, e))
+            return
+        for k, p in (("cert", cert_p), ("key", key_p)):
+            ent = self._getters.get(k)
+            if ent:                                  # 写回输入框 → 立即落盘 + 刷新命令行
+                ent[1].setText(_rel_to_root(p))
+        self.log("kbd", "已生成证书：%s（私钥留在本机，别拷到控制机）" % cert_p.name)
+        QMessageBox.information(
+            self, "证书已生成",
+            "已生成并验证（TLS 能加载）：\n  %s\n  %s\n\n"
+            "**下一步（必做）**：把 **cert.pem** 拷到控制机（B）的同路径覆盖：\n"
+            "  B 机：remote_kbd\\certs\\cert.pem\n"
+            "**私钥 key.pem 不要拷** —— B 机从不读它。\n\n"
+            "拷完在 B 机跑  python -m tools.selftest_link  验证键盘连得上；\n"
+            "然后在任一台跑  python -m tools.config_sync --write  更新部署清单。\n\n"
+            "（「键盘中继」若正在跑，需要重启它才会用上新证书。）"
+            % (cert_p, key_p))
 
     def _pick_region(self, line):
         """「框选…」：抓屏拖一个框 → 把 x,y,w,h 写回输入框。
@@ -508,6 +569,18 @@ def _cast(text, cast, fallback):
         return cast(str(text).strip())
     except (TypeError, ValueError):
         return fallback
+
+
+def _rel_to_root(path):
+    """能转成相对仓库根的路径就转 —— 配置换机器/换目录后还能用。
+
+    卡片里的路径全部走这里（浏览…、生成证书、按 link.yaml 填），
+    免得几处各写一遍（写两遍迟早会有一处忘了转）。
+    """
+    try:
+        return str(Path(path).relative_to(dcfg.ROOT))
+    except ValueError:
+        return str(path)
 
 
 def _parse_size(text):

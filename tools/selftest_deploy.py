@@ -212,6 +212,14 @@ def t_cards():
     btns = [b.text() for b in card.findChildren(QPushButton)]
     check("框选…" in btns, "小地图卡片上没有「框选…」按钮：%s" % btns)
 
+    # 键盘卡片的「生成证书…」：A 机的原则是**不敲命令**（deploy/app.py 开头那条），
+    # 而生成证书有个只做一半就很坑的分支（私钥留 A、cert.pem 必须拷到 B）——
+    # 所以它得是个按钮，而且点了之后要把"拷哪一份"说清楚。
+    card_kbd = ServiceCard("kbd", copy.deepcopy(dcfg.DEFAULTS["kbd"]))
+    btns_kbd = [b.text() for b in card_kbd.findChildren(QPushButton)]
+    check("生成证书…" in btns_kbd,
+          "键盘卡片上没有「生成证书…」按钮：%s" % btns_kbd)
+
     # 空配置 → 输入框空、values() 是 None（会被 missing_hint 拦住）
     role, line, _getter = card._getters["region"]
     check(line.text() == "", "没框过区域时输入框应该是空的")
@@ -556,6 +564,52 @@ def t_bat_files_are_ascii():
     check("config_sync --preflight" in dep,
           "部署台启动器里没挂配置漂移预检")
     check("errorlevel 3" in dep, "漂移预检没有按退出码分流（弹窗之外该记一笔）")
+    # 依赖预检要走**同一份清单**（deploy/deps.py）：写死在 .bat 里的三个名字
+    # 曾经漏掉 cryptography/psutil，现场才炸 —— "装完了"必须等于"真能用"。
+    check("deploy.deps" in dep,
+          "启动器的依赖预检没走 deploy/deps.py（清单会各写一份，迟早又漏）")
+
+
+def t_deps_all_importable():
+    """A 机运行所需的模块，在**跑这个用例的机器上**必须都能 import。
+
+    为什么单列：`python -m remote_kbd.gen_cert` 缺 cryptography 那次，根因是
+    "入口只 import 了标准库 + 一个没列进依赖清单的包" —— 这类缺口现场才暴露，
+    而且现象跟缺的东西八竿子打不着（生成证书失败 / 键盘连不上 / 探针窗口起不来）。
+    清单只有一处：deploy/deps.py（装环境脚本、启动器、环境自检都照它）。
+    """
+    from deploy import deps
+
+    check(deps.MODULES, "清单是空的 —— 那这个检查就是摆设")
+    for name, why in deps.MODULES:
+        check(len(why or "") > 4, "%s 没写「为什么需要它」" % name)
+    miss = deps.check()
+    check(not miss, "缺这些模块：%s" % (miss,))
+
+
+def t_gen_cert_pair_loads():
+    """「生成证书」生成出来的那一对，要能被 TLS **真的加载**（relay 就是这么用的）。
+
+    只验"文件存在"不够：写坏了、私钥和证书不配对，都算"生成成功"，
+    而现场的现象只是"键盘连不上"。
+    """
+    import shutil
+    import ssl
+    import tempfile
+
+    from remote_kbd import gen_cert
+
+    tmp = Path(tempfile.mkdtemp(prefix="cert_"))
+    try:
+        cert_p, key_p = gen_cert.generate(tmp)
+        check(cert_p.exists() and key_p.exists(),
+              "证书/私钥没生成：%s %s" % (cert_p, key_p))
+        check(gen_cert.out_dir().name == "certs",
+              "证书默认目录变了？out_dir=%s" % gen_cert.out_dir())
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(cert_p), str(key_p))     # 与 remote_kbd/relay.py 同一用法
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
 
 
 # ---------------------------------------------------------------- 跑
@@ -578,6 +632,8 @@ TESTS = (
     ("启动后卡片的「将执行」不为空", t_cards_show_cmd_at_startup),
     ("自检前先查探针/时钟两张卡", t_sweep_guard_asks_for_probe_and_clock),
     ("批处理文件必须是纯 ASCII", t_bat_files_are_ascii),
+    ("A 机运行依赖齐全（清单只有一处）", t_deps_all_importable),
+    ("生成的证书能被 TLS 加载", t_gen_cert_pair_loads),
 )
 
 

@@ -227,6 +227,23 @@ def check_config_sync(_cfg=None):
     return config_sync.check()
 
 
+def check_deps(_cfg=None):
+    """部署台运行所需的模块齐不齐（清单**只有一处**：deploy/deps.py）。
+
+    为什么放进自检：缺包的现象常和缺的东西八竿子打不着（缺 cryptography →
+    "生成证书"报错；缺 tkinter → 探针窗口起不来），而"装环境脚本跑过了"和
+    "现场真能用"是两件事 —— 这里当场说清缺哪几个。
+    """
+    from deploy import deps
+
+    miss = deps.check()
+    if not miss:
+        return [ok("运行依赖齐全", "%d 个模块都能 import" % len(deps.MODULES))]
+    return [bad("运行依赖缺 %d 个" % len(miss),
+                "\n".join("%s —— %s" % (n, w) for n, w in miss)
+                + "\n\n跑一次装环境脚本；tkinter 缺的话要重跑 Python 安装器并勾 tcl/tk。")]
+
+
 def run(cfg, expect=None):
     """跑全部检查，返回 [{level, title, detail}]。
 
@@ -249,6 +266,7 @@ def run(cfg, expect=None):
     guard(check_region, cfg.get("mmap", {}))
     guard(check_link, cfg, expect)
     guard(check_config_sync, cfg)
+    guard(check_deps, cfg)
     return items
 
 

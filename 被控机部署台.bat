@@ -19,15 +19,19 @@ rem The console twin of PYW (pythonw.exe -> python.exe), used for the check belo
 set "PYC=%PYW:pythonw.exe=python.exe%"
 if /i "%PYC%"=="pythonw" set "PYC=python"
 
-rem Preflight. pythonw has no console window, so a missing dependency would
-rem otherwise look like "double-click does nothing" -- say it out loud instead.
-"%PYC%" -c "import PyQt5, yaml, serial" 2>nul
+rem Preflight 1: every module the A machine actually runs, checked by
+rem deploy/deps.py -- one list shared with the install script, the console's
+rem self-check and the selftests. "Installed" then means installed, not
+rem "the three names someone remembered to type here".
+"%PYC%" -m deploy.deps
 if errorlevel 1 (
     echo.
-    echo Deploy console cannot start: missing python packages.
+    echo Deploy console cannot start: missing python packages ^(listed above^).
     echo   interpreter : %PYC%
     echo   install deps: "%PYC%" -m pip install -r deploy\requirements.txt
-    echo   manual      : pip install PyQt5 pyserial PyYAML
+    echo   or run the install .bat next to this file ^(creates a .venv^).
+    echo   tkinter is not pip-installable: re-run the Python installer and
+    echo   tick tcl/tk.
     echo.
     echo If that interpreter is not found either, install Python 3.10 first.
     echo.

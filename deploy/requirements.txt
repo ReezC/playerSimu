@@ -8,3 +8,10 @@
 PyQt5>=5.15
 pyserial>=3.5
 PyYAML>=6.0
+# 推流自检里的 CPU%（deploy/push_sweep.py）。没有也能跑，只是表里那两列是空的 ——
+# 但既然"装环境"就该装齐，省得以后为了看 CPU% 再回来补。
+psutil>=5.9
+# 只有 remote_kbd/gen_cert.py（生成自签证书）需要它 —— relay 和 KbdClient 都只用
+# 标准库的 ssl。所以这台机器上丢了它只影响"生成证书"，不影响键盘链路本身。
+# 但既然装环境脚本是照这份清单装的，就列在这儿，省得新机器上生成证书时才发现缺。
+cryptography>=3.0

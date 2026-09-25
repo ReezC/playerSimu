@@ -43,8 +43,10 @@ MUST = (
      "收流地址/端口/分辨率/帧率/探针换算 —— 不一致就是「流发出来了、B 机没画面」"),
     ("config/push_presets.json",
      "试推的候选清单 —— 不一致两边跑的不是同一份（有握手后不致命，但表会串味）"),
-    ("remote_kbd/certs/cert.pem", "键盘中继的证书是**配对**的，不一致就连不上"),
-    ("remote_kbd/certs/key.pem", "同上（私钥与证书必须成对）"),
+    ("remote_kbd/certs/cert.pem",
+     "键盘中继：B 机拿它当 cafile **校验 A 机出示的证书**"
+     "（remote_kbd/kbd_client.py 的 create_default_context(cafile=...)）—— "
+     "两边不是同一份，键盘就连不上/一直重连。**权威来源是 A 机**（relay 是服务端）"),
 )
 
 #: 接线相关代码：不一致会出现"一边在等、一边没发"这种最难查的现象。
@@ -68,6 +70,9 @@ SOFT = (
 LOCAL = (
     ("config/deploy.json",
      "A 机本地：本机串口/屏幕区域/推流参数。它**派生**自 link.yaml，由环境自检比对"),
+    ("remote_kbd/certs/key.pem",
+     "私钥**只在 A 机**用（relay 服务端 load_cert_chain，见 remote_kbd/relay.py）；"
+     "B 机从不加载它 —— 所以两边不必一致（要求同步一份私钥是没必要的）"),
     ("config/probe_calib.json", "B 机标定出来的几何（框选 / solve 的产物）"),
     ("config/live.yaml", "B 机实时预览的偏好"),
     ("config/session.json", "B 机上次打开的会话"),

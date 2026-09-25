@@ -75,9 +75,12 @@ PARAMS = {
         dict(key="port", keys=("port",), label="TCP 端口", kind="int",
              minimum=1, maximum=65535, width=110,
              tip="等 B 机 agent 连上来的 TLS 端口，与 link.yaml 的 kbd.port 一致。"),
-        dict(key="cert", keys=("cert",), label="证书", kind="path", mode="file",
+        dict(key="cert", keys=("cert",), label="证书", kind="cert", mode="file",
              filt="证书 (*.pem);;所有文件 (*)",
-             tip="TLS 证书。没有就用 remote_kbd/gen_cert.py 生成一份。"),
+             tip="TLS 证书。**没有就点右边「生成证书…」** —— 一次生成一对，"
+                 "并告诉你该把哪一份拷到控制机（B）。\n"
+                 "注意：cert.pem 要与 B 机那份**一致**（B 拿它校验这台机器的证书），"
+                 "私钥 key.pem 只留在这台机器。"),
         dict(key="key", keys=("key",), label="私钥", kind="path", mode="file",
              filt="私钥 (*.pem);;所有文件 (*)",
              tip="TLS 私钥（证书旁边那个 key.pem）。"),
