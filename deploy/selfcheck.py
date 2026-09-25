@@ -134,20 +134,39 @@ def check_host(cfg, timeout_ms=800):
 
 
 def check_certs(cfg):
-    """TLS 证书/私钥在不在（键盘中继要用）。"""
-    out = []
+    """TLS 证书/私钥在不在、**配不配对**（键盘中继要用）。
+
+    为什么还要验配对：只查"文件在不在"挡不住"证书换了、私钥没换"这种 ——
+    现场现象只是"键盘连不上"，而 relay 日志里刷的是 TLS 握手失败，很难联想到证书。
+    这里用 relay 的同一句 `load_cert_chain` 验一次；坏了就在卡片上按
+    「生成证书…」重新生成一对（**证书问题都在部署台里解决**，不用去敲命令）。
+    """
+    out, paths = [], {}
     for label, key in (("证书", "cert"), ("私钥", "key")):
         rel = str(cfg.get(key) or "").strip()
         if not rel:
-            out.append(warn("没指定 TLS %s" % label))
+            out.append(warn("没指定 TLS %s" % label, "键盘卡片上填一下（或用「生成证书…」）"))
             continue
         path = Path(rel)
         path = path if path.is_absolute() else (ROOT / path)
+        paths[key] = path
         if path.exists():
             out.append(ok("TLS %s 在" % label, str(path)))
         else:
             out.append(bad("TLS %s 不存在" % label,
-                           "%s\n用 python -m remote_kbd.gen_cert 生成一份" % path))
+                           "%s\n在键盘卡片的「生成证书…」上点一下即可" % path))
+    if len(paths) == 2:
+        try:
+            import ssl
+
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(str(paths["cert"]), str(paths["key"]))
+            out.append(ok("TLS 证书与私钥配对", "（relay 就是这么加载的）"))
+        except Exception as e:                       # noqa: BLE001
+            out.append(bad("TLS 证书/私钥不配对",
+                           "%s: %s\n在键盘卡片上点「生成证书…」重新生成一对；\n"
+                           "然后把新的 cert.pem 拷到控制机（B）覆盖同路径。"
+                           % (type(e).__name__, e)))
     return out
 
 

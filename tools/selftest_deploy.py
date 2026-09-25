@@ -562,8 +562,11 @@ def t_bat_files_are_ascii():
     # （2026-09-25 实测：A 机跑旧版 sweep_link.py，握手静默退回老流程）。
     dep = (ROOT / "被控机部署台.bat").read_text(encoding="ascii")
     check("config_sync --preflight" in dep,
-          "部署台启动器里没挂配置漂移预检")
-    check("errorlevel 3" in dep, "漂移预检没有按退出码分流（弹窗之外该记一笔）")
+          "部署台启动器里没挂配置漂移预检（至少留个带日期的记录）")
+    # **故意不弹窗**：同一个结论在部署台右上角的环境自检里就有一行，而修它的入口
+    # 也在那儿（比如键盘卡片的「生成证书…」）—— 启动时弹一个只会打断人。
+    check("--msgbox" not in dep,
+          "启动器又在弹配置漂移窗了 —— 那类提示归部署台里的自检项")
     # 依赖预检要走**同一份清单**（deploy/deps.py）：写死在 .bat 里的三个名字
     # 曾经漏掉 cryptography/psutil，现场才炸 —— "装完了"必须等于"真能用"。
     check("deploy.deps" in dep,

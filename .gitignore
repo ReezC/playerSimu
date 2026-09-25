@@ -39,3 +39,25 @@ projects/*/测试集/
 # 临时调试脚本 / 临时产物（命名习惯 _t_*，跑完即删）
 # 只忽略仓库根下的：tools/_t.py 是仓库原有文件，别误伤
 /_t_*
+
+# 给 A 机的更新包输出（tools/deploy_pack.py）
+dist/
+
+# ---- 各机本地：**绝不能靠 git 带** ---------------------------------------
+# 两台机器各有一份、而且**应当不同**：A 机的串口/屏幕区域/推流参数、B 机标定出来的
+# 几何、时钟偏移、界面偏好、跑出来的产物，以及证书（私钥只在 A 机用，A 那份才是权威）。
+# 它们被 git 跟踪过一段时间，后果有两个：git pull 会把 A 机的本机设置当"待更新文件"
+# 覆盖掉；两边的证书也一直对不上（cert.pem 不一致 = 键盘连不上）。
+# 名单口径见 tools/config_sync.py 的 LOCAL —— selftest_config_sync 会验有没有漏。
+config/deploy.json
+remote_kbd/certs/key.pem
+config/probe_calib.json
+config/ui.yaml
+config/live.yaml
+config/session.json
+config/clock_offset.txt
+config/decision.json
+config/wz.yaml
+perf_push_A.json
+perf_push_B.json
+remote_kbd/certs/

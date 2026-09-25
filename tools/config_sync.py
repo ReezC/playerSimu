@@ -9,11 +9,17 @@
     所以这里的定位很小：**单向分发（以一侧为源）+ 哈希校验（在另一侧验）** ——
     把"有没有漂移"变成一个一眼能看见的结论，**不替人去改文件**。
 
-**三档**（`--show` 原样打印，可以当文档看）：
-    MUST    必须一致：link.yaml / 候选清单 / 证书对 / **接线相关的那几个 .py**
-    SOFT    建议一致：ui.yaml（字号与框色是人的偏好，不一致只提示）
-    LOCAL   各机本地、**绝不同步**：deploy.json（A 机物理布局 + 本机参数）、
-            B 机标定出来的几何、时钟偏移、各机产物……
+**四组**（`--show` 原样打印，可以当文档看）：
+    MUST        必须一致、**而 git 带不到**：目前只有 `remote_kbd/certs/cert.pem`
+    GIT_MANAGED 由 **git** 保证一致：代码、link.yaml、候选清单（清单不重复管）
+    SOFT        建议一致：现在是空的（偏好类已归 LOCAL）
+    LOCAL       各机本地、**绝不同步**：deploy.json（A 机串口/屏幕区域/推流参数）、
+                B 机标定出来的几何、时钟偏移、ui.yaml、各机产物……
+
+**A 机是用 `git pull` 同步的** —— 这一点决定了上面的分工：
+代码与共用配置走 git（版本化、能回溯、能下放），哈希清单只补 git **带不到**的那部分。
+另外：LOCAL 里的东西会被 `.gitignore` 挡住（`selftest_config_sync` 会验），
+否则 `git pull` 会把 A 机的串口/屏幕区域当成"待更新文件"覆盖掉。
 
 **用它就三步**：
     1. 在"源"那一侧（通常是改代码/配置的那台，比如 B 机）：
@@ -37,34 +43,34 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-#: **必须一致**的文件（每条都写清"不一致会出现什么现象"，省得有人觉得无关紧要）。
+#: **必须一致、而 git 带不到**的文件 —— 清单只管这些。
+#:
+#: 为什么只剩一个：代码和 `config/link.yaml`、`config/push_presets.json` 是**被 git
+#: 跟踪**的（A 机 `git pull` 就同步了）—— 版本化、可回溯、能下放，那比哈希清单强得多，
+#: 所以清单**不再重复管**它们。重复管的坏处很具体：忘了重跑 `--write` 就报假漂移，
+#: 而人一旦被假警报咬过，就再也不信这个检查了。
+#: 真正需要哈希的是"必须在两台机器上一致、却不在 git 里"的东西 —— 目前就是证书：
+#: 它必须两边相同，又是各机本地生成的（当年就是因为这个才发现两边差着）。
 MUST = (
-    ("config/link.yaml",
-     "收流地址/端口/分辨率/帧率/探针换算 —— 不一致就是「流发出来了、B 机没画面」"),
-    ("config/push_presets.json",
-     "试推的候选清单 —— 不一致两边跑的不是同一份（有握手后不致命，但表会串味）"),
     ("remote_kbd/certs/cert.pem",
      "键盘中继：B 机拿它当 cafile **校验 A 机出示的证书**"
      "（remote_kbd/kbd_client.py 的 create_default_context(cafile=...)）—— "
      "两边不是同一份，键盘就连不上/一直重连。**权威来源是 A 机**（relay 是服务端）"),
 )
 
-#: 接线相关代码：不一致会出现"一边在等、一边没发"这种最难查的现象。
-#: 只列**不一致就会出怪现象**的那几个，不是全仓库（全仓库比对留给 git）。
-MUST_CODE = (
-    ("tools/sweep_link.py", "握手协议本体 —— 不一致就永远对不上（一方听不懂公告）"),
-    ("tools/push_presets.py", "记账字段与评分口径 —— 不一致会合并出空的表"),
-    ("tools/probe_codec.py", "探针几何与解码 —— 两边口径必须是同一份"),
-    ("tools/stream_sweep.py", "B 机侧：测量、收报告、出表"),
-    ("deploy/push_sweep.py", "A 机侧：公告、发报告、等结论"),
-    ("deploy/config.py", "A 机配置的键集合 —— 缺键会被 read() 静默丢掉"),
+#: **由 git 保证一致**（不在清单里，列出来只为让人知道它们归谁管）。
+GIT_MANAGED = (
+    ("config/link.yaml", "双机共用的链路配置 —— 在一侧改，靠 git 同步"),
+    ("config/push_presets.json", "试推候选清单 —— 同上"),
+    ("tools/*.py", "握手协议、评分口径、探针解码、测量与出表……"),
+    ("deploy/*.py", "A 机侧：部署台、环境自检、推流自检"),
 )
 
 #: **建议一致**（偏好类）：不一致只提示，不当作错误。
-SOFT = (
-    ("config/ui.yaml",
-     "字号与框色是人的偏好 —— 不一致只是「两个界面长得不一样」，不影响功能"),
-)
+#:
+#: 现在是空的：`config/ui.yaml`（字号/框色）已归入 LOCAL（各机各自的偏好，
+#: 谁都不该覆盖谁）。留这个元组是为了以后真有"建议一致"的东西时有地方放。
+SOFT = ()
 
 #: **各机本地，绝不同步**：每条都写原因，省得以后有人"顺手同步一下"。
 LOCAL = (
@@ -74,6 +80,9 @@ LOCAL = (
      "私钥**只在 A 机**用（relay 服务端 load_cert_chain，见 remote_kbd/relay.py）；"
      "B 机从不加载它 —— 所以两边不必一致（要求同步一份私钥是没必要的）"),
     ("config/probe_calib.json", "B 机标定出来的几何（框选 / solve 的产物）"),
+    ("config/ui.yaml",
+     "字号与框色是**每台机器各自的偏好** —— 谁都不该覆盖谁"
+     "（所以它既不进 git，也不要求两边一致）"),
     ("config/live.yaml", "B 机实时预览的偏好"),
     ("config/session.json", "B 机上次打开的会话"),
     ("config/clock_offset.txt", "B 机现测出来的时钟偏移（会漂，抄过去就是错的）"),
@@ -85,8 +94,8 @@ LOCAL = (
 
 
 def tracked():
-    """进清单的文件（MUST + MUST_CODE + SOFT）→ ((相对路径, 为什么), ...)。"""
-    return tuple(MUST) + tuple(MUST_CODE) + tuple(SOFT)
+    """进清单的文件（MUST + SOFT）→ ((相对路径, 为什么), ...)。"""
+    return tuple(MUST) + tuple(SOFT)
 
 
 def _is_soft(rel):
@@ -209,13 +218,15 @@ def preflight(root=ROOT, manifest=None, msgbox=False):
 
 
 def show():
-    """打印三档分类 + 每条"不一致会怎样"（当文档看）。"""
-    print("共用文件一致性：三档（详见 tools/config_sync.py 顶部说明）\n")
+    """打印分组 + 每条的"不一致会怎样"（当文档看）。"""
+    print("共用文件一致性：分组如下（详见 tools/config_sync.py 顶部说明）\n")
     for name, items, note in (
-            ("MUST  必须一致", tuple(MUST) + tuple(MUST_CODE),
-             "不一致会出明确怪现象"),
-            ("SOFT  建议一致", SOFT, "不一致只提示（偏好类）"),
-            ("LOCAL 各机本地，绝不同步", LOCAL, "同步过去反而会出错")):
+            ("MUST        必须一致、而 git 带不到", MUST, "不一致会出明确怪现象"),
+            ("SOFT        建议一致", SOFT, "不一致只提示（当前为空）"),
+            ("GIT_MANAGED 由 git 保证一致（不进清单）", GIT_MANAGED,
+             "在一侧改、git 同步即可，清单不重复管"),
+            ("LOCAL       各机本地、绝不同步", LOCAL,
+             "同步过去、或被 git 带过去，都会出错")):
         print("%s  —— %s" % (name, note))
         for rel, why in items:
             print("    %-34s %s" % (rel, why))

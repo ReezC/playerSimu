@@ -40,14 +40,12 @@ if errorlevel 1 (
 )
 
 rem Preflight 2: config/code drift vs the deployment manifest (tools/config_sync.py).
-rem "Looks like it is running, but runs yesterday's files" is the most expensive
-rem failure on this machine: an old sweep_link.py makes the whole sweep silently
-rem fall back to the old manual flow. The console vanishes with pythonw, so drift
-rem pops a message box instead of a print. Exit code 3 = drift; never blocks.
-"%PYC%" -m tools.config_sync --preflight --msgbox
-if errorlevel 3 (
-    echo [%date% %time%] config drift detected - see the popup >> deploy_sync.log
-)
+rem Quiet on purpose: this used to pop a message box, but the console itself shows
+rem the same row in its env self-check (top right), which is where the fix lives
+rem too (e.g. the "generate certificate" button). A popup here just interrupts.
+rem Kept as a check only so there is a dated record in deploy_sync.log to look at
+rem when something behaves oddly ("looks like it runs yesterday's files").
+"%PYC%" -m tools.config_sync --preflight >> deploy_sync.log 2>&1
 
 rem pythonw = no console window. If it fails before the window shows, the app
 rem pops an error box and writes the traceback to deploy_crash.log (deploy/app.py).
