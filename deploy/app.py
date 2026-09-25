@@ -937,10 +937,41 @@ class DeployWindow(QMainWindow):
         self.log("ui", "已请求停止推流自检（当前这条 ffmpeg 会停掉，已测的段会落盘）")
 
     def _start_push_sweep(self):
-        """启动推流自检（先停正在跑的推流，避免两路推流混在一起）。"""
+        """工具栏「推流自检…」：先确认**测量前提**，再让人确认，然后开跑。
+
+        **为什么先查那两张卡**：延迟靠「屏幕时间码探针」和「时钟对时服务」量出来。
+        它们没起时，A 机侧那几个数（speed / 丢帧 / CPU）照样能跑出来，但那一整轮
+        **延迟一个也量不到** —— B 机的预检会直接拒掉整轮（"那个位置没有码带"）。
+        2026-09-25 实测反复踩这个（白跑 8 分钟），所以在这儿拦住并顺手帮着起。
+        """
         if getattr(self, "_sweep", None) is not None and self._sweep.is_alive():
             QMessageBox.information(self, "正在跑", "推流自检已经在跑了。")
             return
+        missing = [k for k in ("probe", "clock")
+                   if not (self.procs.get(k) and self.procs[k].running())]
+        if missing:
+            names = "、".join(services.TITLE[k] for k in missing)
+            r = QMessageBox.question(
+                self, "先起两张卡",
+                "延迟是靠这两张卡量出来的，它们现在没在跑：\n\n  %s\n\n"
+                "不起也能跑完，但只能得到 A 机侧那几个数（speed / 丢帧 / CPU），\n"
+                "端到端延迟量不出来（B 机的预检会把整轮拒掉）。\n\n"
+                "先把它们起起来吗？" % names,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if r != QMessageBox.Yes:
+                return
+            for k in missing:
+                self.start_service(k)
+            self.log("ui", "已起 %s —— 等它们就绪（约 2.5 秒）再开始自检"
+                     % names)
+            # 留一点时间让探针把码带画上、时钟服务绑上端口：不然第一段就白量
+            # （B 机那边预检会当场判"那个位置没有码带"）。
+            QTimer.singleShot(2500, self._confirm_and_run_sweep)
+            return
+        self._confirm_and_run_sweep()
+
+    def _confirm_and_run_sweep(self):
+        """（前提就绪后）弹确认框，并按候选清单开跑。"""
         conf = pp.load()
         mins = len(conf["presets"]) * (conf["seconds"] + conf["settle_seconds"] + 3) / 60.0
         push_running = bool(self.procs.get("push") and self.procs["push"].running())

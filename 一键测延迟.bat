@@ -1,15 +1,32 @@
 @echo off
 chcp 65001 > nul
-rem ── 一键测延迟（B 机这一侧的"开关"）──────────────────────────────────────
-rem 双击它就相当于把 B 机这半边的开关打开，后面全自动：
-rem   等 A 机的段公告 → 按公告逐段量端到端延迟 → 收 A 机发来的报告
-rem   → 合并出表 → 结论回传给 A 机（部署台会弹窗显示那张表和该写回的参数）
+set PYTHONIOENCODING=utf-8
+rem ---------------------------------------------------------------------------
+rem  One-click latency sweep (B-side switch).
 rem
-rem 前提：
-rem   1. A 机部署台点一下「推流自检…」（**先后顺序无所谓**，握手会对齐）；
-rem   2. 先把工作台「实时」页点「停止」，让出 UDP 5000 —— 同时只能有一个收流者。
+rem  Double-click = turn B's half on; everything after that is automatic:
+rem    wait for A's segment announcements -> measure latency per segment ->
+rem    receive A's report -> merge into one table -> send the conclusion
+rem    back to A (its console pops the table up).
 rem
-rem 不想全自动（老流程：按清单顺序、要掐时间）就把 --auto 换成 --no-link。
+rem  Before you start:
+rem    1. On A: click the "push self-test" action in the deploy console.
+rem       Order does not matter -- the handshake aligns both sides, B may
+rem       even start first.
+rem    2. On B: click "stop" on the live preview page first, to free UDP 5000.
+rem       Only one receiver can bind that port.
+rem    3. On A: the clock service and the on-screen timecode probe cards must
+rem       be running. Without them the latency half cannot be measured at all
+rem       (B's precheck rejects the whole run).
+rem
+rem  Details in Chinese:  python -m tools.stream_sweep --help
+rem  Old manual flow (sequential list, needs timing):  ... --no-link
+rem
+rem  NOTE: keep this file pure ASCII. cmd.exe reads .bat with the console code
+rem  page, so non-ASCII comment text gets executed as a command (mojibake
+rem  "is not recognized" errors). Chinese output from python is fine because
+rem  of chcp 65001 + PYTHONIOENCODING below.
+rem ---------------------------------------------------------------------------
 cd /d "%~dp0"
 python -m tools.stream_sweep --auto
 echo.

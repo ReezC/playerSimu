@@ -35,6 +35,16 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem Preflight 2: config/code drift vs the deployment manifest (tools/config_sync.py).
+rem "Looks like it is running, but runs yesterday's files" is the most expensive
+rem failure on this machine: an old sweep_link.py makes the whole sweep silently
+rem fall back to the old manual flow. The console vanishes with pythonw, so drift
+rem pops a message box instead of a print. Exit code 3 = drift; never blocks.
+"%PYC%" -m tools.config_sync --preflight --msgbox
+if errorlevel 3 (
+    echo [%date% %time%] config drift detected - see the popup >> deploy_sync.log
+)
+
 rem pythonw = no console window. If it fails before the window shows, the app
 rem pops an error box and writes the traceback to deploy_crash.log (deploy/app.py).
 start "" "%PYW%" -m deploy.app

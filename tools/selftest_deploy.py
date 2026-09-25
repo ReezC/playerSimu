@@ -484,6 +484,80 @@ def t_cards_show_cmd_at_startup():
         win.close()
 
 
+def t_sweep_guard_asks_for_probe_and_clock():
+    """启动推流自检前**必须先查探针/时钟两张卡**，没起就问一句、并帮着起。
+
+    实测（2026-09-25）：这两张卡没起，A 机照样跑满 18 段，B 机预检把整轮拒掉 ——
+    A 机侧那几个数是有用的，但那一轮**延迟一个也没量到**，8 分钟白跑。
+    """
+    import unittest.mock as mock
+
+    from PyQt5.QtWidgets import QApplication, QMessageBox
+    from deploy.app import DeployWindow
+
+    app = QApplication.instance() or QApplication([])
+
+    # ① 点「否」：什么都不该发生（不起服务、不开跑）
+    win = DeployWindow()
+    try:
+        with mock.patch.object(QMessageBox, "question") as q:
+            q.return_value = QMessageBox.No
+            win._start_push_sweep()
+            # 参数是 (parent, 标题, 正文, ...) —— 要看**正文**里提没提那两张卡
+            asked = str(q.call_args[0][2]) if q.call_args else ""
+        check("探针" in asked, "问的时候没提到探针卡：%r" % asked)
+        check("时钟" in asked, "问的时候没提到时钟卡：%r" % asked)
+        check(not win.procs, "点了「否」却还是把服务起起来了")
+        check(win._sweep is None, "点了「否」却开始跑了")
+    finally:
+        win.close()
+
+    # ② 点「是」：起这两张卡 → **等就绪** → 才继续到确认框
+    win2 = DeployWindow()
+    try:
+        started, ran = [], []
+        # singleShot 要**立刻执行**回调：不然它把回调吞了，"等就绪"这条永远走不到后面
+        # （第一版就是这么写的，自己绊自己一跳）。
+        with mock.patch.object(QMessageBox, "question",
+                               return_value=QMessageBox.Yes), \
+                mock.patch.object(win2, "start_service",
+                                  side_effect=lambda k: started.append(k)), \
+                mock.patch("PyQt5.QtCore.QTimer.singleShot",
+                           side_effect=lambda _ms, fn: fn()) as ss, \
+                mock.patch.object(win2, "_confirm_and_run_sweep",
+                                  side_effect=lambda: ran.append(1)):
+            win2._start_push_sweep()
+        check(sorted(started) == ["clock", "probe"],
+              "点「是」时该起 clock+probe，实际起了 %s" % (started,))
+        check(ss.called, "起完服务没等就绪就往下走（探针还没画上码带）")
+        check(ran == [1], "起完服务后没走到确认框")
+    finally:
+        win2.close()
+
+
+def t_bat_files_are_ascii():
+    """仓库根的 .bat **必须是纯 ASCII**：cmd.exe 按控制台代码页读批处理，
+    非 ASCII 的注释会被**当成命令执行**（现场就是一堆 mojibake 报错）。
+
+    实测（2026-09-25）：`一键测延迟.bat` 里混了中文和 `─` 框线字符，双击后
+    控制台把 `rem` 后面的片段当命令跑，报了三条 "'xx' is not recognized"，
+    然后**照常往下跑**了 —— 所以这事不致命但很吓人，直接钉住。
+    """
+    for p in sorted(ROOT.glob("*.bat")):
+        data = p.read_bytes()
+        bad = [i for i, c in enumerate(data) if c >= 128]
+        check(not bad, "%s 里有非 ASCII 字节（位置 %s）—— cmd 会把它当命令执行"
+                       % (p.name, bad[:5]))
+
+    # 部署台启动器里必须挂着"配置漂移预检"：GUI 用 pythonw 起、**没有控制台**，
+    # 漂移只能靠弹窗说话 —— 不挂的话"跑的是旧文件"就一直隐形
+    # （2026-09-25 实测：A 机跑旧版 sweep_link.py，握手静默退回老流程）。
+    dep = (ROOT / "被控机部署台.bat").read_text(encoding="ascii")
+    check("config_sync --preflight" in dep,
+          "部署台启动器里没挂配置漂移预检")
+    check("errorlevel 3" in dep, "漂移预检没有按退出码分流（弹窗之外该记一笔）")
+
+
 # ---------------------------------------------------------------- 跑
 
 TESTS = (
@@ -502,6 +576,8 @@ TESTS = (
     ("设置弹窗：字号点确定才落盘", t_settings_dialog_font),
     ("日志保留行数两处一起改", t_log_history_applies),
     ("启动后卡片的「将执行」不为空", t_cards_show_cmd_at_startup),
+    ("自检前先查探针/时钟两张卡", t_sweep_guard_asks_for_probe_and_clock),
+    ("批处理文件必须是纯 ASCII", t_bat_files_are_ascii),
 )
 
 

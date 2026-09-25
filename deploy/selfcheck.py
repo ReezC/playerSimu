@@ -214,6 +214,19 @@ def check_link(cfg, expect):
 
 # ---------------------------------------------------------------- 汇总
 
+def check_config_sync(_cfg=None):
+    """配置/代码与**部署清单**是否一致（三档分类见 tools/config_sync.py）。
+
+    为什么放进部署台的自检：A 机最容易出的漂移就是"跑的还是旧文件" ——
+    旧的 `link.yaml`、旧的 `push_sweep.py`。今天的"握手不生效"就是这么来的
+    （A 机日志里那句 `B 机那边请现在开始跑` 就是旧版本的招牌）。
+    注意它回答的是**跨机器**的问题：本机自洽那部分由 `check_link` 管。
+    """
+    from tools import config_sync
+
+    return config_sync.check()
+
+
 def run(cfg, expect=None):
     """跑全部检查，返回 [{level, title, detail}]。
 
@@ -235,6 +248,7 @@ def run(cfg, expect=None):
     guard(check_certs, cfg.get("kbd", {}))
     guard(check_region, cfg.get("mmap", {}))
     guard(check_link, cfg, expect)
+    guard(check_config_sync, cfg)
     return items
 
 
