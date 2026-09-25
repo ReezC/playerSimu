@@ -596,6 +596,36 @@ def t_push_scale_mode_builds_both_chains():
           "GPU 那档还在先把整屏拷回内存（那就白改了）")
 
 
+def t_sweep_row_says_why():
+    """推流自检的 A 侧：**这一段为什么没成**必须写进 why，表里要看得见。
+
+    实测 2026-09-26：GPU 缩放那两档 ffmpeg 立刻退出（`out_fps=0 / frames=0`），
+    可报告里记着 `ok: True` —— 因为 `_run_once` 只认"进程起没起来"，ffmpeg 那句报错
+    被丢掉了。于是表上只剩一句"没量到延迟"，原因只能靠猜（我就猜了一轮）。
+    现在 ffmpeg 输出的尾巴一起留下、写进 why。
+    """
+    from deploy.push_sweep import annotate_a_row
+
+    row = {"name": "x", "speed": 0.99, "ok": True, "why": ""}
+    extra = {"ffmpeg_tail": [
+        "[cuda @ 000001] Cannot load cu",
+        "[Parsed_ddagrab_0 @ 000002] Setting 'framerate' to value '144'",
+        "Impossible to convert between the formats supported by the filter "
+        "'graph 0 input from stream 0:0' and the filter 'auto_scaler_0'"]}
+    annotate_a_row(row, [], extra, True)       # 起来了、但一句 stats 都没有
+    check(row["ok"] is False and "立刻退出" in row["why"],
+          "ffmpeg 立刻退出没被判成失败：%s" % row)
+    check("Impossible to convert" in row["why"],
+          "why 里没有 ffmpeg 那句报错（那才是原因）：%s" % row["why"])
+    check(row["speed"] is None, "失败的那段还留着 speed，会被当成有效数据")
+
+    # 正常的一段**不许**被动（既有报告、既有表都靠它）
+    good = {"name": "y", "speed": 0.998, "ok": True, "why": ""}
+    annotate_a_row(good, [{"speed": 0.998}], {"ffmpeg_tail": []}, True)
+    check(good["ok"] is True and good["why"] == "" and good["speed"] == 0.998,
+          "正常的一段被改了：%s" % good)
+
+
 def t_cert_entry_is_findable():
     """证书入口要**显眼**：工具栏「证书…」必须在，且点开能说清现状。
 
@@ -689,6 +719,7 @@ TESTS = (
     ("生成的证书能被 TLS 加载", t_gen_cert_pair_loads),
     ("证书入口显眼（工具栏「证书…」）", t_cert_entry_is_findable),
     ("采集链两种模式都拼得对（默认档不变）", t_push_scale_mode_builds_both_chains),
+    ("自检里那一段没成时，why 要带上 ffmpeg 的报错", t_sweep_row_says_why),
 )
 
 

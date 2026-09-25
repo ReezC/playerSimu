@@ -341,7 +341,7 @@ def t_auto_flow_end_to_end():
             check(text and len(text) > 40, "结论文本太短：%r" % (text,))
             check(res_seen and res_seen[0] == text,
                   "A 机没收到（或收到的不是同一份）结论：%r" % (res_seen,))
-            check("把最优那条写回部署台" in text or "没有可比的组合" in text,
+            check("写回部署台" in text or "没有任何可比的段" in text,
                   "结论里没有「怎么用」那一段：%s" % text[:200])
     finally:
         if th is not None:

@@ -120,7 +120,7 @@ def _row_b(name, p50=120.0, p95=200.0, recv=60.0, mono=True, st=0.0, span=20.0,
 
 
 def t_merge_alignment():
-    """合并：按**顺序**对齐、用**墙钟**核对；对不上要**说出来**（不闷头出表）。"""
+    """合并：按**段号**配对、用**墙钟**核对；对不上要**说出来**（不闷头出表）。"""
     rows = pp.merge([_row_a("a", st=100.0), _row_a("b", st=200.0)],
                     [_row_b("a", st=100.5), _row_b("b", st=200.5)])
     check(len(rows) == 2 and rows[0]["name"] == "a" and rows[1]["name"] == "b",
@@ -128,35 +128,74 @@ def t_merge_alignment():
     check(rows[0]["warn"] == "", "正常对齐却报了警：%r" % rows[0]["warn"])
     check(rows[0]["lat_p95"] == 200.0, "延迟没并进来：%s" % rows[0])
 
-    # 顺序错位（有人在中间插了一条）→ 必须说出来
+    # 同一个段号、两边名字不同 → 说明公告与清单串了（必须说出来）
     rows2 = pp.merge([_row_a("a")], [_row_b("x")])
-    check("顺序不一致" in rows2[0]["warn"], "顺序错位没报警：%r" % rows2[0]["warn"])
+    check("名字不同" in rows2[0]["warn"], "同名段号串了没报警：%r" % rows2[0]["warn"])
 
     # 墙钟差太远（B 机中途重开过预览）→ 必须说出来
     rows3 = pp.merge([_row_a("a", st=100.0)], [_row_b("a", st=160.0)])
     check("墙钟对不上" in rows3[0]["warn"], "墙钟错位没报警：%r" % rows3[0]["warn"])
 
-    # 段数不同 → 明确列一行，别静默丢
-    rows4 = pp.merge([_row_a("a"), _row_a("b")], [_row_b("a")])
-    check(rows4[-1]["idx"] == -1 and "段数不同" in rows4[-1]["warn"],
-          "段数不同没提示：%s" % rows4[-1])
+
+def t_merge_pairs_by_segment_index():
+    """**B 机晚起、缺了前几段时，整表不许错位一行。**
+
+    实测（2026-09-26）：B 机从第 2 段才开始量（它晚起），原来的"按数组位置配对"把
+    B 的每一行都往前错一格 —— 表里 `60fps-20M-g60` 显示的是 `120fps-6M-g30` 的数
+    （92.3fps / 77ms），而**表看着毫无破绽**。段号是握手公告直接带过来的，两边一定一致。
+
+    另一半同样重要：配对不上的行**要列出来**（A 侧多出来的往往是"ffmpeg 起不来"，
+    那正是"GPU 缩放支不支持"的答案），不能因为长度不同就砍掉。
+    """
+    a = [_row_a("s0", st=100.0), _row_a("s1", st=130.0), _row_a("s2", st=160.0)]
+    for i, r in enumerate(a):
+        r["idx"] = i
+    b = [_row_b("s1", p50=101.0, st=130.0), _row_b("s2", p50=102.0, st=160.0)]
+    for i, r in enumerate(b, start=1):
+        r["idx"] = i
+    rows = pp.merge(a, b)
+    check([r["name"] for r in rows] == ["s0", "s1", "s2"],
+          "行数/顺序不对：%s" % [r["name"] for r in rows])
+    check(rows[0].get("only") == "A" and rows[0]["lat_p50"] is None,
+          "缺的那一段没单独列出来：%s" % rows[0])
+    check(rows[1]["lat_p50"] == 101.0 and rows[2]["lat_p50"] == 102.0,
+          "段号没对上（整表错位一行）：%s"
+          % [(r["name"], r["lat_p50"]) for r in rows])
+
+    # A 侧多出来的一段（比如 GPU 缩放那档 ffmpeg 起不来）→ 要露面
+    a2 = a + [_row_a("cuda", st=190.0)]
+    a2[-1]["idx"] = 3
+    rows2 = pp.merge(a2, b)
+    tips = [r for r in rows2 if r.get("only") == "A"]
+    check(len(tips) == 2 and {t["name"] for t in tips} == {"s0", "cuda"},
+          "A 侧多出来的段没列出来：%s" % [(r["name"], r.get("only")) for r in rows2])
 
 
 def t_classify_rules():
-    """淘汰规则：A 机跟不上 / 几何不可信 / 丢帧太多 —— 一条都不能放过去。"""
-    slow = {"speed": 0.94, "probe_mono": True, "recv_ratio": 1.0, "lat_p95": 100.0}
+    """淘汰规则：A 机跟不上 / 几何不可信 / **链路**丢帧 —— 一条都不能放过去。"""
+    slow = {"speed": 0.94, "probe_mono": True, "lat_p95": 100.0}
     ok, why = pp.classify(slow)
     check(not ok and "speed" in why, "A 机跟不上没被淘汰：%s" % why)
 
-    jumpy = {"speed": 1.0, "probe_mono": False, "recv_ratio": 1.0, "lat_p95": 280.0}
+    jumpy = {"speed": 1.0, "probe_mono": False, "lat_p95": 280.0}
     ok2, why2 = pp.classify(jumpy)
     check(not ok2 and "几何" in why2, "几何不可信没被淘汰：%s" % why2)
 
-    lossy = {"speed": 1.0, "probe_mono": True, "recv_ratio": 0.90, "lat_p95": 200.0}
+    # 真的链路丢帧：A 发出 117，B 只收到 60
+    lossy = {"speed": 1.0, "probe_mono": True, "out_fps": 117.0, "recv_fps": 60.0,
+             "lat_p95": 200.0}
     ok3, why3 = pp.classify(lossy)
-    check(not ok3 and "丢帧" in why3, "丢帧太多没被淘汰：%s" % why3)
+    check(not ok3 and "链路丢帧" in why3, "链路丢帧没被淘汰：%s" % why3)
 
-    good = {"speed": 1.02, "probe_mono": True, "recv_ratio": 1.0, "lat_p95": 180.0}
+    # ★ 「A 机发不满」**不是**链路丢帧：分母要用 A 的**实际输出**，不是目标帧率
+    # （实测 2026-09-26：拿目标帧率当分母时 18 条全被判丢帧，整张表一条建议都给不出）
+    short = {"speed": 1.0, "probe_mono": True, "out_fps": 54.0, "recv_fps": 53.8,
+             "target_fps": 60.0, "recv_ratio": 53.8 / 60.0, "lat_p95": 160.0}
+    ok5, why5 = pp.classify(short)
+    check(ok5, "A 机发不满被误判成丢帧（整表会全军覆没）：%s" % why5)
+
+    good = {"speed": 1.02, "probe_mono": True, "out_fps": 120.0, "recv_fps": 120.0,
+            "lat_p95": 180.0}
     ok4, why4 = pp.classify(good)
     check(ok4 and not why4, "正常的一条被判不合格：%s" % why4)
 
@@ -172,13 +211,28 @@ def t_rank_picks_p95_first():
           "p95 更小的没被选成最优（选的是 %s）—— 排序口径错了"
           % (best and best["name"]))
 
-    # 两条都淘汰 → best 为空，结论要说清"全军覆没"
-    x = {**_row_b("x")}
+    # 两条都淘汰 → **照样给折中建议**（只是把话说清：为什么都不合格）
+    # （原来返回 best=None，表尾只剩"没有可比的组合" —— 那一轮其实量到了有用东西）
+    x = {**_row_b("x", p50=110.0, p95=190.0)}
     x.update(speed=0.5)
-    y = {**_row_b("y")}
+    y = {**_row_b("y", p50=90.0, p95=160.0)}
     y.update(speed=0.6)
     rows2, best2, why2 = pp.rank([x, y])
-    check(best2 is None and "全军覆没" in why2, "全灭时的结论不对：%s" % why2)
+    check(best2 is not None and best2["name"] == "y",
+          "全灭时没给折中建议（或没按 p95 挑）：%s" % (best2 and best2["name"]))
+    check("折中建议" in why2 and "原因" in why2,
+          "没说明它为什么被淘汰：%s" % why2)
+    txt2 = pp.render(rows2, best2, why=why2)
+    check("折中建议" in txt2, "表里没把折中那句话说清楚：%s" % txt2[-200:])
+
+    # **没量到延迟的行**（只有 A 侧数据：B 机缺段 / ffmpeg 起不来）也要能排序。
+    # 实测：这些行的 lat_p95 是 **None**（键在、值是 None，`dict.get` 的默认值不生效），
+    # 一排序就 `TypeError: '<' not supported between 'float' and 'NoneType'`。
+    z = {**_row_b("无延迟")}
+    z.update(speed=0.5, lat_p50=None, lat_p95=None)
+    rows3, best3, why3 = pp.rank([z, x])
+    check(best3 is not None and best3["name"] == "x",
+          "含 None 的行没法排序，或者把它选成了最优：%s" % (best3 and best3["name"]))
 
 
 def t_render_and_apply():
@@ -198,6 +252,40 @@ def t_render_and_apply():
           "写回时动了机器属性：%s" % got)
     check(got["fps"] == 60 and got["bitrate"] == "12M" and got["gop"] == 30,
           "写回时没带上最优那条的参数：%s" % got)
+
+
+def t_chain_check_rewrites_output():
+    """采集链快查那条命令：**输出换成 `-f null`、日志档位放开，但链本身不许动**。
+
+    为什么钉它：这个工具的全部价值是"几秒钟、不碰网络、不动 B 机"地回答"这条链起不起
+    得来"（一轮完整自检要 9 分钟还得占着 B 机）。要是它还在往 `udp://` 推，那它就变成
+    又一次占用端口/打扰 B 机；而 `-loglevel error` 会把配置阶段的 warning 吞掉 ——
+    那恰恰是要找的那句话。
+    """
+    from deploy import services
+    from tools.push_chain import have_filters, null_output_argv
+
+    # 查不成滤镜时**不许说"齐"** —— 那是假通过（本机 ffmpeg 不在 PATH 上就会撞到）
+    got, miss = have_filters("这个_ffmpeg_肯定不存在", ("scale_cuda",))
+    check(got is None and not miss,
+          "查不了滤镜时没有第三种状态（会假报\"齐\"）：got=%r miss=%r" % (got, miss))
+
+    cfg = {"ffmpeg": "ffmpeg", "capture": "ddagrab", "encoder": "h264_nvenc",
+           "host": "192.168.1.2", "port": 5000, "width": 1366, "height": 768,
+           "fps": 144, "bitrate": "20M", "gop": 30, "passthrough": True}
+    argv = null_output_argv(services.build_cmd("push", dict(cfg, scale_mode="cuda")), 3)
+    line = " ".join(argv)
+    check("udp://" not in line and "null" in line,
+          "快查命令还在往网络推 / 没换成 -f null：%s" % line[-140:])
+    check("-t" in argv and "3.000" in argv, "没加 -t（不会自己停，得人去 Ctrl+C）")
+    check("-stats" in argv and "-nostats" not in argv, "没打开 -stats（看不到 fps/speed）")
+    check("-loglevel" in argv and "error" not in argv,
+          "还留着 -loglevel error（配置阶段的 warning 会被吞掉）")
+    check("scale_cuda=1366:768" in line and "hwmap=derive_device=cuda" in line,
+          "GPU 那条滤镜链被改掉了 —— 那查的就不是它了：%s" % line)
+    check("-c:v" in argv and "h264_nvenc" in argv, "编码器被动了（那查的也不是它）")
+    check("-f" in argv and argv[argv.index("-f") + 1] == "null",
+          "没有干净的输出端：%s" % line[-120:])
 
 
 def t_a_side_command_has_stats():
@@ -228,11 +316,14 @@ def t_a_side_command_has_stats():
 CASES = [
     ("清单文件可读、名字唯一、坏了退回默认", t_presets_file),
     ("A 机侧命令带 -stats（speed 的唯一来源）", t_a_side_command_has_stats),
+    ("采集链快查：输出换成 -f null、链本身不动", t_chain_check_rewrites_output),
     ("候选只覆盖自己写的键（机器属性继承）", t_push_block_inherits_machine),
     ("ffmpeg -stats 行解析（speed/fps/丢帧/码率）", t_parse_ffmpeg_stats),
     ("统计取尾部（稳态），不是平均", t_take_last),
-    ("两机合并：按顺序对齐、墙钟核对、歪了要报", t_merge_alignment),
-    ("淘汰规则：跟不上 / 几何不可信 / 丢帧多", t_classify_rules),
+    ("两机合并：按段号配对、墙钟核对、歪了要报", t_merge_alignment),
+    ("B 机晚起缺段时不许错位一行（含 A 侧多出的段）",
+     t_merge_pairs_by_segment_index),
+    ("淘汰规则：跟不上 / 几何不可信 / 链路丢帧", t_classify_rules),
     ("排序：先 p95，全灭时结论要说清", t_rank_picks_p95_first),
     ("出表与「写回部署台」不手抄", t_render_and_apply),
 ]

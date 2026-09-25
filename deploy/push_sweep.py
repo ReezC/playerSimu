@@ -33,6 +33,31 @@ from tools import push_presets as pp, sweep_link                 # noqa: E402
 RESULT_WAIT_S = 300.0
 
 
+def annotate_a_row(row, stats, extra, proc_ok):
+    """A 机一段的成败与原因 → 就地写进 row（返回它）。**纯函数，自检能直接覆盖**。
+
+    为什么单拎出来：`_run_once` 要真起 ffmpeg，自检没法覆盖；而"这段成没成、为什么
+    没成"恰恰是整张表最容易骗人的地方 —— 实测 2026-09-26，GPU 缩放那两档 ffmpeg
+    立刻退出，报告里却记着 `ok: True`，表上于是只剩一句"没量到延迟"，**原因被丢掉**，
+    只能靠猜。现在把 ffmpeg 输出的尾巴当证据留下、写进 `why`。
+
+    两条判据（都要，缺一条就会漏）：
+      · 进程根本没起来（Popen 抛异常）；
+      · 起来了、但**一句 stats 都没有**、ffmpeg 又打了报错 → 立刻退出
+        （参数非法 / 滤镜或设备不支持的典型长相）。
+    """
+    tail = list((extra or {}).get("ffmpeg_tail") or [])
+    if not proc_ok:
+        row["ok"] = False
+        row["why"] = "ffmpeg 起不来：%s" % (tail[-1] if tail else "（没有任何输出）")
+        row["speed"] = None
+    elif not stats and tail:
+        row["ok"] = False
+        row["why"] = "ffmpeg 立刻退出：%s" % tail[-1]
+        row["speed"] = None
+    return row
+
+
 def make_announcer(cfg):
     """按配置建公告通道（A 机 → B 机）→ Announcer / None。
 
@@ -201,16 +226,14 @@ class PushSweep(threading.Thread):
             stats, extra, proc_ok = self._run_once(push, seconds, settle)
             t1 = time.time()
             row = pp.row_a(p["name"], i, p, t0, t1, stats, extra=extra)
-            if not proc_ok:
-                row["ok"] = False
-                row["why"] = "ffmpeg 没起来（参数非法？编码器不可用？）"
-                row["speed"] = None
+            annotate_a_row(row, stats, extra, proc_ok)
             self.rows.append(row)
             self.on_line("        → speed %s、实际 %s fps、丢帧 %s%s"
                          % (row.get("speed") if row.get("speed") is not None else "-",
                             row.get("out_fps") if row.get("out_fps") is not None else "-",
-                            row.get("drop"), 
-                            ("" if proc_ok else "（ffmpeg 起不来）")))
+                            row.get("drop"),
+                            ("" if row.get("ok", True)
+                             else "（%s）" % row.get("why"))))
             for a in (link.poll_acks() if link is not None else ()):
                 self._acks += 1
                 self.on_line("        ← B 机已跟上（第 %s 段）"
@@ -267,10 +290,13 @@ class PushSweep(threading.Thread):
         self.on_done(self.rows, path)
 
     def _run_once(self, push, seconds, settle):
-        """起一次 ffmpeg，跑 settle+seconds 秒，收 `-stats` 行。
+        """起一次 ffmpeg，跑 settle+seconds 秒，收 `-stats` 行 + 异常时的报错行。
 
-        返回 (stats 列表, extra, 进程是否起来过)。**只收 stats，不读别的输出** ——
-        ffmpeg 的 `-loglevel error` 保证正常时不刷屏，异常时那几行也会进日志。
+        返回 (stats 列表, extra, 进程是否起来过)。**ffmpeg 的非 stats 输出要收下来**
+        （`extra["ffmpeg_tail"]` 存最后几行）—— 那是"这段为什么没成"的**唯一证据**：
+        实测 2026-09-26，GPU 缩放那两档 ffmpeg 立刻退出，可报告里记着 `ok: True`、
+        表上只剩一句"没量到延迟"，真正的原因（滤镜链起不来）**被丢掉了**，只能靠猜。
+        `-loglevel error` 保证正常时没有这种行，所以收它不会刷屏。
         """
         cmd = cmd_for(push)
         self.on_line("        " + services.format_cmd(cmd)[:160] + " …")
@@ -289,6 +315,7 @@ class PushSweep(threading.Thread):
         t0 = time.monotonic()
         cpu_t0 = _psutil_cpu_t0(proc.pid)
         gpu_seen = []
+        err_lines = []                    # ffmpeg 的报错行（最后几行就是原因）
         try:
             while True:
                 el = time.monotonic() - t0
@@ -307,6 +334,12 @@ class PushSweep(threading.Thread):
                         g = _gpu_enc_pct()
                         if g:
                             gpu_seen.append(g)
+                else:
+                    s = line.strip()
+                    if s:
+                        err_lines.append(s)
+                        del err_lines[:-6]        # 只留尾部：原因总是最后几行
+                        self.on_line("        ffmpeg: " + s[:200])
         finally:
             try:
                 proc.terminate()
@@ -322,6 +355,8 @@ class PushSweep(threading.Thread):
         if gpu_seen:
             extra["gpu_enc_pct"] = sum(g["gpu_enc_pct"] for g in gpu_seen) / len(gpu_seen)
             extra["gpu_pct"] = sum(g["gpu_pct"] for g in gpu_seen) / len(gpu_seen)
+        if err_lines:
+            extra["ffmpeg_tail"] = err_lines
         return stats, extra, True
 
 

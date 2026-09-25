@@ -286,14 +286,17 @@ def result_text(rows_a, rows_b):
     """
     rows = pp.merge(rows_a, rows_b)
     rows, best, why = pp.rank(rows)
-    out = [pp.render(rows, best)]
+    out = [pp.render(rows, best, why=why)]
     if best:
-        out.append("\n把最优那条写回部署台：")
+        out.append("\n把上面那条写回部署台：")
         out.append("  config/deploy.json 的 push 段改成 —— fps=%s 码率=%s GOP=%s "
                    "passthrough=%s" % (best.get("fps"), best.get("bitrate"),
                                        best.get("gop"), best.get("passthrough")))
+        if not any(r.get("pass") for r in rows):
+            out.append("（注意：它只是**折中建议** —— 上面那句前提没满足，"
+                       "先解决它再重跑一轮）")
     else:
-        out.append("\n（没有可比的组合：B 机那份里没有量到延迟的段？）")
+        out.append("\n（没有任何可比的段：B 机那份里没量到延迟的段？）")
     return "\n".join(out)
 
 

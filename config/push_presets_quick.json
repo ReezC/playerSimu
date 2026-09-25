@@ -1,0 +1,26 @@
+{
+  "_note": [
+    "推流自检的「快速档」候选清单：只留 4 条，覆盖决策空间里真正有区分度的几档。",
+    "为什么留这 4 条（2026-09-26 那一轮 18 条的实测结论）：",
+    "  · 帧率是唯一有效的旋钮（60→114ms / 120→77ms / 144→65ms，p50）；",
+    "  · 码率 6M/12M/20M 差 <1ms、GOP 30/60 差 <1ms —— 那 12 条是白跑的；",
+    "  · 所以：低帧率基准 1 条、中档 1 条、最好那档 1 条、GPU 那条 1 条（待定论）。",
+    "跑法（A 机部署台/命令行都行）：",
+    "  A: python -m deploy.push_sweep --presets config/push_presets_quick.json --seconds 10",
+    "  B: python -m tools.stream_sweep        （先后随意：B 按 A 的公告量，仍是握手）",
+    "整轮 ≈ 4 段 × (10s 测量 + 4s 丢弃) ≈ 1 分钟（原来 18 段 ≈ 9 分钟）。",
+    "**只回答'这条链起不起得来'的问题，请用 tools/push_chain（3 秒、不用 B 机）。**"
+  ],
+  "seconds": 10.0,
+  "settle_seconds": 4.0,
+  "presets": [
+    {"name": "60fps-6M-g30", "fps": 60, "bitrate": "6M", "gop": 30,
+     "passthrough": true, "scale_mode": "cpu"},
+    {"name": "120fps-12M-g30", "fps": 120, "bitrate": "12M", "gop": 30,
+     "passthrough": true, "scale_mode": "cpu"},
+    {"name": "144fps-20M-g30", "fps": 144, "bitrate": "20M", "gop": 30,
+     "passthrough": true, "scale_mode": "cpu"},
+    {"name": "144fps-20M-g30-cuda", "fps": 144, "bitrate": "20M", "gop": 30,
+     "passthrough": true, "scale_mode": "cuda"}
+  ]
+}

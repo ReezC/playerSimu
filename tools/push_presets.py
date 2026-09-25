@@ -7,17 +7,18 @@
     放这里就能在**一台机器上被自检完整覆盖**（见 tools/selftest_push_presets.py），
     而不是等两边都跑起来才发现"表对不上"。
 
-**架构（2026-09-25 定的，方案 A）**：两台机器不新开任何控制通道 ——
-    · 候选清单 `config/push_presets.json` 跟着仓库走，**两边是同一份**；
-    · A 机按清单**顺序**逐条试推（每条跑 seconds 秒），写 `perf_push_A.json`；
-    · B 机按**同一顺序**逐条测量，写 `perf_push_B.json`；
-    · 两边都记**起止墙钟**（双机已对时，差 ~1ms），合并时用它核对（见 `merge`）。
-    谁也不用去驱动谁，安全面不扩大。
+**架构（2026-09-25 定的，方案 A；2026-09-25 晚改成握手）**：
+    · 候选清单 `config/push_presets.json` 跟着仓库走（两边**不再必须**同一份 —— 参数
+      由 A 机的握手公告直接带给 B 机，见 tools/sweep_link.py）；
+    · A 机按清单逐条试推（每条跑 seconds 秒），**每段开始前公告**给 B 机，写 `perf_push_A.json`；
+    · B 机**按公告对齐**逐段测量（晚起、中途重启都不影响），写 `perf_push_B.json`；
+    · 合并**按段号配对**（见 `merge` 的说明：按数组位置配会整表错位一行）；
+    · A 机跑完把报告发回 B（同一条通道），B 出表后把结论回传给 A 弹出来。
 
 **指标口径**（哪些数能信，都在注释里写死）：
     A 侧：`speed`（<1.00 = A 机跟不上，直接淘汰）、实际 fps、丢帧、实际码率、CPU/GPU。
     B 侧：延迟 p50/p95（**只在探针几何判据通过时才记**，见 probe_codec.Verdict）、
-          抖动、recv/目标 fps（丢包代理）、read() 耗时（判延迟在 A 机还是 B 机内部）。
+          抖动、**收到 fps / A 实际发出 fps**（真正的链路丢帧代理）、read() 耗时。
 """
 
 import json
@@ -234,52 +235,100 @@ def overlap_ratio(a, b):
     return max(0.0, hi - lo) / span
 
 
-def merge(rows_a, rows_b, tol_s=2.0):
-    """两侧的记账 → 一张表。**按顺序对齐，用墙钟核对**。
+def _pair(a, b):
+    """一条合并行：A 侧的参数与指标 + B 侧的延迟指标。"""
+    return {"idx": int(a.get("idx", -1)), "name": a.get("name"),
+            "fps": a.get("fps"), "bitrate": a.get("bitrate"), "gop": a.get("gop"),
+            "passthrough": a.get("passthrough"),
+            "speed": a.get("speed"), "out_fps": a.get("out_fps"),
+            "out_ratio": a.get("out_ratio"), "drop": a.get("drop"),
+            "a_bitrate_kbps": a.get("bitrate_kbps"),
+            "cpu_pct": a.get("cpu_pct"), "gpu_enc_pct": a.get("gpu_enc_pct"),
+            "recv_fps": (b or {}).get("recv_fps"),
+            "recv_ratio": (b or {}).get("recv_ratio"),
+            "proc_fps": (b or {}).get("proc_fps"),
+            "lat_p50": (b or {}).get("lat_p50"), "lat_p95": (b or {}).get("lat_p95"),
+            "lat_max": (b or {}).get("lat_max"), "jitter": (b or {}).get("jitter"),
+            "read_p50": (b or {}).get("read_p50"),
+            "probe_mono": (b or {}).get("probe_mono"),
+            "probe_why": (b or {}).get("probe_why"),
+            "t_start": a.get("t_start"), "t_end": a.get("t_end"),
+            # A 侧自己记的成败（"ffmpeg 起不来"就是靠它说出来的）
+            "a_ok": a.get("ok"), "a_why": a.get("why") or "",
+            "warn": "", "only": ""}
 
-    为什么按顺序对齐而不是纯靠墙钟：两边走的是同一份清单、同一个顺序，顺序是最
-    强的对齐依据；墙钟拿来做**校验** —— 重叠太少或起止对不上就说明有一边跑歪了
-    （比如 B 机中途重开了预览、或 A 机某条没起来），这时要**说出来**，不能闷头
-    出一张看着很整齐的表。`tol_s` 是允许的起止偏差。
+
+def merge(rows_a, rows_b, tol_s=2.0):
+    """两侧的记账 → 一张表。**按段号（idx）配对**，墙钟只用来核对。
+
+    **为什么不能按数组位置配**（原来的写法，2026-09-26 实测出错）：B 机晚起、
+    或某一段没等到流时，两边数组的**长度和起点都不一样** —— 按位置配会把 B 的每一行
+    都往前错一格：日志里 `60fps-20M-g60` 显示的是 `120fps-6M-g30` 的数（92.3fps/77ms），
+    而表看着毫无破绽 ✗。段号是握手公告直接带过来的（`tools/sweep_link.py` 的 `i`），
+    两边一定一致，还能直接看出"谁缺了哪一段"。
+
+    配对不上的行**照样列出来**（不丢）：A 侧多出来的通常是"ffmpeg 起不来"那几条 ——
+    那本身就是最有用的信息（比如 GPU 缩放那档在这台机器上支不支持）。
+    墙钟仍然核对，但只影响提示文字，不影响配对。
     """
-    rows = []
-    n = min(len(rows_a), len(rows_b))
-    for i in range(n):
-        a, b = rows_a[i], rows_b[i]
-        r = {"idx": i, "name": a["name"],
-             "fps": a.get("fps"), "bitrate": a.get("bitrate"), "gop": a.get("gop"),
-             "passthrough": a.get("passthrough"),
-             "speed": a.get("speed"), "out_fps": a.get("out_fps"),
-             "out_ratio": a.get("out_ratio"), "drop": a.get("drop"),
-             "a_bitrate_kbps": a.get("bitrate_kbps"),
-             "cpu_pct": a.get("cpu_pct"), "gpu_enc_pct": a.get("gpu_enc_pct"),
-             "recv_fps": b.get("recv_fps"), "recv_ratio": b.get("recv_ratio"),
-             "proc_fps": b.get("proc_fps"),
-             "lat_p50": b.get("lat_p50"), "lat_p95": b.get("lat_p95"),
-             "lat_max": b.get("lat_max"), "jitter": b.get("jitter"),
-             "read_p50": b.get("read_p50"),
-             "probe_mono": b.get("probe_mono"), "probe_why": b.get("probe_why"),
-             "t_start": a.get("t_start"), "t_end": a.get("t_end"),
-             "warn": ""}
-        ov = overlap_ratio(a, b)
-        drift = abs(a["t_start"] - b["t_start"])
-        if a["name"] != b["name"]:
-            r["warn"] = "两侧顺序不一致（A=%s / B=%s）" % (a["name"], b["name"])
-        elif ov < OVERLAP_WARN or drift > tol_s + max(
-                a["t_end"] - a["t_start"], 0.0) * 0.5:
-            r["warn"] = ("墙钟对不上（重叠 %.0f%%、起点差 %.1fs）—— "
-                         "这一行只能按顺序信，别当两机同时测的" % (ov * 100, drift))
+    by_b = {}
+    for b in rows_b:
+        by_b.setdefault(int(b.get("idx", -1)), b)
+    rows, used = [], set()
+    for a in rows_a:
+        i = int(a.get("idx", -1))
+        b = by_b.get(i)
+        r = _pair(a, b)
+        if b is None:
+            r["only"] = "A"
+            r["warn"] = "B 机没有这一段（它晚起 / 这一段没等到流）"
+        else:
+            used.add(i)
+            if a.get("name") != b.get("name"):
+                r["warn"] = ("同一段号两边名字不同（A=%s / B=%s）—— 公告与清单串了"
+                             % (a.get("name"), b.get("name")))
+            else:
+                ov = overlap_ratio(a, b)
+                drift = abs(a["t_start"] - b["t_start"])
+                if ov < OVERLAP_WARN or drift > tol_s + max(
+                        a["t_end"] - a["t_start"], 0.0) * 0.5:
+                    r["warn"] = ("墙钟对不上（重叠 %.0f%%、起点差 %.1fs）—— "
+                                 "这一行的延迟别当两机同时测的" % (ov * 100, drift))
         rows.append(r)
-    if len(rows_a) != len(rows_b):
-        note = ("两侧段数不同（A %d / B %d）—— 多出来的那几条没有对象，"
-                "只能各自看" % (len(rows_a), len(rows_b)))
-        rows.append({"idx": -1, "name": "(段数不一致)", "warn": note})
+    for b in rows_b:                                  # B 侧多出来的（A 没跑这一段）
+        i = int(b.get("idx", -1))
+        if i in used:
+            continue
+        r = _pair({"idx": i, "name": b.get("name"), "fps": None, "bitrate": None,
+                   "gop": None, "t_start": b.get("t_start"),
+                   "t_end": b.get("t_end")}, b)
+        r["only"] = "B"
+        r["warn"] = "A 机没有这一段（清单里删了？A 机跳过了？）"
+        rows.append(r)
+    rows.sort(key=lambda r: r.get("idx", -1))
     return rows
 
 
 # ══════════════════════════════════════════
 # 评分
 # ══════════════════════════════════════════
+
+def link_loss_ratio(row):
+    """**链路**丢帧：B 机收到的 / A 机实际发出的（拿不到给 None）。
+
+    **为什么不能拿"收到 / 目标 fps"当这个判据**（原来的写法，2026-09-26 实测把它
+    坑了）：A 机自己发不满目标时（实测 60fps 档只出 54、144 档只出 117），
+    那个比值必然 < 0.98 —— 于是**18 条全部被判成"丢帧太多"**，整张表一条建议都给不出 ✗。
+    而"没发出那么多"和"发出去丢了"是两件完全不同的事：
+      · A 发不满 = A 机的天花板 → 这是**候选之间的差别**，由 speed/实际fps 反映；
+      · B 收得比 A 发的少 = 链路/B 机丢帧 → 这一段延迟才真的不可信。
+    分母用 A 的**实际输出**才是对的口径。
+    """
+    out, recv = row.get("out_fps"), row.get("recv_fps")
+    if not out or not recv or out <= 0:
+        return None
+    return max(0.0, float(recv) / float(out))
+
 
 def classify(row):
     """这一行能不能用 + 为什么 → (可用?, 原因)。**先淘汰再比大小。**
@@ -289,17 +338,29 @@ def classify(row):
       ② 探针几何判据没过 —— 这一段的延迟数是假的（`probe_mono` False）。
          注意：几何问题**不属于某一条候选**，整轮都该是坏的；所以真跑的时候
          `stream_sweep` 会在一开始先拦（见那边的 precheck），这里只是兜底；
-      ③ 丢帧太多（recv/目标 < 0.98）—— 链路或 B 机跟不上，这一段的延迟也不可信。
+      ③ **链路**丢帧（见 link_loss_ratio）—— 那一段的延迟也不可信；
+      ④ 这一段压根没量到延迟。
     """
+    if row.get("a_ok") is False:
+        # A 机这一段压根没起来（比如 GPU 缩放那档 ffmpeg 起不来）—— 这是最该看见的原因
+        return False, "A 机这一段没跑起来（%s）" % (row.get("a_why") or "没说原因")
+    if not row.get("out_fps") and (row.get("a_ok") is not False) \
+            and row.get("recv_fps") is None and row.get("speed") is None:
+        # **一句 stats 都没有** = ffmpeg 起来又立刻死了（实测 2026-09-26：GPU 缩放那两档
+        # 就是 `out_fps=0 / frames=0`）。A 侧的 ok 只看"进程起没起来"，这种情况它记的是
+        # True，所以判据得放在这里 —— 否则表上只会说"没量到延迟"，真正的原因就丢了。
+        return False, ("A 机这一段没起来（ffmpeg 一句输出都没有 —— 多半是这段"
+                       "滤镜链不支持，比如 scale_cuda）")
     sp = row.get("speed")
     if sp is not None and sp < SPEED_MIN:
-        return False, "A 机跟不上（speed %.2f < %.2f）" % (sp, SPEED_MIN)
+        return False, "A 机跟不上（speed %.3f < %.2f）" % (sp, SPEED_MIN)
     if row.get("probe_mono") is False:
         return False, "探针几何判据没过，延迟数不可信"
-    rr = row.get("recv_ratio")
-    if rr is not None and rr < RECV_RATIO_MIN:
-        return False, "丢帧太多（收到 %.1f%%，< %.0f%%）" % (rr * 100,
-                                                       RECV_RATIO_MIN * 100)
+    ll = link_loss_ratio(row)
+    if ll is not None and ll < RECV_RATIO_MIN:
+        return False, ("链路丢帧（B 收到 %.1f / A 发出 %.1f fps，只到 %.0f%%）"
+                       % (row.get("recv_fps") or -1, row.get("out_fps") or -1,
+                          ll * 100))
     if row.get("lat_p95") is None:
         return False, "没量到延迟"
     return True, ""
@@ -311,6 +372,11 @@ def rank(rows):
     排序口径（写死，别每次跑完临时改）：
         **先看 p95**（卡顿才是手感杀手），再看 p50，再看码率（省带宽），最后看 CPU。
         并列时**低帧率优先**：同样的 p95，帧率低的那套对 A 机更轻、对 B 机压力更小。
+
+    **全军覆没也要给建议**（2026-09-26 修）：原来全部被淘汰时返回 `best=None`，
+    表尾只留一句"没有可比的组合" —— 人拿不到任何能用的结论，而那一轮其实**量到了
+    很有价值的东西**（比如 144fps 那档 p50 只有 65ms）。现在照样排序、照样给
+    **折中建议**，只是把话说明白：它为什么被淘汰、先解决什么。
     """
     ok, bad = [], []
     for r in rows:
@@ -320,32 +386,48 @@ def rank(rows):
         (ok if good else bad).append(r)
 
     def key(r):
-        return (r.get("lat_p95", 1e9), r.get("lat_p50", 1e9),
-                r.get("a_bitrate_kbps") or 1e9, r.get("cpu_pct") or 0.0,
-                r.get("fps") or 0)
+        # `None` 要当"最差"排（**不能只靠 dict.get 的默认值**：键在、值是 None 时
+        # 默认值不生效 —— 实测排序时 `None < float` 直接 TypeError）。
+        # 会碰到 None 的行是"只有 A 侧数据"那种（B 机缺段 / ffmpeg 起不来）。
+        def n(v, d=1e9):
+            return d if v is None else v
+
+        return (n(r.get("lat_p95")), n(r.get("lat_p50")),
+                n(r.get("a_bitrate_kbps")), n(r.get("cpu_pct"), 0.0),
+                n(r.get("fps"), 0))
 
     ok.sort(key=key)
-    best = ok[0] if ok else None
-    if best is None:
-        return ok + bad, None, ("没有一条通过淘汰规则（%d 条全军覆没）—— "
-                                "先解决 A 机 speed<1.00 或探针几何" % len(bad))
-    why = ("最优：%s（p95 %.0fms / p50 %.0fms / 码率 %.1fMbps）"
-           % (best["name"], best["lat_p95"], best.get("lat_p50") or -1,
-              (best.get("a_bitrate_kbps") or 0) / 1000.0))
+    bad.sort(key=key)
+    if not ok and not bad:
+        return [], None, "没有任何可比的段（两边都没量到？）"
+    best = ok[0] if ok else bad[0]
+    if ok:
+        why = ("最优：%s（p95 %.0fms / p50 %.0fms / 码率 %.1fMbps）"
+               % (best["name"], best["lat_p95"], best.get("lat_p50") or -1,
+                  (best.get("a_bitrate_kbps") or 0) / 1000.0))
+    else:
+        why = ("**没有一条满足全部前提**，下面是折中建议：%s（p95 %.0fms / p50 %.0fms）\n"
+               "      它被淘汰的原因：%s\n"
+               "      先把这个解决掉再重跑一轮 —— 在那之前这张表只能当参考。"
+               % (best["name"], best.get("lat_p95") or -1,
+                  best.get("lat_p50") or -1, best.get("fail") or "?"))
     return ok + bad, best, why
 
 
-def render(rows, best, title="推流自检"):
-    """→ 一张给人看的表（终端/日志都能读）。"""
+def render(rows, best, title="推流自检", why=""):
+    """→ 一张给人看的表（终端/日志都能读）。
+
+    `why` 是 `rank()` 给的那句结论（**全军覆没时它写着"折中建议 + 为什么"**）——
+    传进来优先用它，别自己再拼一句（两处口径会漂）。
+    """
     out = ["", "=" * 108, "%s   （p95 排序；标 ✗ 的已被淘汰）" % title, "=" * 108]
     out.append("%-16s %5s %6s %5s %7s %7s %6s %7s %9s %9s %9s  %s"
                % ("段", "fps", "码率", "GOP", "speed", "实际fps", "丢帧",
                   "收到fps", "延迟p50", "延迟p95", "抖动", "判定"))
     for r in rows:
-        if r.get("idx", -1) < 0:
-            out.append("  ⚠ " + (r.get("warn") or ""))
-            continue
         mark = "✓" if r.get("pass") else "✗"
+        if r.get("only"):                     # 只有一侧有数据：照样列，别悄悄丢掉
+            mark = "%s侧" % r["only"]
 
         def f(v, w, p=1, dash="-"):
             return ("%*.1f" % (w, v)) if isinstance(v, (int, float)) else \
@@ -353,19 +435,28 @@ def render(rows, best, title="推流自检"):
 
         out.append("%-16s %5s %6s %5s %7s %s %s %s %9s %9s %9s  %s %s"
                    % (r["name"], r.get("fps"), r.get("bitrate"), r.get("gop"),
-                      ("%.2f" % r["speed"]) if r.get("speed") is not None else "-",
+                      # 三位小数：0.996 打印成 "1.00" 会写出"1.00 < 1.00"这种荒唐话
+                      ("%.3f" % r["speed"]) if r.get("speed") is not None else "-",
                       f(r.get("out_fps"), 7), f(r.get("drop"), 6, 0),
                       f(r.get("recv_fps"), 7),
                       f(r.get("lat_p50"), 9, 0), f(r.get("lat_p95"), 9, 0),
                       f(r.get("jitter"), 9, 0), mark,
-                      (("—— " + r["fail"]) if not r.get("pass") else
-                       (("⚠ " + r["warn"]) if r.get("warn") else ""))))
+                      ("—— " + "；".join(
+                          [t for t in (r.get("a_why"), r.get("warn")) if t])
+                       if r.get("only") else
+                       (("—— " + r["fail"]) if not r.get("pass") else
+                        (("⚠ " + r["warn"]) if r.get("warn") else "")))))
     out.append("=" * 108)
     if best:
-        out.append("结论：" + render_best_line(best))
+        out.append("结论：" + (why or render_best_line(best)))
+    elif why:
+        out.append(why)
     out.append("说明：`speed` 是 ffmpeg 的处理速度（<1.00 = A 机跟不上，一定丢帧）；")
+    out.append("      `实际fps / 目标fps` 低于 100% 是 A 机顶不上去 —— **不一定是坏事**：")
+    out.append("      屏幕只有 120Hz 时，144 档最多也就出 120（实测就是 117~120）。")
     out.append("      `延迟 p50/p95` 只在**探针几何判据通过**时才记（否则整轮该先修几何）；")
-    out.append("      `收到fps/目标fps` < 98% 说明链路或 B 机跟不上，那一段的延迟也别信。")
+    out.append("      判定里的「链路丢帧」= B 收到的比 A **实际发出**的少（拿目标帧率当分母"
+               "会把「A 发不满」误判成丢帧）。")
     return "\n".join(out)
 
 
