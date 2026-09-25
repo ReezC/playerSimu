@@ -3,6 +3,10 @@
 用 WZ 导出的精灵作模板，在真实画面上做归一化互相关匹配，
 高分命中即为伪标注，再 NMS 去重。
 
+**性能**（GPU 能不能加速、该先做什么）见 `docs/自动标注性能探究.md`：
+实测 GPU 只比现在的 19 进程快约 2×（不划算），而**改灰度匹配快 2.6×**
+（检出同一批框、位置差 ≤1px，代价是丢掉颜色信息 —— 要做成开关）。
+
 CLI:
     python -m tools.detect_mobs --mobs 0130100,0130101 --frames data/plain2 ^
         --sprites datasets/sprites/mob --out datasets/labels_plain2 --downscale 2

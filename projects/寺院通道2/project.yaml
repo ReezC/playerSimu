@@ -113,15 +113,15 @@ decision:
   - 0.120059
   - 0.018229
   probe_calib:
-    x_ratio: 0.07247437774524158
-    y_ratio: 0.024739583333333332
-    cell_ratio: 0.013177159590043924
-    gap_ratio: 0.0
+    x_ratio: 0.0739385065885798
+    y_ratio: 0.02734375
+    cell_ratio: 0.01171303074670571
+    gap_ratio: 0.0014641288433382138
     bits: 40
     frame:
     - 1366
     - 768
-    solved_at: '2026-09-25 00:00:02'
+    solved_at: '2026-09-25 15:50:05'
   hp_color: *id001
   mp_color: *id002
   hp_threshold: 68

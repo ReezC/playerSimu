@@ -22,9 +22,13 @@ from ctypes import wintypes
 
 import numpy as np
 
-# 提高 Windows timer 分辨率到 1ms（否则等帧循环的 sleep 会睡到 15.6ms）
+# 提高 Windows timer 分辨率到 1ms（否则等帧循环的 sleep 会睡到 15.6ms）。
+# 走 core/winperf 的统一入口：同一件事只该有一处实现（工作台启动时也会调用它，
+# 见 core/winperf.py —— 那边还负责退出时 timeEndPeriod，别在这里各写一份）。
+from core import winperf
+
 try:
-    ctypes.windll.winmm.timeBeginPeriod(1)
+    winperf.begin_timer_period(1)
 except Exception:
     pass
 

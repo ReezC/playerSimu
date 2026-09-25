@@ -204,7 +204,7 @@ dataset:
   quality: 92
 train:
   model: yolo26n.pt
-  epochs: 120
+  epochs: 200
   imgsz: 960
   batch: 8
   device: '0'

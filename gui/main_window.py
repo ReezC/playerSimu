@@ -456,6 +456,9 @@ class MainWindow(QMainWindow):
         self.live_panel.potions_ready.connect(self.player_panel._on_potions)
         tabs.addTab(self.player_panel, "决策参数")
         self.route_panel = RoutePanel()
+        # 小地图来源选「从实时画面框选」时，框选和标定都要拿实时那一帧
+        # （理由同上面 HP/MP 条：框选得在画面上做）。
+        self.route_panel.live_panel = self.live_panel
         tabs.addTab(self.route_panel, "路线识别")
         # 最小宽度兜底：主视区尺寸波动时不把配置区挤没
         tabs.setMinimumWidth(460)

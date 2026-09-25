@@ -41,9 +41,24 @@ def load_live() -> dict[str, Any]:
 
 
 def save_live(cfg: dict[str, Any]):
-    """写实时预览参数到 config/live.yaml。"""
+    """写实时预览参数到 config/live.yaml（**整文件覆盖**）。"""
     with open(LIVE_CONFIG, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+
+
+def update_live(**kw) -> dict[str, Any]:
+    """改 `config/live.yaml` 里的**几个键**，其余原样保留。
+
+    **为什么要有它**：`save_live()` 是整文件覆盖 —— 直接
+    `save_live({...几个键})` 会把别处写进去的键（`perf_log`、
+    `perf_keepalive`）**一起抹掉**，而且不报错。现象很绕：
+    「设置里明明开着，重启后文件里没了、选项又变回默认」。
+    凡是要改这份配置，一律走这里。
+    """
+    cfg = load_live()
+    cfg.update(kw)
+    save_live(cfg)
+    return cfg
 
 
 def record_dir() -> Path:

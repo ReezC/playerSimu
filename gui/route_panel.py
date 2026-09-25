@@ -19,8 +19,8 @@
 """
 
 from PyQt5.QtGui import QPixmap
-from PyQt5.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QMessageBox,
-                             QPushButton, QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QApplication, QCheckBox, QHBoxLayout, QLabel,
+                             QMessageBox, QPushButton, QVBoxLayout, QWidget)
 
 from core import mapdata
 from decision.agent import settings
@@ -28,6 +28,7 @@ from gui.canvas import ImageCanvas
 from gui.minimap_calib import MinimapCalibDialog   # 量「面板 ↔ 底图」的弹窗
 from gui.widgets import NoWheelComboBox      # 滚轮不许改参数（docs/UI规范.md）
 from perception import minimap as mm
+from tools.config import load_live, update_live    # 来源/框选区域存 config/live.yaml
 
 
 def _generate_task(params, ctx):
@@ -120,6 +121,40 @@ class RoutePanel(QWidget):
         self.cmb_mmap_mode.currentIndexChanged.connect(self._on_mmap_mode)
         row.addWidget(self.cmb_mmap_mode)
 
+        # ---- 面板画面从哪来（**实验**开关；存 config/live.yaml，和地图无关）----
+        #   收流        —— A 机那条独立推流：原始像素，黄点最清楚（默认）
+        #   从实时画面  —— 不另推一路，直接在实时预览那一帧上裁一块
+        #                  （画面是 H.264 压过的；面板↔底图匹配没问题，黄点待实测）
+        row.addSpacing(12)
+        row.addWidget(QLabel("小地图来源"))
+        self.cmb_mmap_src = NoWheelComboBox()
+        self.cmb_mmap_src.addItem("收流（A 机小地图推流）", mm.SRC_STREAM)
+        self.cmb_mmap_src.addItem("从实时画面框选（实验）", mm.SRC_LIVE)
+        self.cmb_mmap_src.setToolTip(
+            "小地图面板的画面从哪来。\n\n"
+            "收流（默认）：A 机「被控机部署台 → 小地图推流」单独推一路原始像素 ——\n"
+            "  黄点（玩家点）只有几个像素，这一路是唯一能保证它不糊的画质。\n\n"
+            "从实时画面框选（实验）：不另推一路，直接在「实时」页那一帧上裁一块。\n"
+            "  省掉 A 机一次截屏 + 一路 TCP，但画面是压过的 —— 面板和底图还能对上，\n"
+            "  黄点识别能不能稳还没实测。选了它右边会出现「框选…」。\n\n"
+            "两者只在「画面从哪来」这一步不同：标定、换算、世界坐标都一样。")
+        self.cmb_mmap_src.currentIndexChanged.connect(self._on_mmap_src)
+        row.addWidget(self.cmb_mmap_src)
+
+        # 「框选…」只在「从实时画面框选」时出现（别的来源没有要框的东西）。
+        # 走 gui/region_selector（放大镜 + 像素网格 + Esc + <4px 当误点，
+        # 见 docs/UI规范.md §8：框选一律走那一份，不许各写一份）。
+        self.btn_mmap_region = QPushButton("框选…")
+        self.btn_mmap_region.setToolTip(
+            "在**实时画面**上把小地图面板框出来（框完立刻和底图核对一次，\n"
+            "把匹配分显示在下面）。\n\n"
+            "先到「实时」页点开始预览，看到画面里的游戏小地图再回来框。\n"
+            "只框**面板本身**：多框进来的血条/聊天会一起算进去，匹配分会掉下来。\n\n"
+            "画面尺寸变了（换分辨率 / 改推流参数）要重框一次。")
+        self.btn_mmap_region.clicked.connect(self._pick_mmap_region)
+        self.btn_mmap_region.setVisible(False)
+        row.addWidget(self.btn_mmap_region)
+
         # 标定做成弹窗（照「手动目测标定尺度」那套交互）：量出来的是
         # 「面板 ↔ 底图」的缩放/偏移，而判据是**看得见**的重合程度 ——
         # 摆在这块面板里放不下，也不该让人去命令行跑一遍。
@@ -197,6 +232,82 @@ class RoutePanel(QWidget):
             return "局部小地图"
         return str(mode)
 
+    # ---------------- 小地图来源（面板画面从哪来）----------------
+
+    def _mmap_src(self):
+        """当前来源（config/live.yaml 的 `mmap_src`，默认收流）。
+
+        存 B 机本地配置、而不是每张图的标定里：它取决于本机的推流/画面几何，
+        和"这是哪张地图"无关（切项目不该跟着变）。
+        """
+        v = load_live().get("mmap_src")
+        return v if v in (mm.SRC_STREAM, mm.SRC_LIVE) else mm.SRC_STREAM
+
+    def _on_mmap_src(self, _i):
+        """换来源：立刻存下来 + 让「框选…」按它显隐。"""
+        src = self.cmb_mmap_src.currentData()
+        update_live(mmap_src=src)
+        self.btn_mmap_region.setVisible(src == mm.SRC_LIVE)
+        self._refresh_mmap()
+
+    def _pick_mmap_region(self):
+        """在**实时画面**上框出小地图面板（实验来源用）。
+
+        规范（docs/UI规范.md §8）：框选一律走 `gui/region_picker`（放大镜、
+        `+/-` 调倍率、Esc 取消、**<4px 当误点**）；**框完当场验证** —— 小地图
+        这条的验证就是"这块画面和底图能对上多少分"，所以框完立刻算一次分。
+        """
+        lp = getattr(self, "live_panel", None)
+        frame = None if lp is None else lp.current_frame()
+        if frame is None:
+            QMessageBox.information(
+                self, "先开始预览",
+                "「从实时画面框选」要在实时画面上框：\n"
+                "先到「实时」页点「开始」，看到画面（含游戏的小地图面板）再回来框。")
+            return
+        from gui.region_selector import select_region_on_image
+
+        rect = select_region_on_image(frame, self)
+        if rect is None:
+            return                  # 取消（<4px 的框在框选里就按误点丢掉了）
+        update_live(mmap_src=mm.SRC_LIVE, mmap_crop=[int(v) for v in rect])
+        self._refresh_mmap()        # 先把来源/区域刷进状态行
+        self._verify_mmap_region(frame, rect)
+
+    def _verify_mmap_region(self, frame, rect):
+        """框完当场验证：裁出来那块 ↔ 底图 对一次分，写在状态行上。
+
+        **为什么必须当场验**：框大了（把血条/聊天栏框进去）、面板被游戏 UI
+        挡住、「显示方式」选错 —— 这三种的现象都是"寻路看起来坏了"，
+        而在这个入口上（匹配分）一眼就能看出来。
+        """
+        x, y, w, h = (int(v) for v in rect)
+        head = "已框选 (x=%d, y=%d, %d×%d)" % (x, y, w, h)
+        mid = self._map_id()
+        t = mapdata.load(mid, with_canvas=True) if mid else None
+        if t is None or t.canvas is None:
+            self._set_hint(head + "　（这张图还没有底图 —— 先在下面点「生成地形图」）",
+                           "#b06000")
+            return
+        self._set_hint(head + "　正在和底图核对…")
+        QApplication.processEvents()    # 先把上面那行画出来（核对要几十毫秒）
+        mode = self.cmb_mmap_mode.currentData() or mm.MODE_FIT
+        loc = mm.locate(frame[y:y + h, x:x + w], t.canvas, mode)
+        if loc is None:
+            self._set_hint(head + "　匹配不上 —— 可能框大了（含血条/聊天栏）、"
+                                  "面板被游戏 UI 挡住，或「显示方式」选错了",
+                           "#c5221f")
+            return
+        ok = loc["score"] >= 0.8
+        self._set_hint(head + "　匹配分 %.2f%s"
+                       % (loc["score"], "" if ok else "（偏低：0.8 以上才算对上）"),
+                       "#188038" if ok else "#b06000")
+
+    def _set_hint(self, text, color="#80868b"):
+        """状态行即时反馈（带颜色：中性灰 / 提示橙 / 对不上红 / 对上了绿）。"""
+        self.lbl_mmap_hint.setText(text)
+        self.lbl_mmap_hint.setStyleSheet("color: %s;" % color)
+
     def _open_mmap_calib(self):
         """打开标定弹窗（量「面板 ↔ 底图」的换算）。
 
@@ -216,8 +327,29 @@ class RoutePanel(QWidget):
                 "标定要有底图（datasets/map/%s.png）才能对齐。\n\n"
                 "先在下面点「生成地形图」把地形和底图导出来。" % mid)
             return
+        # 画面来源按上面选的那个：
+        #   收流       → client=None，弹窗自己连 A 机那一口（原路不变）
+        #   从实时画面 → 塞一个"裁实时帧"的适配器进去（弹窗那边一行都不用改）
+        client = None
+        if self._mmap_src() == mm.SRC_LIVE:
+            region = load_live().get("mmap_crop")
+            lp = getattr(self, "live_panel", None)
+            if not region or len(region) != 4:
+                QMessageBox.information(
+                    self, "先框选区域",
+                    "来源是「从实时画面框选」—— 先在实时画面上把小地图面板框出来：\n"
+                    "点上面的「框选…」。")
+                return
+            if lp is None or lp.current_frame() is None:
+                QMessageBox.information(
+                    self, "先开始预览",
+                    "标定要拿实时画面里那一块 —— 先到「实时」页点「开始」，\n"
+                    "看到画面再回来。")
+                return
+            from gui.live_panel import LiveFrameRegionClient
+            client = LiveFrameRegionClient(lp, region)
         dlg = MinimapCalibDialog(mid, mode=self.cmb_mmap_mode.currentData(),
-                                 parent=self)
+                                 client=client, parent=self)
         dlg.exec_()
         if dlg.saved:
             self._refresh_mmap()      # 状态行立刻变成「已标定 … 匹配分 …」
@@ -226,6 +358,16 @@ class RoutePanel(QWidget):
         mid = self._map_id()
         p = getattr(self, "project", None)
         cal = mapdata.load_calib(mid) if mid else None
+
+        # 状态行颜色归位：框选验证时会染成绿/橙/红，任何一次刷新都该回到中性灰
+        self.lbl_mmap_hint.setStyleSheet("color: #80868b;")
+        # 来源跟着配置走（blockSignals：不然 setCurrentIndex 会反过来写回去）
+        src_kind = self._mmap_src()
+        self.cmb_mmap_src.blockSignals(True)
+        j = self.cmb_mmap_src.findData(src_kind)
+        self.cmb_mmap_src.setCurrentIndex(j if j >= 0 else 0)
+        self.cmb_mmap_src.blockSignals(False)
+        self.btn_mmap_region.setVisible(src_kind == mm.SRC_LIVE)
 
         # 「没打开项目」和「项目里还没选地图」是两回事 ——
         # 以前一律写「（没打开项目）」，项目明明开着却看到这句，像项目丢了。
@@ -248,26 +390,43 @@ class RoutePanel(QWidget):
             self.lbl_mmap_hint.setText("先在①选地图" if p is not None
                                        else "打开项目后再设")
             self.lbl_mmap_hint.setToolTip("")
-        elif not cal or not cal.get("score"):
-            # 注意判的是 **score 有没有**（不是 mode 有没有）：显示方式选了、
-            # 几何还没量时也是「未标定」—— 那时寻路照样算不出世界坐标。
+        elif not mm.has_geometry(cal):
+            # **判的是「有没有几何」，不是「score 有没有」**：手工对齐没有
+            # 匹配分（score=0），但它照样是一份能用的标定 —— 拿 score 判会让人
+            # 看到「未标定」，以为自己白标了（见 perception/minimap.has_geometry）。
             self.lbl_mmap_hint.setText("未标定")
-            self.lbl_mmap_hint.setToolTip(
-                "这张图还没量过「面板像素 → 底图像素」的换算。\n"
-                "在 A 机「被控机部署台 → 小地图推流」启动之后，\n"
-                "点上面的「标定…」量一次（弹窗里看得见重合不重合）。\n\n"
-                "等价的命令行做法（排查用）：\n"
-                "    python -m perception.minimap --map %s" % mid)
+            if src_kind == mm.SRC_LIVE:
+                # 来源是"从实时画面框选"时，前置条件完全不同 —— 别让人去 A 机
+                # 找那口推流（他可能压根没在用）。
+                tip = ("这张图还没量过「面板像素 → 底图像素」的换算。\n"
+                       "来源是「从实时画面框选」：先在实时画面上把小地图面板框出来\n"
+                       "（右边的「框选…」），再点「标定…」量一次（弹窗里看得见重合）。")
+            else:
+                tip = ("这张图还没量过「面板像素 → 底图像素」的换算。\n"
+                       "在 A 机「被控机部署台 → 小地图推流」启动之后，\n"
+                       "点上面的「标定…」量一次（弹窗里看得见重合不重合）。\n\n"
+                       "等价的命令行做法（排查用）：\n"
+                       "    python -m perception.minimap --map %s" % mid)
+            self.lbl_mmap_hint.setToolTip(tip)
         else:
             geo = ("缩放 %.2f　偏移 %s" % (cal["scale"], cal.get("offset"))
                    if cal.get("mode") == mm.MODE_FIT
                    else "显示区起点 %s" % (cal.get("view"),))
+            # 手工对齐的没有匹配分：写「手工对齐」，别摆一个 0.00 让人以为坏了
+            how = ("手工对齐" if (cal.get("src") == "manual"
+                                  or not cal.get("score"))
+                   else "匹配分 %.2f" % cal["score"])
             self.lbl_mmap_hint.setText(
-                "已标定　%s　%s　匹配分 %.2f"
-                % (self._mode_label(cal["mode"]), geo, cal.get("score", 0.0)))
+                "已标定　%s　%s　%s" % (self._mode_label(cal["mode"]), geo, how))
+            crop = load_live().get("mmap_crop")
             self.lbl_mmap_hint.setToolTip(
                 "量出来的几何参数：缩放 / 偏移 / 显示区起点。\n"
-                "改「显示方式」只换方式，这些数不会丢。")
+                "改「显示方式」只换方式，这些数不会丢。\n\n"
+                "画面来源：%s%s"
+                % ("从实时画面框选" if src_kind == mm.SRC_LIVE
+                   else "A 机小地图推流",
+                   ("，区域 %s（在「实时」页的画面上框的）" % (crop,)
+                    if src_kind == mm.SRC_LIVE and crop else "")))
 
     # ---------------- 地形图 ----------------
 

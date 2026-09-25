@@ -88,8 +88,21 @@ decision:
   player_track_jump: 200
   hp_bar: null
   mp_bar: null
-  hp_color: null
-  mp_color: null
+  probe_calib: {}
+  hp_color:
+  - - 0
+    - 0
+    - 137
+  - - 78
+    - 80
+    - 255
+  mp_color:
+  - - 144
+    - 78
+    - 0
+  - - 255
+    - 198
+    - 77
   hp_threshold: 30
   mp_threshold: 7
   pot_cd: 1500

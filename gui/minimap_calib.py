@@ -22,18 +22,23 @@ import time
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPainter, QPixmap
-from PyQt5.QtWidgets import (QCheckBox, QDialog, QGraphicsPixmapItem,
-                             QGraphicsScene, QHBoxLayout, QLabel, QMessageBox,
-                             QPushButton, QVBoxLayout)
+from PyQt5.QtWidgets import (QApplication, QCheckBox, QDialog,
+                             QGraphicsPixmapItem, QGraphicsScene, QHBoxLayout,
+                             QLabel, QMessageBox, QPushButton, QVBoxLayout)
 
 from core import mapdata
-from gui.canvas import ZoomPanView     # 和质检台/标定弹窗**同一份**看图交互
-from gui.widgets import NoWheelDoubleSpinBox, NoWheelSlider
+from gui.canvas import ZoomPanView    # 看图交互在几个窗口里是同一份
+from gui.widgets import NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSlider
+from gui.worker import safe_slot      # 槽里抛异常 = 整个工作台 abort（见 worker.py）
 from perception import minimap as mm
 
-#: 缩放滑块：0.200 ~ 4.000（和「手动目测标定尺度」同量级）
+#: 缩放滑块：0.200 ~ 12.000。
+#: 上限从 4.0 放到 12.0：小底图（几十像素）被客户端放大若干倍、A 机的推流 zoom
+#: 又乘一次，面板里的实际倍数能到 9~10 倍（实测猴林迷宫I：底图 78×203、面板
+#: 753×612 → 光宽度就差 9.7 倍）。卡在 4 倍时，人手动也拖不到正确位置。
 SLIDER_MIN = 200
-SLIDER_MAX = 4000
+SLIDER_MAX = 12000
+SPIN_MAX = 12.0
 
 #: 匹配分低于这个值时，「保存」会先问一句。0.55 = locate 内部那条 min_score
 SCORE_WARN = 0.55
@@ -100,15 +105,46 @@ class MinimapCalibDialog(QDialog):
         self.block = [int(v) for v in (cal.get("view") or [0, 0])]
         self.score = float(cal.get("score") or 0.0)
         self.inset = 4                     # crop 的边框内缩（与 locate_crop 一致）
+        # crop 下 `offset` **就是 inset**（模板从面板边缘往里缩了多少，
+        # 与 locate_crop 的返回一致）。老文件里可能根本没有这个键（默认 [0,0]）
+        # —— 那样存下去的东西会比人工对齐差 inset 个底图像素（在
+        # px_per_world≈16 的图上是 63 世界单位，现场就是被这个坑到）。
+        # 归一化放这里：从文件读来的这个值不可信，唯一可信的是 inset 本身。
+        if self.mode == mm.MODE_CROP:
+            self.offset = [self.inset, self.inset]
+        #: 叠加层透明度（%）。对齐时要能同时看清「面板」和「底图」，全靠它。
+        self.alpha = int(cal.get("alpha") or 55)
+        # 叠加参照：canvas（WZ 那张底图）/ terrain（我们自己渲染的地形叠加图）。
+        # **为什么要有得选**：实测有些客户端的小地图是**按 foothold 现画**的，
+        # 跟 WZ 里那张 `miniMap/canvas` 完全是两套画（白底绿棕 vs 黑底蓝地形），
+        # 叠那张图人工也永远对不上；叠「平台形状一致」的地形图才对得上。
+        self.ref = (cal.get("ref") or "canvas")
+        self._ref_pix = None
+        self._ref_zoom = 1                 # 参照图 1 像素 = 多少底图像素
         self._frame = None
         self._scene_wh = None
-        self._geom_ready = bool(cal.get("score"))   # 有旧标定就别再自己摆
+        # 有旧标定就别再自己摆 —— 判「**有没有几何**」而不是「有没有分数」：
+        # 手工对齐的 score=0，拿分数判会把刚存好的几何覆盖成粗略猜测，
+        # 这正是现场「点了保存、重开又变回去」的直接原因。
+        self._geom_ready = mm.has_geometry(cal)
+        #: 当前几何是**人眼对齐**的还是自动量出来的（存进标定的 src 字段）
+        self.manual = (cal.get("src") == "manual")
         self._prev_anchor = None           # 上一拍的锚点（看位移用）
         self._last_locate = 0.0            # 上次定位时刻（自动模式节流用）
 
         self._build()
+        self._load_ref()
+
+        self._locate_cost = 0.0            # 上次定位耗时（自动模式据此退让）
 
         self.client = client or mm.MiniMapClient(self.host, self.port).start()
+        # 标题行左边：这是哪张图、**画面从哪来**。来源不同时，"等帧该去哪等"
+        # 完全不一样（收流等 A 机那一口；从实时画面框选要本机「实时」页在跑），
+        # 不写出来人就只能猜 —— 这块以前是空着的。
+        self.lbl_where.setText(
+            "地图 %s　%s" % (self.map_id,
+                             getattr(self.client, "label", "")
+                             or "A 机小地图推流"))
         self._timer = QTimer(self)
         self._timer.setInterval(100)       # 取帧很便宜（只是读一个引用）
         self._timer.timeout.connect(self._on_tick)
@@ -136,6 +172,21 @@ class MinimapCalibDialog(QDialog):
             "显示方式在「路线识别 → 小地图定位」里选（要进游戏走两步看地形动不动\n"
             "才知道该用哪种），这里只是沿用你选的那个，不替你改。")
         top.addWidget(self.lbl_mode)
+
+        top.addSpacing(10)
+        top.addWidget(QLabel("叠加参照"))
+        self.cmb_ref = NoWheelComboBox()
+        self.cmb_ref.addItem("小地图底图", "canvas")
+        self.cmb_ref.addItem("地形叠加图", "terrain")
+        self.cmb_ref.setToolTip(
+            "画面里那层半透明图用哪一张跟面板对。\n\n"
+            "· 小地图底图：WZ 里的 `miniMap/canvas`（游戏真用它当小地图时才叠得准）\n"
+            "· 地形叠加图：我们自己按 foothold 画的那张（**平台形状**一致）——\n"
+            "  有些客户端的小地图是按地形现画的，跟底图完全是两套画，那时候只能拿\n"
+            "  这张来人工目测对齐（平台边缘对平台边缘）。\n\n"
+            "（自动定位只认底图；这张只影响你眼睛看到的叠加层。）")
+        self.cmb_ref.currentIndexChanged.connect(safe_slot(self._on_ref))
+        top.addWidget(self.cmb_ref)
         root.addLayout(top)
 
         # ---- 状态 + 收流控制 ----
@@ -173,13 +224,18 @@ class MinimapCalibDialog(QDialog):
         self.scene = QGraphicsScene(self)
         self.view.setScene(self.scene)
         self._bg_item = QGraphicsPixmapItem()
+        # 整张叠加图那个 item 留着（隐藏）：按钮已经去掉 —— 现在看那张图走
+        # 「叠加参照 = 地形叠加图」。留着是免得 _draw_overlay 变成会炸的死代码。
+        self._ov_img_item = QGraphicsPixmapItem()
+        self._ov_img_item.setVisible(False)
+        self.scene.addItem(self._ov_img_item)
         self._ov_item = _OverlayItem(self._on_overlay_moved)
         self._ov_item.setFlag(QGraphicsPixmapItem.ItemIsMovable, True)
         # ItemSendsGeometryChanges **必须开**：不开的话 Qt 会把位置变化的
         # itemChange 优化掉 —— 表现就是"拖了、画面动了、量出来的数一个没变"
         # （自检里就是这么逮到的）。
         self._ov_item.setFlag(QGraphicsPixmapItem.ItemSendsGeometryChanges, True)
-        self._ov_item.setOpacity(0.55)
+        self._ov_item.setOpacity(max(0, min(100, self.alpha)) / 100.0)
         self.scene.addItem(self._bg_item)
         self.scene.addItem(self._ov_item)
         root.addWidget(self.view, 1)
@@ -193,13 +249,31 @@ class MinimapCalibDialog(QDialog):
         self.sld.valueChanged.connect(self._on_slider)
         srow.addWidget(self.sld, 1)
         self.sp_scale = NoWheelDoubleSpinBox()
-        self.sp_scale.setRange(0.05, 8.0)
+        self.sp_scale.setRange(0.05, SPIN_MAX)
         self.sp_scale.setDecimals(3)
         self.sp_scale.setSingleStep(0.01)
         self.sp_scale.setSuffix("×")
         self.sp_scale.setMinimumWidth(96)
         self.sp_scale.valueChanged.connect(self._on_spin)
         srow.addWidget(self.sp_scale)
+
+        # ---- 叠加层透明度（WZ 素材那层的浓淡）----
+        srow.addSpacing(10)
+        srow.addWidget(QLabel("透明度"))
+        self.sld_alpha = NoWheelSlider(Qt.Horizontal)
+        self.sld_alpha.setRange(0, 100)
+        self.sld_alpha.setValue(int(self.alpha))
+        self.sld_alpha.setFixedWidth(150)
+        self.sld_alpha.setToolTip(
+            "面板上面那层「WZ 素材/地形图」的浓淡（%）。\n"
+            "对齐时两头都要看得见：太浓只看见底图，太淡又看不见地形 ——\n"
+            "数值跟着标定存，下次打开还是它。")
+        self.sld_alpha.valueChanged.connect(safe_slot(self._on_alpha))
+        srow.addWidget(self.sld_alpha)
+        self.lbl_alpha = QLabel("%d%%" % self.alpha)
+        self.lbl_alpha.setMinimumWidth(42)
+        self.lbl_alpha.setStyleSheet("color:#80868b;")
+        srow.addWidget(self.lbl_alpha)
         root.addLayout(srow)
 
         # ---- 判据：角点世界坐标 vs 世界范围 ----
@@ -209,28 +283,21 @@ class MinimapCalibDialog(QDialog):
         root.addWidget(self.lbl_judge)
 
         # ---- 按钮 ----
+        # 槽一律过 safe_slot：PyQt5 里槽函数抛未捕获异常会 qFatal() → 整个工作台
+        # 无征兆闪退（见 gui/worker.py）。以前这里没包，出问题只会看到"点了没反应"。
         brow = QHBoxLayout()
         brow.setSpacing(6)
-        self.btn_grab = QPushButton("抓一帧")
-        self.btn_grab.setToolTip("从 A 机推来的流里取最新一帧（A 机没在推时这里会说明）")
-        self.btn_grab.clicked.connect(self._on_grab)
-        brow.addWidget(self.btn_grab)
-
         self.btn_locate = QPushButton("自动定位")
-        self.btn_locate.setToolTip("用模板匹配算出缩放/偏移（比手拖准，1 像素级）")
-        self.btn_locate.clicked.connect(lambda: self._locate_now())
+        self.btn_locate.setToolTip(
+            "按**当前这一帧**算一次「面板 ↔ 底图」的缩放/偏移（1 像素级）。\n"
+            "和「持续自动定位」是同一条计算，只是一个算一次、一个跟着帧反复算。\n"
+            "全局小地图点这一下就够了（倍数本来就能算出来，附近微调即可）。")
+        self.btn_locate.clicked.connect(safe_slot(self._on_locate_clicked))
         brow.addWidget(self.btn_locate)
-
-        self.btn_overlay = QPushButton("打开叠加图")
-        self.btn_overlay.setToolTip(
-            "把「当前小地图对应叠加图的哪一块」画到 <id>_overlay.png 上\n"
-            "（寻路要往哪走、定位对不对，看那张图最直观）")
-        self.btn_overlay.clicked.connect(self._draw_overlay)
-        brow.addWidget(self.btn_overlay)
 
         brow.addStretch(1)
         self.btn_save = QPushButton("保存标定")
-        self.btn_save.clicked.connect(self._on_save)
+        self.btn_save.clicked.connect(safe_slot(self._on_save))
         brow.addWidget(self.btn_save)
 
         btn_close = QPushButton("关闭")
@@ -239,8 +306,9 @@ class MinimapCalibDialog(QDialog):
         root.addLayout(brow)
 
         hint = QLabel("拖动画面里的半透明底图，让它和下面的面板重合，然后「保存标定」。"
-                      "　方向键=把叠加层挪 1 像素（Shift=5 像素）　"
-                      "滚轮=缩放视图　中键拖=平移视图　双击=适应窗口")
+                      "　方向键=挪 1 个底图像素（Shift=5 个）　滚轮=缩放视图　"
+                      "中键拖=平移视图　双击=适应窗口　"
+                      "不勾「实时画面」＝画面停住，方便对着量。")
         hint.setStyleSheet("color:#80868b;")
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -249,15 +317,15 @@ class MinimapCalibDialog(QDialog):
 
     def _on_tick(self):
         frame, _t = self.client.latest()
-        # 「实时画面」勾着才自动换帧；不勾就停在「抓一帧」抓到的那张上
-        # （帧还在流里滚，只是不覆盖你在看的那张 —— 想专门量某一帧时用得上）
+        # 「实时画面」勾着才自动换帧；不勾就把画面**停住**（帧还在流里滚，
+        # 只是不覆盖你在看的那张）—— 想对着某一帧慢慢量就把它取消掉。
         if (self.ck_live.isChecked() and frame is not None
                 and frame is not self._frame):
             self._take(frame)
         self._refresh_status()
 
     def _take(self, frame):
-        """把这一帧拿来看/用来定位（实时画面与「抓一帧」都走这里）。"""
+        """把这一帧拿来看/用来定位。"""
         self._frame = frame
         self._apply_frame(frame)
         if self.ck_auto.isChecked():
@@ -304,28 +372,82 @@ class MinimapCalibDialog(QDialog):
     # ---------------- 几何：标定字典 ↔ 叠加层 ----------------
 
     def calib(self):
-        """当前几何 → 标定 dict（和命令行工具存的是同一套字段）。"""
+        """当前几何 → 标定 dict（和命令行工具存的是同一套字段）。
+
+        ⚠ crop 的 `offset` **必须写成 inset**（不能用从文件里读来的那个数）：
+        它是「模板从面板边缘往里缩了多少」，`panel_to_canvas` 拿它做换算 ——
+        写成 0 等于说「没缩」，于是程序按文件算出来的世界坐标和人工对齐差
+        inset 个底图像素（`t_save_then_reopen` 钉着这条）。
+        """
+        off = ([int(self.inset), int(self.inset)] if self.mode == mm.MODE_CROP
+               else [int(self.offset[0]), int(self.offset[1])])
         return {"mode": self.mode,
                 "scale": round(float(self.scale), 4),
-                "offset": [int(self.offset[0]), int(self.offset[1])],
+                "offset": off,
                 "view": [int(self.block[0]), int(self.block[1])],
-                "score": round(float(self.score), 4)}
+                "score": round(float(self.score), 4),
+                # 这份几何是**量出来的**还是**人眼对齐的**：手工对齐没有匹配分，
+                # 而「标过没有」不能拿 score 判（见 mm.has_geometry）。
+                "src": "manual" if self.manual else "auto",
+                # 记下人工对齐时用的是哪张参照图 + 那层叠多浓：下次打开接着用
+                "ref": self.ref,
+                "alpha": int(self.alpha)}
+
+    def _load_ref(self):
+        """按 self.ref 选叠加参照图。返回是否用上了期望的那张。"""
+        self._ref_pix, self._ref_zoom = None, 1
+        if self.ref == "terrain" and self.canvas is not None:
+            p = mapdata.map_dir() / ("%s_overlay.png" % self.map_id)
+            pm = QPixmap(str(p)) if p.exists() else QPixmap()
+            if not pm.isNull():
+                self._ref_pix = pm
+                # 叠加图是把底图放大 overlay_zoom 倍画的（见 tools/map_terrain_view）
+                self._ref_zoom = mm.overlay_zoom(self.canvas.shape[1])
+            else:
+                self.ref = "canvas"        # 没有叠加图 → 退回底图（下拉也跟着回）
+        if self._ref_pix is None and self.canvas is not None:
+            self._ref_pix = np_to_pixmap(self.canvas)
+            self._ref_zoom = 1
+        if self._ref_pix is not None:
+            self._ov_item.setPixmap(self._ref_pix)
+        return self.ref == self.cmb_ref.currentData()
+
+    def _on_ref(self, _i=None):
+        """换参照图：几何（scale/offset/view）不变，只是换一层图给人看。"""
+        want = self.cmb_ref.currentData() or "canvas"
+        self.ref = want
+        self._load_ref()
+        # 没叠加图时 _load_ref 会把 ref 退回 canvas —— 下拉跟着回，别显示不一致
+        j = self.cmb_ref.findData(self.ref)
+        if j >= 0 and j != self.cmb_ref.currentIndex():
+            self.cmb_ref.blockSignals(True)
+            self.cmb_ref.setCurrentIndex(j)
+            self.cmb_ref.blockSignals(False)
+        self._sync_overlay()
+        if self.ref != want:
+            self._say("没有 %s_overlay.png —— 先在「路线识别」里点「生成地形图」，"
+                      "暂时按小地图底图叠着看" % self.map_id, bad=True)
 
     def _sync_overlay(self):
-        """标定字段 → 叠加层的位置/缩放（fit 用 scale+offset，crop 用 view）。"""
+        """标定字段 → 叠加层的位置/缩放（fit 用 scale+offset，crop 用 view）。
+
+        `self.scale` 一律是**面板像素 / 底图像素**；参照图可能是放大过的
+        （地形叠加图是底图的 overlay_zoom 倍），所以 item 的缩放要除以 `_ref_zoom`。
+        """
         if self.canvas is None:
             return
-        pm = self._ov_item.pixmap()
-        if pm.isNull() or pm.width() != self.canvas.shape[1]:
-            self._ov_item.setPixmap(np_to_pixmap(self.canvas))
+        k = float(self.scale) / max(1, self._ref_zoom)
         self._ov_item._busy = True
         try:
             if self.mode == mm.MODE_CROP:
-                # 面板 1:1 显示底图的一块：把整张底图挪到「那一块的左上角对上 (0,0)」
-                self._ov_item.setScale(1.0)
-                self._ov_item.setPos(-self.block[0], -self.block[1])
+                # crop = 面板显示底图的**一块**，而这一块可能被放大了 scale 倍
+                # （小底图被客户端放大，实测能到 9~10 倍）。所以叠加层也跟着缩放：
+                # 让「底图坐标 block」那一点正好落在面板的 (inset, inset) 上。
+                self._ov_item.setScale(k)
+                self._ov_item.setPos(-self.block[0] * self.scale + self.inset,
+                                     -self.block[1] * self.scale + self.inset)
             else:
-                self._ov_item.setScale(self.scale)
+                self._ov_item.setScale(k)
                 self._ov_item.setPos(self.offset[0], self.offset[1])
         finally:
             self._ov_item._busy = False
@@ -334,15 +456,28 @@ class MinimapCalibDialog(QDialog):
         self._refresh_judge()
 
     def _on_overlay_moved(self):
-        """人拖了叠加层 → 反算回标定字段（拖动就是唯一的输入方式之一）。"""
+        """人拖了叠加层 → 反算回标定字段（拖动就是唯一的输入方式之一）。
+
+        能走到这里就说明是**人**动的：程序自己摆位时 `_sync_overlay` 会挂
+        `_busy` 挡住回调（见 `_OverlayItem`），所以这里标 manual 不会误标。
+        """
+        self.manual = True            # 人眼对齐 → 存进标定时记 src=manual
         pos = self._ov_item.pos()
         if self.mode == mm.MODE_CROP:
-            self.block = [-int(round(pos.x())), -int(round(pos.y()))]
+            s = max(1e-6, float(self.scale))
+            self.block = [int(round((self.inset - pos.x()) / s)),
+                          int(round((self.inset - pos.y()) / s))]
         else:
-            self.scale = float(self._ov_item.scale())
+            self.scale = float(self._ov_item.scale()) * max(1, self._ref_zoom)
             self.offset = [int(round(pos.x())), int(round(pos.y()))]
         self._sync_widgets()
         self._refresh_judge()
+
+    def _on_alpha(self, val):
+        """透明度：只改叠加层的浓淡，几何一点不动（对齐时反复调的就是它）。"""
+        self.alpha = int(val)
+        self.lbl_alpha.setText("%d%%" % self.alpha)
+        self._ov_item.setOpacity(max(0, min(100, self.alpha)) / 100.0)
 
     def _sync_widgets(self):
         """把 scale 回填到滑块/数字框（别让界面和实际几何不一致）。"""
@@ -353,10 +488,10 @@ class MinimapCalibDialog(QDialog):
         self.sld.setValue(max(SLIDER_MIN, min(SLIDER_MAX,
                                               int(round(self.scale * 1000)))))
         self.sld.blockSignals(False)
-        # crop 是 1:1 显示，改缩放没有意义 —— 直接禁掉，免得人白调半天
-        crop = (self.mode == mm.MODE_CROP)
-        self.sld.setEnabled(not crop)
-        self.sp_scale.setEnabled(not crop)
+        # 两种方式都要能调缩放：crop 也可能是「放大后取一块」（实测小底图会到
+        # 9~10 倍）—— 以前这里把 crop 的缩放禁掉了，正好把唯一的手动出路堵死。
+        self.sld.setEnabled(True)
+        self.sp_scale.setEnabled(True)
 
     def _on_slider(self, val):
         self.scale = val / 1000.0
@@ -372,30 +507,38 @@ class MinimapCalibDialog(QDialog):
         if self.canvas is None:
             return
         if self._frame is None:
-            self._say("还没收到帧 —— A 机上的「小地图推流」启动了吗？", bad=True)
+            self._say(getattr(self.client, "hint", None)
+                      or "还没收到帧 —— A 机上的「小地图推流」启动了吗？",
+                      bad=True)
             return
         now = time.perf_counter()
-        if auto and (now - self._last_locate) < 0.25:
-            return                        # 节流：定位比帧率慢时不至于把界面堵死
+        if auto:
+            # 节流：**自适应**。固定 250ms 不够 —— 大面板上一次定位可能要几秒，
+            # 每帧都算会把工作台主线程（渲染/显示也在这个线程）拖住，
+            # 观感就是「画面慢动作、延迟数字却变得好看」。这里要求定位最多占
+            # 1/5 的时间：上次花了 3 秒，就 12 秒才算一次。
+            gap = max(0.25, float(getattr(self, "_locate_cost", 0.0)) * 4.0)
+            if (now - self._last_locate) < gap:
+                return
         self._last_locate = now
 
-        # 「持续自动定位」是**跟踪**，不是重新搜一遍：
-        # 全局小地图（fit）的完整搜索要试二十来个尺度，大底图上一次能跑几百毫秒
-        # —— 每帧都那样跑，10 fps 的流会把界面线程堵死。跟踪只试当前尺度附近
-        # 那一两个（人走两步不会让客户端换缩放比例），代价立刻降到一次匹配。
-        scales = None
-        if auto and self.mode == mm.MODE_FIT and self.scale > 0:
-            scales = [round(self.scale * f, 4) for f in (0.98, 1.0, 1.02)]
-            scales = [s for s in scales if 0.25 <= s <= 8.0]
+        # **手动点和持续模式走完全同一条计算**（只是重复次数不同）：
+        # 用户视角就该是这样 —— 「自动定位」= 按当前帧算一次，「持续」= 每秒多算几次。
+        # 之前手动那次跑的是"完整搜索"（几十秒），结果人只会看到"点了没反应"。
+        #
+        # 尺度从哪来：全局小地图（fit）的倍数本来就能**算出来**——
+        # 面板刚好装下整张底图，那就是 min(面板宽/底图宽, 面板高/底图高)；
+        # 只需要在它附近微调（±10%，5 个候选）。crop 则由 locate_crop 自己
+        # 搜放大倍数（每个候选都很便宜）。
+        scales = self._near_scales()
 
         t0 = time.perf_counter()
         if scales is not None:
             loc = mm.locate_fit(self._frame, self.canvas, scales=scales)
-            if loc is None:
-                loc = mm.locate_fit(self._frame, self.canvas)  # 跟丢了就整体重搜一次
         else:
             loc = mm.locate(self._frame, self.canvas, self.mode)
         dt = time.perf_counter() - t0
+        self._locate_cost = float(dt)      # 给自动模式的自适应节流用
 
         if loc is None:
             self._say_fail()
@@ -411,6 +554,7 @@ class MinimapCalibDialog(QDialog):
         self.offset = [int(v) for v in loc["offset"]]
         self.block = [int(v) for v in (loc.get("view") or [0, 0])]
         self.score = float(loc["score"])
+        self.manual = False           # 自动量出来的 → 存进标定时记 src=auto
         self._sync_overlay()
         # 顺带报一下这次定位花了多久：这一路以后要接进实时线程，耗时是硬指标
         #（B 机关键路径本来就没余量，见 docs/寻路设计.md §5 的性能一节）。
@@ -418,10 +562,44 @@ class MinimapCalibDialog(QDialog):
                   % (self.score, dt * 1000, move),
                   bad=(self.score < SCORE_WARN or dt > 0.25))
 
+    def _near_scales(self):
+        """fit 用的候选倍数：当前值附近 ±10%（5 个）—— 一发即中型。
+
+        全局小地图的倍数本来就能算出来（面板刚好装下整张底图 = 两个方向比例的
+        较小者），这里只是在它附近微调；**不做全范围搜索**：
+        大面板上全搜索要几十秒，手动点一下根本等不到，看着就是"没反应"。
+        crop 不用这个（locate_crop 自己搜放大倍数，且每个候选都很便宜）。
+        """
+        if self.mode != mm.MODE_FIT or not (self.scale > 0):
+            return None
+        out = [round(self.scale * f, 4) for f in (0.90, 0.95, 1.0, 1.05, 1.10)]
+        return [s for s in out if 0.25 <= s <= 12.0] or None
+
+    def _on_locate_clicked(self):
+        """「自动定位」按钮：**同步算一次**，和持续模式同一条计算。
+
+        先把提示写上再算：这一下通常几十毫秒（fit 只用当前倍数附近 5 个候选），
+        但万一遇到大底图也要让人看到"它在算"，而不是"点了没反应"。
+        """
+        if self.canvas is None or self._frame is None:
+            self._say("还没收到画面 —— A 机「被控机部署台 → 小地图推流」启动了吗？"
+                      "（当前 %s）" % (getattr(self.client, "err", "") or "没连上"),
+                      bad=True)
+            return
+        self._say("正在算…")
+        QApplication.processEvents()       # 让上面这行先画出来
+        self._locate_now()
+
     def _say_fail(self):
-        """没对上：把两种方式的分数都摆出来当线索（和命令行工具一致）。"""
+        """没对上：把两种方式的分数都摆出来当线索（和命令行工具一致）。
+
+        ⚠ 别在这里做"完整搜索"：那是几十秒起步（见 _locate_now 的注释），
+        失败时再卡一次，人只会以为按钮坏了。用当前尺度附近的候选给个参考分就够。
+        """
         bits = []
-        for tag, r in (("全局小地图", mm.locate_fit(self._frame, self.canvas)),
+        for tag, r in (("全局小地图", mm.locate_fit(
+                            self._frame, self.canvas,
+                            scales=self._near_scales())),
                        ("局部小地图", mm.locate_crop(self._frame, self.canvas))):
             bits.append("%s%s" % (tag, "没对上" if r is None else "%.3f" % r["score"]))
         extra = ""
@@ -431,8 +609,9 @@ class MinimapCalibDialog(QDialog):
             extra = ("\n底图只有 %dx%d、面板 %dx%d 更大 —— 面板装不下整张底图，"
                      "所以不可能是「局部小地图」，多半是「全局小地图」"
                      "（去「路线识别」里换，这里不替你改）。" % (cw, ch, w, h))
-        self._say("没对上 —— 可能：A 机框选区域不只是小地图 / 推的不是这张图 / "
-                  "面板被游戏 UI 挡住。参考分：%s%s" % ("、".join(bits), extra),
+        self._say("没对上 —— 可能：画面来源那块框得不对（A 机推流区域 / 本机框选区域"
+                  "不只是小地图）/ 画面不是这张图 / 面板被游戏 UI 挡住。"
+                  "参考分：%s%s" % ("、".join(bits), extra),
                   bad=True)
 
     def _say(self, text, bad=False):
@@ -443,19 +622,22 @@ class MinimapCalibDialog(QDialog):
     # ---------------- 状态 / 判据 ----------------
 
     def _refresh_status(self):
-        cli = self.client
-        n = getattr(cli, "n_recv", 0)
         if self._frame is None:
-            err = getattr(cli, "err", "") or ""
+            err = getattr(self.client, "err", "") or ""
             self.lbl_conn.setStyleSheet("color:#c5221f;")
-            self.lbl_conn.setText("等帧中…（连 %s:%d）%s" % (self.host, self.port, err))
+            # 等帧的说法随来源变：收流等的是 A 机那一口，从实时画面框选等的是
+            # 本机「实时」页 —— 说错会让人跑去 A 机上瞎找（那边可能压根没开）。
+            base = getattr(self.client, "wait_hint", None) or (
+                "等帧中…（连 %s:%d）" % (self.host, self.port))
+            self.lbl_conn.setText("%s　%s" % (base, err) if err else base)
         elif not self.ck_live.isChecked():
             self.lbl_conn.setStyleSheet("color:#5f6368;")
-            self.lbl_conn.setText("已抓一帧（实时画面关着）")
+            self.lbl_conn.setText("画面已停住（「实时画面」没勾）")
         else:
+            # 只报**速率**，不报累计帧数：那是个只会一直变大的数字，看它没意义
             self.lbl_conn.setStyleSheet("color:#188038;")
-            self.lbl_conn.setText("收帧中 · %.1f 拍/秒 · 已收 %d 帧"
-                                  % (getattr(cli, "fps", 0.0) or 0.0, n))
+            self.lbl_conn.setText("收帧中 · %.1f 拍/秒"
+                                  % (getattr(self.client, "fps", 0.0) or 0.0))
 
     def _refresh_judge(self):
         if self.canvas is None or self._frame is None or self.terrain is None:
@@ -470,8 +652,16 @@ class MinimapCalibDialog(QDialog):
             self.lbl_judge.setText("换算失败：%s" % e)
             return
         b = self.terrain.bounds
-        ok = (abs(lx - b[0]) < 80 and abs(ly - b[1]) < 80
-              and abs(rx - b[2]) < 80 and abs(ry - b[3]) < 80)
+        if self.mode == mm.MODE_CROP:
+            # 局部小地图只显示底图的**一块**：判据是「这一块落在世界范围内」，
+            # 而不是「四角贴住世界范围的四角」—— 后者在 crop 下永远不成立，
+            # 于是标得再准那行也是橙的，人就开始怀疑自己标错了。
+            pad = 16.0
+            ok = (b[0] - pad <= lx and rx <= b[2] + pad
+                  and b[1] - pad <= ly and ry <= b[3] + pad)
+        else:
+            ok = (abs(lx - b[0]) < 80 and abs(ly - b[1]) < 80
+                  and abs(rx - b[2]) < 80 and abs(ry - b[3]) < 80)
         self.lbl_judge.setText(
             "匹配分 %.3f　面板左上 → 世界 (%.0f, %.0f)　右下 → 世界 (%.0f, %.0f)　"
             "世界范围 (%.0f, %.0f) ~ (%.0f, %.0f)"
@@ -481,53 +671,112 @@ class MinimapCalibDialog(QDialog):
 
     # ---------------- 动作 ----------------
 
-    def _on_grab(self):
-        frame, _t = self.client.latest()
-        if frame is None:
-            self._say("还没收到帧 —— A 机「被控机部署台 → 小地图推流」启动了吗？"
-                      "（当前 %s）" % (getattr(self.client, "err", "") or "没连上"),
-                      bad=True)
-            return
-        self._frame = frame
-        self._apply_frame(frame)
-        self._say("已抓一帧 %dx%d" % (frame.shape[1], frame.shape[0]))
-
     def _draw_overlay(self):
-        """把「当前是叠加图哪一块」画到 <id>_overlay.png 上（和命令行同一函数）。"""
-        if self.canvas is None or self._frame is None:
-            self._say("先抓一帧再画", bad=True)
+        """「打开 / 关闭叠加图」：把那**一整张**地形图就地切到画面里看。
+
+        要看到的东西就是 `<id>_overlay.png` 本身 —— **地形画在 WZ 素材小地图上**
+        （`tools/map_terrain_view.py` 的 `use_canvas=True` 默认就是这么画的），
+        再白框标出「当前小地图是它的哪一块」。
+
+        就地切换（而不是弹新窗口）：按钮文字跟着变成「关闭叠加图」，
+        再点一下回到"面板 + 半透明底图"的标定视图 —— 这样调标定和看结果
+        不用来回找窗口。
+        """
+        if self._ov_img_item.isVisible():
+            self._show_overlay_view(False)
             return
-        h, w = self._frame.shape[:2]
-        cw, ch = self.canvas.shape[1], self.canvas.shape[0]
-        c = self.calib()
-        if self.mode == mm.MODE_CROP:
-            _rc, rect_o = mm.view_rects(c, (w, h), (cw, ch))
+        if self.canvas is None:
+            self._say("没有底图 —— 先在「路线识别」里点「生成地形图」", bad=True)
+            return
+        # 这一整段包起来：safe_slot 只把异常打到看不见的 stderr，表现就是
+        # "点了没反应"。宁可把原因写在状态行上。
+        try:
+            p = None
+            if self._frame is None:
+                # 没画面也要能看那张图（只是没有白框）：它就是「地形画在 WZ 素材上」
+                src = mapdata.map_dir() / ("%s_overlay.png" % self.map_id)
+                if src.exists():
+                    p = str(src)
+                else:
+                    self._say("还没有 %s_overlay.png —— 先在「路线识别」里点"
+                              "「生成地形图」；另外现在也没收到画面（%s）"
+                              % (self.map_id,
+                                 getattr(self.client, "hint", None)
+                                 or "A 机的「小地图推流」启动了吗？"), bad=True)
+                    return
+            else:
+                h, w = self._frame.shape[:2]
+                cw, ch = self.canvas.shape[1], self.canvas.shape[0]
+                c = self.calib()
+                if self.mode == mm.MODE_CROP:
+                    _rc, rect_o = mm.view_rects(c, (w, h), (cw, ch))
+                else:
+                    z = mm.overlay_zoom(cw)
+                    ox, oy = c["offset"]
+                    rect_o = (ox * z, oy * z, (ox + cw * c["scale"]) * z,
+                              (oy + ch * c["scale"]) * z)
+                p = mm.draw_on_overlay(self.map_id, rect_o)
+                if p is None:
+                    self._say("还没有 %s_overlay.png —— 先在「路线识别」里点"
+                              "「生成地形图」" % self.map_id, bad=True)
+                    return
+            pm = QPixmap(str(p))
+            if pm.isNull():
+                self._say("图读不出来：%s" % p, bad=True)
+                return
+        except Exception as e:
+            self._say("叠加图出错：%s: %s" % (type(e).__name__, e), bad=True)
+            return
+        self._ov_img_item.setPixmap(pm)
+        self._show_overlay_view(True)
+        self._say("叠加图 = 地形画在 WZ 小地图素材上；白框 = 当前那一块（%s）" % p)
+
+    def _show_overlay_view(self, on):
+        """切换画面：True = 只看那张叠加图；False = 回到标定视图。"""
+        self._ov_img_item.setVisible(bool(on))
+        self._bg_item.setVisible(not on)
+        self._ov_item.setVisible(not on)
+        self.btn_overlay.setText("关闭叠加图" if on else "打开叠加图")
+        if on:
+            self.scene.setSceneRect(self._ov_img_item.boundingRect())
         else:
-            z = mm.overlay_zoom(cw)
-            ox, oy = c["offset"]
-            rect_o = (ox * z, oy * z, (ox + cw * c["scale"]) * z,
-                      (oy + ch * c["scale"]) * z)
-        p = mm.draw_on_overlay(self.map_id, rect_o)
-        if p is None:
-            self._say("还没有 %s_overlay.png —— 先在「路线识别」里点「生成地形图」"
-                      % self.map_id, bad=True)
-        else:
-            self._say("已写出 %s（框 = 当前小地图对应的那一块）" % p)
+            self._scene_wh = None          # 让下一帧重新按面板尺寸设场景
+        self.view.fit()
 
     def _on_save(self):
+        """存下当前几何。**每条早退都要说话**（见下面两处 `_say`）。
+
+        以前有两条"静默返回"：没底图直接 return、提示里选了「否」也直接 return
+        —— 人都以为自己存上了（这正是「我点了保存，结果没保存」的由来）。
+        """
         if self.canvas is None:
+            self._say("没有底图，存不了 —— 先在「路线识别」里点「生成地形图」"
+                      "（没有底图就没法换算世界坐标）", bad=True)
             return
         if self.score < SCORE_WARN:
-            r = QMessageBox.question(
-                self, "匹配分偏低",
-                "当前匹配分 %.3f（低于 %.2f）。\n\n"
-                "分数低说明面板和底图对不上 —— 存下去的话，寻路会按这个错位的\n"
-                "换算算世界坐标（表现是「人在这块平台，程序以为在另一块」）。\n\n"
-                "建议先点「自动定位」；实在匹配不上（面板被 UI 挡住等）再用\n"
-                "手动拖动对齐 —— 但那样只有你的眼睛能保证它对。\n\n"
-                "还是要保存吗？" % (self.score, SCORE_WARN),
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if self.manual:
+                title = "手工对齐"
+                text = ("这份几何是**你用眼睛对齐**的（没有匹配分）。\n\n"
+                        "存下去之后，寻路完全按你的对齐算世界坐标 —— 人在这块平台、\n"
+                        "程序以为在另一块，是这类标定最典型的错法。\n\n"
+                        "再确认一眼：半透明底图和下面的面板**处处重合**吗？")
+            else:
+                title = "匹配分偏低"
+                text = ("当前匹配分 %.3f（低于 %.2f）。\n\n"
+                        "分数低说明面板和底图对不上 —— 存下去的话，寻路会按这个\n"
+                        "错位的换算算世界坐标（表现是「人在这块平台，程序以为在\n"
+                        "另一块」）。\n\n"
+                        "建议先点「自动定位」；实在匹配不上（面板被 UI 挡住等）\n"
+                        "再手动拖动对齐。" % (self.score, SCORE_WARN))
+            # 默认给「是」：人已经点过一次「保存标定」，那次点击就是他的意图，
+            # 这里只是提醒 —— 不该让他再猜一次默认值（以前默认「否」，手一抖
+            # 就静默什么都没发生）。
+            r = QMessageBox.question(self, title, text + "\n\n还是要保存吗？",
+                                     QMessageBox.Yes | QMessageBox.No,
+                                     QMessageBox.Yes)
             if r != QMessageBox.Yes:
+                self._say("没有保存（你在提示里选了「否」—— 几何还在，可以再点"
+                          "「保存标定」）", bad=True)
                 return
         cal = mapdata.load_calib(self.map_id) or {}
         # 只更新量出来的几何 + 方式：显示方式仍算「你在界面里选的」
@@ -535,7 +784,9 @@ class MinimapCalibDialog(QDialog):
         cal["picked_by"] = "gui"
         mapdata.save_calib(self.map_id, cal)
         self.saved = True
-        self._say("已保存标定 → %s" % mapdata.calib_path(self.map_id))
+        self._say("已保存标定（%s）→ %s"
+                  % ("手工对齐" if self.manual else "自动匹配",
+                     mapdata.calib_path(self.map_id)))
 
     # ---------------- 键盘微调 ----------------
 
@@ -545,7 +796,10 @@ class MinimapCalibDialog(QDialog):
         方向语义和拖动一致：按左 = 叠加层往左走（于是「看到的是底图哪一块」右移）。
         别按「数字往哪边走」去理解 —— 人对着画面按，手感才是对的。
         """
-        step = 5 if (e.modifiers() & Qt.ShiftModifier) else 1
+        # 一格 = **1 个底图像素**（在放大后的面板上就是 scale 个像素）：
+        # 直接按 1 个屏幕像素挪，在 9 倍放大的图上根本动不了几何（block 是整数）。
+        base = max(1.0, float(self.scale))
+        step = (5.0 if (e.modifiers() & Qt.ShiftModifier) else 1.0) * base
         d = {Qt.Key_Left: (-step, 0), Qt.Key_Right: (step, 0),
              Qt.Key_Up: (0, -step), Qt.Key_Down: (0, step)}.get(e.key())
         if d is None or self.canvas is None:

@@ -111,6 +111,29 @@ def main():
     _ensure_std_streams()
     _install_crash_handlers()
 
+    # 性能保活：向系统声明「别把我当后台程序降级」——关电源节流（EcoQoS 降频）、
+    # 进程优先级→高于正常、定时器精度→1 ms、防挂起（见 core/winperf.py）。
+    #
+    # **为什么非做不可**：关键回路是 10 ms 级的时序拍（decision/agent.py 的
+    # TIMING_TICK），而 Windows 默认定时器粒度约 15.6 ms —— 想睡 10 ms 实际睡
+    # 15.6 ms；再叠加系统对**非前台进程**的降频与定时器合并，症状就是
+    # 「窗口一失焦就卡」。原先全项目没有任何一处向系统声明过这件事
+    #（timeBeginPeriod 只在 wgc_capture 被 import 时调过，而那条路只有
+    # 「来源 = 本地窗口」抓屏才走 → **收流模式全程停在 15.6 ms**）。
+    #
+    # 放在这里（而不是某个回路启动时）：进程级设置越早声明越好，且必须赶在
+    # 任何线程/定时器起来之前。开关在「设置 → 性能保活」。
+    from core import winperf
+    keepalive = None
+    try:
+        if winperf.enabled_by_config():
+            # probe=5：顺带实测 5 次「睡 10 ms 到底睡了多久」（约 50 ms 启动开销）。
+            # 这是唯一能自己证明"真的生效"的数字，值回这点时间。
+            keepalive = winperf.apply(probe=5)
+    except Exception as e:                 # 保活失败绝不能影响启动
+        keepalive = None
+        print("性能保活未生效: %s: %s" % (type(e).__name__, e))
+
     # 高分屏：必须在 QApplication 创建之前设置
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
@@ -150,6 +173,21 @@ def main():
     if _icon.exists():
         win.setWindowIcon(QIcon(str(_icon)))
 
+    # 保活结果写进运行日志：**看得见**才不会变成"玄学调优" ——
+    # 失焦变卡这类问题，人会下意识怀疑"是不是设置问题"，日志里有这行就能直接排除。
+    from core import winperf as _wp
+    if keepalive is None:
+        win.log("性能保活：未启用（设置 → 性能保活 里可以打开）", "warn")
+    else:
+        msg = _wp.describe()
+        if keepalive.get("probe_ms") is not None:
+            # **只报"现在是多少"**，不写"未提升精度时约 15.6 ms" —— 实测过：
+            # 有的机器（含本机的 B 机）默认就已经是 1 ms 级（别的程序早把系统
+            # 定时器分辨率提上去了）。写上那句，会让"这一项到底是不是我的瓶颈"
+            # 变成一句空话。想知道改前/改后，跑 tools.selftest_winperf（它实测两次）。
+            msg += "　|　实测量到 sleep(10ms) = %.1f ms" % keepalive["probe_ms"]
+        win.log(msg, "info")
+
     if len(sys.argv) > 1:
         try:
             win.open_project(Path(sys.argv[1]))
@@ -166,6 +204,9 @@ def main():
     win.close()
     del win
     app.processEvents()
+    # 把定时器精度还回去（timeEndPeriod）：不还的话，本进程占着 1 ms 精度的
+    # 名额不放 —— 在高精度定时器是稀缺资源的系统上，别的程序会吃不到。
+    _wp.release()
     return rc
 
 

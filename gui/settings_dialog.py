@@ -4,7 +4,7 @@
 |---|---|---|
 | **界面** | 界面字号、可视化颜色/线宽 | 只管**长什么样**，改了立刻看得见 |
 | **保护与恢复** | 停止自动的条件、防卡键、断线重连 | 管**出问题怎么办** |
-| **诊断** | 性能日志开关 | 只在排查问题时动 |
+| **诊断** | 性能日志开关、性能保活 | 只在排查问题时动 |
 
 **为什么分页签**：原来是一根长列表，找一项得一路往下扫；而且「外观」和「安全」
 混在一起容易看错上下文（比如把字号当成决策参数）。分页之后每页只有一件事，
@@ -13,7 +13,8 @@
 字号改动**立即生效**，不需要重启 —— 底层是 QApplication.setFont()，所有没写死
 字号的控件都会跟随。保护与恢复里的都是决策参数：点确定后写回**当前项目**
 （没打开项目时不落盘，只改内存 —— 见 decision/agent.py 的 set_save_hook）；
-性能日志开关不是决策参数，它落在 config/live.yaml（和实时预览同一份配置）。
+性能日志开关不是决策参数，它落在 config/live.yaml（和实时预览同一份配置）；
+性能保活也是（进程优先级/电源节流/定时器精度，见 core/winperf.py）。
 
 代码顺序 = 页签顺序 = 视觉顺序（docs/UI规范.md §4）。
 """
@@ -24,7 +25,7 @@ from PyQt5.QtWidgets import (QCheckBox, QColorDialog, QDialog, QDialogButtonBox,
                              QPushButton, QScrollArea, QTabWidget,
                              QVBoxLayout, QWidget)
 
-from core import perf
+from core import perf, winperf
 from decision.agent import settings
 from gui import theme
 from perception import classes
@@ -32,7 +33,7 @@ from perception import classes
 # （详见 docs/UI规范.md：滚轮不许改参数）
 from gui.widgets import (NoWheelDoubleSpinBox, NoWheelSlider,
                          NoWheelSpinBox)
-from tools.config import load_live, save_live
+from tools.config import load_live, update_live
 
 #: 页签名（顺序 = 显示顺序）。测试和文档都按这份来。
 TAB_NAMES = ("界面", "保护与恢复", "诊断")
@@ -270,6 +271,20 @@ class SettingsDialog(QDialog):
         self.ck_perf.setChecked(bool(load_live().get("perf_log", True)))
         lay.addWidget(self.ck_perf)
 
+        self._head(
+            lay, "性能保活",
+            "向 Windows 声明「别把我当后台程序降级」，四件事：\n"
+            "  · 关电源节流（EcoQoS 降频）　· 进程优先级 → 高于正常\n"
+            "  · 定时器精度 → 1 ms　　　　　· 阻止系统空闲时挂起\n\n"
+            "**默认开，建议一直开着**：关键回路是 10 ms 级的时序拍，而 Windows 默认\n"
+            "定时器粒度约 15.6 ms —— 关掉它的现象是「窗口一失焦就卡」，很难归因\n"
+            "（没人会想到是自己关的）。放开手去做别的事时，这一项就是「别掉拍」的保证。\n\n"
+            "自己验一下数字（会实测 sleep(10ms) 到底睡多久）：\n"
+            "    python -m tools.selftest_winperf")
+        self.ck_keepalive = QCheckBox("性能保活（失焦时也不被系统降级）")
+        self.ck_keepalive.setChecked(bool(load_live().get("perf_keepalive", True)))
+        lay.addWidget(self.ck_keepalive)
+
         lay.addStretch(1)
         return page
 
@@ -344,12 +359,20 @@ class SettingsDialog(QDialog):
         vis_cfg = {k: b._color for k, b in self._color_btns.items()}
         vis_cfg["vision_width"] = self.sp_vision_width.value()
         theme.save_vis(vis_cfg)
-        # 性能日志：写回整份 config/live.yaml（save_live 是整文件覆盖，所以要先读
-        # 再改这一个键，别把实时预览那几项冲掉），并立即生效。
+        # 性能日志 / 性能保活：都落在 config/live.yaml（save_live 是整文件覆盖，
+        # 所以先读整份、只改这两个键、再写回 —— 别把实时预览那几项冲掉）。
         pl = self.ck_perf.isChecked()
-        cfg = load_live()
-        if pl != bool(cfg.get("perf_log", True)):
-            cfg["perf_log"] = pl
-            save_live(cfg)
+        ka = self.ck_keepalive.isChecked()
+        if pl != bool(load_live().get("perf_log", True)):
+            update_live(perf_log=pl)
             perf.set_enabled(pl)
+        if ka != bool(load_live().get("perf_keepalive", True)):
+            update_live(perf_keepalive=ka)
+        # 保活立即生效：开 → 马上声明（幂等，重复调无害）；
+        # 关 → 把定时器精度还回去（timeEndPeriod）。**进程优先级不主动降回去**：
+        # "关掉保活"的意图是「别再动系统」，不是「把我降到最低」。
+        if ka:
+            winperf.apply()
+        else:
+            winperf.release()
         self.accept()

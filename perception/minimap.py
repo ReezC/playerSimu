@@ -32,6 +32,7 @@ import struct
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -54,6 +55,10 @@ class MiniMapClient:
         self._lock = threading.Lock()
         self._frame = None          # 最新的 BGR 帧（numpy）
         self._t = 0.0               # 收到它的时刻（perf_counter）
+        # 最近若干帧的到达时刻：算"拍/秒"要用它。**不能用 1/(现在-最后一帧时刻)**
+        # ——那算的是"距上一帧过了多久"，界面每 100ms 取一次值，会看到 52 这种
+        # 假数字（真实推流是 10 fps）。
+        self._times = deque(maxlen=40)
         self._stop = threading.Event()
         self._th = None
         self.n_recv = 0
@@ -102,6 +107,7 @@ class MiniMapClient:
                                 self.n_drop += 1
                             self._frame = img
                             self._t = time.perf_counter()
+                            self._times.append(self._t)
                         self.n_recv += 1
             except Exception as e:
                 if self._stop.is_set():
@@ -122,8 +128,20 @@ class MiniMapClient:
 
     @property
     def fps(self):
-        f, t = self.latest()
-        return 0.0 if not t else 1.0 / max(1e-6, time.perf_counter() - t)
+        """最近的**真实**收帧速率（拍/秒）。
+
+        用「最近 N 帧的时间跨度」算，而不是「距最后一帧过了多久」——
+        后者界面每 100ms 取一次值时，会在几毫秒内给出 52 这种假数字。
+        断流超过 1 秒直接算 0（别把上一轮的速率一直挂着）。
+        """
+        with self._lock:
+            ts = list(self._times)
+        if len(ts) < 2:
+            return 0.0
+        span = ts[-1] - ts[0]
+        if span <= 0 or (time.perf_counter() - ts[-1]) > 1.0:
+            return 0.0
+        return (len(ts) - 1) / span
 
 
 def _recv_exact(sock, n):
@@ -149,10 +167,30 @@ def _recv_exact(sock, n):
 MODE_FIT = "fit"
 MODE_CROP = "crop"
 
+#: 面板画面**从哪来**（工作台「路线识别 → 小地图来源」；存在 config/live.yaml）：
+#:   stream —— A 机的「小地图推流」：独立一路、原始像素（JPEG q100），画面最清晰；
+#:   live   —— 从**实时预览那一帧**里裁一块：不用多推一路，但那是 H.264 压过的画面，
+#:             黄点只剩几个像素（**实验**：面板↔底图匹配问题不大，黄点识别待实测）。
+#: 为什么放在 live.yaml 而不是每张图的标定里：它取决于本机的推流/画面几何，与地图无关。
+SRC_STREAM = "stream"
+SRC_LIVE = "live"
+
 #: 标定 dict 的形状（存 datasets/map/<id>.mapcalib.json）
 #:   mode/scale/offset  —— 面板像素 → 底图像素：canvas = (panel - offset) / scale
 #:   view               —— crop 模式专用：当前显示的是底图从 (view) 开始的那一块
 #:   score              —— 标定时匹配得有多好（>0.8 才可信）
+
+
+def _crop_scales(canvas_wh, panel_wh):
+    """crop 的候选放大倍数：整数为主（像素画放大就是复制像素），再补半档。"""
+    cw, ch = canvas_wh
+    pw, ph = panel_wh
+    cand = set(float(v) for v in range(1, 13))
+    cand |= {x * 0.5 for x in range(2, 25)}
+    if cw > 0 and ch > 0:
+        # 「面板刚好装下底图」的那个比例：客户端常在它附近取值
+        cand.add(round(min(pw / cw, ph / ch), 3))
+    return sorted(c for c in cand if 0.5 <= c <= 12.0)
 
 
 def locate_fit(frame, canvas, scales=None, min_score=0.55):
@@ -164,9 +202,12 @@ def locate_fit(frame, canvas, scales=None, min_score=0.55):
         ch, cw = cg.shape[:2]
         base = min(fw / float(cw), fh / float(ch))
         # 候选尺度要**够密**：客户端把小地图放大几倍是不确定的（2x / 3x / 正好嵌进面板）。
-        cand = [round(1.0 + 0.25 * i, 3) for i in range(17)]
+        # 上限放到 12：小底图（几十像素）被客户端放大 6~10 倍是实测见过的，
+        # 原来只到 5，那种图上的自动定位会一路失败（人手动拖也不够，见 locate_crop）。
+        cand = [round(1.0 + 0.25 * i, 3) for i in range(21)]      # 1.00 ~ 6.00
+        cand += [round(6.0 + 0.5 * i, 3) for i in range(13)]      # 6.0 ~ 12.0
         cand += [round(base, 3), round(base * 0.5, 3), round(base * 2.0, 3)]
-        scales = sorted({c for c in cand if 0.25 <= c <= 8.0})
+        scales = sorted({c for c in cand if 0.25 <= c <= 12.0})
 
     best = None
     for s in scales:
@@ -187,28 +228,72 @@ def locate_fit(frame, canvas, scales=None, min_score=0.55):
     return best
 
 
-def locate_crop(frame, canvas, inset=4, min_score=0.55):
-    """方式 2：面板是底图的一块（1:1，随玩家滚动）→ 标定 dict 或 None。
+def locate_crop(frame, canvas, inset=4, min_score=0.55, scales=None):
+    """方式 2：面板是底图的**一块**（可能先放大了若干倍）→ 标定 dict 或 None。
 
-    做法：拿**面板画面**当模板、在**底图**里找它 —— 一次 matchTemplate 就得到
-    「现在显示的是底图的哪一块」（view），滚动到哪都不用另算。
+    **为什么不能只按 1:1 找**（实测踩到）：客户端把小地图放大后再切块很常见。
+    猴林迷宫I 就是：底图 78×203，而面板 753×612 —— 光宽度就差 9.7 倍。这种图上
+    「整张缩放进面板」（fit）和「1:1 取一块」**两种都量不出来**，人手动把叠加层
+    拖到 4 倍也不够（缩放上限），表现就是「匹配分 0.7 上下、怎么看都不对」。
+
+    **做法**：对每个候选放大倍数 s，把**面板按 1/s 缩回去**（缩回底图尺度），
+    再在**原尺寸底图**里找它 —— 一次 matchTemplate 得到「显示的是底图哪一块」。
+
+    缩回去有两种实现，**按 s 分开用**（这里踩过一个静默的坑）：
+      · s ≥ 1（客户端把地图**放大**了，最常见）：**抽样**（`[::step]`），不插值 ——
+        客户端放大就是复制像素，抽样正好把它还原回去，计算量还降到 1/s²；
+      · s < 1（客户端把地图**缩小**着显示）：只能**插值**（`cv2.resize`）。
+        ⚠ 以前不分这两种：`step = max(1, round(0.54)) = 1` → 模板其实还是 1:1 那张，
+        分数照样 1.0，却把 scale 记成 0.54 —— view 是对的、scale 是错的，
+        换算整体偏 1/s 倍（`t_crop_roundtrip` 系的一条回归逮到过）。
+        另外 `eff` 一律取**真正实现出来的倍数**（抽样就是 step，插值就按实际输出尺寸算），
+        不写"想要的那个 s"。
+
+    于是标定里同时有 `scale`（面板像素 / 底图像素）和 `view`（面板左上角对应的
+    底图坐标），换算仍是 `canvas = (panel - offset) / scale + view`。
     """
     f = _gray(frame)
     c = _gray(canvas)
     h, w = f.shape[:2]
     # 面板可能有边框/外圈，用中间部分当模板更稳（分数不会被边框拉低）
     t = f[inset:h - inset, inset:w - inset] if (h > 2 * inset and w > 2 * inset) else f
-    if t.shape[0] > c.shape[0] or t.shape[1] > c.shape[1]:
-        return None                 # 面板比底图还大 → 不可能是裁剪模式
-    r = np.nan_to_num(cv2.matchTemplate(c, t, cv2.TM_CCOEFF_NORMED))
-    _, mx, _, ml = cv2.minMaxLoc(r)
-    if mx < min_score:
+
+    if scales is None:
+        scales = _crop_scales((c.shape[1], c.shape[0]), (w, h))
+
+    best = None
+    for s in scales:
+        if s <= 0:
+            continue
+        if s < 1.0:
+            # 缩小：抽样做不到（step 最小是 1），必须插值。
+            # ⚠ 别在这里偷懒用 step=1 顶替 —— 那样模板是 1:1 的、分数满分，
+            # 却把 scale 记成 s，等于给出一份"看着很准其实偏一倍"的换算。
+            tt = cv2.resize(t, (max(1, int(round(t.shape[1] * s))),
+                                max(1, int(round(t.shape[0] * s)))),
+                            interpolation=cv2.INTER_AREA)
+            eff = t.shape[1] / float(tt.shape[1])      # 真正实现出来的倍数
+        else:
+            step = max(1, int(round(s)))
+            if abs(s - step) > 0.3:
+                continue        # 抽样实现不出这个倍数（相邻整数档已经在候选里了）
+            tt = t[::step, ::step] if step > 1 else t
+            eff = float(step)
+        if tt.shape[0] < 6 or tt.shape[1] < 6:
+            continue
+        if tt.shape[0] > c.shape[0] or tt.shape[1] > c.shape[1]:
+            continue                    # 缩回去还是比底图大 → 不是这个倍数
+        r = np.nan_to_num(cv2.matchTemplate(c, tt, cv2.TM_CCOEFF_NORMED))
+        _, mx, _, ml = cv2.minMaxLoc(r)
+        if best is None or mx > best["score"]:
+            # view 是「面板左上角(去掉 inset 之后)对应的底图坐标」——
+            # 匹配位置本身就是这个坐标，所以**不要再按 s 折算**（换算里已经除了 s）。
+            best = {"mode": MODE_CROP, "scale": eff,
+                    "offset": [inset, inset],
+                    "view": [int(ml[0]), int(ml[1])], "score": float(mx)}
+    if best is None or best["score"] < min_score:
         return None
-    # 注意 inset **只能减一次**：模板是从面板里裁掉 inset 之后去匹配的，
-    # 匹配位置本身就是「底图坐标」，换算时 (panel - inset) + view 即可 ——
-    # 这里再减一次 inset 就整体偏了 4 像素（实测差 4*16=64 世界像素）。
-    return {"mode": MODE_CROP, "scale": 1.0, "offset": [inset, inset],
-            "view": [int(ml[0]), int(ml[1])], "score": float(mx)}
+    return best
 
 
 def locate(frame, canvas, mode):
@@ -246,6 +331,27 @@ def panel_to_world(px, py, calib, terrain):
     return terrain.canvas_to_world(*panel_to_canvas(px, py, calib))
 
 
+def has_geometry(calib):
+    """这份标定里有没有**可用的几何** —— 「标定过没有」都该用它判断。
+
+    **为什么不看 `score`**（现场踩到）：`score` 是「模板匹配有多像」，而
+    **人工对齐没有匹配分**（人拿眼睛对出来的，分数就是 0）。以前拿 score 当
+    「标过没有」，于是手工对齐存下去之后仍被判成「没标过」：
+
+      · 标定弹窗重开时把刚存好的几何**覆盖**成粗略猜测 —— 现象就是
+        「我明明点了保存，重开却变回去了」；
+      · 工作台那行一直显示「未标定」。
+
+    两条都能在 `tools/selftest_minimap.py` 的 `t_save_then_reopen` 里复现。
+    """
+    if not isinstance(calib, dict) or not calib.get("mode"):
+        return False
+    if not calib.get("scale"):
+        return False
+    need = "view" if calib.get("mode") == MODE_CROP else "offset"
+    return calib.get(need) is not None
+
+
 # ══════════════════════════════════════════════════════════════
 # 「现在显示的是底图哪一块」（crop / 局部小地图专用）
 # ══════════════════════════════════════════════════════════════
@@ -262,17 +368,22 @@ def overlay_zoom(canvas_w):
 def view_rects(loc, panel_wh, canvas_wh):
     """crop 模式：算出「面板现在显示的是底图哪一块」→ (底图矩形, 叠加图矩形)。
 
-    底图矩形 = 从 `view - inset` 起、**面板那么大**的一块。
+    面板是**放大过**的（scale = 面板像素 / 底图像素），所以它在底图坐标里覆盖
+    的大小是 `面板 / scale`，起点是 `view - inset/scale`。
+
     注意 inset 只能减一次：模板是从面板里裁掉 inset 再去匹配的，匹配位置本身
-    就是底图坐标（见 locate_crop / panel_to_canvas 的注释）。
+    就是底图坐标（见 locate_crop / panel_to_canvas 的注释）；scale 也是同理 ——
+    匹配时面板已经按 1/s 缩回去了，所以 view 就是底图坐标，**不要再折算一次**。
     """
     pw, ph = panel_wh
-    inset = int((loc.get("offset") or [4, 4])[0])
+    s = float(loc.get("scale") or 1.0)
+    inset = float((loc.get("offset") or [4, 4])[0])
     vx, vy = loc.get("view") or (0, 0)
-    x0, y0 = int(vx) - inset, int(vy) - inset
+    x0, y0 = vx - inset / s, vy - inset / s
+    x1, y1 = x0 + pw / s, y0 + ph / s
     z = overlay_zoom(canvas_wh[0])
-    return ((x0, y0, x0 + pw, y0 + ph),
-            (x0 * z, y0 * z, (x0 + pw) * z, (y0 + ph) * z))
+    return ((int(x0), int(y0), int(x1), int(y1)),
+            (int(x0 * z), int(y0 * z), int(x1 * z), int(y1 * z)))
 
 
 def crop_compare(frame, canvas, rect):

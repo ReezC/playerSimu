@@ -218,6 +218,15 @@ class LiveThread(QThread):
     # ---------------- 主循环 ----------------
 
     def run(self):
+        # 这条线程就是关键回路（收流 → 推理 → 决策），单独把**线程**优先级提一档：
+        # Windows 会给「前台进程的线程」额外的调度优待，失焦时被压下去的往往正是
+        # 这条要 10 ms 一拍、还不能迟到的回路。进程级的兜底见 core/winperf.py
+        # （启动时已应用；这里再加一层，是因为线程优先级和进程优先级是两回事）。
+        try:
+            from core import winperf
+            winperf.boost_thread()
+        except Exception:
+            pass          # 提不上去也要照常跑，绝不因此不启动
         try:
             self._run()
         except Exception as e:

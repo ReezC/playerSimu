@@ -6,7 +6,7 @@
     · 显示三个分开的速度指标
 """
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (QCheckBox, QFormLayout, QHBoxLayout, QLabel,
                              QLineEdit, QMessageBox, QPushButton, QSizePolicy,
@@ -19,7 +19,7 @@ import numpy as np
 from decision.agent import settings
 from gui.live_thread import LiveThread
 from gui.widgets import NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox
-from tools.config import ROOT, get, load_live, save_live
+from tools.config import ROOT, get, load_live, update_live
 
 
 def _bgr_to_pixmap(img):
@@ -39,6 +39,74 @@ def _bgr_to_pixmap(img):
     return QPixmap.fromImage(qimg.copy())
 
 
+class LiveFrameRegionClient:
+    """把「实时画面里框出来的一块」喂给标定弹窗（代替 A 机的小地图推流）。
+
+    **为什么要有它**：小地图标定要的只是"一张面板画面"，从哪来其实无所谓 ——
+    以前只能等 A 机那条独立推流（清晰，但要多推一路、多一份 A 机开销）。这个
+    适配器直接从**实时预览那一帧**上裁一块（工作台「小地图来源 = 从实时画面框选」，
+    实验做法）。接口和 `perception.minimap.MiniMapClient` 一致，所以标定弹窗
+    **一行都不用改** —— 换来源 = 换喂帧的人。
+
+    ⚠ 为什么标"实验"：实时画面是 H.264 压过的，小地图黄点只有几个像素，能不能
+    稳定认出玩家点**还没实测**（面板 ↔ 底图的匹配问题不大：底图本来就比面板小，
+    匹配是在粗结构上做的）。判据还是标定弹窗里那个匹配分 + 以后黄点识别的实测。
+    """
+
+    def __init__(self, panel, region):
+        self.panel = panel
+        self.region = [int(v) for v in region]
+        self.n_recv = 0
+        self.fps = 0.0
+        self.err = ""
+        self.connected = True
+        # 给标定弹窗的文字：换来源之后，"等帧中…（连 A机:5003）"那类提示会说错
+        self.label = "实时画面框选 %d×%d" % (self.region[2], self.region[3])
+        self.wait_hint = ("还没有实时画面 —— 先到「实时」页点开始预览，再回来标定")
+        self.hint = "实时画面里那块区域没取到（先到「实时」页开始预览）"
+        self._src = None        # 上一帧（身份比较：同一帧不重复裁）
+        self._crop = None
+        self._t = 0.0
+        self._t0 = time.time()
+        self._n0 = 0
+
+    def start(self):
+        return self
+
+    def stop(self):
+        pass                    # 借的是实时预览那一路，不能停它（和弹窗的约定一致）
+
+    def latest(self, clear=False):
+        """→ (那一块的 BGR 图, 时间戳)；取不到给 (None, 0.0)，原因写进 `err`。
+
+        **同一帧返回同一个对象**：标定弹窗靠 `frame is not self._frame` 判断
+        "来了新帧"，每次重建对象会让它以为帧在不停刷新。
+        """
+        img = None if self.panel is None else self.panel.current_frame()
+        if img is None:
+            # 报错要写"怎么修"（UI规范 §6）：不然人只会看到"没有画面"然后卡住
+            self.err = "还没有实时画面 —— 先到「实时」页点「开始」预览"
+            return None, 0.0
+        x, y, w, h = self.region
+        H, W = img.shape[:2]
+        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > W or y + h > H:
+            # 画面尺寸变了（换分辨率 / 改推流参数）→ 说清楚，别给一块错位的图
+            self.err = ("框选的区域 %s 超出当前画面 %dx%d —— 重新框一次"
+                        % (self.region, W, H))
+            return None, 0.0
+        if img is not self._src:
+            self._src = img
+            self._crop = np.ascontiguousarray(img[y:y + h, x:x + w])
+            self._t = time.time()
+            self.n_recv += 1
+            span = self._t - self._t0
+            if span >= 1.0:
+                self.fps = (self.n_recv - self._n0) / span
+                self._t0, self._n0 = self._t, self.n_recv
+            self.err = ""
+        return self._crop, self._t
+
+
 class LivePanel(QWidget):
     potions_ready = pyqtSignal(float, float)   # (hp, mp) 比例，转发给决策参数页
 
@@ -49,6 +117,13 @@ class LivePanel(QWidget):
         self._last_pix = None
         self._last_bgr = None   # 最近一帧画面（BGR），供 HP/MP 条在画面上框选
         self._rect = None       # 本地窗口模式下框选的区域 (x, y, w, h)
+        # 绘制合并（见 _on_frame）：只保留最新一帧，渲染慢时丢中间帧而不是排队
+        self._pending = None
+        self._render_pending = False
+        self._disp_drawn = 0      # 真画出来的帧数
+        self._disp_merged = 0     # 还没画就又来新帧 → 被合并掉的帧数
+        self._disp_skipped = 0    # 面板不可见 → 整帧不画（省主线程）
+        self._draw_ms = 0.0       # 最近一次绘制耗时（含 QImage/QPixmap + 缩放）
         self._build()
 
     # ---------------- 界面 ----------------
@@ -399,14 +474,17 @@ class LivePanel(QWidget):
     def _save_live_params(self, *_):
         """conf 改动实时写 config，让运行中的实时预览立即生效（其余参数下次启动生效）。"""
         try:
-            save_live({
-                "conf_mob": self.sp_conf_mob.value(),
-                "conf_player": self.sp_conf_player.value(),
-                "imgsz": self.sp_imgsz.value(),
-                "device": self.ed_device.text().strip() or "0",
-                "capture_fps": self.sp_capfps.value(),
-                "draw": self.ck_draw.isChecked(),
-            })
+            # 走 update_live（不是 save_live）：后者是整文件覆盖，会把别处写的键
+            # （perf_log / perf_keepalive）一起抹掉 —— 现象是「设置里明明开着，
+            # 重启后文件里没了、选项变回默认」，很难归因。
+            update_live(
+                conf_mob=self.sp_conf_mob.value(),
+                conf_player=self.sp_conf_player.value(),
+                imgsz=self.sp_imgsz.value(),
+                device=self.ed_device.text().strip() or "0",
+                capture_fps=self.sp_capfps.value(),
+                draw=self.ck_draw.isChecked(),
+            )
         except Exception:
             pass
 
@@ -429,16 +507,18 @@ class LivePanel(QWidget):
         if self.project is not None:
             pid = self.project.get("player_id") or ""
 
-        # 保存实时参数，下次开 GUI 不用再调
-        save_live({
-            "conf_mob": self.sp_conf_mob.value(),
-            "conf_player": self.sp_conf_player.value(),
-            "imgsz": self.sp_imgsz.value(),
-            "device": self.ed_device.text().strip() or "0",
-            "capture_fps": self.sp_capfps.value(),
-            "draw": self.ck_draw.isChecked(),
-            "perf_log": bool(load_live().get("perf_log", True)),
-        })
+        # 保存实时参数，下次开 GUI 不用再调。
+        # 走 update_live：其余键（perf_log / perf_keepalive）原样留着 ——
+        # 以前这里整文件覆盖，还得手工把 perf_log 抄一遍补回来，那正是
+        # 「整文件覆盖丢键」这个坑的症状。
+        update_live(
+            conf_mob=self.sp_conf_mob.value(),
+            conf_player=self.sp_conf_player.value(),
+            imgsz=self.sp_imgsz.value(),
+            device=self.ed_device.text().strip() or "0",
+            capture_fps=self.sp_capfps.value(),
+            draw=self.ck_draw.isChecked(),
+        )
 
         common = {
             "weights": w,
@@ -534,13 +614,49 @@ class LivePanel(QWidget):
     # ---------------- 回调 ----------------
 
     def _on_frame(self, img):
-        pm = _bgr_to_pixmap(img)
-        self._last_pix = pm
-        self._last_bgr = img
+        """收到新帧：**只留最新一帧**，渲染跟不上就丢中间帧，绝不排队。
+
+        **为什么要合并**（"失焦就卡"的主因之一）：这个槽跑在 GUI 主线程上，
+        每帧要做两次整幅拷贝（QImage + QPixmap）加一次缩放 —— 1920×1080 大约
+        10~20 ms；而线程按 30 fps 推信号。主线程只要慢一点（**失焦时被系统降级**、
+        窗口正在缩放、机器在跑训练），队列就**越堆越长**：画面越来越滞后、
+        鼠标点一下半天才响应。这个延迟发生在主线程队列里，工作线程侧的统计
+        根本看不到（见 `_render` 的注释）—— 所以只看监控数字一切正常。
+
+        合并办法：最新帧放 `_pending`，只挂**一个**零延时任务去画；画之前又来
+        新帧就只覆盖 `_pending`（等于"追赶时不补旧帧"）。面板不可见（切到别的
+        页签、窗口被藏起来）连画都不画：画面没人看，省下的时间留给决策回路。
+        """
+        self._last_bgr = img        # 取帧类功能（探针/HP 条框选）永远要最新的
+        self._pending = img
+        if self._render_pending:
+            self._disp_merged += 1  # 上一帧还没画完 → 这一帧被合并掉
+            return
+        self._render_pending = True
+        QTimer.singleShot(0, self._draw_pending)
+
+    def _draw_pending(self):
+        """把 `_pending` 画出来（零延时任务，和上一条 _on_frame 同一个合并节拍）。"""
+        self._render_pending = False
+        img = self._pending
+        self._pending = None
+        if img is None:
+            return
+        if not self.isVisible():
+            self._disp_skipped += 1
+            return
+        t0 = time.perf_counter()
+        self._last_pix = _bgr_to_pixmap(img)
         self._render()
+        self._draw_ms = (time.perf_counter() - t0) * 1000.0
+        self._disp_drawn += 1
 
     def current_frame(self):
-        """返回最近一帧画面（BGR ndarray）；还没有画面时返回 None。"""
+        """返回最近一帧画面（BGR ndarray）；还没有画面时返回 None。
+
+        **不受绘制合并影响**：被合并/因为不可见没画的帧，这里照样拿得到 ——
+        探针标定、HP/MP 条框选都靠它。
+        """
         return self._last_bgr
 
     def _render(self):
@@ -631,11 +747,15 @@ class LivePanel(QWidget):
         # 断线重连在做的事放在最前面 —— 这时候帧率数字意义不大，状态才是要紧的
         note = (s.get("reconnect") or "").strip()
         head = "【%s】 " % note if note else ""
+        # 绘制那一段单独报：「显示 fps」只说明**推**了多少，看不出主线程画得
+        # 动不动 —— 而"失焦就卡"恰恰卡在这里（合并丢弃的帧数一涨，就说明主线程
+        # 跟不上推送、开始在丢中间帧；不丢帧时界面才不会滞后）。
         self.lbl_stats.setText(
             "%s%s ｜ 输入 %5.1f fps ｜ 处理 %5.1f fps ｜ 丢帧 %d ｜ 推理 %5.1f ms ｜ "
-            "显示 %4.1f fps ｜ 检出 %d ｜ %d×%d"
+            "显示 %4.1f fps ｜ 绘制 %4.1f ms 合并丢弃 %d ｜ 检出 %d ｜ %d×%d"
             % (head, d_txt, s.get("recv_fps", 0), s.get("proc_fps", 0),
                s.get("dropped", 0), s.get("infer_ms", 0), s.get("show_fps", 0),
+               self._draw_ms, self._disp_merged,
                s.get("boxes", 0), w, h))
 
     def _on_stream_status(self, status):
