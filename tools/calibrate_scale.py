@@ -30,12 +30,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from core import wzexport
 from core.context import ConsoleContext, TaskContext
 from core.imgio import imread
 
 
 def find_stand_frames(mob_root, limit=0, only=None):
-    """每只怪只取 stand 的第一帧作为模板。
+    """每只怪取一张模板帧：**优先 stand，没有就 fly**（很多飞的怪只有 fly）。
 
     only:
         None      —— 全部怪（按目录名排序，受 limit 截断）
@@ -53,11 +54,11 @@ def find_stand_frames(mob_root, limit=0, only=None):
         if want is not None and d.name not in want:
             continue
 
-        stands = sorted(d.glob("stand_*.png"))
-        if not stands:
+        _act, frames = wzexport.mob_action_frames(d)
+        if not frames:
             continue
 
-        out.append((d.name, stands[0]))
+        out.append((d.name, frames[0]))
         if want is None and limit and len(out) >= limit:
             break
 
@@ -161,7 +162,11 @@ def _match_round(frames, tpls, scales, region, ctx):
                     done += 1
                     continue
 
+                # 同 detect_mobs：分母趋 0 时 OpenCV 会给 FLT_MAX（**有限值**，
+                # nan_to_num 不处理），不掐掉的话黑区会给出"满分"，
+                # 标定出来的 scale 就跟着错。归一化相关不会超过 1。
                 r = np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
+                r[r > 1.0] = 0.0
                 peak = float(r.max())
                 # 区分度 = 峰值 − 高分位数。到处都是高分说明这个模板没有辨识力
                 distinct = peak - _top_quantile(r)
@@ -237,8 +242,10 @@ def run_calibrate(params, ctx=None):
         if missing:
             raise RuntimeError(
                 "精灵库里找不到这些怪：%s\n"
-                "（sprite_dir = %s；这些 id 要么没有目录，要么目录里没有 stand_*.png）"
-                % (", ".join(missing), sprites))
+                "（sprite_dir = %s；这些 id 要么没有目录，要么目录里一帧都没有 —— "
+                "stand/fly/move 都找过了。link 型的怪要用新版 WzProbe 重新导出："
+                "dump-mob <wz目录> <精灵库目录> 0 --only %s）"
+                % (", ".join(missing), sprites, ",".join(missing)))
     else:
         cand = find_stand_frames(sprites, max_mobs)
 

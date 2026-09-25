@@ -127,7 +127,12 @@ class PlayerLocator:
                 r = cv2.matchTemplate(canvas, tbb, cv2.TM_CCORR_NORMED, mask=tmm)
             except Exception:
                 continue
-            r = np.nan_to_num(r)
+            # 同 tools/detect_mobs：TM_CCORR_NORMED 的分母（窗口能量）趋 0 时，
+            # OpenCV 给的是 FLT_MAX 或 NaN —— np.nan_to_num 只把 NaN 变 0，
+            # FLT_MAX 会留下，于是黑边/纯色面板上能拿到"满分定位"，
+            # minMaxLoc 也会挑中它。归一化相关按定义不超过 1，超了就是退化解。
+            r = np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
+            r[r > 1.0] = 0.0
             _, mx, _, ml = cv2.minMaxLoc(r)
             if best is None or mx > best[0]:
                 # 坐标与尺寸乘回原尺度（匹配是在 downscale 后的图上做的）

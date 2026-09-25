@@ -1,12 +1,66 @@
-"""路线识别面板：平台识别 / 跳跃落点预测 / 扫平台 的总开关。
+"""路线识别面板：平台识别 / 跳跃落点预测 的总开关 + 小地图定位 + 地形图。
 
-这些功能每帧做图像处理（平台顶边检测、玩家运动追踪），比较吃 CPU，
-默认关闭。需要时再开。
+「总开关」这几项每帧做图像处理（平台顶边检测、玩家运动追踪），比较吃 CPU，
+默认关闭。**关掉 = 这块一点活都不干**（包括地形关系识别，见 live_thread），
+所以它是一条真的性能开关，不是只影响画面。
+
+**小地图定位**：寻路要用小地图上的黄点算出世界坐标，而「小地图面板怎么显示
+底图」有两种方式，**不同地图可能不一样**（所以界面上的名字按"看见的是什么"来）：
+
+    全局小地图（fit）   整张底图缩放到面板里     → 地形图不随人移动，只有黄点在动
+    局部小地图（crop）  面板 1:1 显示底图的一块  → 地形图跟着人滑动（黄点基本在中间）
+
+这里**让你选**（每张图存一份，见 datasets/map/<id>.mapcalib.json），
+程序不替你猜。判断方法就写在面板上：进游戏左右走两步看一眼即可。
+
+**地形图**：把 `datasets/map/<id>_overlay.png`（tools/map_terrain_view.py 生成：
+每条平台一色 + 传送点/绳梯/刷怪点）显示出来。小地图定位对不对、寻路要往哪走，
+看着这张图才有概念 —— 只有一串数字的话没法判断。
 """
 
-from PyQt5.QtWidgets import QCheckBox, QLabel, QVBoxLayout, QWidget
+from PyQt5.QtGui import QPixmap
+from PyQt5.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QMessageBox,
+                             QPushButton, QVBoxLayout, QWidget)
 
+from core import mapdata
 from decision.agent import settings
+from gui.canvas import ImageCanvas
+from gui.minimap_calib import MinimapCalibDialog   # 量「面板 ↔ 底图」的弹窗
+from gui.widgets import NoWheelComboBox      # 滚轮不许改参数（docs/UI规范.md）
+from perception import minimap as mm
+
+
+def _generate_task(params, ctx):
+    """后台：缺地形数据就先从 WZ 导，再画叠加图。**不碰任何 Qt 控件。**
+
+    （跑在 gui.worker.TaskThread 里，见那里的铁律：工作线程只 emit 信号。）
+    """
+    mid = str(params["map_id"])
+    out = mapdata.map_dir()
+    json_path = out / ("%s.json" % mid)
+
+    if json_path.exists() and not params.get("force_export"):
+        # 地形数据已经有了：只重画叠加图（毫秒级）—— 大部分时候用户只是想看
+        # 最新的那张，没必要每次去解析一遍 Map.wz（那是几十秒）。
+        ctx.log("已有地形数据 %s，只重画叠加图" % json_path.name)
+    else:
+        from core import wzexport
+        wzexport.run_export_terrain({"map_id": mid, "out": str(out)}, ctx)
+
+    if ctx.canceled():
+        return {"summary": "已取消"}
+
+    from tools.map_terrain_view import render
+    t = mapdata.load(mid, with_canvas=True)
+    if t is None:
+        raise RuntimeError("读不到地形 JSON：%s" % json_path)
+
+    target = out / ("%s_overlay.png" % mid)
+    # render 返回的是 foothold 条数（其中墙多少），不是"串成的段数" —— 别写错标签
+    w, h, n_fh, n_wall = render(t, target)
+    ctx.log("叠加图 %s  %d×%d（foothold %d / 其中墙 %d，串成 %d 段）"
+            % (target.name, w, h, n_fh, n_wall, len(t.segments)), "ok")
+    return {"summary": "已生成 %s" % target.name, "path": str(target)}
 
 
 class RoutePanel(QWidget):
@@ -37,7 +91,283 @@ class RoutePanel(QWidget):
         root.addWidget(self.lbl_hint)
         self._refresh_hint()
 
-        root.addStretch(1)
+        # ---- 小地图定位（寻路用；方式由你选，程序不猜）----
+        root.addSpacing(12)
+        lbl2 = QLabel("小地图定位")
+        lbl2.setStyleSheet("font-weight: 600;")
+        root.addWidget(lbl2)
+
+        # 面板上只留「参数 + 状态」；怎么判断选哪种、标定怎么跑，都放 tooltip
+        # （docs/UI规范.md：正文别塞说明，细节交给 tooltip）
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.addWidget(QLabel("当前地图"))
+        self.lbl_mmap = QLabel("—")
+        row.addWidget(self.lbl_mmap)
+        row.addSpacing(12)
+        row.addWidget(QLabel("显示方式"))
+        self.cmb_mmap_mode = NoWheelComboBox()
+        # 名字按「你在小地图上看到的是什么」取：整张都在 = 全局；
+        # 只看到一块、跟着人滑动 = 局部。（fit/crop 是实现里的叫法，别摆到界面上）
+        self.cmb_mmap_mode.addItem("全局小地图", mm.MODE_FIT)
+        self.cmb_mmap_mode.addItem("局部小地图", mm.MODE_CROP)
+        self.cmb_mmap_mode.setToolTip(
+            "小地图面板怎么显示底图，两种方式每张图可能不一样，所以由你选"
+            "（每张图存一份）。\n\n"
+            "怎么判断：进游戏左右走两步，盯着小地图看 ——\n"
+            "  · 地形图**不动**，只有黄点在移动 → 全局小地图\n"
+            "  · 地形图**跟着你滑动**（黄点差不多在中间） → 局部小地图")
+        self.cmb_mmap_mode.currentIndexChanged.connect(self._on_mmap_mode)
+        row.addWidget(self.cmb_mmap_mode)
+
+        # 标定做成弹窗（照「手动目测标定尺度」那套交互）：量出来的是
+        # 「面板 ↔ 底图」的缩放/偏移，而判据是**看得见**的重合程度 ——
+        # 摆在这块面板里放不下，也不该让人去命令行跑一遍。
+        self.btn_mmap_calib = QPushButton("标定…")
+        self.btn_mmap_calib.setToolTip(
+            "量这张图的「面板 ↔ 底图」换算（存 datasets/map/<id>.mapcalib.json）。\n\n"
+            "弹窗里：A 机推来的实时面板 + 半透明底图叠在一起 ——\n"
+            "「自动定位」用模板匹配量（准）；匹配不上时可以手动拖动对齐，\n"
+            "目测重合后「保存标定」。\n\n"
+            "前置：A 机的「被控机部署台 → 小地图推流」已经在跑。")
+        self.btn_mmap_calib.clicked.connect(self._open_mmap_calib)
+        row.addWidget(self.btn_mmap_calib)
+        row.addStretch(1)
+        root.addLayout(row)
+
+        self.lbl_mmap_hint = QLabel()
+        self.lbl_mmap_hint.setStyleSheet("color: #80868b;")
+        self.lbl_mmap_hint.setWordWrap(True)
+        root.addWidget(self.lbl_mmap_hint)
+
+        # ---- 地形图（看得见才好判断小地图定位对不对）----
+        root.addSpacing(12)
+        lbl3 = QLabel("地形图")
+        lbl3.setStyleSheet("font-weight: 600;")
+        root.addWidget(lbl3)
+
+        self.lbl_map_img = QLabel()
+        self.lbl_map_img.setStyleSheet("color: #80868b;")
+        self.lbl_map_img.setWordWrap(True)
+        root.addWidget(self.lbl_map_img)
+
+        # 只读看图画布：和质检台同一套交互（滚轮缩放 / 中键平移 / 双击适应）
+        self.canvas = ImageCanvas()
+        self.canvas.setMinimumHeight(320)
+        root.addWidget(self.canvas, 1)
+
+        # ---- 生成：一条命令干完「导出 WZ 地形 → 画叠加图」----
+        # 数据缺就导（几十秒，后台跑），已有就只重画（毫秒级）。
+        self.task = None
+        gen = QHBoxLayout()
+        gen.setSpacing(6)
+        self.btn_gen = QPushButton("生成地形图")
+        self.btn_gen.setToolTip(
+            "自动跑完导出地形这件事：\n"
+            "  1. datasets/map/<地图id>.json 不存在 → 起 WzProbe.exe dump-terrain\n"
+            "     只导这一张（解析 Map.wz 要几十秒，期间界面可以继续用）；\n"
+            "  2. 已经有地形数据 → 跳过第 1 步，只重画叠加图（毫秒级）；\n"
+            "  3. 画完自动刷新上面的图，不用重启工作台。\n\n"
+            "资源/客户端换过之后要**重新导出**地形数据的话，先删掉\n"
+            "datasets/map/<地图id>.json 再点这个按钮。")
+        self.btn_gen.clicked.connect(self._generate)
+        gen.addWidget(self.btn_gen)
+
+        self.lbl_gen = QLabel("")
+        self.lbl_gen.setStyleSheet("color: #80868b;")
+        self.lbl_gen.setWordWrap(True)
+        gen.addWidget(self.lbl_gen, 1)
+        root.addLayout(gen)
+
+        self._refresh_mmap()
+        self._refresh_map_image()
+
+    # ---------------- 小地图定位 ----------------
+
+    def _map_id(self):
+        p = getattr(self, "project", None)
+        return (p.get("map_id") or "").strip() if p is not None else ""
+
+    @staticmethod
+    def _mode_label(mode):
+        """内部值 → 界面上的名字（fit = 全局 / crop = 局部）。"""
+        if mode == mm.MODE_FIT:
+            return "全局小地图"
+        if mode == mm.MODE_CROP:
+            return "局部小地图"
+        return str(mode)
+
+    def _open_mmap_calib(self):
+        """打开标定弹窗（量「面板 ↔ 底图」的换算）。
+
+        显示方式**按上面选的那个**带进去：方式要进游戏走两步才知道该用哪种，
+        弹窗里不替你改（和命令行工具的态度一致，见 perception/minimap.py）。
+        """
+        mid = self._map_id()
+        if not mid:
+            QMessageBox.information(
+                self, "先选地图",
+                "先在①「识别目标选项」里选地图 —— 标定是按每张图各存一份的。")
+            return
+        t = mapdata.load(mid, with_canvas=True)
+        if t is None or t.canvas is None:
+            QMessageBox.information(
+                self, "这张图没有小地图底图",
+                "标定要有底图（datasets/map/%s.png）才能对齐。\n\n"
+                "先在下面点「生成地形图」把地形和底图导出来。" % mid)
+            return
+        dlg = MinimapCalibDialog(mid, mode=self.cmb_mmap_mode.currentData(),
+                                 parent=self)
+        dlg.exec_()
+        if dlg.saved:
+            self._refresh_mmap()      # 状态行立刻变成「已标定 … 匹配分 …」
+
+    def _refresh_mmap(self):
+        mid = self._map_id()
+        p = getattr(self, "project", None)
+        cal = mapdata.load_calib(mid) if mid else None
+
+        # 「没打开项目」和「项目里还没选地图」是两回事 ——
+        # 以前一律写「（没打开项目）」，项目明明开着却看到这句，像项目丢了。
+        # （地图是在①里选的；选完这里靠 showEvent 重读，见下面。）
+        if p is None:
+            self.lbl_mmap.setText("（没打开项目）")
+        elif not mid:
+            self.lbl_mmap.setText("（这个项目还没选地图）")
+        else:
+            self.lbl_mmap.setText(mid)
+
+        self.cmb_mmap_mode.setEnabled(bool(mid))
+        self.btn_mmap_calib.setEnabled(bool(mid))
+        self.cmb_mmap_mode.blockSignals(True)      # 不挡信号会把刚读的值又写回去
+        i = self.cmb_mmap_mode.findData((cal or {}).get("mode"))
+        self.cmb_mmap_mode.setCurrentIndex(i if i >= 0 else 0)
+        self.cmb_mmap_mode.blockSignals(False)
+
+        if not mid:
+            self.lbl_mmap_hint.setText("先在①选地图" if p is not None
+                                       else "打开项目后再设")
+            self.lbl_mmap_hint.setToolTip("")
+        elif not cal or not cal.get("score"):
+            # 注意判的是 **score 有没有**（不是 mode 有没有）：显示方式选了、
+            # 几何还没量时也是「未标定」—— 那时寻路照样算不出世界坐标。
+            self.lbl_mmap_hint.setText("未标定")
+            self.lbl_mmap_hint.setToolTip(
+                "这张图还没量过「面板像素 → 底图像素」的换算。\n"
+                "在 A 机「被控机部署台 → 小地图推流」启动之后，\n"
+                "点上面的「标定…」量一次（弹窗里看得见重合不重合）。\n\n"
+                "等价的命令行做法（排查用）：\n"
+                "    python -m perception.minimap --map %s" % mid)
+        else:
+            geo = ("缩放 %.2f　偏移 %s" % (cal["scale"], cal.get("offset"))
+                   if cal.get("mode") == mm.MODE_FIT
+                   else "显示区起点 %s" % (cal.get("view"),))
+            self.lbl_mmap_hint.setText(
+                "已标定　%s　%s　匹配分 %.2f"
+                % (self._mode_label(cal["mode"]), geo, cal.get("score", 0.0)))
+            self.lbl_mmap_hint.setToolTip(
+                "量出来的几何参数：缩放 / 偏移 / 显示区起点。\n"
+                "改「显示方式」只换方式，这些数不会丢。")
+
+    # ---------------- 地形图 ----------------
+
+    def _map_image_path(self, mid):
+        """这张图该显示哪张图 → (路径或 None, 说明文字)。
+
+        优先 `<id>_overlay.png`：那是 tools/map_terrain_view.py 画出来的"看得懂的
+        地形图"（每条平台一色、黄=传送点、青=绳梯、品红=刷怪点）。没有就退到
+        小地图底图 `<id>.png`；都没有说明地形还没导出，把该跑的命令写出来。
+        """
+        d = mapdata.map_dir()
+        over = d / ("%s_overlay.png" % mid)
+        if over.exists():
+            return over, ("地形叠加图 %s　（每条平台一色 · 黄=传送点 · "
+                          "青=绳梯 · 品红=刷怪点）" % over.name)
+        base = d / ("%s.png" % mid)
+        if base.exists():
+            return base, ("小地图底图 %s　（还没有叠加图 —— 点下面的「生成地形图」"
+                          "画一张看得更清楚的；也可以手跑：\n"
+                          "    python -m tools.map_terrain_view %s）"
+                          % (base.name, mid))
+        return None, (
+            "这张图还没有地形数据（datasets/map/%s.json 不存在）。\n"
+            "点下面的「生成地形图」会自动导出并画出来（也可以手跑：\n"
+            "    WzProbe.exe dump-terrain <WZ目录> datasets/map --only %s）"
+            % (mid, mid))
+
+    def _refresh_map_image(self):
+        mid = self._map_id()
+        if not mid:
+            self.lbl_map_img.setText(
+                "先在①选地图。" if getattr(self, "project", None) is not None
+                else "打开一个项目后再看。")
+            self.canvas.load(QPixmap(), [], editable=False, fit=True)
+        else:
+            path, note = self._map_image_path(mid)
+            self.lbl_map_img.setText(note)
+            pm = QPixmap(str(path)) if path is not None else QPixmap()
+            self.canvas.load(pm, [], editable=False, fit=True)
+
+        # 没地图就没得生成；正在跑的时候也不让重复点
+        self.btn_gen.setEnabled(bool(mid) and self.task is None)
+
+    # ---------------- 生成地形图 ----------------
+
+    def _generate(self):
+        """点「生成地形图」：缺 WZ 数据就先导出，然后画叠加图。
+
+        整件事丢到后台线程（见 gui/worker.py 的铁律：工作线程只 emit 信号，
+        绝不碰控件）—— 导出要解析 Map.wz，几十秒，卡住界面就没法用了。
+        """
+        mid = self._map_id()
+        if not mid:
+            QMessageBox.information(
+                self, "先选地图",
+                "先在①「识别目标选项」里选地图 —— 才知道要导哪一张。")
+            return
+        if self.task is not None:
+            return
+
+        self.btn_gen.setEnabled(False)
+        self.lbl_gen.setStyleSheet("color: #5f6368;")
+        self.lbl_gen.setText("开始…")
+
+        from gui.worker import TaskThread, safe_slot
+        self.task = TaskThread(_generate_task, {"map_id": mid}, self)
+        # 槽函数一律过 safe_slot：槽里抛异常会让 PyQt5 直接 abort() 整个程序
+        self.task.sig_log.connect(safe_slot(self._on_gen_log))
+        self.task.sig_done.connect(safe_slot(self._on_gen_done))
+        self.task.finished.connect(safe_slot(self._on_gen_finished))
+        self.task.start()
+
+    def _on_gen_log(self, msg, _level="info"):
+        """把子进程最后一行输出显示在按钮旁边（长路径截断）。"""
+        line = " ".join(str(msg).split())
+        self.lbl_gen.setText(line[:120] + ("…" if len(line) > 120 else ""))
+
+    def _on_gen_done(self, ok, summary, _result=None):
+        self._refresh_map_image()          # 画好了立刻换图
+        self.lbl_gen.setStyleSheet("color: %s;" % ("#137333" if ok else "#c5221f"))
+        self.lbl_gen.setText(("✓ " if ok else "✗ ") + (summary or ""))
+
+    def _on_gen_finished(self):
+        # 线程真正结束才释放引用（和 export_dialog / main_window 同一套写法）
+        t = self.task
+        self.task = None
+        if t is not None:
+            t.deleteLater()
+        self.btn_gen.setEnabled(bool(self._map_id()))
+
+    def _on_mmap_mode(self, _i):
+        mid = self._map_id()
+        if not mid:
+            return
+        cal = mapdata.load_calib(mid) or {}
+        # **只改方式**，量出来的几何参数（scale/offset/view）保留
+        cal["mode"] = self.cmb_mmap_mode.currentData()
+        cal["picked_by"] = "gui"
+        mapdata.save_calib(mid, cal)
+        self._refresh_mmap()
 
     def bind(self, project):
         """切项目：把开关刷成当前项目的值。
@@ -54,6 +384,21 @@ class RoutePanel(QWidget):
         self.ck_enabled.setChecked(bool(settings.route_enabled))
         self.ck_enabled.blockSignals(False)
         self._refresh_hint()
+        self.project = project
+        self._refresh_mmap()
+        self._refresh_map_image()
+
+    def showEvent(self, e):
+        """切到「路线识别」页签时重读一次。
+
+        为什么需要：地图是在①「识别目标选项」里选的，而这个页签**不会**跟着刷新 ——
+        选完地图切过来还是旧值（甚至停在「（这个项目还没选地图）」），
+        看着像①的选择没生效。按页签刷新的时机来重读，代价只是一次文件读取。
+        """
+        super().showEvent(e)
+        if getattr(self, "project", None) is not None:
+            self._refresh_mmap()
+            self._refresh_map_image()
 
     def _refresh_hint(self):
         self.lbl_hint.setText(

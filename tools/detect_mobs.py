@@ -84,20 +84,20 @@ def _pick_frames(files, max_per_mob=0):
         return flat          # ← 不超上限就全用，这是默认路径
 
     # 战斗里最常见的姿态优先排队；未列入的动作按名字排在后面
-    order = ("stand", "move", "hit1", "hit2",
+    order = ("stand", "fly", "move", "hit1", "hit2",
              "attack1", "attack2", "skill1", "jump")
     acts = [a for a in order if a in groups]
     acts += [a for a in sorted(groups) if a not in acts]
 
     picked = []
     round_ = 0
-    while len(picked) < per_mob:
+    while len(picked) < max_per_mob:
         added = False
         for a in acts:
             if round_ < len(groups[a]):
                 picked.append(groups[a][round_])
                 added = True
-                if len(picked) >= per_mob:
+                if len(picked) >= max_per_mob:
                     break
         if not added:
             break
@@ -177,6 +177,30 @@ def clean_stale_outputs(out_dir, vis_dir, keep_n):
 # ══════════════════════════════════════════════════════════════
 # NMS
 # ══════════════════════════════════════════════════════════════
+def _masked_energy(gray, mask_bool, x, y):
+    """窗口在**掩码范围内**的灰度平方和（能量）。越界返回 0。
+
+    为什么要算这个：`cv2.matchTemplate(TM_CCORR_NORMED, mask=...)` 的分数是
+
+        分数 = 掩码内互相关 / sqrt(模板能量 × **窗口能量**)
+
+    窗口能量趋 0（纯黑、近黑、纯色 UI 面板）时分母趋 0 —— OpenCV 这时不返回 0，
+    而是给出 FLT_MAX 或 NaN。于是"黑区里几个亮像素"就能拿到 1.0 这种满分，
+    而每个模板只取前几个峰 → **峰全被黑区吃掉，真正的怪一个都轮不上**（实测：
+    148 帧 2543 框，绝大部分在黑边里，画面里的怪基本没标上）。
+
+    判据用「窗口能量 / 模板能量」而不是绝对亮度或绝对标准差：
+      · 绝对亮度 → 暗处的怪会被误杀；
+      · 绝对标准差（老代码的 min_texture=4）→ 近黑区几个亮像素就有 5~7，拦不住；
+      · 能量比 → 比的是「这块到底像不像一个精灵」，与画面明暗无关。
+    """
+    h, w = mask_bool.shape
+    if x < 0 or y < 0 or x + w > gray.shape[1] or y + h > gray.shape[0]:
+        return 0.0
+    patch = gray[y:y + h, x:x + w]
+    return float((patch[mask_bool] ** 2).sum())
+
+
 def nms(dets):
     """dets: [(score, x, y, w, h, tag)]，按分数贪心抑制重叠框。"""
     dets = sorted(dets, key=lambda d: -d[0])
@@ -274,6 +298,15 @@ def work(fp_str):
     mob_scales = cfg.get("mob_scales", {})
     default_scale = cfg.get("scale", 1.12)
 
+    # 浮点**灰度**底图（每帧一次）：下面按掩码算「窗口能量」要用。
+    # 必须用灰度：直接对 BGR 求能量会把三个通道加起来，窗口之间没法比。
+    imgf = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    # 窗口能量至少要达到模板能量的这个比例（振幅比）才算「这块真有个精灵」。
+    # 0.35 是宽容的：游戏里怪可能略暗/带半透明特效，振幅不会掉一半以上；
+    # 而黑区里几个杂散亮像素的能量比通常只有几个百分点。
+    min_ratio = float(cfg.get("min_energy_ratio", 0.35))
+
     for mid, frame, b, al in _W["tpl"]:
         # 尺度按「怪+帧 → 怪 → 全局默认」三级查找，支持逐帧微调
         sc = mob_scales.get("%s:%s" % (mid, frame),
@@ -286,13 +319,27 @@ def work(fp_str):
         t = cv2.resize(b, (w, h), interpolation=cv2.INTER_AREA)
         m = (cv2.resize(al, (w, h), interpolation=cv2.INTER_AREA) > 128)
         m = m.astype(np.uint8) * 255
+        mbool = m > 0
+
+        # 模板自身能量（掩码内）—— 判据的基准，见 _masked_energy。
+        tg = cv2.cvtColor(t, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        e_t = float((tg[mbool] ** 2).sum())
+        if e_t <= 0:
+            continue                    # 全黑模板：匹配不出任何东西，别浪费一轮
 
         try:
             r = cv2.matchTemplate(img, t, cv2.TM_CCORR_NORMED, mask=m)
         except Exception:
             continue
 
-        r = np.nan_to_num(r)
+        # **先掐掉退化解**。分母（窗口能量）趋 0 时 OpenCV 不返回 0，而是给
+        # FLT_MAX 或 NaN；np.nan_to_num 只把 NaN 变成 0，FLT_MAX 会原样留下 ——
+        # 它必然大于阈值，于是每个模板的「前几个峰」全被黑区吃掉，真正的怪
+        # 一个都轮不上（实测：满屏黑框 + 画面里的怪基本没标上）。
+        # 归一化互相关**按定义不超过 1**，超了就说明是退化解，直接判 0。
+        r = np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
+        r[r > 1.0] = 0.0
+
         if r.max() < cfg["thr"]:
             continue
 
@@ -300,17 +347,32 @@ def work(fp_str):
         # 只看绝对分数会在画面各处产生海量假匹配。
         p = float(np.percentile(r, 99.5))
 
-        for _ in range(cfg["peaks"]):
+        # 配额只按**收下的**峰算：退化解（能量不足）被否掉时不该消耗名额 ——
+        # 否则黑区里几个杂散亮点就把这只怪的 3 个名额用完了。
+        got = 0
+        for _ in range(cfg["peaks"] * 4 + 4):
+            if got >= cfg["peaks"]:
+                break
             _, mx, _, ml = cv2.minMaxLoc(r)
             if mx < cfg["thr"] or mx - p < cfg["dist"]:
                 break
 
-            dets.append((float(mx), ml[0] * ds + ox, ml[1] * ds + oy,
+            x, y = int(ml[0]), int(ml[1])
+            if min_ratio > 0:
+                e_i = _masked_energy(imgf, mbool, x, y)
+                if e_i < (min_ratio ** 2) * e_t:
+                    # 窗口里没有"一个精灵那么多"的能量（黑边 / 纯色 UI 面板）
+                    # → 这个峰是退化解：抹掉它继续找，别当成检出。
+                    r[y, x] = 0.0
+                    continue
+
+            dets.append((float(mx), x * ds + ox, y * ds + oy,
                          w * ds, h * ds, mid))
+            got += 1
 
             # 抹掉该峰邻域，避免同一只怪被反复计入
-            r[max(0, ml[1] - h // 2):ml[1] + h // 2 + 1,
-              max(0, ml[0] - w // 2):ml[0] + w // 2 + 1] = 0.0
+            r[max(0, y - h // 2):y + h // 2 + 1,
+              max(0, x - w // 2):x + w // 2 + 1] = 0.0
 
     kept = nms(dets)
 
@@ -417,6 +479,7 @@ def run_detect(params, ctx=None):
         downscale    降采样倍数
         thresh       匹配阈值
         min_distinct 区分度
+        min_energy_ratio  窗口能量 / 模板能量 的下限（振幅比，默认 0.35）
         per_mob      每种怪用几帧做模板，0=全部
         max_peaks    每个模板最多取几个峰
         region       "x,y,w,h" 或 None
@@ -470,6 +533,12 @@ def run_detect(params, ctx=None):
     thr = float(params.get("thresh", 0.90))
     dist = float(params.get("min_distinct", 0.06))
     peaks = int(params.get("max_peaks", 4))
+    # 窗口能量相对模板能量的下限（**振幅比**）：低于它就判为退化解 —— 黑边、
+    # 纯色 UI 面板里的几个杂散亮像素，分数看着是 1.0，其实毫无意义。
+    # 这是"往黑色区域乱标"的真正闸门：老代码用的是局部标准差的绝对阈值
+    # （min_texture=4.0），而近黑区域里几个亮像素的 std 就有 5~7，根本拦不住。
+    # 判据细节见 _masked_energy。
+    min_energy_ratio = float(params.get("min_energy_ratio", 0.35))
 
     region = params.get("region")
     if isinstance(region, str) and region.strip():
@@ -501,6 +570,7 @@ def run_detect(params, ctx=None):
         "thr": thr,
         "dist": dist,
         "peaks": peaks,
+        "min_energy_ratio": min_energy_ratio,
         "per_mob": per_mob,
         "out": str(out),
         "manual_dir": str(out.parent / "labels"),   # 人工修正目录，重标时保留其怪物框
@@ -523,7 +593,8 @@ def run_detect(params, ctx=None):
 
     ctx.log("模板 %d 个（%d 种怪，含镜像）" % (n_tpl, len(mobs)))
     ctx.log("画面 %d 张   默认尺度 %.3f   降采样 %d" % (len(frames), cfg["scale"], ds))
-    ctx.log("阈值 %.2f   区分度 %.3f   每模板峰数 %d" % (thr, dist, peaks))
+    ctx.log("阈值 %.2f   区分度 %.3f   每模板峰数 %d   最小能量比 %.2f"
+            % (thr, dist, peaks, min_energy_ratio))
     if region:
         ctx.log("搜索区域 %s" % (region,))
     ctx.log("每帧 %d 次匹配" % n_tpl)
@@ -652,6 +723,9 @@ def main():
                     help="每只怪的模板帧**上限**（默认 20）。"
                          "非死亡帧数不超过它时全部使用，不截断")
     ap.add_argument("--max-peaks", type=int, default=4)
+    ap.add_argument("--min-energy-ratio", type=float, default=0.35,
+                    help="窗口能量 / 模板能量的下限（振幅比）：低于它的峰判为退化解"
+                         "（黑边、纯色面板里的杂散亮点），不当检出。设 0 关闭")
     ap.add_argument("--region", default=None)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--workers", type=int, default=0)
@@ -668,6 +742,7 @@ def main():
         "downscale": a.downscale,
         "thresh": a.thresh,
         "min_distinct": a.min_distinct,
+        "min_energy_ratio": a.min_energy_ratio,
         "per_mob": a.per_mob,
         "max_peaks": a.max_peaks,
         "region": a.region,

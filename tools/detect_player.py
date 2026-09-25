@@ -7,8 +7,13 @@
 所以玩家标注简单得多：每帧用 PlayerLocator 定位一次，取最高分命中。
 输出**追加**到 labels_auto 的怪物标注后面（LabelCard 先跑怪物、再跑玩家）。
 
-**必须全图匹配**：角色可能出现在画面角落，不能套「中央区域」假设。
-全图 stand 模板约 1s/帧，靠多进程并行加速（离线标注，慢点无所谓）。
+**为什么默认全图匹配**：角色可能出现在画面角落，不能套「中央区域」假设。
+全图 stand 模板约 11 秒/帧（102 个模板 × 整幅图），靠多进程并行加速。
+
+**YOLO 粗定位（提速用）**：params 里给了 `yolo`（权重等）时，先跑一遍模型圈出
+玩家可能出现的区域，模板匹配只在区域内做；**YOLO 没给出框的帧仍走全图** ——
+漏检（玩家在角落/被遮挡）时召回与优化前完全一致，只是常见帧快一个量级。
+关掉：`yolo_coarse=False`（或项目里不选模型）。
 
 CLI:
     python -m tools.detect_player --player 珠缨 --frames data/frames ^
@@ -55,7 +60,10 @@ def work(fp_str):
     h, w = full.shape[:2]
     # imread 已经返回 BGR（cv2.imdecode），不要再 cvtColor ——
     # 之前多转了一次 RGB2BGR，把橙发转成蓝发，模板在颜色错乱的图上匹配不上。
-    r = _W["loc"].locate(full)         # 全图匹配（玩家可能在角落）
+    # 搜索范围：粗定位给了区域就只在区域内找（快得多）；没给（漏检帧 / 没开
+    # 粗定位）就是 None → 全图，与优化前**完全一致**（locate 会把偏移加回，
+    # 所以 cx/cy 仍是画面坐标，写出的标注格式不变）。
+    r = _W["loc"].locate(full, search_rect=(cfg.get("roi") or {}).get(fp.stem))
 
     # 玩家框（class 0）一律重写，不做「断点续标」：重新采集后旧 txt 里
     # 残留的 class 0 框位置是错的，若按「已有 class 0 就跳过」会整批跳过，
@@ -139,6 +147,9 @@ def run_detect_player(params, ctx=None):
         "vis_dir": params.get("vis_dir") or str(out.parent / "vis"),
         # 可视化框颜色：用设置里配的玩家框颜色（主进程取一次，别让每个子进程读配置）
         "box_color": class_color(CLASS_PLAYER),
+        # 粗定位结果 {帧stem: (x,y,w,h)}：**主进程算好**再随 initargs 下发
+        # （子进程里绝不能碰模型）；空表 = 全部全图匹配
+        "roi": {},
     }
 
     # 重新采集后帧数变少时，清掉帧号超界的旧标注/可视化（同 detect_mobs）
@@ -159,7 +170,34 @@ def run_detect_player(params, ctx=None):
 
     ctx.log("玩家 %s   模板 %d 个   scale %.3f   阈值 %.2f"
             % (pid, loc.template_count, cfg["scale"], cfg["thresh"]))
-    ctx.log("全图匹配（玩家可能在角落），%d 帧" % len(frames))
+
+    # ---- YOLO 粗定位（可选）：把模板匹配限制在玩家可能出现的区域 ----
+    # 实测模板匹配约 11 秒/帧（102 模板 × 整幅图），YOLO 同一批帧约 0.1 秒/帧
+    # → 先圈区域再匹配，常见帧快一个量级。**没圈到的帧仍全图匹配**，所以
+    # 漏检（玩家在角落/被遮挡）时的召回与优化前完全一致。
+    y = params.get("yolo") or {}
+    if y.get("weights") and params.get("yolo_coarse", True):
+        try:
+            from tools.yolo_augment import player_rois
+            cfg["roi"] = player_rois(
+                [str(f) for f in frames], y["weights"],
+                player_id=cfg["player_id"],
+                weights_player_id=y.get("weights_player_id", ""),
+                conf=float(y.get("conf", 0.25)),
+                imgsz=int(y.get("imgsz", 960)),
+                device=y.get("device"),
+                ctx=ctx)
+        except Exception as e:
+            # 粗定位只是提速手段 —— 失败就退回全图，不能让标注整体失败
+            ctx.log("YOLO 粗定位失败（%s: %s），这批退回全图匹配"
+                    % (type(e).__name__, e), "warn")
+            cfg["roi"] = {}
+
+    if cfg["roi"]:
+        ctx.log("YOLO 粗定位：%d/%d 帧圈出区域（其余 %d 帧仍全图匹配，漏检兜底）"
+                % (len(cfg["roi"]), len(frames), len(frames) - len(cfg["roi"])))
+    else:
+        ctx.log("全图匹配（玩家可能在角落），%d 帧" % len(frames))
 
     workers = int(params.get("workers", 0)) or max(1, (os.cpu_count() or 4) - 1)
     ctx.log("并行进程 %d" % workers)

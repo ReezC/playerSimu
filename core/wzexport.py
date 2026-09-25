@@ -210,13 +210,49 @@ def build_mob_name_map():
     return name_map
 
 
+#: 取怪的动作帧时按这个顺序退：**很多飞的怪只有 fly**，没有 stand 就用 fly，
+#: 连 move 都没有才落到「目录里任意一张 png」兜底。
+MOB_ACTIONS = ("stand", "fly", "move")
+
+
+def _frame_no(stem):
+    """'stand_10' → 10。按帧号排，避免字符串排把 10 排到 2 前面。"""
+    try:
+        return int(stem.rsplit("_", 1)[1])
+    except Exception:
+        return 0
+
+
+def mob_action_frames(mob_dir, actions=MOB_ACTIONS):
+    """在怪目录里按优先级找一组动作帧 → (动作名, [路径…])；都没有 → (None, [])。
+
+    **为什么需要它**：导出会把 img 里的**所有**动作都写出来，所以只有 fly 的怪
+    在库里是 fly_0.png… 而没有 stand_*.png。以前各处写死 stand_*.png，
+    这类怪在「确认要识别的怪物」里整类列不出来（缩略图也是空的），
+    标定还会直接报「精灵库里找不到这些怪」。
+    """
+    if not mob_dir.is_dir():
+        return None, []
+    for a in actions:
+        fs = sorted(mob_dir.glob("%s_*.png" % a), key=lambda p: _frame_no(p.stem))
+        if fs:
+            return a, fs
+    fs = sorted(p for p in mob_dir.glob("*.png") if p.stem != "meta")
+    return (None, fs) if fs else (None, [])
+
+
 def list_sprite_mobs():
-    """列出精灵库里所有有 stand 帧的怪 id（排序，供手动选怪用）。"""
+    """列出精灵库里所有**可用**的怪 id（排序，供手动选怪用）。
+
+    判据是「有动作帧」，不是「有 stand」—— 很多**飞的怪只有 fly**
+    （导出会把 img 里所有动作都写出来，所以它在库里是 fly_*.png）。
+    以前写死 stand_*.png，这类怪在「确认要识别的怪物」里整类列不出来。
+    """
     root = sprite_dir_path()
     out = []
     if root.is_dir():
         for d in root.iterdir():
-            if d.is_dir() and list(d.glob("stand_*.png")):
+            if d.is_dir() and mob_action_frames(d)[1]:
                 out.append(d.name)
     return sorted(out)
 
@@ -329,3 +365,93 @@ def run_export_maps(params, ctx=None):
 
     ctx.progress(total, total, "完成")
     return {"summary": summary, "index": idx, "out": out}
+
+
+def run_export_terrain(params, ctx=None):
+    """导出**地形**（寻路用）：`datasets/map/<id>.json` + 小地图底图 `<id>.png`。
+
+    params: map_id（必须）/ exe / wz_dir / out（默认 datasets/map）
+
+    **只导这一张**（`--only <id>`）：不带 id 会把 Map.wz 里三千多张全导一遍
+    （几十秒到几分钟）—— 从界面上点一下等那么久不合适；单张通常几秒。
+    写法与 run_export_maps 一致：起子进程、stdout 逐行转日志、可取消。
+    """
+    ctx = ctx or TaskContext()
+
+    mid = str(params.get("map_id") or "").strip()
+    if not mid:
+        raise ValueError("没有指定地图 id")
+
+    cfg = load_cfg()
+    exe = find_probe_exe(params.get("exe") or cfg.get("probe_exe") or "")
+    wz_dir = params.get("wz_dir") or cfg.get("wz_dir") or ""
+    out = params.get("out") or str(ROOT / "datasets" / "map")
+
+    if not exe:
+        raise FileNotFoundError(
+            "找不到 WzProbe.exe —— 在 config/wz.yaml 里填 probe_exe，"
+            "或把 exe 放回默认位置")
+    if not wz_dir or not Path(wz_dir).is_dir():
+        raise FileNotFoundError(
+            "WZ 目录不存在: %s（在 config/wz.yaml 里配 wz_dir）" % (wz_dir or "（空）"))
+
+    Path(out).mkdir(parents=True, exist_ok=True)
+
+    ctx.log("WzProbe  : %s" % exe)
+    ctx.log("WZ 目录  : %s" % wz_dir)
+    ctx.log("输出     : %s" % out)
+    ctx.log("导出地形 %s（只导这一张）…" % mid)
+
+    cmd = [exe, "dump-terrain", wz_dir, str(out), "--only", mid]
+
+    # Windows 下不弹黑框
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",      # WzProbe 里已设 Console.OutputEncoding = UTF8
+        errors="replace",
+        bufsize=1,
+        creationflags=flags,
+    )
+
+    canceled = False
+    try:
+        for line in proc.stdout:
+            if ctx.canceled():
+                canceled = True
+                proc.kill()
+                break
+            line = line.rstrip()
+            if line:
+                ctx.log(line)
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        proc.wait()
+
+    if canceled:
+        ctx.log("已取消导出", "warn")
+        return {"summary": "已取消"}
+
+    if proc.returncode != 0:
+        raise RuntimeError("WzProbe 退出码 %d，地形导出失败" % proc.returncode)
+
+    j = Path(out) / ("%s.json" % mid)
+    png = Path(out) / ("%s.png" % mid)
+    if not j.exists():
+        raise RuntimeError(
+            "导出结束了，但找不到 %s —— 这张 id 可能不在 Map.wz 里" % j)
+
+    has_png = png.exists()
+    ctx.log("── 地形导出完成 ──", "ok")
+    ctx.log("  %s" % j.name)
+    ctx.log("  %s" % (("%s（小地图底图）" % png.name) if has_png else
+                      "（这张图没有 miniMap 节点 → 只有地形，没有底图）"))
+    return {"summary": "已导出 %s" % mid,
+            "json": str(j), "png": str(png) if has_png else ""}

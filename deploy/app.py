@@ -3,12 +3,17 @@
     python -m deploy.app          （或双击仓库根的「被控机部署台.bat」）
 
 把 docs/A_SETUP.md 里那几条手工命令做成按钮：时钟对时 / 时间码探针 /
-键盘中继 / 屏幕推流。参数改一下立刻写进 config/deploy.json，下次打开原样复现。
+键盘中继 / 屏幕推流 / 小地图推流。参数改一下立刻写进 config/deploy.json，
+下次打开原样复现。
+
+**A 机上不敲命令**：连「小地图要框哪一块」也是这里的按钮（「小地图推流」卡片
+→ 框选…）。框选走 tools/minimap_push.ask_region —— 和命令行 --pick 是同一份
+实现，框之前会把本窗口**先藏起来**再抓屏，不然截到的图里盖着部署台自己。
 
 **版面为什么这么排**
-    左边一列 4 张服务卡片，顺序 = 部署顺序（对时 → 探针 → 键盘 → 推流）；
-    右上角是环境自检（「按了没反应」的九成原因都在那五条里），
-    右下角是四个服务混在一起的运行日志（可筛选）。
+    左边一列 5 张服务卡片，顺序 = 部署顺序（对时 → 探针 → 键盘 → 推流 → 小地图）；
+    右上角是环境自检（「按了没反应」的九成原因都在那几条里），
+    右下角是几个服务混在一起的运行日志（可筛选）。
     改参数、启停、看日志、看自检全在一屏里 —— 不用开第二个窗口，也不用回头翻手册。
 
 **每张卡片底部都写着「这一项实际会执行的命令行」**（可选中复制）
@@ -101,6 +106,7 @@ SERVICE_COLOR = {
     "probe": "#188038",     # 绿
     "kbd": "#b06000",       # 橙
     "push": "#7b1fa2",      # 紫
+    "mmap": "#00796b",      # 青
 }
 UI_COLOR = "#5f6368"        # 界面自身的提示（不属于任何一个服务）
 
@@ -268,6 +274,18 @@ class ServiceCard(QFrame):
             row_box.addWidget(btn)
             holder = QWidget()
             holder.setLayout(row_box)
+        elif spec["kind"] == "region":
+            row_box = QHBoxLayout()
+            row_box.setSpacing(4)
+            row_box.addWidget(widget, 1)
+            btn = QPushButton("框选…")
+            btn.setFixedWidth(58)
+            btn.setToolTip("抓一张全屏图，把游戏的小地图面板框出来\n"
+                           "（框之前这个窗口会自动藏起来）")
+            btn.clicked.connect(lambda _c, w=widget: self._pick_region(w))
+            row_box.addWidget(btn)
+            holder = QWidget()
+            holder.setLayout(row_box)
 
         form.addWidget(holder, row, 1)
         form.setColumnStretch(1, 1)
@@ -338,6 +356,12 @@ class ServiceCard(QFrame):
             w.currentTextChanged.connect(self.changed)
             return w, w.currentText
 
+        if kind == "region":
+            w = QLineEdit(_region_text(cfg))
+            w.setPlaceholderText("x,y,w,h —— 点右边「框选…」")
+            w.textChanged.connect(self.changed)
+            return w, (lambda: w.text().strip())
+
         if kind == "serial":
             w = NoWheelComboBox()
             w.setEditable(True)
@@ -381,6 +405,32 @@ class ServiceCard(QFrame):
             except ValueError:
                 pass
             line.setText(path)
+
+    def _pick_region(self, line):
+        """「框选…」：抓屏拖一个框 → 把 x,y,w,h 写回输入框。
+
+        走 `tools.minimap_push.ask_region`（**和命令行 --pick 同一份实现**）：
+        owner 传自己，它会先把部署台窗口藏起来再抓屏 —— 不藏的话截到的图里
+        盖着部署台自己，人对着自己的界面框小地图（这一步不做就白框）。
+
+        写回输入框靠 `setText` 触发 textChanged → 部署台照常「立即落盘 + 刷新
+        命令行预览」，不另走一条路 —— 否则「框完没保存」这种坑迟早会出现。
+        """
+        try:
+            from tools.minimap_push import ask_region
+        except Exception as e:
+            QMessageBox.warning(self, "框选不可用",
+                                "加载框选模块失败：%s: %s" % (type(e).__name__, e))
+            return
+        try:
+            rect = ask_region(owner=self)
+        except Exception as e:
+            # 抓屏失败（没有可用屏幕 / 远程会话）也要说清楚，别静默什么都不发生
+            QMessageBox.warning(self, "框选失败", "%s: %s" % (type(e).__name__, e))
+            return
+        if not rect:
+            return
+        line.setText(",".join(str(int(v)) for v in rect))
 
     # ---------------- 命令行预览 ----------------
 
@@ -428,6 +478,12 @@ class ServiceCard(QFrame):
                 w, h = _parse_size(val)
                 out[spec["keys"][0]] = w
                 out[spec["keys"][1]] = h
+            elif spec["kind"] == "region":
+                # 一个框 → 四个键。解析不出来时写 None（**不猜一个默认区域**）：
+                # 猜出来的区域会推一片无关画面出去，B 机那边「底图对不上」，
+                # 看着完全像寻路坏了；写 None 则会被 missing_hint 当场拦住。
+                for k, v in zip(spec["keys"], _parse_region(val)):
+                    out[k] = v
             else:
                 out[spec["keys"][0]] = val
         return out
@@ -458,6 +514,34 @@ def _parse_size(text):
         return int(float(a)), int(float(b))
     except Exception:
         return 1366, 768
+
+
+def _region_text(cfg):
+    """配置里的 x/y/w/h → 输入框显示文本 'x,y,w,h'；没框选过就是空串。"""
+    vals = [(cfg or {}).get(k) for k in ("x", "y", "w", "h")]
+    if any(v in (None, "") for v in vals):
+        return ""
+    try:
+        return ",".join(str(int(v)) for v in vals)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _parse_region(text):
+    """'x,y,w,h' → (x, y, w, h)；解析不出来返回 (None, None, None, None)。
+
+    逗号/中文逗号/空格都认（手输时全角逗号很常见）。**不退回默认值** ——
+    理由见 ServiceCard.values()。
+    """
+    parts = [v for v in
+             str(text or "").replace("，", ",").replace(" ", ",").split(",")
+             if v != ""]
+    if len(parts) != 4:
+        return (None, None, None, None)
+    try:
+        return tuple(int(float(v)) for v in parts)
+    except (TypeError, ValueError):
+        return (None, None, None, None)
 
 
 def _hms(sec):

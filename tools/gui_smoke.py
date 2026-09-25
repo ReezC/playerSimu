@@ -86,6 +86,16 @@ def main():
         print("safe_slot   失败: %s" % e)
 
     print()
+
+    # **退出顺序要定死**：先关窗、让 Qt 处理完销毁，最后才轮到 QApplication。
+    # 不这么做的话，解释器退出时 Python 和 Qt 的析构顺序是不定的 —— QApplication
+    # 先没、图形视图后没，就会访问已经失效的 Qt 内部，表现成退出码 0xC0000005
+    # （Windows 上还能弹一个"程序已停止工作"）。实测：界面里多一个 QGraphicsView
+    # （「路线识别」里的地形图）就会把命中率推到 8 次里 1~3 次。
+    win.close()
+    del win
+    app.processEvents()
+
     if bad:
         print("发现 %d 处问题" % bad)
         return 1

@@ -1,16 +1,19 @@
-"""四个被控机服务的参数表 + 命令行构造。
+"""被控机（A 机）服务的参数表 + 命令行构造。
 
 **参数表驱动界面**（deploy/app.py 照着 PARAMS 生成控件）：这样「界面能改什么」
 和「命令里能传什么」天然一致 —— 不会出现界面上摆了开关、命令却不认，或者反过来
 改了参数但命令没带上。
 
-**A 机要跑的四件事**（手册见 docs/A_SETUP.md）：
+**A 机上要跑的事**（手册见 docs/A_SETUP.md）：
     clock  对时服务。B 机的延迟统计依赖它，**必须先在跑**。
     probe  屏幕时间码探针。B 机靠画面里这条码测端到端延迟。
     kbd    键盘中继。收 B 机 agent 的按键指令 → 转发给 Pro Micro 硬件键盘。
     push   屏幕推流。桌面 → H.264 → UDP/mpegts 发给 B 机。
+    mmap   小地图推流（**只在用寻路定位时才要**）。小地图面板单独截屏 →
+           JPEG/TCP 给 B 机；主画面那一路压过一遍，黄点只有几个像素就糊了。
 
-**顺序也是部署顺序**（ORDER）：对时 → 探针 → 键盘 → 推流。
+**顺序也是部署顺序**（ORDER）：对时 → 探针 → 键盘 → 推流 → 小地图。
+小地图排在最后：前面的没起来时，它推出去也没人收。
 """
 
 import shutil
@@ -19,13 +22,14 @@ import time
 from pathlib import Path
 
 # 部署顺序 = 界面上的排列顺序 = 「全部启动」的顺序
-ORDER = ("clock", "probe", "kbd", "push")
+ORDER = ("clock", "probe", "kbd", "push", "mmap")
 
 TITLE = {
     "clock": "时钟对时服务",
     "probe": "屏幕时间码探针",
     "kbd": "键盘中继（Pro Micro）",
     "push": "屏幕推流（ffmpeg）",
+    "mmap": "小地图推流",
 }
 
 SUB = {
@@ -33,11 +37,13 @@ SUB = {
     "probe": "画面顶部那条黑白码，B 机靠它量端到端延迟",
     "kbd": "把 B 机发来的按键转发给 Pro Micro 硬件键盘",
     "push": "桌面 → H.264 → UDP，发给 B 机收流",
+    "mmap": "小地图面板单独截屏发给 B 机（寻路定位用，不用寻路就别起）",
 }
 
 # 每个参数一项：key / 标签 / 控件类型 / 提示。
 #   kind: int | float | text | check | choice | combo_edit | size | serial | path
-#   keys: 真正写进配置的键（只有「分辨率」是两个键）
+#         | region（「框选…」按钮，值写进 keys 里的四个坐标键）
+#   keys: 真正写进配置的键（只有「分辨率」和「小地图区域」是多键）
 PARAMS = {
     "clock": [
         dict(key="port", keys=("port",), label="UDP 端口", kind="int",
@@ -128,6 +134,43 @@ PARAMS = {
              tip="ffmpeg.exe 的位置。装了但没进 PATH 时（本机就是这样）在这里指过去。\n"
                  "安装：winget install --id Gyan.FFmpeg -e"),
     ],
+    "mmap": [
+        dict(key="region", keys=("x", "y", "w", "h"), label="小地图区域",
+             kind="region", width=250,
+             tip="小地图面板在 A 机屏幕上的矩形（屏幕坐标 x,y,w,h）。\n"
+                 "点右边的「框选…」，把**小地图面板本身**框出来。\n\n"
+                 "框的时候只框面板：多框进来的血条/聊天/其它 UI 会一起推给 B 机，"
+                 "既占带宽，又会让 B 机「底图对不上」——那种现象看着像寻路坏了，"
+                 "其实是区域框大了。\n\n"
+                 "部署台会在框选前把自己藏起来再抓屏，所以框到的是游戏画面；\n"
+                 "但**运行期间**没有这种保护 —— 推的是屏幕这一块，谁压在上面就推谁，\n"
+                 "所以启动后别让别的窗口盖在小地图上。\n"
+                 "游戏窗口移动过、换过分辨率/显示缩放、改过 UI 布局 → 要重新框一次。"),
+        dict(key="port", keys=("port",), label="TCP 端口", kind="int",
+             minimum=1, maximum=65535, width=110,
+             tip="A 机监听这个端口，B 机连进来收小地图帧。\n"
+                 "**与 config/link.yaml 的 minimap.port 一致**（B 机的 "
+                 "perception/minimap.py 读那份）。\n\n"
+                 "改了端口要在（管理员）PowerShell 放行入站 TCP：\n"
+                 'netsh advfirewall firewall add rule name="playerSimu 小地图端口" '
+                 "dir=in action=allow protocol=TCP localport=端口"),
+        dict(key="bind", keys=("bind",), label="监听地址", kind="text", width=140,
+             tip="0.0.0.0 = 所有网卡（推荐，换网络不用改）。"),
+        dict(key="zoom", keys=("zoom",), label="放大倍数", kind="int",
+             minimum=1, maximum=8, width=110,
+             tip="抓到的这块区域先放大几倍再发。\n"
+                 "小地图面板本身像素很少，黄点只有 2~5 像素：放大只是让它在\n"
+                 "JPEG 编码里少掉点细节，**不增加信息量**，B 机会按比例缩回去。\n"
+                 "面板本身够大（≥150px）就不用放大。"),
+        dict(key="fps", keys=("fps",), label="帧率", kind="combo_edit", cast=int,
+             choices=("5", "10", "15"), width=110,
+             tip="小地图不需要高帧率：定位只回答「我在哪一块平台」，10 fps 足够。\n"
+                 "帧率越高，B 机每帧都要解一次、匹配一次（关键路径本来就没余量）。"),
+        dict(key="quality", keys=("quality",), label="JPEG 质量", kind="int",
+             minimum=30, maximum=100, width=110,
+             tip="默认 100。这一路的**唯一价值**就是像素清晰（主画面那路压过一遍，\n"
+                 "黄点早糊了），所以默认不压。带宽真不够再往下调。"),
+    ],
 }
 
 
@@ -179,7 +222,43 @@ def build_cmd(key, cfg):
     if key == "push":
         return _push_cmd(p, num)
 
+    if key == "mmap":
+        return _mmap_cmd(p, num)
+
     raise KeyError("未知服务 %r" % (key,))
+
+
+def _mmap_cmd(p, num):
+    """小地图推流的命令行。
+
+    区域**从命令行传**（而不是让它去读 config/minimap_region.json）：
+    部署台里的框选结果存在 config/deploy.json，参数以界面上显示的那份为准 ——
+    「界面显示 A、命令跑的却是 B」那种不一致在这里不能出现。
+    """
+    cmd = [python_exe(), "-m", "tools.minimap_push",
+           "--bind", str(p.get("bind") or "0.0.0.0"),
+           "--port", str(int(num(p.get("port"), 5003, int))),
+           "--zoom", str(int(num(p.get("zoom"), 3, int))),
+           "--fps", str(int(num(p.get("fps"), 10, int))),
+           "--quality", str(int(num(p.get("quality"), 100, int)))]
+    if region_set(p):
+        cmd += ["--x", str(int(num(p.get("x"), 0, int))),
+                "--y", str(int(num(p.get("y"), 0, int))),
+                "--w", str(int(num(p.get("w"), 0, int))),
+                "--h", str(int(num(p.get("h"), 0, int)))]
+    return cmd
+
+
+def region_set(p):
+    """小地图区域填全了没有（x/y/w/h 四个都是数）。填全靠它一处判断。"""
+    vals = [(p or {}).get(k) for k in ("x", "y", "w", "h")]
+    if any(v in (None, "") for v in vals):
+        return False
+    try:
+        [int(v) for v in vals]
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _push_cmd(p, num):
@@ -304,6 +383,9 @@ _ERROR_HINTS = (
       "unknown encoder 'h264_nvenc'", "error while opening encoder"),
      "显卡编码起不来：把推流的「编码器」改成 libx264（720p 以内够用），"
      "或确认 N 卡驱动 / 是不是被别的进程占满了编码器会话。"),
+    (("only one usage of each socket address", "address already in use", "10048"),
+     "端口被占用（10048 = WSAEADDRINUSE）：A 机上已经有一个同类服务在跑，"
+     "或者别的程序占着这个端口。看卡片状态和任务管理器，别重复启动。"),
 )
 
 
@@ -358,6 +440,24 @@ def missing_hint(key, cfg):
             return "分辨率填得不对，应该是「宽x高」，例如 1366x768。"
         if w < 160 or h < 120:
             return "分辨率太小了（%dx%d）。" % (w, h)
+
+    if key == "mmap":
+        if not region_set(p):
+            return ("还没框选小地图区域。\n\n"
+                    "点这张卡片里「小地图区域」右边的**「框选…」**按钮，"
+                    "在屏幕上把游戏的小地图面板框出来（只框面板本身，"
+                    "别把血条/聊天一起框进去）。\n\n"
+                    "框完再点「启动」；区域是「什么时候框的」就对应"
+                    "「屏幕当时是什么样」，游戏窗口动过就要重框。")
+        w, h = int(p.get("w")), int(p.get("h"))
+        if w < 20 or h < 20:
+            return ("小地图区域太小了（%d x %d）。\n\n"
+                    "框的时候要把**整个小地图面板**框进去 —— 几个像素的"
+                    "区域推出去，B 机那边认不出是哪个地图，会报「没对上」。" % (w, h))
+        if int(p.get("x")) < 0 or int(p.get("y")) < 0:
+            return ("区域坐标是负数（x=%d y=%d）—— 重新框一次；"
+                    "手输的话 x/y 是屏幕左上角起算的像素。" % (int(p.get("x")),
+                                                             int(p.get("y"))))
 
     if key == "probe":
         try:

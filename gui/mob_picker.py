@@ -24,10 +24,11 @@ def _mob_display(mid, name_map):
     return ("%s  (%s)" % (name, mid)) if name else mid
 
 
-def _stand_icon(mid, size=_THUMB):
-    p = wzexport.sprite_dir_path() / mid / "stand_0.png"
-    if p.exists():
-        pm = QPixmap(str(p))
+def _mob_icon(mid, size=_THUMB):
+    """缩略图：优先 stand 第 0 帧，没有就用 fly —— 很多飞的怪只有 fly。"""
+    _act, frames = wzexport.mob_action_frames(wzexport.sprite_dir_path() / mid)
+    if frames:
+        pm = QPixmap(str(frames[0]))
         if not pm.isNull():
             return QIcon(pm.scaled(size, size, Qt.KeepAspectRatio,
                                    Qt.SmoothTransformation))
@@ -140,7 +141,7 @@ class MobPickDialog(QDialog):
         for mid in self._mobs:
             item = QListWidgetItem(_mob_display(mid, self.name_map))
             item.setData(Qt.UserRole, mid)
-            item.setIcon(_stand_icon(mid))
+            item.setIcon(_mob_icon(mid))
             self.lst.addItem(item)
         n = len(self._mobs)
         self.lbl_sel.setText("共 %d 种" % n if n else "还没有选怪")
@@ -162,7 +163,7 @@ class MobPickDialog(QDialog):
                 continue
             item = QListWidgetItem(disp)
             item.setData(Qt.UserRole, mid)
-            item.setIcon(_stand_icon(mid))
+            item.setIcon(_mob_icon(mid))
             self.cand.addItem(item)
             shown += 1
             if shown >= _MAX_CANDIDATES:

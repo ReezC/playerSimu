@@ -16,6 +16,7 @@
 
 import os
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -76,9 +77,14 @@ class Harness:
 
     @contextmanager
     def _patched(self):
+        # **两条按键路径都要挡**：agent 自己发序列用的 key_down/key_up 在 ag 命名空间，
+        # 而 KeyState（移动键）走的是 decision.input 里的那两个 —— 只挡前者的话，
+        # 走 KeyState 的用例会**真的往本机发键**（往当前窗口打字，实测踩过）。
         with patch.object(ag.time, "monotonic", self.clock), \
              patch.object(ag, "key_down", self._rec("down")), \
              patch.object(ag, "key_up", self._rec("up")), \
+             patch.object(dinput, "key_down", self._rec("down")), \
+             patch.object(dinput, "key_up", self._rec("up")), \
              patch.object(dinput, "release_all_remote", self._rec("RELEASEALL")), \
              patch.object(dinput, "link_health", lambda: {"ok": True}):
             yield
@@ -261,6 +267,235 @@ def t_releaseall_clears_held_only():
         ctx = h.agent._output_ctx
         check(ctx is not None, "输出序列上下文被整块清掉了（进度应保留）")
         check(not ctx[3], "上下文里还记着按下的键：%s" % (ctx[3],))
+
+
+def t_periodic_reset_channel():
+    """定时重置指令通道：到点真的发 RELEASEALL、0 禁用、关自动也要发、走硬件通道。
+
+    以前只测了「RELEASEALL 之后序列进度不被清」（t_releaseall_clears_held_only），
+    没测**它到底有没有按时发出去** —— 而这才是"防卡键"的全部价值所在：
+    间隔配错了、或者被某个早退挡住不发，序列进度那两条照样全绿。
+    """
+    def ral_times(h):
+        return [t for t, kind, _k in h.log if kind == "RELEASEALL"]
+
+    # ① 0 = 禁用
+    h = Harness(fresh_settings(resetall_interval=0)).run(5.0)
+    check(not ral_times(h), "interval=0 还在发 RELEASEALL：%s" % ral_times(h))
+
+    # ② 1 秒一次：6 秒里应发 6 次（第一拍就发一次），间隔约 1 秒
+    h = Harness(fresh_settings(resetall_interval=1)).run(6.0)
+    ts = ral_times(h)
+    check(len(ts) >= 5, "6 秒只发了 %d 次 RELEASEALL（应 5~6 次）" % len(ts))
+    gaps = [round(b - a, 3) for a, b in zip(ts, ts[1:])]
+    check(all(0.85 <= g <= 1.15 for g in gaps),
+          "RELEASEALL 间隔不是 1 秒：%s" % gaps)
+
+    # ③ 30 秒的配置不能 1 秒就发
+    h = Harness(fresh_settings(resetall_interval=30)).run(6.0)
+    check(len(ral_times(h)) == 1,
+          "间隔 30 秒却在 6 秒里发了 %d 次" % len(ral_times(h)))
+
+    # ④ **关自动也要发** —— 卡键最常见的时刻正是「发现卡了 → 去关自动」之后，
+    #    这一段在 tick 的 `if not s.enabled` 早退之前（见 _periodic_reset 的说明）
+    s = fresh_settings(resetall_interval=1)
+    s.enabled = False
+    h = Harness(s).run(4.0)
+    n = len(ral_times(h))
+    check(n >= 3, "关自动后就不再发了（4 秒只发 %d 次）—— 自愈在最需要时正好关着" % n)
+
+    # ⑤ 手动输入开着 → 跳过这一整个周期（不能把人正按着的键松掉）
+    from decision import manual_input
+    with patch.object(manual_input, "active", lambda: True):
+        h = Harness(fresh_settings(resetall_interval=1)).run(4.0)
+    check(not ral_times(h),
+          "手动输入开着还在发 RELEASEALL（会把人按着的键一起松掉）：%s"
+          % ral_times(h))
+
+
+def t_periodic_reset_local_backend():
+    """本地(仅测试)后端：没有固件可 RELEASEALL，必须自己把按着的键 UP 掉。
+
+    远程/串口模式下 relay 那条 RELEASEALL 直接把固件侧按键清空，本地只需同步
+    **记录**（KeyState.clear，故意不发 up）；但「本地(仅测试)」后端根本没有固件 ——
+    `dinput.release_all_remote()` 是空操作（`if _remote is not None`），
+    这时若也只清记录，本机那个键就永远按着了：后面 keys.set 里它已经被忘掉，
+    再也不会补发 up。
+    """
+    s = fresh_settings(resetall_interval=1)
+    h = Harness(s)
+    h.clock0 = h.clock.t
+    # release_all_remote 换成空操作 = 本地后端的真实行为（没有 _remote）
+    with patch.object(ag.time, "monotonic", h.clock), \
+         patch.object(ag, "key_down", h._rec("down")), \
+         patch.object(ag, "key_up", h._rec("up")), \
+         patch.object(dinput, "key_down", h._rec("down")), \
+         patch.object(dinput, "key_up", h._rec("up")), \
+         patch.object(dinput, "release_all_remote", lambda: None), \
+         patch.object(dinput, "link_health",
+                      lambda: {"ok": True, "backend": "local"}):
+        h.agent.keys.set({"left"})                 # 手上正按着左键
+        check(("down", "left") in [(k, v) for _t, k, v in h.log],
+              "左键没按下：%s" % h.log)
+        h.clock.t += 1.1                           # 跨过一次定期重置
+        h.agent.tick(h.ws(True))
+        ups = [v for _t, k, v in h.log if k == "up"]
+        check("left" in ups,
+              "本地后端下按着的键没被 UP 掉（记录被清、键永远按着）：%s" % h.log)
+        # 同一帧还会重新按下「当前真正需要的键」（这里是要往怪那边走 → right/ctrl），
+        # 所以只断言**被松开那个键**不再按着，别要求整个记录为空。
+        check("left" not in h.agent.keys._pressed,
+              "松开后记录里还留着 left：%s" % h.agent.keys._pressed)
+
+
+def t_link_health_watch():
+    """通道体检：10 秒一次，不健康就标出来 + 丢后台重连，恢复后跟上。
+
+    界面那行字读的就是 input_link_ok / input_link_err（player_panel 的
+    _poll_link_health），这里不测的话，链路死了界面会一直显示「已连接」。
+    """
+    s = fresh_settings(resetall_interval=0)
+    h = Harness(s)
+    h.clock0 = h.clock.t          # 手动推进时钟（不经 run()）时记录器要用它
+    state = {"ok": False, "backend": "remote", "err": "发指令后 5 秒没收到固件回执"}
+    reconnected = []
+
+    with patch.object(ag.time, "monotonic", h.clock), \
+         patch.object(dinput, "link_health", lambda: dict(state)), \
+         patch.object(dinput, "reconnect_remote",
+                      lambda *a, **k: (reconnected.append(1), True)[1]), \
+         patch.object(ag, "key_down", h._rec("down")), \
+         patch.object(ag, "key_up", h._rec("up")), \
+         patch.object(dinput, "release_all_remote", h._rec("RELEASEALL")):
+        # 体检是 10 秒一次，所以第一拍（t≈0）不看；推到 11 秒才该看第一次
+        h.clock.t += 11.0
+        h.agent.tick(h.ws(True))
+        check(s.input_link_ok is False,
+              "通道不健康没标记到 settings（界面读它显示红字）")
+        check("回执" in (s.input_link_err or ""),
+              "没把原因写进 input_link_err：%r" % s.input_link_err)
+        time.sleep(0.05)              # 重连丢在后台线程里（不能卡住决策循环）
+        check(reconnected, "通道不健康却没触发重连（卡键就救不回来了）")
+
+        # 恢复健康 → 标记跟着恢复
+        state.update({"ok": True, "err": ""})
+        h.clock.t += 11.0
+        h.agent.tick(h.ws(True))
+        check(s.input_link_ok is True and not s.input_link_err,
+              "通道恢复后界面标记没跟着恢复：ok=%s err=%r"
+              % (s.input_link_ok, s.input_link_err))
+
+
+def t_timer_paused_never_fires():
+    """暂停的定时行为：到点了也不触发；暂停还要**打断正在演的那段**并松键。"""
+    # ① 早就该触发的时间点 + paused → 一次都不能发
+    s = fresh_settings(custom_timers=[
+        {"name": "t1", "interval": [1, 1], "paused": True, "paused_left": 60.0,
+         "seq": [{"type": "down", "key": "f3"}, {"type": "up", "key": "f3"}]}],
+        custom_timer_next={})
+    h = Harness(s)
+    s.custom_timer_next["t1"] = h.clock.t - 100.0      # 100 秒前就该触发了
+    h.run(3.0, mob_plan=lambda _t: False)
+    check(not [1 for _t, k, _v in h.log if k in ("down", "up")],
+          "暂停的定时行为还是触发了：%s" % h.log)
+    check("t1" not in s.custom_timer_next,
+          "暂停的定时行为还留着排期：%s" % s.custom_timer_next)
+
+    # ② 序列演到一半被暂停：按着的键必须松开，状态要清掉
+    s2 = fresh_settings(custom_timers=[
+        {"name": "t2", "interval": [60, 60],
+         "seq": [{"type": "down", "key": "f5"},
+                 {"type": "delay", "ms": 60000},
+                 {"type": "up", "key": "f5"}]}], custom_timer_next={})
+    h2 = Harness(s2)
+    h2.clock0 = h2.clock.t
+    with h2._patched():
+        s2.custom_timer_next["t2"] = h2.clock.t        # 立刻到点
+        h2.clock.t += 0.1
+        h2.agent.tick(h2.ws(True))                     # 这一拍只是"启动序列"
+        h2.clock.t += 0.1
+        h2.agent.tick(h2.ws(True))                     # 这一拍才发出第一个键
+        check(("down", "f5") in [(k, v) for _t, k, v in h2.log],
+              "序列没起来：%s" % h2.log)
+        s2.custom_timers[0]["paused"] = True           # 用户点了暂停
+        h2.clock.t += 0.1
+        h2.agent.tick(h2.ws(True))
+        check(("up", "f5") in [(k, v) for _t, k, v in h2.log],
+              "暂停没有松开正在演的序列按键（键会卡住）：%s" % h2.log)
+        check("t2" not in h2.agent._timer_states, "暂停后序列状态还留着")
+        # 只断言"被暂停那段按的键"不再按着（同一拍还会按移动键，不能要求整表为空）
+        check("f5" not in h2.agent.keys._pressed, "暂停后那个键还按着：%s"
+              % h2.agent.keys._pressed)
+
+    # ③ 暂停状态要能存进项目、读得回来（重开项目仍是暂停 + 倒计时冻着）
+    got = ag.DecisionSettings._load_timers([
+        {"name": "t3", "interval": [5, 10], "seq": [],
+         "paused": True, "paused_left": 42.5},
+        {"name": "t4", "interval": [5, 10], "seq": []}])
+    check(got[0].get("paused") is True and abs(got[0]["paused_left"] - 42.5) < 1e-6,
+          "暂停状态没读回来：%s" % (got[0],))
+    check("paused" not in got[1] and "paused_left" not in got[1],
+          "没暂停的行为被塞了暂停字段：%s" % (got[1],))
+
+
+def t_timer_pause_button():
+    """界面：每一项都有暂停按钮；暂停后按钮变「继续」、倒计时变红且带「（已暂停）」、
+    冻住不走；继续则从停下的剩余时间接着走（不是清零重来）。"""
+    p, app = build_panel()
+    settings = ag.settings          # 界面读的就是这个单例（save 在 main 里被换成空操作）
+    saved = (settings.custom_timers, settings.custom_timer_next)
+    settings.custom_timers = [
+        {"name": "A", "seq": [{"type": "down", "key": "f3"}], "interval": [10, 10]},
+        {"name": "B", "seq": [{"type": "down", "key": "f4"}], "interval": [10, 10]},
+    ]
+    settings.custom_timer_next = {}
+    try:
+        p._refresh_timers()
+        app.processEvents()
+        check([b.text() for b in p._timer_pause_btns.values()] == ["暂停", "暂停"],
+              "按钮初始文字不对：%s"
+              % [b.text() for b in p._timer_pause_btns.values()])
+
+        settings.custom_timer_next["A"] = time.monotonic() + 300.0
+        p._timer_pause_btns["A"].click()
+        app.processEvents()
+        a = settings.custom_timers[0]
+        check(a.get("paused") is True, "点了暂停但状态没置上")
+        check(abs(float(a.get("paused_left") or 0) - 300.0) < 2.0,
+              "冻住的剩余时间不对：%s" % a.get("paused_left"))
+        check("A" not in settings.custom_timer_next, "暂停后 agent 的排期没撤掉")
+        check(p._timer_pause_btns["A"].text() == "继续", "按钮没变成「继续」")
+
+        lbl = p._timer_cd_labels["A"]
+        check("（已暂停）" in lbl.text(), "倒计时没标「（已暂停）」：%r" % lbl.text())
+        check("c5221f" in lbl.styleSheet(),
+              "暂停后倒计时没标红：%r" % lbl.styleSheet())
+        before = lbl.text()
+        time.sleep(1.2)
+        p._tick_feed_cd()
+        check(lbl.text() == before, "暂停后倒计时还在走：%r → %r" % (before, lbl.text()))
+
+        check(settings.custom_timers[1].get("paused") is None,
+              "暂停 A 把 B 也暂停了")
+        check(p._timer_pause_btns["B"].text() == "暂停", "B 的按钮被带变了")
+        check("（已暂停）" not in p._timer_cd_labels["B"].text(), "B 的倒计时被带红了")
+
+        # 继续：从停下的地方接着走
+        p._timer_pause_btns["A"].click()
+        app.processEvents()
+        nx = settings.custom_timer_next.get("A", 0.0)
+        check(settings.custom_timers[0].get("paused") is False, "继续后状态没清")
+        check(abs((nx - time.monotonic()) - 300.0) < 3.0,
+              "继续没有接着原来的剩余时间（像是清零重来了）：还剩 %.0f 秒"
+              % (nx - time.monotonic()))
+        check(p._timer_pause_btns["A"].text() == "暂停", "继续后按钮没变回「暂停」")
+        check("（已暂停）" not in p._timer_cd_labels["A"].text(),
+              "继续后倒计时还写着已暂停")
+        check("c5221f" not in p._timer_cd_labels["A"].styleSheet(),
+              "继续后倒计时还是红的")
+    finally:
+        settings.custom_timers, settings.custom_timer_next = saved
+        p._refresh_timers()
 
 
 def t_rest_state_machine():
@@ -528,11 +763,19 @@ CHECKS = [
     ("输出CD：进攻击状态走排期（状态抖动不超速）", t_cd_on_enter_attack_state),
     ("输出CD：序列比CD长时以序列为准", t_cd_shorter_than_sequence),
     ("定期RELEASEALL：本机序列进度全保留", t_releaseall_keeps_progress),
+    ("定时重置指令通道：到点发/0禁用/关自动也发/手动输入跳过",
+     t_periodic_reset_channel),
+    ("指令通道体检：不健康标出来 + 后台重连 + 恢复跟随", t_link_health_watch),
+    ("定时重置：本地后端也要真的松开按键（没有固件兜底）",
+     t_periodic_reset_local_backend),
     ("类别表：只在 perception/classes.py 定义", t_class_table_single_source),
     ("时序拍：next_deadline 报的是序列到点时刻", t_next_deadline),
     ("时序拍：序列元素按本机绝对时钟发（不再一帧量化）",
      t_sequence_timing_not_frame_quantized),
     ("定期RELEASEALL：只作废按键记录", t_releaseall_clears_held_only),
+    ("自定义定时行为：暂停后不触发、且打断正在演的序列",
+     t_timer_paused_never_fires),
+    ("自定义定时行为：暂停按钮/红字（已暂停）/继续接着走", t_timer_pause_button),
     ("休息状态机：到点/手动结束/关防掉线/手动进入", t_rest_state_machine),
     ("休息状态机：手动进入要先等清怪", t_rest_manual_request),
     ("按键层：F10~F12 三条发送路径全拦", t_input_local_only),

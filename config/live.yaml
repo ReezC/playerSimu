@@ -4,4 +4,4 @@ imgsz: 800
 device: '0'
 capture_fps: 60
 draw: true
-perf_log: false
+perf_log: true

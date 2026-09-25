@@ -18,28 +18,28 @@ calib:
 bars:
   hp:
   - 0.341142
-  - 0.971354
+  - 0.973958
   - 0.120791
-  - 0.022135
+  - 0.019531
   hp_color: &id001
   - - 0
     - 0
     - 135
-  - - 89
-    - 91
+  - - 79
+    - 82
     - 255
   mp:
-  - 0.462665
-  - 0.970052
-  - 0.122987
-  - 0.02474
+  - 0.464129
+  - 0.973958
+  - 0.120791
+  - 0.019531
   mp_color: &id002
-  - - 136
-    - 81
+  - - 143
+    - 78
     - 0
   - - 255
-    - 201
-    - 102
+    - 198
+    - 77
 decision:
   attack_dist: 80.0
   min_attack_dist: 0
@@ -92,8 +92,8 @@ decision:
     shop: null
     enter: enter
   target_cd:
-  - 1500
-  - 2500
+  - 2000
+  - 3000
   input_device: remote
   input_delay:
   - 0
@@ -105,17 +105,27 @@ decision:
   player_track_jump: 200
   hp_bar:
   - 0.341142
-  - 0.971354
+  - 0.973958
   - 0.120791
-  - 0.022135
+  - 0.019531
   mp_bar:
-  - 0.462665
-  - 0.970052
-  - 0.122987
-  - 0.02474
+  - 0.464129
+  - 0.973958
+  - 0.120791
+  - 0.019531
+  probe_calib:
+    x_ratio: 0.0739385065885798
+    y_ratio: 0.02734375
+    cell_ratio: 0.01171303074670571
+    gap_ratio: 0.0016603221083455343
+    bits: 40
+    frame:
+    - 1366
+    - 768
+    solved_at: '2026-09-25 00:15:23'
   hp_color: *id001
   mp_color: *id002
-  hp_threshold: 30
+  hp_threshold: 39
   mp_threshold: 7
   pot_cd: 1500
   auto_hp_pot: true
@@ -131,7 +141,7 @@ decision:
   sweep_turn_cd: 500
   back_range: 150
   route_enabled: false
-  debounce_conf: 0.6
+  debounce_conf: 0.5
   debounce_ms: 2000
   auto_feed_pet: true
   feed_interval_min: 10.0

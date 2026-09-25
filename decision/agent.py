@@ -122,6 +122,14 @@ class DecisionSettings:
         self.player_track_jump = 150        # 玩家追踪阈值（像素）：新玩家框离预测位置超此距离就不认（防跟错）
         self.hp_bar = None          # HP 条区域 (x, y, w, h) 或 None
         self.mp_bar = None          # MP 条区域 (x, y, w, h) 或 None
+        # 探针框选标定的结果（人工在实时画面上框出来的）。**按项目存** ——
+        # 和 HP/MP 条同一套思路：不同项目可能分辨率/客户端布局不同；没打开项目时
+        # 随「最近打开的项目」走（见 main_window._bind_decision_params）。
+        # 形状（存**画面比例**，换分辨率不用重标；read_bits 支持浮点 cell）：
+        #   {"x_ratio","y_ratio","cell_ratio","gap_ratio","bits","frame","solved_at"}
+        # {} = 没标定过 → 回退到 config/probe_calib.json（旧版全局标定）→
+        #      再回退到 config/link.yaml 的 probe.x/y/cell/gap 像素值。
+        self.probe_calib = {}
         self.hp_color = None        # HP 填充色范围 [[B,G,R],[B,G,R]] 或 None（默认红）
         self.mp_color = None        # MP 填充色范围 [[B,G,R],[B,G,R]] 或 None（默认蓝）
         self.hp_threshold = 30      # HP 阈值（百分比 0~100）
@@ -209,6 +217,7 @@ class DecisionSettings:
                 "turn_output_delay_ms": self.turn_output_delay_ms,
                 "player_track_jump": self.player_track_jump,
                 "hp_bar": self.hp_bar, "mp_bar": self.mp_bar,
+                "probe_calib": self.probe_calib,
                 "hp_color": self.hp_color, "mp_color": self.mp_color,
                 "hp_threshold": self.hp_threshold,
                 "mp_threshold": self.mp_threshold,
@@ -304,6 +313,7 @@ class DecisionSettings:
             "player_track_jump", data.get("player_debounce_dist", 150)))
         self.hp_bar = load_rect(data.get("hp_bar"))
         self.mp_bar = load_rect(data.get("mp_bar"))
+        self.probe_calib = dict(data.get("probe_calib") or {})
         self.hp_color = self._load_color(data.get("hp_color"))
         self.mp_color = self._load_color(data.get("mp_color"))
         self.hp_threshold = int(data.get("hp_threshold", 30))
@@ -417,7 +427,11 @@ class DecisionSettings:
 
     @staticmethod
     def _load_timers(v):
-        """读回自定义定时行为列表：[{name, seq, interval:[min,max]}]。"""
+        """读回自定义定时行为列表：[{name, seq, interval:[min,max], paused?, paused_left?}]。
+
+        `paused` / `paused_left` 只在暂停过时才存在（UI 上的暂停按钮写的）——
+        跟着项目一起存，重开项目仍是暂停状态、倒计时还冻在原来那个数上。
+        """
         if not isinstance(v, list):
             return []
         out = []
@@ -436,7 +450,15 @@ class DecisionSettings:
                 hi = max(lo, float(iv[1]))
             except Exception:
                 continue
-            out.append({"name": name, "seq": seq, "interval": [lo, hi]})
+            item = {"name": name, "seq": seq, "interval": [lo, hi]}
+            if e.get("paused"):
+                try:
+                    left = max(0.0, float(e.get("paused_left") or 0.0))
+                except Exception:
+                    left = 0.0
+                item["paused"] = True
+                item["paused_left"] = left
+            out.append(item)
         return out
 
 
@@ -1099,8 +1121,18 @@ class CombatAgent:
                 return
         except Exception:
             pass
-        dinput.release_all_remote()
-        self.keys.clear()
+        # 怎么"松"取决于后端：
+        #   · 远程 / 串口 —— 固件那边一次 RELEASEALL 把所有键清掉，最可靠
+        #     （逐键 RELEASE 可能丢在网络上）。本地只需同步**记录**（clear 故意不发 up）。
+        #   · 本地(仅测试) —— **根本没有固件**，release_all_remote() 在那种后端上是
+        #     空操作（见 decision/input.py：`if _remote is not None`）。这时若也只
+        #     clear 记录，那个键就永远按着了：记录已清，后面 keys.set 再也不会补发 up
+        #     （实测：本地后端下只看到 down left，永远看不到 up left）。
+        if dinput.link_health().get("backend") == "local":
+            self.keys.release_all()
+        else:
+            dinput.release_all_remote()
+            self.keys.clear()
         # **本机规划的行为序列一律保留进度**，只作废它们记的「按着哪些键」：
         #     _output_ctx     输出行为序列（攻击连点 / 跳输出，自己按 CD 排下一轮）
         #     _back_ctx       回身输出序列（循环行为）
@@ -1549,6 +1581,14 @@ class CombatAgent:
         for t in s.custom_timers:
             name = t.get("name") or ""
             if not name:
+                continue
+            # 暂停：不排期、也不演序列。**正在演的那一段要立刻停下并松键** ——
+            # 否则"暂停"只是不再触发下一次，手上这段序列还在按着键往下走。
+            if t.get("paused"):
+                st = self._timer_states.pop(name, None)
+                if st is not None:
+                    self._release_ctx(st)
+                s.custom_timer_next.pop(name, None)
                 continue
             seq = t.get("seq") or []
             iv = t.get("interval")

@@ -121,6 +121,11 @@ class MapCard(StepCard):
 
     PLAYER_ROOT = Path("datasets/sprites/player")
 
+    #: 地图下拉里「还没选地图」的占位项。项目没选地图时**显示的就是它** ——
+    #: 不能空着让下拉自动落到第一张图上：那样用户以为已经选中了，其实项目里是空的
+    #: （"显示 ≠ 已提交"），接着打开怪物弹窗一个怪都没有（实测踩过）。
+    NO_MAP = "（未选地图）"
+
     def reload_players(self):
         """读角色模板目录，填角色下拉。"""
         self.cmb_player.blockSignals(True)
@@ -163,14 +168,25 @@ class MapCard(StepCard):
 
         self.cmb.blockSignals(True)
         self.cmb.clear()
+        if not keep:
+            # 项目还没选地图 → 显示占位项。**必须显示出来**：以前空着就自动显示
+            # 列表的第一张图，用户以为"已经选中这张了"，其实项目里还是空的 ——
+            # 接着点「确认要识别怪物」，弹窗一个怪都没有（实测踩过）。
+            self.cmb.addItem(self.NO_MAP, "")
         for m in self._shown:
             self.cmb.addItem(m["label"], m["id"])
 
-        # 项目里选的地图若被筛选条件挡掉了，补一条占位让它仍能显示。
-        # 否则下拉会回落到第一项，下次运行 map_id 就被悄悄改掉了。
-        if keep and self.cmb.findData(keep) < 0:
+        idx = self.cmb.findData(keep) if keep else 0
+        if keep and idx < 0:
+            # 项目选的地图若被筛选条件挡掉了，补一条占位让它仍能显示。
+            # 否则下拉会回落到第一项，下次运行 map_id 就被悄悄改掉了。
             self.cmb.insertItem(0, "%s   （不在当前筛选范围内）" % keep, keep)
-            self.cmb.setCurrentIndex(0)
+            idx = 0
+        if idx >= 0:
+            # 列表重建后 currentIndex 会掉到第一项 → 显式恢复到项目里那张图。
+            # 保证**下拉显示的就是项目里的**：改一下筛选框就会"显示 A、存的 B"
+            # （这条也是实测踩出来的，和上面那条是同一类坑）。
+            self.cmb.setCurrentIndex(idx)
 
         self.cmb.blockSignals(False)
 
@@ -197,30 +213,112 @@ class MapCard(StepCard):
 
         mid = self.value("map_id")
         if not mid:
-            return
+            return                      # 选到了「（未选地图）」占位项：项目里没有可写的
 
-        m = next((x for x in self._pool if x["id"] == mid), None)
+        self._commit_pick(mid)
+
+    def _commit_pick(self, mid):
+        """选地图 = 把**这张图**和**它的怪列表**一起写进项目。返回是否写成。
+
+        怪列表必须跟着地图一起写：项目只改了 map_id、`mobs` 还是空的话，
+        「确认要识别怪物」弹窗就会一个怪都没有（实测踩过）。
+        """
+        m = self._manifest_entry(mid)
         if m is None:
-            return
+            # 别静默失败 —— 之前这里 `return`，界面看着像"选上了"，其实什么都没存
+            self.set_result("⚠ 地图清单里找不到 %s —— 点「刷新列表」再选一次" % mid)
+            return False
 
         self.project.set("map_id", mid)
-        self.project.set("mobs", m["mobs"])
-        self.project.set("mob_names", m["mob_names"])
+        self.project.set("mobs", list(m["mobs"]))
+        self.project.set("mob_names", list(m["mob_names"]))
+        self.project.set("mobs_cleared", False)     # 换了图，上一张的清空记录作废
         self.project.save()
         self.set_result(self._describe(mid, m["mobs"], m["mob_names"]))
+        return True
+
+    def _manifest_entry(self, mid):
+        """按 id 查地图清单条目（缓存为空时先补读一次）。查不到返回 None。"""
+        if not mid:
+            return None
+        if not self._pool:
+            self._pool = wzexport.list_maps(only_with_mob=False, keyword="")
+        return next((x for x in self._pool if x["id"] == mid), None)
+
+    def _fill_mobs_from_manifest(self, p, mid, override=False):
+        """项目里有地图、却没有怪 → 按清单把「该识别的怪」补上。返回是否补了。
+
+        **为什么需要**：`mobs` 只在「选地图」时写入，而"新建项目时手填地图 ID"
+        或"下拉显示 ≠ 已提交"这两种情况都会留下「有地图、怪列表空」的项目 →
+        弹窗空着，看着像 bug（实测踩过）。这种状态在界面上本来就是 warn
+        （「该图无怪」），补上是安全的。
+
+        override=False 时只在**空**的前提下补，不覆盖用户手动增删的结果；
+        用户主动清空过（`mobs_cleared`）也不补 —— 那是他的决定，不该每次打开
+        弹窗都给他加回来。
+        """
+        mid = (mid or "").strip()
+        if not p or not mid:
+            return False
+        if (p.get("mobs") or []) and not override:
+            return False
+        if p.get("mobs_cleared") and not override:
+            return False
+        m = self._manifest_entry(mid)
+        if m is None or not m["mobs"]:
+            return False                # 清单里这张图确实没有怪：不编造
+        p.set("mobs", list(m["mobs"]))
+        p.set("mob_names", list(m["mob_names"]))
+        p.set("mobs_cleared", False)
+        p.save()
+        return True
 
     def _pick_mobs(self):
         """打开「确认要识别怪物」弹窗，手动增删这张图要处理的怪。"""
         if self.project is None:
             return
+
+        # 用**当前显示的那张图**（若还没提交，就在这一刻提交）。
+        # 以前直接读 project.get("mobs")：下拉显示 A、项目里是空的/是 B 的时候，
+        # 弹窗要么空、要么列出另一张图的怪（实测踩过）。
+        mid = ((self.value("map_id") or "").strip()
+               or (self.project.get("map_id") or "").strip())
+        if not mid:
+            QMessageBox.information(
+                self, "先选地图",
+                "还没选地图 —— 先在「地图」下拉里选一张（列表太长就用上面的「筛选」）。\n"
+                "「要识别的怪物」是跟着地图走的，所以得先有地图。")
+            return
+        if (self.project.get("map_id") or "") != mid:
+            if not self._commit_pick(mid):
+                return
+        else:
+            self._fill_mobs_from_manifest(self.project, mid)
+
+        cur = self.project.get("mobs") or []
+        if not cur:
+            # 空列表要给出**原因**（图本身没怪 / 被清空过 / 清单里找不到），
+            # 否则又是一句"没有怪物"让人猜。
+            if self.project.get("mobs_cleared"):
+                why = "这张图是你上次手动清空的（可以在这里重新添加）。"
+            elif self._manifest_entry(mid) is None:
+                why = "地图清单里没有这张图 —— 先在工具栏「WZ 导出」重导地图清单。"
+            else:
+                why = ("地图清单里 %s 没有登记任何怪。\n"
+                       "如果确定这张图有怪，先在工具栏「WZ 导出」重导地图清单。" % mid)
+            QMessageBox.information(self, "这张图没有怪", why)
+
         from gui.mob_picker import MobPickDialog
 
-        dlg = MobPickDialog(self.project.get("mobs") or [], self)
+        dlg = MobPickDialog(cur, self)
         if dlg.exec_():
             new = dlg.result_mobs()
             name_map = wzexport.build_mob_name_map()
             self.project.set("mobs", new)
             self.project.set("mob_names", [name_map.get(m, "") for m in new])
+            # 记一笔「用户主动清空」：否则下次打开弹窗会被 _fill_mobs_from_manifest
+            # 按清单加回来，等于悄悄撤销他的决定
+            self.project.set("mobs_cleared", not new)
             self.project.save()
             self.refresh()
 
@@ -234,6 +332,9 @@ class MapCard(StepCard):
             self._shown = wzexport.list_maps(only_with_mob=self.value("only_mob"))
             self._fill_combo()
             self.set_value("map_id", p.get("map_id"))
+            # 「有地图、没怪」的项目（新建时手填了地图 ID 的那种）在这里补一次：
+            # 不补的话下面「确认要识别怪物」永远是空弹窗（实测踩过）。
+            self._fill_mobs_from_manifest(p, p.get("map_id"))
             self.reload_players()
             pid = p.get("player_id")
             if not pid and self.cmb_player.count() > 0:
@@ -757,30 +858,42 @@ class LabelCard(StepCard):
         foot.addWidget(self.btn_label_mob)
         foot.addWidget(self.btn_label_player)
 
-        # ---- YOLO 辅助开关 + 权重（在标注按钮下方）----
+        # ---- YOLO 标注（**按需手动跑**）+ 权重 ----
+        #
+        # 以前是「勾上以后跟着 ④ 一起跑」，现在是一个按钮：模板匹配跑完，
+        # 你看质检台决定要不要再补一轮模型框 —— 流程由你定，不默认替你决定。
         aux = QHBoxLayout()
         aux.setSpacing(6)
-        self.ck_yolo_mob = QCheckBox("YOLO 辅助怪物")
-        self.ck_yolo_mob.setToolTip("勾选后，「标注怪物」会额外用其它项目模型补怪物框")
-        self.ck_yolo_mob.toggled.connect(self._on_yolo_toggle)
-        aux.addWidget(self.ck_yolo_mob)
-        self.ck_yolo_player = QCheckBox("YOLO 辅助玩家")
-        self.ck_yolo_player.setToolTip("勾选后，「标注玩家」会额外用角色一致的模型补玩家框")
-        self.ck_yolo_player.toggled.connect(self._on_yolo_toggle)
-        aux.addWidget(self.ck_yolo_player)
-        self.lbl_yolo_weight = QLabel("辅助权重")
+        self._yolo_only = False          # 本次运行是不是「只跑 YOLO 标注」
+        # **两个按钮**，各管一类 —— 不做成"一个按钮跟着上次点的主按钮变"：
+        # 那种设计用户看不见当前作用对象（实测反馈：找不到"标注玩家"的那个）。
+        _tip = ("用选中的模型补一轮框，写进 labels_auto（**不重跑模板匹配**）。\n"
+                "只追加「和已有框不重叠」的框，不会覆盖模板匹配的框。\n"
+                "适合：模板匹配跑完、在质检台看到漏检，再补这一轮。")
+        self.btn_yolo_mob = QPushButton("YOLO 标注（怪物）")
+        self.btn_yolo_mob.setStyleSheet(self._BTN)
+        self.btn_yolo_mob.setToolTip(_tip + "\n\n只补 class 1（怪物）。")
+        self.btn_yolo_mob.clicked.connect(lambda: self._emit_yolo("mob"))
+        aux.addWidget(self.btn_yolo_mob)
+        self.btn_yolo_player = QPushButton("YOLO 标注（玩家）")
+        self.btn_yolo_player.setStyleSheet(self._BTN)
+        self.btn_yolo_player.setToolTip(
+            _tip + "\n\n只补 class 0（玩家），且**模型所属角色必须与当前角色一致**"
+                   "（不同角色会被误标成当前角色）。")
+        self.btn_yolo_player.clicked.connect(lambda: self._emit_yolo("player"))
+        aux.addWidget(self.btn_yolo_player)
+        self.lbl_yolo_weight = QLabel("YOLO 权重")
         aux.addWidget(self.lbl_yolo_weight)
         self.cmb_yolo = NoWheelComboBox()
         self.cmb_yolo.setMaxVisibleItems(12)
+        self.cmb_yolo.setToolTip(
+            "给「YOLO 标注」用的模型。\n\n"
+            "顺带说明：跑「标注怪物 / 标注玩家」时，如果这里选了模型，\n"
+            "模板匹配会先用它**粗定位**（只在模型圈出的区域里找）—— 实测快几十倍，\n"
+            "还能避开画面里长得像目标的固定物件（例如地图上的绳子）。\n"
+            "模型没圈到的帧仍然全图匹配，所以不会因此漏标。")
         aux.addWidget(self.cmb_yolo, 1)
         self.layout().addLayout(aux)
-        self.lbl_yolo_weight.setVisible(False)
-        self.cmb_yolo.setVisible(False)
-
-    def _on_yolo_toggle(self):
-        show = self.ck_yolo_mob.isChecked() or self.ck_yolo_player.isChecked()
-        self.lbl_yolo_weight.setVisible(show)
-        self.cmb_yolo.setVisible(show)
 
     def _emit_run(self, target):
         self._label_target = target
@@ -811,6 +924,23 @@ class LabelCard(StepCard):
         if len(stems) == len(dlg.stems):
             return True, None           # 全选 → 不筛，和以前的行为完全一致
         return True, stems
+
+    def _emit_yolo(self, target):
+        """只跑模型这一遍：补框，**不重跑模板匹配**。
+
+        目标由按下的那个按钮**显式给定**（不做"跟着上次点的主按钮变"——
+        那种设计用户看不见作用对象）。
+        补框是追加操作（只加"和已有框不重叠"的），不会覆盖模板匹配的框，
+        所以不弹「重新标注」确认 —— 只让你挑一次帧（和主按钮同一套选帧弹窗）。
+        """
+        self._label_target = target
+        self._yolo_only = True
+        ok, picked = self._pick_frames(target)
+        if not ok:
+            self._yolo_only = False
+            return
+        self._only[target] = picked
+        self.run_clicked.emit(self)
 
     def _confirm_relabel(self, target):
         """标过的情况下弹二次确认。重标只覆盖自动框，人工修正会保留。"""
@@ -843,6 +973,8 @@ class LabelCard(StepCard):
         super().set_busy(busy)
         self.btn_label_mob.setEnabled(not busy)
         self.btn_label_player.setEnabled(not busy)
+        self.btn_yolo_mob.setEnabled(not busy)
+        self.btn_yolo_player.setEnabled(not busy)
 
     def build_params(self, form):
         self.field(form, "thresh", "匹配阈值", "float", 0.90,
@@ -956,21 +1088,29 @@ class LabelCard(StepCard):
     def check_deps(self, p):
         if p.snapshot()["frames"] == 0:
             return False, "还没有画面，请先完成 ② 采集"
+
+        # 「YOLO 标注」独立跑：只要求权重（玩家模式还要求角色一致），
+        # 不要求模板匹配那些前提 —— 它是补框，和模板匹不匹配没关系。
+        if self._yolo_only:
+            w = self.cmb_yolo.currentData()
+            if not w:
+                return False, "还没有训练好的模型 —— 先在其它项目完成 ⑦ 训练"
+            if self._label_target == "player":
+                pid = (p.get("player_id") or "").strip()
+                if not pid:
+                    return False, "还没选择角色，请先完成 ① 地图"
+                wpid = self._yolo_player.get(w, "")
+                if wpid != pid:
+                    return False, ("模型角色「%s」≠ 当前角色「%s」，用它标玩家会误标，"
+                                   "请选一个角色一致的模型"
+                                   % (wpid or "（无）", pid or "（无）"))
+            return True, ""
+
         if self._label_target == "player":
             if not (p.get("player_id") or "").strip():
                 return False, "还没选择角色，请先完成 ① 地图"
             if not p.get("player_scale"):
                 return False, "玩家还没标定尺度，请先完成 ③ 标定尺度"
-            if self.ck_yolo_player.isChecked():
-                w = self.cmb_yolo.currentData()
-                if not w:
-                    return False, "还没有训练好的模型 —— 先在其它项目完成 ⑦ 训练"
-                wpid = self._yolo_player.get(w, "")
-                pid = (p.get("player_id") or "").strip()
-                if wpid != pid:
-                    return False, ("模型角色「%s」≠ 当前角色「%s」，辅助玩家会误标，"
-                                   "请选一个角色一致的模型"
-                                   % (wpid or "（无）", pid or "（无）"))
             return True, ""
         if not (p.get("mobs") or []):
             return False, "还没确定怪种，请先完成 ① 地图"
@@ -979,12 +1119,32 @@ class LabelCard(StepCard):
                            "需要用 WzProbe dump-mob 导出，"
                            "或修改 config/wz.yaml 的 sprite_dir"
                            % wzexport.sprite_dir_path())
-        if self.ck_yolo_mob.isChecked() and not self.cmb_yolo.currentData():
-            return False, "还没有训练好的模型 —— 先在其它项目完成 ⑦ 训练"
         return True, ""
 
     def make_task(self, p):
         sec = p.sec("label")
+
+        # 「YOLO 标注」单独跑：只做模型这一遍（往 labels_auto 追加框），
+        # **不重跑模板匹配** —— 流程由用户自己安排。
+        if self._yolo_only:
+            self._yolo_only = False
+            w = self.cmb_yolo.currentData()
+            if not w:
+                raise ValueError("还没有训练好的模型，先在其它项目完成 ⑦ 训练")
+            from tools.yolo_augment import run_yolo_augment
+            target = self._label_target
+            return run_yolo_augment, {
+                "weights": w,
+                "frames": str(p.frames),
+                "out": str(p.dir_of("labels_auto")),
+                "mode": target,                  # "mob" / "player"，与按钮文字一致
+                "player_id": p.get("player_id") or "",
+                "weights_player_id": self._yolo_player.get(w, ""),
+                "conf": 0.40,
+                "imgsz": p.sec("train").get("imgsz", 960),
+                "device": p.sec("train").get("device", "0"),
+                "only": self._only.get(target) or [],
+            }
 
         if self._label_target == "player":
             from tools.yolo_augment import run_detect_player_augmented
@@ -1000,27 +1160,23 @@ class LabelCard(StepCard):
                     "vis_dir": str(p.vis) + "_player",
                 },
             }
-            if self.ck_yolo_player.isChecked():
-                w = self.cmb_yolo.currentData()
-                if not w:
-                    raise ValueError("还没有训练好的模型，先在其它项目完成 ⑦ 训练")
-                params["augment"] = {
+            # 粗定位（**自动**，不是开关）：选了权重就先用它圈出玩家区域，
+            # 模板匹配只在区域里找 —— 实测 11 秒/帧 → 零点几秒，还能避开画面里
+            # 长得像玩家、位置又固定的东西（实测：地图上垂下来的一根绳子分数
+            # 0.851，比真玩家还高）。没圈到的帧仍走全图，漏检不会被漏掉；
+            # 模型角色与当前角色不一致时 player_rois 会自己放弃并打日志。
+            w = self.cmb_yolo.currentData()
+            if w:
+                params["detect"]["yolo"] = {
                     "weights": w,
-                    "frames": str(p.frames),
-                    "out": str(p.dir_of("labels_auto")),
-                    "mode": "player",
                     "player_id": p.get("player_id") or "",
                     "weights_player_id": self._yolo_player.get(w, ""),
-                    "conf": 0.40,
+                    "conf": 0.25,       # 粗定位宁可多圈一点（漏检有全图兜底）
                     "imgsz": p.sec("train").get("imgsz", 960),
                     "device": p.sec("train").get("device", "0"),
                 }
-            # 选帧：只处理勾中的帧（[] = 全选不筛）。augment 也要一起筛 ——
-            # 否则「YOLO 辅助」会去改没勾的帧的标注，用户的选择就白做了。
-            _only = self._only.get("player") or []
-            params["detect"]["only"] = _only
-            if "augment" in params:
-                params["augment"]["only"] = _only
+            # 选帧：只处理勾中的帧（[] = 全选不筛）
+            params["detect"]["only"] = self._only.get("player") or []
             return run_detect_player_augmented, params
 
         from tools.yolo_augment import run_detect_mob_augmented
@@ -1041,24 +1197,8 @@ class LabelCard(StepCard):
                 "vis": True,
             },
         }
-        if self.ck_yolo_mob.isChecked():
-            w = self.cmb_yolo.currentData()
-            if not w:
-                raise ValueError("还没有训练好的模型，先在其它项目完成 ⑦ 训练")
-            params["augment"] = {
-                "weights": w,
-                "frames": str(p.frames),
-                "out": str(p.dir_of("labels_auto")),
-                "mode": "mob",
-                "conf": 0.40,
-                "imgsz": p.sec("train").get("imgsz", 960),
-                "device": p.sec("train").get("device", "0"),
-            }
-        # 选帧：只处理勾中的帧（[] = 全选不筛）；augment 同步筛，理由同玩家分支
-        _only = self._only.get("mob") or []
-        params["detect"]["only"] = _only
-        if "augment" in params:
-            params["augment"]["only"] = _only
+        # 选帧：只处理勾中的帧（[] = 全选不筛）
+        params["detect"]["only"] = self._only.get("mob") or []
         return run_detect_mob_augmented, params
 
 

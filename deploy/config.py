@@ -52,6 +52,19 @@ DEFAULTS = {
         "passthrough": False,
         "pkt_size": 1316,
     },
+    "mmap": {            # 小地图推流（寻路定位用；不用寻路就别起这张卡片）
+        "bind": "0.0.0.0",
+        "port": 5003,    # 与 link.yaml 的 minimap.port 一致
+        "zoom": 3,
+        "fps": 10,
+        "quality": 100,
+        # 小地图面板在 A 机屏幕上的矩形（屏幕坐标）。None = 还没框选，
+        # 界面上的「框选…」按钮就是往这四个键里写。
+        "x": None,
+        "y": None,
+        "w": None,
+        "h": None,
+    },
     "window": {          # 上次的窗口大小，下次开原样
         "w": 1280,
         "h": 860,
@@ -114,6 +127,9 @@ def seed_from_link():
     put("push", "width", stream.get("width"))
     put("push", "height", stream.get("height"))
     put("push", "fps", stream.get("fps"))
+    # 小地图推流端口（B 机 perception/minimap.py 读同一个键）。
+    # **区域不在这里**：它依 A 机屏幕布局，只能框出来，不能从配置推。
+    put("mmap", "port", (lk.get("minimap") or {}).get("port"))
     return cfg
 
 
@@ -160,6 +176,7 @@ def link_expect():
         ("对时端口", clock.get("server_port"), "clock.port"),
         ("键盘端口", kbd.get("port"), "kbd.port"),
         ("串口号", kbd.get("serial"), "kbd.serial"),
+        ("小地图端口", (lk.get("minimap") or {}).get("port"), "mmap.port"),
     )
     for label, val, where in pairs:
         if val not in (None, "", (None, None)):

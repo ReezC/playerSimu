@@ -1,0 +1,14 @@
+{
+  "frames": 266,
+  "boxes": 478,
+  "zero_frames": 33,
+  "max_boxes": 5,
+  "median_boxes": 2.0,
+  "size_median": 226.74683662622505,
+  "size_p10": 82.7825276257158,
+  "size_p90": 229.978217055442,
+  "img_size": [
+    1920,
+    1080
+  ]
+}

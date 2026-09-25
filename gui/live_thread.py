@@ -450,10 +450,10 @@ class LiveThread(QThread):
                     float(self._p.get("probe_gap", 2)))
         bits = int(self._p.get("probe_bits", 40))
 
-        # 探针几何：**优先用人工框选的结果**（config/probe_calib.json，存的是画面
-        # 比例），没有才回退到上面的像素值。比例版换流分辨率/窗口大小都不用重标。
-        # 每秒重读一次 —— 在界面上框选完不用重开预览就能生效。
-        _calib = [0.0, None]        # [上次重读时刻, 标定值]
+        # 探针几何：**项目标定优先**（decision_settings.probe_calib，按项目存 ——
+        # 不同项目分辨率/客户端布局可能不同），再退到旧的全局标定文件，最后是
+        # link.yaml 的像素值。每秒重读一次：框选完不用重开预览就能生效。
+        _calib = [0.0, None]        # [上次重读时刻, (标定值, 来源)]
         _calib_src = [None]         # 上一次记进 perf 注记的来源
 
         def _probe_geom(shape):
@@ -461,21 +461,45 @@ class LiveThread(QThread):
             if now - _calib[0] >= 1.0:
                 _calib[0] = now
                 try:
-                    _calib[1] = probe_codec.load_calib()
+                    _calib[1] = probe_codec.pick_calib(decision_settings.probe_calib)
                 except Exception:
-                    _calib[1] = None
-                src = "人工标定" if _calib[1] else "配置值"
+                    _calib[1] = (None, "配置值")
+                src = _calib[1][1]
                 if _calib_src[0] != src:
                     _calib_src[0] = src
                     perf.note("probe", src)     # 段头能看到这一段的几何是哪来的
-            cal = _calib[1]
+            cal = _calib[1][0]
             if cal:
                 return probe_codec.calib_to_px(cal, shape)
             return probe_px
         offset_ms = float(self._p.get("clock_offset_ms", 0.0) or 0.0)
 
         delays = []
-        probe_miss = 0
+        probe_miss = 0           # 解码失败（连码都解不出来）
+        probe_invalid = 0        # 解出来了、但值是**不可能的**（≥ 一天）＝几何错了
+        probe_ok = 0             # 解出了合法值（含下面被丢弃的）
+        probe_reject = 0         # 值合法、但**算不出延迟** —— 双机时钟没对齐
+        _clock = [0.0, offset_ms]
+
+        def _clock_ms():
+            """当前该用的时钟偏移（毫秒）。
+
+            启动时对过一次时，但两台机器的 NTP 各漂各的 —— 一旦漂出
+            `resolve_delay_ms` 能接受的范围（±1 分钟内），现象就是
+            「探针解码正常、却算不出延迟」，而界面上只写「解不出」。
+            所以每 5 秒从文件重读一次：在别处重新对时后自动生效，不用重开预览。
+            """
+            now = time.perf_counter()
+            if now - _clock[0] >= 5.0:
+                _clock[0] = now
+                try:
+                    from tools.config import ROOT
+                    _clock[1] = float((ROOT / "config" / "clock_offset.txt")
+                                      .read_text(encoding="utf-8").strip())
+                except Exception:
+                    pass        # 读不到就沿用旧值（别把 0 写进去）
+            return _clock[1]
+
         if probe_on:
             # 自动对时：offset 会随 Windows NTP 漂移，后台线程里重新对一次，
             # 失败就沿用 params 传进来的旧值。
@@ -484,6 +508,7 @@ class LiveThread(QThread):
                 off = sync_offset(save=True, quiet=True)
                 if off is not None:
                     offset_ms = off
+                    _clock[1] = off     # 立刻生效，不用等下一次重读
             except Exception:
                 pass
             try:
@@ -576,10 +601,17 @@ class LiveThread(QThread):
                         # 1433→161，中位同步从 35ms 掉到 12ms）。把 miss/ok 记下来，
                         # 报告里一比就知道这个数能不能信。
                         perf.count("probe_miss")
+                    elif not (0 <= ts_a < probe_codec.DAY_MS):
+                        # 解出来了、但值不可能（≥ 一天）＝**几何错了**（采样点没落在
+                        # 方块上），不是时钟问题。混进「时钟对不上」会把人引错方向
+                        # （实测：解出 306001920ms ≈ 85 小时，界面却提示去对时）。
+                        probe_invalid += 1
+                        perf.count("probe_invalid")
                     else:
+                        probe_ok += 1
                         perf.count("probe_ok")
                         d = resolve_delay_ms(
-                            (f.t_recv_wall + offset_ms / 1000.0) * 1000.0, ts_a)
+                            (f.t_recv_wall + _clock_ms() / 1000.0) * 1000.0, ts_a)
                         # 超过 5 秒视为解码错误（而不是真的有 5 秒延迟）
                         if d is not None and d < 5000:
                             delays.append(d)
@@ -589,7 +621,11 @@ class LiveThread(QThread):
                             # 性能指标，以前只在界面显示中位数、不进日志。
                             perf.sample("e2e_probe_ms", d)
                         else:
-                            # 解出来了但数值离谱（>5 秒）= 解错了一位数字，不算样本
+                            # 解出来了但算不出延迟：多半是双机时钟没对齐（也可能是
+                            # 解错了一位数字）。**和「解码失败」是两回事**，界面上要
+                            # 分开显示 —— 以前混成一句「未解出」，框选明明说解出了，
+                            # 这里却显示未解出，看着像 bug。
+                            probe_reject += 1
                             perf.count("probe_reject")
 
                 # ---- 推理（由「开始推理」开关控制）----
@@ -742,7 +778,12 @@ class LiveThread(QThread):
                         ws.jump_prediction = None
                     # 地形关系识别（感知层）：给每只怪打上所在平台 + 是否与玩家
                     # 当前平台连接。Agent 只消费 mob.reachable，不做几何运算。
-                    relate_terrain(ws.mobs, ws.player, ws.platforms)
+                    # 开关关掉时**整块跳过**（等于"没有平台可对齐"）—— 那正是
+                    # relate_terrain 在 platforms 为空时的分支结果：mob.platform_id
+                    # 留着 None、reachable 保持默认 True。语义相同，少一遍每帧循环，
+                    # 也让这个开关真正做到「关掉 = 路线识别的活一点不干」。
+                    if decision_settings.route_enabled:
+                        relate_terrain(ws.mobs, ws.player, ws.platforms)
                     _t = time.perf_counter()
                     action = agent.tick(ws)
                     perf.ms("agent_ms", _t)
@@ -938,6 +979,10 @@ class LiveThread(QThread):
                                      if delays else None),
                         "probe_on": probe_on,
                         "probe_miss": probe_miss,
+                        "probe_invalid": probe_invalid,
+                        "probe_ok": probe_ok,
+                        "probe_reject": probe_reject,
+                        "clock_offset_ms": _clock_ms(),
                         "show_fps": n_show / el if el > 0 else 0.0,
                         "boxes": n_boxes,
                         "platforms": len(ws.platforms),

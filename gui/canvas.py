@@ -170,10 +170,88 @@ class BBoxItem(QGraphicsRectItem):
         super().mouseReleaseEvent(e)
 
 
-class ImageCanvas(QGraphicsView):
-    """显示图片 + 可编辑的框。
+class ZoomPanView(QGraphicsView):
+    """看图的三种基本操作：滚轮=缩放、中键拖=平移、双击=适应窗口。
 
-    交互：
+    **为什么抽成一个基类**：质检台（ImageCanvas）和「手动目测标定」的视图都要这套
+    交互，以前各写了一份 —— 于是同一个操作在两处手感不同（缩进步进 1.15 / 1.25、
+    标定那边干脆没有双击适应），用起来就像 bug。现在只有这一份实现，谁要改一起改。
+
+    子类的鼠标事件只要**不处理中键**、并且最终 `super()` 上来即可复用；左键留给
+    子类自己（质检台用左键拉框、标定弹窗用左键拖模板）。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # 缩放时以鼠标位置为锚点，手感自然
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setDragMode(QGraphicsView.NoDrag)
+        self._panning = False
+        self._pan_start = None
+
+    def fit(self):
+        """适应窗口。子类有更好的基准（比如只框住图片）时覆盖它。
+
+        **空场景必须直接返回**：`fitInView` 拿到 0×0 的矩形会算出非法缩放，
+        Qt 内部随后越界 —— 实测表现为**偶发进程崩溃**（gui_smoke 0xC0000005，
+        8 次里崩 2 次），而且只在"画布是一张空图"时才出现，很难联想到这里。
+        """
+        r = self.scene().sceneRect()
+        if r.width() < 1 or r.height() < 1:
+            return
+        self.fitInView(r, Qt.KeepAspectRatio)
+
+    # ---------------- 事件 ----------------
+
+    def mousePressEvent(self, e):
+        # 中键拖动 = 平移画布。放大看细节时，边角的框/模板经常在视图外，
+        # 没有平移就只能反复缩小放大，很难用。
+        if e.button() == Qt.MiddleButton:
+            self._panning = True
+            self._pan_start = e.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._panning and self._pan_start is not None:
+            d = e.pos() - self._pan_start
+            self._pan_start = e.pos()
+
+            h = self.horizontalScrollBar()
+            v = self.verticalScrollBar()
+            h.setValue(h.value() - d.x())
+            v.setValue(v.value() - d.y())
+
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MiddleButton and self._panning:
+            self._panning = False
+            self._pan_start = None
+            self.setCursor(Qt.ArrowCursor)
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def wheelEvent(self, e):
+        f = 1.15 if e.angleDelta().y() > 0 else (1.0 / 1.15)
+        self.scale(f, f)
+        e.accept()
+
+    def mouseDoubleClickEvent(self, e):
+        # 双击 = 适应窗口，比去点按钮快
+        self.fit()
+        e.accept()
+
+
+class ImageCanvas(ZoomPanView):
+    """显示图片 + 可编辑的框（质检台）。
+
+    交互（缩放/平移/双击见 ZoomPanView）：
         在框上拖        → 移动
         在框边缘拖      → 缩放（8 个方向）
         在空白处拖      → 拉一个新框
@@ -195,9 +273,6 @@ class ImageCanvas(QGraphicsView):
         self.scene_ = QGraphicsScene(self)
         self.setScene(self.scene_)
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
-        self.setDragMode(QGraphicsView.NoDrag)
-        # 缩放时以鼠标位置为锚点，手感自然
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setBackgroundBrush(QBrush(QColor("#202124")))
 
         self.pix_item = None
@@ -209,9 +284,6 @@ class ImageCanvas(QGraphicsView):
         self._draw_start = None
         self._rubber = None
         self._draw_cls = None     # 正在拉的框用哪个类（按下时定，Ctrl 会临时改）
-
-        self._panning = False
-        self._pan_start = None
 
     # ---------------- 载入 ----------------
 
@@ -237,7 +309,7 @@ class ImageCanvas(QGraphicsView):
             self.add_box(x, y, bw, bh, cls, manual, self._colors)
 
         if fit:
-            self.fitInView(self.scene_.sceneRect(), Qt.KeepAspectRatio)
+            self.fit()      # 走 fit() 里的空场景守卫（0×0 上 fitInView 会崩）
 
     def img_size(self):
         if self.pix_item is None:
@@ -312,21 +384,15 @@ class ImageCanvas(QGraphicsView):
             it.setEnabled(self.editable)
 
     def fit(self):
-        if self.pix_item is not None:
-            self.fitInView(self.scene_.sceneRect(), Qt.KeepAspectRatio)
+        # 基准就是图片本身（sceneRect 在 load 里按图片尺寸设）；
+        # 空画布那一下由 ZoomPanView.fit 直接返回（见那里的崩溃说明）。
+        super().fit()
 
     # ---------------- 事件 ----------------
+    # 中键平移 / 滚轮缩放 / 双击适应窗口 都在 ZoomPanView 里，这里只管左键：
+    # 空白处拖 = 拉新框，框上拖 = 移动/缩放。
 
     def mousePressEvent(self, e):
-        # 中键拖动 = 平移画布。放大看细节时，边角的框经常在视图外，
-        # 没有平移就只能反复缩小放大，很难用。
-        if e.button() == Qt.MiddleButton:
-            self._panning = True
-            self._pan_start = e.pos()
-            self.setCursor(Qt.ClosedHandCursor)
-            e.accept()
-            return
-
         # 空白处按下 = 开始拉新框（不用切换工具，符合直觉）。
         # **按住 Ctrl = 这一框按「玩家」画**：质检时玩家框少但要准，为了它来回切
         # 下拉框很烦；按 Ctrl 画完就回到下拉框里选的类别，不用切回去。
@@ -349,18 +415,6 @@ class ImageCanvas(QGraphicsView):
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
-        if self._panning and self._pan_start is not None:
-            d = e.pos() - self._pan_start
-            self._pan_start = e.pos()
-
-            h = self.horizontalScrollBar()
-            v = self.verticalScrollBar()
-            h.setValue(h.value() - d.x())
-            v.setValue(v.value() - d.y())
-
-            e.accept()
-            return
-
         if self._rubber is not None and self._draw_start is not None:
             cur = self.mapToScene(e.pos())
             self._rubber.setRect(QRectF(self._draw_start, cur).normalized())
@@ -370,13 +424,6 @@ class ImageCanvas(QGraphicsView):
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
-        if e.button() == Qt.MiddleButton and self._panning:
-            self._panning = False
-            self._pan_start = None
-            self.setCursor(Qt.ArrowCursor)
-            e.accept()
-            return
-
         if self._rubber is not None:
             r = self._rubber.rect()
             self.scene_.removeItem(self._rubber)
@@ -395,16 +442,6 @@ class ImageCanvas(QGraphicsView):
             return
 
         super().mouseReleaseEvent(e)
-
-    def wheelEvent(self, e):
-        f = 1.15 if e.angleDelta().y() > 0 else (1.0 / 1.15)
-        self.scale(f, f)
-        e.accept()
-
-    def mouseDoubleClickEvent(self, e):
-        # 双击 = 适应窗口，比去点按钮快
-        self.fit()
-        e.accept()
 
     def keyPressEvent(self, e):
         if e.matches(QKeySequence.Copy) and self.editable:

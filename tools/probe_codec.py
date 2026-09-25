@@ -122,6 +122,14 @@ def ts_plausible(ts, minutes: float = 10.0) -> bool:
     """
     if ts is None:
         return False
+    # **先卡范围：必须落在「一天之内」才算合法值。**
+    # 40 位能表示到 1.1e12 ms（约 34.9 年），而一天只要 27 位 —— 解出的乱码
+    # 大多数都 ≥ 一天。老代码只算环形距离，`DAY_MS - d` 在 d > DAY_MS 时是**负数**，
+    # 于是任何高位置 1 的乱码都被判成「接近此刻」＝放行。
+    # 后果实测过：错位采样存进一份坏几何，界面说「与本地时刻相符 —— 对准了」，
+    # 而实时那边永远算不出延迟（解出的是 306001920ms ≈ 85 小时这种值）。
+    if not (0 <= ts < DAY_MS):
+        return False
     d = abs(ts - now_ms())
     d = min(d, DAY_MS - d)
     return d < minutes * 60 * 1000
@@ -168,7 +176,7 @@ def geometry_from_rect(rect, bits: int = DEFAULT_BITS, gap_hint=None) -> dict | 
 
 
 def solve_from_rect(gray, rect, bits: int = DEFAULT_BITS, strict: bool = True,
-                    gap_hint=None) -> dict | None:
+                    gap_hint=None, cell_hint=None) -> dict | None:
     """以框选为起点小范围搜索，返回**真能解出时间码**的几何；解不出返回 None。
 
     **为什么还要搜**：人眼框的边不等于像素级精确（±2~3px 很常见），而这是 40 位码 ——
@@ -195,13 +203,27 @@ def solve_from_rect(gray, rect, bits: int = DEFAULT_BITS, strict: bool = True,
     # 优先就近：位移小、cell 偏差小的先试（多半第一下就中 —— 采样窗口本身
     # 就有 ±cell/4 的容差，±3px 的框选误差通常直接过）。
     # 范围给到 ±5：框错一点点不该让人重来一遍；700 多个候选也就几十毫秒。
+    # 候选 cell：框选高度 ±1，再**加上调用方给的已知好值**（通常来自 link.yaml
+    # 的 probe.cell）。有它，框得整体偏小也能救回来 —— 判据没放宽（照样必须解出
+    # 合理时间码），所以多试几个候选不会放坏值进去，只是更宽容。
+    cells = [base["cell"], base["cell"] - 1, base["cell"] + 1]
+    if cell_hint and float(cell_hint) not in cells:
+        cells.append(float(cell_hint))
+
     cands = []
+    # **已知好值排在最前面**：调用方给的 (cell_hint, gap_hint) 通常是上一次能出数的
+    # 几何（来自 link.yaml）。必须优先 —— 否则「框得偏小 + 乱码侥幸落在值域内」
+    # 会被先选中（实测踩过：cell=14 gap=0 解出一个碰巧在一天之内的乱码，把真正
+    # 对的那份挡在后面，框选提示"对准了"，实时却一直报几何不对）。
+    # 判据没放宽：它要是解不出合理值，就继续往下扫。
+    if cell_hint and gap_hint is not None:
+        cands.append((0, 0, 0, 0, float(cell_hint), float(gap_hint)))
     for dx in range(-5, 6):
         for dy in range(-5, 6):
-            for dcell in (0, -1, 1):
+            for cell in cells:
                 for g in sorted(gaps, key=lambda v: abs(v - base["gap"])):
-                    cands.append((abs(dx) + abs(dy), abs(dcell), dx, dy,
-                                  base["cell"] + dcell, g))
+                    cands.append((abs(dx) + abs(dy), abs(cell - base["cell"]),
+                                  dx, dy, cell, g))
     cands.sort(key=lambda c: (c[0], c[1]))
 
     fallback = None
@@ -214,6 +236,11 @@ def solve_from_rect(gray, rect, bits: int = DEFAULT_BITS, strict: bool = True,
         except Exception:
             continue
         if ts is None:
+            continue
+        # 值必须落在一天之内，否则必然是错位采样（见 ts_plausible 的说明）。
+        # 这条**不依赖双机是否对时**，所以连 strict=False 的退路也要守 ——
+        # 「解不出就不保存」这句得先保证「解出的值本身可能是真的」。
+        if not (0 <= ts < DAY_MS):
             continue
         hit = {"x": x, "y": y, "cell": float(cell), "gap": float(g),
                "bits": int(bits), "ts": int(ts),
@@ -238,10 +265,14 @@ def load_calib() -> dict | None:
         return None
 
 
-def save_calib(geo, frame_shape, bits: int = DEFAULT_BITS) -> dict:
-    """把几何按**画面比例**存下来（换分辨率不用重标）。返回存下的 dict。"""
+def calib_from_geo(geo, frame_shape, bits: int = DEFAULT_BITS) -> dict:
+    """框选几何 → 标定 dict（**存画面比例**）。纯函数，不落盘。
+
+    项目标定用的就是它：比例存进项目后，换分辨率/窗口都不用重标
+    （read_bits 明确支持浮点 cell）。
+    """
     h, w = int(frame_shape[0]), int(frame_shape[1])
-    d = {
+    return {
         "x_ratio": geo["x"] / w,
         "y_ratio": geo["y"] / h,
         "cell_ratio": geo["cell"] / w,
@@ -250,10 +281,42 @@ def save_calib(geo, frame_shape, bits: int = DEFAULT_BITS) -> dict:
         "frame": [w, h],            # 标定时用的画面尺寸（只为看日志，不参与换算）
         "solved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+def save_calib(geo, frame_shape, bits: int = DEFAULT_BITS) -> dict:
+    """把几何存成**全局**标定文件（旧路径，保留兼容）。返回存下的 dict。
+
+    新流程存进**项目**（见 settings.probe_calib）—— 不同项目可能分辨率/客户端
+    布局不同；这个文件只作为「项目里没有时的回退」，让老标定不至于白丢。
+    """
+    d = calib_from_geo(geo, frame_shape, bits)
     CALIB_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(CALIB_FILE, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
     return d
+
+
+def pick_calib(project_calib=None):
+    """该用哪份标定 → (标定 dict, 来源文字)；都没有返回 (None, "配置值")。
+
+    **优先级：项目里的 → 全局文件 → 都不用（调用方回退到 link.yaml 的像素值）。**
+
+    项目优先，和 HP/MP 条同一套思路：不同项目可能分辨率/客户端布局不同，
+    标定要跟着项目走；没打开项目时 `project_calib` 来自「最近打开的项目」
+    （见 gui/main_window.py 的 _bind_decision_params）。全局文件是旧版存法，
+    留着是为了不把已经标好的白丢。
+    """
+    for d, src in ((project_calib, "项目标定"), (load_calib(), "全局标定")):
+        if not d:
+            continue
+        try:
+            vals = [float(d[k]) for k in
+                    ("x_ratio", "y_ratio", "cell_ratio", "gap_ratio")]
+        except Exception:
+            continue                    # 结构不对就跳过，别拿坏值去采样
+        if all(v > 0 for v in vals):
+            return dict(d), src
+    return None, "配置值"
 
 
 def calib_to_px(cal, shape):

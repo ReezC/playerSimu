@@ -27,6 +27,28 @@
     "passthrough": false,
     "pkt_size": 1316
   },
+  "mmap": {
+    "bind": "0.0.0.0",
+    "port": 5003,
+    "zoom": 3,
+    "fps": 10,
+    "quality": 100,
+    "x": null,
+    "y": null,
+    "w": null,
+    "h": null
+  },
+  "mmap": {
+    "bind": "0.0.0.0",
+    "port": 5003,
+    "zoom": 3,
+    "fps": 10,
+    "quality": 100,
+    "x": null,
+    "y": null,
+    "w": null,
+    "h": null
+  },
   "window": {
     "w": 1396,
     "h": 860

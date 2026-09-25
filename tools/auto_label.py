@@ -34,7 +34,9 @@ def load_templates(root: Path, limit_mobs: int, per_mob: int, verbose=True):
         if not frames:
             continue
 
-        pref = [f for f in frames if f.name.startswith(("stand_", "move_"))] or frames
+        # fly 也要在优先队列里：飞的怪常常只有 fly，没有 stand
+        pref = [f for f in frames
+                if f.name.startswith(("stand_", "fly_", "move_"))] or frames
         for f in pref[:per_mob]:
             t = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
             if t is None or t.ndim != 3 or t.shape[2] != 4:
@@ -165,7 +167,10 @@ def main() -> int:
                 except Exception:
                     continue
 
+                # 同 detect_mobs：分母趋 0 时 OpenCV 会给 FLT_MAX（有限值，
+                # nan_to_num 不管），不掐掉的话黑边会给出"满分"假框。
                 res = np.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
+                res[res > 1.0] = 0.0
                 if res.max() < args.thresh:
                     continue
 

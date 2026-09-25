@@ -121,6 +121,93 @@ def _overlap(cx, cy, w, h, boxes, thr=OVERLAP_THR):
     return False
 
 
+def _roi_from_box(x1, y1, x2, y2, shape, margin=0.5, min_side=64.0):
+    """玩家框 → 模板匹配的搜索区域（自然外扩一圈再裁到图内）。
+
+    margin 是相对框**长边**的外扩比例。**必须留足余量**：`player_locator` 会跳过
+    「比搜索区还大」的模板（`perception/player_locator.py:122`），区域贴着模板大小
+    时稍有偏差就整帧白跑 —— 那等于白丢召回。
+
+    shape: (h, w)。返回 (x, y, w, h)；框无效/太小返回 None。
+    """
+    h, w = int(shape[0]), int(shape[1])
+    bw, bh = float(x2) - float(x1), float(y2) - float(y1)
+    if bw <= 0 or bh <= 0 or w <= 0 or h <= 0:
+        return None
+    m = max(min_side / 2.0, margin * max(bw, bh))
+    rx1 = int(max(0.0, float(x1) - m))
+    ry1 = int(max(0.0, float(y1) - m))
+    rx2 = int(min(float(w), float(x2) + m))
+    ry2 = int(min(float(h), float(y2) + m))
+    if rx2 - rx1 < 8 or ry2 - ry1 < 8:
+        return None
+    return (rx1, ry1, rx2 - rx1, ry2 - ry1)
+
+
+def player_rois(frames, weights, player_id="", weights_player_id="",
+                conf=0.25, imgsz=960, device=None, margin=0.5, ctx=None):
+    """跑一遍 YOLO，得到**每帧玩家框所在的搜索区域** → `{帧stem: (x, y, w, h)}`。
+
+    **为什么**：玩家标注的成本全在模板匹配上（102 个模板 × 整幅图，实测约
+    11 秒/帧），而同一批帧 YOLO 只要约 0.1 秒/帧（批推理 + GPU + imgsz 缩小）。
+    先用 YOLO 圈出玩家可能在的地方，模板匹配只在圈里找。
+
+    **没检出的帧不进返回表**，调用方对缺项按「全图匹配」处理 —— 这是刻意设计：
+    YOLO 漏检（玩家在角落、被怪挡住、姿态罕见）时那一帧仍走原来的全图路径，
+    **召回率与不优化时完全一致**。优化只动速度，不动结果。
+    角色不一致的模型直接返回空表（圈出来的区域没有意义），同样退回全图。
+    """
+    if player_id and weights_player_id and player_id != weights_player_id:
+        if ctx:
+            ctx.log("模型角色「%s」≠ 当前角色「%s」，跳过 YOLO 粗定位"
+                    % (weights_player_id, player_id), "warn")
+        return {}
+
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        if ctx:
+            ctx.log("没有装 ultralytics，跳过 YOLO 粗定位", "warn")
+        return {}
+
+    if ctx:
+        ctx.progress(0, 0, "加载模型（粗定位）…")
+    model = YOLO(str(weights))
+
+    out = {}
+    stream = model.predict(source=[str(f) for f in frames], conf=conf,
+                           iou=0.5, imgsz=imgsz, device=device,
+                           verbose=False, stream=True)
+    for r in stream:
+        if ctx is not None and ctx.canceled():
+            if ctx:
+                ctx.log("已取消，粗定位中断（剩下的帧按全图匹配）", "warn")
+            break
+        path = Path(getattr(r, "path", "") or "")
+        if not path.stem:
+            continue
+        boxes = getattr(r, "boxes", None)
+        shape = getattr(r, "orig_shape", None)
+        if boxes is None or not len(boxes) or not shape:
+            continue
+        cls = boxes.cls.cpu().numpy()
+        confs = boxes.conf.cpu().numpy()
+        xyxy = boxes.xyxy.cpu().numpy()
+        best = None
+        for c, cf, box in zip(cls, confs, xyxy):
+            if int(c) != CLASS_PLAYER:
+                continue
+            if best is None or float(cf) > best[0]:
+                best = (float(cf), float(box[0]), float(box[1]),
+                        float(box[2]), float(box[3]))
+        if best is None:
+            continue
+        roi = _roi_from_box(best[1], best[2], best[3], best[4], shape, margin)
+        if roi:
+            out[path.stem] = roi
+    return out
+
+
 def run_yolo_augment(params, ctx=None):
     """用已有模型预测，把预测框合并进已有标注。
 

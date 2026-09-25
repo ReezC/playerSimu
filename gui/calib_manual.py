@@ -15,11 +15,12 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QImage, QPainter, QPixmap, QTransform
 from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                              QDoubleSpinBox, QGraphicsPixmapItem, QGraphicsScene,
-                             QGraphicsView, QHBoxLayout, QLabel, QSlider,
+                             QHBoxLayout, QLabel, QPushButton, QSlider,
                              QVBoxLayout)
 
 from core import wzexport
 from core.imgio import imread   # 支持中文路径，cv2.imread 遇中文会静默失败
+from gui.canvas import ZoomPanView   # 和质检台**同一份**看图交互（滚轮/中键/双击）
 from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,
                          NoWheelSlider)
 
@@ -54,54 +55,6 @@ def _load_trimmed_pixmap(path):
     h, w = rgba.shape[:2]
     qimg = QImage(rgba.data, w, h, rgba.strides[0], QImage.Format_RGBA8888)
     return QPixmap.fromImage(qimg.copy())
-
-
-class ZoomableView(QGraphicsView):
-    """支持滚轮缩放 + 中键按住拖拽平移的视图。
-
-    左键仍留给「拖动模板」用（ItemIsMovable），互不冲突。
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
-        self._panning = False
-        self._pan_start = None
-
-    def wheelEvent(self, ev):
-        factor = 1.25 if ev.angleDelta().y() > 0 else 0.8
-        self.scale(factor, factor)
-        ev.accept()
-
-    def mousePressEvent(self, ev):
-        if ev.button() == Qt.MiddleButton:
-            self._panning = True
-            self._pan_start = ev.pos()
-            self.setCursor(Qt.ClosedHandCursor)
-            ev.accept()
-            return
-        super().mousePressEvent(ev)
-
-    def mouseMoveEvent(self, ev):
-        if self._panning and self._pan_start is not None:
-            delta = ev.pos() - self._pan_start
-            self._pan_start = ev.pos()
-            self.horizontalScrollBar().setValue(
-                self.horizontalScrollBar().value() - delta.x())
-            self.verticalScrollBar().setValue(
-                self.verticalScrollBar().value() - delta.y())
-            ev.accept()
-            return
-        super().mouseMoveEvent(ev)
-
-    def mouseReleaseEvent(self, ev):
-        if ev.button() == Qt.MiddleButton and self._panning:
-            self._panning = False
-            self.setCursor(Qt.ArrowCursor)
-            ev.accept()
-            return
-        super().mouseReleaseEvent(ev)
 
 
 class CalibManualDialog(QDialog):
@@ -148,8 +101,41 @@ class CalibManualDialog(QDialog):
         top.addWidget(self.cmb_frame, 1)
         root.addLayout(top)
 
+        # ---- 翻帧：和质检台同一套（◀　位置　拖动滑块　▶）----
+        # 为什么不能只有下拉框：对齐模板常要在**连续几帧**里挑目标最清楚的那帧，
+        # 滑一下就翻一帧，比"展开下拉再选"快得多（质检台就是这么用的）。
+        # 下拉框保留 —— 帧很多时它能直接跳到指定帧，两者是互补的。
+        nav = QHBoxLayout()
+        nav.setSpacing(6)
+        self.btn_prev = QPushButton("◀")
+        self.btn_prev.setFixedWidth(36)
+        self.btn_prev.setStyleSheet("padding: 2px 4px;")
+        self.btn_prev.setToolTip("上一帧（也可以直接拖右边的滑块）")
+        self.btn_prev.clicked.connect(lambda: self._step_frame(-1))
+        nav.addWidget(self.btn_prev)
+
+        self.lbl_pos = QLabel("0 / 0")
+        self.lbl_pos.setMinimumWidth(96)
+        self.lbl_pos.setAlignment(Qt.AlignCenter)
+        nav.addWidget(self.lbl_pos)
+
+        self.sld_frame = NoWheelSlider(Qt.Horizontal)
+        self.sld_frame.setMinimum(0)
+        self.sld_frame.valueChanged.connect(self._on_frame_slider)
+        nav.addWidget(self.sld_frame, 1)
+
+        self.btn_next = QPushButton("▶")
+        self.btn_next.setFixedWidth(36)
+        self.btn_next.setStyleSheet("padding: 2px 4px;")
+        self.btn_next.setToolTip("下一帧（也可以直接拖左边的滑块）")
+        self.btn_next.clicked.connect(lambda: self._step_frame(1))
+        nav.addWidget(self.btn_next)
+        root.addLayout(nav)
+
         # ---- 视图 ----
-        self.view = ZoomableView()
+        # 用**质检台同一个基类**（gui.canvas.ZoomPanView）：滚轮缩放、中键平移、
+        # 双击适应窗口 —— 以前这里自己写了一份，于是没有双击适应、缩进步进也不同。
+        self.view = ZoomPanView()
         self.view.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         self.view.setStyleSheet("background:#202124; border:1px solid #3c4043;")
         self.scene = QGraphicsScene(self)
@@ -184,7 +170,8 @@ class CalibManualDialog(QDialog):
         row.addWidget(self.ck_mirror)
         root.addLayout(row)
 
-        hint = QLabel("拖动模板到目标上，调缩放让轮廓重合，确定即取当前缩放为尺度。")
+        hint = QLabel("拖动模板到目标上，调缩放让轮廓重合，确定即取当前缩放为尺度。"
+                      "　滚轮=缩放　中键拖=平移　双击=适应窗口　◀▶/滑块=翻帧")
         hint.setStyleSheet("color:#80868b;")
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -222,6 +209,42 @@ class CalibManualDialog(QDialog):
         for f in frames:
             self.cmb_frame.addItem(f.name, str(f))
         self.cmb_frame.blockSignals(False)
+
+        # 滑块范围跟着帧数走（帧 0 个时也要能显示 0 / 0，不能停在旧帧数上）
+        self.sld_frame.blockSignals(True)
+        self.sld_frame.setMaximum(max(0, len(frames) - 1))
+        self.sld_frame.setValue(0)
+        self.sld_frame.blockSignals(False)
+        self._update_pos()
+
+    def _update_pos(self):
+        """帧下拉 / 滑块 / 「i / n」标签三者对齐（和质检台一样显示 1-based）。"""
+        n = len(getattr(self, "_frames", None) or [])
+        i = self.cmb_frame.currentIndex()
+        self.lbl_pos.setText("%d / %d" % (i + 1 if (n and i >= 0) else 0, n))
+
+        self.sld_frame.blockSignals(True)
+        self.sld_frame.setValue(max(0, i))
+        self.sld_frame.blockSignals(False)
+
+    def _step_frame(self, delta):
+        """◀ / ▶：翻一帧。到头就停住，不绕回（免得手快翻到不知道哪去了）。"""
+        n = self.cmb_frame.count()
+        if not n:
+            return
+        i = max(0, min(self.cmb_frame.currentIndex() + delta, n - 1))
+        if i != self.cmb_frame.currentIndex():
+            self.cmb_frame.setCurrentIndex(i)       # 信号 → _reload_frame
+        else:
+            self._update_pos()
+
+    def _on_frame_slider(self, val):
+        """拖动滑块翻帧（质检台里就是拖这条）。"""
+        if (0 <= val < self.cmb_frame.count()
+                and val != self.cmb_frame.currentIndex()):
+            self.cmb_frame.setCurrentIndex(val)     # 信号 → _reload_frame
+        else:
+            self._update_pos()
 
     def _on_target(self):
         self.cmb_tpl.blockSignals(True)
@@ -293,6 +316,8 @@ class CalibManualDialog(QDialog):
         self._center_template()
 
     def _reload_frame(self):
+        # 先对齐滑块/标签：这个函数可能是滑块拖动触发的，不能让它们自己不同步
+        self._update_pos()
         path = self.cmb_frame.currentData()
         pm = _load_frame_pixmap(path) if path else None
         if pm is None:
@@ -310,7 +335,9 @@ class CalibManualDialog(QDialog):
         self._tpl_item.setPos(bg.width() / 2, bg.height() / 2)
 
     def _fit_view(self):
-        self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+        # 走 ZoomPanView.fit()：和质检台的「适应窗口」是同一份实现
+        # （双击画面也是调它，两边行为必然一致）
+        self.view.fit()
 
     def _on_slider(self, val):
         self._scale = val / 1000.0

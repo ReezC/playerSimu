@@ -12,8 +12,11 @@ from PyQt5.QtWidgets import (QCheckBox, QFormLayout, QHBoxLayout, QLabel,
                              QLineEdit, QMessageBox, QPushButton, QSizePolicy,
                              QVBoxLayout, QWidget)
 
+import time
+
 import numpy as np
 
+from decision.agent import settings
 from gui.live_thread import LiveThread
 from gui.widgets import NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox
 from tools.config import ROOT, get, load_live, save_live
@@ -230,18 +233,22 @@ class LivePanel(QWidget):
     # ---------------- 探针几何（人工框选标定） ----------------
 
     def _probe_label_text(self):
-        """当前探针几何 + 来源，一行说完。"""
+        """当前探针几何 + 来源，一行说完。
+
+        来源有三种，**项目标定优先**（标定跟项目走，见 pick_calib 的说明）。
+        """
         from tools import probe_codec
         bits = int(get("probe", "bits", 40))
-        cal = probe_codec.load_calib()
+        cal, src = probe_codec.pick_calib(settings.probe_calib)
         if cal:
             if self._last_bgr is not None:
                 h, w = self._last_bgr.shape[:2]
                 x, y, cell, gap = probe_codec.calib_to_px(cal, (h, w))
-                return ("探针：人工标定  x=%.0f y=%.0f cell=%.1f gap=%.1f bits=%d"
-                        "（按当前画面 %d×%d 换算）" % (x, y, cell, gap, bits, w, h))
-            return ("探针：人工标定（画面比例 x=%.4f y=%.4f cell=%.4fW gap=%.4fW bits=%d）"
-                    % (cal["x_ratio"], cal["y_ratio"], cal["cell_ratio"],
+                return ("探针：%s  x=%.0f y=%.0f cell=%.1f gap=%.1f bits=%d"
+                        "（按当前画面 %d×%d 换算）" % (src, x, y, cell, gap,
+                                                     bits, w, h))
+            return ("探针：%s（画面比例 x=%.4f y=%.4f cell=%.4fW gap=%.4fW bits=%d）"
+                    % (src, cal["x_ratio"], cal["y_ratio"], cal["cell_ratio"],
                        cal["gap_ratio"], bits))
         return ("探针：用 link.yaml 的配置值  x=%s y=%s cell=%s gap=%s bits=%d"
                 "　（位置不对就点「框选探针」）"
@@ -250,6 +257,18 @@ class LivePanel(QWidget):
 
     def _refresh_probe_label(self, extra=""):
         self.lbl_probe.setText(self._probe_label_text() + extra)
+
+    def _arm_probe_verify(self):
+        """布置「存后自检」：2.5 秒后用实时统计的**增量**回头看通没通。
+
+        存下来 ≠ 生效：框选/量出的几何只保证"当时那一帧解得出来"，实时是每帧
+        在当前画面上采样。所以这里记下当前的计数，稍后比对（见 _verify_calib_if_due）。
+        """
+        st = getattr(self, "_last_stats", None) or {}
+        self._verify = [time.monotonic() + 2.5,
+                        int(st.get("probe_ok") or 0),
+                        int(st.get("probe_invalid") or 0)
+                        + int(st.get("probe_miss") or 0)]
 
     def _pick_probe(self):
         """在实时画面上框选探针方块带 → 当场解码验证 → 通过才保存标定。
@@ -277,8 +296,11 @@ class LivePanel(QWidget):
         # 没对过时的机器上，「接近此刻」这条判据用不了（差多少全看钟差），
         # 这时退一步：能解出合法码就先标上，并明确告诉用户去对时。
         offset_ok = (ROOT / "config" / "clock_offset.txt").exists()
+        # 两个 hint 都来自 link.yaml：框得偏小时，用这份**已知能出数**的几何兜底。
+        # 判据不因此放宽（照样要解出合理时间码），所以只是更宽容、不会存坏值。
         geo = probe_codec.solve_from_rect(gray, rect, bits, strict=offset_ok,
-                                          gap_hint=get("probe", "gap", 2))
+                                          gap_hint=get("probe", "gap", 2),
+                                          cell_hint=get("probe", "cell", 20))
         if geo is None:
             QMessageBox.warning(
                 self, "没解出时间码",
@@ -287,16 +309,29 @@ class LivePanel(QWidget):
                 "  1. A 机是不是在跑  python -m tools.probe_gen\n"
                 "  2. 要框住**整条方块带**：包括最左边那个常亮的白块，"
                 "和它后面那个常黑的块（头两个是编码的起始标记）\n"
-                "  3. 方块要够大：cell ≥ 16px（太小的话 40 位时间戳会被压缩磨掉）\n"
+                "  3. 方块要够大：cell ≥ 16px，而且**框的高度要正好贴住方块高度**\n"
+                "     （框紧了 cell 会小一截，再往下每个方块都错位 —— 40 位码必错）\n"
                 "  4. bits 要和 A 机一致（现在是 %d）\n"
                 "  5. 画面里那条带子如果发虚/被 UI 压住，先在 A 机挪开探针再标" % bits)
             return
 
         dx, dy, dcell = geo["snap"]
-        probe_codec.save_calib(geo, frame.shape, bits)
+        # **存进项目**（settings 按项目持久化，和 HP/MP 条同一套机制）：
+        # 换项目就换一份标定；没打开项目时只改内存（会被项目里的值覆盖）。
+        settings.probe_calib = probe_codec.calib_from_geo(geo, frame.shape, bits)
+        settings.save()
+        # 存了不等于生效：过 2.5 秒拿实时统计的**增量**回头验一次
+        # （见 _verify_calib_if_due；"那一帧能解出"和"每帧都能解出"是两回事）。
+        self._arm_probe_verify()
         h, w = frame.shape[:2]
-        tail = ("　自动对齐修正 dx=%+d dy=%+d dcell=%+d" % (dx, dy, dcell)
-                if (dx or dy or dcell) else "")
+        # 修正量要写清楚：框小了会被「已知好值」救回来，但那不等于没问题 ——
+        # 40 位码靠**节距**对齐，框选高度差几像素就该重框（这里只是兜底）。
+        tail = ""
+        if dx or dy or dcell:
+            tail = "　自动对齐修正 dx=%+d dy=%+d dcell=%+d" % (dx, dy, dcell)
+            if abs(dcell) >= 2:
+                tail += ("（框选高度差 %dpx，已按 link.yaml 的 cell=%.0f 对齐 ——\n"
+                         "建议重框：高度贴住方块）" % (abs(dcell), geo["cell"]))
         if geo["plausible"]:
             extra = "　✓ 解出 ts=%d ms，与本地时刻相符" % geo["ts"]
             head = "✓ 标定成功"
@@ -306,8 +341,11 @@ class LivePanel(QWidget):
             extra = "　⚠ 解出 ts=%d ms，但对不上本地时刻" % geo["ts"]
             head = "✓ 已标出位置（还没对时）"
             body = ("在框选附近解出了时间码 %d ms，几何应该是对的；但它和本地时刻对不上，"
-                    "说明**双机还没对时** ——\n"
-                    "跑一次：python -m tools.clock_sync --host <A机IP> --save"
+                    "说明**双机还没对时**。\n\n"
+                    "**注意**：在这种情况下，上面那行「端到端延迟」仍会显示解不出 ——\n"
+                    "因为「解出时间码」和「算出延迟」是两件事：后者还要双机时钟对齐在\n"
+                    "1 分钟以内。跑一次对时就都通了：\n"
+                    "    python -m tools.clock_sync --host <A机IP> --save"
                     % geo["ts"])
         self._refresh_probe_label(extra)
         QMessageBox.information(
@@ -522,15 +560,74 @@ class LivePanel(QWidget):
         super().resizeEvent(ev)
         self._render()          # 窗口变大时把画面重新贴满
 
+    def _verify_calib_if_due(self, s):
+        """框选保存后过 2.5 秒回头看一眼：实时那边到底通没通。
+
+        「保存成功」只说明**当时那一帧**解得出来；实时是每帧都在当前画面上采样，
+        几何差一点就会解出乱码（而乱码偶尔也能落在值域内骗过判据）。所以这里用
+        **增量**判断：这几秒里有没有解出过。不通过就当场说清楚，
+        别让人对着两行矛盾的信息自己猜（实测为这个来回折腾了好几轮）。
+        """
+        v = getattr(self, "_verify", None)
+        if not v or time.monotonic() < v[0]:
+            return
+        self._verify = None
+        ok = int(s.get("probe_ok") or 0) - v[1]
+        bad = (int(s.get("probe_invalid") or 0)
+               + int(s.get("probe_miss") or 0)) - v[2]
+        if not s.get("probe_on") or s.get("delay_ms") is not None or ok > 0:
+            return                      # 通了：不打扰
+        if bad <= 0:
+            return                      # 这几秒没解过（可能没画面）：不下结论
+        QMessageBox.warning(
+            self, "标定没生效",
+            "标定已保存，但**实时那边这几秒一帧都没解出来**（无效 %d 帧）——\n"
+            "说明这份几何在连续画面上不对，多半是框选时没框住方块。\n\n"
+            "重框时注意：\n"
+            "  1. 高度要**正好贴住方块**（小一格，40 位码往后全错位）\n"
+            "  2. 宽度要**量到整条带的外缘**（最后一块的右边）\n"
+            "  3. 对照 link.yaml 的 probe.cell / probe.gap（现在是 %s / %s）\n\n"
+            "（这份标定已经存了，但它不生效；重框会覆盖它。）"
+            % (bad, get("probe", "cell", 20), get("probe", "gap", 2)))
+
     def _on_stats(self, s):
+        self._last_stats = s
+        self._verify_calib_if_due(s)
         w, h = s.get("size") or (0, 0)
         d = s.get("delay_ms")
+        self.lbl_stats.setToolTip("")
         if d is not None:
             d_txt = "端到端延迟 %6.0f ms" % d
-        elif s.get("probe_on"):
-            d_txt = "端到端延迟  ——  （探针未解出，共 %d 帧）" % s.get("probe_miss", 0)
-        else:
+        elif not s.get("probe_on"):
             d_txt = "端到端延迟  ——  （未启用探针）"
+        elif s.get("probe_invalid"):
+            # 解出来了、但值是**不可能的**（≥ 一天，例如 306001920ms ≈ 85 小时）
+            # ＝采样点没落在方块上，**几何错了**。这时绝不能提示「去对时」——
+            # 实测踩过：界面让人去对时，其实是框选没框准，方向全错。
+            d_txt = "端到端延迟  ——  （解出的时间码无效：探针几何不对）"
+            self.lbl_stats.setToolTip(
+                "从框选区里解出的值不在一天之内（本次运行 %d 帧），说明采样点没落在\n"
+                "方块上 —— **是位置/大小标错了，不是时钟问题**。点「框选探针」重框：\n"
+                "  1. 要框住**整条方块带**（含最左边常亮白块 + 后面那个常黑块）\n"
+                "  2. **框的高度要正好贴住方块**（框紧了 cell 会小一截，40 位码当场错位）\n"
+                "  3. 对照 link.yaml 的 probe.cell（现在是 %s）看是不是差一截"
+                % (int(s.get("probe_invalid", 0)), get("probe", "cell", 20)))
+        elif s.get("probe_ok"):
+            rej = int(s.get("probe_reject", 0))
+            d_txt = "端到端延迟  ——  （已解出、但时钟对不上）"
+            self.lbl_stats.setToolTip(
+                "探针**解码是成功的、值也在一天之内**（本次运行已丢弃 %d 帧），算不出\n"
+                "延迟是因为双机时钟差得超出可接受范围（对时后应只差几毫秒）。跑一次对时：\n"
+                "    python -m tools.clock_sync --host <A机IP> --save\n"
+                "当前用的时钟偏移 = %.0f ms（config/clock_offset.txt，每 5 秒自动重读，\n"
+                "所以对完时不用重开预览）。" % (rej, s.get("clock_offset_ms", 0.0)))
+        else:
+            d_txt = "端到端延迟  ——  （探针解不出，共 %d 帧）" % s.get("probe_miss", 0)
+            self.lbl_stats.setToolTip(
+                "连时间码都没解出来（不是时钟问题）。按顺序查：\n"
+                "  1. A 机在跑 python -m tools.probe_gen 吗\n"
+                "  2. 点「框选探针」重新框一次（框住整条方块带）\n"
+                "  3. 探针方块带有没有被游戏 UI 压住 / 画得太小（cell ≥ 16px）")
         # 断线重连在做的事放在最前面 —— 这时候帧率数字意义不大，状态才是要紧的
         note = (s.get("reconnect") or "").strip()
         head = "【%s】 " % note if note else ""

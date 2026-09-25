@@ -151,6 +151,29 @@ def check_certs(cfg):
     return out
 
 
+def check_region(cfg):
+    """小地图区域框了没有 / 框得对不对（只有用寻路定位时才需要）。
+
+    **没框选只算 warn 不算 bad**：不用寻路的人根本不需要这张卡片，
+    把它标成红的会让人以为部署台坏了。
+    """
+    vals = [cfg.get(k) for k in ("x", "y", "w", "h")]
+    if any(v in (None, "") for v in vals):
+        return [warn("小地图区域还没框选",
+                     "只在用寻路定位时才需要：在「小地图推流」卡片里点「框选…」，\n"
+                     "把游戏的小地图面板框出来（只框面板本身）。")]
+    try:
+        x, y, w, h = (int(v) for v in vals)
+    except (TypeError, ValueError):
+        return [bad("小地图区域填得不对",
+                    "应该是四个整数 x,y,w,h，现在是：%s\n"
+                    "点「框选…」重框一次最省事。" % (vals,))]
+    if w < 20 or h < 20:
+        return [warn("小地图区域偏小（%dx%d）" % (w, h),
+                     "确认框的是**整个**小地图面板 —— 太小 B 机认不出是哪个地图。")]
+    return [ok("小地图区域已框选", "屏幕 (%d,%d) %dx%d" % (x, y, w, h))]
+
+
 def check_link(cfg, expect):
     """部署台的参数和 config/link.yaml 对不对得上。
 
@@ -168,6 +191,7 @@ def check_link(cfg, expect):
         "对时端口": cfg.get("clock", {}).get("port"),
         "键盘端口": cfg.get("kbd", {}).get("port"),
         "串口号": cfg.get("kbd", {}).get("serial"),
+        "小地图端口": cfg.get("mmap", {}).get("port"),
     }
     out = []
     for label, (want, where) in expect.items():
@@ -209,6 +233,7 @@ def run(cfg, expect=None):
     guard(check_serial, cfg.get("kbd", {}))
     guard(check_host, cfg.get("push", {}))
     guard(check_certs, cfg.get("kbd", {}))
+    guard(check_region, cfg.get("mmap", {}))
     guard(check_link, cfg, expect)
     return items
 

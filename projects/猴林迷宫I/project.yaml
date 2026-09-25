@@ -1,0 +1,234 @@
+name: 猴林迷宫I
+map_id: '100040102'
+mobs:
+- '3230100'
+- '4230101'
+scale: 1.406
+mob_scales: {}
+scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
+calib:
+  min_scale: 0.4
+  max_scale: 2.4
+  step: 0.1
+  sample: 5
+bars: {}
+decision:
+  attack_dist: 400.0
+  min_attack_dist: 50
+  chase_jump_enabled: true
+  chase_jump_min: -30
+  chase_jump_max: 5
+  mouse_speed: 1.8000000000000005
+  evade_type: jump
+  jump_interval: 0
+  jump_random_prob: 0.1
+  back_jump_seq:
+  - type: down
+    key: back
+  - type: delay
+    ms: 800
+  - type: down
+    key: jump
+  - type: delay
+    ms: 20
+  - type: up
+    key: back
+  - type: up
+    key: jump
+  - type: down
+    key: forward
+  - type: delay
+    ms: 150
+  - type: down
+    key: attack
+  - type: up
+    key: attack
+  - type: up
+    key: forward
+  output_seq:
+  - type: down
+    key: jump
+    prob: 10
+    then:
+    - type: up
+      key: jump
+  - type: down
+    key: attack
+  - type: up
+    key: attack
+  keymap:
+    auto: f11
+    left: left
+    right: right
+    up: up
+    down: down
+    attack: s
+    jump: D
+    hp_pot: g
+    mp_pot: null
+    feed_pet: pagedown
+    shop: null
+    enter: enter
+  target_cd:
+  - 1500
+  - 2500
+  input_device: local
+  input_delay:
+  - 0
+  - 50
+  attack_cd: 200
+  attack_lock_debounce_ms: 1000
+  min_turn_hold_ms: 1000
+  turn_output_delay_ms: 200
+  player_track_jump: 200
+  hp_bar: null
+  mp_bar: null
+  probe_calib: {}
+  hp_color:
+  - - 0
+    - 0
+    - 137
+  - - 78
+    - 80
+    - 255
+  mp_color:
+  - - 144
+    - 78
+    - 0
+  - - 255
+    - 198
+    - 77
+  hp_threshold: 30
+  mp_threshold: 7
+  pot_cd: 1500
+  auto_hp_pot: true
+  auto_mp_pot: false
+  strategy: patrol
+  vision_top: 200
+  vision_bottom: 200
+  vision_left: -1
+  vision_right: -1
+  vision_center: true
+  vision_off_x: 0
+  vision_off_y: 0
+  sweep_turn_cd: 1000
+  back_range: 200
+  route_enabled: false
+  debounce_conf: 0.45
+  debounce_ms: 2000
+  auto_feed_pet: true
+  feed_interval_min: 6.0
+  feed_interval_max: 8.0
+  custom_timers: []
+  facing_timeout_min: 2.0
+  player_lost_timeout_min: 3.0
+  resetall_interval: 60
+  anti_afk_enabled: false
+  anti_afk_type: hidden_rest
+  anti_afk_min: 25.0
+  anti_afk_max: 30.0
+  anti_afk_enter_seq:
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  - type: delay
+    ms: 1000
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  - type: delay
+    ms: 1000
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  - type: delay
+    ms: 160000
+  - type: down
+    key: 普攻
+  - type: up
+    key: 普攻
+  - type: delay
+    ms: 200
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  anti_afk_exit_seq:
+  - type: down
+    key: 普攻
+  - type: up
+    key: 普攻
+  - type: delay
+    ms: 1000
+  - type: down
+    key: 普攻
+  - type: up
+    key: 普攻
+  - type: delay
+    ms: 1000
+  - type: down
+    key: 普攻
+  - type: up
+    key: 普攻
+  anti_afk_rest_min: 4.5
+  anti_afk_rest_max: 5.5
+  reconnect_enabled: false
+  reconnect_probe_after_lost_sec: 0.0
+  reconnect_step_timeout_ms: 3000
+  reconnect_queue_timeout_ms: 180000
+  reconnect_max_retry: 3
+  reconnect_resume_auto: true
+  custom_keys:
+    攻击药水: grave
+    回避药水: '5'
+    隐身术: a
+    普攻: f
+    表情_无语: f6
+notes: ''
+capture:
+  source: file
+  file: D:/Media/record/mxd/猴林迷宫I.mp4
+  url: udp://0.0.0.0:5000
+  fps: 5.0
+  stride: 60
+  seconds: 120.0
+  dedup: 0.01
+  limit: 0
+  clean: true
+label:
+  thresh: 0.9
+  min_distinct: 0.06
+  per_mob: 20
+  max_peaks: 3
+  downscale: 1
+  region: null
+  player_thresh: 0.78
+dataset:
+  val_ratio: 0.2
+  min_boxes: 1
+  quality: 92
+train:
+  model: yolo26n.pt
+  epochs: 200
+  imgsz: 960
+  batch: 8
+  device: '0'
+  patience: 40
+player_id: 数值策划
+verify: {}
+iterate: {}
+mob_names:
+- 风独眼兽
+- 僵尸猴
+mobs_cleared: false
+player_scale: 1.406
+player_scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual

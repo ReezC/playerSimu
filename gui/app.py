@@ -157,7 +157,16 @@ def main():
             win.log("打开项目失败: %s" % e, "error")
 
     win.show()
-    return app.exec_()
+    rc = app.exec_()
+
+    # **退出顺序要定死**：先关窗、让 Qt 把销毁事件处理完，最后才轮到 QApplication。
+    # 反过来的话（QApplication 先被回收）解释器退出时会去碰已经失效的 Qt 内部，
+    # 表现成关掉界面后弹一个"程序已停止工作"，退出码 0xC0000005。
+    # 界面里的 QGraphicsView 越多越容易撞上（实测加一个就够）。
+    win.close()
+    del win
+    app.processEvents()
+    return rc
 
 
 if __name__ == "__main__":

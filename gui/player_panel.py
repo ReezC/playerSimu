@@ -542,12 +542,20 @@ class PlayerPanel(QWidget):
         # 防抖：高置信度怪框消失后保留位置（独立于策略）
         self.sp_debounce_conf = self._spin(0.0, 1.0, 0.5, 2)
         self.sp_debounce_conf.setSingleStep(0.05)
-        self.sp_debounce_conf.setToolTip("置信度高于此值的怪，框短暂消失会保留位置，防漏检。")
+        self.sp_debounce_conf.setToolTip(
+            "置信度高于此值的怪，框短暂消失会保留位置，防漏检。\n"
+            "保留期间框会按消失前的速度继续走一小段（逐渐收住），\n"
+            "不会粘在原地 —— 移动中的怪也跟得上。")
         self.sp_debounce_conf.valueChanged.connect(self._on_debounce)
         bf.addRow("防抖置信度", self.sp_debounce_conf)
 
         self.sp_debounce_ms = self._spin(0, 10000, 300, 0)
-        self.sp_debounce_ms.setToolTip("怪框消失后保留位置的时长。")
+        self.sp_debounce_ms.setToolTip(
+            "怪框消失后保留位置的时长。\n"
+            "这段时间里框按消失前的速度继续走、每帧收一点，所以是「滑过去」\n"
+            "而不是「跳一下」；到期就不再输出。\n"
+            "调大的代价：角色可能朝一个已经消失的框走过去（性能面板的\n"
+            "chase_ghost 就是这个占比）。")
         self.sp_debounce_ms.valueChanged.connect(self._on_debounce)
         bf.addRow("防抖时间(ms)", self.sp_debounce_ms)
 
@@ -761,6 +769,8 @@ class PlayerPanel(QWidget):
         tv = QVBoxLayout(timer_grp)
         tv.setSpacing(6)
         self._timer_cd_labels = {}       # {name: 倒计时 QLabel}
+        self._timer_cd_state = {}        # {name: 上次是不是"已暂停"}（省掉每秒重复设样式）
+        self._timer_pause_btns = {}      # {name: 暂停/继续 QPushButton}
         self._timer_list = QVBoxLayout()
         self._timer_list.setSpacing(4)
         tv.addLayout(self._timer_list)
@@ -1448,18 +1458,29 @@ class PlayerPanel(QWidget):
         self.lbl_feed_cd.setText("距离下次：%d:%02d" % (m, s))
         # 自定义定时行为倒计时
         for name, lbl in self._timer_cd_labels.items():
-            next_ts = settings.custom_timer_next.get(name, 0.0)
-            if next_ts > 0:
-                remaining = next_ts - now
+            t = next((x for x in settings.custom_timers if x.get("name") == name), None)
+            paused = bool(t.get("paused")) if t else False
+            if paused:
+                # 暂停时倒计时冻在"停下那一刻的剩余"上（agent 那边已经不再排期）
+                remaining = max(0.0, float(t.get("paused_left") or 0.0))
             else:
-                t = next((x for x in settings.custom_timers if x.get("name") == name), None)
-                lo = (t.get("interval", [5, 10])[0] if t else 5) * 60.0
-                remaining = lo
-            if remaining < 0:
-                remaining = 0
+                next_ts = settings.custom_timer_next.get(name, 0.0)
+                if next_ts > 0:
+                    remaining = next_ts - now
+                else:
+                    lo = (t.get("interval", [5, 10])[0] if t else 5) * 60.0
+                    remaining = lo
+                if remaining < 0:
+                    remaining = 0
             m = int(remaining) // 60
             s = int(remaining) % 60
-            lbl.setText("距离下次：%d:%02d" % (m, s))
+            lbl.setText("距离下次：%d:%02d%s"
+                        % (m, s, "（已暂停）" if paused else ""))
+            # 样式只在状态变化时设一次（每秒重复 setStyleSheet 会白白触发重绘）
+            if self._timer_cd_state.get(name) != paused:
+                self._timer_cd_state[name] = paused
+                lbl.setStyleSheet("color:%s;" % ("#c5221f" if paused
+                                                 else "#80868b"))
 
     # ---------------- 自定义定时行为 ----------------
 
@@ -1467,9 +1488,12 @@ class PlayerPanel(QWidget):
         """重建自定义定时行为列表。"""
         self._clear_layout(self._timer_list)
         self._timer_cd_labels.clear()
+        self._timer_cd_state.clear()
+        self._timer_pause_btns.clear()
         for t in settings.custom_timers:
             name = t.get("name", "")
             lo, hi = t.get("interval", [5, 10])
+            paused = bool(t.get("paused"))
             row = QHBoxLayout()
             row.setSpacing(6)
             lbl_name = QLabel(name)
@@ -1482,6 +1506,18 @@ class PlayerPanel(QWidget):
             row.addWidget(lbl_name)
             row.addWidget(lbl_iv)
             row.addWidget(lbl_cd, 1)
+            # 暂停 / 继续：把某一个定时行为单独停掉（其它的照常），
+            # 点「继续」从停下的地方接着倒计时
+            btn_pause = QPushButton("继续" if paused else "暂停")
+            btn_pause.setFixedWidth(52)
+            btn_pause.setToolTip(
+                "暂停：这个行为不再触发（正在演的序列立刻停下并松开按键），\n"
+                "倒计时冻在当前剩余时间上（红字 +「已暂停」）。\n"
+                "其它的定时行为不受影响。" if not paused else
+                "继续：从暂停时的剩余时间接着倒计时。")
+            btn_pause.clicked.connect(lambda _c, n=name: self._toggle_timer_pause(n))
+            self._timer_pause_btns[name] = btn_pause
+            row.addWidget(btn_pause)
             btn_edit = QPushButton("编辑")
             btn_edit.setFixedWidth(52)
             btn_edit.setToolTip("修改名字 / 时间区间 / 行为序列")
@@ -1493,7 +1529,41 @@ class PlayerPanel(QWidget):
             row.addWidget(btn_del)
             self._timer_list.addLayout(row)
             self._timer_cd_labels[name] = lbl_cd
+        # 有定时行为就得让倒计时在跑：新增/编辑后也保证这一秒表在转
+        # （以前只在"打开项目时已有定时行为"和"开喂宠"时启动，新增完不会动）
+        if settings.custom_timers and not self._feed_timer.isActive():
+            self._feed_timer.start()
         self._tick_feed_cd()
+
+    def _toggle_timer_pause(self, name):
+        """暂停 / 继续一个自定义定时行为。
+
+        暂停：不再触发 + 正在演的序列停下（agent 那边处理），倒计时冻住；
+        继续：把冻住的剩余时间写回 `custom_timer_next`，agent 看到 next > 0
+        就不会重新随机 —— 也就是**接着走**，而不是把等待清零从头开始。
+        """
+        import time
+        t = next((x for x in settings.custom_timers if x.get("name") == name), None)
+        if t is None:
+            return
+        now = time.monotonic()
+        if t.get("paused"):
+            left = max(0.0, float(t.pop("paused_left", 0.0) or 0.0))
+            t["paused"] = False
+            settings.custom_timer_next[name] = now + left
+        else:
+            next_ts = settings.custom_timer_next.get(name, 0.0)
+            if next_ts > now:
+                left = next_ts - now
+            else:
+                # agent 还没排期（刚加/刚编辑过）：按区间下限占位，别显示 0:00
+                lo = (t.get("interval") or [5, 10])[0]
+                left = max(0.0, float(lo) * 60.0)
+            t["paused"] = True
+            t["paused_left"] = left
+            settings.custom_timer_next.pop(name, None)
+        settings.save()
+        self._refresh_timers()
 
     def _add_timer(self):
         """添加一个自定义定时行为：一个弹窗搞定名字 + 时间区间 + 行为序列。"""
