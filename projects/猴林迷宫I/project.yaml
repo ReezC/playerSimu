@@ -221,7 +221,12 @@ train:
   device: '0'
   patience: 40
 player_id: 数值策划
-verify: {}
+verify:
+  model: ''
+  source: E:/MyPrograms/playerSimu/projects/猴林迷宫I/测试集
+  conf: 0.3
+  imgsz: 960
+  limit: 0
 iterate: {}
 mob_names:
 - 风独眼兽
