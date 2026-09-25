@@ -7,7 +7,7 @@
     "out_scale": 0.8004
   },
   "kbd": {
-    "serial": "COM3",
+    "serial": "COM4",
     "port": 9000,
     "cert": "remote_kbd/certs/cert.pem",
     "key": "remote_kbd/certs/key.pem"
@@ -20,38 +20,16 @@
     "port": 5000,
     "width": 1366,
     "height": 768,
-    "fps": 60,
+    "fps": 50,
     "bitrate": "6M",
     "gop": 60,
     "low_latency": true,
     "passthrough": false,
     "pkt_size": 1316
   },
-  "mmap": {
-    "bind": "0.0.0.0",
-    "port": 5003,
-    "zoom": 3,
-    "fps": 10,
-    "quality": 100,
-    "x": null,
-    "y": null,
-    "w": null,
-    "h": null
-  },
-  "mmap": {
-    "bind": "0.0.0.0",
-    "port": 5003,
-    "zoom": 3,
-    "fps": 10,
-    "quality": 100,
-    "x": null,
-    "y": null,
-    "w": null,
-    "h": null
-  },
   "window": {
-    "w": 1396,
-    "h": 860
+    "w": 1280,
+    "h": 667
   },
   "log": {
     "filter": "all"
