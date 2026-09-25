@@ -78,6 +78,16 @@ ANTI_AFK_TYPES = [("hidden_rest", "隐身休息")]
 # 输出CD / delay / 跳间隔足够（抓帧节拍是 66.7 毫秒，两者差一个数量级）。
 TIMING_TICK = 0.01
 
+#: 「站桩输出」时换向所需的方向键按住时长（秒）。
+#:
+#: 为什么单列一个数：`min_turn_hold_ms`（换向后方向键至少按住多久）是给**走着的
+#: 时候**用的 —— 那时按着方向键本来就在走，多按一会儿没坏处。但**站桩输出**时
+#: 它会把"停下来打"重新变成"一边走一边打"：实测（扫平台 + 怪换到另一边）方向键
+#: 被按住整整 **1.000 秒**，角色从怪身上走过去，出范围后又回头 → 来回抖。
+#: 站桩时按方向键**只为了把角色转过来**（转向后输出还有 `turn_output_delay_ms`
+#: 兜着），所以按到"转过来"就够，不该按到"走起来"。
+TURN_TAP_S = 0.15
+
 
 class DecisionSettings:
     """决策参数（UI 写，决策线程读）。
@@ -557,9 +567,14 @@ class CombatAgent:
           · `edge`（由 tick 每拍算好，见那边的说明）—— 起跳范围刚由「无怪」变成
             「有怪」的那一拍。所以同一只怪一直挂在区间里**不会反复跳**：它只在刚
             进来那一下有跳的资格；
-          · **攻击范围内没有怪** —— 有得打就先打，跳会打断输出、还可能把自己跳出
-            攻击距离。这一条由调用点的位置保证：两个调用点都在「攻击范围为空」
-            那个分支里（tick 的说明里写了）。
+          · **攻击范围内没有别的怪** —— 有得打就先打，跳会打断输出、还可能把自己
+            跳出攻击距离。目标**自己**在范围内不算「别的怪」：区间落在攻击距离
+            内侧时（-15~0 这种）本来就该如此，那正是「已进范围但偏远，跳一下够着」。
+            这一条由三个调用点各自保证：
+              · 「攻击范围为空」那两处（chase / sweep）—— 前提天然成立；
+              · tick 里 `if in_range:` 分支那一处 —— 显式要求 `len(in_range) == 1`
+                （范围内只有当前目标）。**别把它删掉**：删了内侧区间就一次都不跳。
+            回归用例见 tools/selftest_decision.py 的 t_chase_jump_inside_band。
 
         `_next_chase_jump` 这个全局节流保留：万一起跳区间边缘抖动（怪正好压在边界
         上来回），沿会反复出现，靠它兜住别连跳。
@@ -596,7 +611,7 @@ class CombatAgent:
             keys.add(self.settings.keymap["left"])
             self.set_facing(-1)
 
-    def _hold_turn(self, keys, now):
+    def _hold_turn(self, keys, now, cap_s=None):
         """换向后，方向键至少按住「最小切换朝向时间」——返回要真正发出去的键。
 
         为什么：换方向的键按下去立刻就松，角色的转身动作可能还没做完，这时候
@@ -608,9 +623,15 @@ class CombatAgent:
         的情况，把当前朝向对应的方向键补回去。
 
         0 = 关闭（不干预，保持老行为）。
+
+        `cap_s`：这次按住时间的**上限**（秒）。站桩输出时传 `TURN_TAP_S` ——
+        那会儿按方向键只为了把角色转过来，按到"走起来"就是从怪身上走过去
+        （实测按住 1 秒 = 走 1 秒，出范围又回头 → 来回抖）。
         """
         s = self.settings
         hold = max(0.0, float(s.min_turn_hold_ms)) / 1000.0
+        if cap_s is not None:
+            hold = min(hold, max(0.0, float(cap_s)))
         if hold <= 0 or now - self._turn_at >= hold:
             return keys
         km = s.keymap
@@ -1303,9 +1324,10 @@ class CombatAgent:
 
         # 追击起跳的**上升沿**：起跳范围内「从无怪变成有怪」的那一拍才有跳的资格。
         # 一只怪一直挂在范围内 → 只有进来的那一拍是沿，之后不再触发 —— 这就是
-        # 「同一只怪不会一直跳」。放在这里每拍算一次，不塞进某个分支：下面两处
-        # 起跳（chase / sweep）共用同一个沿，行为不会随分支而变。
-        # 另有一条前提在调用点上：**攻击范围内有怪就不跳**（先打那些）。
+        # 「同一只怪不会一直跳」。放在这里每拍算一次，不塞进某个分支：下面三处
+        # 起跳（attack 分支的内侧 / chase / sweep）共用同一个沿，行为不会随分支而变。
+        # 另有一条前提在调用点上：**攻击范围内没有别的怪**（有得打就先打）。注意
+        # 「别的」二字 —— 目标自己落在范围内不算，内侧区间（-15~0）全靠这一点。
         _band = [m for m in mobs
                  if self._in_chase_jump_range(self._center_dist(m, ws.player))]
         jump_edge = bool(_band) and not self._band_had
@@ -1347,13 +1369,23 @@ class CombatAgent:
             self._target_id = target.id
             self._target_until = now + self._random_target_cd()
             self._no_target_since = None
+            # 追击起跳（区间落在攻击距离**内侧**的情形：`chase_jump_min~max`
+            # 都为负，如 -15~0 → 区间 [65,80]、攻击距离 80）。
+            #
+            # 这一处**必须单独判**：进区间的怪自己就落在攻击范围内，所以下面那句
+            # 「攻击范围内有怪就不跳」对它永远成立，跳的资格一次都轮不上 ——
+            # 只有「攻击范围为空」那两处调用点的话，这道配置就完全不跳了。
+            # 前提仍然是同一条：**范围内没有别的怪**（`len(in_range) == 1`，即
+            # 除目标外为 0）—— 有得打就先打，跳会打断输出、还可能把自己跳出攻击
+            # 距离；目标自己在范围内不算「别的怪」，那正是「已进范围但偏远，跳一下
+            # 够着」。沿也用同一个 `jump_edge`：同一只怪一直挂在区间里不会反复跳。
+            if len(in_range) == 1 and jump_edge:
+                self._maybe_chase_jump(best, now, edge=True)
             keys = self._attack_state(target, best, mobs, ws)
             # 扫平台「打完停下」：本帧已进入 attack 状态（输出行为在跑）→ 下一帧起
             # 不再朝倾向朝向移动，一直站到攻击范围内清空（下面 else 分支解除）。
             # CD 期间也保持停下：范围内还有怪就不该往前走。
             self._sweep_hold = (s.strategy == "sweep" and self.state == "attack")
-            # 这里**不**起跳：攻击范围内有怪就先打。追击起跳只在下面那个
-            # 「攻击范围为空」的分支里发生（见 _maybe_chase_jump 的说明）。
         else:
             # 前方攻击范围内没框
             self._sweep_hold = False    # 清空 → 恢复朝倾向朝向移动
@@ -1418,7 +1450,12 @@ class CombatAgent:
 
         # 最小切换朝向时间：换向后方向键至少按住这么久（决策里没有方向键时补回来）。
         # 放在发键之前 —— 这里返回的才是真正要发出去的键，也一并回读给 UI。
-        keys = self._hold_turn(keys, now)
+        #
+        # **站桩输出时只按一小下**（`_sweep_hold` = 扫平台 + 攻击范围内的怪 → 本帧
+        # 决策故意不给方向键）：那时按方向键只为了把角色转过来，按满
+        # `min_turn_hold_ms` 就是一边走一边打，角色会从怪身上走过去。见 TURN_TAP_S。
+        keys = self._hold_turn(keys, now,
+                               cap_s=(TURN_TAP_S if self._sweep_hold else None))
         self.keys.set(keys)
 
         # 输出行为：攻击 / 跳规避 / 回身输出（按 self.state）

@@ -10,6 +10,7 @@ A 机在屏幕固定位置画一串黑白方块，编码"当前毫秒时间戳"�
 
 import datetime
 import json
+import statistics
 import time
 from pathlib import Path
 
@@ -324,6 +325,75 @@ def calib_to_px(cal, shape):
     h, w = shape[:2]
     return (cal["x_ratio"] * w, cal["y_ratio"] * h,
             cal["cell_ratio"] * w, cal["gap_ratio"] * w)
+
+
+# ---- 「这份几何可不可信」的判据（工作台与 tools/probe_tune 共用一份）----
+#
+# **为什么光有 ts_plausible 不够**：它只问"解出的时刻接近现在吗"。而 40 位码里
+# 低位是**快变化的毫秒**，错位采样只把低位采错 —— 凑出一个仍落在 ±10 分钟窗口里
+# 的值完全可能（实测：link.yaml 的几何比实际画的小 2.8px/块，42 块累积偏 118px，
+# 低位全错，解出的却"看着合法"，于是延迟被报成一坨乱数 —— p95 4.7s 紧贴上限）。
+# 而**单调性是时间轴上的性质**：时间戳每帧只该往前走一小步，错位必然破坏它。
+# 所以两者都要：ts_plausible 挡"值域明显不对"，单调性挡"低位被采错"。
+
+#: 判据窗口：最近多少帧的时间戳参与单调性判断
+VERDICT_HIST = 24
+#: 允许的最大步长 = 帧周期 × 这个倍数（超过就是错位解出的跳变）
+VERDICT_STEP_MUL = 4.0
+
+
+class Verdict:
+    """几何可不可信（跨帧单调性）+ 延迟能不能报。
+
+    用法：每解出一帧就 `add(ts, 帧周期ms)`，然后 `summary()` 取结论。
+    几何变了要 `reset()`（换标定那一刻时间戳会跳一次，不该算作"乱跳"）。
+    """
+
+    def __init__(self, need_now=True):
+        #: 要不要"解出的时刻接近本机现在"这一条。**离线回放必须关掉它** ——
+        #: 拿昨天的录像跑，解出的时刻当然离"现在"几小时；单调性照样有效。
+        self.need_now = need_now
+        self.ts_hist = []
+        self.mono = True
+        self.step_med = None
+        self.step_max = None
+        self.jumped = 0
+        self.plausible = False
+
+    def reset(self):
+        self.ts_hist = []
+        self.mono = True
+        self.step_med = None
+        self.step_max = None
+        self.jumped = 0
+        self.plausible = False
+
+    def add(self, ts, frame_period_ms):
+        self.ts_hist.append(ts)
+        if len(self.ts_hist) > VERDICT_HIST:
+            del self.ts_hist[0]
+        ds = [b - a for a, b in zip(self.ts_hist, self.ts_hist[1:])]
+        self.jumped = sum(1 for d in ds
+                          if d < 0 or d > VERDICT_STEP_MUL * frame_period_ms)
+        pos = [d for d in ds if d > 0]
+        self.step_med = statistics.median(pos) if pos else None
+        self.step_max = max(ds) if ds else None
+        self.mono = not self.jumped
+        self.plausible = ts_plausible(ts)
+
+    def summary(self):
+        """→ (可信?, 一行话)。不可信时**必须说清原因**，别只说"不行"。"""
+        if len(self.ts_hist) < 3:
+            return False, "采样中…（时间戳还没攒够）"
+        if not self.mono:
+            return False, ("几何不对：解出的时间戳在乱跳（%d 次倒退/跳变，最大跳到 "
+                           "%.0fms）—— 错位采样的典型特征，挪 x/y 或调 cell/gap"
+                           % (self.jumped, self.step_max or 0))
+        if self.need_now and not self.plausible:
+            return False, ("解出的时刻对不上本地时间（差超 10 分钟）—— 几何不对，"
+                           "或双机时钟没对（先在 B 机跑 tools.clock_sync --save）")
+        return True, ("几何可用：时间戳单调，步长中位 %s ms"
+                      % ("%.1f" % self.step_med if self.step_med else "—"))
 
 
 def resolve_delay_ms(t_recv_epoch_ms: float, ts_a: int) -> float | None:

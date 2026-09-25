@@ -1,4 +1,4 @@
-conf_mob: 0.45
+conf_mob: 0.15
 conf_player: 0.7
 imgsz: 800
 device: '0'
@@ -6,5 +6,10 @@ capture_fps: 60
 draw: true
 perf_log: true
 perf_keepalive: true
-mmap_src: stream
-mmap_crop: null
+mmap_src: live
+mmap_crop:
+- 6
+- 72
+- 134
+- 109
+mmap_draw: true

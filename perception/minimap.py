@@ -174,6 +174,9 @@ MODE_CROP = "crop"
 #: 为什么放在 live.yaml 而不是每张图的标定里：它取决于本机的推流/画面几何，与地图无关。
 SRC_STREAM = "stream"
 SRC_LIVE = "live"
+#: 来源的中文名 —— 界面、提示、报告共用这一份，别一处写「独立推流」另一处写
+#: 「收流」：标定是按来源分开存的，名字对不上就没人搞得清哪份是哪份。
+SRC_LABEL = {SRC_STREAM: "独立推流", SRC_LIVE: "从实时画面"}
 
 #: 标定 dict 的形状（存 datasets/map/<id>.mapcalib.json）
 #:   mode/scale/offset  —— 面板像素 → 底图像素：canvas = (panel - offset) / scale
@@ -353,6 +356,684 @@ def has_geometry(calib):
 
 
 # ══════════════════════════════════════════════════════════════
+# 玩家标记（「黄点」）识别 —— S3 的门槛
+# ══════════════════════════════════════════════════════════════
+#
+# **为什么这里宁可说「认不出」也不硬猜**：这个位置会被 `segment_of` 拿去判
+# 「我在哪块平台上」，猜错比认不出糟得多 —— 认不出只是这一拍没有定位，猜错会
+# 让寻路朝反方向走。所以下面的结论有三种，不是两种：
+#     认得出 / 认不出 / **这张图的颜色层根本不可用**（要换来源，或改用底图相减）
+#
+# 标记的画法见 `docs/寻路设计.md` §2.2：
+#   · WZ 素材 `Map/MapHelper.img/minimap/user`（外观随客户端，实测是亮黄点）
+#   · 无素材兜底 **5×5 青色方块** `Color(0,255,255)`
+#   · NPC / portal 点 `Color(132,216,243)` —— **要排除**，它不是玩家
+#
+# 实测（2026-09-25，寺院通道2 的采集帧）：玩家点**亮黄、6×6、22~25 像素、
+# 单连通块**，中心色 **BGR≈(65,243,245)** —— B 分量 65 是压缩/抗锯齿渗出来的，
+# 所以阈值**不能按纯黄 (0,255,255) 卡死**。同一天把同一套阈值放到「东部岩山V」
+# 的图上，直接命中 2000~7000 像素 / 87~110 块（那张图底图本身就到处黄褐色）
+# → 「颜色层够不够用」必须**当场判出来**，这正是下面 `flood` 那一路的由来。
+
+#: 两个「颜色家族」：黄（WZ 素材 `user`，实测玩家点就是它）与青（无素材兜底方块）。
+#: **分开判、黄优先**：这两族在同一张图上经常只有一族干净 —— 实测寺院通道2 的
+#: **地图本身就是饱和青色**，青族被淹了，而黄族只有玩家那一个点。
+#: 判据直接在 RGB 上卡「两个通道很亮、第三个很暗」，不用 HSV：
+#:   黄：(R,G ≥ 200) 且 (B ≤ 150) 且 |R−G| ≤ 60
+#:   青：(G,B ≥ 200) 且 (R ≤ 120) 且 |G−B| ≤ 60
+#: 这样一刀同时挡掉三类捣乱的：NPC/portal 的蓝 RGB(132,216,243)（R=132 > 120）、
+#: 底图的黄褐纹理 RGB(218,168,103)（G=168 < 200）、白字白框 (B/R 都很高)。
+DOT_YELLOW = ("R>=200", "G>=200", "B<=150", "|R-G|<=60")
+DOT_CYAN = ("G>=200", "B>=200", "R<=120", "|G-B|<=60")
+#: 家族顺序 = 优先级（玩家标记实测是黄的；青是无素材时的兜底画法）。
+DOT_FAMILIES = ("yellow", "cyan")
+#: 亮度下限：两族判据里"亮通道 ≥ 200"已经隐含了，这个值只给文档/调参用。
+DOT_V_MIN = 170
+#: 候选点的边长下限 / 上限。上限按**面板宽度**给 —— 换分辨率/换窗口，面板会大一倍。
+DOT_SIDE_MIN = 3
+DOT_SIDE_MAX_DIV = 16          # 上限 = max(6, 面板宽 // 这个数)
+#: 方形度下限（面积 / 外接矩形）：点近似方块；细长条（描边、地形线）不是点。
+DOT_FILL_MIN = 0.45
+DOT_ASPECT_MAX = 2.6
+#: 面板边缘这些像素不算 —— 面板有边框和地图名，那圈亮色会冒充标记。
+DOT_INSET = 3
+#: 颜色层「被淹」的两条线（见 _is_flood）：像点的块个数上限，以及
+#: 成片像素的占比 / 绝对下限（取大的那个）。**不要用掩码总像素判**：压缩噪声
+#: 会撒出成百上千个 1~2 像素的碎点，谁也不像标记，却能顶到几千。
+#:
+#: 绝对值给得**小**（60）是实测定的：面板大小差 5.6 倍（独立推流 753×612、
+#: 从实时画面 134×109），而标记在两种面板里都只占 **0.09%** —— 也就是说
+#: 「多大算成片」必须跟着面板走，绝对值只兜住"面板特别小"那种情况。
+#: 踩过的坑：绝对值原来写 400，而独立推流那颗 28×24 的点就有 411 像素 ——
+#: 差一点就把正常的一帧判成「颜色层不可用」。
+DOT_MAX_CANDS = 12
+DOT_FLOOD_RATIO = 0.01
+DOT_FLOOD_PX = 60
+#: 跨帧：相邻两拍位移上限（超过就当噪声，把上一拍位置丢掉重捕），
+#: 以及「连续几拍都找到」才算确认（单帧亮斑不算，屏幕上到处是亮斑）。
+DOT_MAX_JUMP_PX = 40.0
+DOT_CONFIRM_FRAMES = 2
+
+#: 漏检之后**沿用上一帧位置**的时间上限（毫秒）—— 口径同 `perception/tracker.py`
+#: 的 `debounce_ms`（那边是"漏检期间保留幽灵框"）。为什么不干脆一直沿用：那位置
+#: 会越来越像真的（人跑远了它还在原地），而且寻路会拿它当"我在哪块平台上"。
+DOT_HOLD_MS = 500.0
+#: 有上一帧位置时，只在它周围这么大一块里搜（面板像素，半边长）。
+#: **这么做有两个好处**：① 快 —— 收流那条来源的面板是 753×612，全图掩码 +
+#: 连通域每拍要几毫秒，缩到 37×37 基本免费；② 稳 —— 底图上的杂色根本进不来，
+#: 「被淹」那个否决条件也就用不上了（见 find_player_dot 的 `near`）。
+DOT_ROI_PAD = 18
+#: 漏检期间按（衰减的）速度外推：每漏一拍乘一次这个系数，总位移有上限
+#: （同 MobTracker._drift：不能冻住，也不能飘到地图另一头）。
+DOT_GHOST_DECAY = 0.75
+DOT_GHOST_MAX_SHIFT = 8.0        # 幽灵外推的总位移上限（面板像素）
+
+#: 上面这四个可以**从 config/live.yaml 覆盖**（界面在「路线识别 → 小地图定位」里调）。
+#: 键名 → 默认值：改键名要一起改 `track_params()` 和界面那排输入框。
+TRACK_KEYS = (("mmap_hold_ms", DOT_HOLD_MS),
+              ("mmap_roi_pad", DOT_ROI_PAD),
+              ("mmap_max_jump", DOT_MAX_JUMP_PX),
+              ("mmap_ghost_shift", DOT_GHOST_MAX_SHIFT))
+
+
+def track_params(live_cfg=None):
+    """从 config/live.yaml 的 dict 里取出四个跟踪参数（缺的用默认值）。
+
+    **只有这一处知道键名与默认值**：界面、实时线程、命令行工具都调它，
+    免得三处各写一份、改了一处另外两处还是老值。
+    """
+    cfg = live_cfg or {}
+    out = {}
+    for key, dflt in TRACK_KEYS:
+        raw = cfg.get(key)
+        try:
+            out[key] = float(dflt) if raw is None else float(raw)
+        except (TypeError, ValueError):
+            out[key] = float(dflt)          # 配置写坏了 → 退回默认，不炸
+    return out
+
+
+def tracker_kwargs(track):
+    """`track_params()` 的 dict → `PlayerDotTracker(**…)` 的关键字。"""
+    return {"hold_ms": track.get("mmap_hold_ms"),
+            "roi_pad": track.get("mmap_roi_pad"),
+            "max_jump": track.get("mmap_max_jump"),
+            "ghost_max_shift": track.get("mmap_ghost_shift")}
+
+
+def dot_color(panel, family=None):
+    """族判据本身（RGB 上直接卡），**不含面板边缘的 inset** —— 也用来量颜色。
+
+    `family` 取 "yellow" / "cyan" 只取一族；None = 两族并集。
+    """
+    b = panel[:, :, 0].astype(np.int16)
+    g = panel[:, :, 1].astype(np.int16)
+    r = panel[:, :, 2].astype(np.int16)
+    yellow = (r >= 200) & (g >= 200) & (b <= 150) & (np.abs(r - g) <= 60)
+    cyan = (g >= 200) & (b >= 200) & (r <= 120) & (np.abs(g - b) <= 60)
+    if family == "yellow":
+        return yellow
+    if family == "cyan":
+        return cyan
+    return yellow | cyan
+
+
+def dot_mask(panel, family=None):
+    """「玩家标记色」掩码（uint8 0/1），已挖掉面板边缘。
+
+    `family` 取 "yellow" / "cyan" 只取一族；None = 两族并集（**只用于看证据图**，
+    判断该用哪族请走 find_player_dot —— 两族分开判才不会互相拖累）。
+    """
+    m = dot_color(panel, family).astype(np.uint8)
+    ins = DOT_INSET
+    if m.shape[0] > 2 * ins and m.shape[1] > 2 * ins:
+        m[:ins, :] = 0
+        m[-ins:, :] = 0
+        m[:, :ins] = 0
+        m[:, -ins:] = 0
+    return m
+
+
+def dot_side_max(panel_w):
+    """「像点」的边长上限：按**面板宽度**给（换分辨率/换窗口，面板会大一倍）。"""
+    return max(6, int(panel_w) // DOT_SIDE_MAX_DIV)
+
+
+def _dot_candidates(m, panel_w):
+    """掩码 → (像「点」的连通块列表, 成片像素数)。
+
+    每项：{x, y（重心）, w, h, area, fill}。**不做「选一个」** —— 多候选时该选谁
+    要跨帧才看得出来（见 PlayerDotTracker），单帧选一个等于瞎猜。
+
+    第二个返回值 `dense` 是「边长达到最小点尺寸的块」的像素总和 —— **判断"颜色层
+    有没有被淹"要用它，不能用掩码总像素**：压缩噪声会撒出成百上千个 1~2 像素的
+    碎点，它们谁也不像标记，却能把总像素顶到几千。
+    """
+    side_max = dot_side_max(panel_w)
+    n, _lab, stats, cent = cv2.connectedComponentsWithStats(m, 8)
+    out = []
+    dense = 0
+    for i in range(1, n):
+        x, y, w, h, a = (int(t) for t in stats[i])
+        if w < DOT_SIDE_MIN or h < DOT_SIDE_MIN:
+            continue                       # 碎点：不算候选，也不算"成片"
+        dense += a
+        if w > side_max or h > side_max:
+            continue
+        if a < DOT_SIDE_MIN * DOT_SIDE_MIN - 2:      # 3×3 至少 7 个像素
+            continue
+        fill = a / float(max(1, w * h))
+        if fill < DOT_FILL_MIN:
+            continue
+        if max(w, h) > DOT_ASPECT_MAX * min(w, h):
+            continue
+        out.append({"x": float(cent[i][0]), "y": float(cent[i][1]),
+                    "w": w, "h": h, "area": a, "fill": round(fill, 2)})
+    # 越大越方越像点：给个稳定顺序（多候选时先看像的那个）
+    out.sort(key=lambda c: (-c["area"], -c["fill"]))
+    return out, dense
+
+
+def roi_around(center, shape, pad):
+    """以 center 为中心、半边长 pad 的矩形（裁到画面内）→ (x0,y0,x1,y1) 或 None。
+
+    画面太小（裁出来没意义）返回 None，让调用方退回全画面搜。
+    """
+    if center is None:
+        return None
+    h, w = shape[:2]
+    cx, cy = float(center[0]), float(center[1])
+    x0, x1 = int(cx - pad), int(cx + pad) + 1
+    y0, y1 = int(cy - pad), int(cy + pad) + 1
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, x1), min(h, y1)
+    if x1 - x0 < 2 * DOT_SIDE_MIN or y1 - y0 < 2 * DOT_SIDE_MIN:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def _is_flood(n_cands, dense, area_search):
+    """这个搜索区里的颜色层还能不能信 → True = 不可用。
+
+    两条独立的信号，命中任一条就算淹：
+      · 像点的块**个数**太多（一片碎块里总有一个"最像的"，但选它是瞎猜）；
+      · 成片像素占比太高（底图自己就一大片标记色，比如东部岩山V）。
+    """
+    if n_cands > DOT_MAX_CANDS:
+        return True
+    return dense > max(DOT_FLOOD_PX, DOT_FLOOD_RATIO * max(1, area_search))
+
+
+def _calib_roi(panel_shape, calib, terrain):
+    """「底图覆盖到的那块面板区域」(x0,y0,x1,y1) —— 把面板标题/边框排除在外。
+
+    **为什么要它**（实测踩到）：面板上方有一条「地图名 + 图标」的标题带，颜色是
+    暖色 —— 颜色层把它整块命中，一块 214×272 的面板光那条就吃掉 4000+ 像素，
+    于是每帧都被判成「颜色层不可用」。底图只覆盖地图区，所以**拿底图在面板上的
+    范围当搜索区**，标题自然落在外面。
+
+    只在 fit 方式下算得出来：crop 方式下面板显示的整块就是底图的一部分（标题在
+    面板自己的边框里，靠 DOT_INSET 那一圈挡掉）。
+    """
+    if not has_geometry(calib) or calib.get("mode") != MODE_FIT:
+        return None
+    cv_ = getattr(terrain, "canvas", None)
+    if cv_ is None:
+        return None
+    s = float(calib.get("scale") or 1.0)
+    ox, oy = calib.get("offset") or (0, 0)
+    ch, cw = cv_.shape[:2]
+    # ⚠ 参数是 numpy 的 `.shape`（**高在前**）：按 (宽, 高) 解会把宽高弄反，
+    # 搜索结果区被裁成正方形的一角 —— 实测表现是「底图相减明明减掉了，却找不到点」。
+    h, w = panel_shape[:2]
+    x0, y0 = max(0, int(ox)), max(0, int(oy))
+    x1, y1 = min(w, int(ox + cw * s)), min(h, int(oy + ch * s))
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def _apply_roi(m, roi):
+    """把掩码裁到 roi 里（其余置 0）。roi 为 None 就原样返回。"""
+    if not roi:
+        return m
+    out = np.zeros_like(m)
+    x0, y0, x1, y1 = [int(v) for v in roi]
+    np.copyto(out[y0:y1, x0:x1], m[y0:y1, x0:x1])
+    return out
+
+
+def _basemap_extra_mask(panel, calib, terrain, m, family=None):
+    """「底图上这块也是标记色」的掩码 → 从面板掩码里减掉它，只留多出来的。
+
+    **为什么要这一层**：有的图底图本身就到处黄褐色（实测东部岩山V 那张图，
+    纯颜色层命中 7000+ 像素）。玩家标记是**画在底图之上**的东西，所以
+    「面板命中 − 底图在同一个位置也命中」才是标记（NPC 点同样会被留下，靠
+    尺寸/方形度和跨帧跟踪再筛）。底图与面板有几何误差，减之前把底图掩码**胀**开
+    几个像素，宁可信底图（少留几个候选）也别把底图的纹理当标记。
+    """
+    s = float(calib.get("scale") or 1.0)
+    ox, oy = calib.get("offset") or (0, 0)
+    vx, vy = (calib.get("view") or (0, 0)) if calib.get("mode") == MODE_CROP else (0, 0)
+    h, w = panel.shape[:2]
+    # canvas = (panel - offset)/scale + view  ⇒  panel = (canvas - view)*scale + offset
+    mat = np.float32([[s, 0, ox - vx * s], [0, s, oy - vy * s]])
+    warped = cv2.warpAffine(terrain.canvas, mat, (w, h),
+                            flags=cv2.INTER_NEAREST, borderValue=(0, 0, 0))
+    base = dot_mask(warped, family)
+    k = max(3, int(round(s * 2))) | 1        # 奇数核
+    base = cv2.dilate(base, np.ones((k, k), np.uint8))
+    return (m & (1 - base)).astype(np.uint8)
+
+
+def find_player_dot(panel, calib=None, terrain=None, roi=None, near=None,
+                    ref_w=None):
+    """面板里找玩家标记 → 结论 dict（**认不出也是结论，不要硬凑**）。
+
+    搜索顺序 = **黄族 → 青族**，每族先颜色层、再底图相减层；第一个「有候选且不算
+    被淹」的组合胜出。分开判很要紧：实测寺院通道2 的**地图本身就是饱和青色**，
+    青族被淹，而黄族只有玩家那一个点 —— 混在一起判会把这条结论一起丢掉。
+
+    返回：
+        ok         找到像标记的点
+        x, y       面板像素坐标（重心；ok 时才有意义）
+        w, h, area 外接矩形与像素数
+        bgr        重心附近的实际颜色（中位）
+        mask_px    胜出族的命中像素数
+        dense_px   胜出族的「成片」像素数（判断被淹用它，不是 mask_px）
+        candidates 胜出族的候选个数
+        family     "yellow" / "cyan"
+        layer      "color" / "basemap"（结论来自哪一层）
+        flood      True = 颜色层没帮上忙（靠底图层给的，或干脆给不出）
+        diag       每族的诊断句（拒绝时拼进 reason，便于人判断该怎么救）
+        roi        实际用的搜索区（有 fit 标定时会自动排除面板标题带）
+        reason     一句话，能直接贴进日志/状态行
+
+    `roi` 不传时：有 fit 标定就自动用「底图覆盖区」（排除面板标题/边框）。
+    `near`（面板坐标）不传时是**首次捕获**语义；传了表示"我上一帧在这儿" ——
+    那时多候选按**离 near 最近**挑，而且"被淹"不再是否决条件（见 loop 里那段）。
+    """
+    used_roi = roi or _calib_roi(panel.shape[:2], calib, terrain)
+    if used_roi:
+        rx0, ry0, rx1, ry1 = [int(v) for v in used_roi]
+        area_search = max(1, (rx1 - rx0) * (ry1 - ry0))
+    else:
+        area_search = max(1, int(panel.shape[0] * panel.shape[1]))
+
+    diag = []
+    any_flood = False
+    hit = None
+    for fam in DOT_FAMILIES:                   # 黄族优先（实测玩家标记就是黄的）
+        m0 = _apply_roi(dot_mask(panel, fam), used_roi)
+        mask_px = int(m0.sum())
+        for layer in ("color", "basemap"):
+            if layer == "basemap":
+                # 颜色层救不回来时才用「面板 − 底图」：这一层要标定 + 底图
+                if not has_geometry(calib) or terrain is None \
+                        or getattr(terrain, "canvas", None) is None:
+                    continue
+                m = _basemap_extra_mask(panel, calib, terrain, m0, fam)
+                if int(m.sum()) >= mask_px * 0.5:   # 没减掉多少 → 这层没意义
+                    continue
+            else:
+                m = m0
+            # `ref_w`：**给裁剪图用**。像点的边长上限是按面板宽度定的，而局部
+            # 搜索传进来的是一小块（37×37）—— 按那块的宽度算，上限只剩 6px，
+            # 28×24 的玩家点会被尺寸筛选直接挡掉（实测就是这么"局部搜索没生效"的）。
+            cands, dense = _dot_candidates(m, ref_w or panel.shape[1])
+            flooded = _is_flood(len(cands), dense, area_search)
+            # `near`（有上一帧位置）时**被淹不再是否决条件**：那会儿搜的就是
+            # 上一帧周围一小块，"离上一帧最近"比"整张图大不大"可靠得多。
+            if cands and (not flooded or near is not None):
+                hit = {"family": fam, "layer": layer, "mask_px": mask_px,
+                       "dense_px": dense, "candidates": len(cands),
+                       "all": cands, "flooded": bool(flooded)}
+                break
+            any_flood = any_flood or flooded
+            diag.append("%s族/%s层：像点的块 %d 个、成片 %d 像素%s"
+                        % ("黄" if fam == "yellow" else "青", layer, len(cands),
+                           dense, "（被淹）" if flooded else ""))
+        if hit is not None:
+            break
+
+    base = {"mask_px": 0, "dense_px": 0, "flood": False, "candidates": 0,
+            "layer": "", "family": "", "all": [], "roi": used_roi,
+            "diag": diag, "w": 0, "h": 0, "area": 0,
+            "x": 0.0, "y": 0.0, "bgr": None}
+
+    if hit is None:
+        # 认不出就**认不出**：这时候给一个"最像的块"，下游会当成"我在哪块平台上"，
+        # 比认不出糟得多（实测东部岩山V 那张图：底图本身就到处黄褐色）。
+        why = "；".join(diag) if diag else "两族都没有像点的块"
+        pre = "颜色层不可用" if any_flood else "认不出玩家标记"
+        return dict(base, ok=False, flood=any_flood, reason=(
+            "%s（%s）—— 换来源（独立推流），或给它一份底图标定走「底图相减」"
+            % (pre, why)))
+
+    cands = hit["all"]
+    if near is not None:
+        # 有上一帧位置 → **离它最近的那个**就是它（距离比"哪块更大"可靠得多）
+        c = min(cands, key=lambda t: (t["x"] - near[0]) ** 2
+                + (t["y"] - near[1]) ** 2)
+    else:
+        c = cands[0]
+    cx, cy = int(round(c["x"])), int(round(c["y"]))
+    patch = panel[max(0, cy - 3):cy + 4, max(0, cx - 3):cx + 4]
+    # 颜色取**这个族判据命中的那些像素**的中位 —— 直接取补丁中位会被周围压暗，
+    # 报出来是个"看着不像标记"的颜色（实测：标记核心 R,G≈245，补丁中位只有 167）。
+    pm = dot_color(patch, hit["family"]) if patch.size else None
+    sel = patch[pm] if pm is not None else None
+    if sel is not None and len(sel):
+        med = np.median(sel, axis=0).astype(int)
+    elif patch.size:
+        med = np.median(patch.reshape(-1, 3), axis=0).astype(int)
+    else:
+        med = np.zeros(3, int)
+    reason = ("找到玩家标记（%s 族 / %s 层）" % (hit["family"], hit["layer"])
+              if len(cands) == 1 else
+              "找到 %d 个候选（%s 族 / %s 层；跨帧跟踪会挑）"
+              % (len(cands), hit["family"], hit["layer"]))
+    out = dict(base, ok=True, x=c["x"], y=c["y"], w=c["w"], h=c["h"],
+               area=c["area"], bgr=tuple(int(v) for v in med), reason=reason)
+    out.update(hit)
+    # flood 的含义：**颜色层没帮上忙**（结论要么是靠底图层得到的，要么根本给不出）
+    out["flood"] = (hit["layer"] == "basemap")
+    return out
+
+
+class PlayerDotTracker:
+    """跨帧跟踪玩家标记：多候选挑最近的、跳变丢掉重捕、连续两拍才算确认。
+
+    **为什么非要跨帧**：单帧里"亮黄的方块"不止玩家一个（NPC 点、特效、地图纹理），
+    而玩家点是**连续移动**的：用上一拍位置当下先验，一跳 40px 以上的直接判噪声。
+    三条做法都照 `perception/tracker.py` 那套（怪物/角色的防抖）：
+
+      ① **有上一帧位置就只在它周围搜一小块**（`DOT_ROI_PAD`）—— 又快又稳：
+         收流那条来源的面板 753×612，全图掩码+连通域每拍几毫秒，缩到 37×37 基本
+         免费；底图上的杂色也根本进不来；
+      ② **漏检就沿用上一帧位置**（`DOT_HOLD_MS` 内），口径同那边的"幽灵框"——
+         不然读数一秒里闪好几次"认不出"，寻路也白丢一小段惯性；
+      ③ 幽灵期间按**衰减的速度**往前推一点（总位移有上限），同 `_drift`：既不能
+         冻在原地（人在跑，位置越差越远），也不能一直推（会飘到地图另一头）。
+    """
+    def __init__(self, hold_ms=None, roi_pad=None, max_jump=None,
+                 ghost_max_shift=None):
+        self.x = None
+        self.y = None
+        self.hits = 0
+        self.frames = 0
+        # 这四个是**界面参数**（config/live.yaml，见 track_params）：
+        #   沿用窗口 / 搜索半径 / 跳变上限 / 外推上限 —— 都能在「路线识别」里调。
+        self.hold_ms = float(DOT_HOLD_MS if hold_ms is None else hold_ms)
+        self.roi_pad = int(DOT_ROI_PAD if roi_pad is None else roi_pad)
+        self.max_jump = float(DOT_MAX_JUMP_PX if max_jump is None else max_jump)
+        self.ghost_max_shift = float(DOT_GHOST_MAX_SHIFT if ghost_max_shift is None
+                                     else ghost_max_shift)
+        self.missed = 0            # 连续漏检拍数（口径同 MobTracker 的 missed）
+        self.last_roi = None       # 上一次实际搜的区域（诊断/自检用）
+        self._vx = self._vy = 0.0  # 速度（面板像素/拍，平滑过）
+        self._shifted = 0.0        # 幽灵外推累计走了多远
+        self._last_seen = 0.0
+        self._last = None          # 上一次成功的完整结论（补位时原样复用）
+
+    def update(self, panel, calib=None, terrain=None, roi=None, now=None):
+        now = time.monotonic() if now is None else now
+        self.frames += 1
+        r = self._search(panel, calib, terrain, roi)
+
+        if not r["ok"]:
+            # 漏检：防抖窗口内**沿用上一帧位置**（同 MobTracker 的幽灵框做法）。
+            # `hold_ms <= 0` = 关掉这条（口径同项目里其它"0 = 关"的参数）。
+            # ⚠ 不判这个的话，"窗口设 0"在同一拍里仍然算没过期 —— Windows 的
+            # `time.monotonic()` 粒度约 15.6 ms，两次调用会返回同一个值。
+            if (self.hold_ms > 0 and self._last is not None
+                    and (now - self._last_seen) * 1000.0 <= self.hold_ms):
+                self.missed += 1
+                hx, hy = self._drift()
+                self.x, self.y = hx, hy
+                return dict(self._last, x=hx, y=hy, held=True,
+                            missed=self.missed,
+                            confirmed=self.hits >= DOT_CONFIRM_FRAMES,
+                            reason="上一帧位置（漏检 %d 拍）" % self.missed)
+            self.hits = 0
+            self.missed = 0
+            self._last = None
+            return dict(r, hits=0, confirmed=False, held=False, missed=0)
+
+        if self.x is not None:
+            d = ((r["x"] - self.x) ** 2 + (r["y"] - self.y) ** 2) ** 0.5
+            if self.max_jump > 0 and d > self.max_jump:
+                # 跳变：**丢掉上一拍位置**再报认不出 —— 下一拍从零重捕（真传送也
+                # 只丢一拍；留着旧位置的话，人真换了地方就永远追不上了）
+                self.x = self.y = None
+                self.hits = 0
+                self.missed = 0
+                self._last = None
+                return dict(r, ok=False, hits=0, confirmed=False, held=False,
+                            missed=0, reason=(
+                                "候选位置跳变 %.0f px（阈值 %.0f）—— 当噪声丢弃，"
+                                "下一拍重捕" % (d, self.max_jump)))
+
+        # 速度：够算"漏检期间大概往哪边走"就行，平滑一下免得被单拍抖动带偏
+        if self.x is not None:
+            self._vx = 0.5 * self._vx + 0.5 * (r["x"] - self.x)
+            self._vy = 0.5 * self._vy + 0.5 * (r["y"] - self.y)
+        else:
+            self._vx = self._vy = 0.0
+        self.x, self.y = r["x"], r["y"]
+        self.hits += 1
+        self.missed = 0
+        self._shifted = 0.0
+        self._last_seen = now
+        self._last = dict(r)
+        return dict(r, hits=self.hits, held=False, missed=0,
+                    confirmed=self.hits >= DOT_CONFIRM_FRAMES)
+
+    # ---------------- 内部 ----------------
+
+    def _search(self, panel, calib, terrain, roi):
+        """这一拍在哪搜：有上一帧位置 → 它周围一小块（`near` 语义）；否则全画面。"""
+        near = (self.x, self.y) if self._last is not None else None
+        if near is not None:
+            # 半径要**盖得住玩家点本身**（面板大，点也大：收流那条 753×612 上
+            # 点是 28×24），不然点会被裁掉半截、重心也跟着偏。
+            pad = max(self.roi_pad, dot_side_max(panel.shape[1]))
+            used = roi_around(near, panel.shape, pad)
+            self.last_roi = used
+            if used is not None:
+                x0, y0, x1, y1 = used
+                rr = find_player_dot(panel[y0:y1, x0:x1],
+                                     near=(near[0] - x0, near[1] - y0),
+                                     ref_w=panel.shape[1])
+                if rr["ok"]:
+                    # **坐标要加回偏移**，候选列表也一样（下游按面板坐标用）
+                    return dict(rr, x=rr["x"] + x0, y=rr["y"] + y0,
+                                layer="roi",
+                                all=[dict(c, x=c["x"] + x0, y=c["y"] + y0)
+                                     for c in rr["all"]])
+                # 这一小块里没有 → 退回全画面（可能真换了地方 / 标定变了）
+        self.last_roi = roi
+        return find_player_dot(panel, calib, terrain, roi=roi)
+
+    def _drift(self):
+        """漏检时按（衰减的）速度往前推一点，总位移有上限（同 MobTracker._drift）。"""
+        step = DOT_GHOST_DECAY ** max(0, self.missed - 1)
+        dx, dy = self._vx * step, self._vy * step
+        d = (dx * dx + dy * dy) ** 0.5
+        left = max(0.0, self.ghost_max_shift) - self._shifted
+        if d > left and d > 1e-9:                 # 到了上限就不走了
+            k = max(0.0, left) / d
+            dx, dy = dx * k, dy * k
+        self._shifted += (dx * dx + dy * dy) ** 0.5
+        return (self.x or 0.0) + dx, (self.y or 0.0) + dy
+
+
+# ══════════════════════════════════════════════════════════════
+# 玩家定位（S3 的成品）：面板画面 → 世界坐标 → 在哪条段
+# ══════════════════════════════════════════════════════════════
+
+class PlayerLocator:
+    """把三件事串成**一次调用**：黄点识别 → 世界坐标 → 站在哪条段。
+
+        PlayerDotTracker      面板里找玩家标记（黄点，含跨帧确认）
+          ↓ panel_to_world    面板像素 → 底图像素 → 世界坐标（用标定 + miniMap 的 mag）
+          ↓ segment_of        世界坐标 → 地形里的哪条段（Segment.index）
+
+    **为什么非得有人把它串起来**：这三步以前分别散在「标定弹窗」和「命令行诊断」
+    里，各自只做一段 —— 真接进实时回路时又得再拼一遍，而拼错的方式很隐蔽
+    （面板↔底图漏一次换算、或者把 `Player.current_platform_id`（视觉平台编号）
+    当成 `segment_id`（地形段号））：算出来的位置整体错，下游却当成"我在哪块
+    平台上"照用。所以这里把口径固定死，谁都别再拼第二份。
+
+    **算不出来是常态，也是结论**：`world_x/world_y/segment_id` 一律是 None 而不是
+    0（0 是合法的世界坐标 —— 地图西北角），`note` 写清为什么。
+    """
+
+    def __init__(self, map_id=None, track=None):
+        #: 跟踪参数（`PlayerDotTracker` 的关键字：hold_ms/roi_pad/max_jump/
+        #: ghost_max_shift）。**必须记在 locator 上**：换图会重建 tracker，
+        #: 不记的话"界面里调过一次、一换图又回默认"。
+        self.track = {k: v for k, v in (track or {}).items() if v is not None}
+        self.tracker = None
+        self.map_id = None
+        self.terrain = None
+        self._calib_cache = {}
+        self._new_tracker()
+        self.load(map_id)
+
+    def _new_tracker(self):
+        self.tracker = PlayerDotTracker(**self.track)
+
+    def set_track(self, **kw):
+        """改跟踪参数（界面拨一下立刻生效，并**换图也保留**）。"""
+        for k, v in kw.items():
+            if v is None:
+                self.track.pop(k, None)
+            else:
+                self.track[k] = v
+        self._new_tracker()
+        return self
+
+    def use_track_config(self, live_cfg):
+        """按 `config/live.yaml` 那份配置更新跟踪参数（界面那排输入框改完就叫它）。
+
+        键名与默认值只在 `tracker_kwargs()` / `track_params()` 里写一份。
+        """
+        return self.set_track(**tracker_kwargs(track_params(live_cfg)))
+
+    def load(self, map_id):
+        """（换）加载某张图的地形。传 None 就是"不定位"。"""
+        map_id = map_id or None
+        if map_id == self.map_id and self.terrain is not None:
+            return self
+        self.map_id = map_id
+        self.terrain = (mapdata.load(map_id, with_canvas=True)
+                        if map_id else None)
+        # 换图 → 位置不连续，别拿上一张图的点去跟踪（跳变判据会乱丢）。
+        # ⚠ 重建时把界面调的跟踪参数带上（见 self.track）。
+        self._new_tracker()
+        self._calib_cache = {}
+        return self
+
+    def calib_for(self, src, ttl=1.0):
+        """读某条来源的标定，**带 1 秒缓存**。
+
+        为什么不每次读文件：实时回路 30 拍/秒，每拍读一次 JSON 纯属浪费；
+        为什么不只在启动时读一次：标定在弹窗里随时会被改，读死了要重启才生效。
+        1 秒的折中足够（弹窗保存后本来就会自己刷新一次）。
+        """
+        now = time.monotonic()
+        hit = self._calib_cache.get(src)
+        if hit is not None and now - hit[0] < ttl:
+            return hit[1]
+        cal = mapdata.load_calib(self.map_id, src) if self.map_id else None
+        self._calib_cache[src] = (now, cal)
+        return cal
+
+    def update(self, panel, src=None, calib=None, terrain=None):
+        """面板画面（BGR）→ 定位结论 dict。
+
+        返回：
+            ok         这一拍**拿到了世界坐标**（认不出点 / 没标定 → False）
+            confirmed  黄点是"连续两拍都在附近"确认过的（决策层该只认这种）
+            px, py     黄点在面板里的像素（重心；认不出时是上一次的残值，别用）
+            world_x/world_y  世界坐标；没算出来是 None
+            segment_id 站在哪条段（None = 没落在平台上）
+            dot        黄点那一层给的说明（认不出时就是原因）
+            note       没算出坐标 / 没落平台的原因（**可能很长**，给 tooltip/日志）
+            short      `note` 的一句话版本（正常时是空串）——给**贴在画面上**的
+                       读数用：那是一行不换行的字，塞下 `note` 会横穿整个画面
+        """
+        src = src or SRC_STREAM
+        terrain = terrain if terrain is not None else self.terrain
+        if calib is None:
+            calib = self.calib_for(src)
+        r = self.tracker.update(panel, calib=calib, terrain=terrain)
+        out = {"ok": False, "confirmed": bool(r.get("confirmed")),
+               # held：这一拍没认出黄点，位置是**上一帧**的（防抖窗口内沿用）。
+               # 决策层可以用（两三拍之内还算得准），但要能分辨出来。
+               "held": bool(r.get("held")), "missed": int(r.get("missed") or 0),
+               "px": r["x"], "py": r["y"], "world_x": None, "world_y": None,
+               "segment_id": None, "src": src, "dot": r["reason"], "note": "",
+               "short": "认不出黄点"}
+        if not r["ok"]:
+            out["note"] = r["reason"]
+            return out
+        if terrain is None:
+            out["note"] = "没有这张图的地形/底图（先「生成地形图」）"
+            out["short"] = "没有地形数据"
+            return out
+        if not has_geometry(calib or {}):
+            out["note"] = ("还没量过这张图的「面板 → 底图」换算"
+                           "（来源「%s」下点「标定…」）"
+                           % SRC_LABEL.get(src, src))
+            out["short"] = "还没标定"
+            return out
+
+        wx, wy = panel_to_world(r["x"], r["y"], calib, terrain)
+        out["world_x"], out["world_y"] = wx, wy
+        b = terrain.bounds
+        if b and not (b[0] - 1 <= wx <= b[2] + 1 and b[1] - 1 <= wy <= b[3] + 1):
+            # 落在图外基本只有一个原因：标定（或底图）不对。说出来，别把
+            # 一个地图外的坐标交给寻路。
+            out["note"] = ("算出来在底图范围外 (%.0f, %.0f) —— 标定或底图不对？"
+                           % (wx, wy))
+            out["short"] = "算到图外了"
+            return out
+        seg = terrain.segment_of(wx, wy)
+        out["segment_id"] = seg.index if seg is not None else None
+        out["ok"] = True
+        if seg is None:
+            out["note"] = "坐标算出来了，但脚下没有平台（半空 / 墙里？）"
+            out["short"] = "脚下没有平台"
+        elif out["held"]:
+            # 位置是上一帧的（这一拍没认出黄点，防抖窗口内沿用）—— 说出来，
+            # 别让人以为这是这一拍量出来的
+            out["note"] = ("这一拍没认出黄点，用的是上一帧的位置（漏检 %d 拍）"
+                           % out["missed"])
+            out["short"] = "上一帧位置"
+        else:
+            out["short"] = ""
+        return out
+
+
+def apply_to_player(player, loc):
+    """把定位结论写进 `WorldState` 的 `Player` 那一页（**一处口径**）。
+
+    三个字段的含义见 `perception/world_state.py` —— 尤其别把 `segment_id` 写进
+    `current_platform_id`：那是**视觉平台**编号，两者不是一回事。
+    """
+    player.world_x = loc.get("world_x")
+    player.world_y = loc.get("world_y")
+    player.segment_id = loc.get("segment_id")
+    # held = 这一拍没认出黄点、位置沿用上一帧（防抖窗口内）。决策层可以照用，
+    # 但要能分辨出来 —— 将来做"精细落点"时这类位置不该当新鲜观测。
+    player.world_held = bool(loc.get("held"))
+    player.world_note = loc.get("note") or ""
+    return player
+
+
+# ══════════════════════════════════════════════════════════════
 # 「现在显示的是底图哪一块」（crop / 局部小地图专用）
 # ══════════════════════════════════════════════════════════════
 
@@ -384,6 +1065,48 @@ def view_rects(loc, panel_wh, canvas_wh):
     z = overlay_zoom(canvas_wh[0])
     return ((int(x0), int(y0), int(x1), int(y1)),
             (int(x0 * z), int(y0 * z), int(x1 * z), int(y1 * z)))
+
+
+def overlay_draw_rects(loc, panel_wh, canvas_wh):
+    """→（叠加图上的**源矩形**（None = 整张）, 面板里的**目标矩形**）。
+
+    把标定好的叠加画到别处时就靠这一对：源矩形从叠加图上取一块，
+    贴到目标矩形（面板坐标）。
+
+      fit  ：面板里放的是**整张**底图 → 源 = 整张叠加图，目标 = 面板里从 `offset`
+             起、`底图 × scale` 那么大的那一块（面板比它大的地方本来就该留白）。
+      crop ：面板里放的是底图的**一块** → 源 = 那一块（`view_rects` 算好的），
+             目标 = 整个面板。
+
+    **为什么抽成一份**：标定弹窗的叠加层、以及「把叠加画到实时画面上」都要用
+    同一个映射。各写一份迟早对不上，而这种偏最阴 —— 两边看着都"差不多"，
+    只有拿尺子量（或者进游戏走两步）才发现差一截。
+    """
+    pw, ph = panel_wh
+    cw, ch = canvas_wh
+    if loc.get("mode") == MODE_CROP:
+        _canvas_rect, img_rect = view_rects(loc, panel_wh, canvas_wh)
+        return img_rect, (0, 0, int(pw), int(ph))
+    s = float(loc.get("scale") or 1.0)
+    ox, oy = loc.get("offset") or (0, 0)
+    return None, (int(ox), int(oy),
+                  int(round(cw * s)), int(round(ch * s)))
+
+
+def frame_overlay_rects(loc, frame_rect, canvas_wh):
+    """→（源矩形, **实时画面坐标**下的目标矩形）。
+
+    面板在实时画面里的位置由 `frame_rect=(fx, fy, fw, fh)` 给出（工作台
+    「小地图定位 → 框选小地图」框出来的那一块，存 config/live.yaml 的 `mmap_crop`），
+    标定说面板里该怎么放 —— 两者拼一下就是"画在画面的哪儿"。
+
+    **收流来源同样适用**：那一路小地图虽然另有独立推流（画质好、黄点不糊），
+    但小地图面板本身**也在主画面里**（只是被 H.264 压过），所以"它在画面的哪儿"
+    照样是框出来的那一块，和来源无关。
+    """
+    fx, fy, fw, fh = (int(v) for v in frame_rect)
+    src, (dx, dy, dw, dh) = overlay_draw_rects(loc, (fw, fh), canvas_wh)
+    return src, (fx + dx, fy + dy, dw, dh)
 
 
 def crop_compare(frame, canvas, rect):

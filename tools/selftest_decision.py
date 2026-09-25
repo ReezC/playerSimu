@@ -56,16 +56,30 @@ class Harness:
     def __init__(self, settings):
         self.s = settings
         self.clock = Clock()
-        self.log = []                       # [(相对秒, "down"/"up"/"RELEASEALL", 键)]
+        self.log = []                       # [(相对秒, "down"/"up"/"tap"/"RELEASEALL", 键)]
         self.agent = CombatAgent(settings)
+        # 自定义怪物列表：(相对秒) -> [Mob]。起跳这类用例要**精确摆距离**，
+        # 默认那只怪固定距离摆不出来（见 ws）。None = 用默认那只。
+        self.mobs_fn = None
 
     # ---- 世界状态 ----
     def ws(self, with_mob=True):
+        """默认世界：玩家在 x=500，一只怪在 x=560（**距角色中心 40 px**）。
+
+        设了 `mobs_fn` 就用它 —— 距离算得起：怪宽 40，所以
+        「角色中心 → 怪框最近的边」= mob.x - 520。
+        """
         w = WorldState(width=1920, height=1080)
         w.player = Player(x=500.0, y=500.0, w=60.0, h=100.0, bottom=600.0,
                           hp=1.0, mp=1.0, found=True)
-        w.mobs = ([Mob(id=1, x=560.0, y=500.0, w=40.0, h=40.0, conf=0.9, reachable=True)]
-                  if with_mob else [])
+        if self.mobs_fn is not None:
+            w.mobs = list(self.mobs_fn(self.clock.t - getattr(self, "clock0",
+                                                              self.clock.t)))
+        elif with_mob:
+            w.mobs = [Mob(id=1, x=560.0, y=500.0, w=40.0, h=40.0, conf=0.9,
+                          reachable=True)]
+        else:
+            w.mobs = []
         return w
 
     # ---- 记录器 ----
@@ -77,12 +91,18 @@ class Harness:
 
     @contextmanager
     def _patched(self):
-        # **两条按键路径都要挡**：agent 自己发序列用的 key_down/key_up 在 ag 命名空间，
-        # 而 KeyState（移动键）走的是 decision.input 里的那两个 —— 只挡前者的话，
-        # 走 KeyState 的用例会**真的往本机发键**（往当前窗口打字，实测踩过）。
+        # **三条按键路径都要挡**：
+        #   ① agent 自己发序列用的 key_down/key_up（在 ag 命名空间）；
+        #   ② KeyState（移动键）走的是 decision.input 里的那两个；
+        #   ③ `tap`（点按类：追击起跳 / 规避跳 / 喝药 / 喂宠）—— 它**直接调
+        #      `_send`**，既不过①②，也不进 KeyState。漏掉这条，用例会真的往
+        #      本机发键（往当前窗口打字）。
+        # 前两条记成 down/up（presses/gaps 靠它），第三条单独记成 tap —— 点按
+        # 是「按下+松开」，塞进 down/up 会打乱那些按对配平的用例。
         with patch.object(ag.time, "monotonic", self.clock), \
              patch.object(ag, "key_down", self._rec("down")), \
              patch.object(ag, "key_up", self._rec("up")), \
+             patch.object(ag, "tap", self._rec("tap")), \
              patch.object(dinput, "key_down", self._rec("down")), \
              patch.object(dinput, "key_up", self._rec("up")), \
              patch.object(dinput, "release_all_remote", self._rec("RELEASEALL")), \
@@ -123,6 +143,10 @@ class Harness:
 
     def count(self, key):
         return len(self.presses(key))
+
+    def taps(self, key):
+        """某个键被 `tap` 点按的时刻列表（起跳 / 规避跳 / 喝药 / 喂宠走这条路）。"""
+        return [t for t, kind, k in self.log if kind == "tap" and k == key]
 
 
 def fresh_settings(**over):
@@ -659,6 +683,176 @@ def t_input_local_only():
           "手动输入把普通键也挡了")
 
 
+def t_chase_jump_inside_band():
+    """起跳区间落在攻击距离**内侧**时（如 -15~0），怪进区间那一拍要跳。
+
+    **回归用例。** 用户配置就是这样：attack_dist=80、区间 -15~0 → 区间 [65,80]，
+    而 80 正好也是攻击距离的上限 —— 进区间的这只怪**自己**就落在攻击范围内。
+    于是「攻击范围内有怪就不跳」这条门槛对它永远成立，一次都不会跳（跳的资格
+    只留给「攻击范围为空」那两处调用点）。
+
+    同时钉住「只跳一次」：那只怪一直挂在区间里，后面几拍**不许**再跳 —— 当年
+    从「节流到点就再跳一次」改成「只在进区间那一拍跳」正是为了这个，别为了修
+    上面那条又把它丢了。
+    """
+    s = fresh_settings(attack_dist=80.0, chase_jump_enabled=True,
+                       chase_jump_min=-15, chase_jump_max=0,
+                       strategy="patrol", jump_random_prob=0.0)
+    h = Harness(s)
+    # 距离 = mob.x - 520。x=590 → 70：落在 [65,80] 里，同时 ≤80 也在攻击范围内。
+    h.mobs_fn = lambda t: ([] if t < 0.5 else
+                           [Mob(id=1, x=590.0, y=500.0, w=40.0, h=40.0, conf=0.9)])
+    h.run(2.5)
+    taps = h.taps(s.keymap["jump"])
+    check(taps, "起跳区间 -15~0（内侧）时，怪进区间那一拍没有跳 —— "
+                "它自己就在攻击范围内，被「范围内有怪就不跳」挡住了")
+    check(len(taps) == 1,
+          "同一只怪挂在区间里跳了 %d 次（应只在进来的那一拍跳一次）" % len(taps))
+
+
+def t_chase_jump_outside_band_once():
+    """起跳区间落在攻击距离**外侧**时（0~50）：还在追的时候，进区间那拍跳一次。
+
+    这条是当前唯一能跑通的路径（调用点只在「攻击范围内没怪」的分支里）。
+    钉住它，免得修内侧那条时把外侧一起改坏；也钉住「不是每拍都跳」。
+
+    距离 = mob.x - 520，三种位置：170（区间外，还在追）→ 100（区间 [80,130] 内，
+    攻击范围还没够着）→ 70（进攻击范围，已出区间）。
+    """
+    s = fresh_settings(attack_dist=80.0, chase_jump_enabled=True,
+                       chase_jump_min=0, chase_jump_max=50,
+                       strategy="patrol", jump_random_prob=0.0)
+    h = Harness(s)
+
+    def _mobs(t):
+        x = 690.0 if t < 1.0 else (620.0 if t < 2.0 else 590.0)
+        return [Mob(id=1, x=x, y=500.0, w=40.0, h=40.0, conf=0.9)]
+
+    h.mobs_fn = _mobs
+    h.run(3.0)
+    taps = h.taps(s.keymap["jump"])
+    check(len(taps) == 1,
+          "外侧区间应当正好跳一次（追的时候进区间），实际 %d 次：%s"
+          % (len(taps), taps))
+
+
+def t_chase_jump_approach_edge():
+    """怪从远处**一路走近**、刚跨进区间的那一拍跳一次（用户报的就是这个场景）。
+
+    和「凭空出现在区间里」那条的区别：这里的沿是在**移动中**产生的 —— 最容易
+    出的两类错正好都能照出来：沿被判掉（一次都不跳）、或每拍都跳。
+    距离每拍递减 2px（200 → 60），跨过 [65,80] 时一定会落在区间内。
+    """
+    s = fresh_settings(attack_dist=80.0, chase_jump_enabled=True,
+                       chase_jump_min=-15, chase_jump_max=0,
+                       strategy="patrol", jump_random_prob=0.0)
+    h = Harness(s)
+
+    def _mobs(t):
+        dist = max(60.0, 200.0 - 2.0 * int(t / FRAME))      # 距离 = mob.x - 520
+        return [Mob(id=1, x=520.0 + dist, y=500.0, w=40.0, h=40.0, conf=0.9)]
+
+    h.mobs_fn = _mobs
+    h.run(6.0)
+    taps = h.taps(s.keymap["jump"])
+    check(len(taps) == 1,
+          "怪走进起跳区间时应当正好跳一次，实际 %d 次：%s" % (len(taps), taps))
+
+
+def t_chase_jump_guard_shut():
+    """两条「不该跳」的边：范围内有**别的**怪、以及开关关掉。
+
+    这条挡的是「修内侧区间时顺手把条件放宽」：把 `len(in_range) == 1` 写成
+    「只要目标在区间内就跳」，前面两条用例**照样能过**（它们都只有一只怪）。
+    所以这里专门摆两只：最近那只（70，在区间内）就是目标，另一只 75 也在攻击
+    范围内 —— 有得打就先打，跳会打断输出、还可能把自己跳出攻击距离。
+    """
+    base = dict(attack_dist=80.0, chase_jump_min=-15, chase_jump_max=0,
+                strategy="patrol", jump_random_prob=0.0)
+    # ① 范围内还有别的怪 → 不跳（目标自己就落在区间里，靠 guard 挡住）
+    s = fresh_settings(chase_jump_enabled=True, **base)
+    h = Harness(s)
+    h.mobs_fn = lambda t: [Mob(id=1, x=590.0, y=500.0, w=40.0, h=40.0, conf=0.9),
+                           Mob(id=2, x=595.0, y=500.0, w=40.0, h=40.0, conf=0.9)]
+    h.run(2.0)
+    check(not h.taps(s.keymap["jump"]),
+          "攻击范围内还有别的怪时也跳了：有得打就先打，跳会打断输出")
+
+    # ② 开关关掉 → 一只怪、就站在区间里，也不跳
+    s2 = fresh_settings(chase_jump_enabled=False, **base)
+    h2 = Harness(s2)
+    h2.mobs_fn = lambda t: [Mob(id=1, x=590.0, y=500.0, w=40.0, h=40.0, conf=0.9)]
+    h2.run(2.0)
+    check(not h2.taps(s2.keymap["jump"]), "起跳开关是关的，却跳了")
+
+
+def t_sweep_stands_still_in_attack():
+    """扫平台（sweep）在攻击范围内有怪时**要站桩输出**，不许一边走一边打。
+
+    **回归用例**（用户报的：平台巡逻时怪在范围内，却不停地走）。根因不在"进攻击
+    状态"那一下（实测只按了 0.09 秒），而在**换向**：怪换到另一边时 `_hold_turn`
+    会把方向键补回来、按满 `min_turn_hold_ms` —— 用户配置是 1000ms，于是角色一边
+    打一边走整整 1 秒，从怪身上走过去、出范围又回头 = 来回抖。
+
+    判据按**按键时长**：怪一直挂在攻击范围内时，方向键每一段按住都不该超过
+    `TURN_TAP_S` + 几拍余量；下面第二段同时钉住"走着的策略没被一起改掉"。
+    """
+    def mobs(t):
+        # 一直在攻击范围内（80px 以内）；0.6 秒时从右边换到左边 → 逼出换向
+        return [Mob(id=1, x=(590.0 if t < 0.6 else 430.0), y=500.0,
+                    w=40.0, h=40.0, conf=0.9)]
+
+    s = fresh_settings(strategy="sweep", jump_random_prob=0.0, attack_dist=80.0,
+                       min_turn_hold_ms=1000, turn_output_delay_ms=200)
+    h = Harness(s)
+    h.mobs_fn = mobs
+    h.run(2.0)
+
+    dirs = {s.keymap["left"], s.keymap["right"]}
+    segs, cur = [], {}
+    for t, kind, k in h.log:
+        if k not in dirs:
+            continue
+        if kind == "down":
+            cur[k] = t
+        elif k in cur:
+            segs.append((cur.pop(k), t))
+    # **收尾那一段也算**：跑完时还按着的键，要一直算到结束时刻 ——
+    # 不然"从头按到尾"的那种（恰恰是要抓的"一直在走"）会被整段漏掉。
+    for k, a in cur.items():
+        segs.append((a, h.clock.t - h.clock0))
+    check(segs, "扫平台时一次方向键都没按 —— 用例本身没造出换向")
+    limit = ag.TURN_TAP_S + 4 * FRAME
+    for a, b in segs:
+        check(b - a <= limit,
+              "站桩输出时方向键按了 %.3f 秒（上限 %.2f）—— 角色会一边走一边打、"
+              "从怪身上走过去再回头（按住段 %s）"
+              % (b - a, limit, [(round(x, 3), round(y, 3)) for x, y in segs]))
+    check(sum(b - a for a, b in segs) <= 0.6,
+          "两秒里按着方向键走了 %.2f 秒 —— 那不叫站桩"
+          % sum(b - a for a, b in segs))
+
+    # 对照：**走着的**策略（平地巡逻）不受这条限制 —— 它本来就该一直朝怪走
+    s2 = fresh_settings(strategy="patrol", jump_random_prob=0.0, attack_dist=80.0,
+                        min_turn_hold_ms=1000, turn_output_delay_ms=200)
+    h2 = Harness(s2)
+    h2.mobs_fn = mobs
+    h2.run(2.0)
+    dirs2 = {s2.keymap["left"], s2.keymap["right"]}
+    total2, cur2 = 0.0, {}
+    for t, kind, k in h2.log:
+        if k not in dirs2:
+            continue
+        if kind == "down":
+            cur2[k] = t
+        elif k in cur2:
+            total2 += t - cur2.pop(k)
+    total2 += sum(h2.clock.t - h2.clock0 - a for a in cur2.values())
+    check(total2 >= 1.0,
+          "平地巡逻被一起改掉了（它本来就该朝怪走过去，实测只按了 %.2f 秒）"
+          % total2)
+
+
 # ---------------------------------------------------------------- 界面层自检
 
 def build_panel():
@@ -756,6 +950,83 @@ def t_touchpad_wheel_passthrough():
           "板子上的滚轮没滚页面：600 -> %d（应 660 = 3 行）" % vsb.value())
 
 
+def t_auto_confirm_local():
+    """输入设备=本地(仅测试) 时，**开启**自动要先二次确认；取消就不该开起来。
+
+    **为什么单列一条**：本地模式的按键打到的是**这台机器自己**的前台程序
+    （浏览器 / 聊天窗口 / 工作台自己都算），而「开启自动」正是最容易被顺手
+    点一下的那个按钮，还挂着 F11 全局热键（在别的程序里按也生效）。
+    反过来**关闭不弹** —— 让人能顺手停下来这件事不该有门槛。
+
+    顺带钉住：取消之后按钮要拨回未开启，否则下一次点它就变成了"关自动"。
+    """
+    from PyQt5.QtWidgets import QMessageBox
+
+    p, app = build_panel()
+    settings = ag.settings          # 界面读的就是这个单例（save 在 main 里被换成空操作）
+    was_dev, was_on = settings.input_device, settings.enabled
+    asked = [0]
+
+    def _answer(ret):
+        def f(*_a, **_kw):
+            asked[0] += 1
+            return ret
+        return f
+
+    try:
+        # ① 本地 + 选「否」：按钮拨回去，自动不能开起来
+        settings.input_device = "local"
+        settings.enabled = False
+        p._refresh_auto_ui()
+        asked[0] = 0
+        p.btn_auto.setChecked(True)
+        with patch.object(QMessageBox, "question", _answer(QMessageBox.No)):
+            p._toggle_auto()
+        check(asked[0] == 1, "本地模式下开自动没有二次确认")
+        check(settings.enabled is False, "在确认框上选了「否」，自动却开起来了")
+        check(p.btn_auto.isChecked() is False,
+              "选了「否」按钮还停在「停止自动」上 —— 下次点它会变成关自动")
+
+        # ② 本地 + 选「是」：正常开起来
+        asked[0] = 0
+        p.btn_auto.setChecked(True)
+        with patch.object(QMessageBox, "question", _answer(QMessageBox.Yes)):
+            p._toggle_auto()
+        check(asked[0] == 1, "确认过了还再问一次")
+        check(settings.enabled is True, "选了「是」，自动却没开起来")
+
+        # ③ 关自动不该问
+        asked[0] = 0
+        p.btn_auto.setChecked(False)
+        with patch.object(QMessageBox, "question", _answer(QMessageBox.Yes)):
+            p._toggle_auto()
+        check(asked[0] == 0, "关自动也弹确认了 —— 停下这件事不该有门槛")
+        check(settings.enabled is False, "关自动没生效")
+
+        # ④ 换成 ProMicro 就不问（正常挂机不该每次都被拦）
+        settings.input_device = "remote"
+        asked[0] = 0
+        p.btn_auto.setChecked(True)
+        with patch.object(QMessageBox, "question", _answer(QMessageBox.No)):
+            p._toggle_auto()
+        check(asked[0] == 0, "ProMicro 模式下开自动不该弹确认")
+        check(settings.enabled is True, "ProMicro 模式下自动没开起来")
+
+        # ⑤ 全局热键那条路也要拦 —— 它在任何程序里都生效，最该拦
+        settings.input_device = "local"
+        settings.enabled = False
+        p._refresh_auto_ui()
+        asked[0] = 0
+        with patch.object(QMessageBox, "question", _answer(QMessageBox.No)):
+            p.toggle_auto()                     # F11 热键路径（main_window.nativeEvent）
+        check(asked[0] == 1, "F11 热键开自动没走确认")
+        check(settings.enabled is False, "热键路径选了「否」，自动还是开起来了")
+    finally:
+        settings.input_device = was_dev
+        settings.enabled = was_on
+        p._refresh_auto_ui()
+
+
 # ---------------------------------------------------------------- 入口
 
 CHECKS = [
@@ -778,11 +1049,19 @@ CHECKS = [
     ("自定义定时行为：暂停按钮/红字（已暂停）/继续接着走", t_timer_pause_button),
     ("休息状态机：到点/手动结束/关防掉线/手动进入", t_rest_state_machine),
     ("休息状态机：手动进入要先等清怪", t_rest_manual_request),
+    ("追击起跳：区间在攻击距离内侧时也要跳（且只跳一次）",
+     t_chase_jump_inside_band),
+    ("追击起跳：区间在外侧时进区间跳一次", t_chase_jump_outside_band_once),
+    ("追击起跳：怪走进区间的那一拍跳一次", t_chase_jump_approach_edge),
+    ("追击起跳：有别的怪在场 / 开关关掉都不跳", t_chase_jump_guard_shut),
+    ("扫平台：攻击范围内有怪要站桩（不许边走边打）",
+     t_sweep_stands_still_in_attack),
     ("按键层：F10~F12 三条发送路径全拦", t_input_local_only),
     ("触控板：本地 F10 开关（手动输入开着也能用）", t_touchpad_f10_toggle),
     ("触控板：面板隐藏时自动关闭", t_touchpad_hidden_closes_mode),
     ("触控板：状态栏显示「触控模式中」", t_touchpad_status_text),
     ("触控板：非触控模式滚轮让给滚动区", t_touchpad_wheel_passthrough),
+    ("本地(仅测试)输入：开启自动要二次确认，关闭不拦", t_auto_confirm_local),
 ]
 
 

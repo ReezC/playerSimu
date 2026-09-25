@@ -44,6 +44,15 @@ ROLE = {
     "rss_mb": "常驻内存",
     "handles": "内核句柄数",
     "boxes": "每帧框数（负载）",
+    # 本机负载（core/machineload.py 每 10 秒采一次）。有它们才能事后对账：
+    # 「那段时间推理为什么慢」= 把 infer_ms 和 avail_gb / mp_workers 对齐着看。
+    "avail_gb": "可用物理内存（GB）——低于 4 会拖慢每次 op",
+    "mp_workers": "并行子进程数（训练取数/并行标注）",
+    "mp_worker_mb": "并行子进程占用（MB）",
+    # 小地图定位（S3，perception/minimap.PlayerLocator）：这两个是**每帧计数**，
+    # 比值 = 定位成功率。掉了先看世界坐标那行写的 reason（没标定/没认出黄点）。
+    "mmap_ok": "小地图定位成功（帧）",
+    "mmap_miss": "小地图定位失败（帧）",
 }
 
 

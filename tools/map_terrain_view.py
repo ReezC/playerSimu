@@ -74,6 +74,12 @@ def render(t, out_path, use_canvas=True, target_w=1280, k=None, dx=0, dy=0):
         pts = [P(*p) for p in seg.points]
         for a, b in zip(pts, pts[1:]):
             cv2.line(vis, a, b, col, 2)
+        # 段号：状态行里那句「第 N 段」就是它 —— 不标出来的话，那个数字在图上
+        # 对不上号（颜色是循环用的，段数一多就重色了）。
+        # 标在**最左边那个点**上，多段之间不会挤在一起。
+        if pts:
+            lft = min(pts, key=lambda q: q[0])
+            _label(vis, "%d" % i, (lft[0] + 6, max(22, lft[1] - 6)), col, 0.7)
         for f in seg.footholds:
             n_fh += 1
             if f.is_wall:
@@ -110,7 +116,8 @@ def render(t, out_path, use_canvas=True, target_w=1280, k=None, dx=0, dy=0):
     # ---- 图例 ----
     lines = [
         "%s   canvas %dx%d  (x%d)" % (t.id, w, h, z),
-        "green/blue/...: foothold segments (%d)" % len(t.segments),
+        "green/blue/...: foothold segments (%d) — 数字 = 段号"
+        "（状态行里的「第 N 段」）" % len(t.segments),
         "red: walls   cyan: ladderRope (%d)" % len(t.ladders),
         "yellow: portals (%d)   magenta: mob spawns" % len(t.portals),
         # 尺度用 px_per_world（= 世界跨度/底图宽），**不是 mag**

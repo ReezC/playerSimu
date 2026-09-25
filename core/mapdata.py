@@ -91,11 +91,15 @@ class Foothold:
 class Segment:
     """一条由 prev/next 串起来的平台（可能是折线：上坡/台阶）。"""
 
-    __slots__ = ("footholds", "group")
+    #: `index` = 它在 `Terrain.segments` 里的序号（由 `_chain` 填）。
+    #: **为什么要它**：段本身没有 id，而"我在哪块平台上"必须能报给人和日志 ——
+    #: 序号在同一次导出的地形数据里是稳定的（重新导出地形后可能变，那时也该重看）。
+    __slots__ = ("footholds", "group", "index")
 
     def __init__(self):
         self.footholds = []
         self.group = None
+        self.index = -1
 
     @property
     def points(self):
@@ -237,6 +241,7 @@ class Terrain:
             seg.footholds = walk(head, "nxt")
             if seg.footholds:
                 seg.group = seg.footholds[0].group
+                seg.index = len(segs)      # 「我在第几段」靠它说清楚（见 __slots__）
                 segs.append(seg)
         return segs
 
@@ -412,23 +417,89 @@ def calib_path(map_id):
          "view": [x, y], "score": …, "note": "…"}
     **为什么每张图一份**：不同的图客户端可能用不同显示方式（装得下就整张缩放、
     装不下就 1:1 裁剪滚动），而且缩放/偏移也各不相同。
+
+    **还要按「小地图来源」分开存**（实测）：同一张图，独立推流那条面板
+    753×612、从实时画面那条 134×109 —— 差 5.6 倍。一份标定只对一条来源成立，
+    共用就等于「拿 A 量出来的几何去算 B」：算出来的位置整体错，而错的位置会被
+    当成「我在哪块平台上」，比没标定糟得多。
+
+    文件形状（v2）：
+        {"v": 2, "sources": {"stream": {...}, "live": {...}}}
+    每条来源里的字段和老格式**完全一样**，所以消费单个标定的代码
+    （locate / panel_to_canvas / has_geometry）一行都不用改。
+    老格式（整份平铺、没记来源）仍读得出来，但会标上 `legacy`：界面据此提醒
+    「这份是换来源之前量的，请重量一次」。
     """
     return map_dir() / ("%s.mapcalib.json" % map_id)
 
 
-def load_calib(map_id):
+#: 标定文件格式版本（1 = 老格式：整份平铺；2 = 按来源分）
+CALIB_V2 = 2
+
+
+def _read_calib_file(map_id):
     import json as _json
     try:
-        return _json.loads(calib_path(map_id).read_text(encoding="utf-8"))
+        d = _json.loads(calib_path(map_id).read_text(encoding="utf-8"))
     except Exception:
         return None
+    return d if isinstance(d, dict) else None
 
 
-def save_calib(map_id, calib):
+def load_calibs(map_id):
+    """→ {来源: 标定 dict}。老格式（整份平铺）归到 `""` 这个键下。"""
+    d = _read_calib_file(map_id)
+    if not d:
+        return {}
+    srcs = d.get("sources")
+    if isinstance(srcs, dict):
+        return {k: dict(v) for k, v in srcs.items() if isinstance(v, dict)}
+    if d.get("mode") or d.get("scale"):
+        return {"": d}
+    return {}
+
+
+def load_calib(map_id, src=None):
+    """→ 某条来源的标定（形状同老格式）；没有 → None。
+
+    src=None：老格式直接给；新格式**只有一份**时给那一份，多份则返回 None ——
+    「哪一份」必须由调用方说清，猜错就是拿另一条来源的几何去算世界坐标。
+    """
+    srcs = load_calibs(map_id)
+    if src:
+        if src in srcs:
+            return srcs[src]
+        if "" in srcs:
+            out = dict(srcs[""])
+            out["legacy"] = True        # 老格式：先当它可用，但让界面提醒重量
+            return out
+        return None
+    if "" in srcs:
+        return srcs[""]
+    if len(srcs) == 1:
+        return next(iter(srcs.values()))
+    return None
+
+
+def save_calib(map_id, calib, src=None):
+    """写标定。**src 给了就只覆盖那一条来源**，其它来源原样保留。
+
+    src=None 走老格式（整份平铺）—— 只有诊断/迁移用；界面那条路一律传 src，
+    不传的话写一次就把另一条来源的标定抹掉了（而人看不出来）。
+    """
     import json as _json
     p = calib_path(map_id)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(_json.dumps(calib, ensure_ascii=False, indent=2),
+    body = dict(calib or {})
+    body.pop("legacy", None)            # 读的时候临时加的标记，别写进文件
+    if src is None:
+        out = body
+    else:
+        srcs = load_calibs(map_id)
+        srcs.pop("", None)              # 老格式那份已经由这次保存的来源接管了
+        srcs[src] = body
+        out = {"v": CALIB_V2, "sources": srcs}
+    p.write_text(_json.dumps(out, ensure_ascii=False, indent=2),
                  encoding="utf-8")
     return p
 

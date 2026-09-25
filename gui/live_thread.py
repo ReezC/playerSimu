@@ -34,6 +34,13 @@ from perception.classes import (CLASS_MOB, CLASS_OTHER_PLAYER, CLASS_PLAYER,
 # （4 是「其他玩家」类，见 perception/classes.py —— 别再拿 2，那是 drop）。
 PLAYER_CLASS_MAP = {"": CLASS_PLAYER}
 
+#: 本机负载清点的间隔（秒）。
+#: 为什么要有：训练/并行标注与实时预览同时跑的时候，`infer_ms` 会**与输入尺寸
+#: 无关地**整体变慢（同一份配置实测 10.0 → 23.7 ms），而 GPU 时钟、功耗都正常。
+#: 状态行必须能当场把这件事说出来，否则又变成「感觉今天特别卡」的玄学。详见
+#: core/machineload.py。
+LOAD_WATCH_SEC = 10.0
+
 # 类别 → 框颜色（BGR）。**每个类别的颜色都能在设置里改**（theme.class_colors
 # 统一从 config/ui.yaml 的 vis 段读）；类别清单本身在 perception/classes.py 定义。
 def _box_colors():
@@ -199,11 +206,115 @@ class LiveThread(QThread):
         self._stop = threading.Event()
         self._infer = threading.Event()   # 推理开关：默认关，先只收画面
         self._last_potions = 0.0
+        # 本机负载告警的 (文本, 明细)：由 _load_watch 线程整体重绑定、主回路只读。
+        # 用元组整份替换而不是分别写两个键，读的一侧就不会拿到「一半新一半旧」。
+        self._load = ("", "")
+
+        # ---- 小地图定位（S3）：把玩家的**世界坐标 / 所在段**写进 WorldState ----
+        # 决策层以后寻路要用它回答"我在哪块平台上"。三样东西随时会被改（切项目、
+        # 换来源、重框小地图），所以都做成可写字段 + `set_mmap()`，不在启动时读死。
+        self._mmap_mid = str(self._p.get("mmap_map_id") or "")
+        self._mmap_src = self._p.get("mmap_src") or "stream"
+        crop = self._p.get("mmap_crop")
+        self._mmap_crop = [int(v) for v in crop] if crop and len(crop) == 4 else None
+        self._locator = None            # perception.minimap.PlayerLocator（懒导入懒建）
+        self._mmap_cli = None           # 来源=收流 时那一路 TCP（懒起）
+        # 黄点容差（界面上那排，键名见 perception.minimap.TRACK_KEYS）。
+        # `_track_applied` 记住"已经喂给 locator 的那一份"，主回路比对后按需应用
+        # —— **不在 set_mmap 里直接改 locator**：那是另一条线程正在用的对象。
+        self._mmap_track = self._p.get("mmap_track") or None
+        self._track_applied = None
+
+    def set_mmap(self, map_id=None, src=None, crop=None, track=None):
+        """更新小地图定位要的东西（**运行中也改得动**：切项目/换来源/重框/改容差）。
+
+        只传要改的那个。值都是不可变对象或新列表，读的一侧（主回路）拿到的是
+        改前或改后的完整值，不会拿到半新半旧。
+        """
+        if map_id is not None:
+            self._mmap_mid = str(map_id)
+        if src is not None:
+            self._mmap_src = src
+        if crop is not None:
+            self._mmap_crop = ([int(v) for v in crop] if len(crop) == 4 else None)
+        if track is not None:
+            self._mmap_track = dict(track)
+
+    def _mmap_panel_from_frame(self, frame):
+        """来源=从实时画面 → 从这一帧**复制**出小地图那一块；别的来源 → None。
+
+        **为什么必须复制、还得在画框之前**：主回路是就地往 `vis` 上画玩家蓝框、
+        平台线、攻击线的，而同一块 numpy 缓冲区后面的改动会串进"早先切的视图"里。
+        黄点识别是按饱和色找的，一条画上去的框线正好能污染它。
+        块很小（134×109 这种），一次拷贝可以忽略。
+        """
+        if self._mmap_src != "live" or not self._mmap_mid or frame is None:
+            return None
+        crop = self._mmap_crop
+        if not crop:
+            return None
+        x, y, w, h = crop
+        H, W = frame.shape[:2]
+        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > W or y + h > H:
+            return None                 # 换了分辨率还没重框 → 由 note 说清楚
+        import numpy as np
+        return np.ascontiguousarray(frame[y:y + h, x:x + w])
+
+    def _locate_mmap(self, panel):
+        """这一拍定位一次玩家 → 结论 dict；没在用/没地图 → None。
+
+        `panel` 是 `_mmap_panel_from_frame` 给的（来源=从实时画面）；来源=收流时
+        这里自己去小地图推流那一路取最新帧（断线由 `MiniMapClient` 自己重连）。
+        """
+        mid = self._mmap_mid
+        if not mid:
+            return None
+        from perception import minimap as mm
+        if self._locator is None:
+            self._locator = mm.PlayerLocator(
+                mid, track=mm.tracker_kwargs(self._mmap_track or {}))
+            self._track_applied = dict(self._mmap_track or {})
+        elif self._locator.map_id != mid:
+            self._locator.load(mid)
+        # 界面上改了黄点容差 → **在这一拍之前对齐**（比对是 4 个数，每拍做一次
+        # 无所谓）。注意应用它会重建 tracker（跨帧状态清零）—— 那正是"人改了参数"
+        # 该有的效果，所以只在真的变了才做。
+        if self._mmap_track is not None and self._mmap_track != self._track_applied:
+            self._locator.use_track_config(self._mmap_track)
+            self._track_applied = dict(self._mmap_track)
+
+        src = self._mmap_src
+        if src != "live":
+            if self._mmap_cli is None:
+                try:
+                    self._mmap_cli = mm.MiniMapClient(
+                        get("a_host"), port=get("minimap", "port", 5003)).start()
+                except Exception as e:                      # noqa: BLE001
+                    return {"ok": False, "note": "小地图推流起不来：%s: %s"
+                            % (type(e).__name__, e)}
+            panel, _t = self._mmap_cli.latest()
+            if panel is None:
+                return {"ok": False, "note": "还没收到小地图推流（%s）"
+                        % (self._mmap_cli.err or "A 机那一路起了吗？")}
+        elif panel is None:
+            return {"ok": False, "note": ("没有可裁的小地图区域 —— %s"
+                                          % ("先框选小地图" if not self._mmap_crop
+                                             else "框选区超出当前画面，重框一次"))}
+        return self._locator.update(panel, src=src)
 
     # ---------------- 控制 ----------------
 
     def stop(self):
         self._stop.set()
+        # 小地图定位那条 TCP（来源=收流 才起）：它自带一条接收线程，**必须显式收掉**
+        # —— 留着会在工作台退出时跟 Qt 主线程抢着析构，表现是无征兆闪退（同
+        # closeEvent 里那两条注释）。
+        cli = self._mmap_cli
+        if cli is not None:
+            try:
+                cli.stop()
+            except Exception:
+                pass
 
     def stopped(self):
         return self._stop.is_set()
@@ -264,6 +375,7 @@ class LiveThread(QThread):
         from decision.reconnect import Reconnector
         from perception.tracker import MobTracker, PlayerTracker
         from perception.world_state import WorldState
+        from perception import minimap as mm     # 小地图定位（S3）：apply_to_player 等
         from perception.platforms import (PlatformTracker, PlayerMotionTracker,
                                           relate_terrain)
 
@@ -319,6 +431,35 @@ class LiveThread(QThread):
 
         slot = _LatestSlot()
         reader_done = threading.Event()
+
+        # ---- 本机负载守望：**另起一条线程** ----
+        # 它回答的是「为什么上面那些数字变差了」，所以要在推理的同时常备，又
+        # **绝不能拖慢推理**：psutil 清点进程要 10~50 ms，放进主回路就是每 10 秒
+        # 卡一帧 —— 那正好污染我们在盯的 infer_ms / pipe_ms，成了自己测自己。
+        from core import machineload
+
+        def _load_watch():
+            while not self._stop.is_set():
+                try:
+                    d = machineload.probe()
+                    self._load = (machineload.warn(d), machineload.detail(d))
+                    # 顺手进性能日志：下次再遇到「推理为什么慢」，直接和 infer_ms
+                    # 对齐着看就行，不必靠人工回忆当时机器上还跑着什么。
+                    if d["avail_gb"] is not None:
+                        perf.sample("avail_gb", d["avail_gb"])
+                    if d["has_psutil"]:
+                        perf.sample("mp_workers", float(d["workers"]))
+                        perf.sample("mp_worker_mb", d["worker_mb"])
+                except Exception as e:
+                    # **不许静默 pass**：清点一直失败却什么都不显示，就等于这个
+                    # 功能根本没做（而它又是「推理为什么慢」的唯一解释）。显示出来
+                    # 才会有人去修；下一轮成功时它自己就恢复了。
+                    self._load = ("负载清点失败", "本机负载清点抛异常，这个功能现在"
+                                  "没有在工作（不影响收流与推理）：\n%s: %s"
+                                  % (type(e).__name__, e))
+                self._stop.wait(LOAD_WATCH_SEC)   # 停止时立刻返回，不用等满 10 秒
+
+        threading.Thread(target=_load_watch, daemon=True).start()
 
         src = None
         size_ref = [None]      # (w, h)，第一帧后填，给统计条显示分辨率
@@ -488,7 +629,18 @@ class LiveThread(QThread):
         probe_invalid = 0        # 解出来了、但值是**不可能的**（≥ 一天）＝几何错了
         probe_ok = 0             # 解出了合法值（含下面被丢弃的）
         probe_reject = 0         # 值合法、但**算不出延迟** —— 双机时钟没对齐
-        _clock = [0.0, offset_ms]
+        #: 跨帧单调性判据：判「这份几何可不可信」。**与 tools/probe_tune 共用一份
+        #: 实现**（probe_codec.Verdict）—— 各写一份必然漂移，而漂移会造出"工具说
+        #: OK、工作台说不对"这种最难查的分歧。
+        #:
+        #: 为什么非要它：`ts_plausible` 只问"解出的时刻接近现在吗"，而 40 位码的
+        #: **低位是快变化的毫秒**，错位采样只把低位采错，凑出一个仍在 ±10 分钟
+        #: 窗口里的值完全可能。实测（2026-09-25）：link.yaml 的几何比实际画的小
+        #: 2.8px/块、42 块累积偏 118px，低位全错，解出的却"看着合法"，于是延迟被
+        #: 报成一坨乱数（p95 4.7s，紧贴自己的 --max-delay 上限）。
+        probe_vd = probe_codec.Verdict()
+        probe_jumpy = 0          # 判据判成「乱跳」的帧数（>0 就是几何可疑）
+        _geom_key = [None]       # 上一次用的几何；变了就重置判据（见下）
 
         def _clock_ms():
             """当前该用的时钟偏移（毫秒）。
@@ -564,6 +716,11 @@ class LiveThread(QThread):
                 _t_pipe = time.perf_counter()   # 「收到这一帧 → 决策完」的总耗时
                 perf.frame_arrived(_t_pipe)     # 记下这帧被取走的时刻（算 out_key_ms）
                 vis = f.image          # BGR（decode_format="bgr24" 直出）
+                # 小地图那块面板**趁现在裁**（复制一份）：下面会往 vis 上就地画
+                # 玩家蓝框/攻击线，画过的像素会串进黄点识别里。见
+                # _mmap_panel_from_frame 的说明。来源=收流时这里是 None（那一帧
+                # 来自 A 机单独那一路，和主画面无关）。
+                _mmap_panel = self._mmap_panel_from_frame(vis)
 
                 # 定期重读可视化配置：标记颜色/线宽改了实时生效
                 if time.perf_counter() - _vis_refresh_last >= 1.0:
@@ -601,6 +758,14 @@ class LiveThread(QThread):
                     # 几何每帧现算：人工标定是比例，要按当前画面尺寸换算
                     # （read_bits 支持浮点 cell，所以不必取整）
                     px, py, cell, gap = _probe_geom(gray.shape)
+                    # 几何一变（刚标完 / 换了项目）就重置判据：换标定那一刻时间戳
+                    # 必然跳一次，不该被算成"乱跳"—— 否则刚存完就报"几何可疑"，
+                    # 人会被自己刚做的事吓到。
+                    _key = (round(px, 2), round(py, 2), round(cell, 2),
+                            round(gap, 2))
+                    if _key != _geom_key[0]:
+                        _geom_key[0] = _key
+                        probe_vd.reset()
                     ts_a = decode_ms(gray, px, py, cell, gap, bits)
                     if ts_a is None:
                         probe_miss += 1
@@ -619,6 +784,14 @@ class LiveThread(QThread):
                     else:
                         probe_ok += 1
                         perf.count("probe_ok")
+                        # 跨帧单调性（只在这里记，结论交给界面）—— 判据没过时界面
+                        # **不许显示延迟数**：报一个假延迟比不报糟得多。
+                        # 步长上限用显示帧周期算（判据自己会乘一个宽松倍数）。
+                        probe_vd.add(ts_a, 1000.0 / max(1.0, float(
+                            self._p.get("show_fps", 30.0) or 30.0)))
+                        if not probe_vd.mono:
+                            probe_jumpy += 1
+                            perf.count("probe_jumpy")
                         d = resolve_delay_ms(
                             (f.t_recv_wall + _clock_ms() / 1000.0) * 1000.0, ts_a)
                         # 超过 5 秒视为解码错误（而不是真的有 5 秒延迟）
@@ -793,6 +966,16 @@ class LiveThread(QThread):
                     # 也让这个开关真正做到「关掉 = 路线识别的活一点不干」。
                     if decision_settings.route_enabled:
                         relate_terrain(ws.mobs, ws.player, ws.platforms)
+                        # 小地图定位（S3）：写进 WorldState 的**玩家世界坐标 +
+                        # 所在段**（决策层要它才知道"我在哪块平台上"）。和上面三处
+                        # 一样挂在 route_enabled 下 —— 它属于「寻路那套」，关掉就
+                        # 该一点活都不干。算不出来时写 None（**不是 0**，0 是地图
+                        # 西北角这个合法坐标，见 perception/world_state.py）。
+                        _loc = self._locate_mmap(_mmap_panel)
+                        if _loc is not None:
+                            mm.apply_to_player(ws.player, _loc)
+                            perf.count("mmap_ok" if _loc.get("ok")
+                                       else "mmap_miss")
                     _t = time.perf_counter()
                     action = agent.tick(ws)
                     perf.ms("agent_ms", _t)
@@ -991,6 +1174,12 @@ class LiveThread(QThread):
                         "probe_invalid": probe_invalid,
                         "probe_ok": probe_ok,
                         "probe_reject": probe_reject,
+                        # 几何可信度：`probe_mono` False = 解出的时间戳在乱跳 →
+                        # 界面上那个延迟数不可信（见 probe_codec.Verdict）。
+                        "probe_mono": bool(probe_vd.mono),
+                        "probe_jumpy": probe_jumpy,
+                        "probe_step_ms": probe_vd.step_med,
+                        "probe_samples": len(probe_vd.ts_hist),
                         "clock_offset_ms": _clock_ms(),
                         "show_fps": n_show / el if el > 0 else 0.0,
                         "boxes": n_boxes,
@@ -1003,6 +1192,11 @@ class LiveThread(QThread):
                         "fps_src": fps_ref[0],
                         # 断线重连状态文字（reconnect.py 写，空串 = 没在重连）
                         "reconnect": getattr(decision_settings, "reconnect_note", ""),
+                        # 本机负载告警（_load_watch 线程写）：空串 = 现在没人跟我们
+                        # 抢机器。非空时状态行会把它顶到最前面 —— 它是上面那些
+                        # 数字「为什么变差」的解释，比数字本身更要紧。
+                        "load_warn": self._load[0],
+                        "load_detail": self._load[1],
                     })
                     t_last_stat = now
 

@@ -148,7 +148,10 @@ class PlayerPanel(QWidget):
         self.btn_auto = QPushButton("开启自动（F11）")
         self.btn_auto.setCheckable(True)
         self.btn_auto.setMinimumHeight(34)
-        self.btn_auto.setToolTip("开始/停止自动打怪。也可用 F11 快捷键开关。")
+        self.btn_auto.setToolTip(
+            "开始/停止自动打怪。也可用 F11 快捷键开关（全局热键，在别的程序里也生效）。\n"
+            "输入设备是「本地(仅测试)」时，**开启**会自动先弹一次确认 —— 那个模式下\n"
+            "按键是打给这台机器自己的，工作台一失焦就会落到别的窗口里。关闭不弹。")
         self.btn_auto.clicked.connect(self._toggle_auto)
         ctrl_row.addWidget(self.btn_auto)
 
@@ -228,7 +231,9 @@ class PlayerPanel(QWidget):
         self.cmb_device.addItem("ProMicro(远程)", "remote")
         self.cmb_device.addItem("ProMicro(本地)", "serial")
         self.cmb_device.setToolTip(
-            "本地(仅测试)：本机键盘模拟（SendInput）；\n"
+            "本地(仅测试)：本机键盘模拟（SendInput）。**键打到这台机器自己**，"
+            "不是游戏机 ——\n"
+            "  工作台一失焦就会落到别的窗口里，所以这个模式下开自动前会先确认一次。\n"
             "ProMicro(远程)：网络连游戏机的 Pro Micro 硬件键盘；\n"
             "ProMicro(本地)：本机 USB 直连 Pro Micro，无需 relay。")
         self.cmb_device.currentIndexChanged.connect(self._on_input_device)
@@ -915,10 +920,56 @@ class PlayerPanel(QWidget):
 
     def _toggle_auto(self, checked=None):
         on = self.btn_auto.isChecked()
+        if on and not self._confirm_local_auto():
+            # 在确认框上选了「否」：把按钮拨回去，**不碰 settings.enabled**。
+            # blockSignals 只是防御（clicked 不会因为 setChecked 再发一次，
+            # 但以后万一有人把它接到 toggled 上，这里就会自己叫自己）。
+            self.btn_auto.blockSignals(True)
+            self.btn_auto.setChecked(False)
+            self.btn_auto.blockSignals(False)
+            self._refresh_auto_ui()
+            return
         settings.enabled = on
         if not on:
             self._force_release_all()   # 关闭自动立即释放所有按键，防卡键
         self._refresh_auto_ui()
+
+    #: 本地输入二次确认是否正在显示。全局热键（WM_HOTKEY）在**任何**程序里都生效，
+    #: 连按两下会在模态框自己的事件循环里再进来一次，把确认框叠成一摞。
+    _auto_confirming = False
+
+    def _confirm_local_auto(self):
+        """输入设备是「本地(仅测试)」时，开自动前先让用户确认一次。
+
+        **为什么非要有**：本地模式走的是本机 SendInput —— 按键打到的是**这台
+        机器自己**的键盘输入上，不是游戏机。工作台一失焦、或你切到别的窗口，
+        这些键就落进当时的前台程序（浏览器、聊天窗口，也可能是工作台自己）。
+        而「开启自动」恰恰是最容易被顺手点一下的那个按钮，还挂着 F11 全局热键
+        （在别的程序里按也生效）。
+
+        默认按钮给**「否」**：这里拦的是"手快点了一下"，安全的那一侧才是默认 ——
+        和「保存标定」那种（人的意图已经表达了、只是提醒）正相反。
+
+        关自动**不问**：越顺手能停下来越好。
+        """
+        if settings.input_device != "local":
+            return True
+        if self._auto_confirming:
+            return False        # 已经在问了，别叠第二个
+        self._auto_confirming = True
+        try:
+            r = QMessageBox.question(
+                self, "输入设备是「本地(仅测试)」",
+                "本地模式的按键是「本机模拟」的：它打到这台机器自己的键盘输入上，"
+                "不是游戏机。\n\n"
+                "工作台一失焦、或你切到别的窗口，这些键就会落进当时的前台程序"
+                "（浏览器、聊天窗口，也可能是工作台自己）。\n\n"
+                "确定现在开启自动吗？\n\n"
+                "（要挂机跑，请先把「输入设备」切到 ProMicro(远程) 或 ProMicro(本地)。）",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        finally:
+            self._auto_confirming = False
+        return r == QMessageBox.Yes
 
     def _toggle_manual(self, checked=None):
         from decision import manual_input

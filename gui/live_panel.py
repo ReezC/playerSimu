@@ -6,8 +6,8 @@
     · 显示三个分开的速度指标
 """
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import QRect, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QImage, QPainter, QPixmap
 from PyQt5.QtWidgets import (QCheckBox, QFormLayout, QHBoxLayout, QLabel,
                              QLineEdit, QMessageBox, QPushButton, QSizePolicy,
                              QVBoxLayout, QWidget)
@@ -124,6 +124,16 @@ class LivePanel(QWidget):
         self._disp_merged = 0     # 还没画就又来新帧 → 被合并掉的帧数
         self._disp_skipped = 0    # 面板不可见 → 整帧不画（省主线程）
         self._draw_ms = 0.0       # 最近一次绘制耗时（含 QImage/QPixmap + 缩放）
+        #: 挂在实时画面上的「地形叠加图」那一层：None = 不画。
+        #: 由「路线识别 → 小地图定位」算好后塞进来（set_minimap_overlay），
+        #: **纯显示层** —— 帧数据一个字节都不改，见那个方法的说明。
+        self._ov_minimap = None
+        #: 小地图定位（S3）用的三样：地图 id / 来源 / 面板在画面里的矩形。
+        #: 由「路线识别」面板推过来（set_mmap），随线程参数一起带进实时线程。
+        self._mmap_mid = ""
+        self._mmap_src = "stream"
+        self._mmap_crop = None
+        self._mmap_track = None     # 黄点容差（界面上那排，键名见 mm.TRACK_KEYS）
         self._build()
 
     # ---------------- 界面 ----------------
@@ -345,12 +355,61 @@ class LivePanel(QWidget):
                         int(st.get("probe_invalid") or 0)
                         + int(st.get("probe_miss") or 0)]
 
+    def _verify_geo_live(self, geo, bits, seconds=0.8, want=6):
+        """拿实时流跑 ~0.8 秒，判这份几何解出的时间戳是否**单调** → (可信?, 说明)。
+
+        **为什么不能只"再解一帧"**：单帧解出一个"接近此刻"的值**证明不了几何对**
+        —— 40 位码的低位是快变化的毫秒，错位采样只把低位采错，凑出一个仍落在
+        ±10 分钟窗口里的值完全可能（实测踩过：比实际画的小 2.8px/块的几何，42 块
+        累积偏 118px、低位全错，解出的值"看着合法"，延迟被报成一坨乱数 p95 4.7s）。
+
+        单调性是**时间轴上的性质**：时间戳每帧只该往前走一小步，错位必然破坏它。
+        所以这里真的等几百毫秒收几帧 —— 短到人感觉不出来，但足够识破"低位采错"。
+        帧从 `current_frame()` 取（预览在跑，它每帧都换）。
+        """
+        from PyQt5.QtWidgets import QApplication
+
+        import cv2
+        from tools import probe_codec as pc
+
+        period = 1000.0 / max(1.0, float((getattr(self, "_last_stats", None) or {})
+                                         .get("show_fps") or 30.0))
+        vd = pc.Verdict()
+        app = QApplication.instance()
+        t0 = time.monotonic()
+        seen = set()
+        while time.monotonic() - t0 < seconds and len(vd.ts_hist) < want:
+            if app is not None:
+                app.processEvents()      # 让收流线程推来的新帧进 _on_frame
+            f = self.current_frame()
+            if f is None or id(f) in seen:
+                time.sleep(0.005)
+                continue
+            seen.add(id(f))
+            try:
+                gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+                ts = pc.decode_ms(gray, geo["x"], geo["y"], geo["cell"],
+                                  geo["gap"], bits)
+            except Exception:
+                ts = None
+            if ts is not None:
+                vd.add(ts, period)
+        if len(vd.ts_hist) < 3:
+            # 帧不够（预览没在跑 / 刚起）：**不下结论、也不拦**，如实说一句
+            return True, "只收到 %d 帧，判据没跑起来" % len(vd.ts_hist)
+        return vd.summary()
+
     def _pick_probe(self):
         """在实时画面上框选探针方块带 → 当场解码验证 → 通过才保存标定。
 
         **为什么必须验证**：这是 40 位码，差一个方块宽度就整个错位，而错位采样
         也能解出一个「合法」的 40 位数（看着完全正常）。所以判据是「解出来的时刻
         接近现在」（见 probe_codec.ts_plausible）。解不出就什么都不改。
+
+        但**光有那一条不够**（见 `_verify_geo_live`）：保存前还要拿实时流跑 0.8 秒
+        看时间戳**单不单调**，不单调就默认不保存 —— 这是 2026-09-25 那半天查错
+        换来的闸：错的几何一旦静默存进项目，工作台从此按它采样，延迟读数全是假的
+        而界面上一切正常。
         """
         from gui.region_selector import select_region_on_image
         from tools import probe_codec
@@ -389,6 +448,27 @@ class LivePanel(QWidget):
                 "  4. bits 要和 A 机一致（现在是 %d）\n"
                 "  5. 画面里那条带子如果发虚/被 UI 压住，先在 A 机挪开探针再标" % bits)
             return
+
+        # ★ **单调性闸**：解得出"接近此刻"的值不等于几何对（低位采错照样能凑）。
+        # 所以保存前拿实时流跑 0.8 秒看时间戳单不单调，不单调就默认**不保存**。
+        mono_ok, mono_why = self._verify_geo_live(geo, bits)
+        if not mono_ok:
+            r = QMessageBox.question(
+                self, "这份几何可能不对",
+                "框选能解出时间码，但**实时这一小会儿解出的时间戳在乱跳**：\n\n"
+                "    %s\n\n"
+                "时间戳本该每帧只往前走一小步。乱跳说明采样点没落在方块中心、"
+                "低位被采错了 ——\n这种错**光看能不能解出是看不出来的**，而它会让"
+                "「端到端延迟」变成一个假数。\n\n"
+                "「否」= 不保存，回去重框（推荐）\n"
+                "「是」= 仍然保存（我知道自己在做什么）\n\n"
+                "重框要点：高度**贴住方块**、宽度**量到整条带的外缘**。\n"
+                "也可以改用  python -m tools.probe_tune  手工推框 —— 它按同一个判据"
+                "当场告诉你\n对没对，判据没过还不让保存。" % mono_why,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if r != QMessageBox.Yes:
+                self._refresh_probe_label("　⨯ 已取消保存（几何没通过单调性判据）")
+                return
 
         dx, dy, dcell = geo["snap"]
         # **存进项目**（settings 按项目持久化，和 HP/MP 条同一套机制）：
@@ -441,9 +521,30 @@ class LivePanel(QWidget):
 
     # ---------------- 项目 ----------------
 
+    def set_mmap(self, map_id=None, src=None, crop=None, track=None):
+        """把「小地图定位」要的东西转给实时线程（切项目/换来源/重框/改容差时叫它）。
+
+        实时线程在跑就当场生效（`set_mmap` 只写几个字段，主回路每拍现读），
+        没跑就等下一次 start() 由参数带进去 —— 两条路都在下面的 start() 里对齐。
+        """
+        if map_id is not None:
+            self._mmap_mid = str(map_id)
+        if src is not None:
+            self._mmap_src = src
+        if crop is not None:
+            self._mmap_crop = [int(v) for v in crop]
+        if track is not None:
+            self._mmap_track = dict(track)
+        if self.thread is not None:
+            self.thread.set_mmap(map_id=map_id, src=src, crop=crop,
+                                 track=track)
+
     def bind(self, project):
         """绑定项目：自动找最新的模型权重。"""
         self.project = project
+        # 地图跟着项目走：小地图定位要用它去读地形与标定（见 set_mmap）
+        self.set_mmap(map_id=((project.get("map_id") or "").strip()
+                              if project is not None else ""))
         if self.thread is not None:
             self.stop()
 
@@ -530,6 +631,11 @@ class LivePanel(QWidget):
             "perf_log": bool(load_live().get("perf_log", True)),
             "show_fps": 30.0,
             "player_id": pid,
+            # 小地图定位（S3）：把玩家世界坐标写进 WorldState（见 live_thread）
+            "mmap_map_id": self._mmap_mid,
+            "mmap_src": self._mmap_src,
+            "mmap_crop": self._mmap_crop,
+            "mmap_track": self._mmap_track,
         }
 
         if source == "window":
@@ -659,6 +765,49 @@ class LivePanel(QWidget):
         """
         return self._last_bgr
 
+    def set_minimap_overlay(self, pix, src_rect=None, frame_rect=None,
+                            alpha=0.55, note=""):
+        """在实时画面上挂一层「地形叠加图」；传 `pix=None` 卸掉。
+
+        **为什么必须画在显示层、不能烘进帧**：`current_frame()`（= `_last_bgr`）
+        还要喂给探针标定、HP/MP 条框选，以及小地图「从实时画面框选」的标定弹窗
+        （`LiveFrameRegionClient` 拿它裁出面板去做模板匹配）。叠加一旦烘进帧，
+        标定弹窗就会**拿叠加图和它自己匹配** —— 匹配分虚高，框选还会框到画上去的
+        东西。所以这一层只在 `_render` 里往 QPixmap 上补，帧数据一个字节不动。
+
+        成本（实测：画面 1366×768、面板 134×109、叠加源图 1340×1010）：
+        `setPixmap(缩放)` 1.150 ms → 加这一层 1.212 ms，**多 0.06 ms**；
+        同样的效果烘进 numpy 帧要 2.7 ms（差 25 倍），还不算它污染帧的代价。
+        快的原因是 Qt 只往目标区写，不会去重采样整张源图 —— **别改成 Smooth**。
+
+        参数一律是**画面坐标 / 画面像素**，由调用方照标定算好
+        （`perception/minimap.frame_overlay_rects`）：面板这边不读文件、不算几何。
+        """
+        if pix is None or pix.isNull() or frame_rect is None:
+            self._ov_minimap = None
+            self._render()          # 立刻擦掉上一层，别等下一帧
+            return
+        # `note`：叠在**框选那块的下方**的一行字（玩家世界坐标，见 路线识别面板）。
+        # 一起存进来，因为每次重画时都要重新贴上 —— 帧是新的，文字也得跟着重贴。
+        self._ov_minimap = (pix, src_rect, tuple(int(v) for v in frame_rect),
+                            float(alpha), str(note or ""))
+        self._render()
+
+    def set_overlay_note(self, note):
+        """只换叠图那行读数 → 换成 True；现在没挂叠图 → False。
+
+        **为什么要单开一个入口**：世界坐标那行每 250ms 更新一次，走
+        `set_minimap_overlay` 会把地形 JSON 和底图 PNG 一起重读一遍（那是几十
+        毫秒级的活，还全在 GUI 主线程上）—— 而这里要换的只是一个字符串。
+        调用方拿 False 时再整算一次（见 route_panel._tick_world）。
+        """
+        ov = self._ov_minimap
+        if ov is None:
+            return False
+        self._ov_minimap = tuple(ov[:4]) + (str(note or ""),)
+        self._render()
+        return True
+
     def _render(self):
         if self._last_pix is None:
             return
@@ -669,8 +818,88 @@ class LivePanel(QWidget):
         #
         # 这个延迟发生在主线程队列里，工作线程侧的统计根本看不到 ——
         # 所以监控数字一切正常，体感却明显滞后。
-        self.view.setPixmap(self._last_pix.scaled(
-            self.view.size(), Qt.KeepAspectRatio, Qt.FastTransformation))
+        pix = self._last_pix.scaled(
+            self.view.size(), Qt.KeepAspectRatio, Qt.FastTransformation)
+        if self._ov_minimap is not None and not pix.isNull():
+            self._paint_minimap_overlay(pix, self._ov_minimap)
+        self.view.setPixmap(pix)
+
+    def _paint_minimap_overlay(self, pix, ov):
+        """把叠加层画到**已经缩放到标签尺寸**的那张图上。
+
+        倍率要用 `pix.width() / 原始帧宽` 反推，**不能**用 `min(标签宽/画面宽, ...)`：
+        `scaled()` 会取整，两者差的那一点点在这个几十像素的叠加区上正好看得见。
+        """
+        img, src, rect, alpha, note = (list(ov) + [""])[:5]
+        fw = self._last_pix.width() or 1
+        fh = self._last_pix.height() or 1
+        sx, sy = pix.width() / float(fw), pix.height() / float(fh)
+        if sx <= 0 or sy <= 0:
+            return
+        x, y, w, h = rect
+        dst = QRect(int(round(x * sx)), int(round(y * sy)),
+                    max(1, int(round(w * sx))), max(1, int(round(h * sy))))
+        if not dst.intersects(pix.rect()):
+            return                  # 整块在画面外（换了分辨率还没重框）：不白画
+        p = QPainter(pix)
+        try:
+            p.setOpacity(max(0.0, min(1.0, alpha)))
+            if src is None:         # None = 整张叠加图（fit 模式）
+                p.drawPixmap(dst, img)
+                self._draw_note(p, dst, note)       # 画完叠图再贴读数
+                return
+            sx0, sy0, sx1, sy1 = (int(round(v)) for v in src)
+            # 源矩形**超出叠加图**是正常情况：面板框得比底图还高时就会这样
+            # （实测就是这么框的：面板 134×109，而底图只有 101 高 —— 多出来的
+            # 那 8 行底图里本来就没有内容）。
+            #
+            # 这种情况**交给 Qt 就行**：实测它会自己剪掉源、并把目标矩形按比例
+            # 调好 —— 画出来的范围和"手工求交集再按比例裁目标"逐像素一致
+            # （差 ≤1px 是取整）。**别在这儿自己再写一遍裁剪**：多余，而且比例
+            # 系数很容易写错，错了就是整层叠图偏一小截、看着像"标定偏了"。
+            p.drawPixmap(dst, img, QRect(sx0, sy0, max(1, sx1 - sx0),
+                                         max(1, sy1 - sy0)))
+            self._draw_note(p, dst, note)
+        finally:
+            p.end()
+
+    @staticmethod
+    def _draw_note(p, dst, note):
+        """在小地图那块框的**下方**贴一行读数（玩家世界坐标）。
+
+        为什么画在叠加层**之后**：它是读数，被半透明的地形图压住就看不清了。
+        放不下就翻到框的上方 —— 框本来就贴着画面下沿时，写字会掉出画面外
+        （这个项目里标签一律这么处理）。带描边是为了在任何底色上都读得出来。
+        """
+        from PyQt5.QtGui import QColor, QFont
+        if not note:
+            return
+        p.setOpacity(1.0)
+        f = QFont()
+        f.setPointSize(9)
+        f.setBold(True)
+        p.setFont(f)
+        fm = p.fontMetrics()
+        x = max(0, int(dst.left()))
+        y = int(dst.bottom()) + 4
+        # 兜一道：这行字是**一行不换行**的，太长会横穿整个画面还看不清。
+        # 调用方本来就该只给短句（见 route_panel._tick_world 的 _say），
+        # 但这里也不能靠"上游会给短的"活着 —— 超出就省略号截断。
+        max_w = max(60, p.device().width() - x - 2)
+        if fm.horizontalAdvance(note) + 8 > max_w:
+            note = fm.elidedText(note, Qt.ElideRight, max(20, max_w - 8))
+        tw, th = fm.horizontalAdvance(note) + 8, fm.height() + 2
+        if y + th > p.device().height():
+            y = max(0, int(dst.top()) - th - 4)     # 下方放不下 → 翻到上面
+        box = QRect(x, y, tw, th)
+        p.fillRect(box, QColor(0, 0, 0, 150))
+        p.setPen(QColor(0, 0, 0))
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):   # 描边
+            p.drawText(box.adjusted(dx + 4, dy, dx + 4, dy),
+                       Qt.AlignLeft | Qt.AlignVCenter, note)
+        p.setPen(QColor(255, 255, 255))
+        p.drawText(box.adjusted(4, 0, 4, 0),
+                   Qt.AlignLeft | Qt.AlignVCenter, note)
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
@@ -688,6 +917,25 @@ class LivePanel(QWidget):
         if not v or time.monotonic() < v[0]:
             return
         self._verify = None
+        # ② 解得出、但**时间戳在乱跳** → 这份几何按单调性判据不可信。
+        #    比"一帧都解不出"隐蔽得多：屏幕上延迟数照样在跳，看着像在工作。
+        if (s.get("probe_mono") is False and int(s.get("probe_jumpy") or 0) > 0
+                and int(s.get("probe_samples") or 0) >= 6):
+            QMessageBox.warning(
+                self, "这份标定不可信",
+                "标定已保存、也**解得出时间码**，但实时这几秒解出的时间戳在乱跳"
+                "（%d 帧）——\n说明采样点没落在方块中心、低位被采错了。这种错"
+                "**光看能不能解出是看不出来的**\n（错位照样能凑出一个「接近此刻」"
+                "的值），所以那个延迟数一律不可信。\n\n"
+                "两个办法：\n"
+                "  1. 点「框选探针」重框：高度贴住方块、宽度量到整条带外缘；\n"
+                "  2. python -m tools.probe_tune 手工推框（同一判据、当场告诉你对没对，\n"
+                "     判据没过还不让保存）。\n\n"
+                "参考：A 机按 cell=23 / gap=3（逻辑）画，换算到 1366x768 流里约"
+                " cell=18.4 gap=2.4。"
+                % int(s.get("probe_jumpy") or 0)
+                + "\\n\\n（这份标定已经存了；重框会覆盖它。）")
+            return
         ok = int(s.get("probe_ok") or 0) - v[1]
         bad = (int(s.get("probe_invalid") or 0)
                + int(s.get("probe_miss") or 0)) - v[2]
@@ -712,7 +960,27 @@ class LivePanel(QWidget):
         w, h = s.get("size") or (0, 0)
         d = s.get("delay_ms")
         self.lbl_stats.setToolTip("")
-        if d is not None:
+        # **几何可疑优先于一切**：时间戳在乱跳时，那个延迟数就是乱数（而且可能
+        # 正好"看着正常"）—— 必须抢在它前面说清楚，否则又把人引到链路上去查。
+        jumpy = (s.get("probe_on") and s.get("probe_mono") is False
+                 and int(s.get("probe_jumpy") or 0) > 0
+                 and int(s.get("probe_samples") or 0) >= 6)
+        if jumpy:
+            d_txt = ("端到端延迟  ——  （几何可疑：时间戳在乱跳 %d 帧）"
+                     % int(s.get("probe_jumpy") or 0))
+            self.lbl_stats.setToolTip(
+                "解得出时间码，但**解出的时间戳在乱跳**（%d 帧；步长本该≈帧周期）\n"
+                "—— 这是错位采样的特征：采样点没落在方块中心，低位被采错了。\n\n"
+                "**这种错光看「能不能解出」是看不出来的**（错位照样能凑出一个接近\n"
+                "此刻的值），所以上面那个延迟数一律不可信，宁可不显示。\n\n"
+                "怎么修：\n"
+                "  1. 点「框选探针」重框：高度**贴住方块**、宽度**量到整条带外缘**\n"
+                "  2. python -m tools.probe_tune 手工推框（同一判据、当场看对没对）\n\n"
+                "参考：A 机按 cell=23 / gap=3（逻辑）画，换算到 1366x768 流里约\n"
+                "cell=18.4 gap=2.4 —— 如果你现在的 cell/gap 明显比这小，就是它了。\n"
+                "（判据：probe_codec.Verdict，与 tools/probe_tune 共用一份。）"
+                % int(s.get("probe_jumpy") or 0))
+        elif d is not None:
             d_txt = "端到端延迟 %6.0f ms" % d
         elif not s.get("probe_on"):
             d_txt = "端到端延迟  ——  （未启用探针）"
@@ -747,6 +1015,17 @@ class LivePanel(QWidget):
         # 断线重连在做的事放在最前面 —— 这时候帧率数字意义不大，状态才是要紧的
         note = (s.get("reconnect") or "").strip()
         head = "【%s】 " % note if note else ""
+        # 本机负载告警再压一层到最前面：它是「上面这些数字为什么变差」的解释，
+        # 比数字本身更要紧 —— 实测同时跑训练/并行标注时，推理的前向会与输入尺寸
+        # 无关地整体变慢（同一份配置 10.0 → 23.7 ms），而 GPU 时钟功耗都正常。
+        lw = (s.get("load_warn") or "").strip()
+        if lw:
+            head = "【%s】 " % lw + head
+        # 明细放 tooltip：状态行那一行已经塞满了，硬挤进去反而看不清数字
+        ld = (s.get("load_detail") or "").strip()
+        if ld:
+            cur = self.lbl_stats.toolTip()
+            self.lbl_stats.setToolTip((cur + "\n\n" if cur else "") + ld)
         # 绘制那一段单独报：「显示 fps」只说明**推**了多少，看不出主线程画得
         # 动不动 —— 而"失焦就卡"恰恰卡在这里（合并丢弃的帧数一涨，就说明主线程
         # 跟不上推送、开始在丢中间帧；不丢帧时界面才不会滞后）。

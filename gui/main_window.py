@@ -456,9 +456,13 @@ class MainWindow(QMainWindow):
         self.live_panel.potions_ready.connect(self.player_panel._on_potions)
         tabs.addTab(self.player_panel, "决策参数")
         self.route_panel = RoutePanel()
-        # 小地图来源选「从实时画面框选」时，框选和标定都要拿实时那一帧
+        # 框选小地图、以及「把叠图画到实时画面上」，都要拿实时那个面板
         # （理由同上面 HP/MP 条：框选得在画面上做）。
         self.route_panel.live_panel = self.live_panel
+        # 面板自己建的时候还没有 live_panel，叠图挂不上去；这里补一次。
+        # 不补的话：上次退出时开关是开着的用户，要先去「路线识别」页点一下
+        # 才会看到叠图 —— 而它明明是开着的（"勾了没反应"就长这样）。
+        self.route_panel._refresh_overlay()
         tabs.addTab(self.route_panel, "路线识别")
         # 最小宽度兜底：主视区尺寸波动时不把配置区挤没
         tabs.setMinimumWidth(460)

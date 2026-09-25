@@ -31,6 +31,7 @@ from gui.canvas import ZoomPanView    # 看图交互在几个窗口里是同一�
 from gui.widgets import NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSlider
 from gui.worker import safe_slot      # 槽里抛异常 = 整个工作台 abort（见 worker.py）
 from perception import minimap as mm
+from tools.config import load_live
 
 #: 缩放滑块：0.200 ~ 12.000。
 #: 上限从 4.0 放到 12.0：小底图（几十像素）被客户端放大若干倍、A 机的推流 zoom
@@ -77,12 +78,16 @@ class MinimapCalibDialog(QDialog):
     """量「面板 → 底图」的缩放/偏移（存 datasets/map/<id>.mapcalib.json）。"""
 
     def __init__(self, map_id, mode=None, host=None, port=None, client=None,
-                 parent=None):
+                 parent=None, src=None):
         super().__init__(parent)
         self.setWindowTitle("小地图标定")
         self.setMinimumSize(900, 720)
         #: 点过「保存标定」没有 —— 外层（路线识别）据此决定要不要刷新状态
         self.saved = False
+        #: **这份标定是给哪条来源量的**。标定按来源分开存（见 mapdata.calib_path）：
+        #: 两条来源的面板尺寸差 5.6 倍，一份几何只对一条成立。外层（路线识别）知道
+        #: 自己喂的是哪条来源，会显式传进来；没传就按配置里的当前来源算。
+        self.src = src or (load_live().get("mmap_src") or mm.SRC_STREAM)
 
         self.map_id = str(map_id)
         self.terrain = mapdata.load(self.map_id, with_canvas=True)
@@ -95,7 +100,7 @@ class MinimapCalibDialog(QDialog):
         #: 没传就自己连一路，关窗时自己停 —— 不能让弹窗留下一个后台线程。
         self._own_client = client is None
 
-        cal = mapdata.load_calib(self.map_id) or {}
+        cal = mapdata.load_calib(self.map_id, self.src) or {}
         self.mode = mode or cal.get("mode") or mm.MODE_FIT
         self.scale = float(cal.get("scale") or 1.0)
         self.offset = [int(v) for v in (cal.get("offset") or [0, 0])]
@@ -131,6 +136,9 @@ class MinimapCalibDialog(QDialog):
         self.manual = (cal.get("src") == "manual")
         self._prev_anchor = None           # 上一拍的锚点（看位移用）
         self._last_locate = 0.0            # 上次定位时刻（自动模式节流用）
+        #: 「保存标定」成功那一刻的几何指纹（None = 还没量过任何东西）。
+        #: 关窗时拿它比：有差异就是"有没保存的改动" —— 见 reject()。
+        self._saved_snap = None
 
         self._build()
         self._load_ref()
@@ -151,6 +159,7 @@ class MinimapCalibDialog(QDialog):
         self._timer.start()
 
         self._sync_overlay()
+        self._refresh_loaded()
         self._refresh_status()
         self._refresh_judge()
 
@@ -188,6 +197,16 @@ class MinimapCalibDialog(QDialog):
         self.cmb_ref.currentIndexChanged.connect(safe_slot(self._on_ref))
         top.addWidget(self.cmb_ref)
         root.addLayout(top)
+
+        # ---- 这份几何是**从哪来的**（单独一行，不往上面那行续 —— UI 规范 §4）----
+        # 为什么非要写出来：不写的话，「还原了上次标定」和「程序刚摆了个大致位置」
+        # 在屏幕上**长得一模一样**，于是人只能猜"我标过没有"。现场就是这么卡住的：
+        # 标定压根没存上（文件都不存在），弹窗却每次都默默摆一个大概位置 ——
+        # 看着像"还原了一份错的"，实际是"没有可还原的东西"。
+        self.lbl_loaded = QLabel()
+        self.lbl_loaded.setWordWrap(True)
+        self.lbl_loaded.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        root.addWidget(self.lbl_loaded)
 
         # ---- 状态 + 收流控制 ----
         # 两行分开写：一行是**连接状态**（收帧中 / 等帧），一行是**动作结果**
@@ -313,6 +332,68 @@ class MinimapCalibDialog(QDialog):
         hint.setWordWrap(True)
         root.addWidget(hint)
 
+    # ---------------- 「这份几何从哪来」/「有没有没存的改动」 ----------------
+
+    def _refresh_loaded(self):
+        """顶部那行：现在的几何是**上次存的**，还是**程序刚摆的**。
+
+        判据用 `mm.has_geometry`（不是 score）—— 手工对齐没有匹配分，拿分数判会
+        把"已经标过"说成"还没标定"（这正是以前「点了保存、重开又变回去」的由来）。
+        """
+        p = mapdata.calib_path(self.map_id)
+        # **只读这条来源的那一份**：两条来源的面板尺寸差 5.6 倍，串了就是错的几何
+        cal = mapdata.load_calib(self.map_id, self.src) or {}
+        label = mm.SRC_LABEL.get(self.src, self.src)
+        if mm.has_geometry(cal):
+            when = ""
+            try:                        # 文件时间＝"上次标定是什么时候"最直接的证据
+                when = time.strftime("　存于 %m-%d %H:%M",
+                                     time.localtime(p.stat().st_mtime))
+            except Exception:
+                pass
+            how = ("手工对齐" if cal.get("src") == "manual"
+                   else "自动匹配 %.2f" % float(cal.get("score") or 0.0))
+            # 老格式没记来源 → **不能**写成「来源：从实时画面」：那是猜的，而这份
+            # 几何只对当时那条来源成立（说成当前来源就是让人放心用错的数）。
+            shown = "未记·老格式" if cal.get("legacy") else label
+            self.lbl_loaded.setText("已载入上次标定（来源：%s）：%s%s"
+                                    % (shown, how, when))
+            self.lbl_loaded.setStyleSheet("color:#188038;")
+            tip = ("这份几何是从文件里读回来的，关掉再打开还是它：\n%s\n\n"
+                   "**它只对「%s」这条来源成立** —— 换来源后面板尺寸就变了，"
+                   "要按新来源重量一次。\n"
+                   "改了之后要点「保存标定」才会覆盖它（关窗时也会提醒）。"
+                   % (p, label))
+            if cal.get("legacy"):
+                tip += ("\n\n⚠ 这份文件是**老格式**（没记来源 —— 它是「按来源分开存」"
+                        "之前量的）—— 如果你换过来源，这份几何多半对不上，"
+                        "请重量一次再保存。")
+            self.lbl_loaded.setToolTip(tip)
+        else:
+            self.lbl_loaded.setText(
+                "这张图在「%s」下还没标定过：现在摆的是程序猜的粗略位置 —— "
+                "调好重合后点「保存标定」，否则下次打开还是这样。" % label)
+            self.lbl_loaded.setStyleSheet("color:#b06000;")
+            self.lbl_loaded.setToolTip(
+                "还没有可用的几何：\n%s\n\n"
+                "（文件不存在，或者里面只有「显示方式」—— 那不算标定过。）\n"
+                "标定是**按来源分开存**的：这里只认「%s」那一份，标的是另一条"
+                "来源也照样算没标。\n"
+                "「保存标定」会写进上面这个文件。" % (p, label))
+
+    def _snapshot(self):
+        """几何指纹：只取决定换算的那四项（透明度、参照图这些不算改动）。"""
+        c = self.calib()
+        return (c.get("mode"),
+                round(float(c.get("scale") or 0.0), 4),
+                tuple(int(v) for v in (c.get("offset") or [0, 0])),
+                tuple(int(v) for v in (c.get("view") or [0, 0])))
+
+    def _unsaved(self):
+        """有没保存的改动吗（还没量过东西时一律 False：那时确实没什么可存）。"""
+        return (self._saved_snap is not None
+                and self._snapshot() != self._saved_snap)
+
     # ---------------- 收帧 ----------------
 
     def _on_tick(self):
@@ -322,6 +403,10 @@ class MinimapCalibDialog(QDialog):
         if (self.ck_live.isChecked() and frame is not None
                 and frame is not self._frame):
             self._take(frame)
+        # 基线取在**第一拍摆完位之后**：程序自己那次粗略摆位（自动定位还开着时
+        # 会再跟一次自动量）不算"你改过" —— 否则一开一关就弹"还没保存"。
+        if self._saved_snap is None and self._frame is not None:
+            self._saved_snap = self._snapshot()
         self._refresh_status()
 
     def _take(self, frame):
@@ -778,15 +863,32 @@ class MinimapCalibDialog(QDialog):
                 self._say("没有保存（你在提示里选了「否」—— 几何还在，可以再点"
                           "「保存标定」）", bad=True)
                 return
-        cal = mapdata.load_calib(self.map_id) or {}
+        cal = mapdata.load_calib(self.map_id, self.src) or {}
         # 只更新量出来的几何 + 方式：显示方式仍算「你在界面里选的」
         cal.update(self.calib())
         cal["picked_by"] = "gui"
-        mapdata.save_calib(self.map_id, cal)
+        cal.pop("legacy", None)         # 老格式的标记不写回文件（见 mapdata.save_calib）
+        # 写文件这步**必须自己兜住异常**：这个槽外面还包着 safe_slot，而它只
+        # `traceback.print_exc()` —— 正常启动走的是 pythonw（没有控制台），
+        # 于是写失败会**一点痕迹都没有**：人点了保存、界面什么都没说，以为存上了。
+        p = mapdata.calib_path(self.map_id)
+        try:
+            # **带上来源**：不带就等于整份覆盖 —— 会把另一条来源的标定抹掉，
+            # 而人完全看不出来（然后在那条来源下算出错的世界坐标）。
+            mapdata.save_calib(self.map_id, cal, self.src)
+        except Exception as e:
+            self._say("**保存失败**：%s: %s　（目标文件 %s —— 检查目录是否可写）"
+                      % (type(e).__name__, e, p), bad=True)
+            return
+        if not p.exists():
+            # 写没报错、文件却不在（同步盘/权限怪问题）：也要说出来，别让人以为存上了
+            self._say("**保存失败**：写完却找不到文件 %s" % p, bad=True)
+            return
         self.saved = True
+        self._saved_snap = self._snapshot()     # 这一份就是"已保存"的基线
+        self._refresh_loaded()                  # 顶部那行立刻变成「已载入上次标定…」
         self._say("已保存标定（%s）→ %s"
-                  % ("手工对齐" if self.manual else "自动匹配",
-                     mapdata.calib_path(self.map_id)))
+                  % ("手工对齐" if self.manual else "自动匹配", p))
 
     # ---------------- 键盘微调 ----------------
 
@@ -814,6 +916,28 @@ class MinimapCalibDialog(QDialog):
     def closeEvent(self, e):
         self._shutdown()
         super().closeEvent(e)
+
+    def reject(self):
+        """关闭（按钮 / Esc / 右上角）前：有没保存的改动就问一句。
+
+        **为什么要在出口上拦**：「调了半天、结果没存」是这个弹窗最容易发生、
+        而且**事后无法自证**的事故 —— 数据没了，屏幕上却和"存过了"长得一样。
+        （判据是几何指纹，不是"点没点过保存"。）
+        """
+        if self._unsaved():
+            r = QMessageBox.question(
+                self, "还有没保存的改动",
+                "现在的几何和上次保存的不一样，关掉就没了。\n\n"
+                "「是」= 先保存再关（匹配分偏低时会再确认一次）\n"
+                "「否」= 直接关掉，放弃这次的改动",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if r == QMessageBox.Yes:
+                self._on_save()
+                if self._unsaved():
+                    # 没存成（比如在分数提示里选了「否」，或写文件失败）→ 别关，
+                    # 状态行已经写明原因了，人看得见。
+                    return
+        super().reject()
 
     def done(self, code):
         self._shutdown()

@@ -20,7 +20,7 @@ bars:
   - 0.973958
   - 0.120791
   - 0.018229
-  hp_color: &id001
+  hp_color:
   - - 0
     - 0
     - 137
@@ -32,7 +32,7 @@ bars:
   - 0.973958
   - 0.120059
   - 0.018229
-  mp_color: &id002
+  mp_color:
   - - 144
     - 78
     - 0
@@ -40,12 +40,12 @@ bars:
     - 198
     - 77
 decision:
-  attack_dist: 70.0
+  attack_dist: 80.0
   min_attack_dist: 0
   chase_jump_enabled: true
   chase_jump_min: -10
-  chase_jump_max: 5
-  mouse_speed: 1.9
+  chase_jump_max: 0
+  mouse_speed: 1.5
   evade_type: jump
   jump_interval: 0
   jump_random_prob: 0.1
@@ -113,17 +113,29 @@ decision:
   - 0.120059
   - 0.018229
   probe_calib:
-    x_ratio: 0.0739385065885798
+    x_ratio: 0.07247437774524158
     y_ratio: 0.02734375
-    cell_ratio: 0.01171303074670571
+    cell_ratio: 0.011896046852122987
     gap_ratio: 0.0014641288433382138
     bits: 40
     frame:
     - 1366
     - 768
-    solved_at: '2026-09-25 15:50:05'
-  hp_color: *id001
-  mp_color: *id002
+    solved_at: '2026-09-25 20:55:35'
+  hp_color:
+  - - 0
+    - 0
+    - 137
+  - - 78
+    - 80
+    - 255
+  mp_color:
+  - - 144
+    - 78
+    - 0
+  - - 255
+    - 198
+    - 77
   hp_threshold: 68
   mp_threshold: 7
   pot_cd: 1000
@@ -140,11 +152,11 @@ decision:
   sweep_turn_cd: 500
   back_range: 100
   route_enabled: false
-  debounce_conf: 0.6
+  debounce_conf: 0.4
   debounce_ms: 2000
   auto_feed_pet: true
-  feed_interval_min: 10.0
-  feed_interval_max: 15.0
+  feed_interval_min: 8.0
+  feed_interval_max: 12.0
   custom_timers:
   - name: 自动回避药水
     seq:
@@ -173,6 +185,8 @@ decision:
     interval:
     - 3.0
     - 3.0
+    paused: true
+    paused_left: 174.35899999999674
   facing_timeout_min: 0.0
   player_lost_timeout_min: 3.0
   resetall_interval: 60
@@ -278,7 +292,7 @@ verify:
   imgsz: 960
   limit: 0
 iterate:
-  conf: 0.6
+  conf: 0.5
   keep_empty: true
   limit: 0
 mob_names:

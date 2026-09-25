@@ -84,13 +84,15 @@ def _report_startup_error():
 try:
     from PyQt5.QtCore import Qt, QTimer, pyqtSignal
     from PyQt5.QtGui import QFont
-    from PyQt5.QtWidgets import (QApplication, QCheckBox, QFileDialog, QFrame,
-                                 QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-                                 QMainWindow, QMessageBox, QPlainTextEdit,
-                                 QPushButton, QScrollArea, QSizePolicy,
-                                 QSplitter, QVBoxLayout, QWidget)
+    from PyQt5.QtWidgets import (QAction, QApplication, QCheckBox, QFileDialog,
+                                 QFrame, QGridLayout, QHBoxLayout, QLabel,
+                                 QLineEdit, QMainWindow, QMessageBox,
+                                 QPlainTextEdit, QPushButton, QScrollArea,
+                                 QSizePolicy, QSplitter, QToolBar, QVBoxLayout,
+                                 QWidget)
 
     from deploy import selfcheck, services
+    from tools import push_presets as pp
     from deploy.runner import Proc
     from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,
                              NoWheelSpinBox)
@@ -762,6 +764,7 @@ class DeployWindow(QMainWindow):
     sig_line = pyqtSignal(str, str)      # 服务 key, 一行日志（从读取线程发过来）
     sig_exit = pyqtSignal(str, object)   # 服务 key, 退出码
     sig_check = pyqtSignal(list)         # 自检结果
+    sig_sweep_done = pyqtSignal(object, object)   # 推流自检跑完（rows, 落盘路径）
 
     def __init__(self):
         super().__init__()
@@ -775,8 +778,11 @@ class DeployWindow(QMainWindow):
         self.sig_line.connect(self._on_line)
         self.sig_exit.connect(self._on_exit)
         self.sig_check.connect(self._on_check)
+        self.sig_sweep_done.connect(self._on_sweep_done)
+        self._sweep = None            # 推流自检线程（跑的时候非空）
 
         self._build()
+        self._build_toolbar()
         self.setStyleSheet(QSS)
         self.resize(int(self.cfg["window"]["w"]), int(self.cfg["window"]["h"]))
 
@@ -796,6 +802,89 @@ class DeployWindow(QMainWindow):
         self.run_selfcheck()
 
     # ---------------- 界面 ----------------
+
+    def _build_toolbar(self):
+        """工具栏：目前只有「推流自检」，以后要放别的整机级动作也放这里。
+
+        为什么值得有这条：**A 机扛不扛得住、哪套参数延迟最低**，原先只能靠人一条条
+        手改参数、手记数字。自检把它变成"各点一次、等几分钟、拿一张表"，
+        而延迟那一半由 B 机量（两边按同一份清单顺序走，墙钟对账，见 tools/push_presets.py）。
+        """
+        bar = QToolBar("工具")
+        bar.setObjectName("Tools")
+        bar.setMovable(False)
+        self.addToolBar(bar)
+
+        act = QAction("推流自检…", self)
+        act.setToolTip(
+            "按 config/push_presets.json 的候选清单**逐条换参试推**，采 A 机侧指标\n"
+            "（ffmpeg 的 speed / 实际帧率 / 丢帧 / 码率 / CPU / NVENC 利用率）。\n\n"
+            "跑法：\n"
+            "  1. 这里点开始（它会先停掉正在跑的「屏幕推流」）；\n"
+            "  2. **紧接着**在 B 机跑  python -m tools.stream_sweep  （量端到端延迟）；\n"
+            "  3. 把 A 机生成的 perf_push_A.json 拷到 B 机，再跑\n"
+            "     python -m tools.stream_sweep --merge perf_push_A.json  出表与结论。\n\n"
+            "会反复重启推流（游戏画面会闪几次），跑完不自动开回推流 —— 确认结果后\n"
+            "自己在「屏幕推流」卡片上点启动。")
+        act.triggered.connect(self._start_push_sweep)
+        bar.addAction(act)
+        self.act_sweep = act
+
+    def _start_push_sweep(self):
+        """启动推流自检（先停正在跑的推流，避免两路推流混在一起）。"""
+        if getattr(self, "_sweep", None) is not None and self._sweep.is_alive():
+            QMessageBox.information(self, "正在跑", "推流自检已经在跑了。")
+            return
+        conf = pp.load()
+        mins = len(conf["presets"]) * (conf["seconds"] + conf["settle_seconds"] + 3) / 60.0
+        push_running = bool(self.procs.get("push") and self.procs["push"].running())
+        r = QMessageBox.question(
+            self, "开始推流自检",
+            "将按 config/push_presets.json 的 **%d 条候选**逐条换参试推，\n"
+            "每条试推 %.0f 秒（前 %.0f 秒丢弃），一轮约 **%.0f 分钟**。\n\n"
+            "%s\n\n"
+            "期间游戏画面会闪几次（每次都在重启 ffmpeg）。开始吗？"
+            % (len(conf["presets"]), conf["seconds"], conf["settle_seconds"], mins,
+               ("正在跑的「屏幕推流」会先被停掉。" if push_running else
+                "（「屏幕推流」当前没在跑。）")),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if r != QMessageBox.Yes:
+            return
+        if push_running:
+            self.stop_service("push")
+        self.log("ui", "推流自检开始：%d 条候选 —— B 机那边请现在跑 tools.stream_sweep"
+                 % len(conf["presets"]))
+        from deploy.push_sweep import PushSweep
+        self._sweep = PushSweep(self.cfg,
+                               on_line=lambda t: self.sig_line.emit("ui", t),
+                               on_done=lambda rows, path: self.sig_sweep_done.emit(
+                                   rows, str(path)))
+        self._sweep.start()
+        self.act_sweep.setEnabled(False)
+
+    def _on_sweep_done(self, rows, path):
+        """自检跑完（在界面线程）：把 A 机侧的结论说清，并提醒去 B 机合并。"""
+        self.act_sweep.setEnabled(True)
+        bad = [r for r in rows if not r.get("ok", True)]
+        slow = [r for r in rows if (r.get("speed") or 0) < 1.0]
+        best = max((r for r in rows if (r.get("speed") or 0) >= 1.0),
+                   key=lambda r: (r.get("speed") or 0), default=None)
+        msg = ["A 机侧跑完 %d 条，记账在：\n  %s" % (len(rows), path), ""]
+        if slow:
+            msg.append("**A 机跟不上的（speed < 1.00）**：%s"
+                       % "、".join("%s(%.2f)" % (r["name"], r["speed"]) for r in slow))
+        if bad:
+            msg.append("**没起得来的**：%s" % "、".join(r["name"] for r in bad))
+        if best:
+            msg.append("A 机侧余量最大的：%s（speed %.2f、实际 %.1f fps）"
+                       % (best["name"], best["speed"], best.get("out_fps") or -1))
+        msg.append("")
+        msg.append("延迟那一半在 B 机：\n"
+                   "  1. 把上面那个 perf_push_A.json 拷到 B 机；\n"
+                   "  2. python -m tools.stream_sweep --merge perf_push_A.json")
+        msg.append("跑完不自动开回推流 —— 定下来参数后自己在「屏幕推流」卡片点启动。")
+        self.log("ui", "推流自检完成（%d 条）→ %s" % (len(rows), path))
+        QMessageBox.information(self, "推流自检完成", "\n".join(msg))
 
     def _build(self):
         central = QWidget()

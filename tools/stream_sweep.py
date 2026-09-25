@@ -1,0 +1,283 @@
+"""【B 机运行】推流自检 · 测量侧：按候选清单逐条量端到端延迟。
+
+配套：A 机在部署台点工具栏的「推流自检」（它按**同一份清单**逐条换参试推）。
+两边各点一次、各跑一轮，最后把 A 机那份 `perf_push_A.json` 拷过来合并出表。
+
+用法：
+    python -m tools.stream_sweep --precheck          # 只做预检（几何/链路），10 秒
+    python -m tools.stream_sweep                     # 测一轮，写 perf_push_B.json
+    python -m tools.stream_sweep --merge perf_push_A.json   # 合并出表并给结论
+    python -m tools.stream_sweep --seconds 8 --settle 2     # 先短跑一轮试流程
+
+**为什么先预检、不先扫 18 套**：延迟数只在**探针几何判据通过**时才算数
+（`probe_codec.Verdict`）。几何不对的时候，18 套跑完得到的是一张"好看但全假"的
+表 —— 2026-09-25 就是这么白花了半天。所以这里第一步就把几何判死：不过就**拒绝
+开扫**，并告诉你去 `python -m tools.probe_tune` 手工推框。
+
+**和 A 机怎么对上**：不新开任何控制通道。两边按清单**同一顺序**走；每段都记起止
+**墙钟**（双机已对时，差 ~1ms），合并时用它核对（重叠太少/起点差太多就报警）。
+所以顺序：**先点 A 机开始，紧接着（几秒内）跑这个命令**。
+"""
+
+import argparse
+import json
+import socket
+import statistics
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import cv2                                                      # noqa: E402
+import numpy as np                                              # noqa: E402
+
+from link import PyAVSource                                     # noqa: E402
+from tools import probe_codec, push_presets as pp               # noqa: E402
+from tools.config import ROOT, get                              # noqa: E402
+
+#: 每段等流等多久（A 机换参数会重启 ffmpeg，UDP 流会断一下）
+WAIT_S = 15.0
+
+
+def _offset_s():
+    """时钟偏移（秒）：启动时对一次时，失败就用文件里的旧值。"""
+    try:
+        from tools.probe_recv import load_offset_ms
+        return float(load_offset_ms(None)) / 1000.0
+    except Exception as e:
+        print("[sweep] 拿不到时钟偏移（%s）—— 先跑 tools.clock_sync --save" % e)
+        return 0.0
+
+
+def _geometry(shape):
+    """探针几何：**与工作台同一套来源**（项目标定 → 全局 → link.yaml）。"""
+    from tools.probe_tune import initial_geo
+    bits = int(get("probe", "bits", 40))
+    geo, src = initial_geo(shape, bits)
+    return geo, bits, src
+
+
+def open_stream(url, fmt, wait_s):
+    """开流并拿到第一帧；开不起来就重试，直到 wait_s 用尽 → (src, frame) / (None, None)。
+
+    为什么要重试：A 机每换一次参数都会重启 ffmpeg，UDP 流会断一下再回来；
+    而 PyAV 的 open 是"探到流头才算成功"（`analyzeduration=1s`），
+    在断流期间会直接抛异常。所以这里包一层等待，别让一次重启判成"这一套失败"。
+    """
+    t0 = time.monotonic()
+    last = None
+    while time.monotonic() - t0 < wait_s:
+        src = None
+        try:
+            src = PyAVSource(url, container_format=fmt)
+            src.open()
+            f = src.read()
+            if f is not None:
+                return src, f
+        except Exception as e:               # noqa: BLE001
+            last = "%s: %s" % (type(e).__name__, e)
+        if src is not None:
+            try:
+                src.close()
+            except Exception:
+                pass
+        time.sleep(0.4)
+    if last:
+        print("[sweep] 等流超时（%.0fs）：%s" % (wait_s, last))
+    return None, None
+
+
+def measure_segment(src, geo, bits, offset_s, seconds, settle):
+    """量一段 → meas dict。前 settle 秒丢弃（推流刚起、解码器刚锁）。
+
+    返回的键见 `push_presets.row_b`。**延迟只在几何判据通过时才认**：
+    `probe_mono` 为 False 时那串数就是乱码凑出来的（见 probe_codec.Verdict），
+    合并阶段的 `classify` 会据此淘汰整行。
+    """
+    vd = probe_codec.Verdict()
+    delays, gaps, reads = [], [], []
+    n = n_settle = 0
+    last_mono = None
+    t0 = time.monotonic()
+    while True:
+        el = time.monotonic() - t0
+        if el >= settle + seconds:
+            break
+        _t0 = time.perf_counter()
+        f = src.read()
+        _t1 = time.perf_counter()
+        if f is None:
+            time.sleep(0.002)
+            continue
+        now = time.monotonic() - t0
+        if last_mono is not None:
+            g = (f.t_recv_mono - last_mono) * 1000.0
+            if now >= settle:
+                gaps.append(g)
+        last_mono = f.t_recv_mono
+        if now < settle:
+            n_settle += 1
+            continue
+        n += 1
+        reads.append((_t1 - _t0) * 1000.0)
+
+        gray = cv2.cvtColor(np.asarray(f.image), cv2.COLOR_RGB2GRAY)
+        ts = probe_codec.decode_ms(gray, geo["x"], geo["y"], geo["cell"],
+                                  geo["gap"], bits)
+        if ts is not None:
+            vd.add(ts, 1000.0 / 60.0)
+            d = probe_codec.resolve_delay_ms(
+                (f.t_recv_wall + offset_s) * 1000.0, ts)
+            if d is not None and d < 5000:
+                delays.append(d)
+
+    span = max(1e-6, (time.monotonic() - t0) - settle)
+
+    def pct(xs, q):
+        if not xs:
+            return None
+        xs = sorted(xs)
+        return xs[min(len(xs) - 1, int(len(xs) * q))]
+
+    ok, why = vd.summary()
+    return {"frames": n, "settle_frames": n_settle,
+            "recv_fps": (n / span) if span > 0 else None,
+            "proc_fps": None,                    # 测量侧不做推理（这是"轻消费者"）
+            "lat_p50": pct(delays, 0.5), "lat_p95": pct(delays, 0.95),
+            "lat_max": max(delays) if delays else None, "lat_n": len(delays),
+            "jitter": (statistics.pstdev(delays) if len(delays) > 2 else None),
+            "read_p50": pct(reads, 0.5), "gap_p50": pct(gaps, 0.5),
+            "probe_mono": bool(vd.mono), "probe_why": why,
+            "bad_packets": int(getattr(src, "bad_packets", 0) or 0)}
+
+
+def precheck(src, geo, bits, offset_s, seconds=4.0):
+    """几何/链路预检 → (能不能开扫, 原因)。**不过就不扫**（省得出一张全假的表）。"""
+    m = measure_segment(src, geo, bits, offset_s, seconds=seconds, settle=1.0)
+    if m["lat_n"] == 0:
+        return False, ("这一小会儿一帧延迟都没量到（解码数 %d / 收到 %d 帧）—— "
+                       "先确认探针在画、几何对得上" % (m["lat_n"], m["frames"]))
+    if not m["probe_mono"]:
+        return False, ("探针几何判据没过：%s\n"
+                       "    延迟数现在**不可信**（错位采样照样能凑出看着合法的值）。\n"
+                       "    先在 B 机修几何：python -m tools.probe_tune --project <项目目录>\n"
+                       "    （或用工作台实时页的「框选探针」；几何不对就别浪费 6 分钟扫参数）"
+                       % m["probe_why"])
+    return True, ("预检通过：延迟 p50 %.0fms、收到 %.1f fps、几何单调（步长≈帧周期）"
+                  % (m["lat_p50"] or -1, m["recv_fps"] or -1))
+
+
+def merge_and_report(a_path, b_path):
+    """A/B 两份记账 → 出表 + 结论 + 一行"怎么用"。"""
+    try:
+        a = json.loads(Path(a_path).read_text(encoding="utf-8"))
+        rows_a = a.get("rows", a if isinstance(a, list) else [])
+    except Exception as e:
+        print("[sweep] 读不了 A 机那份 %s：%s" % (a_path, e))
+        return 1
+    try:
+        b = json.loads(Path(b_path).read_text(encoding="utf-8"))
+        rows_b = b.get("rows", b if isinstance(b, list) else [])
+    except Exception as e:
+        print("[sweep] 读不了 %s：%s（先跑一轮 `python -m tools.stream_sweep`）"
+              % (b_path, e))
+        return 1
+    rows = pp.merge(rows_a, rows_b)
+    rows, best, why = pp.rank(rows)
+    print(pp.render(rows, best))
+    if best:
+        print("\n把最优那条写回部署台：")
+        print("  config/deploy.json 的 push 段改成 —— fps=%s 码率=%s GOP=%s "
+              "passthrough=%s" % (best.get("fps"), best.get("bitrate"),
+                                  best.get("gop"), best.get("passthrough")))
+    print("\n（A 机那份：%s；B 机那份：%s）" % (Path(a_path).name, Path(b_path).name))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--url", default=None)
+    ap.add_argument("--format", default=None, help="强制输入格式（裸流必须给）")
+    ap.add_argument("--presets", default=None, help="候选清单路径（默认 config/push_presets.json）")
+    ap.add_argument("--seconds", type=float, default=None, help="每段测量时长")
+    ap.add_argument("--settle", type=float, default=None, help="每段丢弃的起始秒数")
+    ap.add_argument("--wait", type=float, default=WAIT_S, help="每段等流超时")
+    ap.add_argument("--precheck", action="store_true", help="只做预检")
+    ap.add_argument("--merge", default=None, help="合并 A 机那份并出表")
+    args = ap.parse_args()
+
+    b_path = ROOT / pp.B_REPORT
+    if args.merge:
+        return merge_and_report(args.merge, b_path)
+
+    cfg = pp.load(args.presets)
+    seconds = float(args.seconds if args.seconds is not None else cfg["seconds"])
+    settle = float(args.settle if args.settle is not None else cfg["settle_seconds"])
+    presets = cfg["presets"]
+    url = args.url or get("stream", "url")
+    fmt = args.format or get("stream", "format", None)
+    offset_s = _offset_s()
+
+    print("[sweep] 候选 %d 条 × (%.0fs 测量 + %.0fs 丢弃) ≈ %.0f 分钟"
+          % (len(presets), seconds, settle,
+             len(presets) * (seconds + settle + 3) / 60.0))
+    print("[sweep] 命令：先点 A 机部署台的「推流自检」，紧接着跑这个 —— 两边按同一顺序走")
+
+    src, frame = open_stream(url, fmt, args.wait)
+    if src is None:
+        print("[sweep] 等不到流：A 机在推吗？（%s）" % url)
+        return 1
+    geo, bits, geo_src = _geometry(np.asarray(frame.image).shape)
+    print("[sweep] 流 %sx%s  探针几何来源=%s x=%.1f y=%.1f cell=%.2f gap=%.2f"
+          % (src.size[0], src.size[1], geo_src, geo["x"], geo["y"],
+             geo["cell"], geo["gap"]))
+
+    ok, why = precheck(src, geo, bits, offset_s)
+    print("[sweep] 预检：%s" % why)
+    if not ok:
+        src.close()
+        return 2
+    if args.precheck:
+        src.close()
+        return 0
+    # ★ 必须现在放手：UDP 5000 同时只能有一个收流者，而下面每段都要重新开一次
+    # （A 机换参数会重启 ffmpeg，流会断一下）。不关的话后面每一段都会"绑不上端口"。
+    src.close()
+
+    rows = []
+    for i, p in enumerate(presets):
+        print("\n[sweep] 第 %d/%d 段：%s —— 等 A 机切到这一套…"
+              % (i + 1, len(presets), p["name"]), flush=True)
+        s2, f2 = open_stream(url, fmt, args.wait)
+        if s2 is None:
+            t = time.time()
+            rows.append(pp.row_b(p["name"], i, p, t, t, {}, extra={
+                "ok": False, "why": "这一段没等到流（A 机没切过来？）"}))
+            continue
+        t0 = time.time()
+        meas = measure_segment(s2, geo, bits, offset_s, seconds, settle)
+        t1 = time.time()
+        s2.close()
+        r = pp.row_b(p["name"], i, p, t0, t1, meas)
+        rows.append(r)
+        print("[sweep]   → 收到 %.1f fps、延迟 p50 %.0f / p95 %.0f ms（几何%s）"
+              % (meas["recv_fps"] or -1, meas["lat_p50"] or -1,
+                 meas["lat_p95"] or -1, "单调" if meas["probe_mono"] else "**可疑**"))
+
+    out = {"meta": {"when": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "host": socket.gethostname(),
+                    "geometry": geo, "geometry_src": geo_src, "bits": bits,
+                    "offset_s": offset_s, "seconds": seconds, "settle": settle,
+                    "source": url, "presets": [p["name"] for p in presets]},
+           "rows": rows}
+    Path(b_path).write_text(json.dumps(out, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+    print("\n[sweep] 已写 %s（%d 段）" % (b_path, len(rows)))
+    print("[sweep] 把 A 机的 %s 拷过来，然后：\n"
+          "        python -m tools.stream_sweep --merge %s" % (pp.A_REPORT, pp.A_REPORT))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

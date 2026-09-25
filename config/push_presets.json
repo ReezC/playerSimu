@@ -1,0 +1,34 @@
+{
+  "_note": [
+    "推流自检的候选清单 —— **两台机器共用这一份**（跟着仓库走）。",
+    "A 机（部署台工具栏「推流自检」）按这里的**顺序**逐条试推；",
+    "B 机（python -m tools.stream_sweep）按同一顺序量延迟；两边用墙钟对账合并。",
+    "每条只覆盖写出来的键，其余从 config/deploy.json 的 push 段继承",
+    "（host/port/ffmpeg/采集方式/编码器这些是「这台机器的属性」，自检不该动）。",
+    "顺序有意义：别只改中间几条就开跑，两边必须是同一份。",
+    "提示：-bufsize 在部署台里硬编码 1M —— 6M 码率时 VBV 缓冲约 167ms，",
+    "      20M 时只有约 50ms。所以码率这一档对延迟的影响，主要来自这里。"
+  ],
+  "seconds": 20,
+  "settle_seconds": 4,
+  "presets": [
+    {"name": "60fps-6M-g30",  "fps": 60,  "bitrate": "6M",  "gop": 30, "passthrough": true},
+    {"name": "60fps-6M-g60",  "fps": 60,  "bitrate": "6M",  "gop": 60, "passthrough": true},
+    {"name": "60fps-12M-g30", "fps": 60,  "bitrate": "12M", "gop": 30, "passthrough": true},
+    {"name": "60fps-12M-g60", "fps": 60,  "bitrate": "12M", "gop": 60, "passthrough": true},
+    {"name": "60fps-20M-g30", "fps": 60,  "bitrate": "20M", "gop": 30, "passthrough": true},
+    {"name": "60fps-20M-g60", "fps": 60,  "bitrate": "20M", "gop": 60, "passthrough": true},
+    {"name": "120fps-6M-g30", "fps": 120, "bitrate": "6M",  "gop": 30, "passthrough": true},
+    {"name": "120fps-6M-g60", "fps": 120, "bitrate": "6M",  "gop": 60, "passthrough": true},
+    {"name": "120fps-12M-g30", "fps": 120, "bitrate": "12M", "gop": 30, "passthrough": true},
+    {"name": "120fps-12M-g60", "fps": 120, "bitrate": "12M", "gop": 60, "passthrough": true},
+    {"name": "120fps-20M-g30", "fps": 120, "bitrate": "20M", "gop": 30, "passthrough": true},
+    {"name": "120fps-20M-g60", "fps": 120, "bitrate": "20M", "gop": 60, "passthrough": true},
+    {"name": "144fps-6M-g30",  "fps": 144, "bitrate": "6M",  "gop": 30, "passthrough": true},
+    {"name": "144fps-6M-g60",  "fps": 144, "bitrate": "6M",  "gop": 60, "passthrough": true},
+    {"name": "144fps-12M-g30", "fps": 144, "bitrate": "12M", "gop": 30, "passthrough": true},
+    {"name": "144fps-12M-g60", "fps": 144, "bitrate": "12M", "gop": 60, "passthrough": true},
+    {"name": "144fps-20M-g30", "fps": 144, "bitrate": "20M", "gop": 30, "passthrough": true},
+    {"name": "144fps-20M-g60", "fps": 144, "bitrate": "20M", "gop": 60, "passthrough": true}
+  ]
+}

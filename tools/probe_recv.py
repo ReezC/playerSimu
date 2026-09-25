@@ -18,6 +18,7 @@ import numpy as np
 from link import FileSource, PyAVSource
 from tools.config import ROOT, get
 from tools.probe_codec import decode_ms, resolve_delay_ms
+from tools.probe_tune import initial_geo        # 探针几何：与工作台同一套来源
 
 
 def load_offset_ms(cli_offset: float | None) -> float:
@@ -71,8 +72,7 @@ def main() -> int:
 
     cfg_probe = bool(get("probe", "enabled", True))
     use_probe = cfg_probe if args.probe is None else args.probe
-    px, py = get("probe", "x", 100), get("probe", "y", 8)
-    cell, gap, bits = get("probe", "cell", 16), get("probe", "gap", 2), get("probe", "bits", 40)
+    bits = int(get("probe", "bits", 40))
     offset_ms = load_offset_ms(args.offset) if use_probe else 0.0
 
     if args.file:
@@ -99,9 +99,29 @@ def main() -> int:
         print(f"[probe_recv] ⚠ 流宽 {w} 与配置预期 {EXPECT_W} 不同，"
               f"探针参数可能不匹配（需调整 out_scale 或 cell）")
 
+    # 探针几何：**和工作台同一套优先级**（项目标定 → 全局文件 → link.yaml）。
+    #
+    # 老写法只读 link.yaml 的 probe.x/y/cell/gap，而工作台走 pick_calib —— 两边在
+    # 两套坐标里比大小，对不上时**谁都不报警**。实测（2026-09-25）：link.yaml 那几
+    # 个数是旧的（注释写 A 机按 cell=23/gap=3 画、文件里是 cell=16/gap=2，中心距
+    # 21 vs 18），每块偏 2.8px、42 块累积 118px → 低位全采错 → 这个工具报出来的
+    # "延迟" 是一坨乱数（p95 4.7s，紧贴 --max-delay），被当成真延迟查了半天。
+    # 所以现在：用同一份几何 + **把用的是哪份、以及 link.yaml 差多少都打出来**。
+    geo, geo_src = initial_geo((h, w, 3), bits) if use_probe else (
+        {"x": 0.0, "y": 0.0, "cell": 16.0, "gap": 2.0}, "未启用")
+    px, py = geo["x"], geo["y"]
+    cell, gap = geo["cell"], geo["gap"]
+    cfg_geo = (float(get("probe", "x", 100)), float(get("probe", "y", 8)),
+               float(get("probe", "cell", 16)), float(get("probe", "gap", 2)))
+    if use_probe and max(abs(cfg_geo[0] - px), abs(cfg_geo[1] - py),
+                         abs(cfg_geo[2] - cell), abs(cfg_geo[3] - gap)) > 0.26:
+        print("[probe_recv] ⚠ 实际用的几何与 link.yaml 不一致（差 >0.25px，会逐块累积）："
+              "link.yaml x=%.1f y=%.1f cell=%.2f gap=%.2f"
+              % cfg_geo)
+
     print(f"[probe_recv] source={args.file or src.url} {w}x{h} fps={src.fps}")
     print(f"[probe_recv] probe={'on' if use_probe else 'off'} offset={offset_ms:.3f}ms "
-          f"region=({px:.1f},{py:.1f}) cell={cell:.2f} gap={gap:.2f}")
+          f"region=({px:.1f},{py:.1f}) cell={cell:.2f} gap={gap:.2f} 几何来源={geo_src}")
 
     gaps: list[float] = []
     delays: list[float] = []

@@ -7,6 +7,7 @@ Qt 的信号是线程安全的：从工作线程 emit，会自动排队到接收
 （这里是主线程）执行，所以界面更新是安全的。
 """
 
+import inspect
 import traceback
 
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -23,10 +24,29 @@ def safe_slot(fn):
 
     从工作线程连过来的槽（日志 / 进度 / 完成）必须过这一层，
     否则任何一处写错都能让程序直接消失。
+
+    **另外：按槽自己的签名裁掉多余的信号参数。**
+        Qt 发信号带的参数常常比槽需要的多（`QPushButton.clicked` 就带一个
+        bool，`currentIndexChanged` 带一个 int）。而本函数返回的是
+        `wrapper(*args, **kwargs)` —— PyQt 看到"什么参数都能接"，就把那个 bool
+        原样传进来，于是**零参的槽抛 TypeError，又被这层自己吞掉**：
+        按钮点了没有任何反应，只在 stderr.log 里留一行 traceback。
+        实测踩过：标定弹窗的「保存标定」「自动定位」两个按钮都是死的，而
+        自检没抓到 —— 那些用例直接调 `_on_save()`，绕过了信号。
+        所以这里按形参个数裁一刀，多的丢掉（`*args` 的槽照旧原样转发）。
     """
+    try:
+        _params = list(inspect.signature(fn).parameters.values())
+        _n_pos = len([p for p in _params
+                      if p.kind in (p.POSITIONAL_ONLY,
+                                    p.POSITIONAL_OR_KEYWORD)])
+        _vargs = any(p.kind == p.VAR_POSITIONAL for p in _params)
+    except (TypeError, ValueError):     # 内置/partial 之类拿不到签名 → 老行为
+        _n_pos, _vargs = 0, True
+
     def wrapper(*args, **kwargs):
         try:
-            return fn(*args, **kwargs)
+            return fn(*(args if _vargs else args[:_n_pos]), **kwargs)
         except Exception:
             traceback.print_exc()
     return wrapper

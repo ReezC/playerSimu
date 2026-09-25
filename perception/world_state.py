@@ -45,7 +45,27 @@ class Player:
     grounded: bool = False
     jumping: bool = False
     falling: bool = False
+    #: **视觉平台**的编号：每帧从画面里认出来的那条可站立顶边（PlatformTracker 给的）。
+    #: ⚠ 它**不是**地形数据的段号，见下面的 `segment_id` —— 两个都是整数、都叫
+    #: "平台"，混用会得出"看着对其实错"的结论。
     current_platform_id: int | None = None
+
+    # ---------------- 世界坐标（小地图定位算好后由感知层填）----------------
+    #:
+    #: 这套是**游戏内部坐标**（WZ 地形里的 foothold / 传送点 / 怪刷新点都用它）。
+    #: 由 `perception/minimap.PlayerLocator` 从「小地图面板上的黄点」换算得来。
+    #: **算不出来时是 None，不是 0** —— 0 是个合法的世界坐标（地图西北角），
+    #: 拿它当"没定位"会让寻路朝地图角落走。
+    world_x: float | None = None
+    world_y: float | None = None
+    #: 站在**地形**的哪条段（`core/mapdata.Terrain.segment_of` 给的 `Segment.index`）；
+    #: None = 没落在任何平台上（半空/墙里/没定位）。**寻路要的是这一个。**
+    segment_id: int | None = None
+    #: True = 这一拍没认出黄点，上面的坐标/段号是**沿用上一帧**的（防抖窗口内，
+    #: 口径同 `perception/tracker.py` 的幽灵框）。可以用，但别当新鲜观测。
+    world_held: bool = False
+    #: 没算出来 / 没落平台时的原因（一句话，给界面与日志；正常时是空串）
+    world_note: str = ""
 
 
 @dataclass
