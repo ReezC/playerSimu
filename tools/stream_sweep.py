@@ -42,6 +42,8 @@ from tools.config import ROOT, get                              # noqa: E402
 
 #: 每段等流等多久（A 机换参数会重启 ffmpeg，UDP 流会断一下）
 WAIT_S = 15.0
+#: 等 A 机把报告发过来最多多久（B 机自己还有最后一段要量完，所以给得宽）
+REPORT_WAIT_S = 200.0
 #: 最近一次开流失败的原因 —— 用来分辨"该重试"还是"要人动手"（端口被占）
 _LAST_ERR = []
 #: 这类错误重试没有意义：UDP 5000 被别人占着（工作台的实时预览最常干这事）
@@ -264,31 +266,81 @@ def precheck(src, geo, bits, offset_s, seconds=4.0):
                   % (m["lat_p50"] or -1, m["recv_fps"] or -1))
 
 
-def merge_and_report(a_path, b_path):
-    """A/B 两份记账 → 出表 + 结论 + 一行"怎么用"。"""
-    try:
-        a = json.loads(Path(a_path).read_text(encoding="utf-8"))
-        rows_a = a.get("rows", a if isinstance(a, list) else [])
-    except Exception as e:
-        print("[sweep] 读不了 A 机那份 %s：%s" % (a_path, e))
-        return 1
-    try:
-        b = json.loads(Path(b_path).read_text(encoding="utf-8"))
-        rows_b = b.get("rows", b if isinstance(b, list) else [])
-    except Exception as e:
-        print("[sweep] 读不了 %s：%s（先跑一轮 `python -m tools.stream_sweep`）"
-              % (b_path, e))
-        return 1
+def result_text(rows_a, rows_b):
+    """A/B 两份记账 → 出表 + 结论 + 一行"怎么用" → **返回文本**。
+
+    抽成返回文本，是为了同一份结论能**打印给 B 机看，也能回传给 A 机**（全自动那条路
+    就是靠它：结论回给部署台弹出来，人不用去 B 机抄数字）。
+    """
     rows = pp.merge(rows_a, rows_b)
     rows, best, why = pp.rank(rows)
-    print(pp.render(rows, best))
+    out = [pp.render(rows, best)]
     if best:
-        print("\n把最优那条写回部署台：")
-        print("  config/deploy.json 的 push 段改成 —— fps=%s 码率=%s GOP=%s "
-              "passthrough=%s" % (best.get("fps"), best.get("bitrate"),
-                                  best.get("gop"), best.get("passthrough")))
+        out.append("\n把最优那条写回部署台：")
+        out.append("  config/deploy.json 的 push 段改成 —— fps=%s 码率=%s GOP=%s "
+                   "passthrough=%s" % (best.get("fps"), best.get("bitrate"),
+                                       best.get("gop"), best.get("passthrough")))
+    else:
+        out.append("\n（没有可比的组合：B 机那份里没有量到延迟的段？）")
+    return "\n".join(out)
+
+
+def read_rows(path):
+    """读一份记账 → rows（读不了返回 None）。"""
+    try:
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+        return d.get("rows", d if isinstance(d, list) else [])
+    except Exception:                        # noqa: BLE001
+        return None
+
+
+def merge_and_report(a_path, b_path):
+    """（命令行 `--merge` 用）读两份文件 → 打印结果。"""
+    rows_a = read_rows(a_path)
+    if rows_a is None:
+        print("[sweep] 读不了 A 机那份 %s（先把它拷过来）" % a_path)
+        return 1
+    rows_b = read_rows(b_path)
+    if rows_b is None:
+        print("[sweep] 读不了 %s：%s（先跑一轮 `python -m tools.stream_sweep`）"
+              % (b_path, b_path))
+        return 1
+    print(result_text(rows_a, rows_b))
     print("\n（A 机那份：%s；B 机那份：%s）" % (Path(a_path).name, Path(b_path).name))
     return 0
+
+
+def finish_and_report(link, b_path, say=None):
+    """收尾：等 A 机的报告 → 合并出表 → **把结论回给 A 机** → 返回结论文本。
+
+    这是"两个开关"里 B 机那一半的关键：报告走同一条握手通道（UDP 5002），
+    所以不需要有人去 A 机拷 `perf_push_A.json`、也不需要记住路径。
+
+    拿不到报告也照样出成绩（B 侧那几个数自己成立），只是会说清"少了 A 机那半"。
+    """
+    say = say or (lambda t: print(t, flush=True))
+    rows_b = read_rows(b_path) or []
+    rows_a = None
+    if link is not None:
+        say("[sweep] 等 A 机把报告发过来…（走握手通道，不用手工拷文件）")
+        blob = link.wait_blob("rep", REPORT_WAIT_S)
+        if blob:
+            try:
+                Path(pp.A_REPORT).write_text(blob, encoding="utf-8")
+                say("[sweep] 收到 A 机报告 → 已写 %s" % pp.A_REPORT)
+                rows_a = read_rows(pp.A_REPORT)
+            except Exception as e:            # noqa: BLE001
+                say("[sweep] 写 %s 失败：%s" % (pp.A_REPORT, e))
+        else:
+            say("[sweep] 没等到 A 机的报告（%.0f 秒）—— A 机可能是旧版本、"
+                "或它那侧没跑自检。下面只有 B 机侧的数。" % REPORT_WAIT_S)
+    text = result_text(rows_a or [], rows_b)
+    say("\n" + text)
+    if link is not None:
+        n = link.send_blob("res", text)
+        say("[sweep] 结论已回给 A 机（%d 片）—— 部署台会弹出来" % n if n
+            else "[sweep] 结论回传失败（A 机的地址没学到？）")
+    return text
 
 
 def main():
@@ -303,6 +355,9 @@ def main():
     ap.add_argument("--merge", default=None, help="合并 A 机那份并出表")
     ap.add_argument("--no-link", action="store_true", dest="no_link",
                     help="不走握手，按清单顺序量（老流程：要在 A 机点开始后几秒内跑）")
+    ap.add_argument("--auto", action="store_true", dest="auto",
+                    help="全自动：等 A 机公告 → 逐段量 → 收 A 机报告 → 出表"
+                         " → 结论回传给 A 机（B 机这边只要跑这一个命令）")
     args = ap.parse_args()
 
     b_path = ROOT / pp.B_REPORT
@@ -339,17 +394,31 @@ def main():
           % (src.size[0], src.size[1], geo_src, geo["x"], geo["y"],
              geo["cell"], geo["gap"]))
 
+    # --auto：握手监听要**早于预检**建起来 —— 预检不过时得把原因回给 A 机，
+    # 否则部署台那边不知道 B 已经放弃，只能干等超时。
+    link = open_link(args.no_link) if args.auto else None
+
     ok, why = precheck(src, geo, bits, offset_s)
     print("[sweep] 预检：%s" % why)
     if not ok:
         # 光说"没量到延迟"没法行动 —— 用刚拿到的那一帧直接判是哪一种毛病
         # （没有码带 / 码带在但几何错 / 压在边缘，见 probe_codec.no_decode_hint）。
+        hint = ""
         try:
             g0 = cv2.cvtColor(np.asarray(frame.image), cv2.COLOR_RGB2GRAY)
-            print("[sweep] 诊断：%s" % probe_codec.no_decode_hint(
-                g0, geo["x"], geo["y"], geo["cell"], geo["gap"], bits))
+            hint = probe_codec.no_decode_hint(g0, geo["x"], geo["y"],
+                                              geo["cell"], geo["gap"], bits)
+            print("[sweep] 诊断：%s" % hint)
         except Exception as e:                # noqa: BLE001
-            print("[sweep] 诊断：看不了画面（%s）" % e)
+            hint = "看不了画面（%s）" % e
+            print("[sweep] 诊断：%s" % hint)
+        if link is not None:
+            # 没开扫就退出，也要**说话**：A 机的部署台在等结论，等超时不如现在就知道
+            link.send_blob("res", "B 机预检没过，**没有开扫**（没白跑 8 分钟）：\n"
+                                  "  %s\n[sweep] 诊断：%s\n\n"
+                                  "按上面的诊断修好（多在 B 机侧），A 机再点一次"
+                                  "「推流自检」即可。" % (why, hint))
+            link.close()
         src.close()
         return 2
     if args.precheck:
@@ -359,7 +428,8 @@ def main():
     # （A 机换参数会重启 ffmpeg，流会断一下）。不关的话后面每一段都会"绑不上端口"。
     src.close()
 
-    link = open_link(args.no_link)
+    if link is None and not args.auto:        # --auto 在前头已经建过了（别建两次）
+        link = open_link(args.no_link)
     rows = []
     try:
         for i, p, sec, stl, total in iter_segments(
@@ -391,7 +461,8 @@ def main():
                      meas["lat_p95"] or -1,
                      "单调" if meas["probe_mono"] else "**可疑**"))
     finally:
-        if link is not None:
+        # --auto 不能在这儿关：后面还要用它收 A 机的报告、再把结论回过去
+        if link is not None and not args.auto:
             link.close()
 
     out = {"meta": {"when": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -403,8 +474,18 @@ def main():
     Path(b_path).write_text(json.dumps(out, ensure_ascii=False, indent=2),
                             encoding="utf-8")
     print("\n[sweep] 已写 %s（%d 段）" % (b_path, len(rows)))
-    print("[sweep] 把 A 机的 %s 拷过来，然后：\n"
-          "        python -m tools.stream_sweep --merge %s" % (pp.A_REPORT, pp.A_REPORT))
+    if args.auto:
+        try:
+            finish_and_report(link, b_path)
+        finally:
+            if link is not None:
+                link.close()
+    else:
+        if link is not None:
+            link.close()
+        print("[sweep] 把 A 机的 %s 拷过来，然后：\n"
+              "        python -m tools.stream_sweep --merge %s"
+              % (pp.A_REPORT, pp.A_REPORT))
     return 0
 
 

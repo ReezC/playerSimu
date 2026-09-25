@@ -116,9 +116,13 @@ def no_decode_hint(gray, x, y, cell, gap, bits: int = DEFAULT_BITS):
                 "在跑），再确认位置没整体挪走"
                 % (lo, hi, mid, len(good)))
     return ("采样点**黑白都有**（黑 %d / 白 %d，其中 %d 个落在中间）—— **码带是在的**，"
-            "对不上的是起点/节距/位宽：用 `python -m tools.probe_auto --solve` 重量；"
-            "中间那些偏多，就是「差零点几像素」那种小错位"
-            % (lo, hi, mid))
+            "对不上的是起点/节距/位宽：用 `python -m tools.probe_auto --solve` 重量。%s"
+            % (lo, hi, mid,
+               "而且采样点**全落在方块中间**（没有压边的）—— 这种最像「节距差零点几像素」："
+               "每块偏一点点，几十块之后正好偏掉一个整块，于是高位是对的、尾部时对时错"
+               "（现象就是时间戳偶尔大跳/倒退）"
+               if mid == 0 else
+               "中间那些偏多 = 采样窗口有一部分压在方块边缘上，同样是重标几何"))
 
 
 def cell_ambiguity(gray, x, y, cell, gap, bits: int = DEFAULT_BITS):

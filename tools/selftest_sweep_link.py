@@ -192,6 +192,128 @@ def t_garbage_is_ignored():
         lis.close()
 
 
+# ---------------------------------------------------------------- 报告 / 结论的整段文本
+
+def t_blob_reaches_both_sides():
+    """报告与结论的整段文本要能原样过去（报告走 A→B，结论走 B→A）。
+
+    这就是"两个开关"的传输层：B 机不用去 A 机拷 `perf_push_A.json`，
+    A 机也不用去 B 机抄那张表 —— 都走同一条握手通道。
+    """
+    ann, lis = _pair()
+    try:
+        # 用**不可压缩**的内容，才验得到真分片：JSON/重复串压完之后常常一片就发完了
+        # （第一版就是这么写的：断言"≥2 片"直接挂 —— 压缩比太大）。
+        report = os.urandom(4000).hex()
+        check(ann.send_blob("rep", report) >= 2, "长报告没分片（应当 ≥2 片）")
+        got = lis.wait_blob("rep", 3.0)
+        check(got == report,
+              "A→B 的报告没原样到（%d vs %d 字节）" % (len(got or ""), len(report)))
+
+        # B 回结论的地址是**从公告里学来的**（不用配 A 机 IP）
+        res = "表\n结论：用 144fps-20M-g30"
+        check(lis.send_blob("res", res) >= 1, "回结论发不出去")
+        back = ann.wait_blob("res", 3.0)
+        check(back == res, "B→A 的结论没原样到：%r" % (back,))
+    finally:
+        ann.close()
+        lis.close()
+
+
+def t_blob_loss_does_not_raise():
+    """丢片只能"没收到"，绝不许抛 —— 现场是 UDP，丢一片很常见。"""
+    ann, lis = _pair()
+    try:
+        text = os.urandom(4000).hex()              # 不可压缩，才分得出多片
+        parts = sweep_link.blob_msgs(text)
+        check(len(parts) >= 3, "（前置）这段该分成 ≥3 片，实际 %d" % len(parts))
+        for m in parts[:-1]:                       # 故意漏掉最后一片
+            ann.send("rep", **{k: v for k, v in m.items() if k != "kind"})
+        check(lis.wait_blob("rep", 0.6) is None, "缺片却拼出了一段文本")
+
+        # 乱序也要能拼回来（UDP 不保证顺序）
+        asm = sweep_link.BlobAssembler(5.0)
+        got = None
+        for m in reversed(parts):
+            got = asm.feed(m) or got
+        check(got == text, "乱序的片没拼回来")
+    finally:
+        ann.close()
+        lis.close()
+
+
+def t_auto_flow_end_to_end():
+    """**"两个开关"的完整回路**：A 公告 → B 逐段量 → A 发报告 → B 出表 → 结论回 A。
+
+    整条在本地跑（不占真实配置端口、不需要真流）：这是"以后只要点两个开关"那句话的
+    可执行证据，也是唯一能一次性钉住"分段 → 报告 → 合并 → 回传"四段接线的用例。
+    """
+    import json
+    import tempfile
+    import threading
+    import unittest.mock as mock
+
+    from tools import push_presets as pp
+    from tools.stream_sweep import finish_and_report, iter_segments
+
+    port = _free_port()
+    ann = sweep_link.Announcer("127.0.0.1", port, bind_port=_free_port())
+    lis = sweep_link.Listener(port, host="127.0.0.1")
+    presets = [{"name": "A机第%d条" % (i + 1)} for i in range(3)]
+    res_seen = []
+
+    def a_side():
+        """模拟部署台那一侧：公告三段 → 发报告 → 等结论。
+
+        段间隔**必须大于 `wait_seg` 的排空窗口（0.25s）**：那段安静期用来"只认最新"，
+        间距太近会把连着发的几段合并且只留最后一段（真机是 24s 一段，不会碰上）。
+        第一版这里写了 0.15s，于是 B 只量到第 3 段 —— 用例自己先绊了一跤。
+        """
+        ann.start(3)
+        for i, p in enumerate(presets):
+            ann.seg(i, 3, p, 20.0, 4.0)
+            time.sleep(0.45)
+        rows = [pp.row_a(presets[0]["name"], 0, presets[0], 1.0, 2.0, []),
+                pp.row_a(presets[1]["name"], 1, presets[1], 3.0, 4.0, [])]
+        ann.done(3)
+        time.sleep(0.1)
+        ann.send_blob("rep", json.dumps({"rows": rows}, ensure_ascii=False))
+        res_seen.append(ann.wait_blob("res", 6.0))
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="sweepauto_"))
+    th = None
+    try:
+        th = threading.Thread(target=a_side, daemon=True)
+        th.start()
+        segs = [(i, p["name"]) for i, p, _s, _st, _t in
+                iter_segments(lis, [], 20.0, 4.0, on_line=lambda _t: None)]
+        check([s[0] for s in segs] == [0, 1, 2],
+              "B 机没按 A 机的公告走：%s" % (segs,))
+        # B 机那份记账（真跑时由逐段测量写出来）
+        b_rows = [pp.row_b(p["name"], i, p, 1.0, 2.0,
+                           {"recv_fps": 60.0, "lat_p50": 120.0 + i,
+                            "lat_p95": 140.0 + i, "probe_mono": True})
+                  for i, p in enumerate(presets)]
+        b_path = tmpdir / "perf_push_B.json"
+        b_path.write_text(json.dumps({"rows": b_rows}, ensure_ascii=False),
+                          encoding="utf-8")
+        with mock.patch.object(pp, "A_REPORT", str(tmpdir / "perf_push_A.json")):
+            text = finish_and_report(lis, b_path, say=lambda _t: None)
+            th.join(timeout=6)
+            check(text and len(text) > 40, "结论文本太短：%r" % (text,))
+            check(res_seen and res_seen[0] == text,
+                  "A 机没收到（或收到的不是同一份）结论：%r" % (res_seen,))
+            check("把最优那条写回部署台" in text or "没有可比的组合" in text,
+                  "结论里没有「怎么用」那一段：%s" % text[:200])
+    finally:
+        if th is not None:
+            th.join(timeout=8)        # 先让它自己收尾，别把 socket 从它脚下抽走
+        ann.close()
+        lis.close()
+        import shutil
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
 # ---------------------------------------------------------------- B 机侧：段的来源
 
 class _FakeLink:
@@ -279,6 +401,9 @@ TESTS = (
     ("收不到公告能判断出来（好退回老流程）", t_no_handshake_is_visible),
     ("A 机说 done 之后不再等", t_done_stops_waiting),
     ("垃圾包一律当没听懂", t_garbage_is_ignored),
+    ("报告/结论的整段文本能双向送达", t_blob_reaches_both_sides),
+    ("丢片/乱序只当没收到，不许抛", t_blob_loss_does_not_raise),
+    ("两个开关的完整回路（公告→量→报告→出表→回传）", t_auto_flow_end_to_end),
     ("B 机按 A 机公告走，不按本机清单", t_iter_segments_follows_a_not_local_list),
     ("收不到公告就退回按清单顺序（并说出来）", t_iter_segments_falls_back_when_silent),
     ("A 机的公告按配置发得出去", t_push_sweep_announces),

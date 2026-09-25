@@ -38,6 +38,9 @@
     "w": null,
     "h": null
   },
+  "sweep": {
+    "port": 5002
+  },
   "window": {
     "w": 1667,
     "h": 667

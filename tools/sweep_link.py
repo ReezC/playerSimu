@@ -47,7 +47,62 @@ MAX_PKT = 1200
 #: 留余量是因为 ffmpeg 起停比标称的窗口长一点（重启本身要一两秒）。
 STALE_SLACK = 5.0
 
-_KINDS = ("start", "seg", "done", "ack")
+_KINDS = ("start", "seg", "done", "ack", "rep", "res")
+
+#: 分片消息（报告/结论这类整段文本）每片的载荷上限（base64 之后的字符数）。
+#: 一条 A 机报告压完 ≈1~2KB，所以通常 2~3 片就发完；留分片是为了将来行数变多也不炸。
+BLOB_CHUNK = 900
+
+
+def blob_msgs(text, chunk: int = BLOB_CHUNK):
+    """一段文本 → 一串分片消息（dict 列表，按顺序发）。
+
+    为什么压缩：报告是 JSON 文本（一堆重复的键名），zlib 之后小一半以上；
+    为什么 base64：UDP 报文里塞二进制要自己处理编码，base64 让报文保持"纯 JSON"，
+    接收侧还能照旧用 `decode()` 过滤垃圾。
+    """
+    import base64
+    import zlib
+
+    raw = base64.b64encode(zlib.compress(str(text).encode("utf-8"), 6)).decode("ascii")
+    parts = [raw[i:i + chunk] for i in range(0, len(raw), chunk)] or [""]
+    return [{"i": k, "n": len(parts), "d": p} for k, p in enumerate(parts)]
+
+
+class BlobAssembler:
+    """把分片消息拼回一整段文本。**丢片/乱序/超时都只是"没收到"，不抛异常。**
+
+    乱序不用管（按编号摆），丢片只能等超时（UDP 不重传）—— 所以这里只报"齐了"或
+    "还没齐"，由调用方决定等到什么时候。
+    """
+
+    def __init__(self, timeout=180.0):
+        self.timeout = float(timeout)
+        self._parts = {}
+        self._n = None
+        self.t0 = time.time()
+
+    def feed(self, msg):
+        """收下一片；**凑齐了返回文本**，否则返回 None。"""
+        try:
+            i, n, d = int(msg["i"]), int(msg["n"]), str(msg["d"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        self._n = n if self._n is None else max(self._n, n)
+        self._parts[i] = d
+        if self._n is not None and len(self._parts) >= self._n:
+            try:
+                import base64
+                import zlib
+
+                raw = "".join(self._parts[k] for k in range(self._n))
+                return zlib.decompress(base64.b64decode(raw)).decode("utf-8")
+            except Exception:                # noqa: BLE001
+                return None                      # 拼出来坏了：当没收到
+        return None
+
+    def expired(self, now=None):
+        return (now if now is not None else time.time()) - self.t0 > self.timeout
 
 
 def encode(msg):
@@ -138,6 +193,35 @@ class Announcer:
 
     def done(self, n):
         return self.send("done", n=int(n))
+
+    def send_blob(self, kind, text):
+        """把一整段文本分片发给 B 机（报告用）→ 发出去几片。"""
+        n = 0
+        for m in blob_msgs(text):
+            if self.send(kind, **{k: v for k, v in m.items() if k != "kind"}):
+                n += 1
+        return n
+
+    def wait_blob(self, kind, timeout):
+        """等 B 机发回来的一整段文本（结论用）→ 文本 / None。"""
+        asm = BlobAssembler(timeout)
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or asm.expired():
+                return None
+            self.sock.settimeout(min(0.25, left))
+            try:
+                data, _addr = self.sock.recvfrom(MAX_PKT)
+            except (socket.timeout, BlockingIOError):
+                continue
+            except OSError:
+                return None
+            m = decode(data)
+            if m and m.get("kind") == kind:
+                got = asm.feed(m)
+                if got is not None:
+                    return got
 
     def poll_acks(self):
         """收干净已到的回执 → [ack dict]（非阻塞，随时调）。"""
@@ -239,6 +323,55 @@ class Listener:
         残留的高段号在 seg_key 里显得"更新"，不排掉就会一直追着上一轮的尾巴跑。
         """
         return bool(self._sweep_t) and float(seg.get("t") or 0.0) < self._sweep_t
+
+    def send_blob(self, kind, text, addr=None):
+        """把一整段文本分片发回去（结论用）→ 地址默认用**最近那条公告的来源**。
+
+        这样 B 机不用自己配"A 机 IP"：A 机来公告时源地址就在报文里（见 `_seg_addr`）。
+        """
+        addr = addr or self._seg_addr
+        if addr is None:
+            return 0
+        n = 0
+        for m in blob_msgs(text):
+            body = dict(m)
+            body["kind"] = kind
+            body["v"] = VERSION
+            body["t"] = time.time()
+            body["who"] = socket.gethostname()
+            try:
+                self.sock.sendto(json.dumps(body, ensure_ascii=False,
+                                            separators=(",", ":")).encode("utf-8"),
+                                 addr)
+                n += 1
+            except Exception:                    # noqa: BLE001
+                pass
+        return n
+
+    def wait_blob(self, kind, timeout):
+        """等 A 机发来的一整段文本（报告用）→ 文本 / None。"""
+        asm = BlobAssembler(timeout)
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or asm.expired():
+                return None
+            self.sock.settimeout(0.0 if left <= 0 else min(0.25, left))
+            try:
+                data, addr = self.sock.recvfrom(MAX_PKT)
+            except (socket.timeout, BlockingIOError):
+                continue
+            except OSError:
+                return None
+            m = decode(data)
+            if not m:
+                continue
+            self.last_addr = addr
+            if m.get("kind") == kind:
+                got = asm.feed(m)
+                if got is not None:
+                    self._seg_addr = addr             # 回结论时要发回这儿
+                    return got
 
     def ack(self, seg, **extra):
         """回一条回执给**这条公告的源地址**（A 机的日志里会显示"B 机已跟上"）。"""

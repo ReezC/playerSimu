@@ -804,6 +804,7 @@ class DeployWindow(QMainWindow):
     sig_exit = pyqtSignal(str, object)   # 服务 key, 退出码
     sig_check = pyqtSignal(list)         # 自检结果
     sig_sweep_done = pyqtSignal(object, object)   # 推流自检跑完（rows, 落盘路径）
+    sig_sweep_result = pyqtSignal(str)            # B 机回传的结论（合并表 + 建议参数）
 
     def __init__(self):
         super().__init__()
@@ -818,6 +819,7 @@ class DeployWindow(QMainWindow):
         self.sig_exit.connect(self._on_exit)
         self.sig_check.connect(self._on_check)
         self.sig_sweep_done.connect(self._on_sweep_done)
+        self.sig_sweep_result.connect(self._on_sweep_result)
         self._sweep = None            # 推流自检线程（跑的时候非空）
 
         self._build()
@@ -956,16 +958,30 @@ class DeployWindow(QMainWindow):
             return
         if push_running:
             self.stop_service("push")
-        self.log("ui", "推流自检开始：%d 条候选 —— B 机那边请现在跑 tools.stream_sweep"
+        self.log("ui", "推流自检开始：%d 条候选 —— B 机那边跑 tools.stream_sweep --auto"
+                 "（在你之前或之后开始都行；结论会自动回到这里弹出来）"
                  % len(conf["presets"]))
         from deploy.push_sweep import PushSweep
         self._sweep = PushSweep(self.cfg,
                                on_line=lambda t: self.sig_line.emit("ui", t),
                                on_done=lambda rows, path: self.sig_sweep_done.emit(
-                                   rows, str(path)))
+                                   rows, str(path)),
+                               # 结论从自检线程回来的 → 必须走信号（Qt 会排到界面线程）
+                               on_result=self.sig_sweep_result.emit)
         self._sweep.start()
         self.act_sweep.setEnabled(False)
         self.act_sweep_stop.setEnabled(True)
+
+    def _on_sweep_result(self, text):
+        """B 机回传的结论（在界面线程）：**直接弹出来**，别让人去 B 机抄数字。
+
+        这就是"两个开关"的最后一步：A 机点「推流自检…」、B 机双击「一键测延迟」，
+        之后这张表自己就来了（合并后的逐段对照 + 建议写回部署台的参数）。
+        """
+        self.log("ui", "B 机测出的结果：")
+        for ln in str(text).splitlines():
+            self.log("ui", "  " + ln)
+        QMessageBox.information(self, "B 机测出的结果", str(text))
 
     def _on_sweep_done(self, rows, path):
         """自检跑完（在界面线程）：把 A 机侧的结论说清，并提醒去 B 机合并。"""
@@ -1139,6 +1155,11 @@ class DeployWindow(QMainWindow):
             card.stop_clicked.connect(self.stop_service)
             self.cards[key] = card
             layout.insertWidget(i, card)
+        # **必须自己刷一次「将执行」**：卡片的标签只有 `_on_param_changed` 会填，
+        # 而这里重建时信号是**刚连上**的 —— 构造期间那些 setValue 早就发完了，
+        # 所以不刷就等于：刚打开部署台时五张卡的「将执行」全是空的（看着像没配好），
+        # 得随手碰一下参数才出来。实测就是这个问题（2026-09-25）。
+        self._refresh_cmd_all()
         self._refresh_flow()
         self._refresh_states()
 

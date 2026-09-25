@@ -29,6 +29,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from deploy import config as dcfg, services                      # noqa: E402
 from tools import push_presets as pp, sweep_link                 # noqa: E402
 
+#: 发完报告后等 B 机回结论最多多久（B 机还有最后一段要量完 + 合并出表）
+RESULT_WAIT_S = 300.0
+
 
 def make_announcer(cfg):
     """按配置建公告通道（A 机 → B 机）→ Announcer / None。
@@ -119,12 +122,16 @@ class PushSweep(threading.Thread):
     """
 
     def __init__(self, cfg, presets_path=None, on_line=None, on_done=None,
-                 seconds=None, settle=None):
+                 seconds=None, settle=None, on_result=None):
         super().__init__(daemon=True)
         self.cfg = dict(cfg or {})
         self.presets_path = presets_path
         self.on_line = on_line or (lambda _t: None)
         self.on_done = on_done or (lambda _rows, _p: None)
+        #: B 机回传的**结论**（合并后的表 + 建议参数）。跑完 A 机自己只有 A 侧那几个数，
+        #: 延迟那一半在 B 机 —— 所以这个回调就是"最后告诉我结果"那条路。
+        #: 注意它是在**本线程**里被调的：接 Qt 的话请接信号 emit（见 deploy/app.py）。
+        self.on_result = on_result or (lambda _t: None)
         self._seconds = seconds
         self._settle = settle
         self._stop = threading.Event()
@@ -230,6 +237,32 @@ class PushSweep(threading.Thread):
                              % int((self.cfg.get("sweep") or {}).get("port")
                                    or sweep_link.DEFAULT_PORT))
             link.done(len(presets))
+            # 把 A 机这份报告**发给 B 机**，并等它回结论 —— 这是"两个开关"收尾的那一半：
+            # B 机不用去猜路径、也不用人工拷 perf_push_A.json；结论会由 B 机算好后回传，
+            # 部署台弹窗直接显示（合并表 + 建议写回的参数）。
+            txt = ""
+            try:
+                txt = path.read_text(encoding="utf-8")
+            except Exception:                    # noqa: BLE001
+                pass
+            if txt and link.send_blob("rep", txt):
+                self.on_line("        已把 %s 发给 B 机；等它测完最后一段并出表…"
+                             "（最多 %.0f 秒）" % (Path(path).name, RESULT_WAIT_S))
+                res = link.wait_blob("res", RESULT_WAIT_S)
+                if res:
+                    self.on_line("        ↓ B 机测出的结果 ↓")
+                    for ln in res.splitlines():
+                        self.on_line("        " + ln)
+                    try:
+                        self.on_result(res)
+                    except Exception as e:        # noqa: BLE001
+                        self.on_line("        （结论显示失败：%s）" % e)
+                else:
+                    self.on_line("        没等到 B 机的结论 —— 它那边的命令是不是没加 "
+                                 "`--auto`？或者它提前退出了（看它终端的输出）。")
+            elif txt:
+                self.on_line("        （报告发给 B 机失败 —— 它可能在旧版本，"
+                             "按老办法自己去拷 %s）" % Path(path).name)
             link.close()
         self.on_done(self.rows, path)
 

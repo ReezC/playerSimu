@@ -455,6 +455,35 @@ def t_log_history_applies():
         pane.close()
 
 
+def t_cards_show_cmd_at_startup():
+    """**刚打开部署台时，每张卡的「将执行」就必须是满的。**
+
+    实测（用户报的）：五张卡的「将执行」全空 ✗，随手碰一下任意参数才填上。
+    根因是 `_rebuild_cards()` 重建卡片后没人调 `refresh_cmd()` —— 构造期间
+    `changed` 信号还没连上（连的是重建之后的对象），所以也不会顺带触发；
+    旁边那个 `_refresh_cmd_all()` 当时是**死代码**。
+
+    为什么值得用真窗口测：这个标签是卡片存在的意义（"界面里能改的东西和命令里
+    能传的东西是同一份定义"，见部署台 docstring）。空着不但没用，还误导 ——
+    看着像"这个服务没配好"。命令行本身是好的（`cmd_text()` 现算），所以
+    "能启动、能复制"都掩盖不了它。
+    """
+    from PyQt5.QtWidgets import QApplication
+    from deploy.app import DeployWindow
+
+    app = QApplication.instance() or QApplication([])
+    win = DeployWindow()
+    try:
+        app.processEvents()
+        empty = [k for k, c in win.cards.items() if not c.lbl_cmd.text().strip()]
+        check(not empty, "启动后这些卡片的「将执行」是空的：%s" % (empty,))
+        for k, c in win.cards.items():
+            check(c.lbl_cmd.text() == c.cmd_text(),
+                  "%s 卡片显示的「将执行」和现算的不一致（是占位串？）" % k)
+    finally:
+        win.close()
+
+
 # ---------------------------------------------------------------- 跑
 
 TESTS = (
@@ -472,6 +501,7 @@ TESTS = (
     ("框选能在已有事件循环里跑（部署台那条路）", t_ask_region_modal),
     ("设置弹窗：字号点确定才落盘", t_settings_dialog_font),
     ("日志保留行数两处一起改", t_log_history_applies),
+    ("启动后卡片的「将执行」不为空", t_cards_show_cmd_at_startup),
 )
 
 
