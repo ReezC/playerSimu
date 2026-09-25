@@ -9,8 +9,8 @@
   "kbd": {
     "serial": "COM4",
     "port": 9000,
-    "cert": "remote_kbd/certs/cert.pem",
-    "key": "remote_kbd/certs/key.pem"
+    "cert": "remote_kbd\\certs\\cert.pem",
+    "key": "remote_kbd\\certs\\key.pem"
   },
   "push": {
     "ffmpeg": "ffmpeg",
@@ -42,7 +42,7 @@
     "port": 5002
   },
   "window": {
-    "w": 1667,
+    "w": 1280,
     "h": 667
   },
   "log": {
