@@ -391,6 +391,29 @@ def t_settings_dialog_font():
             check(cfg["log"]["max_lines"] == 1200,
                   "日志行数没写进 cfg：%s" % (cfg["log"],))
             check(saved == [1], "确定后没通知窗口落盘：%s" % (saved,))
+
+            # ★ 真正要钉住的那条：**界面上已经存在的控件**要跟着变。
+            # 只断言 app.font() 是不够的 —— 实测过：打过样式表的控件在 setFont 之后
+            # 一动不动（父窗口一份 QSS、里面一个字号都没写，子控件 11 → 11）。
+            # "设置里改了、界面上没变"就是这么来的，所以这里用**真控件**量一次。
+            from PyQt5.QtWidgets import QLabel, QVBoxLayout
+            from PyQt5.QtWidgets import QWidget as _Widget
+            holder = _Widget()
+            holder.setStyleSheet("QLabel { color: #202124; }")
+            hl = QVBoxLayout(holder)
+            lab = QLabel("测试")
+            hl.addWidget(lab)
+            holder.show()
+            theme.apply(app, 11)
+            was = lab.font().pointSize()
+            dlg3 = DeploySettingsDialog(cfg, on_saved=None)
+            dlg3.slider.setValue(18)
+            dlg3._accept()
+            check(lab.font().pointSize() == 18,
+                  "点确定后**已有控件**的字号没跟着变：%d → %d"
+                  "（只有 app.font() 变了，界面看着一模一样）"
+                  % (was, lab.font().pointSize()))
+            holder.close()
     finally:
         theme.apply(app, theme.DEFAULT_SIZE)     # 别把字号留给后面的用例
         shutil.rmtree(str(tmpdir), ignore_errors=True)

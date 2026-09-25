@@ -609,6 +609,15 @@ class SelfCheckPane(QWidget):
         self._box = box
 
     def set_items(self, items):
+        # 「明细」那行比标题小一号，但**按当前界面字号推**：写死 `font-size:11px` 的话，
+        # 把字号调大调小对它都无效 —— 这正是"内联样式压过全局字体"的经典坑
+        # （gui/theme.py 开头那段就是为它写的）。
+        base = 11
+        try:
+            base = QApplication.instance().font().pointSize()
+        except Exception:                    # noqa: BLE001
+            pass
+        small = max(8, int(round(base * 0.85)))
         for lbl in self.rows:
             lbl.setParent(None)
         self.rows = []
@@ -617,8 +626,9 @@ class SelfCheckPane(QWidget):
             text = '<span style="color:%s">●</span> %s' % (
                 color, html.escape(it["title"]))
             if it.get("detail"):
-                text += '<br><span style="color:#80868b; font-size:11px">%s</span>' % (
-                    html.escape(it["detail"]).replace("\n", "<br>"))
+                text += ('<br><span style="color:#80868b; font-size:%dpx">%s</span>'
+                         % (small,
+                            html.escape(it["detail"]).replace("\n", "<br>")))
             lbl = QLabel(text)
             lbl.setObjectName("SelfRow")
             lbl.setWordWrap(True)
@@ -679,10 +689,24 @@ class LogPane(QWidget):
         self.txt.setMaximumBlockCount(self.HISTORY)
         self.txt.setTextInteractionFlags(
             Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        self.apply_font()
+        root.addWidget(self.txt, 1)
+
+    def apply_font(self):
+        """日志正文用等宽字体，但**字号跟随界面字号**。
+
+        为什么不能只在 `__init__` 里 `setFont(QFont("Consolas"))` 了事：那是一份
+        **显式字体**，之后把全局字号改大改小它都不跟（`gui/theme.py` 的 repolish
+        只覆盖"由样式表解析出来的字体"，显式 setFont 过的不在其内）。
+        所以字号一变就得自己重设一次 —— 窗口在 `_on_settings_saved` 里调它。
+        """
         f = QFont("Consolas")
         f.setStyleHint(QFont.Monospace)
+        try:
+            f.setPointSizeF(max(7.0, QApplication.instance().font().pointSizeF()))
+        except Exception:                    # noqa: BLE001
+            pass
         self.txt.setFont(f)
-        root.addWidget(self.txt, 1)
 
     def set_history(self, n):
         """改「保留多少行历史」（设置弹窗里改的就是它）。
@@ -890,6 +914,12 @@ class DeployWindow(QMainWindow):
         from gui import theme            # 与工作台共用 config/ui.yaml
         self.log_pane.set_history(int(self.cfg["log"].get("max_lines")
                                       or LogPane.HISTORY))
+        # 两处**不受全局字号自动影响**的地方，这里补一刀：
+        #   · 日志正文是显式等宽字体（见 LogPane.apply_font）
+        #   · 自检明细那行小字是按基准字号算出来的 px（见 SelfCheckPane.set_items）
+        self.log_pane.apply_font()
+        if getattr(self, "_check_items", None):
+            self.self_check.set_items(self._check_items)
         self.cfg["log"]["filter"] = self.log_pane.filter
         self._save_timer.start()         # 300ms 合并，与改参数同一条节拍
         self.log("ui", "设置已更新：界面字号 %d px、日志保留 %d 行"
@@ -1274,6 +1304,7 @@ class DeployWindow(QMainWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def _on_check(self, items):
+        self._check_items = items            # 留一份：字号变了要按新字号重排（见设置）
         self.self_check.set_items(items)
         bad = [i for i in items if i["level"] != "ok"]
         self.log("ui", "自检完成：%d 项，%d 项需要注意"

@@ -164,14 +164,53 @@ def hex_to_bgr(hexstr):
     return (int(hexstr[4:6], 16), int(hexstr[2:4], 16), int(hexstr[0:2], 16))
 
 
+def repolish(w):
+    """让 `w` 及其子控件按**当前**全局字号重新解析一遍样式。
+
+    **为什么非要有这一步**（实测踩到的坑，2026-09-25）：光调 `app.setFont()`，
+    **打过样式表的控件完全不跟**。
+      · 没打过样式表：`setFont` 立刻跟随（实测 11 → 18 ✓）
+      · 打过样式表（部署台/工作台的主窗口都打了一整份 QSS）：**一动不动** ✗
+        实测：父窗口一份 QSS、**里面一个字号都没写**，子控件在 setFont 之后 11 → 11。
+    根因是 `QStyleSheetStyle` 在 polish 时会把自己解析出的字体 `setFont` 到控件上 ——
+    等于给控件标了"显式字体"，此后全局字体再变它就不理了。
+
+    修法是**把同一个样式表字符串再设一遍**：`setStyleSheet` 会递归 repolish，
+    字体就按新的全局字号重新解析了（实测 11 → 18 ✓）。
+    它不像"遍历控件逐个 setFont"那样把**有意设过**的字体一起冲掉
+    （日志正文那份等宽字体就是有意的，见 deploy/app.py 的 LogPane.apply_font）。
+    """
+    from PyQt5.QtWidgets import QWidget
+
+    try:
+        if w.styleSheet():
+            w.setStyleSheet(w.styleSheet())
+        for c in w.findChildren(QWidget):
+            if c.styleSheet():
+                c.setStyleSheet(c.styleSheet())
+    except Exception:                    # noqa: BLE001
+        pass                             # 刷新失败不该把设置弹窗弄崩
+
+
 def apply(app, size=None):
-    """把字号应用到整个程序。
+    """把字号应用到整个程序 —— **包括已经存在的控件**。
 
     app  : QApplication 实例
     size : 字号；None 表示读配置
+
+    两步缺一不可：`setFont` 管"新建的控件"和"没打过样式表的控件"，
+    `repolish` 管"已经存在的、打过样式表的控件"（见 repolish 的说明）。
     """
     from PyQt5.QtGui import QFont
 
     size = clamp(size if size is not None else load_size())
     app.setFont(QFont(FAMILY, size))
+    # 样式表也可能挂在 QApplication 上，那 topLevelWidgets 里就没有带 QSS 的了
+    try:
+        if app.styleSheet():
+            app.setStyleSheet(app.styleSheet())
+    except Exception:                    # noqa: BLE001
+        pass
+    for w in app.topLevelWidgets():
+        repolish(w)
     return size
