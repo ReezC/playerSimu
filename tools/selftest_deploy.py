@@ -173,8 +173,13 @@ def t_app_source():
     # 只查**代码行**（顶格缩进的语句）：说明文字里会提到 app.exec_()，那是解释
     check("\n    app.exec_()" not in src,
           "框选又自己跑 app.exec_() 了 —— 在部署台里会卡住（事件循环已在跑）")
-    check("hidden.hide()" in src and "hidden.show()" in src,
-          "框选没有「先藏起调用方窗口再抓屏」")
+    # 「藏起调用方窗口再抓屏」现在归共用实现（gui/region_picker.py）管，
+    # 这里只验**它确实走的是共用实现**（细节由 tools/selftest_region.py 钉）
+    check("select_screen_region" in src,
+          "部署台的框选没走全仓库唯一那份实现（gui.region_picker）")
+    picker = (ROOT / "gui" / "region_picker.py").read_text(encoding="utf-8")
+    check("hidden.hide()" in picker and "hidden.show()" in picker,
+          "共用框选没有「先藏起调用方窗口再抓屏」")
 
     app_src = (ROOT / "deploy" / "app.py").read_text(encoding="utf-8")
     check('"mmap"' in app_src.split("SERVICE_COLOR")[1].split("}")[0],
@@ -235,7 +240,9 @@ def t_ask_region_modal():
     「event loop is already running」并卡住 —— 界面上按一下没反应，
     而命令行与部署台共用同一个函数，必须两边都能跑。
 
-    做法是自动替人拉框：QTimer 里找出那个模态 QDialog，直接给它发鼠标事件。
+    做法是自动替人拉框：**轮询等**那个模态 QDialog 出现，再给它发鼠标事件。
+    （不能固定延时：抓屏那条路会先"藏起调用方窗口 + 等 250ms"，窗口出现得比
+    固定延时要晚 —— 抢跑的话事件发给空气，看着就像"框选没返回"。）
     不用 `activeModalWidget()`（离屏平台下窗口拿不到激活，它可能是 None）。
     万一没关掉，watchdog 会兜住 —— 自检**绝不能挂住**。
 
@@ -281,9 +288,30 @@ def t_ask_region_modal():
             dlg.close()
 
     def run_drag(x1, y1, x2, y2, owner):
-        QTimer.singleShot(150, drag(x1, y1, x2, y2))
-        QTimer.singleShot(2500, watchdog)
-        return ask_region(owner=owner)
+        go = drag(x1, y1, x2, y2)
+        tick = QTimer()
+        tick.setInterval(30)
+        waited = [0]
+
+        def poll():
+            if find_dialog() is None and waited[0] < 4000:
+                waited[0] += 30          # 窗口还没出来（藏窗口 + 250ms），接着等
+                return
+            tick.stop()
+            go()
+
+        tick.timeout.connect(poll)
+        tick.start()
+        wd = QTimer()
+        wd.setSingleShot(True)
+        wd.setInterval(5000)
+        wd.timeout.connect(watchdog)
+        wd.start()
+        try:
+            return ask_region(owner=owner)
+        finally:
+            tick.stop()
+            wd.stop()
 
     try:
         rect = run_drag(100, 40, 300, 190, win)
@@ -293,8 +321,10 @@ def t_ask_region_modal():
               "框选时没把调用方窗口藏起来（会框到部署台自己）")
         check(win.isVisible(), "框选结束后没把调用方窗口放回来")
 
-        # 太小的框 = 误点，当取消（宁可重框，也别推一个 3 像素的区域出去）
-        check(run_drag(10, 10, 13, 13, win) is None, "太小的框没当成取消")
+        # 太小的框 = 误点，当取消（宁可重框，也别推一个 2 像素的区域出去）。
+        # 阈值是框选规范里的 4px，且尺寸按 QRect 含两端算：拖 (10,10)→(13,13)
+        # 是 4×4（= 刚好合格），要更小才是误点，所以这里拖 (10,10)→(11,11)。
+        check(run_drag(10, 10, 11, 11, win) is None, "太小的框没当成取消")
         check(win.isVisible(), "取消之后窗口没被放回来")
 
         # 命令行那条路：没有 owner 也要能框

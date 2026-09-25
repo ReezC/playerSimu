@@ -54,102 +54,31 @@ def save_cfg(cfg):
 
 
 def ask_region(owner=None, wait=0.0):
-    """抓一张全屏图，弹全屏框选窗让人拖出小地图区域 → (x, y, w, h)；取消返回 None。
+    """抓全屏图，弹框选窗让人拖出小地图区域 → (x, y, w, h)；取消返回 None。
+
+    **交互走全仓库唯一那份实现**（`gui.region_picker`，带放大镜 / 像素网格 /
+    `+/-` 倍数，见 docs/UI规范.md §9）：小地图面板的边框就差一两个像素，没有
+    放大镜只能靠感觉 —— 而框大了会把血条/聊天一起推给 B 机，那边的现象是
+    「底图对不上」，看着像寻路坏了。
 
     **为什么能在部署台里被调用**（以前不行）：老实现结尾是 `app.exec_()` —— 在
     一个**已经有事件循环**的 Qt 程序（部署台）里再跑一次会报
     「The event loop is already running」，而且是卡住不返回，按钮看着像死了。
-    现在用 `QDialog.exec_()`（嵌套的模态循环，Qt 本来就支持），于是命令行和
-    部署台两条路共用这一个实现 —— 不会有「界面上框的和命令行的不是一套」这种事。
+    region_picker 用的是 `QDialog.exec_()`（嵌套的模态循环，Qt 本来就支持），
+    所以命令行和部署台两条路共用同一个实现。
 
-    owner 传了就先把它所在的**窗口藏起来**再抓屏：不然抓到的截图里盖着部署台
-    自己，人对着自己的界面框小地图（这一步是必须的，不是锦上添花）。
-    窗口重新 show() 在 finally 里，中途取消也不会把界面弄丢。
+    owner 传了就先把它的窗口藏起来再抓屏（region_picker 负责），不然抓到的
+    截图里盖着部署台自己；框完/取消都会 show() 回来。
 
     wait > 0 时先等这么多秒再抓屏 —— 命令行用：给用户切回游戏窗口的时间。
     """
-    from PyQt5.QtCore import QRect, Qt
-    from PyQt5.QtGui import QGuiApplication, QPainter, QPen
-    from PyQt5.QtWidgets import QApplication, QDialog
-
     if wait > 0:
         print("  %.0f 秒后抓屏 —— 现在切到游戏窗口，让小地图露出来（别被挡）"
               % wait, flush=True)
         time.sleep(wait)
 
-    screen = QGuiApplication.primaryScreen()
-    if screen is None:
-        print("没有可用屏幕，抓不了屏")
-        return None
-
-    hidden = owner.window() if owner is not None else None
-    if hidden is not None and hidden.isVisible():
-        hidden.hide()
-        QApplication.processEvents()      # 先把重绘/隐藏做完
-        time.sleep(0.25)                  # 再等窗口真的从屏幕上消失
-
-    try:
-        shot = screen.grabWindow(0)
-
-        class Pick(QDialog):
-            """全屏框选窗：底图 = 刚才那张截图，拖出来的是屏幕坐标。
-
-            **不挂父窗口**（parent=None）：父窗口马上要被藏起来，挂上去的话
-            Qt 会连这个对话框一起隐掉。
-            """
-
-            def __init__(self):
-                super().__init__(None)
-                self.setWindowFlags(Qt.FramelessWindowHint
-                                    | Qt.WindowStaysOnTopHint | Qt.Dialog)
-                self.setGeometry(screen.geometry())
-                self.setCursor(Qt.CrossCursor)
-                self.pic = shot
-                self.a = self.b = None
-                self.rect = None
-
-            def paintEvent(self, _e):
-                p = QPainter(self)
-                p.drawPixmap(0, 0, self.pic)
-                if self.a and self.b:
-                    r = QRect(self.a, self.b).normalized()
-                    pen = QPen(Qt.red)
-                    pen.setWidth(3)
-                    p.setPen(pen)
-                    p.drawRect(r)
-
-            def mousePressEvent(self, e):
-                self.a = e.pos()
-
-            def mouseMoveEvent(self, e):
-                self.b = e.pos()
-                self.update()
-
-            def mouseReleaseEvent(self, e):
-                if self.a is None:
-                    self.a = e.pos()
-                r = QRect(self.a, e.pos()).normalized()
-                # 太小的框当成误点：框 3 个像素的"区域"推出去毫无意义，
-                # 而且会让 B 机那边匹配失败却看不出原因。
-                self.rect = r if (r.width() >= 8 and r.height() >= 8) else None
-                self.close()
-
-            def keyPressEvent(self, e):
-                if e.key() == Qt.Key_Escape:
-                    self.rect = None
-                    self.close()
-
-        dlg = Pick()
-        dlg.showFullScreen()
-        dlg.exec_()
-
-        r = dlg.rect
-        if not r:
-            return None
-        return (r.x(), r.y(), r.width(), r.height())
-    finally:
-        if hidden is not None:
-            hidden.show()
+    from gui.region_picker import select_screen_region
+    return select_screen_region(parent=owner, hide_owner=True)
 
 
 def main() -> int:

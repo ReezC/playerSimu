@@ -574,7 +574,10 @@ class PlayerPanel(QWidget):
         pg.setLabelAlignment(Qt.AlignLeft)
 
         self.btn_hp_bar = QPushButton("框选 HP 条")
-        self.btn_hp_bar.setToolTip("在游戏画面上框选血条，用于识别当前血量。")
+        self.btn_hp_bar.setToolTip(
+            "在实时画面上框选血条，用于识别当前血量。\n"
+            "框选时跟着光标的放大镜是 12×（+/- 可调 4~16 倍）：\n"
+            "血条上沿差一两个像素，采样就会吃到背景色。")
         self.btn_hp_bar.clicked.connect(lambda: self._pick_bar("hp"))
         self.lbl_hp_bar = QLabel("未选")
         self.lbl_hp_bar.setStyleSheet("color: #80868b;")
@@ -584,7 +587,10 @@ class PlayerPanel(QWidget):
         pg.addRow("HP条", hp_row)
 
         self.btn_mp_bar = QPushButton("框选 MP 条")
-        self.btn_mp_bar.setToolTip("在游戏画面上框选蓝条，用于识别当前蓝量。")
+        self.btn_mp_bar.setToolTip(
+            "在实时画面上框选蓝条，用于识别当前蓝量。\n"
+            "框选时跟着光标的放大镜是 12×（+/- 可调 4~16 倍）：\n"
+            "蓝条上沿差一两个像素，采样就会吃到背景色。")
         self.btn_mp_bar.clicked.connect(lambda: self._pick_bar("mp"))
         self.lbl_mp_bar = QLabel("未选")
         self.lbl_mp_bar.setStyleSheet("color: #80868b;")
@@ -1617,7 +1623,11 @@ class PlayerPanel(QWidget):
         settings.save()
 
     def _pick_bar(self, kind):
-        """在实时画面上框选 HP/MP 条区域，并采样该条的填充色。"""
+        """在实时画面上框选 HP/MP 条区域，并采样该条的填充色。
+
+        框选走全仓库唯一那份实现（带放大镜，见 docs/UI规范.md §9）：血条上沿
+        差一两个像素，采样就会吃到背景色。条又细又长，所以起始倍数给到 12×。
+        """
         from gui.region_selector import select_region_on_image
         frame = None
         lp = getattr(self, "live_panel", None)
@@ -1627,7 +1637,7 @@ class PlayerPanel(QWidget):
             QMessageBox.information(
                 self, "提示", "请先在「实时」页开始预览、看到画面后，再框选 HP/MP 条")
             return
-        rect = select_region_on_image(frame, self)
+        rect = select_region_on_image(frame, self, zoom=12)
         if rect is None:
             return
         x, y, rw, rh = rect
