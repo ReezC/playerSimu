@@ -160,6 +160,91 @@ def t_load_warn_on_status():
         p.close()
 
 
+def t_lag_watchdog_rules():
+    """积压锁死看门狗：**持续**高才报、回落自己消失、迟滞区不闪也不乱计时。
+
+    实测（2026-09-26）：B 机读线程跟不上 A 的推流速率时，积压堆在 ffmpeg/内核里长，
+    端到端延迟稳在 2.6~3.9 秒**且自己回不来**（perf.log 连续 6 段都是这样，
+    而机器并不忙：avail 5.7GB、mp_workers 0）。所以判据必须是"持续"而不是"高过一下"。
+
+    为什么不用 `recv_fps < 名义帧率`：那是**间接**证据，会天天误报 —— 健康段 recv
+    也是 117~121，而容器名义帧率是 144（A 机本来就没发满）。
+    """
+    from gui.live_thread import (LAG_RECOVER_MS, LAG_WARN_MS, LAG_WARN_SEC,
+                                lag_watchdog)
+
+    st = [None, None, False]
+    # ① 只是抖一下（3 秒）→ 不许报
+    check(lag_watchdog(900.0, 100.0, st)[0] == "", "刚高一下（首拍）就报警")
+    check(lag_watchdog(900.0, 103.0, st)[0] == "",
+          "不到 %.0f 秒就报警了" % LAG_WARN_SEC)
+    # ② 持续够久 → 报，并且只"刚刚判定"一次（perf 记一次，不刷屏）
+    txt, fresh = lag_watchdog(900.0, 100.0 + LAG_WARN_SEC + 0.1, st)
+    check(txt and "锁死" in txt, "持续高却没报警：%r" % txt)
+    check(fresh is True, "第一次判定没标成'刚刚'（perf 记不到那一下）")
+    txt2, fresh2 = lag_watchdog(950.0, 100.0 + LAG_WARN_SEC + 0.6, st)
+    check(txt2 and fresh2 is False, "判定被重复算'刚刚'（perf 会刷屏）")
+    check("峰值" in txt2, "告警里没有峰值：%r" % txt2)
+    # ③ 迟滞区（回落到 300ms）→ 已判定过就**继续挂着**，不闪
+    check(lag_watchdog(LAG_RECOVER_MS + 100.0, 120.0, st)[0] != "",
+          "迟滞区里告警闪掉了（会一闪一闪）")
+    # ④ 真回落 → 清空状态，下次重新计时
+    check(lag_watchdog(90.0, 200.0, st)[0] == "", "回落了还挂着告警")
+    check(st[0] is None and st[2] is False, "回落没清状态：%s" % st)
+    check(lag_watchdog(900.0, 201.0, st)[0] == "", "清空后没重新计时")
+    # ⑤ 迟滞区**且没判定过**：不许靠"在 400ms 上耗 20 秒"骗过判据
+    st2 = [None, None, False]
+    check(lag_watchdog(LAG_RECOVER_MS + 200.0, 300.0, st2)[0] == "", "400ms 就报警")
+    check(lag_watchdog(LAG_RECOVER_MS + 200.0, 340.0, st2)[0] == "",
+          "在迟滞区耗久了也被判成锁死：%s" % st2)
+    check(st2[0] is None, "迟滞区还在计时（判据边界没守住）：%s" % st2)
+    # ⑥ 探针没开 / 拿不到延迟 → 不报（宁可不报，别误报）
+    check(lag_watchdog(None, 999.0, [None, None, False])[0] == "",
+          "拿不到延迟时乱报")
+    # 边界自证：三个阈值必须是有序的，改坏了上面这些区间就全乱
+    check(0 < LAG_RECOVER_MS < LAG_WARN_MS and LAG_WARN_SEC > 0,
+          "阈值不合法：恢复 %s / 告警 %s / 时长 %s"
+          % (LAG_RECOVER_MS, LAG_WARN_MS, LAG_WARN_SEC))
+
+
+def t_lag_warn_on_status():
+    """积压锁死要**顶在状态行最前面**（比负载告警还优先），恢复后自己消失。
+
+    为什么优先级要压倒负载告警：负载告警是"为什么变慢"的解释，而积压锁死是一个
+    **已经发生的故障状态**（延迟几秒、自己回不来），不处置会一直是坏的。
+    """
+    app, lp, p, made, orig = _panel()
+    try:
+        base = {"size": (1366, 768), "recv_fps": 101.0, "proc_fps": 40.0,
+                "dropped": 3000, "show_fps": 30.0, "boxes": 3, "probe_on": True,
+                "delay_ms": 3100.0}
+        p._on_stats(dict(base, lag_warn="延迟积压锁死：3100 ms 已持续 12 秒",
+                         lag_detail="读线程 101.0 fps ｜ 主回路 40.0 fps\n怎么办："
+                                    "1) 停止再开始预览 2) A 机降到 60fps 档"))
+        txt = p.lbl_stats.text()
+        check("积压锁死" in txt, "状态行没显示积压告警：%r" % txt)
+        check(txt.lstrip().startswith("【延迟积压锁死"),
+              "积压告警没被顶到最前面：%r" % txt[:60])
+        tip = p.lbl_stats.toolTip()
+        check("读线程 101.0 fps" in tip and "停止再开始预览" in tip,
+              "明细（含怎么办）没进 tooltip：%r" % tip)
+
+        # 与负载告警同时出现时：积压在前，负载在后，两条都在
+        p._on_stats(dict(base, lag_warn="延迟积压锁死：3100 ms 已持续 12 秒",
+                         load_warn="负载告警：并行子进程 11 个(11.8GB)"))
+        txt2 = p.lbl_stats.text()
+        check(txt2.lstrip().startswith("【延迟积压锁死") and "负载告警" in txt2,
+              "两条告警没有按优先级并存：%r" % txt2[:120])
+
+        # 恢复（延迟回落）→ 告警自己消失
+        p._on_stats(dict(base, delay_ms=85.0))
+        check("积压锁死" not in p.lbl_stats.text(),
+              "延迟恢复后状态行还挂着告警：%r" % p.lbl_stats.text())
+    finally:
+        lp._bgr_to_pixmap = orig
+        p.close()
+
+
 def t_minimap_overlay_is_display_only():
     """小地图叠图：只准画在显示层、**帧数据一个字节都不许改**，位置要落在画面坐标上。
 
@@ -476,6 +561,8 @@ TESTS = (
     ("不可见时一帧都不画，但帧仍是最新的", t_hidden_skips_draw),
     ("状态行露出「绘制 ms / 合并丢弃」（源码约定）", t_stats_show_draw),
     ("负载告警顶在状态行最前面，恢复后自己消失", t_load_warn_on_status),
+    ("积压锁死看门狗：持续高才报、回落自己消失、迟滞不闪", t_lag_watchdog_rules),
+    ("积压锁死顶在状态行最前面（压过负载告警）", t_lag_warn_on_status),
     ("小地图叠图：只画显示层、帧数据不许改", t_minimap_overlay_is_display_only),
     ("小地图叠图：源超出叠加图时画出来的范围要对", t_overlay_source_out_of_image),
     ("探针单调性闸：几何可疑不报延迟、保存前拦错几何", t_probe_mono_gate),

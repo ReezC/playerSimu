@@ -421,9 +421,9 @@ def render(rows, best, title="推流自检", why=""):
     传进来优先用它，别自己再拼一句（两处口径会漂）。
     """
     out = ["", "=" * 108, "%s   （p95 排序；标 ✗ 的已被淘汰）" % title, "=" * 108]
-    out.append("%-16s %5s %6s %5s %7s %7s %6s %7s %9s %9s %9s  %s"
+    out.append("%-16s %5s %6s %5s %7s %7s %6s %7s %9s %9s %9s %9s  %s"
                % ("段", "fps", "码率", "GOP", "speed", "实际fps", "丢帧",
-                  "收到fps", "延迟p50", "延迟p95", "抖动", "判定"))
+                  "收到fps", "延迟p50", "延迟p95", "延迟max", "抖动", "判定"))
     for r in rows:
         mark = "✓" if r.get("pass") else "✗"
         if r.get("only"):                     # 只有一侧有数据：照样列，别悄悄丢掉
@@ -433,14 +433,14 @@ def render(rows, best, title="推流自检", why=""):
             return ("%*.1f" % (w, v)) if isinstance(v, (int, float)) else \
                 ("%*s" % (w, dash))
 
-        out.append("%-16s %5s %6s %5s %7s %s %s %s %9s %9s %9s  %s %s"
+        out.append("%-16s %5s %6s %5s %7s %s %s %s %9s %9s %9s %9s  %s %s"
                    % (r["name"], r.get("fps"), r.get("bitrate"), r.get("gop"),
                       # 三位小数：0.996 打印成 "1.00" 会写出"1.00 < 1.00"这种荒唐话
                       ("%.3f" % r["speed"]) if r.get("speed") is not None else "-",
                       f(r.get("out_fps"), 7), f(r.get("drop"), 6, 0),
                       f(r.get("recv_fps"), 7),
                       f(r.get("lat_p50"), 9, 0), f(r.get("lat_p95"), 9, 0),
-                      f(r.get("jitter"), 9, 0), mark,
+                      f(r.get("lat_max"), 9, 0), f(r.get("jitter"), 9, 0), mark,
                       ("—— " + "；".join(
                           [t for t in (r.get("a_why"), r.get("warn")) if t])
                        if r.get("only") else
@@ -452,6 +452,9 @@ def render(rows, best, title="推流自检", why=""):
     elif why:
         out.append(why)
     out.append("说明：`speed` 是 ffmpeg 的处理速度（<1.00 = A 机跟不上，一定丢帧）；")
+    out.append("      `延迟max` 是这一段**最坏的那一帧** —— 几秒的偶发尖峰只有它看得见"
+               "（p95 会把它平均掉：")
+    out.append("      20s ≈ 600 帧时，一帧 3 秒只占 0.2%，p95 完全不动）。")
     out.append("      `实际fps / 目标fps` 低于 100% 是 A 机顶不上去 —— **不一定是坏事**：")
     out.append("      屏幕只有 120Hz 时，144 档最多也就出 120（实测就是 117~120）。")
     out.append("      `延迟 p50/p95` 只在**探针几何判据通过**时才记（否则整轮该先修几何）；")

@@ -1136,14 +1136,23 @@ class LivePanel(QWidget):
         # 本机负载告警再压一层到最前面：它是「上面这些数字为什么变差」的解释，
         # 比数字本身更要紧 —— 实测同时跑训练/并行标注时，推理的前向会与输入尺寸
         # 无关地整体变慢（同一份配置 10.0 → 23.7 ms），而 GPU 时钟功耗都正常。
+        # 载荷告警挂上去（先挂它、后挂积压 —— **代码顺序与显示顺序是反的**：
+        # 这里都是往 head 前面拼，所以后拼的显示在最左边）。
         lw = (s.get("load_warn") or "").strip()
         if lw:
             head = "【%s】 " % lw + head
+        # 积压锁死放**最前面**（比负载告警还优先）：它不是"为什么变慢"的解释，
+        # 而是一个**已经发生的故障状态**（延迟几秒、自己回不来），不处置会一直是坏的。
+        # 判据在 gui/live_thread.lag_watchdog（纯函数，已自检）。
+        lag = (s.get("lag_warn") or "").strip()
+        if lag:
+            head = "【%s】 " % lag + head
         # 明细放 tooltip：状态行那一行已经塞满了，硬挤进去反而看不清数字
-        ld = (s.get("load_detail") or "").strip()
-        if ld:
-            cur = self.lbl_stats.toolTip()
-            self.lbl_stats.setToolTip((cur + "\n\n" if cur else "") + ld)
+        for key in ("lag_detail", "load_detail"):
+            d = (s.get(key) or "").strip()
+            if d:
+                cur = self.lbl_stats.toolTip()
+                self.lbl_stats.setToolTip((cur + "\n\n" if cur else "") + d)
         # 绘制那一段单独报：「显示 fps」只说明**推**了多少，看不出主线程画得
         # 动不动 —— 而"失焦就卡"恰恰卡在这里（合并丢弃的帧数一涨，就说明主线程
         # 跟不上推送、开始在丢中间帧；不丢帧时界面才不会滞后）。

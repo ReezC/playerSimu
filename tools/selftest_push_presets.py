@@ -243,6 +243,10 @@ def t_render_and_apply():
     rows, best, _why = pp.rank(pp.merge([a], [b]))
     txt = pp.render(rows, best)
     check("speed" in txt and "p95" in txt, "表头缺少关键列：%s" % txt[:200])
+    # 「最坏那一帧」必须在表里：几秒的偶发尖峰只会出现在 max 上（p95 平均掉它）
+    # （_row_b 的 lat_max = p95 + 30 = 180.0，正好用来确认这一列真的印出来了）
+    check("延迟max" in txt and "180.0" in txt,
+          "表里没有延迟 max 那一列（秒级尖峰会看不见）：%s" % txt[:400])
     check("结论：" in txt and "best" in txt, "没给出结论：%s" % txt[-300:])
 
     base = {"host": "192.168.1.2", "port": 5000, "pkt_size": 1316,
@@ -288,6 +292,45 @@ def t_chain_check_rewrites_output():
           "没有干净的输出端：%s" % line[-120:])
 
 
+def t_chain_verdict_not_fooled_by_summary_line():
+    """链快查的判定：**不许被 ffmpeg 退出前那行汇总骗过去**。
+
+    实测（2026-09-26，A 机）：GPU 那条链根本没起来，ffmpeg 却照样打了
+        frame=    0 fps=0.0 q=0.0 Lsize=       0KiB time=N/A bitrate=N/A speed=N/A
+    我的第一版只看"有没有 stats 行"，于是报"起得来：实际 -1.0 fps"、
+    结论"采集链没问题" —— 和上一轮那张错位表是同一类错：**拿一句汇总当结论**。
+    所以判定要求两条同时成立：输出过帧 **且** 真的跑满了时长。
+    """
+    from tools.push_chain import pick_reason, verdict
+
+    stats = [{"frame": 0.0, "fps": 0.0}]
+    tail = [
+        "[Parsed_hwmap_1 @ 0000020a0cf34e40] Failed to created derived device "
+        "context: -40.",
+        "[Parsed_hwmap_1 @ 0000020a0cf34e40] Failed to configure output pad on "
+        "Parsed_hwmap_1",
+        "[fc#0 @ 0000020a182106c0] Error configuring filter graph: "
+        "Function not implemented",
+        "[fc#0 @ 0000020a182106c0] Task finished with error code: -40 "
+        "(Function not implemented)",
+        "[vost#0:0/h264_nvenc @ 00000209c8943800] Could not open encoder before EOF",
+    ]
+    ok, why = verdict(stats, tail, 0.01, 3.0)
+    check(not ok, "0 帧 + 立刻退出的链被判成起得来：%s" % why)
+    check("not implemented" in why.lower() or "derived device context" in why,
+          "没挑出根因那一句：%s" % why)
+    check(pick_reason(tail).startswith("[Parsed_hwmap_1"),
+          "根因挑错了（挑了后果/尾巴那句）：%s" % pick_reason(tail))
+
+    # 正常一条：跑满时长、有帧 → 起得来
+    ok2, why2 = verdict([{"frame": 300.0, "fps": 100.0, "speed": 0.99}], [], 3.0, 3.0)
+    check(ok2 and "起得来" in why2, "正常的一条被判成起不来：%s" % why2)
+    # 有帧但中途就退出（说明跑到一半出错）→ 不算起得来
+    ok3, why3 = verdict([{"frame": 5.0, "fps": 1.0}],
+                        ["Impossible to convert between the formats ..."], 0.2, 3.0)
+    check(not ok3, "中途就退出的那条被判成起得来：%s" % why3)
+
+
 def t_a_side_command_has_stats():
     """A 机侧命令：用部署台**同一份**实现 + 把 `-nostats` 换成 `-stats`。
 
@@ -317,6 +360,7 @@ CASES = [
     ("清单文件可读、名字唯一、坏了退回默认", t_presets_file),
     ("A 机侧命令带 -stats（speed 的唯一来源）", t_a_side_command_has_stats),
     ("采集链快查：输出换成 -f null、链本身不动", t_chain_check_rewrites_output),
+    ("链快查判定：不被退出前那行汇总骗过去", t_chain_verdict_not_fooled_by_summary_line),
     ("候选只覆盖自己写的键（机器属性继承）", t_push_block_inherits_machine),
     ("ffmpeg -stats 行解析（speed/fps/丢帧/码率）", t_parse_ffmpeg_stats),
     ("统计取尾部（稳态），不是平均", t_take_last),

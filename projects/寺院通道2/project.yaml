@@ -93,7 +93,7 @@ decision:
   target_cd:
   - 1500
   - 2500
-  input_device: local
+  input_device: remote
   input_delay:
   - 0
   - 30

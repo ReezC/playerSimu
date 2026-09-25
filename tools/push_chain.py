@@ -92,6 +92,47 @@ def have_filters(ff, names):
     return [n for n in names if n in blob], [n for n in names if n not in blob]
 
 
+#: 报错行里哪几句是**根因**（挑最早出现的那句；别拿 "Terminating thread…" 这种尾巴
+#: 或 "Nothing was written into output file" 这种后果当原因）
+_REASON_HINTS = ("failed to", "no such filter", "cannot load", "error configuring",
+                 "not implemented", "unknown encoder", "invalid argument",
+                 "impossible to convert", "device not found", "no capable devices")
+
+
+def pick_reason(tail):
+    """报错行 → 最该看的那一句（纯函数）；挑不到就给最后一行。"""
+    for s in tail or []:
+        lo = s.lower()
+        if any(h in lo for h in _REASON_HINTS):
+            return s
+    return (tail or [""])[-1]
+
+
+def verdict(stats, tail, ran_s, seconds):
+    """跑完一条之后的判定 → (起得来?, 一句话)。**纯函数 —— 这段决定工具会不会骗人。**
+
+    两条**都**满足才算"起得来"：
+      · **输出过帧**（`frame=` > 0）；只看"有没有 stats 行"会被骗 —— ffmpeg 退出前
+        照样打一行 `frame=0 fps=0.0 … speed=N/A`。实测 2026-09-26：GPU 那条链根本没
+        起来，我的第一版因此报"起得来：实际 -1.0 fps"、结论"采集链没问题" ✗。
+        （和上一轮那张错位表是同一类错：**拿一句汇总当结论**。）
+      · **真的跑满了时长**（≥90%）—— 立刻退出说明在配置阶段就失败了。
+    """
+    last = pp.take_last(stats)
+    try:
+        frames = float(last.get("frame") or 0)
+    except (TypeError, ValueError):
+        frames = 0.0
+    if frames > 0 and ran_s >= float(seconds) * 0.9:
+        return True, ("起得来：编码 %.0f 帧、实际 %.1f fps、speed %s"
+                      % (frames, last.get("fps") or -1,
+                         ("%.3f" % last["speed"])
+                         if last.get("speed") is not None else "-"))
+    why = pick_reason(tail) or ("只跑了 %.1f 秒、输出 %.0f 帧（一句报错都没有）"
+                                % (ran_s, frames))
+    return False, "起不来：%s" % why
+
+
 def run_one(name, cfg, seconds, ff):
     """跑一条候选几秒 → (起得来?, 一句话结论)。ffmpeg 的输出原样转出来。"""
     cmd = null_output_argv(services.build_cmd("push", cfg), seconds)
@@ -137,14 +178,7 @@ def run_one(name, cfg, seconds, ff):
             except Exception:                # noqa: BLE001
                 pass
 
-    last = pp.take_last(stats)
-    if stats:
-        return True, ("起得来：实际 %.1f fps、speed %s（%d 条 stats）"
-                      % (last.get("fps") or -1,
-                         ("%.3f" % last["speed"]) if last.get("speed") is not None else "-",
-                         len(stats)))
-    why = tail[-1] if tail else "（ffmpeg 一句输出都没有）"
-    return False, "起不来：%s" % why
+    return verdict(stats, tail, time.time() - t0, seconds)
 
 
 def main():

@@ -47,6 +47,58 @@ from perception.classes import (CLASS_MOB, CLASS_OTHER_PLAYER, CLASS_PLAYER,
 # （4 是「其他玩家」类，见 perception/classes.py —— 别再拿 2，那是 drop）。
 PLAYER_CLASS_MAP = {"": CLASS_PLAYER}
 
+#: 积压锁死的判据：端到端延迟中位超过 LAG_WARN_MS 且持续 LAG_WARN_SEC 秒不回落
+#: ⇒ 认定"自己回不来了"，面板直说。回落到 LAG_RECOVER_MS 以下才撤销（迟滞，防闪）。
+#:
+#: **为什么判据不是 `recv_fps < 推流速率`**（那是更"直接"的说法，但会天天误报）：
+#: `recv_fps` 是**读线程吞吐**这个间接量 —— 实测 2026-09-26：塌陷后 recv=101、A 机推
+#: 117；可**健康段的 recv 也是 117~121**，而容器报的名义帧率是 **144**（A 实际发不满）。
+#: 拿 recv 去和名义帧率比，健康时也判成"积压" ✗。真正定义这个问题的是"**延迟稳在高位、
+#: 自己回不来**"，那正是探针能直接量到的东西（perf.log 的 e2e_probe_ms）。
+LAG_WARN_MS = 500.0
+LAG_WARN_SEC = 10.0
+LAG_RECOVER_MS = 200.0
+
+
+def _lag_text(med_ms, secs, peak_ms):
+    return ("延迟积压锁死：%d ms 已持续 %.0f 秒（峰值 %d ms），不会自己回落"
+            % (med_ms, secs, peak_ms or med_ms))
+
+
+def lag_watchdog(med_ms, now, state):
+    """积压锁死看门狗（**纯函数**）→ (告警短句, 本次是否刚刚判定)。
+
+    `med_ms`：当前端到端延迟中位（拿不到给 None，此时**不报** —— 探针没开就别乱说）；
+    `now`：`time.perf_counter()`；`state`：调用方持有的可变列表 `[起算时刻, 峰值, 已报]`。
+
+    返回空串 = 现在没事。短句只写"是什么 + 多久"，**怎么办放在明细里**（状态行那一行
+    已经塞满了，硬挤进去反而看不清数字 —— 和 load_warn/load_detail 同一套做法）。
+
+    三种区间（迟滞是真需要的，不是保险）：
+      · `≤ LAG_RECOVER_MS(200)`  → **真的回来了**：整段状态清掉，下次重新计时；
+      · `≥ LAG_WARN_MS(500)`     → 计时；够 LAG_WARN_SEC 秒 ⇒ 判定"锁死"并一直挂着；
+      · 中间（200~500）          → **已判定过就继续挂着**（不闪）；没判定过就把计时清掉
+        —— 在 400ms 上耗满 10 秒不算"积压锁死"（那只是有点高），判据要守住边界。
+    """
+    if med_ms is None:
+        return "", False
+    if med_ms <= LAG_RECOVER_MS:
+        state[0], state[1], state[2] = None, None, False
+        return "", False
+    if med_ms < LAG_WARN_MS and not state[2]:
+        state[0], state[1], state[2] = None, None, False
+        return "", False
+    if state[0] is None:
+        state[0] = now
+    state[1] = max(state[1] or 0.0, med_ms)
+    if not state[2]:
+        if now - state[0] < LAG_WARN_SEC:
+            return "", False
+        state[2] = True                       # 判定："自己回不来"这句话从此挂着
+        return _lag_text(med_ms, now - state[0], state[1]), True
+    return _lag_text(med_ms, now - state[0], state[1]), False
+
+
 #: 本机负载清点的间隔（秒）。
 #: 为什么要有：训练/并行标注与实时预览同时跑的时候，`infer_ms` 会**与输入尺寸
 #: 无关地**整体变慢（同一份配置实测 10.0 → 23.7 ms），而 GPU 时钟、功耗都正常。
@@ -483,6 +535,22 @@ class LiveThread(QThread):
         # 拿不到 fps 就置 0，表示「不知道预算」，此时不统计超预算（宁可不报，别误报）。
         budget = 0.0
 
+        def _boost_reader():
+            """读线程也提一档优先级 —— **它是输入侧唯一的兜底**。
+
+            为什么必须做（2026-09-26 现场："有时候会跑到 3000+ms 延迟"）：
+            `_LatestSlot` 丢的是"**已经解出来**的旧帧"，而积压真正待的地方在它上游 ——
+            ffmpeg 的解码队列和内核 UDP 缓冲。读线程一旦被饿住（推理/绘制占满 CPU、
+            或抢 GIL），上游就堆起来，之后它再一帧帧慢慢啃回来 ⇒ 表现就是**延迟冲到
+            几秒、再缓慢回落**，而且"有时候"才出现（机器忙的时候）。
+            主回路早就提了优先级（见 run()），读线程原来没提 —— 它同样是 1/帧 的硬期限。
+            """
+            try:
+                from core import winperf
+                winperf.boost_thread()
+            except Exception:
+                pass          # 提不上去也要照常读，绝不因此不启动
+
         if source == "window":
             from core import wincap
             from link.frame import Frame
@@ -503,6 +571,7 @@ class LiveThread(QThread):
             frame_id = [0]
 
             def _reader():
+                _boost_reader()
                 try:
                     while not self._stop.is_set() and not reader_done.is_set():
                         t0 = time.perf_counter()
@@ -551,6 +620,7 @@ class LiveThread(QThread):
             budget = 1.0 / fps_ref[0] if fps_ref[0] else 0.0
 
             def _reader():
+                _boost_reader()
                 try:
                     while not self._stop.is_set() and not reader_done.is_set():
                         try:
@@ -593,6 +663,8 @@ class LiveThread(QThread):
         # 上一次统计窗口的 [收帧数, 处理数, 丢弃数]，用来算**窗口内**的速率
         # （累计平均会把「刚刚开始恶化」抹平）
         _prev = [0, 0, 0]
+        # 积压锁死看门狗的状态：[起算时刻, 峰值ms, 已报过]（见 lag_watchdog）
+        _lag_state = [None, None, False]
 
         # 端到端延迟：解码 A 机屏幕上的时间码探针。
         #
@@ -1171,9 +1243,13 @@ class LiveThread(QThread):
                     # 吞吐/丢弃/负载：recv 是链路能给的输入速度，proc 是我们真处理
                     # 掉的；两者差距 + drop 增量 = 「实时性已经在丢」的第一手证据。
                     win = now - t_last_stat
+                    # 窗口内速率（累计平均会把"刚刚开始恶化"抹平）。算成局部变量：
+                    # 看门狗的明细要用**当前**这两个数（累计值看着会"还挺好"）。
+                    _recv_w = ((slot.put_count - _prev[0]) / win) if win > 0 else 0.0
+                    _proc_w = ((n - _prev[1]) / win) if win > 0 else 0.0
                     if win > 0:
-                        perf.sample("recv_fps", (slot.put_count - _prev[0]) / win)
-                        perf.sample("proc_fps", (n - _prev[1]) / win)
+                        perf.sample("recv_fps", _recv_w)
+                        perf.sample("proc_fps", _proc_w)
                     if slot.dropped > _prev[2]:
                         perf.count("drop", slot.dropped - _prev[2])
                     _prev[0], _prev[1], _prev[2] = slot.put_count, n, slot.dropped
@@ -1181,6 +1257,38 @@ class LiveThread(QThread):
                     perf.flush()        # 到点（默认 30 秒）落一段到 perf.log
                     el = now - t_start
                     gaps_recent = gaps[-60:]
+                    _med_delay = (sorted(delays)[len(delays) // 2]
+                                  if delays else None)
+                    _lag_warn, _lag_fresh = lag_watchdog(_med_delay, now,
+                                                         _lag_state)
+                    if _lag_fresh:
+                        # 判定那一下记进 perf.log：事后翻日志能看到"什么时候开始锁死的"，
+                        # 而不是只知道"某一段很慢"
+                        perf.count("lag_lock")
+                    # 明细放 tooltip：含"怎么办"的三步（状态行那一行塞不下）。
+                    # 用**窗口内**速率，不用累计值 —— 累计值在下滑时看着还挺好。
+                    _lag_detail = ""
+                    if _lag_warn:
+                        _lag_detail = (
+                            "端到端延迟中位持续 %.0f 秒不回落（峰值 %.0f ms）。\n"
+                            "  现场：读线程 %.1f fps ｜ 主回路 %.1f fps ｜ 槽位丢帧 %d ｜ "
+                            "推理 %.1f ms ｜ 容器名义帧率 %s。\n\n"
+                            "  **为什么会这样**：UDP 没有反压 —— A 机按自己的速率发，"
+                            "B 机哪一环处理不过来，数据就堆在中间（内核缓冲 + ffmpeg 队列）；"
+                            "而 `_LatestSlot` 只丢得了「已经解出来」的旧帧，管不到那两层。\n"
+                            "  只要「中间某一环的速度 < 上游给它的量」，积压就只增不减 ⇒ "
+                            "延迟稳在高位、自己回不来。\n\n"
+                            "  **怎么办**（按见效快慢）：\n"
+                            "  1. 立刻缓解：**停止再开始预览** —— 丢掉当前积压，延迟马上回来"
+                            "（根因没动）；\n"
+                            "  2. 治本：把 A 机推流帧率降到 B 机处理得过来的档"
+                            "（一般是 60fps 档：A 实际约 54fps）；\n"
+                            "  3. 治本：把「推理尺寸」从 800 降到 640（推理约省 1/3，余量变大）。"
+                            % (now - (_lag_state[0] or now), _lag_state[1] or 0.0,
+                               _recv_w, _proc_w, slot.dropped,
+                               (sorted(infer_ms)[len(infer_ms) // 2]
+                                if infer_ms else 0.0),
+                               ("%.0f" % fps_ref[0]) if fps_ref[0] else "未知"))
                     self.stats_ready.emit({
                         # 读线程真正收到的帧率 —— 这是链路能给的输入速度
                         "recv_fps": slot.put_count / el if el > 0 else 0.0,
@@ -1188,8 +1296,10 @@ class LiveThread(QThread):
                         "proc_fps": n / el if el > 0 else 0.0,
                         "dropped": slot.dropped,
                         "infer_ms": sorted(infer_ms)[len(infer_ms) // 2] if infer_ms else 0.0,
-                        "delay_ms": (sorted(delays)[len(delays) // 2]
-                                     if delays else None),
+                        "delay_ms": _med_delay,
+                        # 积压锁死：短句上状态行（最高优先级）、明细进 tooltip
+                        "lag_warn": _lag_warn,
+                        "lag_detail": _lag_detail,
                         "probe_on": probe_on,
                         "probe_miss": probe_miss,
                         "probe_invalid": probe_invalid,
