@@ -49,13 +49,27 @@ _FATAL = ("10048", "address already in use")
 
 
 def _offset_s():
-    """时钟偏移（秒）：启动时对一次时，失败就用文件里的旧值。"""
+    """时钟偏移（秒）：启动时对一次时，失败就用文件里的旧值。
+
+    **顺手看一眼旧值有多旧**：两台机器各漂各的（实测 ~45ms/小时），拿一小时前的偏移
+    去算延迟，那段漂移会**整片**加到每个数上。所以旧了就明说 —— 同一轮里的数还能横向
+    比（大家用同一个偏移），但不能拿它去和别的时间点的数比。
+    """
     try:
         from tools.probe_recv import load_offset_ms
-        return float(load_offset_ms(None)) / 1000.0
-    except Exception as e:
+        off = float(load_offset_ms(None)) / 1000.0
+    except Exception as e:                   # noqa: BLE001
         print("[sweep] 拿不到时钟偏移（%s）—— 先跑 tools.clock_sync --save" % e)
         return 0.0
+    try:
+        age = time.time() - (ROOT / "config" / "clock_offset.txt").stat().st_mtime
+        if age > 300:
+            print("[sweep] 提醒：这份时钟偏移是 %.0f 分钟前的（漂移 ~45ms/小时）——"
+                  " 想和别的时间点的数比，先跑一次 tools.clock_sync --save"
+                  % (age / 60.0))
+    except Exception:                        # noqa: BLE001
+        pass
+    return off
 
 
 def _geometry(shape):
@@ -306,7 +320,9 @@ def main():
     print("[sweep] 候选 %d 条 × (%.0fs 测量 + %.0fs 丢弃) ≈ %.0f 分钟"
           % (len(presets), seconds, settle,
              len(presets) * (seconds + settle + 3) / 60.0))
-    print("[sweep] 命令：先点 A 机部署台的「推流自检」，紧接着跑这个 —— 两边按同一顺序走")
+    print("[sweep] 命令：在 A 机部署台点「推流自检」——**你这条命令先跑还是后跑都行**；"
+          "每段开始 A 机会公告过来，按公告对齐（收不到公告才退回『按清单顺序』那套，"
+          "那才要掐时间）")
 
     src, frame = open_stream(url, fmt, args.wait)
     if src is None:
@@ -326,6 +342,14 @@ def main():
     ok, why = precheck(src, geo, bits, offset_s)
     print("[sweep] 预检：%s" % why)
     if not ok:
+        # 光说"没量到延迟"没法行动 —— 用刚拿到的那一帧直接判是哪一种毛病
+        # （没有码带 / 码带在但几何错 / 压在边缘，见 probe_codec.no_decode_hint）。
+        try:
+            g0 = cv2.cvtColor(np.asarray(frame.image), cv2.COLOR_RGB2GRAY)
+            print("[sweep] 诊断：%s" % probe_codec.no_decode_hint(
+                g0, geo["x"], geo["y"], geo["cell"], geo["gap"], bits))
+        except Exception as e:                # noqa: BLE001
+            print("[sweep] 诊断：看不了画面（%s）" % e)
         src.close()
         return 2
     if args.precheck:

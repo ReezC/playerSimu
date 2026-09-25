@@ -89,6 +89,38 @@ def read_cells(gray, x, y, cell, gap, bits: int = DEFAULT_BITS):
     return out, means
 
 
+def no_decode_hint(gray, x, y, cell, gap, bits: int = DEFAULT_BITS):
+    """解不出时间码时，**下一步该查什么** —— 看采样点上的灰度分布。
+
+    只给两种结论，因为**下一步的动作只有两种**：
+      · 采样点几乎只有一种灰度（黑一片 / 白一片）→ 那个位置**没有码带**：
+        去 A 机确认在画时间码（部署台「探针」卡片），或位置整体挪走了；
+      · 黑白都采到了 → **码带是在的**，对不上的是起点/节距/位宽 → 重新 solve 几何
+        （另报一句有多少采样点落在黑白之间：那说明采样窗口还压在方块边缘上）。
+
+    **为什么不再细分**：试过按"黑/白/灰各占多少"分三档，但那些数字强烈依赖相位 ——
+    实测同样的错位，起点差一点就会量出完全不同的分布（`gap=9` 判成"黑白分明"、
+    `gap=6.75` 判成"灰蒙蒙"，而两者要做的事一模一样）。上面这两条的判据是**结构性**的
+    （真码带一定黑白都有），所以稳。2026-09-25 现场卡的就是"只有一句没量到延迟"。
+    """
+    _seq, means = read_cells(gray, x, y, cell, gap, bits)
+    good = [m for m in means if m >= 0]
+    if len(good) < 2:
+        return "采样点几乎都跑到画面外了 —— 位置整个不对（换个几何）"
+    lo = sum(1 for m in good if m < 40)          # 黑块
+    hi = sum(1 for m in good if m > 215)         # 白块
+    mid = len(good) - lo - hi
+    if lo == 0 or hi == 0:
+        return ("那个位置**几乎只有一种灰度**（黑 %d / 白 %d / 中间 %d，共 %d 个采样点）"
+                "—— **画面上大概没有码带**：先确认 A 机在画时间码（部署台「探针」卡片"
+                "在跑），再确认位置没整体挪走"
+                % (lo, hi, mid, len(good)))
+    return ("采样点**黑白都有**（黑 %d / 白 %d，其中 %d 个落在中间）—— **码带是在的**，"
+            "对不上的是起点/节距/位宽：用 `python -m tools.probe_auto --solve` 重量；"
+            "中间那些偏多，就是「差零点几像素」那种小错位"
+            % (lo, hi, mid))
+
+
 def cell_ambiguity(gray, x, y, cell, gap, bits: int = DEFAULT_BITS):
     """这一组几何有多少个采样点落在黑白之间（含跑到画面外的）→ 越少越准。
 

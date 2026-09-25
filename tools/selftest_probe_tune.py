@@ -436,6 +436,34 @@ def t_verdict_is_shared_with_workbench():
           "界面没接单调性结论（几何可疑时会把假延迟照样摆出来）")
 
 
+def t_no_decode_hint():
+    """解不出来时，诊断要把**下一步动作不同**的两种情况分开。
+
+    ① 那个位置没有码带（采样点只有一个灰度）→ 去 A 机确认「探针」卡在跑；
+    ② 码带在、黑白都采到了却解不出 → 重新 solve 几何。
+    原先只有笼统一句"一帧延迟都没量到"，人只能靠猜（2026-09-25 实测就卡在这）。
+
+    判据是**结构性**的（真码带一定黑白都有），所以不随相位漂 —— 试过按"黑/白/灰
+    各占多少"细分三档，同样的错位换一个起点就会换一个档，那种分类不能用。
+    """
+    geo = {"x": 40.0, "y": 30.0, "cell": 16.0, "gap": 2.25}
+    strip = synth(geo, probe_codec.now_ms(), 40)
+    check(probe_codec.decode_ms(strip, 40, 30, 16.0, 2.25, 40) is not None,
+          "（前置）这份几何本来就该解得出来")
+
+    # ① 没画码带：纯黑 / 纯白 都该判成"没有码带"
+    for name, img in (("纯黑", np.zeros((80, 900), np.uint8)),
+                      ("纯白", np.full((80, 900), 255, np.uint8))):
+        h = probe_codec.no_decode_hint(img, 40, 30, 16.0, 2.25, 40)
+        check("没有码带" in h, "%s 画面的诊断不对：%s" % (name, h))
+
+    # ② 码带在，几何错（这里是节距差一截）→ 必须说"码带在"
+    for cell, gap in ((8.0, 2.25), (16.0, 9.0)):
+        h = probe_codec.no_decode_hint(strip, 40, 30, cell, gap, 40)
+        check("码带是在的" in h,
+              "cell=%.2f gap=%.2f 时没认出码带还在：%s" % (cell, gap, h))
+
+
 CASES = [
     ("几何正确时解出原值", t_roundtrip),
     ("偏 0.5px/块就解错（今天的病灶）", t_drift_breaks_decode),
@@ -456,6 +484,7 @@ CASES = [
     ("--project 指定项目真的被读到", t_project_calib_path),
     ("probe_recv 与工作台共用几何来源", t_probe_recv_shares_geometry_source),
     ("单调性判据只有一份实现（工作台与工具共用）", t_verdict_is_shared_with_workbench),
+    ("解不出时的诊断能分出三种毛病", t_no_decode_hint),
 ]
 
 
