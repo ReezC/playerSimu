@@ -67,6 +67,35 @@ def t_three_tiers_are_clean():
                 "config/sync_manifest.json"):
         check(rel not in gi, "%s 是共用文件，被 .gitignore 挡住 = A 机拉不到" % rel)
 
+    # ★ 光有 .gitignore **不算数**：它对**已经被跟踪**的文件无效。
+    # 实测踩过（2026-09-25）：规则写了，但那 11 个本机文件仍被跟踪 —— 于是
+    # `git pull` 一路要求"清理"，而且被误以为"已经移出版本控制了"（连我都被误导）。
+    # 所以这里直接用 git 查**真实的跟踪状态**（不是查文件里有没有那条规则）。
+    import subprocess
+
+    try:
+        subprocess.run(["git", "--version"], capture_output=True, check=True)
+    except Exception:                                # noqa: BLE001
+        print("      （这台机器没有 git，跳过跟踪状态检查）")
+    else:
+        tracked_bad = []
+        # LOCAL 那批 + 证书（cert.pem 在 MUST 里、key.pem 在 LOCAL 里 —— 它们
+        # **都不该被 git 带**，所以这里一起查）
+        for rel in [r for r, _w in cs.LOCAL] + ["remote_kbd/certs/cert.pem"]:
+            if not (cs.ROOT / rel).exists():
+                continue
+            r = subprocess.run(["git", "ls-files", "--error-unmatch", rel],
+                               cwd=str(cs.ROOT), capture_output=True, text=True)
+            if r.returncode == 0:
+                tracked_bad.append(rel)
+        check(not tracked_bad,
+              "这些本机文件**仍被 git 跟踪**（.gitignore 对已跟踪文件无效）——\n"
+              "        在源那一侧跑一次：\n"
+              "          git rm --cached %s\n"
+              "        然后 git add -A && git commit && git push；"
+              "A 机备份好本机文件再 git pull。"
+              % " ".join(tracked_bad))
+
 
 def t_detects_one_byte_change():
     """改一个字节就要报不一致；偏好类只提示；没改则报一致。"""
@@ -118,6 +147,42 @@ def t_missing_or_broken_is_loud_not_crash():
         shutil.rmtree(str(root), ignore_errors=True)
 
 
+def t_local_pair_is_checked_first():
+    """跨机比较之前，先看**本机这一对证书本身**配不配对。
+
+    实测踩过（2026-09-25）：A 上 `cert.pem`/`key.pem` 被手工换混了（一次新的、一次旧的）
+    → relay 起不来（`KEY_VALUES_MISMATCH`），拷到 B 的那份也用不了，而两边清单都"一致"。
+    等于拿一把坏尺子比长度：所以本机配对要排在最前面。
+    """
+    import shutil
+
+    from remote_kbd import gen_cert
+
+    root = _fake_root()
+    d1 = Path(tempfile.mkdtemp(prefix="c1_"))
+    d2 = Path(tempfile.mkdtemp(prefix="c2_"))
+    try:
+        c1, _k1 = gen_cert.generate(d1)
+        _c2, k2 = gen_cert.generate(d2)
+        certs = root / "remote_kbd" / "certs"
+        certs.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(str(c1), str(certs / "cert.pem"))      # 第一对的证书
+        shutil.copyfile(str(k2), str(certs / "key.pem"))       # 第二对的私钥 → 必然不配对
+        cs.write(root)
+        rows = cs.check(root)
+        check(rows[0]["level"] == "warn" and "配不上" in rows[0]["title"],
+              "混了对的证书没被指出来：%s" % rows)
+        check("生成证书" in rows[0]["detail"],
+              "没说怎么修（应当指向一键生成）：%s" % rows[0]["detail"])
+        # 只在"跑键盘中继那台"才是错（部署台的 check_certs 报 bad）；
+        # 这里在两边都跑，所以只能是提示 —— 否则控制机上天天误报
+        check("控制机只用 cert.pem" in rows[0]["detail"],
+              "没说明只有 A 机需要它配对：%s" % rows[0]["detail"])
+    finally:
+        for d in (root, d1, d2):
+            shutil.rmtree(str(d), ignore_errors=True)
+
+
 def t_preflight_exit_codes():
     """启动器（`被控机部署台.bat`）靠**退出码**分流：一致 → 0，漂移 → 3。
 
@@ -147,6 +212,7 @@ CASES = (
     ("改一个字节就报不一致（偏好类只提示）", t_detects_one_byte_change),
     ("缺清单/坏清单/缺文件都说话但不抛", t_missing_or_broken_is_loud_not_crash),
     ("启动器预检的退出码（一致0 / 漂移3）", t_preflight_exit_codes),
+    ("先看本机这对证书自己配不配对", t_local_pair_is_checked_first),
 )
 
 

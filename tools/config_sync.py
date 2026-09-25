@@ -151,23 +151,64 @@ def write(root=ROOT, manifest=None):
                      if missing else ""))
 
 
+def _local_pair_row(root):
+    """本机这一对证书**本身**配不配对 → 一行 warn / None。
+
+    **为什么放在跨机比较之前**：跨机一致也可能是在比较"一对配不上对的证书"。
+    实测踩过（2026-09-25）：A 上 `cert.pem`/`key.pem` 被手工换混了（一次新的、
+    一次旧的），拷到 B 的那份自然也用不了，而两边清单都显示"一致" ——
+    等于拿一把坏尺子比长度。
+
+    **为什么是 warn 不是 bad**：只有**跑键盘中继那台**（A）才需要这对配对
+    （relay 要 `load_cert_chain(cert, key)`）；控制机（B）只把 `cert.pem` 当 cafile，
+    自己的 `key.pem` **从不加载** —— 在 B 上判成"错"就是误报。
+    这个函数在两边都会跑，所以按"可能的影响"说话：A 上它确实是错的（relay 起不来），
+    部署台（只在 A 跑）自己的 `check_certs` 会把它报成 bad。
+    """
+    d = Path(root) / "remote_kbd" / "certs"
+    cert_p, key_p = d / "cert.pem", d / "key.pem"
+    if not (cert_p.exists() and key_p.exists()):
+        return None
+    try:
+        import ssl
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(cert_p), str(key_p))
+    except Exception as e:                       # noqa: BLE001
+        return {"level": "warn", "title": "本机这一对证书配不上",
+                "detail": "%s: %s\n"
+                          "cert.pem 与 key.pem 不是一对（多半是手工换混了）。\n"
+                          "**跑键盘中继那台（A）**必须修：先在键盘卡片上点"
+                          "「生成证书…」重新生成一对 → 重启键盘中继 → 再把新的 "
+                          "cert.pem 拷到控制机（B）。顺序别反。\n"
+                          "（这台机器：%s；控制机只用 cert.pem，不受这条影响）"
+                          % (type(e).__name__, e, d)}
+    return None
+
+
 def check(root=ROOT, manifest=None):
-    """比对 → 与 `deploy/selfcheck.py` 同形的行：[{level, title, detail}]。"""
+    """比对 → 与 `deploy/selfcheck.py` 同形的行：[{level, title, detail}]。
+
+    **顺序**：先看本机这对证书自己配不配对，再看跨机一致性 —— 拿一把坏尺子
+    去比长度没有意义（实测踩过：两边都"和清单一致"，可两份都是配不上对的证书）。
+    """
     root = Path(root)
     man = Path(manifest) if manifest else manifest_path(root)
     title = "配置与部署清单"
+    first = [r for r in (_local_pair_row(root),) if r]
     if not man.exists():
-        return [{"level": "warn", "title": title,
-                 "detail": "没有 %s —— 还没在源那一侧跑过 "
-                           "`python -m tools.config_sync --write`。\n"
-                           "它回答的是「两台机器的共用文件是不是同一份」"
-                           "（本机自洽那部分由「与 link.yaml 一致」那几项管）。"
-                           % man.name}]
+        return first + [{"level": "warn", "title": title,
+                         "detail": "没有 %s —— 还没在源那一侧跑过 "
+                                   "`python -m tools.config_sync --write`。\n"
+                                   "它回答的是「两台机器的共用文件是不是同一份」"
+                                   "（本机自洽那部分由「与 link.yaml 一致」那几项管）。"
+                                   % man.name}]
     try:
         data = json.loads(man.read_text(encoding="utf-8"))
         want = dict(data.get("files") or {})
     except Exception as e:                       # noqa: BLE001
-        return [{"level": "bad", "title": title, "detail": "清单读不了：%s" % e}]
+        return first + [{"level": "bad", "title": title,
+                         "detail": "清单读不了：%s" % e}]
 
     hard, soft, missing = [], [], []
     for rel, _why in tracked():
@@ -190,18 +231,19 @@ def check(root=ROOT, manifest=None):
         # 免得两边互相等（或者拷反了，越弄越乱）。
         hints = [HINTS[r.split("：")[0]] for r in hard
                  if r.split("：")[0] in HINTS]
-        return [{"level": "bad", "title": title,
-                 "detail": "**和另一台不一致**（%s）：\n  %s\n%s"
-                           % (where, "\n  ".join(hard),
-                              ("\n" + "\n".join(hints)) if hints
-                              else "\n把源那一侧的文件拷过来即可（别在这边手改 —— "
-                                   "下次部署又会被覆盖）。")}]
+        return first + [{"level": "bad", "title": title,
+                         "detail": "**和另一台不一致**（%s）：\n  %s\n%s"
+                                   % (where, "\n  ".join(hard),
+                                      ("\n" + "\n".join(hints)) if hints
+                                      else "\n把源那一侧的文件拷过来即可"
+                                           "（别在这边手改 —— 下次部署又会被覆盖）。")}]
     if soft:
-        return [{"level": "warn", "title": title,
-                 "detail": "共用文件一致；只有偏好类不同（%s）：\n  %s"
-                           % (where, "\n  ".join(soft))}]
-    return [{"level": "ok", "title": title,
-             "detail": "%d 个共用文件都和清单一致（%s）" % (len(want), where)}]
+        return first + [{"level": "warn", "title": title,
+                         "detail": "共用文件一致；只有偏好类不同（%s）：\n  %s"
+                                   % (where, "\n  ".join(soft))}]
+    return first + [{"level": "ok", "title": title,
+                     "detail": "%d 个共用文件都和清单一致（%s）"
+                               % (len(want), where)}]
 
 
 def _msgbox(title, text, flags=0x30):
