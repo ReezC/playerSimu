@@ -25,6 +25,19 @@ import time
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from tools.config import get, load_live
+
+# 探针解码：**必须模块级**。原来它是在 `_run()` 里局部 import 的，那会让
+# `probe_codec` 变成 `_run` 的**局部名** —— 函数里任何在那一行之前读它的地方都会
+# UnboundLocalError（实测踩过：新建跨帧判据 `probe_codec.Verdict()` 放在计数区，
+# 早于局部 import 一百多行，一开预览就"失败：UnboundLocalError"）。
+# 仍然保留"不可用就降级"的语义：导入失败时置 None，`_run` 里按 None 判断关掉探针。
+try:
+    from tools import probe_codec
+    from tools.probe_codec import decode_ms, resolve_delay_ms
+except Exception:                     # pragma: no cover - 正常环境不会走到
+    probe_codec = None
+    decode_ms = resolve_delay_ms = None
+
 from gui import theme
 from perception.classes import (CLASS_MOB, CLASS_OTHER_PLAYER, CLASS_PLAYER,
                                 ZH_NAMES as CLASS_NAMES)
@@ -641,6 +654,10 @@ class LiveThread(QThread):
         probe_vd = probe_codec.Verdict()
         probe_jumpy = 0          # 判据判成「乱跳」的帧数（>0 就是几何可疑）
         _geom_key = [None]       # 上一次用的几何；变了就重置判据（见下）
+        #: [上次重读时刻, 当前偏移毫秒] —— `_clock_ms()` 用。**别删**：上面那次
+        #: 加判据的编辑曾把它整行吃掉，现象是开预览就 `NameError: name '_clock'
+        #: is not defined`（pyflakes 一跑就能看见）。
+        _clock = [0.0, offset_ms]
 
         def _clock_ms():
             """当前该用的时钟偏移（毫秒）。
@@ -672,13 +689,12 @@ class LiveThread(QThread):
                     _clock[1] = off     # 立刻生效，不用等下一次重读
             except Exception:
                 pass
-            try:
-                from tools import probe_codec
-                from tools.probe_codec import decode_ms, resolve_delay_ms
-            except Exception as e:
-                self.failed.emit("探针解码模块不可用: %s" % e)
+            # 解码模块在**模块级**导入（见文件头说明）：这里只判"有没有"，
+            # 别再局部 import —— 那会把 probe_codec 变成局部名，函数里更早的
+            # 引用会 UnboundLocalError。
+            if probe_codec is None or decode_ms is None:
+                self.failed.emit("探针解码模块不可用（tools.probe_codec 导入失败）")
                 probe_on = False
-                decode_ms = resolve_delay_ms = None
 
         # 时序拍的最小间隔：序列到点时主循环至少按这个粒度醒来一次（见 agent 的
         # TIMING_TICK）。序列计时走本机绝对时钟，这个粒度对 CD/delay 足够。
@@ -787,13 +803,18 @@ class LiveThread(QThread):
                         # 跨帧单调性（只在这里记，结论交给界面）—— 判据没过时界面
                         # **不许显示延迟数**：报一个假延迟比不报糟得多。
                         # 步长上限用显示帧周期算（判据自己会乘一个宽松倍数）。
+                        _t_recv_ms = (f.t_recv_wall + _clock_ms() / 1000.0) * 1000.0
+                        # 原始差也喂进判据：单调但**整片平移**的解（错位采样的另一种
+                        # 形态）只有它能识破，否则界面会把它误报成"时钟对不上，去对时"。
                         probe_vd.add(ts_a, 1000.0 / max(1.0, float(
-                            self._p.get("show_fps", 30.0) or 30.0)))
+                            self._p.get("show_fps", 30.0) or 30.0)),
+                            delay_raw_ms=_t_recv_ms - (probe_codec.day_start_ms() + ts_a))
                         if not probe_vd.mono:
                             probe_jumpy += 1
                             perf.count("probe_jumpy")
-                        d = resolve_delay_ms(
-                            (f.t_recv_wall + _clock_ms() / 1000.0) * 1000.0, ts_a)
+                        if not probe_vd.value_ok:
+                            perf.count("probe_value_off")
+                        d = resolve_delay_ms(_t_recv_ms, ts_a)
                         # 超过 5 秒视为解码错误（而不是真的有 5 秒延迟）
                         if d is not None and d < 5000:
                             delays.append(d)
@@ -1180,6 +1201,12 @@ class LiveThread(QThread):
                         "probe_jumpy": probe_jumpy,
                         "probe_step_ms": probe_vd.step_med,
                         "probe_samples": len(probe_vd.ts_hist),
+                        # 值域判据：时间戳单调、也在一天之内，但**整片被挪了位置**
+                        # （错位采样的另一种形态）→ 有它才能从"去对时"里分辨出来。
+                        "probe_value_ok": bool(probe_vd.value_ok),
+                        "probe_value_off_s": (
+                            probe_vd.value_off_ms / 1000.0
+                            if probe_vd.value_off_ms is not None else None),
                         "clock_offset_ms": _clock_ms(),
                         "show_fps": n_show / el if el > 0 else 0.0,
                         "boxes": n_boxes,
@@ -1206,9 +1233,21 @@ class LiveThread(QThread):
                 agent.shutdown()     # 释放所有按键，避免游戏里键一直按着
             except Exception:
                 pass
-            # 先等 reader 退出（read 有 udp 超时，最多 2 秒就能响应），再 close ——
-            # 反过来 close 会和阻塞中的 read 抢 ffmpeg 上下文导致死锁，表现为「正在停止」卡住。
-            reader.join(timeout=3.0)
+            # 先等 reader 退出，再 close —— 反过来 close 会和阻塞中的 read 抢 ffmpeg
+            # 上下文导致死锁（「正在停止」卡住 / 源不释放）。
+            #
+            # ⚠ **等待时间必须 ≥ UDP 的读超时**：`link/pyav_source.py` 里是 **5 秒**
+            # （`timeout=5000000`）。原来这里写 3.0，注释还写着"最多 2 秒就能响应"
+            # —— 那是更早的参数，早就不成立了。实测踩到过：reader 还卡在 `read()`
+            # 里，主线程就把 `src.close()` 掉了 → **UDP 5000 一直不放开**：
+            # 界面上预览已经是「停止」，可下一个收流工具（probe_tune / stream_sweep）
+            # 一开就报 10048「端口已被占用」，人只能去猜是不是 A 机没推流。
+            reader.join(timeout=6.0)
+            if reader.is_alive():
+                # 留痕：这种情况端口不会立刻还回来，用户需要知道要重开工作台
+                print("[live] 警告：读取线程 6 秒内没退出，源可能没释放 —— "
+                      "UDP 端口会继续被本进程占着（要跑别的收流工具请重开工作台）",
+                      flush=True)
             if src is not None:
                 try:
                     src.close()

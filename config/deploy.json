@@ -39,10 +39,11 @@
     "h": null
   },
   "window": {
-    "w": 1280,
+    "w": 1667,
     "h": 667
   },
   "log": {
-    "filter": "all"
+    "filter": "all",
+    "max_lines": 4000
   }
 }

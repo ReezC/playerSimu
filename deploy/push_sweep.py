@@ -27,7 +27,25 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deploy import config as dcfg, services                      # noqa: E402
-from tools import push_presets as pp                            # noqa: E402
+from tools import push_presets as pp, sweep_link                 # noqa: E402
+
+
+def make_announcer(cfg):
+    """按配置建公告通道（A 机 → B 机）→ Announcer / None。
+
+    **返回 None 的每一种情况都不该影响自检**：配置里没 B 机地址、端口被占、
+    网络层出问题 —— 自检照跑，只是两边退回"人掐时间"那套老流程（见 sweep_link 的说明）。
+    """
+    host = (cfg.get("push") or {}).get("host")
+    if not host:
+        return None
+    try:
+        port = int((cfg.get("sweep") or {}).get("port") or sweep_link.DEFAULT_PORT)
+        # 绑到同一个端口号：B 机的回执是回给"公告的源地址:源端口"的，
+        # 而部署台的日志里那句「B 机已跟上」就是从这张 socket 上读到的。
+        return sweep_link.Announcer(str(host), port, bind_port=port)
+    except Exception:                            # noqa: BLE001
+        return None
 
 
 def cmd_for(push):
@@ -111,6 +129,8 @@ class PushSweep(threading.Thread):
         self._settle = settle
         self._stop = threading.Event()
         self.rows = []
+        self._ann_failed = False      # 公告发不出去只说一次，别刷屏
+        self._acks = 0                # B 机回执计数（收尾时一句话交代）
 
     def stop(self):
         self._stop.set()
@@ -121,7 +141,19 @@ class PushSweep(threading.Thread):
         try:
             self._run()
         except Exception as e:                       # noqa: BLE001
+            # 出错也要把握手端口放掉：不放掉，同一个部署台里再跑一轮就会"绑不上"
+            # 而静默退回老流程（见 make_announcer）。
+            link = getattr(self, "_link", None)
+            if link is not None:
+                link.close()
+                self._link = None
             self.on_line("推流自检出错：%s: %s" % (type(e).__name__, e))
+            # 出错也要**收尾**：不收尾界面里那两个按钮就永远卡在"运行中"
+            # （开始禁用、停止可用），只能关掉部署台重开。
+            try:
+                self.on_done(self.rows, "")
+            except Exception:
+                pass
 
     def _run(self):
         conf = pp.load(self.presets_path)
@@ -131,10 +163,20 @@ class PushSweep(threading.Thread):
                        else conf["settle_seconds"])
         presets = conf["presets"]
         base = dict(self.cfg.get("push") or {})
+        link = make_announcer(self.cfg)
+        self._link = link            # 出错路径上要放掉它（见 run()）
+        port = int((self.cfg.get("sweep") or {}).get("port") or sweep_link.DEFAULT_PORT)
         self.on_line("候选 %d 条 ×（%.0fs 试推 + %.0fs 丢弃）≈ %.0f 分钟；"
-                     "B 机那边请**现在**开始跑 tools.stream_sweep"
+                     "B 机跑 tools.stream_sweep —— **现在跑、或者先跑着等**都行"
                      % (len(presets), seconds, settle,
                         len(presets) * (seconds + settle + 3) / 60.0))
+        if link is None:
+            self.on_line("        （握手建不起来：push.host 没配、或 UDP %d 被占 —— "
+                         "那就还是老规矩：B 机要在点开始后几秒内跑起来）" % port)
+        else:
+            link.start(len(presets))
+            self.on_line("        握手：每段开始会公告到 B 机 UDP %d；B 机一回执这里就"
+                         "显示「← B 机已跟上（第 n 段）」" % port)
 
         for i, p in enumerate(presets):
             if self._stop.is_set():
@@ -143,6 +185,12 @@ class PushSweep(threading.Thread):
             push = pp.push_block(p, base)
             self.on_line("[%d/%d] %s —— 起推流…" % (i + 1, len(presets), p["name"]))
             t0 = time.time()
+            # 公告要**在 ffmpeg 起来之前**发：B 机收到就去等流，而上一段的流刚好停了 ——
+            # 这样 B 机等到的第一帧一定属于这一段（对齐是结构性的，不靠时间差凑）。
+            if link is not None and not link.seg(i, len(presets), p, seconds, settle):
+                if not self._ann_failed:
+                    self._ann_failed = True
+                    self.on_line("        （公告发不出去 —— 握手失效；B 机会退回老规矩）")
             stats, extra, proc_ok = self._run_once(push, seconds, settle)
             t1 = time.time()
             row = pp.row_a(p["name"], i, p, t0, t1, stats, extra=extra)
@@ -156,6 +204,10 @@ class PushSweep(threading.Thread):
                             row.get("out_fps") if row.get("out_fps") is not None else "-",
                             row.get("drop"), 
                             ("" if proc_ok else "（ffmpeg 起不来）")))
+            for a in (link.poll_acks() if link is not None else ()):
+                self._acks += 1
+                self.on_line("        ← B 机已跟上（第 %s 段）"
+                             % (int(a.get("seg") or 0) + 1))
 
         path = dcfg.ROOT / pp.A_REPORT
         try:
@@ -168,6 +220,17 @@ class PushSweep(threading.Thread):
             self.on_line("已写 %s（%d 条）" % (path, len(self.rows)))
         except Exception as e:                       # noqa: BLE001
             self.on_line("写 %s 失败：%s" % (path, e))
+        if link is not None:
+            if self._acks:
+                self.on_line("握手：B 机跟上 %d/%d 段" % (self._acks, len(self.rows)))
+            else:
+                self.on_line("握手：**B 机一次回执都没有**（UDP %d）—— 它没在跑 "
+                             "tools.stream_sweep、或防火墙挡了这个口。A 机侧这几个数"
+                             "不受影响，但延迟那一半这轮拿不到。"
+                             % int((self.cfg.get("sweep") or {}).get("port")
+                                   or sweep_link.DEFAULT_PORT))
+            link.done(len(presets))
+            link.close()
         self.on_done(self.rows, path)
 
     def _run_once(self, push, seconds, settle):

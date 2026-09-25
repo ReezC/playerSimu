@@ -38,19 +38,9 @@ from tools.config import load_live, update_live
 #: 页签名（顺序 = 显示顺序）。测试和文档都按这份来。
 TAB_NAMES = ("界面", "保护与恢复", "诊断")
 
-#: 页签栏样式。主窗口那份 QSS 是 `self.setStyleSheet()` 打在主窗口上的，
-#: 对话框不继承 —— 所以这里单独来一份，好让设置弹窗和主窗口长得一致。
-#: 只写页签相关几条；其余控件沿用各自的内联样式。
-_TAB_QSS = """
-QTabWidget::pane { border: 1px solid #e2e5ea; border-radius: 6px;
-                   background: #ffffff; top: -1px; }
-QTabBar::tab { background: #f0f2f5; color: #5f6368; padding: 6px 14px;
-               border: 1px solid #e2e5ea; border-bottom: none;
-               border-top-left-radius: 6px; border-top-right-radius: 6px;
-               margin-right: 2px; }
-QTabBar::tab:selected { background: #ffffff; color: #202124; font-weight: 600; }
-QTabBar::tab:hover { color: #202124; }
-"""
+#: 页签栏样式：**与部署台（A 机）的设置弹窗共用一份**（gui/theme.TAB_QSS）。
+#: 对话框不继承主窗口的 QSS，两边都得自己带 —— 但只该有一处定义。
+_TAB_QSS = theme.TAB_QSS
 
 
 class SettingsDialog(QDialog):

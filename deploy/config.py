@@ -65,12 +65,21 @@ DEFAULTS = {
         "w": None,
         "h": None,
     },
+    "sweep": {           # 推流自检的握手通道（与 link.yaml 的 sweep.port 一致）
+        # A 机往 B 机的这个 UDP 口发"第几段开始"，B 机的回执也回到这个口上
+        # （见 tools/sweep_link.py）。两边都绑这个号，所以 A 机自己也占着它。
+        "port": 5002,
+    },
     "window": {          # 上次的窗口大小，下次开原样
         "w": 1280,
         "h": 860,
     },
     "log": {             # 上次选的日志筛选
         "filter": "all",
+        # 右下角「运行日志」保留多少行历史（设置弹窗里改）。
+        # **必须在 DEFAULTS 里声明**：read() 的 _deep_merge 只认这里已有的键，
+        # 没声明的键会被静默丢掉 —— 表现为「设置里改了、下次打开又变回默认」。
+        "max_lines": 4000,
     },
 }
 
@@ -130,6 +139,8 @@ def seed_from_link():
     # 小地图推流端口（B 机 perception/minimap.py 读同一个键）。
     # **区域不在这里**：它依 A 机屏幕布局，只能框出来，不能从配置推。
     put("mmap", "port", (lk.get("minimap") or {}).get("port"))
+    # 自检握手端口（B 机 tools/stream_sweep.py 读同一个键）
+    put("sweep", "port", (lk.get("sweep") or {}).get("port"))
     return cfg
 
 
@@ -177,6 +188,7 @@ def link_expect():
         ("键盘端口", kbd.get("port"), "kbd.port"),
         ("串口号", kbd.get("serial"), "kbd.serial"),
         ("小地图端口", (lk.get("minimap") or {}).get("port"), "mmap.port"),
+        ("自检握手端口", (lk.get("sweep") or {}).get("port"), "sweep.port"),
     )
     for label, val, where in pairs:
         if val not in (None, "", (None, None)):

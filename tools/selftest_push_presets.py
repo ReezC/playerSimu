@@ -13,7 +13,6 @@
     python -m tools.selftest_push_presets      # 全过返回 0，有失败返回 1
 """
 
-import json
 import sys
 import tempfile
 from pathlib import Path

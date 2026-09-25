@@ -87,6 +87,76 @@ def t_verdict_rejects_jumpy_ts():
     check(("乱跳" in why) or ("不对" in why), "拒绝理由说不清：%r" % why)
 
 
+def t_picker_prefers_framed_geometry():
+    """框选给的几何**必须赢过 hint**（link.yaml 的旧值），判据是"采样清晰度"。
+
+    实测事故（2026-09-25 晚）：用户把方块带**像素级**框准，回来仍是那份偏小的旧节距
+    （cell=16/gap=2 → 周期 18.0，而实际 ≈18.3）—— 因为老逻辑是"谁先解出「接近此刻」
+    的值就用谁"，而 hint 排在最前面；错位采样照样能凑出落在 ±10 分钟窗口里的值。
+    现象：绿框右边框不全、尾部 6~8 块采样发灰、延迟整块挪 ≈0.1 秒。
+
+    这里造一张**周期 18.3** 的合成码带，框选矩形给对、hint 故意给错的旧值：
+    选出来的必须是框选那一份，且**采样模糊 0 块**。
+    """
+    from tools import probe_codec as pc
+
+    cell_true, gap_true = 17.0, 1.3            # 周期 18.3
+    bits = 40
+    ts = int(pc.now_ms())
+    geo_true = {"x": 30.0, "y": 0.0, "cell": cell_true, "gap": gap_true}
+    img = synth(geo_true, ts, bits)
+    n = 2 + bits
+    # 框选矩形 = 第一条块左缘 → 最后一条块右缘（这就是"像素级框准"）
+    rect = (geo_true["x"], 0.0, n * (cell_true + gap_true) - gap_true, cell_true)
+    geo = pc.solve_from_rect(img, rect, bits, strict=False,
+                             gap_hint=2.0, cell_hint=16.0)      # hint 是旧值
+    check(geo is not None, "框选几何解不出来")
+    check(abs(geo["cell"] - cell_true) <= 1.01,
+          "选出来的仍是 hint 那份（cell=%.2f）而不是框选那份（应≈%.1f）"
+          % (geo["cell"], cell_true))
+    amb = pc.cell_ambiguity(img, geo["x"], geo["y"], geo["cell"], geo["gap"], bits)
+    check(amb == 0, "选出来的几何采样仍发灰（模糊 %d 块）—— 判据没起到作用" % amb)
+
+    # 反面：hint 故意给一个**周期离谱**的（14/0），框选那份仍要赢
+    geo2 = pc.solve_from_rect(img, rect, bits, strict=False,
+                              gap_hint=0.0, cell_hint=14.0)
+    check(geo2 is not None and abs(geo2["cell"] - cell_true) <= 1.01,
+          "hint 离谱时没能回到框选那份：%s" % (geo2 or {}).get("cell"))
+
+
+def t_verdict_tolerates_one_gap():
+    """**单次大跳不许误报** —— 那是采样侧掉帧，不是错位。
+
+    实测误报过（2026-09-25 晚）：框选保存前的验证只收到 6 帧、其中一次步长 195ms
+    （30fps 的显示层掉了一帧），被判成"几何不对"并弹窗拦下。判据本该分轻重：
+      · **倒退**（时间戳往回了）—— 强证据，一次都不许放过（同一帧重复送到是 0）；
+      · **大跳**（比平时大）—— 弱证据，容忍 1 次；连着跳才是错位采样。
+    """
+    vd = Verdict()
+    now = probe_codec.now_ms()
+    base = now - 400
+    # 中间 50→195 是掉帧造成的一跳（+145ms），其余正常
+    for st in (0, 16, 33, 50, 195, 212, 229, 246):
+        vd.add(base + st, 16.7, delay_raw_ms=300.0)
+    ok, why = vd.summary()
+    check(ok, "单次掉帧造成的大跳被误判成「几何不对」：%s" % why)
+
+    # 倒退一次 → 必须否
+    vd2 = Verdict()
+    for st in (0, 16, 33, 20, 50, 66):
+        vd2.add(base + st, 16.7, delay_raw_ms=300.0)
+    ok2, why2 = vd2.summary()
+    check(not ok2, "倒退了一次却判 OK：%s" % why2)
+    check("倒退" in why2, "理由里没说清是倒退：%r" % why2)
+
+    # 连着大跳（真错位的形态）→ 必须否
+    vd3 = Verdict()
+    for k in range(8):
+        vd3.add(base + k * 700, 16.7, delay_raw_ms=300.0)
+    ok3, why3 = vd3.summary()
+    check(not ok3, "连着大跳却判 OK：%s" % why3)
+
+
 def t_verdict_accepts_smooth_ts():
     """正常（单调、步长≈帧周期、接近此刻）必须放行 —— 否则工具会把好几何也否掉。"""
     vd = Verdict()
@@ -222,6 +292,70 @@ def t_offline_skips_now_check():
     check(not ok3, "离线模式把乱跳的时间戳放行了（那判据就白关了）：%s" % why3)
 
 
+def t_port_busy_says_what_to_do():
+    """端口被占（10048）要**说清怎么办** —— 这是实测最常撞的那一下。
+
+    现象：A 机在推流，B 机这边工作台的「实时」页却一直「无流」，工具一跑就丢一个
+    `OSError: [Errno 10048]`（连 errno 名字都没有），人只能去猜是网络还是 A 机没推。
+    根因几乎总是同一个：**UDP 5000 被工作台的实时预览占着**（一个端口只能有一个
+    收流者，而 PyAV/ffmpeg 那个 socket 不让别人复用）。
+    """
+    import tools.stream_sweep as sw
+    from tools.probe_tune import human_open_error
+
+    busy = human_open_error(Exception(
+        "[Errno 10048] Error number -10048 occurred: 'udp://0.0.0.0:5000'"))
+    check("端口已被占用" in busy, "10048 没被翻译成人话：%s" % busy)
+    check("实时" in busy and "停止" in busy,
+          "没说清去哪关掉占用者（人要能照做）：%s" % busy)
+
+    other = human_open_error(Exception("timed out"))
+    check("端口" not in other and "timed out" in other,
+          "别的错被硬套成端口占用了：%s" % other)
+
+    # stream_sweep 侧：认得出"重试没意义"的那类错（别白扫 17 段）
+    del sw._LAST_ERR[:]
+    for _ in range(3):
+        sw._LAST_ERR.append("[Errno 10048] Error number -10048 occurred")
+    check(sw.fatal_open_error() is not None,
+          "stream_sweep 没认出端口被占（会白等 15 秒 × 18 段）")
+    del sw._LAST_ERR[:]
+    sw._LAST_ERR.append("timed out")
+    check(sw.fatal_open_error() is None, "普通超时被当成了致命错误")
+
+
+def t_verdict_catches_shifted_value():
+    """**整片挪位**也要判出来：时间戳单调、也在一天之内，只是位置不对。
+
+    这是 2026-09-25 实测撞到的第二种错位形态：当时在用的几何
+    `x=99 y=21 cell=16.25 gap=2.00`（比实际画的小 2.5px/块）—— 单调性过了、
+    ±10 分钟值域也过了，**但延迟算不出来**（解出的时刻比此刻早几十秒~几分钟）。
+    只靠前两道判据，界面会把它误报成「时钟对不上 → 去对时」，方向全错；
+    真去对时也永远好不了。
+    """
+    vd = Verdict()
+    now = probe_codec.now_ms()
+    for k in range(10):
+        vd.add(now - 300_000 + k * 16, 16.7, delay_raw_ms=300_000 + k * 16)
+    ok, why = vd.summary()
+    check(not ok, "整片挪位 5 分钟的解被判成可信（报出来的延迟会是假的）")
+    check("挪" in why or "几何" in why, "拒绝理由没说到点上：%r" % why)
+
+    # 正常的一帧（延迟 160ms）不许被误杀
+    vd2 = Verdict()
+    for k in range(10):
+        vd2.add(now - 160 + k * 16, 16.7, delay_raw_ms=160 + k * 16)
+    ok2, why2 = vd2.summary()
+    check(ok2, "正常的 160ms 延迟被判成不可信：%s" % why2)
+
+    # 没喂 raw 差时（离线回放那条路）不该因此变红 —— 判据是"有数据才判"
+    vd3 = Verdict(need_now=False)
+    for k in range(10):
+        vd3.add(k * 16, 16.7)
+    ok3, why3 = vd3.summary()
+    check(ok3, "没喂原始差时被值域判据误杀：%s" % why3)
+
+
 def t_save_guard():
     """**判据没过就不许保存**（要硬存得显式 force）。
 
@@ -314,6 +448,10 @@ CASES = [
     ("起始几何与工作台同一来源", t_initial_geo_matches_workbench),
     ("采样取整与 read_bits 一致", t_sample_uses_same_rounding),
     ("离线回放关掉「接近此刻」、保留单调性", t_offline_skips_now_check),
+    ("框选几何必须赢过 hint（按采样清晰度挑）", t_picker_prefers_framed_geometry),
+    ("单次掉帧的大跳不许误报（倒退则必报）", t_verdict_tolerates_one_gap),
+    ("整片挪位（单调但位置不对）也要判出来", t_verdict_catches_shifted_value),
+    ("端口被占（10048）要说清怎么办", t_port_busy_says_what_to_do),
     ("判据没过不许保存（--force 才硬存）", t_save_guard),
     ("--project 指定项目真的被读到", t_project_calib_path),
     ("probe_recv 与工作台共用几何来源", t_probe_recv_shares_geometry_source),

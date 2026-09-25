@@ -293,6 +293,67 @@ def t_overlay_source_out_of_image():
         p.close()
 
 
+def t_probe_box_overlay():
+    """实时画面上那条采样框：**颜色跟着判据变、每个采样点都画、且只画在副本上**。
+
+    实测背景（2026-09-25）：几何和屏幕上真正画的码对不上时延迟读数是一坨乱数，
+    而界面上一片正常 —— 人能一眼看出来的只有"绿框没框全"。所以把采样框直接画出来、
+    颜色直接绑到判据结论上，这是最快的现场判据（也是这次事故唯一的现场证据）。
+
+    另外钉一条**写错了很难查**的：只许画在副本上。`_on_frame` 里 `_pending` 与
+    `_last_bgr` 是同一个数组，`current_frame()` 把它交给探针框选/HP 条框选用 ——
+    在原图上画框线，线会落进方块改变灰度均值，自己污染自己的采样。
+    """
+    import unittest.mock as mock
+
+    import cv2 as _cv2
+    import numpy as _np
+
+    from tools import probe_codec as pc
+    from tools.selftest_probe_tune import synth as _synth
+
+    app, lp, p, made, orig = _panel()
+    try:
+        geo = {"x": 40.0, "y": 30.0, "cell": 16.0, "gap": 2.25}
+        gray = _synth(geo, pc.now_ms(), 40)
+        bgr = _cv2.cvtColor(gray, _cv2.COLOR_GRAY2BGR)
+        before = bgr.copy()
+        fake = (40.0, 30.0, 16.0, 2.25, 40, "测试")
+        with mock.patch.object(p, "_probe_geo_px", lambda _shape: fake):
+            # ① 判据说可疑 → 红框；且**输入数组一个像素都不许动**
+            p._last_stats = {"probe_on": True, "probe_samples": 20,
+                             "probe_mono": False, "probe_jumpy": 5}
+            out = p._draw_probe_overlay(bgr)
+            check(_np.array_equal(bgr, before),
+                  "采样框画在原图上了 —— current_frame() 的采样会被自己的框线污染")
+            edge_bad = out[28, 80]              # 框上边（y-2=28 那一行）
+            check(edge_bad[2] > 150 and edge_bad[0] < 120,
+                  "判据可疑时框线不是红的：BGR=%s" % (edge_bad.tolist(),))
+
+            # ② 判据 OK + 有延迟 → 绿框
+            p._last_stats = {"probe_on": True, "probe_samples": 20,
+                             "probe_mono": True, "probe_jumpy": 0,
+                             "probe_value_ok": True, "delay_ms": 121.0}
+            out2 = p._draw_probe_overlay(bgr.copy())
+            edge_ok = out2[28, 80]
+            check(edge_ok[1] > 150 and edge_ok[0] < 120,
+                  "判据 OK 时框线不是绿的：BGR=%s" % (edge_ok.tolist(),))
+
+            # ③ 采样点画出来了（白块=黄、黑块=蓝，总要出现）
+            cols = {tuple(int(v) for v in c) for c in out2.reshape(-1, 3)}
+            check((0, 255, 255) in cols, "没看到白块采样点（黄十字）")
+            check((255, 120, 0) in cols, "没看到黑块采样点（蓝十字）")
+
+            # ④ 探针关掉 → 灰框，而且不该画采样点
+            p._last_stats = {"probe_on": False}
+            out3 = p._draw_probe_overlay(bgr.copy())
+            check(out3[28, 80][0] > 100 and out3[28, 80][2] > 100,
+                  "探针未启用时框不是灰的：%s" % (out3[28, 80].tolist(),))
+    finally:
+        lp._bgr_to_pixmap = orig
+        p.close()
+
+
 def t_probe_mono_gate():
     """探针**单调性闸**：几何可疑时不许显示延迟；框选保存前要用实时流验单调性。
 
@@ -369,6 +430,47 @@ def t_probe_mono_gate():
         p.close()
 
 
+#: pyflakes 报的哪几类才当"会炸"处理。**只留 undefined name / syntax error**：
+#: 上面那两次事故（局部 import 遮蔽、整行被吃掉）pyflakes 报的都是 `undefined name`
+#: （拿最小样本实测过）。而"未使用 import/变量"是整洁问题、仓库里也有历史遗留，
+#: 混进来会让人习惯性无视这条检查。
+_FATAL_PAT = ("undefined name", "syntax error", "referenced before assignment")
+
+
+def t_static_check_no_crash_classes():
+    """静态检查：**会当场炸**的那几类名字错误（undefined / 先用后赋值…）。
+
+    这条是拿两次真实事故换来的（都发生在 `LiveThread._run()` 里，而自检从来不跑
+    它 —— 它要一条真流）：
+      ① `from tools import probe_codec` 写在函数里，而新代码在它前面一百多行就用了
+         → `UnboundLocalError`；
+      ② 一次编辑把 `_clock = [0.0, offset_ms]` 整行吃掉 → `NameError`。
+    两次都是"一开预览就报错、而自检全绿"。所以这里用 pyflakes 兜住这一类：
+    只挑会让程序当场挂的几类，忽略"未使用 import"那种整洁问题。
+    没装 pyflakes 就跳过（不阻塞 —— 这是附加防线，不是唯一防线）。
+    """
+    import io
+    import subprocess
+    import sys as _sys
+
+    files = []
+    for sub in ("gui", "tools", "deploy"):
+        files += [str(p) for p in (ROOT / sub).glob("*.py")]
+    try:
+        r = subprocess.run([_sys.executable, "-m", "pyflakes"] + files,
+                           capture_output=True, text=True, timeout=180)
+    except Exception as e:                       # noqa: BLE001
+        print("      （pyflakes 不可用，跳过：%s）" % type(e).__name__)
+        return
+    if r.returncode not in (0, 1):
+        print("      （pyflakes 跑不起来，跳过）")
+        return
+    bad = [ln for ln in io.StringIO(r.stdout).read().splitlines()
+           if any(pat in ln for pat in _FATAL_PAT)]
+    check(not bad, "静态检查发现会当场炸的名字错误（自检跑不到这些路径）：\n       %s"
+          % "\n       ".join(bad[:6]))
+
+
 TESTS = (
     ("连推 10 帧只画最新那帧（合并，不排队）", t_coalesce),
     ("不可见时一帧都不画，但帧仍是最新的", t_hidden_skips_draw),
@@ -377,6 +479,8 @@ TESTS = (
     ("小地图叠图：只画显示层、帧数据不许改", t_minimap_overlay_is_display_only),
     ("小地图叠图：源超出叠加图时画出来的范围要对", t_overlay_source_out_of_image),
     ("探针单调性闸：几何可疑不报延迟、保存前拦错几何", t_probe_mono_gate),
+    ("实时画面上的采样框：颜色跟判据、只画在副本上", t_probe_box_overlay),
+    ("静态检查：会当场炸的名字错误（pyflakes）", t_static_check_no_crash_classes),
 )
 
 

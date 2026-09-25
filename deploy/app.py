@@ -94,6 +94,7 @@ try:
     from deploy import selfcheck, services
     from tools import push_presets as pp
     from deploy.runner import Proc
+    from deploy.settings_dialog import DeploySettingsDialog
     from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,
                              NoWheelSpinBox)
 except Exception:
@@ -637,6 +638,7 @@ class LogPane(QWidget):
 
     #: 保留多少行历史（和 txt 的 maximumBlockCount 一致）。筛选切换要能重排，
     #: 所以必须自己留一份缓冲 —— 只靠控件里的内容做不到「切回来还能看见」。
+    #: 默认值与 deploy/config.py 的 log.max_lines 一致（设置弹窗里能改）
     HISTORY = 4000
 
     def __init__(self, parent=None):
@@ -674,13 +676,26 @@ class LogPane(QWidget):
         self.txt = QPlainTextEdit()
         self.txt.setObjectName("Log")
         self.txt.setReadOnly(True)
-        self.txt.setMaximumBlockCount(4000)
+        self.txt.setMaximumBlockCount(self.HISTORY)
         self.txt.setTextInteractionFlags(
             Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         f = QFont("Consolas")
         f.setStyleHint(QFont.Monospace)
         self.txt.setFont(f)
         root.addWidget(self.txt, 1)
+
+    def set_history(self, n):
+        """改「保留多少行历史」（设置弹窗里改的就是它）。
+
+        **两处必须一起改**（`_buf` 的历史缓冲 + 控件的 maximumBlockCount）：只改一边
+        就会出现"切一下筛选能看见、控件里却没有"这种对不上的怪象。
+        `deque` 的 maxlen 建好就改不了 —— 所以连同内容重建一个，旧行按新上限保留
+        （调小会立刻丢掉较旧的行，这也正是界面上 tooltip 说清楚的代价）。
+        """
+        n = max(100, int(n))
+        self.HISTORY = n
+        self._buf = deque(self._buf, maxlen=n)
+        self.txt.setMaximumBlockCount(n)
 
     def _on_filter(self, _i):
         self.filter = self.cmb.currentData()
@@ -821,7 +836,10 @@ class DeployWindow(QMainWindow):
             "（ffmpeg 的 speed / 实际帧率 / 丢帧 / 码率 / CPU / NVENC 利用率）。\n\n"
             "跑法：\n"
             "  1. 这里点开始（它会先停掉正在跑的「屏幕推流」）；\n"
-            "  2. **紧接着**在 B 机跑  python -m tools.stream_sweep  （量端到端延迟）；\n"
+            "  2. 在 B 机跑  python -m tools.stream_sweep  —— **现在跑、或者先跑着等都行**\n"
+            "     （每段开始会公告给 B 机的 UDP 5002，它按公告对齐，不再需要掐时间；\n"
+            "      B 机一收到就回执，这里会显示「← B 机已跟上（第 n 段）」。\n"
+            "      一条回执都没有 = B 机没在跑，或防火墙挡了 5002）；\n"
             "  3. 把 A 机生成的 perf_push_A.json 拷到 B 机，再跑\n"
             "     python -m tools.stream_sweep --merge perf_push_A.json  出表与结论。\n\n"
             "会反复重启推流（游戏画面会闪几次），跑完不自动开回推流 —— 确认结果后\n"
@@ -829,6 +847,62 @@ class DeployWindow(QMainWindow):
         act.triggered.connect(self._start_push_sweep)
         bar.addAction(act)
         self.act_sweep = act
+
+        act_stop = QAction("停止自检", self)
+        act_stop.setToolTip(
+            "中断正在跑的推流自检（当前那条 ffmpeg 会被停掉，已测的几段照样落盘）。\n"
+            "为什么要有它：一轮 18 条要七八分钟，中途发现参数写错 / 要改候选清单时\n"
+            "**必须能停下** —— 否则只能硬关部署台，而那样 ffmpeg 子进程会残留。")
+        act_stop.triggered.connect(self._stop_push_sweep)
+        act_stop.setEnabled(False)
+        bar.addAction(act_stop)
+        self.act_sweep_stop = act_stop
+
+        # 设置放**最后**：低频动作往后放，常点的自检留在顺手的位置。
+        act_set = QAction("设置…", self)
+        act_set.setToolTip(
+            "界面字号（**与工作台共用 config/ui.yaml**：这里改了，B 机工作台也是这个字号）、\n"
+            "右下角「运行日志」保留多少行。\n\n"
+            "字号点确定后立即生效，不用重启。")
+        act_set.triggered.connect(self._on_settings)
+        bar.addAction(act_set)
+        self.act_settings = act_set
+
+    def _on_settings(self):
+        """打开设置弹窗。"""
+        try:
+            dlg = DeploySettingsDialog(self.cfg, on_saved=self._on_settings_saved,
+                                       parent=self)
+            dlg.exec_()
+        except Exception:
+            # 槽里抛出的异常在 PyQt5 里会走到 qFatal —— 整个部署台**无征兆消失**
+            # （见 gui/worker.py 里 safe_slot 的说明）。部署台工具栏这几处没用那层
+            # 保护，所以这里自己兜住，并且把话说到界面上，而不是让它静静死掉。
+            traceback.print_exc()
+            QMessageBox.warning(self, "设置打不开", traceback.format_exc(limit=3))
+
+    def _on_settings_saved(self):
+        """设置弹窗点了确定：把界面同步过来，再走**与改卡片参数同一条**落盘路径。
+
+        为什么不在这里自己 save()：`dcfg.save()` 是整份写，而界面上五张卡片各自
+        有内存态 —— 直接写会拿一份过期的 cfg 把卡片刚改的东西盖掉（见 _save_now）。
+        """
+        from gui import theme            # 与工作台共用 config/ui.yaml
+        self.log_pane.set_history(int(self.cfg["log"].get("max_lines")
+                                      or LogPane.HISTORY))
+        self.cfg["log"]["filter"] = self.log_pane.filter
+        self._save_timer.start()         # 300ms 合并，与改参数同一条节拍
+        self.log("ui", "设置已更新：界面字号 %d px、日志保留 %d 行"
+                 % (theme.load_size(), self.log_pane.HISTORY))
+
+    def _stop_push_sweep(self):
+        sw = getattr(self, "_sweep", None)
+        if sw is None or not sw.is_alive():
+            self.log("ui", "没有正在跑的推流自检")
+            self.act_sweep_stop.setEnabled(False)
+            return
+        sw.stop()
+        self.log("ui", "已请求停止推流自检（当前这条 ffmpeg 会停掉，已测的段会落盘）")
 
     def _start_push_sweep(self):
         """启动推流自检（先停正在跑的推流，避免两路推流混在一起）。"""
@@ -861,10 +935,12 @@ class DeployWindow(QMainWindow):
                                    rows, str(path)))
         self._sweep.start()
         self.act_sweep.setEnabled(False)
+        self.act_sweep_stop.setEnabled(True)
 
     def _on_sweep_done(self, rows, path):
         """自检跑完（在界面线程）：把 A 机侧的结论说清，并提醒去 B 机合并。"""
         self.act_sweep.setEnabled(True)
+        self.act_sweep_stop.setEnabled(False)
         bad = [r for r in rows if not r.get("ok", True)]
         slow = [r for r in rows if (r.get("speed") or 0) < 1.0]
         best = max((r for r in rows if (r.get("speed") or 0) >= 1.0),
@@ -926,6 +1002,9 @@ class DeployWindow(QMainWindow):
         i = self.log_pane.cmb.findData(self.cfg["log"].get("filter") or "all")
         if i >= 0:
             self.log_pane.cmb.setCurrentIndex(i)
+        # 日志保留行数也复现上次设置的那个（设置弹窗里改的就是它）
+        self.log_pane.set_history(int(self.cfg["log"].get("max_lines")
+                                      or LogPane.HISTORY))
         right.addWidget(self.self_check)
         right.addWidget(self.log_pane)
         right.setStretchFactor(0, 0)

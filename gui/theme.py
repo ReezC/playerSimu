@@ -30,6 +30,23 @@ DEFAULT_SIZE = 11
 MIN_SIZE = 9
 MAX_SIZE = 20
 
+#: 设置弹窗的页签栏样式。**两个界面共用这一份**（工作台 gui/settings_dialog.py、
+#: 部署台 deploy/settings_dialog.py）。
+#:
+#: 为什么放这里：主窗口那份 QSS 是 `setStyleSheet()` 打在**主窗口**上的，对话框不
+#: 继承 —— 所以每个对话框都得自己带一份。而各写一份必然漂移，最后表现为"两个界面
+#: 的设置弹窗长得不一样"，那是最容易让人以为装错版本的那种差异。
+TAB_QSS = """
+QTabWidget::pane { border: 1px solid #e2e5ea; border-radius: 6px;
+                   background: #ffffff; top: -1px; }
+QTabBar::tab { background: #f0f2f5; color: #5f6368; padding: 6px 14px;
+               border: 1px solid #e2e5ea; border-bottom: none;
+               border-top-left-radius: 6px; border-top-right-radius: 6px;
+               margin-right: 2px; }
+QTabBar::tab:selected { background: #ffffff; color: #202124; font-weight: 600; }
+QTabBar::tab:hover { color: #202124; }
+"""
+
 
 def clamp(v):
     try:

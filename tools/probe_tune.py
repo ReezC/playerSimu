@@ -46,10 +46,8 @@ p95 4.7s、max 4.9s，紧贴 --max-delay 上限；而真延迟不可能堆在自
 """
 
 import argparse
-import statistics
 import sys
 import time
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -59,14 +57,21 @@ from tools import probe_codec
 from tools.config import get
 # 判据与工作台**共用一份实现**（`probe_codec.Verdict`）：两边各写一份必然漂移，
 # 而漂移的那一份会让"工具说 OK、工作台说不对"这种最难查的分歧出现。
-from tools.probe_codec import VERDICT_HIST as HIST      # noqa: F401  （兼容旧名）
-from tools.probe_codec import VERDICT_STEP_MUL as STEP_MAX_MUL  # noqa: F401
 from tools.probe_codec import Verdict                   # noqa: F401
 
 #: 时钟偏移的重读间隔（秒）—— 两台机器的 NTP 各漂各的，实测 ~45ms/小时
 OFFSET_REFRESH = 5.0
 
 COLORS = {"ok": (80, 220, 80), "bad": (60, 60, 240), "warn": (0, 200, 255)}
+
+#: 「采样点有没有落在方块中心」的判据 —— **完全不依赖时钟**，只看画面本身。
+#:
+#: 方块只有黑/白两态，采样窗口取在块中心：对齐时均值贴近 0 或 255；一旦偏了
+#: （cell/gap 差零点几像素、x/y 差一两像素），采样窗口压到边缘上，均值就落进中间带。
+#: 这是"几何到底准不准"最直接的证据 —— 比任何依赖时钟的推断都硬：**时钟错不会
+#: 让采样点变灰，几何错才会**。
+CELL_AMBIG_LO = 60.0
+CELL_AMBIG_HI = 195.0
 
 
 # ══════════════════════════════════════════
@@ -76,31 +81,11 @@ COLORS = {"ok": (80, 220, 80), "bad": (60, 60, 240), "warn": (0, 200, 255)}
 def sample_cells(gray, x, y, cell, gap, bits):
     """按几何采样 2+bits 个方块 → (bits 列表, 每块灰度均值)。
 
-    **取整规则必须与 `probe_codec.read_bits` 完全一致** —— 差半个像素的取整会
-    在 42 个方块上累积，越往后越偏，那正是这个工具要修的毛病。
+    实现在 `probe_codec.read_cells` —— **工作台实时页画采样框也用它**，这样
+    "屏幕上画在哪"和"实际采哪儿"永远是同一套坐标（各写一份必然悄悄错开）。
+    这里只保留旧名字，省得自检跟着改。
     """
-    n = 2 + bits
-    h, w = gray.shape[:2]
-    half = max(1, int(float(cell) // 4))
-    cy = int(round(float(y) + float(cell) / 2.0))
-    out, means = [], []
-    for i in range(n):
-        cx = int(round(float(x) + i * (float(cell) + float(gap)) + float(cell) / 2.0))
-        if cy >= h or cx >= w:
-            out.append(0)
-            means.append(-1.0)
-            continue
-        y0, y1 = max(0, cy - half), min(h, cy + half)
-        xa, xb = max(0, cx - half), min(w, cx + half)
-        patch = gray[y0:y1, xa:xb]
-        if patch.size == 0:
-            out.append(0)
-            means.append(-1.0)
-            continue
-        m = float(patch.mean())
-        means.append(m)
-        out.append(1 if m > 128.0 else 0)
-    return out, means
+    return probe_codec.read_cells(gray, x, y, cell, gap, bits)
 
 
 def decode_with(gray, geo, bits):
@@ -144,6 +129,22 @@ def apply_key(geo, ch):
     if not ch:
         return None
     return nudge_key(geo, ch.lower(), shift=ch.isupper())
+
+
+def human_open_error(e):
+    """开流失败 → 一句**能照做**的话。
+
+    实测最常撞的就是 10048：工作台的「实时」页正占着 UDP 5000，工具连开都开不了，
+    而 PyAV 只丢一个 `OSError: [Errno 10048] Error number -10048 occurred`
+    （连 errno 名字都没有）—— 人只能去猜是网络还是 A 机没推。
+    """
+    msg = str(e)
+    if "10048" in msg or "address already in use" in msg.lower():
+        return ("打不开 UDP 5000：**端口已被占用** —— 多半是工作台的「实时」页正开着预览"
+                "（也可能是上一个没收干净的收流进程）。\n"
+                "     先到「实时」页点「停止」（或关掉工作台）再跑本工具。\n"
+                "     要看是谁占着：netstat -ano -p UDP | findstr :5000")
+    return "打不开流：%s: %s" % (type(e).__name__, msg)
 
 
 def frame_period_ms(src):
@@ -345,27 +346,48 @@ def main():
     src = (FileSource(args.file, realtime=False) if args.file
            else PyAVSource(args.url or get("stream", "url"),
                            container_format=args.format))
-    src.open()
+    try:
+        src.open()
+    except Exception as e:                       # noqa: BLE001
+        print("[probe_tune] " + human_open_error(e))
+        return 1
     w, h = src.size or (0, 0)
     frame = src.read()
     if frame is None:
-        print("[probe_tune] 没读到帧：流没起？还是裸流没给 --format？")
+        print("[probe_tune] 打是打开了，但没读到帧：A 机在推吗？裸流的话要给 --format。")
+        print("     另：端口被占也可能表现成这个（先看 netstat -ano -p UDP | findstr :5000）")
         return 1
     shape = np.asarray(frame.image).shape
     geo, src_name = initial_geo(shape, bits, args.project)
     period = frame_period_ms(src)
 
     # 时钟偏移：启动时自动对一次（失败就用旧文件），之后每 5 秒重读一次文件 ——
-    # 两台机器的 NTP 各漂各的（实测 ~45ms/小时），看完数不重读会把漂移当成延迟变化。
+    # 两台机器的 NTP 各漂各的（实测 ~45ms/小时），不重读会把漂移当成延迟变化。
+    #
+    # **同时记住这次到底是"刚量的"还是"沿用的旧值"** —— 这两者在判据给出
+    # "解出的时刻比此刻晚"时含义完全相反：
+    #   刚量的 → 这几十~几百毫秒就是**几何**差出来的（低位被采错），继续推 cell/gap；
+    #   沿用的 → 也可能只是那份旧偏移被 Windows 对时"跳"过，先对时再谈几何。
+    fresh, offset_s = False, 0.0
     try:
-        from tools.probe_recv import load_offset_ms
-        offset_s = float(load_offset_ms(None)) / 1000.0
-        print("[probe_tune] 时钟偏移 %.1f ms（本工具启动时会自动对时）"
-              % (offset_s * 1000.0))
-    except Exception as e:
-        offset_s = 0.0
-        print("[probe_tune] 没拿到时钟偏移（%s）：延迟数仅供参考，先跑 tools.clock_sync"
-              % type(e).__name__)
+        from tools.clock_sync import sync_offset
+        off = sync_offset(save=True, quiet=True)
+        if off is not None:
+            offset_s, fresh = float(off) / 1000.0, True
+    except Exception:
+        pass
+    if fresh:
+        print("[probe_tune] 时钟偏移 %.1f ms（**本次刚量的**）" % (offset_s * 1000.0))
+    else:
+        try:
+            from tools.probe_recv import load_offset_ms
+            offset_s = float(load_offset_ms(None)) / 1000.0
+            print("[probe_tune] 时钟偏移 %.1f ms（**沿用 config/clock_offset.txt 的旧值**"
+                  "—— A 机「时钟对时」卡没通）" % (offset_s * 1000.0))
+        except Exception as e:
+            offset_s = 0.0
+            print("[probe_tune] 没拿到时钟偏移（%s）：延迟数仅供参考，先跑 tools.clock_sync"
+                  % type(e).__name__)
     _off_t = [time.perf_counter()]
 
     def offset():
@@ -391,6 +413,7 @@ def main():
     t_start = time.perf_counter()
     vd = Verdict(need_now=not offline)
     lat = None
+    t_log = time.perf_counter()
     note = ("离线回放：只看单调性，延迟不适用" if offline
             else "几何来源：%s" % src_name)
     if offline:
@@ -398,17 +421,23 @@ def main():
 
     while True:
         gray = cv2.cvtColor(np.asarray(frame.image), cv2.COLOR_RGB2GRAY)
-        ts, seq, _means = decode_with(gray, geo, bits)
+        ts, seq, means = decode_with(gray, geo, bits)
+        # 落在黑白之间的块数（含采样点跑到画面外）：几何准不准最直接的证据
+        amb = [i for i, m in enumerate(means)
+               if m < 0 or CELL_AMBIG_LO <= m <= CELL_AMBIG_HI]
         if ts is None:
             vd = Verdict(need_now=not offline)
             lat = None
             note = "标记块没解出（头两位必须是 白,黑）—— 先挪 x/y 把起点对准"
         else:
-            vd.add(ts, period)
+            # 本机收帧时刻（已做时钟偏移校正）与"解出的时刻"的原始差 —— 就是延迟，
+            # 但**不过滤**：要把它喂给判据，让"整片平移"那种错也现形（见 ValueTol）。
+            _t_recv_ms = (frame.t_recv_wall + offset()) * 1000.0
+            _d_raw = _t_recv_ms - (probe_codec.day_start_ms() + ts)
+            vd.add(ts, period, delay_raw_ms=(None if offline else _d_raw))
             ok, _why = vd.summary()
             if ok and not offline:
-                d = probe_codec.resolve_delay_ms(
-                    (frame.t_recv_wall + offset()) * 1000.0, ts)
+                d = probe_codec.resolve_delay_ms(_t_recv_ms, ts)
                 lat = d if (d is not None and d < 5000) else None
             else:
                 lat = None
@@ -472,6 +501,50 @@ def main():
             print("[probe_tune] link.yaml 的 probe 段抄这几行（cell/gap 允许小数）：")
             print("  x: %g\n  y: %g\n  cell: %g\n  gap: %g"
                   % (geo["x"], geo["y"], geo["cell"], geo["gap"]))
+
+        # 每隔 2 秒**在终端里也报一次判据**（不只画在窗口上）：
+        # 这样 ① 命令行短跑（不加窗口交互）也能看清对没对，② 出问题时把终端输出
+        # 贴出来就够定位，不用复述窗口里写了什么。判据不可信时**不报延迟数**。
+        if time.perf_counter() - t_log >= 2.0:
+            t_log = time.perf_counter()
+            _ok, _why = vd.summary()
+            if not _ok:
+                _say = "判据没过 —— " + _why[:90]
+            elif lat is not None:
+                _say = "判据 OK | 延迟 %.1f ms" % lat
+            else:
+                # 判据过了却算不出延迟：**别只说 OK** —— 这状态说明"解出的时刻落在
+                # 不可能的位置"（比此刻还晚）。**归一化到谁头上，取决于这次偏移的来路**：
+                #   刚量的 → 时钟可信，那这几十~几百毫秒就是几何差出来的（继续推框）；
+                #   沿用的 → 也可能只是旧偏移被 Windows 对时"跳"过（先去对时）。
+                _late = -(vd.value_off_ms or 0) / 1000.0
+                if fresh:
+                    _say = ("判据 OK，但**算不出延迟**：解出的时刻比此刻晚了 %.2f 秒 ——"
+                            "画面不可能来自未来。\n"
+                            "       本次**刚对过时**（offset %.0f ms），所以这 %.2f 秒就是"
+                            "**几何**差出来的（低位被采错）：\n"
+                            "       继续推 cell/gap（往 x≈111 y≈11 cell≈18.4 gap≈2.4 方向），"
+                            "盯着这个数字**变小、变正** ——\n"
+                            "       正的几十~几百毫秒才是真延迟。"
+                            % (_late, offset_s * 1000.0, _late))
+                else:
+                    _say = ("判据 OK，但**算不出延迟**：解出的时刻比此刻晚了 %.2f 秒 ——"
+                            "画面不可能来自未来（真延迟必须是正的、几十~几百毫秒）。\n"
+                            "       两种可能，按这个顺序排掉：\n"
+                            "       ① 时钟偏移不可信（本次是沿用的旧值）：A 机「时钟对时」"
+                            "卡要在跑，然后在 B 机跑 python -m tools.clock_sync --save；\n"
+                            "       ② 排掉 ① 还这样 → **几何就差这 %.2f 秒**，继续推 cell/gap。"
+                            % (_late, _late))
+            if not amb:
+                _clr = "采样清晰度：%d/%d 块干净（都落在方块中心）" % (len(means),
+                                                               len(means))
+            else:
+                _clr = ("采样模糊：%d/%d 块落在黑白之间（第 %s 块）—— **几何没对准**，"
+                        "先推框让这条归零" % (len(amb), len(means),
+                                          ",".join(str(i) for i in amb[:6])))
+            print("[probe_tune] x=%.2f y=%.2f cell=%.2f gap=%.2f | %s\n"
+                  "       %s" % (geo["x"], geo["y"], geo["cell"], geo["gap"],
+                                _say, _clr), flush=True)
 
         nxt = src.read()
         if nxt is not None:

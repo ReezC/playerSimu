@@ -185,6 +185,16 @@ def t_app_source():
     check('"mmap"' in app_src.split("SERVICE_COLOR")[1].split("}")[0],
           "SERVICE_COLOR 里没有 mmap")
 
+    # 工具栏里的「设置…」：用户找字号只有这一条路。放源码层验（不用把整个部署台
+    # 界面拉起来 —— 那个窗口一构造就会建卡片、起定时器、跑一次环境自检）。
+    check('QAction("设置…"' in app_src, "工具栏里没有「设置…」按钮")
+    check("from deploy.settings_dialog import DeploySettingsDialog" in app_src,
+          "没导入设置弹窗")
+    check("DeploySettingsDialog(self.cfg" in app_src,
+          "「设置…」没把活的配置交给弹窗（弹窗收 cfg + on_saved，见其模块说明）")
+    check("act_set.triggered.connect(self._on_settings)" in app_src,
+          "「设置…」没接到 _on_settings")
+
 
 def t_cards():
     """五张卡片都能建起来；小地图卡片有「框选…」且框完能落到配置里。"""
@@ -334,6 +344,94 @@ def t_ask_region_modal():
         win.close()
 
 
+# ---------------------------------------------------------------- 设置弹窗
+
+def t_settings_dialog_font():
+    """设置弹窗的字号：**点确定才写配置**，拖动过程中只更新预览。
+
+    为什么单列一条：字号是**两个界面共用一份**（config/ui.yaml）。一旦在拖动时就
+    写盘，"点开看一眼又取消"也会把工作台那边的字号一起改掉 —— 这种"我没改啊"
+    最难查。另外钉住"点确定后立即生效"：那是这个功能存在的全部意义（不用重启）。
+    """
+    import shutil
+    import tempfile
+    import unittest.mock as mock
+
+    from PyQt5.QtWidgets import QApplication
+    from deploy.settings_dialog import LOG_DEFAULT, DeploySettingsDialog
+    from gui import theme
+
+    app = QApplication.instance() or QApplication([])
+    tmpdir = Path(tempfile.mkdtemp(prefix="depui_"))
+    cfg = copy.deepcopy(dcfg.DEFAULTS)
+    cfg["log"]["max_lines"] = LOG_DEFAULT
+    saved = []
+    try:
+        with mock.patch.object(theme, "CFG", tmpdir / "ui.yaml"):
+            theme.save_size(11)
+            dlg = DeploySettingsDialog(cfg, on_saved=lambda: saved.append(1))
+            # ① 拖动：只改预览，配置一个字节都不许动
+            dlg.slider.setValue(16)
+            check(theme.load_size() == 11,
+                  "还没点确定就把字号写进配置了（取消也撤不回来）")
+            check("16" in dlg.lbl_val.text(),
+                  "数值标签没跟着滑块走：%r" % dlg.lbl_val.text())
+            # ② 取消：什么都不该落
+            dlg.reject()
+            check(not saved, "取消也通知了落盘")
+            check(theme.load_size() == 11, "取消之后字号变了")
+            # ③ 确定：写配置 + 立即应用 + 通知窗口
+            dlg2 = DeploySettingsDialog(cfg, on_saved=lambda: saved.append(1))
+            dlg2.slider.setValue(16)
+            dlg2.sp_lines.setValue(1200)
+            dlg2._accept()
+            check(theme.load_size() == 16, "点确定后字号没落盘")
+            check(app.font().pointSize() == 16,
+                  "点确定后没立即生效，字体还是 %d px" % app.font().pointSize())
+            check(cfg["log"]["max_lines"] == 1200,
+                  "日志行数没写进 cfg：%s" % (cfg["log"],))
+            check(saved == [1], "确定后没通知窗口落盘：%s" % (saved,))
+    finally:
+        theme.apply(app, theme.DEFAULT_SIZE)     # 别把字号留给后面的用例
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+def t_log_history_applies():
+    """日志保留行数：**两处一起改**（历史缓冲 + 控件上限），旧行真的被丢掉。
+
+    只改一处就会出现"切一下筛选能看见几百行前的日志、控件里却没有"（或反过来），
+    这种"同一个面板两套内容"最难查。顺带钉住 DEFAULTS 里有这个键 —— 没声明的话
+    会被 read() 的 _deep_merge 静默丢掉（见本文件开头的三类错）。
+    """
+    from PyQt5.QtWidgets import QApplication
+    from deploy.app import LogPane
+
+    # **必须把实例存下来**：QApplication 一旦被 Python 回收，后面建控件就是 qFatal
+    # （"Must construct a QApplication before a QWidget"）—— 表现为进程**直接 abort**
+    # （退出码 0xC0000409），而且 stdout 缓冲区一起丢掉，连一行报错都看不到。
+    # 实测踩过：写成 `QApplication.instance() or QApplication([])`（不赋值）就是这样，
+    # 查了半天才发现"崩在测试里"和"崩在退出时"长得一模一样。
+    app = QApplication.instance() or QApplication([])
+    check(app is not None, "没拿到 QApplication")
+    check("max_lines" in dcfg.DEFAULTS["log"],
+          "DEFAULTS 的 log 段没有 max_lines —— 存了也会被 _deep_merge 丢掉")
+
+    pane = LogPane()
+    try:
+        pane.set_history(600)
+        check(pane.txt.maximumBlockCount() == 600,
+              "控件上限没跟着改：%d" % pane.txt.maximumBlockCount())
+        for i in range(800):
+            pane.append("ui", "line %d" % i)
+        check(len(pane._buf) == 600, "历史缓冲没按新上限截断：%d" % len(pane._buf))
+        text = pane.txt.toPlainText()
+        check("line 799" in text, "最近的行反而被截掉了")
+        check("line 200" in text, "边界那条丢了：应当正好保留最近 600 行")
+        check("line 199" not in text, "旧行没被丢掉（上限没生效）")
+    finally:
+        pane.close()
+
+
 # ---------------------------------------------------------------- 跑
 
 TESTS = (
@@ -349,6 +447,8 @@ TESTS = (
     ("源码约束（框选不再自己跑事件循环）", t_app_source),
     ("卡片与框选控件（离屏）", t_cards),
     ("框选能在已有事件循环里跑（部署台那条路）", t_ask_region_modal),
+    ("设置弹窗：字号点确定才落盘", t_settings_dialog_font),
+    ("日志保留行数两处一起改", t_log_history_applies),
 )
 
 

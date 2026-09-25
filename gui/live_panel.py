@@ -255,6 +255,20 @@ class LivePanel(QWidget):
             "不启用时延迟显示为 ——，因为 pts 推算只能反映网络抖动，测不出真实延迟。")
         row.addWidget(self.ck_probe)
 
+        self.ck_probe_box = QCheckBox("探针框")
+        self.ck_probe_box.setChecked(True)
+        self.ck_probe_box.setToolTip(
+            "在实时画面上把**采样几何**画出来（框 + 每个采样点），不用去命令行看：\n\n"
+            "  · 框的颜色就是判据的结论 ——\n"
+            "      绿 = 几何可用（时间戳单调、值也合理）；\n"
+            "      红 = 几何可疑（时间戳乱跳 / 整片挪位）；\n"
+            "      黄 = 判据还在攒样本；灰 = 探针没启用。\n"
+            "  · 每个十字是该块的采样点，颜色跟着判成 0/1 变（黄=白块、蓝=黑块）；\n"
+            "      变紫 = 这个点压在黑白之间，也就是**没对准**。\n"
+            "  · 框角上有两个圆圈 = 头两个固定标记块（白、黑）。\n\n"
+            "框没括住整条码带、或尾部十字开始发紫，就是几何不对 —— 点「框选探针」重框。")
+        row.addWidget(self.ck_probe_box)
+
         # 探针几何：人工框选（秒级、当场验证）—— 「调完探针大小，收流位置全靠猜」的解药。
         # 与 HP/MP 条同一套框选交互（在实时画面上拖矩形），但换算不同：
         # 方块带是 n = 2+bits 个等大等距方块，头两个是固定标记（白、黑），
@@ -343,6 +357,92 @@ class LivePanel(QWidget):
     def _refresh_probe_label(self, extra=""):
         self.lbl_probe.setText(self._probe_label_text() + extra)
 
+    # ---------------- 在实时画面上画采样框（判"框得对不对"的眼睛） ----------------
+
+    def _probe_geo_px(self, shape):
+        """当前生效的探针几何（像素）→ (x, y, cell, gap, bits, 来源)，拿不到给 None。
+
+        **与实时回路、框选、命令行工具同一个来源**（项目标定 → 全局 → link.yaml）：
+        屏幕上画的框必须就是真正采样的那几个点，否则人看到的和机器采的会悄悄错开。
+        """
+        from tools import probe_codec
+
+        bits = int(get("probe", "bits", 40))
+        cal, src = probe_codec.pick_calib(settings.probe_calib)
+        if cal:
+            x, y, cell, gap = probe_codec.calib_to_px(cal, shape)
+            return x, y, cell, gap, bits, src
+        return (float(get("probe", "x", 100)), float(get("probe", "y", 8)),
+                float(get("probe", "cell", 16)), float(get("probe", "gap", 2)),
+                bits, "link.yaml")
+
+    def _probe_box_color(self):
+        """框该用什么颜色 → (BGR, 一句话)。**颜色就是判据的结论**。
+
+        实测背景（2026-09-25）：几何和屏幕上真正画的码对不上时，延迟读数是一坨乱数，
+        而界面上一切正常 —— 人能一眼看出的只有"绿框没框全"。所以把颜色直接绑到判据上。
+        """
+        s = getattr(self, "_last_stats", None) or {}
+        if not s.get("probe_on", True):
+            return (128, 128, 128), "探针未启用"
+        n = int(s.get("probe_samples") or 0)
+        if n < 6:
+            return (0, 200, 255), "判据采样中（%d 帧）" % n
+        if s.get("probe_mono") is False and int(s.get("probe_jumpy") or 0) > 0:
+            return (60, 60, 240), ("几何可疑：时间戳乱跳 %d 帧"
+                                   % int(s.get("probe_jumpy") or 0))
+        if s.get("probe_value_ok") is False:
+            return (60, 60, 240), ("几何可疑：解出的时刻差了 %.0f 秒"
+                                   % abs(s.get("probe_value_off_s") or 0))
+        d = s.get("delay_ms")
+        if d is None:
+            return (0, 200, 255), "判据 OK，但算不出延迟（多半是时钟偏移）"
+        return (80, 220, 80), "几何 OK：延迟 %.0f ms" % d
+
+    def _draw_probe_overlay(self, bgr):
+        """在**副本**上画采样框 + 每个采样点 → 返回它（颜色见 _probe_box_color）。
+
+        **为什么必须画在副本上**：`_on_frame` 里 `_pending` 与 `_last_bgr` 是同一个
+        数组，而 `current_frame()` 把它交给探针框选 / HP 条框选用 —— 在原图上画框线，
+        线会落在方块上改变灰度均值，等于**自己污染自己的采样**。
+        """
+        import cv2
+
+        from tools import probe_codec
+
+        h, w = bgr.shape[:2]
+        geo = self._probe_geo_px((h, w))
+        if geo is None:
+            return bgr
+        # **自己拷一份再画**（不依赖调用方记得 copy）：`_on_frame` 里 `_pending` 与
+        # `_last_bgr` 是同一个数组，而 `current_frame()` 要把它交给框选用 ——
+        # 在它上面画框线，线落进方块就会改变灰度均值，自己污染自己的采样。
+        # 自检 (`t_probe_box_overlay`) 直接钉了"输入数组一个像素都不许动"。
+        bgr = bgr.copy()
+        x, y, cell, gap, bits, _src = geo
+        color, why = self._probe_box_color()
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        seq, means = probe_codec.read_cells(gray, x, y, cell, gap, bits)
+        n = 2 + bits
+        cv2.rectangle(bgr, (int(round(x)) - 2, int(round(y)) - 2),
+                      (int(round(x + n * (cell + gap))) + 2,
+                       int(round(y + cell)) + 2), color, 2)
+        for i in range(n):
+            cx = int(round(x + i * (cell + gap) + cell / 2.0))
+            cy = int(round(y + cell / 2.0))
+            if means[i] < 0:
+                c = (0, 0, 255)                       # 采样点跑出画面了
+            elif probe_codec.AMBIG_LO <= means[i] <= probe_codec.AMBIG_HI:
+                c = (255, 0, 255)                     # 压在黑白之间 = 没对准
+            else:
+                c = (0, 255, 255) if seq[i] else (255, 120, 0)
+            cv2.drawMarker(bgr, (cx, cy), c, cv2.MARKER_CROSS, 7, 1)
+            if i < 2:                                 # 头两个是固定标记（白、黑）
+                cv2.circle(bgr, (cx, cy), int(cell / 2), (255, 255, 0), 1)
+        cv2.putText(bgr, why, (max(6, int(x) - 2), max(18, int(y) - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        return bgr
+
     def _arm_probe_verify(self):
         """布置「存后自检」：2.5 秒后用实时统计的**增量**回头看通没通。
 
@@ -355,7 +455,7 @@ class LivePanel(QWidget):
                         int(st.get("probe_invalid") or 0)
                         + int(st.get("probe_miss") or 0)]
 
-    def _verify_geo_live(self, geo, bits, seconds=0.8, want=6):
+    def _verify_geo_live(self, geo, bits, seconds=1.5, want=8):
         """拿实时流跑 ~0.8 秒，判这份几何解出的时间戳是否**单调** → (可信?, 说明)。
 
         **为什么不能只"再解一帧"**：单帧解出一个"接近此刻"的值**证明不了几何对**
@@ -372,8 +472,12 @@ class LivePanel(QWidget):
         import cv2
         from tools import probe_codec as pc
 
-        period = 1000.0 / max(1.0, float((getattr(self, "_last_stats", None) or {})
-                                         .get("show_fps") or 30.0))
+        # 步长上限的参考周期**故意放宽到 ≥66ms**（≈15fps）：这里收的是**显示帧**，
+        # 显示层掉一帧就是两倍步长（实测见过 195ms 的一跳）——那不等于错位。
+        # 这道闸是"存之前的一个粗筛"，细判留给实时的连续判据（24 帧窗口）。
+        period = max(1000.0 / max(1.0, float((getattr(self, "_last_stats", None) or {})
+                                             .get("show_fps") or 30.0)),
+                     1000.0 / 15.0)
         vd = pc.Verdict()
         app = QApplication.instance()
         t0 = time.monotonic()
@@ -752,7 +856,11 @@ class LivePanel(QWidget):
             self._disp_skipped += 1
             return
         t0 = time.perf_counter()
-        self._last_pix = _bgr_to_pixmap(img)
+        vis = img
+        if getattr(self, "ck_probe_box", None) is not None and self.ck_probe_box.isChecked():
+            # 画采样框（`_draw_probe_overlay` 内部自己拷副本，见那里的说明）
+            vis = self._draw_probe_overlay(img)
+        self._last_pix = _bgr_to_pixmap(vis)
         self._render()
         self._draw_ms = (time.perf_counter() - t0) * 1000.0
         self._disp_drawn += 1
@@ -919,8 +1027,10 @@ class LivePanel(QWidget):
         self._verify = None
         # ② 解得出、但**时间戳在乱跳** → 这份几何按单调性判据不可信。
         #    比"一帧都解不出"隐蔽得多：屏幕上延迟数照样在跳，看着像在工作。
-        if (s.get("probe_mono") is False and int(s.get("probe_jumpy") or 0) > 0
-                and int(s.get("probe_samples") or 0) >= 6):
+        if (int(s.get("probe_samples") or 0) >= 6
+                and ((s.get("probe_mono") is False
+                      and int(s.get("probe_jumpy") or 0) > 0)
+                     or s.get("probe_value_ok") is False)):
             QMessageBox.warning(
                 self, "这份标定不可信",
                 "标定已保存、也**解得出时间码**，但实时这几秒解出的时间戳在乱跳"
@@ -962,24 +1072,32 @@ class LivePanel(QWidget):
         self.lbl_stats.setToolTip("")
         # **几何可疑优先于一切**：时间戳在乱跳时，那个延迟数就是乱数（而且可能
         # 正好"看着正常"）—— 必须抢在它前面说清楚，否则又把人引到链路上去查。
-        jumpy = (s.get("probe_on") and s.get("probe_mono") is False
-                 and int(s.get("probe_jumpy") or 0) > 0
-                 and int(s.get("probe_samples") or 0) >= 6)
+        mono_bad = (s.get("probe_mono") is False
+                    and int(s.get("probe_jumpy") or 0) > 0)
+        value_bad = (s.get("probe_value_ok") is False
+                     and s.get("probe_value_off_s") is not None)
+        jumpy = (s.get("probe_on") and int(s.get("probe_samples") or 0) >= 6
+                 and (mono_bad or value_bad))
         if jumpy:
-            d_txt = ("端到端延迟  ——  （几何可疑：时间戳在乱跳 %d 帧）"
-                     % int(s.get("probe_jumpy") or 0))
+            if mono_bad:
+                why = "时间戳在乱跳 %d 帧" % int(s.get("probe_jumpy") or 0)
+            else:
+                why = ("解出的时刻差了 %.0f 秒（整片挪位）"
+                       % abs(s.get("probe_value_off_s") or 0))
+            d_txt = "端到端延迟  ——  （几何可疑：%s）" % why
             self.lbl_stats.setToolTip(
-                "解得出时间码，但**解出的时间戳在乱跳**（%d 帧；步长本该≈帧周期）\n"
-                "—— 这是错位采样的特征：采样点没落在方块中心，低位被采错了。\n\n"
-                "**这种错光看「能不能解出」是看不出来的**（错位照样能凑出一个接近\n"
+                "解得出时间码，但**这份几何不可信**：\n"
+                "  · 乱跳那条 —— 解出的时间戳忽大忽小（步长本该≈帧周期）；\n"
+                "  · 挪位那条 —— 时间戳**单调**、也在一天之内，但整片被挪了几秒~\n"
+                "    几分钟：错位采样把低位采成了另一个位置，值照样「看着正常」。\n\n"
+                "**这两种错光看「能不能解出」都看不出来**（错位照样能凑出一个接近\n"
                 "此刻的值），所以上面那个延迟数一律不可信，宁可不显示。\n\n"
                 "怎么修：\n"
                 "  1. 点「框选探针」重框：高度**贴住方块**、宽度**量到整条带外缘**\n"
                 "  2. python -m tools.probe_tune 手工推框（同一判据、当场看对没对）\n\n"
                 "参考：A 机按 cell=23 / gap=3（逻辑）画，换算到 1366x768 流里约\n"
                 "cell=18.4 gap=2.4 —— 如果你现在的 cell/gap 明显比这小，就是它了。\n"
-                "（判据：probe_codec.Verdict，与 tools/probe_tune 共用一份。）"
-                % int(s.get("probe_jumpy") or 0))
+                "（判据：probe_codec.Verdict，与 tools/probe_tune 共用一份。）")
         elif d is not None:
             d_txt = "端到端延迟 %6.0f ms" % d
         elif not s.get("probe_on"):

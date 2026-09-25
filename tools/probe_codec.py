@@ -49,6 +49,58 @@ def encode_bits(ts_ms: int, bits: int = DEFAULT_BITS) -> list[int]:
     return [1, 0] + seq
 
 
+#: 「采样点落在黑白之间」的灰度带。方块只有黑/白两态，采样窗口取在块中心：
+#: 对齐时均值贴近 0 或 255；偏了（节距差零点几像素、x/y 差一两像素）就压到边缘上。
+#: **这是不依赖时钟的对齐证据** —— 时钟错不会让采样点变灰，几何错才会。
+AMBIG_LO = 60.0
+AMBIG_HI = 195.0
+
+
+def read_cells(gray, x, y, cell, gap, bits: int = DEFAULT_BITS):
+    """按几何采样 2+bits 个方块 → (bits 列表, 每块灰度均值；取不到给 -1.0)。
+
+    **取整规则必须与 `read_bits` 完全一致**（差半个像素的取整会在 41 块上累积、
+    越往后越偏 —— 正是"绿框没框全"那种）。画采样框的地方（工作台实时页、
+    tools/probe_tune）也走这一个函数：**"屏幕上画在哪"和"实际采哪儿"永远同一套坐标**，
+    否则人看到的框和机器采的点会悄悄错开，越看越糊涂。
+    """
+    n = 2 + bits
+    h, w = gray.shape[:2]
+    half = max(1, int(float(cell) // 4))
+    cy = int(round(float(y) + float(cell) / 2.0))
+    out, means = [], []
+    for i in range(n):
+        cx = int(round(float(x) + i * (float(cell) + float(gap))
+                       + float(cell) / 2.0))
+        if cy >= h or cx >= w:
+            out.append(0)
+            means.append(-1.0)
+            continue
+        y0, y1 = max(0, cy - half), min(h, cy + half)
+        xa, xb = max(0, cx - half), min(w, cx + half)
+        patch = gray[y0:y1, xa:xb]
+        if patch.size == 0:
+            out.append(0)
+            means.append(-1.0)
+            continue
+        m = float(patch.mean())
+        means.append(m)
+        out.append(1 if m > 128.0 else 0)
+    return out, means
+
+
+def cell_ambiguity(gray, x, y, cell, gap, bits: int = DEFAULT_BITS):
+    """这一组几何有多少个采样点落在黑白之间（含跑到画面外的）→ 越少越准。
+
+    **为什么它是挑选几何的正确标准**："解出一个接近此刻的时间码"骗得过去（错位
+    照样能凑出落在 ±10 分钟窗口里的值），而"采样点是不是压在方块中心"骗不过去。
+    2026-09-25 实测：用户像素级框选的几何被一份偏小的旧节距顶掉，就是因为在用
+    前者当判据（绿框右边框不全、尾部 6~8 块发灰、延迟整片挪 ≈0.1s）。
+    """
+    _seq, means = read_cells(gray, x, y, cell, gap, bits)
+    return sum(1 for m in means if m < 0 or AMBIG_LO <= m <= AMBIG_HI)
+
+
 def bits_to_ms(seq: list[int], bits: int = DEFAULT_BITS) -> int | None:
     """方块序列 -> 毫秒时间戳；校验失败返回 None"""
     n = 2 + bits
@@ -212,11 +264,8 @@ def solve_from_rect(gray, rect, bits: int = DEFAULT_BITS, strict: bool = True,
         cells.append(float(cell_hint))
 
     cands = []
-    # **已知好值排在最前面**：调用方给的 (cell_hint, gap_hint) 通常是上一次能出数的
-    # 几何（来自 link.yaml）。必须优先 —— 否则「框得偏小 + 乱码侥幸落在值域内」
-    # 会被先选中（实测踩过：cell=14 gap=0 解出一个碰巧在一天之内的乱码，把真正
-    # 对的那份挡在后面，框选提示"对准了"，实时却一直报几何不对）。
-    # 判据没放宽：它要是解不出合理值，就继续往下扫。
+    # (cell_hint, gap_hint) 也放进候选（通常来自 link.yaml 的旧值）—— 但**只是候选，
+    # 不再"排最前面就赢"**。取舍交给下面的「采样清晰度」评分（见那段说明）。
     if cell_hint and gap_hint is not None:
         cands.append((0, 0, 0, 0, float(cell_hint), float(gap_hint)))
     for dx in range(-5, 6):
@@ -227,7 +276,18 @@ def solve_from_rect(gray, rect, bits: int = DEFAULT_BITS, strict: bool = True,
                                   dx, dy, cell, g))
     cands.sort(key=lambda c: (c[0], c[1]))
 
-    fallback = None
+    # ── 选法（2026-09-25 改：**按「采样清晰度」挑，不按"谁先解出合理值"**）──
+    #
+    # 老逻辑是"第一个能解出「接近此刻」的候选就用它"，而且**hint（link.yaml 的旧值）
+    # 排在最前面**。后果实测：用户把方块带像素级框准了，回来仍是那份**偏小的旧节距**
+    # —— 因为错位采样照样能凑出一个落在 ±10 分钟窗口里的值（"看着合法"），hint 永远
+    # 抢先。现象：绿框右边框不全、尾部 6~8 块采样发灰、延迟整片挪 ≈0.1 秒。
+    #
+    # 新判据 `cell_ambiguity`（采样点落在黑白之间的块数）**与时钟无关**：
+    # 时钟错不会让采样点变灰，几何错才会。取"模糊块最少"的那份，
+    # 同分再比"离框选近"（位移小、cell 偏差小）。
+    best_ok = None       # 解出合理值里、模糊最少的
+    best_any = None      # 只解出码（对不上此刻）里、模糊最少的 —— 非 strict 时当退路
     for _d, _dc, dx, dy, cell, g in cands:
         if cell < 3:
             continue
@@ -239,19 +299,27 @@ def solve_from_rect(gray, rect, bits: int = DEFAULT_BITS, strict: bool = True,
         if ts is None:
             continue
         # 值必须落在一天之内，否则必然是错位采样（见 ts_plausible 的说明）。
-        # 这条**不依赖双机是否对时**，所以连 strict=False 的退路也要守 ——
-        # 「解不出就不保存」这句得先保证「解出的值本身可能是真的」。
+        # 这条**不依赖双机是否对时**，所以连 strict=False 的退路也要守。
         if not (0 <= ts < DAY_MS):
             continue
         hit = {"x": x, "y": y, "cell": float(cell), "gap": float(g),
                "bits": int(bits), "ts": int(ts),
                "snap": (dx, dy, int(cell - base["cell"])),
                "plausible": bool(ts_plausible(ts))}
+        amb = cell_ambiguity(gray, x, y, cell, g, bits)
+        hit["ambiguity"] = int(amb)
+        score = (amb, abs(dx) + abs(dy), abs(float(cell) - base["cell"]))
         if hit["plausible"]:
-            return hit
-        if fallback is None:
-            fallback = hit          # 能解出码但对不上此刻：留着当退路
-    return None if strict else fallback
+            if best_ok is None or score < best_ok[0]:
+                best_ok = (score, hit)
+            # 框选本身就对上了（模糊 0、值也合理、没位移）：不用再扫
+            if amb == 0 and not dx and not dy:
+                break
+        elif best_any is None or score < best_any[0]:
+            best_any = (score, hit)
+    if best_ok is not None:
+        return best_ok[1]
+    return None if strict else (best_any[1] if best_any else None)
 
 
 def load_calib() -> dict | None:
@@ -340,6 +408,20 @@ def calib_to_px(cal, shape):
 VERDICT_HIST = 24
 #: 允许的最大步长 = 帧周期 × 这个倍数（超过就是错位解出的跳变）
 VERDICT_STEP_MUL = 4.0
+#: 「解出的时刻」与"本机收到这一帧的时刻"之间允许的范围（毫秒）。
+#:
+#: **这是第三道判据，补的是前两道抓不到的那种错**：错位采样如果只是把整片值**平移**
+#: （低位被采错、高位数对了但位置不对），解出来的时间戳会**照旧单调**（平移也是单调的），
+#: 也**照旧落在 ±10 分钟窗口里** —— 于是前两道全过，而那个值其实是"另一刻"：
+#: 延迟算不出来，界面上还会误报成"时钟对不上，去对时"（实测踩过：几何错的方向全错）。
+#:
+#: 取值范围怎么定：
+#:   · 下界 **−1 秒**：收到的画面**不可能来自未来**。管道只会让内容变旧，所以延迟
+#:     必须是正的；留 1 秒是给对时残差/抖动。实测撞到的错位正是"解出的时刻比此刻
+#:     晚了十几秒"（落在负区）—— 下界不收紧就抓不住（−60 秒内都算"能接受"）。
+#:   · 上界 **60 秒**：真延迟不可能到这个量级（局域网 + 已对时）；超过就是整片挪位了。
+VERDICT_VALUE_MIN_MS = -1000
+VERDICT_VALUE_MAX_MS = 60_000
 
 
 class Verdict:
@@ -358,7 +440,16 @@ class Verdict:
         self.step_med = None
         self.step_max = None
         self.jumped = 0
+        #: 分开记：**倒退**（强证据，时间戳本该只增）与**大跳**（弱证据 —— 显示层
+        #: 掉一帧、抓帧丢一帧都会造成"这一跳比平时大"，实测误报过：只 1 次跳变、
+        #: 最大 195ms，其实是 30fps 显示层的正常抖动）。
+        self.back_steps = 0
+        self.big_steps = 0
         self.plausible = False
+        #: 解出的时刻与"本机收帧时刻"的原始差（毫秒，越接近真实延迟越好）；
+        #: None = 还没喂过。见 VERDICT_VALUE_TOL_MS 的说明。
+        self.value_off_ms = None
+        self.value_ok = True
 
     def reset(self):
         self.ts_hist = []
@@ -366,32 +457,61 @@ class Verdict:
         self.step_med = None
         self.step_max = None
         self.jumped = 0
+        self.back_steps = 0
+        self.big_steps = 0
         self.plausible = False
+        self.value_off_ms = None
+        self.value_ok = True
 
-    def add(self, ts, frame_period_ms):
+    def add(self, ts, frame_period_ms, delay_raw_ms=None):
+        """喂一帧。`delay_raw_ms` = 本机收帧时刻 − 解出时刻（毫秒）。
+
+        传了它就多一道**值域判据**（见 VERDICT_VALUE_TOL_MS）：单调但整片平移的解
+        会被它抓住 —— 那种解"看着一切正常"，只是那个数不能用。
+        """
         self.ts_hist.append(ts)
         if len(self.ts_hist) > VERDICT_HIST:
             del self.ts_hist[0]
         ds = [b - a for a, b in zip(self.ts_hist, self.ts_hist[1:])]
-        self.jumped = sum(1 for d in ds
-                          if d < 0 or d > VERDICT_STEP_MUL * frame_period_ms)
+        lim = VERDICT_STEP_MUL * frame_period_ms
+        self.back_steps = sum(1 for d in ds if d < 0)
+        self.big_steps = sum(1 for d in ds if d > lim)
+        self.jumped = self.back_steps + self.big_steps
         pos = [d for d in ds if d > 0]
         self.step_med = statistics.median(pos) if pos else None
         self.step_max = max(ds) if ds else None
-        self.mono = not self.jumped
+        # 判据：**倒退一次都不行**（时间戳只该往前走；同一帧重复送到是 0，不算倒退），
+        # 而"大跳"最多容忍 1 次 —— 采样侧（工作台的显示帧、工具的取帧）本来就会掉帧，
+        # 掉一帧就让步长翻倍；只有连着跳才是错位采样。实测踩过误报：1 次 195ms 的跳变。
+        self.mono = (self.back_steps == 0 and self.big_steps <= 1)
         self.plausible = ts_plausible(ts)
+        if delay_raw_ms is not None:
+            self.value_off_ms = float(delay_raw_ms)
+            self.value_ok = (VERDICT_VALUE_MIN_MS <= self.value_off_ms
+                             <= VERDICT_VALUE_MAX_MS)
 
     def summary(self):
         """→ (可信?, 一行话)。不可信时**必须说清原因**，别只说"不行"。"""
         if len(self.ts_hist) < 3:
             return False, "采样中…（时间戳还没攒够）"
         if not self.mono:
-            return False, ("几何不对：解出的时间戳在乱跳（%d 次倒退/跳变，最大跳到 "
-                           "%.0fms）—— 错位采样的典型特征，挪 x/y 或调 cell/gap"
-                           % (self.jumped, self.step_max or 0))
+            return False, ("几何不对：解出的时间戳在乱跳（倒退 %d 次、大跳 %d 次，"
+                           "最大步长 %.0fms）—— 错位采样的典型特征，挪 x/y 或调 "
+                           "cell/gap" % (self.back_steps, self.big_steps,
+                                         self.step_max or 0))
         if self.need_now and not self.plausible:
             return False, ("解出的时刻对不上本地时间（差超 10 分钟）—— 几何不对，"
                            "或双机时钟没对（先在 B 机跑 tools.clock_sync --save）")
+        if not self.value_ok:
+            off = self.value_off_ms or 0.0
+            if off < 0:
+                detail = ("解出的时刻比此刻**晚**了 %.1f 秒 —— 收到的画面不可能"
+                          "来自未来" % (-off / 1000.0))
+            else:
+                detail = ("解出的时刻比此刻**早**了 %.0f 秒 —— 真延迟到不了这个量级"
+                          % (off / 1000.0))
+            return False, ("几何不对：%s（时间戳单调、也在一天之内，光看单调看不"
+                           "出来）—— 挪 x/y 或调 cell/gap" % detail)
         return True, ("几何可用：时间戳单调，步长中位 %s ms"
                       % ("%.1f" % self.step_med if self.step_med else "—"))
 

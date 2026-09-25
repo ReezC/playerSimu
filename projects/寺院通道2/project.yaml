@@ -20,7 +20,7 @@ bars:
   - 0.973958
   - 0.120791
   - 0.018229
-  hp_color:
+  hp_color: &id001
   - - 0
     - 0
     - 137
@@ -32,7 +32,7 @@ bars:
   - 0.973958
   - 0.120059
   - 0.018229
-  mp_color:
+  mp_color: &id002
   - - 144
     - 78
     - 0
@@ -114,28 +114,16 @@ decision:
   - 0.018229
   probe_calib:
     x_ratio: 0.07247437774524158
-    y_ratio: 0.02734375
-    cell_ratio: 0.011896046852122987
-    gap_ratio: 0.0014641288433382138
+    y_ratio: 0.024739583333333332
+    cell_ratio: 0.01171303074670571
+    gap_ratio: 0.0016471449487554905
     bits: 40
     frame:
     - 1366
     - 768
-    solved_at: '2026-09-25 20:55:35'
-  hp_color:
-  - - 0
-    - 0
-    - 137
-  - - 78
-    - 80
-    - 255
-  mp_color:
-  - - 144
-    - 78
-    - 0
-  - - 255
-    - 198
-    - 77
+    solved_at: '2026-09-25 21:57:55'
+  hp_color: *id001
+  mp_color: *id002
   hp_threshold: 68
   mp_threshold: 7
   pot_cd: 1000
