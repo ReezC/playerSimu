@@ -573,6 +573,29 @@ def t_bat_files_are_ascii():
           "启动器的依赖预检没走 deploy/deps.py（清单会各写一份，迟早又漏）")
 
 
+def t_push_scale_mode_builds_both_chains():
+    """「缩放位置」两种模式要拼出**该有的**过滤器串，而且默认那档一个参数都不变。
+
+    为什么要它：2026-09-25 实测 A 机 18 条候选 speed 全贴 1.00、实际 fps 只有 ~73 ——
+    瓶颈在"整屏 2560×1440 拷回内存 + CPU 缩放"这条链。GPU 那条（hwmap→scale_cuda）
+    是解法候选，但它依赖 A 机 ffmpeg 支持 scale_cuda，所以：
+      · 默认（cpu）必须与历史完全一致（否则历史表对不上、也没法回退）；
+      · cuda 那条要能在命令行里看出 `scale_cuda` 与 cuda 设备（起不来时好定位）。
+    """
+    cfg_cpu = copy.deepcopy(dcfg.DEFAULTS["push"])
+    cfg_gpu = dict(cfg_cpu, scale_mode="cuda")
+    cpu = " ".join(services.build_cmd("push", cfg_cpu))
+    gpu = " ".join(services.build_cmd("push", cfg_gpu))
+    check("hwdownload,format=bgra,scale=1366:768,format=nv12" in cpu,
+          "默认那档的采集链变了（历史表会对不上）：%s" % cpu[:160])
+    check("scale_cuda" not in cpu, "默认那档混进了 GPU 缩放")
+    check("scale_cuda=1366:768" in gpu and "hwmap=derive_device=cuda" in gpu,
+          "GPU 缩放那档没拼出该有的链：%s" % gpu[:200])
+    check("cuda=cu" in gpu, "GPU 缩放那档没给 cuda 设备（scale_cuda 会起不来）")
+    check("hwdownload,format=bgra" not in gpu,
+          "GPU 那档还在先把整屏拷回内存（那就白改了）")
+
+
 def t_cert_entry_is_findable():
     """证书入口要**显眼**：工具栏「证书…」必须在，且点开能说清现状。
 
@@ -665,6 +688,7 @@ TESTS = (
     ("A 机运行依赖齐全（清单只有一处）", t_deps_all_importable),
     ("生成的证书能被 TLS 加载", t_gen_cert_pair_loads),
     ("证书入口显眼（工具栏「证书…」）", t_cert_entry_is_findable),
+    ("采集链两种模式都拼得对（默认档不变）", t_push_scale_mode_builds_both_chains),
 )
 
 

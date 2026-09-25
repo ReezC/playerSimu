@@ -118,6 +118,16 @@ PARAMS = {
              tip="ddagrab：显卡直接抓桌面，延迟低、几乎不吃 CPU，需要 D3D11 + N 卡。\n"
                  "gdigrab：传统 GDI 抓屏，兼容性最好，但延迟高、CPU 占用高。\n"
                  "独占全屏的游戏用 ddagrab 才抓得到；无边框窗口两者都行。"),
+        dict(key="scale_mode", keys=("scale_mode",), label="缩放位置", kind="choice",
+             choices=(("CPU 缩放（默认，最稳）", "cpu"),
+                      ("GPU 缩放（cuda，省内存带宽）", "cuda")), width=230,
+             tip="整屏（A 机 2560×1440）缩到输出尺寸这一步**在哪做**，差别很大：\n"
+                 "  CPU：抓完 hwdownload（整屏 BGRA ≈ 15MB/帧 拷回内存）+ CPU scale；\n"
+                 "       实测这条链就是 A 机的天花板（speed 一直贴 1.00、实际 fps 只有 ~73）。\n"
+                 "  GPU：hwmap 到 cuda 后 scale_cuda，只在显存里缩放，再把小图拷回来。\n\n"
+                 "GPU 那条要 A 机 ffmpeg 支持 scale_cuda（Gyan 版有）。\n"
+                 "**起不来的话「推流自检」会报 ffmpeg 没起来 —— 改回 CPU 即可**。\n"
+                 "哪种更快，用「推流自检」量一轮看 speed 与实际 fps 就知道。"),
         dict(key="encoder", keys=("encoder",), label="编码器", kind="choice",
              choices=(("h264_nvenc（N 卡硬件编码）", "h264_nvenc"),
                       ("libx264（CPU 软编码）", "libx264")), width=230,
@@ -286,8 +296,17 @@ def _push_cmd(p, num):
         # GDI 抓屏：分辨率/帧率直接写在这，后面不用再 scale
         cmd += ["-f", "gdigrab", "-framerate", str(fps),
                 "-video_size", "%dx%d" % (w, h), "-i", "desktop"]
+    elif str(p.get("scale_mode") or "cpu") == "cuda":
+        # DXGI 硬采 + **GPU 缩放**：整屏那一帧留在显存里（hwmap 到 cuda），
+        # 只在显存里缩到输出尺寸，再把小图拷回内存。
+        # 省掉的是"整屏 BGRA ≈15MB/帧 拷回内存" —— 实测 CPU 那条链的天花板就是它
+        # （2026-09-25：18 条候选 speed 全贴 1.00、实际 fps 只有 ~73）。
+        cmd += ["-init_hw_device", "d3d11va=dx", "-init_hw_device", "cuda=cu",
+                "-filter_hw_device", "dx", "-filter_complex",
+                "ddagrab=framerate=%d,hwmap=derive_device=cuda,"
+                "scale_cuda=%d:%d,hwdownload,format=nv12" % (fps, w, h)]
     else:
-        # DXGI 硬采：抓完要 hwdownload 回内存，再 scale + 转像素格式
+        # DXGI 硬采（默认）：抓完 hwdownload 回内存，再 scale + 转像素格式
         cmd += ["-init_hw_device", "d3d11va=dx", "-filter_hw_device", "dx",
                 "-filter_complex",
                 "ddagrab=framerate=%d,hwdownload,format=bgra,scale=%d:%d,format=nv12"

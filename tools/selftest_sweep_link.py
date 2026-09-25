@@ -192,6 +192,44 @@ def t_garbage_is_ignored():
         lis.close()
 
 
+def t_measure_segment_survives_read_errors():
+    """单段里的读超时**不许炸掉整轮**（一轮 8 分钟、18 段，一次超时全废太贵了）。
+
+    实测（2026-09-25 23:50）：第 18 段一次 `src.read()` 超时抛出 `TimeoutError`，
+    整轮 16 段的结果全丢（那时还没落盘、结论也没回传，A 机还在干等 300 秒）。
+    修法：读失败只计数、继续把这一段量完，并把 `read_err` 报出来。
+    """
+    import numpy as np
+
+    from tools.stream_sweep import measure_segment
+
+    class _Frame:
+        def __init__(self, img, t):
+            self.image = img
+            self.t_recv_wall = t
+            self.t_recv_mono = t
+
+    class _Src:
+        """给几帧、每第 5 次抛一次 TimeoutError（像流断了一下）。"""
+
+        def __init__(self):
+            self.i = 0
+            self.img = np.zeros((768, 1366, 3), np.uint8)
+
+        def read(self):
+            self.i += 1
+            if self.i % 5 == 0:
+                raise TimeoutError()
+            return _Frame(self.img, time.time())
+
+    geo = {"x": 99.0, "y": 19.0, "cell": 16.0, "gap": 2.25}
+    meas = measure_segment(_Src(), geo, 40, 0.0, 0.3, 0.0)   # ← 不许抛
+    check(meas.get("read_err", 0) >= 1,
+          "读失败没被计数：read_err=%s" % meas.get("read_err"))
+    check("recv_fps" in meas and "probe_mono" in meas,
+          "返回结构不对：%s" % sorted(meas))
+
+
 # ---------------------------------------------------------------- 报告 / 结论的整段文本
 
 def t_blob_reaches_both_sides():
@@ -401,6 +439,7 @@ TESTS = (
     ("收不到公告能判断出来（好退回老流程）", t_no_handshake_is_visible),
     ("A 机说 done 之后不再等", t_done_stops_waiting),
     ("垃圾包一律当没听懂", t_garbage_is_ignored),
+    ("单段读超时不炸整轮", t_measure_segment_survives_read_errors),
     ("报告/结论的整段文本能双向送达", t_blob_reaches_both_sides),
     ("丢片/乱序只当没收到，不许抛", t_blob_loss_does_not_raise),
     ("两个开关的完整回路（公告→量→报告→出表→回传）", t_auto_flow_end_to_end),

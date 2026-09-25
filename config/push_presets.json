@@ -2,7 +2,10 @@
   "_note": [
     "推流自检的候选清单 —— **两台机器共用这一份**（跟着仓库走）。",
     "A 机（部署台工具栏「推流自检」）按这里的**顺序**逐条试推；",
-    "B 机（python -m tools.stream_sweep）按同一顺序量延迟；两边用墙钟对账合并。",
+    "B 机（python -m tools.stream_sweep --auto）按 A 机的公告对齐量延迟；",
+    "两边靠握手通道（UDP 5002）对齐与回传，不用掐时间。",
+    "标了 scale_mode 的候选是「采集链」的对比项：cpu=抓完整屏拷回内存再缩放（默认），",
+    "cuda=在显存里缩放（省掉整屏 ≈15MB/帧 的拷贝）。同一组参数只差一处，便于看 speed。",
     "每条只覆盖写出来的键，其余从 config/deploy.json 的 push 段继承",
     "（host/port/ffmpeg/采集方式/编码器这些是「这台机器的属性」，自检不该动）。",
     "顺序有意义：别只改中间几条就开跑，两边必须是同一份。",
@@ -29,6 +32,11 @@
     {"name": "144fps-12M-g30", "fps": 144, "bitrate": "12M", "gop": 30, "passthrough": true},
     {"name": "144fps-12M-g60", "fps": 144, "bitrate": "12M", "gop": 60, "passthrough": true},
     {"name": "144fps-20M-g30", "fps": 144, "bitrate": "20M", "gop": 30, "passthrough": true},
-    {"name": "144fps-20M-g60", "fps": 144, "bitrate": "20M", "gop": 60, "passthrough": true}
+    {"name": "144fps-20M-g60", "fps": 144, "bitrate": "20M", "gop": 60, "passthrough": true},
+
+    {"name": "60fps-6M-g60-cuda",  "fps": 60,  "bitrate": "6M",  "gop": 60, "passthrough": true,
+     "scale_mode": "cuda"},
+    {"name": "144fps-20M-g60-cuda", "fps": 144, "bitrate": "20M", "gop": 60, "passthrough": true,
+     "scale_mode": "cuda"}
   ]
 }

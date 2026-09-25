@@ -191,7 +191,8 @@ def measure_segment(src, geo, bits, offset_s, seconds, settle):
     """
     vd = probe_codec.Verdict()
     delays, gaps, reads = [], [], []
-    n = n_settle = 0
+    n = n_settle = n_err = 0
+    err_first = None
     last_mono = None
     t0 = time.monotonic()
     while True:
@@ -199,7 +200,17 @@ def measure_segment(src, geo, bits, offset_s, seconds, settle):
         if el >= settle + seconds:
             break
         _t0 = time.perf_counter()
-        f = src.read()
+        try:
+            f = src.read()
+        except Exception as e:               # noqa: BLE001
+            # **一次读超时不许炸掉整轮**：A 机每段都会重启 ffmpeg，那一下流本来就是断的。
+            # 实测踩过（2026-09-25 23:50）：第 18 段的一次 read 超时把整轮 16 段全废了 ——
+            # 那时结果还没落盘、结论也没回传，A 机还在干等。所以这里记一笔就继续量。
+            n_err += 1
+            if err_first is None:
+                err_first = "%s: %s" % (type(e).__name__, e)
+            time.sleep(0.01)
+            continue
         _t1 = time.perf_counter()
         if f is None:
             time.sleep(0.002)
@@ -240,6 +251,7 @@ def measure_segment(src, geo, bits, offset_s, seconds, settle):
 
     ok, why = vd.summary()
     return {"frames": n, "settle_frames": n_settle,
+            "read_err": n_err, "read_err_first": err_first,
             "recv_fps": (n / span) if span > 0 else None,
             "proc_fps": None,                    # 测量侧不做推理（这是"轻消费者"）
             "lat_p50": pct(delays, 0.5), "lat_p95": pct(delays, 0.95),
@@ -431,6 +443,23 @@ def main():
     if link is None and not args.auto:        # --auto 在前头已经建过了（别建两次）
         link = open_link(args.no_link)
     rows = []
+
+    def _dump():
+        """把当前 rows 落盘 —— **每段都写一次**。
+
+        为什么不是最后写一次：一轮 8 分钟、18 段。实测踩过（2026-09-25 23:50）：
+        第 18 段一次读超时就让整轮 16 段的结果全丢了（都在内存里）。写 18 次小 JSON
+        的开销可以忽略，而"崩了也留下已测的"是刚需。
+        """
+        out = {"meta": {"when": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "host": socket.gethostname(),
+                        "geometry": geo, "geometry_src": geo_src, "bits": bits,
+                        "offset_s": offset_s, "seconds": seconds, "settle": settle,
+                        "source": url, "presets": [q["name"] for q in presets]},
+               "rows": rows}
+        Path(b_path).write_text(json.dumps(out, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+
     try:
         for i, p, sec, stl, total in iter_segments(
                 link, presets, seconds, settle,
@@ -451,28 +480,38 @@ def main():
                     "ok": False, "why": "这一段没等到流（A 机没切过来？）"}))
                 continue
             t0 = time.time()
-            meas = measure_segment(s2, geo, bits, offset_s, sec, stl)
+            try:
+                meas = measure_segment(s2, geo, bits, offset_s, sec, stl)
+            except Exception as e:                # noqa: BLE001
+                # 这一段读挂了也不许带走整轮：记成"这一段没量到"，继续下一段
+                print("[sweep]   这一段读挂了（%s: %s）—— 记为失败，继续下一段"
+                      % (type(e).__name__, e), flush=True)
+                meas = {}
+            finally:
+                try:
+                    s2.close()
+                except Exception:                 # noqa: BLE001
+                    pass
             t1 = time.time()
-            s2.close()
             r = pp.row_b(p["name"], i, p, t0, t1, meas)
             rows.append(r)
             print("[sweep]   → 收到 %.1f fps、延迟 p50 %.0f / p95 %.0f ms（几何%s）"
-                  % (meas["recv_fps"] or -1, meas["lat_p50"] or -1,
-                     meas["lat_p95"] or -1,
-                     "单调" if meas["probe_mono"] else "**可疑**"))
+                  % (meas.get("recv_fps") or -1, meas.get("lat_p50") or -1,
+                     meas.get("lat_p95") or -1,
+                     "单调" if meas.get("probe_mono") else "**可疑**"))
+            _dump()                               # 每段都落盘（见 _dump 的说明）
+    except Exception as e:                        # noqa: BLE001
+        # 兜底：整轮中途出事也要**把已测的段落盘、并且出表**（别让 A 机干等）
+        print("[sweep] 第 %d 段附近出错（%s: %s）—— 已测的 %d 段照样出表。"
+              % (locals().get("i", -1) + 1, type(e).__name__, e, len(rows)),
+              flush=True)
+        _dump()
     finally:
         # --auto 不能在这儿关：后面还要用它收 A 机的报告、再把结论回过去
         if link is not None and not args.auto:
             link.close()
 
-    out = {"meta": {"when": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "host": socket.gethostname(),
-                    "geometry": geo, "geometry_src": geo_src, "bits": bits,
-                    "offset_s": offset_s, "seconds": seconds, "settle": settle,
-                    "source": url, "presets": [p["name"] for p in presets]},
-           "rows": rows}
-    Path(b_path).write_text(json.dumps(out, ensure_ascii=False, indent=2),
-                            encoding="utf-8")
+    _dump()                                   # 与逐段落盘同一份实现（每次覆盖写）
     print("\n[sweep] 已写 %s（%d 段）" % (b_path, len(rows)))
     if args.auto:
         try:

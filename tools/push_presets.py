@@ -43,7 +43,7 @@ OVERLAP_WARN = 0.5
 #: 候选里允许改的键（其余一律从当前 deploy.json 的 push 段继承 —— 比如
 #: host/port/ffmpeg 路径/采集方式/编码器，这些不该被"自检"乱动）
 PRESET_KEYS = ("fps", "bitrate", "gop", "passthrough", "low_latency",
-               "width", "height", "capture", "encoder")
+               "width", "height", "capture", "encoder", "scale_mode")
 
 
 # ══════════════════════════════════════════
@@ -73,8 +73,15 @@ def default_presets():
 
 
 def name_of(p):
-    """候选 → 段名（表里、日志里都用它，**必须稳定**：两机按名字对账）。"""
-    return "%sfps-%s-g%d" % (p.get("fps"), p.get("bitrate"), int(p.get("gop", 0)))
+    """候选 → 段名（表里、日志里都用它，**必须稳定**：两机按名字对账）。
+
+    采集链不同（`scale_mode`）也是不同的候选 —— 名字必须能区分，否则两机对账
+    会把"CPU 缩放"和"GPU 缩放"混成同一条，表就废了。默认那档不加后缀，
+    这样**既有候选的名字一个都不变**（历史表还能对上）。
+    """
+    base = "%sfps-%s-g%d" % (p.get("fps"), p.get("bitrate"), int(p.get("gop", 0)))
+    mode = str(p.get("scale_mode") or "cpu")
+    return base if mode == "cpu" else "%s-%s" % (base, mode)
 
 
 def load(path=None):
