@@ -245,6 +245,13 @@ def run_train(params, ctx=None):
                    _fmt(final.get("map50")), _fmt(final.get("map"))))
     ctx.log("  用时 %.1f 分钟" % (dt / 60.0))
     ctx.log("  输出 %s" % save_dir.as_posix())
+    # 通俗评估 + 建议（同一份口径也贴在训练卡片上，见 gui/steps/cards.TrainCard.summarize）
+    try:
+        from perception.metrics import advise
+        ctx.log("")
+        ctx.log(advise(run_info))
+    except Exception as e:                      # noqa: BLE001
+        ctx.log("生成建议失败（训练结果不受影响）：%s" % e, "warn")
     ctx.log("")
 
     return {

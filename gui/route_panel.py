@@ -24,7 +24,7 @@
 
 import time
 
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QGroupBox, QHBoxLayout,
                              QLabel, QMessageBox, QPushButton, QVBoxLayout,
@@ -35,7 +35,7 @@ from decision.agent import settings
 from gui.canvas import ImageCanvas
 from gui.minimap_calib import MinimapCalibDialog   # 量「面板 ↔ 底图」的弹窗
 from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,
-                         NoWheelSpinBox)   # 滚轮不许改参数（UI规范 §5）
+                         NoWheelSlider, NoWheelSpinBox)   # 滚轮不许改参数（UI规范 §5）
 from perception import minimap as mm
 from tools.config import load_live, update_live    # 来源/框选区域存 config/live.yaml
 
@@ -226,6 +226,30 @@ class RoutePanel(QWidget):
         self.cmb_mmap_src.currentIndexChanged.connect(self._on_mmap_src)
         row2.addWidget(self.cmb_mmap_src)
 
+        # ---- 「坐标系偏移」(x, y)：算出来的世界坐标**加上**它（2026-09-26 用户要求）----
+        # 单独一行（docs/UI规范.md §4：一行只放一个参数组）；存在 config/live.yaml 的
+        # `mmap_world_offset`，和 `mmap_src` 同一份（B 机本地、与地图无关）。
+        row_off = QHBoxLayout()
+        row_off.setSpacing(6)
+        row_off.addWidget(QLabel("坐标系偏移"))
+        self._sp_off = []
+        for _lbl in ("x", "y"):
+            row_off.addWidget(QLabel(_lbl))
+            sp = NoWheelSpinBox()
+            sp.setRange(-5000, 5000)
+            sp.setMinimumWidth(84)
+            sp.setToolTip(
+                "算出来的世界坐标会**加上**这个向量 —— 用来把"
+                "「黄点重心」和你要的玩家原点（脚下/身体中心）对齐。\n\n"
+                "怎么量：走到一个你知道确切世界坐标的点，看那行读数差多少，"
+                "把差值填进来（读数是 算出来的 + 这里）。\n"
+                "它只影响读数与寻路判断，**不碰标定**（面板↔底图那套照旧）。")
+            sp.valueChanged.connect(self._on_world_offset)
+            row_off.addWidget(sp)
+            self._sp_off.append(sp)
+        row_off.addStretch(1)
+        root.addLayout(row_off)
+
         # 「框选小地图」是**必做的一步**，不再跟着来源显隐：它记的是
         # 「小地图面板在实时画面里的哪个位置」（config/live.yaml 的 mmap_crop），
         # 两种来源都要用它 ——
@@ -355,6 +379,23 @@ class RoutePanel(QWidget):
             "没画出来时，右边会写明卡在哪一步。")
         self.ck_mmap_draw.toggled.connect(self._on_mmap_draw)
         row3.addWidget(self.ck_mmap_draw)
+        # 浓淡（透明度）：**勾上叠图才出现**（2026-09-26 用户要求）—— 以前只能进
+        # 「标定…」弹窗里调，看一眼调一下要来回开窗。写回的是**同一处**（标定文件的
+        # `alpha`，按来源分开存），所以两个入口永远一致。
+        self.lbl_alpha = QLabel("浓淡")
+        self.lbl_alpha.setVisible(False)
+        row3.addWidget(self.lbl_alpha)
+        self.sld_alpha = NoWheelSlider(Qt.Horizontal)
+        self.sld_alpha.setRange(0, 100)
+        self.sld_alpha.setMinimumWidth(120)
+        self.sld_alpha.setToolTip(
+            "叠图的透明度（0 = 看不见，100 = 完全实）。\n\n"
+            "存进这张图的**标定文件**（按来源分开），和「标定…」弹窗里那个滑块是"
+            "同一处 —— 在哪儿调都一样。\n\n"
+            "看不清楚就调低一点：小地图面板本来就小，太实会盖住底图上的细节。")
+        self.sld_alpha.valueChanged.connect(self._on_overlay_alpha)
+        self.sld_alpha.setVisible(False)
+        row3.addWidget(self.sld_alpha)
         self.lbl_mmap_draw = QLabel()
         self.lbl_mmap_draw.setStyleSheet("color: #80868b;")
         self.lbl_mmap_draw.setWordWrap(True)
@@ -883,14 +924,75 @@ class RoutePanel(QWidget):
         v = load_live().get("mmap_src")
         return v if v in (mm.SRC_STREAM, mm.SRC_LIVE) else mm.SRC_STREAM
 
+    def _on_overlay_alpha(self, v):
+        """改了叠图浓淡 ⇒ 写回**标定文件**（和「标定…」弹窗同一处）并立刻重画。
+
+        为什么存标定而不是 live.yaml：那儿本来就是它的家（弹窗的滑块写的就是它，
+        按来源分开存）—— 放两处迟早对不上，而"看着没变"是最难查的一类。
+        """
+        mid = self._map_id()
+        if not mid:
+            return
+        try:
+            src = self._mmap_src()
+            cal = mapdata.load_calib(mid, src) or {}
+            cal["alpha"] = int(v)
+            mapdata.save_calib(mid, cal, src)
+        except Exception:                           # noqa: BLE001
+            pass
+        self._refresh_overlay()
+
+    def _on_world_offset(self, _v=None):
+        """改了「坐标系偏移」⇒ 写进**这张图的标定文件**（按地图 id + 来源，2026-09-26 用户定）。
+
+        和 `scale/offset/view/alpha` 同一份：面板与实时线程都从标定里读（`PlayerLocator`
+        那边已经按来源取好了）⇒ 天然一致，不会再出现"两边各存一份、看着没变"。
+        """
+        mid = self._map_id()
+        if not mid:
+            return
+        try:
+            src = self._mmap_src()
+            cal = mapdata.load_calib(mid, src) or {}
+            cal["world_offset"] = [int(sp.value()) for sp in self._sp_off]
+            mapdata.save_calib(mid, cal, src)
+        except Exception:                           # noqa: BLE001
+            pass
+
+    def _stream_client(self):
+        """收流那条客户端（懒建、复用）—— 来源=收流时定位就用它。
+
+        为什么必须跟来源走：两条来源的**面板尺寸差好几倍**（A 机推流还带 zoom），
+        标定也是**按来源分开存**的（`sources.stream` / `sources.live`）——
+        拿 A 那份几何去量 B 那块画面，结果就是"标定过了却没坐标"（2026-09-26 踩过）。
+        """
+        if getattr(self, "_mmap_cli", None) is None:
+            try:
+                from tools.config import get
+                self._mmap_cli = mm.MiniMapClient(
+                    get("a_host"), port=get("minimap", "port", 5003)).start()
+            except Exception:                       # noqa: BLE001
+                self._mmap_cli = None
+        return self._mmap_cli
+
     def _on_mmap_src(self, _i):
         """换来源：立刻存下来，并刷一遍状态。
 
         「框选小地图」**不跟着来源显隐**了 —— 它记的是面板在画面里的位置，
         两种来源都要用（收流时主画面里也有小地图，只是被压过）。
+
+        换来源要把收流那条客户端**收掉**：留着它白占 A 机一路连接（现在是广播、
+        不会再饿死别人，但没必要），下次切回来按时会重连。
         """
         src = self.cmb_mmap_src.currentData()
         update_live(mmap_src=src)
+        cli = getattr(self, "_mmap_cli", None)
+        if cli is not None:
+            try:
+                cli.stop()
+            except Exception:                       # noqa: BLE001
+                pass
+            self._mmap_cli = None
         self._refresh_mmap()
 
     def _pick_mmap_region(self):
@@ -1124,6 +1226,26 @@ class RoutePanel(QWidget):
             sp.blockSignals(True)
             sp.setValue(int(round(trk[k])))
             sp.blockSignals(False)
+        # 「坐标系偏移」从**这张图的标定**里回填（按地图 id + 来源，别把 setValue 当用户改动）
+        off = (cal or {}).get("world_offset") or []
+        if not off:
+            # 一次性搬运：早先临时存在 live.yaml 里的那份 —— 标定里还没有就搬过来
+            #（搬过来之后就以标定为准；live.yaml 那个键不再读，留着不碍事）
+            off = load_live().get("mmap_world_offset") or []
+            if len(off) == 2 and mid:
+                try:
+                    cc = dict(cal or {})
+                    cc["world_offset"] = [int(off[0]), int(off[1])]
+                    mapdata.save_calib(mid, cc, src_kind)
+                except Exception:                   # noqa: BLE001
+                    pass
+        else:
+            off = [off[0], off[1]]
+        if len(off) == 2:
+            for sp, v in zip(self._sp_off, off):
+                sp.blockSignals(True)
+                sp.setValue(int(v))
+                sp.blockSignals(False)
         # 世界坐标那行（勾上叠图才显示）：跟着地图一起刷新 —— 换了图，地形和
         # 标定都换了，读数必须重算，否则显示的是上一张图的段号。
         self._locator.load(mid or None)
@@ -1219,23 +1341,39 @@ class RoutePanel(QWidget):
         mid = self._map_id()
         if lp is None or not mid:
             return _say("玩家世界坐标：（没打开项目 / 没选地图）")
-        frame = lp.current_frame()
-        crop = load_live().get("mmap_crop") or []
-        if frame is None:
-            return _say("玩家世界坐标：先到「实时」页点「开始」预览")
-        if len(crop) != 4:
-            return _say("玩家世界坐标：先「框选小地图」（读数要从那块画面算）")
-        x, y, w, h = [int(v) for v in crop]
-        H, W = frame.shape[:2]
-        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > W or y + h > H:
-            return _say("玩家世界坐标：框选的区域超出当前画面 %d×%d —— 重框一次"
-                        % (W, H))
-
-        # 复制一份再用：那一帧是实时线程的就地画布（上面有玩家框/平台线），而且
-        # 随时会被下一帧覆盖 —— 直接切视图会读到写了一半的像素。
-        panel = frame[y:y + h, x:x + w].copy()
+        # **画面按「小地图来源」走**（2026-09-26 踩过）：这里原来写死"从主画面裁一块 +
+        # `src=SRC_LIVE`" ⇒ 来源选**收流**时读的是**另一份标定**（`sources.live`，
+        # 多半压根没存过）⇒ 表现就是"标定完了却没坐标"；而且喂的是 H.264 压过的画面，
+        # 黄点更糊 —— 跟"选收流"的初衷正好相反。实时线程那份（`live_thread`）一直是对的，
+        # 这里照它分一次流。
+        src = self._mmap_src()
+        panel = None
+        if src == mm.SRC_STREAM:
+            cli = self._stream_client()
+            if cli is None:
+                return _say("玩家世界坐标：小地图推流连不上（link.yaml 里读到 a_host 了吗）",
+                            "#b06000")
+            panel, _t = cli.latest()
+            if panel is None:
+                return _say("玩家世界坐标：还没收到小地图推流（%s）"
+                            % (cli.err or "A 机那一路起了吗？"), "#b06000")
+        else:
+            frame = lp.current_frame()
+            crop = load_live().get("mmap_crop") or []
+            if frame is None:
+                return _say("玩家世界坐标：先到「实时」页点「开始」预览")
+            if len(crop) != 4:
+                return _say("玩家世界坐标：先「框选小地图」（读数要从那块画面算）")
+            x, y, w, h = [int(v) for v in crop]
+            H, W = frame.shape[:2]
+            if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > W or y + h > H:
+                return _say("玩家世界坐标：框选的区域超出当前画面 %d×%d —— 重框一次"
+                            % (W, H))
+            # 复制一份再用：那一帧是实时线程的就地画布（上面有玩家框/平台线），而且
+            # 随时会被下一帧覆盖 —— 直接切视图会读到写了一半的像素。
+            panel = frame[y:y + h, x:x + w].copy()
         loc = self._locator.load(mid)
-        r = loc.update(panel, src=mm.SRC_LIVE)
+        r = loc.update(panel, src=src)
         if not r["ok"]:
             # 面板上写一句话，**详情进 tooltip**；画面上那行更短（见 _say 的说明）——
             # 完整诊断有一百多字，贴到画面上就是一条横穿半屏的黑带。
@@ -1309,6 +1447,40 @@ class RoutePanel(QWidget):
             self._ov_pix = (p, QPixmap(p))
         return self._ov_pix[1]
 
+    def _calib_panel_wh(self, cal=None):
+        """**标定当时那块面板的尺寸** `(w, h)` —— 画叠图时要把标定几何折算到当前画面。
+
+        为什么需要（2026-09-26 用户报「叠图被放大」）：标定记的是"那块面板像素 ↔ 底图
+        像素"的换算，而叠图要画在"**现在**框出来的那一块"上 —— 两者尺寸可能差好几倍
+        （典型：A 机推流带 zoom）⇒ 不折算就把整块叠图放大。用户的原话也是这个意思：
+        「那个倍率只是算坐标用的」。
+
+        取法（按可靠程度）：
+          1. 标定文件里的 `panel`（新存的有；老标定没有）；
+          2. **当前收流帧**的尺寸 —— 来源=收流时它正是标定那块面板（zoom=1 时 =
+             真实面板大小）；
+          3. 都拿不到 ⇒ None（退回老行为，不折算；状态行会提示"比面板框还大"）。
+        """
+        if cal is None:
+            try:
+                cal = mapdata.load_calib(self._map_id(), self._mmap_src()) or {}
+            except Exception:                       # noqa: BLE001
+                cal = {}
+        p = cal.get("panel")
+        if p and len(p) == 2:
+            try:
+                if int(p[0]) > 0 and int(p[1]) > 0:
+                    return (int(p[0]), int(p[1]))
+            except (TypeError, ValueError):
+                pass
+        if self._mmap_src() == mm.SRC_STREAM:
+            cli = self._stream_client()
+            if cli is not None:
+                f, _t = cli.latest()
+                if f is not None:
+                    return (int(f.shape[1]), int(f.shape[0]))
+        return None
+
     def _refresh_overlay(self):
         """照标定算出「叠图的哪一块画到画面的哪里」，交给实时面板去画。
 
@@ -1320,6 +1492,9 @@ class RoutePanel(QWidget):
         """
         lp = getattr(self, "live_panel", None)
         on = self._mmap_draw_on()
+        # 浓淡滑块跟着开关显隐（勾上才有意义；关着时它只会让人以为能调）
+        self.lbl_alpha.setVisible(on)
+        self.sld_alpha.setVisible(on)
         why = self._overlay_blocker()
         if on and not why and lp is not None:
             mid = self._map_id()
@@ -1329,17 +1504,28 @@ class RoutePanel(QWidget):
                 cal = mapdata.load_calib(mid, self._mmap_src()) or {}
                 src, dst = mm.frame_overlay_rects(
                     cal, [int(v) for v in crop],
-                    (t.canvas.shape[1], t.canvas.shape[0]))
+                    (t.canvas.shape[1], t.canvas.shape[0]),
+                    calib_panel=self._calib_panel_wh(cal))
                 pix = self._overlay_pix(mid)
                 alpha = float(cal.get("alpha") or 55) / 100.0
                 # `note` = 玩家世界坐标那行：贴在画面里那块框的下面（见
                 # gui/live_panel._draw_note）。每次重画都要重贴 —— 帧是新的。
                 lp.set_minimap_overlay(pix, src, dst, alpha,
                                        note=self._world_note)
+                # ⚠ 叠图比**面板框**还大 ⇒ 标定八成不对（2026-09-26 实测踩过：
+                # 标定文件里 `scale=5.63`（在 A 机 zoom=3 的收流帧上按"整图 fit"
+                # 拟合出来的、匹配分才 0.70）⇒ 底下算出来 134×101×5.63 = 754×569，
+                # **整屏都是它**。说在明面上，别让人对着画面猜「是不是程序画错了」。
+                warn = ""
+                if dst[2] > int(crop[2]) * 1.2 or dst[3] > int(crop[3]) * 1.2:
+                    warn = ("　⚠ 比面板框 %dx%d 还大 —— 标定八成不对：确认 A 机推流的 "
+                            "zoom 是 1、「显示方式」全局/局部选对了，再标一次"
+                            % (int(crop[2]), int(crop[3])))
                 self.lbl_mmap_draw.setText(
-                    "已画在画面 (%d, %d) %d×%d　浓淡 %.0f%%（在「标定…」里调）"
-                    % (dst[0], dst[1], dst[2], dst[3], alpha * 100))
-                self.lbl_mmap_draw.setStyleSheet("color:#188038;")
+                    "已画在画面 (%d, %d) %d×%d　浓淡 %.0f%%（在「标定…」里调）%s"
+                    % (dst[0], dst[1], dst[2], dst[3], alpha * 100, warn))
+                self.lbl_mmap_draw.setStyleSheet(
+                    "color:#b06000;" if warn else "color:#188038;")
                 return
             why = "算不出往画面的哪儿画（框选/标定/底图不齐全）"
         if lp is not None:

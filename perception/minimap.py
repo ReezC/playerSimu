@@ -933,6 +933,8 @@ class PlayerLocator:
         self.map_id = None
         self.terrain = None
         self._calib_cache = {}
+        #: 「坐标系偏移」缓存（见 _world_offset）：(时刻, (x, y))
+        self._off_cache = None
         self._new_tracker()
         self.load(map_id)
 
@@ -985,6 +987,27 @@ class PlayerLocator:
         self._calib_cache[src] = (now, cal)
         return cal
 
+    def _world_offset(self, calib):
+        """「坐标系偏移」(x, y)：算出来的世界坐标**加上**它（用户 2026-09-26 要求）。
+
+        为什么要它：坐标是按**黄点重心**算的（见 `find_player_dot` 的 `x, y`），而
+        "黄点重心 ↔ 游戏里的玩家原点"这层对应是游戏自己定的 —— 与其猜（按中心还是
+        按脚下），不如给一个显式偏移让人自己量一次。读数、段号、foothold、绳梯判据
+        都在**加完之后**算（见 `update`），所以寻路的"我在哪块平台上"也跟着准。
+
+        **按地图 id 存**（用户 2026-09-26 定的口径）：它跟标定走 —— 存在
+        `datasets/map/<id>.mapcalib.json` 的 `sources.<来源>.world_offset`，
+        和 `scale/offset/view/alpha` 同一份（每张图、每个来源各自一套 ✓）。
+        直接读 `calib`（调用方已经按来源取好了），所以面板和实时线程天然一致。
+        """
+        v = (calib or {}).get("world_offset") or []
+        if len(v) == 2:
+            try:
+                return (float(v[0]), float(v[1]))
+            except (TypeError, ValueError):
+                pass
+        return (0.0, 0.0)
+
     def update(self, panel, src=None, calib=None, terrain=None):
         """面板画面（BGR）→ 定位结论 dict。
 
@@ -1035,6 +1058,11 @@ class PlayerLocator:
             return out
 
         wx, wy = panel_to_world(r["x"], r["y"], calib, terrain)
+        # 「坐标系偏移」：**在这一步加**（用户自己精确标定用）—— 后面的范围检查、
+        # 段号、foothold、绳梯判据全都用加完之后的坐标，口径才是一份。
+        ox, oy = self._world_offset(calib)
+        if ox or oy:
+            wx, wy = wx + ox, wy + oy
         out["world_x"], out["world_y"] = wx, wy
         b = terrain.bounds
         if b and not (b[0] - 1 <= wx <= b[2] + 1 and b[1] - 1 <= wy <= b[3] + 1):
@@ -1148,7 +1176,7 @@ def overlay_draw_rects(loc, panel_wh, canvas_wh):
                   int(round(cw * s)), int(round(ch * s)))
 
 
-def frame_overlay_rects(loc, frame_rect, canvas_wh):
+def frame_overlay_rects(loc, frame_rect, canvas_wh, calib_panel=None):
     """→（源矩形, **实时画面坐标**下的目标矩形）。
 
     面板在实时画面里的位置由 `frame_rect=(fx, fy, fw, fh)` 给出（工作台
@@ -1158,9 +1186,29 @@ def frame_overlay_rects(loc, frame_rect, canvas_wh):
     **收流来源同样适用**：那一路小地图虽然另有独立推流（画质好、黄点不糊），
     但小地图面板本身**也在主画面里**（只是被 H.264 压过），所以"它在画面的哪儿"
     照样是框出来的那一块，和来源无关。
+
+    `calib_panel` = **标定当时那块面板的尺寸** `(w, h)`（不传 = 不折算，老行为）。
+    ⚠ 为什么必须传（2026-09-26 实测踩过）：标定记的是"**那块**面板像素 ↔ 底图像素"的
+    换算，而这里要往"**现在**框出来的那一块"上画 —— 两者尺寸可能差好几倍（典型：A 机
+    推流带 zoom，标定面板 754px 宽，而主画面里的小地图只有 251px）⇒ 不折算的话，
+    叠图会被整块放大：`底图 134 × scale 5.63 = 754` 的方块糊在 251px 的小地图上。
+    传了它，就按 `标定面板 ÷ 当前那块画面` 的比例把几何先换算过去再画 ——
+    于是 A 机改 zoom、或面板尺寸变了，叠图都不会再被放大。
     """
     fx, fy, fw, fh = (int(v) for v in frame_rect)
-    src, (dx, dy, dw, dh) = overlay_draw_rects(loc, (fw, fh), canvas_wh)
+    loc2 = loc
+    if calib_panel:
+        try:
+            pw = float(calib_panel[0] or 0)
+        except (TypeError, ValueError, IndexError):
+            pw = 0.0
+        if pw > 0 and fw > 0 and abs(pw / float(fw) - 1.0) > 1e-6:
+            z = pw / float(fw)                  # 标定面板 → 当前那块画面 的比例
+            loc2 = dict(loc)
+            loc2["scale"] = (float(loc.get("scale") or 1.0) / z)
+            loc2["offset"] = [float(v) / z for v in (loc.get("offset") or (0, 0))]
+            loc2["view"] = [float(v) / z for v in (loc.get("view") or (0, 0))]
+    src, (dx, dy, dw, dh) = overlay_draw_rects(loc2, (fw, fh), canvas_wh)
     return src, (fx + dx, fy + dy, dw, dh)
 
 

@@ -556,6 +556,62 @@ def t_static_check_no_crash_classes():
           % "\n       ".join(bad[:6]))
 
 
+def t_limit_reason_rules():
+    """「这一段卡在谁身上」的判据：输入受限 / 本机受限 / 说不清（纯函数，2026-09-26）。
+
+    **为什么要它**：状态行上「输入 fps」和「处理 fps」是不丢帧时**必然相等**的两个数，
+    于是"处理速度掉到 20"看着像 B 机算不动 —— 实测最慢那段其实是输入只有 34fps
+    （`gap_ms` 中位 29.6ms，而本机一拍才 24ms，30fps 都还有余量）。
+    判据必须拿**输入间隔**和**本机耗时**比，而不是那两个必然相等的 fps。
+    """
+    from gui.live_thread import limit_reason
+
+    # ① 输入只有 34fps、本机一拍 13ms ⇒ 上游给的少（实测慢段的形状）
+    check(limit_reason(34.0, 34.0, 13.0, 29.4) == "input",
+          "输入受限没认出来：%r" % limit_reason(34.0, 34.0, 13.0, 29.4))
+    # ② 收到 60 却只处理 40（丢帧在涨）⇒ 本机跟不上
+    check(limit_reason(60.0, 40.0, 20.0, 16.7) == "self",
+          "本机跟不上没认出来：%r" % limit_reason(60.0, 40.0, 20.0, 16.7))
+    # ③ 两个都慢（本机 24ms、输入间隔 29.6ms）⇒ **说不清就别指方向**
+    check(limit_reason(34.0, 34.0, 24.0, 29.6) == "",
+          "两个都慢时乱指方向（会把人引去查错机器）：%r"
+          % limit_reason(34.0, 34.0, 24.0, 29.6))
+    # ④ 都不慢 / 还没数 ⇒ 不贴标签
+    check(limit_reason(60.0, 60.0, 13.0, 16.7) == "", "都够快时贴了标签")
+    check(limit_reason(0, 0, 0, 0) == "", "还没数就贴标签")
+
+
+def t_pixmap_handles_padded_frame():
+    """显示链路：**带行 padding 的帧**也要画对，且不再多拷一次（2026-09-26 性能）。
+
+    两个坑一起钉：
+      · padding：`to_ndarray(bgr24)` 的帧 stride 比 3*w 大，按 3*w 读会整幅错位；
+      · 那次多余的 `qimg.copy()`：1920×1080 实测 9.43 → 7.02 ms/帧，而它跑在
+        **GUI 主线程**上 —— 去掉它等于把 CPU 还给推理。
+        （去掉 `ascontiguousarray` 反而更慢：14.77 ms/帧，跨步 tobytes 走通用路径。）
+    """
+    from PyQt5.QtWidgets import QApplication
+    from gui.live_panel import _bgr_to_pixmap
+
+    app = QApplication.instance() or QApplication([])      # noqa: F841
+    pad = np.zeros((8, 34, 3), np.uint8)                   # 真画面只有前 32 列
+    pad[:, :32] = (10, 20, 30)                             # BGR
+    pix = _bgr_to_pixmap(pad[:, :32])
+    check((pix.width(), pix.height()) == (32, 8),
+          "带 padding 的帧画出来尺寸不对：%dx%d" % (pix.width(), pix.height()))
+    c = pix.toImage().pixelColor(4, 4)
+    check((c.red(), c.green(), c.blue()) == (30, 20, 10),
+          "像素串了（BGR 30/20/10 该读成 RGB 30/20/10）：%r"
+          % ((c.red(), c.green(), c.blue()),))
+    # 源码约定：不许再出现那次「白拷一整幅」的调用。
+    # ⚠ 判据写成**完整调用**（不是 `qimg.copy()`）：`_bgr_to_pixmap` 的 docstring 里
+    # 正解释着"为什么不要它"，宽判据会把注释也算成违规（写这条时就是这么红的）。
+    src = (ROOT / "gui" / "live_panel.py").read_text(encoding="utf-8")
+    check("QPixmap.fromImage(qimg.copy())" not in src,
+          "`_bgr_to_pixmap` 里又出现了 `QPixmap.fromImage(qimg.copy())`"
+          "（白拷一整幅，1080p 约 2 ms/帧，还全在 GUI 主线程上）")
+
+
 TESTS = (
     ("连推 10 帧只画最新那帧（合并，不排队）", t_coalesce),
     ("不可见时一帧都不画，但帧仍是最新的", t_hidden_skips_draw),
@@ -567,6 +623,8 @@ TESTS = (
     ("小地图叠图：源超出叠加图时画出来的范围要对", t_overlay_source_out_of_image),
     ("探针单调性闸：几何可疑不报延迟、保存前拦错几何", t_probe_mono_gate),
     ("实时画面上的采样框：颜色跟判据、只画在副本上", t_probe_box_overlay),
+    ("「卡在谁身上」：输入受限 / 本机受限 / 说不清（纯函数）", t_limit_reason_rules),
+    ("显示链路：带 padding 的帧画得对，且不再白拷一整幅", t_pixmap_handles_padded_frame),
     ("静态检查：会当场炸的名字错误（pyflakes）", t_static_check_no_crash_classes),
 )
 

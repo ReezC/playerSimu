@@ -1680,12 +1680,45 @@ class ZoneEditorDialog(QDialog):
         self._refresh_status()
 
     def _refresh_status(self):
+        """状态行：选中了几条 + **选中那几条的坐标** + 鼠标位置 + 集合数。
+
+        为什么要把坐标写出来（2026-09-26 用户要求）：圈集合、对绳梯、核 `fh id` 全靠
+        这几对数 —— 以前只能看鼠标那一格的坐标，选中了哪条、它跨多远、在哪一层，
+        都得自己拿眼睛量。多选时一行放不下 ⇒ 面板上给**包围盒**，逐条清单进 tooltip。
+        """
         n = len(self._sel)
         hx, hy = getattr(self, "_hover", (0.0, 0.0))
+        where, tip = "", ""
+        fs = [f for f in self.terrain.footholds if str(f.fid) in self._sel]
+        if len(fs) == 1:
+            f = fs[0]
+            mid = (f.x1 + f.x2) / 2.0
+            where = ("　｜　#%s（%s）x %d..%d　长 %d　y=%d"
+                     % (f.fid, "墙" if f.is_wall else "地板",
+                        round(f.x1), round(f.x2), round(abs(f.x2 - f.x1)),
+                        round(f.y_at(mid))))
+            tip = ("选中 foothold #%s\n  x %d .. %d（长 %d）\n  y=%d（中点）"
+                   "\n  左端 (%d, %d)　右端 (%d, %d)"
+                   % (f.fid, round(f.x1), round(f.x2), round(abs(f.x2 - f.x1)),
+                      round(f.y_at(mid)),
+                      round(f.x1), round(f.y_at(f.x1)),
+                      round(f.x2), round(f.y_at(f.x2))))
+        elif fs:
+            sp = zones.set_span(self.terrain, [str(f.fid) for f in fs])
+            if sp:
+                where = ("　｜　包围盒 x %d..%d　y %d..%d"
+                         % (round(sp[0]), round(sp[1]), round(sp[2]), round(sp[3])))
+            tip = "选中 %d 条 foothold：\n%s" % (
+                len(fs), "\n".join(
+                    "  #%s（%s）x %d..%d　y=%d"
+                    % (f.fid, "墙" if f.is_wall else "地板", round(f.x1),
+                       round(f.x2), round(f.y_at((f.x1 + f.x2) / 2.0)))
+                    for f in fs[:40]))
         self.lbl_status.setText(
-            "已选 %d 条 foothold%s　｜　鼠标 (%.0f, %.0f)　｜　集合 %d 个"
-            % (n, "（点「注册为集合…」给它起名）" if n else "",
+            "已选 %d 条 foothold%s%s　｜　鼠标 (%.0f, %.0f)　｜　集合 %d 个"
+            % (n, "（点「注册为集合…」给它起名）" if n else "", where,
                hx, hy, len(self.zones.sets)))
+        self.lbl_status.setToolTip(tip)
 
     # ---------------- 边 ----------------
 

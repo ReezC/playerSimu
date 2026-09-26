@@ -20,7 +20,7 @@ bars:
   - 0.973958
   - 0.120791
   - 0.018229
-  hp_color: &id001
+  hp_color:
   - - 0
     - 0
     - 137
@@ -32,7 +32,7 @@ bars:
   - 0.973958
   - 0.120059
   - 0.018229
-  mp_color: &id002
+  mp_color:
   - - 144
     - 78
     - 0
@@ -122,8 +122,20 @@ decision:
     - 1366
     - 768
     solved_at: '2026-09-25 21:57:55'
-  hp_color: *id001
-  mp_color: *id002
+  hp_color:
+  - - 0
+    - 0
+    - 137
+  - - 78
+    - 80
+    - 255
+  mp_color:
+  - - 144
+    - 78
+    - 0
+  - - 255
+    - 198
+    - 77
   hp_threshold: 68
   mp_threshold: 7
   pot_cd: 600
@@ -250,7 +262,7 @@ decision:
 notes: ''
 capture:
   source: file
-  file: D:/Media/record/mxd/寺院通道2_左上打牛.mp4
+  file: D:/Media/record/mxd/e8db0337c8693aa76d702ea41736b3b6_raw.mp4
   url: udp://0.0.0.0:5000
   fps: 5.0
   stride: 60
@@ -259,7 +271,7 @@ capture:
   limit: 200
   clean: false
 label:
-  thresh: 0.5
+  thresh: 0.2
   min_distinct: 0.06
   per_mob: 20
   max_peaks: 3
@@ -273,7 +285,7 @@ dataset:
 train:
   model: yolo26n.pt
   epochs: 200
-  imgsz: 960
+  imgsz: 1280
   batch: 8
   device: '0'
   patience: 40

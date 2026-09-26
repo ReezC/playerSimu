@@ -25,9 +25,11 @@
 
 MODE_FIXED = "定点"          # 唯一已实现的模式；将来加 "移动" 时在这里多一个取值
 
-#: 到达判据用的缓冲（像素）：绳端压着的那条 foothold 有宽度，人站在上面时 y 未必
-#: 真的越过绳端，所以留一点余量（太紧会导致"到了还在爬"，太松会提前结束）。
-ARRIVE_PAD = 14.0
+# ⚠ 这里原来有个 `ARRIVE_PAD = 14.0`（"离绳顶还差 14 像素就算到达"）——
+# **2026-09-26 用户指出：他从没提过这个需求，那个数也没有任何数据支持**，已删除。
+# 后果是实测角色停在 -204（平台面是 -208，差 4px 没上去）。判据现在只用**能指出
+# 来源的数据**（集合 / 目标平台的面），见 `ClimbJob._arrived`。要再加容差，先说明
+# 来历并征得用户同意（见 README「工程约定：不许拍脑袋补数」）。
 
 #: 一次上绳的总超时（秒）。对齐不了 / 卡在绳上不动，都不许无限等（P4 要求"超时报警"）。
 DEFAULT_TIMEOUT_S = 12.0
@@ -89,6 +91,7 @@ class ClimbJob:
     FAILED = "failed"        # 超时 / 中途掉下来
 
     def __init__(self, ladder_id, x, y1, y2, direction, dst_set="",
+                 dst_y=None,
                  mode=MODE_FIXED, tol_px=6, hold_ms=250,
                  timeout_s=DEFAULT_TIMEOUT_S, max_attempts=DEFAULT_MAX_ATTEMPTS):
         self.mode = mode
@@ -98,6 +101,12 @@ class ClimbJob:
         self.y_bot = float(max(y1, y2))
         self.dir = 1 if direction >= 0 else -1     # +1 向上 / -1 向下
         self.dst_set = str(dst_set or "")
+        #: **目标平台那条 foothold 的面**（世界坐标 y；None = 不知道，退回几何兜底）。
+        #: 2026-09-26 用户实测：爬上去站着读数是 -209，而绳端连接的那条 foothold 的 y 是
+        #: -208 ⇒ **至少 y ≤ -208 就该算到达**。拿"绳的上端 + 容差"（-191）当目标是不对的：
+        #: 绳的顶端常常在平台面下面一截 ⇒ "到绳顶了还要求再往上" ⇒ 超时 ⇒ 重试 ⇒ 放弃
+        #: （现象就是"爬到某个 y 就不动了"）。
+        self.dst_y = None if dst_y is None else float(dst_y)
         self.tol_px = max(1, int(tol_px))
         self.hold_ms = max(0, int(hold_ms))
         self.timeout_s = float(timeout_s)
@@ -223,17 +232,34 @@ class ClimbJob:
         """
         if here_sets and self.dst_set and self.dst_set in set(here_sets):
             return "到达：脚下已经是「%s」" % self.dst_set
+        # 判据①（比"绳端"准，2026-09-26 用户要求）：**够到目标平台的面**就算到。
+        # 用户实测：爬上去站着读数是 -209，而绳端连接的那条 foothold 的 y 是 -208
+        # ⇒ 至少 `y ≤ -208` 就该判到达。**不加容差**：平台面就是"站上去的高度"，
+        # 加 14px 等于"还没踩上去就算到了"（那正是老写法"到绳顶还要求再往上"的反面）。
+        if self.dst_y is not None:
+            if py is not None:
+                pyv = float(py)
+                if self.dir > 0 and pyv <= self.dst_y:
+                    return "到达：y=%.0f 已到目标平台的面（%.0f）" % (pyv, self.dst_y)
+                if self.dir < 0 and pyv >= self.dst_y:
+                    return "到达：y=%.0f 已到目标平台的面（%.0f）" % (pyv, self.dst_y)
+            # **有平台面就不再拿"绳端"当目标**：绳顶常常比平台面低一截，拿它当目标是错的
+            #（用户 2026-09-26 定的口径：至少 `y ≤ dst_y` 才算到）。
+            return ""
         # ⚠ 方向别搞反：y 向下增大（`y_top` 是 min）。向上爬 ⇒ y **减小到**绳上端附近；
         # 所以判据是"够到绳端 ± 容差"，不是"越过绳端之外"（第一版写成 ± 反了，
         # 兜底判据就**永远不会触发** —— 人到了绳顶还一直按着跳）。
         if py is not None:
-            py = float(py)
-            if self.dir > 0 and py <= self.y_top + ARRIVE_PAD:
-                return "到达：y=%.0f 已到 %s 上端（%.0f）" % (py, self.ladder_id,
-                                                             self.y_top)
-            if self.dir < 0 and py >= self.y_bot - ARRIVE_PAD:
-                return "到达：y=%.0f 已到 %s 下端（%.0f）" % (py, self.ladder_id,
-                                                             self.y_bot)
+            pyv = float(py)
+            # 够到绳的**那一端**（不加容差）：这条只在**算不出目标平台面**时兜底
+            #（比如那条边的目标集合还没圈 foothold）。**不许再加 pad** —— 见文件头
+            # 关于 ARRIVE_PAD 的说明与 README 的「不许拍脑袋补数」。
+            if self.dir > 0 and pyv <= self.y_top:
+                return "到达：y=%.0f 已到 %s 上端（%.0f）" % (pyv, self.ladder_id,
+                                                              self.y_top)
+            if self.dir < 0 and pyv >= self.y_bot:
+                return "到达：y=%.0f 已到 %s 下端（%.0f）" % (pyv, self.ladder_id,
+                                                              self.y_bot)
         return ""
 
     def _fail(self, why):
@@ -446,4 +472,38 @@ def job_for_edge(terrain, z, edge, **kw):
             "说不清 %s →(爬 %s)→ %s 是向上还是向下"
             "（终点或起点不在绳的两端，或者一头圈进了两个集合）—— 回编辑器看一下。"
             % (edge.get("from"), want, edge.get("to")))
-    return ClimbJob(want, L.x, L.y1, L.y2, d, dst_set=edge.get("to"), **kw)
+    return ClimbJob(want, L.x, L.y1, L.y2, d, dst_set=edge.get("to"),
+                    dst_y=dst_surface_y(terrain, z, edge.get("to"), L, d), **kw)
+
+
+def dst_surface_y(terrain, z, dst_set, L, direction=1):
+    """目标集合里**爬上去会踩上的那一层**的面（y）——"到哪儿算到了"。
+
+    挑选（**按方向**，2026-09-26 用户实测定的口径）：
+      · 向上爬 ⇒ 只要**在绳上端之上（或齐平）**的那些面（`y <= y_top`），取**最靠下**
+        的那个（也就是最先踩上的那层）；
+      · 向下爬 ⇒ 对称：只要 `y >= y_bot` 的，取最靠上的那个。
+      两组都空（绳顶悬在平台面**下面**这种事很常见）⇒ 退回"离绳端最近的那个面"。
+
+    ⚠ 为什么不能只取"离绳端最近"（第一版就是这么写的，当场挑错了）：同一个集合里
+    可能有**只差几像素的两层**（实测「左上平台」里既有一条 -204、又有一条 -208），
+    "最近"会挑中绳端**下方**那条 ⇒ 判据比用户要的松 ✗。用户要的是 `y <= -208` ✓。
+
+    找不到（集合里没有 foothold / 本图没有这些 id）⇒ None ⇒ 调用方退回几何兜底。
+    """
+    ids = set(str(v) for v in ((z.sets.get(dst_set) or {}).get("footholds") or []))
+    if not ids:
+        return None
+    y_top, y_bot = min(L.y1, L.y2), max(L.y1, L.y2)
+    cand = []
+    for f in terrain.footholds:
+        if f.is_wall or str(f.fid) not in ids:
+            continue
+        cand.append(float(f.y_at((f.x1 + f.x2) / 2.0)))
+    if not cand:
+        return None
+    if direction >= 0:                            # 向上：绳端之上的那些面，取最靠下的
+        up = [y for y in cand if y <= y_top]
+        return max(up) if up else min(cand, key=lambda y: abs(y - y_top))
+    dn = [y for y in cand if y >= y_bot]          # 向下：对称
+    return min(dn) if dn else min(cand, key=lambda y: abs(y - y_bot))

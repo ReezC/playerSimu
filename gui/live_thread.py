@@ -99,6 +99,37 @@ def lag_watchdog(med_ms, now, state):
     return _lag_text(med_ms, now - state[0], state[1]), False
 
 
+#: 判"这一段卡在谁身上"的余量系数：本机一拍花的时间还不到**输入帧间隔**的这个比例，
+#: 就说明本机有富余 —— 帧少是上游给的少（A 机 / 推流），不是我们算不动。
+LIMIT_SLACK = 0.5
+
+
+def limit_reason(recv_fps, proc_fps, infer_ms, gap_ms):
+    """这一段的吞吐卡在谁身上 → `"input"` / `"self"` / `""`（**纯函数**，便于自检）。
+
+    **为什么需要它**（2026-09-26 查性能时发现的坑）：状态行上「输入 fps」和「处理 fps」
+    是两个计数器（读线程**收到**的 / 主回路**取走**的），可只要没怎么丢帧，它们就
+    **必然几乎相等**（差的就是那几个丢帧）—— 于是"处理速度掉到 20"看着像 B 机算不动，
+    实际常常是 A 机那边只推了 20。只看这两个数会把人引去查错机器。
+
+    实测佐证（perf.log 最慢那段）：`gap_ms` 中位 29.6ms（≈34fps）而 `infer_ms` 才 24ms，
+    本机 30fps 都还有余量 ⇒ 是输入先降下来的。所以判据用**输入间隔**和**本机耗时**比，
+    而不是用那两个必然相等的 fps。
+
+    三种结论：
+      · `"self"`  收到了却没处理完（proc 明显小于 recv，丢帧在涨）⇒ 本机跟不上；
+      · `"input"` 本机一拍只花 infer_ms，却隔 gap_ms 才等到一帧 ⇒ 上游给的少；
+      · `""`      说不清（两个都慢、或压根还没数）—— **宁可不指方向，也别指错**。
+    """
+    if not recv_fps or not proc_fps:
+        return ""
+    if proc_fps < recv_fps * 0.9:
+        return "self"
+    if infer_ms and gap_ms and infer_ms < gap_ms * LIMIT_SLACK:
+        return "input"
+    return ""
+
+
 #: 本机负载清点的间隔（秒）。
 #: 为什么要有：训练/并行标注与实时预览同时跑的时候，`infer_ms` 会**与输入尺寸
 #: 无关地**整体变慢（同一份配置实测 10.0 → 23.7 ms），而 GPU 时钟、功耗都正常。
@@ -1291,6 +1322,12 @@ class LiveThread(QThread):
                     perf.flush()        # 到点（默认 30 秒）落一段到 perf.log
                     el = now - t_start
                     gaps_recent = gaps[-60:]
+                    # 「卡在谁身上」要在报之前算出来：输入/处理两个 fps 在不丢帧时
+                    # 必然相等（见 limit_reason），得靠**输入间隔**和**本机耗时**比。
+                    _infer_med = (sorted(infer_ms)[len(infer_ms) // 2]
+                                  if infer_ms else 0.0)
+                    _gap_med = (sorted(gaps_recent)[len(gaps_recent) // 2]
+                                if gaps_recent else 0.0)
                     _med_delay = (sorted(delays)[len(delays) // 2]
                                   if delays else None)
                     _lag_warn, _lag_fresh = lag_watchdog(_med_delay, now,
@@ -1329,7 +1366,10 @@ class LiveThread(QThread):
                         # 我们实际处理了多少帧 —— 两个数差得越多，说明丢帧越多
                         "proc_fps": n / el if el > 0 else 0.0,
                         "dropped": slot.dropped,
-                        "infer_ms": sorted(infer_ms)[len(infer_ms) // 2] if infer_ms else 0.0,
+                        "infer_ms": _infer_med,
+                        # 输入帧间隔中位 + "这一段卡在谁身上"（面板据此贴一句提示）
+                        "gap_med": _gap_med,
+                        "limit": limit_reason(_recv_w, _proc_w, _infer_med, _gap_med),
                         "delay_ms": _med_delay,
                         # 积压锁死：短句上状态行（最高优先级）、明细进 tooltip
                         "lag_warn": _lag_warn,

@@ -26,17 +26,24 @@ def _bgr_to_pixmap(img):
     """numpy BGR → QPixmap。
 
     三个坑（都是真实踩过的）：
-      1. 必须 copy()：QImage 只引用那段内存不持有所有权，numpy 数组一回收，
-         界面拿到野指针 → 花屏或崩溃。
+      1. QImage 只引用那段内存、**不持有所有权** ⇒ 它引的那段必须在
+         `fromImage` 期间活着；`data` 是本函数的局部变量，够用。
+         ⚠ 曾经还有一次 `qimg.copy()`（怕 numpy 数组被回收）—— 那是多余的：
+         保活的是 `data`，而 `fromImage` 会立刻把像素拷进 QPixmap。
+         1920×1080 实测：去掉它 **9.43 → 7.02 ms/帧**（30fps 下每秒省 72ms，
+         而这笔开销跑在 **GUI 主线程**上 ⇒ 直接少抢推理的 CPU）。
       2. to_ndarray(bgr24) 返回的帧带行 padding（非连续，stride 比 3*w 大），
          QImage 按 3*w 读会整幅错位 —— 先 ascontiguousarray 去掉 padding。
+         ⚠ 别改成"直接 tobytes + 3*w"：那样**更慢**（实测 7.02 → 14.77 ms/帧，
+         跨步拷贝走的是逐行通用路径），仍然要 ascontiguousarray。
       3. numpy 的 .data 在新版返回 memoryview，PyQt5 的 QImage 不认它，
          要用 tobytes() 拿 bytes 再构造。
     """
     img = np.ascontiguousarray(img)
     h, w, ch = img.shape
-    qimg = QImage(img.tobytes(), w, h, img.strides[0], QImage.Format_BGR888)
-    return QPixmap.fromImage(qimg.copy())
+    data = img.tobytes()
+    qimg = QImage(data, w, h, img.strides[0], QImage.Format_BGR888)
+    return QPixmap.fromImage(qimg)
 
 
 class LiveFrameRegionClient:
@@ -1173,13 +1180,18 @@ class LivePanel(QWidget):
         # 绘制那一段单独报：「显示 fps」只说明**推**了多少，看不出主线程画得
         # 动不动 —— 而"失焦就卡"恰恰卡在这里（合并丢弃的帧数一涨，就说明主线程
         # 跟不上推送、开始在丢中间帧；不丢帧时界面才不会滞后）。
+        # 「卡在谁身上」（2026-09-26）：输入/处理两个数在**不丢帧时必然相等** ⇒
+        # "处理速度掉到 20"看着像 B 机算不动，其实常常是 A 机只推了 20。判据在
+        # `live_thread.limit_reason`（纯函数、有自检）：说不清时**不贴标签**。
+        _limit_txt = {"input": "　⚠ 受 A 机推流限制",
+                      "self": "　⚠ 本机算不过来"}.get(s.get("limit") or "", "")
         self.lbl_stats.setText(
             "%s%s ｜ 输入 %5.1f fps ｜ 处理 %5.1f fps ｜ 丢帧 %d ｜ 推理 %5.1f ms ｜ "
-            "显示 %4.1f fps ｜ 绘制 %4.1f ms 合并丢弃 %d ｜ 检出 %d ｜ %d×%d"
+            "显示 %4.1f fps ｜ 绘制 %4.1f ms 合并丢弃 %d ｜ 检出 %d ｜ %d×%d%s"
             % (head, d_txt, s.get("recv_fps", 0), s.get("proc_fps", 0),
                s.get("dropped", 0), s.get("infer_ms", 0), s.get("show_fps", 0),
                self._draw_ms, self._disp_merged,
-               s.get("boxes", 0), w, h))
+               s.get("boxes", 0), w, h, _limit_txt))
 
     def _on_stream_status(self, status):
         if status == "waiting":

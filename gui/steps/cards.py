@@ -1445,6 +1445,17 @@ def _ver_label(path):
 class TrainCard(StepCard):
     def __init__(self):
         super().__init__(7, "train", "训练", hint="训练 YOLO 检测器，每轮指标实时刷新")
+        # 「查看报告」（2026-09-26 用户要求）：把**本项目所有权重**和每版的评估 + 建议
+        # 放进一个弹窗（原来那段建议直接贴在结果区，占地方、也只能看最新一版）。
+        # 卡片只负责开窗 —— 权重枚举（`_model_files`）与建议文字（`perception.metrics`）
+        # 都在外面，各自能脱离 Qt 自检。
+        foot = self.layout().itemAt(self.layout().count() - 1).layout()
+        self.btn_report = QPushButton("查看报告")
+        self.btn_report.setToolTip(
+            "看本项目训练过的每一个权重：点左边一版，右边说它这一版读到什么、"
+            "下一步做什么。")
+        self.btn_report.clicked.connect(self._open_report)
+        foot.addWidget(self.btn_report)
 
     def build_params(self, form):
         self.field(form, "model", "基础权重", "str", "yolo26n.pt")
@@ -1483,6 +1494,14 @@ class TrainCard(StepCard):
         p.sec("train").update(
             self.values(["model", "epochs", "imgsz", "batch", "device"]))
 
+    def _open_report(self):
+        """开「训练报告」弹窗（懒导入：弹窗不该在卡片模块里被 import 进来）。"""
+        if self.project is None:
+            self.set_result("先选一个项目")
+            return
+        from gui.train_report import TrainReportDialog
+        TrainReportDialog(self.project, parent=self).exec_()
+
     def summarize(self, p):
         """最新一版的指标 + 历次版本 mAP50（全部从产物读，不靠记忆）。"""
         vs = _run_dirs(p)
@@ -1498,6 +1517,9 @@ class TrainCard(StepCard):
             pm = (vs[1][3] or {}).get("metrics") or {}
             if m.get("map50") is not None and pm.get("map50") is not None:
                 line1 += "（比 %s %+.3f）" % (vs[1][1], m["map50"] - pm["map50"])
+        # ⚠ **通俗评估 + 建议已经移到「查看报告」弹窗里**（2026-09-26 用户要求"移位"）：
+        # 它要按权重**逐个**翻看，贴在结果区既占地方、又只能看到最新那一版。
+        # 数据仍是同一份（`runs/detect_vN/run.json`）⇒ 卡片摘要和弹窗不会两处对不上。
         return line1 + "\n历次 mAP50：%s" % " · ".join(self._hist_bits(vs))
 
     @staticmethod
