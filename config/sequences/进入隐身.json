@@ -1,0 +1,65 @@
+{
+  "format": "playerSimu.sequence",
+  "version": 1,
+  "name": "进入隐身",
+  "saved_at": "2026-09-26 18:28:48",
+  "_note": "「行为编辑器 → 保存」写出来的预设；改完文本可以直接加载回来。",
+  "seq": [
+    {
+      "type": "down",
+      "key": "隐身术"
+    },
+    {
+      "type": "up",
+      "key": "隐身术"
+    },
+    {
+      "type": "delay",
+      "ms": 1000
+    },
+    {
+      "type": "down",
+      "key": "隐身术"
+    },
+    {
+      "type": "up",
+      "key": "隐身术"
+    },
+    {
+      "type": "delay",
+      "ms": 1000
+    },
+    {
+      "type": "down",
+      "key": "隐身术"
+    },
+    {
+      "type": "up",
+      "key": "隐身术"
+    },
+    {
+      "type": "delay",
+      "ms": 160000
+    },
+    {
+      "type": "down",
+      "key": "普攻"
+    },
+    {
+      "type": "up",
+      "key": "普攻"
+    },
+    {
+      "type": "delay",
+      "ms": 200
+    },
+    {
+      "type": "down",
+      "key": "隐身术"
+    },
+    {
+      "type": "up",
+      "key": "隐身术"
+    }
+  ]
+}

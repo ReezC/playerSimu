@@ -176,6 +176,40 @@ class MiniMapClient:
         return (len(ts) - 1) / span
 
 
+def offset_of(calib):
+    """从**标定字典**里读「坐标系偏移」→ `(x, y)`（没有 / 坏了给 `(0, 0)`）。
+
+    ⚠ **口径**（2026-09-26 用户澄清，**别搞反**）：`定位结果 + 这个偏移` 才是玩家的
+    **真实世界坐标** —— 那正是**游戏自己的世界坐标系**。地形数据（`core/mapdata` 的
+    foothold / ladder 的 x、y）**本来就在这个系里**（例：105090600 的 fh44 地形 y=-208，
+    它的世界 y 就是 -208）。⇒ 判据里拿玩家读数与地形坐标比大小是**直接比**，
+    **不要**给地形坐标再加偏移（我犯过这个错：把"到达目标平台面"从 -208 放宽成 -175 ✗）。
+    这个偏移修的是"黄点重心 ↔ 玩家原点"那层对应，不是坐标系换算。
+    """
+    v = (calib or {}).get("world_offset") or []
+    if len(v) == 2:
+        try:
+            return (float(v[0]), float(v[1]))
+        except (TypeError, ValueError):
+            pass
+    return (0.0, 0.0)
+
+
+def world_offset(map_id, src=None):
+    """某张图 + 某个来源的「坐标系偏移」（见 `offset_of` 的口径说明）。
+
+    ⚠ `src` 的默认值**不能在签名里写成 `SRC_STREAM`**：这几个常量定义在本文件靠后的
+    位置，默认值在 `def` 那一刻就要取值 ⇒ 会直接 `NameError`（写这条时就是这么炸的 ✗）。
+    所以这里 `src=None`，调用时再兜底。
+    """
+    if not map_id:
+        return (0.0, 0.0)
+    try:
+        return offset_of(mapdata.load_calib(map_id, src or SRC_STREAM))
+    except Exception:                                # noqa: BLE001
+        return (0.0, 0.0)
+
+
 def _recv_exact(sock, n):
     """读满 n 字节。**对端关闭**返回 None；**超时照原样往上抛**（别吞）。
 
@@ -1000,13 +1034,7 @@ class PlayerLocator:
         和 `scale/offset/view/alpha` 同一份（每张图、每个来源各自一套 ✓）。
         直接读 `calib`（调用方已经按来源取好了），所以面板和实时线程天然一致。
         """
-        v = (calib or {}).get("world_offset") or []
-        if len(v) == 2:
-            try:
-                return (float(v[0]), float(v[1]))
-            except (TypeError, ValueError):
-                pass
-        return (0.0, 0.0)
+        return offset_of(calib)
 
     def update(self, panel, src=None, calib=None, terrain=None):
         """面板画面（BGR）→ 定位结论 dict。

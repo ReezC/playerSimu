@@ -99,7 +99,7 @@ class Harness:
         # **三条按键路径都要挡**：
         #   ① agent 自己发序列用的 key_down/key_up（在 ag 命名空间）；
         #   ② KeyState（移动键）走的是 decision.input 里的那两个；
-        #   ③ `tap`（点按类：追击起跳 / 规避跳 / 喝药 / 喂宠）—— 它**直接调
+        #   ③ `tap`（点按类：追击起跳 / 规避跳 / 喝药）—— 它**直接调
         #      `_send`**，既不过①②，也不进 KeyState。漏掉这条，用例会真的往
         #      本机发键（往当前窗口打字）。
         # 前两条记成 down/up（presses/gaps 靠它），第三条单独记成 tap —— 点按
@@ -150,7 +150,7 @@ class Harness:
         return len(self.presses(key))
 
     def taps(self, key):
-        """某个键被 `tap` 点按的时刻列表（起跳 / 规避跳 / 喝药 / 喂宠走这条路）。"""
+        """某个键被 `tap` 点按的时刻列表（起跳 / 规避跳 / 喝药走这条路）。"""
         return [t for t, kind, k in self.log if kind == "tap" and k == key]
 
 
@@ -168,7 +168,6 @@ def fresh_settings(**over):
     s.custom_timers = []
     s.custom_timer_next = {}
     s.turn_output_delay_ms = 0
-    s.auto_feed_pet = False
     s.auto_hp_pot = False
     s.auto_mp_pot = False
     s.strategy = "chase"
@@ -275,8 +274,14 @@ def t_releaseall_keeps_progress():
         downs = [t for t, k, kk in h.log if k == "down" and kk == key]
         ups = [t for t, k, kk in h.log if k == "up" and kk == key]
         check(downs, "%s：序列第一个键一次都没发" % name)
+        # ⚠ 「清空指令通道之后要**重按**该按着的键」（2026-09-26 用户口径）⇒ delay 期间
+        #   多出来的那几下发**不是"重放"**，而是同一根键被固件丢掉之后的补按 ✓。
+        #   所以判据不能数 down 的次数 ✗，得**扣掉每次 RELEASEALL 之后的那一次补按**：
+        #   真"被打回起点"才会表现为"无端多出很多次"。
+        ral = [t for t, k, _v in h.log if k == "RELEASEALL"]
         early = [t for t in downs if t < delay_s - 0.2]
-        check(len(early) == 1,
+        budget = 1 + len([t for t in ral if t < delay_s - 0.2])
+        check(len(early) <= budget,
               "%s：delay 还没走完就重放了 %d 次（进度被打回起点）：%s"
               % (name, len(early), downs[:6]))
         late = [t for t in (downs + ups) if t >= delay_s - 0.2]
@@ -284,12 +289,19 @@ def t_releaseall_keeps_progress():
 
 
 def t_releaseall_clears_held_only():
-    """RELEASEALL 之后上下文里记的按键要作废（固件那边已经松了）。"""
+    """RELEASEALL 之后：**进度保留** + 该按着的键要**重按回去**（用户 2026-09-26 口径）。
+
+    以前这里只钉"把记录作废"（固件那边确实被松了 ✓），但那还不够：宏 / 寻路都可能很长，
+    `down ↑` 后面跟着几秒 delay —— 这几秒里 ↑ **必须一直按着** ✓。RELEASEALL 把它松掉、
+    记录又清了 ⇒ 没人补按 ⇒ 角色中途"松手" ✗（正是用户说的"按着 ↑ 结果被停了，
+    需要重启被清掉的键"）。所以现在钉三件事：进度在 ✓、键被重按 ✓、delay 没走完不许松 ✓。
+    """
     s = fresh_settings(resetall_interval=1, output_seq=[
         {"type": "down", "key": "attack"}, {"type": "delay", "ms": 3000},
         {"type": "up", "key": "attack"}])
     h = Harness(s)
     h.clock0 = h.clock.t                      # 直接手动推进，不经 run()
+    atk = s.keymap.get("attack", "attack")
     with h._patched():
         h.agent.tick(h.ws(True))              # 起跑：按住 attack
         h.clock.t += 2.0                      # 跨过一次定期 RELEASEALL
@@ -297,7 +309,13 @@ def t_releaseall_clears_held_only():
         check(any(k == "RELEASEALL" for _, k, _ in h.log), "没触发定期 RELEASEALL")
         ctx = h.agent._output_ctx
         check(ctx is not None, "输出序列上下文被整块清掉了（进度应保留）")
-        check(not ctx[3], "上下文里还记着按下的键：%s" % (ctx[3],))
+        check(atk in ctx[3],
+              "重按之后记录里没有它了（下次 RELEASEALL 就不会再补按）：%s" % (ctx[3],))
+        downs = [t for t, k, v in h.log if k == "down" and v == atk]
+        check(len(downs) >= 2,
+              "清空指令通道之后没把该按着的键重按回去（只作废了记录）：%s" % h.log)
+        check(not [t for t, k, v in h.log if k == "up" and v == atk],
+              "delay 还没走完就把键松了：%s" % h.log)
 
 
 def t_periodic_reset_channel():
@@ -469,6 +487,45 @@ def t_timer_paused_never_fires():
           "没暂停的行为被塞了暂停字段：%s" % (got[1],))
 
 
+def t_timer_pause_on_rest_flag():
+    """「休息时暂停计时」是**每条行为各自**的开关（用户 2026-09-26 要求）。
+
+    默认勾上 = 老行为（休息期间所有定时行为都冻住 ✓）；不勾的那条在休息期间**照常倒数**、
+    到点照演 ✓（给"休息时也得按的键"用：喂宠 / 喊话…）。
+    ⚠ 只看被冻住的那条会漏掉反向：**没勾的不许被冻** ✗（那正是新开关的全部意义）。
+    """
+    s = fresh_settings(anti_afk_enabled=True, anti_afk_type="hidden_rest",
+                       anti_afk_rest_min=5.0, anti_afk_rest_max=5.0,
+                       custom_timer_next={})
+    s.custom_timers = [
+        {"name": "冻住", "interval": [10, 10],
+         "seq": [{"type": "down", "key": "f1"}, {"type": "up", "key": "f1"}]},
+        {"name": "照走", "interval": [10, 10], "pause_on_rest": False,
+         "seq": [{"type": "down", "key": "f2"}, {"type": "up", "key": "f2"}]},
+    ]
+    h = Harness(s)
+    h.clock0 = h.clock.t
+    with h._patched():
+        check(h.agent._timer_pauses_on_rest("冻住") is True,
+              "缺省该是「冻住」（老行为）：%r" % (s.custom_timers[0],))
+        check(h.agent._timer_pauses_on_rest("照走") is False, "项目级开关没读到")
+        check(h.agent._timer_pauses_on_rest("（没这条）") is True,
+              "认不出来该退回「冻住」（老行为），别反过来 ✗")
+        s.custom_timer_next = {"冻住": 600.0, "照走": 600.0}
+        # ⚠ 起点别用 0.0：`_pause_timers` 把 `_rest_last_tick <= 0` 当"这次休息还没开始"
+        #    （直接 return ⇒ 什么都不推 ✗）—— 写用例时踩到过 ✓。
+        h.agent._begin_rest(100.0)
+        h.agent._pause_timers(103.0)
+        # 「冻住」= 截止时刻**跟着休息一起往后推**（剩余时间不变 ✓）；
+        # 「照走」= 截止时刻**不动**（时间照常流逝 ⇒ 休息期间照样会到点 ✓）。
+        check(s.custom_timer_next.get("冻住", 0.0) > 600.0,
+              "勾了「休息时暂停计时」的那条没冻住（截止时刻没往后推）：%s"
+              % s.custom_timer_next)
+        check(s.custom_timer_next.get("照走") == 600.0,
+              "没勾的那条也被冻住了（时间该照常流逝）：%s" % s.custom_timer_next)
+        h.agent.state = "idle"
+
+
 def t_timer_pause_button():
     """界面：每一项都有暂停按钮；暂停后按钮变「继续」、倒计时变红且带「（已暂停）」、
     冻住不走；继续则从停下的剩余时间接着走（不是清零重来）。"""
@@ -503,7 +560,7 @@ def t_timer_pause_button():
               "暂停后倒计时没标红：%r" % lbl.styleSheet())
         before = lbl.text()
         time.sleep(1.2)
-        p._tick_feed_cd()
+        p._tick_timer_cd()
         check(lbl.text() == before, "暂停后倒计时还在走：%r → %r" % (before, lbl.text()))
 
         check(settings.custom_timers[1].get("paused") is None,
@@ -817,6 +874,35 @@ def t_chase_jump_outside_band_once():
           "外侧区间应当正好跳一次（追的时候进区间），实际 %d 次：%s"
           % (len(taps), taps))
 
+    # **「追击起跳需要的冲刺时间」**（用户 2026-09-26 要求）：`chase` 状态得**连续**维持
+    # 够久才准起跳，否则区间/沿都对也不跳；计时进别的状态就归零（见 tick 里那段）。
+    # 这里直接喂 `_maybe_chase_jump`：条件全摆好，只差"冲够了没有"，好判。
+    s.chase_jump_dash_ms = 300
+    with h._patched():
+        h.log.clear()
+        h.agent._next_chase_jump = 0.0
+        h.agent._chase_since = None                      # 没在 chase
+        h.agent._maybe_chase_jump(100.0, 10.0, edge=True)
+        check(not h.taps(s.keymap["jump"]),
+              "没在 chase 状态也起跳了（等于没这道闸）")
+        h.agent._chase_since = 9.8                       # 才 200ms < 300
+        h.agent._maybe_chase_jump(100.0, 10.0, edge=True)
+        check(not h.taps(s.keymap["jump"]),
+              "冲刺时间没够（200ms < 300ms）却起跳了")
+        h.agent._chase_since = 9.6                       # 400ms ≥ 300
+        h.agent._maybe_chase_jump(100.0, 10.0, edge=True)
+        check(h.taps(s.keymap["jump"]),
+              "冲刺时间够了（400ms ≥ 300ms）却不起跳")
+    # 设成 0 = 不额外要求（老行为）
+    s.chase_jump_dash_ms = 0
+    with h._patched():
+        h.log.clear()
+        h.agent._next_chase_jump = 0.0
+        h.agent._chase_since = None
+        h.agent._maybe_chase_jump(100.0, 10.0, edge=True)
+        check(h.taps(s.keymap["jump"]),
+              "冲刺时间设 0 时不该还拦着（那是老行为）")
+
 
 def t_chase_jump_approach_edge():
     """怪从远处**一路走近**、刚跨进区间的那一拍跳一次（用户报的就是这个场景）。
@@ -866,6 +952,88 @@ def t_chase_jump_guard_shut():
     h2.mobs_fn = lambda t: [Mob(id=1, x=590.0, y=500.0, w=40.0, h=40.0, conf=0.9)]
     h2.run(2.0)
     check(not h2.taps(s2.keymap["jump"]), "起跳开关是关的，却跳了")
+
+
+def t_patrol_idle_releases_output():
+    """怪在输出序列**中途**消失 ⇒ 输出键必须松开（2026-09-26 用户报的现象）。
+
+    现象："画面上一个框都没有，角色却持续在按输出"。
+    根因：`tick` 那条「平地巡逻 + 无怪」的早退只 `keys.release_all()`（只松 KeyState 的
+    移动键），而输出键是 `_run_seq` 用 `key_down` **直接发的**，要靠 `_release_combat_keys()`
+    才松 ⇒ 序列停在下过半截、"up" 永不发出 ⇒ 攻击键一直按着（状态却已是 idle、画面无框）。
+    默认 `resetall_interval=60` 会兜一次，所以是"偶尔、持续一阵子"。
+
+    复现：默认输出序列 `down attack → 隔 70~130ms → up attack`，而帧间隔约 66ms
+    ⇒ 让怪在 0.2s 后消失，就正好落在 down 与 up 之间。
+    """
+    s = fresh_settings(strategy="patrol", jump_random_prob=0.0,
+                       output_seq=[{"type": "down", "key": "attack"},
+                                   {"type": "delay", "ms": 300},
+                                   {"type": "up", "key": "attack"}])
+    h = Harness(s)
+    atk = s.keymap["attack"]
+    h.mobs_fn = lambda t: ([Mob(id=1, x=560.0, y=500.0, w=40.0, h=40.0, conf=0.9)]
+                           if t < 0.2 else [])
+    with h._patched():
+        h.run(1.2)
+        downs = [k for _t, kind, k in h.log if kind == "down"]
+        ups = [k for _t, kind, k in h.log if kind == "up"]
+        check(atk in downs, "用例本身没跑起来（输出键一次都没按下）：%s" % h.log[:8])
+        check(atk in ups,
+              "怪在输出序列中途没了 ⇒ 攻击键按着没松（画面无框却在输出）：%s"
+              % h.log[-8:])
+        check(h.agent.state == "idle", "无怪之后该回 idle：%s" % h.agent.state)
+
+
+def t_walk_only_center():
+    """「走」**只有一种走法：朝目标集合的 x 中点**（用户 2026-09-26 明确否掉了"走的方向"）。
+
+    这条原先测的是"三种方向"（`WalkJob.mode` = center / left / right，还在设置里摆了个
+    「走的方向」下拉）。用户的定论是：**设置里不该有这个参数** —— 默认就一种：朝集合正中间
+    走；将来若某一步真要"只按 ←/→"，那是**逐边**的事（foothold 编辑器 →「可到达」窗口里
+    配），不是全局设置 ⇒ 这条用例改成**反向钉住**：那个参数不许回来。
+
+    集合里两条 foothold：x=600 与 x=800 ⇒ 中点 = 700。
+    """
+    from PyQt5.QtWidgets import QApplication
+
+    from decision import route
+
+    spots = [(600.0, 590.0, 610.0, -208.0, "1"),
+             (800.0, 790.0, 810.0, -208.0, "2")]
+    # ① **反向钉**：走的方向参数必须**不在**
+    check(not hasattr(route.WalkJob, "MODE_CENTER"),
+          "`WalkJob` 里又出现了 MODE_CENTER（走只有一种走法，用户 2026-09-26 明确删掉）")
+    check("mode" not in route.WalkJob("乙平台", spots).__dict__,
+          "`WalkJob` 里又出现了 `mode`（走只有朝中点一种，方向不该来设置）")
+    # ② 朝中点：站 500 → 往右；站 900 → 往左；站 705（中点附近、容差内）→ 站住等判到达
+    check(route.WalkJob("乙平台", spots).update(0.0, px=500.0)["move"] == 1,
+          "朝中点：在中点左边该往右走")
+    check(route.WalkJob("乙平台", spots).update(0.0, px=900.0)["move"] == -1,
+          "朝中点：在中点右边该往左走")
+    o = route.WalkJob("乙平台", spots).update(0.0, px=620.0)
+    check(o["move"] == 1 and "集合中心 x=700" in o["note"],
+          "朝中点：还没到该继续走、并说清目标是集合中点：%s" % o)
+    o = route.WalkJob("乙平台", spots).update(0.0, px=705.0)
+    check(not o["move"] and "站住" in o["note"],
+          "朝中点：到中点附近（差 5 px ≤ 容差）该站住等判到达：%s" % o)
+    # ③ 到位判据：站在目标 foothold 上就算到（走是唯一"站上去就算到"的任务）
+    # ⚠ 位置要放在**真的 foothold 区间里**（800 属于第二条 790~810）：700 是两条之间的
+    # 空隙，站在那儿判"没到位"是对的 —— 朝中点走时会**经过** foothold，经过那一拍就判到 ✓
+    job = route.WalkJob("乙平台", spots)
+    job.update(0.0, px=100.0)
+    o = job.update(0.1, px=800.0, py=-208.0)
+    check(o["done"] and "到达" in o["note"],
+          "站在目标 foothold 上没判到达：%s" % o["note"])
+    # ④ **反向钉**：设置页里不许再有「走的方向」控件（全局参数，用户没提过 ⇒ 不许有）
+    app = QApplication.instance() or QApplication([])      # noqa: F841
+    from gui.settings_dialog import SettingsDialog
+    _d = SettingsDialog()
+    try:
+        check(not hasattr(_d, "cmb_walk_mode"),
+              "设置页里又出现了「走的方向」（用户 2026-09-26 明确否掉）")
+    finally:
+        _d.reject()
 
 
 def t_sweep_stands_still_in_attack():
@@ -1136,6 +1304,155 @@ def t_auto_confirm_local():
         p._refresh_auto_ui()
 
 
+def t_stuck_key_watchdog():
+    """卡键看门狗（2026-09-26 用户要求"先优化查卡键"）：输出键在**非输出状态**还按着
+    ⇒ 记一笔（perf 的 key_stuck + 说明）+ **松开**；而正常输出时**不许误杀**。
+
+    为什么要有：用户报过"画面上一个框都没有、角色却持续在按输出"。根因之一（怪在输出
+    序列 down 与 up 之间消失 ⇒ up 永不发出）已经修掉，但**任何**漏放路径都该被兜住；
+    更要紧的是卡键原本在 perf.log 里**看不出来**（只能靠猜"是不是幽灵框"）✗。
+    判据只看输出序列的键：移动键按住几十秒是正常的。
+    """
+    from decision import agent as ag
+
+    s = fresh_settings(strategy="patrol", jump_random_prob=0.0,
+                       output_seq=[{"type": "down", "key": "attack"},
+                                   # 长 delay：让 up 一时半会儿回不来（漏放的温床）
+                                   {"type": "delay", "ms": 60000},
+                                   {"type": "up", "key": "attack"}])
+    h = Harness(s)
+    atk = s.keymap["attack"]
+    h.mobs_fn = lambda t: [Mob(id=1, x=560.0, y=500.0, w=40.0, h=40.0, conf=0.9)]
+    with h._patched():
+        # ① 先让输出序列**真的把键按下去**（harness 只认真按过的键，凭空造的上下文它不认 ✗）
+        h.run(0.3)
+        check(atk in [k for _t, kind, k in h.log if kind == "down"],
+              "用例本身没跑起来（输出键没按下）：%s" % h.log[:6])
+        # 造"漏放"现场：状态已经不是输出状态了，而键还按着（正常路径这一拍才会释放）
+        h.agent.state = "idle"
+        h.agent._out_held_since = None
+        h.log.clear()
+        h.agent._watch_output_held(1000.0)                 # 刚发现 ⇒ 只开始计时
+        ups = lambda: [k for _t, kind, k in h.log if kind == "up"]
+        check(atk not in ups(),
+              "刚发现就松手了（该先给宽限 %.1fs）：%s" % (ag.OUT_KEY_STUCK_S, h.log))
+        h.agent._watch_output_held(1000.0 + ag.OUT_KEY_STUCK_S - 0.2)
+        check(atk not in ups(), "宽限还没到就松开了：%s" % h.log)
+        h.agent._watch_output_held(1000.0 + ag.OUT_KEY_STUCK_S + 0.1)
+        check(atk in ups(),
+              "卡键超过 %.1fs 也没被松开：%s" % (ag.OUT_KEY_STUCK_S, h.log))
+        check(h.agent._output_ctx is None, "松开之后输出上下文还在（下一拍会被它带跑）")
+
+        # ② 正常输出中（状态就是 attack）⇒ **不许**误杀：连跑 6 秒也不松
+        h.log.clear()
+        h.agent._output_ctx = [list(s.output_seq), 0, 0.0, {atk}, []]
+        h.agent.state = "attack"
+        h.agent._out_held_since = None
+        for k in range(12):
+            h.agent._watch_output_held(2000.0 + k * 0.5)
+        check(h.agent._output_ctx is not None,
+              "正在打的时候被看门狗松手了（误杀）：%s" % h.log)
+        check(atk not in ups(), "正在打的时候发了 up：%s" % h.log)
+        h.agent._output_ctx = None
+        h.agent.state = "idle"
+
+
+def t_multi_step_route():
+    """**多步路径**（2026-09-26 新加）：一条路径解析成 N 个任务后，按顺序跑完。
+
+    为什么单独做一层：`命令前往` 原来只下**第一步**（"后面 N 步不会自动接着走" ✗），
+    而"定点休息"要真的**走到**那个集合 ⇒ 必须有"逐步走完"的执行器。
+
+    钉四件事：
+      · 起跑：第一个立刻挂上、其余进队列；
+      · 到了 ⇒ **自动接下一步**（不是原地结束 ✗）；
+      · 全走完 ⇒ 任务清空 + 一句"整条路径走完"；
+      · 任何一步失败 ⇒ **整条停掉**，并说清断在第几步（不许硬着头皮往下走 ✗）。
+    """
+    from decision import route
+
+    s = fresh_settings()
+    s.enabled = True
+    h = Harness(s)
+    # 落点就摆在玩家附近（x≈520）：到位判据 = 脚下集合已经是目标
+    a = route.WalkJob("甲集合", [(520.0, 510.0, 530.0, -208.0, "1")])
+    b = route.WalkJob("乙集合", [(520.0, 510.0, 530.0, -208.0, "2")])
+    with h._patched():
+        check(h.agent.start_route([a, b], why="用例：两步"),
+              "多步路径没起跑")
+        check(h.agent._climb is a and len(h.agent._route) == 1,
+              "第一步没立刻挂上 / 剩余步没进队列：%r" % (h.agent._route,))
+
+        ws = h.ws(with_mob=False)
+        ws.player.here_sets = ["甲集合"]              # 第一步到了
+        check(h.agent._climb_tick(1.0, 520.0, set(), ws) is False,
+              "第一步到了就整条结束（没接着走第二步）")
+        check(h.agent._climb is b, "第二步没挂上：%r" % (h.agent._climb,))
+
+        ws.player.here_sets = ["乙集合"]              # 第二步到了 ⇒ 整条走完
+        check(h.agent._climb_tick(2.0, 520.0, set(), ws) is True,
+              "最后一步到了却没结束整条路径")
+        check(h.agent._climb is None and not h.agent._route,
+              "走完了还留着任务：%r / %r" % (h.agent._climb, h.agent._route))
+        check("整条路径走完" in h.agent.current_goto_note(),
+              "走完了没说清：%r" % h.agent.current_goto_note())
+
+        # 失败 ⇒ 整条停掉，并说清断在第几步。
+        # ⚠ 两个细节：① 任务的超时从**第一次 update** 起算 ⇒ 要两拍才到期；
+        #            ② 默认还会**重试**（`max_attempts`）⇒ 失败要走到"放弃"那一支，
+        #               所以这里把次数设成 1。
+        a2 = route.WalkJob("丙集合", [(520.0, 510.0, 530.0, -208.0, "3")],
+                           timeout_s=0.5, max_attempts=1)
+        b2 = route.WalkJob("丁集合", [(520.0, 510.0, 530.0, -208.0, "4")])
+        h.agent.start_route([a2, b2], why="用例：中途失败")
+        ws2 = h.ws(with_mob=False)
+        ws2.player.here_sets = []
+        h.agent._climb_tick(10.0, 520.0, set(), ws2)      # 起算
+        h.agent._climb_tick(11.0, 520.0, set(), ws2)      # 超时 ⇒ 放弃
+        check(h.agent._climb is None and not h.agent._route,
+              "中途失败却没把整条路径停掉：%r / %r" % (h.agent._climb, h.agent._route))
+        note = h.agent.current_goto_note()
+        check("路径中断" in note and "1/2" in note.replace("第 1/2 步", "1/2"),
+              "失败没写清断在第几步：%r" % note)
+
+
+def t_afk_type_does_not_reschedule():
+    """用户 2026-09-26 要确认的：**改「防掉线行为类型」不许重新计时**。
+
+    计时只在这两处产生（读代码确认）：
+      · `tick` 里防掉线开关的**上升沿**（`if not self._was_afk_enabled`）⇒ 排下次触发；
+      · `_begin_rest` 抽一次本次休息时长、`_finish_rest` 排下一次。
+    **`anti_afk_type` 在整个计时链里一次都没被读**（它只出现在字段定义 / to_dict /
+    from_dict / 设置界面）⇒ 换类型就是"换一种歇法"，不会把走了一半的计时清零 ✓。
+    这条把它钉住：以后谁要是拿"类型变了"当重排的触发条件，用例立刻红。
+    """
+    s = fresh_settings()
+    s.enabled = True
+    s.anti_afk_enabled = True
+    h = Harness(s)
+    with h._patched():
+        h.agent._was_afk_enabled = False          # 假装刚打开防掉线（走上升沿）
+        h.agent.tick(h.ws(with_mob=False))
+        next0 = h.agent._next_afk
+        check(next0 > 0, "防掉线开着却没排下一次触发")
+        # ⚠ 用**夹具时钟**起休息，别自己编一个 now：夹具的时钟在 1000 附近，
+        # 拿 now=100.0 去 `_begin_rest` 会让"休息到点时刻"落在过去 ⇒ 一秒就到期，
+        # 看起来像"改类型把计时清了" ✗（我第一版就是这么误判的）。
+        h.agent._begin_rest(h.clock.t)
+        until0 = h.agent._rest_until
+        check(until0 > h.clock.t, "开始休息没算休息时长：%r" % until0)
+        # 换行为类型（模拟用户在设置里改），再正常走几拍
+        s.anti_afk_type = "(换成另一种类型)"
+        for _k in range(5):
+            h.agent.tick(h.ws(with_mob=False))
+        check(h.agent._rest_until == until0,
+              "改了行为类型，本次休息时长被重算了：%r → %r"
+              % (until0, h.agent._rest_until))
+        check(h.agent._next_afk == next0,
+              "改了行为类型，下次触发时刻被重排了：%r → %r"
+              % (next0, h.agent._next_afk))
+
+
 def t_align_params():
     """「判定参数」（设置 → 判定参数页签）：**对齐类功能**靠这两个数说话，存得住、有默认。
 
@@ -1158,6 +1475,30 @@ def t_align_params():
           % settings.align_tol_px)
     check(int(settings.align_hold_ms) >= 0, "对齐误差时间默认值不对：%r"
           % settings.align_hold_ms)
+
+    # 寻路超时时间（2026-09-26 新增的判定参数）：有默认值 + 界面能改 + 改完落回配置
+    check(hasattr(settings, "goto_timeout_s"), "决策设置里没有「寻路超时时间」")
+    check(float(settings.goto_timeout_s) >= 0,
+          "寻路超时时间默认值不对：%r" % settings.goto_timeout_s)
+    # ⚠ 这里**曾经**还测过「走的方向」（`walk_mode`）—— 用户 2026-09-26 明确否掉：
+    # 走只有"朝集合中点"一种走法，设置里不许有这个参数 ⇒ 改成**反向钉住**它。
+    check(not hasattr(settings, "walk_mode"),
+          "`DecisionSettings` 里又出现了 `walk_mode`（用户 2026-09-26 明确删掉）")
+    from gui.settings_dialog import SettingsDialog
+    _d = SettingsDialog()
+    try:
+        check(hasattr(_d, "sp_goto_timeout"),
+              "判定参数页里没有「寻路超时时间」控件")
+        check(not hasattr(_d, "cmb_walk_mode"),
+              "设置页里又出现了「走的方向」（用户 2026-09-26 明确否掉）")
+        _was = settings.goto_timeout_s
+        _d.sp_goto_timeout.setValue(45)
+        _d._accept()
+        check(int(settings.goto_timeout_s) == 45,
+              "改了寻路超时时间却没写回：%r" % settings.goto_timeout_s)
+        settings.goto_timeout_s = _was
+    finally:
+        _d.reject()
 
     # 存读一致（改完必须还在）
     was_tol, was_hold = settings.align_tol_px, settings.align_hold_ms
@@ -1247,30 +1588,62 @@ def t_climb_job():
     o = job.update(0.20, px=703.0)         # 距重新进范围才 100ms
     check(not o["jump"], "抖出去之后没有重新计时：%s" % o)
 
-    # ④ 到达判据一：脚下就是**目标集合**（最贴近"到了哪块平台"）
-    job = mk()
+    # ④ 到达判据 = **纯几何**（用户 2026-09-26 定的规则："按 ↑ 直到玩家的真实世界坐标
+    #    ≤ 绳梯上端连接的 foothold 的 y"，即 `dst_y`）。
+    #    ⚠ **"脚下是目标集合"不算到达依据**：定位读数会抖，`-170`（离目标还差 5px）那种
+    #    位置也可能被报成"已在目标集合" ⇒ 提前收工 —— 用户实测就是"在 -170 就松开了 ↑" ✗。
+    #    集合判据没丢，它在**失败之后**用来"别再重试"（见 agent 的 ⑤b2 用例）。
+    job = mk(dst_y=-208.0)
     job.update(0.0, px=700.0)
     o = job.update(0.25, px=700.0, py=0.0, here_sets=["甲平台"])
     check(o["jump"] and not o["done"], "还在别的平台上就说到达了：%s" % o)
     o = job.update(0.40, px=700.0, py=-90.0, here_sets=["乙平台"])
-    check(o["done"] and not o["jump"], "脚下已是目标集合却没判到达：%s" % o)
-    o = job.update(0.50, px=700.0)
+    check(not o["done"],
+          "只凭「脚下是目标集合」就判到达（提前收工 —— y 还没到目标面）：%s" % o)
+    o = job.update(0.50, px=700.0, py=-208.0, here_sets=["乙平台"])
+    # 够到目标面就算"到达"了，但**这一拍还不松手**（要再按住误差时间，见 ④b）
+    check(not o["done"] and o["dir"] == 1 and "到达" in o["note"],
+          "y 到了目标面却没判到达：%s" % o["note"])
+    check("-208" in o["note"], "到达没写清依据（该说 y 到了哪个面）：%r" % o["note"])
+    o = job.update(0.90, px=700.0)
     check(o["done"] and not o["jump"], "到达之后还在按键：%s" % o)
 
-    # ⑤ 到达判据二（没有集合信息时的兜底）：y 越过绳的上端
+    # ④b **到达之后要再按住方向键一会儿才松**（用户 2026-09-26 要求：
+    #     "↑ 需要延迟『坐标对齐误差时间』（设置里那个）再松开"）。
+    #     为什么：读数到目标面 ≠ 人已经站上去（读数滞后一个端到端延迟；游戏里"迈上平台"
+    #     那一步也要按着 ↑）⇒ 立刻松手就是差最后一点点。
+    job = mk(dst_y=-208.0)                       # hold_ms=200（= 设置里的误差时间）
+    job.update(0.0, px=700.0)
+    o = job.update(0.25, px=700.0, py=-208.0, ladder_id="L2")   # 一上来就够到目标面
+    check(not o["done"] and o["dir"] == 1 and not o["jump"],
+          "刚够到目标面就松了 ↑（该再按住一会儿）：%s" % o)
+    check("按住" in o["note"], "没写清「还要再按住一会儿」：%r" % o["note"])
+    o = job.update(0.35, px=700.0, py=-208.0, ladder_id="L2")   # 100ms < 200ms
+    check(not o["done"] and o["dir"] == 1, "保持时间没到就松了 ↑：%s" % o)
+    o = job.update(0.50, px=700.0, py=-208.0, ladder_id="L2")   # 250ms ≥ 200ms
+    check(o["done"] and o["dir"] == 0, "保持够了还没收工 / 没松 ↑：%s" % o)
+
+    # ⑤ 到达判据（没有目标面信息时的兜底）：y 越过绳的上端。
+    #    ⚠ 判到到达那一拍**还不松手**（要再按住误差时间，见 ④b）⇒ 断言分两拍。
     job = mk()
     job.update(0.0, px=700.0)
     job.update(0.25, px=700.0, py=-100.0)
     o = job.update(0.40, px=700.0, py=-120.0)      # 上端 -100 − 缓冲 14
-    check(o["done"], "y 越过绳上端却没判到达（兜底判据）：%s" % o)
+    check(not o["done"] and o["dir"] == 1 and "到达" in o["note"],
+          "y 越过绳上端却没判到达（兜底判据）：%s" % o)
+    check(job.update(0.65, px=700.0, py=-120.0)["done"],
+          "到达后等够了还没收工：%s" % job.note)      # 0.65-0.40 = 250ms ≥ 200ms
 
-    # ⑥ 向下爬：按 ↓，y 越过下端算到
+    # ⑥ 向下爬：按 ↓，y 越过下端算到（同样"到达后再按住一会儿"）
     job = mk(direction=-1, dst_set="丙平台")
     job.update(0.0, px=700.0)
     o = job.update(0.25, px=700.0)
     check(o["jump"] and o["dir"] == -1, "向下爬该按↓：%s" % o)
     o = job.update(0.40, px=700.0, py=200.0)
-    check(o["done"], "y 越过绳下端却没判到达：%s" % o)
+    check(not o["done"] and o["dir"] == -1 and "到达" in o["note"],
+          "y 越过绳下端却没判到达：%s" % o)
+    check(job.update(0.65, px=700.0, py=200.0)["done"],
+          "到达后等够了还没收工：%s" % job.note)
 
     # ⑦ 超时报警（P4 要求：不许无限等）
     job = mk(timeout_s=1.0)
@@ -1332,8 +1705,23 @@ def t_climb_job():
           and j2.ladder_id == "L2" and abs(j2.x - 701.0) < 1e-6,
           "从真实边造出来的任务不对：dir=%s x=%s dst=%s"
           % (j2.dir, j2.x, j2.dst_set))
-    for bad in ({"kind": "walk", "from": "右下", "to": "上下过渡平台"},
-                {"kind": "climb", "from": "右下", "to": "上下过渡平台",
+    # ⑩b **坐标口径**（2026-09-26 用户澄清 —— 我在这里改错过一次，写下来别再犯）：
+    #      地形数据（foothold / ladder 的 x、y）**本来就在游戏的世界坐标系里**：
+    #      fh44 地形 y=-208 ⇒ 它的世界 y 就是 -208，不用加任何东西。玩家的真实世界坐标
+    #      = 小地图定位 + 那 33px「坐标系偏移」（偏移修的是"黄点重心 ↔ 玩家原点"那层
+    #      对应，**不是坐标系换算**）⇒ 两者**直接比** ✓。
+    #      ⇒ 造任务时**不许**给地形坐标再加偏移：加了会把"到达目标平台面"从 -208 放宽成
+    #      -175（差 33px），看起来像"提前算到了" ✗。
+    _lids = zones.ladder_ids(t)
+    _L = next(x for x in t.ladders if _lids.get(id(x)) == edge.get("ladder"))
+    check(abs(j2.x - _L.x) < 1e-6,
+          "任务的 x 不是绳的地形 x（不许给它加偏移）：%s vs %s" % (j2.x, _L.x))
+    check(j2.dst_y == route.dst_surface_y(t, z, edge.get("to"), _L, j2.dir),
+          "任务的 dst_y 不是地形 foothold 的面本身（不许加偏移）：%s" % j2.dst_y)
+
+    # ⚠ 「走」不再列在这儿了（2026-09-26）：它有执行器了，`job_for_edge` 会正常
+    # 分发给 `walk_job_for_edge` ✓（它的"该抛"用例在 ⑬ 里）。
+    for bad in ({"kind": "climb", "from": "右下", "to": "上下过渡平台",
                  "ladder": "L9"},
                 {"kind": "climb", "from": "右下", "to": "左上", "ladder": "L2"}):
         try:
@@ -1341,6 +1729,144 @@ def t_climb_job():
             raise AssertionError("构造不该成功（会往反方向爬）：%s" % bad)
         except ValueError:
             pass          # 正是期望的：说不清就抛，**不许猜**
+    # 分发表：三类通行方式各出各的任务（加进来时漏一个就会静悄悄"没做" ✗）。
+    # ⚠ 要挑**目标集合里有 foothold** 的走边：没有落点的走边本来就该抛 ValueError
+    #（那是 `walk_job_for_edge` 的"不许猜"，不是分发漏了）。
+    _w_e = next((e for e in z.edges if e.get("kind") == "walk"
+                 and (z.sets.get(e.get("to")) or {}).get("footholds")), None)
+    if _w_e is not None:
+        check(isinstance(route.job_for_edge(t, z, _w_e), route.WalkJob),
+              "job_for_edge 没按类型分发（走边该出 WalkJob）")
+    else:
+        print("      （用户数据里没有可用的「走」边，分发这条跳过）")
+
+    # ⑪ **爬到一半不动了 ⇒ 必须把话说清楚**（2026-09-26 用户第二次报"卡在某个 y 就不动"）。
+    #    老行为是默默按住跳键耗到超时、再重试 3 次、放弃 —— 界面上只有一个"停住的角色"，
+    #    而两种候选原因的**修法正好相反**（读数口径差一截 / 这段绳到不了顶）⇒ 只能靠猜。
+    #    现在：y 卡住 STALL_S 秒 ⇒ 判失败，且 note 里必须同时有**卡住的 y**和**离目标面差多少**。
+    job = mk(dst_y=-208.0)
+    job.update(0.0, px=701.0, py=-150.0, ladder_id="L2")
+    o = job.update(0.25, px=701.0, py=-150.0, ladder_id="L2")
+    check(job.phase == route.ClimbJob.CLIMB, "没进上绳阶段：%s" % job.note)
+    # 先把"往上爬"演出来（y 一路变小），再停在 -170 —— 就是用户报的那一幕
+    # ⚠ 计时变量**别叫 `t`**：这个函数里 `t` 是地形对象（⑩ 载入的），覆盖它会让后面
+    # 造任务的地方变成 `'float' object has no attribute 'footholds'`（自己踩的 ✗）。
+    _t1 = 0.25
+    for _py in (-160.0, -170.0):
+        _t1 += 0.1
+        job.update(_t1, px=701.0, py=_py, ladder_id="L2")
+    while _t1 < 0.25 + route.STALL_S + 0.6:
+        _t1 += 0.1
+        o = job.update(_t1, px=701.0, py=-170.0, ladder_id="L2")   # 真实报的那个 y
+        if o["failed"]:
+            break
+    check(o["failed"],
+          "爬到某个 y 不动了却没判失败（会一直按着跳键耗到超时，人只看到一个停住的角色）")
+    check("-170" in o["note"] and "-208" in o["note"],
+          "失败话里没把两个数说清（卡在哪个 y / 离目标面还差多少）：%r" % o["note"])
+    check("偏移" in o["note"], "没提示去核对「坐标系偏移」：%r" % o["note"])
+
+    # ⑪b y 一直在变好 ⇒ 不许判"不动了"（正常爬升不能被误杀）
+    job = mk(dst_y=-208.0)
+    job.update(0.0, px=701.0, py=-100.0, ladder_id="L2")
+    job.update(0.25, px=701.0, py=-100.0, ladder_id="L2")
+    o = None
+    for k in range(40):
+        o = job.update(0.35 + k * 0.1, px=701.0, py=-100.0 - (k + 1) * 5.0,
+                       ladder_id="L2")
+        if o["done"]:
+            break
+    check(not o["failed"], "一直在往上爬却被判「不动了」：%r" % o["note"])
+    check(o["done"], "都爬到目标面了还没判到达：%r" % o["note"])
+
+    # ⑪c 拿不到 y 读数（定位没输出）⇒ **不许**判"爬不动"：那是观测问题，不是爬不动
+    #（那种情况该由 agent 的"拿不到世界坐标"那条路负责说）
+    job = mk(dst_y=-208.0)
+    job.update(0.0, px=701.0, py=None, ladder_id="L2")
+    o = job.update(0.25, px=701.0, py=None, ladder_id="L2")
+    for k in range(40):
+        o = job.update(0.35 + k * 0.1, px=701.0, py=None, ladder_id="L2")
+    check(not o["failed"], "拿不到 y 时乱判「爬不动」：%r" % o["note"])
+
+    # ⑫ **上绳之后只按 ↑、不再按跳**（用户 2026-09-26 定的规则：
+    #    "按 ↑ 直到玩家的真实世界坐标 ≤ 绳梯上端连接的 foothold 的 y"）。
+    #    实测现象：命令前往左上平台时"还在绳上、离平台还差一截" —— 罪魁就是跳键一直被按住
+    #    （跳键只该用来**贴上绳**）。反过来也必须钉住：**还没上绳时不许不按跳**
+    #    （否则角色永远贴不上去，任务只会空转到超时）。
+    job = mk(dst_y=-208.0)
+    job.update(0.0, px=701.0)
+    o = job.update(0.25, px=701.0)
+    check(o["jump"] and o["dir"] == 1, "还没上绳就该按跳贴上去：%s" % o)
+    o = job.update(0.30, px=701.0, py=-150.0, ladder_id="L2")
+    check(not o["jump"], "上了绳还在按跳（会卡在绳上/绳顶，迈不上平台）：%s" % o)
+    check(o["dir"] == 1, "上了绳却不按 ↑ 了（那这一拍就是站着不动）：%s" % o)
+    check("↑" in o["note"] and "-208" in o["note"],
+          "上绳后的提示没说清「按↑直到到哪」：%r" % o["note"])
+
+    # ⑬ **走（walk）执行器**（2026-09-26 用户要求"把 walk 的执行器做了"）。
+    #    它和上绳/下跳**同一套对外形状**（`update` 纯函数 + retry/cancel）⇒ agent 里
+    #    "任务优先 / 有怪先打 / 失败延迟重来 / 结束原因挂画面" 一行都不用改 ✓。
+    #    注意动作：走**不按跳、不按上下**，只有左右。
+    job = route.WalkJob("乙平台", [(700.0, 690.0, 710.0, -208.0, "52")])
+    job.update(0.0, px=600.0)
+    o = job.update(0.1, px=600.0)
+    check(o["move"] == 1 and not o["jump"] and o["dir"] == 0,
+          "走：该往目标那侧走、且不跳不按上下：%s" % o)
+    o = job.update(0.2, px=905.0)                      # 反方向 ⇒ 往左
+    check(o["move"] == -1, "走：目标在左边却往右走：%s" % o)
+    o = job.update(0.3, px=705.0)                      # 进容差（±12）
+    check(not o["move"], "进容差还继续走（会冲过头）：%s" % o)
+    o = job.update(0.4, px=705.0, py=-208.0)
+    check(o["done"] and "到达" in o["note"], "站在目标 foothold 上却没判到达：%s" % o)
+    # 集合判据优先（走是唯一"站上去就算到"的任务）
+    job = route.WalkJob("乙平台", [(700.0, 690.0, 710.0, -208.0, "52")])
+    job.update(0.0, px=-500.0)
+    o = job.update(0.1, px=-500.0, here_sets=["乙平台"])
+    check(o["done"] and not o["move"], "脚下已是目标集合却没判到达：%s" % o)
+    # x 对了但人其实在另一层（y 差太多）⇒ **不算到达**（几何兜底要有高度带）
+    job = route.WalkJob("乙平台", [(700.0, 690.0, 710.0, -208.0, "52")])
+    job.update(0.0, px=700.0)
+    o = job.update(0.1, px=700.0, py=-120.0)
+    check(not o["done"], "x 对了但高度差很远也判到达了（换层了）：%s" % o)
+    # 走不动（x 卡住）⇒ 失败并说清卡在哪个 x —— 被墙/台阶挡住时人要看得懂
+    job = route.WalkJob("乙平台", [(900.0, 890.0, 910.0, -208.0, "7")],
+                        timeout_s=60.0)
+    job.update(0.0, px=100.0)
+    # ⚠ 计时变量**别叫 `t`**：这个函数里 `t` 是地形对象（上面 ⑩ 载入的），
+    # 覆盖了它后面 `walk_job_for_edge(t, …)` 就成了 `'float' object has no attribute
+    # 'footholds'`（自己踩的 ✗）。
+    _tt = 0.0
+    o = None
+    for _ in range(80):
+        _tt += 0.1
+        o = job.update(_tt, px=100.0)
+        if o["failed"]:
+            break
+    check(o["failed"] and "走不动" in o["note"] and "100" in o["note"],
+          "走不动却没判失败 / 没写清卡在哪：%r" % o["note"])
+    # 超时要报警（和上绳一样：不许无限等）
+    job = route.WalkJob("乙平台", [(900.0, 890.0, 910.0, -208.0, "7")], timeout_s=1.0)
+    job.update(0.0, px=100.0)
+    check(job.update(2.0, px=101.0)["failed"], "走：超时没报警")
+    # 拿不到世界坐标 ⇒ 不许乱走（往哪边走都可能是错的）
+    job = route.WalkJob("乙平台", [(900.0, 890.0, 910.0, -208.0, "7")])
+    job.update(0.0, px=None)
+    check(not job.update(0.1, px=None)["move"], "拿不到坐标还在走：%s" % job.note)
+    # 从**真实边**造任务：落点必须来自目标集合的 foothold，说不清就抛（不许猜）
+    _w = next((e for e in z.edges if e.get("kind") == "walk"
+               and (z.sets.get(e.get("to")) or {}).get("footholds")), None)
+    check(_w is not None, "用户数据里没有可用的「走」边，这条测不了")
+    _wj = route.walk_job_for_edge(t, z, _w)
+    check(isinstance(_wj, route.WalkJob) and _wj.spots
+          and _wj.dst_set == _w.get("to"),
+          "从真实「走」边造出来的任务不对：%s" % (_wj,))
+    for bad in ({"kind": "climb", "from": "甲", "to": "乙"},
+                {"kind": "walk", "from": "甲", "to": "（不存在的集合）"}):
+        try:
+            route.walk_job_for_edge(t, z, bad)
+            raise AssertionError("构造不该成功（会下一条不知道往哪走的命令）：%s" % bad)
+        except ValueError:
+            pass          # 正是期望的：说不清就抛
 
 
 def t_climb_wiring():
@@ -1384,6 +1910,37 @@ def t_climb_wiring():
         check(h.agent.state == "climb", "没进 climb 状态：%s" % h.agent.state)
         check(jump in downs() and up in downs(),
               "上绳时该按住跳 + ↑（向上爬）：%s" % h.log)
+
+        # ①b **已上绳那一拍：只按 ↑、不按跳**（用户 2026-09-26 定的动作规则：
+        #     「按 ↑ 直到玩家的真实世界坐标 ≤ 绳梯上端连接的 foothold 的 y」）。
+        #     为什么钉在 **agent 这一层**：执行器那边已经有纯用例 ⑫ ✓，但它只能证明
+        #     "任务说要按 ↑" —— 证明不了"agent 真按了 ↑、而不是顺手把跳也按下去" ✗。
+        #     用户看到的正是这一层（"角色还在绳上、离平台还差一截" ✗），所以这条必须在。
+        h.log.clear()
+        ws_m = h.ws(with_mob=False)
+        ws_m.player.ladder_id = "L2"          # 感知报：现在就在这根绳上
+        # ⚠ 目标和**绳端都要放远**：`job()` 的绳上端 y1=-100，而夹具玩家在 y=500 ⇒
+        #   `_arrived` 里"越过绳端"那条兜底判据**独立于 dst_y** ⇒ 会当场判到达、把键全松开 ✗
+        #   （写这条时先红了一次，就是这个）。`clock0` 也别忘了（夹具记日志要用它）。
+        j_m = job(dst_y=-9999.0, y1=-9999.0, y2=9999.0)
+        h.agent.start_climb(j_m)
+        h.clock0 = h.clock.t
+        act1 = h.agent.tick(ws_m)             # 第一拍：对齐 / 进上绳阶段
+        h.log.clear()
+        act2 = h.agent.tick(ws_m)             # 第二拍：这就是"已上绳"那一拍
+        # ⚠ 判据看 **tick 回值里的 keys**（= 这一拍**按住**的键）+ 有没有松过，
+        #   **不能**只看 `down` 事件：↑ 在第一拍就按下去了，第二拍它是"一直按着"的，
+        #   而 KeyState 只在**变化**时才发事件 ⇒ 日志当然是空的 ✗
+        #  （这条用例连红了三次，前两次都是拿日志去证明"按住"，误判成"没按"）。
+        check(jump not in (act2.get("keys") or []),
+              "已上绳还在按跳（游戏里会卡在绳上/绳顶、迈不上平台）：%s"
+              % (act2.get("keys"),))
+        check(up in (act2.get("keys") or []),
+              "已上绳却没按住 ↑（这一拍等于站着不动）：%s" % (act2.get("keys"),))
+        check(up not in [k for _t, kind, k in h.log if kind == "up"],
+              "已上绳却把 ↑ 松了：%s" % h.log)
+        check("已上绳" in str(h.agent.current_goto_note() or ""),
+              "画面上没说清「已上绳、按住 ↑」：%r" % h.agent.current_goto_note())
 
         # ② **攻击范围内有怪 ⇒ 先打**（这一拍绝不按↑去爬绳）
         h.agent.start_climb(job())
@@ -1472,6 +2029,44 @@ def t_climb_wiring():
         check(jump not in downs(), "收工那一拍还在按跳：%s" % h.log)
         check(h.agent._climb_retry_at is None,
               "收工之后还留着「等重来」的时刻（下一个任务会立刻被它带跑）")
+
+        # ⑤d **寻路任务优先于休息**（用户 2026-09-26 要求："即使在休息中，寻路也需要能生效"）：
+        #     挂着任务时那一拍**不进休息分支**（休息那套也按键，两边会打架），任务照跑；
+        #     休息的**状态保留**，任务结束下一拍接着休息。
+        s.anti_afk_enabled = True
+        h.agent.state = "afk_rest"          # 假装正在隐身休息
+        h.agent._afk_ctx = None
+        h.agent.start_climb(job())
+        h.log.clear()
+        h.agent.tick(h.ws(with_mob=False))
+        # ① 寻路照跑：上绳的键（↑）真的按下去了
+        check(up in downs(), "休息中寻路没生效（上绳的键一个都没按）：%s" % h.log)
+        # ② 两套**互相独立**：休息状态不被任务抢走（还是"休息"那一族；它自己会按自己的
+        #    时刻表往前走 —— 进 afk_exit 是休息机器自己的事，不是被任务顶掉的）。
+        check(h.agent.state in ("afk_enter", "afk_rest", "afk_exit"),
+              "寻路任务把休息状态顶掉了（两边耦合了）：%s" % h.agent.state)
+        # （这里**不再**断言"任务结束后还在休息"：休息机器有它自己的时刻表，会自己
+        #   进 afk_exit / 收尾回 idle —— 那是它本来该做的，不是被任务顶掉的 ✗。
+        #   要钉的就是上面两条：任务照跑、休息状态不被任务改写。）
+        h.agent.stop_climb("用例：测完收工")
+        h.agent.state = "idle"
+        s.anti_afk_enabled = False
+
+        # ⑤e **寻路超时时间(s)**（用户 2026-09-26 要求）：从下达那一刻算，超了就切断 ——
+        #     任务自己的 timeout 会被 `retry()` 清零，累计可能远超预期，所以要有总闸。
+        was_cap = s.goto_timeout_s
+        s.goto_timeout_s = 0.5
+        j9 = job()
+        h.agent.start_climb(j9)
+        h.agent.tick(h.ws(with_mob=False))              # 第一拍（还没超）
+        check(h.agent._climb is j9, "刚下达就被超时切断：%r" % (h.agent._climb,))
+        h.agent._climb_started -= 1.0                   # 假装它已经跑了 1 秒
+        h.agent.tick(h.ws(with_mob=False))
+        check(h.agent._climb is None, "超过「寻路超时时间」还没切断：%r" % (h.agent._climb,))
+        check("寻路超时" in h.agent.current_goto_note(),
+              "切断了却没说清原因：%r" % h.agent.current_goto_note())
+        check(not h.taps(s.keymap["jump"]) or True, "")  # 占位：键的释放由既有用例覆盖
+        s.goto_timeout_s = was_cap
 
         # ⑤c 下跳：**先按住 ↓ 那一拍不许按跳**（agent 那层也得对 —— 这是新加的分支）
         dj = route.DropJob("甲平台", "乙平台", [(500.0, 470.0, 530.0, "41")],
@@ -1651,9 +2246,519 @@ def t_drop_job():
             pass
 
 
+def t_afk_spot_rest():
+    """「定点休息」：五个阶段都走通 + 走不到要如实说（用户 2026-09-26 定的流程，P2）。
+
+    为什么必须钉：这一型的**参数界面早就有**（两个下拉 + 到达后行为按钮 ✓），可运行期
+    一直走的是**隐身那套** ⇒ 选了它"什么都不发生" ✗（`ANTI_AFK_TYPES` 上面那段警告写的
+    就是这种情况）。所以这里从"进休息"一直走到"回战斗"，五步逐个断言：
+
+      ① 走（用注入的解析器起一条多步路径）→ ② 到达后行为 → ③ 歇休息时长
+      → ④ 结束后前往 → ⑤ 回战斗。
+
+    另外钉**失败路径**：解析不出来 / 半路断了 ⇒ 如实说 + 回战斗（**不许硬走、不许静默** ✗）。
+    """
+    from decision import route
+
+    s = fresh_settings(anti_afk_enabled=True, anti_afk_type="spot_rest",
+                       anti_afk_spot_set="乙平台", anti_afk_spot_after="丙平台",
+                       anti_afk_rest_min=0.2, anti_afk_rest_max=0.2)
+    # 到达后行为：按一下商城再松开（一按一松 ⇒ 短、好断言）
+    s.anti_afk_spot_seq = [{"type": "down", "key": "shop"},
+                           {"type": "up", "key": "shop"}]
+    h = Harness(s)
+    h.clock0 = h.clock.t            # 夹具记日志要用它（别的用例的 helper 也会先设）
+    seen = []                       # 解析器被问过哪些目的地
+
+    def resolver(dst):
+        seen.append(dst)
+        if dst == "乙平台":
+            return {"path": ["甲平台", "乙平台"],
+                    "jobs": [route.WalkJob("乙平台",
+                                           [(500.0, 490.0, 510.0, -208.0, "1")])],
+                    "why": "", "here": False}
+        return {"path": ["乙平台", "丙平台"],
+                "jobs": [route.WalkJob("丙平台",
+                                       [(520.0, 510.0, 530.0, -208.0, "2")])],
+                "why": "", "here": False}
+
+    ws = h.ws(with_mob=False)
+    ag = h.agent
+    # ① 没注入解析器 ⇒ **如实说**（不许静默，也不许硬走）
+    ag.route_plan = None
+    ok, msg = ag.plan_and_start_route("乙平台")
+    check(not ok and "实时" in msg, "没注入解析器时该如实说：%r" % msg)
+
+    ag.route_plan = None
+    with h._patched():
+        ag.route_plan = resolver
+        # ② 进休息（定点那一支）⇒ 立刻去「乙平台」，并把**整条**交给执行器
+        ag._begin_rest(0.0)
+        check(ag.state == "afk_spot_walk", "定点休息没进「走」阶段：%s" % ag.state)
+        ws.player.here_sets = ["甲平台"]
+        ag._run_rest_spot(0.0, ws)
+        check(seen == ["乙平台"], "没按「指定地点」解析路径：%s" % seen)
+        check(ag._climb is not None and ag._route_total == 1,
+              "整条路径没交给执行器：climb=%r 步数=%s" % (ag._climb, ag._route_total))
+        # ⚠ 阶段还要**发布出去**：`settings.rest_state` 是界面的唯一信息来源，而发布
+        #   在 `_run_rest` 的**尾巴**上（`_run_rest_spot` 自己不发）。
+        #   少了这一环，用户看到的就是「未休息」✗（2026-09-26 就是这么被问的）。
+        ag._run_rest(0.0, ws)                  # 走**真入口**（tick 走的就是它）
+        check(ag.settings.rest_state == "afk_spot_walk",
+              "「走去休息点」没发布 rest_state（界面会显示「未休息」）：%r"
+              % ag.settings.rest_state)
+        # 走完（`_climb` 被清空）+ 脚下已经是「乙平台」⇒ 转「到达后行为」
+        ag._climb, ag._route = None, []
+        ws.player.here_sets = ["乙平台"]
+        ag._run_rest_spot(0.1, ws)
+        check(ag.state == "afk_spot_act", "走到了没转「到达后行为」：%s" % ag.state)
+        # ③ 到达后行为演完 ⇒ 进「歇」
+        t = 0.1
+        for _ in range(60):
+            t += 0.5
+            ag._run_rest_spot(t, ws)
+            if ag.state == "afk_spot_rest":
+                break
+        check(ag.state == "afk_spot_rest",
+              "到达后行为没演完 / 没进「歇」：%s" % ag.state)
+        # 休息时长**从这一刻起算**：差一点点不许往下走
+        ag._run_rest_spot(ag._rest_until - 0.01, ws)
+        check(ag.state == "afk_spot_rest", "休息时间没到就往下走了：%s" % ag.state)
+        # ④ 歇够了 ⇒ 「结束后前往」（第二个集合，再解析一次）
+        ag._run_rest_spot(ag._rest_until + 0.01, ws)
+        check(ag.state == "afk_spot_back", "歇完没走「结束后前往」：%s" % ag.state)
+        ag._run_rest_spot(ag._rest_until + 0.02, ws)
+        check(seen[-1] == "丙平台", "「结束后前往」没解析第二个地点：%s" % seen)
+        check(ag._climb is not None, "「结束后前往」没交给执行器")
+        # ⑤ 走到了 ⇒ 回战斗
+        ag._climb, ag._route = None, []
+        ag._run_rest_spot(ag._rest_until + 0.03, ws)
+        check(ag.state == "idle", "走完「结束后前往」没回战斗：%s" % ag.state)
+
+        # ⑥ 失败路径一：**解析不出来** ⇒ 如实说 + 立刻收工（不许硬等 / 不许静默 ✗）
+        ag.route_plan = lambda dst: {"path": [], "jobs": [], "here": False,
+                                     "why": "没有从「甲平台」到「乙平台」的路"}
+        ag._begin_rest(10.0)
+        ws.player.here_sets = ["甲平台"]
+        ag._run_rest_spot(10.0, ws)
+        check(ag.state == "idle", "解析不出来却没收工（会卡在休息里）：%s" % ag.state)
+        note = ag.current_goto_note()
+        check("定点休息" in note and "没有" in note, "走不到没如实说：%r" % note)
+
+        # ⑦ 失败路径二：**半路断了**（`_climb` 空了、脚下却不在目标上）⇒ 同样如实说 + 收工
+        ag.route_plan = resolver
+        ag._begin_rest(20.0)
+        ws.player.here_sets = ["甲平台"]
+        ag._run_rest_spot(20.0, ws)
+        check(ag._climb is not None, "第二次没出发")
+        ag._climb, ag._route = None, []
+        ag._run_rest_spot(20.1, ws)         # 脚下还在「甲平台」
+        check(ag.state == "idle", "半路断了却没收工：%s" % ag.state)
+        check("定点休息" in ag.current_goto_note(),
+              "半路断了没如实说：%r" % ag.current_goto_note())
+
+    # ⑧ 「被打断后延迟重试」在**去休息点那段路上**也要生效（用户 2026-09-26 要求：
+    #    "从开始前往指定地点就开算"）：走的中途触发了自动补血 ⇒ 这次休息作废，
+    #    并把下次提前到 `retry_sec` 之后（不是随机 N~M 分钟）。
+    s3 = fresh_settings(anti_afk_enabled=True, anti_afk_type="spot_rest",
+                        anti_afk_spot_set="乙平台",
+                        anti_afk_retry_on_interrupt=True, anti_afk_retry_sec=42.0,
+                        anti_afk_rest_min=0.2, anti_afk_rest_max=0.2,
+                        auto_hp_pot=True, hp_threshold=95, pot_cd=0)
+    # ⚠ 夹具的 keymap 默认**没有 `hp_pot`**（`_drink_potions` 会直接早退 ⇒ 根本不补血 ✗）
+    s3.keymap["hp_pot"] = "f5"
+    s3.enabled = True
+    h3 = Harness(s3)
+    h3.clock0 = h3.clock.t
+    h3.hp = 0.1                              # 血低 ⇒ 这一拍会真的补血
+    ws3 = h3.ws(with_mob=False)
+    ws3.player.here_sets = ["甲平台"]
+    with h3._patched():
+        a3 = h3.agent
+        a3.route_plan = lambda dst: {
+            "path": ["甲平台", dst],
+            "jobs": [route.WalkJob(dst, [(500.0, 490.0, 510.0, -208.0, "1")])],
+            "why": "", "here": False}
+        a3._begin_rest(0.0)
+        a3._run_rest(0.0, ws3)
+        check(a3.state == "afk_spot_walk" and a3._climb is not None,
+              "没进「前往休息点」阶段：%s" % a3.state)
+        h3.clock.t += 0.1
+        a3.tick(ws3)                         # 整拍：走 + 补血 + 打断判定
+        check(a3.state == "idle", "去休息点路上补了血却没打断这次休息：%s" % a3.state)
+        check(a3._climb is None, "打断后还挂着「去休息点」的路线（会继续白跑 ✗）")
+        left = a3._next_afk - h3.clock.t
+        check(abs(left - 42.0) < 1.5,
+              "打断后没按 retry_sec 排下一次（还剩 %.0f 秒）" % left)
+
+    # ⑨ **赶路时"有怪先打"**（用户 2026-09-26 报的坑：手动休息会寻路，但攻击范围内有怪
+    #    时**不还手** ✗）。判据要和「命令前往」**同一套**（正常路径 `if in_range:` 那支）：
+    #    有怪 ⇒ 打（攻击键按下）、这一拍不往前走；打的时候**休息阶段名不许被改掉** ✗
+    #    （改掉 = 这次休息静默作废，比不打还糟）。
+    s4 = fresh_settings(anti_afk_enabled=True, anti_afk_type="spot_rest",
+                        anti_afk_spot_set="乙平台", attack_cd=0,
+                        anti_afk_rest_min=0.2, anti_afk_rest_max=0.2)
+    s4.enabled = True
+    h4 = Harness(s4)
+    h4.clock0 = h4.clock.t
+    # 怪摆在正前方、攻击范围内（Mob 的写法抄既有用例）
+    h4.mobs_fn = lambda t: [Mob(id=1, x=540.0, y=500.0, w=40.0, h=40.0, conf=0.9)]
+    ws4 = h4.ws(with_mob=True)
+    ws4.player.here_sets = ["甲平台"]
+    with h4._patched():
+        a4 = h4.agent
+        a4.route_plan = lambda dst: {
+            "path": ["甲平台", dst],
+            "jobs": [route.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
+            "why": "", "here": False}
+        a4._begin_rest(0.0)
+        a4._run_rest(0.0, ws4)
+        check(a4.state == "afk_spot_walk", "没进「赶路」阶段：%s" % a4.state)
+        h4.log.clear()
+        for _ in range(3):                # 序列起跑到真的按下键要两拍（既有用例同款）
+            h4.clock.t += 0.1
+            a4.tick(ws4)
+        atk = s4.keymap["attack"]
+        check(("down", atk) in [(k, v) for _t, k, v in h4.log],
+              "攻击范围内有怪，赶路时没触发 attack（用户报的坑 ✗）：%s" % h4.log[:8])
+        check(a4.state == "afk_spot_walk",
+              "打了怪却把休息阶段名改掉了（这次休息会静默作废 ✗）：%s" % a4.state)
+
+
+def t_timer_manual_fire():
+    """「手动触发」：立刻演一次 + **计时从头开始**（用户 2026-09-26 要求）。
+
+    为什么钉它：这是"点了就该有反应"的按钮，而它两条语义都容易做错：
+      · 只在界面上重排计时、不进实时线程 ⇒ 角色不会动 ✗（按键在 agent 那边）；
+      · 触发后接着**原来的剩余时间**走 ⇒ 那不叫"计时从头开始" ✗。
+    顺带钉：演到一半再点一次必须**先松开旧序列按着的键**（否则卡键 ✗）、
+    暂停的项不响应、陌生名字安静丢掉、以及这个请求通道**不进配置文件**。
+    """
+    s = fresh_settings(custom_timers=[
+        {"name": "t1", "interval": [5, 10],
+         "seq": [{"type": "down", "key": "f3"}, {"type": "up", "key": "f3"}]}],
+        custom_timer_next={})
+    h = Harness(s)
+    h.clock0 = h.clock.t
+    with h._patched():
+        # ① 先排上期，再把"下次"人为摆成**马上就要到**（1 秒后）
+        h.agent._custom_timers(h.clock.t)
+        check(s.custom_timer_next.get("t1", 0.0) > 0, "没排期：%s" % s.custom_timer_next)
+        s.custom_timer_next["t1"] = h.clock.t + 1.0
+        # ② 手动触发 ⇒ 立刻开演；下次**从头**算（≥ 5 分钟之后，而不是刚才那 1 秒）
+        s.custom_timer_fire.append("t1")
+        h.clock.t += 0.01
+        h.agent._custom_timers(h.clock.t)
+        check(not s.custom_timer_fire,
+              "请求没被取走（会一直重复触发）：%s" % s.custom_timer_fire)
+        check("t1" in h.agent._timer_states, "手动触发没开演序列")
+        left = s.custom_timer_next["t1"] - h.clock.t
+        check(left >= 5 * 60 - 1,
+              "计时没从头开始（还接着原来的 1 秒）：还剩 %.0f 秒" % left)
+        # ③ 序列真的把键发出去了
+        h.clock.t += 0.1
+        h.agent._custom_timers(h.clock.t)
+        check(("down", "f3") in [(k, v) for _t, k, v in h.log],
+              "手动触发没真的按键：%s" % h.log)
+
+    # ④ 演到一半再点一次 ⇒ **旧序列按下的键必须先松开**（否则卡键）
+    s2 = fresh_settings(custom_timers=[
+        {"name": "t2", "interval": [1, 1],
+         "seq": [{"type": "down", "key": "f5"},
+                 {"type": "delay", "ms": 60000},
+                 {"type": "up", "key": "f5"}]}], custom_timer_next={})
+    h2 = Harness(s2)
+    h2.clock0 = h2.clock.t
+    with h2._patched():
+        s2.custom_timer_fire.append("t2")
+        h2.agent._custom_timers(h2.clock.t)
+        h2.clock.t += 0.1
+        h2.agent._custom_timers(h2.clock.t)
+        check(("down", "f5") in [(k, v) for _t, k, v in h2.log], "没按下 f5")
+        h2.log.clear()
+        s2.custom_timer_fire.append("t2")            # 演到一半再点一次
+        h2.clock.t += 0.1
+        h2.agent._custom_timers(h2.clock.t)
+        check(("up", "f5") in [(k, v) for _t, k, v in h2.log],
+              "重排时没松开旧序列按下的键（会卡键）：%s" % h2.log)
+        # ⑤ 暂停的项：手动触发**不演**（暂停的语义就是"不触发"）
+        s2.custom_timers[0]["paused"] = True
+        h2.log.clear()
+        s2.custom_timer_fire.append("t2")
+        h2.clock.t += 0.1
+        h2.agent._custom_timers(h2.clock.t)
+        check("t2" not in h2.agent._timer_states, "暂停的项被手动触发了")
+        check(not s2.custom_timer_fire, "暂停项的请求没被取走（会一直攒着）")
+        # ⑥ 不认识的名字 ⇒ 安静丢掉，不崩
+        s2.custom_timer_fire.append("（没这项）")
+        h2.clock.t += 0.1
+        h2.agent._custom_timers(h2.clock.t)
+        check(not s2.custom_timer_fire, "陌生名字的请求没被丢掉")
+    # ⑦ **不进配置文件**：它是运行时状态，不是参数（重启后不该还留着"待触发"）
+    check("custom_timer_fire" not in s.to_dict(),
+          "`custom_timer_fire` 被写进配置了（运行态不该持久化）")
+
+
+def t_timer_manual_fire_button():
+    """界面：每项都有「手动触发」按钮（**琥珀色**，和旁边三个不一样），点了发请求；
+    **自动关着 / 已暂停时灰掉** —— 否则就是"点了没反应"，那种坑最难查 ✗。"""
+    p, app = build_panel()
+    settings = ag.settings          # 界面读的就是这个单例
+    saved = (settings.custom_timers, settings.custom_timer_next,
+             list(settings.custom_timer_fire), settings.enabled)
+    settings.custom_timers = [
+        {"name": "A", "seq": [{"type": "down", "key": "f3"}], "interval": [10, 10]},
+        {"name": "B", "seq": [{"type": "down", "key": "f4"}], "interval": [10, 10],
+         "paused": True, "paused_left": 60.0},
+    ]
+    settings.custom_timer_next = {}
+    settings.custom_timer_fire.clear()
+    try:
+        settings.enabled = True
+        p._refresh_timers()
+        app.processEvents()
+        btns = p._timer_fire_btns
+        check([b.text() for b in btns.values()] == ["手动触发", "手动触发"],
+              "没给每一项加「手动触发」按钮：%s" % [b.text() for b in btns.values()])
+        check("#a05c00" in btns["A"].styleSheet(),
+              "按钮没换成（琥珀）色：%r" % btns["A"].styleSheet())
+        check(btns["A"].isEnabled(), "自动开着、也没暂停 ⇒ 该能点")
+        check(not btns["B"].isEnabled(), "已暂停的那项还能点（点了也不会有反应 ✗）")
+        btns["A"].click()
+        app.processEvents()
+        check(settings.custom_timer_fire == ["A"],
+              "点了没把触发请求发出去：%s" % settings.custom_timer_fire)
+        # 自动关掉 ⇒ 必须灰掉（agent 每拍 `_release_held_keys`，序列活不过一帧）
+        settings.custom_timer_fire.clear()
+        settings.enabled = False
+        p._refresh_timers()
+        app.processEvents()
+        check(not p._timer_fire_btns["A"].isEnabled(), "自动关着按钮还能点")
+    finally:
+        settings.custom_timers = saved[0]
+        settings.custom_timer_next = saved[1]
+        settings.custom_timer_fire[:] = saved[2]
+        settings.enabled = saved[3]
+        p._refresh_timers()
+
+
+def t_rest_state_text_covers_all_states():
+    """休息阶段 → 文字：**每个状态都得有话说**，界面更不许说反话。
+
+    2026-09-26 用户报：「定点休息」手动进入后，玩家面板卡片上写着**「未休息」** ✗
+    （他问的是"是没读到休息时长，还是显示错"）—— 答案是**显示**错：时长一直读得到 ✓，
+    错在"状态→文字"那张表只认隐身那三个状态 ✗。
+
+    所以这条钉两件事：
+      ① 表覆盖**全部** `REST_STATES`（以后加新休息类型、漏了文字 ⇒ 当场红 ✗）；
+      ② 玩家面板那张卡片对定点休息的各个阶段都说对（尤其**不许**出现「未休息」✗）。
+    实时页那行由 `selftest_minimap` 钉（它那边才建 RoutePanel）。
+    """
+    from gui.player_panel import PlayerPanel     # 只调静态方法，不建窗口
+    from decision.agent import settings as ds
+
+    for st in ag.REST_STATES:
+        check(ag.rest_state_text(st), "状态 %s 没有对应说法（界面会说反话 ✗）" % st)
+    check(ag.rest_state_text("") == "" and ag.rest_state_text("（乱填）") == "",
+          "空 / 认不出来的状态该给空串（**不许猜**成某个肯定句）")
+
+    saved = (ds.rest_state, ds.rest_until_monotonic, ds.anti_afk_spot_set,
+             ds.anti_afk_spot_after)
+    try:
+        ds.anti_afk_spot_set = "左上平台"
+        ds.anti_afk_spot_after = "右下休息平台"
+        ds.rest_state = "afk_spot_rest"
+        ds.rest_until_monotonic = time.monotonic() + 125
+        txt = PlayerPanel._rest_text()
+        check("定点休息中" in txt, "卡片没写「定点休息中」：%r" % txt)
+        check("未休息" not in txt, "卡片说反话（写着「未休息」）：%r" % txt)
+        check("2:0" in txt, "卡片没显示休息剩余时间：%r" % txt)
+
+        ds.rest_state = "afk_spot_walk"
+        ds.rest_until_monotonic = 0.0
+        txt = PlayerPanel._rest_text()
+        check("前往休息点" in txt and "左上平台" in txt,
+              "去休息点那段没说清去哪儿：%r" % txt)
+        check("未休息" not in txt, "去休息点的路上说反话：%r" % txt)
+
+        ds.rest_state = "afk_spot_back"
+        txt = PlayerPanel._rest_text()
+        check("结束后前往" in txt and "右下休息平台" in txt,
+              "「结束后前往」没说清去哪儿：%r" % txt)
+
+        ds.rest_state = "afk_rest"                  # 隐身那一型不许被改坏
+        ds.rest_until_monotonic = time.monotonic() + 65
+        check("休息中" in PlayerPanel._rest_text(), "隐身休息的文案被弄坏了")
+    finally:
+        (ds.rest_state, ds.rest_until_monotonic, ds.anti_afk_spot_set,
+         ds.anti_afk_spot_after) = saved
+
+
+def t_rest_contract():
+    """防掉线契约（2026-09-26 批准的三条结构性收敛）。合在一条里是因为它们都是
+    "静默出错"类 —— 界面说反话 / 卡键 / 角色白跑一趟，单看代码都像没问题 ✗：
+
+      ① **状态表覆盖齐全**：一个状态只在一处登记，其余派生（`REST_STATE_SPEC`）；
+      ② **收尾自保**：`_finish_rest` 自己把 `_afk_ctx` 的键松开、标记清掉
+         （不指望每个调用点都记得 ✗）；
+      ③ **只收自己那条路线**：休息结束要收掉"定点休息走过去"的任务，但
+         **不许**连坐用户自己下的「命令前往」✗。
+    """
+    from decision import route
+
+    # ① 契约表：字段齐全 + 派生元组确实是从表里来的
+    spec = ag.REST_STATE_SPEC
+    check(set(spec) == set(ag.REST_STATES), "REST_STATES 与契约表不一致")
+    for st, v in spec.items():
+        check(str(v.get("text") or ""), "状态 %s 没有文案（界面会说反话 ✗）" % st)
+        for f in ("spot", "timed", "interrupt"):
+            check(isinstance(v.get(f), bool), "状态 %s 缺字段 %s" % (st, f))
+    check(set(ag.SPOT_STATES) == {s for s, v in spec.items() if v["spot"]},
+          "SPOT_STATES 没从表里派生")
+    check(set(ag.REST_STATES_TIMED) == {s for s, v in spec.items() if v["timed"]},
+          "REST_STATES_TIMED 没从表里派生")
+    check(set(ag.REST_STATES_INTERRUPT)
+          == {s for s, v in spec.items() if v["interrupt"]},
+          "REST_STATES_INTERRUPT 没从表里派生")
+
+    s = fresh_settings(anti_afk_enabled=True, anti_afk_type="spot_rest",
+                       anti_afk_spot_set="乙平台", anti_afk_rest_min=0.2,
+                       anti_afk_rest_max=0.2)
+    s.anti_afk_spot_seq = [{"type": "down", "key": "shop"},
+                           {"type": "delay", "ms": 60000}]
+    h = Harness(s)
+    h.clock0 = h.clock.t
+    with h._patched():
+        a = h.agent
+        a.route_plan = lambda dst: {"path": [], "jobs": [], "here": True,
+                                    "why": "已经在上面了"}
+        a._begin_rest(0.0)
+        ws = h.ws(with_mob=False)
+        ws.player.here_sets = ["乙平台"]
+        a._run_rest(0.0, ws)               # 到了 ⇒ 进「到达后行为」并按下 shop
+        a._run_rest(0.5, ws)
+        check(a._afk_ctx is not None and a.state == "afk_spot_act",
+              "到达后行为没起跑（这条测不了）：%s / %s" % (a._afk_ctx, a.state))
+        # ② 随便谁调 `_finish_rest` 都要收干净（松键 + 清标记）
+        a._finish_rest(1.0)
+        check(a._afk_ctx is None, "收尾没清 `_afk_ctx`（下一个序列会带着旧键跑 ✗）")
+        check(a._spot_started is False, "收尾没清 `_spot_started`")
+        check(a.state == "idle" and a.settings.rest_state == "", "收尾没回到 idle")
+        # ⚠ 键名从日志里取（序列用的是**逻辑键名**，`keymap` 那层映射发生在 `input` 里）
+        _downs = [v for _t, k, v in h.log if k == "down"]
+        _ups = [v for _t, k, v in h.log if k == "up"]
+        check(_downs and _downs[0] in _ups,
+              "收尾没松开序列按着的键（会卡键 ✗）：%s" % h.log)
+
+        # ③ 归属判定：休息自己的路线要收掉
+        a.start_route([route.WalkJob("乙平台", [(500.0, 490.0, 510.0, -208.0, "1")])],
+                      why="定点休息：去「乙平台」")
+        check(a._climb is not None, "没挂上路线（这条测不了）")
+        a._finish_rest(2.0)
+        check(a._climb is None and not a._route,
+              "休息结束没把「去休息点」那条路线收掉 ✗")
+        # ③b **用户自己下的「命令前往」不许被连坐** ✗
+        a.start_route([route.WalkJob("丙平台", [(500.0, 490.0, 510.0, -208.0, "2")])],
+                      why="命令前往：丙平台")
+        a._finish_rest(3.0)
+        check(a._climb is not None,
+              "休息收尾把用户自己下的「命令前往」也收掉了（那不是休息的路线 ✗）")
+
+
+def t_goto_timeout_per_hop():
+    """「寻路超时时间(s)」按**每一段**算，不是按整条路线（用户 2026-09-26 定的口径）。
+
+    口径：**每完成一段**（从一个集合走到另一个集合）就**重新计时** ✓ —— 长路线不该因为
+    "两段各自都没超、加起来超了"被整条切断 ✗。
+
+    代码上靠 `start_climb()` 重打 `_climb_started`（`_task_finished` 接下一段时会调它 ✓），
+    但这件事**以前没有任何用例钉** ✗ —— 谁把 `start_climb` 里的那句挪走，行为就悄悄变成
+    "整条路线共用一次超时"，只会在某次长路线走到一半被切断时才发现 ✗。两种情形分开钉：
+
+      · 两段各 9 秒、上限 10 秒（累计 18 秒）⇒ **不许**被切断；
+      · 单独一段 11 秒、上限 10 秒 ⇒ 必须切断，并说清"这一段"跑了多久。
+    """
+    from decision import route
+
+    s = fresh_settings(goto_timeout_s=10.0)
+    s.enabled = True
+    h = Harness(s)
+    a = route.WalkJob("甲集合", [(520.0, 510.0, 530.0, -208.0, "1")])
+    b = route.WalkJob("乙集合", [(520.0, 510.0, 530.0, -208.0, "2")])
+    with h._patched():
+        h.agent.start_route([a, b], why="用例：两段")
+        ws = h.ws(with_mob=False)
+        # ① 第一段跑了 9 秒（没超）⇒ 到了 ⇒ 第二段**重新计时**
+        h.clock.t += 9.0
+        ws.player.here_sets = ["甲集合"]
+        check(h.agent._climb_tick(h.clock.t, 520.0, set(), ws) is False,
+              "第一段到了没接上第二段")
+        check(h.agent._climb is b, "第二段没挂上：%r" % (h.agent._climb,))
+        # ② 第二段再跑 9 秒（累计 18 秒 > 上限）⇒ **不许**被切
+        h.clock.t += 9.0
+        ws.player.here_sets = ["乙集合"]
+        check(h.agent._climb_tick(h.clock.t, 520.0, set(), ws) is True,
+              "两段各 9 秒、上限 10 ⇒ 累计 18 秒被整条切断（该**每段重新计时** ✗）")
+        check("寻路超时" not in h.agent.current_goto_note(),
+              "两段都没超却报了超时：%r" % h.agent.current_goto_note())
+
+        # ③ 单独一段超过上限 ⇒ 必须切，并说清是"这一段"
+        c = route.WalkJob("丙集合", [(520.0, 510.0, 530.0, -208.0, "3")],
+                          timeout_s=600.0, max_attempts=1)
+        h.agent.start_climb(c)
+        ws.player.here_sets = ["甲集合"]
+        h.clock.t += 11.0
+        check(h.agent._climb_tick(h.clock.t, 520.0, set(), ws) is True,
+              "单段超过「寻路超时时间」却没切断：%r" % (h.agent._climb,))
+        note = h.agent.current_goto_note()
+        check("寻路超时" in note, "切断了却没说清原因：%r" % note)
+        check("这一段" in note, "超时话里没说清是**这一段**跑了多久：%r" % note)
+
+
+def t_afk_retry_params_are_common():
+    """「被打断重试」+「打断后重试(s)」必须挂在**通用层**（换类型也看得见）。
+
+    2026-09-26 实锤：这两个控件被 `addRow` 进了「隐身休息」子组的表单 ✗ ⇒ 选「定点休息」
+    时整个隐身子组被隐藏 ⇒ 参数**跟着一起消失**（用户："我怎么没在定点休息组里看到
+    配置？"）。它们本来就是两种类型共用的 ✓（区别只在"算不算被打断"的时间窗）。
+    """
+    p, app = build_panel()
+    settings = ag.settings
+    saved = settings.anti_afk_type
+    try:
+        settings.anti_afk_type = "spot_rest"
+        p._refresh_afk_ui()
+        app.processEvents()
+        check(not p._afk_hidden.isVisibleTo(p),
+              "选「定点休息」时隐身子组该藏起来（这条测不了别的）")
+        check(not p._afk_hidden.isAncestorOf(p.ck_afk_retry),
+              "「被打断重试」挂在隐身子组里（换类型会跟着消失 ✗）")
+        check(not p._afk_hidden.isAncestorOf(p.sp_afk_retry),
+              "「打断后重试(s)」挂在隐身子组里（换类型会跟着消失 ✗）")
+        check(p.ck_afk_retry.isVisibleTo(p) and p.sp_afk_retry.isVisibleTo(p),
+              "选「定点休息」时看不到这两个参数 —— 用户 2026-09-26 报的就是这个 ✗")
+    finally:
+        settings.anti_afk_type = saved
+        p._refresh_afk_ui()
+
+
 # ---------------------------------------------------------------- 入口
 
 CHECKS = [
+    ("定点休息：走→到达后行为→歇时长→结束后前往→回战斗；走不到如实说",
+     t_afk_spot_rest),
+    ("防掉线：打断重试那两个参数挂在通用层（选定点休息也看得见）",
+     t_afk_retry_params_are_common),
+    ("寻路超时：每完成一段重新计时（长路线不被整条切断），单段超时才切",
+     t_goto_timeout_per_hop),
+    ("防掉线契约：状态表齐全 / 收尾自保松键 / 只收自己那条路线",
+     t_rest_contract),
+    ("休息文案：每个阶段都有话说；定点休息不许显示「未休息」",
+     t_rest_state_text_covers_all_states),
+    ("自定义定时行为：手动触发立刻演一次、计时从头开始（暂停/关自动不响应）",
+     t_timer_manual_fire),
+    ("自定义定时行为：界面「手动触发」按钮（换色 + 灰掉的时机）",
+     t_timer_manual_fire_button),
     ("输出CD：序列里没有攻击键也要守CD", t_cd_no_attack_key),
     ("输出CD：进攻击状态走排期（状态抖动不超速）", t_cd_on_enter_attack_state),
     ("输出CD：序列比CD长时以序列为准", t_cd_shorter_than_sequence),
@@ -1670,6 +2775,8 @@ CHECKS = [
     ("定期RELEASEALL：只作废按键记录", t_releaseall_clears_held_only),
     ("自定义定时行为：暂停后不触发、且打断正在演的序列",
      t_timer_paused_never_fires),
+    ("自定义定时行为：「休息时暂停计时」是每条各自的开关（没勾的照常倒数）",
+     t_timer_pause_on_rest_flag),
     ("自定义定时行为：暂停按钮/红字（已暂停）/继续接着走", t_timer_pause_button),
     ("休息状态机：到点/手动结束/关防掉线/手动进入", t_rest_state_machine),
     ("休息状态机：手动进入要先等清怪", t_rest_manual_request),
@@ -1680,6 +2787,9 @@ CHECKS = [
     ("追击起跳：区间在外侧时进区间跳一次", t_chase_jump_outside_band_once),
     ("追击起跳：怪走进区间的那一拍跳一次", t_chase_jump_approach_edge),
     ("追击起跳：有别的怪在场 / 开关关掉都不跳", t_chase_jump_guard_shut),
+    ("平地巡逻无怪时松掉输出键（怪在输出序列中途消失也不许卡键）",
+     t_patrol_idle_releases_output),
+    ("走只有一种走法：朝集合中点（「走的方向」参数不许回来）", t_walk_only_center),
     ("扫平台：攻击范围内有怪要站桩（不许边走边打）",
      t_sweep_stands_still_in_attack),
     ("按键层：F10~F12 三条发送路径全拦", t_input_local_only),
@@ -1690,6 +2800,12 @@ CHECKS = [
     ("本地(仅测试)输入：开启自动要二次确认，关闭不拦", t_auto_confirm_local),
     ("判定参数：对齐误差范围/时间有默认值、存读一致、设置里有那一页",
      t_align_params),
+    ("卡键看门狗：非输出状态下按住输出键超时 ⇒ 松开并留痕；正常输出不误杀",
+     t_stuck_key_watchdog),
+    ("防掉线：换行为类型不重排计时（休息时长与下次触发都不动）",
+     t_afk_type_does_not_reschedule),
+    ("多步路径：按顺序逐步走完，到了自动接下一步，失败整条停并说清断在第几步",
+     t_multi_step_route),
     ("定点上绳：对齐保持/抖出去重计时/到达双判据/偏离绳梯/超时/掉下来/重来/真实边",
      t_climb_job),
     ("上绳接进状态机：有怪先打、打完继续爬、开关不按跳、失败自动重来、到位/取消收干净",

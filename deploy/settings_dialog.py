@@ -170,7 +170,7 @@ class DeploySettingsDialog(QDialog):
         self.sp_lines = NoWheelSpinBox()
         self.sp_lines.setRange(LOG_MIN, LOG_MAX)
         self.sp_lines.setSingleStep(500)
-        self.sp_lines.setSuffix(" 行")
+        # 单位不写进框里（UI 规范 §9）；这里是"行数"，旁边的标签「保留行数」已经说清了
         self.sp_lines.setValue(int((self.cfg.get("log") or {}).get("max_lines")
                                    or LOG_DEFAULT))
         self.sp_lines.setToolTip(

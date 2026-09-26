@@ -156,10 +156,11 @@ class CalibManualDialog(QDialog):
         self.sp_scale.setDecimals(3)
         self.sp_scale.setSingleStep(0.01)
         self.sp_scale.setValue(self._scale)
-        self.sp_scale.setSuffix("×")
         self.sp_scale.setMinimumWidth(90)
         self.sp_scale.valueChanged.connect(self._on_spin)
         row.addWidget(self.sp_scale)
+        # 单位写在框**外面**（UI 规范 §9：不写进编辑框）
+        row.addWidget(QLabel("×"))
         self.lbl_scale = QLabel()
         self.lbl_scale.setMinimumWidth(90)
         self.lbl_scale.setStyleSheet("color:#80868b;")

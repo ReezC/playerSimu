@@ -989,7 +989,35 @@ class ZoneEditorDialog(QDialog):
     # ---------------- 界面 ----------------
 
     def _build(self):
-        root = QHBoxLayout(self)
+        # 最上面一条**常驻**的顶栏：只放「保存」（2026-09-26 用户要求：放最上面 + 换颜色）。
+        # 为什么非要搬上来：它原来在右栏**最底下**，而右栏是滚动区 ⇒ 窗口一矮、或者往下滚
+        # 两下，这个最要紧的按钮就**看不见**了 ✗（"找不到保存"比任何交互细节都糟）；
+        # 顶栏在滚动区**外面** ⇒ 永远看得见 ✓。
+        outer = QVBoxLayout(self)
+        # ⚠ 顶栏要**够矮**：它长在滚动区外面 ⇒ 高度会直接顶起窗口的最小高度，
+        # 而本窗口有一条既要满足的要求 —— 窗口能一路缩到 **240** 高（用例钉着：
+        # `t_dialog_background_breathing_and_size` 会 resize 到 240 并断言不被顶回去 ✗）。
+        # 所以这里零边距、零间距、按钮内边距也压到最小，只留醒目配色 ✓。
+        outer.setSpacing(2)
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(0)
+        self.btn_save = QPushButton("保存")
+        self.btn_save.setObjectName("saveZones")
+        # 换色：深绿底 + 白字（本仓库的主操作/成功色 —— 和"跳"、"已保存"同一档绿）
+        self.btn_save.setStyleSheet(
+            "QPushButton { background: #188038; color: #ffffff;"
+            " border: 1px solid #0d652d; border-radius: 6px;"
+            " padding: 2px 18px; font-weight: 600; }"
+            "QPushButton:hover { background: #146c2e; }"
+            "QPushButton:pressed { background: #0d652d; }")
+        self.btn_save.setToolTip("写入 %s（快捷键 Ctrl+S）" % self._zones_path.name)
+        self.btn_save.clicked.connect(self._on_save)
+        top.addWidget(self.btn_save)
+        top.addStretch(1)
+        outer.addLayout(top)
+
+        root = QHBoxLayout()          # 原来的左右两栏（左=画布，右=集合/可达那一列）
 
         left = QVBoxLayout()
         self.scene = QGraphicsScene(self)
@@ -1187,10 +1215,8 @@ class ZoneEditorDialog(QDialog):
         row.addWidget(self.btn_redo)
         right.addLayout(row)
 
-        self.btn_save = QPushButton("保存")
-        self.btn_save.setToolTip("写入 %s" % self._zones_path.name)
-        self.btn_save.clicked.connect(self._on_save)
-        right.addWidget(self.btn_save)
+        # ⚠ 「保存」**搬到最上面的顶栏了**（见 `_build` 开头）—— **不在这儿**：
+        # 它原来在右栏最底下、而右栏是滚动区 ⇒ 窗口一矮、或者往下滚两下就看不见 ✗。
         right.addStretch(1)
 
         # 滚动区：窗口矮下来时**出滚动条**，而不是把按钮压没
@@ -1203,6 +1229,7 @@ class ZoneEditorDialog(QDialog):
         area.setMaximumWidth(420)
         self.right_area = area                  # 留着（用例要断言"右栏真的在滚动区里"）
         root.addWidget(area, 0)
+        outer.addLayout(root, 1)                # 左右两栏塞进「顶栏 + 内容」这个外层
 
         # 呼吸高亮的节拍器：只改笔刷，不重排场景（见 _on_pulse）
         self.timer = QTimer(self)

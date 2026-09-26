@@ -664,8 +664,9 @@ class CalibCard(StepCard):
         self.sp_apply_all.setDecimals(3)
         self.sp_apply_all.setSingleStep(0.05)
         self.sp_apply_all.setValue(1.0)
-        self.sp_apply_all.setSuffix("×")
         row.addWidget(self.sp_apply_all, 1)
+        # 单位写在框**外面**（UI 规范 §9：不写进编辑框）
+        row.addWidget(QLabel("×"))
         btn_apply = QPushButton("一键设置尺度")
         btn_apply.setToolTip("把所有怪物/玩家的尺度基准统一设为这个值，并清空逐怪覆盖")
         btn_apply.clicked.connect(self._apply_all_scale)

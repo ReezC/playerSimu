@@ -497,6 +497,24 @@ class PlayerPanel(QWidget):
         cj_row.addStretch(1)
         bf.addRow("追击起跳", cj_row)
 
+        # 「追击起跳需要的冲刺时间(ms)」（用户 2026-09-26 要求）：放在它**下面一行**。
+        # 含义 = `chase` 状态**连续**维持了这么久才准起跳（中途进别的状态就归零）：
+        # 刚进追击 / 刚打完 / 刚转身那会儿就跳，常常是"为了跳而跳" —— 人还没冲起来，
+        # 跳出去够不着、还把节奏打断。0 = 不额外要求（老行为）。
+        # ⚠ `_spin(lo, hi, val, **decimals**, step=None)` —— 第 4 个参数是**小数位**。
+        # 这里要的是"毫秒、整数、步进 50" ⇒ `_spin(0, 5000, 0, 0, 50)`；
+        # 曾把 50 写在第 4 位 ⇒ decimals=50 ⇒ 框里显示 0.000…0（50 个 0）✗。
+        # 单位也不写进框里（UI 规范：单位写在框外）—— 已经在下面那行标签的 "(ms)" 里了。
+        self.sp_chase_dash = self._spin(0, 5000, 0, 0, 50)
+        self.sp_chase_dash.setToolTip(
+            "追击起跳需要的**冲刺时间**（毫秒）：\n"
+            "`chase`（追击）状态必须**连续**维持这么久，才会真的起跳；\n"
+            "只要中途进了别的状态（攻击 / 站桩 / 规避 / 休息…）计时就**归零**。\n\n"
+            "例：填 300 ⇒ 冲了 300ms 以上，进起跳区间那一拍才跳。\n"
+            "0 = 不额外要求（老行为：一到区间就跳）。")
+        self.sp_chase_dash.valueChanged.connect(self._on_chase_jump)
+        bf.addRow("追击起跳需要的冲刺时间(ms)", self.sp_chase_dash)
+
         # 规避策略（仅最小攻击距离 > 0 时显示）
         evade_grp = QGroupBox("规避策略")
         ef = QFormLayout(evade_grp)
@@ -657,30 +675,10 @@ class PlayerPanel(QWidget):
         pg.addRow("MP当前", self.pb_mp)
         self._lbl_mp_cur = pg.labelForField(self.pb_mp)
 
-        # 自动喂宠
-        feed_row = QHBoxLayout()
-        self.ck_feed = QCheckBox("自动喂宠")
-        self.ck_feed.setToolTip("定时自动喂宠物。")
-        self.ck_feed.stateChanged.connect(self._on_auto_feed)
-        self.lbl_feed_cd = QLabel("")
-        self.lbl_feed_cd.setStyleSheet("color:#80868b;")
-        feed_row.addWidget(self.ck_feed)
-        feed_row.addWidget(self.lbl_feed_cd)
-        feed_row.addStretch(1)
-        pg.addRow("", feed_row)
-
-        # 喂宠间隔：随机区间 [下限, 上限]（分钟）
-        self.sp_feed_interval_min = self._spin(0.1, 600, 5, 1, 0.1)
-        self.sp_feed_interval_max = self._spin(0.1, 600, 10, 1, 0.1)
-        self.sp_feed_interval_min.setToolTip("每隔随机 N~M 分钟喂一次宠物（支持小数，如 1.5）。")
-        self.sp_feed_interval_max.setToolTip("每隔随机 N~M 分钟喂一次宠物（支持小数，如 1.5）。")
-        self.sp_feed_interval_min.valueChanged.connect(self._on_feed_interval)
-        self.sp_feed_interval_max.valueChanged.connect(self._on_feed_interval)
-        feed_iv_row = QHBoxLayout()
-        feed_iv_row.addWidget(self.sp_feed_interval_min)
-        feed_iv_row.addWidget(QLabel("~"))
-        feed_iv_row.addWidget(self.sp_feed_interval_max)
-        pg.addRow("喂宠间隔(min)", feed_iv_row)
+        # ⚠ 「自动喂宠」整块**已移除**（用户 2026-09-26）。
+        #    他要的那个效果改用「自定义定时行为」实现 ✓ —— 按键那层的「喂宠」键**保留** ✓，
+        #    在那里配一条定时行为（间隔 + 喂宠键）就是原来那个功能 ✓，而且能自己调序列。
+        #    别把这一块又加回来 ✗。
 
         self._pot_form = pg
 
@@ -844,6 +842,23 @@ class PlayerPanel(QWidget):
         afk_iv_row.addWidget(self.sp_afk_max)
         af.addRow("触发时间(min)", afk_iv_row)
 
+        # **休息时长**（2026-09-26 用户要求）：从「隐身休息」子组**上移到通用层**，
+        # 紧跟触发时间之后 —— 它是**每个防掉线行为类型**通用的参数
+        # （隐身休息 / 定点休息… 都是"歇这么久"）。上移后它不再跟着类型显隐 ✓。
+        self.sp_rest_min = self._spin(0.1, 600, 10, 1, 0.1)
+        self.sp_rest_max = self._spin(0.1, 600, 20, 1, 0.1)
+        self.sp_rest_min.setToolTip("**本次休息**随机 N~M 分钟（支持小数，如 7.5）。\n"
+                                    "所有防掉线行为类型通用。")
+        self.sp_rest_max.setToolTip("**本次休息**随机 N~M 分钟（支持小数，如 7.5）。\n"
+                                    "所有防掉线行为类型通用。")
+        self.sp_rest_min.valueChanged.connect(self._on_afk_rest_time)
+        self.sp_rest_max.valueChanged.connect(self._on_afk_rest_time)
+        rest_iv_row = QHBoxLayout()
+        rest_iv_row.addWidget(self.sp_rest_min)
+        rest_iv_row.addWidget(QLabel("~"))
+        rest_iv_row.addWidget(self.sp_rest_max)
+        af.addRow("休息时长(min)", rest_iv_row)
+
         # 行为类型：不同类型展开不同的参数子组（目前只有「隐身休息」）
         self.cmb_afk_type = NoWheelComboBox()
         for tid, tname in ANTI_AFK_TYPES:
@@ -870,47 +885,84 @@ class PlayerPanel(QWidget):
         self.btn_afk_exit.clicked.connect(lambda: self._edit_afk_seq("exit"))
         hf.addRow("退出隐身", self.btn_afk_exit)
 
-        self.sp_rest_min = self._spin(0.1, 600, 10, 1, 0.1)
-        self.sp_rest_max = self._spin(0.1, 600, 20, 1, 0.1)
-        self.sp_rest_min.setToolTip("隐身休息随机 N~M 分钟（支持小数，如 7.5）。")
-        self.sp_rest_max.setToolTip("隐身休息随机 N~M 分钟（支持小数，如 7.5）。")
-        self.sp_rest_min.valueChanged.connect(self._on_afk_rest_time)
-        self.sp_rest_max.valueChanged.connect(self._on_afk_rest_time)
-        rest_iv_row = QHBoxLayout()
-        rest_iv_row.addWidget(self.sp_rest_min)
-        rest_iv_row.addWidget(QLabel("~"))
-        rest_iv_row.addWidget(self.sp_rest_max)
-        hf.addRow("休息时长(min)", rest_iv_row)
+        # ⚠ 「休息时长」**已上移到通用层**（触发时间下面，2026-09-26 用户要求）：
+        # 它是**每个防掉线行为类型**通用的参数，不再是「隐身休息」专属 ⇒ 别加回这个子组 ✗。
 
-        # 「被打断重试」：休息期间**触发了自动补血**就算被打断 —— 补血说明隐身没兜住
+        # 「被打断重试」：休息期间**触发了自动补血**就算被打断 —— 补血说明没兜住
         # （隐身到期 / 被范围技能扫到 / 有东西在打我们），继续歇着等于等着挨打。
+        # ⚠ 两种休息类型共用这一个开关**和**下面那个秒数（2026-09-26 用户确认）：
+        #    只是"算不算被打断"的时间窗不一样，见 `agent.REST_STATE_SPEC` 的 interrupt 列。
+        # ⚠⚠ 它们**必须挂在通用层**（`af`），不能挂进「隐身休息」子组（`hf`）——
+        #    挂错了的话：选「定点休息」时整个隐身子组被隐藏 ⇒ **这两个参数也跟着消失** ✗
+        #    （用户 2026-09-26 就是这么问的："我怎么没在定点休息组里看到配置？"）。
+        #    ⚠ 但**代码顺序不等于显示顺序**：`af.addRow` 的调用顺序才是 ⇒ 下面这两个
+        #    `af.addRow` 特意放在**两个子组之前**（那两处各有一行注释标着）。
         self.ck_afk_retry = QCheckBox("被打断重试")
         self.ck_afk_retry.setToolTip(
-            "休息期间**触发了自动补血**就算被打断：立刻执行「退出隐身行为」回到战斗，\n"
-            "并把下次休息提前到下面设的秒数之后（不再是随机的那 N~M 分钟）。\n\n"
-            "为什么补血算被打断：它说明隐身没兜住 —— 隐身到期、被范围技能扫到，\n"
-            "或者有东西在打我们。这时候继续歇着只是等着挨打。\n"
+            "休息期间**触发了自动补血**就算被打断：立刻收工回战斗，并把下次休息提前到\n"
+            "下面设的秒数之后（不再是随机的那 N~M 分钟）。\n\n"
+            "为什么补血算被打断：它说明没兜住 —— 隐身到期、被范围技能扫到，或者有东西\n"
+            "在打我们。这时候继续歇着只是等着挨打。\n\n"
+            "**从哪一刻开算**：\n"
+            "  · 隐身休息：进入隐身之后到退出隐身之前；\n"
+            "  · 定点休息：**从开始前往指定地点那一刻就开算**（到达后行为、正歇着也算）\n"
+            "    —— 去休息点路上被打断，这次就不作数，等下面那个秒数后重来。\n"
             "不勾选时：补血照常发生，但休息不被打断。")
         self.ck_afk_retry.stateChanged.connect(self._on_afk_retry)
-        hf.addRow("", self.ck_afk_retry)
 
         self.sp_afk_retry = self._spin(1, 3600, 60, 0, 1)
         self.sp_afk_retry.setToolTip(
-            "被打断后隔多少秒重试下一次休息（1~3600 秒）。\n"
+            "被打断后隔多少秒**再试一次**休息（1~3600 秒）—— 两种休息类型都适用。\n"
             "设小一点 = 被打了就很快再试着休息（容易反复被打断）；\n"
             "设大一点 = 干脆先打一会儿再说。")
         self.sp_afk_retry.valueChanged.connect(self._on_afk_retry_sec)
-        hf.addRow("打断后重试(s)", self.sp_afk_retry)
+
+        # ---- **通用层**：两种休息类型共用的参数，放子组**外面** ⇒ 换类型也看得见 ✓ ----
+        # （见上面那段注释：挂进「隐身休息」子组的话，选「定点休息」时会一起消失 ✗）
+        af.addRow("", self.ck_afk_retry)
+        af.addRow("打断后重试(s)", self.sp_afk_retry)
 
         af.addRow(self._afk_hidden)
+
+        # 定点休息子组（用户 2026-09-26 要求）：走到指定集合 → 到达后行为 → 歇**通用休息时长**
+        # → 「结束后前往」填了就先走过去 → 回战斗。
+        # ⚠ 行进流程（用路径解析 + 多步执行）记在 docs/开发计划.md 的 P2，还没接完 ——
+        #    所以这个子组的 tooltip 里写明了现状，别让人以为选了就已经能走 ✗。
+        self._afk_spot = QGroupBox("定点休息")
+        sf = QFormLayout(self._afk_spot)
+        sf.setLabelAlignment(Qt.AlignLeft)
+
+        self.cmb_spot_set = NoWheelComboBox()
+        self.cmb_spot_set.setToolTip(
+            "休息要去的地点：当前地图**已注册的 foothold 集合**。\n\n"
+            "⚠ 现状：这一类型的**行进流程还在做**（见 docs/开发计划.md P2）——\n"
+            "现在它会像隐身休息那样原地歇，还不会自己走过去。")
+        self.cmb_spot_set.currentIndexChanged.connect(self._on_spot_changed)
+        sf.addRow("指定地点", self.cmb_spot_set)
+
+        self.btn_spot_seq = QPushButton("编辑到达后行为")
+        self.btn_spot_seq.setToolTip("走到指定地点之后执行的动作序列（例如坐下、用道具）。")
+        self.btn_spot_seq.setStyleSheet(self._BTN_EDIT_SEQ)
+        self.btn_spot_seq.clicked.connect(lambda: self._edit_afk_seq("spot"))
+        sf.addRow("到达后行为", self.btn_spot_seq)
+
+        self.cmb_spot_after = NoWheelComboBox()
+        self.cmb_spot_after.setToolTip("休息**结束之后**先走去哪个集合，再回去打怪。\n"
+                                       "选「（不前往）」= 休息完直接继续打怪。")
+        self.cmb_spot_after.currentIndexChanged.connect(self._on_spot_changed)
+        sf.addRow("结束后前往", self.cmb_spot_after)
+
+        af.addRow(self._afk_spot)
 
         root.addWidget(afk)
         root.addStretch(1)
 
-        # 喂宠倒计时：每秒刷新一次「距离下次」
-        self._feed_timer = QTimer(self)
-        self._feed_timer.setInterval(1000)
-        self._feed_timer.timeout.connect(self._tick_feed_cd)
+        # 倒计时刷新（每秒）：自定义定时行为的「剩余 M:SS」（读 agent 维护的下次触发时刻）。
+        # ⚠ 名字原来是 `_feed_timer`（那会儿它只管喂宠）——「自动喂宠」2026-09-26 整块移除后
+        #    它就是**通用的倒计时节拍**了 ⇒ 一并改名，别留着旧名字误导人 ✗。
+        self._cd_timer = QTimer(self)
+        self._cd_timer.setInterval(1000)
+        self._cd_timer.timeout.connect(self._tick_timer_cd)
 
         # 自动开关状态轮询：agent 后台可能因朝向超时等把 enabled 关掉，定时同步 UI
         self._state_timer = QTimer(self)
@@ -1150,6 +1202,9 @@ class PlayerPanel(QWidget):
             self._refresh_auto_ui()
         resting = bool(settings.rest_state)
         self.btn_end_rest.setEnabled(resting)
+        # 「手动触发」跟着自动开关变灰/变亮（自动关着时序列活不过一帧，见 `_fire_timer`）。
+        # 每秒设一次 enabled：值没变时 Qt 不会重绘，代价可以忽略。
+        self._sync_timer_fire_btns()
         # 「手动进入休息」：自动开着 + 防掉线开着 + 没在休息 + 没在等清怪。
         # 已经在「待休息」时再点没意义（本来就是等清怪），禁掉更清楚。
         self.btn_start_rest.setEnabled(
@@ -1266,14 +1321,23 @@ class PlayerPanel(QWidget):
             sec = max(0, int(until - time.monotonic()))
             return "　剩余 %d:%02d" % (sec // 60, sec % 60)
 
-        st = settings.rest_state
-        # 休息时长从「开始进入隐身」起算，所以这个阶段剩余时间也已经在走了
-        if st == "afk_enter":
-            return "进入隐身…" + left(settings.rest_until_monotonic)
-        if st == "afk_rest":
-            return "休息中" + left(settings.rest_until_monotonic)
-        if st == "afk_exit":
-            return "退出隐身…"
+        st = str(settings.rest_state or "")
+        # 阶段 → 短句走 **agent 里那张共用表**（`REST_STATE_TEXT`）。
+        # ⚠ 这里原来是三个 `if`，只认隐身那三个状态 ⇒ 「定点休息」进来之后一个都匹配不上，
+        #   于是卡片上写着 **「未休息」** ✗（2026-09-26 用户当场就问了：是没读到休息时长，
+        #   还是显示错？—— 是**显示**错，时长一直读得到 ✓）。
+        from decision import agent as agent_mod
+        txt = agent_mod.rest_state_text(st)
+        if txt:
+            # 去休息点 / 结束后前往：顺带说清**去哪个集合**（不然只看到"前往休息点…"）
+            if st in ("afk_spot_walk", "afk_spot_act"):
+                dst = str(getattr(settings, "anti_afk_spot_set", "") or "")
+                txt += ("「%s」" % dst) if dst else ""
+            elif st == "afk_spot_back":
+                dst = str(getattr(settings, "anti_afk_spot_after", "") or "")
+                txt += ("「%s」" % dst) if dst else ""
+            # 倒计时只在**真的在计时**的阶段加（其余阶段它是 0 ⇒ `left()` 给空串 ✓）
+            return txt + left(settings.rest_until_monotonic)
         # 到点了但攻击范围内还有怪：卡在这一步时最容易被误认为「坏了」
         if settings.rest_pending:
             return "待休息：等清空攻击范围内的怪"
@@ -1308,12 +1372,17 @@ class PlayerPanel(QWidget):
         settings.chase_jump_enabled = bool(self.ck_chase_jump.isChecked())
         settings.chase_jump_min = int(self.sp_chase_jump_min.value())
         settings.chase_jump_max = int(self.sp_chase_jump_max.value())
+        settings.chase_jump_dash_ms = int(self.sp_chase_dash.value())
         settings.save()
         self._refresh_chase_jump_ui()
 
     def _refresh_chase_jump_ui(self):
-        """开关关掉时把两个距离框灰掉。"""
+        """开关关掉时把参数框灰掉（两个距离 + 冲刺时间）。"""
         on = self.ck_chase_jump.isChecked()
+        # 冲刺时间也跟着灰：开关关着时改它没意义（用户要求"勾选追击起跳时才有这个参数"）。
+        # `hasattr` 兜底：老配置文件/半初始化的面板里可能还没这个框。
+        if hasattr(self, "sp_chase_dash"):
+            self.sp_chase_dash.setEnabled(on)
         self.sp_chase_jump_min.setEnabled(on)
         self.sp_chase_jump_max.setEnabled(on)
 
@@ -1385,12 +1454,48 @@ class PlayerPanel(QWidget):
         而且灰着的框旁边就是那句 tooltip，比"消失了"更好解释。
         """
         self._afk_hidden.setVisible(settings.anti_afk_type == "hidden_rest")
+        self._afk_spot.setVisible(settings.anti_afk_type == "spot_rest")
         self.sp_afk_retry.setEnabled(bool(settings.anti_afk_retry_on_interrupt))
+
+    def set_zone_sets(self, names):
+        """把**当前地图已注册的集合名**灌进「定点休息」那两个下拉（由路线识别面板推过来）。
+
+        为什么是"推"而不是自己去读：集合属于**地图**（`core/zones` 按 map id 存），
+        而玩家面板不持有地图 id —— 路线识别面板那边才有（`_map_id()` / `bind(project)`），
+        所以走它已经用的那套"面板间推送"（同 live_panel.set_mmap ✓）。
+        保留当前选择：refill 之后按名字重新选回去；选的名字没了就回到"未选"。
+        """
+        names = [str(n) for n in (names or [])]
+        for cmb, empty_label, cur in (
+                (self.cmb_spot_set, "（未选）", settings.anti_afk_spot_set),
+                (self.cmb_spot_after, "（不前往）", settings.anti_afk_spot_after)):
+            cmb.blockSignals(True)
+            cmb.clear()
+            cmb.addItem(empty_label, "")
+            for n in sorted(names):
+                cmb.addItem(n, n)
+            j = cmb.findData(str(cur or ""))
+            cmb.setCurrentIndex(j if j >= 0 else 0)
+            cmb.blockSignals(False)
+
+    def _on_spot_changed(self, _i=None):
+        """「定点休息」的三个参数写回配置。
+
+        ⚠ 单独一个槽（不接 `_on_anti_afk`）：那个槽的第一个参数是**勾选框状态**，
+        下拉的 `currentIndexChanged(int)` 传进去会被当成 bool ⇒ 选到 index 0 就把
+        "自动防掉线"关掉了 ✗（这类签名串台的坑，本仓库踩过好几次）。
+        """
+        settings.anti_afk_spot_set = str(self.cmb_spot_set.currentData() or "")
+        settings.anti_afk_spot_after = str(self.cmb_spot_after.currentData() or "")
+        settings.save()
 
     def _edit_afk_seq(self, which):
         """打开「进入隐身」/「退出隐身」的行为编辑器。"""
         from gui.seq_editor import SeqEditorDialog
-        attr = "anti_afk_enter_seq" if which == "enter" else "anti_afk_exit_seq"
+        # 三个入口共用：进入隐身 / 退出隐身 / 定点休息的「到达后行为」
+        attr = {"enter": "anti_afk_enter_seq",
+                "exit": "anti_afk_exit_seq",
+                "spot": "anti_afk_spot_seq"}[which]
         title = ("进入隐身" if which == "enter" else "退出隐身") + "行为编辑器"
         dlg = SeqEditorDialog(getattr(settings, attr) or [], self, title=title)
         if dlg.exec_():
@@ -1521,32 +1626,17 @@ class PlayerPanel(QWidget):
         settings.auto_mp_pot = bool(state)
         settings.save()
 
-    def _on_auto_feed(self, state):
-        settings.auto_feed_pet = bool(state)
-        settings.save()
-        # 开关切换都清计时：打开后等一个间隔再喂（不立即吃）、关掉不留残值
-        settings.feed_next_monotonic = 0.0
-        if settings.auto_feed_pet:
-            self._feed_timer.start()
-            self._tick_feed_cd()
-        else:
-            self._feed_timer.stop()
-            self.lbl_feed_cd.setText("")
+    # ⚠ `_on_auto_feed`（自动喂宠开关的槽）**已随功能一起移除**（用户 2026-09-26）——
+    #    想喂宠就用「自定义定时行为」配一条 ✓（按键那层的「喂宠」键还在 ✓）。
 
-    def _tick_feed_cd(self):
-        """每秒刷新喂宠 + 自定义定时行为的倒计时（读 agent 维护的下次触发时刻）。"""
+    def _tick_timer_cd(self):
+        """每秒刷新**自定义定时行为**的倒计时（读 agent 维护的下次触发时刻）。
+
+        ⚠ 名字原来是 `_tick_feed_cd`（那会儿它还管喂宠）：「自动喂宠」2026-09-26 整块移除后
+          它就只管定时行为了 ⇒ 一并改名，别留着旧名字误导人 ✗。
+        """
         import time
         now = time.monotonic()
-        next_ts = settings.feed_next_monotonic
-        if next_ts > 0:
-            remaining = next_ts - now
-        else:
-            remaining = settings.feed_interval_min * 60.0   # agent 还没跑过：按最短间隔（下限）占位
-        if remaining < 0:
-            remaining = 0
-        m = int(remaining) // 60
-        s = int(remaining) % 60
-        self.lbl_feed_cd.setText("距离下次：%d:%02d" % (m, s))
         # 自定义定时行为倒计时
         for name, lbl in self._timer_cd_labels.items():
             t = next((x for x in settings.custom_timers if x.get("name") == name), None)
@@ -1581,6 +1671,7 @@ class PlayerPanel(QWidget):
         self._timer_cd_labels.clear()
         self._timer_cd_state.clear()
         self._timer_pause_btns.clear()
+        self._timer_fire_btns = {}       # {name: 「手动触发」按钮}
         for t in settings.custom_timers:
             name = t.get("name", "")
             lo, hi = t.get("interval", [5, 10])
@@ -1597,6 +1688,25 @@ class PlayerPanel(QWidget):
             row.addWidget(lbl_name)
             row.addWidget(lbl_iv)
             row.addWidget(lbl_cd, 1)
+            # 「手动触发」（2026-09-26 用户要求）：立刻演一次 + 计时从头开始。
+            # 颜色**故意和旁边三个不一样**（琥珀色）—— 它是"会让角色立刻动起来"的那一个，
+            # 混在「暂停 / 编辑 / 删除」里最容易点错（用户明确要求"换个按钮颜色"）。
+            btn_fire = QPushButton("手动触发")
+            btn_fire.setFixedWidth(78)
+            btn_fire.setStyleSheet(
+                "QPushButton { background:#fef7e0; color:#a05c00;"
+                " border:1px solid #fadf8e; border-radius:5px; font-weight:600; }"
+                "QPushButton:hover { background:#feefc3; }"
+                "QPushButton:disabled { color:#9aa0a6; background:#f8f9fa;"
+                " border-color:#dadce0; }")
+            btn_fire.setToolTip(
+                "**立刻演一次**这个行为，并把**计时从头开始**"
+                "（下一次触发从这一刻重新随机）。\n\n"
+                "灰着 = 现在点不了：自动没开（序列活不下来），"
+                "或者这一项已暂停（先点「继续」）。")
+            btn_fire.clicked.connect(lambda _c, n=name: self._fire_timer(n))
+            self._timer_fire_btns[name] = btn_fire
+            row.addWidget(btn_fire)
             # 暂停 / 继续：把某一个定时行为单独停掉（其它的照常），
             # 点「继续」从停下的地方接着倒计时
             btn_pause = QPushButton("继续" if paused else "暂停")
@@ -1622,9 +1732,35 @@ class PlayerPanel(QWidget):
             self._timer_cd_labels[name] = lbl_cd
         # 有定时行为就得让倒计时在跑：新增/编辑后也保证这一秒表在转
         # （以前只在"打开项目时已有定时行为"和"开喂宠"时启动，新增完不会动）
-        if settings.custom_timers and not self._feed_timer.isActive():
-            self._feed_timer.start()
-        self._tick_feed_cd()
+        if settings.custom_timers and not self._cd_timer.isActive():
+            self._cd_timer.start()
+        self._tick_timer_cd()
+        self._sync_timer_fire_btns()
+
+    def _fire_timer(self, name):
+        """手动触发一次这个定时行为（**计时从头开始**，用户 2026-09-26 要求）。
+
+        为什么只往 `settings.custom_timer_fire` 里塞个名字：序列只能在**实时线程**里
+        演（按键、计时都在 agent 那边），界面里直接演会跟主回路抢按键 ✗ —— 走仓库里
+        已有的"请求通道"做法（同 `rest_request` / `rest_abort` ✓）。
+        """
+        if not settings.enabled:
+            return          # 按钮本来就是灰的（自动关着时序列活不过一帧）
+        settings.custom_timer_fire.append(str(name))
+
+    def _sync_timer_fire_btns(self):
+        """「手动触发」按钮的可用性：**自动没开 / 这一项已暂停**时点不了。
+
+        判据和 agent 那边**对齐**（不然就是"点了没反应" ✗）：
+          · 自动没开 ⇒ tick 每拍都会 `_release_held_keys()`（它会把 `_timer_states`
+            全清掉）⇒ 序列活不过一帧；
+          · 已暂停 ⇒ agent 那边本来就跳过这一项（见 `_custom_timers` 的 paused 分支）。
+        """
+        for name, btn in getattr(self, "_timer_fire_btns", {}).items():
+            t = next((x for x in settings.custom_timers
+                      if x.get("name") == name), None)
+            btn.setEnabled(bool(settings.enabled)
+                           and not bool((t or {}).get("paused")))
 
     def _toggle_timer_pause(self, name):
         """暂停 / 继续一个自定义定时行为。
@@ -1687,6 +1823,8 @@ class PlayerPanel(QWidget):
         t["name"] = r["name"]
         t["interval"] = r["interval"]
         t["seq"] = r["seq"]
+        # 「休息时暂停计时」（2026-09-26 新增）：编辑窗里那个勾 ⇒ 写回这一条 ✓
+        t["pause_on_rest"] = bool(r.get("pause_on_rest", True))
         # 编辑后重新计时：无论名字变没变，都按新间隔重新随机
         settings.custom_timer_next.pop(name, None)
         settings.custom_timer_next.pop(r["name"], None)
@@ -1700,17 +1838,12 @@ class PlayerPanel(QWidget):
         settings.save()
         self._refresh_timers()
 
-    def _on_feed_interval(self, _val=None):
-        settings.feed_interval_min = float(self.sp_feed_interval_min.value())
-        settings.feed_interval_max = float(self.sp_feed_interval_max.value())
-        if settings.feed_interval_max < settings.feed_interval_min:
-            settings.feed_interval_max = settings.feed_interval_min
-        settings.save()
+    # ⚠ `_on_feed_interval`（喂宠间隔的槽）**已随功能一起移除**（用户 2026-09-26）。
 
     def _pick_bar(self, kind):
         """在实时画面上框选 HP/MP 条区域，并采样该条的填充色。
 
-        框选走全仓库唯一那份实现（带放大镜，见 docs/UI规范.md §9）：血条上沿
+        框选走全仓库唯一那份实现（带放大镜，见 docs/UI规范.md §8）：血条上沿
         差一两个像素，采样就会吃到背景色。条又细又长，所以起始倍数给到 12×。
         """
         from gui.region_selector import select_region_on_image
@@ -2107,7 +2240,8 @@ class PlayerPanel(QWidget):
         self.ck_chase_jump.setChecked(bool(settings.chase_jump_enabled))
         self.ck_chase_jump.blockSignals(False)
         for sp, v in ((self.sp_chase_jump_min, settings.chase_jump_min),
-                      (self.sp_chase_jump_max, settings.chase_jump_max)):
+                      (self.sp_chase_jump_max, settings.chase_jump_max),
+                      (self.sp_chase_dash, settings.chase_jump_dash_ms)):
             sp.blockSignals(True)
             sp.setValue(int(v))
             sp.blockSignals(False)
@@ -2237,26 +2371,12 @@ class PlayerPanel(QWidget):
         self.ck_auto_mp.setChecked(settings.auto_mp_pot)
         self.ck_auto_mp.blockSignals(False)
 
-        self.ck_feed.blockSignals(True)
-        self.ck_feed.setChecked(settings.auto_feed_pet)
-        self.ck_feed.blockSignals(False)
-
-        if settings.auto_feed_pet:
-            self._feed_timer.start()
-            self._tick_feed_cd()
-
-        self.sp_feed_interval_min.blockSignals(True)
-        self.sp_feed_interval_min.setValue(settings.feed_interval_min)
-        self.sp_feed_interval_min.blockSignals(False)
-
-        self.sp_feed_interval_max.blockSignals(True)
-        self.sp_feed_interval_max.setValue(settings.feed_interval_max)
-        self.sp_feed_interval_max.blockSignals(False)
+        # ⚠ 「自动喂宠」的控件回填**已移除**（2026-09-26 整块删除）—— 别再加回来 ✗。
 
         # 自定义定时行为列表
         self._refresh_timers()
         if settings.custom_timers:
-            self._feed_timer.start()
+            self._cd_timer.start()
 
         self.ck_afk.blockSignals(True)
         self.ck_afk.setChecked(settings.anti_afk_enabled)

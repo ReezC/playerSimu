@@ -144,12 +144,12 @@ class RoutePanel(QWidget):
         # （感知没有开关，见上面那段说明）。
         row_retry = QHBoxLayout()
         row_retry.setSpacing(6)
-        row_retry.addWidget(QLabel("上绳梯失败后延迟激活时间"))
+        # 单位写在标签里（UI 规范 §9：不写进编辑框）
+        row_retry.addWidget(QLabel("上绳梯失败后延迟激活时间(s)"))
         self.sp_retry = NoWheelDoubleSpinBox()
         self.sp_retry.setRange(0.0, 30.0)
         self.sp_retry.setDecimals(1)
         self.sp_retry.setSingleStep(0.5)
-        self.sp_retry.setSuffix(" s")
         self.sp_retry.setMinimumWidth(90)
         self.sp_retry.setValue(float(getattr(settings, "climb_retry_delay_s", 1.0)))
         self.sp_retry.setToolTip(
@@ -295,11 +295,14 @@ class RoutePanel(QWidget):
         # 存 config/live.yaml（和「来源」「框选」一样：取决于本机画面与帧率，与地图无关）。
         self._sp_track = {}          # 配置键名 → 输入框（键名以 mm.TRACK_KEYS 为准）
 
-        def _track_spin(key, name, lo, hi, suffix, tip):
-            """造一个容差输入框：滚轮不改值（UI规范 §5）、带单位、说明进 tooltip。"""
+        def _track_spin(key, name, lo, hi, tip):
+            """造一个容差输入框：滚轮不改值（UI规范 §5）、说明进 tooltip。
+
+            单位**不写进框里**（UI 规范 §9）：写在旁边那个 QLabel 上
+            （「沿用(ms)」「跳变上限(px)」这种）。
+            """
             sp = NoWheelSpinBox()
             sp.setRange(lo, hi)
-            sp.setSuffix(suffix)
             sp.setFixedWidth(84)
             sp.setToolTip("%s：\n%s" % (name, tip))
             sp.valueChanged.connect(self._on_mmap_track)
@@ -310,15 +313,15 @@ class RoutePanel(QWidget):
         row4 = QHBoxLayout()
         row4.setSpacing(6)
         row4.addWidget(QLabel("标记跟踪"))
-        row4.addWidget(QLabel("沿用"))
+        row4.addWidget(QLabel("沿用(ms)"))
         row4.addWidget(_track_spin(
-            "mmap_hold_ms", "沿用", 0, 5000, " ms",
+            "mmap_hold_ms", "沿用", 0, 5000,
             "黄点这一拍认不出时，**沿用上一帧位置**多久（毫秒）。\n"
             "窗口内位置会按速度外推一点点；窗口过了才当真跟丢。\n"
             "0 = 不用这条（认不出就直接说认不出）。"))
-        row4.addWidget(QLabel("外推上限"))
+        row4.addWidget(QLabel("外推上限(px)"))
         row4.addWidget(_track_spin(
-            "mmap_ghost_shift", "外推上限", 0, 100, " px",
+            "mmap_ghost_shift", "外推上限", 0, 100,
             "沿用期间位置最多往外推这么多像素（面板像素，1 px ≈ 16 世界像素）。"))
         row4.addStretch(1)
         root.addLayout(row4)
@@ -327,15 +330,15 @@ class RoutePanel(QWidget):
         row5 = QHBoxLayout()
         row5.setSpacing(6)
         row5.addWidget(QLabel(""))
-        row5.addWidget(QLabel("搜索半径"))
+        row5.addWidget(QLabel("搜索半径(px)"))
         row5.addWidget(_track_spin(
-            "mmap_roi_pad", "搜索半径", 0, 200, " px",
+            "mmap_roi_pad", "搜索半径", 0, 200,
             "有上一帧位置时，只在它周围这么大一块里找（像素）。\n"
             "实际半径还会自动放大到能盖住黄点本身（面板大、点也大）。\n"
             "越小越快；人跑得快时找不到会自动退回全画面重找。"))
-        row5.addWidget(QLabel("跳变上限"))
+        row5.addWidget(QLabel("跳变上限(px)"))
         row5.addWidget(_track_spin(
-            "mmap_max_jump", "跳变上限", 0, 500, " px",
+            "mmap_max_jump", "跳变上限", 0, 500,
             "两拍之间位置跳超过这么多像素就当噪声：丢掉位置、下一拍重捕。\n"
             "调小 = 更不信突变（适合跟丢少、噪声多的画面）；0 = 不判跳变。"))
         row5.addStretch(1)
@@ -661,7 +664,7 @@ class RoutePanel(QWidget):
 
         数据全是 `decision.agent.settings` 上的**运行时状态**（agent 写、界面只读），
         口径和「决策参数」页那张休息卡片一致（见 `gui/player_panel._rest_text`、
-        `_tick_feed_cd`）。⚠ 时间是 `time.monotonic()` 秒 —— 两侧同进程同一时钟源，
+        `_tick_timer_cd`）。⚠ 时间是 `time.monotonic()` 秒 —— 两侧同进程同一时钟源，
         所以这里直接减（别换成 wall clock，那会被系统对时带偏）。
         """
         out = []
@@ -672,12 +675,13 @@ class RoutePanel(QWidget):
             return "　剩余 %s" % _mmss(until - time.monotonic())
 
         st = getattr(settings, "rest_state", "")
-        if st == "afk_enter":
-            out.append("休息　进入隐身…%s" % left(settings.rest_until_monotonic))
-        elif st == "afk_rest":
-            out.append("休息　休息中%s" % left(settings.rest_until_monotonic))
-        elif st == "afk_exit":
-            out.append("休息　退出隐身…")
+        # 阶段 → 短句**共用 agent 那张表**（`rest_state_text`）：两处各写一份必然漂 ✗
+        #（2026-09-26 实锤：定点休息进了休息，这边**一行都不显示**，而玩家面板写着
+        #  「未休息」—— 同一次、两个界面、两种错法 ✗）。
+        from decision import agent as agent_mod
+        _rt = agent_mod.rest_state_text(st)
+        if _rt:
+            out.append("休息　%s%s" % (_rt, left(settings.rest_until_monotonic)))
         elif getattr(settings, "rest_pending", False):
             # 到点了但攻击范围内还有怪：卡在这步最容易被当成"坏了"，写出来
             out.append("休息　待休息（等清空攻击范围内的怪）")
@@ -697,10 +701,8 @@ class RoutePanel(QWidget):
             tail = (left(nx) if nx > 0 else
                     "　剩余 %s" % _mmss((t.get("interval") or [5, 10])[0] * 60.0))
             out.append("定时行为「%s」%s" % (name, tail))
-        if getattr(settings, "auto_feed_pet", False):
-            # agent 还没排期（刚打开开关）⇒ 明写"未排期"，不要一行光秃秃的"喂宠"
-            out.append("喂宠%s" % (left(getattr(settings, "feed_next_monotonic", 0.0))
-                                  or "　未排期"))
+        # ⚠ 「自动喂宠」那一行**已移除**（用户 2026-09-26 去掉整个功能：他会用「自定义定时
+        #    行为」自己实现 ✓ ⇒ 它会作为一条普通定时行为出现在上面那段循环里 ✓）。
         if int(getattr(settings, "resetall_interval", 0) or 0) > 0:
             # **要倒计时**，不写"每 N s"（2026-09-26 用户要求）：排期在 agent 的 tick
             # 里，所以它没在跑（或刚开自动还没排到）时只有"未排期"——
@@ -727,8 +729,28 @@ class RoutePanel(QWidget):
         from gui import theme
         col = theme.load_vis().get("timer_color") or "#ffeb3b"
         dst = self._current_goto_set()
+        # 休息时「当前任务」写「**休息**」（用户 2026-09-26 要求）—— 休息**优先**于寻路：
+        # 「定点休息」本来就会挂着一条"走过去"的任务，那行若还写「前往：X」，会让人以为
+        # 在执行「命令前往」（目的地确实是休息点 ✓，但主人是休息机器 ✓；目的地由下面
+        # 那行「前往休息点…「X」」说清 ✓）。
+        from decision import agent as agent_mod
+        _rest = agent_mod.rest_state_text(getattr(settings, "rest_state", ""))
         lines = [first,                       # str ⇒ 保持黑底白字（读数是排查用的）
-                 ("当前任务　%s" % ("前往：%s" % dst if dst else "战斗"), col, False)]
+                 ("当前任务　%s" % ("休息" if _rest else
+                                   ("前往：%s" % dst if dst else "战斗")), col, False)]
+        # 任务**现在这一步在干什么 / 为什么失败**（2026-09-26 补）：任务里一直写着原因
+        #（对齐中差几像素 / 偏离绳 / 爬不动了 / 拿不到世界坐标），以前没人看得到 ⇒
+        # 连着两次"角色爬到某个 y 就不动了"都只能靠猜。挂在任务名下面一行，任务结束就消失。
+        # 任务结束后还要挂一会儿（`agent.GOTO_NOTE_KEEP_S`）：用户问的是"为什么在 -170
+        # 就松开了 ↑"，而任务一结束那行原本会立刻消失 ⇒ 看见时已无从查证 ✗。
+        _note = ""
+        try:
+            ag = self._live_agent()
+            _note = str(ag.current_goto_note() or "") if ag is not None else ""
+        except Exception:                           # noqa: BLE001
+            _note = ""
+        if _note:
+            lines.append(("　%s" % _note, col, False))
         lines += [(t, col, False) for t in self._timer_lines()]
         return lines
 
@@ -742,22 +764,16 @@ class RoutePanel(QWidget):
         return getattr(agent_mod, "CURRENT", None)
 
     def _command_first_step(self, z, mid, path):
-        """把路线的**第一步**交给执行器 ⇒ (一句给人看的话, 是否真的下发了命令)。
+        """把**整条路线**交给执行器 ⇒ (一句给人看的话, 是否真的下发了命令)。
 
-        2026-09-26 用户定：**只接「爬」/「下跳」**。这两种是"贴着绳 / 贴着边缘按上去"，
-        对起跳时机不敏感（不必先做跳跃标定）；「走」「跳」「传送门」的执行器还没写 ——
-        那时候**如实说**"这一步还没做"，而不是静悄悄什么都不发生（用户就是这么撞上的：
-        点了「命令前往」角色一动不动，因为那时它只算路、根本没接线）。
+        2026-09-26 改：以前只下**第一步**（后面几步不会自动接着走 ✗）。现在整条交给
+        `agent.start_route()`：每段用 `route.job_for_edge` 造任务（走 / 爬 / 下跳），
+        到了自动接下一段；**任何一段失败就整条停**并说清断在第几步（见 `agent._task_finished`）。
+
+        只接「走」「爬」「下跳」三种执行器；路径里出现「跳 / 传送门」⇒ **整条都不下发**
+        并说清是第几步、靠什么 —— 半途停在一个上不去/下不来的平台上，比不下更糟 ✗
+       （"跳"要先做跳跃标定，"传送门"只差接线；两条都在 `docs/开发计划.md`）。
         """
-        from core import zones as zones_mod
-        e = zones_mod.edge_between(z, path[0], path[1])
-        if e is None:
-            return "　（这两块之间找不到那条可达 —— 回「编辑集合…」看看）", False
-        kind = e.get("kind") or ""
-        if kind not in ("climb", "drop"):
-            return ("　（第一步靠「%s」过去 —— 这种的执行器还没做，"
-                    "现在只做到「爬」和「下跳」）"
-                    % zones_mod.kind_label(kind)), False
         ag = self._live_agent()
         if ag is None:
             return ("　（这条命令要发给**实时**里跑着的角色 —— 先去「实时」页开始；"
@@ -767,20 +783,27 @@ class RoutePanel(QWidget):
             from decision import route as route_mod
             t = mapdata.load(mid, with_canvas=True)
             if t is None:
-                return "　（读不到地形数据，造不出上绳任务）", False
-            job = route_mod.job_for_edge(t, z, e,
-                                         tol_px=int(settings.align_tol_px),
-                                         hold_ms=int(settings.align_hold_ms))
+                return "　（读不到地形数据，造不出任务）", False
+            # ⚠ 判据（整条路径逐段查、跳/门整条拒发、坐标口径、tol/hold 怎么传）**只有一处**：
+            # `decision.route.plan_jobs` —— 「定点休息」那边（实时线程注入的解析器）走的是
+            # 同一个函数。以前这里自己写了一遍，两边分叉的话会出现"面板能下发、休息却走
+            # 不过去"这种最难查的怪事 ✗。
+            plan = route_mod.plan_jobs(t, z, path[0], path[-1],
+                                       tol_px=int(settings.align_tol_px),
+                                       hold_ms=int(settings.align_hold_ms))
         except ValueError as ex:            # 绳找不到 / 说不清上下 ⇒ 如实说，不猜
             return "　（没法下这条命令：%s）" % ex, False
         except Exception as ex:             # noqa: BLE001
             return "　（下命令时出错：%s）" % ex, False
-        ag.start_climb(job)
-        tail = ("" if len(path) <= 2 else
-                "　（后面 %d 步不会自动接着走 —— 执行器现在只做爬/下跳）"
-                % (len(path) - 2))
-        return ("　｜　**已命令**：%s%s"
-                % (zones_mod.edge_text(z, path[0], path[1]), tail)), True
+        if plan.get("here"):
+            return "　（已经在「%s」上了，不用走）" % path[-1], False
+        jobs = plan["jobs"]
+        if not jobs:
+            return "　（整条都没下发：%s）" % plan["why"], False
+        # 整条交给执行器：到了自动接下一段，中途失败整条停（见 agent._task_finished）
+        ag.start_route(jobs, why="命令前往：%s" % path[-1])
+        return ("　｜　**已命令**（整条 %d 步）：%s"
+                % (len(jobs), " → ".join(path))), True
 
     def _say_goto(self, text, color="#80868b"):
         self.lbl_goto.setText(text)
@@ -789,6 +812,25 @@ class RoutePanel(QWidget):
     def _map_id(self):
         p = getattr(self, "project", None)
         return (p.get("map_id") or "").strip() if p is not None else ""
+
+    def zone_sets(self):
+        """当前地图里**已注册的集合名**（给「定点休息」那两个下拉用）。
+
+        谁来调：主窗口 `_bind_cards`（切项目 / 换地图）时把它推给玩家面板
+        （`player_panel.set_zone_sets(...)`）。为什么由这里提供：集合按**地图 id** 存，
+        只有本面板知道当前地图（`_map_id()` ✓），玩家面板不持有它 —— 走仓库既有的
+        「面板间推送」（同 `live_panel.set_mmap` ✓）。
+        读不到（没项目 / 没集合文件）⇒ 给空列表，让那边只显示「（未选）」——
+        **不许**编几个名字出来 ✗。
+        """
+        mid = self._map_id()
+        if not mid:
+            return []
+        try:
+            from core import zones as zones_mod
+            return sorted(zones_mod.load(mid).sets)
+        except Exception:                       # noqa: BLE001
+            return []
 
     def _on_edit_zones(self):
         """打开/聚焦 foothold 集合编辑器（按当前项目的地图）。

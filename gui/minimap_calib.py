@@ -271,10 +271,11 @@ class MinimapCalibDialog(QDialog):
         self.sp_scale.setRange(0.05, SPIN_MAX)
         self.sp_scale.setDecimals(3)
         self.sp_scale.setSingleStep(0.01)
-        self.sp_scale.setSuffix("×")
         self.sp_scale.setMinimumWidth(96)
         self.sp_scale.valueChanged.connect(self._on_spin)
         srow.addWidget(self.sp_scale)
+        # 单位写在框**外面**（UI 规范 §9：不写进编辑框）
+        srow.addWidget(QLabel("×"))
 
         # ---- 叠加层透明度（WZ 素材那层的浓淡）----
         srow.addSpacing(10)

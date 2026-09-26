@@ -930,6 +930,106 @@ def t_terrain_image_shows_zones():
         shutil.rmtree(str(tmp), ignore_errors=True)
 
 
+def t_goto_hands_over_whole_path():
+    """「命令前往」交出去的是**整条路径**（2026-09-26），碰到没做的执行器**整条拒发**。
+
+    为什么要单开一条：原来那条真实数据用例挑到的图**没有爬边** ⇒ 它的"下半段"一直
+    在跳过（"这张图没有带绳号的「爬」边，跳过下半段"）⇒ 多步下发等于**没人测** ✗。
+    这里用**合成 zones**（临时目录里自己写边）造一条两段路径：
+      甲 →（走）乙 →（走）丙
+    ⇒ 断言两段各造一个任务、**一次**交给 `start_route`、顺序对；
+    再造一条含「跳」的 ⇒ 断言**整条不下发**、且提示里点出是第几步。
+    """
+    import tempfile
+    import time as _time
+    import unittest.mock as mock
+
+    from PyQt5.QtWidgets import QApplication
+    from core import zones as zones_mod
+    from decision import agent as agent_mod
+    from decision import route as route_mod
+    from decision.agent import settings as dsettings
+    from gui.route_panel import RoutePanel
+
+    app = QApplication.instance() or QApplication([])      # noqa: F841
+    mid, _canvas = pick_map()
+    t = mapdata.load(mid, with_canvas=True) if mid else None
+    if t is None or not t.footholds:
+        print("      （没有地形数据，跳过）")
+        return
+    walk = [f for f in t.footholds if not f.is_wall]
+    if len(walk) < 3:
+        print("      （非墙 foothold 少于 3 条，跳过）")
+        return
+    tmp = Path(tempfile.mkdtemp(prefix="gotopath_"))
+    try:
+        z = zones_mod.Zones(mid)
+        for name, f in (("甲平台", walk[0]), ("乙平台", walk[1]),
+                        ("丙平台", walk[2])):
+            z.add_set(name, [str(f.fid)])
+        z.add_edge("甲平台", "乙平台", "walk", why="用例")
+        z.add_edge("乙平台", "丙平台", "walk", why="用例")
+        # ⚠ **别在这份文件里再加"甲→丙 跳"**：`find_path` 会挑最短的那条（1 段 < 2 段）
+        # ⇒ ① 就撞在跳上了（我第一版就是这么红的 ✗）。跳那条留给 ② 单独写一份文件。
+        z.save(tmp / ("%s.zones.json" % mid))
+
+        got = []
+
+        class _Fake:
+            def start_route(self, jobs, why=""):
+                got.append((list(jobs), why))
+                return True
+
+            def start_climb(self, job):
+                got.append(([job], ""))
+                return True
+
+        p = RoutePanel()
+        p._map_id = lambda: mid
+        try:
+            with mock.patch.object(zones_mod, "ZONES_DIR", tmp), \
+                 mock.patch.object(dsettings, "save", lambda *a, **k: None), \
+                 mock.patch.object(agent_mod, "CURRENT", _Fake()):
+                # ① 两段都做得了 ⇒ **一次**交出两个任务，顺序 = 路径顺序
+                p._refresh_goto()
+                p.cmb_goto.setCurrentIndex(p.cmb_goto.findData("丙平台"))
+                p._fh_seen = (str(walk[0].fid), _time.monotonic())
+                p._on_goto()
+                txt = p.lbl_goto.text()
+                check("已命令" in txt and "整条 2 步" in txt,
+                      "没把整条路径交出去 / 没说清几步：%r" % txt)
+                check(len(got) == 1 and len(got[0][0]) == 2,
+                      "不是「一次交出整条」（该只调一次 start_route）：%r" % (got,))
+                jobs = got[0][0]
+                check(all(isinstance(j, route_mod.WalkJob) for j in jobs),
+                      "造出来的不是走任务：%r" % (jobs,))
+                check(jobs[0].dst_set == "乙平台" and jobs[1].dst_set == "丙平台",
+                      "两段顺序不对：%s / %s" % (jobs[0].dst_set, jobs[1].dst_set))
+
+                # ② 路径里含「跳」⇒ **整条都不下发**，并说清是第几步。
+                #    另写一份只含「甲 →（跳）丙」的集合文件（别去删边 —— 那要另一个 API）
+                got.clear()
+                z3 = zones_mod.Zones(mid)
+                for name, f in (("甲平台", walk[0]), ("丙平台", walk[2])):
+                    z3.add_set(name, [str(f.fid)])
+                z3.add_edge("甲平台", "丙平台", "jump", why="用例：跳（执行器还没做）")
+                z3.save(tmp / ("%s.zones.json" % mid))
+                p._refresh_goto()
+                p.cmb_goto.setCurrentIndex(p.cmb_goto.findData("丙平台"))
+                p._fh_seen = (str(walk[0].fid), _time.monotonic())
+                p._on_goto()
+                txt2 = p.lbl_goto.text()
+                check(not got, "路径里有「跳」却还是下发了命令：%r" % (got,))
+                check("没下发" in txt2 and "第 1 步" in txt2,
+                      "整条拒发时没说清是第几步、靠什么：%r" % txt2)
+            p.close()
+        finally:
+            pass
+    finally:
+        import shutil
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+
 def t_goto_commands_climb():
     """「命令前往」要**真的下发命令**（只接「爬」/「下跳」，其余的如实说"还没做"）。
 
@@ -979,10 +1079,13 @@ def t_goto_commands_climb():
             p._on_goto()
             txt = p.lbl_goto.text()
             check("能走到" in txt, "该算得出路：%r" % txt)
-            # ⚠ 只查这一句：第一步是「走」时**先**如实说"这种执行器还没做"（那才是它
-            # 不动的真正原因），不必再叠一句"实时没在跑" —— 那样反而像有两处毛病。
-            check("执行器还没做" in txt,
-                  "第一步是「走」却没说明执行器没做（会让人以为是命令没生效）：%r" % txt)
+            # 走（walk）的执行器 2026-09-26 做了 ⇒ 这一步**不再**是"这种执行器还没做"
+            #（那句现在只该留给「跳」「传送门」）。这里没有实时在跑（CURRENT=None）
+            # ⇒ 应该如实说"先去「实时」页开始"。
+            check("执行器还没做" not in txt,
+                  "「走」的执行器已经做了，却还在说没做：%r" % txt)
+            check("实时" in txt and "只算给你看" in txt,
+                  "没有实时在跑时没说清：%r" % txt)
 
         # ---- ② 真实数据里那条「爬」边：命令真的下发到当前 agent ----
         try:
@@ -1023,6 +1126,9 @@ def t_goto_commands_climb():
                   % (job.dst_set, job.ladder_id, cl["to"], cl.get("ladder")))
             lids = zones_mod.ladder_ids(t)
             lx = next(x.x for x in t.ladders if lids.get(id(x)) == cl.get("ladder"))
+            # 任务的 x 就是**绳的地形 x**（地形数据本来就在世界坐标系里 ⇒ 直接比 ✓）。
+            # ⚠ 不给它加「坐标系偏移」：那个偏移修的是"黄点重心 ↔ 玩家原点"，属于**玩家读数
+            # 那一侧**（2026-09-26 用户澄清 —— 我在这里改错过一次）。
             check(abs(job.x - lx) < 1e-6, "任务的 x 不是那根绳的 x：%s vs %s"
                   % (job.x, lx))
         # ---- ③ 说了"爬"，但实时没在跑 ⇒ 命令发不出去，得说出来 ----
@@ -1060,7 +1166,7 @@ def t_osd_task_and_timers():
     p = RoutePanel()
     keys = ("rest_state", "rest_until_monotonic", "rest_pending",
             "next_afk_monotonic", "custom_timers", "custom_timer_next",
-            "auto_feed_pet", "feed_next_monotonic", "resetall_interval")
+            "resetall_interval")
     saved = {k: getattr(ds, k) for k in keys}
     try:
         ds.rest_state = ""
@@ -1068,7 +1174,6 @@ def t_osd_task_and_timers():
         ds.next_afk_monotonic = 0.0
         ds.custom_timers = []
         ds.custom_timer_next = {}
-        ds.auto_feed_pet = False
         ds.resetall_interval = 0
         lines = p._osd_lines("世界 (1, 2)")
         check(lines[0] == "世界 (1, 2)",
@@ -1093,8 +1198,6 @@ def t_osd_task_and_timers():
                             {"name": "喊话", "interval": [3, 4],
                              "paused": True, "paused_left": 42.0}]
         ds.custom_timer_next = {"喂宠": _time.monotonic() + 66}
-        ds.auto_feed_pet = True
-        ds.feed_next_monotonic = _time.monotonic() + 30
         ds.resetall_interval = 60
         rows = [l for l in p._osd_lines("x") if not isinstance(l, str)]
         check(all(len(r) == 3 for r in rows),
@@ -1117,8 +1220,36 @@ def t_osd_task_and_timers():
               "自定义定时行为没写出剩余时间：%r" % (names,))
         check(not any("喊话" in n for n in names),
               "**暂停的定时行为不该显示**（2026-09-26 用户要求）：%r" % (names,))
-        check(any(n.startswith("喂宠") for n in names),
-              "喂宠也是计时任务，该列出来：%r" % (names,))
+        # ⚠ 「定点休息」也要显示（2026-09-26 用户报：手动进入定点休息后，界面写着
+        #   「未休息」✗）—— 这里钉**实时页**那行；玩家面板那张卡片与"每个状态都得有
+        #   说法"由 `selftest_decision.t_rest_state_text_covers_all_states` 钉。
+        ds.rest_state = "afk_spot_rest"
+        ds.rest_until_monotonic = _time.monotonic() + 61
+        names2 = [r[0] for r in p._osd_lines("x") if not isinstance(r, str)]
+        check(any(n.startswith("休息") and "定点休息中" in n for n in names2),
+              "定点休息没出现在「计时任务」里：%r" % (names2,))
+        check(any(n.startswith("休息") and "剩余 1:0" in n for n in names2),
+              "定点休息没写出剩余时间：%r" % (names2,))
+        ds.rest_state = "afk_spot_walk"          # 去休息点的路上（还没开始计时）
+        ds.rest_until_monotonic = 0.0
+        names3 = [r[0] for r in p._osd_lines("x") if not isinstance(r, str)]
+        check(any(n.startswith("休息") and "前往休息点" in n for n in names3),
+              "去休息点那一段没显示：%r" % (names3,))
+
+        # ③ 「当前任务」在休息时必须写**「休息」**（用户 2026-09-26 要求）——
+        #    「定点休息」会挂着一条"走过去"的任务，那行若还写「前往：X」，会让人以为
+        #    在执行「命令前往」（目的地确实是休息点 ✓，但主人是休息机器 ✓，目的地
+        #    由上面那行「前往休息点…「X」」说清 ✓）。
+        ds.rest_state = "afk_spot_rest"
+        ds.rest_until_monotonic = _time.monotonic() + 61
+        lines_r = [r[0] for r in p._osd_lines("x") if not isinstance(r, str)]
+        check(any(n.startswith("当前任务") and "休息" in n for n in lines_r),
+              "休息时「当前任务」没写「休息」：%r" % (lines_r,))
+        check(not any(n.startswith("当前任务") and "战斗" in n for n in lines_r),
+              "休息时「当前任务」还写着「战斗」：%r" % (lines_r,))
+        # ⚠ 「自动喂宠」那一行**已移除**（用户 2026-09-26 去掉整个功能）—— 这里原本断言
+        #    它是计时任务之一；现在"喂宠"只会作为**用户自己配的定时行为**出现（上面那条
+        #    `custom_timers` 里的「喂宠」就是那样用的 ✓，走的是同一条循环 ✓）。
         # 定时清键要**倒计时**，不是"每 N s"（2026-09-26 用户要求）
         check(any(n.startswith("定时清键") for n in names),
               "定时清键是计时任务，该列出来：%r" % (names,))
@@ -2500,7 +2631,66 @@ def t_route_panel_button():
           "命令行那条等价做法应当留在 tooltip 里（排查用）")
 
 
+def t_route_resolver_start_from_player_sets():
+    """给 agent 的**路径解析器**：起点取"我现在站哪个集合"（`_player_here`）。
+
+    2026-09-26 实锤的 bug：`_fill_route_ctx` **没有**把 `here_sets` 留一份给解析器
+    （`self._player_here` 全文件只有"读"、没有"写" ✗）⇒ 解析器只好退回
+    `settings.route_goto_set`（那是**路线面板在跟踪玩家时**才写的东西 ✗）⇒
+    「定点休息」经常报"你现在站的这块没圈进任何集合" ⇒ **角色根本不过去** ✗
+    （用户在右下点手动休息、原地不动，就是这么来的）。
+    """
+    import types
+
+    from gui import live_thread as lt
+
+    # 用**假地形 + 假集合**：这条钉的是**接线**（`_fill_route_ctx` 要把 here_sets 留给
+    # 解析器），喂一对最小的替身就够 —— 真地图 / 真集合那条路由 `t_goto_*` 那几条覆盖 ✓。
+    class _Z:
+        sets = {"甲平台": {"footholds": ["1"]}, "乙平台": {"footholds": ["2"]}}
+        edges = []
+
+        def set_of(self, fid):
+            return ["甲平台"] if str(fid) == "1" else []
+
+    class _T:
+        def ladder_at(self, x, y):
+            return None
+
+    # 借 LiveThread 的真方法跑（不建线程、不碰设备）：只喂它要的那几个属性
+    # ⚠ 这里**不**要写 `ROUTE_CTX_TTL_S`：那是 `LiveThread.__init__` 里的**实例属性**，
+    #   不是模块常量（写成 `lt.ROUTE_CTX_TTL_S` ⇒ AttributeError ✗）；而且下面的
+    #   `_route_ctx` 是替身，压根不读它 ✓。
+    th = types.SimpleNamespace(_route_cache={}, _mmap_mid="假图", _player_here=[])
+    th._route_ctx = lambda m: (_T(), _Z())
+    th._fill_route_ctx = lambda pl, loc: lt.LiveThread._fill_route_ctx(th, pl, loc)
+    stg = types.SimpleNamespace(align_tol_px=6, align_hold_ms=250, route_goto_set="")
+
+    class _P:
+        world_x = 100.0
+        world_y = -200.0
+        here_sets = []
+        ladder_id = None
+
+    pl = _P()
+    th._fill_route_ctx(pl, {"foothold_id": "1"})
+    check(th._player_here == ["甲平台"],
+          "`_fill_route_ctx` 没给解析器留一份「我现在站哪个集合」：%r"
+          % (th._player_here,))
+
+    # 行为判据：解析器**不许**再说"起点不知道"（那正是用户碰上的那条 ✗）
+    res = lt.LiveThread._make_route_resolver(th, stg)("乙平台")
+    check("没圈进任何集合" not in (res.get("why") or ""),
+          "解析器还说起点不知道（没吃到 `_player_here`）：%s" % (res,))
+
+    # 定位没有输出时：必须**忘掉**旧值（别拿上一次的位置当起点 ✗）
+    th._fill_route_ctx(_P(), None)
+    check(not th._player_here, "定位没输出时还留着旧的 here_sets（会拿旧位置当起点 ✗）")
+
+
 TESTS = (
+    ("路径解析器的起点取「我现在站哪个集合」（`_player_here` 要有写有读）",
+     t_route_resolver_start_from_player_sets),
     ("fit 往返：合成整图 → 量回缩放/偏移", t_fit_roundtrip),
     ("crop 往返：合成一块 → 量回 view（含 inset 约定）", t_crop_roundtrip),
     ("1:1 裁块的 scale 不许被顶替成假值", t_crop_scale_not_faked),
@@ -2519,6 +2709,8 @@ TESTS = (
      t_goto_picker_and_preview),
     ("命令前往真的下发命令（爬=造任务挂给当前 agent；别的方式/没实时都说清楚）",
      t_goto_commands_climb),
+    ("命令前往交出去的是整条路径（合成 zones；含跳⇒整条拒发并说清第几步）",
+     t_goto_hands_over_whole_path),
     ("画面那几行：当前任务（战斗/前往：集合）+ 计时任务逐行（休息最前、无底色、颜色可配）",
      t_osd_task_and_timers),
     ("小地图收流超时要分得清：一帧都没来 / 推到一半停 / 对端真关",

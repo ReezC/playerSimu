@@ -621,6 +621,10 @@ class MainWindow(QMainWindow):
         self.player_panel.bind(self.project)
         # 路线识别面板：换项目要重读**地形图 + 集合下拉**（那些都按地图 id 存）
         self.route_panel.bind(self.project)
+        # 「定点休息」的两个集合下拉：集合名属于**地图** ⇒ 名单只能由路线识别面板给
+        # （玩家面板不持有地图 id）。以前写好了 `set_zone_sets()` 却**没人调** ⇒
+        # 那两个下拉一直只有「（未选）」✗（2026-09-26 补）。
+        self.player_panel.set_zone_sets(self.route_panel.zone_sets())
         self.lbl_status.setText("未选择项目" if self.project is None else
                                 self.lbl_status.text())
         # 标题跟着项目走（切项目 / 新建 / 打开都走这里）

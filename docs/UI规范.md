@@ -140,7 +140,7 @@
 
 ## 6. 文案与提示
 
-- 标签用中文 + **单位**：`输出行为CD(ms)`、`喂宠间隔(min)`、`最大攻击距离`（像素）
+- 标签用中文 + **单位**：`输出行为CD(ms)`、`打断后重试(s)`、`最大攻击距离`（像素）
 - **参数控件的 tooltip 至少说清三件事**：
   1. 这是什么、单位是什么；
   2. **0 / 负值代表什么**（关闭？不限制？）；
@@ -195,7 +195,53 @@ A 机的部署台也走同一份实现，所以 `gui/region_picker.py` **只许�
 
 ---
 
-## 9. 提交前
+## 9. 数值控件：单位与精度（2026-09-26 新增）
+
+**① 毫秒一律整数。** 凡是以毫秒为单位的参数（变量名带 `ms` / `millis` / 毫秒），
+必须用整数控件（`NoWheelSpinBox`），**不许**用小数控件。
+
+为什么写进规范：`_spin(lo, hi, val, decimals, step)` 这类工厂的第 4 个参数是**小数位**；
+把"步进 50"写进第 4 位 ⇒ `decimals=50` ⇒ 框里显示 `0.0000000000000000000000000…`
+（实测用户就是这么被坑到的 ✗）。毫秒没有小数意义，整数控件从根上避免这一类错。
+
+**② 单位写在框外，不许写进编辑框。**
+
+```python
+# ✗ 不写：单位进了框，长数字被挤窄，value() 的显示里混着单位
+self.sp_hold.setSuffix(" ms")
+form.addRow("对齐保持时间", self.sp_hold)
+
+# ✓ 这样写：单位在**表单行标签**里（或旁边放一个 QLabel）
+self.sp_hold = NoWheelSpinBox()
+form.addRow("对齐保持时间(ms)", self.sp_hold)
+```
+
+为什么：单位混进框内 ⇒ 数字和单位挤一起、读起来像"值的一部分"、同一个单位在不同页面
+写法还不统一（`" ms"` / `"ms"` / `" 毫秒"`），查配置时对不上。
+
+**自动检查**（`python -m tools.check_ui`）：
+
+| 规则 | 判据 | 级别 |
+|---|---|---|
+| `check_ms_is_integer` | 变量名带 ms 却是 `NoWheelDoubleSpinBox` / `setDecimals(>0)` | **错误** |
+| `check_unit_in_label` | 出现 `setSuffix(` | **错误**（2026-09-26 存量清零后升级） |
+| `check_settings_have_ui` | 持久化的 `DecisionSettings` 字段在 `gui/`、`deploy/` 里都找不到 | 提示（逐个确认是否有意为之） |
+
+⚠ **参数只写进 `DecisionSettings` 而不给界面入口 = 隐藏参数**（只能在配置文件里改）。
+实测栽过：`goto_timeout_s` 先只有 `to_dict`，界面上找不到 ✗；
+断线重连的 5 个子参数也一直是这样 ✗。`check_settings_have_ui` 就是拦这一类，
+2026-09-26 已全部补齐（该检查 0 条）。
+
+⚠ 这条**一开始是"提示"级**：立规则时存量有 15 处 `setSuffix`，一上来就红一片的检查
+等于没有检查 ⇒ 先报提示、逐个挪；**2026-09-26 存量全部挪到框外（check_ui 错误 0 条）
+之后升级为错误**。做法两种，都在框外：
+
+```python
+form.addRow("触发下限(分钟)", sp_lo)        # ① 单位进表单行标签
+row.addWidget(self.sp_scale); row.addWidget(QLabel("×"))   # ② 紧挨着控件放一个 QLabel
+```
+
+## 10. 提交前
 
 ```
 python -m tools.check_ui        # 必须 exit=0

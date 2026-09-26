@@ -384,6 +384,44 @@ class LiveThread(QThread):
         self._route_cache = {"mid": mid, "ts": now, "t": t, "z": z}
         return t, z
 
+    def _make_route_resolver(self, stg):
+        """给 agent 装的**路径解析器**：`dst_set → {"path","jobs","why","here"}`。
+
+        「定点休息」要用它自己走到指定地点（agent 不持有地形/集合 ⇒ 解析这一层在这里）。
+
+        ⚠ 为什么是**函数**、不是预存的表（`docs/开发计划.md` 里原先写的是
+        `set_name → [job,…]`）：路径的**起点**是"我现在站哪个集合"，它每一拍都可能变
+        ⇒ 只能**调用时**才解析。
+        ⚠ 开销：`find_path` 是 BFS（毫秒级），`mapdata.load` 走 `_route_ctx` 的 **2 秒缓存**
+        —— 一次休息最多解析两三次，**不在帧循环里** ✗（别把它挂进每拍）。
+        """
+        def resolve(dst_set):
+            mid = str(getattr(self, "_mmap_mid", "") or "")
+            if not mid:
+                return {"jobs": [], "why": "还不知道当前是哪个项目 / 地图", "here": False}
+            t, z = self._route_ctx(mid)
+            if t is None or z is None:
+                return {"jobs": [], "here": False,
+                        "why": "读不到地形 / 集合数据（先在「路线识别」里生成地形图）"}
+            src = next((n for n in (getattr(self, "_player_here", None) or [])
+                        if n in z.sets), "")
+            if not src:
+                src = str(getattr(stg, "route_goto_set", "") or "")
+            if not src:
+                return {"jobs": [], "here": False,
+                        "why": "你现在站的这块没圈进任何集合 ⇒ 解析不出路线"}
+            from decision import route as route_mod
+            try:
+                return route_mod.plan_jobs(
+                    t, z, src, dst_set,
+                    tol_px=int(getattr(stg, "align_tol_px", 6) or 6),
+                    hold_ms=int(getattr(stg, "align_hold_ms", 250) or 0))
+            except ValueError as ex:            # 绳找不到 / 说不清上下 / 落点找不到
+                return {"jobs": [], "why": str(ex), "here": False}
+            except Exception as ex:             # noqa: BLE001
+                return {"jobs": [], "why": "造任务时出错：%s" % ex, "here": False}
+        return resolve
+
     def _fill_route_ctx(self, player, loc):
         """把「脚下属于哪些集合 / 贴在哪根绳上」写进 `Player`（上绳执行器要用）。
 
@@ -401,9 +439,15 @@ class LiveThread(QThread):
         if x is None or y is None or not mid:
             player.here_sets = []
             player.ladder_id = None
+            self._player_here = []          # 定位没有输出 ⇒ 起点也不知道（别留旧值骗解析器）
             return
         t, z = self._route_ctx(mid)
         player.here_sets = list(z.set_of(fid)) if (z is not None and fid) else []
+        # 「我现在站哪个集合」也给**路径解析器**留一份（`_make_route_resolver` 要用它当起点）。
+        # ⚠ 2026-09-26 漏了这一步 ⇒ 解析器只能退回 `settings.route_goto_set`（那是路线面板
+        #   在跟踪玩家时才写的东西 ✗），于是「定点休息」经常报"你现在站的这块没圈进任何集合"
+        #   ⇒ **根本不过去** ✗（用户在右下点手动休息，角色原地不动就是这么来的）。
+        self._player_here = list(player.here_sets)
         lad = t.ladder_at(float(x), float(y)) if t is not None else None
         if lad is None:
             player.ladder_id = None
@@ -537,6 +581,9 @@ class LiveThread(QThread):
         # （`start_climb`），而它原本只是本函数的局部变量 ⇒ 面板拿不到（见 decision/agent
         # 的 CURRENT）。只做引用赋值，不加锁 —— 和 settings 一个路子；退出时注销（见 finally）。
         agent_mod.CURRENT = agent
+        # 给 agent 装**路径解析器**：「定点休息」要用它自己走到指定地点。
+        # agent 不持有地形 / 集合 ⇒ 解析这一层由这里提供（和 `_fill_route_ctx` 同一处）。
+        agent.route_plan = self._make_route_resolver(decision_settings)
         mob_tracker = MobTracker()   # 给怪稳定 id，供目标锁定 CD 跨帧匹配
         player_tracker = PlayerTracker()   # 跟住「我」：位置连续性，别把别人认成自己
         # 断线重连状态机（判界面 → 停自动 → 按 Enter/点鼠标走回游戏）
@@ -1413,6 +1460,7 @@ class LiveThread(QThread):
         finally:
             reader_done.set()
             agent_mod.CURRENT = None     # 注销：别再往一个停了的 agent 下命令
+            agent.route_plan = None      # 顺手摘掉路径解析器（它的闭包持有本线程）
             try:
                 agent.shutdown()     # 释放所有按键，避免游戏里键一直按着
             except Exception:

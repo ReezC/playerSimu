@@ -1,0 +1,41 @@
+{
+  "format": "playerSimu.sequence",
+  "version": 1,
+  "name": "退出隐身",
+  "saved_at": "2026-09-26 18:29:01",
+  "_note": "「行为编辑器 → 保存」写出来的预设；改完文本可以直接加载回来。",
+  "seq": [
+    {
+      "type": "down",
+      "key": "普攻"
+    },
+    {
+      "type": "up",
+      "key": "普攻"
+    },
+    {
+      "type": "delay",
+      "ms": 1000
+    },
+    {
+      "type": "down",
+      "key": "普攻"
+    },
+    {
+      "type": "up",
+      "key": "普攻"
+    },
+    {
+      "type": "delay",
+      "ms": 1000
+    },
+    {
+      "type": "down",
+      "key": "普攻"
+    },
+    {
+      "type": "up",
+      "key": "普攻"
+    }
+  ]
+}

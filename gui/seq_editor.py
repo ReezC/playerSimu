@@ -19,19 +19,18 @@
 """
 
 import copy
+from pathlib import Path
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QBrush, QColor
-from PyQt5.QtWidgets import (QDialog, QFormLayout, QHBoxLayout, QInputDialog,
-                             QLabel, QLineEdit, QMenu, QMessageBox, QPushButton,
-                             QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-                             QWidget)
+from PyQt5.QtWidgets import (QCheckBox, QDialog, QFileDialog, QFormLayout,
+                             QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu,
+                             QMessageBox, QPushButton, QTreeWidget,
+                             QTreeWidgetItem, QVBoxLayout, QWidget)
 
+from core import seq_presets as sp             # 预设的存取（纯逻辑，见那边的判据）
+from core.seq_presets import MAX_DELAY_MS      # 延迟上限的真源搬到了 core（数据不是 UI）
 from gui.widgets import NoWheelDoubleSpinBox   # 必须模块级：控件在 __init__ 里建
-
-# 行为序列里「额外延迟」的上限（毫秒）= 24 小时。
-# 原来卡在 100000（100 秒），想配分钟级的等待根本填不进去。
-MAX_DELAY_MS = 86400000
 
 # 可选的键（显示名 → 序列键名）。back/forward 是特殊键，执行时按朝向解析。
 SEQ_KEYS = [
@@ -50,7 +49,11 @@ SEQ_KEYS = [
     ("回车", "enter"),
     ("Esc", "esc"),
 ]
-_KEY_DISPLAY = dict(SEQ_KEYS)
+# ⚠ 方向**是键名 → 显示名**（`_elem_text` 就是那么用的：`_KEY_DISPLAY.get(key)`）——
+# 原来写成 `dict(SEQ_KEYS)` 了（那是显示名 → 键名 ✗）⇒ 查谁都查不到 ⇒ 界面上一直显示**裸键名**
+# （`按下 esc` / `按下 attack` ✗，本该是「按下 Esc」「按下 输出」）。加「双击改键」时用例当场
+# 抓到（`键改了但行文本没变：'按下 esc'` ✓）。别再把方向反过来 ✗。
+_KEY_DISPLAY = {k: d for d, k in SEQ_KEYS}
 
 # 键类型可视化配色：同键的「按下/松开」共色，不同键不同色，延迟单独灰。
 _KEY_STYLE = {
@@ -101,6 +104,10 @@ QPushButton#addDelay { background: #f1f3f4; border-color: #dadce0; color: #5f636
 QPushButton#addDelay:hover { background: #e8eaed; }
 QPushButton#okBtn { background: #1a73e8; border-color: #1a73e8; color: #ffffff; font-weight: 600; }
 QPushButton#okBtn:hover { background: #1765cc; }
+QPushButton#savePreset { background: #e6f4ea; border-color: #a8dab5; color: #137333; font-weight: 600; }
+QPushButton#savePreset:hover { background: #ceead6; }
+QPushButton#loadPreset { background: #fef7e0; border-color: #fadf8e; color: #a05c00; font-weight: 600; }
+QPushButton#loadPreset:hover { background: #feefc3; }
 """
 
 
@@ -119,17 +126,43 @@ def _elem_text(elem):
 
 
 class SeqEditorWidget(QWidget):
-    """行为序列编辑核心（树 + 按钮 + 编辑逻辑），可嵌入任意容器。"""
+    """行为序列编辑核心（树 + 按钮 + 编辑逻辑），可嵌入任意容器。
 
-    def __init__(self, seq, parent=None):
+    `preset_name`：**保存**预设时的默认文件名（不传就是 `行为预设.json`）——
+    由行为名 / 弹窗标题带进来，省得每存一次都要重新打一遍名字。
+    """
+
+    def __init__(self, seq, parent=None, preset_name=None):
         super().__init__(parent)
+        self.preset_name = sp.safe_name(preset_name or "行为预设")
         root = QVBoxLayout(self)
         root.setSpacing(10)
         root.setContentsMargins(0, 0, 0, 0)
 
+        # 预设：保存 / 加载（2026-09-26 用户要求，T1）。放**最上面**，和"往序列里
+        # 加东西"那一排分开 —— 这是整条序列的存读，不是改某一个元素。
+        row_save = QHBoxLayout()
+        row_save.setSpacing(8)
+        self.btn_save = QPushButton("保存")
+        self.btn_save.setObjectName("savePreset")
+        self.btn_save.setToolTip("把当前整条序列存成预设文件（人能读的 JSON；\n"
+                                 "默认放 config/sequences/，也可以自己另选路径）")
+        self.btn_save.clicked.connect(self._save_preset)
+        self.btn_load = QPushButton("加载")
+        self.btn_load.setObjectName("loadPreset")
+        self.btn_load.setToolTip("从预设文件读回一条序列，**整体替换**当前内容。\n"
+                                 "文件坏了只会报错，当前序列一个字都不会动。")
+        self.btn_load.clicked.connect(self._load_preset)
+        row_save.addWidget(self.btn_save)
+        row_save.addWidget(self.btn_load)
+        row_save.addStretch(1)
+        root.addLayout(row_save)
+
         tip = QLabel("每个键动作之间自动加入随机输入延迟；「额外延迟」是固定间隔。\n"
                      "「反方向 / 目标方向」会按角色当前朝向自动解析成 ← / →。\n"
-                     "右键元素可「修改几率」「编辑触发后执行」；子元素缩进显示。\n"
+                     "加「键按下」会**自动配一条同键的「键松开」**；\n"
+                     "右键元素可「修改几率」「编辑触发后执行」；"
+                     "**双击**元素按类型进编辑（键 / 毫秒）；子元素缩进显示。\n"
                      "新增元素会插到当前选中项的同级下方；未选中则追加到顶层末尾。")
         tip.setObjectName("tip")
         tip.setWordWrap(True)
@@ -139,6 +172,9 @@ class SeqEditorWidget(QWidget):
         self.tree.setHeaderHidden(True)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._context_menu)
+        # **双击一个元素 ⇒ 按它的类型弹对应的编辑窗**（用户 2026-09-26 要求）——
+        # 和「可到达」列表双击 = 改那条边是同一个手势（见 `gui/zone_editor.py`）✓。
+        self.tree.itemDoubleClicked.connect(self._on_double_click)
         root.addWidget(self.tree, 1)
 
         # 添加按钮：按类型着色
@@ -166,8 +202,7 @@ class SeqEditorWidget(QWidget):
         root.addLayout(row2)
 
         # 初始化树（深拷贝，避免污染传入序列）
-        self._add_children(self.tree.invisibleRootItem(), copy.deepcopy(seq))
-        self.tree.expandAll()
+        self.set_seq(seq)
 
     # ---------------- 树 ↔ 序列 ----------------
 
@@ -202,6 +237,17 @@ class SeqEditorWidget(QWidget):
 
     def seq(self):
         return self._collect(self.tree.invisibleRootItem())
+
+    def set_seq(self, seq):
+        """**整体替换**树里的序列（加载预设用）。
+
+        传进来的东西调用方已经校验过；这里仍然深拷贝一份 —— 树里的元素随时会被右键改
+        （`_edit_prob` / `_edit_then` 都是"取副本、改完写回"），不能让外面那份跟着变。
+        """
+        self.tree.clear()
+        self._add_children(self.tree.invisibleRootItem(),
+                           copy.deepcopy(list(seq or [])))
+        self.tree.expandAll()
 
     # ---------------- 序列操作 ----------------
 
@@ -243,10 +289,17 @@ class SeqEditorWidget(QWidget):
             self.tree.expandItem(parent)
 
     def _add_down(self):
+        """加一个「键按下」⇒ **自动在它下面配一个同键的「键松开」**（用户 2026-09-26 要求）。
+
+        为什么：只按不松是最常见的坑（键卡住、后面的动作按不出来 ✗），而手敲一对本来就要
+        点两次、选两次。位置不用自己算：`_insert` 插完会把新项**选中** ✓ ⇒ 紧接着插的
+        「松开」正好落在它下面 ⇒ 天然的 down → up →（下一条）✓。
+        """
         key = self._pick_key()
         if key is None:
             return
         self._insert({"type": "down", "key": key})
+        self._insert({"type": "up", "key": key})     # ← 紧跟一条**同键**的松开 ✓
 
     def _add_up(self):
         key = self._pick_key()
@@ -296,6 +349,105 @@ class SeqEditorWidget(QWidget):
         parent.takeChild(row)
         parent.insertChild(row + 1, item)
         self.tree.setCurrentItem(item)
+
+    # ---------------- 预设：保存 / 加载 ----------------
+
+    def _save_preset(self):
+        """整条序列存成预设文件（默认 `config/sequences/<默认名>.json`）。
+
+        校验不过 / 写不进去 ⇒ **只报错**，界面上的序列一个字不动。
+        """
+        d = sp.default_dir()
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as ex:                     # 目录建不了（权限 / 盘满）
+            QMessageBox.warning(self, "保存失败", "建不了目录：\n%s\n%s" % (d, ex))
+            return
+        start = str(d / ("%s.json" % self.preset_name))
+        path, _flt = QFileDialog.getSaveFileName(self, "保存行为预设", start,
+                                                 "预设文件 (*.json)")
+        if not path:
+            return
+        p = Path(path)
+        if p.suffix.lower() != ".json":
+            p = p.with_suffix(".json")            # 没打后缀就补上（否则下次"加载"里看不到）
+        try:
+            info = sp.save_preset(p, self.seq(), name=p.stem)
+        except (OSError, ValueError) as ex:
+            QMessageBox.warning(self, "保存失败",
+                                "没写成功（**当前序列没有改动**）：\n%s" % ex)
+            return
+        QMessageBox.information(self, "已保存",
+                                "存到：\n%s\n（%d 个元素）"
+                                % (p, sp.count(info["seq"])))
+
+    def _load_preset(self):
+        """从预设文件读回一条序列（**整体替换**当前内容）。"""
+        d = sp.default_dir()
+        path, _flt = QFileDialog.getOpenFileName(
+            self, "加载行为预设", str(d if d.is_dir() else sp.ROOT),
+            "预设文件 (*.json)")
+        if not path:
+            return
+        self._apply_preset_file(path)
+
+    def _apply_preset_file(self, path):
+        """真正做事的那一半（**不弹文件框**，便于自检直接喂路径）⇒ 成功 True。
+
+        坏文件 ⇒ 警告 + `False`，**当前序列一个字都不动**。
+        判据来自用户 2026-09-26：静默清空 = 以为加载成功了、其实序列没了
+        ⇒ 按键行为**直接变了** ✗（那种坑比报错难查一百倍）。
+        """
+        try:
+            info = sp.load_preset(path)
+        except (OSError, ValueError) as ex:
+            QMessageBox.warning(self, "加载失败",
+                                "这个文件不能用，当前序列**没有改动**：\n%s" % ex)
+            return False
+        if self.seq() and QMessageBox.question(
+                self, "确认加载",
+                "加载会**整体替换**当前序列（现在有 %d 个元素），继续？"
+                % sp.count(self.seq())) != QMessageBox.Yes:
+            return False
+        self.set_seq(info["seq"])
+        self.preset_name = sp.safe_name(info["name"])
+        QMessageBox.information(self, "已加载",
+                                "读了「%s」：%d 个元素%s"
+                                % (info["name"], sp.count(info["seq"]),
+                                   ("\n（存于 %s）" % info["saved_at"]
+                                    if info["saved_at"] else "")))
+        return True
+
+    # ---------------- 双击：按类型进编辑 ----------------
+
+    def _on_double_click(self, item, _col=0):
+        """**双击一个元素** ⇒ 按它的**类型**弹对应的编辑窗（用户 2026-09-26 要求）。
+
+        · `delay`       ⇒ 改毫秒数；
+        · `down` / `up` ⇒ 改键（重选一个键）。
+        这两个"改"以前**只能删了重加** ✗（右键菜单里只有几率 / 触发后执行 ✓）。
+
+        改完就地更新那一条的**三处**：存储的字典 + 行文本 + 配色 ✓ ——
+        `item.data()` 返回的是**副本**，忘记 `setData` 写回就是"看着改了、其实没改" ✗。
+        """
+        if item is None:
+            return
+        elem = dict(item.data(0, Qt.UserRole))
+        if elem.get("type") == "delay":
+            ms, ok = QInputDialog.getInt(
+                self, "额外延迟", "延迟毫秒数（1000 = 1 秒，60000 = 1 分钟）：",
+                int(elem.get("ms", 0)), 0, MAX_DELAY_MS, 10)
+            if not ok:
+                return
+            elem["ms"] = ms
+        else:
+            key = self._pick_key()
+            if key is None:
+                return
+            elem["key"] = key
+        item.setData(0, Qt.UserRole, elem)        # 写回（data() 是副本）
+        item.setText(0, _elem_text(elem))
+        self._apply_style(item, elem)
 
     # ---------------- 右键菜单 ----------------
 
@@ -364,7 +516,8 @@ class SeqEditorDialog(QDialog):
         root.setSpacing(10)
         root.setContentsMargins(16, 16, 16, 16)
 
-        self.editor = SeqEditorWidget(seq, self)
+        # 默认预设名跟着弹窗标题走（"回身输出" ⇒ 存出来就是 回身输出.json）
+        self.editor = SeqEditorWidget(seq, self, preset_name=title)
         root.addWidget(self.editor, 1)
 
         row3 = QHBoxLayout()
@@ -411,20 +564,30 @@ class TimerEditDialog(QDialog):
         self.sp_lo.setRange(0.1, 600)
         self.sp_lo.setDecimals(1)
         self.sp_lo.setSingleStep(0.1)
-        self.sp_lo.setSuffix(" 分钟")
         self.sp_hi = NoWheelDoubleSpinBox()
         self.sp_hi.setRange(0.1, 600)
         self.sp_hi.setDecimals(1)
         self.sp_hi.setSingleStep(0.1)
-        self.sp_hi.setSuffix(" 分钟")
+        # 单位写在**行标签**里（UI 规范 §9：不写进编辑框）
         form.addRow("行为名", self.ed_name)
-        form.addRow("触发下限", self.sp_lo)
-        form.addRow("触发上限", self.sp_hi)
+        form.addRow("触发下限(分钟)", self.sp_lo)
+        form.addRow("触发上限(分钟)", self.sp_hi)
+        # 「休息时暂停计时」（用户 2026-09-26 要求）—— **每条行为各自一份**的开关：
+        #   勾上（默认）= 防掉线休息期间这条**冻住计时**（老行为 ✓，剩余时间不走）；
+        #   不勾 = 休息期间**照常倒数、到点照演** ✓（给"休息时也得按的键"用：喂宠 / 喊话…）。
+        self.ck_pause_rest = QCheckBox("休息时暂停计时")
+        self.ck_pause_rest.setToolTip(
+            "勾上（默认）：防掉线休息期间**这条行为冻住计时**\n"
+            "（剩余时间不走，休息结束后接着倒 ✓）。\n\n"
+            "不勾：休息期间它**照常倒计时、到点照演** —— 给「休息时也得按的键」用\n"
+            "（喂宠、喊话、报点之类）。⚠ 它和休息自己的序列是**各按各的**（各自按自己的\n"
+            "时刻表走 ✓，同一根键被两边同时操作时没有仲裁 ✗）。")
+        form.addRow("", self.ck_pause_rest)
         root.addLayout(form)
 
         # 序列编辑核心（嵌入）
         seq = (timer.get("seq") or list(self._DEFAULT_SEQ)) if timer else list(self._DEFAULT_SEQ)
-        self.editor = SeqEditorWidget(seq, self)
+        self.editor = SeqEditorWidget(seq, self, preset_name="定时行为")
         root.addWidget(self.editor, 1)
 
         # 确定 / 取消
@@ -448,12 +611,22 @@ class TimerEditDialog(QDialog):
         else:
             self.sp_lo.setValue(5)
             self.sp_hi.setValue(10)
+        # 「休息时暂停计时」也要预填（缺省 = 勾上 = 老行为：休息时冻住 ✓）
+        self.ck_pause_rest.setChecked(bool((timer or {}).get("pause_on_rest", True)))
         self.sp_lo.valueChanged.connect(self._clamp_hi)
         self._clamp_hi()
+        # 预设默认文件名跟着「行为名」走（改名字时同步，省得存出一堆"行为预设.json"）
+        self.ed_name.textChanged.connect(self._sync_preset_name)
+        self._sync_preset_name()
 
     def _clamp_hi(self):
         if self.sp_hi.value() < self.sp_lo.value():
             self.sp_hi.setValue(self.sp_lo.value())
+
+    def _sync_preset_name(self):
+        """把「行为名」同步成预设的默认文件名（空名时退回"定时行为"）。"""
+        self.editor.preset_name = sp.safe_name(self.ed_name.text().strip()
+                                               or "定时行为")
 
     def _on_ok(self):
         if not self.ed_name.text().strip():
@@ -466,4 +639,6 @@ class TimerEditDialog(QDialog):
             "name": self.ed_name.text().strip(),
             "interval": [self.sp_lo.value(), self.sp_hi.value()],
             "seq": self.editor.seq(),
+            # 「休息时暂停计时」（2026-09-26 新增的项目级开关 ✓）
+            "pause_on_rest": bool(self.ck_pause_rest.isChecked()),
         }

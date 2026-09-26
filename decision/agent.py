@@ -70,8 +70,55 @@ DEFAULT_OUTPUT_SEQ = [
 ]
 
 
-# 防掉线行为类型：(id, 显示名)。目前只实现「隐身休息」，后续可在此扩展。
-ANTI_AFK_TYPES = [("hidden_rest", "隐身休息")]
+# 防掉线行为类型：(id, 显示名)。加新类型时**必须**同时在决策层实现它的流程
+# （见 `_run_rest` 与 `docs/开发计划.md` P2），别只加个名字就完事 —— 那样用户选了
+# 却什么都不发生 ✗。
+ANTI_AFK_TYPES = [("hidden_rest", "隐身休息"),
+                  ("spot_rest", "定点休息")]
+
+#: 休息状态机的**唯一契约表**（2026-09-26 收敛，用户批准）——
+#: 以前一个状态要在 **7 处**各登记一次（状态清单 / 是否 spot / 界面文字 / 是否有倒计时 /
+#: 是否可被打断 / 主 tick 分发 / trace 发布），**漏一处就静默出错** ✗，而且已经实锤两次：
+#:   · 漏「界面文字」⇒ 玩家面板写着「未休息」✗（用户当场就问"是没读到时长还是显示错"）；
+#:   · 漏 route_panel 那张表 ⇒ 实时页一行都不显示 ✗。
+#: 现在只在这里定义，其余全部**派生**（`REST_STATES` / `SPOT_STATES` / `REST_STATES_TIMED` /
+#: `REST_STATES_INTERRUPT` / `rest_state_text`）⇒ 加新类型只需改这一处 ✓。
+#:
+#: 字段含义：
+#:   text      —— 给界面的一句话（两个面板共用，别各写一份 ✗）
+#:   spot      —— 属于「定点休息」那一型（手动结束 / 被打断的处理和隐身那型不一样）
+#:   timed     —— 这个阶段 `rest_until_monotonic` 是有效值（界面能显示剩余）
+#:   interrupt —— 这一阶段「补了血」算被打断（勾了「被打断重试」才生效）
+REST_STATE_SPEC = {
+    "afk_enter":     {"text": "进入隐身…",   "spot": False, "timed": True,
+                      "interrupt": True},
+    "afk_rest":      {"text": "休息中",      "spot": False, "timed": True,
+                      "interrupt": True},
+    "afk_exit":      {"text": "退出隐身…",   "spot": False, "timed": False,
+                      "interrupt": False},
+    "afk_spot_walk": {"text": "前往休息点…", "spot": True,  "timed": False,
+                      "interrupt": True},
+    "afk_spot_act":  {"text": "到达后行为…", "spot": True,  "timed": False,
+                      "interrupt": True},
+    "afk_spot_rest": {"text": "定点休息中",  "spot": True,  "timed": True,
+                      "interrupt": True},
+    "afk_spot_back": {"text": "结束后前往…", "spot": True,  "timed": False,
+                      "interrupt": False},
+}
+
+#: 属于「休息」的状态（主 tick 靠它决定"这一拍走休息分支"）。
+REST_STATES = tuple(REST_STATE_SPEC)
+#: 其中属于「定点休息」的那几个（见 `_interrupt_rest` 与主 tick 里 `rest_abort` 那段）。
+SPOT_STATES = tuple(s for s, v in REST_STATE_SPEC.items() if v["spot"])
+#: 带倒计时的阶段（发布 `rest_until_monotonic` 时按它过滤）。
+REST_STATES_TIMED = tuple(s for s, v in REST_STATE_SPEC.items() if v["timed"])
+#: 补血算「被打断」的阶段（隐身那型的"走到一半"、定点那型的"正在歇"）。
+REST_STATES_INTERRUPT = tuple(s for s, v in REST_STATE_SPEC.items() if v["interrupt"])
+
+
+def rest_state_text(state):
+    """休息阶段 → 短句；空 / 认不出来 ⇒ 空串（**不许猜**成"未休息"那种肯定句 ✗）。"""
+    return (REST_STATE_SPEC.get(str(state or "")) or {}).get("text", "")
 
 # 时序拍的最小间隔（秒）：主循环按 `next_deadline()` 精确唤醒，但**至少**隔这么久
 # 才醒一次（避免到点时刻已过时忙等）。序列计时走本机绝对时钟，10 毫秒的粒度对
@@ -107,6 +154,11 @@ class DecisionSettings:
         self.chase_jump_enabled = False  # 追击起跳开关
         self.chase_jump_min = 0     # 追击起跳区间下限（相对最大攻击距离的偏移，像素）
         self.chase_jump_max = 50    # 追击起跳区间上限（同样是相对最大攻击距离的偏移）
+        # **追击起跳需要的冲刺时间（毫秒）**（用户 2026-09-26 要求）：
+        # `chase` 状态必须**连续维持**这么久，才有起跳的资格；中途进别的状态就归零。
+        # 为什么：刚进追击（或刚打完、刚转身）就跳，常常是"为了跳而跳"—— 人还没冲起来，
+        # 跳出去够不着还把节奏打断。0 = 不额外要求（老行为）。
+        self.chase_jump_dash_ms = 0
         self.mouse_speed = 1.0      # 触控板灵敏度：本地鼠标位移 → 远程鼠标位移的比例（1.0 = 1:1）
         self.evade_type = "jump"    # 规避类型："jump" 跳 / "back" 后退
         self.jump_interval = 200    # 跳间隔（毫秒）：跳键和输出键之间的间隔
@@ -169,6 +221,16 @@ class DecisionSettings:
         # 实际等待 = 延迟时间 + 这个值（见 align_hold_ms 的注释与设置里的说明）。
         self.align_tol_px = 6       # 坐标对齐误差范围（像素）
         self.align_hold_ms = 250    # 坐标对齐误差时间（毫秒）
+        # **寻路超时时间（秒）**（用户 2026-09-26 要求）：一个寻路任务（走 / 爬 / 下跳）
+        # 从**下达那一刻**算起持续这么久还没结束 ⇒ 切断（如实说明，不再重试）。
+        # 为什么不能只靠任务自己的 `timeout_s`：失败重来会重置任务内部的计时
+        #（`ClimbJob.retry` 清 `_t0`、`WalkJob.retry` 同样）⇒ 累计可能远超预期。
+        # 0 = 不限时（老行为）。见 `agent._climb_tick` 里那道总闸。
+        self.goto_timeout_s = 30
+        # ⚠ 这里**曾经**有 `walk_mode`（走的方向：center / left / right，还摆进了设置里）。
+        # 2026-09-26 用户明确删掉：**走只有一种走法 —— 朝目标集合的 x 中点**，
+        # 设置里不许有这个参数（设置是全局参数，用户没提过的一律不加）。
+        # 将来若某一步真需要"只按 ←/→"，那是**逐边**配置（foothold 编辑器 →「可到达」窗口）。
         # 上绳梯/下跳**失败后延迟激活时间**（秒，2026-09-26 用户要求）：
         # 以前失败了是**立即**重新激活 —— 失败那一下人往往还在原地、朝向也没变，
         # 立刻重来容易在同一处再歪一次。等一会儿再重新对齐，成功率更高。
@@ -176,12 +238,15 @@ class DecisionSettings:
         self.climb_retry_delay_s = 1.0
         self.debounce_conf = 0.5    # 防抖置信度：高于它的怪框消失后保留位置
         self.debounce_ms = 300      # 防抖时间（毫秒）：保留消失前位置的时长
-        self.auto_feed_pet = False  # 自动喂宠
-        self.feed_interval_min = 5  # 喂宠间隔下限（分钟）
-        self.feed_interval_max = 10 # 喂宠间隔上限（分钟）
-        self.feed_next_monotonic = 0.0   # 下次喂宠时刻（time.monotonic），UI 倒计时读；运行时状态，不持久化
+        # ⚠ 「自动喂宠」整块**已移除**（用户 2026-09-26：他会用**自定义定时行为**自己实现 ✓）。
+        #    按键那一层（`keymap["feed_pet"]` / 行为编辑器里的「喂宠」）**必须保留** ✓ ——
+        #    那正是他实现它要用的东西，别顺手一起删掉 ✗。
         self.custom_timers = []          # 自定义定时行为：[{name, seq, interval:[min,max]}]
         self.custom_timer_next = {}      # {name: next_monotonic}，运行时状态，不持久化
+        #: 「手动触发」的**请求通道**（2026-09-26 用户要求）：界面往里塞名字 → 实时线程里
+        #: 的 agent 取走，**立刻演一次并把计时从头排**。**运行时状态，不持久化**（同
+        #: `custom_timer_next`：它不是参数，重启后不该还留着一条"待触发" ✗）。
+        self.custom_timer_fire = []
         self.facing_timeout_min = 10     # 朝向无变化超时（分钟）：超过就停止自动，0=禁用
         self.player_lost_timeout_min = 3 # 找不到玩家超时（分钟）：超过就停止自动，0=禁用
         self.resetall_interval = 60      # 定时 RELEASEALL（秒）：清空固件侧按键防卡键，0=禁用
@@ -196,7 +261,16 @@ class DecisionSettings:
         self.anti_afk_rest_max = 20     # 休息时长上限（分钟）
         # 「被打断重试」：休息期间**触发了自动补血**就算被打断 —— 补血说明隐身没兜住
         # （隐身到期 / 被范围技能扫到 / 有东西在打我们），这时候继续歇着等于等着挨打。
-        # 勾选后：立刻转去执行退出隐身，并把下次休息提前到 retry_sec 之后（不再是随机 N~M 分钟）。
+        # 勾选后：立刻收工回战斗，并把下次休息提前到 retry_sec 之后（不再是随机 N~M 分钟）。
+        # ⚠ **哪些阶段算"被打断的窗口"按类型不同**（用户 2026-09-26 明确）：
+        #    隐身那型 = 进入隐身 → 退出隐身之间；
+        #    定点那型 = **从"开始前往指定地点"就开算**（到达后行为 / 正歇着也算；
+        #    「结束后前往」那段不算 —— 那时休息已经完成了）。
+        #    真源是 `REST_STATE_SPEC` 的 `interrupt` 列，别在这里再抄一份 ✗。
+        # ---- 「定点休息」专用（用户 2026-09-26 要求；流程见 docs/开发计划.md P2）----
+        self.anti_afk_spot_set = ""     # 指定地点：已注册的 foothold 集合名
+        self.anti_afk_spot_seq = []     # 到达后行为（行为序列）
+        self.anti_afk_spot_after = ""   # 结束后前往：另一个集合名（空 = 休息完直接回战斗）
         self.anti_afk_retry_on_interrupt = False
         self.anti_afk_retry_sec = 60    # 被打断后多久重试下一次休息（秒）
         # ---- 断线自动重连（decision/reconnect.py）----
@@ -226,12 +300,14 @@ class DecisionSettings:
         self.keymap[name] = key
 
     def to_dict(self):
-        """导出所有决策参数（不含运行时状态 enabled / feed_next_monotonic）。"""
+        """导出所有决策参数（只导**参数**；运行时状态如 enabled / rest_* / custom_timer_next
+        不在里面 ✓）。"""
         return {"attack_dist": self.attack_dist,
                 "min_attack_dist": self.min_attack_dist,
                 "chase_jump_enabled": self.chase_jump_enabled,
                 "chase_jump_min": self.chase_jump_min,
                 "chase_jump_max": self.chase_jump_max,
+                "chase_jump_dash_ms": self.chase_jump_dash_ms,
                 "mouse_speed": self.mouse_speed,
                 "evade_type": self.evade_type,
                 "jump_interval": self.jump_interval,
@@ -269,11 +345,11 @@ class DecisionSettings:
                 "align_tol_px": self.align_tol_px,
                 "align_hold_ms": self.align_hold_ms,
                 "climb_retry_delay_s": self.climb_retry_delay_s,
+                "goto_timeout_s": self.goto_timeout_s,
                 "debounce_conf": self.debounce_conf,
                 "debounce_ms": self.debounce_ms,
-                "auto_feed_pet": self.auto_feed_pet,
-                "feed_interval_min": self.feed_interval_min,
-                "feed_interval_max": self.feed_interval_max,
+                # ⚠ 「自动喂宠」的三个键已移除（2026-09-26）—— 老项目文件里可能还留着，
+                #    `from_dict` **直接忽略**它们 ✓（已经不是参数了，别再写回去 ✗）。
                 "custom_timers": self.custom_timers,
                 "facing_timeout_min": self.facing_timeout_min,
                 "player_lost_timeout_min": self.player_lost_timeout_min,
@@ -286,6 +362,9 @@ class DecisionSettings:
                 "anti_afk_exit_seq": self.anti_afk_exit_seq,
                 "anti_afk_rest_min": self.anti_afk_rest_min,
                 "anti_afk_rest_max": self.anti_afk_rest_max,
+                "anti_afk_spot_set": self.anti_afk_spot_set,
+                "anti_afk_spot_seq": self.anti_afk_spot_seq,
+                "anti_afk_spot_after": self.anti_afk_spot_after,
                 "anti_afk_retry_on_interrupt": self.anti_afk_retry_on_interrupt,
                 "anti_afk_retry_sec": self.anti_afk_retry_sec,
                 "reconnect_enabled": self.reconnect_enabled,
@@ -321,6 +400,7 @@ class DecisionSettings:
         self.chase_jump_enabled = bool(data.get("chase_jump_enabled", False))
         self.chase_jump_min = int(data.get("chase_jump_min", 0))
         self.chase_jump_max = int(data.get("chase_jump_max", 50))
+        self.chase_jump_dash_ms = int(data.get("chase_jump_dash_ms", 0))
         self.mouse_speed = float(data.get("mouse_speed", 1.0))
         self.evade_type = data.get("evade_type", "jump")
         self.jump_interval = int(data.get("jump_interval", 200))
@@ -371,14 +451,14 @@ class DecisionSettings:
         self.align_tol_px = int(data.get("align_tol_px", 6))
         self.align_hold_ms = int(data.get("align_hold_ms", 250))
         self.climb_retry_delay_s = float(data.get("climb_retry_delay_s", 1.0))
+        self.goto_timeout_s = float(data.get("goto_timeout_s", 30.0))
+        # ⚠ 老配置里可能还留着 `walk_mode` 键 —— **直接忽略**（用户 2026-09-26 删掉了它：
+        # 走只有"朝集合中点"一种走法）⇒ 不读、也不再写回（见 `to_dict`）。
         self.debounce_conf = float(data.get("debounce_conf", 0.5))
         self.debounce_ms = int(data.get("debounce_ms", 300))
-        self.auto_feed_pet = bool(data.get("auto_feed_pet", False))
-        # 分钟类参数统一用 float：UI 支持小数（如 7.5 分钟）
-        self.feed_interval_min = float(data.get("feed_interval_min", 5))
-        self.feed_interval_max = float(data.get("feed_interval_max", 10))
-        if self.feed_interval_max < self.feed_interval_min:
-            self.feed_interval_max = self.feed_interval_min
+        # ⚠ 老项目文件里可能还留着 `auto_feed_pet` / `feed_interval_min|max`
+        #    （「自动喂宠」2026-09-26 已整块移除）—— **直接忽略** ✓，不读、也不再写回 ✓。
+        #    想喂宠就用「自定义定时行为」配一条（按键那层的「喂宠」键还在 ✓）。
         self.custom_timers = self._load_timers(data.get("custom_timers"))
         self.facing_timeout_min = float(data.get("facing_timeout_min", 10))
         self.player_lost_timeout_min = float(data.get("player_lost_timeout_min", 3))
@@ -397,6 +477,9 @@ class DecisionSettings:
         self.anti_afk_rest_max = float(data.get("anti_afk_rest_max", 20))
         if self.anti_afk_rest_max < self.anti_afk_rest_min:
             self.anti_afk_rest_max = self.anti_afk_rest_min
+        self.anti_afk_spot_set = str(data.get("anti_afk_spot_set") or "")
+        self.anti_afk_spot_seq = self._load_seq(data.get("anti_afk_spot_seq"), [])
+        self.anti_afk_spot_after = str(data.get("anti_afk_spot_after") or "")
         self.anti_afk_retry_on_interrupt = bool(
             data.get("anti_afk_retry_on_interrupt", False))
         # 至少 1 秒：0/负值会变成"退出隐身的同时立刻又要休息"，来回抖
@@ -512,6 +595,20 @@ class DecisionSettings:
 #: 读到 None 就按"实时没在跑"处理（见 `route_panel._command_first_step`），不会误发按键。
 CURRENT = None
 
+#: 寻路任务**结束后**，那句"为什么结束"还在界面上挂多久（秒）。
+#: 为什么要有：用户问的常是"为什么在 -170 就松开了 ↑"，而任务一结束那行就消失了
+#: ⇒ 看见的时候已经无从查证（2026-09-26 连着两次都是这么绕远的）。做法同
+#: `decision/reconnect.py` 的 NOTE_KEEP。
+GOTO_NOTE_KEEP_S = 10.0
+
+#: **卡键看门狗**的判据（秒）：输出序列的键已经按了这么久，而角色**早就不在输出状态**
+#: ⇒ 认定漏放：记一笔（perf 的 `key_stuck` + 一句说明）、**松开**、清掉上下文。
+#:
+#: 为什么只看**输出序列**的键：移动键（走 / 追怪）按住几十秒是正常的 ✗；而输出/技能键
+#: 在"已经不在打"的情况下还按着，一定是漏放。给 1.5 秒宽限：正常那一拍 up 就回来了，
+#: 而且状态切换本来就有几帧的缓冲。
+OUT_KEY_STUCK_S = 1.5
+
 
 class CombatAgent:
     def __init__(self, settings):
@@ -524,6 +621,30 @@ class CombatAgent:
         #: 失败后**等哪一刻再重新激活**（`time.monotonic()` 秒；None = 没在等）。
         #: 由 `_climb_tick` 设/清，延迟长短读 `settings.climb_retry_delay_s`。
         self._climb_retry_at = None
+        #: 这个寻路任务是**哪一刻**下的命令（给"寻路超时时间"那道总闸用）。
+        self._climb_started = 0.0
+        #: **多步路径**：还没跑的任务队列 + 进度（见 `start_route`）。
+        self._route = []
+        self._route_why = ""
+        self._route_step = 0
+        self._route_total = 0
+        #: 由**实时线程**注入的**路径解析器**：`dst_set → {"path","jobs","why","here"}`
+        #:（见 `gui/live_thread._make_route_resolver` 与 `decision.route.plan_jobs`）。
+        #: 为什么是注入而不是自己算：地形与集合数据在实时线程手里
+        #:（`_fill_route_ctx` 同一处），agent 不持有它们 —— 不发明第二套数据源。
+        #: ⚠ 它是**函数**，不是预存的表：路径的起点是"我现在站哪个集合"，每一刻都可能变
+        #:（`docs/开发计划.md` 原先写的是 `set_name → [job,…]` —— 那样只能在某一刻算一次 ✗）。
+        self.route_plan = None
+        #: 「定点休息」当前那个"要走出去"的阶段**出发了没有**（见 `_run_rest_spot`）。
+        #: 为什么要有它：路径一结束时 `_climb` 会被清空 —— 可"还没出发"和"走完了"都长这样，
+        #: 必须分得清（不然刚进休息那一拍就会被当成"走完了"或"没走成" ✗）。
+        self._spot_started = False
+        #: 输出序列的键"在非输出状态下还按着"是从哪一刻开始的（卡键看门狗用）。
+        self._out_held_since = None
+
+        #: 任务里最后那句 note + 它的时刻（任务结束之后还要能答"为什么结束"，
+        #: 见 `current_goto_note` 与 `GOTO_NOTE_KEEP_S`）。
+        self._last_goto_note = ("", 0.0)
         self.facing = 1             # 朝向：+1 右（默认）/ -1 左，由最后按的方向键决定
         self._patrol_dir = 1        # 扫平台倾向朝向（巡逻主方向）：打背后怪不改变它
         self._last_facing_change = time.monotonic()  # 朝向最后一次变化的时刻（超时监控用）
@@ -538,12 +659,15 @@ class CombatAgent:
         self._target_until = 0.0    # 锁定到期时间（monotonic）
         self._next_hp_pot = 0.0     # 下次补血的时刻
         self._next_mp_pot = 0.0     # 下次补蓝的时刻
-        self._next_feed = 0.0       # 下次喂宠的时刻
-        self._was_feed_enabled = False  # 喂宠开关上一次状态（上升沿检测，打开时不立即喂）
+        # ⚠ 这里原来还有 `_next_feed` / `_was_feed_enabled`（自动喂宠的排期）——
+        #    功能整块移除（用户 2026-09-26）⇒ 一并删掉 ✓（要喂宠请用「自定义定时行为」✓）。
         self._timer_states = {}      # 自定义定时行为执行中序列状态：{name: [phase, next_ts, held]}
         self._kill_mobs = set()     # 要立即消除的防抖幽灵框 id（攻击幽灵框时记录，避免空放技能）
         self._next_evade = 0.0      # 下次规避动作（跳）的时刻
         self._next_chase_jump = 0.0 # 下次追击起跳的时刻（全局节流，只在沿抖动时兜底）
+        #: `chase` 状态**连续**保持的起始时刻（None = 现在不在 chase）。
+        #: 给「追击起跳需要的冲刺时间」用：每拍按**上一拍**的状态续/清（见 tick 里那段）。
+        self._chase_since = None
         self._band_had = False      # 上一拍起跳范围内有没有怪（用来判「从无到有」的沿）
         self._next_resetall = 0.0   # 下次定时 RELEASEALL 的时刻
         self._pending_attack = None # 待发的输出键时刻（跳规避：跳键后 interval 发输出）
@@ -633,6 +757,14 @@ class CombatAgent:
         s = self.settings
         if not s.chase_jump_enabled or not edge:
             return
+        # **冲刺时间闸**（用户 2026-09-26 要求）：`chase` 状态得**连续**维持够久才准起跳，
+        # 否则就算区间、沿都对也不跳。计时只要进别的状态就归零（`_set_state` 之外的那处
+        # 每拍续/清，见 tick 里 `_chase_since` 那段）—— 所以"刚打完 / 刚转身 / 刚进追击"
+        # 这些时刻都还得先冲一段再跳。
+        min_ms = max(0, int(getattr(s, "chase_jump_dash_ms", 0) or 0))
+        if min_ms > 0 and (self._chase_since is None
+                           or (now - self._chase_since) * 1000.0 < min_ms):
+            return
         if now < self._next_chase_jump:
             return
         if not self._in_chase_jump_range(dist):
@@ -644,6 +776,39 @@ class CombatAgent:
         perf.count("jump")
         attack_cd_s = max(0.0, float(s.attack_cd)) / 1000.0
         self._next_chase_jump = now + max(0.3, attack_cd_s + self._random_input_delay())
+
+    def _watch_output_held(self, now):
+        """输出序列的键按着不放、而角色**早就不在输出状态** ⇒ 记一笔 + 松开 + 说明。
+
+        2026-09-26 用户要求"先优化查卡键"（他报过"画面上一个框都没有、角色却持续在按
+        输出"）。已修的根因是"怪在输出序列 down 与 up 之间消失 ⇒ up 永不发出"；这里是
+        **兜底网**：任何漏放路径都会被它兜住，而且卡键从此在 perf.log 里查得到
+        （`key_stuck` 计数 + `perf.note` 那句"哪个键、按了多久、当时什么状态"）——
+        以前这件事**完全看不出来** ✗，只能靠猜。
+
+        判据只看**输出序列**的键（`_output_ctx` 的 held）：移动键按住几十秒是正常的 ✗，
+        输出/技能键在非输出状态下还按着就一定是漏放 ✓。宽限 `OUT_KEY_STUCK_S` 秒。
+        """
+        ctx = self._output_ctx
+        held = set(ctx[3]) if ctx else set()
+        #: 处于这些状态时，输出键按着是**正常**的（正在打）
+        if self.state in ("attack", "evade_jump", "evade_back_jump"):
+            self._out_held_since = now if held else None
+            return
+        if not held:
+            self._out_held_since = None
+            return
+        if self._out_held_since is None:
+            self._out_held_since = now
+            return
+        if (now - self._out_held_since) < OUT_KEY_STUCK_S:
+            return
+        perf.count("key_stuck")
+        perf.note("key_stuck", "%s 按住 %.1fs（当时状态 %s）—— 已松开"
+                  % ("/".join(sorted(held)), now - self._out_held_since, self.state))
+        self._release_ctx(ctx)          # 逐个 key_up（不是掐断序列）
+        self._output_ctx = None
+        self._out_held_since = None
 
     def set_facing(self, f):
         """设置朝向；朝向真的变了就重置「朝向无变化」超时计时 + 记下换向时刻。"""
@@ -697,6 +862,106 @@ class CombatAgent:
 
     # ---------------- 上绳任务（执行器，见 decision/route.py）----------------
 
+    def start_route(self, jobs, why=""):
+        """跑一条**多步路径**（「命令前往」/「定点休息」共用）→ True = 已起跑。
+
+        `jobs` 是**已经解析好**的任务列表（每步一个 `route.job_for_edge` 的产物：
+        WalkJob / ClimbJob / DropJob）—— 路径怎么解析由**实时线程**负责
+        （它手里才有地形与集合，见 `route_plan` 的说明），这里只管按顺序跑。
+
+        每一步跑完（到了）自动接下一步；**任何一步失败就整条停掉**并把"断在第几步、
+        为什么"写进 note（如实说，别硬着头皮往下走 ✗）。
+        """
+        jobs = list(jobs or [])
+        if not jobs:
+            return False
+        self._route = jobs[1:]
+        self._route_why = str(why or "")
+        self._route_step = 1
+        self._route_total = len(jobs)
+        perf.count("route_start")
+        self.start_climb(jobs[0])
+        return True
+
+    def stop_route(self, why="取消寻路"):
+        """把整条路径停掉（含还没跑的那些步）。"""
+        self._route = []
+        self._route_step = self._route_total = 0
+        self.stop_climb(why)
+
+    def plan_and_start_route(self, dst_set, why=""):
+        """让**实时线程**解析「从现在这儿去 `dst_set`」的多步路径并起跑 ⇒ `(ok, 一句人话)`。
+
+        谁在用：防掉线「定点休息」（`_run_rest_spot`）——它要自己走去指定地点，
+        而 agent 不持有地形 / 集合 ⇒ 解析这一层是注入进来的 `route_plan`（**函数**，
+        见它的说明；起点"我现在站哪个集合"每一刻都可能变，所以不能预存成表）。
+
+        三种回值：
+          · `(True, "已出发…")` —— 起跑了（`_climb` 非空，后面每一拍由 `_climb_tick` 推）；
+          · `(True, "已经在「X」上了")` —— **不用走**（`_climb` 空着，直接进下一步）；
+          · `(False, "为什么")` —— 没注入 / 解析不出来 / 没有可走的路 ⇒ 调用方**如实说**
+            （不许硬走，也不许静默 ✗）。
+        """
+        dst = str(dst_set or "").strip()
+        if not dst:
+            return False, "没选地点（先去玩家面板里选一个集合）"
+        fn = self.route_plan
+        if not callable(fn):
+            return False, ("实时线程还没把「路径解析器」交给我 —— 先在「实时」页开始，"
+                           "命令才发得出去")
+        try:
+            res = fn(dst)
+        except Exception as ex:                  # noqa: BLE001
+            return False, "解析路径时出错：%s" % ex
+        if not isinstance(res, dict):
+            return False, "路径解析器给的东西看不懂：%r" % (res,)
+        jobs = list(res.get("jobs") or [])
+        if not jobs:
+            if res.get("here"):
+                return True, str(res.get("why") or ("已经在「%s」上了" % dst))
+            return False, str(res.get("why") or "解析不出路线")
+        if not self.start_route(jobs, why=why or ("前往：%s" % dst)):
+            return False, "路径是空的，没起跑"
+        return True, ("已出发：%s" % " → ".join(res.get("path") or [dst]))
+
+    def _task_finished(self, failed=False, why=""):
+        """当前这一**步**收工（到了 / 失败了）⇒ 推进多步路径 → True = 整条都完事了。
+
+        为什么单独一个方法：任务收工的点有好几个（到了 / 到集合收工 / 超时 / 没坐标 /
+        到次数上限放弃），**每个点都要决定"下一步"** —— 散着写必然漏一个 ——
+        所以统一收口到这里。
+        """
+        job = self._climb
+        self._climb = None
+        self._climb_retry_at = None
+        self._release_combat_keys()
+        note = str(why or getattr(job, "note", "") or "")
+        if note:
+            self._last_goto_note = (note, time.monotonic())
+        if failed:
+            if self._route:
+                perf.count("route_break")
+                self._last_goto_note = (
+                    "路径中断（第 %d/%d 步）：%s；后面 %d 步没走"
+                    % (self._route_step, self._route_total, note, len(self._route)),
+                    time.monotonic())
+                self._route = []
+                self._route_step = self._route_total = 0
+            return True
+        if self._route:
+            nxt = self._route.pop(0)
+            self._route_step += 1
+            perf.count("route_step")
+            self.start_climb(nxt)
+            return False            # 这一拍不算完事：下一拍接着走下一步
+        if self._route_total > 1:
+            perf.count("route_done")
+            self._last_goto_note = ("整条路径走完（共 %d 步）" % self._route_total,
+                                    time.monotonic())
+        self._route = []
+        self._route_step = self._route_total = 0
+        return True
+
     def start_climb(self, job):
         """挂上一个**上绳/下跳任务**（`route.ClimbJob` / `DropJob`）；下一次 tick 开始执行。
 
@@ -705,6 +970,7 @@ class CombatAgent:
         """
         self._climb = job
         self._climb_retry_at = None      # 清掉上一个任务留下的"等我到点再重来"
+        self._climb_started = time.monotonic()   # 「寻路超时时间」从这一刻算起
         perf.count("climb_start")
         return job
 
@@ -729,6 +995,24 @@ class CombatAgent:
         """
         job = self._climb
         return str(getattr(job, "dst_set", "") or "") if job is not None else ""
+
+    def current_goto_note(self):
+        """寻路任务**当前那一步在干什么 / 为什么失败**（没任务又一无所有时空串）。
+
+        给画面那行用（`route_panel._osd_lines`）。为什么非要露出来：2026-09-26 用户连着
+        两次报"角色爬到某个 y 就不动了"，而任务里其实**一直写着原因**（对齐中差几像素 /
+        偏离绳 / 爬不动了 / 拿不到世界坐标 / 到达）—— 只是没人看得到 ⇒ 只能靠猜。
+
+        ⚠ 任务**结束之后**还要挂一段时间（`GOTO_NOTE_KEEP_S`）：用户问的是"为什么在 -170
+        就松开了 ↑"，而任务一结束那行就没了 ⇒ 看见的时候已经无从查证 ✗。
+        """
+        job = self._climb
+        if job is not None:
+            return str(getattr(job, "note", "") or "")
+        note, at = getattr(self, "_last_goto_note", ("", 0.0))
+        if note and (time.monotonic() - at) <= GOTO_NOTE_KEEP_S:
+            return "刚才：%s" % note
+        return ""
 
     def resetall_left(self):
         """离下次**定时清键**（RELEASEALL）还有几秒；没排期时给 None。
@@ -765,26 +1049,42 @@ class CombatAgent:
         """
         job = self._climb
         p = ws.player
+        # **寻路超时**（用户 2026-09-26 要求，当天又明确了口径）：按**每一段**算 ——
+        # **每完成一段**（从一个集合走到另一个集合）就重新计时 ✓。
+        # 代码上靠 `start_climb()` 重打 `_climb_started`，而 `_task_finished` 接下一段时
+        # 正是调它 ✓（所以"多段路线共用一次超时"是**不会**发生的 —— 用例
+        # `t_goto_timeout_per_hop` 钉着，别把它改成整条路线一个钟 ✗）。
+        # ⇒ 它挡的是"**某一段**卡住 / 在一段里反复重试"，不是"整条路线太久"：
+        #    5 段各自都正常的路线，总耗时可以远超这个值，那**不算超时** ✓。
+        cap_s = max(0.0, float(getattr(self.settings, "goto_timeout_s", 0.0) or 0.0))
+        if cap_s > 0 and self._climb_started and (now - self._climb_started) > cap_s:
+            job.cancel("寻路超时：这一段已经跑了 %.0f 秒（上限 %.0f 秒）"
+                       "—— 先看它卡在哪一步" % (now - self._climb_started, cap_s))
+            perf.count("goto_timeout")
+            return self._task_finished(failed=True)
+        # 任务被清掉之后，界面还要能回答"刚才为什么松开了 ↑" ⇒ 每一拍把最新那句留一份
+        #（`current_goto_note` 在任务已结束时也能给出它，见那里的说明）。
+        self._last_goto_note = (str(getattr(job, "note", "") or ""), now)
         if wx is None:
             # 定不了位（小地图那条没跑 / 没认出黄点）⇒ **如实失败**，绝不拿画面坐标硬凑
             #（那正是上面那个死循环的成因）。这里直接放弃：坐标拿不到不是"再试一次"能好的。
             perf.count("climb_giveup")
             job.cancel("拿不到世界坐标（小地图定位没有输出）—— 先确认「实时」页在跑、"
                        "小地图那块能认出黄点")
-            self._climb = None
-            self._climb_retry_at = None
-            self._release_combat_keys()
-            return True
+            return self._task_finished(failed=True)
         py = getattr(p, "world_y", None)
         # 保持窗口 = **任务自己的**保持时间 + 当前端到端延迟（用户要求 3）。
         # ⚠ 别拿 `settings.align_hold_ms` 覆盖它：任务是「命令前往」那一刻按设置建的
         #（`route_panel._command_first_step` 传的就是它），覆盖会把"任务自己说了算"
         # 的语义弄丢（自检里 `hold_ms=0` 的用例当场变成 250ms，一等就红）。
         # 延迟每拍都在变，所以在**基线**上叠，基线只记一次（否则会一层层累加）。
-        if getattr(job, "base_hold_ms", None) is None:
-            job.base_hold_ms = int(job.hold_ms)
-        job.hold_ms = max(0, int(job.base_hold_ms)
-                          + int(round(float(getattr(ws, "e2e_ms", 0.0) or 0.0))))
+        # ⚠ 走（`WalkJob`）**没有"保持窗口"这回事**（走到就算到，不用再按住一会儿）
+        # ⇒ 用 `getattr` 兜底：没有 `hold_ms` 的任务直接跳过这一段，别硬塞一个给它。
+        if getattr(job, "hold_ms", None) is not None:
+            if getattr(job, "base_hold_ms", None) is None:
+                job.base_hold_ms = int(job.hold_ms)
+            job.hold_ms = max(0, int(job.base_hold_ms)
+                              + int(round(float(getattr(ws, "e2e_ms", 0.0) or 0.0))))
         out = job.update(now, float(wx), py=py,
                          ladder_id=getattr(p, "ladder_id", None),
                          here_sets=getattr(p, "here_sets", None))
@@ -808,11 +1108,11 @@ class CombatAgent:
             #    判据用**集合**（`dst_set`，人工圈的、最贴近"到了哪块平台"）。
             here = set(getattr(p, "here_sets", None) or ())
             if job.dst_set and job.dst_set in here:
-                perf.count("climb_done")
-                self._climb = None
-                self._climb_retry_at = None
-                self._release_combat_keys()
-                return True
+                # 单独记一笔：**它是"失败后别再重试"的兜底，不是到达判据** ——
+                # 日志里要和几何到达（climb_done）分开，否则又看不出是哪种结束的 ✗。
+                perf.count("climb_done_set")
+                # 人已经在目标集合里 ⇒ 这一步算**到了**（多步路径继续往下走）
+                return self._task_finished(failed=False)
             if job.attempt < job.max_attempts:
                 # ② **失败保护**：失败不是终止 —— 重新激活再来一次（上绳本来就容易歪
                 #    一下：偏离绳 / 掉下来都算）。但要**延迟**激活（要求 1）：
@@ -838,16 +1138,11 @@ class CombatAgent:
                 return False
             # ③ 到上限才真放弃（数据写错时不能无限重来 —— 那看着就像卡死）
             perf.count("climb_giveup")
-            self._climb = None
-            self._climb_retry_at = None
-            self._release_combat_keys()
-            return True
+            return self._task_finished(failed=True)
         if out["done"]:
             perf.count("climb_done")
-            self._climb = None
-            self._climb_retry_at = None
-            self._release_combat_keys()
-            return True
+            # 到了 ⇒ 交给统一收口：多步路径要接着走下一步（见 _task_finished）
+            return self._task_finished(failed=False)
         return False
 
     def _resolve_seq_key(self, name):
@@ -944,19 +1239,34 @@ class CombatAgent:
         for sub in sub_stack:
             self._release_ctx(sub)
 
-    def _clear_ctx_held(self, ctx):
-        """只作废上下文记的「按着哪些键」，**保留进度**（phase / next_ts / 序列本身）。
+    def _reassert_ctx(self, ctx):
+        """清空指令通道之后：把上下文里**该按着的键**重按一遍（**进度和记录都保留**）。
 
-        定期 RELEASEALL 之后用：固件侧那批键已经被一次性松掉了，本地这份记录随之
-        作废（和 `keys.clear()` 一个道理 —— 不补发 RELEASE，因为已经松了）；但
-        「序列走到第几步、下一次什么时候发」是本机的进度，跟 RELEASEALL 无关，
-        必须留着 —— 否则序列会从头重来（进入隐身里那个长 delay 永远走不完）。
+        用户 2026-09-26 定的口径：寻路 / 行为编辑器编的宏都可能很长，中间被"清空指令
+        通道"（定期 RELEASEALL、点「重置指令通道」）打断时，固件侧那些键被一次性松掉了
+        —— 而本机这边**进度还在**（`next_ts` 还早着呢）⇒ 没人补按 ⇒ 表现就是"按着 ↑
+        结果被停了、之后一路都不动" ✗。这里就做那一件小事：把 `held` 里每个键**重新
+        PRESS** 一次。（固件 `addHeld` 会去重 ✓，本地后端下重复 PRESS 也是幂等的 ✓。）
+
+        ⚠ 记录**故意保留**（原来这里叫 `_clear_ctx_held`：清掉就算完 ✗）：
+          · 清掉 ⇒ 这一轮补按上了，可**下一次** RELEASEALL 就再也想不起来要补 ✗；
+          · 留着 ⇒ 每一轮都能补，而且序列走到 `up` 元素时照常发 RELEASE ✓ 不会卡键 ✓。
+        收尾照旧由序列自己负责（`_release_ctx` / `_release_held_set` ✓）。
         """
         if not ctx:
             return
-        ctx[3].clear()
+        keys = sorted(k for k in ctx[3] if k)
+        for k in keys:
+            try:
+                key_down(k)
+            except Exception:                   # noqa: BLE001
+                pass
+        if keys:
+            perf.count("key_reassert")
+            perf.note("key_reassert",
+                      "清空指令通道后重按 %s（序列进度保留）" % "/".join(keys))
         for sub in ctx[4]:
-            self._clear_ctx_held(sub)
+            self._reassert_ctx(sub)
 
     @staticmethod
     def _release_held_set(held):
@@ -1378,7 +1688,7 @@ class CombatAgent:
         else:
             dinput.release_all_remote()
             self.keys.clear()
-        # **本机规划的行为序列一律保留进度**，只作废它们记的「按着哪些键」：
+        # **本机规划的行为序列一律保留进度**，并且把「该按着的键」**重按回去**：
         #     _output_ctx     输出行为序列（攻击连点 / 跳输出，自己按 CD 排下一轮）
         #     _back_ctx       回身输出序列（循环行为）
         #     _afk_ctx        进入 / 退出隐身（里面可能有很长的 delay）
@@ -1387,10 +1697,15 @@ class CombatAgent:
         # 记的进度，和它无关。原来把这些上下文一起清掉，等于每 resetall_interval
         # 秒让所有序列从头重来：长 delay 永远走不完、前面的动作被反复重放、
         # 输出序列还会无视 CD 立刻重打一轮。
+        # ⚠ 但**光"作废记录"还不够**（2026-09-26 用户口径）：这些宏 / 寻路可能很长，
+        #   序列里按着的键往往还要再按一会儿（`down ↑` 后面跟 3 秒 delay ⇒ 这 3 秒里
+        #   ↑ 必须一直按着 ✓）。RELEASEALL 把它松了，记录又清了 ⇒ **没人补按** ⇒
+        #   角色中途"松手" ✗（用户的原话："按着 ↑ 结果被停了，需要重启被清掉的键"）。
+        #   ⇒ 走 `_reassert_ctx`：**重按 + 保留记录**（下次再清还能再按一遍 ✓）。
         for ctx in (self._output_ctx, self._back_ctx, self._afk_ctx):
-            self._clear_ctx_held(ctx)
+            self._reassert_ctx(ctx)
         for st in self._timer_states.values():
-            self._clear_ctx_held(st)
+            self._reassert_ctx(st)
 
     def tick(self, ws, timing_only=False):
         """跑一帧决策；`timing_only=True` 时只跑一次「时序拍」。
@@ -1449,38 +1764,69 @@ class CombatAgent:
         # 唯一例外是**自动喝药**：隐身不等于安全（隐身到期、被范围技能扫到、
         # 血本来就没满），血量掉了照样要补。注意正常路径里喝药在「定位到玩家」
         # 之后才跑，而休息时角色是隐身的、很可能定位不到，所以这里必须显式补一次。
-        if self.state in ("afk_enter", "afk_rest", "afk_exit"):
+        # ⚠ **休息与寻路互相独立**（用户 2026-09-26 明确要求，我上一版擅自耦合过 ✗）：
+        #   休息的分支**不判断寻路**（不跳过、不改休息状态、不存/不恢复）；
+        #   寻路任务那一侧也**不判断是否在休息**（`_climb_tick` 里没有任何休息条件）。
+        #   两边各按自己的时刻表走 —— 同时挂着的处理见下面（各按各的键）。
+        # ⚠ 状态清单走 `REST_STATES`（模块级常量）：加新休息类型时**只改那一处**，
+        #   漏了就是"用户选了却什么都不发生 ✗"（`spot_rest` 就是这么补上的）。
+        if self.state in REST_STATES:
             if not s.anti_afk_enabled:
                 # 休息途中关掉防掉线：立刻退出休息，别把角色留在隐身里
                 self._release_ctx(self._afk_ctx)
                 self._afk_ctx = None
                 self._finish_rest(now)
             else:
-                # 手动「结束休息」：不能直接跳回打怪 —— 角色还在隐身里，
-                # 半截的进入隐身序列也可能按着键。所以松掉当前序列、转去执行
-                # 退出隐身行为，走完再由 _finish_rest 收尾。已经在退出阶段就忽略。
+                # 手动「结束休息」：
+                #  · 隐身那一型**不能直接跳回打怪** —— 角色还在隐身里，半截的进入序列
+                #    也可能按着键 ⇒ 松掉当前序列、转去执行退出隐身行为，走完再 _finish_rest；
+                #  · 定点那一型身上没有隐身（只可能在走路 / 演到达行为）⇒ 停掉路线直接收工，
+                #    并把这一拍结束掉（别让它接着往下走一步）。
                 if s.rest_abort and self.state != "afk_exit":
                     s.rest_abort = False
                     self._release_ctx(self._afk_ctx)
                     self._afk_ctx = None
+                    if self.state in SPOT_STATES:
+                        self.stop_route("手动结束休息")
+                        self._finish_rest(now)
+                        return {"state": self.state, "reason": "手动结束休息",
+                                "target": None, "dx": 0, "dist": 0, "keys": [],
+                                "facing": self.facing,
+                                "kill_mobs": self._take_kill_mobs()}
                     self.state = "afk_exit"
-                self._run_rest(now)
+                self._run_rest(now, ws)
                 if timing_only:
                     return None      # 休息期间不做战斗动作，也不读世界状态
                 # 休息期间照常补血。勾了「被打断重试」时，**这一拍真的补了血就算被打断**：
-                # 立刻退出隐身回去接着打（见 _interrupt_rest）。
+                # 立刻收工回去接着打（见 _interrupt_rest）。
+                # ⚠ 哪些阶段算「能被打断」由**契约表**说了算（`REST_STATES_INTERRUPT`）——
+                #   别再手写元组（`afk_spot_act` 那种漏一次就是"补了血却继续歇着"✗）。
                 if self._drink_potions(ws, now) and s.anti_afk_retry_on_interrupt \
-                        and self.state in ("afk_enter", "afk_rest"):
+                        and self.state in REST_STATES_INTERRUPT:
                     self._interrupt_rest(now)
-                return {"state": self.state, "reason": "隐身休息", "target": None,
-                        "dx": 0, "dist": 0, "keys": [], "facing": self.facing,
+                # **寻路任务照跑 + 赶路时"有怪先打"**（见 `_rest_travel_beat`）：
+                # 前者是用户 2026-09-26 的要求（"即使在休息中，寻路也需要能生效"）✓；
+                # 后者是同一天报的坑（"点手动进入休息后…攻击范围内有怪时没有触发 attack"
+                # ✗）—— 「命令前往」走的是正常决策路径、那里有"有怪先打"的仲裁 ✓，
+                # 而休息分支是**早退**的（除了补血不做任何战斗动作）⇒ 定点休息一路挨打 ✗。
+                # ⚠ 必须紧跟一次 `self.keys.set(...)` —— 休息分支是**早退**，正常路径末尾那次
+                # 下发（`self.keys.set(keys)`）到不了这儿，不补下发的话按的键发不出去 ✗。
+                _rk = self._rest_travel_beat(now, ws)
+                self.keys.set(_rk)
+                return {"state": self.state,
+                        "reason": ("定点休息" if self.state in SPOT_STATES else "隐身休息"),
+                        "target": None,
+                        "dx": 0, "dist": 0, "keys": sorted(_rk),
+                        "facing": self.facing,
                         "kill_mobs": self._take_kill_mobs()}
-        else:
-            # 不在休息中：丢掉过期的「结束休息」请求，否则下一次休息一开始就会被它结束掉
+        elif self.state not in REST_STATES:
+            # 不在休息中：丢掉过期的「结束休息」请求，否则下一次休息一开始就会被它结束掉。
+            # ⚠ 判断用"状态"而不是上面那个 `if` 的反面：休息中挂着寻路任务时上面那个 `if`
+            # 是不成立的（那一拍让给任务），但**人点的「结束休息」不能被顺手丢掉**。
             s.rest_abort = False
 
-        # 不依赖玩家定位的定时行为：到点就执行（喂宠 / 自定义定时）
-        self._feed_pet(now)
+        # 不依赖玩家定位的定时行为：到点就执行（自定义定时行为）
+        # （「自动喂宠」2026-09-26 已整块移除 ⇒ 这里只剩自定义定时行为 ✓）
         self._custom_timers(now)
 
         if timing_only:
@@ -1562,6 +1908,20 @@ class CombatAgent:
         jump_edge = bool(_band) and not self._band_had
         self._band_had = bool(_band)
 
+        # 「追击起跳需要的冲刺时间」的计时（用户 2026-09-26 要求）：**连续** chase 才累加，
+        # 一进别的状态立刻归零。放在这里（每拍、所有分支之前）算一次，三处起跳调用点共用
+        # 同一份计时 —— 和 `jump_edge` 同一个道理：判据不随分支而变。
+        # ⚠ 用**上一拍**的 `self.state`（本拍的状态在各分支末尾才写）⇒ 有一拍延迟，
+        # 对"要冲几百毫秒"这件事无所谓；换来的是**只改这一处**，不用在每条分支里各清一次。
+        if self.state == "chase":
+            if self._chase_since is None:
+                self._chase_since = now
+        else:
+            self._chase_since = None
+
+        # 卡键看门狗（每拍一次；用**上一拍**的状态判断，见方法说明）
+        self._watch_output_held(now)
+
         # 自动喝药：依赖玩家定位（读血/蓝），定位到玩家后才执行
         self._drink_potions(ws, now)
 
@@ -1579,7 +1939,7 @@ class CombatAgent:
             s.rest_pending = False
             s.next_afk_monotonic = 0.0
             self._begin_rest(now)
-            self._run_rest(now)
+            self._run_rest(now, ws)
             return {"state": self.state, "reason": "进入隐身休息", "target": None,
                     "dx": 0, "dist": 0, "keys": [], "facing": self.facing,
                     "kill_mobs": self._take_kill_mobs()}
@@ -1676,6 +2036,17 @@ class CombatAgent:
                 # 平地巡逻：无怪，idle
                 self._set_state("idle")
                 self.keys.release_all()
+                # ⚠ **必须把输出序列按着的键也松开**（2026-09-26 用户报的现象：
+                # "画面上一个框都没有，角色却持续在按输出"）。
+                # `self.keys.release_all()` 只松 **KeyState 的移动键**；输出键是 `_run_seq`
+                # 用 `key_down` **直接发的**（不经 KeyState）⇒ 只有 `_release_combat_keys()`
+                # （内部 `_release_ctx(_output_ctx)`）才松它。
+                # 漏了它的后果：怪在输出序列的 down 与 up 之间消失（默认两拍隔 70~130ms，
+                # 比一格帧间隔 66ms 还长，很容易撞上）⇒ 序列停在下过半截、"up" 永不发出
+                # ⇒ 攻击键一直按着（而状态已是 idle、画面上也没框了）；默认 60s 的
+                # RELEASEALL 会兜一次，所以表现为"偶尔持续一阵子"。
+                # 别的早退（未定位玩家 / 关自动 / 再查一次开关）本来就都调了它，这里对齐。
+                self._release_combat_keys()
                 return {"state": "idle", "reason": "无怪",
                         "kill_mobs": self._take_kill_mobs()}
 
@@ -1733,18 +2104,39 @@ class CombatAgent:
         """
         self._release_held_keys()
         self.keys.release_all()
-        self.state = "afk_enter"
         self._afk_ctx = None
+        self._spot_started = False
+        if str(self.settings.anti_afk_type or "") == "spot_rest":
+            # 「定点休息」：先**走到指定地点**（路线由实时线程解析 ✓），休息时长
+            # **从"到达后行为演完"才起算** ⇒ 这里先不定 `_rest_until` ✓。
+            # 手上可能还挂着「命令前往」的任务 ⇒ 停掉：两边都会按键，会打架 ✗。
+            self.stop_route("定点休息要出发")
+            self.state = "afk_spot_walk"
+            self._rest_until = 0.0
+            perf.count("afk_start")
+            perf.note("afk_start", "定点休息：去「%s」"
+                      % (self.settings.anti_afk_spot_set or "(没选地点)"))
+        else:
+            # 「隐身休息」：进入隐身序列 → 等 → 退出隐身序列
+            perf.count("afk_start")
+            perf.note("afk_start", "隐身休息：进入隐身")
+            self.state = "afk_enter"
+            self._rest_until = now + self._random_rest_interval()
         self._rest_last_tick = now
-        self._rest_until = now + self._random_rest_interval()
         # 上一次的"被打断"标记不许带到这一次（否则这次正常结束也会按秒数重排）
         self._rest_retry_after_interrupt = False
 
-    def _run_rest(self, now):
-        """隐身休息状态机：执行进入隐身行为 → 休息倒计时 → 执行退出隐身行为。"""
+    def _run_rest(self, now, ws=None):
+        """休息状态机：**隐身那一型**走「进入隐身 → 等 → 退出隐身」；
+        **定点那一型**走 `_run_rest_spot`（走 → 到达后行为 → 等 → 结束后前往）。
+
+        `ws` 只有定点那一型要用（判"到了没有"看它脚下的集合 ✓ —— 和 executor 同一套判据）。
+        """
         s = self.settings
         self._pause_timers(now)
-        if self.state == "afk_enter":
+        if self.state in SPOT_STATES:
+            self._run_rest_spot(now, ws)
+        elif self.state == "afk_enter":
             # 休息时长到了，而进入隐身的序列还没走完 → **把剩下的进入行为丢掉**，
             # 直接去执行退出隐身。进入隐身可能很长（含 delay、含连招），等它演完
             # 休息时间早就超了；用户要的是「到点就退」，不是「把进入演完再退」。
@@ -1781,7 +2173,130 @@ class CombatAgent:
         s.rest_state = self.state if self.state.startswith("afk_") else ""
         # 进入隐身的阶段剩余时间也已经在走了（休息从那一刻起算），一起回读
         s.rest_until_monotonic = (self._rest_until
-                                  if self.state in ("afk_enter", "afk_rest") else 0.0)
+                                  if self.state in REST_STATES_TIMED else 0.0)
+
+    def _run_rest_spot(self, now, ws):
+        """「定点休息」的五个阶段（顺序是用户 2026-09-26 定的，见 `docs/开发计划.md` P2）：
+
+        ① 走到指定地点 → ② 到达后行为 → ③ 歇**通用休息时长** → ④「结束后前往」非空就
+        先走过去 → ⑤ 回战斗。
+
+        判"到了没有"用**执行器同一套判据**（脚下集合 `here_sets` ✓）—— 不另发明一个 ✗。
+        走不到 / 半路断了 ⇒ **如实说 + 回战斗**（不许硬走，也不许静默 ✗）。
+        """
+        s = self.settings
+        here = set(getattr(getattr(ws, "player", None), "here_sets", None) or ())
+        dst = str(s.anti_afk_spot_set or "").strip()
+
+        if self.state == "afk_spot_walk":
+            if not self._spot_started:
+                if dst and dst in here:                 # 已经站上去了：不用走
+                    self.state = "afk_spot_act"
+                    self._afk_ctx = None
+                    return
+                ok, msg = self.plan_and_start_route(dst, why="定点休息：去「%s」" % dst)
+                self._spot_started = True
+                if not ok:
+                    self._rest_give_up(now, msg)
+                    return
+                if self._climb is None:                 # 解析器说"已经在上面了"
+                    self.state = "afk_spot_act"
+                    self._afk_ctx = None
+                return
+            if self._climb is not None:
+                return                  # 还在走（这一拍外面会推 `_climb_tick`）
+            if dst and dst in here:
+                self.state = "afk_spot_act"
+                self._afk_ctx = None
+            else:
+                self._rest_give_up(now, "去「%s」没走成：%s"
+                                   % (dst or "(没选地点)",
+                                      self.current_goto_note() or "任务没走完就停了"))
+        elif self.state == "afk_spot_act":
+            # ② 到达后行为（行为编辑器编的那条序列）
+            if self._afk_ctx is None:
+                self._afk_ctx = [s.anti_afk_spot_seq, 0, 0.0, set(), []]
+            r = self._run_seq(now, self._afk_ctx)
+            if r is None:
+                self._afk_ctx = None
+                self.state = "afk_spot_rest"
+                # ③ 通用休息时长**从这一刻**起算（到达后行为演完才开始歇 ✓）
+                self._rest_until = now + self._random_rest_interval()
+            else:
+                self._afk_ctx = r
+        elif self.state == "afk_spot_rest":
+            if now < self._rest_until:
+                return
+            self._afk_ctx = None
+            after = str(s.anti_afk_spot_after or "").strip()
+            if not after:
+                self._finish_rest(now)                  # ⑤ 回战斗
+                return
+            self.state = "afk_spot_back"                # ④ 结束后前往
+            self._spot_started = False
+        elif self.state == "afk_spot_back":
+            if not self._spot_started:
+                ok, msg = self.plan_and_start_route(
+                    s.anti_afk_spot_after,
+                    why="定点休息结束：去「%s」" % s.anti_afk_spot_after)
+                self._spot_started = True
+                if not ok:
+                    self._rest_note("定点休息：结束后前往没走成 —— %s" % msg)
+                    self._finish_rest(now)
+                elif self._climb is None:               # 已经在那儿了
+                    self._finish_rest(now)
+                return
+            if self._climb is None:
+                self._finish_rest(now)                  # ⑤ 回战斗
+
+    def _rest_travel_beat(self, now, ws):
+        """休息分支里**赶路阶段**那一拍：**有怪先打**，没有就接着走 ⇒ 这一拍要发的键。
+
+        为什么非要有它（用户 2026-09-26 报："点手动进入休息后，会进行寻路，但是攻击范围内
+        有怪时没有触发 attack"）：休息分支是**早退**的（除了补血不做任何战斗动作），而
+        「有怪先打」那套仲裁只在**正常决策路径**里 ⇒ 「命令前往」会打 ✓、定点休息却一路
+        挨打也不还手 ✗（走不到休息点，还可能被打死 ✗）。
+
+        做法**照抄正常路径**（同一套判据，别自己发明 ✓）：正常路径里 `if in_range:` 那一支
+        正是 `_attack_state` + `_output_actions`，而且**不**调 `_climb_tick` ——
+        「有得打就先打、这一拍不往前走」✓，这里一模一样 ✓。
+
+        ⚠ 只在**赶路**那两个阶段做（`afk_spot_walk` / `afk_spot_back`）：演「到达后行为」
+          或正在歇的时候掺战斗，会把宏序列和按键搅在一起 ✗；隐身的三个阶段更是**一点战斗
+          都不该有**（那正是它存在的意义 ✓）。
+        ⚠ 借 `self.state` 这个**名字**时**必须还原**：休息阶段名就存在 `self.state` 里 ✗，
+          被战斗改掉的话休息机器下一拍就认不出自己（等于悄悄放弃这次休息 ✗✗）。
+        """
+        out = set()
+        if self.state in ("afk_spot_walk", "afk_spot_back"):
+            mobs = self._filter_mobs(ws.mobs, ws.player, ws)
+            in_range = self._in_range(mobs, ws)
+            if in_range:
+                tgt = in_range[0]                 # 最近的（`_in_range` 已按距离升序 ✓）
+                best = self._center_dist(tgt, ws.player)
+                keep = self.state
+                self.state = "attack"             # 只借名字，让输出那套（按状态选动作）跑起来
+                try:
+                    out |= self._attack_state(tgt, best, mobs, ws)
+                    self._output_actions(now, tgt, mobs, ws)
+                finally:
+                    self.state = keep             # ← 不还原就等于放弃这次休息 ✗
+                perf.count("spot_travel_fight")
+                return out
+        if self._climb is not None:
+            self._climb_tick(now, getattr(ws.player, "world_x", None), out, ws)
+        return out
+
+    def _rest_give_up(self, now, why):
+        """「定点休息」走不到 ⇒ **如实说 + 收工回战斗**（不许硬走，也不许静默 ✗）。"""
+        perf.count("afk_give_up")                     # 打点：这类"没休息成"要能事后数出来
+        perf.note("afk_give_up", "定点休息走不到：%s" % why)
+        self._rest_note("定点休息：%s" % why)
+        self._finish_rest(now)
+
+    def _rest_note(self, text):
+        """把一句"为什么"挂到画面上那行（和任务 note 同一处、同一种读法 ✓）。"""
+        self._last_goto_note = (str(text), time.monotonic())
 
     def _interrupt_rest(self, now):
         """休息被**自动补血**打断 → 立刻转去执行退出隐身（下次休息由 _finish_rest 提前）。
@@ -1805,13 +2320,39 @@ class CombatAgent:
             perf.count("afk_interrupt")
         except Exception:
             pass
+        if self.state in SPOT_STATES:
+            # 「定点休息」**没有隐身在身上**（只可能在走路 / 演到达行为）⇒ 不走 `afk_exit`
+            # 那套（那会去演"退出隐身"序列，按出无关的键 ✗），直接收工回战斗，
+            # 并把下次休息提前（`_rest_retry_after_interrupt` 由 `_finish_rest` 消费）。
+            self._release_ctx(self._afk_ctx)
+            self._afk_ctx = None
+            self.stop_route("定点休息被打断（补血了）")
+            self._rest_note("定点休息被打断（补血了）⇒ 回战斗，下次提前")
+            self._rest_retry_after_interrupt = True
+            self._finish_rest(now)
+            return
         self._release_ctx(self._afk_ctx)
         self._afk_ctx = None
         self.state = "afk_exit"
         self._rest_retry_after_interrupt = True
 
     def _finish_rest(self, now):
-        """退出隐身休息，恢复正常战斗，并排下一次触发时间。"""
+        """收工：**不管哪一型、从哪条路**退出休息，都在这里干净地回到战斗，并排下一次。
+
+        ⚠ **这里自己兜底**（2026-09-26 用户批准的结构性收敛）：调用点来自好几处
+        （tick 里的停自动 / 关防掉线 / 手动结束、休息状态机走完、定点休息的失败路径）——
+        只要有一个忘了先松键，角色就会**卡着键**继续走 / 继续打 ✗，而那种 bug 在游戏里
+        极难查 ✓。所以"松键、清标记、收路线"全放这儿，谁调都安全 ✓。
+        """
+        # ① **按键自保**：还按着的键松掉、序列标记清干净
+        self._release_ctx(self._afk_ctx)
+        self._afk_ctx = None
+        self._spot_started = False
+        # ② **只收掉属于休息的那条路线**（定点休息"走过去"的任务）—— 用户自己下的
+        #    「命令前往」不许连坐 ✗（它是有意"挂上就是授权、一路做到位"的）。
+        if str(self._route_why or "").startswith("定点休息"):
+            self.stop_route("休息结束")
+        # ③ 状态复位
         self.state = "idle"
         self._rest_pending = False
         self._rest_last_tick = 0.0
@@ -1832,6 +2373,10 @@ class CombatAgent:
         else:
             self._next_afk = now + self._random_afk_interval()
         self.settings.next_afk_monotonic = self._next_afk   # UI 立刻能显示下次倒计时
+        # ④ 打点（2026-09-26 补）：以后"它到底休息过没有 / 下次多久"看 perf.log 就够
+        perf.count("afk_done")
+        perf.note("afk_done", "休息收工（类型 %s）⇒ 回战斗，下次 %.0f 秒后"
+                  % (self.settings.anti_afk_type, max(0.0, self._next_afk - now)))
 
     def _pause_timers(self, now):
         """暂停喂宠 / 自定义定时行为的计时器：把「下次触发时刻」随流逝时间一起往后推。
@@ -1848,49 +2393,69 @@ class CombatAgent:
         delta = now - last
         if delta <= 0:
             return
-        if self._next_feed > 0:
-            self._next_feed += delta
-            s.feed_next_monotonic = self._next_feed
         for k, v in list(s.custom_timer_next.items()):
-            if v > 0:
+            # ⚠ 只有**勾了「休息时暂停计时」**的那些才冻住（用户 2026-09-26 加的**项目级**
+            #    开关，默认 True = 老行为）。没勾的照常倒数 ⇒ 休息期间也会到点、也会演 ✓
+            #    （`_custom_timers` 在休息分支里本来就会跑 ✓）—— 给"休息时也要按的键"用 ✓。
+            if v > 0 and self._timer_pauses_on_rest(k):
                 s.custom_timer_next[k] = v + delta
 
-    def _feed_pet(self, now):
-        """自动喂宠：勾选后每隔 feed_cd 按一次喂宠键。
+    def _timer_pauses_on_rest(self, name):
+        """这个定时行为在休息期间要不要**冻住计时** ⇒ bool（认不出来按 True = 冻住）。
 
-        开关边沿：关掉清计时；打开时不立即喂，先等一个完整间隔。
+        判据来自项目里那一条的 `pause_on_rest`（缺省 True = 老行为：休息时全都冻住 ✓）。
+        设成 False ⇒ 休息期间它照常倒数、到点照演 ✓（按键那一层不受影响 ✓）。
         """
-        s = self.settings
-        if not s.auto_feed_pet:
-            s.feed_next_monotonic = 0.0
-            self._next_feed = 0.0     # 关掉清计时
-            self._was_feed_enabled = False
-            return
-        feed_key = s.keymap.get("feed_pet")
-        if not feed_key:
-            s.feed_next_monotonic = 0.0
-            self._next_feed = 0.0     # 没键也清，设好键后立即吃
-            self._was_feed_enabled = False
-            return
-        # 上升沿：刚打开，重置为「等一个间隔后再喂」，不立即吃
-        if not self._was_feed_enabled:
-            lo = max(0.0, float(s.feed_interval_min))
-            hi = max(lo, float(s.feed_interval_max))
-            self._next_feed = now + random.uniform(lo, hi) * 60.0
-        self._was_feed_enabled = True
-        if now >= self._next_feed:
-            tap(feed_key, self._attack_duration)
-            lo = max(0.0, float(s.feed_interval_min))
-            hi = max(lo, float(s.feed_interval_max))
-            self._next_feed = now + random.uniform(lo, hi) * 60.0
-        s.feed_next_monotonic = self._next_feed
+        t = next((x for x in self.settings.custom_timers
+                  if (x.get("name") or "") == str(name or "")), None)
+        return bool((t or {}).get("pause_on_rest", True))
+
+    # ⚠ `_feed_pet`（自动喂宠）**已整块移除**（用户 2026-09-26）—— 他改用「自定义定时行为」
+    #    自己实现 ✓（那条路走 `_custom_timers`，按键那层的「喂宠」键仍是现成的 ✓）。
 
     def _custom_timers(self, now):
         """自定义定时行为：每个行为每隔随机 [min,max] 分钟执行一次其序列。
 
         行为序列分帧执行（复用 _run_seq），执行期间不影响其他定时行为。
+        另外处理**手动触发**（用户 2026-09-26 要求）：立刻演一次 + **计时从头开始** ✓。
         """
         s = self.settings
+        # ---- 手动触发：界面往 `custom_timer_fire` 里塞名字，这里取走并立刻开演 ----
+        # 为什么要有这条通道：按键与计时都在实时线程里 ⇒ 界面直接演会跟主回路抢按键 ✗
+        #（和 `rest_request` / `rest_abort` 同一套做法 ✓）。
+        # "计时从头开始"= 用 `now` 重新随机一个间隔 ✓（不是接着原来的剩余时间走 ✗）。
+        # ⚠ 正在演的那一段要**先松键**再重排：否则它按下的键会一直卡着（序列被换掉了，
+        #   没人再去 release 它）✗。
+        pend = getattr(s, "custom_timer_fire", None)
+        while pend:
+            nm = str(pend.pop(0) or "")
+            t = next((x for x in s.custom_timers
+                      if (x.get("name") or "") == nm), None)
+            # 名字对不上 / 这一项已暂停 ⇒ 丢掉请求（暂停的项在下面本来就跳过 ✗）
+            if t is None or t.get("paused"):
+                continue
+            old = self._timer_states.pop(nm, None)
+            if old is not None:
+                self._release_ctx(old)
+            iv = t.get("interval")
+            lo, hi = ((max(0.0, float(iv[0])), max(0.0, float(iv[1])))
+                      if isinstance(iv, (list, tuple)) and len(iv) == 2
+                      else (0.0, 0.0))
+            self._timer_states[nm] = [list(t.get("seq") or []), 0, 0.0, set(), []]
+            s.custom_timer_next[nm] = now + random.uniform(lo, hi) * 60.0
+
+        # ---- 孤儿清理（2026-09-26 用户批准的 ④ 项）----
+        # 用户在序列**演到一半**时把那条定时行为删掉 ⇒ 它的上下文还留着、键还按着，
+        # 而下面的循环再也不会碰它（名单里没这个名字了）⇒ **永久卡键** ✗ —— 更糟的是
+        # 定期 RELEASEALL 现在还会把它**重按回去** ✗✗。所以名单一变就顺手收掉它。
+        _names = {str(x.get("name") or "") for x in s.custom_timers}
+        for nm in [k for k in self._timer_states if k not in _names]:
+            st = self._timer_states.pop(nm)
+            self._release_ctx(st)
+            perf.count("timer_orphan")
+            perf.note("timer_orphan", "定时行为「%s」已经不在列表里 ⇒ 松开它按着的键"
+                      % nm)
+
         for t in s.custom_timers:
             name = t.get("name") or ""
             if not name:

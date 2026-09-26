@@ -31,7 +31,7 @@ from gui import theme
 from perception import classes
 # NoWheel* 必须模块级导入：控件在 __init__ 里建，方法里的懒导入到不了那儿。
 # （详见 docs/UI规范.md：滚轮不许改参数）
-from gui.widgets import (NoWheelDoubleSpinBox, NoWheelSlider,
+from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSlider,
                          NoWheelSpinBox)
 from tools.config import load_live, update_live
 
@@ -189,21 +189,20 @@ class SettingsDialog(QDialog):
 
         self.sp_vision_width = NoWheelSpinBox()
         self.sp_vision_width.setRange(1, 10)
-        self.sp_vision_width.setSuffix(" px")
         self.sp_vision_width.setValue(int(self._vis["vision_width"]))
-        vf.addRow("视野线宽度", self.sp_vision_width)
+        # 单位写在行标签里（UI 规范 §9：不写进编辑框）
+        vf.addRow("视野线宽度(px)", self.sp_vision_width)
         lay.addLayout(vf)
 
         # ---- foothold 集合编辑器 ----
         # 单独一组：上面那组的说明写着"实时预览"，而这项只管编辑器那个窗口。
         lay.addSpacing(8)
-        self._head(lay, "foothold 集合编辑器",
+        self._head(lay, "foothold 集合编辑器（线宽，px）",
                    "地形线条在编辑器里画多粗。\n"
                    "点确定后**再打开一次**编辑器就按新值画（窗口一直开着的话，"
                    "点一次「编辑集合…」也会刷新）。")
         self.sp_fh_width = NoWheelSpinBox()
         self.sp_fh_width.setRange(theme.FOOTHOLD_W_MIN, theme.FOOTHOLD_W_MAX)
-        self.sp_fh_width.setSuffix(" px")
         self.sp_fh_width.setValue(theme.load_foothold_width())
         self.sp_fh_width.setToolTip(
             "线宽单位是**屏幕像素**（和缩放无关）：编辑器整图看时约缩小到 0.35 倍、\n"
@@ -223,34 +222,31 @@ class SettingsDialog(QDialog):
         """出问题怎么办：什么时候停下、怎么清干净、断了怎么回来。"""
         page, lay = self._page()
 
-        self._head(lay, "朝向无变化停止自动",
+        self._head(lay, "朝向无变化停止自动（min）",
                    "角色朝向超过该时长没变化，自动停止（0 = 禁用）。")
         self.sp_timeout = NoWheelDoubleSpinBox()
         self.sp_timeout.setRange(0.0, 1440.0)
         self.sp_timeout.setDecimals(1)
         self.sp_timeout.setSingleStep(0.5)
-        self.sp_timeout.setSuffix(" min")
         self.sp_timeout.setValue(float(settings.facing_timeout_min))
         lay.addWidget(self.sp_timeout)
 
         lay.addSpacing(8)
-        self._head(lay, "找不到玩家停止自动",
+        self._head(lay, "找不到玩家停止自动（min）",
                    "连续找不到玩家超过该时长，自动停止（0 = 禁用）。")
         self.sp_player_lost = NoWheelDoubleSpinBox()
         self.sp_player_lost.setRange(0.0, 1440.0)
         self.sp_player_lost.setDecimals(1)
         self.sp_player_lost.setSingleStep(0.5)
-        self.sp_player_lost.setSuffix(" min")
         self.sp_player_lost.setValue(float(settings.player_lost_timeout_min))
         lay.addWidget(self.sp_player_lost)
 
         lay.addSpacing(8)
-        self._head(lay, "定时清空按键（防卡键）",
+        self._head(lay, "定时清空按键（s，防卡键）",
                    "每隔该秒数向 Pro Micro 发一次 RELEASEALL，"
                    "清空可能卡住的键（0 = 禁用）。")
         self.sp_resetall = NoWheelSpinBox()
         self.sp_resetall.setRange(0, 3600)
-        self.sp_resetall.setSuffix(" s")
         self.sp_resetall.setValue(int(settings.resetall_interval))
         lay.addWidget(self.sp_resetall)
 
@@ -264,6 +260,65 @@ class SettingsDialog(QDialog):
         self.ck_reconnect = QCheckBox("检测到断线后自动重连")
         self.ck_reconnect.setChecked(bool(settings.reconnect_enabled))
         lay.addWidget(self.ck_reconnect)
+
+        # 重连的**子参数**（2026-09-26 补：审计发现这 5 个"只能在配置文件里改" ✗ ——
+        # 页面上原本只有上面那个总开关）。版式同样遵守 UI 规范 §9：一行一个、单位进标签、
+        # 说明进 tooltip、毫秒一律**整数**控件。
+        rc_form = QFormLayout()
+        rc_form.setLabelAlignment(Qt.AlignLeft)
+        rc_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+
+        def rc_row(label, w, tip):
+            w.setToolTip(tip)
+            rc_form.addRow(label, w)
+            return w
+
+        self.sp_rc_probe = NoWheelDoubleSpinBox()
+        self.sp_rc_probe.setRange(0.0, 600.0)
+        self.sp_rc_probe.setDecimals(1)
+        self.sp_rc_probe.setSingleStep(0.5)
+        self.sp_rc_probe.setValue(float(settings.reconnect_probe_after_lost_sec))
+        rc_row("丢失多久后开始探界面(s)", self.sp_rc_probe,
+               "玩家框丢多久之后开始判别界面（0 = 立刻）。\n\n"
+               "默认 0：断线提示框只显示两三秒，等 5 秒再探就错过它了，客户端会一直卡在\n"
+               "提示框上等人按确定。探一次只要约 4 ms，不必为省这点开销推迟。")
+
+        self.sp_rc_step = NoWheelSpinBox()
+        self.sp_rc_step.setRange(0, 60000)
+        self.sp_rc_step.setSingleStep(500)
+        self.sp_rc_step.setValue(int(settings.reconnect_step_timeout_ms))
+        rc_row("每步等待超时(ms)", self.sp_rc_step,
+               "重连每一步（点服务器 / 点频道 / 排队 / 选角）等「界面真的变了」的超时。\n"
+               "到点还没变就按下面的次数重试。")
+
+        self.sp_rc_queue = NoWheelSpinBox()
+        self.sp_rc_queue.setRange(0, 600000)
+        self.sp_rc_queue.setSingleStep(1000)
+        self.sp_rc_queue.setValue(int(settings.reconnect_queue_timeout_ms))
+        rc_row("排队弹窗超时(ms)", self.sp_rc_queue,
+               "排队那一步专用的长超时：排队可能要等很久，用上面那个 3 秒会一直重试。")
+
+        self.sp_rc_retry = NoWheelSpinBox()
+        self.sp_rc_retry.setRange(0, 20)
+        self.sp_rc_retry.setValue(int(settings.reconnect_max_retry))
+        rc_row("同一步最多重试(次)", self.sp_rc_retry,
+               "同一步骤最多重试几次；到上限就停下并提示（不会无限重连）。")
+
+        self.ck_rc_resume = QCheckBox("回到游戏后自动恢复自动打怪")
+        self.ck_rc_resume.setChecked(bool(settings.reconnect_resume_auto))
+        self.ck_rc_resume.setToolTip(
+            "重连成功、回到游戏画面之后，自动把「自动打怪」重新打开。\n"
+            "不勾就停在「已回到游戏、自动仍是关的」，由你自己决定。")
+        rc_form.addRow("", self.ck_rc_resume)
+        lay.addLayout(rc_form)
+
+        # 总开关关着时子参数灰掉（改它没意义）—— 和「追击起跳」那一组同一个做法
+        def _rc_enable(on):
+            for w in (self.sp_rc_probe, self.sp_rc_step, self.sp_rc_queue,
+                      self.sp_rc_retry, self.ck_rc_resume):
+                w.setEnabled(bool(on))
+        self.ck_reconnect.toggled.connect(_rc_enable)
+        _rc_enable(self.ck_reconnect.isChecked())
 
         lay.addStretch(1)
         return page
@@ -279,32 +334,64 @@ class SettingsDialog(QDialog):
         """
         page, lay = self._page()
 
-        self._head(lay, "坐标对齐误差范围",
-                   "需要对齐坐标的功能（寻路走到某个 x、上绳前对准绳的 x）容许的偏差。\n"
-                   "单位是**游戏世界像素**（就是小地图算出来的那套坐标），不是屏幕像素。\n"
-                   "调小 ⇒ 对得更准但要磨一会儿（甚至走过头来回摆）；\n"
-                   "调大 ⇒ 快，但站偏了也算数（上绳会按不上）。\n\n"
-                   "默认 6（px）：绳在数据里就是一条线（宽度 0），而世界坐标本身有几像素抖动\n"
-                   "—— 6 够吸住，又不会宽到把隔壁平台的边也算进来。")
+        # 版式（2026-09-26 用户要求，见 docs/UI规范.md §9）：
+        #   · **一行一个参数**：左边参数名（**带单位**）、右边配置 —— 扫一眼就找得到；
+        #   · 参数说明**全部进 tooltip**（页面上不再摆大段文字：那是查参数时的噪音）；
+        #   · 单位写在**标签**里，不写进编辑框（`setSuffix` 在规范的禁用清单里）。
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+
+        def row(label, w, tip):
+            w.setToolTip(tip)
+            form.addRow(label, w)
+            return w
+
+        # ① 坐标对齐误差范围
         self.sp_align_tol = NoWheelSpinBox()
         self.sp_align_tol.setRange(1, 200)
-        self.sp_align_tol.setSuffix(" px")
         self.sp_align_tol.setValue(int(settings.align_tol_px))
-        lay.addWidget(self.sp_align_tol)
+        row("坐标对齐误差范围(px)", self.sp_align_tol,
+            "需要对齐坐标的功能（寻路走到某个 x、上绳前对准绳的 x）容许的偏差。\n"
+            "单位是**游戏世界像素**（就是小地图算出来的那套坐标），不是屏幕像素。\n"
+            "调小 ⇒ 对得更准但要磨一会儿（甚至走过头来回摆）；\n"
+            "调大 ⇒ 快，但站偏了也算数（上绳会按不上）。\n\n"
+            "默认 6：绳在数据里就是一条线（宽度 0），而世界坐标本身有几像素抖动 ——\n"
+            "6 够吸住，又不会宽到把隔壁平台的边也算进来。")
 
-        lay.addSpacing(8)
-        self._head(lay, "坐标对齐误差时间",
-                   "进入误差范围后，还要**保持这么久**才算对齐成功。\n"
-                   "为什么不能只看一帧：小地图定位与按键下发不是同一时刻的（有延迟、还会抖），\n"
-                   "单帧落进误差范围不代表真站住了。\n"
-                   "**实际等待 = 画面 / 指令延迟 + 这个值**，所以它不是「总超时」。\n\n"
-                   "默认 250（ms）：约 3~4 个视频帧，够滤掉抖动，又不至于每步都干等。")
+        # ② 坐标对齐误差时间
         self.sp_align_hold = NoWheelSpinBox()
         self.sp_align_hold.setRange(0, 5000)
-        self.sp_align_hold.setSuffix(" ms")
         self.sp_align_hold.setValue(int(settings.align_hold_ms))
-        lay.addWidget(self.sp_align_hold)
+        row("坐标对齐误差时间(ms)", self.sp_align_hold,
+            "进误差范围后要**保持这么久**才算对齐成功；\n"
+            "上绳**够到目标平台面之后**也要再按住 ↑ 这么久才松（2026-09-26 用户要求）。\n"
+            "为什么不能只看一帧：小地图定位与按键下发不是同一时刻（有延迟、还会抖），\n"
+            "单帧落进误差范围不代表真站住了。\n"
+            "**实际等待 = 画面 / 指令延迟 + 这个值**，所以它不是「总超时」。\n\n"
+            "默认 250：约 3~4 个视频帧，够滤掉抖动，又不至于每步都干等。")
 
+        # ③ 寻路超时时间（2026-09-26 新增；当天又明确了口径：按**每一段**算）
+        self.sp_goto_timeout = NoWheelSpinBox()
+        self.sp_goto_timeout.setRange(0, 3600)
+        self.sp_goto_timeout.setValue(int(round(float(
+            getattr(settings, "goto_timeout_s", 30.0) or 0.0))))
+        row("寻路超时时间(s)", self.sp_goto_timeout,
+            "「**每一段**」寻路（从当前集合走到下一个集合）最多花这么久，超了就切断它\n"
+            "（画面上那行会写明「寻路超时：这一段已经跑了 N 秒」）。\n\n"
+            "⚠ **每完成一段就重新计时**：一条多段路线里每段各自算 ⇒ 整条路线的**总**耗时\n"
+            "可以远超这个值（那**不算**超时 ✓）。它挡的是「某一段卡住了」或者\n"
+            "「在一段里反复重试」。\n\n"
+            "为什么除了任务自己的超时还要它：失败重来会把任务内部的计时**清零**，\n"
+            "同一段里累计下来可能远超预期。\n\n"
+            "0 = 不限时（老行为）。默认 30。")
+
+        # ⚠ 这里**曾经**摆过一个「走的方向」下拉（2026-09-26 用户明确删掉）：
+        # 走只有一种走法 —— 朝目标集合的 x 中点；设置是**全局参数**，
+        # 用户没提过的参数一律不许往这里加。将来若某一步需要"只按 ←/→"，
+        # 那是**逐边**配置（foothold 编辑器 →「可到达」窗口）。
+
+        lay.addLayout(form)
         lay.addStretch(1)
         return page
 
@@ -404,6 +491,27 @@ class SettingsDialog(QDialog):
         if rc != bool(settings.reconnect_enabled):
             settings.reconnect_enabled = rc
             settings.save()
+        # 重连子参数（2026-09-26 新增到界面上）
+        rp = float(self.sp_rc_probe.value())
+        if rp != float(settings.reconnect_probe_after_lost_sec):
+            settings.reconnect_probe_after_lost_sec = rp
+            settings.save()
+        rs = int(self.sp_rc_step.value())
+        if rs != int(settings.reconnect_step_timeout_ms):
+            settings.reconnect_step_timeout_ms = rs
+            settings.save()
+        rq = int(self.sp_rc_queue.value())
+        if rq != int(settings.reconnect_queue_timeout_ms):
+            settings.reconnect_queue_timeout_ms = rq
+            settings.save()
+        rr = int(self.sp_rc_retry.value())
+        if rr != int(settings.reconnect_max_retry):
+            settings.reconnect_max_retry = rr
+            settings.save()
+        ra = bool(self.ck_rc_resume.isChecked())
+        if ra != bool(settings.reconnect_resume_auto):
+            settings.reconnect_resume_auto = ra
+            settings.save()
         # 定时清空按键
         t3 = self.sp_resetall.value()
         if t3 != settings.resetall_interval:
@@ -417,6 +525,11 @@ class SettingsDialog(QDialog):
         ah = int(self.sp_align_hold.value())
         if ah != settings.align_hold_ms:
             settings.align_hold_ms = ah
+            settings.save()
+        # 寻路超时时间（2026-09-26 新增，跟着项目存）
+        gt = int(self.sp_goto_timeout.value())
+        if gt != int(getattr(settings, "goto_timeout_s", 30) or 0):
+            settings.goto_timeout_s = gt
             settings.save()
         # 可视化
         vis_cfg = {k: b._color for k, b in self._color_btns.items()}
