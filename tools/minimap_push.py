@@ -81,6 +81,22 @@ def ask_region(owner=None, wait=0.0):
     return select_screen_region(parent=owner, hide_owner=True)
 
 
+def _already_listening(port, host="127.0.0.1", timeout=0.4):
+    """这个端口上**已经有东西在监听**吗（连一下就知道）。
+
+    为什么要有这一步（2026-09-26 排查"B 机连上却一帧都收不到"）：
+    `SO_REUSEADDR` 让**第二个推流**也能 bind 成功 ⇒ 于是可能同时有两个推流进程，
+    而 B 机的连接只会落到**其中一个**上 —— 落到旧的那个（比如上次没关干净的、
+    或者卡在抓屏上的）时，现象就是"连得上、永远没帧"，且新起的这个日志里什么都看不到。
+    """
+    import socket as _s
+    try:
+        with _s.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except Exception:                       # noqa: BLE001
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="A 机：小地图截屏推流")
     ap.add_argument("--bind", default=None, help="监听地址，默认 0.0.0.0")
@@ -98,6 +114,9 @@ def main() -> int:
     ap.add_argument("--no-gui", action="store_true",
                     help="不开窗口。**目前无实际作用**（保留兼容）：不加 --pick 时"
                          "本来就不开窗口，抓屏直接抓桌面")
+    ap.add_argument("--force", action="store_true",
+                    help="端口上已经有东西在监听时也强行启动（默认拦住 —— 两个推流"
+                         "同端口会让 B 机连到旧的那个，表现为「连上却收不到帧」）")
     args = ap.parse_args()
 
     from PyQt5.QtCore import QBuffer, QByteArray, QIODevice
@@ -141,28 +160,58 @@ def main() -> int:
     fps = max(1, int(cfg["fps"]))
     screen = QGuiApplication.primaryScreen()
 
+    # **端口上已经有东西在听** ⇒ 大声拦住（见 _already_listening 的说明）。
+    # 不拦的话：两个推流同时在跑，B 机可能连到旧的那个 ⇒ "连上却一帧都收不到"，
+    # 而且新起的这个日志里一片安静，根本看不出问题在哪。
+    if _already_listening(cfg["port"]) and not args.force:
+        print("⚠ 端口 %d 上**已经有东西在监听** —— 多半是上一个「小地图推流」还开着。\n"
+              "  两个推流同端口时，B 机只会连到其中一个：连到旧的那个就表现为\n"
+              "  「连得上、但一帧都收不到」。\n"
+              "  先把它关掉（部署台那张卡片点停止 / 任务管理器里的 python -m "
+              "tools.minimap_push），或者确认那是别的服务后加 --force 强制启动。"
+              % int(cfg["port"]))
+        return 3
+
     # **A 机监听、B 机连进来**（和 A 机已有的 relay / clock_server 同一方向）：
     # 这样 B 机只用 A 机的 IP（link.yaml 的 a_host 本来就有），A 机不用知道 B 的地址；
     # 防火墙也只需在 A 机放行这一个端口。
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((cfg.get("bind") or "0.0.0.0", int(cfg["port"])))
-    srv.listen(1)
+    srv.listen(8)
+    # **非阻塞 accept**：同一帧要广播给**每一路**客户端（见下面 clients 的说明）
+    srv.setblocking(False)
     print("监听 %s:%d   区域 (%d,%d) %dx%d   zoom=%d   %d fps   JPEG q=%d"
           % (cfg.get("bind") or "0.0.0.0", int(cfg["port"]),
              x, y, w, h, zoom, fps, quality))
     print("等 B 机连进来…（B 机跑：python -m perception.minimap --map <地图id>）")
 
-    sock = None
+    # **支持多个 B 机客户端**（2026-09-26 修）：原来一次只服务一个连接 —— B 机上
+    # 只要多一条客户端（工作台面板的定位 + 「标定…」弹窗 + 忘了关的命令行探针都是
+    # 各连一条），**后连的那条就只能排队、永远收不到帧**：现象是"TCP 连得上、
+    # 一帧都不来"（B 机报「等帧超时」），而 A 机日志里一片正常 —— 极难查。
+    # 现在每帧**广播**给所有连着的客户端，谁都不会被饿死。
+    clients = []             # [[sock, 对端名, 本次已发帧数, 连上的时刻], ...]
     n = 0
     t0 = time.time()
     while True:
         try:
-            if sock is None:
-                sock, peer = srv.accept()
-                sock.settimeout(10)
-                print("[%s] B 机 %s:%d 已连上" % (time.strftime("%H:%M:%S"),
-                                                 peer[0], peer[1]))
+            # ① 收新连接（非阻塞：有多少收多少，别让谁排队等）
+            while True:
+                try:
+                    c, peer = srv.accept()
+                except (BlockingIOError, socket.timeout):
+                    break
+                except OSError:
+                    break
+                c.settimeout(10)
+                name = "%s:%d" % (peer[0], peer[1])
+                clients.append([c, name, 0, time.perf_counter()])
+                print("[%s] B 机 %s 已连上（现在 %d 路）"
+                      % (time.strftime("%H:%M:%S"), name, len(clients)))
+            if not clients:
+                time.sleep(0.5)          # 没人连着：不必白抓屏
+                continue
             t_frame = time.perf_counter()
             shot = screen.grabWindow(0, x, y, w, h)
             if zoom > 1:
@@ -173,12 +222,43 @@ def main() -> int:
             shot.save(buf, "JPEG", quality)
             buf.close()
             data = bytes(ba)
-            sock.sendall(len(data).to_bytes(4, "big") + data)
+            pkt = len(data).to_bytes(4, "big") + data
             n += 1
-            if n % (fps * 10) == 0:      # 每 10 秒报一次
-                print("[%s] 已发 %d 帧  约 %.1f fps  单帧 %.1f KB"
-                      % (time.strftime("%H:%M:%S"), n, n / (time.time() - t0),
-                         len(data) / 1024.0))
+            keep = []
+            for rec in clients:
+                c, name, sent, c_t0 = rec
+                try:
+                    c.sendall(pkt)       # 一帧编一次、发多路（编码是大头）
+                except Exception as e:                  # noqa: BLE001
+                    print("[%s] %s 断了（%s: %s），移除这一路（剩 %d 路）"
+                          % (time.strftime("%H:%M:%S"), name, type(e).__name__, e,
+                             len(clients) - 1))
+                    try:
+                        c.close()
+                    except Exception:                   # noqa: BLE001
+                        pass
+                    continue
+                rec[2] = sent + 1
+                if rec[2] == 1:
+                    # **第一帧**单独报：B 机"等帧"最需要知道的就是"推出去了没有"
+                    print("[%s] 第一帧已发出 → %s（%.0f ms，%.1f KB）"
+                          % (time.strftime("%H:%M:%S"), name,
+                             (time.perf_counter() - t_frame) * 1000.0,
+                             len(data) / 1024.0))
+                elif rec[2] % max(1, fps * 10) == 0:    # 之后每 10 秒报一次
+                    print("[%s] → %s 已发 %d 帧（本次）　累计 %d 帧　约 %.1f fps  "
+                          "单帧 %.1f KB"
+                          % (time.strftime("%H:%M:%S"), name, rec[2], n,
+                             n / max(1e-6, time.time() - t0), len(data) / 1024.0))
+                elif rec[2] == 2 and time.perf_counter() - c_t0 > 3.0:
+                    # **发出去了没有**：连上 3 秒才发出第二帧，八成卡在抓屏上
+                    #（A 机在远程桌面/锁屏/最小化时 `grabWindow` 会卡住）
+                    print("[%s] ⚠ %s 连上 %.0f 秒才发出第二帧 —— 抓屏卡住了？"
+                          "（A 机在远程桌面/锁屏/最小化时截屏会卡）"
+                          % (time.strftime("%H:%M:%S"), name,
+                             time.perf_counter() - c_t0))
+                keep.append(rec)
+            clients = keep
             dt = 1.0 / fps - (time.perf_counter() - t_frame)
             if dt > 0:
                 time.sleep(dt)
@@ -186,14 +266,8 @@ def main() -> int:
             print("退出（共发 %d 帧）" % n)
             return 0
         except Exception as e:
-            print("[%s] 断了（%s: %s），2 秒后重连" % (time.strftime("%H:%M:%S"),
-                                                    type(e).__name__, e))
-            try:
-                if sock:
-                    sock.close()
-            except Exception:
-                pass
-            sock = None
+            print("[%s] 抓帧/编码出错（%s: %s），2 秒后继续"
+                  % (time.strftime("%H:%M:%S"), type(e).__name__, e))
             time.sleep(2)
     return 0
 

@@ -247,6 +247,28 @@ class Terrain:
 
     # ---------------- 查询（Agent 用这几个） ----------------
 
+    def foothold_below(self, x, y, tol=40):
+        """脚下那条**可站立**的 foothold（跳过墙）→ Foothold 或 None。
+
+        **与 `find_below` 同一套口径**（同一容差、同样跳过竖向的墙、同样取最近那条），
+        区别只是**顺便告诉你是哪一条**。这是"我在不在某个 foothold 集合里"的唯一判据
+        （`core/zones.py`）：先问脚下是哪条 foothold，再看它属于哪个集合。
+
+        为什么不复用"段"：自动串段会把**要跳/攀才能互通**的 foothold 并成同一段
+        （实测 105090600 的第 0 段把一面 388 像素高的悬崖当成了平台边缘 ✗）——
+        集合改由人工分组，判定只认 foothold，见 docs/寻路设计.md §12。
+        """
+        best, best_f = None, None
+        for f in self.footholds:
+            if f.is_wall or not (f.left <= x <= f.right):
+                continue
+            fy = f.y_at(x)
+            if fy < y - tol:          # 在头顶上方（容差内不算）
+                continue
+            if best is None or fy < best:
+                best, best_f = fy, f
+        return best_f
+
     def find_below(self, x, y, tol=40):
         """脚下最近的可站立平台 → (x, y_on_line) 或 None。
 
@@ -257,34 +279,26 @@ class Terrain:
         （`MiniMap.cs` 用的是 `Game.Player.X/Y`），而地面在脚底 —— 实测 105090700
         的出生点 sp 离脚下地面 **8 世界像素**（玩家越高/站着不动时会有小幅波动）。
         所以「我站在哪块平台上」要按"下方几十像素内的最近地面"来判，不能用 2px。
+
+        实现在 `foothold_below`（**一份口径，别各写一份** —— 两边容差一旦不同，
+        就会出现"工具说在这条上、界面说在那条上"这种最难查的分歧）。
         """
-        best = None
-        for f in self.footholds:
-            if f.is_wall or not (f.left <= x <= f.right):
-                continue
-            fy = f.y_at(x)
-            if fy < y - tol:          # 在头顶上方（容差内不算）
-                continue
-            if best is None or fy < best:
-                best = fy
-        return None if best is None else (x, best)
+        f = self.foothold_below(x, y, tol)
+        return None if f is None else (x, f.y_at(x))
 
     def segment_of(self, x, y, tol=40):
         """点 (x, y) 落在哪条段上（判定"我现在站在哪块平台"）→ Segment 或 None。
 
-        **按 find_below 的口径实现**（不是"离得足够近"）：黄点在玩家中心、
-        离地面 ~26px，用固定距离判定会一直判不到。所以先找脚下地面，
-        再反查它属于哪条段。
+        **按 foothold_below 的口径实现**：先问脚下是哪条 foothold，再反查它在哪条段里。
+        （原先靠"y 差 ≤0.51"反查，是为没有 foothold 返回值时打的补丁；现在直接认对象。）
+        注意：**语义判定一律走集合**（`core/zones.py`），段只留作显示/辅助选择。
         """
-        pos = self.find_below(x, y, tol)
-        if pos is None:
+        f = self.foothold_below(x, y, tol)
+        if f is None:
             return None
         for seg in self.segments:
-            for f in seg.footholds:
-                if f.is_wall or not (f.left - 1 <= x <= f.right + 1):
-                    continue
-                if abs(f.y_at(x) - pos[1]) <= 0.51:
-                    return seg
+            if f in seg.footholds:      # Foothold 没有 __eq__ ⇒ 按身份比较（同一批对象）
+                return seg
         return None
 
     def ladder_at(self, x, y):

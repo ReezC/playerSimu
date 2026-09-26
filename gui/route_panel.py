@@ -13,23 +13,37 @@
 这里**让你选**（每张图存一份，见 datasets/map/<id>.mapcalib.json），
 程序不替你猜。判断方法就写在面板上：进游戏左右走两步看一眼即可。
 
-**地形图**：把 `datasets/map/<id>_overlay.png`（tools/map_terrain_view.py 生成：
-每条平台一色 + 传送点/绳梯/刷怪点）显示出来。小地图定位对不对、寻路要往哪走，
-看着这张图才有概念 —— 只有一串数字的话没法判断。
+**地形图**：显示 `datasets/map/<id>_zones.png` —— **地形编辑器的结果**（圈进集合的
+平台按集合颜色画 + 名字标在平台上方，没圈的画暗灰）。"程序认得的平台"就是它，
+所以寻路要往哪走、小地图定位对不对，看着这张图才有概念。
+
+同目录还留一张 `<id>_overlay.png`（每段一色 + 段号，`tools/map_terrain_view.py`
+生成）：**叠到实时画面上用的仍是它** —— 那里要看的是"所有几何位置对不对"，
+不是"我圈了哪几块"。两张都由「生成地形图」一起画。
 """
+
+import time
 
 from PyQt5.QtCore import QTimer
 from PyQt5.QtGui import QPixmap
-from PyQt5.QtWidgets import (QApplication, QCheckBox, QHBoxLayout, QLabel,
-                             QMessageBox, QPushButton, QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QApplication, QCheckBox, QGroupBox, QHBoxLayout,
+                             QLabel, QMessageBox, QPushButton, QVBoxLayout,
+                             QWidget)
 
 from core import mapdata
 from decision.agent import settings
 from gui.canvas import ImageCanvas
 from gui.minimap_calib import MinimapCalibDialog   # 量「面板 ↔ 底图」的弹窗
-from gui.widgets import NoWheelComboBox, NoWheelSpinBox   # 滚轮不许改参数（UI规范 §5）
+from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,
+                         NoWheelSpinBox)   # 滚轮不许改参数（UI规范 §5）
 from perception import minimap as mm
 from tools.config import load_live, update_live    # 来源/框选区域存 config/live.yaml
+
+
+def _mmss(sec):
+    """秒 → `M:SS`（倒计时统一这个写法，和 player_panel 那边一致）。"""
+    sec = max(0, int(sec))
+    return "%d:%02d" % (sec // 60, sec % 60)
 
 
 def _generate_task(params, ctx):
@@ -52,6 +66,7 @@ def _generate_task(params, ctx):
     if ctx.canceled():
         return {"summary": "已取消"}
 
+    from core import zones as zones_mod
     from tools.map_terrain_view import render
     t = mapdata.load(mid, with_canvas=True)
     if t is None:
@@ -62,42 +77,95 @@ def _generate_task(params, ctx):
     w, h, n_fh, n_wall = render(t, target)
     ctx.log("叠加图 %s  %d×%d（foothold %d / 其中墙 %d，串成 %d 段）"
             % (target.name, w, h, n_fh, n_wall, len(t.segments)), "ok")
-    return {"summary": "已生成 %s" % target.name, "path": str(target)}
+
+    # 第二张：**地形编辑器的结果**（颜色=集合、名字标在平台上）——「路线识别」的
+    # 「地形图」显示的是它。两张都画：叠图那版仍要留着（叠到实时画面上时，要看的是
+    # "所有几何位置对不对"，不是"我圈了哪几块"）。都只有毫秒级。
+    z = zones_mod.load(mid)
+    ztarget = out / ("%s_zones.png" % mid)
+    render(t, ztarget, zones=z)
+    ctx.log("集合图 %s（%d 个集合%s）"
+            % (ztarget.name, len(z.sets),
+               "；还没圈集合，点「编辑集合…」" if not z.sets else ""), "ok")
+    return {"summary": "已生成 %s" % ztarget.name, "path": str(ztarget)}
 
 
 class RoutePanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(8)
+        page = QVBoxLayout(self)
+        page.setContentsMargins(12, 12, 12, 12)
+        page.setSpacing(8)
 
-        title = QLabel("路线识别")
-        title.setStyleSheet("font-weight: 600;")
-        root.addWidget(title)
+        def card(title, tip="", stretch=0):
+            """按 UI 规范把**一组**控件装进一张卡片 → 返回卡片内的布局。
 
-        note = QLabel("平台识别、跳跃落点预测、扫平台等寻路功能的总开关。\n"
-                      "这些功能每帧做图像处理，比较吃 CPU，默认关闭。")
-        note.setWordWrap(True)
-        note.setStyleSheet("color: #5f6368;")
-        root.addWidget(note)
+            为什么是 `QGroupBox` 而不是工作流那套 `StepCard`：那个自带状态灯和运行
+            按钮，是给"一步一步的任务"用的；这里是**参数页** —— 项目里参数分组一律
+            写 `QGroupBox("标题")`（`gui/player_panel.py` 里 12 处都是），白底圆角 +
+            灰色小标题的样式由 `main_window` 的全局 QSS 给（`QGroupBox` /
+            `QGroupBox::title`）。**别在这儿自己写样式**：写了就跟着主题走不动了。
 
-        self.ck_enabled = QCheckBox("启用路线识别")
-        self.ck_enabled.setChecked(bool(settings.route_enabled))
-        self.ck_enabled.toggled.connect(self._on_toggle)
-        root.addWidget(self.ck_enabled)
+            ⚠ 顺序仍然是**代码顺序 = 视觉顺序**（docs/UI规范.md §4）：卡片按下面
+            出现的先后从上到下排，要挪位置就整块搬（见下面三次 `root = card(...)`）。
+            """
+            box = QGroupBox(title)
+            if tip:
+                box.setToolTip(tip)
+            lay = QVBoxLayout(box)
+            lay.setContentsMargins(10, 6, 10, 8)
+            lay.setSpacing(6)
+            page.addWidget(box, stretch)
+            return lay
 
-        self.lbl_hint = QLabel()
-        self.lbl_hint.setStyleSheet("color: #80868b;")
-        self.lbl_hint.setWordWrap(True)
-        root.addWidget(self.lbl_hint)
-        self._refresh_hint()
+        # ---- ① 路线识别：集合 + 执行器参数 ----
+        # 下面这段所有 `root.add*` 都落进这张卡片（`root` 依次指向各卡片的内布局）。
+        root = card("路线识别")
 
-        # ---- 小地图定位（寻路用；方式由你选，程序不猜）----
-        root.addSpacing(12)
-        lbl2 = QLabel("小地图定位")
-        lbl2.setStyleSheet("font-weight: 600;")
-        root.addWidget(lbl2)
+        # 这一组**只剩「编辑集合」**（2026-09-26 用户定：其余都没意义）。
+        # 原来上面还有一段说明 + `启用路线识别` 开关 + 一行状态提示 —— 那个开关门控的是
+        # **感知**（平台识别 / 落点预测 / 小地图定位），关掉时「命令前往」连"你在哪个
+        # 平台"都答不出来，正是"点一下没反应"的典型来源。现在这些感知**一直跑**
+        # （见 gui/live_thread.py），页面上只留真正要人动手的那一件事。
+        # foothold 集合编辑器：寻路模块的第一块（「我在不在 A 平台」靠它）
+        self.btn_zones = QPushButton("编辑集合…")
+        self.btn_zones.setToolTip(
+            "打开 foothold 集合编辑器：把这张图的地形画出来，点选/框选 foothold\n"
+            "注册成命名集合（存 datasets/map/<id>.zones.json，**按地图 id 一份**）。\n\n"
+            "「我在不在 A 平台」这条判据就靠它：自动串段会把「要跳/攀才能互通」的\n"
+            "并成同一段（实测 105090600 的第 0 段把一面 388 像素高的悬崖当成了平台\n"
+            "边缘），所以分组只能由人圈。详见 docs/寻路设计.md §12。")
+        self.btn_zones.clicked.connect(self._on_edit_zones)
+        root.addWidget(self.btn_zones)
+
+        # ---- 上绳梯失败后的**延迟激活**（2026-09-26 用户要求 1）----
+        # 以前失败了是**立即**重新激活 —— 失败那一下人往往还在原地、朝向也没变，
+        # 立刻重来容易在同一处再歪一次。这个参数只管"等多久再重来"，不碰感知
+        # （感知没有开关，见上面那段说明）。
+        row_retry = QHBoxLayout()
+        row_retry.setSpacing(6)
+        row_retry.addWidget(QLabel("上绳梯失败后延迟激活时间"))
+        self.sp_retry = NoWheelDoubleSpinBox()
+        self.sp_retry.setRange(0.0, 30.0)
+        self.sp_retry.setDecimals(1)
+        self.sp_retry.setSingleStep(0.5)
+        self.sp_retry.setSuffix(" s")
+        self.sp_retry.setMinimumWidth(90)
+        self.sp_retry.setValue(float(getattr(settings, "climb_retry_delay_s", 1.0)))
+        self.sp_retry.setToolTip(
+            "上绳梯 / 下跳**失败后等多久**再重新激活（就是原来的\"重新对齐再来一次\"）。\n\n"
+            "0 = 立即重来（老行为）。\n"
+            "等一会儿的好处：失败那一下人往往还在原地、朝向也没变，立刻重来容易在同一处\n"
+            "再歪一次；先站稳一小会儿再重来，成功率更高。\n\n"
+            "⚠ 等待期间**不按键**（角色站着不动）；如果那时已经站在目标集合里，\n"
+            "任务会**直接收工**，不再重来。")
+        self.sp_retry.valueChanged.connect(self._on_retry_delay)
+        row_retry.addWidget(self.sp_retry)
+        row_retry.addStretch(1)
+        root.addLayout(row_retry)
+
+        # ---- ② 小地图定位（寻路用；方式由你选，程序不猜）----
+        root = card("小地图定位")
 
         # 面板上只留「参数 + 状态」；怎么判断选哪种、标定怎么跑，都放 tooltip
         # （docs/UI规范.md：正文别塞说明，细节交给 tooltip）
@@ -298,16 +366,58 @@ class RoutePanel(QWidget):
         self.lbl_mmap_hint.setWordWrap(True)
         root.addWidget(self.lbl_mmap_hint)
 
-        # ---- 地形图（看得见才好判断小地图定位对不对）----
-        root.addSpacing(12)
-        lbl3 = QLabel("地形图")
-        lbl3.setStyleSheet("font-weight: 600;")
-        root.addWidget(lbl3)
+        # ---- ③ 地形图（看得见才好判断小地图定位对不对）----
+        # 这张卡片吃掉剩余高度：里面的画布是 `addWidget(canvas, 1)`（见下）
+        root = card("地形图", stretch=1)
 
         self.lbl_map_img = QLabel()
         self.lbl_map_img.setStyleSheet("color: #80868b;")
         self.lbl_map_img.setWordWrap(True)
         root.addWidget(self.lbl_map_img)
+
+        # ---- 预览平台 + 命令前往（路线测试用）----
+        # 下拉里是**地形编辑器里注册过的集合**（跟着集合文件走，编辑器一保存就刷新）。
+        # 「预览」= 在下面那张图上把这个平台的包围盒框出来 —— 先确认"我要去的那个平台
+        # 到底是哪块"，再去测路；「命令前往」现在先算一遍**这条路通不通**（走边图），
+        # 等 P4 的执行器做出来，同一个按钮就真的让它走。
+        row_goto = QHBoxLayout()
+        row_goto.setSpacing(6)
+        row_goto.addWidget(QLabel("预览平台"))
+        self.cmb_goto = NoWheelComboBox()
+        self.cmb_goto.setMinimumWidth(150)
+        self.cmb_goto.setToolTip(
+            "要去的平台（下拉里是**地形编辑器注册过的集合**）。\n\n"
+            "选中就把它在下面的地形图上框出来 —— 先看清是哪块，再谈路怎么走。\n"
+            "空项 = 不预览（图上不叠框）。\n\n"
+            "⚠ 还没圈集合时这里是空的：先到「编辑集合…」里圈一个。")
+        self.cmb_goto.currentIndexChanged.connect(self._on_goto_pick)
+        row_goto.addWidget(self.cmb_goto)
+        self.btn_goto = QPushButton("命令前往")
+        self.btn_goto.setToolTip(
+            "**现在**：按边图算一遍「从现在所在平台 → 预览的平台」通不通，\n"
+            "把路线（哪一步是走/爬/传送门）写在下面那行里。\n"
+            "走不到时会说出**边界**（从起点能到哪些集合）—— 那就是缺边的位置。\n\n"
+            "**将来**（P4 的执行器）：同一个按钮会真的命令角色走过去，\n"
+            "途中遇到怪先打（攻击优先仲裁），超时报警。")
+        self.btn_goto.clicked.connect(self._on_goto)
+        row_goto.addWidget(self.btn_goto)
+        # 「结束当前寻路」（2026-09-26 用户要求 3）：撤掉挂着的上绳/下跳任务 ——
+        # 也就是让画面那行「当前任务」回到"战斗"。挨着「命令前往」放：一开一关一对。
+        self.btn_stop_goto = QPushButton("结束当前寻路")
+        self.btn_stop_goto.setToolTip(
+            "撤掉**当前挂着的寻路任务**（上绳 / 下跳），角色立刻回到全权战斗。\n\n"
+            "挂任务的是「命令前往」；这个按钮就是它的对手 —— 命令走错了、或者\n"
+            "你不想让它爬了，点这里（不用去关自动）。\n\n"
+            "没有任务在跑时会明说，不会静悄悄什么都不做。")
+        self.btn_stop_goto.clicked.connect(self._on_stop_goto)
+        row_goto.addWidget(self.btn_stop_goto)
+        row_goto.addStretch(1)
+        root.addLayout(row_goto)
+
+        self.lbl_goto = QLabel()
+        self.lbl_goto.setStyleSheet("color: #80868b;")
+        self.lbl_goto.setWordWrap(True)
+        root.addWidget(self.lbl_goto)
 
         # 只读看图画布：和质检台同一套交互（滚轮缩放 / 中键平移 / 双击适应）
         self.canvas = ImageCanvas()
@@ -339,12 +449,419 @@ class RoutePanel(QWidget):
 
         self._refresh_mmap()
         self._refresh_map_image()
+        self._refresh_goto()
 
-    # ---------------- 小地图定位 ----------------
+    # ---------------- 预览平台 / 命令前往（路线测试）----------------
+
+    # ---------------- 预览平台 / 命令前往（路线测试）----------------
+
+    def _refresh_goto(self):
+        """「预览平台」下拉：按**地形编辑器注册过的集合**填（空项永远在最前）。
+
+        也跟着集合文件走 —— 编辑器保存后（`_on_zones_saved`）与重开面板时都重读，
+        所以新圈的集合不用重启就能选。
+        """
+        mid = self._map_id()
+        cur = self._goto_name() or str(getattr(settings, "route_goto_set", "") or "")
+        names = []
+        if mid:
+            try:
+                from core import zones as zones_mod
+                names = list(zones_mod.load(mid).sets)
+            except Exception:                       # noqa: BLE001
+                names = []      # 文件坏了不该让面板起不来（下面那句提示会说明）
+        self.cmb_goto.blockSignals(True)
+        self.cmb_goto.clear()
+        self.cmb_goto.addItem("（不预览）", "")
+        for n in names:
+            self.cmb_goto.addItem(n, n)
+        j = self.cmb_goto.findData(cur)
+        self.cmb_goto.setCurrentIndex(j if j >= 0 else 0)
+        self.cmb_goto.blockSignals(False)
+        self.cmb_goto.setEnabled(bool(names))
+        self.btn_goto.setEnabled(bool(names))
+        if not names:
+            self._say_goto("还没有平台集合 —— 点上面的「编辑集合…」圈一个（路线按集合走）。",
+                           "#b06000")
+
+    def _goto_name(self):
+        v = self.cmb_goto.currentData()
+        return str(v or "")
+
+    def _preview_boxes(self, mid):
+        """预览平台在图上那个框 → [(cls, x, y, w, h, manual)]，空 = 没选/算不出来。
+
+        坐标走 `tools.map_terrain_view.image_xy` —— 和**画那张图**用的是同一套换算。
+        自己再算一遍迟早会漂（漂了就是"框画在别处"，看着像集合圈错了，最难查）。
+        """
+        name = self._goto_name()
+        if not (name and mid):
+            return []
+        try:
+            from core import zones as zones_mod
+            from tools.map_terrain_view import image_xy
+            t = mapdata.load(mid, with_canvas=True)
+            z = zones_mod.load(mid)
+            s = z.sets.get(name)
+            if t is None or s is None:
+                return []
+            sp = zones_mod.set_span(t, s.get("footholds") or [])
+            if sp is None:
+                return []
+            x0, y0 = image_xy(t, sp[0], sp[2])
+            x1, y1 = image_xy(t, sp[1], sp[3])
+            # **最少 8 像素**：平台是一根横线（包围盒高度可能是 0），按原样框出来就是
+            # 一条 1px 的发丝 —— 等于没框（预览的作用就是"看得见是哪块"）。不够就在
+            # 中心两侧补到 8px。
+            if x1 - x0 < 8:
+                cx = (x0 + x1) / 2.0
+                x0, x1 = cx - 4, cx + 4
+            if y1 - y0 < 8:
+                cy = (y0 + y1) / 2.0
+                y0, y1 = cy - 4, cy + 4
+            return [(1, x0, y0, x1 - x0, y1 - y0, False)]
+        except Exception:                           # noqa: BLE001
+            return []
+
+    def _on_goto_pick(self):
+        """选了平台 → 存进配置（跟着项目走）+ 在图上把它框出来。"""
+        name = self._goto_name()
+        if str(getattr(settings, "route_goto_set", "") or "") != name:
+            settings.route_goto_set = name
+            settings.save()     # 没打开项目时不落盘（见 decision/agent 的 set_save_hook）
+        self._say_goto("" if name else "（不预览：图上看全集）")
+        self._refresh_map_image()
+
+    def _here_set(self, z, fresh_s=3.0):
+        """现在所在的集合名（拿不到给空串）。
+
+        `fresh_s`：定位读数的新鲜度上限。**过期的读数不能当起点** —— 人会走，
+        拿几分钟前的位置算出来的路是错的，而且看着像"边图坏了"。
+        """
+        fid, ts = getattr(self, "_fh_seen", ("", 0.0))
+        if not fid or time.monotonic() - ts > fresh_s:
+            return ""
+        names = z.set_of(str(fid))
+        return names[0] if names else ""
+
+    def _on_goto(self):
+        """算一遍「现在所在平台 → 预览平台」，**并把第一步交给执行器**。
+
+        两件事一起做：
+          · 算路：通不通 + 沿途每一步靠什么过去（走/爬绳/跳/传送门）+ 走不到时的**边界**
+            （从起点能到哪些集合）—— 那正是路线测试要的信息（缺哪条边）；
+          · 下命令：第一步是「爬」或「下跳」就真的下发（2026-09-26 用户定，见
+            `_command_first_step`）。以前这里**只算不走**，点了按钮角色一动不动。
+        """
+        mid = self._map_id()
+        dst = self._goto_name()
+        if not mid or not dst:
+            self._say_goto("先在左边选一个平台。", "#b06000")
+            return
+        try:
+            from core import zones as zones_mod
+            z = zones_mod.load(mid)
+        except Exception as e:                      # noqa: BLE001
+            self._say_goto("集合文件读不出来：%s" % e, "#c5221f")
+            return
+        src = self._here_set(z)
+        if not src:
+            self._say_goto("还不知道你在哪个平台：先勾「在实时画面上叠地形图」、"
+                           "到「实时」页跑一小会儿（下面那行要显示得出「位于fh：…」）。",
+                           "#b06000")
+            return
+        path, why = zones_mod.find_path(z, src, dst)
+        if path is None:
+            self._say_goto("%s" % why, "#c5221f")
+            return
+        cmd, sent = self._command_first_step(z, mid, path)
+        steps = " → ".join(path)
+        detail = "；".join("%s --%s-->"
+                           % (a, zones_mod.edge_text(z, a, b))
+                           for a, b in zip(path, path[1:]))
+        here = z.set_of(str(getattr(self, "_fh_seen", ("", 0.0))[0]))
+        note = ("（你现在同时属于 %d 个集合：%s；按「%s」当起点）"
+                % (len(here), "、".join(here), src) if len(here) > 1 else "")
+        # 命令没发出去 ⇒ 用**橙色**：那是在说"这一步现在做不到"，不是路线本身不对。
+        self._say_goto("能走到（%s）：%s%s%s%s"
+                       % (why, steps, ("　｜　" + detail) if detail else "",
+                          note, cmd),
+                       "#0b8043" if sent else "#b06000")
+
+    def _on_stop_goto(self):
+        """「结束当前寻路」：撤掉挂着的任务，让「当前任务」回到"战斗"。
+
+        判定用 `current_goto_set()`（agent 的公开口径），**不去摸 `_climb`** ——
+        那是私有的运行时状态。
+        """
+        ag = self._live_agent()
+        if ag is None:
+            self._say_goto("现在没有在跑的实时推理（先去「实时」页开始）—— "
+                           "没有寻路任务可结束。", "#b06000")
+            return
+        if not self._current_goto_set():
+            self._say_goto("现在没有寻路任务（当前任务：战斗）。", "#b06000")
+            return
+        ag.stop_climb("手动结束寻路")
+        self._say_goto("已结束当前寻路任务（当前任务：战斗）。", "#0b8043")
+
+    def _current_goto_set(self):
+        """当前寻路任务的目标集合名（没有任务 / 实时没在跑时给空串）。"""
+        ag = self._live_agent()
+        if ag is None:
+            return ""
+        try:
+            return str(ag.current_goto_set() or "")
+        except Exception:                           # noqa: BLE001
+            return ""
+
+    def _timer_lines(self):
+        """所有**计时任务**的名称 + 计时信息（一行一个）：休息最优先，其次自定义定时行为。
+
+        数据全是 `decision.agent.settings` 上的**运行时状态**（agent 写、界面只读），
+        口径和「决策参数」页那张休息卡片一致（见 `gui/player_panel._rest_text`、
+        `_tick_feed_cd`）。⚠ 时间是 `time.monotonic()` 秒 —— 两侧同进程同一时钟源，
+        所以这里直接减（别换成 wall clock，那会被系统对时带偏）。
+        """
+        out = []
+
+        def left(until):
+            if not until or until <= 0:
+                return ""
+            return "　剩余 %s" % _mmss(until - time.monotonic())
+
+        st = getattr(settings, "rest_state", "")
+        if st == "afk_enter":
+            out.append("休息　进入隐身…%s" % left(settings.rest_until_monotonic))
+        elif st == "afk_rest":
+            out.append("休息　休息中%s" % left(settings.rest_until_monotonic))
+        elif st == "afk_exit":
+            out.append("休息　退出隐身…")
+        elif getattr(settings, "rest_pending", False):
+            # 到点了但攻击范围内还有怪：卡在这步最容易被当成"坏了"，写出来
+            out.append("休息　待休息（等清空攻击范围内的怪）")
+        elif getattr(settings, "next_afk_monotonic", 0.0) > 0:
+            out.append("休息　下次%s" % left(settings.next_afk_monotonic))
+        else:
+            out.append("休息　未排期（防掉线关着）")
+        for t in (getattr(settings, "custom_timers", None) or []):
+            if t.get("paused"):
+                # **暂停的不列**（2026-09-26 用户要求）：它现在不会触发，列出来只会
+                # 让人以为"还有一项在跑"。暂停状态在「决策参数」页的列表里看得到。
+                continue
+            name = str(t.get("name") or "?")
+            nx = float((getattr(settings, "custom_timer_next", None) or {})
+                       .get(name, 0.0))
+            # 还没排期（刚加/刚编辑过）⇒ 按区间下限占位，别显示 0:00
+            tail = (left(nx) if nx > 0 else
+                    "　剩余 %s" % _mmss((t.get("interval") or [5, 10])[0] * 60.0))
+            out.append("定时行为「%s」%s" % (name, tail))
+        if getattr(settings, "auto_feed_pet", False):
+            # agent 还没排期（刚打开开关）⇒ 明写"未排期"，不要一行光秃秃的"喂宠"
+            out.append("喂宠%s" % (left(getattr(settings, "feed_next_monotonic", 0.0))
+                                  or "　未排期"))
+        if int(getattr(settings, "resetall_interval", 0) or 0) > 0:
+            # **要倒计时**，不写"每 N s"（2026-09-26 用户要求）：排期在 agent 的 tick
+            # 里，所以它没在跑（或刚开自动还没排到）时只有"未排期"——
+            # 公开口径见 `CombatAgent.resetall_left`，别在这儿摸 `_next_resetall`。
+            ag = self._live_agent()
+            try:
+                sec = ag.resetall_left() if ag is not None else None
+            except Exception:                       # noqa: BLE001
+                sec = None
+            out.append("定时清键%s" % ("　剩余 %s" % _mmss(sec) if sec is not None
+                                     else "　未排期"))
+        return out
+
+    def _osd_lines(self, first):
+        """画面那几行（小地图框下方，从上到下）：世界坐标 → **当前任务** → 定时任务。
+
+        2026-09-26 用户要求 1、2：
+          · 「当前任务」默认「战斗」（全权战斗 Agent），有寻路任务时「前往：{集合名}」；
+          · 再往下**换行**罗列所有计时任务（休息最优先，其次自定义定时行为）；
+          · 这几行**不要背景色**，字色取设置里的「定时任务颜色」。
+        **合成一个列表**交给 live_panel（而不是分几次推）：它们要连成一片贴在同一处，
+        分开推会出现"上一行的位置被下一行占掉"。
+        """
+        from gui import theme
+        col = theme.load_vis().get("timer_color") or "#ffeb3b"
+        dst = self._current_goto_set()
+        lines = [first,                       # str ⇒ 保持黑底白字（读数是排查用的）
+                 ("当前任务　%s" % ("前往：%s" % dst if dst else "战斗"), col, False)]
+        lines += [(t, col, False) for t in self._timer_lines()]
+        return lines
+
+    def _live_agent(self):
+        """当前在跑的 `CombatAgent`（没在跑给 None）——「命令前往」用它下发任务。
+
+        它是 `decision/agent.py` 的模块级 `CURRENT`（「实时」线程启动时登记、退出时注销）：
+        以前 agent 只是实时线程里的局部变量 ⇒ 面板够不着，只能"算路给你看"。
+        """
+        from decision import agent as agent_mod
+        return getattr(agent_mod, "CURRENT", None)
+
+    def _command_first_step(self, z, mid, path):
+        """把路线的**第一步**交给执行器 ⇒ (一句给人看的话, 是否真的下发了命令)。
+
+        2026-09-26 用户定：**只接「爬」/「下跳」**。这两种是"贴着绳 / 贴着边缘按上去"，
+        对起跳时机不敏感（不必先做跳跃标定）；「走」「跳」「传送门」的执行器还没写 ——
+        那时候**如实说**"这一步还没做"，而不是静悄悄什么都不发生（用户就是这么撞上的：
+        点了「命令前往」角色一动不动，因为那时它只算路、根本没接线）。
+        """
+        from core import zones as zones_mod
+        e = zones_mod.edge_between(z, path[0], path[1])
+        if e is None:
+            return "　（这两块之间找不到那条可达 —— 回「编辑集合…」看看）", False
+        kind = e.get("kind") or ""
+        if kind not in ("climb", "drop"):
+            return ("　（第一步靠「%s」过去 —— 这种的执行器还没做，"
+                    "现在只做到「爬」和「下跳」）"
+                    % zones_mod.kind_label(kind)), False
+        ag = self._live_agent()
+        if ag is None:
+            return ("　（这条命令要发给**实时**里跑着的角色 —— 先去「实时」页开始；"
+                    "现在只算给你看）"), False
+        try:
+            from core import mapdata
+            from decision import route as route_mod
+            t = mapdata.load(mid, with_canvas=True)
+            if t is None:
+                return "　（读不到地形数据，造不出上绳任务）", False
+            job = route_mod.job_for_edge(t, z, e,
+                                         tol_px=int(settings.align_tol_px),
+                                         hold_ms=int(settings.align_hold_ms))
+        except ValueError as ex:            # 绳找不到 / 说不清上下 ⇒ 如实说，不猜
+            return "　（没法下这条命令：%s）" % ex, False
+        except Exception as ex:             # noqa: BLE001
+            return "　（下命令时出错：%s）" % ex, False
+        ag.start_climb(job)
+        tail = ("" if len(path) <= 2 else
+                "　（后面 %d 步不会自动接着走 —— 执行器现在只做爬/下跳）"
+                % (len(path) - 2))
+        return ("　｜　**已命令**：%s%s"
+                % (zones_mod.edge_text(z, path[0], path[1]), tail)), True
+
+    def _say_goto(self, text, color="#80868b"):
+        self.lbl_goto.setText(text)
+        self.lbl_goto.setStyleSheet("color: %s;" % color)
 
     def _map_id(self):
         p = getattr(self, "project", None)
         return (p.get("map_id") or "").strip() if p is not None else ""
+
+    def _on_edit_zones(self):
+        """打开/聚焦 foothold 集合编辑器（按当前项目的地图）。
+
+        **非模态 + 单实例**（2026-09-26 改）：
+          · 非模态：圈集合时要照着「实时」页的画面判断哪块是 A 平台、还要反复跑一下
+            看世界坐标对不对 —— 模态对话框会把整个工作台锁住，只能不停地关窗开窗；
+          · 单实例：编辑器挂在**主窗口**上（`win._zone_editor`），再点一次就把它提到
+            前面来，不新开第二个窗口（两个窗口改同一份文件，谁覆盖谁说不清）。
+        换地图时会关掉旧窗口重建 —— 否则那扇窗画的还是上一张图，人会以为"集合丢了"。
+
+        **槽里抛异常 = 整个工作台 abort**（见 gui/worker.py 的说明），所以自己兜住：
+        地形没导、文件坏了、地图 id 不对，都变成一句能看懂的话，而不是进程消失。
+        """
+        mid = self._map_id()
+        if not mid:
+            QMessageBox.information(self, "先选地图",
+                                    "先在①「识别目标选项」里选地图 —— 集合是按地图存的。")
+            return
+        win = self.window()
+        try:
+            from gui.zone_editor import ZoneEditorDialog
+            dlg = getattr(win, "_zone_editor", None)
+            if dlg is not None and getattr(dlg, "map_id", "") != mid:
+                dlg.close()
+                dlg.deleteLater()
+                dlg = None
+            if dlg is None:
+                dlg = ZoneEditorDialog(mid, parent=win)
+                setattr(win, "_zone_editor", dlg)
+            # 面板可能被重建过（换项目）⇒ 提示要接到**当前**这块面板上。
+            # 记一下接到谁，避免同一个面板重复连接、旧的连接自然失效。
+            if getattr(dlg, "_hint_to", None) is not self:
+                dlg.saved_now.connect(self._on_zones_saved)
+                dlg._hint_to = self
+            # 窗口已经开着时（`show()` 对可见窗口是空操作、`raise_()` 也不触发
+            # showEvent）要手动重读一次设置 —— 否则「设置 → 线条宽度」改完再点这个
+            # 按钮，还是按旧的宽度画，人会以为设置没生效。
+            if hasattr(dlg, "reload_line_width"):
+                dlg.reload_line_width()
+            dlg.show()                     # show() 而不是 exec_() —— 非模态
+            dlg.raise_()                   # 已经在开着就提到前面来（切换焦点）
+            dlg.activateWindow()
+        except Exception as e:                      # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            QMessageBox.warning(self, "编辑器打不开", "%s: %s" % (type(e).__name__, e))
+
+    def _on_zones_saved(self, map_id, n_sets):
+        """编辑器保存后更新面板提示 + **立刻重画集合图**。
+
+        为什么在这里重画：编辑器保存后，下面那张「地形图」显示的就是旧结果了
+        （少一个集合、颜色也变了），而它正是用来看"圈得对不对"的 ——
+        所以保存即刷新，不用人再去点一次「生成地形图」。
+        """
+        self._set_hint("集合已保存（%s：%d 个集合）" % (map_id, n_sets), "#0b8043")
+        self._render_zones_png(map_id)
+        self._refresh_map_image()
+        self._refresh_goto()        # 新圈/改名的集合要能立刻在下拉里选到
+
+    def _render_zones_png(self, mid):
+        """把「地形编辑器的结果」画成 `<id>_zones.png`（同步跑，上百毫秒）。
+
+        为什么不丢后台线程：这是一张 1280 宽的小图（实测上百毫秒），而它要**立刻**
+        反映到上面的图里；后台线程是留给"导出 WZ"那种几十秒的活的。
+        出错只打印 —— 画不出图不该把人挡在"保存成功"之外。
+        """
+        try:
+            from core import zones as zones_mod
+            from tools.map_terrain_view import render
+            t = mapdata.load(mid, with_canvas=True)
+            if t is None:
+                return
+            render(t, mapdata.map_dir() / ("%s_zones.png" % mid),
+                   zones=zones_mod.load(mid))
+        except Exception:                   # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+
+    def _load_zones(self, mid):
+        """读这张图的 foothold 集合（**按 mtime 缓存**）→ `core.zones.Zones`。
+
+        为什么看 mtime：编辑器和这块面板是**两个窗口**，那边一保存，这边 4 次/秒的
+        读数要立刻跟着变 —— 但也没必要每次重读文件。
+        """
+        from core import zones
+        p = zones.zones_path(mid)
+        try:
+            mt = p.stat().st_mtime if p.exists() else 0.0
+        except OSError:
+            mt = 0.0
+        c = getattr(self, "_zones_cache", None)
+        if c is not None and c[0] == mid and c[1] == mt:
+            return c[2]
+        z = zones.load(mid)
+        self._zones_cache = (mid, mt, z)
+        return z
+
+    def _fh_zone(self, loc):
+        """脚下那条 foothold 属于哪些集合 → 名字（空串 = 这条判据用不上）。
+
+        **判据是「脚下的 foothold id ∈ 集合」，不是段号**（见 docs/寻路设计.md §12）：
+        自动串段会把"要跳/攀才能互通"的并成同一段（实测 105090600 的第 0 段把一面
+        388 像素高的悬崖当成了平台边缘），所以"我在不在 A 平台"只能靠人工圈的集合。
+        没圈过集合时明说「未分组」，**不显示成空白** —— 空白会被当成程序坏了。
+        """
+        fid = loc.get("foothold_id")
+        if not fid:
+            return ""
+        try:
+            names = self._load_zones(self._map_id()).set_of(fid)
+        except Exception:                   # noqa: BLE001
+            return ""
+        return "、".join(names) if names else "未分组"
 
     @staticmethod
     def _mode_label(mode):
@@ -685,7 +1202,7 @@ class RoutePanel(QWidget):
             "认不出黄点"那条诊断有 150+ 字，贴上去就是一条黑带盖住半屏、还看不清）。
             所以面板上可以写全，画面上只用一句话版本，详情进 tooltip。
             """
-            self._world_note = osd if osd is not None else text
+            self._world_note = self._osd_lines(osd if osd is not None else text)
             self.lbl_mmap_world.setText(text)
             self.lbl_mmap_world.setStyleSheet("color: %s;" % color)
             self.lbl_mmap_world.setToolTip(tip)
@@ -726,6 +1243,9 @@ class RoutePanel(QWidget):
                         "#b06000",
                         "%s\n\n黄点那一层：%s" % (r["note"], r["dot"]),
                         osd="世界坐标：%s" % r["short"])
+        # 记下"现在在哪条 foothold + 什么时候读到的"：命令前往要用它当起点，
+        # 而**过期的读数不能当起点**（人会走）—— 见 _here_set。
+        self._fh_seen = (r.get("foothold_id") or "", time.monotonic())
         seg = r["segment_id"]
         head = "玩家世界坐标 (%d, %d)" % (round(r["world_x"]), round(r["world_y"]))
         if seg is None:
@@ -737,13 +1257,26 @@ class RoutePanel(QWidget):
         # 别让人以为这是这一拍量到的
         held = "（上一帧）" if r.get("held") else ""
         tail = "" if r["confirmed"] else "（还没连续确认）"
-        return _say("%s　第 %d 段%s%s" % (head, seg, held, tail),
+        # 显示的**不再是「第 N 段」**（段号是自动串出来的、语义上不可靠，见 _fh_zone），
+        # 而是"脚下的 foothold 属于哪个人工圈的集合" —— 那才是寻路要用的判据。
+        zone = self._fh_zone(r)
+        where = "　位于fh：%s" % zone if zone else ""
+        # 在绳梯上要说出来（2026-09-26 要求）：爬绳时**通常不站在任何 foothold 上**
+        # （人在绳上），那时"fh：未分组"会让人以为定位坏了 —— 报「绳梯：L2」才对得上
+        # 编辑器画在绳上的编号，也才对得上「爬」那条边里写的绳号。
+        lad = r.get("ladder_id")
+        lad_s = "　绳梯：%s" % lad if lad else ""
+        # 贴到画面上的那行**必须短**（它不换行，长了横穿半屏）—— 集合名可以很长
+        # （"右下休息平台"就是 6 个字），所以那里截断，面板那一行保留全名
+        zone_s = zone if len(zone) <= 8 else zone[:7] + "…"
+        return _say("%s%s%s%s%s" % (head, where, lad_s, held, tail),
                     color,
                     "来源：从实时画面　标定：%s%s"
                     % (mm.SRC_LABEL[mm.SRC_LIVE],
                        ("\n\n" + r["note"]) if r.get("held") else ""),
-                    osd="世界 (%d, %d)　第 %d 段%s"
-                        % (round(r["world_x"]), round(r["world_y"]), seg, held))
+                    osd="世界 (%d, %d)%s%s%s"
+                        % (round(r["world_x"]), round(r["world_y"]),
+                           ("　fh：%s" % zone_s) if zone_s else "", lad_s, held))
 
     def _overlay_blocker(self):
         """现在画不了的话卡在哪一步（空串 = 能画）。
@@ -823,19 +1356,31 @@ class RoutePanel(QWidget):
     def _map_image_path(self, mid):
         """这张图该显示哪张图 → (路径或 None, 标题, 附注)。
 
-        优先 `<id>_overlay.png`：那是 tools/map_terrain_view.py 画出来的"看得懂的
-        地形图"（每条平台一色、黄=传送点、青=绳梯、品红=刷怪点）。没有就退到
-        小地图底图 `<id>.png`；都没有说明地形还没导出，把该跑的命令写出来。
+        优先 `<id>_zones.png`（**地形编辑器的结果**：颜色 = 集合、名字标在平台上方、
+        灰 = 还没圈进任何集合）—— 那才是"程序认得的平台"，寻路要照它走。
+        没有就退到 `<id>_overlay.png`（每段一色 + 段号；**叠到实时画面上用的仍是它**），
+        再退到小地图底图 `<id>.png`；都没有说明地形还没导出，把该跑的命令写出来。
 
         **分三段返回**（不是拼成一整句）：中间那段「几×几 像素」得**量了文件**才知道，
         而那只 QPixmap 在调用方（它本来就要为显示加载一次，不多花一次解码）。
         拼成一整句的话，"几×几"要么掉到命令行提示后面，要么得在这儿再解码一遍。
         """
         d = mapdata.map_dir()
+        zi = d / ("%s_zones.png" % mid)
+        if zi.exists():
+            from core import zones as zones_mod
+            try:
+                n = len(zones_mod.load(mid).sets)
+            except Exception:               # noqa: BLE001
+                n = -1
+            tip = ("（地形编辑器的结果：颜色 = 集合，名字标在平台上方）"
+                   if n != 0 else
+                   "（还没有集合 —— 点「编辑集合…」圈一个，颜色和名字才出得来）")
+            return zi, ("集合图 %s" % zi.name), tip
         over = d / ("%s_overlay.png" % mid)
         if over.exists():
             return over, ("地形叠加图 %s" % over.name), (
-                "（每条平台一色 · 黄=传送点 · 青=绳梯 · 品红=刷怪点）")
+                "（每段一色 + 段号。想要**集合版**就点下面的「生成地形图」重画一张）")
         base = d / ("%s.png" % mid)
         if base.exists():
             return base, ("小地图底图 %s" % base.name), (
@@ -855,6 +1400,11 @@ class RoutePanel(QWidget):
                 else "打开一个项目后再看。")
             self.canvas.load(QPixmap(), [], editable=False, fit=True)
         else:
+            # 集合图是**派生数据**（实测 38ms），缺了就顺手补上 —— 否则打开面板看到的
+            # 还是旧那版叠加图，"地形图显示编辑器结果"这件事就只改了一半，
+            # 还得人自己去点一次「生成地形图」。写不出来就退回叠加图（下面那条路）。
+            if not (mapdata.map_dir() / ("%s_zones.png" % mid)).exists():
+                self._render_zones_png(mid)
             path, title, extra = self._map_image_path(mid)
             pm = QPixmap(str(path)) if path is not None else QPixmap()
             # 「几×几」放在**标题后面、附注前面**：它是这张图的第一眼信息，
@@ -865,7 +1415,8 @@ class RoutePanel(QWidget):
             size = "" if pm.isNull() else "%d×%d 像素" % (pm.width(), pm.height())
             self.lbl_map_img.setText("　".join(
                 x for x in (title, size, extra) if x))
-            self.canvas.load(pm, [], editable=False, fit=True)
+            # 选了「预览平台」就把它框出来（只读覆盖层，图本身不变）
+            self.canvas.load(pm, self._preview_boxes(mid), editable=False, fit=True)
 
         # 没地图就没得生成；正在跑的时候也不让重复点
         self.btn_gen.setEnabled(bool(mid) and self.task is None)
@@ -933,24 +1484,26 @@ class RoutePanel(QWidget):
         mapdata.save_calib(mid, cal, src_kind)
         self._refresh_mmap()        # 里面会顺带按新方式重算叠图（fit/crop 画法不同）
 
+    def _on_retry_delay(self, v):
+        """改了"失败后延迟激活时间" ⇒ 写进配置（它是决策参数，跟着项目存）。"""
+        settings.climb_retry_delay_s = float(v)
+        settings.save()
+
     def bind(self, project):
-        """切项目：把开关刷成当前项目的值。
+        """切项目：本页要跟着换的是**图**和**集合下拉**（都按地图 id 存）。
 
-        `route_enabled` 也是一个决策参数，**按项目存**（见
-        MainWindow._bind_decision_params），所以切项目必须重新读一遍，
-        否则显示的是上一个项目的值。
-
-        这里必须 blockSignals：不挡的话 setChecked 会触发 _on_toggle，
-        把刚读出来的值又 save 回去 —— 而且 save 的是新项目，
-        等于拿旧项目的开关覆盖新项目。
+        以前这里还要回填一个"启用路线识别"的开关（还专门处理过 blockSignals 的坑）——
+        那个开关和它门控的感知一起撤掉了（见 __init__ 的说明），所以只剩这几件。
         """
-        self.ck_enabled.blockSignals(True)
-        self.ck_enabled.setChecked(bool(settings.route_enabled))
-        self.ck_enabled.blockSignals(False)
-        self._refresh_hint()
         self.project = project
+        # 延迟激活时间也是决策参数（按项目存）⇒ 换项目重读一遍；blockSignals 别把
+        # 刚读出来的值又写回去（和以前那个开关踩过的坑是同一个）。
+        self.sp_retry.blockSignals(True)
+        self.sp_retry.setValue(float(getattr(settings, "climb_retry_delay_s", 1.0)))
+        self.sp_retry.blockSignals(False)
         self._refresh_mmap()
         self._refresh_map_image()
+        self._refresh_goto()        # 换图/换项目：下拉要跟着换成这张图的集合
 
     def showEvent(self, e):
         """切到「路线识别」页签时重读一次。
@@ -964,13 +1517,4 @@ class RoutePanel(QWidget):
             self._refresh_mmap()
             self._refresh_map_image()
 
-    def _refresh_hint(self):
-        self.lbl_hint.setText(
-            "已启用：实时预览会每帧检测平台顶边、预测跳跃落点（更耗 CPU）。"
-            if self.ck_enabled.isChecked() else
-            "已关闭：跳过平台识别和跳跃预测，实时预览更流畅。")
 
-    def _on_toggle(self, on):
-        settings.route_enabled = bool(on)
-        settings.save()
-        self._refresh_hint()

@@ -23,8 +23,6 @@ class Mob:
     vx: float = 0.0    # 屏幕速度（px/帧，追踪得到）
     vy: float = 0.0
     age: int = 0       # 连续被追踪到的帧数
-    platform_id: int | None = None   # 所在平台/楼层（fh），由感知层算好
-    reachable: bool = True           # 是否与玩家当前 fh 连接（可达），由感知层算好
     missed: int = 0                  # 连续漏检帧数（>0 = 防抖保留的幽灵框）
 
 
@@ -42,13 +40,6 @@ class Player:
     h: float = 0.0          # 玩家框高
     vx: float = 0.0         # 屏幕速度（px/s，由连续帧估计）
     vy: float = 0.0
-    grounded: bool = False
-    jumping: bool = False
-    falling: bool = False
-    #: **视觉平台**的编号：每帧从画面里认出来的那条可站立顶边（PlatformTracker 给的）。
-    #: ⚠ 它**不是**地形数据的段号，见下面的 `segment_id` —— 两个都是整数、都叫
-    #: "平台"，混用会得出"看着对其实错"的结论。
-    current_platform_id: int | None = None
 
     # ---------------- 世界坐标（小地图定位算好后由感知层填）----------------
     #:
@@ -64,29 +55,16 @@ class Player:
     #: True = 这一拍没认出黄点，上面的坐标/段号是**沿用上一帧**的（防抖窗口内，
     #: 口径同 `perception/tracker.py` 的幽灵框）。可以用，但别当新鲜观测。
     world_held: bool = False
+    # ---- 寻路执行器要的两样（由实时回路按世界坐标算好，2026-09-26 补）----
+    #: 脚下这条 foothold 属于**哪些命名集合**（`core.zones.set_of` 的结果）。
+    #: ⚠ 以前**没有任何地方写它** ⇒ `ClimbJob._arrived` 的"脚下已是目标集合"判据
+    #: 永不触发，只能靠几何兜底（寻路到了也判不出来）。
+    here_sets: list = field(default_factory=list)
+    #: 现在**贴在哪根绳上**（`core.zones.ladder_ids` 的那套编号，如 "L1"）；不在绳上 = None。
+    #: ⚠ 同样以前没人写 ⇒ "从绳上掉下来"每 2 秒误判一次 ⇒ 任务不停失败重试。
+    ladder_id: str | None = None
     #: 没算出来 / 没落平台时的原因（一句话，给界面与日志；正常时是空串）
     world_note: str = ""
-
-
-@dataclass
-class Platform:
-    """可站立平台的碰撞顶边，而不是平台整块的视觉矩形。"""
-    id: int
-    x1: float
-    x2: float
-    y: float
-    conf: float = 0.0
-    age: int = 0
-
-
-@dataclass
-class JumpPrediction:
-    """玩家处于下落阶段时，对本次落点的纯视觉预测。"""
-    target_platform_id: int
-    landing_x: float
-    landing_y: float
-    landing_time: float
-    reachable: bool
 
 
 @dataclass
@@ -97,5 +75,7 @@ class WorldState:
     height: int = 0        # 画面高
     mobs: list = field(default_factory=list)
     player: Player = field(default_factory=Player)
-    platforms: list = field(default_factory=list)
-    jump_prediction: JumpPrediction | None = None
+    #: 当前**端到端延迟**（毫秒，实时回路填；拿不到时 0）。
+    #: 用途：上绳对齐的"保持窗口" = 设置里的保持时间 + 它（见 `agent._climb_tick`）——
+    #: 定位读数本来就是"过去某一刻"的位置，延迟越大越不能拿单帧当真。
+    e2e_ms: float = 0.0

@@ -26,10 +26,23 @@ import cv2
 import numpy as np
 
 from core import mapdata
+from core import zones as zones_mod
 
 #: 相邻段的配色（循环用）—— 只为"看得出这是两条不同的平台"。
 _PALETTE = [(60, 220, 60), (60, 200, 255), (255, 160, 60), (200, 80, 255),
             (255, 255, 60), (120, 255, 200), (200, 200, 200), (90, 130, 255)]
+
+#: 没圈进任何集合的 foothold 画这个灰 —— 一眼看出"哪些地形我还认不得"。
+_NO_SET = (105, 105, 105)
+
+
+def hex_bgr(h):
+    """'#rrggbb' → (b, g, r)（cv2 用 BGR）；坏值给中性灰，不抛。"""
+    try:
+        s = str(h).lstrip("#")
+        return (int(s[4:6], 16), int(s[2:4], 16), int(s[0:2], 16))
+    except Exception:                       # noqa: BLE001
+        return (170, 170, 170)
 
 
 def _label(vis, text, org, color, scale=0.9):
@@ -37,11 +50,33 @@ def _label(vis, text, org, color, scale=0.9):
     cv2.putText(vis, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2)
 
 
-def render(t, out_path, use_canvas=True, target_w=1280, k=None, dx=0, dy=0):
+def image_xy(t, x, y, target_w=1280, dx=0, dy=0):
+    """世界坐标 → `<id>_overlay.png` / `<id>_zones.png` 上的像素。
+
+    **和 `render` 是同一套换算**（render 的 P() 直接调它）—— 因为「路线识别」面板要在
+    那张图上叠一个框标出"预览的平台"，自己再写一遍迟早会跟 render 漂移
+    （改过 target_w 就对不上了，表现为框画在别处）。
+    """
+    w = (t.canvas_size or (1600, 900))[0]
+    z = max(1, int(round(float(target_w) / max(1, w))))
+    kk = float(t.px_per_world)
+    ox = float(t.mini.get("centerX") or 0)
+    oy = float(t.mini.get("centerY") or 0)
+    return ((x + ox) / kk * z + dx * z, (y + oy) / kk * z + dy * z)
+
+
+def render(t, out_path, use_canvas=True, target_w=1280, k=None, dx=0, dy=0,
+           zones=None):
     """把地形画在底图上。
 
     **必须放大**：底图只有 164x94 这种尺寸（世界跨度 2630 → 16 世界像素/底图像素），
     1:1 画出来根本看不清；这里统一放大到约 target_w 宽（最近邻，不引入模糊）。
+
+    `zones` 给了就画**地形编辑器的结果**（集合）而不是"每条段一色"：
+    圈进集合的平台按**集合颜色**画粗线、名字标在平台上方，没圈的画暗灰 ——
+    「路线识别」面板显示的就是这一版（要求：显示地形编辑器的结果）。
+    不给就还是原来那版（每段一色 + 段号），**叠图仍用它**（叠在实时画面上时，
+    要看的是"所有几何位置对不对"，不是"我圈了哪几块"）。
     """
     size = t.canvas_size or (1600, 900)
     w, h = size
@@ -64,26 +99,63 @@ def render(t, out_path, use_canvas=True, target_w=1280, k=None, dx=0, dy=0):
     oy = float(t.mini.get("centerY") or 0)
 
     def P(x, y):
-        return (int(round((x + ox) / kk * z + dx * z)),
-                int(round((y + oy) / kk * z + dy * z)))
+        """世界坐标 → 图上像素。
 
-    # ---- 平台段（每段一色）----
+        默认走 `image_xy` —— 面板要在同一张图上叠框标出"预览的平台"，两边**不能各算
+        一份**（改过 target_w 就会漂）。只有 CLI 手工标定的 `--k` 覆盖要在这里单独算
+        （那种情况下 kk 不是 t.px_per_world，image_xy 不认）。
+        """
+        if k is not None:
+            return (int(round((x + ox) / kk * z + dx * z)),
+                    int(round((y + oy) / kk * z + dy * z)))
+        px, py = image_xy(t, x, y, target_w, dx, dy)
+        return (int(round(px)), int(round(py)))
+
+    # ---- 平台 ----
     n_fh = n_wall = 0
-    for i, seg in enumerate(t.segments):
-        col = _PALETTE[i % len(_PALETTE)]
-        pts = [P(*p) for p in seg.points]
-        for a, b in zip(pts, pts[1:]):
-            cv2.line(vis, a, b, col, 2)
-        # 段号：状态行里那句「第 N 段」就是它 —— 不标出来的话，那个数字在图上
-        # 对不上号（颜色是循环用的，段数一多就重色了）。
-        # 标在**最左边那个点**上，多段之间不会挤在一起。
-        if pts:
-            lft = min(pts, key=lambda q: q[0])
-            _label(vis, "%d" % i, (lft[0] + 6, max(22, lft[1] - 6)), col, 0.7)
-        for f in seg.footholds:
+    if zones is not None:
+        # 集合版：成员按集合色画粗，没圈的画暗灰 —— 一眼看出"还差哪块地形没圈"
+        owner = {}
+        for name, s in zones.sets.items():
+            col = hex_bgr(s.get("color") or zones_mod.PALETTE[0])
+            for fid in (s.get("footholds") or []):
+                owner.setdefault(str(fid), (col, name))
+        for f in t.footholds:
             n_fh += 1
             if f.is_wall:
                 n_wall += 1
+                cv2.line(vis, P(f.x1, f.y1), P(f.x2, f.y2), (60, 60, 220), 2)
+                continue
+            col, nm = owner.get(str(f.fid), (_NO_SET, None))
+            cv2.line(vis, P(f.x1, f.y1), P(f.x2, f.y2), col,
+                     4 if nm is not None else 1)
+        # 集合名标在**包围盒上边中点**：不压住平台本身（标在质心会盖住线）
+        for name, s in zones.sets.items():
+            sp = zones_mod.set_span(t, s.get("footholds") or [])
+            if sp is None:
+                continue
+            x0, x1, y0, _y1 = sp
+            col = hex_bgr(s.get("color") or zones_mod.PALETTE[0])
+            cx = P((x0 + x1) / 2.0, y0)[0]
+            cy = P((x0 + x1) / 2.0, y0)[1]
+            tw = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0][0]
+            _label(vis, name, (int(cx - tw / 2), max(34, cy - 12)), col, 0.9)
+    else:
+        for i, seg in enumerate(t.segments):
+            col = _PALETTE[i % len(_PALETTE)]
+            pts = [P(*p) for p in seg.points]
+            for a, b in zip(pts, pts[1:]):
+                cv2.line(vis, a, b, col, 2)
+            # 段号：状态行里那句「第 N 段」就是它 —— 不标出来的话，那个数字在图上
+            # 对不上号（颜色是循环用的，段数一多就重色了）。
+            # 标在**最左边那个点**上，多段之间不会挤在一起。
+            if pts:
+                lft = min(pts, key=lambda q: q[0])
+                _label(vis, "%d" % i, (lft[0] + 6, max(22, lft[1] - 6)), col, 0.7)
+            for f in seg.footholds:
+                n_fh += 1
+                if f.is_wall:
+                    n_wall += 1
 
     # ---- 绳梯 / 绳子 ----
     for L in t.ladders:
@@ -116,8 +188,10 @@ def render(t, out_path, use_canvas=True, target_w=1280, k=None, dx=0, dy=0):
     # ---- 图例 ----
     lines = [
         "%s   canvas %dx%d  (x%d)" % (t.id, w, h, z),
-        "green/blue/...: foothold segments (%d) — 数字 = 段号"
-        "（状态行里的「第 N 段」）" % len(t.segments),
+        ("集合 %d 个（名字标在平台上方）— 颜色 = 该集合"
+         "   gray: 还没圈进任何集合" % len(zones.sets)) if zones is not None else
+        ("green/blue/...: foothold segments (%d) — 数字 = 段号"
+         "（状态行里的「第 N 段」）" % len(t.segments)),
         "red: walls   cyan: ladderRope (%d)" % len(t.ladders),
         "yellow: portals (%d)   magenta: mob spawns" % len(t.portals),
         # 尺度用 px_per_world（= 世界跨度/底图宽），**不是 mag**

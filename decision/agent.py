@@ -148,6 +148,10 @@ class DecisionSettings:
         self.auto_hp_pot = False    # 自动补血开关
         self.auto_mp_pot = False    # 自动补蓝开关
         self.strategy = "patrol"    # 战斗策略类型："patrol" 平地巡逻
+        # 路线测试：「路线识别」里选的**目标平台**（集合名，空 = 没选）。
+        # 放在这里而不是 panel 里，是为了**跟着项目存**（换项目/重开还是这个）。
+        # 面板那句「命令前往」按它算一遍路；等 P4 的执行器做出来再由它真去走。
+        self.route_goto_set = ""
         self.vision_top = 200       # 向上视野（像素），<0 = 不限制
         self.vision_bottom = 200    # 向下视野
         self.vision_left = 200      # 向左视野
@@ -157,7 +161,19 @@ class DecisionSettings:
         self.vision_off_y = 0       # 视野框 y 偏移（像素）
         self.sweep_turn_cd = 1000   # 扫平台：当前朝向没怪持续此时间（毫秒）才换朝向
         self.back_range = 100       # 扫平台：允许锁定背后多远距离内的怪（像素）
-        self.route_enabled = False  # 路线识别：平台识别/跳跃预测/扫平台 总开关（默认关，关掉不跑不卡）
+
+        # 判定参数（设置 → 「判定参数」页签）：**对齐类**功能（寻路走到某个 x、上绳前对齐
+        # 绳的 x、判定"在不在绳上"）靠这两个数说话 —— "多近才算对齐"、"对齐要保持多久算成功"。
+        # 为什么"保持时间"不能省：小地图定位与按键下发**不是同一时刻**的（有延迟、还会抖），
+        # 单帧落进误差范围不代表真的站住了；等它稳定一小会儿再算成功，才不会被抖动来回骗。
+        # 实际等待 = 延迟时间 + 这个值（见 align_hold_ms 的注释与设置里的说明）。
+        self.align_tol_px = 6       # 坐标对齐误差范围（像素）
+        self.align_hold_ms = 250    # 坐标对齐误差时间（毫秒）
+        # 上绳梯/下跳**失败后延迟激活时间**（秒，2026-09-26 用户要求）：
+        # 以前失败了是**立即**重新激活 —— 失败那一下人往往还在原地、朝向也没变，
+        # 立刻重来容易在同一处再歪一次。等一会儿再重新对齐，成功率更高。
+        # 0 = 立即重来（老行为）。参数在「路线识别」页（`gui/route_panel.py`）。
+        self.climb_retry_delay_s = 1.0
         self.debounce_conf = 0.5    # 防抖置信度：高于它的怪框消失后保留位置
         self.debounce_ms = 300      # 防抖时间（毫秒）：保留消失前位置的时长
         self.auto_feed_pet = False  # 自动喂宠
@@ -178,6 +194,11 @@ class DecisionSettings:
         self.anti_afk_exit_seq = []     # 退出隐身行为序列
         self.anti_afk_rest_min = 10     # 休息时长下限（分钟）
         self.anti_afk_rest_max = 20     # 休息时长上限（分钟）
+        # 「被打断重试」：休息期间**触发了自动补血**就算被打断 —— 补血说明隐身没兜住
+        # （隐身到期 / 被范围技能扫到 / 有东西在打我们），这时候继续歇着等于等着挨打。
+        # 勾选后：立刻转去执行退出隐身，并把下次休息提前到 retry_sec 之后（不再是随机 N~M 分钟）。
+        self.anti_afk_retry_on_interrupt = False
+        self.anti_afk_retry_sec = 60    # 被打断后多久重试下一次休息（秒）
         # ---- 断线自动重连（decision/reconnect.py）----
         self.reconnect_enabled = False        # 断线自动重连开关
         # 玩家框丢多久之后开始探界面（0 = 立刻）。默认 0：断线提示框只显示
@@ -244,7 +265,10 @@ class DecisionSettings:
                 "vision_off_y": self.vision_off_y,
                 "sweep_turn_cd": self.sweep_turn_cd,
                 "back_range": self.back_range,
-                "route_enabled": self.route_enabled,
+                "route_goto_set": self.route_goto_set,
+                "align_tol_px": self.align_tol_px,
+                "align_hold_ms": self.align_hold_ms,
+                "climb_retry_delay_s": self.climb_retry_delay_s,
                 "debounce_conf": self.debounce_conf,
                 "debounce_ms": self.debounce_ms,
                 "auto_feed_pet": self.auto_feed_pet,
@@ -262,6 +286,8 @@ class DecisionSettings:
                 "anti_afk_exit_seq": self.anti_afk_exit_seq,
                 "anti_afk_rest_min": self.anti_afk_rest_min,
                 "anti_afk_rest_max": self.anti_afk_rest_max,
+                "anti_afk_retry_on_interrupt": self.anti_afk_retry_on_interrupt,
+                "anti_afk_retry_sec": self.anti_afk_retry_sec,
                 "reconnect_enabled": self.reconnect_enabled,
                 "reconnect_probe_after_lost_sec": self.reconnect_probe_after_lost_sec,
                 "reconnect_step_timeout_ms": self.reconnect_step_timeout_ms,
@@ -341,7 +367,10 @@ class DecisionSettings:
         self.vision_off_y = int(data.get("vision_off_y", 0))
         self.sweep_turn_cd = int(data.get("sweep_turn_cd", 1000))
         self.back_range = int(data.get("back_range", 100))
-        self.route_enabled = bool(data.get("route_enabled", False))
+        self.route_goto_set = str(data.get("route_goto_set") or "")
+        self.align_tol_px = int(data.get("align_tol_px", 6))
+        self.align_hold_ms = int(data.get("align_hold_ms", 250))
+        self.climb_retry_delay_s = float(data.get("climb_retry_delay_s", 1.0))
         self.debounce_conf = float(data.get("debounce_conf", 0.5))
         self.debounce_ms = int(data.get("debounce_ms", 300))
         self.auto_feed_pet = bool(data.get("auto_feed_pet", False))
@@ -368,6 +397,10 @@ class DecisionSettings:
         self.anti_afk_rest_max = float(data.get("anti_afk_rest_max", 20))
         if self.anti_afk_rest_max < self.anti_afk_rest_min:
             self.anti_afk_rest_max = self.anti_afk_rest_min
+        self.anti_afk_retry_on_interrupt = bool(
+            data.get("anti_afk_retry_on_interrupt", False))
+        # 至少 1 秒：0/负值会变成"退出隐身的同时立刻又要休息"，来回抖
+        self.anti_afk_retry_sec = max(1.0, float(data.get("anti_afk_retry_sec", 60)))
         # 断线自动重连
         self.reconnect_enabled = bool(data.get("reconnect_enabled", False))
         self.reconnect_probe_after_lost_sec = float(
@@ -472,11 +505,25 @@ class DecisionSettings:
         return out
 
 
+#: 当前**正在跑的** CombatAgent（「实时」线程启动时登记、退出时注销）。
+#: 为什么要有它：「路线识别」页的「命令前往」要**主动下命令**（`start_climb`），而 agent
+#: 原本只是 `gui/live_thread.py` 里的**局部变量** ⇒ 面板拿不到，只能"算一遍给你看"。
+#: 跨线程只做**引用赋值**（GUI 线程写、推理线程读）—— 和 settings 一个路子，不加锁：
+#: 读到 None 就按"实时没在跑"处理（见 `route_panel._command_first_step`），不会误发按键。
+CURRENT = None
+
+
 class CombatAgent:
     def __init__(self, settings):
         self.settings = settings
         self.keys = KeyState()
         self.state = "idle"
+        #: 当前挂着的**上绳/下跳任务**（`decision/route.py` 的 ClimbJob / DropJob）——
+        #: None = 没有。由 `start_climb()` 挂上；跑完/失败/取消都会清掉（见 `_climb_tick`）。
+        self._climb = None
+        #: 失败后**等哪一刻再重新激活**（`time.monotonic()` 秒；None = 没在等）。
+        #: 由 `_climb_tick` 设/清，延迟长短读 `settings.climb_retry_delay_s`。
+        self._climb_retry_at = None
         self.facing = 1             # 朝向：+1 右（默认）/ -1 左，由最后按的方向键决定
         self._patrol_dir = 1        # 扫平台倾向朝向（巡逻主方向）：打背后怪不改变它
         self._last_facing_change = time.monotonic()  # 朝向最后一次变化的时刻（超时监控用）
@@ -503,7 +550,10 @@ class CombatAgent:
         self._no_target_since = None  # 朝向没目标的起始时刻（换朝向防抖用）
         self._back_ctx = None       # 回身输出序列上下文 [seq, phase, next, held, sub_stack]
         self._output_ctx = None     # 输出行为序列上下文
-        self._sweep_hold = False    # 扫平台：输出已触发 → 停朝倾向朝向移动，直到范围内清空
+        self._stand_attack = False  # 站桩输出：攻击范围内有目标 → 本帧不给方向键。
+                                    # **两个策略通用**（原来只有扫平台用它）——
+                                    # 用来看"这一拍该不该按方向键"（见 _attack_state
+                                    # 与 TURN_TAP_S 那一段）。
         self._link_checked = 0.0    # 上次指令通道体检时刻
         self._link_retry = 0.0      # 上次尝试重连通道的时刻（避免狂重连）
         self._next_afk = 0.0        # 下次防掉线触发时刻
@@ -512,6 +562,7 @@ class CombatAgent:
         self._rest_pending = False  # 已到防掉线触发时间，等攻击范围内的怪清空
         self._rest_last_tick = 0.0  # 上次推进「暂停计时器」的时刻
         self._rest_until = 0.0      # 本次休息的结束时刻
+        self._rest_retry_after_interrupt = False  # 这次休息被补血打断 → 下次按 retry_sec 排
 
     @staticmethod
     def _center_dist(m, player):
@@ -643,6 +694,161 @@ class CombatAgent:
         if not key:
             return keys
         return set(keys) | {key}
+
+    # ---------------- 上绳任务（执行器，见 decision/route.py）----------------
+
+    def start_climb(self, job):
+        """挂上一个**上绳/下跳任务**（`route.ClimbJob` / `DropJob`）；下一次 tick 开始执行。
+
+        谁来调：`gui/route_panel.py` 的「命令前往」（把路线的第一步交过来，2026-09-26）。
+        这里**没有"要不要按跳"的开关**了 —— 命令挂上来就是授权，一路做到位。
+        """
+        self._climb = job
+        self._climb_retry_at = None      # 清掉上一个任务留下的"等我到点再重来"
+        perf.count("climb_start")
+        return job
+
+    def stop_climb(self, why="取消上绳"):
+        """撤掉上绳任务（换目标 / 关自动 / 出错都走这里）：状态收干净，别再按键。"""
+        if self._climb is None:
+            return
+        self._climb.cancel(why)
+        self._climb = None
+        self._climb_retry_at = None
+        self._release_combat_keys()
+        perf.count("climb_cancel")
+        if self.state == "climb":
+            self._set_state("idle")
+
+    def current_goto_set(self):
+        """当前**寻路任务**的目标集合名（没有任务时空串）。
+
+        给界面用（「路线识别」页的「当前任务」那行、以及「结束当前寻路」按钮）：
+        寻路任务就是挂着的上绳/下跳 job（`start_climb`），它带着 `dst_set`。
+        **别再让界面去读 `_climb`** —— 那是私有的运行时状态，改一次名字就全线崩。
+        """
+        job = self._climb
+        return str(getattr(job, "dst_set", "") or "") if job is not None else ""
+
+    def resetall_left(self):
+        """离下次**定时清键**（RELEASEALL）还有几秒；没排期时给 None。
+
+        给界面用（「当前任务」下面那几行计时）：和 `_next_resetall` 同一把钟
+        （`time.monotonic` 秒）。**排期发生在 tick 里**，所以刚开自动那一拍到排期
+        之间就是 None —— 界面据此写"未排期"，别显示 0:00 骗人。
+        """
+        if self._next_resetall <= 0:
+            return None
+        return max(0.0, self._next_resetall - time.monotonic())
+
+    def _climb_tick(self, now, wx, keys, ws):
+        """跑一拍上绳任务 → True = **这一帧就算完事**（到了 / 失败了）。
+
+        为什么任务优先于追怪、巡逻：那是我**主动下的命令**，不是"看见什么就跟着跑"。
+        而攻击范围内有怪时根本到不了这里（tick 里 `if in_range:` 在前面接管）
+        ⇒ 「有怪先打、打完继续走」**天然成立**，不用在这儿再写一道仲裁。
+
+        任务一旦挂上就**一路做到位**（对齐 → 按跳 → 判到达），中间不再停一截等谁点开关
+        —— 这是 2026-09-26 用户定的：「命令前往」那次点击就是授权。
+
+        ⚠ `wx` 必须是**世界坐标 x**（`ws.player.world_x`），**不是画面坐标**！
+        2026-09-26 踩过：这里以前收的是 `ws.player.x`（画面检测框中心），而 `ClimbJob.x`
+        是世界坐标 ⇒ `dx` 永远是个大数 ⇒ 角色朝一个方向一直走/来回抖，**无限循环**
+        （用户报的"卡在 -300~-380"就是这个）。`py` 从头就在用 `world_y` —— 一个画面
+        一个世界，本身就是自相矛盾的。
+
+        另外两处也是同一天修的：
+          · `hold_ms` = 设置里的对齐保持时间 **+ 当前端到端延迟**（`ws.e2e_ms`）——
+            用户要求 3：定位读数是"过去某一刻"的位置，延迟越大越不能拿单帧当真；
+          · `ladder_id` / `here_sets` 现在由感知层写进 `Player`（**以前没有任何地方写**，
+            于是"到了"永远判不出来、"掉下绳"每 2 秒误判一次 ⇒ 任务不停失败重试）。
+        """
+        job = self._climb
+        p = ws.player
+        if wx is None:
+            # 定不了位（小地图那条没跑 / 没认出黄点）⇒ **如实失败**，绝不拿画面坐标硬凑
+            #（那正是上面那个死循环的成因）。这里直接放弃：坐标拿不到不是"再试一次"能好的。
+            perf.count("climb_giveup")
+            job.cancel("拿不到世界坐标（小地图定位没有输出）—— 先确认「实时」页在跑、"
+                       "小地图那块能认出黄点")
+            self._climb = None
+            self._climb_retry_at = None
+            self._release_combat_keys()
+            return True
+        py = getattr(p, "world_y", None)
+        # 保持窗口 = **任务自己的**保持时间 + 当前端到端延迟（用户要求 3）。
+        # ⚠ 别拿 `settings.align_hold_ms` 覆盖它：任务是「命令前往」那一刻按设置建的
+        #（`route_panel._command_first_step` 传的就是它），覆盖会把"任务自己说了算"
+        # 的语义弄丢（自检里 `hold_ms=0` 的用例当场变成 250ms，一等就红）。
+        # 延迟每拍都在变，所以在**基线**上叠，基线只记一次（否则会一层层累加）。
+        if getattr(job, "base_hold_ms", None) is None:
+            job.base_hold_ms = int(job.hold_ms)
+        job.hold_ms = max(0, int(job.base_hold_ms)
+                          + int(round(float(getattr(ws, "e2e_ms", 0.0) or 0.0))))
+        out = job.update(now, float(wx), py=py,
+                         ladder_id=getattr(p, "ladder_id", None),
+                         here_sets=getattr(p, "here_sets", None))
+        km = self.settings.keymap
+        if out["move"]:
+            # 方向交给 `_steer`（它会 `set_facing`，别名/转身都走同一套）
+            self._steer(float(out["move"]), keys)
+        # 方向键：**不按跳时也要按**（下跳要求"先按住 ↓，再按跳"，见 DropJob.ARMED）
+        if out["dir"]:
+            dk = km.get("up") if out["dir"] > 0 else km.get("down")
+            if dk:
+                keys.add(dk)
+        if out["jump"]:
+            jk = km.get("jump")
+            if jk:
+                keys.add(jk)              # **按住**：KeyState.set 会一直按着
+        if out["failed"]:
+            # ① **已经到了目标集合 ⇒ 直接收工**（2026-09-26 用户要求 2）。
+            #    失败判定可能晚于实际到达（定位抖一下、或者到了之后又被打下来），
+            #    这时再"重新激活"就是"人已经站上去了、还在原地爬" —— 比不做更糟。
+            #    判据用**集合**（`dst_set`，人工圈的、最贴近"到了哪块平台"）。
+            here = set(getattr(p, "here_sets", None) or ())
+            if job.dst_set and job.dst_set in here:
+                perf.count("climb_done")
+                self._climb = None
+                self._climb_retry_at = None
+                self._release_combat_keys()
+                return True
+            if job.attempt < job.max_attempts:
+                # ② **失败保护**：失败不是终止 —— 重新激活再来一次（上绳本来就容易歪
+                #    一下：偏离绳 / 掉下来都算）。但要**延迟**激活（要求 1）：
+                #    等待期间**不按键**（这一拍只返回 False ⇒ 状态还是 climb、keys 空
+                #    ⇒ 角色站着），到点才重新对齐。
+                delay = max(0.0, float(
+                    getattr(self.settings, "climb_retry_delay_s", 0.0) or 0.0))
+                if delay <= 0.0:
+                    perf.count("climb_retry")
+                    job.retry()
+                    return False         # 这一帧不算完事，下一帧从"重新对齐"接着走
+                if self._climb_retry_at is None:
+                    self._climb_retry_at = now + delay
+                    perf.count("climb_retry_wait")
+                    job.note = "%s（等 %.1fs 后重新对齐，已试 %d/%d 次）" % (
+                        job.note, delay, job.attempt, job.max_attempts)
+                    return False
+                if now < self._climb_retry_at:
+                    return False         # 还在等：这一拍不按键
+                self._climb_retry_at = None
+                perf.count("climb_retry")
+                job.retry()
+                return False
+            # ③ 到上限才真放弃（数据写错时不能无限重来 —— 那看着就像卡死）
+            perf.count("climb_giveup")
+            self._climb = None
+            self._climb_retry_at = None
+            self._release_combat_keys()
+            return True
+        if out["done"]:
+            perf.count("climb_done")
+            self._climb = None
+            self._climb_retry_at = None
+            self._release_combat_keys()
+            return True
+        return False
 
     def _resolve_seq_key(self, name):
         """序列里的键名 → 实际物理键名。
@@ -845,6 +1051,17 @@ class CombatAgent:
         min_dist = s.min_attack_dist
         keys = set()
 
+        # **挂着寻路任务时，战斗只许"站桩 attack"、不许走位**（2026-09-26 用户要求 0）：
+        # 规避（后退 / 跳规避）会按方向键、还会跳 —— 那会把"对齐到绳的 x"整个推翻，
+        # 两套逻辑抢方向键时人看到的就是"来回左右走"。攻击照打，只是不再挪窝。
+        if self._climb is not None:
+            if target.x > px:
+                self.set_facing(1)
+            elif target.x < px:
+                self.set_facing(-1)
+            self._set_state("attack")
+            return keys
+
         target_too_close = (min_dist > 0 and best < min_dist)
         any_too_close = (min_dist > 0 and
                          any(self._center_dist(m, ws.player) < min_dist for m in mobs))
@@ -866,17 +1083,24 @@ class CombatAgent:
                 state = "attack"
 
         if state == "attack":
-            if s.strategy == "sweep" and self._sweep_hold:
-                # 扫平台：输出已经触发过 → 松开朝倾向朝向的移动键，站着打。
-                # 只同步内部朝向、不按键 —— 按了方向键就会一边走一边打，角色会
-                # 从怪身上走过去；走出去后攻击范围内没框了，又回头走 → 来回抖。
-                if target.x > px:
-                    self.set_facing(1)
-                elif target.x < px:
-                    self.set_facing(-1)
-            else:
-                # 攻击时按住朝向目标的方向键：角色转向慢，确保面向目标、攻击打得到
-                self._steer(target.x - px, keys)
+            # **攻击范围内有目标 ⇒ 站桩输出：一个方向键都不按。**
+            #
+            # 为什么不能"按住朝目标的方向键，确保面向它"（老写法，2026-09-26 用户报的
+            # 就是它）：这类游戏**按住方向键 = 走**，于是两次输出之间角色一直在朝怪挪，
+            # 挪到身上、出范围又回头 → 来回抖（用户原话：希望只要攻击范围内有目标就
+            # 站桩输出）。
+            #
+            # 而且按方向键对"面向"**毫无帮助**：`_in_range` 的判据里已经带了
+            # `(m.x - px) * facing >= 0` —— 能进这个分支的怪，本来就在当前朝向的
+            # 正前方。真正需要转身的情况（怪在背后）走的是另一条路：`_locked_target`
+            # + 回身输出序列，那里按 `min_turn_hold_ms` 兜着，才是"刚转向"的例外。
+            #
+            # 只同步**内部朝向**、不按键：游戏里的朝向跟着"最后按的方向键"走，把内部
+            # 朝向贴住实际面向，免得下一帧 `_in_range` 拿错朝向把背后的框算进范围。
+            if target.x > px:
+                self.set_facing(1)
+            elif target.x < px:
+                self.set_facing(-1)
 
         self._set_state(state)
         return keys
@@ -1243,7 +1467,11 @@ class CombatAgent:
                 self._run_rest(now)
                 if timing_only:
                     return None      # 休息期间不做战斗动作，也不读世界状态
-                self._drink_potions(ws, now)
+                # 休息期间照常补血。勾了「被打断重试」时，**这一拍真的补了血就算被打断**：
+                # 立刻退出隐身回去接着打（见 _interrupt_rest）。
+                if self._drink_potions(ws, now) and s.anti_afk_retry_on_interrupt \
+                        and self.state in ("afk_enter", "afk_rest"):
+                    self._interrupt_rest(now)
                 return {"state": self.state, "reason": "隐身休息", "target": None,
                         "dx": 0, "dist": 0, "keys": [], "facing": self.facing,
                         "kill_mobs": self._take_kill_mobs()}
@@ -1318,9 +1546,10 @@ class CombatAgent:
         px = ws.player.x
 
         # 按视野矩形过滤怪物（视野外的怪不参与决策）
+        # ⚠ 原来这里还有一道「地形关系」过滤（`m.reachable`：怪是否与玩家同一平台），
+        # 它依赖**平台识别**；那套感知 2026-09-26 已整块移除 ⇒ 这道过滤没有依据了，
+        # 一并删掉。**行为变化**：视野里别的平台上、其实过不去的怪，现在也会被盯上。
         mobs = self._filter_mobs(ws.mobs, ws.player, ws)
-        # 地形关系（怪是否与玩家当前平台连接）已由感知层算好，这里只消费结果
-        mobs = [m for m in mobs if m.reachable]
 
         # 追击起跳的**上升沿**：起跳范围内「从无怪变成有怪」的那一拍才有跳的资格。
         # 一只怪一直挂在范围内 → 只有进来的那一拍是沿，之后不再触发 —— 这就是
@@ -1379,19 +1608,30 @@ class CombatAgent:
             # 除目标外为 0）—— 有得打就先打，跳会打断输出、还可能把自己跳出攻击
             # 距离；目标自己在范围内不算「别的怪」，那正是「已进范围但偏远，跳一下
             # 够着」。沿也用同一个 `jump_edge`：同一只怪一直挂在区间里不会反复跳。
-            if len(in_range) == 1 and jump_edge:
+            if len(in_range) == 1 and jump_edge and self._climb is None:
+                # 寻路任务挂着 ⇒ **不跳**：跳跃会毁掉"对齐绳的 x"（同上）。
                 self._maybe_chase_jump(best, now, edge=True)
             keys = self._attack_state(target, best, mobs, ws)
-            # 扫平台「打完停下」：本帧已进入 attack 状态（输出行为在跑）→ 下一帧起
-            # 不再朝倾向朝向移动，一直站到攻击范围内清空（下面 else 分支解除）。
-            # CD 期间也保持停下：范围内还有怪就不该往前走。
-            self._sweep_hold = (s.strategy == "sweep" and self.state == "attack")
+            # 站桩输出：本帧进了 attack 状态（范围内有怪、且没在规避）→ 下一帧起一个
+            # 方向键都不按，一直站到攻击范围内清空（下面 else 分支解除）。CD 期间也
+            # 保持停下：范围内还有怪就不该往前走。**两个策略都要**（老写法只给扫平台，
+            # 平地巡逻就成了"一边打一边朝怪挪"，见 _attack_state 的说明）。
+            self._stand_attack = (self.state == "attack")
         else:
             # 前方攻击范围内没框
-            self._sweep_hold = False    # 清空 → 恢复朝倾向朝向移动
+            self._stand_attack = False    # 清空 → 恢复移动（巡逻/追怪）
             target, best = self._locked_target(candidates, ws, now)
             keys = set()
-            if target is not None:
+            # **上绳任务优先**（见 _climb_tick）：它没跑完时这一帧只听它的；
+            # 跑完的那一帧返回 True ⇒ 落回下面的追怪/巡逻，行为照旧。
+            # ⚠ 交给上绳任务的是**世界坐标 x**（不是上面那个画面坐标 `px`）——
+            # 见 `_climb_tick` 的说明：喂错了就是"朝一个方向一直走"的死循环。
+            if (self._climb is not None
+                    and not self._climb_tick(now, ws.player.world_x, keys, ws)):
+                self._set_state("climb")
+                perf.count("climb_tick")
+                best = 0.0      # 收尾要 round(best)（跟 sweep 分支一样兜个底，别传 None）
+            elif target is not None:
                 # 有锁定目标（sweep 背后怪 / patrol 最近怪）：朝它走
                 self._steer(target.x - px, keys)
                 # 追击起跳：本分支攻击范围内本来就是空的，不存在「其他怪」，前提天然满足
@@ -1451,11 +1691,13 @@ class CombatAgent:
         # 最小切换朝向时间：换向后方向键至少按住这么久（决策里没有方向键时补回来）。
         # 放在发键之前 —— 这里返回的才是真正要发出去的键，也一并回读给 UI。
         #
-        # **站桩输出时只按一小下**（`_sweep_hold` = 扫平台 + 攻击范围内的怪 → 本帧
-        # 决策故意不给方向键）：那时按方向键只为了把角色转过来，按满
-        # `min_turn_hold_ms` 就是一边走一边打，角色会从怪身上走过去。见 TURN_TAP_S。
-        keys = self._hold_turn(keys, now,
-                               cap_s=(TURN_TAP_S if self._sweep_hold else None))
+        # **站桩输出时只按一小下**（`_stand_attack` = 攻击范围内有怪 → 本帧决策故意
+        # 不给方向键）：那时按方向键只为了把角色转过来，按满 `min_turn_hold_ms` 就是
+        # 一边走一边打，角色会从怪身上走过去。见 TURN_TAP_S。
+        # 上绳任务自己管方向键（对齐时要求"站住别动"）⇒ 关掉补键（cap 0 = 不干预）
+        cap = 0.0 if self._climb is not None else (
+            TURN_TAP_S if self._stand_attack else None)
+        keys = self._hold_turn(keys, now, cap_s=cap)
         self.keys.set(keys)
 
         # 输出行为：攻击 / 跳规避 / 回身输出（按 self.state）
@@ -1495,6 +1737,8 @@ class CombatAgent:
         self._afk_ctx = None
         self._rest_last_tick = now
         self._rest_until = now + self._random_rest_interval()
+        # 上一次的"被打断"标记不许带到这一次（否则这次正常结束也会按秒数重排）
+        self._rest_retry_after_interrupt = False
 
     def _run_rest(self, now):
         """隐身休息状态机：执行进入隐身行为 → 休息倒计时 → 执行退出隐身行为。"""
@@ -1539,8 +1783,35 @@ class CombatAgent:
         s.rest_until_monotonic = (self._rest_until
                                   if self.state in ("afk_enter", "afk_rest") else 0.0)
 
+    def _interrupt_rest(self, now):
+        """休息被**自动补血**打断 → 立刻转去执行退出隐身（下次休息由 _finish_rest 提前）。
+
+        做法与「休息时长到点、但进入隐身还没演完」**同一套**（见 `_run_rest` 的
+        afk_enter 分支）：松掉半截序列按着的键 → 转 afk_exit → 演完由 `_finish_rest`
+        收尾。刻意**不半路把进入序列掐断再补按一次隐身键** —— "隐身术"这类切换型技能
+        被按两次就反了，状态从此对不上；走"退出序列"语义才自洽（退出序列本来负责关隐身）。
+
+        下次休息的时刻不在这里算：`_finish_rest` 看到标记会改用 `anti_afk_retry_sec`
+        （**秒**，比"下次随机 N~M 分钟"灵活得多）。
+        """
+        if self.state == "afk_exit":
+            return                              # 已经在退出了，别重复
+        # 打点：**这次功能到底有没有在工作**只能靠它回答 ——
+        # 否则以后出问题只能猜"它到底触发过没有"（2026-09-26 加）。
+        # 局部 import：这里是每分钟几次的量级，不在热路径上；放模块头会把 core.perf
+        # 拉进 decision 层的依赖里，没必要。
+        try:
+            from core import perf
+            perf.count("afk_interrupt")
+        except Exception:
+            pass
+        self._release_ctx(self._afk_ctx)
+        self._afk_ctx = None
+        self.state = "afk_exit"
+        self._rest_retry_after_interrupt = True
+
     def _finish_rest(self, now):
-        """退出隐身休息，恢复正常战斗，并随机下一次触发时间。"""
+        """退出隐身休息，恢复正常战斗，并排下一次触发时间。"""
         self.state = "idle"
         self._rest_pending = False
         self._rest_last_tick = 0.0
@@ -1554,7 +1825,12 @@ class CombatAgent:
         # 恢复的第一帧就会被判「朝向长时间未变化」直接停自动。
         self._last_facing_change = now
         self._player_lost_since = None
-        self._next_afk = now + self._random_afk_interval()
+        if self._rest_retry_after_interrupt:
+            # 这次是被补血打断的 → 按用户设的**秒数**重试，而不是随机 N~M 分钟
+            self._rest_retry_after_interrupt = False
+            self._next_afk = now + max(1.0, float(self.settings.anti_afk_retry_sec))
+        else:
+            self._next_afk = now + self._random_afk_interval()
         self.settings.next_afk_monotonic = self._next_afk   # UI 立刻能显示下次倒计时
 
     def _pause_timers(self, now):
@@ -1655,16 +1931,23 @@ class CombatAgent:
                 s.custom_timer_next[name] = now + random.uniform(lo, hi) * 60.0
 
     def _drink_potions(self, ws, now):
-        """自动喝药：血/蓝低于阈值就点按对应键，喝药冷却 pot_cd 内不再喝。"""
+        """自动喝药：血/蓝低于阈值就点按对应键，喝药冷却 pot_cd 内不再喝。
+
+        **返回"这一拍是否真的喝了血药"** —— 休息期间它同时是「被打断」的信号
+        （见 `_interrupt_rest`）。只有**真的按下去**的那一拍才返回 True，
+        不是"血量低就一直 True"（否则休息会被同一个低血量反复打断）。
+        """
         s = self.settings
         hp_pot = s.keymap.get("hp_pot")
         mp_pot = s.keymap.get("mp_pot")
         cd = max(0, float(s.pot_cd)) / 1000.0   # 喝药冷却（秒）
+        drank_hp = False
 
         if s.auto_hp_pot and hp_pot and ws.player.hp < s.hp_threshold / 100.0:
             if now >= self._next_hp_pot:
                 tap(hp_pot, self._attack_duration)
                 self._next_hp_pot = now + cd
+                drank_hp = True
         else:
             self._next_hp_pot = 0.0     # 血够了/没开自动补血，重置（下次低于阈值立刻补）
 
@@ -1674,6 +1957,7 @@ class CombatAgent:
                 self._next_mp_pot = now + cd
         else:
             self._next_mp_pot = 0.0
+        return drank_hp
 
     def _release_combat_keys(self):
         """释放打怪相关按键：KeyState + 回身输出/输出/防掉线序列。
@@ -1687,7 +1971,7 @@ class CombatAgent:
         self._back_ctx = None
         self._output_ctx = None
         self._afk_ctx = None
-        self._sweep_hold = False    # 中止战斗：清掉「打完停下」标记，别带到下一轮
+        self._stand_attack = False  # 中止战斗：清掉「站桩输出」标记，别带到下一轮
 
     def _release_held_keys(self):
         """释放所有还按着的键：KeyState 的 + 序列（回身输出/防掉线/定时行为）残留的。"""

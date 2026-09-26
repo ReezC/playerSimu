@@ -61,6 +61,8 @@ class Harness:
         # 自定义怪物列表：(相对秒) -> [Mob]。起跳这类用例要**精确摆距离**，
         # 默认那只怪固定距离摆不出来（见 ws）。None = 用默认那只。
         self.mobs_fn = None
+        # 世界里的血量（0~1）：喝药/「被打断重试」这类用例要能摆低血量
+        self.hp = 1.0
 
     # ---- 世界状态 ----
     def ws(self, with_mob=True):
@@ -70,14 +72,17 @@ class Harness:
         「角色中心 → 怪框最近的边」= mob.x - 520。
         """
         w = WorldState(width=1920, height=1080)
+        # ⚠ `world_x/world_y` 是**世界坐标**（寻路/上绳执行器用的就是它），
+        # `x/y` 是画面坐标（检测框中心）。两套都在，别混 —— 2026-09-26 的
+        # "上绳死循环"就是喂错坐标系造成的（见 t_climb_uses_world_x）。
         w.player = Player(x=500.0, y=500.0, w=60.0, h=100.0, bottom=600.0,
-                          hp=1.0, mp=1.0, found=True)
+                          hp=self.hp, mp=1.0, found=True,
+                          world_x=500.0, world_y=500.0)
         if self.mobs_fn is not None:
             w.mobs = list(self.mobs_fn(self.clock.t - getattr(self, "clock0",
                                                               self.clock.t)))
         elif with_mob:
-            w.mobs = [Mob(id=1, x=560.0, y=500.0, w=40.0, h=40.0, conf=0.9,
-                          reachable=True)]
+            w.mobs = [Mob(id=1, x=560.0, y=500.0, w=40.0, h=40.0, conf=0.9)]
         else:
             w.mobs = []
         return w
@@ -169,6 +174,8 @@ def fresh_settings(**over):
     s.strategy = "chase"
     s.anti_afk_min = s.anti_afk_max = 5.0
     s.anti_afk_rest_min = s.anti_afk_rest_max = 1.0        # 1 分钟 = 60 秒
+    s.anti_afk_retry_on_interrupt = False
+    s.anti_afk_retry_sec = 60.0
     for k, v in over.items():
         setattr(s, k, v)
     return s
@@ -569,6 +576,81 @@ def t_rest_state_machine():
     check(h3.count("f9") == 0, "关掉防掉线不该再演退出序列")
 
 
+def t_rest_interrupt_retry():
+    """「被打断重试」：休息期间**真的补了血** ⇒ 立刻退出隐身，并按秒数重排下次休息。
+
+    为什么补血算被打断：它说明隐身没兜住（隐身到期 / 被范围技能扫到 / 有东西在打我们），
+    继续歇着等于等着挨打。三条边界都要对：
+      · 勾选 + 补血   ⇒ 打断，且下次休息 = 现在 + retry_sec（**秒**，不是随机 N~M 分钟）
+      · 不勾选 + 补血 ⇒ **绝不打断**（补血照常发生，休息照旧）
+      · 勾选 + 没补血 ⇒ 不打断（触发它的是"补血"这个事件，不是"在休息"）
+    """
+    def setup(**over):
+        s = fresh_settings(anti_afk_enabled=True,
+                           anti_afk_rest_min=5.0, anti_afk_rest_max=5.0,
+                           auto_hp_pot=True, hp_threshold=90, pot_cd=0, **over)
+        s.keymap["hp_pot"] = "f5"
+        s.anti_afk_enter_seq = [{"type": "down", "key": "f1"},
+                                {"type": "up", "key": "f1"}]
+        s.anti_afk_exit_seq = [{"type": "down", "key": "f9"},
+                               {"type": "up", "key": "f9"}]
+        return s
+
+    # 打点：被打断要能在 perf.log 里看见 —— 否则以后只能猜"它到底触发过没有"。
+    # 走**公开路径**验证（configure → flush → 读文件），不去翻 perf 的内部字典。
+    import tempfile
+    from core import perf
+    old_log, old_en = perf.LOG, perf.ENABLED
+    logf = Path(tempfile.mkdtemp(prefix="perf_afk_")) / "perf.log"
+    try:
+        perf.configure(True, log=logf)
+        # ① 勾选 + 补血 → 打断（并立刻演退出隐身）
+        s = setup(anti_afk_retry_on_interrupt=True, anti_afk_retry_sec=7.0)
+        h = Harness(s)
+        h.hp = 0.1                               # 低于阈值 ⇒ 每一拍都会补血
+        h.agent._rest_pending = True
+        h.run(1.5, mob_plan=lambda _t: False)
+        check(h.taps("f5"), "休息期间没有补血（前提就不成立）")
+        check(h.count("f9") >= 1, "被打断后没有执行退出隐身序列")
+        check(h.agent.state == "idle", "打断后没回到战斗：state=%s" % h.agent.state)
+        left = h.agent._next_afk - h.clock.t
+        check(left < 20.0,
+              "下次休息没有提前到 retry_sec（还剩 %.1f 秒；正常路径是随机的 300 秒）"
+              % left)
+        perf.flush(force=True)
+        check("afk_interrupt" in logf.read_text(encoding="utf-8"),
+              "被打断了但 perf.log 里没有 afk_interrupt（这个功能会变成没法观测）")
+
+        # ② 不勾选 + 补血 → 绝不打断（**也不该留下打点**）
+        s2 = setup(anti_afk_retry_on_interrupt=False)
+        h2 = Harness(s2)
+        h2.hp = 0.1
+        h2.agent._rest_pending = True
+        # flush 是**追加**写：只比对这一轮新增的那段，否则会看到 ① 留下的打点
+        before = logf.read_text(encoding="utf-8")
+        h2.run(1.5, mob_plan=lambda _t: False)
+        check(h2.taps("f5"), "没补血（前提不成立）")
+        check(h2.agent.state in ("afk_enter", "afk_rest"),
+              "没勾选却被补血打断了：state=%s" % h2.agent.state)
+        check(h2.count("f9") == 0, "没勾选却演了退出隐身序列")
+        perf.flush(force=True)
+        check("afk_interrupt" not in logf.read_text(encoding="utf-8")[len(before):],
+              "没勾选也记了 afk_interrupt（打点会骗人）")
+
+        # ③ 勾选 + 没补血（血够）→ 不打断
+        s3 = setup(anti_afk_retry_on_interrupt=True)
+        h3 = Harness(s3)
+        h3.hp = 1.0
+        h3.agent._rest_pending = True
+        h3.run(1.5, mob_plan=lambda _t: False)
+        check(not h3.taps("f5"), "血够却补了血（前提不成立）")
+        check(h3.agent.state in ("afk_enter", "afk_rest"),
+              "没补血却被打断了：state=%s" % h3.agent.state)
+    finally:
+        perf.configure(old_en)
+        perf.LOG = old_log
+
+
 def t_rest_manual_request():
     """手动「进入休息」：先标记待休息，等攻击范围内的怪清空才真的进。"""
     s = fresh_settings(anti_afk_enabled=True, anti_afk_rest_min=1.0,
@@ -832,25 +914,52 @@ def t_sweep_stands_still_in_attack():
           "两秒里按着方向键走了 %.2f 秒 —— 那不叫站桩"
           % sum(b - a for a, b in segs))
 
-    # 对照：**走着的**策略（平地巡逻）不受这条限制 —— 它本来就该一直朝怪走
+    # 对照 ①：**平地巡逻（patrol）同样要站桩**。
+    # 2026-09-26 用户报的就是它：老写法在 attack 分支里按住朝怪的方向键
+    # （注释写着"确保面向目标"，但 `_in_range` 的判据里已经带了
+    # `(m.x - px) * facing >= 0` —— 能进这个分支的怪本来就在正前方），
+    # 于是两次输出之间角色一直在朝怪挪，走到身上、出范围又回头。
+    def dir_segments(hh, ss):
+        """方向键的按住段落 [(起, 止)]，**收尾还按着的那段算到结束时刻**。"""
+        ds = {ss.keymap["left"], ss.keymap["right"]}
+        segs_, cur_ = [], {}
+        for t, kind, k in hh.log:
+            if k not in ds:
+                continue
+            if kind == "down":
+                cur_[k] = t
+            elif k in cur_:
+                segs_.append((cur_.pop(k), t))
+        for k, a in cur_.items():
+            segs_.append((a, hh.clock.t - hh.clock0))
+        return segs_
+
     s2 = fresh_settings(strategy="patrol", jump_random_prob=0.0, attack_dist=80.0,
                         min_turn_hold_ms=1000, turn_output_delay_ms=200)
     h2 = Harness(s2)
     h2.mobs_fn = mobs
     h2.run(2.0)
-    dirs2 = {s2.keymap["left"], s2.keymap["right"]}
-    total2, cur2 = 0.0, {}
-    for t, kind, k in h2.log:
-        if k not in dirs2:
-            continue
-        if kind == "down":
-            cur2[k] = t
-        elif k in cur2:
-            total2 += t - cur2.pop(k)
-    total2 += sum(h2.clock.t - h2.clock0 - a for a in cur2.values())
-    check(total2 >= 1.0,
-          "平地巡逻被一起改掉了（它本来就该朝怪走过去，实测只按了 %.2f 秒）"
-          % total2)
+    segs2 = dir_segments(h2, s2)
+    check(segs2, "平地巡逻一次方向键都没按 —— 用例本身没造出换向")
+    for a, b in segs2:
+        check(b - a <= limit,
+              "平地巡逻站桩时方向键按了 %.3f 秒（上限 %.2f）—— 两次输出之间会朝怪挪，"
+              "走到身上再回头（按住段 %s）"
+              % (b - a, limit, [(round(x, 3), round(y, 3)) for x, y in segs2]))
+    check(sum(b - a for a, b in segs2) <= 0.6,
+          "两秒里按着方向键走了 %.2f 秒 —— 那不叫站桩" % sum(b - a for a, b in segs2))
+
+    # 对照 ②：**怪在攻击范围外**时，patrol 该照旧朝它走 —— 别把移动一起改掉
+    # （x=690：中心距约 160px > attack_dist 80，且在视野内）
+    s3 = fresh_settings(strategy="patrol", jump_random_prob=0.0, attack_dist=80.0,
+                        min_turn_hold_ms=1000, turn_output_delay_ms=200)
+    h3 = Harness(s3)
+    h3.mobs_fn = lambda t: [Mob(id=1, x=690.0, y=500.0, w=40.0, h=40.0, conf=0.9)]
+    h3.run(2.0)
+    total3 = sum(b - a for a, b in dir_segments(h3, s3))
+    check(total3 >= 1.0,
+          "怪在攻击范围外时，平地巡逻不走了（实测只按了 %.2f 秒）—— 追怪被一起改掉了"
+          % total3)
 
 
 # ---------------------------------------------------------------- 界面层自检
@@ -1027,6 +1136,521 @@ def t_auto_confirm_local():
         p._refresh_auto_ui()
 
 
+def t_align_params():
+    """「判定参数」（设置 → 判定参数页签）：**对齐类功能**靠这两个数说话，存得住、有默认。
+
+    为什么单独立一条：这两个数决定"多近才算对齐 / 保持多久算成立"，是**爬绳、寻路
+    走到某个 x、判定在不在绳上**共同的判据。数值本身不重要，重要的是：
+      · 有**明确默认值**（老项目文件里没有这两个键时不能变成 0 —— 0 会让"误差范围"
+        变成"必须像素级精确"，谁都对不上）；
+      · 存读一致（`to_dict`/`from_dict` 都带上，否则改完重开就丢）；
+      · 设置弹窗里真的有一个能改它们的页签。
+    """
+    from PyQt5.QtWidgets import QApplication
+
+    from decision.agent import settings      # 模块级没有这个名字，函数里取（同别的用例）
+
+    app = QApplication.instance() or QApplication([])
+    check(hasattr(settings, "align_tol_px") and hasattr(settings, "align_hold_ms"),
+          "决策设置里没有对齐参数")
+    check(int(settings.align_tol_px) > 0,
+          "坐标对齐误差范围默认值是 0 —— 那就成了必须像素级精确：%r"
+          % settings.align_tol_px)
+    check(int(settings.align_hold_ms) >= 0, "对齐误差时间默认值不对：%r"
+          % settings.align_hold_ms)
+
+    # 存读一致（改完必须还在）
+    was_tol, was_hold = settings.align_tol_px, settings.align_hold_ms
+    try:
+        settings.align_tol_px, settings.align_hold_ms = 11, 333
+        d = settings.to_dict()
+        check(d.get("align_tol_px") == 11 and d.get("align_hold_ms") == 333,
+              "对齐参数没进 to_dict：%s" % {k: d.get(k) for k in
+                                            ("align_tol_px", "align_hold_ms")})
+        fresh = ag.DecisionSettings()
+        fresh.from_dict(d)
+        check((fresh.align_tol_px, fresh.align_hold_ms) == (11, 333),
+              "from_dict 没读回来：%s" % ((fresh.align_tol_px, fresh.align_hold_ms),))
+        # 老文件（没有这两个键）⇒ 用默认值，**不能变 0**
+        old = ag.DecisionSettings()
+        old.from_dict({})
+        check(old.align_tol_px > 0 and old.align_hold_ms >= 0,
+              "老配置读进来把对齐参数变成了 0：%s" % ((old.align_tol_px,
+                                                       old.align_hold_ms),))
+    finally:
+        settings.align_tol_px, settings.align_hold_ms = was_tol, was_hold
+
+    # 设置弹窗里真的有这一页、且能改到
+    from gui.settings_dialog import TAB_NAMES, SettingsDialog
+    check("判定参数" in TAB_NAMES,
+          "设置弹窗没有「判定参数」页签：%s" % (TAB_NAMES,))
+    sd = SettingsDialog()
+    check(hasattr(sd, "sp_align_tol") and hasattr(sd, "sp_align_hold"),
+          "「判定参数」页里没有那两个控件")
+    tab_names = [sd.tabs.tabText(i) for i in range(sd.tabs.count())]
+    check(tab_names == list(TAB_NAMES),
+          "页签顺序和 TAB_NAMES 对不上：%s" % (tab_names,))
+    # 页面里显示的是当前值
+    check(int(sd.sp_align_tol.value()) == int(settings.align_tol_px),
+          "误差范围控件没显示当前值：%r vs %r"
+          % (sd.sp_align_tol.value(), settings.align_tol_px))
+    # 执行器**没有**"要不要按跳"的开关（2026-09-26 用户定：那是测试内容，不该进设置）——
+    # 授权就是「命令前往」那一下（见 route_panel._command_first_step），别在这里再放一道闸。
+    check(not hasattr(sd, "ck_climb"), "「判定参数」页里又出现了上绳开关")
+    check(not hasattr(settings, "climb_enabled"),
+          "DecisionSettings 里又出现了 climb_enabled —— 这个闸已经删了")
+    sd.reject()
+
+
+def t_climb_job():
+    """定点上绳执行器（`decision/route.py`）：对齐 → 按住跳+方向 → 判定到达 → 超时/掉下来。
+
+    用户 2026-09-26 定的流程，逐条钉住。**最值得钉的是"什么时候算对齐好了"**：只看一帧
+    会被抖动骗（小地图世界坐标本身就有几像素抖），所以"进误差范围后还要保持 N 毫秒"
+    这段逻辑错一点，表现就是"老是跳不上去/来回蹭"。
+    """
+    from core import mapdata, zones
+    from decision import route
+
+    def mk(**kw):
+        a = dict(ladder_id="L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
+                 dst_set="乙平台", tol_px=6, hold_ms=200)
+        a.update(kw)
+        return route.ClimbJob(**a)
+
+    # ① 没对齐 ⇒ 往目标那侧挪，不跳
+    job = mk()
+    o = job.update(0.0, px=600.0)
+    check(o["move"] == 1 and not o["jump"], "差得远时该往右挪、不跳：%s" % o)
+    o = job.update(0.1, px=760.0)
+    check(o["move"] == -1 and not o["jump"], "站过头时该往左挪：%s" % o)
+
+    # ② 进误差范围 ⇒ **先站住**；保持时间不够不许跳（最容易做错的一步）
+    job = mk()
+    o = job.update(0.0, px=703.0)          # 差 3 ≤ 6 ⇒ 进范围
+    check(o["move"] == 0 and not o["jump"],
+          "刚进误差范围该停下等保持时间，不能马上跳：%s" % o)
+    o = job.update(0.1, px=703.0)          # 才 100ms < 200ms
+    check(o["phase"] == route.ClimbJob.ALIGN and not o["jump"],
+          "保持时间没到就跳了：%s" % o)
+    o = job.update(0.25, px=703.0)         # 250ms ≥ 200 ⇒ 上绳
+    check(o["phase"] == route.ClimbJob.CLIMB and o["jump"],
+          "保持够了该按住跳：%s" % o)
+    check(o["dir"] == 1 and o["move"] == 0,
+          "向上爬时该按↑、且不再左右挪：%s" % o)
+
+    # ③ 保持期间抖出去 ⇒ **重新计时**（不许攒够一次就永久算数）
+    job = mk()
+    job.update(0.0, px=703.0)
+    job.update(0.05, px=730.0)             # 抖出去
+    job.update(0.10, px=703.0)             # 又回来 ⇒ 重新开始
+    o = job.update(0.20, px=703.0)         # 距重新进范围才 100ms
+    check(not o["jump"], "抖出去之后没有重新计时：%s" % o)
+
+    # ④ 到达判据一：脚下就是**目标集合**（最贴近"到了哪块平台"）
+    job = mk()
+    job.update(0.0, px=700.0)
+    o = job.update(0.25, px=700.0, py=0.0, here_sets=["甲平台"])
+    check(o["jump"] and not o["done"], "还在别的平台上就说到达了：%s" % o)
+    o = job.update(0.40, px=700.0, py=-90.0, here_sets=["乙平台"])
+    check(o["done"] and not o["jump"], "脚下已是目标集合却没判到达：%s" % o)
+    o = job.update(0.50, px=700.0)
+    check(o["done"] and not o["jump"], "到达之后还在按键：%s" % o)
+
+    # ⑤ 到达判据二（没有集合信息时的兜底）：y 越过绳的上端
+    job = mk()
+    job.update(0.0, px=700.0)
+    job.update(0.25, px=700.0, py=-100.0)
+    o = job.update(0.40, px=700.0, py=-120.0)      # 上端 -100 − 缓冲 14
+    check(o["done"], "y 越过绳上端却没判到达（兜底判据）：%s" % o)
+
+    # ⑥ 向下爬：按 ↓，y 越过下端算到
+    job = mk(direction=-1, dst_set="丙平台")
+    job.update(0.0, px=700.0)
+    o = job.update(0.25, px=700.0)
+    check(o["jump"] and o["dir"] == -1, "向下爬该按↓：%s" % o)
+    o = job.update(0.40, px=700.0, py=200.0)
+    check(o["done"], "y 越过绳下端却没判到达：%s" % o)
+
+    # ⑦ 超时报警（P4 要求：不许无限等）
+    job = mk(timeout_s=1.0)
+    check(job.update(0.0, px=600.0)["failed"] is False, "刚开始就说超时")
+    o = job.update(1.5, px=600.0)
+    check(o["failed"] and not o["jump"], "超时了还按着键/不报警：%s" % o)
+
+    # ⑧ 从绳上掉下来 ⇒ 失败，但要**给容错期**：按跳那几拍人还在空中（ladder_id 是 None），
+    #    一离开就判失败会当场误杀；而**一直**没回到绳上（超过容错期）就必须停手。
+    job = mk()
+    job.update(0.0, px=700.0)
+    o = job.update(0.25, px=700.0, ladder_id=None)
+    check(not o["failed"], "刚按跳那几拍（还没上绳）就判失败：%s" % o)
+    job.update(0.60, px=700.0, ladder_id="L2")          # 上绳了
+    o = job.update(1.00, px=700.0, ladder_id=None)
+    check(not o["failed"], "掉下来一拍就判失败（还可能再抓一次绳）：%s" % o)
+    o = job.update(3.5, px=700.0, ladder_id=None)       # 离开超过容错期
+    check(o["failed"] and not o["jump"],
+          "掉下来一直没回到绳上，却还在按跳：%s" % o)
+
+    # ⑧b **偏离保护**（用户 2026-09-26）：横向偏出去超过阈值并**持续**一段 ⇒ 失败；
+    #     只偏一下（能自己蹭回来）不算 —— 上绳那一下本来就会歪。
+    job = mk()
+    job.update(0.0, px=700.0)
+    o = job.update(0.25, px=700.0)
+    check(o["jump"], "该上绳了：%s" % o)
+    o = job.update(0.30, px=760.0)               # 横向偏 60 > 18，但才 0.05s
+    check(not o["failed"], "才偏一下（还没超过宽限期）就判失败：%s" % o)
+    o = job.update(0.34, px=703.0)               # 自己蹭回来了 ⇒ 计时清零
+    check(not o["failed"] and o["jump"], "蹭回来之后不该还在算偏离：%s" % o)
+    o = job.update(0.40, px=760.0)               # 又偏出去
+    o = job.update(1.10, px=760.0)               # 持续 0.7s ≥ 0.6 ⇒ 失败
+    check(o["failed"] and not o["jump"], "偏离绳梯没判失败：%s" % o)
+    check("偏离" in o["note"], "失败原因没写清是偏离：%r" % o["note"])
+
+    # ⑧c **重新激活**：失败后 retry() 回到第一步重来，次数累加（到上限由 agent 放弃）
+    check(job.attempt == 1, "一开始 attempt 该是 1：%s" % job.attempt)
+    o = job.retry()
+    check(job.attempt == 2 and o["phase"] == route.ClimbJob.ALIGN and not o["jump"],
+          "retry 没回到对齐阶段：%s / attempt=%s" % (o, job.attempt))
+    check(job._t0 is None and job._off_x_since is None,
+          "retry 没把计时清干净（超时会立刻又炸）：%r" % (job._t0,))
+
+    # ⑨ 取消 ⇒ 状态收干净，别再按键
+    job = mk()
+    job.update(0.0, px=700.0)
+    o = job.cancel("换目标了")
+    check(o["failed"] and not o["jump"] and o["note"] == "换目标了",
+          "取消之后没收拾干净：%s" % o)
+
+    # ⑩ 从**真实边**造任务：方向必须和 climb_direction 一致（用户的数据）
+    t = mapdata.load("105090600")
+    z = zones.load("105090600")
+    edge = next((e for e in z.edges if e.get("kind") == "climb"
+                 and e.get("from") == "右下" and e.get("to") == "上下过渡平台"), None)
+    check(edge is not None, "用户数据里那条「右下 → 上下过渡平台」的爬边不见了")
+    j2 = route.job_for_edge(t, z, edge, tol_px=6, hold_ms=250)
+    check(j2.dir == 1 and j2.dst_set == "上下过渡平台"
+          and j2.ladder_id == "L2" and abs(j2.x - 701.0) < 1e-6,
+          "从真实边造出来的任务不对：dir=%s x=%s dst=%s"
+          % (j2.dir, j2.x, j2.dst_set))
+    for bad in ({"kind": "walk", "from": "右下", "to": "上下过渡平台"},
+                {"kind": "climb", "from": "右下", "to": "上下过渡平台",
+                 "ladder": "L9"},
+                {"kind": "climb", "from": "右下", "to": "左上", "ladder": "L2"}):
+        try:
+            route.job_for_edge(t, z, bad)
+            raise AssertionError("构造不该成功（会往反方向爬）：%s" % bad)
+        except ValueError:
+            pass          # 正是期望的：说不清就抛，**不许猜**
+
+
+def t_climb_wiring():
+    """上绳任务接进状态机：**有怪先打（打完继续走）**、开关关掉不按跳、状态能进 climb。
+
+    这是用户 2026-09-26 第 1 条要求的落点："当决定要前往时则进寻路状态，但是攻击范围内
+    有怪还是会进 attack"。这里**不额外写仲裁** —— 靠 tick 里 `if in_range:` 排在
+    `else:` 之前天然成立；这条用例就是证明它真的成立（而不是我以为成立）。
+    """
+    from decision import route
+
+    s = ag.DecisionSettings()
+    s.enabled = True
+    s.strategy = "patrol"
+    h = Harness(s)
+    h.clock0 = h.clock.t      # `_patched()` 的打点靠它（`run()` 里本来会设）
+    # ⚠ 必须自己把自动打开：`tick()` 第一件事就是判 `enabled`，关着直接返回
+    # 「未开启」——那条路一个键都不发。以前这里是**靠前面用例的副作用**把开关打开的
+    # （settings 是全局单例），用例顺序一变就红，而且失败信息只说"没进 climb 状态"，
+    # 指向别处（2026-09-26 踩过）。
+    s.enabled = True
+
+    def job(**kw):
+        # x=500 ＝ 夹具里玩家的 x ⇒ 一拍就对齐（hold_ms=0），方便看"该不该按跳"
+        a = dict(ladder_id="L2", x=500.0, y1=-100.0, y2=200.0, direction=1,
+                 dst_set="乙平台", tol_px=6, hold_ms=0)
+        a.update(kw)
+        return route.ClimbJob(**a)
+
+    def downs():
+        return {k for _t, kind, k in h.log if kind == "down"}
+
+    with h._patched():
+        jump, up = s.keymap["jump"], s.keymap["up"]
+
+        # ① 没怪 ⇒ 按住跳 + ↑，且状态是 climb（**没有"要不要按跳"的开关**：
+        #    任务挂上就是授权，一路做到位 —— 见 agent._climb_tick）
+        h.agent.start_climb(job())
+        h.log.clear()
+        h.agent.tick(h.ws(with_mob=False))
+        check(h.agent.state == "climb", "没进 climb 状态：%s" % h.agent.state)
+        check(jump in downs() and up in downs(),
+              "上绳时该按住跳 + ↑（向上爬）：%s" % h.log)
+
+        # ② **攻击范围内有怪 ⇒ 先打**（这一拍绝不按↑去爬绳）
+        h.agent.start_climb(job())
+        h.log.clear()
+        h.agent.tick(h.ws(with_mob=True))
+        check(h.agent.state != "climb",
+              "攻击范围内有怪却去爬绳了（该先打）：%s" % h.agent.state)
+        check(up not in downs(), "有怪时还在按↑爬绳：%s" % h.log)
+
+        # ③ 怪没了 ⇒ **接着爬**（"打完继续走"）
+        h.log.clear()
+        h.agent.tick(h.ws(with_mob=False))
+        check(h.agent.state == "climb", "打完没回到 climb：%s" % h.agent.state)
+        check(jump in downs() and up in downs(), "打完没接着上绳：%s" % h.log)
+
+        # ④ 那个"要不要按跳"的开关**已经删了**（2026-09-26 用户定）：留着它就会出现
+        #    "点了命令前往却只对齐、不上绳"这种要用户自己找开关的坑。
+        check(not hasattr(s, "climb_enabled"),
+              "DecisionSettings 里又出现了 climb_enabled（谁加回来的？）")
+
+        # ⑤ 到位 ⇒ 任务自己结束、状态退出 climb、不再按跳
+        j = job()
+        h.agent.start_climb(j)
+        h.log.clear()
+        ws = h.ws(with_mob=False)
+        h.agent.tick(ws)
+        ws.player.world_y = -200.0             # 越过绳上端（-100 − 缓冲 14）
+        # ⚠ 判到达用的是**世界**坐标 y（`world_y`）—— 摆 `y`（画面坐标）是不算数的
+        h.log.clear()
+        h.agent.tick(ws)
+        check(h.agent._climb is None, "到了任务没自己撤掉：%r" % (h.agent._climb,))
+        check(h.agent.state != "climb", "到了还挂着 climb 状态：%s" % h.agent.state)
+        check(jump not in downs(), "到了还在按跳：%s" % h.log)
+
+        # ⑤b **失败保护**（2026-09-26 改）：失败 ⇒ **延迟**重新激活；到上限才真放弃。
+        # 原来这里是"立即重来" —— 失败那一下人还在原地、朝向也没变，常常在同一处再歪一次。
+        was_delay = s.climb_retry_delay_s
+        try:
+            s.climb_retry_delay_s = 1.0
+            j = job(max_attempts=2)
+            obj = h.agent.start_climb(j)
+            obj._fail("用例：故意失败")      # 直接打成失败态，省掉摆时间的麻烦
+            h.log.clear()
+            done = h.agent._climb_tick(0.0, 500.0, set(), h.ws(with_mob=False))
+            check(done is False and h.agent._climb is j,
+                  "失败后任务被扔了：done=%s climb=%r" % (done, h.agent._climb))
+            check(j.attempt == 1 and j.phase == route.ClimbJob.FAILED,
+                  "没等延迟就重新激活了（等于老行为）：attempt=%s phase=%s"
+                  % (j.attempt, j.phase))
+            check(jump not in downs(), "等待期间还在按跳（该站着等）：%s" % h.log)
+            # 还没到点 ⇒ 仍然不重来
+            h.agent._climb_tick(0.5, 500.0, set(), h.ws(with_mob=False))
+            check(j.attempt == 1, "延迟没到就重新激活了：attempt=%s" % j.attempt)
+            # 到点 ⇒ 重新对齐（attempt +1）
+            h.agent._climb_tick(1.1, 500.0, set(), h.ws(with_mob=False))
+            check(j.attempt == 2 and j.phase == route.ClimbJob.ALIGN,
+                  "延迟到了却没重新激活：attempt=%s phase=%s" % (j.attempt, j.phase))
+            # 上限：到次数上限就真放弃（不能无限重来 —— 那看着像卡死）
+            obj._fail("用例：又失败")
+            done = h.agent._climb_tick(1.2, 500.0, set(), h.ws(with_mob=False))
+            check(done is True and h.agent._climb is None,
+                  "到了次数上限还没放弃（会一直重来，看着像卡死）：%s / %r"
+                  % (done, h.agent._climb))
+            check(h.agent.state != "climb",
+                  "放弃之后还挂着 climb 状态：%s" % h.agent.state)
+            check(h.agent._climb_retry_at is None,
+                  "放弃之后还留着「等重来」的时刻（下一个任务会立刻被它带跑）")
+        finally:
+            s.climb_retry_delay_s = was_delay
+
+        # ⑤b2 **已经到了目标集合 ⇒ 不重来，直接收工**（2026-09-26 用户要求 2）：
+        # 失败判定可能晚于实际到达（定位抖一下、到了又被打下来）—— 这时接着"重新激活"
+        # 就是"人已经站上去了还在原地爬"，比不做更糟。
+        j2 = job(max_attempts=3)
+        j2.dst_set = "乙平台"
+        h.agent.start_climb(j2)
+        ws2 = h.ws(with_mob=False)
+        ws2.player.here_sets = ["乙平台"]      # 定位说：已经站在目标集合里了
+        j2._fail("用例：判失败，但其实已经到了")
+        h.log.clear()
+        done = h.agent._climb_tick(20.0, 500.0, set(), ws2)
+        check(done is True and h.agent._climb is None,
+              "到了目标集合还在重来（人站上去了还在原地爬）：%s / %r"
+              % (done, h.agent._climb))
+        check(j2.attempt == 1, "已经到了还在加尝试次数：%s" % j2.attempt)
+        check(jump not in downs(), "收工那一拍还在按跳：%s" % h.log)
+        check(h.agent._climb_retry_at is None,
+              "收工之后还留着「等重来」的时刻（下一个任务会立刻被它带跑）")
+
+        # ⑤c 下跳：**先按住 ↓ 那一拍不许按跳**（agent 那层也得对 —— 这是新加的分支）
+        dj = route.DropJob("甲平台", "乙平台", [(500.0, 470.0, 530.0, "41")],
+                           tol_px=6, hold_ms=0)
+        h.agent.start_climb(dj)
+        h.log.clear()
+        h.agent.tick(h.ws(with_mob=False))
+        downs_now = downs()
+        check(s.keymap["down"] in downs_now,
+              "下跳要先按住 ↓，却没按：%s" % h.log)
+        check(s.keymap["jump"] not in downs_now,
+              "「先按住↓」那一拍就按跳了（顺序不对）：%s" % h.log)
+        h.agent.stop_climb("用例结束")
+
+        # ⑥ 取消 / 关自动 ⇒ 状态收干净（不留按着的键）
+        h.agent.start_climb(job())
+        h.agent.tick(h.ws(with_mob=False))
+        h.log.clear()
+        h.agent.stop_climb("用例取消")
+        check(h.agent._climb is None and h.agent.state != "climb",
+              "取消后还挂着任务/状态：%r / %s" % (h.agent._climb, h.agent.state))
+        check(not any(kind == "down" for _t, kind, _k in h.log),
+              "取消之后还在按新键：%s" % h.log)
+
+
+def t_climb_world_x_and_tap():
+    """上绳对齐的三条口径（2026-09-26 用户要求 1、2、3）。
+
+    ① **用世界坐标 x**：用户报的"卡在 -300~-380 来回走、无限循环"就出在这儿 ——
+       喂进去的是画面检测框中心（`ws.player.x`），而 `ClimbJob.x` 是**世界坐标**
+       （同一个调用里 `py` 却用 `world_y`，本身自相矛盾）。
+       这里两种坐标**故意摆成不同的数**：一旦有人喂错，方向就会反过来 ⇒ 用例立刻红。
+    ② **靠近（≤ 20px）改成点按**：按住方向键在游戏里就是"一直走"，差二十几像素那一下
+       必然冲过头。断言"有按的拍、也有松的拍"——全按或全不按都算没做点按。
+    ③ **保持窗口 = 设置里的保持时间 + 当前端到端延迟**（`ws.e2e_ms`）：定位读数是
+       "过去某一刻"的位置，延迟越大越不能拿单帧当真。
+    """
+    from decision import route
+
+    s = ag.settings
+    h = Harness(s)
+
+    def job(**kw):
+        a = dict(ladder_id="L1", x=140.0, y1=-100.0, y2=200.0, direction=1,
+                 dst_set="乙平台", tol_px=6, hold_ms=0)
+        a.update(kw)
+        return route.ClimbJob(**a)
+
+    s.enabled = True          # 同 t_climb_wiring：别靠别的用例把开关打开
+
+    with h._patched():
+        h.clock0 = h.clock.t
+        # ① 世界 x=100（绳在 140 ⇒ 该往右）；画面 x 故意给 900（喂错就会往左）
+        j = job()
+        h.agent.start_climb(j)
+        ws = h.ws(with_mob=False)
+        ws.player.x, ws.player.world_x = 900.0, 100.0
+        h.log.clear()
+        h.agent.tick(ws)
+        d1 = {k for _t, kind, k in h.log if kind == "down"}
+        check(s.keymap["right"] in d1 and s.keymap["left"] not in d1,
+              "方向没跟**世界坐标**走（多半又喂了画面坐标）：%s" % h.log)
+        # 反过来：世界 x 在绳右边 ⇒ 该往左
+        h.agent.start_climb(job())
+        ws2 = h.ws(with_mob=False)
+        ws2.player.x, ws2.player.world_x = 100.0, 300.0
+        h.log.clear()
+        h.agent.tick(ws2)
+        d2 = {k for _t, kind, k in h.log if kind == "down"}
+        check(s.keymap["left"] in d2 and s.keymap["right"] not in d2,
+              "方向没跟世界坐标走：%s" % h.log)
+
+        # ② 差 12 px（≤ NEAR_PX=20）⇒ 点按：几拍里必须有"松"的拍
+        h.agent.start_climb(job())
+        ws3 = h.ws(with_mob=False)
+        ws3.player.world_x = 128.0
+        h.log.clear()
+        moves = []
+        dirs = (s.keymap["left"], s.keymap["right"])
+        for i in range(12):
+            h.clock.t = h.clock0 + i * 0.05
+            h.agent.tick(ws3)
+            moves.append(any(kind == "down" and k in dirs for _t, kind, k in h.log))
+            h.log.clear()
+        check(any(moves) and not all(moves),
+              "靠近时没做「点按」（要么一直按着、要么一直不按）：%s" % moves)
+
+        # ③ 保持窗口把端到端延迟**叠在任务自己的保持时间上**（不是拿设置覆盖它）
+        j4 = job(hold_ms=250)
+        h.agent.start_climb(j4)
+        ws4 = h.ws(with_mob=False)
+        ws4.e2e_ms = 400.0
+        ws4.player.world_x = 140.0            # 正好在绳上
+        h.agent.tick(ws4)
+        check(j4.hold_ms == 650,
+              "保持窗口没算进端到端延迟：hold_ms=%s（该是任务自己的 250 + 400）"
+              % j4.hold_ms)
+        # 延迟每拍都在变 ⇒ 下一拍要**重新算**，不能在上一次的结果上再叠一次
+        ws4.e2e_ms = 100.0
+        h.agent.tick(ws4)
+        check(j4.hold_ms == 350, "延迟是按基线叠的（别层层累加）：%s" % j4.hold_ms)
+        h.agent.stop_climb("用例结束")
+
+
+def t_drop_job():
+    """下跳执行器：就近平齐 → **先按住 ↓** → ↓+跳 → 落地；失败保护与上绳同一套。
+
+    用户 2026-09-26 定的动作：**按住 ↓ 再按跳**（与「跳(jump)」= 在 foothold 边缘按跳
+    是两个类型，别混）。这里钉三件最容易做错的事：
+      · **顺序**：ARMED 那一拍只能有 ↓、**不能有跳**（"先按住再按跳"就是这个意思）；
+      · **就近**：边上给了好几个可下跳点时要挑离自己最近的那个；
+      · **到达**：先认集合，认不出集合就用"y 掉下去了一段"兜底（y 向下增大）。
+    """
+    from core import mapdata, zones
+    from decision import route
+
+    spots = [(700.0, 660.0, 740.0, "41"), (1250.0, 1210.0, 1290.0, "72")]
+    job = route.DropJob("甲平台", "乙平台", spots, tol_px=6, hold_ms=0)
+
+    # ① 就近挑：站在 x=1200 ⇒ 挑 fh 72（不是 700 那个）
+    o = job.update(0.0, px=1200.0)
+    check(job._pick[3] == "72", "没就近挑可下跳点：%r" % (job._pick,))
+    check(o["move"] == 1 and not o["jump"], "该往右挪：%s" % o)
+    # ② 平齐后 ⇒ **先按住 ↓**：这一拍有 ↓、没有跳
+    o = job.update(0.5, px=1250.0)
+    check(o["phase"] == route.DropJob.ARMED and not o["jump"],
+          "对齐好了该先进 ARMED（按住↓）阶段：%s" % o)
+    check(o["dir"] == -1, "ARMED 阶段就该按住 ↓：%s" % o)
+    # ③ 按住一小会儿 ⇒ 补跳
+    o = job.update(0.8, px=1250.0)
+    check(o["phase"] == route.DropJob.DROP and o["jump"] and o["dir"] == -1,
+          "该「↓ + 跳」了：%s" % o)
+    # ④ 到达：先认集合
+    o = job.update(0.9, px=1250.0, py=0.0, here_sets=["甲平台"])
+    check(not o["done"], "还在别的平台上就说到了：%s" % o)
+    o = job.update(1.0, px=1250.0, py=120.0, here_sets=["乙平台"])
+    check(o["done"] and not o["jump"], "脚下已经是目标集合却没判到达：%s" % o)
+
+    # ⑤ 没有集合信息时的兜底：y 比出发时**增大** ≥40（y 向下增大 = 真的掉下去了）
+    job = route.DropJob("甲平台", "乙平台", spots, tol_px=6, hold_ms=0)
+    job.update(0.0, px=700.0)
+    job.update(0.5, px=700.0, py=-300.0)          # 进 ARMED，同时记下出发 y
+    o = job.update(0.8, px=700.0, py=-300.0)
+    check(o["jump"], "该在下跳：%s" % o)
+    o = job.update(1.0, px=700.0, py=-250.0)      # 掉了 50 ≥ 40
+    check(o["done"], "y 掉下去一段却没判到达（兜底判据）：%s" % o)
+
+    # ⑥ 超时 + 失败后重新激活（和上绳同一套保护，用户要求）
+    job = route.DropJob("甲平台", "乙平台", spots, tol_px=6, hold_ms=0,
+                        timeout_s=1.0)
+    check(job.update(0.0, px=700.0)["failed"] is False, "刚开始就说超时")
+    o = job.update(2.0, px=700.0)
+    check(o["failed"] and not o["jump"], "超时了还在按键：%s" % o)
+    o = job.retry()
+    check(job.attempt == 2 and o["phase"] == route.DropJob.ALIGN and not o["jump"],
+          "retry 没回到对齐阶段：%s" % o)
+
+    # ⑦ 从**真实边**造任务（用户那条 左传送门平台 → 左1），并按类型分发
+    t = mapdata.load("105090600")
+    z = zones.load("105090600")
+    edge = next((e for e in z.edges if e.get("kind") == "drop"), None)
+    check(edge is not None, "用户数据里没有下跳边，这条测不了")
+    j2 = route.job_for_edge(t, z, edge, tol_px=6, hold_ms=250)
+    check(isinstance(j2, route.DropJob) and j2.spots
+          and j2.dst_set == edge.get("to"),
+          "从真实边造出来的下跳任务不对：%r" % (j2.spots,))
+    cl = next((e for e in z.edges if e.get("kind") == "climb"), None)
+    check(isinstance(route.job_for_edge(t, z, cl), route.ClimbJob),
+          "job_for_edge 没按类型分发（爬边该出 ClimbJob）")
+    for bad, why in (({"kind": "portal", "from": "甲", "to": "乙"}, "别的通行方式"),
+                     ({"kind": "drop", "from": "甲", "to": "乙",
+                       "footholds": []}, "一个可下跳的都没有")):
+        try:
+            route.job_for_edge(t, z, bad)
+            raise AssertionError("%s 该抛 ValueError（不许猜）" % why)
+        except ValueError:
+            pass
+
+
 # ---------------------------------------------------------------- 入口
 
 CHECKS = [
@@ -1049,6 +1673,8 @@ CHECKS = [
     ("自定义定时行为：暂停按钮/红字（已暂停）/继续接着走", t_timer_pause_button),
     ("休息状态机：到点/手动结束/关防掉线/手动进入", t_rest_state_machine),
     ("休息状态机：手动进入要先等清怪", t_rest_manual_request),
+    ("被打断重试：补血即打断并提前重试（不勾选则不打断）",
+     t_rest_interrupt_retry),
     ("追击起跳：区间在攻击距离内侧时也要跳（且只跳一次）",
      t_chase_jump_inside_band),
     ("追击起跳：区间在外侧时进区间跳一次", t_chase_jump_outside_band_once),
@@ -1062,6 +1688,16 @@ CHECKS = [
     ("触控板：状态栏显示「触控模式中」", t_touchpad_status_text),
     ("触控板：非触控模式滚轮让给滚动区", t_touchpad_wheel_passthrough),
     ("本地(仅测试)输入：开启自动要二次确认，关闭不拦", t_auto_confirm_local),
+    ("判定参数：对齐误差范围/时间有默认值、存读一致、设置里有那一页",
+     t_align_params),
+    ("定点上绳：对齐保持/抖出去重计时/到达双判据/偏离绳梯/超时/掉下来/重来/真实边",
+     t_climb_job),
+    ("上绳接进状态机：有怪先打、打完继续爬、开关不按跳、失败自动重来、到位/取消收干净",
+     t_climb_wiring),
+    ("下跳：先按↓再按跳/就近挑点/到达双判据/超时重来/按类型分发",
+     t_drop_job),
+    ("上绳对齐用世界坐标（画面坐标会走反/死循环）+ 靠近改点按 + 保持窗口含端到端延迟",
+     t_climb_world_x_and_tap),
 ]
 
 

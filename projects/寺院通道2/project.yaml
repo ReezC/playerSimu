@@ -91,8 +91,8 @@ decision:
     shop: null
     enter: enter
   target_cd:
+  - 1000
   - 1500
-  - 2500
   input_device: remote
   input_delay:
   - 0
@@ -126,7 +126,7 @@ decision:
   mp_color: *id002
   hp_threshold: 68
   mp_threshold: 7
-  pot_cd: 1000
+  pot_cd: 600
   auto_hp_pot: true
   auto_mp_pot: false
   strategy: patrol
@@ -139,7 +139,10 @@ decision:
   vision_off_y: 0
   sweep_turn_cd: 500
   back_range: 100
-  route_enabled: false
+  route_goto_set: 左上平台
+  align_tol_px: 6
+  align_hold_ms: 250
+  climb_retry_delay_s: 1.0
   debounce_conf: 0.4
   debounce_ms: 2000
   auto_feed_pet: true
@@ -175,9 +178,9 @@ decision:
     - 3.0
     paused: true
     paused_left: 174.35899999999674
-  facing_timeout_min: 0.0
+  facing_timeout_min: 5.0
   player_lost_timeout_min: 3.0
-  resetall_interval: 60
+  resetall_interval: 30
   anti_afk_enabled: true
   anti_afk_type: hidden_rest
   anti_afk_min: 25.0
@@ -230,6 +233,8 @@ decision:
     key: 普攻
   anti_afk_rest_min: 4.5
   anti_afk_rest_max: 5.5
+  anti_afk_retry_on_interrupt: true
+  anti_afk_retry_sec: 10.0
   reconnect_enabled: false
   reconnect_probe_after_lost_sec: 0.0
   reconnect_step_timeout_ms: 3000
@@ -280,7 +285,7 @@ verify:
   imgsz: 960
   limit: 0
 iterate:
-  conf: 0.5
+  conf: 0.1
   keep_empty: true
   limit: 0
 mob_names:

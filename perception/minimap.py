@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import cv2
 import numpy as np
 
-from core import mapdata
+from core import mapdata, zones
 from core.imgio import imread, imwrite   # 支持中文路径（cv2.imread 遇中文静默失败）
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -82,6 +82,7 @@ class MiniMapClient:
 
     def _run(self):
         while not self._stop.is_set():
+            got0 = self.n_recv      # 这次连接里收过帧没有（首帧超时 vs 推到一半停）
             try:
                 with socket.create_connection((self.host, self.port),
                                               timeout=self.timeout) as s:
@@ -109,12 +110,43 @@ class MiniMapClient:
                             self._t = time.perf_counter()
                             self._times.append(self._t)
                         self.n_recv += 1
+            except (socket.timeout, TimeoutError):
+                # **超时**（不是"对端关闭"）：分两种情况说清该去查什么
+                if self._stop.is_set():
+                    break
+                self.connected = False
+                self.err = self._timeout_note(self.n_recv - got0)
+                time.sleep(1.0)
+            except ConnectionRefusedError:
+                if self._stop.is_set():
+                    break
+                self.connected = False
+                self.err = ("A 机 %s:%d **拒绝连接** —— 那边没在跑「小地图推流」，"
+                            "或者端口和 config/link.yaml 的 minimap.port 不一致"
+                            % (self.host, self.port))
+                time.sleep(1.0)
             except Exception as e:
                 if self._stop.is_set():
                     break
                 self.connected = False
                 self.err = "%s: %s" % (type(e).__name__, e)
                 time.sleep(1.0)
+
+    def _timeout_note(self, got):
+        """超时那句话：分「一帧都没来」和「推到一半停了」两种（2026-09-26）。
+
+        为什么必须分：前者要人去 A 机上查"推流起来没有 / 端口 / 防火墙"；后者说明
+        链路本来是通的，是**推到一半卡住**（典型：小地图被别的窗口盖住、抓屏卡住）。
+        老实现把两者都报成「对端关闭」，等于把人往错方向带。
+        """
+        if got > 0:
+            return ("推到一半停了：这次连接已经收过 %d 帧，然后 %.0f 秒没有新帧 —— "
+                    "去看 A 机那条推流日志（小地图是不是被别的窗口盖住 / 抓屏卡住）"
+                    % (got, self.timeout))
+        return ("等帧超时（%.0f 秒一帧都没来）：确认 A 机「小地图推流」在跑、"
+                "监听端口 %d 与 config/link.yaml 的 minimap.port 一致、"
+                "A 机防火墙放行入站 TCP %d"
+                % (self.timeout, self.port, self.port))
 
     # ---------------- 取帧 ----------------
 
@@ -145,14 +177,18 @@ class MiniMapClient:
 
 
 def _recv_exact(sock, n):
+    """读满 n 字节。**对端关闭**返回 None；**超时照原样往上抛**（别吞）。
+
+    2026-09-26 改：以前这里是 `except Exception: return None` —— 于是超时被当成
+    "对端关闭"，界面/命令行永远显示「ConnectionError: 对端关闭」：A 机明明活得好好的
+    （只是没在推 / 卡住了），人却跑去查网络和进程。**超时和关闭是两回事**，
+    必须分开说，上层才可能报出"卡在哪一步"（见 `MiniMapClient._timeout_note`）。
+    """
     buf = bytearray()
     while len(buf) < n:
-        try:
-            chunk = sock.recv(n - len(buf))
-        except Exception:
-            return None
+        chunk = sock.recv(n - len(buf))      # 超时 ⇒ socket.timeout 往上抛
         if not chunk:
-            return None
+            return None                      # 真关了（FIN）
         buf += chunk
     return bytes(buf)
 
@@ -881,9 +917,8 @@ class PlayerLocator:
 
     **为什么非得有人把它串起来**：这三步以前分别散在「标定弹窗」和「命令行诊断」
     里，各自只做一段 —— 真接进实时回路时又得再拼一遍，而拼错的方式很隐蔽
-    （面板↔底图漏一次换算、或者把 `Player.current_platform_id`（视觉平台编号）
-    当成 `segment_id`（地形段号））：算出来的位置整体错，下游却当成"我在哪块
-    平台上"照用。所以这里把口径固定死，谁都别再拼第二份。
+    （面板↔底图漏一次换算，或者把段号当成别的什么编号）：算出来的位置整体错，
+    下游却当成"我在哪块平台上"照用。所以这里把口径固定死，谁都别再拼第二份。
 
     **算不出来是常态，也是结论**：`world_x/world_y/segment_id` 一律是 None 而不是
     0（0 是合法的世界坐标 —— 地图西北角），`note` 写清为什么。
@@ -959,6 +994,15 @@ class PlayerLocator:
             px, py     黄点在面板里的像素（重心；认不出时是上一次的残值，别用）
             world_x/world_y  世界坐标；没算出来是 None
             segment_id 站在哪条段（None = 没落在平台上）
+            foothold_id      踩着哪条 foothold（字符串 id；None = 没落在平台上）。
+                       **"我在不在某个 foothold 集合里"用这个，不用 segment_id**：
+                       自动串段会把"要跳/攀才能互通"的并成同一段（实测 105090600 的
+                       第 0 段把一面 388 像素高的悬崖当成了平台边缘），集合是人工圈的，
+                       判据只能是 foothold id ∈ 集合（见 core/zones.py、docs/寻路设计.md §12）
+            ladder_id        踩在**哪根绳梯**上（"L2" 这种编号；None = 不在绳上）。
+                       编号来自 `zones.ladder_ids` —— 与编辑器画在绳上的、以及「爬」那条
+                       边里写的绳号**同一套**。判据是几何的（`mapdata.ladder_at`），
+                       和执行器"对齐到绳的 x"用的**判定参数**是两回事（见设置→判定参数）
             dot        黄点那一层给的说明（认不出时就是原因）
             note       没算出坐标 / 没落平台的原因（**可能很长**，给 tooltip/日志）
             short      `note` 的一句话版本（正常时是空串）——给**贴在画面上**的
@@ -974,8 +1018,8 @@ class PlayerLocator:
                # 决策层可以用（两三拍之内还算得准），但要能分辨出来。
                "held": bool(r.get("held")), "missed": int(r.get("missed") or 0),
                "px": r["x"], "py": r["y"], "world_x": None, "world_y": None,
-               "segment_id": None, "src": src, "dot": r["reason"], "note": "",
-               "short": "认不出黄点"}
+               "segment_id": None, "foothold_id": None, "src": src,
+               "dot": r["reason"], "note": "", "short": "认不出黄点"}
         if not r["ok"]:
             out["note"] = r["reason"]
             return out
@@ -1002,6 +1046,17 @@ class PlayerLocator:
             return out
         seg = terrain.segment_of(wx, wy)
         out["segment_id"] = seg.index if seg is not None else None
+        # 脚下**那条** foothold 的 id（字符串，和 zones 文件里的写法一致）。
+        # 与 segment_of 是同一套口径（都走 foothold_below），多算一次可忽略。
+        f = terrain.foothold_below(wx, wy)
+        out["foothold_id"] = str(f.fid) if f is not None else None
+        # **在不在绳梯上**（2026-09-26 用户要求：小地图那行要能报「绳梯：L2」）。
+        # 判据用 mapdata 现成的 `ladder_at`（绳的 x ± LADDER_DX、y 在绳段 ± LADDER_PAD）；
+        # 编号用 `zones.ladder_ids` —— 与编辑器画在绳上的 L1/L2、以及「爬」那条边里写的
+        # 绳号**必须是同一套**（不然同一个 "L2" 在两处指两根绳，人会被带沟里）。
+        L = terrain.ladder_at(wx, wy)
+        out["ladder_id"] = (zones.ladder_ids(terrain).get(id(L))
+                            if L is not None else None)
         out["ok"] = True
         if seg is None:
             out["note"] = "坐标算出来了，但脚下没有平台（半空 / 墙里？）"
@@ -1020,8 +1075,8 @@ class PlayerLocator:
 def apply_to_player(player, loc):
     """把定位结论写进 `WorldState` 的 `Player` 那一页（**一处口径**）。
 
-    三个字段的含义见 `perception/world_state.py` —— 尤其别把 `segment_id` 写进
-    `current_platform_id`：那是**视觉平台**编号，两者不是一回事。
+    三个字段的含义见 `perception/world_state.py`；`segment_id` 是**地形**的段号
+    （`core/mapdata.Terrain.segment_of` 给的）—— 寻路要的就是它。
     """
     player.world_x = loc.get("world_x")
     player.world_y = loc.get("world_y")

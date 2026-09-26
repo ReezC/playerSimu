@@ -882,6 +882,26 @@ class PlayerPanel(QWidget):
         rest_iv_row.addWidget(self.sp_rest_max)
         hf.addRow("休息时长(min)", rest_iv_row)
 
+        # 「被打断重试」：休息期间**触发了自动补血**就算被打断 —— 补血说明隐身没兜住
+        # （隐身到期 / 被范围技能扫到 / 有东西在打我们），继续歇着等于等着挨打。
+        self.ck_afk_retry = QCheckBox("被打断重试")
+        self.ck_afk_retry.setToolTip(
+            "休息期间**触发了自动补血**就算被打断：立刻执行「退出隐身行为」回到战斗，\n"
+            "并把下次休息提前到下面设的秒数之后（不再是随机的那 N~M 分钟）。\n\n"
+            "为什么补血算被打断：它说明隐身没兜住 —— 隐身到期、被范围技能扫到，\n"
+            "或者有东西在打我们。这时候继续歇着只是等着挨打。\n"
+            "不勾选时：补血照常发生，但休息不被打断。")
+        self.ck_afk_retry.stateChanged.connect(self._on_afk_retry)
+        hf.addRow("", self.ck_afk_retry)
+
+        self.sp_afk_retry = self._spin(1, 3600, 60, 0, 1)
+        self.sp_afk_retry.setToolTip(
+            "被打断后隔多少秒重试下一次休息（1~3600 秒）。\n"
+            "设小一点 = 被打了就很快再试着休息（容易反复被打断）；\n"
+            "设大一点 = 干脆先打一会儿再说。")
+        self.sp_afk_retry.valueChanged.connect(self._on_afk_retry_sec)
+        hf.addRow("打断后重试(s)", self.sp_afk_retry)
+
         af.addRow(self._afk_hidden)
 
         root.addWidget(afk)
@@ -1349,9 +1369,23 @@ class PlayerPanel(QWidget):
             settings.anti_afk_rest_max = settings.anti_afk_rest_min
         settings.save()
 
+    def _on_afk_retry(self, state):
+        settings.anti_afk_retry_on_interrupt = bool(state)
+        settings.save()
+        self._refresh_afk_ui()      # 勾了才让"秒数"可调
+
+    def _on_afk_retry_sec(self, _val=None):
+        settings.anti_afk_retry_sec = max(1.0, float(self.sp_afk_retry.value()))
+        settings.save()
+
     def _refresh_afk_ui(self):
-        """按行为类型显示对应的参数子组。"""
+        """按行为类型显示对应的参数子组；「打断后重试(s)」只在勾选时可调。
+
+        用**灰掉**而不是藏掉：布局不跳（藏掉会让下面的控件往上蹦一下），
+        而且灰着的框旁边就是那句 tooltip，比"消失了"更好解释。
+        """
         self._afk_hidden.setVisible(settings.anti_afk_type == "hidden_rest")
+        self.sp_afk_retry.setEnabled(bool(settings.anti_afk_retry_on_interrupt))
 
     def _edit_afk_seq(self, which):
         """打开「进入隐身」/「退出隐身」的行为编辑器。"""
@@ -2248,6 +2282,14 @@ class PlayerPanel(QWidget):
         self.sp_rest_max.blockSignals(True)
         self.sp_rest_max.setValue(settings.anti_afk_rest_max)
         self.sp_rest_max.blockSignals(False)
+
+        self.ck_afk_retry.blockSignals(True)
+        self.ck_afk_retry.setChecked(bool(settings.anti_afk_retry_on_interrupt))
+        self.ck_afk_retry.blockSignals(False)
+
+        self.sp_afk_retry.blockSignals(True)
+        self.sp_afk_retry.setValue(max(1.0, float(settings.anti_afk_retry_sec)))
+        self.sp_afk_retry.blockSignals(False)
 
         self._refresh_afk_ui()
 

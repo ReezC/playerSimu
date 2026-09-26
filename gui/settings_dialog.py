@@ -36,7 +36,7 @@ from gui.widgets import (NoWheelDoubleSpinBox, NoWheelSlider,
 from tools.config import load_live, update_live
 
 #: 页签名（顺序 = 显示顺序）。测试和文档都按这份来。
-TAB_NAMES = ("界面", "保护与恢复", "诊断")
+TAB_NAMES = ("界面", "保护与恢复", "判定参数", "诊断")
 
 #: 页签栏样式：**与部署台（A 机）的设置弹窗共用一份**（gui/theme.TAB_QSS）。
 #: 对话框不继承主窗口的 QSS，两边都得自己带 —— 但只该有一处定义。
@@ -61,7 +61,8 @@ class SettingsDialog(QDialog):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._page_appearance(), TAB_NAMES[0])
         self.tabs.addTab(self._page_protect(), TAB_NAMES[1])
-        self.tabs.addTab(self._page_diagnose(), TAB_NAMES[2])
+        self.tabs.addTab(self._page_judge(), TAB_NAMES[2])
+        self.tabs.addTab(self._page_diagnose(), TAB_NAMES[3])
         self.tabs.setStyleSheet(_TAB_QSS)
         root.addWidget(self.tabs, 1)
 
@@ -182,6 +183,9 @@ class SettingsDialog(QDialog):
         add_row("最大攻击距离线颜色", "attack_color", "")
         add_row("最小攻击距离线颜色", "min_attack_color", "规避范围")
         add_row("视野线颜色", "vision_color", "")
+        add_row("定时任务颜色", "timer_color",
+                "实时画面上「当前任务 / 定时任务」那几行的字色。\n"
+                "那里**没有底色**（只有描边），所以别选太暗的 —— 会压不住游戏画面。")
 
         self.sp_vision_width = NoWheelSpinBox()
         self.sp_vision_width.setRange(1, 10)
@@ -189,6 +193,26 @@ class SettingsDialog(QDialog):
         self.sp_vision_width.setValue(int(self._vis["vision_width"]))
         vf.addRow("视野线宽度", self.sp_vision_width)
         lay.addLayout(vf)
+
+        # ---- foothold 集合编辑器 ----
+        # 单独一组：上面那组的说明写着"实时预览"，而这项只管编辑器那个窗口。
+        lay.addSpacing(8)
+        self._head(lay, "foothold 集合编辑器",
+                   "地形线条在编辑器里画多粗。\n"
+                   "点确定后**再打开一次**编辑器就按新值画（窗口一直开着的话，"
+                   "点一次「编辑集合…」也会刷新）。")
+        self.sp_fh_width = NoWheelSpinBox()
+        self.sp_fh_width.setRange(theme.FOOTHOLD_W_MIN, theme.FOOTHOLD_W_MAX)
+        self.sp_fh_width.setSuffix(" px")
+        self.sp_fh_width.setValue(theme.load_foothold_width())
+        self.sp_fh_width.setToolTip(
+            "线宽单位是**屏幕像素**（和缩放无关）：编辑器整图看时约缩小到 0.35 倍、\n"
+            "放大看细节能到 8 倍 —— 若按「场景单位」给宽度，同一个值在两种视图下\n"
+            "差二十多倍（整图时看不见线，放大时线糊成一片），所以这里定的是\n"
+            "「屏幕上多粗」。\n\n"
+            "觉得线太细看不清就调大；嫌糊住底图就调回 1。\n"
+            "选中/集合内的线会呼吸高亮，它的粗细也跟着这个值走。")
+        lay.addWidget(self.sp_fh_width)
 
         lay.addStretch(1)
         return page
@@ -244,7 +268,47 @@ class SettingsDialog(QDialog):
         lay.addStretch(1)
         return page
 
-    # ---------------- 页签 3：诊断 ----------------
+    # ---------------- 页签 3：判定参数 ----------------
+
+    def _page_judge(self):
+        """**判定**用参数：哪些事算"成立"。
+
+        为什么单独一页：这一页回答的既不是"长什么样"（界面）、也不是"出问题怎么办"
+        （保护与恢复），而是"**怎么算数**" —— 同一个动作（对齐到某个坐标）成不成功、
+        由哪几个数说了算。以后爬绳 / 寻路的判据都挂在这儿，塞进别页会找不着。
+        """
+        page, lay = self._page()
+
+        self._head(lay, "坐标对齐误差范围",
+                   "需要对齐坐标的功能（寻路走到某个 x、上绳前对准绳的 x）容许的偏差。\n"
+                   "单位是**游戏世界像素**（就是小地图算出来的那套坐标），不是屏幕像素。\n"
+                   "调小 ⇒ 对得更准但要磨一会儿（甚至走过头来回摆）；\n"
+                   "调大 ⇒ 快，但站偏了也算数（上绳会按不上）。\n\n"
+                   "默认 6（px）：绳在数据里就是一条线（宽度 0），而世界坐标本身有几像素抖动\n"
+                   "—— 6 够吸住，又不会宽到把隔壁平台的边也算进来。")
+        self.sp_align_tol = NoWheelSpinBox()
+        self.sp_align_tol.setRange(1, 200)
+        self.sp_align_tol.setSuffix(" px")
+        self.sp_align_tol.setValue(int(settings.align_tol_px))
+        lay.addWidget(self.sp_align_tol)
+
+        lay.addSpacing(8)
+        self._head(lay, "坐标对齐误差时间",
+                   "进入误差范围后，还要**保持这么久**才算对齐成功。\n"
+                   "为什么不能只看一帧：小地图定位与按键下发不是同一时刻的（有延迟、还会抖），\n"
+                   "单帧落进误差范围不代表真站住了。\n"
+                   "**实际等待 = 画面 / 指令延迟 + 这个值**，所以它不是「总超时」。\n\n"
+                   "默认 250（ms）：约 3~4 个视频帧，够滤掉抖动，又不至于每步都干等。")
+        self.sp_align_hold = NoWheelSpinBox()
+        self.sp_align_hold.setRange(0, 5000)
+        self.sp_align_hold.setSuffix(" ms")
+        self.sp_align_hold.setValue(int(settings.align_hold_ms))
+        lay.addWidget(self.sp_align_hold)
+
+        lay.addStretch(1)
+        return page
+
+    # ---------------- 页签 4：诊断 ----------------
 
     def _page_diagnose(self):
         """排查问题用的开关。平常不用动这一页。"""
@@ -345,10 +409,23 @@ class SettingsDialog(QDialog):
         if t3 != settings.resetall_interval:
             settings.resetall_interval = t3
             settings.save()
+        # 判定参数（和上面那些一样：跟着**当前项目**存）
+        at = int(self.sp_align_tol.value())
+        if at != settings.align_tol_px:
+            settings.align_tol_px = at
+            settings.save()
+        ah = int(self.sp_align_hold.value())
+        if ah != settings.align_hold_ms:
+            settings.align_hold_ms = ah
+            settings.save()
         # 可视化
         vis_cfg = {k: b._color for k, b in self._color_btns.items()}
         vis_cfg["vision_width"] = self.sp_vision_width.value()
         theme.save_vis(vis_cfg)
+        # foothold 编辑器的线条宽度（和上面那份配置同一文件，但语义上不属于"实时预览"）
+        fw = self.sp_fh_width.value()
+        if fw != theme.load_foothold_width():
+            theme.save_foothold_width(fw)
         # 性能日志 / 性能保活：都落在 config/live.yaml（save_live 是整文件覆盖，
         # 所以先读整份、只改这两个键、再写回 —— 别把实时预览那几项冲掉）。
         pl = self.ck_perf.isChecked()

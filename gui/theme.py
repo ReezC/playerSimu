@@ -77,11 +77,16 @@ VIS_DEFAULTS = dict(
     min_attack_color="#ffa500",   # 最小攻击距离 / 规避范围线 橙
     vision_color="#5f6368",       # 视野线 深灰
     vision_width=1,               # 视野线宽
+    # 「当前任务 / 定时任务」那几行的字色（贴在实时画面上，**不铺底色**，只有描边）——
+    # 2026-09-26 用户要求"文字颜色在设置里配"。默认取亮黄：它要压在游戏画面上，
+    # 暗色读不清（这里没有黑底可衬）。
+    timer_color="#ffeb3b",
 )
 
 #: 参与「颜色合法性校验」的键：类别框色 + 辅助线色（vision_width 是数值，不在内）
 _VIS_COLOR_KEYS = CLASS_COLOR_KEYS + ("lock_color", "attack_color",
-                                      "min_attack_color", "vision_color")
+                                      "min_attack_color", "vision_color",
+                                      "timer_color")
 
 
 def _load():
@@ -99,6 +104,39 @@ def _save(data):
             yaml.safe_dump(data, f, allow_unicode=True)
     except Exception:
         pass
+
+
+# ---- foothold 集合编辑器的线条宽度（gui/zone_editor.py）----
+#
+# 单位是**屏幕像素**，不是场景单位：编辑器的缩放跨度很大（整图 fit 时约 0.35 倍、
+# 放大看细节能到 8 倍），按场景单位给宽度的话"同一个值"在两种视图下差 20 多倍 ——
+# 要么整图时看不见线、要么放大时线糊成一片。所以这里定的是"屏幕上多粗"，
+# 编辑器每次重绘都按当前缩放折算（见 gui/zone_editor._ZoneView.set_line_width）。
+FOOTHOLD_W_DEFAULT = 1
+FOOTHOLD_W_MIN = 1
+FOOTHOLD_W_MAX = 8
+
+
+def load_foothold_width():
+    """读编辑器的线条宽度（屏幕像素，1~8）；文件坏了退回默认。"""
+    try:
+        v = int(_load().get("foothold_line_w", FOOTHOLD_W_DEFAULT))
+    except (TypeError, ValueError):
+        v = FOOTHOLD_W_DEFAULT
+    return max(FOOTHOLD_W_MIN, min(FOOTHOLD_W_MAX, v))
+
+
+def save_foothold_width(v):
+    """保存编辑器的线条宽度，返回实际生效的值（夹到范围内）。"""
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        v = FOOTHOLD_W_DEFAULT
+    v = max(FOOTHOLD_W_MIN, min(FOOTHOLD_W_MAX, v))
+    data = _load()
+    data["foothold_line_w"] = v
+    _save(data)
+    return v
 
 
 def load_size():

@@ -619,7 +619,7 @@ class MainWindow(QMainWindow):
         self.live_panel.bind(self.project)
         # HP/MP 条框选结果存在 project.yaml 里，切项目要跟着换
         self.player_panel.bind(self.project)
-        # 路线识别的开关也是一个决策参数（route_enabled），跟着项目刷新
+        # 路线识别面板：换项目要重读**地形图 + 集合下拉**（那些都按地图 id 存）
         self.route_panel.bind(self.project)
         self.lbl_status.setText("未选择项目" if self.project is None else
                                 self.lbl_status.text())

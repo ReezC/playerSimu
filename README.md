@@ -54,13 +54,16 @@ python -m deploy.app                       # 对时 / 探针 / 键盘中继 / �
 - `remote_kbd/` — A 机键盘中继 + Pro Micro 固件
 - `config/` — 配置（`link.yaml` 双机共用）
 
-## 平台视觉与决策边界
+## 视觉预测与决策边界
 
-实时线程会用 HSV 颜色筛选与水平形态学从每帧提取平台碰撞顶边，输出
-`Platform(id, x1, x2, y)`；`PlatformTracker` 负责保持跨帧 ID。玩家检测框的连续
-位置会补齐 `vx`、`vy`、`grounded`、`jumping`、`falling`、`current_platform_id`，下落时
-还会给出 `jump_prediction`（当前速度下的预测落点）。这些字段都在 `WorldState` 中。
+**平台视觉识别已整块移除**（2026-09-26，用户确认不再需要）。原来实时线程会用 HSV
+筛选 + 水平形态学从每帧提取平台碰撞顶边（`PlatformTracker` / `PlayerMotionTracker` /
+`relate_terrain`），并由此衍生落点预测（`jump_prediction`）、"怪是否与玩家同平台"的
+`mob.reachable` 过滤，以及实时画面上那些青色 `P###` 平台线 —— 现在**这一套全都不在了**
+（`perception/platforms.py` 已删除）。
 
-当前 CombatAgent 会在已识别出当前平台时，仅选择同一平台上的怪物；平台短暂失检时
-自动退化到原有的视野过滤逻辑。跨平台起跳不会自动下发，必须先用实机视频标定跳跃
-初速度和空中修正，避免把尚未校准的视觉预测变成按键动作。
+连带的**行为变化**：CombatAgent 不再按"平台可达"过滤怪 —— 视野里别的平台上、其实过不
+去的怪也会被盯上（原来那道过滤没有依据了）。
+
+仍然有效的纪律：**没标定过的视觉预测不许变成按键动作**。跨平台起跳要先拿实机视频标定
+跳跃初速度和空中修正，再谈自动下发。

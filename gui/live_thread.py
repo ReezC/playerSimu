@@ -283,6 +283,10 @@ class LiveThread(QThread):
         crop = self._p.get("mmap_crop")
         self._mmap_crop = [int(v) for v in crop] if crop and len(crop) == 4 else None
         self._locator = None            # perception.minimap.PlayerLocator（懒导入懒建）
+        #: 「脚下属于哪些集合 / 贴在哪根绳上」用的 (terrain, zones) 缓存（见 _route_ctx）
+        self._route_cache = {}
+        #: 那份缓存最多活多久（秒）—— 编辑器里新圈了集合，最多这么久就生效（见 _route_ctx）
+        self.ROUTE_CTX_TTL_S = 2.0
         self._mmap_cli = None           # 来源=收流 时那一路 TCP（懒起）
         # 黄点容差（界面上那排，键名见 perception.minimap.TRACK_KEYS）。
         # `_track_applied` 记住"已经喂给 locator 的那一份"，主回路比对后按需应用
@@ -324,6 +328,60 @@ class LiveThread(QThread):
             return None                 # 换了分辨率还没重框 → 由 note 说清楚
         import numpy as np
         return np.ascontiguousarray(frame[y:y + h, x:x + w])
+
+    def _route_ctx(self, mid):
+        """(terrain, zones) —— 按地图 id 缓存，**最多每 2 秒重读一次**。
+
+        为什么要缓存：上绳执行器每帧都要问"脚下属于哪些集合、贴在哪根绳上"，而读地形
+        JSON 是几十毫秒的活 —— 每帧读会把实时回路拖垮。
+        为什么还要定期重读：在编辑器里新圈了集合 / 重导了地形，不重读就会拿**旧数据**
+        判"到了没有"（那是"明明到了却说没到"里最难查的一种）。
+        """
+        now = time.monotonic()
+        c = self._route_cache
+        if (c.get("mid") == mid
+                and now - float(c.get("ts") or 0.0) < self.ROUTE_CTX_TTL_S):
+            return c.get("t"), c.get("z")
+        t = z = None
+        try:
+            from core import mapdata
+            from core import zones as zones_mod
+            t = mapdata.load(mid, with_canvas=False)
+            z = zones_mod.load(mid)
+        except Exception:                       # noqa: BLE001
+            t, z = None, None
+        self._route_cache = {"mid": mid, "ts": now, "t": t, "z": z}
+        return t, z
+
+    def _fill_route_ctx(self, player, loc):
+        """把「脚下属于哪些集合 / 贴在哪根绳上」写进 `Player`（上绳执行器要用）。
+
+        · `here_sets`：所在 foothold 属于哪些命名集合（`core.zones.set_of`）——
+          `ClimbJob._arrived` 的**第一判据**就是它（人工圈的集合最贴近"到了哪块平台"）；
+        · `ladder_id`：`Terrain.ladder_at(x, y)` 找到的那根绳的**编号**（"L1" 这种，
+          和「爬」那条边里写的绳号是同一套）—— "从绳上掉下来"判据要用。
+
+        坐标一律用**世界坐标**（这套地形坐标就是用它的）。定位没输出时两个字段清空：
+        空 = 判不出来，`_arrived` 会退回几何兜底（那是对的，别拿旧值骗它）。
+        """
+        x, y = getattr(player, "world_x", None), getattr(player, "world_y", None)
+        fid = str((loc or {}).get("foothold_id") or "")
+        mid = str(getattr(self, "_mmap_mid", "") or "")
+        if x is None or y is None or not mid:
+            player.here_sets = []
+            player.ladder_id = None
+            return
+        t, z = self._route_ctx(mid)
+        player.here_sets = list(z.set_of(fid)) if (z is not None and fid) else []
+        lad = t.ladder_at(float(x), float(y)) if t is not None else None
+        if lad is None:
+            player.ladder_id = None
+        else:
+            try:
+                from core import zones as zones_mod
+                player.ladder_id = zones_mod.ladder_ids(t).get(id(lad))
+            except Exception:                   # noqa: BLE001
+                player.ladder_id = None
 
     def _locate_mmap(self, panel):
         """这一拍定位一次玩家 → 结论 dict；没在用/没地图 → None。
@@ -436,23 +494,22 @@ class LiveThread(QThread):
         # 这里不再重复 use_network —— 否则会二次连接、旧连接泄漏、还可能
         # 因 relay 暂时不可达把已建好的连接回退成本地。
         from decision.agent import CombatAgent, settings as decision_settings
+        from decision import agent as agent_mod
         from decision.input import tap as _tap
         from decision.reconnect import Reconnector
         from perception.tracker import MobTracker, PlayerTracker
         from perception.world_state import WorldState
         from perception import minimap as mm     # 小地图定位（S3）：apply_to_player 等
-        from perception.platforms import (PlatformTracker, PlayerMotionTracker,
-                                          relate_terrain)
 
         agent = CombatAgent(decision_settings)
+        # 登记成"当前 agent"：「路线识别」页的「命令前往」要给它挂**上绳/下跳任务**
+        # （`start_climb`），而它原本只是本函数的局部变量 ⇒ 面板拿不到（见 decision/agent
+        # 的 CURRENT）。只做引用赋值，不加锁 —— 和 settings 一个路子；退出时注销（见 finally）。
+        agent_mod.CURRENT = agent
         mob_tracker = MobTracker()   # 给怪稳定 id，供目标锁定 CD 跨帧匹配
         player_tracker = PlayerTracker()   # 跟住「我」：位置连续性，别把别人认成自己
         # 断线重连状态机（判界面 → 停自动 → 按 Enter/点鼠标走回游戏）
         reconnector = Reconnector(decision_settings)
-        # 平台和玩家运动状态是 WorldState 的一部分，不交给 YOLO：平台顶边用
-        # 轻量图像处理每帧更新，玩家速度则由连续框的位置估计。
-        platform_tracker = PlatformTracker()
-        player_motion = PlayerMotionTracker()
 
         # 玩家也走 YOLO（不再是模板匹配）。每个玩家独占一个 YOLO 类，实时
         # 只取当前 player_id 对应的类；当前固定 class 0，多玩家时扩展
@@ -469,6 +526,9 @@ class LiveThread(QThread):
         _pot_last = [0.0]
         _pot_vals = [1.0, 1.0]      # (hp, mp) 比例缓存
         _last_player = [None]       # 上一帧玩家框 (cx, cy, bottom, conf)，漏检时兜底
+        #: 最近一次**端到端延迟**（毫秒，探针解出来的）；写进 WorldState 给"对齐保持窗口"
+        #: 用（见 decision/agent._climb_tick：窗口 = 设置里的保持时间 + 它）。
+        _e2e_ref = [0.0]
         _vision_box = [None]        # 视野矩形 (left, top, right, bottom)，3s 更新一次
         _vision_last = [0.0]        # 上次更新时间
 
@@ -890,6 +950,7 @@ class LiveThread(QThread):
                         # 超过 5 秒视为解码错误（而不是真的有 5 秒延迟）
                         if d is not None and d < 5000:
                             delays.append(d)
+                            _e2e_ref[0] = d      # 给世界状态用（上绳对齐的保持窗口）
                             if len(delays) > 120:
                                 del delays[0]
                             # 端到端延迟（A 机屏幕时间码 → 本机解码）才是最该盯的
@@ -1003,16 +1064,13 @@ class LiveThread(QThread):
 
                     ws = WorldState(frame_id=f.frame_id, ts=f.t_recv_mono,
                                     width=vis.shape[1], height=vis.shape[0])
+                    ws.e2e_ms = float(_e2e_ref[0])   # 上绳对齐的保持窗口要用（见下）
                     if player_box is not None:
                         ws.player.x, ws.player.y = player_box[0], player_box[1]
                         ws.player.bottom = player_box[2]
                         ws.player.w, ws.player.h = player_box[4], player_box[5]
                         ws.player.found = True
-                    # 路线识别（平台识别/跳跃预测）开关：关掉就跳过，省掉每帧图像处理
-                    if decision_settings.route_enabled:
-                        ws.platforms = platform_tracker.update(vis, f.t_recv_mono)
-                    else:
-                        ws.platforms = []
+
                     # 读 HP/MP 条：从当前画面帧 vis 里按「画面比例」截取（不再抓本机屏幕），
                     # 限流 0.1s。收流/窗口两种模式都从 vis 截，游戏机上不再有抓屏行为。
                     if time.perf_counter() - _pot_last[0] >= 0.1:
@@ -1046,29 +1104,19 @@ class LiveThread(QThread):
                     mob_tracker.debounce_ms = decision_settings.debounce_ms
                     # 用 MobTracker 追踪，得到跨帧稳定的 id（目标锁定 CD 靠它匹配）
                     ws.mobs = mob_tracker.update(mob_dets)
-                    if decision_settings.route_enabled:
-                        ws.jump_prediction = player_motion.update(
-                            ws.player, ws.platforms, f.t_recv_mono)
-                    else:
-                        ws.jump_prediction = None
-                    # 地形关系识别（感知层）：给每只怪打上所在平台 + 是否与玩家
-                    # 当前平台连接。Agent 只消费 mob.reachable，不做几何运算。
-                    # 开关关掉时**整块跳过**（等于"没有平台可对齐"）—— 那正是
-                    # relate_terrain 在 platforms 为空时的分支结果：mob.platform_id
-                    # 留着 None、reachable 保持默认 True。语义相同，少一遍每帧循环，
-                    # 也让这个开关真正做到「关掉 = 路线识别的活一点不干」。
-                    if decision_settings.route_enabled:
-                        relate_terrain(ws.mobs, ws.player, ws.platforms)
-                        # 小地图定位（S3）：写进 WorldState 的**玩家世界坐标 +
-                        # 所在段**（决策层要它才知道"我在哪块平台上"）。和上面三处
-                        # 一样挂在 route_enabled 下 —— 它属于「寻路那套」，关掉就
-                        # 该一点活都不干。算不出来时写 None（**不是 0**，0 是地图
-                        # 西北角这个合法坐标，见 perception/world_state.py）。
-                        _loc = self._locate_mmap(_mmap_panel)
-                        if _loc is not None:
-                            mm.apply_to_player(ws.player, _loc)
-                            perf.count("mmap_ok" if _loc.get("ok")
-                                       else "mmap_miss")
+
+                    # 小地图定位（S3）：写进 WorldState 的**玩家世界坐标 + 所在段**。
+                    # 「命令前往」要它才知道"我在哪块平台上"（`_fh_seen` 的读数就是它）。
+                    # 算不出来时写 None（**不是 0**，0 是地图西北角这个合法坐标，
+                    # 见 perception/world_state.py）。
+                    _loc = self._locate_mmap(_mmap_panel)
+                    if _loc is not None:
+                        mm.apply_to_player(ws.player, _loc)
+                        perf.count("mmap_ok" if _loc.get("ok") else "mmap_miss")
+                    # 「脚下属于哪些集合 / 贴在哪根绳上」也写进去（上绳执行器要用）——
+                    # 2026-09-26 补：以前**没有任何地方写**，于是"到了"判不出来、
+                    # "从绳上掉下来"每 2 秒误判一次 ⇒ 任务不停失败重试。
+                    self._fill_route_ctx(ws.player, _loc)
                     _t = time.perf_counter()
                     action = agent.tick(ws)
                     perf.ms("agent_ms", _t)
@@ -1103,20 +1151,6 @@ class LiveThread(QThread):
 
                 _t_draw = time.perf_counter()
                 if should_show and draw and self._infer.is_set():
-                    # 平台顶边：青色实线；编号稳定于 PlatformTracker，便于排查地图
-                    # 滚动/局部重检时的关联。当前平台额外画白色。
-                    for p in ws.platforms:
-                        color = (255, 255, 255) if p.id == ws.player.current_platform_id else (255, 255, 0)
-                        cv2.line(vis, (int(p.x1), int(p.y)), (int(p.x2), int(p.y)), color, 2)
-                        cv2.putText(vis, "P%d" % p.id, (int(p.x1), max(14, int(p.y) - 5)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-                    if ws.jump_prediction is not None:
-                        jp = ws.jump_prediction
-                        cv2.circle(vis, (int(jp.landing_x), int(jp.landing_y)), 5, (255, 0, 255), -1)
-                        cv2.putText(vis, "land P%d %.0fms" % (jp.target_platform_id,
-                                    jp.landing_time * 1000),
-                                    (int(jp.landing_x) + 6, int(jp.landing_y) - 7),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
                     st = action.get("state", "?")
                     label = "决策:%s" % st
                     t_id = action.get("target")
@@ -1320,7 +1354,6 @@ class LiveThread(QThread):
                         "clock_offset_ms": _clock_ms(),
                         "show_fps": n_show / el if el > 0 else 0.0,
                         "boxes": n_boxes,
-                        "platforms": len(ws.platforms),
                         "frames": n,
                         "gap_p95": (sorted(gaps_recent)[int(len(gaps_recent) * 0.95)]
                                     if gaps_recent else 0.0),
@@ -1339,6 +1372,7 @@ class LiveThread(QThread):
 
         finally:
             reader_done.set()
+            agent_mod.CURRENT = None     # 注销：别再往一个停了的 agent 下命令
             try:
                 agent.shutdown()     # 释放所有按键，避免游戏里键一直按着
             except Exception:

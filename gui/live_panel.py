@@ -897,8 +897,10 @@ class LivePanel(QWidget):
             return
         # `note`：叠在**框选那块的下方**的一行字（玩家世界坐标，见 路线识别面板）。
         # 一起存进来，因为每次重画时都要重新贴上 —— 帧是新的，文字也得跟着重贴。
+        # ⚠ note **原样**存（别 str()）：它可能是多行列表（当前任务 / 定时任务，
+        # 见 _draw_note）—— 套了 str 就会把整个列表画成一行字面量。
         self._ov_minimap = (pix, src_rect, tuple(int(v) for v in frame_rect),
-                            float(alpha), str(note or ""))
+                            float(alpha), note or "")
         self._render()
 
     def set_overlay_note(self, note):
@@ -912,7 +914,7 @@ class LivePanel(QWidget):
         ov = self._ov_minimap
         if ov is None:
             return False
-        self._ov_minimap = tuple(ov[:4]) + (str(note or ""),)
+        self._ov_minimap = tuple(ov[:4]) + (note or "",)   # 同上：原样存，可能是列表
         self._render()
         return True
 
@@ -973,15 +975,21 @@ class LivePanel(QWidget):
 
     @staticmethod
     def _draw_note(p, dst, note):
-        """在小地图那块框的**下方**贴一行读数（玩家世界坐标）。
+        """在小地图那块框的**下方**贴读数（世界坐标 / 当前任务 / 定时任务）。
+
+        **两种形态**，由 `note` 的类型决定（2026-09-26 用户要求）：
+          · `str` —— 一行**黑底白字**（世界坐标那行：花画面上要有底才读得清）；
+          · `list[(文本, 颜色, 是否铺底)]` —— 多行、**默认不铺底色**（"这些文本不要
+            背景色"）⇒ 靠四向描边保证可读性，字色由「设置 → 定时任务颜色」给。
 
         为什么画在叠加层**之后**：它是读数，被半透明的地形图压住就看不清了。
         放不下就翻到框的上方 —— 框本来就贴着画面下沿时，写字会掉出画面外
-        （这个项目里标签一律这么处理）。带描边是为了在任何底色上都读得出来。
+        （这个项目里标签一律这么处理）。
         """
         from PyQt5.QtGui import QColor, QFont
         if not note:
             return
+        lines = list(note) if isinstance(note, (list, tuple)) else [note]
         p.setOpacity(1.0)
         f = QFont()
         f.setPointSize(9)
@@ -990,24 +998,33 @@ class LivePanel(QWidget):
         fm = p.fontMetrics()
         x = max(0, int(dst.left()))
         y = int(dst.bottom()) + 4
-        # 兜一道：这行字是**一行不换行**的，太长会横穿整个画面还看不清。
-        # 调用方本来就该只给短句（见 route_panel._tick_world 的 _say），
-        # 但这里也不能靠"上游会给短的"活着 —— 超出就省略号截断。
+        # 兜一道：每行都**不换行**，太长会横穿整个画面还看不清。调用方本来就该只给
+        # 短句（见 route_panel._tick_world 的 _say），但这里也不能靠"上游会给短的"活着。
         max_w = max(60, p.device().width() - x - 2)
-        if fm.horizontalAdvance(note) + 8 > max_w:
-            note = fm.elidedText(note, Qt.ElideRight, max(20, max_w - 8))
-        tw, th = fm.horizontalAdvance(note) + 8, fm.height() + 2
-        if y + th > p.device().height():
-            y = max(0, int(dst.top()) - th - 4)     # 下方放不下 → 翻到上面
-        box = QRect(x, y, tw, th)
-        p.fillRect(box, QColor(0, 0, 0, 150))
-        p.setPen(QColor(0, 0, 0))
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):   # 描边
-            p.drawText(box.adjusted(dx + 4, dy, dx + 4, dy),
-                       Qt.AlignLeft | Qt.AlignVCenter, note)
-        p.setPen(QColor(255, 255, 255))
-        p.drawText(box.adjusted(4, 0, 4, 0),
-                   Qt.AlignLeft | Qt.AlignVCenter, note)
+        lh = fm.height() + 2
+        if y + lh * len(lines) > p.device().height():
+            y = max(0, int(dst.top()) - lh * len(lines) - 4)   # 下方放不下 → 翻到上面
+        for i, row in enumerate(lines):
+            if isinstance(row, str):
+                text, color, bg = row, None, True
+            else:
+                text = str(row[0])
+                color = row[1] if len(row) > 1 else None
+                bg = bool(row[2]) if len(row) > 2 else True
+            if not text:
+                continue
+            if fm.horizontalAdvance(text) + 8 > max_w:
+                text = fm.elidedText(text, Qt.ElideRight, max(20, max_w - 8))
+            box = QRect(x, y + i * lh, fm.horizontalAdvance(text) + 8, lh)
+            if bg:
+                p.fillRect(box, QColor(0, 0, 0, 150))
+            p.setPen(QColor(0, 0, 0))
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):   # 描边
+                p.drawText(box.adjusted(dx + 4, dy, dx + 4, dy),
+                           Qt.AlignLeft | Qt.AlignVCenter, text)
+            p.setPen(QColor(color) if color else QColor(255, 255, 255))
+            p.drawText(box.adjusted(4, 0, 4, 0),
+                       Qt.AlignLeft | Qt.AlignVCenter, text)
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)

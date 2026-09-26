@@ -856,6 +856,448 @@ def t_overlay_on_live():
           "「路线识别」页点一下才看得到，表现就是「勾了没反应」")
 
 
+def t_terrain_image_shows_zones():
+    """「路线识别」的地形图 = **地形编辑器的结果**（颜色=集合、名字标在平台上）。
+
+    对应 2026-09-26 的要求 2。钉两件事：
+      ① `render(zones=…)` 画出来的图里真的出现了**集合色**（不是"每段一色"那版）；
+      ② 面板挑图时优先挑 `<id>_zones.png`，没有才退回叠加图 ——
+         不然"改了显示"只改了一半（编辑器结果画出来了，面板却还在看旧的）。
+    """
+    import tempfile
+    import unittest.mock as mock
+
+    mid, _canvas = pick_map()
+    t = mapdata.load(mid, with_canvas=True) if mid else None
+    if t is None or not t.segments:
+        print("      （没有带段的地形数据，跳过）")
+        return
+
+    # ⚠ 本文件的约定：**要建控件的用例都得先保证 QApplication 存在** ——
+    # 没有它就直接 QWidget 会被 Qt 判为致命错误、进程 abort（不是 Python 异常，
+    # 所以看不到堆栈，只看到一个退出码）。
+    from PyQt5.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    check(app is not None, "建不起 QApplication")
+
+    from core import zones as zones_mod
+    from tools.map_terrain_view import hex_bgr, render
+
+    z = zones_mod.Zones(mid)
+    f0 = next(f for f in t.footholds if not f.is_wall)
+    z.add_set("甲平台", [str(f0.fid)])
+    col = hex_bgr(z.sets["甲平台"]["color"])
+
+    tmp = Path(tempfile.mkdtemp(prefix="zrender_"))
+    try:
+        out = tmp / "z.png"
+        render(t, out, zones=z)
+        img = cv2.imread(str(out))
+        check(img is not None, "集合图没画出来")
+        # ① 集合色必须真的落在图上（那版"每段一色"用的是固定调色板，不会有这个色）
+        want = np.array(col, dtype=np.int16)
+        hit = int((np.abs(img.astype(np.int16) - want).sum(axis=2) <= 24).sum())
+        check(hit >= 100,
+              "图里找不到集合色 %s（命中 %d 像素）—— 画的还是段色那版？"
+              % (col, hit))
+
+        # ② 面板优先 `<id>_zones.png`，没有才退回 `<id>_overlay.png`
+        import gui.route_panel as rp
+        d = tmp / "map"
+        d.mkdir()
+        (d / ("%s_zones.png" % mid)).write_bytes(out.read_bytes())
+        (d / ("%s_overlay.png" % mid)).write_bytes(out.read_bytes())
+        p = rp.RoutePanel()
+        p._map_id = lambda: mid
+        try:
+            with mock.patch.object(mapdata, "map_dir", lambda: d):
+                path, title, _extra = p._map_image_path(mid)
+            check(path is not None and path.name.endswith("_zones.png"),
+                  "面板没有优先挑集合图：%s" % path)
+            check("集合图" in title, "标题没写清是集合图：%r" % title)
+            # 集合图不在（老项目没重画）→ 退回叠加图，并把"怎么拿到集合版"写在附注里
+            (d / ("%s_zones.png" % mid)).unlink()
+            with mock.patch.object(mapdata, "map_dir", lambda: d):
+                path2, _t2, extra2 = p._map_image_path(mid)
+            check(path2 is not None and path2.name.endswith("_overlay.png"),
+                  "没有集合图时没退回叠加图：%s" % path2)
+            check("生成地形图" in extra2,
+                  "没告诉人怎么画出集合版：%r" % extra2)
+        finally:
+            p.close()
+    finally:
+        import shutil
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+
+def t_goto_commands_climb():
+    """「命令前往」要**真的下发命令**（只接「爬」/「下跳」，其余的如实说"还没做"）。
+
+    2026-09-26 用户报的：点「命令前往」角色一动不动 —— 因为那时它**只算路、没接线**
+    （执行器造好了，但全仓库没有一处调 `start_climb` ✗）。这条钉三件事：
+      · 第一步是「爬」⇒ 从那条边造出 ClimbJob 并挂到**当前 agent**（`start_climb`）；
+      · 第一步是别的通行方式 ⇒ 明说"这种的执行器还没做"（别让人以为点了没反应）；
+      · 实时没在跑（没有当前 agent）⇒ 明说"先去「实时」页开始"，**不许**静悄悄什么都不做。
+    """
+    import tempfile
+    import time as _time
+    import unittest.mock as mock
+
+    from PyQt5.QtWidgets import QApplication
+    from core import zones as zones_mod
+    from decision import agent as agent_mod
+    from decision.agent import settings as dsettings
+    from gui.route_panel import RoutePanel
+
+    app = QApplication.instance() or QApplication([])
+    mid, _canvas = pick_map()
+    t = mapdata.load(mid, with_canvas=True) if mid else None
+    if t is None or not t.footholds:
+        print("      （没有地形数据，跳过）")
+        return
+    walk = [f for f in t.footholds if not f.is_wall]
+    if len(walk) < 2:
+        print("      （foothold 太少，跳过）")
+        return
+
+    tmp = Path(tempfile.mkdtemp(prefix="gotocmd_"))
+    p = RoutePanel()
+    p._map_id = lambda: mid
+    try:
+        # ---- ① 第一步是「走」⇒ 只算路，并**明说**这种执行器还没做 ----
+        z = zones_mod.Zones(mid)
+        z.add_set("甲平台", [str(walk[0].fid)])
+        z.add_set("乙平台", [str(walk[1].fid)])
+        z.add_edge("甲平台", "乙平台", "walk", why="用例")
+        z.save(tmp / ("%s.zones.json" % mid))
+        with mock.patch.object(zones_mod, "ZONES_DIR", tmp), \
+             mock.patch.object(dsettings, "save", lambda *a, **k: None), \
+             mock.patch.object(agent_mod, "CURRENT", None):
+            p._refresh_goto()
+            p.cmb_goto.setCurrentIndex(p.cmb_goto.findData("乙平台"))
+            p._fh_seen = (str(walk[0].fid), _time.monotonic())
+            p._on_goto()
+            txt = p.lbl_goto.text()
+            check("能走到" in txt, "该算得出路：%r" % txt)
+            # ⚠ 只查这一句：第一步是「走」时**先**如实说"这种执行器还没做"（那才是它
+            # 不动的真正原因），不必再叠一句"实时没在跑" —— 那样反而像有两处毛病。
+            check("执行器还没做" in txt,
+                  "第一步是「走」却没说明执行器没做（会让人以为是命令没生效）：%r" % txt)
+
+        # ---- ② 真实数据里那条「爬」边：命令真的下发到当前 agent ----
+        try:
+            zr = zones_mod.load(mid)
+        except Exception as e:                      # noqa: BLE001
+            print("      （读不到真实集合文件，跳过下半段：%s）" % e)
+            return
+        cl = next((e for e in zr.edges
+                   if e.get("kind") == "climb" and e.get("ladder")), None)
+        if cl is None:
+            print("      （这张图没有带绳号的「爬」边，跳过下半段）")
+            return
+        fids = (zr.sets.get(cl["from"]) or {}).get("footholds") or []
+        if not fids:
+            print("      （那条爬边的起点集合里没有 foothold，跳过下半段）")
+            return
+        got = []
+
+        class _Fake:
+            def start_climb(self, job):
+                got.append(job)
+                return job
+
+        with mock.patch.object(dsettings, "save", lambda *a, **k: None), \
+             mock.patch.object(agent_mod, "CURRENT", _Fake()):
+            p._refresh_goto()
+            j = p.cmb_goto.findData(cl["to"])
+            check(j >= 0, "预览下拉里没有那条爬边的终点：%s" % cl["to"])
+            p.cmb_goto.setCurrentIndex(j)
+            p._fh_seen = (str(fids[0]), _time.monotonic())
+            p._on_goto()
+            txt = p.lbl_goto.text()
+            check(got, "命令没下发（爬边第一步也该交给执行器）：%r" % txt)
+            check("已命令" in txt, "下发了命令却没说出来：%r" % txt)
+            job = got[0]
+            check(job.dst_set == cl["to"] and job.ladder_id == cl.get("ladder"),
+                  "下发的任务不对：dst=%s 绳=%s（该是 %s / %s）"
+                  % (job.dst_set, job.ladder_id, cl["to"], cl.get("ladder")))
+            lids = zones_mod.ladder_ids(t)
+            lx = next(x.x for x in t.ladders if lids.get(id(x)) == cl.get("ladder"))
+            check(abs(job.x - lx) < 1e-6, "任务的 x 不是那根绳的 x：%s vs %s"
+                  % (job.x, lx))
+        # ---- ③ 说了"爬"，但实时没在跑 ⇒ 命令发不出去，得说出来 ----
+        with mock.patch.object(agent_mod, "CURRENT", None):
+            p._on_goto()
+            check("实时" in p.lbl_goto.text(),
+                  "没有当前 agent 时该说清「先去实时页开始」：%r" % p.lbl_goto.text())
+        p.close()
+    finally:
+        import shutil
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+
+def t_osd_task_and_timers():
+    """画面那几行：**当前任务**（战斗 / 前往：集合）+ **计时任务**逐行列出（2026-09-26 要求 1、2）。
+
+    钉四件事（错了都会让人看错）：
+      · 没有寻路任务时「当前任务」必须显示**战斗**（用户指定的默认口径）；
+      · 有任务时显示「前往：{集合名}」—— 名字走 agent 的**公开口径**
+        （`current_goto_set()`），不是去摸私有的 `_climb`；
+      · 计时任务**每项一行**、**休息排最前**，然后才是自定义定时行为；
+      · 这些行**不铺底色**、字色取「设置 → 定时任务颜色」（用户明确要求）。
+    外加要求 3：地形图那行「命令前往」右边有个「结束当前寻路」。
+    """
+    import time as _time
+    import unittest.mock as mock
+
+    from PyQt5.QtWidgets import QApplication
+    from decision import agent as agent_mod
+    from decision.agent import settings as ds
+    from gui import theme
+    from gui.route_panel import RoutePanel
+
+    app = QApplication.instance() or QApplication([])
+    p = RoutePanel()
+    keys = ("rest_state", "rest_until_monotonic", "rest_pending",
+            "next_afk_monotonic", "custom_timers", "custom_timer_next",
+            "auto_feed_pet", "feed_next_monotonic", "resetall_interval")
+    saved = {k: getattr(ds, k) for k in keys}
+    try:
+        ds.rest_state = ""
+        ds.rest_pending = False
+        ds.next_afk_monotonic = 0.0
+        ds.custom_timers = []
+        ds.custom_timer_next = {}
+        ds.auto_feed_pet = False
+        ds.resetall_interval = 0
+        lines = p._osd_lines("世界 (1, 2)")
+        check(lines[0] == "世界 (1, 2)",
+              "第一行不是世界坐标（老行为被改了）：%r" % (lines[0],))
+        check(any(not isinstance(l, str) and "当前任务" in l[0] and "战斗" in l[0]
+                  for l in lines),
+              "没有寻路任务时「当前任务」该显示「战斗」：%r" % (lines,))
+
+        class _Fake:
+            def current_goto_set(self):
+                return "左上平台"
+
+        with mock.patch.object(agent_mod, "CURRENT", _Fake()):
+            ls = p._osd_lines("x")
+            check(any(not isinstance(l, str) and "前往：左上平台" in l[0] for l in ls),
+                  "有寻路任务时没写「前往：{集合名}」：%r" % (ls,))
+
+        # 计时任务排布
+        ds.rest_state = "afk_rest"
+        ds.rest_until_monotonic = _time.monotonic() + 125
+        ds.custom_timers = [{"name": "喂宠", "interval": [5, 10]},
+                            {"name": "喊话", "interval": [3, 4],
+                             "paused": True, "paused_left": 42.0}]
+        ds.custom_timer_next = {"喂宠": _time.monotonic() + 66}
+        ds.auto_feed_pet = True
+        ds.feed_next_monotonic = _time.monotonic() + 30
+        ds.resetall_interval = 60
+        rows = [l for l in p._osd_lines("x") if not isinstance(l, str)]
+        check(all(len(r) == 3 for r in rows),
+              "任务行不是 (文本, 颜色, 底色)：%r" % (rows,))
+        check(all(r[2] is False for r in rows),
+              "任务行铺了底色（用户要求：这些文本不要背景色）：%r" % (rows,))
+        col = theme.load_vis()["timer_color"]
+        check(all(r[1] == col for r in rows),
+              "任务行没用设置里的「定时任务颜色」（%s）：%r" % (col, rows))
+        names = [r[0] for r in rows]
+        rest_i = next((i for i, n in enumerate(names) if n.startswith("休息")), None)
+        tim_i = next((i for i, n in enumerate(names) if n.startswith("定时行为")), None)
+        check(rest_i == 1, "休息没紧跟「当前任务」（休息最优先）：%r" % (names,))
+        check(tim_i is not None and tim_i > rest_i,
+              "自定义定时行为没排在休息后面：%r" % (names,))
+        check(len(names) == len(set(names)), "有重复行（每项一行）：%r" % (names,))
+        check(any(n.startswith("休息") and ("剩余 2:0" in n) for n in names),
+              "休息没写出剩余时间：%r" % (names,))
+        check(any(n.startswith("定时行为") and "剩余 1:0" in n for n in names),
+              "自定义定时行为没写出剩余时间：%r" % (names,))
+        check(not any("喊话" in n for n in names),
+              "**暂停的定时行为不该显示**（2026-09-26 用户要求）：%r" % (names,))
+        check(any(n.startswith("喂宠") for n in names),
+              "喂宠也是计时任务，该列出来：%r" % (names,))
+        # 定时清键要**倒计时**，不是"每 N s"（2026-09-26 用户要求）
+        check(any(n.startswith("定时清键") for n in names),
+              "定时清键是计时任务，该列出来：%r" % (names,))
+        check(not any("每 " in n for n in names),
+              "定时清键还写着「每 N s」—— 要倒计时：%r" % (names,))
+        check(any(n.startswith("定时清键") and "未排期" in n for n in names),
+              "实时没在跑时「定时清键」该写「未排期」（别显示 0:00 骗人）：%r" % (names,))
+
+        class _Fake3:
+            def current_goto_set(self):
+                return ""
+
+            def resetall_left(self):
+                return 25.0
+
+        with mock.patch.object(agent_mod, "CURRENT", _Fake3()):
+            names2 = [r[0] for r in p._osd_lines("x") if not isinstance(r, str)]
+            check(any(n.startswith("定时清键") and "剩余 0:2" in n for n in names2),
+                  "定时清键没写出倒计时：%r" % (names2,))
+
+        # 要求 3：「命令前往」右边有「结束当前寻路」
+        check(hasattr(p, "btn_stop_goto") and "结束" in p.btn_stop_goto.text(),
+              "「命令前往」右边没有「结束当前寻路」按钮")
+        called = []
+
+        class _Fake2:
+            def current_goto_set(self):
+                return "甲平台"
+
+            def stop_climb(self, why=""):
+                called.append(why)
+                return True
+
+        with mock.patch.object(agent_mod, "CURRENT", _Fake2()):
+            p._on_stop_goto()
+        check(called, "点了「结束当前寻路」却没撤任务")
+        with mock.patch.object(agent_mod, "CURRENT", None):
+            p._on_stop_goto()
+            check("实时" in p.lbl_goto.text(),
+                  "没有实时在跑时该说清（不是静悄悄什么都不做）：%r"
+                  % p.lbl_goto.text())
+        p.close()
+    finally:
+        for k, v in saved.items():
+            setattr(ds, k, v)
+
+
+def t_goto_picker_and_preview():
+    """「预览平台」下拉 = 注册过的集合；选中要框在图上；「命令前往」要算得出路。
+
+    对应 2026-09-26 的要求（给路线测试用的那组控件）。三点各自会让用例红：
+      · 下拉不跟着集合文件走 → 新圈的集合要重启才选得到；
+      · 预览坐标自己算一份 → 框画在别处，看着像"集合圈错了"（这种最难查）；
+      · 定位不到/读数过期时还照常算路 → 拿一个假起点报"能走到"，会让人照它去测。
+    """
+    import tempfile
+    import unittest.mock as mock
+
+    from PyQt5.QtWidgets import QApplication
+    from core import zones as zones_mod
+    from decision.agent import settings as dsettings
+    from gui.route_panel import RoutePanel
+
+    app = QApplication.instance() or QApplication([])
+    mid, _canvas = pick_map()
+    t = mapdata.load(mid, with_canvas=True) if mid else None
+    if t is None or not t.segments:
+        print("      （没有带段的地形数据，跳过）")
+        return
+    walk = [f for f in t.footholds if not f.is_wall]
+    if len(walk) < 2:
+        print("      （foothold 太少，跳过）")
+        return
+
+    tmp = Path(tempfile.mkdtemp(prefix="goto_"))
+    zp = tmp / ("%s.zones.json" % mid)
+    z = zones_mod.Zones(mid)
+    z.add_set("甲平台", [str(walk[0].fid)])
+    z.add_set("乙平台", [str(walk[1].fid)])
+    z.save(zp)
+    p = RoutePanel()
+    p._map_id = lambda: mid
+    # 「路线识别」这一组**只剩「编辑集合」**（2026-09-26 用户定：其余没意义）。
+    # 那个「启用路线识别」门控的是**感知**（平台识别/落点预测/小地图定位）—— 关掉时
+    # 「命令前往」连"你在哪个平台"都答不出来，是"点一下没反应"的典型来源，所以
+    # 连开关带它门控的那几处一起撤了（见 gui/live_thread.py 与 route_panel.__init__）。
+    check(not hasattr(p, "ck_enabled"), "「启用路线识别」开关又回来了")
+    check(not hasattr(p, "lbl_hint"), "那行状态提示又回来了")
+    check(hasattr(p, "btn_zones") and p.btn_zones.text().startswith("编辑集合"),
+          "「编辑集合」按钮被误删了（那是这一组唯一要留的）")
+    check(not hasattr(dsettings, "route_enabled"),
+          "DecisionSettings 里又出现了 route_enabled —— 感知那道闸已经撤了")
+    try:
+        with mock.patch.object(zones_mod, "ZONES_DIR", tmp), \
+             mock.patch.object(dsettings, "save", lambda *a, **k: None):
+            p._refresh_goto()
+            items = [p.cmb_goto.itemData(i) for i in range(p.cmb_goto.count())]
+            check(items and items[0] == "", "第一项不是空项：%s" % items)
+            check("甲平台" in items and "乙平台" in items,
+                  "下拉没按注册的集合填：%s" % items)
+            check(p.btn_goto.isEnabled(), "有集合时「命令前往」应当可用")
+
+            # 「上绳梯失败后延迟激活时间」（2026-09-26 用户要求 1）：这一页要有它、
+            # 显示当前值、改了要写回配置（它是决策参数，跟着项目存）
+            check(hasattr(p, "sp_retry"),
+                  "「路线识别」页里没有「上绳梯失败后延迟激活时间」")
+            check(abs(float(p.sp_retry.value())
+                      - float(dsettings.climb_retry_delay_s)) < 1e-6,
+                  "控件没显示当前值：%s vs %s"
+                  % (p.sp_retry.value(), dsettings.climb_retry_delay_s))
+            was_rd = dsettings.climb_retry_delay_s
+            p.sp_retry.setValue(2.5)
+            check(abs(float(dsettings.climb_retry_delay_s) - 2.5) < 1e-6,
+                  "改了延迟没写回配置：%r" % dsettings.climb_retry_delay_s)
+            # 换项目（bind）要重读当前项目的值，而且**不许**触发写回
+            dsettings.climb_retry_delay_s = 3.0
+            p.bind(None)
+            check(abs(float(p.sp_retry.value()) - 3.0) < 1e-6,
+                  "bind 没重读延迟（切项目会显示上一个项目的值）：%s"
+                  % p.sp_retry.value())
+            check(abs(float(dsettings.climb_retry_delay_s) - 3.0) < 1e-6,
+                  "bind 里的 setValue 又写回配置了（会拿旧项目的值覆盖新项目）：%r"
+                  % dsettings.climb_retry_delay_s)
+            dsettings.climb_retry_delay_s = was_rd
+
+            # 选中 → 存进配置 + 图上框出来（坐标必须和画图那套换算一致）
+            p.cmb_goto.setCurrentIndex(p.cmb_goto.findData("乙平台"))
+            p._on_goto_pick()
+            check(dsettings.route_goto_set == "乙平台",
+                  "选择没存进配置：%r" % dsettings.route_goto_set)
+            boxes = p._preview_boxes(mid)
+            check(len(boxes) == 1, "预览没给出框：%s" % boxes)
+            # 平台是一根横线：包围盒可能是 0 高，框得**补到看得见**（不然等于没框）
+            check(boxes[0][3] >= 8 and boxes[0][4] >= 8,
+                  "预览框太小了（%.1f×%.1f）—— 平台那种扁的会变成一条发丝"
+                  % (boxes[0][3], boxes[0][4]))
+            from tools.map_terrain_view import image_xy
+            sp = zones_mod.set_span(t, z.sets["乙平台"]["footholds"])
+            ex0, ey0 = image_xy(t, sp[0], sp[2])
+            ex1, ey1 = image_xy(t, sp[1], sp[3])
+            # 比**中心**：扁平台的框会被补到最少 8px（中心不变），比左上角会差那 4px
+            cx = boxes[0][1] + boxes[0][3] / 2.0
+            cy = boxes[0][2] + boxes[0][4] / 2.0
+            check(abs(cx - (ex0 + ex1) / 2.0) < 1.5
+                  and abs(cy - (ey0 + ey1) / 2.0) < 1.5,
+                  "预览框没框在平台上（中心对不上）：(%.1f, %.1f) vs (%.1f, %.1f)"
+                  % (cx, cy, (ex0 + ex1) / 2.0, (ey0 + ey1) / 2.0))
+
+            # 定位不到玩家 / 读数过期 ⇒ 明说，**不许**拿假起点算路
+            p._fh_seen = ("", 0.0)
+            p._on_goto()
+            check("还不知道你在哪个平台" in p.lbl_goto.text(),
+                  "定位不到玩家时没说清：%r" % p.lbl_goto.text())
+            p._fh_seen = (str(walk[0].fid), 0.0)
+            p._on_goto()
+            check("还不知道你在哪个平台" in p.lbl_goto.text(),
+                  "用过期的读数当起点了：%r" % p.lbl_goto.text())
+
+            # 有新鲜位置、但两个集合之间**没有边** ⇒ 走不到，并说出边界
+            p._fh_seen = (str(walk[0].fid), time.monotonic())
+            p._on_goto()
+            check("走不到" in p.lbl_goto.text(),
+                  "没有边却说能走到：%r" % p.lbl_goto.text())
+            check("甲平台" in p.lbl_goto.text(),
+                  "走不到时没说出边界（从哪能到哪）：%r" % p.lbl_goto.text())
+
+            # 补上边 ⇒ 能走到，并把逐步路线写出来
+            z.add_edge("甲平台", "乙平台", "walk")
+            z.save(zp)
+            p._on_goto()
+            check("能走到" in p.lbl_goto.text()
+                  and "甲平台 → 乙平台" in p.lbl_goto.text(),
+                  "加了边还说走不到：%r" % p.lbl_goto.text())
+    finally:
+        p.close()
+        import shutil
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+
 def t_map_image_size_shown():
     """「地形图」那行要报出图片的**实际**尺寸（几×几），不能是推算出来的数。
 
@@ -1261,6 +1703,23 @@ def t_world_pos_chain():
     check(r["segment_id"] == seg.index,
           "落在第 %s 段上，却报成第 %s 段" % (seg.index, r["segment_id"]))
 
+    # **在不在绳梯上**（2026-09-26 要求：小地图那行要能报「绳梯：L2」）：
+    # 把黄点挪到某根绳的中段 ⇒ ladder_id 必须是那根绳的编号（和编辑器画在绳上的、
+    # 以及「爬」那条边里写的**同一个函数**算出来的编号）。
+    from core import zones
+    lids = zones.ladder_ids(t)
+    L = t.ladders[0]
+    lx, ly = t.world_to_canvas(L.x, (min(L.y1, L.y2) + max(L.y1, L.y2)) / 2.0)
+    panel_l, _, _ = _panel_with_dot_at(canvas, lx, ly)
+    rl = mm.PlayerLocator(mid).update(panel_l, src=mm.SRC_LIVE, calib=calib,
+                                      terrain=t)
+    check(rl["ok"], "站在绳上却定位失败：%s（黄点层：%s）" % (rl["note"], rl["dot"]))
+    check(rl["ladder_id"] == lids[id(L)],
+          "站在 %s 上却报成 %r" % (lids[id(L)], rl["ladder_id"]))
+    check("ladder_id" in r, "定位结果里没有 ladder_id（那行就没法报绳梯）")
+    check(r["ladder_id"] is None,
+          "站在平台上却报「在绳上」：%r" % r["ladder_id"])
+
     # 认不出黄点（面板上什么都不画）→ **坐标必须是 None**，不是 0
     blank = panel.copy()
     blank[py - 4:py + 4, px - 4:px + 4] = (70, 55, 45)
@@ -1279,30 +1738,95 @@ def t_world_pos_chain():
           "没标定时该说「还没量过换算」：%s" % r3["note"])
 
 
-def t_apply_to_player():
-    """定位结论写进 `WorldState.Player`：算不出来写 None，且**别串到视觉平台编号**。
+def t_minimap_client_timeout_says_where():
+    """小地图收流超时要说清**卡在哪一步**（2026-09-26 排查用）。
 
-    `Player.current_platform_id`（视觉平台）和 `segment_id`（地形段）都是整数、
-    都叫"平台"，串了会得出"看着对其实错"的结论 —— 这条把它钉死。
+    ⚠ 原来 `_recv_exact` 把异常全吞了（`except Exception: return None`）⇒ 超时被报成
+    「ConnectionError: 对端关闭」—— A 机明明活着（只是没在推 / 卡住了），人却去查网络和
+    进程。三种情况必须分得开：
+      · 连上一帧都没来 → 「一帧都没来」+ 该查什么（推流在不在跑 / 端口 / 防火墙）；
+      · 收过帧之后没动静 → 「推到一半停了」（那是 A 机侧卡住 / 被别的窗口盖住）；
+      · 对端**真的**关了 → 才说「对端关闭」。
+    """
+    import socket as _socket
+    import struct as _struct
+    import time as _time
+    import unittest.mock as mock
+
+    import cv2
+    import numpy as np
+
+    from perception.minimap import MiniMapClient
+
+    jpg = cv2.imencode(".jpg", np.zeros((8, 8, 3), np.uint8))[1].tobytes()
+
+    class _FakeSock:
+        """连得上；先按脚本给字节，给完就开始超时（模拟 A 机不推 / 卡住）。"""
+
+        def __init__(self, payload=b""):
+            self.buf = payload
+            self.pos = 0
+
+        def settimeout(self, _t):
+            pass
+
+        def recv(self, n):
+            if self.pos < len(self.buf):
+                out = self.buf[self.pos:self.pos + n]
+                self.pos += len(out)
+                return out
+            raise _socket.timeout("timed out")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def run_once(payload):
+        cli = MiniMapClient("1.2.3.4", 5003, timeout=0.01)
+        with mock.patch.object(_socket, "create_connection",
+                               lambda *a, **k: _FakeSock(payload)):
+            cli.start()
+            for _ in range(300):
+                if cli.err:
+                    break
+                _time.sleep(0.01)
+            cli.stop()
+        return cli
+
+    cli = run_once(b"")
+    check("一帧都没来" in cli.err,
+          "首帧超时没说清是「一帧都没来」：%r" % cli.err)
+    check("5003" in cli.err and "防火墙" in cli.err,
+          "首帧超时没给出该查什么（端口 / 防火墙）：%r" % cli.err)
+
+    cli = run_once(_struct.pack(">I", len(jpg)) + jpg)
+    check(cli.n_recv >= 1, "假流里那一帧没被收下：n_recv=%d" % cli.n_recv)
+    check("推到一半" in cli.err,
+          "收过帧之后断了却说错（该说「推到一半停了」）：%r" % cli.err)
+
+
+def t_apply_to_player():
+    """定位结论写进 `WorldState.Player`：算不出来写 None（**不是 0**）。
+
+    ⚠ 这条原来还钉着「别把地形段号写进**视觉平台编号**（`current_platform_id`）」——
+    平台识别那套 2026-09-26 已整块移除（那个字段也跟着没了），所以只剩下面两组断言。
     """
     from perception.world_state import Player
     p = Player()
-    p.current_platform_id = 7
     mm.apply_to_player(p, {"world_x": 123.5, "world_y": -45.0, "segment_id": 3,
                            "note": "", "held": True})
     check(p.world_x == 123.5 and p.world_y == -45.0, "世界坐标没写进去")
     check(p.segment_id == 3, "段号没写进去")
     check(p.world_held is True,
           "「位置是沿用上一帧的」没写进 Player —— 决策层分不出新鲜观测和补位")
-    check(p.current_platform_id == 7,
-          "把地形段号写进了 current_platform_id（那是**视觉平台**编号）")
 
     mm.apply_to_player(p, {"world_x": None, "world_y": None, "segment_id": None,
                            "note": "没认出黄点"})
     check(p.world_x is None and p.segment_id is None,
-          "定位失败时应当写 None（不是 0）")
+          "定位失败时应当写 None（不是 0，0 是地图西北角这个合法坐标）")
     check(p.world_note == "没认出黄点", "失败原因没带到 Player 上")
-    check(p.current_platform_id == 7, "失败那次把视觉平台编号也抹了")
 
 
 def t_world_label_text():
@@ -1350,10 +1874,15 @@ def t_world_label_text():
             self.ov = (pix, src, frame_rect, alpha, note)
 
         def set_overlay_note(self, note):
-            """真面板在挂着叠图时会走这条（不重读地形/底图）。这里如实模拟。"""
+            """真面板在挂着叠图时会走这条（不重读地形/底图）。这里如实模拟。
+
+            ⚠ **原样存**，别 `str()`：真面板存的是可能是**多行列表**（世界坐标 +
+            当前任务 + 计时任务，见 live_panel._draw_note）—— 套了 str 就会把整个
+            列表画/测成一行字面量（这里踩过：假面板自己 stringify，用例跟着一起错）。
+            """
             if self.ov is None:
                 return False
-            self.ov = tuple(self.ov[:4]) + (str(note or ""),)
+            self.ov = tuple(self.ov[:4]) + (note or "",)
             self.note_only += 1
             return True
 
@@ -1387,8 +1916,14 @@ def t_world_label_text():
             txt = p.lbl_mmap_world.text()
             check(p.lbl_mmap_world.isVisible(), "勾上叠图了，这行还没显示")
             check("玩家世界坐标" in txt, "这行没写世界坐标：%r" % txt)
-            check("第 %d 段" % seg.index in txt,
-                  "没报出是第几段（期望第 %d 段）：%r" % (seg.index, txt))
+            # 这行显示的**不再是「第 N 段」**（段号是自动串出来的、语义不可靠），
+            # 而是"脚下的 foothold 属于哪个人工圈的集合"——那才是寻路的判据
+            # （见 docs/寻路设计.md §12）。这里只钉**格式**，不钉具体集合名：
+            # 集合是人在编辑器里圈的，自检不该依赖某个人当下的分组。
+            check("位于fh：" in txt,
+                  "没报出「位于fh：集合」：%r" % txt)
+            check("第 %d 段" % seg.index not in txt,
+                  "还在显示段号（语义不可靠，已换成 foothold 集合）：%r" % txt)
             # 数值要对得上（容差 = 一个底图像素：黄点本身有 6 个像素、取整也差一点）
             m = re.search(r"\((-?\d+), (-?\d+)\)", txt)
             check(m is not None, "这行没写出坐标数值：%r" % txt)
@@ -1397,12 +1932,19 @@ def t_world_label_text():
             check(abs(gx - wx) <= tol and abs(gy - wy) <= tol,
                   "读数里的坐标不对：(%d, %d)，期望约 (%.0f, %.0f)"
                   % (gx, gy, wx, wy))
-            check(live.ov is not None and ("第 %d 段" % seg.index) in live.ov[4],
-                  "画面里那块框下面没贴读数（段号）：%r"
+            # ⚠ 贴到画面那一格现在是**多行**（世界坐标 + 当前任务 + 计时任务，
+            # 2026-09-26 要求 1、2）：老形态是单个字符串。这里统一成"行文本列表"
+            # 再断言 —— 要害没变：**每一行都得是短句**（写长了就是横穿半屏的黑带）。
+            def osd_texts():
+                n = (live.ov[4] if live.ov else "") or ""
+                rows = list(n) if isinstance(n, (list, tuple)) else [n]
+                return [r if isinstance(r, str) else r[0] for r in rows]
+
+            check(live.ov is not None and any("fh：" in s for s in osd_texts()),
+                  "画面里那块框下面没贴读数（fh 集合）：%r"
                   % (live.ov[4] if live.ov else None))
-            check(len(live.ov[4]) <= 30,
-                  "贴到画面上的那行太长（%d 字）：%r"
-                  % (len(live.ov[4]), live.ov[4]))
+            check(all(len(s) <= 30 for s in osd_texts()),
+                  "贴到画面上的行太长（每行都该是短句）：%r" % (osd_texts(),))
             check(live.note_only >= 1,
                   "读数没走「只换那行字」那条便宜路 —— 那会每 250ms 把地形 JSON "
                   "和底图 PNG 重读一遍，全在 GUI 主线程上")
@@ -1427,7 +1969,7 @@ def t_world_label_text():
             check("认不出" in txt, "认不出黄点却没在读数里说出来：%r" % txt)
             check(len(txt) <= 40,
                   "面板这行太长了（%d 字）—— 人看的就是这一行：%r" % (len(txt), txt))
-            osd = (live.ov[4] if live.ov else "")
+            osd = osd_texts()[0] if osd_texts() else ""
             check(osd and len(osd) <= 20,
                   "贴到画面上的那行太长（%d 字）：%r" % (len(osd), osd))
             check(len(p.lbl_mmap_world.toolTip()) > 40,
@@ -1503,7 +2045,7 @@ def t_live_thread_mmap_panel_copy():
               "实时线程那份 locator 没跟上界面参数：%s / %s"
               % (th._locator.tracker.hold_ms, th._locator.tracker.roi_pad))
 
-        # 没地图 → 整件事不干（route_enabled 关掉时也一样，别白算）
+        # 没地图 → 整件事不干（别白算）
         th.set_mmap(map_id="")
         check(th._locate_mmap(got) is None, "没有地图却在定位")
     finally:
@@ -1971,6 +2513,16 @@ TESTS = (
     ("小地图定位的参数分两行（来源及其右边另起一行）", t_mmap_rows_split),
     ("把标定好的叠图画到实时画面上（几何/接线/不碰帧）", t_overlay_on_live),
     ("「地形图」那行报出图片实际尺寸（几×几）", t_map_image_size_shown),
+    ("地形图 = 地形编辑器的结果（集合色 + 面板优先挑它）",
+     t_terrain_image_shows_zones),
+    ("预览平台下拉 + 命令前往：填集合/框在图上/算路要老实",
+     t_goto_picker_and_preview),
+    ("命令前往真的下发命令（爬=造任务挂给当前 agent；别的方式/没实时都说清楚）",
+     t_goto_commands_climb),
+    ("画面那几行：当前任务（战斗/前往：集合）+ 计时任务逐行（休息最前、无底色、颜色可配）",
+     t_osd_task_and_timers),
+    ("小地图收流超时要分得清：一帧都没来 / 推到一半停 / 对端真关",
+     t_minimap_client_timeout_says_where),
     ("弹窗的持续自动定位（邻近尺度 + 跟丢回退）", t_dialog_auto_fit),
     ("路线识别面板上的入口", t_route_panel_button),
     ("黄点：亮黄点找得出且位置准（实测色，不是纯黄）", t_dot_yellow_found),

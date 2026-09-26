@@ -1,13 +1,13 @@
 {
   "frames": 27,
-  "boxes": 128,
-  "from_model": 22,
-  "boxes_from_model": 115,
+  "boxes": 135,
+  "from_model": 23,
+  "boxes_from_model": 127,
   "protected": 151,
-  "kept_orig": 5,
-  "boxes_kept": 13,
+  "kept_orig": 4,
+  "boxes_kept": 8,
   "cleared": 0,
-  "median_boxes": 5.0,
-  "conf_thr": 0.5,
+  "median_boxes": 6.0,
+  "conf_thr": 0.1,
   "weights": "E:\\MyPrograms\\playerSimu\\projects\\寺院通道2\\models\\detect_v2.pt"
 }
