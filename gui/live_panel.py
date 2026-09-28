@@ -258,7 +258,10 @@ class LivePanel(QWidget):
         self.ck_probe.setToolTip(
             "解码 A 机屏幕上的时间码，测真实端到端延迟。\n"
             "需要：A 机跑 python -m tools.probe_gen\n"
-            "      B 机跑过一次 python -m tools.clock_sync --host 192.168.1.8 --save\n\n"
+            "      B 机跑过一次对时（A 机 IP 见 config/link.yaml 的 a_host）：\n"
+            "        python -m tools.clock_sync --host <A机IP> --save\n"
+            "      ⚠ 对时偏置会**整段**加进延迟里（偏置旧了延迟数就整体偏高/偏低 ✗）——\n"
+            "        状态行上会把它一并显示出来，体感对不上时先重对一次时。\n\n"
             "不启用时延迟显示为 ——，因为 pts 推算只能反映网络抖动，测不出真实延迟。")
         row.addWidget(self.ck_probe)
 
@@ -779,6 +782,11 @@ class LivePanel(QWidget):
                 "probe_bits": get("probe", "bits", 40),
                 "clock_offset_ms": self._load_offset_ms(),
             })
+        # 两路帧信号（见 live_thread 里那两条说明）：
+        #   · `raw_frame_ready` = **原生帧**（没画过任何东西）⇒ 存起来给 `current_frame()`
+        #     用，框选/测量/叠图核对都读它 ✓；
+        #   · `frame_ready` = **显示帧**（画好框的那份）⇒ 只用来画，**不许**进 `current_frame()` ✗。
+        self.thread.raw_frame_ready.connect(self._on_raw_frame)
         self.thread.frame_ready.connect(self._on_frame)
         self.thread.stats_ready.connect(self._on_stats)
         self.thread.potions_ready.connect(self.potions_ready)
@@ -830,8 +838,23 @@ class LivePanel(QWidget):
 
     # ---------------- 回调 ----------------
 
+    def _on_raw_frame(self, img):
+        """收到**原生帧**（从流里解出来、**一个字都没画**）⇒ 存引用，给 `current_frame()`。
+
+        **为什么单开一路**（用户 2026-09-27 现场 bug）：取帧做测量的那几个功能量的都是
+        **像素** —— 探针标定（灰度解码）、HP/MP 条框选、小地图框选、双点/模板标定弹窗、
+        叠图匹配分核对。以前它们拿到的和显示用的是**同一份**（上面画着玩家蓝框、怪物绿框、
+        攻击线，以及**视野灰色虚线**）⇒ 框选把那条虚线一起框了进去、探针采样被框线污染、
+        匹配分虚高 ✗。现在线程分两路发（`raw_frame_ready` / `frame_ready`），这里只存
+        **原生**那份 ✓。
+
+        ⚠ 不画、不拷、不排队：只存个引用（微秒级）⇒ 不受显示限流与绘制合并影响，
+          **面板不可见时也照更新** —— 不然切回来看一眼再框选，框到的是旧画面 ✗。
+        """
+        self._last_bgr = img
+
     def _on_frame(self, img):
-        """收到新帧：**只留最新一帧**，渲染跟不上就丢中间帧，绝不排队。
+        """收到**显示帧**（已画好检测框/攻击线/视野虚线）：**只留最新一帧**，渲染跟不上就丢中间帧，绝不排队。
 
         **为什么要合并**（"失焦就卡"的主因之一）：这个槽跑在 GUI 主线程上，
         每帧要做两次整幅拷贝（QImage + QPixmap）加一次缩放 —— 1920×1080 大约
@@ -843,8 +866,10 @@ class LivePanel(QWidget):
         合并办法：最新帧放 `_pending`，只挂**一个**零延时任务去画；画之前又来
         新帧就只覆盖 `_pending`（等于"追赶时不补旧帧"）。面板不可见（切到别的
         页签、窗口被藏起来）连画都不画：画面没人看，省下的时间留给决策回路。
+
+        ⚠ 这一份**只用来显示**（它上面画着框和虚线）。**别在这里写 `_last_bgr = img`** ✗
+          —— 那是"框选框到视野虚线"那个 bug 的写法；取帧一律走 `_on_raw_frame` ✓。
         """
-        self._last_bgr = img        # 取帧类功能（探针/HP 条框选）永远要最新的
         self._pending = img
         if self._render_pending:
             self._disp_merged += 1  # 上一帧还没画完 → 这一帧被合并掉
@@ -873,10 +898,15 @@ class LivePanel(QWidget):
         self._disp_drawn += 1
 
     def current_frame(self):
-        """返回最近一帧画面（BGR ndarray）；还没有画面时返回 None。
+        """返回最近一帧**原生画面**（BGR ndarray）；还没有画面时返回 None。
 
-        **不受绘制合并影响**：被合并/因为不可见没画的帧，这里照样拿得到 ——
-        探针标定、HP/MP 条框选都靠它。
+        ⚠ **原生 = 从推流里解出来、没画过任何东西的那一份**（用户 2026-09-27 要求）：
+          它喂的都是"拿像素做测量"的功能 —— 探针标定（灰度解码）、HP/MP 条框选、
+          小地图框选、双点/模板标定弹窗、叠图匹配分核对。显示帧（画着检测框/攻击线/
+          **视野虚线**）**不许**从这里出去 ✗：那正是"框选小地图把虚线一起框进去"的来源。
+
+        **不受绘制合并/显示限流影响**：被合并、因为不可见没画的帧，这里照样是最新的
+        —— 由 `_on_raw_frame` 单独维护（见那儿）。
         """
         return self._last_bgr
 
@@ -1124,6 +1154,27 @@ class LivePanel(QWidget):
                 "（判据：probe_codec.Verdict，与 tools/probe_tune 共用一份。）")
         elif d is not None:
             d_txt = "端到端延迟 %6.0f ms" % d
+            off = s.get("clock_offset_ms")
+            if off is not None:
+                # **把"对时偏置"一并摆出来**（用户 2026-09-26 要求）。
+                #
+                # 为什么必须露出来：这个延迟是「A 机画码那一刻 → 本机收到并解出这一刻」，
+                # 计算时**整段加上了对时偏置**（`t_A = t_B + offset`）⇒ 偏置旧了或那次测得
+                # 不准，延迟数就**整体**高/低那么多 ✗。实测就栽在这：偏置 1144.5 ms 而显示
+                # 1255 ms ⇒ 那个"锁死的 1.25 秒"里几乎全是偏置，链路其实只有百毫秒级 ✗。
+                # 摆出来之后"1255 ≈ 1144"一眼可见 ✓ —— 比事后猜半天有用得多 ✓。
+                d_txt += "　（含对时偏置 %+.0f ms）" % float(off)
+                self.lbl_stats.setToolTip(
+                    "端到端延迟 = A 机「画时间码那一刻」→ 本机收到并解出这一刻。\n"
+                    "计算时**整段加上了对时偏置**（当前 %+.0f ms，来自 config/clock_offset.txt）：\n"
+                    "  · 偏置是准的 ⇒ 上面这个数就是真延迟 ✓；\n"
+                    "  · 偏置旧了 / 那次测得不准 ⇒ 延迟数会**整体**偏高或偏低那么多 ✗\n"
+                    "    （实测踩过：偏置 1144 ms，把百毫秒级的链路显示成 1255 ms ✗）。\n\n"
+                    "怎么确认偏置值不值得信（10 秒）：\n"
+                    "  1. A 机屏和本机预览**同框**比一眼（差多少就是真延迟）；\n"
+                    "  2. 或重跑一次对时 —— 数字变了就说明原来那份旧了：\n"
+                    "     python -m tools.clock_sync --host <A机IP> --save\n"
+                    "     （对时结果 5 秒内自动生效，**不用重开预览**。）" % float(off))
         elif not s.get("probe_on"):
             d_txt = "端到端延迟  ——  （未启用探针）"
         elif s.get("probe_invalid"):

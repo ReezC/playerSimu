@@ -96,7 +96,7 @@ try:
     from deploy.runner import Proc
     from deploy.settings_dialog import DeploySettingsDialog
     from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,
-                             NoWheelSpinBox)
+                             NoWheelSpinBox, mount_scroll)
 except Exception:
     # 最常见的就是 PyQt5 / PyYAML / pyserial 没装（见 deploy/requirements.txt）——
     # 让上面那个框把话说清楚，别让人对着一个不会出现的窗口发呆。
@@ -674,11 +674,9 @@ class SelfCheckPane(QWidget):
         inner.setSpacing(4)
         inner.addLayout(self.body)
         self.rows = []
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setWidget(box)
-        root.addWidget(scroll, 1)
+        # 滚动区**只有一处实现**（`gui.widgets.mount_scroll` —— 内容**自带样式**
+        # （这里是 `QFrame#Card`）时用它 ✓；2026-09-27 收口，A 机部署台原来自己手写了一份 ✗）
+        mount_scroll(root, box, stretch=1)
         self._box = box
 
     def set_items(self, items):
@@ -1195,10 +1193,8 @@ class DeployWindow(QMainWindow):
         body = QHBoxLayout()
         body.setSpacing(10)
 
-        left = QScrollArea()
-        left.setWidgetResizable(True)
-        left.setFrameShape(QFrame.NoFrame)
-        left.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # ⚠ 滚动区**只有一处实现**（`gui.widgets.mount_scroll`，2026-09-27 收口）——
+        #   这里是"内容自己建"（`lw`），所以先建内容、最后再套滚动区（见下面 ✓）。
         lw = QWidget()
         ll = QVBoxLayout(lw)
         ll.setContentsMargins(0, 0, 6, 0)
@@ -1211,7 +1207,9 @@ class DeployWindow(QMainWindow):
             self.cards[key] = card
             ll.addWidget(card)
         ll.addStretch(1)
-        left.setWidget(lw)
+        # 左栏（服务卡片列表）套滚动区、放进 `body`，占 4 份宽（原来在下面那句
+        # `body.addWidget(left, 4)` ✓ —— 现在由 `mount_scroll` 加，别再加第二遍 ✗）
+        left = mount_scroll(body, lw, stretch=4)
 
         right = QSplitter(Qt.Vertical)
         self.self_check = SelfCheckPane()
@@ -1231,7 +1229,6 @@ class DeployWindow(QMainWindow):
         right.setStretchFactor(1, 1)
         right.setSizes([300, 460])
 
-        body.addWidget(left, 4)
         body.addWidget(right, 5)
         root.addLayout(body, 1)
 

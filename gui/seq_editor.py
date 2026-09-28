@@ -1,8 +1,8 @@
 """行为序列编辑器（通用，支持嵌套）。
 
 用于编辑一个有序的行为列表，每个元素是「某键按下」「某键松开」或
-「额外延迟」。执行时每个键动作之间自动插入随机输入延迟，额外延迟是
-固定的时间间隔。回身输出、输出行为、防掉线、自定义定时行为都可复用。
+「额外延迟」。执行时**一帧推进一步**（元素之间不再插随机延迟，2026-09-27 删掉），
+所以「额外延迟」才是那个固定的时间间隔。回身输出、输出行为、防掉线、自定义定时行为都可复用。
 
 元素可带「执行几率」（右键→修改几率），非 100% 时界面显示百分比；
 元素还可带「触发后执行」子列表（右键→编辑触发后行为），形成嵌套结构，
@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (QCheckBox, QDialog, QFileDialog, QFormLayout,
 
 from core import seq_presets as sp             # 预设的存取（纯逻辑，见那边的判据）
 from core.seq_presets import MAX_DELAY_MS      # 延迟上限的真源搬到了 core（数据不是 UI）
+from gui import theme                          # 弹窗几何按客户端存（config/ui.yaml）✓
 from gui.widgets import NoWheelDoubleSpinBox   # 必须模块级：控件在 __init__ 里建
 
 # 可选的键（显示名 → 序列键名）。back/forward 是特殊键，执行时按朝向解析。
@@ -158,7 +159,7 @@ class SeqEditorWidget(QWidget):
         row_save.addStretch(1)
         root.addLayout(row_save)
 
-        tip = QLabel("每个键动作之间自动加入随机输入延迟；「额外延迟」是固定间隔。\n"
+        tip = QLabel("一帧推进一步（元素之间没有随机延迟了）；「额外延迟」才是固定间隔。\n"
                      "「反方向 / 目标方向」会按角色当前朝向自动解析成 ← / →。\n"
                      "加「键按下」会**自动配一条同键的「键松开」**；\n"
                      "右键元素可「修改几率」「编辑触发后执行」；"
@@ -530,6 +531,7 @@ class SeqEditorDialog(QDialog):
         row3.addWidget(btn_ok)
         row3.addWidget(btn_cancel)
         root.addLayout(row3)
+        theme.bind_window_state(self, "seq_editor")    # 拉过的大小/位置按客户端记住 ✓
 
     def seq(self):
         return self.editor.seq()
@@ -549,6 +551,10 @@ class TimerEditDialog(QDialog):
         self.setWindowTitle("编辑定时行为" if timer else "添加定时行为")
         self.resize(480, 620)
         self.setStyleSheet(_QSS)
+        # ⭐ 跟**其它弹窗同一套**（用户 2026-09-28："居中、放弃位置记忆，我期望的是调整过的
+        #   缩放数据记忆要有"✓ ⇒ 每次显示都居中到主窗口 ✓、尺寸沿用拉过的那份 ✓）。
+        #   ⚠ 这个窗原来**漏在规范外**（既没接几何、也没人发现 ✗）—— 这一轮补齐 ✓。
+        theme.bind_window_state(self, "timer_edit")
 
         root = QVBoxLayout(self)
         root.setSpacing(10)

@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
 
 from core import wzexport
 from core.imgio import imread   # 支持中文路径，cv2.imread 遇中文会静默失败
+from gui import theme           # 弹窗几何按客户端存（config/ui.yaml）✓
 from gui.canvas import ZoomPanView   # 和质检台**同一份**看图交互（滚轮/中键/双击）
 from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,
                          NoWheelSlider)
@@ -198,6 +199,7 @@ class CalibManualDialog(QDialog):
         self._on_target()
         self._reload_frame()
         self._apply_scale()
+        theme.bind_window_state(self, "calib_manual")  # 拉过的大小/位置按客户端记住 ✓
 
     # ---------------- 填充 / 刷新 ----------------
 

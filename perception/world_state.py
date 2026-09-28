@@ -63,6 +63,41 @@ class Player:
     #: 现在**贴在哪根绳上**（`core.zones.ladder_ids` 的那套编号，如 "L1"）；不在绳上 = None。
     #: ⚠ 同样以前没人写 ⇒ "从绳上掉下来"每 2 秒误判一次 ⇒ 任务不停失败重试。
     ladder_id: str | None = None
+    #: ⭐ **到没到某根绳的上端**（绳号 `"L2"`；`None` = 没到 / 判不出来）—— 上爬的**到达判据** ✓。
+    #: 用户 2026-09-27 定的新架构："所有的位置状态更新由**位置状态机**自治"⇒ 这个字段由
+    #: `perception/pos_state.py::PositionStateMachine` 算好（判据原文在那里 ✓），
+    #: **执行器只读、不许自己比坐标** ✗（`ClimbJob._arrived` 已经改成读它 ✓）。
+    at_ladder_top: str | None = None
+    #: ⭐ **到没到某根绳的下端**（绳号 `"L2"`；`None` = 判不了）—— 下爬的**到达判据** ✓
+    #: （与 `at_ladder_top` 对称：y ≥ 绳下端 − 「坐标对齐误差范围」且 y 在「移动操作尝试
+    #: 间隔」内**不再变大** ✓）。判据原文在 `perception/pos_state.py` ✓。
+    at_ladder_bottom: str | None = None
+    #: ⭐ **只看位置**编出来的绳号（**不管按没按 ↑/↓** ✓；`None` = 位置不在任何绳段里）——
+    #: 治的是那条**循环依赖**：`ladder_id` 带按键许可，而**执行器自己会松键** ⇒ 那几十
+    #: 毫秒里它变空 ⇒ 执行器"自己把自己判成没上绳" ✗（用户 2026-09-27 报的现象 ✓）。
+    #: 用途：`ClimbJob`（"位置还在绳段里"那条记忆 ✓）与 `agent.tick`（攀爬中不打架 ✓）。
+    on_rope_pos: str | None = None
+    #: ⭐ **脚下那块面的 y**（玩家 x 处的面 y ✓；判不出来 = `None`）—— 下爬"落到目标平台的
+    #: 面"的判据 ✓。
+    ground_y: float | None = None
+    #: ⭐ 脚下这些集合横着占的 **x 范围** `(左, 右)`（非墙 foothold 的并集 ✓；判不出来 = `None`）
+    #: —— "我这块平台有多宽" ✓，`agent._reachable_without_path`（"够得着就不用下寻路任务"）
+    #: 读它，**不再自己去问 `set_span_of`** ✗。
+    here_span: tuple | None = None
+    #: ⭐ 攀爬的**「攀爬失败」广播**（2a）：位置贴着绳（`LADDER_DX`=24 那把**宽**尺 ✓）、x 偏出
+    #: 「坐标对齐误差范围」，**且僵着不动**（y 在「移动操作尝试间隔」内没变 ✓）⇒ 抓空 / 磨绳 ✓。
+    #: ⚠ 「僵着」这一条是**必需**的（2026-09-28 加 ✓）：**斜跳**飞过去时必然穿过"x 差
+    #:   10~24px"那一段，而那时人**已经吸上绳、y 正在上升** ⇒ 只看 x 会把每一跳都杀掉 ✗
+    #:   （用户报"**斜向跳上绳全部失败**"✗）；原地跳跳之前已对齐到 `|dx| ≤ tol` ⇒ 不中招 ✓。
+    #: 执行器只读它判失败、**不再自己比 x** ✗（用户 2026-09-28 核心思路 ✓）。
+    climb_failed: bool = False
+    #: ⭐ 攀爬的**「补发按住↑」广播**（2c）：y 在「移动操作尝试间隔」内变化没超过容差 ⇒ 卡住 ⇒
+    #: 请执行器补发按住 ↑ ✓（执行器**不再自己跟踪 y** ✗）。
+    climb_stalled: bool = False
+    #: ⭐ 上面这些字段就是**位置状态广播的全部内容**（机器每拍写 ✓）；要"整份快照"用
+    #: `perception/pos_state.py::PosSnapshot.of(player)` ✓ —— **拼装只那一处** ✓
+    #: （把以前散在 agent / 执行器里的 `getattr` 拆字段收成一处 ✓，用户 2026-09-27 要求
+    #: "提高内聚、降低耦合" ✓）。⚠ 不再另存一份整快照（两份存储会不一致 ✗）。
     #: 没算出来 / 没落平台时的原因（一句话，给界面与日志；正常时是空串）
     world_note: str = ""
 
@@ -79,3 +114,44 @@ class WorldState:
     #: 用途：上绳对齐的"保持窗口" = 设置里的保持时间 + 它（见 `agent._climb_tick`）——
     #: 定位读数本来就是"过去某一刻"的位置，延迟越大越不能拿单帧当真。
     e2e_ms: float = 0.0
+
+
+# ---------------------------------------------------------------- 运行期镜像
+
+#: ⭐ **脚底偏移（像素）的运行期镜像**（用户 2026-09-28 ✓）—— `gui/live_thread` **每帧**把
+#:   设置里的 `player_foot_offset_px` 写进来，本模块与 `perception` 里那些"画幅 → 世界"
+#:   的换算直接读它 ✓。
+#: ⚠ 为什么不各自 `from decision import agent` 现读：`decision/agent.py` **已经 import 了
+#:   perception** ⇒ 反过来再 import 会绕成**循环依赖** ✗。所以用这块"谁都能读的小白板" ✓。
+FOOT_OFFSET_PX = 0.0
+
+
+# ---------------------------------------------------------------- 颜色小工具
+
+def norm_hex_color(text, fallback):
+    """`#RRGGBB` 归一成 `#rrggbb`（小写 ✓）；写得不对 ⇒ 返回 `fallback`（原值 ✓）。
+
+    为什么放在这儿：用户在「玩家位置」组里**手填**箭头颜色（用户 2026-09-28 ✓）——
+    填错了要**保留原值**（悄悄换成默认色反而让人看不出自己填错了 ✗）；只认 6 位十六进制 ✓。
+    `gui/player_panel` 与 `gui/live_thread` 两端都 import 它 ⇒ **一套规则** ✓。
+    """
+    s = str(text or "").strip()
+    # ⚠ **7 位（`#RRGGBB`）和 9 位（`#AARRGGBB`，带透明度）都认** ✓ —— 取色弹窗
+    #   （`QColorDialog` + `ShowAlphaChannel`）给的就是 9 位 ✓（用户 2026-09-28 起箭头
+    #   颜色也走那个弹窗 ✓）；画的时候由 `hex_to_bgr` **丢掉 alpha** ✓（cv2 不用它 ✗）。
+    if len(s) in (7, 9) and s.startswith("#"):
+        try:
+            int(s[1:], 16)
+            return "#" + s[1:].lower()
+        except ValueError:
+            pass
+    return str(fallback or "")
+
+
+def hex_to_bgr(text, fallback=(0, 229, 255)):
+    """`#RRGGBB` ⇒ cv2 要的 `(B, G, R)`；认不出来 ⇒ `fallback`（BGR ✓）。"""
+    s = norm_hex_color(text, "")
+    if not s:
+        return tuple(int(v) for v in fallback)
+    body = s[1:][-6:]                 # 9 位（#AARRGGBB）⇒ 取后 6 位，**alpha 丢掉** ✓
+    return (int(body[4:6], 16), int(body[2:4], 16), int(body[0:2], 16))

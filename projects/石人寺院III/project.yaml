@@ -15,14 +15,34 @@ calib:
   max_scale: 2.4
   step: 0.1
   sample: 5
-bars: {}
+bars:
+  hp:
+  - 0.341142
+  - 0.973958
+  - 0.120791
+  - 0.019531
+  hp_color: &id001
+  - - 0
+    - 0
+    - 135
+  - - 79
+    - 82
+    - 255
+mmap_crop:
+- 5
+- 71
+- 117
+- 81
 decision:
-  attack_dist: 400.0
-  min_attack_dist: 50
+  attack_dist: 80.0
+  min_attack_dist: 0
+  attack_up_dist: 30
+  attack_down_dist: 20
   chase_jump_enabled: true
-  chase_jump_min: -30
+  chase_jump_min: -10
   chase_jump_max: 5
-  mouse_speed: 1.8000000000000005
+  chase_jump_dash_ms: 50
+  mouse_speed: 1.1999999999999995
   evade_type: jump
   jump_interval: 0
   jump_random_prob: 0.1
@@ -51,12 +71,6 @@ decision:
     key: forward
   output_seq:
   - type: down
-    key: jump
-    prob: 10
-    then:
-    - type: up
-      key: jump
-  - type: down
     key: attack
   - type: up
     key: attack
@@ -66,7 +80,7 @@ decision:
     right: right
     up: up
     down: down
-    attack: s
+    attack: t
     jump: D
     hp_pot: g
     mp_pot: null
@@ -74,48 +88,89 @@ decision:
     shop: null
     enter: enter
   target_cd:
-  - 1500
+  - 1000
   - 2500
-  input_device: local
-  input_delay:
-  - 0
-  - 50
-  attack_cd: 200
+  input_device: remote
+  attack_cd: 300
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 1000
-  turn_output_delay_ms: 200
+  turn_output_delay_ms: 500
   player_track_jump: 200
-  hp_bar: null
+  player_foot_offset_px: 0
+  player_box_min_area_pct: 0.0
+  player_box_area_base_n: 30
+  player_box_area_tol_pct: 0.0
+  player_arrow_x_color: '#00E5FF'
+  player_arrow_y_color: '#FFD400'
+  player_arrow_len_px: 60
+  hp_bar:
+  - 0.341142
+  - 0.973958
+  - 0.120791
+  - 0.019531
   mp_bar: null
   probe_calib: {}
-  hp_color: null
+  hp_color: *id001
   mp_color: null
-  hp_threshold: 30
+  hp_threshold: 39
   mp_threshold: 7
-  pot_cd: 1500
+  pot_cd: 1000
+  mob_sets_ttl_s: 3.0
   auto_hp_pot: true
   auto_mp_pot: false
   strategy: patrol
-  vision_top: 200
-  vision_bottom: 200
+  vision_top: -1
+  vision_bottom: -1
   vision_left: -1
   vision_right: -1
-  vision_center: true
+  vision_center: false
   vision_off_x: 0
   vision_off_y: 0
-  sweep_turn_cd: 1000
-  back_range: 200
-  route_enabled: false
-  debounce_conf: 0.45
+  sweep_turn_cd: 500
+  back_range: 150
+  route_goto_set: 小平台
+  align_tol_px: 10
+  align_hold_ms: 1000
+  climb_align_gap_ms: 180
+  climb_align_near_px: 20
+  climb_retry_delay_s: 1.0
+  climb_retry_delay_inc_s: 1.0
+  goto_timeout_s: 10.0
+  goto_timeout_key: 表情_无语
+  disable_chase_pathfinding: false
+  jump_start_px: 80
+  move_retry_ms: 1000
+  battle_zones:
+  - set: 底层
+    cd_s: 3.0
+    idle_foothold: '39'
+    fight_max_s: 0.0
+    fight_dst: ''
+    can_fight: false
+  - set: 顶层
+    cd_s: 3.0
+    idle_foothold: ''
+    fight_max_s: 15.0
+    fight_dst: 一楼
+    can_fight: false
+  battle_zone_sets: []
+  debounce_conf: 0.5
   debounce_ms: 2000
-  auto_feed_pet: true
-  feed_interval_min: 6.0
-  feed_interval_max: 8.0
-  custom_timers: []
-  facing_timeout_min: 2.0
+  custom_timers:
+  - name: 自动喂宠
+    seq:
+    - type: down
+      key: feed_pet
+    - type: up
+      key: feed_pet
+    interval:
+    - 8.0
+    - 12.0
+    pause_on_rest: false
+  facing_timeout_min: 0.0
   player_lost_timeout_min: 3.0
-  resetall_interval: 60
-  anti_afk_enabled: false
+  resetall_interval: 30
+  anti_afk_enabled: true
   anti_afk_type: hidden_rest
   anti_afk_min: 25.0
   anti_afk_max: 30.0
@@ -143,7 +198,15 @@ decision:
   - type: up
     key: 普攻
   - type: delay
-    ms: 200
+    ms: 1000
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
   - type: down
     key: 隐身术
   - type: up
@@ -167,6 +230,16 @@ decision:
     key: 普攻
   anti_afk_rest_min: 4.5
   anti_afk_rest_max: 5.5
+  anti_afk_spot_set: ''
+  anti_afk_spot_seq: []
+  anti_afk_spot_after: ''
+  anti_afk_spot_loop: false
+  anti_afk_spot_loop_items: []
+  anti_afk_spot_loop_min: 30.0
+  anti_afk_spot_loop_max: 60.0
+  anti_afk_spot_loop_hold: false
+  anti_afk_retry_on_interrupt: true
+  anti_afk_retry_sec: 10.0
   reconnect_enabled: false
   reconnect_probe_after_lost_sec: 0.0
   reconnect_step_timeout_ms: 3000
@@ -182,16 +255,16 @@ decision:
 notes: ''
 capture:
   source: file
-  file: D:/Media/record/mxd/石人寺院III.mp4
+  file: D:/Media/record/mxd/石人寺院III误判素材.mp4
   url: udp://0.0.0.0:5000
   fps: 5.0
-  stride: 60
+  stride: 30
   seconds: 120.0
   dedup: 0.01
   limit: 300
-  clean: true
+  clean: false
 label:
-  thresh: 0.65
+  thresh: 0.2
   min_distinct: 0.06
   per_mob: 20
   max_peaks: 3
@@ -203,9 +276,9 @@ dataset:
   min_boxes: 1
   quality: 92
 train:
-  model: yolo26n.pt
-  epochs: 120
-  imgsz: 960
+  model: E:\MyPrograms\playerSimu\projects\石人寺院III\models\detect_v1.pt
+  epochs: 200
+  imgsz: 1280
   batch: 8
   device: '0'
   patience: 40

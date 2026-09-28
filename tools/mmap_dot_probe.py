@@ -331,14 +331,23 @@ def main():
         tasks.append(("image", lambda: grab_image(a.image, box)))
     else:
         live = config.load_live()
-        crop = live.get("mmap_crop") or []
+        # 框选区域**按项目**取 —— 口径只有一处：`perception.minimap.crop_of`
+        # （本项目 → 没框过时回退老的那份全局值 ✓）。项目从「最近打开的那个项目」拿：
+        # 命令行没有"当前项目"这个概念，而它就是工作台正在用的那个
+        #（同 HP/MP 条框选的兜底口径 ✓；gui/project.py 是纯文件 IO，不拉 Qt ✓）。
+        from gui.project import last_opened
+        proj = last_opened()
+        crop = mm.crop_of(proj, live) or []
         if a.src in ("both", "stream"):
             tasks.append(("stream", lambda: grab_stream(a.frames, a.seconds)))
         if a.src in ("both", "live"):
             if len(crop) != 4:
-                print("live 来源需要 config/live.yaml 里的 mmap_crop（先在工作台"
-                      "「路线识别」里框一次小地图）")
+                print("live 来源需要小地图框选区域 —— 在工作台「路线识别 → 寻路配置 →"
+                      "框选小地图」\n      里框一次（按项目存：projects/<项目>/project.yaml）")
             else:
+                print("小地图框选区域：%s（%s）"
+                      % (crop, "本项目" if (proj is not None and proj.get("mmap_crop"))
+                         else "老的那份全局值 config/live.yaml"))
                 tasks.append(("live", lambda: grab_live(crop, a.frames, a.seconds)))
 
     print("黄点取证（只读）  %s" % time.strftime("%Y-%m-%d %H:%M:%S"))

@@ -31,8 +31,8 @@
 from PyQt5.QtCore import QEvent, QObject, Qt
 from PyQt5.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
                              QAbstractSpinBox, QApplication, QComboBox,
-                             QDoubleSpinBox, QScrollBar, QSlider, QSpinBox,
-                             QTabBar)
+                             QDoubleSpinBox, QFrame, QScrollArea, QScrollBar,
+                             QSlider, QSpinBox, QTabBar, QVBoxLayout, QWidget)
 
 # 守卫只吃这几类控件上的滚轮：数字框 / 下拉框 / 滑块 / 标签栏。
 # （QSpinBox、QDoubleSpinBox ⊂ QAbstractSpinBox；QSlider ⊂ QAbstractSlider）
@@ -186,3 +186,82 @@ def install_wheel_guard(app=None):
     _guard = _WheelGuard(app)
     app.installEventFilter(_guard)
     return _guard
+
+
+def scroll_page(widget, margins=(12, 12, 12, 12), spacing=8,
+                h_scroll=False, min_width=None):
+    """把**长参数页**装进滚动区，返回「页面布局」给调用方照旧 `addWidget` ✓。
+
+    为什么要有这一处（`docs/UI规范.md`：**长面板放进 `QScrollArea`**）：
+
+        直接 `QVBoxLayout(self)` 时，内容比页签高 ⇒ Qt 只能**硬挤** ⇒ 卡片里相邻的行被
+        压到**互相重叠** —— "不支持滚动"和"行和行重叠"其实是**同一个病** ✗。
+        （2026-09-27 用户就是这么报的："路线识别页签不支持滚动？现在攀爬参数组的行和行都
+        重叠了"。）**一处实现**：谁做长面板都走这里，别再各写一遍 `QScrollArea` 那三行 ✗。
+
+    做法照 `gui/player_panel.py` 那份样板 ✓：
+        外层 `QVBoxLayout(widget)`（零边距）→ `QScrollArea`
+        （`setWidgetResizable(True)` = **内容跟着视口走**，窗口拉大时卡片跟着变宽 ✓；
+          `NoFrame` = 不画多余边框 ✓；**横向滚动条关掉** = 参数页只竖着滚 ✓）
+        → 里面一个空 `QWidget` 当 holder ⇒ **返回 holder 的布局** ✓。
+
+    ⚠ 参数里那些 `NoWheel*` 控件是**顺着父级**找最近滚动区来转发滚轮的
+      （`forward_wheel` ✓ UI规范 §5）—— 以前面板里没滚动区，指针压在参数框上时
+      滚轮就是"改不了参数、也滚不动页面"；装了这个之后才真正按规范工作 ✓。
+    """
+    outer = QVBoxLayout(widget)
+    outer.setContentsMargins(0, 0, 0, 0)
+    outer.setSpacing(0)
+
+    holder = QWidget()
+    page = QVBoxLayout(holder)
+    page.setContentsMargins(*margins)
+    page.setSpacing(spacing)
+    outer.addWidget(scroll_area(holder, widget, h_scroll=h_scroll,
+                                min_width=min_width), 1)
+    return page
+
+
+def mount_scroll(layout, content, h_scroll=False, min_width=None, stretch=1):
+    """把**已有的** `content` 套进滚动区，加到 `layout` 里 —— 返回滚动区控件。
+
+    什么时候用 `scroll_page`、什么时候用它：
+
+      · `scroll_page(widget)`：页面是"**空容器 + 一堆卡片**"（参数页那种 ✓）——
+        它替你建 holder，返回**布局**，照旧 `addWidget` ✓；
+      · `mount_scroll(layout, content)`：内容**已经有自己的控件、自己的样式**
+        （A 机部署台的 `QFrame#Card` 明细框、左栏卡片列表 ✓）—— 只套滚动区、
+        **不动内容本身** ✓。
+
+    两个都走同一个 `_scroll_area`（**`QScrollArea` 只在这一处 new** ✓）——
+    "一处实现"这条硬要求就靠它 ✓（`tools/check_ui.py` 会查裸写 ✗）。
+    """
+    scroll = scroll_area(content, layout.parentWidget(),
+                         h_scroll=h_scroll, min_width=min_width)
+    layout.addWidget(scroll, stretch)
+    return scroll
+
+
+def scroll_area(content, parent=None, h_scroll=False, min_width=None):
+    """`QScrollArea` 的**唯一 new 处**（`scroll_page` / `mount_scroll` / 分栏都用它 ✓）。
+
+    直接用它的时候只有一种：**滚动区自己要当"一个控件"交出去**（`QSplitter` 的某一栏、
+    对话框的一侧 ✓ —— 那种地方没有"现成的布局"可以传，见 `gui/zone_editor.py::_panel`）。
+    其余一律走 `scroll_page`（空容器 + 卡片 ✓）或 `mount_scroll`（内容自带样式 ✓）。
+
+    口径（别再各写一份 ✗）：
+      · `setWidgetResizable(True)`：内容跟着视口走（窗口拉宽时卡片跟着变宽 ✓）；
+      · `NoFrame`：页面/页签自己已经有边框了，别套两层 ✓；
+      · 横向默认**关掉**（参数页只竖着滚 ✓）；`h_scroll=True` 才按需出横向滚动条
+        —— 多栏（`QSplitter`）那类"栏宽可以拖窄"的场景需要它 ✓；
+      · `min_width`：给分栏用的最小宽度（**由人定**，别让内容算 —— UI规范 §4 ✓）。
+    """
+    scroll = QScrollArea(parent)
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(
+        Qt.ScrollBarAsNeeded if h_scroll else Qt.ScrollBarAlwaysOff)
+    if min_width:
+        scroll.setMinimumWidth(int(min_width))
+    scroll.setWidget(content)
+    return scroll

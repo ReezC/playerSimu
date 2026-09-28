@@ -11,11 +11,13 @@
 2. **存 foothold id，不存段号** ✅
    id 来自 WZ，**重导地形、改串段算法都不失效**；段号会变，存段号 = 战斗区指到别处。
 
-3. **边是有向的、默认不可用** ✅
+3. **边是有向的** ✅
    "B 沿绳 L3 上去到 C" 与 "C 掉到 B" 是**两条**边（下落单向）。
-   类型 `walk` / `climb` / `drop` / `unconfirmed` / `jump`；**默认 `unconfirmed`**，
-   `walk` 只由 `walk_suggestions()` **建议**、人工确认后才写进 edges —— 与 README
-   「标定前不把视觉预测变成按键」一致；本阶段**根本不生成 `jump` 边**。
+   类型（界面上叫「**通行方式**」）**只有四种**：`walk` / `climb` / `drop` / `jump`
+   —— 四种**都有执行器** ✓（2026-09-27 用户要求**移除** `portal` 传送门与
+   `unconfirmed` 待确认，理由见 `EDGE_KINDS` 上面那段 ✓）。
+   边仍然**只能靠人加**：`walk_suggestions()` / `climb_suggestions()` 只**建议**，
+   采纳之后才写进 edges —— 与 README「标定前不把视觉预测变成按键」一致 ✓。
 
 文件：`datasets/map/<map_id>.zones.json`（一条 foothold 一行，便于 review 与 diff）
 """
@@ -40,32 +42,34 @@ WALL_PAD = 24
 ATTACH_PAD = 24
 
 #: 边的类型（界面上叫「**通行方式**」，见 EDGE_LABELS 的说明）。
-#: `portal` 是**传送门**：走法既不是走/爬/掉，需要记走的是哪个门（`portal` 字段），
-#: 而门的落点**导出数据里没有**（WZ 里是 tm 指向别的图/别的门），只能人来指认。
-#: ⚠ `jump` / `drop` 都是**跳跃键**的动作，执行前要先做**跳跃标定**（§6），
-#: 但**记录**不受影响 —— 先标好"这里要跳/要下跳"，以后标定完就能跑。
-EDGE_KINDS = ("walk", "climb", "drop", "portal", "unconfirmed", "jump")
+#: ⚠ 2026-09-27 用户要求**移除「传送门（`portal`）」与「待确认（`unconfirmed`）」**：
+#:   两者都不是"能走的路" —— 传送门没有执行器、门的落点导出数据里也没有（WZ 只给
+#:   `tm/tn`，跨图/需人指认）；"待确认"更不是通行方式，它是编辑器**建议边**的中转标记 ✗。
+#:   ⇒ 现在**只有四种**，而且**四种都有执行器**（走 `WalkJob` / 爬 `ClimbJob` /
+#:   下跳 `DropJob` / 跳 `JumpJob`）✓ —— 也就是说"路径里出现没做执行器的边"这种情形
+#:   从此不存在 ✓（老文件里若残留这两种 kind，`validate` 会报出来、规划时**不参选** ✓）。
+#: ⚠ `jump` / `drop` 都是**跳跃键**的动作，实机前要先做**跳跃标定**（§6），
+#: 但**记录/规划**不受影响 —— 先标好"这里要跳/要下跳"，标定完就能跑 ✓。
+EDGE_KINDS = ("walk", "climb", "drop", "jump")
 
 #: 边类型 → 界面上的说法 + 画布箭头颜色（绿实线/蓝虚线/橙虚线…，见 §12.3 B5）
 #:
 #: 界面上这一组叫「**通行方式**」（2026-09-26 用户定的术语，已写进 §12.3）——
-#: 问的是"从 A 到 B **怎么过去**"。五种（外加一个占位的"待确认"）：
+#: 问的是"从 A 到 B **怎么过去**"。**四种，都有执行器**：
 #:
-#:     walk  走         —— 走过去（同层、无缝）
-#:     climb 爬（绳梯） —— 爬绳/梯子（要指名哪根绳）
-#:     jump  跳         —— **在 foothold 边缘按跳键**（平着/斜着蹦过去）
-#:     drop  下跳       —— **按住 ↓ 再按跳**（从平台上穿下去，落到下一层）
-#:     portal 传送门    —— 走哪个门（要指名哪个门）
+#:     walk  走         —— 走过去（同层、无缝）      → `route.WalkJob`
+#:     climb 爬（绳梯） —— 爬绳/梯子（要指名哪根绳）  → `route.ClimbJob`
+#:     drop  下跳       —— **按住 ↓ 再按跳**（穿到下一层）→ `route.DropJob`
+#:     jump  跳         —— **在 foothold 边缘按跳键**  → `route.JumpJob`
 #:
 #: ⚠ 跳 vs 下跳是**两个不同类型**，别混（2026-09-26 用户专门澄清过）。它们的
 #: 按键不一样、落点也不一样：跳是"往前蹦"，下跳是"往下穿"。
+#: ⚠ **传送门 / 待确认 2026-09-27 已移除**（用户要求）：不是通行方式 ✗。
 EDGE_LABELS = {
     "walk": ("走(walk)", "#188038"),
     "climb": ("爬（绳梯）", "#1a73e8"),
     "jump": ("跳(jump)", "#00897b"),
     "drop": ("下跳(drop)", "#e8710a"),
-    "portal": ("传送门", "#a142f4"),
-    "unconfirmed": ("待确认", "#9aa0a6"),
 }
 
 #: 集合默认配色（编辑器按注册顺序取，可在界面上改）
@@ -341,13 +345,22 @@ class Zones:
 
     # ---------------- 边 ----------------
 
-    def add_edge(self, src, dst, kind, ladder=None, portal=None, footholds=None,
-                 walk_dir=None, why=""):
-        """加一条**有向**边。自动去重（同 from/to/kind[/portal] 只留一条）。
+    def add_edge(self, src, dst, kind, ladder=None, footholds=None,
+                 walk_dir=None, mid_dir=None, mid_y=None, why=""):
+        """加一条**有向**边。自动去重：**同一条边**只留一条（判据见下面那条 ⚠）。
 
         `ladder`：climb 边必须给（爬哪根绳，id 形如 "L2"，见 `ladder_ids`）。
-        `portal`：portal 边必须给（走哪个门，门名或 "L 坐标" 都行 —— 数据里
-        `Portal.tn` 只有跨图才填，所以这一格是给人看的备注，不参与判据）。
+
+        ⚠ **"同一条边"= `(from, to, kind, ladder)` 全都一样**：
+          「爬」按**哪根绳**分开算 —— 同一对集合、同一类型、**不同绳**是**两条不同的边**
+          （"怎么过去"不一样）。用户 2026-09-27 报的"点了增加没有添加项目"就是这个 bug：
+          地图里已经有 `二楼 →(爬 L3)→ 三楼`，再加一条 `二楼 →(爬 L7)→ 三楼` 被当成重复
+          ⇒ **静默返回老那条**，界面上一点动静都没有，看着就像程序坏了 ✗。
+          （原判据里还有 `portal` 那一格，2026-09-27 随「传送门」一起移除 ✓。）
+        ⚠ 真·完全重复时**不报错**（幂等：调用方可能是"采纳建议"那种重放）⇒ 有没有真的
+          加进去，由**界面**说清楚（`gui/zone_editor._apply_reach` 比对条数，没加就弹一句 ✓）。
+        ⚠ 同一对集合有多条时，规划取哪条见 `edge_between`（按类型优先级：走 > 爬 > …；
+          同类型不同绳时取**文件里先出现**的那条 ✓）。
         """
         kind = str(kind)
         if kind not in EDGE_KINDS:
@@ -355,22 +368,24 @@ class Zones:
         for n in (src, dst):
             if n not in self.sets:
                 raise ValueError("集合不存在：%s" % n)
-        # ⚠ 校验要放在**去重之前**：已经有一条同 from/to/kind 的边时，下面会直接
-        # 返回那一条 —— 乱填的方向类型就悄悄过去了（踩过）。
+        # ⚠ 校验要放在**去重之前**：已经有一条一样的边时，下面会直接返回那一条 ——
+        # 乱填的方向类型就悄悄过去了（踩过）。
         if walk_dir and walk_dir not in WALK_DIRS:
             raise ValueError("「走」的方向类型只能是 %s，收到：%r"
                              % ("/".join(x or "(默认)" for x in WALK_DIRS),
                                 walk_dir))
+        if mid_dir and str(mid_dir) not in MID_JUMP_DIRS:
+            raise ValueError("「中途跳下」的方向只能是 %s，收到：%r"
+                             % ("/".join(x or "(不中途跳下)" for x in MID_JUMP_DIRS),
+                                mid_dir))
         for e in self.edges:
             if (e.get("from") == src and e.get("to") == dst
                     and e.get("kind") == kind
-                    and str(e.get("portal") or "") == str(portal or "")):
+                    and str(e.get("ladder") or "") == str(ladder or "")):
                 return e
         e = {"from": src, "to": dst, "kind": kind}
         if ladder:
             e["ladder"] = str(ladder)
-        if portal:
-            e["portal"] = str(portal)
         if footholds:
             # 「可下跳 foothold」（2026-09-26 用户要求）：**下跳**从哪些 foothold 起跳。
             # 不填 = 起点集合的全部 foothold（见 `drop_footholds`）—— 所以**只在
@@ -380,6 +395,13 @@ class Zones:
             # 「走」的方向类型（默认方向 = **不写这一格**，老文件不用补；
             # 合法性在上面统一校验过了）
             e["dir"] = str(walk_dir)
+        if mid_dir:
+            # 「爬」的**中途跳下**（**不写这一格 = 不启用** ✓ 老文件不用补 ✓；
+            # 合法性同样在上面统一校验过 ✓）
+            e["mid_dir"] = str(mid_dir)
+            if mid_y is not None:
+                # 「高度」= **世界坐标 y**（只有 `mid_dir` 非空时才有意义 ✓）
+                e["mid_y"] = float(mid_y)
         if why:
             e["why"] = str(why)
         self.edges.append(e)
@@ -419,6 +441,15 @@ class Zones:
                 out.append("走边的方向类型不认识：%s → %s：%r（可用：%s）"
                            % (e.get("from"), e.get("to"), e.get("dir"),
                               " / ".join(x or "(默认)" for x in WALK_DIRS)))
+            if e.get("kind") == "climb" and e.get("mid_dir") \
+                    and e.get("mid_dir") not in MID_JUMP_DIRS:
+                out.append("「中途跳下」的方向不认识：%s → %s：%r（可用：%s）"
+                           % (e.get("from"), e.get("to"), e.get("mid_dir"),
+                              " / ".join(x or "(不中途跳下)" for x in MID_JUMP_DIRS)))
+            elif e.get("kind") == "climb" and e.get("mid_dir") \
+                    and not isinstance(e.get("mid_y"), (int, float)):
+                out.append("「中途跳下」配了方向却没给「高度」（得是个数）：%s → %s"
+                           % (e.get("from"), e.get("to")))
             if e.get("kind") == "drop" and "footholds" in e:
                 # 只有**人工改过**这一格才查（没这一格 = 用起点集合的全部，见 drop_footholds）
                 got = [str(x) for x in (e.get("footholds") or [])]
@@ -431,10 +462,13 @@ class Zones:
                     if miss:
                         out.append("下跳边引用了本图不存在的 foothold：%s → %s：%s"
                                    % (e.get("from"), e.get("to"), ", ".join(miss[:8])))
-            if e.get("kind") == "portal" and not e.get("portal"):
-                out.append("传送门边没指定是哪个门：%s → %s（本图内传送门的落点"
-                           "导出数据里没有，只能人工指认）"
-                           % (e.get("from"), e.get("to")))
+            if e.get("kind") not in EDGE_KINDS:
+                # 2026-09-27 起「传送门 / 待确认」不是通行方式了 ⇒ 老文件里若还留着，
+                # 在这里**如实报出来**（别静默当没看见 ✗），规划时也不会拿它当候选 ✓。
+                out.append("边用了**已经移除的通行方式**：%s → %s 是 %r"
+                           "（现在只认 %s —— 回编辑器改成其中一种，或者删掉这条）"
+                           % (e.get("from"), e.get("to"), e.get("kind"),
+                              " / ".join(EDGE_KINDS)))
         for p in self.points:
             if p.get("of") and p["of"] not in self.sets:
                 out.append("路径点「%s」指向不存在的集合：%s" % (p.get("name"), p["of"]))
@@ -480,26 +514,95 @@ def load(map_id):
 # 建议：集合之间哪些"同层可走"
 # ══════════════════════════════════════════
 
-def edge_between(zones, a, b):
-    """a → b 之间已有的边（多条时取"最可靠"的那条：走 > 爬 > 跳 > 传送门）。"""
-    order = {"walk": 0, "climb": 1, "drop": 2, "portal": 3, "unconfirmed": 8, "jump": 9}
+#: 同一对集合有**多条边**时"取哪条"的优先级（`edges_between` / `edge_between` /
+#: `decision.route.pick_edge` **共用这一处**）：
+#: **走 > 爬 > 下跳 > 跳**（`portal` 传送门 / `unconfirmed` 待确认 2026-09-27 已移除 ✓）。
+#: 为什么"走"最优先：同层无缝走过去最廉价、也最不容易失败；爬 / 下跳要让执行器接管动作；
+#: 「跳」的落点还要靠**跳跃标定**（最不确定）⇒ 放最后 ✓。
+#: ⚠ 它现在只是**并列时的兜底**：正式口径见 `docs/寻路设计.md` 的「择路」一节
+#:   （逐步贪心按**纯距离**比，代价相同时才看这个优先级 ✓）。
+KIND_PRIORITY = {"walk": 0, "climb": 1, "drop": 2, "jump": 9}
+
+
+def edges_between(zones, a, b):
+    """a → b 之间的**全部**边，按类型优先级排（**同类型保持文件顺序** —— 稳定可预期 ✓）。
+
+    为什么要"全部"：同一对集合可能有好几条边（走 + 爬、**两根不同的绳**……✓），而
+    "这一步到底走哪条"要看**玩家在哪** —— 那一步在 `decision.route.pick_edge`
+    （这里没有位置，所以只能排序、不能选 ✓）。
+    """
     hit = [e for e in zones.edges if e.get("from") == a and e.get("to") == b]
-    if not hit:
-        return None
-    return sorted(hit, key=lambda e: order.get(e.get("kind"), 5))[0]
+    return sorted(hit, key=lambda e: KIND_PRIORITY.get(e.get("kind"), 5))
 
 
-def edge_text(zones, a, b):
-    """a → b 这一步怎么写给人看（如「走」「爬 绳 L2」）。没有边时是「（没有边）」."""
-    e = edge_between(zones, a, b)
+def edge_between(zones, a, b):
+    """a → b 之间已有的边（多条时取"最可靠"的那条：走 > 爬 > 下跳 > 传送门）。
+
+    ⚠ 这里**没有玩家位置** ⇒ 同类型的多条只能取**文件里先出现**的那条。
+      "哪根绳离我近"是规划时的事：`decision.route.pick_edge(terrain, z, a, b, at=(x, y))`
+      ✓（`docs/寻路设计.md` 的「择路」一节）—— 显示那一步时也要用**选好的那条**，
+      见 `edge_text(..., edge=…)` ✗ 别在这儿猜。
+    """
+    hit = edges_between(zones, a, b)
+    return hit[0] if hit else None
+
+
+def edge_text(zones, a, b, edge=None):
+    """a → b 这一步怎么写给人看（如「走」「爬 绳 L2」）。没有边时是「（没有边）」.
+
+    ⚠ 「走」边配了方向（`dir` = 仅向左 / 仅向右）时**要写出来**（「走(walk)·仅向左」）：
+    「命令前往」那行显示的就是这个字符串，而用户 2026-09-27 卡住的原因正是**分不清
+    "到底选的哪条边、它要往哪边走"**（同一对集合有 drop + walk 两条时尤其 ✗）。
+
+    `edge`：**规划已经选好的那条**（`route.pick_edge` 的结果 ✓）。同一对集合有两条绳、
+    规划按"最近的"选了其中一条时，这行必须显示**它选的那条** —— 不传就按老口径
+    （文件顺序）取，可能和实际执行的那条不一致 ✗。
+    """
+    e = edge if edge is not None else edge_between(zones, a, b)
     if e is None:
         return "（没有边）"
     zh = EDGE_LABELS.get(e.get("kind"), (str(e.get("kind")), ""))[0]
     if e.get("ladder"):
-        return "%s %s" % (zh, e["ladder"])
-    if e.get("portal"):
-        return "%s %s" % (zh, e["portal"])
-    return zh
+        s = "%s %s" % (zh, e["ladder"])
+    elif e.get("kind") == "walk" and walk_dir(e):
+        s = "%s·%s" % (zh, WALK_DIR_LABELS.get(walk_dir(e), walk_dir(e)))
+    else:
+        s = zh
+    # 「爬」配了**中途跳下**也要写出来（⚠ 同一对集合两根绳、或同一根绳配了/没配时，
+    # 用户**就看这一行**分辨 ✗ 别漏 —— 同 `edge_cond` 里那条教训 ✓）
+    m = mid_jump_text(e)
+    return "%s·%s" % (s, m) if m else s
+
+
+def edge_cond(edge):
+    """这条边的**附加条件**（给人看的那一小截）；没有 ⇒ ""。
+
+    出来的是：`仅向左` / `仅向右`（走的方向 ✓）、`绳 L3`（爬哪根）、
+    `起跳 3 处`（下跳限定在哪些 foothold ✓）。
+
+    为什么要有它（2026-09-27 用户要求"扩展更多信息"）：同一对集合常常有好几条边
+    （走 + 跳、两根不同的绳…），而"**这条凭什么和那条不一样**"原来**只有**
+    「命令前往」那行（走 `edge_text` ✓）和 tooltip 里看得见，编辑器列表里只显示了类型 ✗
+    —— 核对"到底哪条生效"得去别处找。
+    ⚠ 中文标签一律取 `EDGE_LABELS` / `WALK_DIR_LABELS`（**别在这儿再抄一遍** ✗）。
+    ⚠ 和 `edge_text` 的分工：那个是"把这一步说成一句话"（`走(walk)·仅向左`）；
+      这个是"**列表行里括号里那一截**"（`（仅向左）`）—— 两者用的标签是同一份 ✓。
+    """
+    if not edge:
+        return ""
+    d = walk_dir(edge)
+    if d:
+        return WALK_DIR_LABELS.get(d, d)
+    s = ""
+    if edge.get("ladder"):
+        s = "绳 %s" % edge["ladder"]
+    elif edge.get("kind") == "drop" and edge.get("footholds"):
+        s = "起跳 %d 处" % len(edge["footholds"])
+    # 「中途跳下」**与绳号并存**（⚠ 不并存的话，同一对集合的两根爬边在列表里就没法分辨 ✗）
+    m = mid_jump_text(edge)
+    if m:
+        return ("%s·%s" % (s, m)) if s else m
+    return s
 
 
 def find_path(zones, src, dst):
@@ -583,14 +686,18 @@ def ladder_ids(terrain):
     return out
 
 
-#: 「走(walk)」的方向类型（2026-09-26 用户要求）：
-#:   ""      默认方向 —— 朝目标走就行（现在的行为）
-#:   "left"  仅向左 —— 只能按左走过去
+#: 「走(walk)」的方向类型（2026-09-26 用户要求；**2026-09-27 起真的生效**）：
+#:   ""      默认方向 —— 朝**目标集合所有落点 x 的中点**走（老行为 ✓）
+#:   "left"  仅向左 —— **只按 ←**，一直按到踏上目标集合（不看中点）
 #:   "right" 仅向右
 #:
-#: ⚠ **暂时只是配置占位**：执行器还没有"走到 x"那一步，所以这三个值现在**不影响任何
-#: 行为** —— 先在编辑器里能填、能存，逻辑等后面做。界面上必须说清楚这一点，
-#: 不然人会以为"设了仅向左它就会只往左走"。
+#: ⚠ 历史（别搞反）：它原先只是个**配置占位**（注释写着"执行器还没有走到 x 那一步，
+#:   先能填能存"）⇒ 用户 2026-09-27 正是踩在这上面：配了「仅向左」，人却被按着 → 朝
+#:   集合中点走，而且"到集合区间的距离"恒为 0 ⇒ 3 秒后判「走不动了」✗
+#:  （现场是「左上平台 → 左上」：目标集合整片盖住人站的 x）。
+#:   现在 `decision.route.WalkJob.walk_dir` 真的按它发键（灌进口在
+#:   `route.walk_job_for_edge` ✓）。**它是逐边的东西** —— 全局设置里不许有这个参数
+#:  （2026-09-26 用户明确否掉，见 `WalkJob` 的注释）。
 WALK_DIRS = ("", "left", "right")
 WALK_DIR_LABELS = {"": "默认方向（朝目标走）",
                    "left": "仅向左",
@@ -601,6 +708,46 @@ def walk_dir(edge):
     """这条「走」边配的方向类型 → "" / "left" / "right"（认不出的当默认）。"""
     v = str((edge or {}).get("dir") or "")
     return v if v in WALK_DIRS else ""
+
+
+#: 「爬（绳梯）」的**中途跳下**（2026-09-28 用户要求 ✓ 原话："通行方式的**攀爬**需要添加配置
+#: 「**中途跳下**」，类型为下拉列表：**默认（向目标中心）**、**仅向左**、**仅向右**。选取后增加
+#: 一个参数「**高度**」"✓）：
+#:   `""`       = **不中途跳下** —— 老行为，一个字不变 ✓（**老文件里没有这一格也走这里** ✓）
+#:   `"center"` = 向**目标集合中心**跳（界面文字「默认（向目标中心）」）
+#:   `"left"` / `"right"` = 仅向左 / 仅向右
+#: ⚠ 只有 `climb` 边用得上；边上的 `mid_y`（「高度」= **世界坐标 y**）只在它非空时有意义 ——
+#:   执行器的判据是**字面**的 `人的 y >= mid_y`（用户明确"照字面"✓）⇒ 这里**只原样存取**，
+#:   不去纠正它的方向语义 ✗（含义见界面 tooltip ✓）。
+MID_JUMP_DIRS = ("", "center", "left", "right")
+MID_JUMP_LABELS = {"": "（不中途跳下）", "center": "默认（向目标中心）",
+                   "left": "仅向左", "right": "仅向右"}
+
+
+def mid_jump_dir(edge):
+    """这条「爬」边配的**中途跳下**方向 → `""`/`"center"`/`"left"`/`"right"`（认不出的当 `""`）。
+
+    ⚠ `""` = **不启用**（老行为 ✓）；老文件里没有 `mid_dir` 这一格也走这里 ✓。
+    写法与 `walk_dir` 同一套（**别另造一套取值** ✗）。
+    """
+    v = str((edge or {}).get("mid_dir") or "")
+    return v if v in MID_JUMP_DIRS else ""
+
+
+def mid_jump_text(edge):
+    """这条边「中途跳下」那截怎么写给人看（如「中途跳下·仅向左·高度 -120」）；没配 ⇒ `""`。
+
+    ⚠ **只在 `mid_dir` 非空时出来** —— 老边（没这一格）一个字符都不会多 ✓
+      （同 `edge_cond` 那条教训：**不显示，人就看不出这条边凭什么不一样** ✓）。
+    """
+    d = mid_jump_dir(edge)
+    if not d:
+        return ""
+    s = MID_JUMP_LABELS.get(d, d)
+    y = (edge or {}).get("mid_y")
+    if isinstance(y, (int, float)) and not isinstance(y, bool):
+        return "中途跳下·%s·高度 %g" % (s, y)
+    return "中途跳下·%s" % s
 
 
 def drop_footholds(z, edge):
@@ -615,16 +762,40 @@ def drop_footholds(z, edge):
     return [str(x) for x in (s.get("footholds") or [])]
 
 
-def climb_direction(terrain, z, ladder, src, dst):
+def climb_direction(terrain, z, ladder, src, dst, mid_jump=False):
     """「src →(爬这根绳)→ dst」是**向上**还是**向下** → +1 / -1 / None（说不清）。
 
-    用户 2026-09-26 定的规则：**按目标那边在绳的上端还是下端判**。
+    ⭐ **方向由"从哪端上绳"定**（用户 2026-09-28 定稿 ✓）—— 也就是看 **`src`
+    （起点集合）贴在绳的上端还是下端**：
+
+      · 人站在 `src` ⇒ 他只能走到**贴着 src 的那一端**上绳 ⇒ 方向就定了
+        （起点在下端 ⇒ **往上爬** +1；起点在上端 ⇒ **往下爬** -1）；
+      · 至于爬到哪里、之后怎么下去，**与方向无关** ✓。
+
+    ⚠⚠ **为什么改成看 `src` 而不是 `dst`**（用户 2026-09-28 现场指出 ✗）：
+      老规则"按**目标**在绳的上端还是下端判"把「**终点必须是绳的一个端点**」当成了**前提**，
+      于是和「**中途跳下**」直接**自相矛盾** ✗ —— 中途跳下（`mid_dir` / `mid_y`，用户
+      2026-09-28 加的 ✓）**本来就意味着终点不在端点**（爬到 `mid_y` 再往 `mid_dir` 跳出去，
+      落在绳**侧面**的集合上 ✓）。用户的实例：`右下 --爬 L2（中途跳下·仅向左·高度 50）-->
+      左上` —— L2 的两头是「右下 / 上下过渡平台」，`左上` **不在任何一头**，但**这条边
+      完全成立**（爬到 y=50 往左跳就够得到 ✓）⇒ 老规则把它判成"说不清" ⇒ 整条边建不出
+      任务 ✗（`pick_edge` 会把它剔掉 ⇒ 界面上报"没有一条能走的边"✗）。
+
+    ⭐ **编辑器的定位**（用户 2026-09-28 的原话）：它编的是「**寻路意图**」，不是"能不能通"
+      —— **连通性 / 成功率不归它管**，那些由「位置状态 / 任务 / 执行器」跑起来**自洽** ✓。
+      所以这里**只做一件事**：从 `src` 那一端把方向读出来 ✓（读不出来才 `None` ✓）。
+
+    参数 `mid_jump`：这条边配了「中途跳下」吗（`bool(edge.get("mid_dir"))` ✓）？——
+      **只有它**能放行"终点不在绳端"的边 ✓：没配中途跳下的边，终点不在端点**就是到不了**
+      （不该猜 ✓ 照旧 `None` ✓）；配了的边，方向照 `src` 算、终点在哪**不管** ✓。
+
     为什么不直接比 y 值：绳可能是斜的、两端的 y 也可能挨得近；而 `ladder_ends` 给的
     是"绳的两头各自压在**哪条 foothold** 上"，再查那条 foothold 属于哪个集合 ——
     用的是同一份数据，不引入第二套判据（§12 的老教训：两套判据必然漂）。
 
-    返回 None 的三种情况（**宁可不做也别猜**）：找不到绳；目标集合不在任何一端；
-    两头都算得上（比如集合把整根绳都圈进去了 ⇒ 那是圈错了，不是"上下都行"）。
+    返回 None 的情况（**宁可不做也别猜**）：找不到绳；起点不在任何一端；
+    起点两头都算得上（集合把整根绳圈进去了 ⇒ 那是圈错了）；终点在绳端、但**跟起点同一端**
+    （自环 / 圈错）；终点不在绳端、且**没配**中途跳下。
     """
     if ladder is None:
         return None
@@ -636,13 +807,24 @@ def climb_direction(terrain, z, ladder, src, dst):
     su, sd = sets_of(up), sets_of(dn)
     if not src or not dst:
         return None
-    if dst not in (su | sd) or src not in (su | sd):
-        return None                    # 起点或终点压根不在这根绳的两头
-    if dst in su and dst not in sd and src not in su:
-        return 1                       # 目标在上端 ⇒ 往上爬
-    if dst in sd and dst not in su and src not in sd:
-        return -1                      # 目标在下端 ⇒ 往下爬
-    return None                        # 两头都算得上 ⇒ 说不清
+    if src not in (su | sd):
+        return None                    # 起点不在这根绳的两头 ⇒ 不知道从哪上绳 ✗
+    # ⭐ 方向**只看起点在哪端**（用户 2026-09-28 ✓）
+    if src in sd and src not in su:
+        d = 1                          # 起点在下端 ⇒ 往上爬
+    elif src in su and src not in sd:
+        d = -1                         # 起点在上端 ⇒ 往下爬
+    else:
+        return None                    # 起点两头都算得上（圈错了）⇒ 说不清
+    if dst in (su | sd):
+        # 终点在绳端 ⇒ 必须是**另一端**（同一端 = 自环/圈错 ⇒ 说不清 ✓，老行为不变 ✓）
+        if d > 0 and dst in su and dst not in sd:
+            return 1
+        if d < 0 and dst in sd and dst not in su:
+            return -1
+        return None
+    # ⭐ 终点**不在**绳端：只有配了「中途跳下」才成立（爬到 mid_y 再跳出去 ✓）
+    return d if mid_jump else None
 
 
 def climb_suggestions(zones, terrain):
@@ -683,38 +865,13 @@ def climb_suggestions(zones, terrain):
     return out
 
 
-def portal_suggestions(zones, terrain):
-    """**本图内**的传送门 → [{from, to, kind:"portal", portal, why, x, y}…]。
-
-    数据的实情（实测 105090600）：`Portal.tm` 是目标地图号，`999999999` = 本图内；
-    `tn` 是目标门名。**本图内**的能直接连（从这个门进去 → 从 `tn` 那个门出来）；
-    跨图的（`tm` 是别的图号）连不了 —— 那张图的地形不在这儿，也不是"回位"要走的路。
-    另外 `pt=0` 是**出生点**、不是门（Spine 里那几个 `sp` 就是），要排除掉。
-    """
-    inmap = {}
-    for p in terrain.portals:
-        if p.pt != 0 and p.pn:
-            inmap.setdefault(p.pn, []).append(p)
-    out = []
-    for p in terrain.portals:
-        if p.pt == 0 or not p.tn or p.tm != 999999999:
-            continue                       # 出生点 / 没目标 / 跨图 —— 都不是本图的路
-        for q in inmap.get(p.tn, []):
-            # 用 foothold_below（不是"正好落在平台上"）：门通常画在平台上方一点点，
-            # 拿点当判据会漏。
-            fp = terrain.foothold_below(p.x, p.y)
-            fq = terrain.foothold_below(q.x, q.y)
-            if fp is None or fq is None:
-                continue
-            for a in zones.set_of(str(fp.fid)):
-                for b in zones.set_of(str(fq.fid)):
-                    if a == b:
-                        continue
-                    out.append({
-                        "from": a, "to": b, "kind": "portal", "portal": p.pn,
-                        "why": "传送门 %s → %s（tn=%s）" % (p.pn, q.pn, p.tn),
-                        "x": p.x, "y": p.y})
-    return out
+# ⚠ 这里原来有一个 `portal_suggestions()`（把**本图内**的传送门连成边）——
+#   **2026-09-27 用户要求移除「传送门」这种通行方式**，函数一并删掉 ✓。
+#   为什么删而不是留着：门没有执行器、门的落点导出数据里也没有（WZ 只给跨图的 `tm`
+#   + 目标门名 `tn`，本图内的落点得靠人指认）⇒ 它产出的"边"根本跑不了 ✗。
+#   地形里的 `Portal`（`mapdata.Portal` / `terrain.portals`）**保留**：那是地图上的
+#   装饰点，编辑器照旧画它、也照旧做"归属某个集合"（`portals_of` ✓）—— 只是不再作为
+#   一种"从这里过去的走法" ✓。
 
 
 def walk_suggestions(zones, terrain, include_near=False):

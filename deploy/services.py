@@ -178,9 +178,9 @@ PARAMS = {
                  "JPEG 编码里少掉点细节，**不增加信息量**，B 机会按比例缩回去。\n"
                  "面板本身够大（≥150px）就不用放大。"),
         dict(key="fps", keys=("fps",), label="帧率", kind="combo_edit", cast=int,
-             choices=("5", "10", "15"), width=110,
-             tip="小地图不需要高帧率：定位只回答「我在哪一块平台」，10 fps 足够。\n"
-                 "帧率越高，B 机每帧都要解一次、匹配一次（关键路径本来就没余量）。"),
+             choices=("10", "15", "30"), width=110,
+             tip="用户 2026-09-27 定：**实时小地图位置是权威**，帧率越高位置状态越新 ⇒\n"
+                 "默认 30。⚠ 帧率越高，B 机每帧都要解一次、匹配一次 ⇒ 真吃紧时降回 10~15。"),
         dict(key="quality", keys=("quality",), label="JPEG 质量", kind="int",
              minimum=30, maximum=100, width=110,
              tip="默认 100。这一路的**唯一价值**就是像素清晰（主画面那路压过一遍，\n"
@@ -254,7 +254,7 @@ def _mmap_cmd(p, num):
            "--bind", str(p.get("bind") or "0.0.0.0"),
            "--port", str(int(num(p.get("port"), 5003, int))),
            "--zoom", str(int(num(p.get("zoom"), 3, int))),
-           "--fps", str(int(num(p.get("fps"), 10, int))),
+           "--fps", str(int(num(p.get("fps"), 30, int))),
            "--quality", str(int(num(p.get("quality"), 100, int)))]
     if region_set(p):
         cmd += ["--x", str(int(num(p.get("x"), 0, int))),

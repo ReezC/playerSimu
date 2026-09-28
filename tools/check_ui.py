@@ -267,6 +267,41 @@ def check_settings_have_ui(warnings):
                             "（只能在配置文件里改；确认是有意为之就忽略）" % f)
 
 
+#: 「滚动区只有一处实现」的**例外标记**：确需自己 new `QScrollArea` 时，在**那一行**写
+#: `# ui-allow-scroll：<理由>`（`check_scroll_single_impl` 认它 ✓）。
+#: 现在全仓只有一处例外：`gui/player_panel.py` 的「操控」常驻栏 —— 它要拿滚动区**实例**
+#: 当 `_wheel_target` 指路（指针停在常驻栏上时滚轮也要滚下面的参数 ✓），而
+#: `scroll_page` 只给布局、不给实例 ⇒ 这里必须自己建 ✓。
+SCROLL_ALLOW = "ui-allow-scroll"
+
+
+def check_scroll_single_impl(errors):
+    """滚动区**只有一处实现**（2026-09-27 收口，用户要求"每个页签都统一规范"）。
+
+    为什么写进检查：那份三行套路（`QScrollArea()` + `setWidgetResizable(True)` +
+    `setWidget(...)`）在本仓库被**手抄过 7 份**（工作台主窗口 / 决策参数页 / 路线识别页 /
+    两个设置弹窗 / A 机部署台两处 / 编辑器分栏）⇒ 结果就是**有的页能滚、有的页不能滚**：
+    用户 2026-09-27 报的「路线识别页签不支持滚动？现在攀爬参数组的行和行都重叠了」
+    正是漏改那一页 ✗（内容比页签高 ⇒ Qt 硬挤 ⇒ 行行重叠）。
+
+    收口到 `gui/widgets.py` 的**一个** `QScrollArea`：
+      · `scroll_page(widget)`  —— 空容器 + 卡片（参数页 ✓）；
+      · `mount_scroll(layout, content)` —— 内容自带样式（部署台的 `QFrame#Card` ✓）；
+      · `scroll_area(content)` —— 滚动区自己要当控件交出去（`QSplitter` 的栏 ✓）。
+    改一处就是全改 ✓；谁再手写一份，这条就红 ✓。
+    """
+    for p in iter_scanned():
+        if p.name == "widgets.py":      # 定义处例外（唯一允许 new 的地方 ✓）
+            continue
+        for i, ln in enumerate(read(p).splitlines(), 1):
+            if "QScrollArea(" not in ln or SCROLL_ALLOW in ln:
+                continue
+            errors.append("%s:%d  滚动区只有一处实现：请改用 gui.widgets 的 "
+                          "scroll_page / mount_scroll / scroll_area\n"
+                          "        （确需自己写就在这一行加 `# %s：<理由>`）\n        %s"
+                          % (rel(p), i, SCROLL_ALLOW, ln.strip()))
+
+
 def check_theme_colors(warnings):
     """（占位）样式里的硬编码颜色。
 
@@ -286,6 +321,7 @@ def main():
     check_widgets_import_scope(errors)
     check_ms_is_integer(errors)          # 毫秒一律整数（2026-09-26 新增）
     check_unit_in_label(errors)          # 单位写在框外（存量清零后已升级为错误）
+    check_scroll_single_impl(errors)     # 滚动区只有一处实现（2026-09-27 收口）
     check_settings_sync(warnings)
     check_settings_have_ui(warnings)     # 每个参数都要有界面入口（2026-09-26 新增）
     check_theme_colors(warnings)

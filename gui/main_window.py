@@ -25,7 +25,7 @@ from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (QFileDialog, QHBoxLayout, QInputDialog,
                              QLabel, QMainWindow, QMessageBox, QPlainTextEdit,
                              QProgressBar, QPushButton, QScrollArea, QShortcut,
-                             QSizePolicy, QSplitter, QStackedWidget, QTabWidget,
+                             QSizePolicy, QSplitter, QTabWidget,
                              QToolBar, QVBoxLayout, QWidget)
 
 from gui import theme
@@ -34,7 +34,7 @@ from gui.live_panel import LivePanel
 from gui.player_panel import PlayerPanel
 from gui.route_panel import RoutePanel
 from gui.settings_dialog import SettingsDialog
-from gui.widgets import NoWheelComboBox
+from gui.widgets import NoWheelComboBox, scroll_page
 from gui.project import Project, last_opened, remember_open, sanitize
 from gui.review import ReviewPanel
 from gui.steps import ALL_CARDS, CIRCLED
@@ -76,6 +76,15 @@ QGroupBox::title {
     padding: 0 4px;
     color: #5f6368;
 }
+
+/* 「操控」组（gui/player_panel.py）：它在**置顶常驻区**（滚动区外面），
+   和下面能滚的参数区**都是白底** ⇒ 扫一眼分不清哪块不跟着滚（用户 2026-09-26
+   要求"加个背景色区分一下"）。只按 objectName 命中这一组：别的分组框、以及
+   本组里嵌套的「前往平台」都照旧白底 ✓（那一块白底正好读成"卡在操控面板里"）。
+   取色不新造：`#e8f0fe` 是调色板里既有的"选中/强调底"（见上面 QComboBox
+   下拉的 selection 色），配 Tab 选中同一个蓝 `#1a73e8` 当标题色 ✓。 */
+QGroupBox#CtrlGroup { background: #e8f0fe; }
+QGroupBox#CtrlGroup::title { color: #1a73e8; }
 
 /* ===== 按钮 ===== */
 QPushButton {
@@ -178,24 +187,24 @@ QToolTip {
 """
 
 
-PAGE_REVIEW = 1     # 质检台在主视区里的固定页号
-PAGE_VERIFY = 2     # 验证结果浏览器的固定页号
-PAGE_LIVE = 3       # 实时预览（收流 + 推理）的固定页号
-PAGE_PLAYER = 4     # 角色匹配验证结果的固定页号
-
-
 class InfoPage(QWidget):
     """纯文字详情页。
 
-    内容可以更新，而不是重建控件 —— 重建会让 QStackedWidget 的页号错位，
-    每次「查看」都往里面塞新页，越用越乱。
+    内容可以更新，而不是重建控件 —— 每次「查看」都往主视区塞一个新页，越用越乱。
+    ⚠ 主视区 2026-09-27 起是**页签容器**（见 `_build_viewer`）⇒ 这里不再有"页号"这回事：
+      以前那几个固定页号常量（`PAGE_REVIEW` / `PAGE_VERIFY` / `PAGE_LIVE` / `PAGE_PLAYER`）
+      **全部删掉** ✗ —— 页号会随"开了几个 / 关了几个页签"变化，拿固定页号去
+      `setCurrentIndex` 迟早错位。现在一律用**控件本身**说话：
+      `open_view(widget, 标题)` / `close_view(widget)` ✓。
     """
 
     def __init__(self, title, body=""):
         super().__init__()
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 20, 24, 20)
+        # ⚠ 页面**要能滚**（`gui.widgets.scroll_page` = 滚动区**唯一实现**，2026-09-27 收口）：
+        #   步骤详情页的正文可能很长（`setWordWrap` 之后占很多行），以前没有滚动区 ⇒
+        #   窗口一矮就**直接被裁掉**、还滚不到 ✗（起始页那几行短文案看不出来）。
+        lay = scroll_page(self, margins=(24, 20, 24, 20), spacing=6)
 
         self.lbl_title = QLabel(title)
         self.lbl_title.setStyleSheet("font-weight: 600; color: #202124;")
@@ -380,11 +389,29 @@ class MainWindow(QMainWindow):
         return bar
 
     def _build_viewer(self):
-        self.viewer = QStackedWidget()
-        # 忽略 sizeHint：QStackedWidget 的 sizeHint 是所有页的最大 sizeHint，
-        # 实时页每帧刷新会带动它变化，传导到 QSplitter 就会挤压右侧卡片。
+        """主视区 = **页签容器**（2026-09-27 用户要求："主视区也能分页签，只要会占用主视区
+        的都应该走打开、关闭页签流程"）。
+
+        为什么从 `QStackedWidget` 换过来：
+          · 以前是"一个固定页号一个页面"：占用者**一直挂着** ⇒ "打开 / 关闭"这件事根本
+            不存在 ✗，而动态页（步骤详情）一来，页号还得靠人肉维护（老的 `viewer_pages`）
+            ⇒ 迟早错位（`InfoPage` 那句注释记的就是这类坑）；
+          · 现在：**要占用主视区 ⇒ 调 `open_view(widget, 标题)`**，关掉走 `close_view` ✓
+            —— 那是**唯一的开合入口**，谁都不许再直接 `viewer.setCurrentIndex` /
+            `addTab` ✗（用例 `t_viewer_has_single_entry` 钉着这条）。
+        ⚠ 尺寸策略照旧（`Ignored`）：实时页每帧刷新会带动 sizeHint 变化，传导到
+          `QSplitter` 就会挤压右侧卡片 ✗（原来踩过）。
+        ⚠ **起始页不参与开合**：它永远是第一个标签、关不掉 —— 它不占用主视区去干活，
+          只是"把所有工作页都关掉之后总得有个落脚的地方" ✓（不然主视区会变成空白 ✗）。
+        """
+        self.viewer = QTabWidget()
         self.viewer.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.viewer.addWidget(self._placeholder(
+        self.viewer.setTabsClosable(True)     # 页签可关（用户要的"关闭流程"）
+        self.viewer.setMovable(True)          # 能拖着重排（纯界面，不牵动任何逻辑 ✓）
+        self.viewer.setDocumentMode(True)     # 主视区是"工作区"，不是一叠设置卡片
+        self.viewer.tabCloseRequested.connect(self._on_view_close)
+
+        self.home_view = self._placeholder(
             "主视区",
             "这里会显示当前步骤的产物：\n\n"
             "  ·   抽帧画面预览（②）\n"
@@ -392,24 +419,17 @@ class MainWindow(QMainWindow):
             "  ·   质检台：翻看 / 筛选 / 修正标注（⑤）\n"
             "  ·   训练曲线与日志（⑦）\n"
             "  ·   检测结果图（⑧）\n\n"
-            "点右侧卡片下方的「查看」可切换到这里。"))
-        # 质检台固定在 index 1 —— 它是流程里最常看的页面，不参与动态创建
-        self.review = ReviewPanel()
-        self.viewer.addWidget(self.review)
+            "点右侧卡片下方的「查看」—— 它会在**这里新开一个页签**（页签上的 × 关闭 ✓）。")
+        self.viewer.addTab(self.home_view, "起始")
 
-        # 验证结果浏览器固定在 index 2
-        self.verify_viewer = VerifyViewer()
-        self.viewer.addWidget(self.verify_viewer)
-
-        # 实时预览固定在 index 3
-        self.live_panel = LivePanel()
-        self.viewer.addWidget(self.live_panel)
-
-        # 角色匹配验证结果固定在 index 4
-        self.player_view = PlayerMatchPage()
-        self.viewer.addWidget(self.player_view)
-
-        self.viewer_pages = {}      # card.key -> 动态页页号（从 5 起）
+        # ---- 四个**常驻工作页**：先不建标签，谁用谁 `open_view` ✓ ----
+        # 控件本身**不销毁**：关掉页签只是"从主视区摘下来"，下次打开还是原来那个对象
+        #（标定/画面/滚动位置都还在 ✓）。
+        self.review = ReviewPanel()           # 质检台（⑤「查看」）
+        self.verify_viewer = VerifyViewer()   # 验证结果浏览器（⑧「查看」）
+        self.live_panel = LivePanel()         # 实时预览（工具栏「实时」）
+        self.player_view = PlayerMatchPage()  # 角色匹配验证结果（角色模板 → 匹配验证）
+        self.view_widgets = {}                # card.key -> 步骤详情页控件
         return self.viewer
 
     def _placeholder(self, title, body):
@@ -417,17 +437,11 @@ class MainWindow(QMainWindow):
 
     def _build_cards(self):
         host = QWidget()
-        lay = QVBoxLayout(host)
-        lay.setContentsMargins(0, 0, 0, 0)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-
-        inner = QWidget()
-        inner_lay = QVBoxLayout(inner)
-        inner_lay.setContentsMargins(2, 2, 8, 2)
-        inner_lay.setSpacing(8)
+        # 滚动区**只有一处实现**（`gui.widgets.scroll_page`，2026-09-27 收口）：这里原来是
+        # 手写的一份 —— 和「决策参数」页、「路线识别」页、两个设置弹窗各写一版 = 五份重复 ✗
+        # ⇒ 改一处忘一处就是"有的页能滚、有的页不能滚"（路线识别页就是这么被漏掉的 ✓）。
+        # 右边距 8 是给滚动条留的位置（跟原来一样 ✓）。
+        inner_lay = scroll_page(host, margins=(2, 2, 8, 2), spacing=8)
 
         for cls in ALL_CARDS:
             card = cls()
@@ -437,9 +451,6 @@ class MainWindow(QMainWindow):
             inner_lay.addWidget(card)
 
         inner_lay.addStretch(1)
-        scroll.setWidget(inner)
-
-        lay.addWidget(scroll)
         return host
 
     def _build_right_tabs(self):
@@ -625,6 +636,14 @@ class MainWindow(QMainWindow):
         # （玩家面板不持有地图 id）。以前写好了 `set_zone_sets()` 却**没人调** ⇒
         # 那两个下拉一直只有「（未选）」✗（2026-09-26 补）。
         self.player_panel.set_zone_sets(self.route_panel.zone_sets())
+        # 「编辑战斗区域」子弹窗里那块**只读集合视图**（用户 2026-09-28 要求 ✓）：地形同样按
+        # **地图 id** 存 ⇒ 和上面一样，把**工厂**从路线识别面板推过去 ✓（玩家面板不持有地图 id ✓；
+        # 拿不到就回 `None` ⇒ 弹窗**退回文本框** ✓，老用法不坏 ✓）。
+        self.player_panel.set_foothold_picker_factory(
+            getattr(self.route_panel, "make_foothold_picker", None))
+        # 「前往平台」（选择平台 / 命令前往 / 结束当前寻路）**显示在决策参数页**：
+        # 控件还是 RoutePanel 造的那一份（逻辑要在那边 ✓），这里只负责搬位置 ✓。
+        self.player_panel.mount_goto(getattr(self.route_panel, "goto_box", None))
         self.lbl_status.setText("未选择项目" if self.project is None else
                                 self.lbl_status.text())
         # 标题跟着项目走（切项目 / 新建 / 打开都走这里）
@@ -668,12 +687,36 @@ class MainWindow(QMainWindow):
     # ---------------- WZ 导出 ----------------
 
     def _show_live(self):
-        """切到实时预览。"""
+        """切到实时预览（没有这个页签就开一个 ✓）。"""
         self.live_panel.bind(self.project)
-        self.viewer.setCurrentIndex(PAGE_LIVE)
+        self.open_view(self.live_panel, "实时")
 
     def _on_settings(self):
-        SettingsDialog(self).exec_()
+        """开设置（**非模态**，2026-09-27 用户定）。
+
+        为什么不再用 `exec_()`：改完「浓淡 / 叠图」要对着**实时画面**（或路线识别页）
+        看效果 ⇒ 开着设置得能去「实时」页看 —— 模态会把整个工作台锁住，只能
+        "关窗 → 看 → 重开设置" ✗（用户就是这么定的；原来那条理由是"要在设置里框选
+        小地图"，那个按钮 2026-09-27 已搬回路线识别页 ✓）。
+        非模态之后只剩一个实例的问题：**关过窗就重建**（打开时要重读基准值，不然会拿
+        旧基准去比"这次改了什么" ✗），还开着就直接抬到前面 ✓。
+        """
+        dlg = getattr(self, "_settings_dlg", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return
+        if dlg is not None:
+            dlg.close()
+            dlg.deleteLater()
+        dlg = SettingsDialog(self)
+        # 「设置 → 界面」里改了叠图开关 / 浓淡 ⇒ 立刻让路线识别面板重画那一层
+        # （那一层是它画的，见 route_panel.apply_overlay_settings ✓）
+        dlg.overlay_changed.connect(self.route_panel.apply_overlay_settings)
+        self._settings_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _on_export(self):
         dlg = ExportDialog(self)
@@ -689,14 +732,14 @@ class MainWindow(QMainWindow):
         self.log("① 地图卡片的下拉列表已刷新", "ok")
 
     def _on_player_verify_started(self):
-        """点「匹配验证」→ 主视区切到角色匹配页，先显示进行中。"""
+        """点「匹配验证」→ 主视区切到角色匹配页（没有就开一个），先显示进行中。"""
         self.player_view.set_result(None, "连流抓帧 + 匹配中…")
-        self.viewer.setCurrentIndex(PAGE_PLAYER)
+        self.open_view(self.player_view, "角色匹配")
 
     def _on_player_verify(self, pm, text):
         """匹配验证出结果 → 主视区显示画面 + 说明。"""
         self.player_view.set_result(pm, text)
-        self.viewer.setCurrentIndex(PAGE_PLAYER)
+        self.open_view(self.player_view, "角色匹配")
 
     # ══════════════════════════════════════════════════
     # 运行任务
@@ -853,51 +896,93 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════════
     # 主视区
     # ══════════════════════════════════════════════════
+    def open_view(self, widget, title):
+        """**让一个控件占用主视区**：已经在 ⇒ 切过去；没有 ⇒ 新开一个页签并切过去。
+
+        这是主视区**唯一的打开入口**（用户 2026-09-27 要求："只要会占用主视区的都应该走
+        打开、关闭页签流程"）—— 别再直接 `self.viewer.setCurrentIndex(...)` /
+        `self.viewer.addTab(...)` ✗：页号会随开合变化，任何人肉算页号的地方迟早错位
+        （用例 `t_viewer_has_single_entry` 钉着这条 ✓）。
+        """
+        idx = self.viewer.indexOf(widget)
+        if idx < 0:
+            idx = self.viewer.addTab(widget, title)
+        self.viewer.setCurrentIndex(idx)
+        return idx
+
+    def close_view(self, widget):
+        """关掉某个控件的页签（**不销毁控件**：下次 `open_view` 还接着用原来那个 ✓）。"""
+        idx = self.viewer.indexOf(widget)
+        if idx >= 0:
+            self.viewer.removeTab(idx)      # removeTab 只是摘下来，不删控件 ✓
+
+    def _on_view_close(self, idx):
+        """点了页签上的 × ⇒ 关掉它。**起始页关不掉**（工作页全关掉之后总得有个落脚处 ✓）。
+
+        ⚠ 「实时」页签关掉**不会停**收流 / 推理 —— 页签只管"看不看得见"，跑不跑由页面里
+          那个「开始 / 停止」决定 ⇒ 必须当场说一句：不然人会以为关掉 = 机器人停了 ✗
+          （那是很危险的误会）。
+        """
+        w = self.viewer.widget(idx)
+        if w is self.home_view:
+            self.log("「起始」页签不能关 —— 它是所有工作页关掉之后的落脚处", "warn")
+            return
+        if w is self.live_panel:
+            self.log("「实时」页签已关（**收流 / 推理还在跑**：要停就重开该页签按「停止」，"
+                     "自动打怪 / 寻路的开关在右侧「决策参数」里）", "warn")
+        self.viewer.removeTab(idx)
+
+    def _view_title(self, card):
+        """步骤详情页的**页签标题**（和页面标题同一份说法 ✓，别两处各写一个）。"""
+        return "%s %s" % (CIRCLED[card.num - 1], card.title)
+
     def _on_view(self, card):
         # ⑤ 标注校验的「查看」= 打开质检台。
         # 原来是挂在 ④ 上的，但质检台做的是校验修正，属于 ⑤ 的职责 ——
         # 挂在 ④ 上会让人以为"标注跑完就算完事了"。
         if card.key == "editor":
             self.review.bind(self.project)
-            self.viewer.setCurrentIndex(PAGE_REVIEW)
+            self.open_view(self.review, "质检台")
             return
 
         # ⑧ 验证的「查看」= 打开验证结果浏览器
         if card.key == "verify":
             self.verify_viewer.bind(self.project)
-            self.viewer.setCurrentIndex(PAGE_VERIFY)
+            self.open_view(self.verify_viewer, "验证结果")
             return
 
         self._rebuild_page(card)
-        idx = self.viewer_pages.get(card.key)
-        if idx is not None:
-            self.viewer.setCurrentIndex(idx)
+        w = self.view_widgets.get(card.key)
+        if w is not None:
+            self.open_view(w, self._view_title(card))
 
     def _rebuild_page(self, card):
-        """详情页：首次访问时创建，之后只更新文字。"""
+        """详情页：首次访问时创建，之后只更新文字（**不重建控件** ✓）。
+
+        ⚠ 这里**只负责"内容"**，页签由 `open_view` 开（开合一入口 ✓）—— 在这里
+          `addTab` 就等于又长出一条旁路 ✗。
+        """
         body = "%s\n\n%s" % (
             card.hint or "",
             card.summarize(self.project) if self.project else "未选择项目")
 
-        idx = self.viewer_pages.get(card.key)
-        page = self.viewer.widget(idx) if idx is not None else None
-
+        page = self.view_widgets.get(card.key)
         if isinstance(page, InfoPage):
             page.set_body(body)
             return
-
-        page = InfoPage("%s %s" % (CIRCLED[card.num - 1], card.title), body)
-        self.viewer.addWidget(page)
-        self.viewer_pages[card.key] = self.viewer.count() - 1
+        self.view_widgets[card.key] = InfoPage(self._view_title(card), body)
 
     def _clear_pages(self):
-        """清掉动态详情页，保留欢迎页、质检台、验证结果浏览器、实时预览、角色匹配。"""
-        while self.viewer.count() > 5:
-            w = self.viewer.widget(self.viewer.count() - 1)
-            self.viewer.removeWidget(w)
-            w.deleteLater()
-        self.viewer_pages.clear()
-        self.viewer.setCurrentIndex(0)
+        """清掉**步骤详情页**（换项目时用）：四个常驻工作页与起始页**不在这里关**。
+
+        为什么常驻工作页不关：它们是"工作台的一部分"（实时 / 质检台 / 验证结果 /
+        角色匹配）—— 换项目后各自 `bind()` 换数据 ✓；把人正在看的页面抽走反而更糟 ✗。
+        """
+        for w in list(self.view_widgets.values()):
+            self.close_view(w)      # 先摘页签，再销毁控件（顺序反了会留下空标签 ✗）
+            w.deleteLater()         # 详情页是"用完即弃"的：内容跟着项目变 ✓
+        self.view_widgets.clear()
+        self.open_view(self.home_view, "起始")
 
     # ══════════════════════════════════════════════════
     # 日志

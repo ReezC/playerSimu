@@ -1,0 +1,41 @@
+{
+  "format": "playerSimu.sequence",
+  "version": 1,
+  "name": "自动喊话",
+  "saved_at": "2026-09-28 09:31:45",
+  "_note": "「行为编辑器 → 保存」写出来的预设；改完文本可以直接加载回来。",
+  "seq": [
+    {
+      "type": "down",
+      "key": "enter"
+    },
+    {
+      "type": "up",
+      "key": "enter"
+    },
+    {
+      "type": "delay",
+      "ms": 500
+    },
+    {
+      "type": "down",
+      "key": "up"
+    },
+    {
+      "type": "up",
+      "key": "up"
+    },
+    {
+      "type": "delay",
+      "ms": 500
+    },
+    {
+      "type": "down",
+      "key": "enter"
+    },
+    {
+      "type": "up",
+      "key": "enter"
+    }
+  ]
+}

@@ -82,15 +82,36 @@ def render(t, out_path, use_canvas=True, target_w=1280, k=None, dx=0, dy=0,
     w, h = size
     z = max(1, int(round(float(target_w) / max(1, w))))
     W, H = w * z, h * z
+    # ⭐ **透明区要一路带到输出**（用户 2026-09-27："小地图底图、**地形叠加图**的背景应该透明吧？
+    #   **你自己加的黑色**？"）—— WZ 底图 PNG 有近一半像素是全透明的（面板之外的圆角 ✓），
+    #   以前两条链都把 alpha 丢了 ⇒ 叠到实时画面上就是一块**黑底** ✗。
+    # 做法：把底图自己的 alpha 单独取出来（`_base_a` ✓），**画线仍然画在 BGR 上**（下面所有
+    #   `cv2.line/putText` 的 3 元组一个都不用改 ✓ —— 在 4 通道图上用 3 元组会把 alpha 写 0 ✗，
+    #   那才是最容易踩的坑 ✓），最后按"**我们画过的像素**"把 alpha 抬到 255 再合并 ✓。
+    #   `_base_a is None` = 底图没有 alpha（老文件 / 图本身就 3 通道）⇒ 保持老行为（3 通道输出 ✓）。
+    _base_a = None
     if use_canvas and t.canvas is not None:
-        vis = t.canvas.copy()
+        _cv = t.canvas
+        # 底图的 alpha 单独存在 `Terrain.canvas_alpha`（`canvas` 本身永远 3 通道 ✓，
+        # 全仓的匹配/拼接都按 BGR 写 ✓ —— 见 `mapdata.load` 的说明 ✓）
+        if getattr(t, "canvas_alpha", None) is not None:
+            _base_a = t.canvas_alpha.copy()
+        if getattr(_cv, "ndim", 0) == 3 and _cv.shape[2] == 4:   # 兜底：直接喂了 BGRA ✓
+            _base_a = _cv[:, :, 3].copy()
+            _cv = _cv[:, :, :3]
+        vis = _cv.copy()
         if vis.shape[1] != w or vis.shape[0] != h:
             vis = cv2.resize(vis, (w, h), interpolation=cv2.INTER_NEAREST)
         vis = cv2.resize(vis, (W, H), interpolation=cv2.INTER_NEAREST)
         # 底图偏亮时把地形压在暗化层上，线才看得清
         vis = cv2.addWeighted(vis, 0.55, np.zeros_like(vis), 0, 0)
+        if _base_a is not None:
+            _base_a = cv2.resize(_base_a, (W, H), interpolation=cv2.INTER_NEAREST)
     else:
         vis = np.zeros((H, W, 3), np.uint8)
+        # 不铺底图（"地形叠加图"就是这一档）⇒ **整张都该透明**，只有线不透明 ✓
+        _base_a = np.zeros((H, W), np.uint8)
+    _vis_bg = vis.copy()            # 画之前的底：用来判"哪些像素是我们画的"✓
 
     # k/dx/dy 是**人工标定**用的微调：默认用数据推出来的 px_per_world（实测 ≈16），
     # 差几像素就拧这几个数（`--k 16.0 --dx 2 --dy -1`），看图对准为止。
@@ -201,8 +222,12 @@ def render(t, out_path, use_canvas=True, target_w=1280, k=None, dx=0, dy=0,
     for i, s in enumerate(lines):
         _label(vis, s, (12, 34 + i * 34), (255, 255, 255), 0.8)
 
+    # ---- 把 alpha 并回去（底图带 alpha / 没铺底图 ⇒ 写**带 alpha 的 PNG** ✓）----
+    if _base_a is not None:
+        _drawn = (vis != _vis_bg).any(axis=2)          # 我们画过的像素 ⇒ **不透明** ✓
+        vis = cv2.merge([vis, np.maximum(_base_a, np.where(_drawn, 255, 0).astype(np.uint8))])
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out_path), vis)
+    cv2.imwrite(str(out_path), vis)                    # 4 通道 ⇒ 写出带 alpha 的 PNG ✓
     return W, H, n_fh, n_wall          # 返回**实际输出**尺寸（已放大）
 
 

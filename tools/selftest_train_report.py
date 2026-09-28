@@ -170,12 +170,64 @@ def t_card_moved_it_out():
         shutil.rmtree(str(tmp), ignore_errors=True)
 
 
+def t_train_card_model_combo():
+    """⑦「基础权重」是**下拉**（2026-09-27 用户要求"整理一下"）：官方预训练 + 各项目权重 + 自定义。
+
+    为什么要它（用户原话："我希望基础权重这里能用下拉列表选择"）：新项目和旧项目
+    **背景、怪都很像**时，直接挑旧项目那一版微调最省事；而以前这格是**文本框** ——
+    人不知道有哪些能选、该填什么 ✗。
+
+    钉四件：
+      ① 候选里有**官方预训练**（仓库根的 `*.pt`；至少 `yolo26n.pt`，默认值永远选得上 ✓）；
+      ② 有**各项目练好的权重**（`tools.yolo_augment.list_weights()`，与 ④ 那张卡的
+         「YOLO 权重」**同一处来源** ✓）—— 本机还没训过就跳过这条（不硬报 ✗）；
+      ③ **当前值不在候选里也要补一项**（老项目里手打过的怪路径 ⇒ 不许被吞掉 ✗：
+         `set_value` 按 userData 找项，找不到就**静默不选中** ⇒ 界面显示的会和你实际
+         拿去训练的**不是同一个** ✗）；
+      ④ 最后一项是**自定义 / 浏览…**（逃生口：任意 .pt 仍填得进去 ✓）。
+    """
+    from tools.yolo_augment import list_weights
+
+    c = cards_mod.TrainCard()
+    cmb = c.widgets["model"][0]
+    c._fill_model_options(None, cur="yolo26n.pt")
+    datas = [cmb.itemData(i) for i in range(cmb.count())]
+    texts = [cmb.itemText(i) for i in range(cmb.count())]
+    check("yolo26n.pt" in datas,
+          "候选里没有官方预训练（默认值就是它）：%s" % datas)
+    check(cmb.currentData() == "yolo26n.pt",
+          "默认没选中 yolo26n.pt：%r" % cmb.currentText())
+    check(c.values(["model"])["model"] == "yolo26n.pt",
+          "取值没走 userData（存进 project.yaml 的会是别的）：%s"
+          % c.values(["model"])["model"])
+    check(datas[-1] == cards_mod.TrainCard.MODEL_CUSTOM,
+          "最后一项不是「自定义 / 浏览…」逃生口：%s" % datas[-1])
+    check(texts[-1].startswith("（自定义"),
+          "自定义那一项没写清楚：%r" % texts[-1])
+    others = [p for _l, p, _pid in list_weights()]
+    if others:
+        miss = [p for p in others if p not in datas]
+        check(not miss,
+              "有些项目已训好的权重没进下拉（跨项目微调就选不到）：%s" % miss[:3])
+    else:
+        print("      （本机还没有任何项目训过的权重，跳过第 ② 条）")
+    # ③ 当前值不在候选里 ⇒ 补一项，而且**真的选中**（显示 = 实际）
+    c._fill_model_options(None, cur="D:/some/where/weird_best.pt")
+    check(cmb.currentData() == "D:/some/where/weird_best.pt",
+          "存着的怪路径没被选中（界面会显示别的权重、训练却用存的 ✗）：%r"
+          % cmb.currentText())
+    check("当前填写" in cmb.currentText(),
+          "补进来的那一项没标明是「当前填写」：%r" % cmb.currentText())
+
+
 TESTS = (
     ("弹窗左栏列出本项目所有权重（新的在前、归档优先、不重复）", t_lists_all_weights),
     ("选中哪版显示哪版 + 与上一版比（目录名标签、差值算对）", t_shows_selected_version),
     ("不同颜色区分关键词与重要信息（整行按 kind 上色 + 关键词高亮）", t_colors_and_keywords),
     ("没有 run.json 的权重 / 空项目：如实说，不编", t_missing_and_empty),
     ("卡片结果区不再贴建议 + 有「查看报告」按钮", t_card_moved_it_out),
+    ("⑦「基础权重」下拉：官方预训练 + 各项目权重 + 自定义（当前值不许被吞掉）",
+     t_train_card_model_combo),
 )
 
 

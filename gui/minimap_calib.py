@@ -12,7 +12,12 @@
 **两条路都能走**：
     「自动定位」  用模板匹配算出 scale/offset/view（准，1 像素级）
     「手动拖动」  匹配分低/面板被 UI 挡住时，人把底图拖到与面板重合的位置
-                  （方向键 1 像素微调，Shift+方向键 5 像素）
+                 （方向键 1 像素微调，Shift+方向键 5 像素）
+
+**两轴（x/y 各自一个缩放）**：本窗**认**双点标定量出来的两轴几何 —— 读进来、按各自的
+缩放画叠加层、保存时原样写回；人拖动/改缩放时两轴**按同一比例**一起变（比例要改，用
+「双点标定」重量一次）。⚠ 这条是 2026-09-27 修的：以前本窗只认一个缩放，双点标定的
+几何一进一出就被抹成等比（`scale_y` 被丢掉），界面还只显示一个数 ✗。
 
 **显示方式（全局 / 局部）不在这里改**：那要进游戏走两步看「地形动不动」才知道，
 所以沿用「路线识别」下拉里你选的那个 —— 和命令行工具的态度一致（程序不替你猜）。
@@ -20,13 +25,15 @@
 
 import time
 
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QImage, QPainter, QPixmap
+from PyQt5.QtCore import QEvent, Qt, QTimer
+from PyQt5.QtGui import QImage, QPainter, QPixmap, QTransform
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QDialog,
                              QGraphicsPixmapItem, QGraphicsScene, QHBoxLayout,
-                             QLabel, QMessageBox, QPushButton, QVBoxLayout)
+                             QLabel, QMessageBox, QPushButton, QVBoxLayout,
+                             QWidget)
 
 from core import mapdata
+from gui import theme                  # 弹窗几何按客户端存（config/ui.yaml）✓
 from gui.canvas import ZoomPanView    # 看图交互在几个窗口里是同一份
 from gui.widgets import NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSlider
 from gui.worker import safe_slot      # 槽里抛异常 = 整个工作台 abort（见 worker.py）
@@ -44,10 +51,57 @@ SPIN_MAX = 12.0
 #: 匹配分低于这个值时，「保存」会先问一句。0.55 = locate 内部那条 min_score
 SCORE_WARN = 0.55
 
+#: 存回文件时 offset 保留的小数位（0.001 面板像素 ≈ 0.01 世界像素，远小于读数误差）
+OFF_DEC = 3
+
+
+def off_store(v):
+    """标定里的一个 offset 分量 → 存文件用的值。
+
+    ⚠ **别再 `int()` 截断**（2026-09-27 改）：这张图上 1 个面板像素 ≈ 8 世界像素 ⇒
+      截断是**系统性**偏最多半个像素 = 4 个世界像素。实测：双点标定解出来的 -10.507
+      一进这扇窗再保存就变成 -10，读数永远差 4 个世界像素、**看着像"点没点准"** ✗
+      （用户 2026-09-27 那个 (48,-222) 里就有这 4 个像素）。
+      ⚠ crop 的 `offset` 是 **inset 整数**（见 `calib()`），那边照旧用 int ✓。
+    """
+    try:
+        return round(float(v), OFF_DEC)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _with_canvas_alpha(t):
+    """底图 + 它自己的 alpha ⇒ **BGRA**（底图没有透明区就原样 3 通道 ✓）。
+
+    用户 2026-09-27："**小地图底图**、地形叠加图的背景应该透明吧？你自己加的黑色？" ——
+    底图 PNG 本来有近一半像素是**透明**的（面板之外的圆角 ✓），以前读图时把 alpha 丢了 ✗
+    ⇒ 透明区变成**纯黑** ✗（见 `core/mapdata.load` 的说明 ✓）。`canvas` 本身仍是 3 通道（全仓
+    的匹配/拼接都按 BGR 写 ✓），alpha 单独放在 `Terrain.canvas_alpha` ✓，要用的人自己合 ✓。
+    """
+    import numpy as np
+
+    c = getattr(t, "canvas", None)
+    a = getattr(t, "canvas_alpha", None)
+    if c is None or a is None:
+        return c
+    return np.dstack([c, a])
+
 
 def np_to_pixmap(img):
-    """numpy BGR → QPixmap（小地图帧/底图都是 BGR）。"""
+    """numpy **BGR / BGRA** → QPixmap（小地图帧是 BGR ✓；底图**带 alpha** 时是 BGRA ✓）。
+
+    ⚠ 4 通道那条必须走 `Format_ARGB32`（它在内存里就是 BGRA 序 ✓）：以前只有 3 通道这一路 ⇒
+      带 alpha 的底图会被当成 BGR 逐像素错读（通道错位 ✗ + 透明区变黑 ✗）——这正是用户问的
+      "小地图底图的背景为什么是黑的"的来源之一 ✓（见 `core/mapdata.load` 里读底图那段的说明 ✓）。
+    """
     import cv2
+    import numpy as np
+
+    if getattr(img, "ndim", 0) == 3 and img.shape[2] == 4:
+        bgra = np.ascontiguousarray(img)                # 原样喂 Qt（BGRA = Format_ARGB32 ✓）
+        h, w = bgra.shape[:2]
+        qimg = QImage(bgra.data, w, h, bgra.strides[0], QImage.Format_ARGB32)
+        return QPixmap.fromImage(qimg.copy())
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     h, w = rgb.shape[:2]
     qimg = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format_RGB888)
@@ -102,8 +156,34 @@ class MinimapCalibDialog(QDialog):
 
         cal = mapdata.load_calib(self.map_id, self.src) or {}
         self.mode = mode or cal.get("mode") or mm.MODE_FIT
+        #: 文件里那份几何是**另一种显示方式**量的吗（下面 `__init__` 末尾会说一句）
+        self._mode_note = ""
+        if mode and cal.get("mode") and str(cal.get("mode")) != str(mode):
+            # fit / crop 两种写法的 `offset`/`view` **含义不一样**（crop 的 offset 是
+            # inset、截距进 `view`，见 `calib_from_two_point`）⇒ 拿「局部」的几何在
+            # 「全局」下摆，位置会整个不对 —— 表现和"没保存"一模一样 ✗（2026-09-27）
+            self._mode_note = (
+                "⚠ 文件里那份几何是**「%s」**方式量的，而这扇窗现在是**「%s」**"
+                "（「显示方式」下拉）—— 两种写法的 offset/view 含义不同，直接拿来对齐会"
+                "看着完全不对（像是没保存）✗。要么把下拉换回「%s」，要么按现在这种方式"
+                "重量一次。" % (cal["mode"], mode, cal["mode"]))
+        # ⚠ **两轴**（2026-09-27 修）：这扇窗原来只认**一个**缩放 —— 读 x 轴、
+        #   叠加层也按等比画、`calib()` 连 `scale_y` 都不写 ⇒ 用「双点标定」量出来的
+        #   两轴几何一进这扇窗（a）看着差一点、（b）**保存时 y 轴被抹成 x** ✗
+        #   （用户 2026-09-27 报的"双点标定完点开标定窗发现不太对"就是这条）。
+        #   现在两轴都读进来、按各自的缩放画、保存时原样写回 ✓。
+        #   ⚠ 这扇窗的拖动/缩放只会**等比**改整体大小（`_ratio` 保留载入时的两轴比例）
+        #     —— 要改两轴**比例**仍然只能用「双点标定」重量一次 ✓。
         self.scale = float(cal.get("scale") or 1.0)
-        self.offset = [int(v) for v in (cal.get("offset") or [0, 0])]
+        self.scale_y = float(mm.scales_of(cal)[1])
+        self._two_axis_note = ""
+        if abs(self.scale_y - self.scale) > 1e-9:
+            self._two_axis_note = (
+                "这份标定**两轴不同**（x %.4f / y %.4f）—— 下面「x 轴缩放」「y 轴缩放」"
+                "两条分别对应它们，改哪条动哪条、保存照写 ✓"
+                "（两轴本该几乎相等：差得多说明标定或采样有问题）。"
+                % (self.scale, self.scale_y))
+        self.offset = [off_store(v) for v in (cal.get("offset") or [0, 0])]
         # crop 专用：现在显示的是底图从**这一块**开始的内容。
         # ⚠ 不叫 self.view —— 那个名字留给画布控件（和 calib_manual 一致），
         # 两边同名过一次，结果控件被几何字段覆盖掉（AttributeError 一大串）。
@@ -118,7 +198,9 @@ class MinimapCalibDialog(QDialog):
         if self.mode == mm.MODE_CROP:
             self.offset = [self.inset, self.inset]
         #: 叠加层透明度（%）。对齐时要能同时看清「面板」和「底图」，全靠它。
-        self.alpha = int(cal.get("alpha") or 55)
+        # ⚠ 别写 `cal.get("alpha") or 55`：**0 是 falsy** ⇒ 存着 0（完全看不见）也会
+        #   显示成 55% ✗（2026-09-26 修，默认值现在只有 `overlay_alpha_pct` 一处 ✓）。
+        self.alpha = mm.overlay_alpha_pct(cal)
         # 叠加参照：canvas（WZ 那张底图）/ terrain（我们自己渲染的地形叠加图）。
         # **为什么要有得选**：实测有些客户端的小地图是**按 foothold 现画**的，
         # 跟 WZ 里那张 `miniMap/canvas` 完全是两套画（白底绿棕 vs 黑底蓝地形），
@@ -139,6 +221,13 @@ class MinimapCalibDialog(QDialog):
         #: 「保存标定」成功那一刻的几何指纹（None = 还没量过任何东西）。
         #: 关窗时拿它比：有差异就是"有没保存的改动" —— 见 reject()。
         self._saved_snap = None
+        #: 载入时那份几何长什么样 + 它是**怎么来的**（`src` / 有没有 `score`）。
+        #: 用来判"人动过没有"：**没动过就原样保留**，不然「打开看一眼、点一下保存」会把
+        #: `src=two_point` 降级成 `manual`、还给一份没有匹配分的几何安上 `score: 0`，
+        #: 顺带把双点标定量出来的 `scale_y` 抹掉 ✗（2026-09-27 修）。
+        self._src_loaded = str(cal.get("src") or "")
+        self._score_loaded = cal.get("score")
+        self._geom_loaded = self._geom_now()
 
         self._build()
         self._load_ref()
@@ -162,6 +251,16 @@ class MinimapCalibDialog(QDialog):
         self._refresh_loaded()
         self._refresh_status()
         self._refresh_judge()
+        # 两类"一打开就看着不对劲、容易被当成没保存"的情况，开头就说清（见上面两处 note）：
+        #   ① 文件里的几何是**另一种显示方式**量的（fit ↔ crop 的 offset/view 含义不同）；
+        #   ② 透明度是 **0%**（叠图完全透明 ⇒ 一片空白）。
+        if self._mode_note:
+            self._say(self._mode_note, bad=True)
+        elif self.alpha <= 0:
+            self._say("⚠ 这份标定的叠加层透明度是 **0%** ⇒ 打开时什么都看不见"
+                      "（几何是**存着的**，不是没保存）—— 把「透明度」往右拖就能看见 ✓。",
+                      bad=True)
+        theme.bind_window_state(self, "minimap_calib")  # 拉过的大小/位置按客户端记住 ✓
 
     # ---------------- 界面 ----------------
 
@@ -259,27 +358,19 @@ class MinimapCalibDialog(QDialog):
         self.scene.addItem(self._ov_item)
         root.addWidget(self.view, 1)
 
-        # ---- 缩放（fit 有效；crop 固定 1:1）----
-        srow = QHBoxLayout()
-        srow.setSpacing(8)
-        srow.addWidget(QLabel("缩放"))
-        self.sld = NoWheelSlider(Qt.Horizontal)
-        self.sld.setRange(SLIDER_MIN, SLIDER_MAX)
-        self.sld.valueChanged.connect(self._on_slider)
-        srow.addWidget(self.sld, 1)
-        self.sp_scale = NoWheelDoubleSpinBox()
-        self.sp_scale.setRange(0.05, SPIN_MAX)
-        self.sp_scale.setDecimals(3)
-        self.sp_scale.setSingleStep(0.01)
-        self.sp_scale.setMinimumWidth(96)
-        self.sp_scale.valueChanged.connect(self._on_spin)
-        srow.addWidget(self.sp_scale)
-        # 单位写在框**外面**（UI 规范 §9：不写进编辑框）
-        srow.addWidget(QLabel("×"))
+        # ---- 两轴缩放（fit / crop 都有效）----
+        # ⚠ **两条**（2026-09-27 用户要求：「旧的标定弹窗应该有 2 个拖动条，x 和 y」）：
+        #   双点标定量出来的是**两轴**（`scale` / `scale_y`），这扇窗要能**分别**微调它们
+        #   —— 以前只有一条「缩放」，改的时候 y 按载入时的比例跟着 x 走，等于"两轴比例"
+        #   只能在双点标定里改 ✗。现在 x / y 各一条拖动条 + 一个数字框（数字框给精确值）。
+        #   （另一条老滑条是「透明度」，别和这两条搞混：它不改几何 ✗。）
+        self.sld, self.sp_scale = self._scale_row(root, "x 轴缩放", 0)
+        self.sld_y, self.sp_scale_y = self._scale_row(root, "y 轴缩放", 1)
 
         # ---- 叠加层透明度（WZ 素材那层的浓淡）----
-        srow.addSpacing(10)
-        srow.addWidget(QLabel("透明度"))
+        arow = QHBoxLayout()
+        arow.setSpacing(8)
+        arow.addWidget(QLabel("透明度"))
         self.sld_alpha = NoWheelSlider(Qt.Horizontal)
         self.sld_alpha.setRange(0, 100)
         self.sld_alpha.setValue(int(self.alpha))
@@ -289,12 +380,23 @@ class MinimapCalibDialog(QDialog):
             "对齐时两头都要看得见：太浓只看见底图，太淡又看不见地形 ——\n"
             "数值跟着标定存，下次打开还是它。")
         self.sld_alpha.valueChanged.connect(safe_slot(self._on_alpha))
-        srow.addWidget(self.sld_alpha)
-        self.lbl_alpha = QLabel("%d%%" % self.alpha)
-        self.lbl_alpha.setMinimumWidth(42)
+        arow.addWidget(self.sld_alpha)
+        self.lbl_alpha = QLabel()
+        # ⚠ 0% 时要写成「叠图看不见」（见 `_sync_alpha_label`）：字更长，宽度留够
+        self.lbl_alpha.setMinimumWidth(96)
         self.lbl_alpha.setStyleSheet("color:#80868b;")
-        srow.addWidget(self.lbl_alpha)
-        root.addLayout(srow)
+        arow.addWidget(self.lbl_alpha)
+        self._sync_alpha_label()
+        root.addLayout(arow)
+
+        # 两轴不同的标定要在这里说出来（见 `__init__` 里的 `_two_axis_note`）：
+        # 人得知道"这份几何是两轴的、这扇窗会怎么对待它" —— 以前那行写的是"保存会把
+        # y 轴改成 x"（现在两轴都保留了 ✓），留着是因为**两轴比例只能用双点标定改**。
+        self.lbl_xy = QLabel(self._two_axis_note)
+        self.lbl_xy.setStyleSheet("color:#3c4043;")
+        self.lbl_xy.setWordWrap(True)
+        self.lbl_xy.setVisible(bool(self._two_axis_note))
+        root.addWidget(self.lbl_xy)
 
         # ---- 判据：角点世界坐标 vs 世界范围 ----
         self.lbl_judge = QLabel()
@@ -326,12 +428,27 @@ class MinimapCalibDialog(QDialog):
         root.addLayout(brow)
 
         hint = QLabel("拖动画面里的半透明底图，让它和下面的面板重合，然后「保存标定」。"
-                      "　方向键=挪 1 个底图像素（Shift=5 个）　滚轮=缩放视图　"
+                      "　方向键=挪 1 个底图像素（Shift=5 个，**焦点在哪都一样**）"
+                      "　数字框里可直接输精确值　滚轮=缩放视图　"
                       "中键拖=平移视图　双击=适应窗口　"
                       "不勾「实时画面」＝画面停住，方便对着量。")
         hint.setStyleSheet("color:#80868b;")
         hint.setWordWrap(True)
         root.addWidget(hint)
+
+        # ⭐ **方向键永远只干"挪底图"这一件事**（用户 2026-09-27 报："期望按方向键或 Shift+
+        #   方向键可以**按像素移动底图**，但是现在是在**操作透明度**" ✗）：
+        #   这扇窗里的拖动条 / 数字框 / 下拉**默认都会抢方向键** —— 拖动条：←→ 改值、
+        #   Shift+←→ 按 pageStep 跳；数字框：↑↓ 增减；下拉：↑↓ 换项 ✗；焦点落在谁身上谁就
+        #   吃掉它（实测落在「透明度」那条上 ⇒ 按方向键变成"在调透明度" ✗，可下面那行提示
+        #   明明写着"方向键=挪 1 个底图像素" ✗）。
+        #   ⇒ 给**所有子控件**装事件过滤器：方向键在**到达控件之前**就被本窗口拿走
+        #     （见 `eventFilter` ✓）⇒ 不管焦点在哪，方向键都是"挪底图" ✓；
+        #     而鼠标拖/点照旧 ✓、数字框里**用键盘输精确值**也照旧 ✓（只让出方向键 ✓）。
+        for _w in self.findChildren(QWidget):
+            _w.installEventFilter(self)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setFocus()
 
     # ---------------- 「这份几何从哪来」/「有没有没存的改动」 ----------------
 
@@ -352,8 +469,15 @@ class MinimapCalibDialog(QDialog):
                                      time.localtime(p.stat().st_mtime))
             except Exception:
                 pass
-            how = ("手工对齐" if cal.get("src") == "manual"
-                   else "自动匹配 %.2f" % float(cal.get("score") or 0.0))
+            _src = str(cal.get("src") or "")
+            if _src == "two_point":
+                # 双点标定的几何是**两轴**的（而且没有匹配分）—— 只报一个数会让人以为
+                # 这份是等比的、或者以为它是自动匹配出来的 ✗（2026-09-27 修）
+                how = "双点标定（两轴 x %.4f / y %.4f）" % mm.scales_of(cal)
+            elif _src == "manual":
+                how = "手工对齐"
+            else:
+                how = "自动匹配 %.2f" % float(cal.get("score") or 0.0)
             # 老格式没记来源 → **不能**写成「来源：从实时画面」：那是猜的，而这份
             # 几何只对当时那条来源成立（说成当前来源就是让人放心用错的数）。
             shown = "未记·老格式" if cal.get("legacy") else label
@@ -382,12 +506,28 @@ class MinimapCalibDialog(QDialog):
                 "来源也照样算没标。\n"
                 "「保存标定」会写进上面这个文件。" % (p, label))
 
+    def _geom_now(self):
+        """当前几何的指纹（两轴 / 偏移 / crop 的起始块）—— 判"人动过没有"用。"""
+        return (self.mode,
+                round(float(self.scale), 6), round(float(self.scale_y), 6),
+                off_store(self.offset[0]), off_store(self.offset[1]),
+                int(self.block[0]), int(self.block[1]))
+
+    def _untouched(self):
+        """几何还是载入时那一份吗（没动过 ⇒ 保存时**原样保留**来源与分数）。"""
+        return self._geom_now() == self._geom_loaded
+
     def _snapshot(self):
-        """几何指纹：只取决定换算的那四项（透明度、参照图这些不算改动）。"""
+        """几何指纹：只取决定换算的那几项（透明度、参照图这些不算改动）。
+
+        ⚠ **`scale_y` 也算**（2026-09-27）：它现在真的决定 y 轴换算，漏了它的话
+        "只改了两轴比例"会被当成"没改动"，关窗时就不提醒保存了 ✗。
+        """
         c = self.calib()
         return (c.get("mode"),
                 round(float(c.get("scale") or 0.0), 4),
-                tuple(int(v) for v in (c.get("offset") or [0, 0])),
+                round(float(mm.scales_of(c)[1]), 4),
+                tuple(off_store(v) for v in (c.get("offset") or [0, 0])),
                 tuple(int(v) for v in (c.get("view") or [0, 0])))
 
     def _unsaved(self):
@@ -434,6 +574,9 @@ class MinimapCalibDialog(QDialog):
                 self.scale = round(fit, 3)
                 self.offset = [int((w - cw * self.scale) / 2),
                                int((h - ch * self.scale) / 2)]
+            # 还没标定过时摆的是**等比**的粗略位置 ⇒ 两轴相同 ✓
+            #（有标定时根本走不到这里：`_geom_ready` 开局就是 True ✓）
+            self.scale_y = float(self.scale)
             self._sync_overlay()
         if self._scene_wh != (w, h):
             self._scene_wh = (w, h)
@@ -464,20 +607,41 @@ class MinimapCalibDialog(QDialog):
         它是「模板从面板边缘往里缩了多少」，`panel_to_canvas` 拿它做换算 ——
         写成 0 等于说「没缩」，于是程序按文件算出来的世界坐标和人工对齐差
         inset 个底图像素（`t_save_then_reopen` 钉着这条）。
+
+        ⚠ **`scale_y` 照写**（2026-09-27 改）：这扇窗以前只写一个 `scale` ⇒ 双点标定
+        量出来的两轴几何一进一出就被抹成等比 ✗。两轴相同时 `with_scales` 不写这个键
+        （老文件里就没有它 ✓），所以等比的老标定不会被塞一个新字段 ✓。
+        ⚠ **人没动过 ⇒ 来源与分数原样保留**：不然"打开看一眼、点一下保存"会把
+        `src=two_point` 降级成 `manual`、还给没有匹配分的几何安上 `score: 0` ✗。
         """
+        # fit 的 offset 走 `off_store`（**不许取整**，见那儿）；crop 的 offset 是 inset 整数 ✓
         off = ([int(self.inset), int(self.inset)] if self.mode == mm.MODE_CROP
-               else [int(self.offset[0]), int(self.offset[1])])
-        return {"mode": self.mode,
-                "scale": round(float(self.scale), 4),
-                "offset": off,
-                "view": [int(self.block[0]), int(self.block[1])],
-                "score": round(float(self.score), 4),
-                # 这份几何是**量出来的**还是**人眼对齐的**：手工对齐没有匹配分，
-                # 而「标过没有」不能拿 score 判（见 mm.has_geometry）。
-                "src": "manual" if self.manual else "auto",
-                # 记下人工对齐时用的是哪张参照图 + 那层叠多浓：下次打开接着用
-                "ref": self.ref,
-                "alpha": int(self.alpha)}
+               else [off_store(self.offset[0]), off_store(self.offset[1])])
+        out = {"mode": self.mode,
+               "offset": off,
+               "view": [int(self.block[0]), int(self.block[1])],
+               # 记下人工对齐时用的是哪张参照图 + 那层叠多浓：下次打开接着用
+               "ref": self.ref,
+               "alpha": int(self.alpha)}
+        if self._untouched():
+            # 几何一个字没动 ⇒ 两个数**照抄载入的那份**（别再 `round(…, 4)` 把双点标定
+            # 量出来的 1.880076 改成 1.8801："看一眼再保存"不该改数据 ✗）
+            out["scale"] = float(self.scale)
+            out = mm.with_scales(out, float(self.scale), float(self.scale_y))
+            # 来源/分数照抄载入的那份：`two_point` 的几何**没有** `score` 这个键，
+            # 别给它安一个 0（那会让人以为它是自动匹配出来的 ✗）
+            out["src"] = self._src_loaded or ("manual" if self.manual else "auto")
+            if self._score_loaded is not None:
+                out["score"] = self._score_loaded
+        else:
+            out["scale"] = round(float(self.scale), 6)
+            out = mm.with_scales(out, round(float(self.scale), 6),
+                                 round(float(self.scale_y), 6))
+            out["score"] = round(float(self.score), 6)
+            # 这份几何是**量出来的**还是**人眼对齐的**：手工对齐没有匹配分，
+            # 而「标过没有」不能拿 score 判（见 mm.has_geometry）。
+            out["src"] = "manual" if self.manual else "auto"
+        return out
 
     def _load_ref(self):
         """按 self.ref 选叠加参照图。返回是否用上了期望的那张。"""
@@ -492,7 +656,7 @@ class MinimapCalibDialog(QDialog):
             else:
                 self.ref = "canvas"        # 没有叠加图 → 退回底图（下拉也跟着回）
         if self._ref_pix is None and self.canvas is not None:
-            self._ref_pix = np_to_pixmap(self.canvas)
+            self._ref_pix = np_to_pixmap(_with_canvas_alpha(self.terrain))
             self._ref_zoom = 1
         if self._ref_pix is not None:
             self._ov_item.setPixmap(self._ref_pix)
@@ -515,25 +679,29 @@ class MinimapCalibDialog(QDialog):
                       "暂时按小地图底图叠着看" % self.map_id, bad=True)
 
     def _sync_overlay(self):
-        """标定字段 → 叠加层的位置/缩放（fit 用 scale+offset，crop 用 view）。
+        """标定字段 → 叠加层的位置/缩放（fit 用两轴 scale+offset，crop 用 view）。
 
-        `self.scale` 一律是**面板像素 / 底图像素**；参照图可能是放大过的
-        （地形叠加图是底图的 overlay_zoom 倍），所以 item 的缩放要除以 `_ref_zoom`。
+        `self.scale` / `self.scale_y` 一律是**面板像素 / 底图像素**（两轴）；参照图可能是
+        放大过的（地形叠加图是底图的 overlay_zoom 倍），所以 item 的缩放要除以 `_ref_zoom`。
         """
         if self.canvas is None:
             return
-        k = float(self.scale) / max(1, self._ref_zoom)
+        # ⚠ **两轴各自缩**（2026-09-27 改）：item 的变换走 `QTransform` —— `setScale`
+        #   只有一个数，会把 y 轴也按 x 画，双点标定量出来的那点差别在叠加层上就
+        #   **看不出来** ✗（而它正是 y 轴换算用的数）。
+        kx = float(self.scale) / max(1, self._ref_zoom)
+        ky = float(self.scale_y) / max(1, self._ref_zoom)
         self._ov_item._busy = True
         try:
             if self.mode == mm.MODE_CROP:
                 # crop = 面板显示底图的**一块**，而这一块可能被放大了 scale 倍
                 # （小底图被客户端放大，实测能到 9~10 倍）。所以叠加层也跟着缩放：
                 # 让「底图坐标 block」那一点正好落在面板的 (inset, inset) 上。
-                self._ov_item.setScale(k)
+                self._ov_item.setTransform(QTransform().scale(kx, ky))
                 self._ov_item.setPos(-self.block[0] * self.scale + self.inset,
                                      -self.block[1] * self.scale + self.inset)
             else:
-                self._ov_item.setScale(k)
+                self._ov_item.setTransform(QTransform().scale(kx, ky))
                 self._ov_item.setPos(self.offset[0], self.offset[1])
         finally:
             self._ov_item._busy = False
@@ -554,37 +722,99 @@ class MinimapCalibDialog(QDialog):
             self.block = [int(round((self.inset - pos.x()) / s)),
                           int(round((self.inset - pos.y()) / s))]
         else:
-            self.scale = float(self._ov_item.scale()) * max(1, self._ref_zoom)
-            self.offset = [int(round(pos.x())), int(round(pos.y()))]
+            # 拖动**只该改位置**；缩放从 item 的变换里**逐轴**读回来（别拿一个数当两个 ✗）
+            t = self._ov_item.transform()
+            self.scale = float(t.m11()) * max(1, self._ref_zoom)
+            self.scale_y = float(t.m22()) * max(1, self._ref_zoom)
+            self.offset = [off_store(pos.x()), off_store(pos.y())]
         self._sync_widgets()
         self._refresh_judge()
 
     def _on_alpha(self, val):
         """透明度：只改叠加层的浓淡，几何一点不动（对齐时反复调的就是它）。"""
         self.alpha = int(val)
-        self.lbl_alpha.setText("%d%%" % self.alpha)
+        self._sync_alpha_label()
         self._ov_item.setOpacity(max(0, min(100, self.alpha)) / 100.0)
 
+    def _sync_alpha_label(self):
+        """透明度那行的读数。**0% 必须写成"叠图看不见"**：
+
+        0% 时叠图完全透明 ⇒ 一打开这扇窗就是"一片空白、像没标定过"✗（用户 2026-09-27
+        报"保存后再打开发现没保存"，而他文件里正是 `alpha: 0` —— 几何存着、只是看不见）。
+        0 是**合法的存档值**（设置那一侧专门修过"0 被 `or` 吃掉"的 bug，别在这儿禁掉它 ✗）
+        ⇒ 能做的就是把话说清楚 ✓。
+        """
+        if self.alpha <= 0:
+            self.lbl_alpha.setText("0%（叠图看不见）")
+            self.lbl_alpha.setStyleSheet("color:#b06000;")
+        else:
+            self.lbl_alpha.setText("%d%%" % self.alpha)
+            self.lbl_alpha.setStyleSheet("color:#80868b;")
+
     def _sync_widgets(self):
-        """把 scale 回填到滑块/数字框（别让界面和实际几何不一致）。"""
-        self.sp_scale.blockSignals(True)
-        self.sp_scale.setValue(float(self.scale))
-        self.sp_scale.blockSignals(False)
-        self.sld.blockSignals(True)
-        self.sld.setValue(max(SLIDER_MIN, min(SLIDER_MAX,
-                                              int(round(self.scale * 1000)))))
-        self.sld.blockSignals(False)
+        """把**两轴**缩放回填到各自的拖动条/数字框（别让界面和实际几何不一致）。"""
+        for sp, v in ((self.sp_scale, self.scale), (self.sp_scale_y, self.scale_y)):
+            sp.blockSignals(True)
+            sp.setValue(float(v))
+            sp.blockSignals(False)
+        for sld, v in ((self.sld, self.scale), (self.sld_y, self.scale_y)):
+            sld.blockSignals(True)
+            sld.setValue(max(SLIDER_MIN, min(SLIDER_MAX,
+                                             int(round(float(v) * 1000)))))
+            sld.blockSignals(False)
         # 两种方式都要能调缩放：crop 也可能是「放大后取一块」（实测小底图会到
         # 9~10 倍）—— 以前这里把 crop 的缩放禁掉了，正好把唯一的手动出路堵死。
-        self.sld.setEnabled(True)
-        self.sp_scale.setEnabled(True)
+        for w in (self.sld, self.sp_scale, self.sld_y, self.sp_scale_y):
+            w.setEnabled(True)
 
-    def _on_slider(self, val):
-        self.scale = val / 1000.0
-        self._sync_overlay()
+    def _scale_row(self, root, label, axis):
+        """一行「轴缩放」控件：标签 + 拖动条 + 数字框 + 单位（`axis` 0 = x、1 = y）。
 
-    def _on_spin(self, val):
-        self.scale = float(val)
+        两条长得一样、走同一套范围和步长 —— 分开写两份，迟早只有一条跟着改 ✗
+        （这扇窗里 x/y 两套东西已经不少了）。
+        """
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(QLabel(label))
+        sld = NoWheelSlider(Qt.Horizontal)
+        sld.setRange(SLIDER_MIN, SLIDER_MAX)
+        sld.setMinimumWidth(120)
+        sld.setToolTip(
+            "这一轴的放大倍数（面板像素 / 底图像素），拖动 = 粗调。\n"
+            "两轴本该**几乎相等**（游戏把小地图等比缩放）；差得多说明标定或采样有问题。\n"
+            "拖动只改几何，不改透明度 —— 想让人看得清用下面那条「透明度」。")
+        sld.valueChanged.connect(safe_slot(
+            lambda v, a=axis: self._set_scale(a, v / 1000.0)))
+        row.addWidget(sld, 1)
+        sp = NoWheelDoubleSpinBox()
+        sp.setRange(0.05, SPIN_MAX)
+        sp.setDecimals(3)
+        sp.setSingleStep(0.01)
+        sp.setMinimumWidth(96)
+        sp.setToolTip("这一轴缩放的精确值（0.05~%.0f）—— 数字框给准数，拖动条给手感。" % SPIN_MAX)
+        sp.valueChanged.connect(safe_slot(lambda v, a=axis: self._set_scale(a, v)))
+        row.addWidget(sp)
+        # 单位写在框**外面**（UI 规范 §9：不写进编辑框）
+        row.addWidget(QLabel("×"))
+        root.addLayout(row)
+        return sld, sp
+
+    def _set_scale(self, axis, v):
+        """改**某一轴**的缩放（`axis` 0 = x、1 = y）—— 两轴各自独立（2026-09-27 起）。
+
+        以前改 x 会让 y 按载入时的比例跟着走（那时只有一条缩放）；现在两条各管自己，
+        因为**"两轴比例"本身就是要能调的量**（双点标定量的、人工也可以微调）✓。
+        人改的 ⇒ 存进标定时记 `src=manual`（和拖动同一个口径：都不是程序量的 ✓）。
+        """
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return
+        if axis == 0:
+            self.scale = v
+        else:
+            self.scale_y = v
+        self.manual = True
         self._sync_overlay()
 
     # ---------------- 定位 ----------------
@@ -637,7 +867,11 @@ class MinimapCalibDialog(QDialog):
         self._prev_anchor = list(anchor) if anchor is not None else None
 
         self.scale = float(loc["scale"])
-        self.offset = [int(v) for v in loc["offset"]]
+        # 自动定位量出来的是**等比**几何（模板匹配只有一个倍数）⇒ y 轴跟着 x
+        #（双点标定的两轴比例这样就被这次定位取代了 —— 这是对的：这份几何确实变成
+        #  "匹配出来的"了，`src` 也会跟着变成 auto ✓；之后还能拿 y 那条拖动条单独调 ✓）
+        self.scale_y = self.scale
+        self.offset = [off_store(v) for v in loc["offset"]]
         self.block = [int(v) for v in (loc.get("view") or [0, 0])]
         self.score = float(loc["score"])
         self.manual = False           # 自动量出来的 → 存进标定时记 src=auto
@@ -799,8 +1033,10 @@ class MinimapCalibDialog(QDialog):
                 else:
                     z = mm.overlay_zoom(cw)
                     ox, oy = c["offset"]
-                    rect_o = (ox * z, oy * z, (ox + cw * c["scale"]) * z,
-                              (oy + ch * c["scale"]) * z)
+                    _sx, _sy = mm.scales_of(c)      # 两轴各自（这份 dict 来自 calib() 是等比，
+                    rect_o = (ox * z, oy * z,        # 但别在这儿写死一个 scale：那是"两处
+                              (ox + cw * _sx) * z,   # 各判一次"的老毛病，迟早分叉 ✗）
+                              (oy + ch * _sy) * z)
                 p = mm.draw_on_overlay(self.map_id, rect_o)
                 if p is None:
                     self._say("还没有 %s_overlay.png —— 先在「路线识别」里点"
@@ -839,7 +1075,11 @@ class MinimapCalibDialog(QDialog):
             self._say("没有底图，存不了 —— 先在「路线识别」里点「生成地形图」"
                       "（没有底图就没法换算世界坐标）", bad=True)
             return
-        if self.score < SCORE_WARN:
+        # ⚠ 双点标定量的几何**没有匹配分**，可它是"量出来的"、不是目测的 ⇒ 别拿
+        #   「匹配分偏低」去吓人：那段话的建议是"先点自动定位"，一点就把量好的两轴几何
+        #   换成等比匹配的结果 ✗（2026-09-27）。只有**人眼对齐 / 自动匹配**那两份才提醒 ✓。
+        if self.score < SCORE_WARN and not (self._untouched()
+                                            and self._src_loaded == "two_point"):
             if self.manual:
                 title = "手工对齐"
                 text = ("这份几何是**你用眼睛对齐**的（没有匹配分）。\n\n"
@@ -864,7 +1104,18 @@ class MinimapCalibDialog(QDialog):
                 self._say("没有保存（你在提示里选了「否」—— 几何还在，可以再点"
                           "「保存标定」）", bad=True)
                 return
-        cal = mapdata.load_calib(self.map_id, self.src) or {}
+        # ⚠ 先把遗留的「坐标系偏移」清掉（`mm.drop_stale_world_offset`）：锚点换成下沿之后
+        #   它该是 (0, 0)，而老的 (7, 33) 是**重心口径**的 —— 不清就会被原样带进新几何，
+        #   读数凭空偏 33 个世界像素（≈4 个面板像素，看着像标定没量准 ✗）。
+        cal = mm.drop_stale_world_offset(mapdata.load_calib(self.map_id, self.src))
+        # ⭐ **先把旧的几何键清掉再 update**（2026-09-28 修，用户报："标定改完没生效 / 两种
+        #   标定法数据不一样"）：`self.calib()` 在两轴相同时**不写 `scale_y`**（`with_scales`
+        #   抹掉 ✓），而 `dict.update` **不删旧键** ⇒ 旧的双点标定 `scale_y` 会**残留**下来
+        #   ⇒ 世界坐标 y 轴按**错的缩放**算（实测 106010105：自动定位后 scale=1.874 等比，
+        #   却残留 scale_y=1.940285539…，两轴差 3.5%，正是用户看到的"两种标定法数据不一样" ✗）。
+        #   同理 `src`/`score` 也该被这次的几何口径整体接管，别让旧值糊着 ✓。
+        for _k in ("scale", "scale_y", "offset", "view", "src", "score"):
+            cal.pop(_k, None)
         # 只更新量出来的几何 + 方式：显示方式仍算「你在界面里选的」
         cal.update(self.calib())
         cal["picked_by"] = "gui"
@@ -892,6 +1143,19 @@ class MinimapCalibDialog(QDialog):
                   % ("手工对齐" if self.manual else "自动匹配", p))
 
     # ---------------- 键盘微调 ----------------
+
+    def eventFilter(self, obj, ev):
+        """**方向键在到达控件之前就被本窗口拿走**（装过滤器的原因见 `__init__` 里那段 ⚠ ✓）。
+
+        为什么必须拦在**控件之前**：拖动条 / 数字框 / 下拉**自己就吃方向键**（改值 / 增减 /
+        换项 ✗）—— 光"别给它们焦点"治不住：人一点它们（比如要用鼠标调透明度）焦点就过去了 ✗
+        （用户 2026-09-27 报的"按方向键在操作透明度"正是这一种 ✗）。
+        """
+        if (ev.type() == QEvent.KeyPress
+                and ev.key() in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down)):
+            self.keyPressEvent(ev)          # 挪底图（1 个底图像素 / Shift 5 个 ✓）
+            return True                     # **吞掉**：别再往下发给那个控件 ✗
+        return super().eventFilter(obj, ev)
 
     def keyPressEvent(self, e):
         """方向键 1 像素、Shift+方向键 5 像素地挪**叠加层**（目测对齐最后那一两像素）。

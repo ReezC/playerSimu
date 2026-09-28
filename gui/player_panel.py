@@ -19,14 +19,16 @@ save() 就整份写回该项目的 project.yaml（见 MainWindow._bind_decision_
 import time
 
 from PyQt5.QtCore import Qt, QEvent, QTimer, pyqtSignal
-from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
-                             QFormLayout, QFrame, QGridLayout, QGroupBox,
-                             QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-                             QMessageBox, QProgressBar, QPushButton, QScrollArea,
-                             QSlider, QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
+                             QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout,
+                             QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+                             QListWidget, QListWidgetItem, QMessageBox, QProgressBar,
+                             QPushButton, QScrollArea, QSlider, QVBoxLayout, QWidget)
 
 from decision import input as dinput
-from decision.agent import ANTI_AFK_TYPES, load_rect, settings
+from decision.agent import (ANTI_AFK_TYPES, ZONE_GOTO_RETRY_S, load_rect,
+                            settings)
+from gui import theme
 from gui.project import last_opened
 # NoWheel* 必须模块级导入：控件在 _build() 里建，懒导入到不了那儿。
 # （详见 docs/UI规范.md：滚轮不许改参数）
@@ -103,6 +105,489 @@ def _sample_bar_color(img):
     return [list(low), list(high)]
 
 
+class BattleZoneListDialog(QDialog):
+    """「**编辑战斗区域**」列表弹窗（用户 2026-09-28 第 2 条 ✓ 原话："点击『编辑』就打开了
+    『编辑战斗区域』弹窗，**初始是空列表**，可以往里面**添加项目、删除项目、双击编辑项目**。
+    点**添加**才是现在已经做好的『编辑战斗区域{foothold集合名}』编辑弹窗"✓）。
+
+    · **列表** = `settings.battle_zones` 的每一项（**真源** ✓，顺序 = 界面顺序 ✓）；
+    · **添加** ⇒ **先选集合名**（`QInputDialog`，候选由外面推 ✓）⇒ 再开 `BattleZoneDialog`
+      配这一项 ✓（"点添加才是那个编辑弹窗" ✓）；
+    · **双击一行 = 编辑它**（同一个 `BattleZoneDialog` ✓）；
+    · **删除** = 选中后删（有确认 ✓）；
+    · ⚠ **每次增删改立刻写回**（`on_save` 回调 ⇒ `PlayerPanel._bz_commit` ⇒ 存盘 + 同步派生
+      副本 ✓）⇒ "关掉弹窗"没有额外确定/取消语义 ✓（老界面就是"改完即存" ✓ 保持不变 ✓）。
+    · ⚠ 走**回调**而不是直接抓 `settings`：本类**不认识** settings ⇒ 好测 ✓（用例塞一个假的
+      `on_save` 就能收下每次结果 ✓）。
+    """
+
+    def __init__(self, zones, names=None, on_save=None, parent=None,
+                 picker_factory=None):
+        super().__init__(parent)
+        self.setWindowTitle("编辑战斗区域")
+        # ⚠ 只钉**下限**（比这更小按钮就挤没了 ✓），并给一个**第一次打开**的尺寸
+        #   —— 之后按客户端记住（见 __init__ 末尾的 `bind_window_state` ✓，docs/UI规范.md §11）
+        self.setMinimumSize(470, 360)
+        self.resize(560, 460)
+        self._names = [str(n) for n in (names or []) if str(n)]
+        #: 「idle 回归 foothold」那块**只读视图**的工厂（**透传给子弹窗** ✓
+        #: —— 见 `BattleZoneDialog.__init__` 里那段说明 ✓）
+        self._picker_factory = picker_factory
+        self._on_save = on_save
+        self._zones = [dict(z) for z in (zones or []) if isinstance(z, dict)]
+
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        root.setContentsMargins(16, 16, 16, 16)
+
+        self.lst = QListWidget()
+        self.lst.setSelectionMode(QAbstractItemView.SingleSelection)
+        # 双击 = 编辑（同 `gui/zone_editor.py` 的列表范式 ✓）
+        self.lst.itemDoubleClicked.connect(self._on_edit)
+        # ⭐⭐ **「可以战斗」就在列表项上勾**（用户 2026-09-28 ✓）：每一项带勾选框，
+        #   勾 / 取消**立刻**写回 ✓。
+        #   ⚠⚠ 它**原来叫「可以战斗」**（✗ 名字与实现相反：代码一直把这份名单当**白名单**用 ✓
+        #   ⇒ 勾上其实是"这块**能打**" ✓）。2026-09-28 用户要求改成「**可以战斗**」✓ ——
+        #   **只是纠正名字，值与行为一点没变** ✓（取反会把已配好的能打区全废掉 ✗）。
+        self.lst.itemChanged.connect(self._on_check)
+        self.lst.setToolTip("**双击一行**改它的参数 ✓（区域查询CD / idle 回归 foothold / "
+                            "最大战斗时长 / 到点去哪）。\n"
+                            "**勾上前面的框** = 「**可以战斗**」：这块平台**允许打架** ✓；"
+                            "人在别的平台上时会先走去一块**能打**的（多块能打就挑**代价最低**的 ✓）。\n"
+                            "⚠ **一个都不勾 = 哪都能打**（不限制 ✓）。")
+        root.addWidget(self.lst, 1)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(6)
+        self.btn_add = QPushButton("添加")
+        self.btn_add.setToolTip("选一个**集合**加进来 ⇒ 立刻打开它的参数窗 ✓")
+        self.btn_add.clicked.connect(self._on_add)
+        self.btn_del = QPushButton("删除")
+        self.btn_del.setToolTip("删掉**选中**的那一项（有确认 ✓）")
+        self.btn_del.clicked.connect(self._on_del)
+        btns.addWidget(self.btn_add)
+        btns.addWidget(self.btn_del)
+        btns.addStretch(1)
+        self.btn_close = QPushButton("关闭")
+        self.btn_close.clicked.connect(self.accept)
+        btns.addWidget(self.btn_close)
+        root.addLayout(btns)
+
+        hint = QLabel("⚠ **勾上前面的框** = 「**可以战斗**」：这块平台**允许打架** ✓；"
+                      "人在别的平台上时这一拍不打架、先去一块**能打**的"
+                      "（多块能打 ⇒ 挑**代价最低**的 ✓）。\n"
+                      "⚠ **一个都不勾 = 哪都能打**（不限制 ✓）。"
+                      "**双击一行**改它的其他参数 ✓。改完**立刻生效并跟着项目存** ✓。")
+        hint.setStyleSheet("color: #80868b;")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        # ⭐ 「**最大战斗时长**」的**倒计时**（用户 2026-09-28 要求 ✓ 原话："编辑战斗区域里，
+        #   要用**灰字**显示**最大战斗时长的倒计时**"✓）。
+        #   数据来自 `agent._publish_fight_clock` 写在 `settings` 上的那三件套
+        #   （`fight_zone_name` / `fight_elapsed_s` / `fight_cap_s` ✓）—— ⚠ **只读** ✓
+        #   面板**不许**当第二个写者（同 `pos_state()` 那条纪律 ✓）。
+        #   ⚠⚠ **`fight_elapsed_s` = "已累计在打的秒数"**（用户 2026-09-28 改口径 ✓）⇒ 剩余
+        #      **直接** `cap - elapsed` ✓、**不许**再拿时钟去减 ✗ —— 寻路打断期间时间是**暂停**
+        #      的（不清零 ✓），拿墙钟减会把打断那段也算进去 ⇒ 显示会跳 ✗（改之前就是这么错的）。
+        #   ⚠ 只有**某个区域真的在计时**时才显示 ✓（不在区域 / 那项不限 ⇒ 什么都不显示 ✓
+        #     别显示 `0:00` ✗ —— 那会让人以为"马上要走了"）。
+        self.lbl_cd = QLabel("")
+        self.lbl_cd.setStyleSheet("color: #80868b;")      # ⭐ **灰字**（用户明确要求 ✓）
+        self.lbl_cd.setWordWrap(True)
+        root.addWidget(self.lbl_cd)
+        # 每 0.5 秒刷一次（够跟手、又不费 ✓）。⚠ 弹窗关掉后这个 timer 跟着对象一起没 ✓
+        # （本弹窗是**每次点「编辑」新建**的 ✓ 不是常驻单例）⇒ 不用额外接 showEvent/hideEvent ✓。
+        self._cd_timer = QTimer(self)
+        self._cd_timer.setInterval(500)
+        self._cd_timer.timeout.connect(self._refresh_fight_cd)
+        self._cd_timer.start()
+
+        self._reload()
+        # 拉过的大小/位置按客户端记住（docs/UI规范.md §11 ✓ —— 用户 2026-09-28 报的
+        # "子窗口太大、还不让缩小"里，也有"尺寸根本留不住、每次都回默认"那一半 ✓）
+        theme.bind_window_state(self, "battle_zone_list")
+
+    # ---------------- 内部 ----------------
+
+    def _refresh_fight_cd(self):
+        """刷新那行**灰字倒计时**（用户 2026-09-28 ✓）—— ⚠ **只读** `settings` 上那三件套 ✓。
+
+        ⚠ 口径全在 `decision/agent._publish_fight_clock` / `_fight_beat`（**一处** ✓ 别在这儿
+          另算一套"什么时候算在打 / 从哪一刻算" ✗ —— 那是 agent 的事实的判断 ✓）。
+        ⚠⚠ **剩余是"减去已累计的秒数"**（用户 2026-09-28 改口径后 ✓）：`cap - fight_elapsed_s`
+          ✓ —— **不是** `cap - (monotonic - started_at)` ✗。原因：现在**只有寻路会打断时间**
+          （用户原话："只要一直战斗就不应该有任何理由停时间"✓），打断期间是**暂停累计**
+          （不清零 ✓）⇒ 拿墙钟减会把打断的那段算进去 ⇒ 显示会莫名跳 ✗。
+        """
+        try:
+            name = getattr(settings, "fight_zone_name", None)
+            el = float(getattr(settings, "fight_elapsed_s", 0.0) or 0.0)
+            cap = float(getattr(settings, "fight_cap_s", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            name, el, cap = None, 0.0, 0.0
+        if not name or cap <= 0.0:
+            self.lbl_cd.setText("")           # 没在计时 ⇒ 什么都不显示（别显示 0:00 ✗）
+            return
+        left = max(0.0, cap - el)
+        self.lbl_cd.setText(
+            "⏱ 「%s」本轮已连续打 %.0f s，还剩 %.0f s（上限 %.0f s）—— 到点会按这一项的"
+            "「到点去哪」换地方" % (name, cap - left, left, cap))
+
+    def _reload(self):
+        """把 `self._zones` 灌进列表 —— 一行 = 一个区域项：**勾选框（可以战斗）+ 摘要** ✓。"""
+        # ⚠⚠ **重画期间必须屏蔽 `itemChanged`**（经典坑 ✗）：`clear()` / `addItem()` 都会发这个
+        #   信号 ⇒ 不屏蔽的话，重画一遍就等于"把每一行的勾选状态再写一遍配置"
+        #   ⇒ 轻则白写盘、重则把 `can_fight` 写乱 ✗。
+        self.lst.blockSignals(True)
+        try:
+            self.lst.clear()
+            for z in self._zones:
+                nm = str(z.get("set") or "")
+                bits = []
+                try:
+                    bits.append("CD %.1fs" % float(z.get("cd_s") or ZONE_GOTO_RETRY_S))
+                except (TypeError, ValueError):
+                    pass
+                if str(z.get("idle_foothold") or ""):
+                    bits.append("idle #%s" % str(z["idle_foothold"]))
+                try:
+                    _fm = float(z.get("fight_max_s") or 0.0)
+                except (TypeError, ValueError):
+                    _fm = 0.0
+                if _fm > 0:
+                    bits.append("最多打 %.0fs" % _fm)
+                item = QListWidgetItem("%s    ·    %s" % (nm, "，".join(bits))
+                                       if bits else nm)
+                item.setData(Qt.UserRole, nm)
+                # ⭐ 勾选框**就是**「可以战斗」（文本里不再重复写它 ✓ 免得两处表达同一件事 ✗）
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if z.get("can_fight") else Qt.Unchecked)
+                self.lst.addItem(item)
+        finally:
+            self.lst.blockSignals(False)
+
+    def zones(self):
+        """当前这一份（`list of dict` ✓ —— 用例 / 外面都能直接读 ✓）。"""
+        return [dict(z) for z in self._zones]
+
+    def _commit(self, reload=True):
+        """**唯一出口**：写回一笔 ✓（`reload=True` 时顺手重画列表 ✓）。
+
+        ⚠ 勾选那条路传 `reload=False`：勾选框**自己**已经表达了状态 ⇒ 重画是多余的，
+          而且会把**当前选中的行**弄丢 ✗。
+        """
+        if reload:
+            self._reload()
+        if callable(self._on_save):
+            self._on_save([dict(z) for z in self._zones])
+
+    def _on_check(self, item):
+        """列表项上的勾选变动 ⇒ 写回 `can_fight`（用户 2026-09-28 追加要求 ✓）。
+
+        ⚠ **状态没变就直接返回**：`_reload` 里虽然已经屏蔽过信号 ✓，但别处若再触发一次，
+          这里也**不该白写一次盘** ✓。
+        """
+        if item is None:
+            return
+        nm = str(item.data(Qt.UserRole) or "")
+        if not nm:
+            return
+        want = (item.checkState() == Qt.Checked)
+        for z in self._zones:
+            if str(z.get("set") or "") == nm:
+                if bool(z.get("can_fight")) == want:
+                    return
+                z["can_fight"] = want
+                break
+        else:
+            return                        # 列表里那项已经不在配置里了 ⇒ 不动 ✓
+        self._commit(reload=False)
+
+    def _picked(self):
+        it = self.lst.currentItem()
+        return str(it.data(Qt.UserRole) or "") if it is not None else ""
+
+    def choose_name(self):
+        """弹那个"选集合"的小窗 ⇒ 返回选中的名字（取消 / 没有候选 ⇒ `""` ✓）。
+
+        ⚠ 独立成一个方法：用例可以**替身掉它**（免得弹真窗口 ✗ 也让"添加"这条能测 ✓）。
+        """
+        cand = [n for n in self._names
+                if n not in set(str(z.get("set") or "") for z in self._zones)]
+        if not cand:
+            QMessageBox.information(
+                self, "没有可加的集合",
+                "候选集合都加过了（或者这张图还没注册集合）。\n\n"
+                "集合是在「寻路编辑器」里圈出来的 —— 先确认那边已经有了 ✓。")
+            return ""
+        nm, ok = QInputDialog.getItem(self, "添加战斗区域", "选一个集合：", cand, 0, False)
+        return str(nm) if (ok and nm) else ""
+
+    def _on_add(self):
+        nm = self.choose_name()
+        if not nm:
+            return
+        dlg = BattleZoneDialog({"set": nm, "cd_s": ZONE_GOTO_RETRY_S},
+                               names=self._names, parent=self,
+                               picker_factory=self._picker_factory)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        self._zones.append(dlg.zone())
+        self._commit()
+
+    def _on_edit(self, *_a):
+        nm = self._picked()
+        cur = [z for z in self._zones if str(z.get("set") or "") == nm]
+        if not cur:
+            return
+        dlg = BattleZoneDialog(cur[0], names=self._names, parent=self,
+                               picker_factory=self._picker_factory)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        new = dlg.zone()
+        self._zones = [z for z in self._zones if str(z.get("set") or "") != nm]
+        self._zones.append(new)               # 顺序无语义（同老界面 ✓）
+        self._commit()
+
+    def _on_del(self):
+        nm = self._picked()
+        if not nm:
+            QMessageBox.information(self, "先选一项", "在列表里点一下要删的那一项 ✓")
+            return
+        if QMessageBox.question(
+                self, "删除战斗区域",
+                "确定把「%s」从战斗区域里删掉吗？" % nm) != QMessageBox.Yes:
+            return
+        self._zones = [z for z in self._zones if str(z.get("set") or "") != nm]
+        self._commit()
+
+
+class BattleZoneDialog(QDialog):
+    """**战斗区域**每一项的编辑弹窗（用户 2026-09-28 原话："**按钮和弹窗呢？你做的我没法测**"）。
+
+    为什么要有它：`settings.battle_zones` 每项是 **5 个字段**（`set` / `cd_s` /
+    `idle_foothold` / `fight_max_s` / `fight_dst` ✓，见 `decision/agent.py` 的 `__init__` ✓），
+    可原来界面上那个「限制战斗区域」**只读写派生副本 `battle_zone_sets`**（= 一串集合名 ✗）
+    ⇒ 后四个字段**一个入口都没有** ⇒ 配不了、也就**测不了** ✗（用户当场就是这么说的 ✓）。
+
+    ⚠ **`set`（集合名）在这里是只读的**：它是这一项的**身份**（`battle_zones` 里唯一 ✓），
+      也是派生副本 `battle_zone_sets` 的来源 —— 允许改名就要连带处理副本、以及别处
+      已经写了这个名字的地方（`fight_dst` / 已配的边……✗）⇒ 要换区域就**删了重加** ✓。
+    ⚠ 候选集合名**从外面推**进来（`names` ✓，同 `set_zone_sets` 那套"面板间推送" ✓）——
+      本面板不持有地图 id（集合是按 map id 存在 `core/zones` 里的 ✓）。
+    """
+
+    def __init__(self, zone, names=None, parent=None, picker_factory=None):
+        super().__init__(parent)
+        z0 = dict(zone or {})
+        #: ⭐ **只读视图工厂**（用户 2026-09-28 要求 ✓ 原话："编辑战斗区域的**子弹窗**需要有
+        #:   『foothold 集合编辑器』的**同款视图（只读）**，可以通过**点选**来**查看 foothold
+        #:   参数**、**配置「idle回归foothold」**"✓）。
+        #:   签名 `fn(set_name, current_fid) -> QWidget | None` ✓ —— **由外面推**进来
+        #:   （本面板不持有地图 id ✗，同 `names` 那套"面板间推送" ✓）；
+        #:   **没推 / 推来 None ⇒ 退回原来的文本框** ✓（老环境、以及用例里直接 new 的
+        #:   那些实例都不受影响 ✓）。视图本体见 `gui/foothold_picker.py` ✓。
+        self._picker_factory = picker_factory
+        self._picker = None
+        self._set = str(z0.get("set") or "")
+        #: ⚠ **「可以战斗」不在这里改**（2026-09-28 用户要求挪到**列表项上**勾 ✓，
+        #:   原话："把可以战斗参数**移出来**，在**已添加的项目上勾选**"✓）——
+        #:   这里只把它**记下来**，`zone()` 时**原样带回** ✓
+        #:   ⇒ 免得"进来编辑一次就把勾选弄丢" ✗✗（这一句是本次最要紧的一步 ✓）。
+        self._can_fight = bool(z0.get("can_fight"))
+        self.setWindowTitle(("编辑战斗区域「%s」" % self._set) if self._set
+                            else "添加战斗区域")
+        # ⚠ 只钉**宽度**、不钉高度，并给一个**打开的尺寸**（2026-09-28 现场修 ✗ ——
+        #   用户报"**编辑战斗区域子窗口也太大了，还不让缩小**"✓）。
+        #   原来这里连 `resize` 都没有 ⇒ 窗口多大**完全由布局的 sizeHint 决定** ✗，
+        #   而里面那块只读视图是 `QGraphicsView`（`FootholdPicker`）—— 它默认把
+        #   **场景尺寸**（整张图的底图 + foothold ≈ 2000×1000）当 sizeHint ⇒
+        #   一显示就被撑到**上千高**，之后任何一次布局重算还会拽回去 ⇒ "太大 + 拖不动"✗。
+        #   ⇒ 根治在视图那边（`gui/foothold_picker.py` 的 `sizeHint` ✓ 现在只表 320×200 ✓）；
+        #     这里再补一个合理初值，免得"每次打开位置尺寸都飘"✓。
+        self.resize(560, 620)
+        self.setMinimumWidth(430)
+
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        root.setContentsMargins(16, 16, 16, 16)
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft)
+
+        # ① 区域集合（只读，见类说明）
+        lb = QLabel(self._set or "（未选）")
+        lb.setStyleSheet("font-weight: 600;")
+        lb.setToolTip("这一项管的是哪块平台（集合名 ✓）。\n"
+                      "⚠ 这里不给改：它是这一项的**身份** —— 要换区域请**删了重加** ✓。")
+        form.addRow("区域集合", lb)
+
+        # ⚠ **「可以战斗」曾经在这里**（2026-09-28 第 3 条那份 ✓）—— 用户当天又要求
+        #   "**把可以战斗参数移出来，在已添加的项目上勾选**"✓ ⇒ 它现在在
+        #   `BattleZoneListDialog` 的**列表项勾选框**上 ✓（那里勾一下立刻生效 ✓）。
+        #   这里删掉控件，但 `__init__` 把它记进 `self._can_fight`、`zone()` **原样带回** ✓
+        #   （否则"进来编辑一次就把勾选弄丢" ✗✗）。
+
+        # ② 区域查询CD(s)（旧「前往重下间隔(s)」的**逐项版** ✓）
+        self.sp_cd = NoWheelDoubleSpinBox()
+        self.sp_cd.setRange(0.5, 600.0)
+        self.sp_cd.setDecimals(1)
+        self.sp_cd.setSingleStep(0.5)
+        self.sp_cd.setValue(max(0.5, float(z0.get("cd_s") or ZONE_GOTO_RETRY_S)))
+        tip_cd = ("**这一项**的「多久才能再来一次」：追击下前往、区域筛缓存都以它为准 ✓\n"
+                  "（三处调用点各传各的：回区域重下传目标区域项、追击/筛缓存传"
+                  "「怪那块 foothold 命中的区域项」✓）。\n\n"
+                  "⚠ 下限 0.5 —— 再小就等于「每拍重下 / 每拍重算」✗。\n"
+                  "默认 %.1f（归属不到任何区域项时也用它兜底 ✓）。" % ZONE_GOTO_RETRY_S)
+        self.sp_cd.setToolTip(tip_cd)
+        form.addRow("区域查询CD(s)", self.sp_cd)
+
+        # ③ idle 回归 foothold
+        #    ⭐ 2026-09-28 用户要求（原话）："编辑战斗区域的**子弹窗**需要有『foothold 集合
+        #    编辑器』的**同款视图（只读）**，可以通过**点选**来**查看 foothold 参数**、
+        #    **配置「idle回归foothold」**"✓ ⇒ 有工厂就摆**只读视图**（点一条 = 选中它 + 旁边
+        #    显示它的参数 ✓），没有就**退回文本框** ✓（视图本体：`gui/foothold_picker.py` ✓）。
+        self.ed_idle = QLineEdit(str(z0.get("idle_foothold") or ""))     # ← 兜底（没工厂时用 ✓）
+        self.ed_idle.setPlaceholderText("例如 41（空 = 不跨层走）")
+        self.ed_idle.setToolTip(
+            "**闲着没事的时候回哪块砖上站着** —— 填一个 **foothold 编号**（字符串 ✓，\n"
+            "在「寻路编辑器」里点那条线能看到它的 id ✓）。\n\n"
+            "· 空 = **不做这件事**（老行为：不跨层水平走 ✓）；\n"
+            "· 填了 ⇒ 没怪、也没别的任务要跑时，会走回这条线上站住 ✓。\n\n"
+            "⚠ 只填**编号**，不要填集合名（集合是上面那一格的事 ✓）。")
+        try:
+            self._picker = self._make_picker()
+        except Exception:                   # noqa: BLE001 —— 视图建不出来就退回文本框 ✓（别炸弹窗 ✗）
+            self._picker = None
+        if self._picker is None:
+            form.addRow("idle 回归 foothold", self.ed_idle)
+        else:
+            # ⭐ 有视图 ⇒ **把文本框收起来**（那套"手填编号"就不摆了 ✓ 免得两处表达同一件事 ✗）
+            box = QVBoxLayout()
+            box.setSpacing(4)
+            box.addWidget(self._picker, 1)
+            self.lbl_fh = QLabel("")
+            self.lbl_fh.setStyleSheet("color: #5f6368;")
+            self.lbl_fh.setWordWrap(True)
+            box.addWidget(self.lbl_fh)
+            row_i = QHBoxLayout()
+            self.btn_idle_clear = QPushButton("清空")
+            self.btn_idle_clear.setToolTip("不设 idle 回归点（= 老行为：不跨层水平走 ✓）")
+            self.btn_idle_clear.clicked.connect(self._on_clear_idle)
+            row_i.addWidget(self.btn_idle_clear)
+            row_i.addStretch(1)
+            box.addLayout(row_i)
+            # ⭐⭐ **不塞进 `QFormLayout`**（用户 2026-09-28 报："图又窄"✓）：表单会给它让出
+            #   **标签列**那一竖条的宽度 ✗，而这块是**图**、宽度就是一切 ⇒ 单独拿出来占满整宽 ✓。
+            #   ⚠ 位置见下面 `root.insertWidget(0, box, 1)` —— 用户要求"可视图放在**最上面**"✓。
+            self._idle_box = box
+            self._refresh_idle_label()
+
+        # ④ 最大战斗时长(s) + ⑤ 到点去哪
+        self.sp_fight = NoWheelDoubleSpinBox()
+        self.sp_fight.setRange(0.0, 3600.0)
+        self.sp_fight.setDecimals(1)
+        self.sp_fight.setSingleStep(5.0)
+        self.sp_fight.setValue(max(0.0, float(z0.get("fight_max_s") or 0.0)))
+        self.sp_fight.setToolTip(
+            "在这块区域里**连着打多久就换地方**（秒 ✓）。\n\n"
+            "· **0 = 不限**（老行为 ✓ —— 打到没怪为止）；\n"
+            "· 填了 ⇒ 到点就去下面的「到点去哪」（没填就不动 ✓）。\n\n"
+            "⚠ 计时口径见 `decision/agent.py` 里那个字段的说明。")
+        form.addRow("最大战斗时长(s)", self.sp_fight)
+
+        self.cmb_dst = NoWheelComboBox()
+        self.cmb_dst.setMinimumWidth(150)
+        self.cmb_dst.addItem("（不前往）", "")          # data = "" ⇒ 空 = 不做这件事 ✓
+        for n in sorted(str(x) for x in (names or [])):
+            if n and n != self._set:                   # 别把自己列成目的地 ✗
+                self.cmb_dst.addItem(n, n)
+        cur = str(z0.get("fight_dst") or "")
+        _i = self.cmb_dst.findData(cur)
+        self.cmb_dst.setCurrentIndex(_i if _i >= 0 else 0)
+        self.cmb_dst.setToolTip(
+            "「最大战斗时长」到点之后**去哪块平台**（集合名 ✓）。\n"
+            "· **（不前往）** = 到点只停手、不换地方（默认 ✓）；\n"
+            "· 候选 = 这张图已注册的集合（不含这一项自己 ✓）。")
+        form.addRow("到点去哪", self.cmb_dst)
+
+        root.addLayout(form)
+        # ⭐ 把那块（视图 + 下拉 + 说明 + 清空）**插到最前面** + 让它吃满剩余高度
+        #   （用户 2026-09-28："可视图放在最上面吧，而且需要窗口纵向缩放"✓）：
+        #   · 插到 index 0 ⇒ 在最上面 ✓（表单项的顺序保持原样不动 ✓）；
+        #   · `stretch=1` ⇒ 窗口**纵向拉大时高度全给它**（这就是"窗口纵向缩放"✓）——
+        #     ⚠ 原来这里 `addStretch(1)` 把剩余高度全给了**空白** ⇒ 视图永远长不大 ✗。
+        #   ⚠⚠ 那块是个 **`QVBoxLayout`**（不是 widget）⇒ 必须用 `insertLayout` ✗
+        #      （写成 `insertWidget` 会当场 `TypeError` ✓ 对照用例抓到的 ✓）。
+        if getattr(self, "_idle_box", None) is not None:
+            root.insertLayout(0, self._idle_box, 1)
+        else:
+            root.addStretch(1)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        btn_ok = QPushButton("确定")
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.clicked.connect(self.reject)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_ok)
+        root.addLayout(row)
+        # 拉过的大小/位置按客户端记住（docs/UI规范.md §11 ✓）—— 第一次打开用上面那个 `resize`
+        theme.bind_window_state(self, "battle_zone")
+
+    def _make_picker(self):
+        """按工厂建那块**只读视图**（建不出来 / 没工厂 ⇒ `None` ✓ 调用方退回文本框 ✓）。"""
+        fn = self._picker_factory
+        if not callable(fn):
+            return None
+        w = fn(self._set, str(self.ed_idle.text() or "").strip())
+        if w is None:
+            return None
+        # 点选之后刷新下面那行参数（视图自己已经改好选中态了 ✓）
+        w.picked.connect(lambda *_a: self._refresh_idle_label())
+        return w
+
+    def _refresh_idle_label(self):
+        """刷新"当前 idle 回归点"那行（**顺带显示它的参数** —— 用户点选要看的就是它 ✓）。"""
+        if self._picker is None or not hasattr(self, "lbl_fh"):
+            return
+        fid = str(self._picker.current() or "")
+        info = self._picker.info(fid) if fid else ""
+        self.lbl_fh.setText(("已选：%s" % info) if info
+                            else "还没选 —— 点上面一条 foothold ⇒ 它就是 idle 回归点 ✓")
+        if hasattr(self, "btn_idle_clear"):
+            self.btn_idle_clear.setEnabled(bool(fid))
+
+    def _on_clear_idle(self):
+        """清空 idle 回归点（= 老行为：不跨层水平走 ✓）。"""
+        if self._picker is not None:
+            self._picker.set_current("")
+            self._refresh_idle_label()
+
+    def idle_fid(self):
+        """当前配的 idle 回归 foothold（**有视图就读视图 ✓ 否则读文本框 ✓**）。
+
+        ⚠ 一处取值（`zone()` 也走它 ✓）：别让"视图"和"文本框"两处各取一次 ✗
+          —— 那样迟早出现"界面看着选了、存下去是空的"✗。
+        """
+        if self._picker is not None:
+            return str(self._picker.current() or "")
+        return str(self.ed_idle.text() or "").strip()
+
+    def zone(self):
+        """确定之后取回这一项（`dict` ✓ 字段与 `settings.battle_zones` 的项一一对应 ✓）。"""
+        return {"set": self._set,
+                "cd_s": float(self.sp_cd.value()),
+                "idle_foothold": self.idle_fid(),
+                "fight_max_s": float(self.sp_fight.value()),
+                "fight_dst": str(self.cmb_dst.currentData() or ""),
+                # ⭐ 「可以战斗」**不在这个弹窗里改**（用户 2026-09-28 要求挪到列表项上勾 ✓）——
+                #   这里只是**原样带回**（见 `__init__` 里 `self._can_fight` ✓）
+                #   ⇒ 编辑别的参数不会顺手把勾选清掉 ✓✓（这一条最容易漏 ✗）。
+                "can_fight": bool(self._can_fight)}
+
+
 class PlayerPanel(QWidget):
     verify_started = pyqtSignal()            # 保留：主窗口既有连接
     verify_result = pyqtSignal(object, str)  # 保留：主窗口既有连接
@@ -119,13 +604,32 @@ class PlayerPanel(QWidget):
 
     # ---------------- 界面 ----------------
 
+    def mount_goto(self, widget):
+        """把「前往平台」那一块（`RoutePanel` 造的）放进本页操控区 ⇒ **幂等** ✓。
+
+        谁调：`MainWindow._bind_cards`（它同时握着两个面板 ✓）。为什么是"搬控件"而不是
+        "在这边另造一套"：那块要用 `RoutePanel` 的地形图 / 地形数据 / 地图 id，
+        复制一份必然分叉（改一边忘一边 ✗）。重复调用不会插两次 ✓。
+        """
+        if widget is None or self._goto_mounted is widget:
+            return
+        widget.setParent(self.goto_holder)
+        # 插到**最上面**：这一组里「前往平台」是主内容，手工休息那行在下（2026-09-26 ✓）。
+        self._goto_lay.insertWidget(0, widget)
+        self._goto_mounted = widget
+
     def _build(self):
         # 版面分两段：上面「操控」组常驻不滚动，下面 QScrollArea 装其余参数。
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 8, 10, 0)
         outer.setSpacing(6)
 
-        scroll = QScrollArea()
+        # ⚠ 这是**唯一一处**"自己 new 滚动区"（`# ui-allow-scroll：<理由>` 是给
+        #   `tools/check_ui.py` 认的标记 ✓）：本页要在滚动区**外面**压一条**常驻**的
+        #   「操控」栏（开关 + 触控板），而且那条栏的滚轮要**指路**到这个滚动区实例
+        #   （`top_bar._wheel_target = scroll`，见下面 ✓）—— 这两件事 `scroll_page`
+        #   表达不了（它不给滚动区实例 ✓）。除此之外一律走 `gui.widgets` 里的那三个 ✓。
+        scroll = QScrollArea()          # ui-allow-scroll：常驻栏要拿滚动区实例当 _wheel_target
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -171,7 +675,20 @@ class PlayerPanel(QWidget):
         ctrl_row.addWidget(self.btn_manual)
 
         ctrl_grp = QGroupBox("操控")
-        cg = QHBoxLayout(ctrl_grp)
+        # objectName **必须给**（2026-09-26 用户要求"给操控组加个背景色区分一下"）：
+        # 主窗口那份 QSS 里的底色规则是按 `QGroupBox#CtrlGroup` 选的 ⇒ 不给名字就选
+        # 不中（表现为"改了没反应"）。为什么不直接写 `QGroupBox` 全局：那会把**所有**
+        # 分组框（含下面滚动的参数区、以及本组里嵌套的「前往平台」）一起染色 ✗。
+        # 颜色定义在主窗口 QSS 的「分组框」那一段（样式只有一处 ✓）。
+        ctrl_grp.setObjectName("CtrlGroup")
+        # 组内**纵向两段**（docs/UI规范.md §4：一行只放一组，放不下就另起一行 ✓）：
+        #   第一段：触控板 + 右列（左右键 / 灵敏度 / 输入设备 / 状态）—— 原样不动 ✓
+        #   第二段：「前往平台」—— 2026-09-26 用户要求从「路线识别 → 地形图」搬来 ✓
+        # 为什么放第二段而不是塞进右列：右列是**按触控板高度配的**（4 行 ≈122px ≤ 132px ✓），
+        # 硬塞会把那一列的"正好对齐"破坏掉 ✗。
+        cv = QVBoxLayout(ctrl_grp)
+        cv.setSpacing(8)
+        cg = QHBoxLayout()
         cg.setSpacing(10)
 
         # 左：触控板（TouchPad 固定 210x132）
@@ -276,6 +793,51 @@ class PlayerPanel(QWidget):
 
         right_col.addStretch(1)
         cg.addLayout(right_col, 1)
+        cv.addLayout(cg)
+
+        # ---- 「命令」组（用户 2026-09-26 改名 + 扩组）----
+        # 「命令」= 一切"让角色**现在**去做某件事"的入口，两类东西：
+        #   · 「前往平台」那一块（选择平台 / 命令前往 / 结束当前寻路）—— 由主窗口
+        #     `mount_goto` 从「路线识别」面板搬进来（**控件与逻辑留在那边** ✓）；
+        #   · 「手动进入休息 / 手动结束休息 / 休息状态」三件 —— 同一天从「防掉线」组搬来
+        #     （它们本来就是命令 ✓，挂在防掉线里想"让角色去歇会儿"时找不到 ✗）。
+        self.goto_holder = QGroupBox("命令")
+        self._goto_lay = QVBoxLayout(self.goto_holder)
+        self._goto_lay.setSpacing(6)
+        self._goto_mounted = None
+        # 「手动进入/结束休息」：立刻休息一次、或休息中提前拉回来。
+        # 左右顺序 = 一次休息的时间顺序（先进后出）。两个按钮都只看实时线程写的
+        # 状态（_poll_auto_state 轮询刷新），自己不做判断。
+        # 右边紧跟休息状态/倒计时，同一行放省垂直空间（实测三个控件合计约 500px ✓）。
+        self.btn_start_rest = QPushButton("手动进入休息")
+        self.btn_start_rest.setToolTip(
+            "立刻按防掉线的流程休息一次：\n"
+            "  进入行为 → 歇完（防掉线里设的休息时长）→ 退出行为 → 继续打怪，\n"
+            "  并按防掉线的间隔重新排下一次自动休息。\n"
+            "和自动防掉线走**同一条流程**：攻击范围内还有怪时会先等它们清空\n"
+            "（状态显示「待休息：等清空攻击范围内的怪」），免得正打着怪突然站住。\n"
+            "自动关着、防掉线没开、或已经在休息时不可点。")
+        self.btn_start_rest.setEnabled(False)
+        self.btn_start_rest.clicked.connect(self._on_start_rest)
+
+        self.btn_end_rest = QPushButton("手动结束休息")
+        self.btn_end_rest.setToolTip(
+            "休息中点了立刻结束休息：执行「退出」那套行为，然后恢复正常打怪。\n"
+            "没在休息时不可点。")
+        self.btn_end_rest.setEnabled(False)
+        self.btn_end_rest.clicked.connect(self._on_end_rest)
+
+        self.lbl_rest = QLabel("")
+        self.lbl_rest.setStyleSheet("color: #80868b;")
+        rest_row = QHBoxLayout()
+        rest_row.setSpacing(8)
+        rest_row.addWidget(self.btn_start_rest)
+        rest_row.addWidget(self.btn_end_rest)
+        rest_row.addWidget(self.lbl_rest, 1)
+        # ⚠ 先加这一行，`mount_goto` 再用 `insertWidget(0, …)` 把「前往平台」块插到**上面**
+        #   ⇒ 组内顺序 = 先"去哪儿"，再"歇不歇" ✓（挂载是后面才发生的 ✓）。
+        self._goto_lay.addLayout(rest_row)
+        cv.addWidget(self.goto_holder)
 
         # 常驻块外面套一层：纵向两行（开关行 + 操控组），右侧补出
         # 「滚动条 + 内容边距」，让边框和滚动内容对齐
@@ -319,19 +881,10 @@ class PlayerPanel(QWidget):
         top_form = QFormLayout()
         top_form.setLabelAlignment(Qt.AlignLeft)
 
-        # 随机输入延迟 [min, max]（毫秒）：点按类按键之间的随机间隔
-        self.sp_delay_min = self._spin(0, 1000, 70, 0)
-        self.sp_delay_max = self._spin(0, 1000, 130, 0)
-        self.sp_delay_min.setToolTip("按键之间的随机间隔（毫秒），模拟真人手速，越小越快。")
-        self.sp_delay_max.setToolTip("按键之间的随机间隔（毫秒），模拟真人手速，越小越快。")
-        self.sp_delay_min.valueChanged.connect(self._on_input_delay)
-        self.sp_delay_max.valueChanged.connect(self._on_input_delay)
-        delay_row = QHBoxLayout()
-        delay_row.addWidget(self.sp_delay_min)
-        delay_row.addWidget(QLabel("~"))
-        delay_row.addWidget(self.sp_delay_max)
-        delay_row.addWidget(QLabel("ms"))
-        top_form.addRow("随机输入延迟", delay_row)
+        # ⚠ 这里原来是「随机输入延迟」那一对（`sp_delay_min/max` + `_on_input_delay`）——
+        #   **2026-09-27 按用户要求整个功能与配置都删掉**（决策层同步删了 `DecisionSettings.
+        #   input_delay` 与 `_random_input_delay`）。**不许加回来**：`tools/selftest_decision.py`
+        #   里两条反向钉盯着（参数对象上没有这个字段、本面板上没有那两个控件）。
 
         # 输出后锁定防抖（毫秒）：这段时间内 attack 目标保持锁定，不切换到范围内其他框
         self.sp_attack_lock_db = self._spin(0, 10000, 300, 0)
@@ -350,6 +903,77 @@ class PlayerPanel(QWidget):
         top_form.addRow("玩家追踪阈值", self.sp_track_jump)
 
         root.addLayout(top_form)
+
+        # ---- ⭐⭐ 「玩家位置」组（用户 2026-09-28 要求 ✓ —— **单开一组**）----
+        #  ① **脚底偏移**：人物框的底边不一定正好压在脚底（鞋底阴影 / 披风 / 特效会让框多出
+        #     一截 ✗）⇒ 差多少由这儿补正；**在实时预览上对着那对箭头调** ✓（正好用它调 ✓）。
+        #  ②③④ **框面积闸**：拿最近 N 拍的框面积**滚动均值**当"正常大小"，当前框比它小太多
+        #     （≤ 基线 ×(1−容差%)）⇒ 这一拍**不做位置查询** ✓ —— ⚠ 用户明确："**拦在查询
+        #     之前**，而不是靠放宽挑面"✗（见 `gui/live_thread` 里 `_locate_mmap` 之前那道闸 ✓）。
+        #     **0 = 关**（老行为一字不变 ✓）。
+        #  ⑤ **实时预览上的箭头**：以玩家位置为原点，一根沿世界 x、一根沿世界 y（画面上"向上"）
+        #     ⇒ 一眼看出"定位 / 脚底偏移到底对不对" ✓。颜色、长度都可配 ✓。
+        loc_grp = QGroupBox("玩家位置")
+        lg = QFormLayout(loc_grp)
+        lg.setContentsMargins(6, 6, 6, 6)
+
+        self.sp_foot_off = self._spin(-500, 500, 0, 0)
+        self.sp_foot_off.setToolTip(
+            "脚底偏移（像素）：算「脚底 / 相机 y」时用「框底 + 这个值」（正数 = 往下挪）。\n"
+            "人物框的底边不一定正好压在脚底（鞋底阴影 / 披风 / 特效会让框多出一截）。\n"
+            "在实时预览上对着那对箭头调：箭头根部该正好落在脚底。")
+        self.sp_foot_off.valueChanged.connect(self._on_player_loc_params)
+        lg.addRow("脚底偏移(px)", self.sp_foot_off)
+
+        self.sp_box_min_area = self._spin(0, 100, 0, 3, 0.1)
+        self.sp_box_min_area.setToolTip(
+            "框面积最小占比(%)：框面积小于「画面面积 × 这个比例」⇒ 这一拍不算有效检测。\n"
+            "人太小 / 框抖掉了 ⇒ 位置不可信，宁可这一拍不定位。\n0 = 不启用。")
+        self.sp_box_min_area.valueChanged.connect(self._on_player_loc_params)
+        lg.addRow("框面积最小占比(%)", self.sp_box_min_area)
+
+        self.sp_area_base_n = self._spin(1, 600, 30, 0)
+        self.sp_area_base_n.setToolTip(
+            "面积基线窗口（拍）：拿最近这么多拍的框面积求均值当「正常大小」。")
+        self.sp_area_base_n.valueChanged.connect(self._on_player_loc_params)
+        lg.addRow("面积基线窗口(拍)", self.sp_area_base_n)
+
+        self.sp_area_tol = self._spin(0, 90, 0, 1, 1)
+        self.sp_area_tol.setToolTip(
+            "面积容差(%)：当前框面积 ≤ 基线 ×(1−容差%) ⇒ 这一拍**推迟 / 不做**位置查询。\n"
+            "0 = 关掉这道闸（老行为）。")
+        self.sp_area_tol.valueChanged.connect(self._on_player_loc_params)
+        lg.addRow("面积容差(%)", self.sp_area_tol)
+
+        # ⭐ 箭头：**一个颜色**（x/y 同色 —— 用户 2026-09-28 改的口径："x 箭头和 y 箭头应该是
+        #   一个颜色"✓）＋ **线条粗细**（用户："选择颜色弹窗里需要能调整线条粗细"✓）。
+        #   ⚠ Qt 的 `QColorDialog` **塞不进自定义控件** ✗ ⇒ 粗细做成**紧挨着色块的那一格** ✓
+        #     （同一排 ⇒ "选色 + 定粗细"一个动作做完 ✓ 与「视野线宽度」同一排版 ✓）。
+        self._arrow_color = "#00E5FF"
+        _arrow_row = QWidget()
+        _ar = QHBoxLayout(_arrow_row)
+        _ar.setContentsMargins(0, 0, 0, 0)
+        _ar.setSpacing(6)
+        self.btn_arrow_color = QPushButton("#00E5FF")
+        self.btn_arrow_color.setFixedWidth(64)
+        self.btn_arrow_color.setToolTip(
+            "点开取色弹窗（可调透明度）；右边那格是**线条粗细**。\n"
+            "箭头以玩家脚底为原点：一根朝画面右（世界 x 正方向）、一根朝上（世界 y 正方向）。")
+        self.btn_arrow_color.clicked.connect(self._pick_arrow_color)
+        self.sp_arrow_width = self._spin(1, 20, 2, 0)
+        self.sp_arrow_width.setToolTip("箭头线条粗细（像素）。")
+        self.sp_arrow_width.valueChanged.connect(self._on_player_loc_params)
+        _ar.addWidget(self.btn_arrow_color)
+        _ar.addWidget(self.sp_arrow_width)
+        _ar.addStretch(1)
+        lg.addRow("箭头色 / 粗细", _arrow_row)
+
+        self.sp_arrow_len = self._spin(0, 2000, 60, 0)
+        self.sp_arrow_len.setToolTip("箭头的线段长度（像素）。0 = 不画箭头。")
+        self.sp_arrow_len.valueChanged.connect(self._on_player_loc_params)
+        lg.addRow("箭头长度(px)", self.sp_arrow_len)
+
+        root.addWidget(loc_grp)
 
         # ---- 参数模板（轻量一行，不套 groupbox：只有两个按钮，边框标题纯占地方）----
         tpl_row = QHBoxLayout()
@@ -433,24 +1057,91 @@ class PlayerPanel(QWidget):
         self.sp_attack_cd = self._spin(0, 10000, 0, 0)
         self.sp_attack_cd.setToolTip(
             "两次输出之间的最小间隔（毫秒），从上次输出那一刻起算，越小打得越快。\n"
-            "实际间隔 = 本值 + 随机延迟；输出行为序列本身更长时以序列为准。\n"
+            "实际间隔 = 本值；输出行为序列本身更长时以序列为准。\n"
             "（主循环一帧只推进一步序列，帧率低时序列耗时会按帧向上取整）")
         self.sp_attack_cd.valueChanged.connect(self._on_attack_cd)
         bf.addRow("输出行为CD(ms)", self.sp_attack_cd)
 
+        # ---- 子组「**攻击**」（用户 2026-09-27 要求）----
+        # 放进来的东西（他点名的那两批）：**攻击范围那四个距离** + **追击起跳**的全部参数 ✓。
+        # 为什么不留在「战斗参数」外面：它们是"打谁 / 打得到谁"这一件事的四个边 + 一个补充
+        # 动作 ⇒ 收进子组之后，"攻击"这个词下面一眼看全 ✓（版式照抄下面的 `evade_grp` ✓）。
+        attack_grp = QGroupBox("攻击")
+        af = QFormLayout(attack_grp)
+        af.setLabelAlignment(Qt.AlignLeft)
+
+        # ① **攻击范围 = 矩形**（用户 2026-09-27 定的）：四个距离 = 四条边 ✓
+        #   水平：最小攻击距离 ~ 最大攻击距离（前者以内是**盲区**）；
+        #   竖直：往上「向上攻击距离」、往下「向下攻击距离」。
+        # ⚠ **0 = 该方向不限**（= 以前完全不看 y 的老行为 ✓）⇒ 老项目升级后行为不变 ✓。
+        #   判据只有一处：`decision/agent.py::DecisionAgent._in_box` ✓。
         self.sp_attack = self._spin(0, 2000, 80, 0)
         self.sp_attack.setToolTip(
-            "怪离角色多近才开始攻击（只算前方）。\n"
-            "距离从角色中心点量到怪框最近的边，不是从玩家框的边缘起算。")
+            "怪离角色多近才开始攻击（**只算前方**）。\n"
+            "距离从角色中心点量到怪框最近的边，不是从玩家框的边缘起算。\n\n"
+            "⚠ 这是**攻击范围矩形**的四条边之一（2026-09-27 起攻击范围是矩形）：\n"
+            "  水平 = 「最小攻击距离」~「最大攻击距离」；竖直 = 上下那两个距离。\n"
+            "  实机效果：设置 → 外观 → 辅助线与标记里的「攻击范围框」就是它 ✓\n\n"
+            "⚠ 配 **0** ⇒ 水平可攻击区为空 ⇒ **不打任何怪、也不画框**（按 0 算，不是无限 ✓）。")
         self.sp_attack.valueChanged.connect(self._on_attack_dist)
-        bf.addRow("最大攻击距离", self.sp_attack)
+        af.addRow("最大攻击距离", self.sp_attack)
+
+        self.sp_min_attack = self._spin(0, 2000, 0, 0)
+        self.sp_min_attack.setToolTip(
+            "怪贴脸到此距离内 = **攻击盲区**：不算可攻击，并触发规避（跳/后退）。\n"
+            "设 0 表示没有盲区（老行为）。\n"
+            "口径同最大攻击距离：角色中心点 → 怪框最近的边；竖直同样受上下攻击距离约束。\n"
+            "实机效果：设置 → 外观 → 辅助线与标记里的「攻击盲区框」就是它 ✓")
+        self.sp_min_attack.valueChanged.connect(self._on_min_attack)
+        af.addRow("最小攻击距离", self.sp_min_attack)
+
+        self.sp_attack_up = self._spin(-1, 2000, -1, 0)
+        self.sp_attack_up.setToolTip(
+            "**向上攻击距离**（像素）：攻击范围矩形从角色中心**往上**能延伸多少。\n\n"
+            "取值（用户 2026-09-27 定的口径，别混）：\n"
+            "  · **-1（或任何负数）= 上方不限** ⇒ 不限制（= 老行为，以前根本不看 y ✓）；\n"
+            "  · **0 = 上方就是 0** ⇒ 上方的怪**一律打不到**（不是「无限」✗）；\n"
+            "  · **正数** = 具体距离：怪框离角色中心的竖直距离 ≤ 它才算够得着 ✓。\n\n"
+            "什么时候要设它：上下两层平台靠得近时，**不打上面那层的怪**（只打同一层的）✓\n"
+            "⚠ 上下**都配 0** ⇒ 整个攻击范围框面积为 0 ⇒ **不打任何怪、也不画那个框** ✓。")
+        self.sp_attack_up.valueChanged.connect(self._on_attack_vertical)
+        af.addRow("向上攻击距离", self.sp_attack_up)
+
+        self.sp_attack_down = self._spin(-1, 2000, -1, 0)
+        self.sp_attack_down.setToolTip(
+            "**向下攻击距离**（像素）：攻击范围矩形从角色中心**往下**能延伸多少。\n\n"
+            "取值同上（**-1/负数 = 下方不限**、**0 = 下方就是 0（打不到）**、正数 = 具体距离 ✓）。\n\n"
+            "⚠ 这里说的是**怪框**离角色中心的竖直距离，和角色自己会不会掉下去无关。")
+        self.sp_attack_down.valueChanged.connect(self._on_attack_vertical)
+        af.addRow("向下攻击距离", self.sp_attack_down)
+
+        # 「**跳跃攻击范围**」（用户 2026-09-27 记的一笔，**本次不实现**）：等跳跃物理做好后，
+        # 它表示"怪框落在这个范围内 ⇒ 按跳就能把它带进攻击范围框 ⇒ 触发 attack" ✓。
+        # 所以这里**故意不放参数框**（没有物理逻辑可依据 ✗），但设置里已经有它的
+        # **显示颜色 + 开关**（「外观 → 辅助线与标记 → 跳跃攻击范围框」✓）。
+        lbl_jump_box = QLabel("「跳跃攻击范围」：等跳跃物理做好后再加参数，"
+                              "现在设置里只有它的显示颜色")
+        lbl_jump_box.setWordWrap(True)
+        lbl_jump_box.setStyleSheet("color: #5f6368;")
+        af.addRow("", lbl_jump_box)
+
+        # ② **追击起跳**（原来散在「战斗参数」里，2026-09-27 一起收进「攻击」子组 ✓）
+        self.ck_chase_jump = QCheckBox("启用")
 
         # 最小切换朝向时间（毫秒）：换向后方向键至少按住这么久
         self.sp_min_turn_hold = self._spin(0, 3000, 0, 0)
         self.sp_min_turn_hold.setToolTip(
             "换朝向时，方向键至少要按住这么久（毫秒）。0 = 不约束。\n"
             "按下去立刻就松开的话，角色的转身动作可能还没做完 —— 这时候打出去\n"
-            "的方向是错的。这段按住时间只能被「又换一次朝向」打断。")
+            "的方向是错的。这段按住时间只能被「又换一次朝向」打断。\n"
+            "\n"
+            "【站桩输出（怪在攻击范围内、停住打）时】\n"
+            "默认只点一下方向键（0.15 秒，够转身、不会走位）；\n"
+            "但**每 3 次攻击**会补一次「朝目标」的方向键、并按满上面这个时间\n"
+            "（就是为了把角色确实转过去 —— 按满会朝怪小走一段，属预期）。\n"
+            "退出站桩（怪离开攻击范围 / 停自动等）后，这个「每 3 次」的计数清零。\n"
+            "⚠ 正在爬绳梯时**绝不按左右**（在绳上按左右 = 松手掉下来），\n"
+            "  那时只用内部朝向判断，不补方向键。")
         self.sp_min_turn_hold.valueChanged.connect(self._on_turn_params)
         bf.addRow("最小切换朝向时间(ms)", self.sp_min_turn_hold)
 
@@ -464,14 +1155,6 @@ class PlayerPanel(QWidget):
         self.sp_turn_output_delay.valueChanged.connect(self._on_turn_params)
         bf.addRow("转向后输出延迟(ms)", self.sp_turn_output_delay)
 
-        self.sp_min_attack = self._spin(0, 2000, 0, 0)
-        self.sp_min_attack.setToolTip(
-            "怪贴脸到此距离内就触发规避（跳/后退）。设 0 表示不规避。\n"
-            "口径同最大攻击距离：角色中心点 → 怪框最近的边。")
-        self.sp_min_attack.valueChanged.connect(self._on_min_attack)
-        bf.addRow("最小攻击距离", self.sp_min_attack)
-
-        self.ck_chase_jump = QCheckBox("启用")
         self.ck_chase_jump.setToolTip(
             "追击起跳：起跳范围内「从无怪变成有怪」的那一拍才跳一次。\n"
             "所以同一只怪一直挂在区间里不会反复跳（它只在刚进来时跳一下）。\n"
@@ -495,7 +1178,7 @@ class PlayerPanel(QWidget):
         cj_row.addWidget(QLabel("~"))
         cj_row.addWidget(self.sp_chase_jump_max)
         cj_row.addStretch(1)
-        bf.addRow("追击起跳", cj_row)
+        af.addRow("追击起跳", cj_row)
 
         # 「追击起跳需要的冲刺时间(ms)」（用户 2026-09-26 要求）：放在它**下面一行**。
         # 含义 = `chase` 状态**连续**维持了这么久才准起跳（中途进别的状态就归零）：
@@ -513,7 +1196,42 @@ class PlayerPanel(QWidget):
             "例：填 300 ⇒ 冲了 300ms 以上，进起跳区间那一拍才跳。\n"
             "0 = 不额外要求（老行为：一到区间就跳）。")
         self.sp_chase_dash.valueChanged.connect(self._on_chase_jump)
-        bf.addRow("追击起跳需要的冲刺时间(ms)", self.sp_chase_dash)
+        af.addRow("追击起跳需要的冲刺时间(ms)", self.sp_chase_dash)
+
+        # 子组挂到「战斗参数」组上（版式同下面的 `evade_grp`：标签留空、整块占一行 ✓）。
+        # ⚠ **必须挂**：只建 QGroupBox 不加进来，这个框永远不会显示（Qt 里没有父级的
+        #   控件不参与布局 ✗）—— 自检 `t_attack_group` 会当场红 ✓。
+        bf.addRow("", attack_grp)
+
+        # ---- 「限制战斗区域」（2026-09-26 用户要求：**一条一行**、别占那么大地方）----
+        # 只在**这些集合**里才进入战斗；不在里面 ⇒ 这一拍不打架，先下「前往」回去
+        #（默认去**第一条** ✓，更多策略用户后续补 ✓）。
+        # 候选 = 这张图**已注册的集合**，由路线识别面板推过来（和「定点休息」那两个
+        # 下拉同一份来源 ✓ —— 集合属于地图，只有那边知道地图 id ✓）。
+        # ⚠ **2026-09-28 用户重构（第 1 条，原话）**："『限制战斗区域』参数改名『**编辑战斗区域**』，
+        #   **移除其 foothold 下拉列表的配置和按钮**（**不在这里限制**），**新增『编辑』按钮**"✓。
+        #   ⇒ 这一行现在只有：标签 + 「编辑」按钮 + **只读的已配摘要** ✓
+        #     （添加 / 删除 / 改参数**全在弹窗里** ✓ —— 行内再来一套按钮就是重复 ✗）。
+        self._bz_rows = QVBoxLayout()          # 已配的那几条（**只读**摘要 ✓ 一条一行）
+        self._bz_rows.setSpacing(4)
+        self._bz_candidate = []                # 候选集合名（由路线识别面板推过来 ✓）
+        self._bz_picker_factory = None         # 「只读 foothold 视图」的工厂（同上，推过来 ✓）
+        self._bz_names = []                    # 当前显示的名字（顺序 = 界面顺序 ✓）
+        self.btn_battle_zone_edit = QPushButton("编辑")
+        self.btn_battle_zone_edit.setToolTip(
+            "打开「编辑战斗区域」：**添加 / 删除 / 双击一行改参数** ✓\n"
+            "每一项可以勾「可以战斗」—— 那就是旧的「限制战斗区域」✓")
+        self.btn_battle_zone_edit.clicked.connect(self._on_battle_zone_edit_clicked)
+        bz = QVBoxLayout()
+        bz.setSpacing(4)
+        bz_row = QHBoxLayout()
+        bz_row.setSpacing(6)
+        bz_row.addWidget(self.btn_battle_zone_edit)
+        bz_row.addStretch(1)
+        bz.addLayout(bz_row)
+        bz.addLayout(self._bz_rows)
+        bz.addWidget(self._bz_hint())
+        bf.addRow("编辑战斗区域", bz)
 
         # 规避策略（仅最小攻击距离 > 0 时显示）
         evade_grp = QGroupBox("规避策略")
@@ -793,38 +1511,6 @@ class PlayerPanel(QWidget):
         afk = QGroupBox("防掉线")
         af = QFormLayout(afk)
 
-        # 手动进入/结束休息：立刻休息一次、或休息中提前拉回来。
-        # 左右顺序 = 一次休息的时间顺序（先进后出）。两个按钮都只看实时线程写的
-        # 状态（_poll_auto_state 轮询刷新），自己不做判断。
-        # 右边紧跟休息状态/倒计时，同一行放省垂直空间（实测三个控件合计约 500px，
-        # 面板 612px，放得下）。
-        self.btn_start_rest = QPushButton("手动进入休息")
-        self.btn_start_rest.setToolTip(
-            "立刻按「隐身休息」流程休息一次：\n"
-            "  进入隐身行为 → 歇完（防掉线里设的休息时长）→ 退出隐身行为 → 继续打怪，\n"
-            "  并按防掉线的间隔重新排下一次自动休息。\n"
-            "和自动防掉线走**同一条流程**：攻击范围内还有怪时会先等它们清空\n"
-            "（状态显示「待休息：等清空攻击范围内的怪」），免得正打着怪突然站住。\n"
-            "自动关着、防掉线没开、或已经在休息时不可点。")
-        self.btn_start_rest.setEnabled(False)
-        self.btn_start_rest.clicked.connect(self._on_start_rest)
-
-        self.btn_end_rest = QPushButton("手动结束休息")
-        self.btn_end_rest.setToolTip(
-            "休息中点了立刻结束休息：执行「退出隐身行为」，然后恢复正常打怪。\n"
-            "没在休息时不可点。")
-        self.btn_end_rest.setEnabled(False)
-        self.btn_end_rest.clicked.connect(self._on_end_rest)
-
-        self.lbl_rest = QLabel("")
-        self.lbl_rest.setStyleSheet("color: #80868b;")
-        rest_row = QHBoxLayout()
-        rest_row.setSpacing(8)
-        rest_row.addWidget(self.btn_start_rest)
-        rest_row.addWidget(self.btn_end_rest)
-        rest_row.addWidget(self.lbl_rest, 1)
-        af.addRow("", rest_row)
-
         self.ck_afk = QCheckBox("自动防掉线")
         self.ck_afk.setToolTip("定时执行防掉线行为（目前：隐身休息）。")
         self.ck_afk.stateChanged.connect(self._on_anti_afk)
@@ -946,6 +1632,77 @@ class PlayerPanel(QWidget):
         self.btn_spot_seq.clicked.connect(lambda: self._edit_afk_seq("spot"))
         sf.addRow("到达后行为", self.btn_spot_seq)
 
+        # ⭐⭐ **「休息过程中循环行为」**（用户 2026-09-28 要求 ✓ 原话："定点休息类型，到达后行为
+        #   按钮下面加个配置，布局为：勾选框「休息过程中循环行为」；勾选后，下方缩进出现参数：
+        #   「循环行为编辑」→行为编辑器按钮 / 循环时间(s) A ~ B"）。
+        #   ⚠ 位置就是"到达后行为的**下面**"（用户点名的 ✓）。
+        self.ck_spot_loop = QCheckBox("休息过程中循环行为")
+        self.ck_spot_loop.setToolTip(
+            "勾上之后，**休息中**（已经到地方、正在歇着的那段）会按下面的间隔**反复**执行"
+            "「循环行为」。\n\n"
+            "· 与上面的「到达后行为」**互不影响**：那条是**一次性**的（到了先做一遍 ✓），"
+            "这条是**循环**的 ✓；\n"
+            "· **不勾** = 老行为一字不变 ✓。")
+        self.ck_spot_loop.stateChanged.connect(self._on_spot_loop_toggle)
+        sf.addRow("", self.ck_spot_loop)     # 空标签 ⇒ 勾选框单独占一行 ✓
+
+        # 勾选后出现的参数（**下方缩进** ✓ 见 `_refresh_spot_loop_ui`）
+        self._spot_loop_box = QWidget()
+        _lb = QFormLayout(self._spot_loop_box)
+        _lb.setContentsMargins(24, 0, 0, 0)  # ⭐ 缩进（"下方缩进出现参数" ✓）
+        _lb.setSpacing(6)
+        # ⭐⭐ **循环行为是一个"列表配置"**（用户 2026-09-28 升级 ✓ 原话："把循环行为编辑做成
+        #   列表配置，行为编辑器里点击确定后，向列表里加一项，每项可以**重命名**、**删除**、
+        #   **双击打开行为编辑器**编辑。实际的执行**每个循环里会按照每个项目依次执行**"）。
+        #   ⇒ 一排"列表 + 三个按钮"，双击行 = 打开行为编辑器 ✓（用户指定的手势 ✓）。
+        self.ck_loop_items = QListWidget()
+        self.ck_loop_items.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.ck_loop_items.setToolTip(
+            "休息中每隔「循环时间」就把这个列表**从头到尾依次执行一遍** ✓。\n\n"
+            "· **双击**一行 = 打开行为编辑器改它 ✓；\n"
+            "· 「重命名」改显示名（只影响这一行怎么显示 ✓）；\n"
+            "· 一项都没编（或全是空行为）⇒ 这个循环**什么都不做** ✓。")
+        self.ck_loop_items.itemDoubleClicked.connect(self._on_loop_item_edit)
+        _lb.addRow("循环行为", self.ck_loop_items)
+        _lbrow = QHBoxLayout()
+        _lbrow.setContentsMargins(0, 0, 0, 0)
+        for _txt, _slot, _tip in (
+                ("添加", self._on_loop_item_add, "新建一项：先起个名，再打开行为编辑器编它 ✓"),
+                ("重命名", self._on_loop_item_rename, "改这一项的显示名 ✓"),
+                ("删除", self._on_loop_item_del, "删掉这一项 ✓"),
+                ("上移", lambda: self._on_loop_item_move(-1), "往前挪一位（执行顺序）✓"),
+                ("下移", lambda: self._on_loop_item_move(1), "往后挪一位（执行顺序）✓")):
+            _b = QPushButton(_txt)
+            _b.setToolTip(_tip)
+            _b.clicked.connect(_slot)
+            _lbrow.addWidget(_b)
+        _lbrow.addStretch(1)
+        _lb.addRow("", _lbrow)
+        self.sp_loop_min = self._spin(0.1, 3600, 30, 1, 0.5)
+        self.sp_loop_max = self._spin(0.1, 3600, 60, 1, 0.5)
+        self.sp_loop_min.valueChanged.connect(self._on_spot_loop_time)
+        self.sp_loop_max.valueChanged.connect(self._on_spot_loop_time)
+        _loop_row = QHBoxLayout()
+        _loop_row.addWidget(self.sp_loop_min)
+        _loop_row.addWidget(QLabel("~"))
+        _loop_row.addWidget(self.sp_loop_max)
+        _lb.addRow("循环时间(s)", _loop_row)
+        # ⭐⭐ **「休息结束推迟到循环执行完」**（用户 2026-09-28 要求 ✓ 原话："勾上休息过程中
+        #   循环行为时，再加一个开关子参数『休息结束推迟到循环执行完』"）。
+        #   ⚠ 位置：**「循环时间(s)」的下面**、同一块缩进里 ⇒ 只有勾了「休息过程中循环行为」
+        #     才看得见 ✓（它本来就是那一块的**子参数** ✓）。
+        self.ck_loop_hold = QCheckBox("休息结束推迟到循环执行完")
+        self.ck_loop_hold.setToolTip(
+            "休息时间到了、而**这一轮循环还在演**时，先**等它演完**再结束休息。\n\n"
+            "· **不勾**（默认）= 老行为：到点**当场收摊**（手上那段半截就断 ✗）、"
+            "立刻去「结束后前往」/ 回战斗 ✓；\n"
+            "· **勾上** = 只等**当前这一轮**演完（演完就结束 ✓、**不再开新一轮** ✓）；\n"
+            "· 这样才不会出现「一边按着循环的键、一边下发寻路的键」（两边打架 ✗）；\n"
+            "· ⚠ **手动点「结束休息」不受它管** —— 那种情况仍是「手上这一项演完就收」✓。")
+        self.ck_loop_hold.stateChanged.connect(self._on_loop_hold_toggle)
+        _lb.addRow("", self.ck_loop_hold)
+        sf.addRow("", self._spot_loop_box)
+
         self.cmb_spot_after = NoWheelComboBox()
         self.cmb_spot_after.setToolTip("休息**结束之后**先走去哪个集合，再回去打怪。\n"
                                        "选「（不前往）」= 休息完直接继续打怪。")
@@ -968,6 +1725,8 @@ class PlayerPanel(QWidget):
         self._state_timer = QTimer(self)
         self._state_timer.setInterval(500)
         self._state_timer.timeout.connect(self._poll_auto_state)
+        # ⭐ 循环项的"当前状态"也搭这趟车刷（500ms ✓ 足够跟手、又不费 ✓）
+        self._state_timer.timeout.connect(self._tick_loop_state)
         self._state_timer.start()
 
         # F11 开关自动（窗口内快捷键；全局热键后续接 RegisterHotKey）
@@ -1336,6 +2095,21 @@ class PlayerPanel(QWidget):
             elif st == "afk_spot_back":
                 dst = str(getattr(settings, "anti_afk_spot_after", "") or "")
                 txt += ("「%s」" % dst) if dst else ""
+            # ⭐ **循环行为的进度**（用户 2026-09-28："休息过程中希望能看到**每一个循环项目**的
+            #   当前状态信息"✓）—— 只在「休息中」那一段显示 ✓（别的阶段这一格是 0 ✓）。
+            if st == "afk_spot_rest":
+                _tot = int(getattr(settings, "spot_loop_total", 0) or 0)
+                _idx = int(getattr(settings, "spot_loop_idx", 0) or 0)
+                _nm = str(getattr(settings, "spot_loop_name", "") or "")
+                if _tot > 0:
+                    if _idx > 0:
+                        txt += " · 循环 %d/%d「%s」" % (_idx, _tot, _nm)
+                    elif _nm:
+                        # 一轮跑完、正在等下一次 ⇒ 说清"还有几秒重来"（不然看着像卡住 ✓）
+                        _at = float(getattr(settings, "spot_loop_next_at", 0.0) or 0.0)
+                        _w = max(0, int(round(_at - time.monotonic()))) if _at > 0 else 0
+                        txt += (" · 循环一轮完成，" + ("%d 秒后重来" % _w if _w > 0
+                                                   else "马上重来"))
             # 倒计时只在**真的在计时**的阶段加（其余阶段它是 0 ⇒ `left()` 给空串 ✓）
             return txt + left(settings.rest_until_monotonic)
         # 到点了但攻击范围内还有怪：卡在这一步时最容易被误认为「坏了」
@@ -1367,6 +2141,17 @@ class PlayerPanel(QWidget):
         settings.min_attack_dist = int(val)
         settings.save()
         self._refresh_evade_ui()
+
+    def _on_attack_vertical(self, _val=None):
+        """改了「向上攻击距离 / 向下攻击距离」⇒ 写进配置（决策参数、跟着项目存 ✓）。
+
+        这两条是 2026-09-27 新加的"竖边"（攻击范围从**只看 x** 改成**矩形** ✓）：
+        **0 = 该方向不限** ✓ —— 老项目文件里没有这两个键 ⇒ 读进来是 0 ⇒ 行为一点不变 ✓。
+        判据只有一处：`decision/agent.py::DecisionAgent._in_box` ✓。
+        """
+        settings.attack_up_dist = int(self.sp_attack_up.value())
+        settings.attack_down_dist = int(self.sp_attack_down.value())
+        settings.save()
 
     def _on_chase_jump(self, _val=None):
         settings.chase_jump_enabled = bool(self.ck_chase_jump.isChecked())
@@ -1431,6 +2216,162 @@ class PlayerPanel(QWidget):
         settings.save()
         self._refresh_afk_ui()
 
+    # ---------------- 循环行为**列表**（用户 2026-09-28 ✓） ----------------
+
+    def _loop_items(self):
+        """设置里那份列表（**永远返回可写的那一份** ✓ 改完自己调 `_save_loop_items` ✓）。"""
+        return settings.anti_afk_spot_loop_items
+
+    def _save_loop_items(self):
+        """写回 + 存盘 + 重画列表（**唯一出口** ✓ 免得五处各写一遍 ✗）。"""
+        settings.save()
+        self._refresh_loop_list()
+
+    def _tick_loop_state(self):
+        """按运行态给**列表里的当前项**加个 `▶` 前缀（用户 2026-09-28 要"每个循环项目的
+        **当前状态**"✓）—— 挂在 500ms 的状态轮询里（`_state_timer` ✓ 不额外开定时器 ✓）。
+
+        ⚠⚠ **只改文本、不动选中行**（用户正拿这个列表编辑 ✓ 抢走选中会很难受 ✗）——
+          也不重灌列表（重灌会清掉选中 ✗）；纯 `setText` ✓。
+        ⚠ 只在**休息中**显示（其余时候把前缀摘掉 ✓ 免得配置界面一直挂个 ▶ 看不懂 ✓）。
+        """
+        if not hasattr(self, "ck_loop_items"):
+            return
+        idx = 0
+        if str(getattr(settings, "rest_state", "") or "") == "afk_spot_rest":
+            idx = int(getattr(settings, "spot_loop_idx", 0) or 0)
+        self.ck_loop_items.blockSignals(True)
+        try:
+            for i in range(self.ck_loop_items.count()):
+                it = self.ck_loop_items.item(i)
+                base = str(it.text()).lstrip("▶ ").strip()
+                it.setText(("▶ %s" % base) if (idx > 0 and i == idx - 1) else base)
+        finally:
+            self.ck_loop_items.blockSignals(False)
+
+    def _refresh_loop_list(self):
+        """把列表灌进控件（一行 = 一项的名字 ✓）；顺便按勾选框显示/隐藏那一块 ✓。"""
+        self.ck_loop_items.blockSignals(True)
+        try:
+            self.ck_loop_items.clear()
+            for it in self._loop_items():
+                self.ck_loop_items.addItem(str((it or {}).get("name") or "（未命名）"))
+        finally:
+            self.ck_loop_items.blockSignals(False)
+        self._refresh_spot_loop_ui()
+
+    def _loop_sel(self):
+        """当前选中的那一项的**下标**（没选给 -1 ✓）。"""
+        return int(self.ck_loop_items.currentRow())
+
+    def _on_loop_item_add(self):
+        """**添加**一项：先起名字 ⇒ 再打开行为编辑器编它 ✓（用户说"点击确定后向列表里加一项"✓）。"""
+        name, ok = QInputDialog.getText(self, "添加循环行为", "这一项叫什么名字？",
+                                        text="循环行为")
+        if not ok:
+            return
+        self._loop_items().append({"name": str(name or "（未命名）").strip() or "（未命名）",
+                                  "seq": []})
+        self._refresh_loop_list()
+        self.ck_loop_items.setCurrentRow(len(self._loop_items()) - 1)
+        self._save_loop_items()
+        self._on_loop_item_edit()          # ⇐ 顺手把行为编辑器打开（用户要"点了确定就加一项"✓）
+
+    def _on_loop_item_edit(self, *_a):
+        """**双击**（或刚添完）⇒ 打开行为编辑器编**这一项**的行为 ✓。"""
+        i = self._loop_sel()
+        if i < 0:
+            QMessageBox.information(self, "先选一项", "在列表里点一下要编辑的那一项 ✓")
+            return
+        from gui.seq_editor import SeqEditorDialog
+
+        items = self._loop_items()
+        dlg = SeqEditorDialog(list(items[i].get("seq") or []), self,
+                              title="「%s」行为编辑器" % (items[i].get("name") or "循环行为"))
+        if dlg.exec_():
+            items[i]["seq"] = dlg.seq()
+            self._save_loop_items()
+
+    def _on_loop_item_rename(self):
+        """**重命名**（只改显示名 ✓ 不影响行为 ✓）。"""
+        i = self._loop_sel()
+        if i < 0:
+            QMessageBox.information(self, "先选一项", "在列表里点一下要改名的那一项 ✓")
+            return
+        items = self._loop_items()
+        name, ok = QInputDialog.getText(self, "重命名", "新名字：",
+                                        text=str(items[i].get("name") or ""))
+        if not ok:
+            return
+        items[i]["name"] = str(name or "（未命名）").strip() or "（未命名）"
+        self._refresh_loop_list()
+        self.ck_loop_items.setCurrentRow(i)
+        self._save_loop_items()
+
+    def _on_loop_item_del(self):
+        """**删除**一项（有确认 ✓）。"""
+        i = self._loop_sel()
+        if i < 0:
+            QMessageBox.information(self, "先选一项", "在列表里点一下要删的那一项 ✓")
+            return
+        items = self._loop_items()
+        if QMessageBox.question(
+                self, "删除循环行为",
+                "确定删掉「%s」吗？" % (items[i].get("name") or "（未命名）")) != QMessageBox.Yes:
+            return
+        del items[i]
+        self._refresh_loop_list()
+        self.ck_loop_items.setCurrentRow(min(i, len(items) - 1))
+        self._save_loop_items()
+
+    def _on_loop_item_move(self, step):
+        """上移 / 下移一位（**执行顺序**就是列表顺序 ✓ 用户要"依次执行"⇒ 顺序得能调 ✓）。"""
+        i = self._loop_sel()
+        j = i + int(step)
+        items = self._loop_items()
+        if i < 0 or j < 0 or j >= len(items):
+            return
+        items[i], items[j] = items[j], items[i]
+        self._refresh_loop_list()
+        self.ck_loop_items.setCurrentRow(j)
+        self._save_loop_items()
+
+    def _on_spot_loop_toggle(self, _state=None):
+        """勾选框变化 ⇒ 写回设置 + 刷新缩进那块的显隐 ✓。"""
+        settings.anti_afk_spot_loop = bool(self.ck_spot_loop.isChecked())
+        self._refresh_spot_loop_ui()
+        settings.save()
+
+    def _on_loop_hold_toggle(self, _state=None):
+        """「休息结束推迟到循环执行完」变化 ⇒ 写回 + 存盘 ✓。
+
+        ⚠ 它**只影响"自然到点"那一条**（口径在 `decision/agent._hold_rest_for_loop` ✓）——
+          界面这边不做任何"立刻生效"的动作（不需要：到点那一刻 agent 现读现判 ✓）。
+        """
+        settings.anti_afk_spot_loop_hold = bool(self.ck_loop_hold.isChecked())
+        settings.save()
+
+    def _on_spot_loop_time(self, _val=None):
+        """「循环时间(s) A~B」的 A/B 任一变化 ⇒ 写回 + 夹下限（A 不许大于 B ✓）。"""
+        settings.anti_afk_spot_loop_min = float(self.sp_loop_min.value())
+        settings.anti_afk_spot_loop_max = float(self.sp_loop_max.value())
+        if settings.anti_afk_spot_loop_max < settings.anti_afk_spot_loop_min:
+            settings.anti_afk_spot_loop_max = settings.anti_afk_spot_loop_min
+        settings.save()
+
+    def _refresh_spot_loop_ui(self):
+        """按勾选框显示/隐藏「循环行为编辑 + 循环时间(s)」那一块（**下方缩进** ✓）。
+
+        ⚠ 用 `setVisible` 而不是 `setEnabled`：用户要的是"**勾选后下方缩进出现**参数"✓
+          —— 藏起来才是"出现" ✓（灰掉仍是"一直在那儿"✗）。
+        """
+        if not hasattr(self, "_spot_loop_box"):
+            return
+        self._spot_loop_box.setVisible(bool(self.ck_spot_loop.isChecked()))
+        # ⚠ **这里不许再调 `_refresh_loop_list`** ✗ —— 那个函数结尾会反过来调本函数
+        #   ⇒ 无限递归（`RecursionError`，当天踩过 ✓）。分工：**列表内容**归
+        #   `_refresh_loop_list`、**整块显隐**归本函数 ✓（回填处先刷列表再刷这里 ✓）。
+
     def _on_afk_rest_time(self, _val=None):
         settings.anti_afk_rest_min = float(self.sp_rest_min.value())
         settings.anti_afk_rest_max = float(self.sp_rest_max.value())
@@ -1456,6 +2397,137 @@ class PlayerPanel(QWidget):
         self._afk_hidden.setVisible(settings.anti_afk_type == "hidden_rest")
         self._afk_spot.setVisible(settings.anti_afk_type == "spot_rest")
         self.sp_afk_retry.setEnabled(bool(settings.anti_afk_retry_on_interrupt))
+        # ⚠ 那块"缩进参数"的显隐**只归勾选框管**（子组一藏它也跟着看不见 ✓）——
+        #   这里再刷一次是为了"切回定点休息类型时状态是对的"（不刷也不会错，但便宜 ✓）。
+        self._refresh_spot_loop_ui()
+
+    def _bz_hint(self):
+        """「编辑战斗区域」下面那行短说明（2026-09-28 用户重构后重写 ✓）。"""
+        lbl = QLabel("点「**编辑**」增删改 ✓；每一项**勾了「可以战斗」**才等于旧的"
+                     "「限制战斗区域」（人在它外面 ⇒ 这一拍不打架、先走回去 ✓）。")
+        lbl.setStyleSheet("color: #80868b;")
+        lbl.setWordWrap(True)
+        lbl.setToolTip(
+            "**每一项 = 一块集合（平台）的配置**（区域查询CD / idle 回归 foothold /\n"
+            "最大战斗时长 / 到点去哪 / **可以战斗** ✓）。\n\n"
+            "「可以战斗」= **旧的「限制战斗区域」**（用户 2026-09-28 搬进每一项 ✓）：\n"
+            "  勾上 ⇒ 人**不在这块集合上**时这一拍**不打架**、先下「前往」回去 ✓，\n"
+            "          而且只打**本集合里**的怪 ✓；\n"
+            "  不勾（默认）⇒ 这块区域**只管它自己那几项参数**，不影响在哪打架 ✓。\n\n"
+            "一个都没勾 = **不限制**（任何地方都打 ✓ 老行为）。\n\n"
+            "怎么配：点「**编辑**」⇒ 打开「编辑战斗区域」列表 ——\n"
+            "  点「添加」选一块集合 ⇒ 立刻弹出它的参数窗 ✓；\n"
+            "  **双击一行**同样是改它 ✓；选中后点「删除」移除 ✓。\n"
+            "改完**立刻生效**，并且**跟着项目存** ✓。\n\n"
+            "⚠ 拿不到定位（不知道自己在哪块平台）时按「不在禁战区里」处理 ⇒ 先回去 ✓：\n"
+            "   宁可先归位，也不要在不知道自己在哪的时候开打 ✗。")
+        return lbl
+
+    def _bz_items(self):
+        """**真源**：`settings.battle_zones` 的每一项 → `[(名字, 项), …]`（顺序 = 界面顺序 ✓）。
+
+        ⚠ **界面一律读它**（`battle_zone_sets` 只是**派生副本** ✗）：用户 2026-09-28 原话
+          "**按钮和弹窗呢？你做的我没法测**" —— 那时界面只读写副本 ⇒ `cd_s` /
+          `idle_foothold` / `fight_max_s` / `fight_dst` 四个字段**一个入口都没有** ✗。
+        """
+        out = []
+        for z in (getattr(settings, "battle_zones", None) or []):
+            if isinstance(z, dict) and str(z.get("set") or ""):
+                out.append((str(z["set"]), z))
+        return out
+
+    def _bz_commit(self, zones):
+        """写回 `battle_zones` + **同步派生副本** + 存盘 + 重画（唯一出口 ✓）。
+
+        ⚠ `sync_battle_zone_sets()` **必须调**（见 `decision/agent.py:734` 的说明 ✓）：
+          `battle_zone_sets` **没有自动同步**（`__getattr__` 代理 + property 会栈溢出 ✗）
+          ⇒ 不调的话"筛怪 / 回区域"还会按**老名单**跑 ✗（`t_align_params` / `t_zone_cd_setting` 钉着 ✓）。
+        """
+        settings.battle_zones = [dict(z) for z in zones]
+        try:
+            settings.sync_battle_zone_sets()
+        except Exception:                     # noqa: BLE001 —— 老设置对象没这个方法也照存 ✓
+            pass
+        settings.save()
+        self._refresh_battle_zones()
+
+    def _bz_candidate_names(self):
+        """候选集合名 = `set_zone_sets` 推过来的**已注册集合** ✓
+        （⚠ 2026-09-28 起不再从下拉读 —— 那个下拉已经被用户要求去掉了 ✓；
+        再兜一层"当前已配的那些"，免得换图后候选空掉 ⇒ 连编辑都点不开 ✗）。"""
+        names = [str(n) for n in (getattr(self, "_bz_candidate", None) or []) if str(n)]
+        for n, _z in self._bz_items():
+            if n not in names:
+                names.append(n)
+        return names
+
+    def _refresh_battle_zones(self):
+        """把 `settings.battle_zones` 灌成**一条一行的只读摘要**（2026-09-28 用户重构 ✓）。
+
+        ⚠ 这里**只显示**：增删改都搬进「编辑战斗区域」弹窗了 ✓（用户第 1 条："不在这里限制"✓）
+          —— 行内再留「编辑 / 删除」按钮就是和弹窗那套重复、还容易两处不同步 ✗。
+        ⚠ 摘要里**必须看得见「可以战斗」**：它是旧「限制战斗区域」的去处 ✓，也是最要紧的一条 ✓
+          （看不见的话，用户根本不知道哪块在禁战 ✓）。
+        """
+        self._clear_layout(self._bz_rows)
+        items = self._bz_items()
+        self._bz_names = [n for n, _z in items]
+        if not items:
+            empty = QLabel("（还没配 —— 点上面的「编辑」添加）")
+            empty.setStyleSheet("color: #80868b;")
+            self._bz_rows.addWidget(empty)
+            return
+        for n, z in items:
+            bits = []
+            if z.get("can_fight"):
+                bits.append("**可以战斗**")
+            bits.append("CD %gs" % float(z.get("cd_s") or ZONE_GOTO_RETRY_S))
+            if str(z.get("idle_foothold") or ""):
+                bits.append("idle 回 fh %s" % z.get("idle_foothold"))
+            if float(z.get("fight_max_s") or 0.0) > 0:
+                bits.append("最多打 %gs → %s"
+                            % (z.get("fight_max_s"), z.get("fight_dst") or "（不前往）"))
+            lbl = QLabel("%s　·　%s" % (n, "，".join(bits)))
+            lbl.setToolTip("这一项的完整设置（**改它请点上面的「编辑」** ✓）：\n"
+                           "  可以战斗 = %s\n  区域查询CD(s) = %s\n"
+                           "  idle 回归 foothold = %s\n  最大战斗时长(s) = %s\n  到点去哪 = %s"
+                           % ("是" if z.get("can_fight") else "否",
+                              z.get("cd_s"), z.get("idle_foothold") or "（无）",
+                              z.get("fight_max_s"), z.get("fight_dst") or "（不前往）"))
+            self._bz_rows.addWidget(lbl)
+
+    def _on_battle_zone_edit_clicked(self):
+        """点「**编辑**」⇒ 打开「**编辑战斗区域**」列表弹窗（用户 2026-09-28 第 2 条 ✓）。
+
+        弹窗里：**添加 / 删除 / 双击一行改参数** ✓；每次增删改都**立刻**经 `_bz_commit`
+        写回（存盘 + 同步派生副本 ✓）⇒ 关掉弹窗不需要额外的"确定"语义 ✓（老界面就是
+        "改完即存"，这个习惯保持不变 ✓）。
+
+        ⚠ 候选集合名**从本面板转交**（弹窗不持有地图 id ✓ 同 `set_zone_sets` 那套推送 ✓）。
+        ⚠ 回来后再 `_refresh_battle_zones()` 一次：弹窗里改过 ⇒ 这行摘要要对齐 ✓
+          （其实每次改动弹窗都会回调 `_bz_commit` 顺带重画 ✓，这里只是收尾兜一层 ✓）。
+        """
+        dlg = BattleZoneListDialog([z for _n, z in self._bz_items()],
+                                   names=self._bz_candidate_names(),
+                                   on_save=self._bz_commit, parent=self,
+                                   picker_factory=self._bz_picker_factory)
+        dlg.exec_()
+        self._refresh_battle_zones()
+
+    def set_foothold_picker_factory(self, fn):
+        """接住「**只读 foothold 视图**」的工厂（由路线识别面板推过来 ✓ 同 `set_zone_sets`）。
+
+        用户 2026-09-28 的要求："编辑战斗区域的**子弹窗**需要有『foothold 集合编辑器』的
+        **同款视图（只读）**，可以通过**点选**来查看 foothold 参数、配置『idle回归foothold』"✓。
+
+        ⚠ 为什么走"推"：集合 / 地形都按 **地图 id** 存（`core/zones` / `core/mapdata`），
+          而本面板**不持有地图 id** ✗ —— 只有路线识别面板知道当前是哪张图 ✓
+          （`gui/main_window.py::_bind_cards` 里和 `set_zone_sets` 一起推 ✓）。
+
+        工厂签名：`fn(set_name, current_fid) -> QWidget | None` ✓
+        （拿不准 / 没地图 / 读不出地形 ⇒ 回 `None` ⇒ 弹窗**退回文本框** ✓ 老用法不坏 ✓）。
+        """
+        self._bz_picker_factory = fn if callable(fn) else None
 
     def set_zone_sets(self, names):
         """把**当前地图已注册的集合名**灌进「定点休息」那两个下拉（由路线识别面板推过来）。
@@ -1465,6 +2537,12 @@ class PlayerPanel(QWidget):
         所以走它已经用的那套"面板间推送"（同 live_panel.set_mmap ✓）。
         保留当前选择：refill 之后按名字重新选回去；选的名字没了就回到"未选"。
         """
+        # 顺带：① 记下「**编辑战斗区域**」的**候选集合名**（就是同一份集合名 ✓ ——
+        #         2026-09-28 起不再往某个下拉里灌：用户要求把那个下拉去掉 ✓
+        #         ⇒ 候选**只存在内存里**（`_bz_candidate` ✓），弹窗要用时由本面板转交 ✓）
+        #       ② 把**已经配好的**区域重画一遍（换项目/换图它也要跟着变 ✓）
+        self._bz_candidate = sorted(str(n) for n in (names or []) if str(n))
+        self._refresh_battle_zones()
         names = [str(n) for n in (names or [])]
         for cmb, empty_label, cur in (
                 (self.cmb_spot_set, "（未选）", settings.anti_afk_spot_set),
@@ -1496,7 +2574,10 @@ class PlayerPanel(QWidget):
         attr = {"enter": "anti_afk_enter_seq",
                 "exit": "anti_afk_exit_seq",
                 "spot": "anti_afk_spot_seq"}[which]
-        title = ("进入隐身" if which == "enter" else "退出隐身") + "行为编辑器"
+        # ⚠ 标题原来只判了 enter/exit ⇒ `spot` 会得到"**退出隐身**行为编辑器"这个错标题 ✗
+        #   （用户 2026-09-28 加第三个入口时顺手改成查表 ✓）。
+        title = {"enter": "进入隐身", "exit": "退出隐身",
+                 "spot": "到达后行为"}[which] + "行为编辑器"
         dlg = SeqEditorDialog(getattr(settings, attr) or [], self, title=title)
         if dlg.exec_():
             setattr(settings, attr, dlg.seq())
@@ -1522,10 +2603,6 @@ class PlayerPanel(QWidget):
         settings.target_cd = [int(self.sp_cd_min.value()), int(self.sp_cd_max.value())]
         settings.save()
 
-    def _on_input_delay(self, _val=None):
-        settings.input_delay = [int(self.sp_delay_min.value()), int(self.sp_delay_max.value())]
-        settings.save()
-
     def _on_attack_cd(self, val):
         settings.attack_cd = int(val)
         settings.save()
@@ -1537,6 +2614,58 @@ class PlayerPanel(QWidget):
     def _on_track_jump(self, val):
         settings.player_track_jump = int(val)
         settings.save()
+
+    def _on_player_loc_params(self, _v=None):
+        """「玩家位置」组（用户 2026-09-28 ✓）：**一个槽写全这一组** ✓。
+
+        ⚠ 它只往 `settings` 里写 + 存盘 —— **运行期不用做任何"立刻生效"的动作**：
+          · 脚底偏移 / 面积闸在 `live_thread` 里**每帧现读** ✓；
+          · 箭头颜色、长度同理 ✓。
+        ⚠ 颜色**自己校验**：只认 `#RRGGBB`（大小写都行 ✓）；写得不对 ⇒ **保留原值** ✓
+          （悄悄换成默认色，反而让人看不出自己填错了 ✗）。
+        """
+        settings.player_foot_offset_px = int(self.sp_foot_off.value())
+        settings.player_box_min_area_pct = float(self.sp_box_min_area.value())
+        settings.player_box_area_base_n = max(1, int(self.sp_area_base_n.value()))
+        settings.player_box_area_tol_pct = float(self.sp_area_tol.value())
+        settings.player_arrow_color = str(getattr(
+            self, "_arrow_color", "") or "#00E5FF")
+        settings.player_arrow_width_px = max(1, int(self.sp_arrow_width.value()))
+        settings.player_arrow_len_px = int(self.sp_arrow_len.value())
+        settings.save()
+
+    def _refresh_arrow_btn(self):
+        """把当前箭头色刷到那个色块按钮上（一眼看出是什么色 ✓）。"""
+        from PyQt5.QtGui import QColor
+        c = str(getattr(self, "_arrow_color", "") or "#00E5FF")
+        self.btn_arrow_color.setText(c)
+        try:
+            self.btn_arrow_color.setStyleSheet(
+                "background-color:%s; color:%s;"
+                % (c, "#000000" if QColor(c).lightness() > 128 else "#ffffff"))
+        except Exception:
+            pass
+
+    def _pick_arrow_color(self):
+        """点色块 ⇒ 开**取色弹窗**（可调透明度 ✓ 与设置里其它颜色块同一套 ✓）。
+
+        ⚠ 用户要"选择颜色弹窗里需要能调整线条粗细" —— 但 `QColorDialog` 是 **Qt 内置控件**，
+          **塞不进自定义控件** ✗ ⇒ 粗细做成它**右边紧挨着的那一格** ✓（同一排 ⇒ "选色 + 定
+          粗细"一个动作里做完 ✓，排版与设置里的「视野线宽度」一致 ✓）。
+        ⚠ 存 `#AARRGGBB`（9 位，与设置里其它颜色一致 ✓）；画的时候 `hex_to_bgr` 只取后 6 位 ✓。
+        """
+        from PyQt5.QtWidgets import QColorDialog
+        from PyQt5.QtGui import QColor
+        from perception.world_state import norm_hex_color
+        c = QColorDialog.getColor(
+            QColor(str(self._arrow_color or "#00E5FF")), self,
+            "选择箭头颜色（可调透明度）",
+            QColorDialog.ShowAlphaChannel | QColorDialog.DontUseNativeDialog)
+        if not c.isValid():
+            return
+        self._arrow_color = norm_hex_color(c.name(QColor.HexArgb), "#00E5FF")
+        self._refresh_arrow_btn()
+        self._on_player_loc_params()
 
     def _on_turn_params(self, _val=None):
         """换向相关的两个时间参数一起写（同一组，一个处理器够了）。"""
@@ -2228,6 +3357,7 @@ class PlayerPanel(QWidget):
 
     def _sync_from_settings(self):
         """启动时把 settings 里的值灌到控件上。"""
+        self._refresh_battle_zones()
         self.sp_attack.blockSignals(True)
         self.sp_attack.setValue(settings.attack_dist)
         self.sp_attack.blockSignals(False)
@@ -2235,6 +3365,13 @@ class PlayerPanel(QWidget):
         self.sp_min_attack.blockSignals(True)
         self.sp_min_attack.setValue(settings.min_attack_dist)
         self.sp_min_attack.blockSignals(False)
+
+        # 攻击范围那两条**竖边**（2026-09-27 新增；老项目里是 0 = 不限 ✓）
+        for sp, v in ((self.sp_attack_up, settings.attack_up_dist),
+                      (self.sp_attack_down, settings.attack_down_dist)):
+            sp.blockSignals(True)
+            sp.setValue(int(v))
+            sp.blockSignals(False)
 
         self.ck_chase_jump.blockSignals(True)
         self.ck_chase_jump.setChecked(bool(settings.chase_jump_enabled))
@@ -2273,14 +3410,6 @@ class PlayerPanel(QWidget):
 
         self._refresh_key_buttons()
 
-        lo, hi = settings.input_delay
-        self.sp_delay_min.blockSignals(True)
-        self.sp_delay_min.setValue(lo)
-        self.sp_delay_min.blockSignals(False)
-        self.sp_delay_max.blockSignals(True)
-        self.sp_delay_max.setValue(hi)
-        self.sp_delay_max.blockSignals(False)
-
         self.sp_attack_cd.blockSignals(True)
         self.sp_attack_cd.setValue(settings.attack_cd)
         self.sp_attack_cd.blockSignals(False)
@@ -2292,6 +3421,21 @@ class PlayerPanel(QWidget):
         self.sp_track_jump.blockSignals(True)
         self.sp_track_jump.setValue(settings.player_track_jump)
         self.sp_track_jump.blockSignals(False)
+
+        # ⭐ 「玩家位置」组（用户 2026-09-28 ✓）—— 回填（老项目里没这些格 ⇒ 用兜底默认 ✓）
+        for _w, _v in ((self.sp_foot_off, settings.player_foot_offset_px),
+                       (self.sp_box_min_area, settings.player_box_min_area_pct),
+                       (self.sp_area_base_n, settings.player_box_area_base_n),
+                       (self.sp_area_tol, settings.player_box_area_tol_pct),
+                       (self.sp_arrow_len, settings.player_arrow_len_px)):
+            _w.blockSignals(True)
+            _w.setValue(_v)
+            _w.blockSignals(False)
+        self._arrow_color = str(settings.player_arrow_color or "#00E5FF")
+        self._refresh_arrow_btn()
+        self.sp_arrow_width.blockSignals(True)
+        self.sp_arrow_width.setValue(max(1, int(settings.player_arrow_width_px)))
+        self.sp_arrow_width.blockSignals(False)
 
         self.sp_min_turn_hold.blockSignals(True)
         self.sp_min_turn_hold.setValue(settings.min_turn_hold_ms)
@@ -2411,7 +3555,25 @@ class PlayerPanel(QWidget):
         self.sp_afk_retry.setValue(max(1.0, float(settings.anti_afk_retry_sec)))
         self.sp_afk_retry.blockSignals(False)
 
+        # ⭐ 「休息过程中循环行为」（用户 2026-09-28 ✓）—— 回填三件 + 缩进那块显隐 ✓
+        self.ck_spot_loop.blockSignals(True)
+        self.ck_spot_loop.setChecked(bool(settings.anti_afk_spot_loop))
+        self.ck_spot_loop.blockSignals(False)
+        self.sp_loop_min.blockSignals(True)
+        self.sp_loop_min.setValue(float(settings.anti_afk_spot_loop_min))
+        self.sp_loop_min.blockSignals(False)
+        self.sp_loop_max.blockSignals(True)
+        self.sp_loop_max.setValue(float(settings.anti_afk_spot_loop_max))
+        self.sp_loop_max.blockSignals(False)
+        # ⭐ 「休息结束推迟到循环执行完」（用户 2026-09-28 ✓）—— 回填（老项目里没这格 ⇒ 关 ✓）
+        self.ck_loop_hold.blockSignals(True)
+        self.ck_loop_hold.setChecked(bool(settings.anti_afk_spot_loop_hold))
+        self.ck_loop_hold.blockSignals(False)
+
+        if hasattr(self, "ck_loop_items"):
+            self._refresh_loop_list()
         self._refresh_afk_ui()
+        self._refresh_spot_loop_ui()
 
         # HP/MP 条：先显示全局值；打开项目后由 bind() 用项目里存的覆盖
         self._sync_bar_ui()

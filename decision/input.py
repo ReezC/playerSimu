@@ -185,6 +185,14 @@ class KeyState:
     def __init__(self):
         self._pressed = set()
 
+    def pressed(self):
+        """当前按着的键（**只读快照** ✓）—— 给"现在按着 ↑/↓ 吗"这类**许可条件**用 ✓。
+
+        用户 2026-09-27 要求："位置状态判定优化：除非按住了 ↑ 或 ↓，不能主动判定为在绳梯上"
+        ⇒ `agent.holding_vertical()` 读它，再由感知层决定要不要写 `player.ladder_id` ✓。
+        """
+        return set(self._pressed)
+
     def set(self, keys):
         """keys：本次应该按下的键名集合。"""
         keys = set(k for k in keys if k)

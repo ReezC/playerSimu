@@ -17,12 +17,16 @@ calib:
   step: 0.1
   sample: 5
 bars: {}
+mmap_crop: null
 decision:
   attack_dist: 400.0
   min_attack_dist: 50
+  attack_up_dist: 0
+  attack_down_dist: 0
   chase_jump_enabled: true
   chase_jump_min: -30
   chase_jump_max: 5
+  chase_jump_dash_ms: 0
   mouse_speed: 1.8000000000000005
   evade_type: jump
   jump_interval: 0
@@ -78,34 +82,33 @@ decision:
   - 1500
   - 2500
   input_device: local
-  input_delay:
-  - 0
-  - 50
   attack_cd: 200
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 1000
   turn_output_delay_ms: 200
   player_track_jump: 200
+  player_foot_offset_px: 0
+  player_box_min_area_pct: 0.0
+  player_box_area_base_n: 30
+  player_box_area_tol_pct: 0.0
+  player_arrow_color: '#00E5FF'
+  player_arrow_width_px: 2
+  player_arrow_len_px: 60
   hp_bar: null
   mp_bar: null
   probe_calib: {}
   hp_color:
   - - 0
     - 0
-    - 137
-  - - 78
-    - 80
+    - 135
+  - - 79
+    - 82
     - 255
-  mp_color:
-  - - 144
-    - 78
-    - 0
-  - - 255
-    - 198
-    - 77
+  mp_color: null
   hp_threshold: 30
   mp_threshold: 7
   pot_cd: 1500
+  mob_sets_ttl_s: 3.0
   auto_hp_pot: true
   auto_mp_pot: false
   strategy: patrol
@@ -118,12 +121,22 @@ decision:
   vision_off_y: 0
   sweep_turn_cd: 1000
   back_range: 200
-  route_enabled: false
+  route_goto_set: ''
+  align_tol_px: 6
+  align_hold_ms: 250
+  climb_align_gap_ms: 180
+  climb_align_near_px: 20
+  climb_retry_delay_s: 1.0
+  climb_retry_delay_inc_s: 1.0
+  goto_timeout_s: 30.0
+  goto_timeout_key: null
+  disable_chase_pathfinding: false
+  jump_start_px: 0
+  move_retry_ms: 3000
+  battle_zones: []
+  battle_zone_sets: []
   debounce_conf: 0.45
   debounce_ms: 2000
-  auto_feed_pet: true
-  feed_interval_min: 6.0
-  feed_interval_max: 8.0
   custom_timers: []
   facing_timeout_min: 2.0
   player_lost_timeout_min: 3.0
@@ -180,6 +193,16 @@ decision:
     key: 普攻
   anti_afk_rest_min: 4.5
   anti_afk_rest_max: 5.5
+  anti_afk_spot_set: ''
+  anti_afk_spot_seq: []
+  anti_afk_spot_after: ''
+  anti_afk_spot_loop: false
+  anti_afk_spot_loop_items: []
+  anti_afk_spot_loop_min: 30.0
+  anti_afk_spot_loop_max: 60.0
+  anti_afk_spot_loop_hold: false
+  anti_afk_retry_on_interrupt: false
+  anti_afk_retry_sec: 60.0
   reconnect_enabled: false
   reconnect_probe_after_lost_sec: 0.0
   reconnect_step_timeout_ms: 3000

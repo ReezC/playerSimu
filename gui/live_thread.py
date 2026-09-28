@@ -24,6 +24,7 @@ import time
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
+from core import behavior                  # 「查怪结果」打点（`mob_fh` ✓ 见 `_make_mob_sets_resolver`）
 from tools.config import get, load_live
 
 # 探针解码：**必须模块级**。原来它是在 `_run()` 里局部 import 的，那会让
@@ -39,6 +40,34 @@ except Exception:                     # pragma: no cover - 正常环境不会走
     decode_ms = resolve_delay_ms = None
 
 from gui import theme
+from perception.pos_state import PositionStateMachine
+
+#: ⭐ 给**怪**挑 foothold 时，"面可以比它算出来的脚底**高**多少"（世界像素 ✓）——
+#: 就是 `mapdata.foothold_below(..., above_tol=…)` 那个参数 ✓。用它的理由见
+#: `_make_mob_sets_resolver` 的 `_resolve` 里那段（用户 2026-09-28 报
+#: "**查#171 一个二楼的怪显示在底层**，现在已经卡住了" ✗）。
+#: 取 200：够盖住"**大怪检测框没包住脚**"（实测差 84 ✓），又不至于把隔一整层的面拉进来
+#: —— 而且比较**仍然是"|Δy| 最小"** ✓ ⇒ 怪真站在哪一层，那一层照样赢 ✓（不受影响 ✓）。
+MOB_ABOVE_TOL = 200.0
+
+#: 「朝『玩家 → 怪』方向找最近集合」那条降级路径里，**竖直距离小于它就不动**（世界像素 ✓）。
+#: 理由：那说明怪和玩家**在同一高度** ⇒ 该由水平追击（`chase`）解决 ✓，上下跑是错的 ✗
+#: （也是防抖：同一层的怪 y 差本来就只有几像素 ✓）。见 `_make_toward_set_resolver` ✓。
+TOWARD_MIN_DY = 24.0
+
+#: 「怪在哪层」那条**方向自洽校验**的最小可比距离（**画面像素** ✓）——两个框**中心**的 y 之差
+#: 小于它就**不校验** ✓。理由：同一层的怪中心本来只差几像素，硬判符号只会误杀 ✓。
+#: ⚠ **它只是下限**（2026-09-28 用户质疑后改 ✓）：实际阈值取
+#: `max(MOB_DIR_MIN_PX, 怪框高 × 0.5)` —— 一个检测框的**固有不确定度**就是它自己半高的量级
+#: （上下沿各可能差半个框 ✓）⇒ 让**框自己**决定"差多少才算明显跨层" ✓ 别拍脑袋定常数 ✗。
+#: 见 `_make_mob_sets_resolver` 里那段（那里原来拿"框底"当参照 ⇒ 符号会乱 ⇒ 误杀 ✓）。
+MOB_DIR_MIN_PX = 8.0
+
+#: ⭐ **相机 y 的 EMA 平滑系数**（2026-09-28 加，治"怪的世界坐标在层之间乱跳" ✓ —— 用户报
+#: "**#159 没找到，理由是什么？**"✓）。每条 `mob_fh` 记一次平滑 ✓（调用频率约 1~2 Hz ⇒
+#: `0.25` 的平滑窗 ≈ 4 拍 ✓）。⚠ 不要调到 1.0（= 不平滑 ⇒ 抖动照旧 ✓）、也别太小（滞后太大 ✓）。
+#: 详见 `_make_mob_sets_resolver` 的 `_resolve` 里那段说明（根因是**黄点与玩家框不同步** ✓）。
+CAM_SMOOTH_A = 0.25
 from perception.classes import (CLASS_MOB, CLASS_OTHER_PLAYER, CLASS_PLAYER,
                                 ZH_NAMES as CLASS_NAMES)
 
@@ -183,6 +212,26 @@ def _crop_ratio(frame, ratio):
     return frame[y:y + rh, x:x + rw]
 
 
+def _blit_alpha(img, color, fn):
+    """按**透明度**把 `fn(target, bgr)` 画到 `img` 上（用户 2026-09-27 要求）。
+
+    OpenCV 的 `line/rectangle/putText` **没有 alpha 参数** ⇒ 半透明只能自己混：
+      ① `a >= 255`（老配置、类别框色）⇒ **直接画**，一点额外开销都没有 ✓；
+      ② 否则先按不透明画到**整幅副本**上，再 `addWeighted(副本, a, 原图, 1-a)` 混回来 ✓
+         （一次全幅拷贝 ≈ 0.5ms，只在这条颜色真配了透明度时才走 ✓；而且它画的是
+         **显示帧**、在收流/标注线程里，不在决策那条链上 ✓）。
+    `color` 是 `theme.hex_to_bgra` 出来的 `(b, g, r, a)` ✓。
+    """
+    import cv2                     # 本文件一贯在函数内 import（见 `_draw_dashed_line`）✓
+    b, g, r, a = color
+    if a >= 255:
+        fn(img, (b, g, r))
+        return
+    ov = img.copy()
+    fn(ov, (b, g, r))
+    cv2.addWeighted(ov, a / 255.0, img, 1.0 - a / 255.0, 0.0, img)
+
+
 def _draw_dashed_line(img, y, color, dash_len=10, gap=6, thickness=1, x0=0, x1=None):
     """画一条水平虚线（y 固定）。x0~x1 指定范围，x1=None 表示到右边缘。"""
     h, w = img.shape[:2]
@@ -290,6 +339,12 @@ class _LatestSlot:
 
 
 class LiveThread(QThread):
+    #: **原生帧**（numpy BGR）：从流里解出来、**一个字都没画**的那份。
+    #: 它专供**取帧做测量**的功能 —— 探针标定、HP/MP 条框选、小地图框选、
+    #: 标定弹窗、叠图匹配分核对。它们量的都是像素，画过一笔就全毁 ✗
+    #: （用户 2026-09-27 现场：框选小地图时把**视野灰色虚线**一起框了进去）。
+    raw_frame_ready = pyqtSignal(object)
+    #: **显示帧**（numpy BGR，已画好检测框 / 攻击线 / 视野虚线）：只给画面上看的那一份。
     frame_ready = pyqtSignal(object)     # numpy BGR 图（已画好框）
     stats_ready = pyqtSignal(dict)
     potions_ready = pyqtSignal(float, float)   # (hp, mp) 比例 0~1
@@ -324,6 +379,21 @@ class LiveThread(QThread):
         # —— **不在 set_mmap 里直接改 locator**：那是另一条线程正在用的对象。
         self._mmap_track = self._p.get("mmap_track") or None
         self._track_applied = None
+        #: 「我现在站哪个集合」与**世界坐标**的最近一次定位结果 —— 路径解析器（择路）要用。
+        #: 定位没输出时都清成空（别留旧值骗解析器 ✗，见 `_fill_route_ctx`）。
+        self._player_here = []
+        self._player_at = None
+        #: ⭐ **位置状态机**（`perception/pos_state.py` ✓）—— 用户 2026-09-27 定：
+        #: "所有的位置状态更新由**位置状态机**自治" ⇒ `_fill_route_ctx` 只喂读数与按键事实，
+        #: 由它把 `here_sets` / `ladder_id` / `at_ladder_top` 算好、广播到 `Player` ✓。
+        #: 它**有状态**（跨帧记"y 到过的最小值" ✓）⇒ 和本线程同寿命，别按帧重建 ✗。
+        self._pos_state = PositionStateMachine()
+        #: ⭐ 「**查过的怪框**」—— 用户 2026-09-27："只要是**查询到的怪框地点**，就标出来，
+        #: **缓存失效再移除**" ✓。key = 怪号（字符串 ✓），value =
+        #: `((x, y, w, h), 集合名列表, why, 首次查到时刻, 失效时刻)` ✓。
+        #: ⚠ 写它的**唯一入口**是 `_mark_mob_query`（由 `mob_sets_of` 那个解析器调用 ✓ ——
+        #: 它是所有"问怪在哪块平台"的**唯一漏斗** ✓）；读它的是画框那一段 ✓（顺手剪过期的 ✓）。
+        self._mob_queries = {}
 
     def set_mmap(self, map_id=None, src=None, crop=None, track=None):
         """更新小地图定位要的东西（**运行中也改得动**：切项目/换来源/重框/改容差）。
@@ -415,48 +485,664 @@ class LiveThread(QThread):
                 return route_mod.plan_jobs(
                     t, z, src, dst_set,
                     tol_px=int(getattr(stg, "align_tol_px", 6) or 6),
-                    hold_ms=int(getattr(stg, "align_hold_ms", 250) or 0))
+                    hold_ms=int(getattr(stg, "align_hold_ms", 250) or 0),
+                    # 「多久没进展算卡住」（爬不动 / 等落地 / **跳跃没落到** 三处共用 ✓）：
+                    # **统一**取「移动操作尝试间隔(ms)」换算成秒 ✓（2026-09-27 用户要求：
+                    # "移除卡住判定时长(s)，统一采用移动操作尝试间隔(ms)" ✓；下限 0.5 秒与
+                    # 任务里的钳法一致 ✓。⚠ **走不吃它** —— 走照旧用 `route.STALL_S` 常量 +
+                    # 「寻路超时时间」兜底 ✓，见 `route.job_for_edge`）
+                    stall_s=route_mod.stall_s_from_retry_ms(
+                        getattr(stg, "move_retry_ms", 3000)),
+                    # 「起跳距离(px)」：「跳」那条边用的**临时参数** ✓
+                    # ⚠ 面板（`route_panel._command_first_step`）也传了同一个值 ——
+                    #   两边必须一致，否则「面板能下发、休息却走不过去」✗
+                    jump_start_px=int(getattr(stg, "jump_start_px", 0) or 0),
+                    # 玩家世界坐标：同一对集合有多条绳时**挑离我最近的那根** ✓
+                    #（定位没输出时是 None ⇒ 退回文件顺序，不猜 ✗）
+                    at=getattr(self, "_player_at", None))
             except ValueError as ex:            # 绳找不到 / 说不清上下 / 落点找不到
                 return {"jobs": [], "why": str(ex), "here": False}
             except Exception as ex:             # noqa: BLE001
                 return {"jobs": [], "why": "造任务时出错：%s" % ex, "here": False}
         return resolve
 
-    def _fill_route_ctx(self, player, loc):
-        """把「脚下属于哪些集合 / 贴在哪根绳上」写进 `Player`（上绳执行器要用）。
+    def _make_mob_sets_resolver(self):
+        """给 agent 装的**「这只怪在哪块平台上」解析器**（用户 2026-09-27 要求）。
 
-        · `here_sets`：所在 foothold 属于哪些命名集合（`core.zones.set_of`）——
-          `ClimbJob._arrived` 的**第一判据**就是它（人工圈的集合最贴近"到了哪块平台"）；
-        · `ladder_id`：`Terrain.ladder_at(x, y)` 找到的那根绳的**编号**（"L1" 这种，
-          和「爬」那条边里写的绳号是同一套）—— "从绳上掉下来"判据要用。
+        要求原话："chase状态需要判定一下怪物位于的foothold集合，若不与玩家处于同一个，
+        需要先下达前往任务" ⇒ agent 要在追怪前知道"怪和我是不是同一块平台"。
 
-        坐标一律用**世界坐标**（这套地形坐标就是用它的）。定位没输出时两个字段清空：
-        空 = 判不出来，`_arrived` 会退回几何兜底（那是对的，别拿旧值骗它）。
+        为什么放在这里、而不是塞进 agent：agent **不持有地形 / 集合**（和 `route_plan` 同一个
+        理由 ✓），而本类有 `_route_ctx(mid)`（`mapdata.load` + `zones.load`，**2 秒缓存** ✓）
+        和玩家世界坐标 ✓ ⇒ 这里换、那里用 ✓（**一处实现** ✓ 约定 10）。
+
+        ⚠ 只对**当前锁定的那一只**调用（每拍最多一次 ✓）：`foothold_below` 要扫一遍 foothold
+          （几百条），**不要**给每只怪都算 ✗（那是每帧几十次的量级）。
+
+        回值：`{"world": (x, y), "sets": [集合名…], "why": ""}`；
+            算不出（没定位 / 没地形 / 没圈进集合）⇒ `why` 说清、`sets` 空 ✓（**不猜** ✓）。
+        """
+        def _resolve(player, mob):
+            from perception import minimap as mm
+
+            mid = str(getattr(self, "_mmap_mid", "") or "")
+            if not mid:
+                return {"world": None, "sets": [], "why": "还不知道当前是哪个项目 / 地图"}
+            t, z = self._route_ctx(mid)
+            if t is None or z is None:
+                return {"world": None, "sets": [],
+                        "why": "读不到地形 / 集合数据（先在「路线识别」里生成地形图）"}
+            # ⚠ 怪只有**画面坐标** ⇒ 用玩家做锚推世界坐标（口径同 `screen_to_world`：
+            #   `画面 = 世界 − Camera` ✓）。脚底口径：怪框底 = `mob.y + mob.h / 2` ✓（和玩家的
+            #   `bottom` 对齐 ✓）。
+            _mh0 = float(getattr(mob, "h", 0.0) or 0.0)
+            _my0 = float(getattr(mob, "y", 0.0) or 0.0)
+            _mx0 = float(getattr(mob, "x", 0.0) or 0.0)
+            _wy0 = getattr(player, "world_y", None)
+            _wx0 = getattr(player, "world_x", None)
+            _bt0 = getattr(player, "bottom", None)
+            if _wy0 is None or _wx0 is None or _bt0 is None:
+                return {"world": None, "sets": [],
+                        "why": "玩家还没定位（拿不到世界坐标 ⇒ 推不出怪在哪）"}
+            _cx = float(_wx0) - float(getattr(player, "x", 0.0) or 0.0)   # 相机 x（不平滑 ✓）
+            # ⭐ 相机 y 用**脚底偏移**（用户 2026-09-28 ✓）：框底**不一定**正好压在脚底
+            #   （鞋底阴影 / 披风 / 特效会让框多出一截 ✗）⇒ 用它补正 ✓。
+            #   ⚠ 读的是 `world_state` 里的**镜像值**（`live_thread` 每帧灌 ✓）—— 这边**不能**
+            #     反过来 import decision（会绕成循环依赖 ✗ 见 world_state 那段说明 ✓）。
+            from perception import world_state as _ws_mod
+            _cy_raw = float(_wy0) - (float(_bt0) + float(_ws_mod.FOOT_OFFSET_PX))
+            # ⚠⚠ **相机 y 必须做 EMA 平滑**（2026-09-28 治本 ✓ —— 用户报"**#159 没找到，理由是什么？**"✓）：
+            #   实测 `behavior.log` 的 `mob_fh`：`ply_wy`（玩家世界 y）在 **−91 ~ +197** 之间摆
+            #   **288 像素** ✗（图 105040303 的层距才 **540** ⇒ 摆了半层多 ✗）⇒ 换算出的怪世界
+            #   坐标在**层之间乱跳** ⇒ 挑面阶梯**全落空** ⇒ `why=怪底下没找到 foothold`（92 次 ✓）。
+            #   ⚠ **根因不在挑面** ✗：`screen_to_world` 用玩家做锚（`cam_y = world_y − bottom` ✓），
+            #     而**黄点（`world_y`）与玩家框（`bottom`）不是同一时刻的** —— 黄点是**独立传感器**、
+            #     有自己的刷新节奏 ✓ ⇒ 玩家一走动/跳跃，`cam_y` 就**抖** ✗
+            #     ⇒ **所有"画面 → 世界"都跟着抖** ✗（怪 / 落点 / 够不够得着 都在抖 ✓）。
+            #   ⇒ 平滑它 ✓。⚠ 代价：镜头**真的**快速滚动时有几十毫秒滞后 —— 而"挑**哪一层**"
+            #     只要粗细够（层距几百 ✓）⇒ 可接受 ✓，比"层间乱跳"好得多 ✓。
+            #   ⚠ 平滑值挂**本线程**上（`mob_cost_of` 也走这里 ✓ **同一份** ✓ 别各算一份 ✗）。
+            # ⛔⛔ **2026-09-28：撤掉 EMA 平滑**（`CAM_SMOOTH_A` 已**停用** ✓ 别再启回来 ✗）。
+            #   它当年的理由是"`ply_wy`（黄点世界 y）在 −91~+197 之间摆 **288 像素** ⇒ 相机抖"
+            #   ✗ —— 那天**把"玩家真的换层"误读成"读数抖动"** ✗✗（2026-09-28 用真 log 核实：
+            #   `ply_wy` 的取值就是**各层的面 y** ✓ 顶层 −176 / 三楼 −91 / 一楼 95 / 底层 196——
+            #   玩家在楼层间跑，这个量**本来就该跳** ✓）。
+            #   用真 log（`mob_fh` 最后 400 条）实测：平滑值偏离"原始相机"**中位 46.8、
+            #   最大 362.5 像素** ✗；而挑面命中率 **38% → 38%（一点没提高）** ✗
+            #   ⇒ 它**滤掉的是真事、留下的是误差** ⇒ 纯有害 ✓ 撤。
+            #   ⇒ 直接用 `_cy_raw`（= `player.world_y − player.bottom` ✓ 语义清楚、可解释 ✓）。
+            #   ⚠ 保留 `_cam_smooth` 这个**字段名**（打点 / 排查还在读它 ✓ —— 现在它恒等于原始值 ✓）。
+            _sm = _cy_raw
+            self._cam_smooth = _sm
+            # 怪的世界坐标：**框底**（`band` / 兜底用）与**框中心**（"向下垂线"那级用 ✓）
+            world = (_mx0 + _cx, (_my0 + _mh0 / 2.0) + _sm)     # 框底 ✓
+            mid_w = (_mx0 + _cx, _my0 + _sm)                    # 框中心 ✓
+            # ⭐ **`above_tol`**（2026-09-28 现场修）：`foothold_below` 默认只允许"面比给的 y
+            #   高 40 像素以内"（那是按**玩家**定的：黄点画的是中心、脚底就在附近 ✓）。
+            #   而怪这头给的是"**框底**换算的世界 y"，**大怪的检测框并不包住脚** ✗（实测：
+            #   二楼那只石人，框底比它真正站的二楼面**高 84 像素** ⇒ 在老口径下那条面
+            #   **直接被跳过** ⇒ 只剩"下方最近"的**一楼**⇒ 怪被判在下一层 ✗）。
+            #   用户现场原话："查#171 一个二楼的怪显示在底层，现在已经卡住了"✓
+            #   （`behavior.log`：`mob_goto_ok 已出发：一楼 → 底层` / `已出发：底层 → 一楼` 来回 ⟲）。
+            #   ⇒ 给怪放宽到 `MOB_ABOVE_TOL`（比较仍然是"|Δy| 最小" ✓ ⇒ **怪真站在一楼、
+            #     框底就是脚时，一楼 Δ≈0 照样赢** ✓ 不受影响 ✓）。
+            # ⭐⭐ **`band` = "怪身体高度范围内的面"**（2026-09-28 定稿口径 ✓）：
+            #   候选面必须落在 `[框底世界 y − 框高, 框底世界 y + 框高]` ✓。
+            #   ⚠ 为什么不再用固定容差（`MOB_ABOVE_TOL=200` 那版 ✗）：**层距会到 540** ——
+            #     实测图 105040303（顶层 375 / 三楼 915 / 二楼 1455 / 底层 1995）⇒ 相邻层
+            #     差 **540** ✗ ⇒ 固定值连**半层**都盖不住 ⇒ 照样跨层 ✗（用户当天又报
+            #     "**又把顶层怪判成底层怪了**" ✓）。
+            #   ⚠ "框底 ≠ 脚底"是**双向**的（框没包住脚 ⇒ 面在框底**上方**；框包过头 ⇒ 面在
+            #     **下方** ✓）⇒ 必须**对称**覆盖 ✓。
+            #   ⚠ 身体高 `h` 是**检测框直接给的** ⇒ 不新造魔数 ✓、而且自适应：
+            #     小怪 ≈40 ⇒ ±40（比老的 ±200 **更严** ✓）；大怪 ≈300 ⇒ ±300（盖得住 540 ✓）。
+            #   ⚠ 区间里一条面都没有 ⇒ **退回**老口径（不瞎判 ✓ 见下面那行 ✓）。
+            _mh = float(getattr(mob, "h", 0.0) or 0.0)
+            _my = float(getattr(mob, "y", 0.0) or 0.0)
+            _mx = float(getattr(mob, "x", 0.0) or 0.0)
+            # ⚠ 用**平滑后**的相机（和上面同一个 `_sm` ✓ —— ⛔ 别再用 `screen_to_world`：
+            #   它拿的是**未平滑**的 cam ⇒ 三者会打架 ✗）。
+            _top = (_mx0 + _cx, (_my0 - _mh0 / 2.0) + _sm)
+            _bot = (_mx0 + _cx, (_my0 + _mh0 / 2.0) + _sm)
+            f = None
+            #: ⭐ **卡在哪一级**（2026-09-28 加 ✓）：`why` 原来只有一句"怪底下没找到 foothold"
+            #: ⇒ 排查时分不清"周围真的没有地形 / 框底偏了一层 / 方向自相矛盾" ✗
+            #: （那天就在这一句上猜了很久 ✓）。各级挑面失败时改写它 ✓。
+            _lvl = "①怪框覆盖的那一段里没有面"
+            if _mh > 0 and _top is not None and _bot is not None:
+                lo, hi = float(_top[1]), float(_bot[1])
+                if lo > hi:
+                    lo, hi = hi, lo            # 世界 y 越大越靠下 ⇒ 归一化（顶层在前 ✓）
+                # ① **主口径：怪框覆盖的那一段**（`band=(框顶, 框底)` ✓）——
+                #    怪**一定站在"穿过它身体"的那条面**上 ⇒ 不猜"脚底在哪一格" ✓。
+                #    实测（图 105040303，层距 **540**）：框底偏差 ≤ 框高时**全对** ✓，
+                #    而老的"框底 ± 容差"到**半层**就崩 ✗（300 就该是顶层、它给三楼 ✗）。
+                f = t.foothold_below(world[0], world[1], band=(lo, hi))
+                if f is None:
+                    # ⭐⭐ ② **用户的"向下垂线"方案**（2026-09-28 ✓ 原话："用 <玩家脚底到怪框
+                    #    **中心的向量**>在世界坐标对应到**怪框中心**的世界坐标后，**向下做垂线**，
+                    #    接触到的第一个 foothold 集合就是该怪的" ✓）。
+                    #    起点用**怪框中心**（不是框底 ✗）—— 中心和上一轮那条讨论同理：
+                    #    误差更小、且在**框高度估错时上下沿反向、中心互相抵消** ✓；
+                    #    而"框覆盖身体"时**中心一定在脚的上方** ⇒ **往下第一条面就是它踩的那条** ✓。
+                    #    这正是 `foothold_below` 的**原始语义**（`fy >= y - tol`、**往下不限** ✓）
+                    #    ⇒ `above_tol=0` = "从这点**往下**第一条" ✓（不用 `band` ✓）。
+                    #    ⚠ **必须补上界** ✗（下一条就是本条的全部风险）：**往下不限** ⇒
+                    #      框整体偏下时会**挑到下一层**、或挑到很远的"虚空面" ✗
+                    #      ⇒ 要求它**不超过"框底 + 半个框高"** ✓（同一套"由框自己定"的自适应思路 ✓
+                    #        只有"明显跑远"才拒 ✓）。
+                    _mid = mid_w        # 框中心（**平滑后**的相机 ✓ 与上面同一份 ✓）
+                    _f2 = t.foothold_below(float(_mid[0]), float(_mid[1]),
+                                           above_tol=0.0)
+                    if _f2 is not None:
+                        try:
+                            if float(_f2.y_at(float(_mid[0]))) <= hi + _mh * 0.5:
+                                f = _f2
+                        except Exception:       # noqa: BLE001 —— 取面高失败就当没这级 ✓
+                            pass
+                if f is None:
+                    # ⭐ **就到这儿为止**（`sets` 空 ✓）—— 宁可**没找到**（不判）也**不要判错**
+                    #   （乱下前往、来回跑 ✗）。
+                    #   ⚠⚠ **原来的 ③「再往上放半个框高」已按用户要求删掉**（2026-09-28 ✓
+                    #     原话："③ 还空 ⇒ 只往上放宽半个框高　这一步没有必要，去掉"）：
+                    #     它只在"框底偏高、没包住脚"那一半有用，而**框没框全**这种事应该由
+                    #     "**框面积闸**"挡在**查询之前**（推迟 / 不查 ✓）—— 靠**放宽挑面**去救
+                    #     是错的方向 ✗（放宽必然把更远 / 更错的层拉进来 ✓，那条实测就在上面 ✓）。
+                    _lvl = "②框中心向下垂线也没找到面"
+            else:
+                # 连框高 / 世界坐标都拿不到（老环境 / 怪框异常）⇒ 退回老口径 ✓。
+                _lvl = "③怪框高 / 世界坐标拿不到 ⇒ 走了老口径"
+                f = t.foothold_below(world[0], world[1], above_tol=MOB_ABOVE_TOL)
+            # ⭐⭐ **方向自洽校验**（用户 2026-09-28 的思路："**至少顶层判定成底层这种离谱的
+            #   向量都反了的应该能及时发现**"✓ —— 这是那条思路里**真正有效**的部分 ✓；
+            #   另一半"y 投影 = 高度差"是**恒等式**，校不出"框底 ≠ 脚底"✗ 见 SKILL 97 ✓）。
+            #   画面 y 与世界 y **同向**（越小越靠上 ✓）⇒ 硬约束：
+            #     · 怪在**画面上比玩家高** ⇒ 它那一层必须**比玩家那层高（世界 y 更小）** ✓；
+            #       低 —— 同理 ✓。
+            #   ⚠ 现在的"挑最近面"**根本不管方向** ✗ ⇒ 才会出现"玩家在一楼、怪在顶层、
+            #     却判成**底层**"这种**符号都反了**的结果 ✗（用户现场 ✓）。
+            #   ⇒ 挑完（含各级兜底）之后**校验一次**：方向反了 ⇒ **丢**（`f = None`
+            #     ⇒ `sets` 空 ⇒ 不判 ⇒ 照旧追 ✓ **宁缺勿错** ✓）。
+            #   ⚠ 玩家那端用 `world_y`（黄点**脚底** ✓ = 玩家所在层的 y；已验证准到 1px ✓）。
+            if f is not None:
+                # ⚠⚠ **方向必须用"画面上的框中心"判，不能用"框底"**（2026-09-28 现场修 ✗）：
+                #   原来拿 `world[1]`（**怪框底**换算的世界 y）当"怪在上下"—— 而"框底 ≠ 脚底"
+                #   **本身就会偏几十上百像素** ⇒ 那个符号会**乱** ⇒ 把**本来判对**的也拒掉 ✗
+                #   （用户当天报："**运行一段时间后所有的查询怪物全是没找到**"✓）。
+                #   ⇒ 改成 `mob.y` vs `player.y`（**框中心** ✓，和 `agent._in_box` 判上下同一套 ✓）：
+                #     两个都是**画面量**、同向（越小越靠上 ✓）⇒ 乘积判符号就够 ✓ 稳健 ✓。
+                #   ⚠ `|中心之差| < MOB_DIR_MIN_PX` ⇒ **太近就不校验** ✓（同一层的怪中心本来
+                #     只差几像素，硬判符号只会误杀 ✓）。
+                try:
+                    _fy = float(f.y_at(world[0]))
+                    _pw = float(getattr(player, "world_y", 0.0) or 0.0)
+                    _mcy = float(getattr(mob, "y", 0.0) or 0.0)
+                    _pcy = float(getattr(player, "y", 0.0) or 0.0)
+                    # ⚠⚠ **阈值由框自己定，不用拍脑袋的常数**（2026-09-28 用户质疑后改 ✓）：
+                    #   原话："**怪框的 4 条边长都会有误差，凭什么认为框中心"不受框底偏差影响"？**"
+                    #   —— 他说得对 ✓：`框中心 = (框顶 + 框底)/2` ⇒ **上下沿有误差中心就有误差** ✗
+                    #   （"不受影响"那个说法**不准确** ✓）。
+                    #   准确的差别是**敏感度差一个量级**：旧方案拿"**换算出的世界 y**"当参照
+                    #   （和被校验的量**同一套坐标** ⇒ 误差**直接进符号** ⇒ 超过**半层**就翻 ✗）；
+                    #   这条只回答"**谁在上面**"，而跨层的画面高度差是**几百像素** ⇒
+                    #   上下沿各差几十像素**不改变谁在上面** ✓。
+                    #   ⇒ 阈值取"**怪框高的一半**"= **这个框自身的固有不确定度**（上下沿各可能差半个框 ✓）
+                    #     —— 只有"**明显是跨层**"才做校验 ✓ 判不准的一概**不拦** ✓（宁可少拦 ✓）。
+                    _tol = max(MOB_DIR_MIN_PX, float(getattr(mob, "h", 0.0) or 0.0) * 0.5)
+                    if (abs(_mcy - _pcy) > _tol
+                            and (_mcy - _pcy) * (_fy - _pw) < 0.0):
+                        f = None              # 画面说在上、层却在下（或反之）⇒ 离谱 ⇒ 拒判 ✓
+                        _lvl = "④判出来了但方向自相矛盾（画面说在上面、层却在下面）"
+                except Exception:             # noqa: BLE001 —— 校验坏掉就当没校（别把追怪弄停 ✗）
+                    pass
+            if f is None:
+                # ⭐ **分档说清卡在哪一级**（2026-09-28 加 ✓）：原来只有一句"没找到 foothold"
+                #   ⇒ 排查时**分不清**是"周围真的没有地形"、"框底偏了一层"、还是"方向自相矛盾"
+                #   ✗（用户报"**又开始全程找不到怪的 foothold 集合了，这不应该**"那轮就卡在这句
+                #   上猜了半天 ✓）。`_lvl` 由各级挑面失败时写 ✓。
+                return {"world": world, "sets": [],
+                        "why": "怪底下没找到 foothold（%s —— 它可能在半空 / 或那片没圈地形）"
+                               % (_lvl or "说不清")}
+            names = [str(n) for n in z.set_of(str(f.fid))]
+            why = "" if names else "怪站的那条 foothold（#%s）没圈进任何集合" % f.fid
+            return {"world": world, "sets": names, "why": why}
+
+        def resolve(player, mob):
+            """⭐ 这里是**唯一漏斗**：每问一次"这只怪在哪块平台"就**记一笔、画面上标出来** ✓。
+
+            用户 2026-09-27："只要是**查询到的怪框地点**，就标出来，**缓存失效再移除**" ✓ ——
+            记在漏斗里（`_mark_mob_query` ✓）的好处：`mob_cost_of` 内部也调本函数 ✓ ⇒
+            agent 那边**一处都不用改** ✓（它在哪调、调几次都不影响"查过就有标记" ✓）。
+            """
+            info = _resolve(player, mob)
+            # ⛔ 「**禁用杀怪寻路**」开着 ⇒ **不记账、也不打点**（用户 2026-09-28 ✓ 原话：
+            #   "开启后**不再查询怪物框所属的 foothold 集合**（**也不显示**）"✓）。
+            #   为什么**一处收口**就够了：记账（`_mark_mob_query` ✓）是画面上那行
+            #   `查#怪号 集合名`的**唯一来源**（绘制段只读那份账 ✓）
+            #   ⇒ **不记账 ⇒ 画面自然不出现** ✓（绘制那段一个字都不用动 ✓）。
+            # ⚠⚠ **这句注释里别写出那个读口的名字** ✗：`selftest_live_panel.t_mob_box_labels`
+            #   是用 `src.index("<读口名>()")` 去找绘制段、再在**固定窗口**里找 `_qlbl` 的
+            #   ⇒ 注释里先出现一次，它就会定位到**注释**、窗口里当然找不到 ⇒ **用例假红** ✗
+            #   （2026-09-28 就是这么踩的：注释比绘制段早 1400 行 ✓）。
+            #   顺手把 `mob_fh` 打点也停了 ✓ —— 开关开着时"查怪在哪块平台"这件事**根本不该发生**
+            #   （要排查就先把它关掉 ✓ 那时打得一样全 ✓）。
+            # ⚠ 仍然 `return info`：**别处**还要用它 —— `_zone_only`（「禁止战斗」时的**区域筛** ✓）
+            #   那是**另一个功能**，不在这个开关的范围内 ✗（见 `DecisionSettings` 那段说明 ✓）。
+            # ⚠ **两层都要 `getattr`**（只护内层会炸 ✗）：自检 / 老环境里 `self.agent` 可能是个
+            #   **替身**（没有 `.settings` ✓）⇒ 写成 `self.agent.settings.disable_...` 会当场
+            #   `AttributeError` ⇒ 把"查过的怪框"那几条用例全带崩 ✗（2026-09-28 踩到 ✓）。
+            _off = False
+            try:
+                _off = bool(self.agent.settings.disable_chase_pathfinding)
+            except AttributeError:
+                _off = False
+            if _off:
+                return info
+            names = (info or {}).get("sets") or []
+            why = (info or {}).get("why") or ""
+            self._mark_mob_query(mob, names, why)
+            # ⭐ **可观测性**（2026-09-28 加；用户："**运行一段时间后所有的查询怪物全是没找到**"✓
+            #   —— 那时 log 里**只有** `mob_goto_*`，`why` 只存在面板里 ⇒ **查不下去** ✗）。
+            #   ⚠ 只记**值变了**的那一次（同 `behavior.sample` 的语义，这里自己实现免依赖 ✓）——
+            #     否则它和 `lock_scored` 一个量级（两万多条 ✗）会把 log 淹掉 ✗。
+            try:
+                _sig = (str(why), tuple(sorted(str(n) for n in names)),
+                        round(float(getattr(mob, "x", 0.0) or 0.0) / 40.0),
+                        round(float(getattr(mob, "y", 0.0) or 0.0) / 40.0))
+                if _sig != getattr(self, "_last_mob_fh", None):
+                    self._last_mob_fh = _sig
+                    _w = (info or {}).get("world")
+                    behavior.event(
+                        "mob_fh",
+                        why=(str(why)[:60] or "ok"),
+                        sets=(",".join(str(n) for n in names)[:40] or "-"),
+                        mob_cy=round(float(getattr(mob, "y", 0.0) or 0.0), 1),
+                        ply_cy=round(float(getattr(player, "y", 0.0) or 0.0), 1),
+                        w_x=(round(float(_w[0]), 1) if _w else None),
+                        w_y=(round(float(_w[1]), 1) if _w else None),
+                        ply_wy=round(float(getattr(player, "world_y", 0.0) or 0.0), 1),
+                        # ⭐⭐ **2026-09-28 补四个量**（用户报"**又开始全程找不到怪的 foothold
+                        #   集合了，这不应该**"✓ —— 排查时发现**缺的正是它们** ✗）：
+                        #   · `mid` = 当前地图（不然**不知道拿哪张图去复现** ✗ —— 那天只能靠集合名猜 ✓）；
+                        #   · `ply_wx` = 玩家**世界 x**（判"世界坐标是不是整体偏了" ✓）；
+                        #   · `ply_cx` = 玩家**画面 x**（和 `w_x` 一减就**反推出相机 x** ✓）；
+                        #   · `ply_bot` = 玩家**画面框底**（`cam` 的对照量 ✓ —— 现在 `cam = ply_wy − ply_bot` ✓）。
+                        mid=str(getattr(self, "_mmap_mid", "") or ""),
+                        ply_wx=round(float(getattr(player, "world_x", 0.0) or 0.0), 1),
+                        ply_cx=round(float(getattr(player, "x", 0.0) or 0.0), 1),
+                        ply_bot=round(float(getattr(player, "bottom", 0.0) or 0.0), 1),
+                        cam=(round(float(getattr(self, "_cam_smooth", 0.0) or 0.0), 1)))
+            except Exception:                 # noqa: BLE001 —— 打点坏了别影响查询 ✓
+                pass
+            return info
+
+        return resolve
+
+    # ---------------------------------------------------------------- 「查过的怪框」
+
+    def _mob_query_ttl(self):
+        """「查过的怪框」标多久 —— **就用缓存那一把尺**（用户："**缓存失效再移除**" ✓）。
+
+        取 `agent._zone_cd_s()`（= 「**区域查询CD(s)**」的兜底值 ✓ —— 2026-09-28 起它是
+        **每个战斗区域项**各自配的 ✓，见 `DecisionSettings.battle_zones` ✓；"查过的怪框"
+        与"区域筛缓存"两处**必须同一把尺**，别新造 ✗）；拿不到就退回模块常量 ✓。
+        """
+        try:
+            return max(0.5, float(self.agent._zone_cd_s()))
+        except Exception:                      # noqa: BLE001 —— 老环境/替身对象 ⇒ 退回默认 ✓
+            from decision.agent import ZONE_GOTO_RETRY_S
+
+            return float(ZONE_GOTO_RETRY_S)
+
+    def _mark_mob_query(self, mob, names, why="", now=None):
+        """记下"**这只怪的框被查过**"（画面上要标出来 ✓），时效见 `_mob_query_ttl` ✓。
+
+        存的是**画面坐标框**（怪每拍都在动 ⇒ 标记要跟着它走 ✓）与这次查到的集合名 ✓；
+        查不出集合（`names` 空 ✓）**也照记** ✓ —— 用户要的是"**查询到**"就标 ✓，
+        正是这种情况最该看见（"查了、但判不出它在哪块平台" ✗）。
+        """
+        mid = getattr(mob, "id", None)
+        if mid is None:
+            return
+        now = time.monotonic() if now is None else float(now)
+        key = str(mid)
+        prev = self._mob_queries.get(key)
+        self._mob_queries[key] = (
+            (float(getattr(mob, "x", 0.0) or 0.0), float(getattr(mob, "y", 0.0) or 0.0),
+             float(getattr(mob, "w", 0.0) or 0.0), float(getattr(mob, "h", 0.0) or 0.0)),
+            [str(n) for n in (names or [])], str(why or ""),
+            float(prev[3]) if prev else now,          # 首次查到时刻（"多久前查的" ✓）
+            now + self._mob_query_ttl())              # 失效时刻 ⇒ 到点就移除 ✓
+
+    def queried_mob_boxes(self, now=None):
+        """还没失效的"查过的怪框" → `[(怪号, (框, 集合名, why, 首查时刻, 失效时刻)), …]`。
+
+        ⚠ **顺手剪掉过期的**（用户："缓存失效再移除" ✓）—— 剪在这里（唯一的读口 ✓），
+        画框那段直接用返回值即可，不必自己判时间 ✓。
+        """
+        now = time.monotonic() if now is None else float(now)
+        for k in [k for k, v in self._mob_queries.items() if v[4] <= now]:
+            del self._mob_queries[k]
+        return list(self._mob_queries.items())
+
+    def _make_set_cost_resolver(self):
+        """给 agent 装的「**从我站的集合 → 目标集合**的寻路距离」解析器（用户 2026-09-28 ✓）。
+
+        用途：人在一块**不能打**的平台上时，要挑一块**代价最低的可战斗区**
+        （见 `decision/agent._pick_battle_zone` ✓）。口径与 `mob_cost_of` **完全同一套**
+        （`route.path_cost` ✓ 一处实现 ✓），只是"目标"从**一只怪**换成**一个集合** ✓。
+
+        回值：`float | None`；**算不出给 `None`** ⇒ 调用方退回"回第一条"的老行为 ✓（不猜 ✗）。
+        ⚠ 与 `mob_cost_of` 同款签名（**收 `player`** ✓）—— 起点集合要从 `player.here_sets` 拿 ✓
+        （agent 不持有地形/集合，这份换算只能在这儿做 ✓）。
+        """
+        def resolve(player, dst_sets):
+            mid = getattr(self, "_mmap_mid", None)
+            if not mid:
+                return None
+            try:
+                t, z = self._route_ctx(mid)
+            except Exception:                 # noqa: BLE001 —— 拿不到地形 ⇒ 不猜 ✓
+                return None
+            if t is None or z is None:
+                return None
+            from decision import route as route_mod
+
+            return route_mod.path_cost(
+                t, z, getattr(player, "here_sets", None), list(dst_sets or []),
+                getattr(self, "_player_at", None))
+
+        return resolve
+
+    def _make_mob_cost_resolver(self, sets_of):
+        """给 agent 装的**「走过去要多少寻路距离」解析器**（用户 2026-09-27 要求）。
+
+        需求原话："优化：锁定目标优先级要按「**寻路距离**」最近，而不是旧的应该是**绝对距离**"
+        —— 挑要打哪只怪时，要能回答"**走到它那儿有多远**" ✓。
+
+        入参 `sets_of` = `mob_sets_of` 那个解析器（**共用同一次"画面→世界 + 落在哪块面"换算** ✓，
+        一处实现 ✓）。回值：`{"cost": float|None, "sets": [...], "why": ""}`
+        —— `cost` = 从**我站的集合**到**怪站的集合**的寻路距离（世界像素，`route.path_cost` 一处口径 ✓）；
+        算不出来给 `None`（**不猜** ✓，调用方退回绝对距离 ✓）。
+
+        ⚠ **只在"要挑目标"那一刻调用**（`agent._nearest`，锁定过期才走 ⇒ 500~1000ms 一次 ✓），
+          而且是对**当时候选的怪**；一次 `path_cost` = 一次 BFS + 每段一次 `pick_edge`（偏重 ✗）
+          ⇒ **绝不挂进每拍、也别对全屏幕的怪都算** ✗（同 `route_plan` 的纪律 ✓）。
+        """
+        def resolve(player, mob):
+            mid = str(getattr(self, "_mmap_mid", "") or "")
+            if not mid:
+                return {"cost": None, "sets": [], "why": "还不知道当前是哪个项目 / 地图"}
+            t, z = self._route_ctx(mid)
+            if t is None or z is None:
+                return {"cost": None, "sets": [],
+                        "why": "读不到地形 / 集合数据（先在「路线识别」里生成地形图）"}
+            info = sets_of(player, mob) or {}
+            names = [str(s) for s in (info.get("sets") or []) if str(s)]
+            if not names:
+                return {"cost": None, "sets": [],
+                        "why": info.get("why") or "怪站的 foothold 没圈进任何集合"}
+            from decision import route as route_mod
+            try:
+                cost = route_mod.path_cost(
+                    t, z, getattr(player, "here_sets", None), names,
+                    getattr(self, "_player_at", None))
+            except Exception as ex:              # noqa: BLE001
+                return {"cost": None, "sets": names, "why": "算寻路距离出错：%s" % ex}
+            why = "" if cost is not None else "寻路距离算不出来（缺几何 / 定位数据）"
+            return {"cost": cost, "sets": names, "why": why}
+
+        return resolve
+
+    def _make_set_span_resolver(self):
+        """给 agent 装的**「这个集合在世界上占的 x 范围」解析器**（用户 2026-09-27 要求 2）。
+
+        用户原话："…且其框底边与角色玩家当前 foothold 集合的 x 范围有交集，那么就不需要下达
+        寻路任务了可以直接锁" —— 要回答"我这块平台横着占多宽" ✓。
+
+        回值：`(左, 右) | None`（世界像素；底层是 `route.set_span` ✓ —— 它复用 `_set_spans`，
+        一处实现 ✓）。agent 不持有地形/集合 ⇒ 和 `route_plan` / `mob_sets_of` 一样由这里给 ✓，
+        共用同一份 `_route_ctx` 2 秒缓存 ✓。
+        """
+        def resolve(name):
+            mid = str(getattr(self, "_mmap_mid", "") or "")
+            if not mid:
+                return None
+            t, z = self._route_ctx(mid)
+            if t is None or z is None:
+                return None
+            from decision import route as route_mod
+            try:
+                return route_mod.set_span(t, z, str(name))
+            except Exception:                    # noqa: BLE001
+                return None
+
+        return resolve
+
+    def _make_toward_set_resolver(self):
+        """给 agent 装的「**朝『玩家 → 怪』方向、最近的那个集合**」解析器。
+
+        用户 2026-09-28 定的**降级路径**（原话："那就**在追击上做文章**：如果玩家的攻击范围框 x 长与
+        怪框 x 长范围相交了却没有触发 attack，就下达一个前往『**玩家到怪物向量**』指向的最近一个
+        foothold 集合的任务"✓；随后又补第 ③ 条："程序认为怪与玩家处于**相同** foothold 集合，
+        但**攻击框 x 相交、y 不相交**（框不住怪的碰撞盒，典型矩形相交问题），**也要**逐层逼近"✓）。
+
+        为什么要它：①「怪所在集合」那条路**要先判准怪在哪层** ✗（这几轮翻车的都是它）；
+        **方向**却是可靠的（画面 1:1 已验证 ✓）⇒ 拿方向绕开层判定 ✓。
+        回值：`集合名 | None`（判不出 ⇒ `None` ⇒ 调用方**不动** ✓ 宁缺勿错 ✓）。
+
+        判据（都在这里，agent 不持有地形 ✓，共用 `_route_ctx` 缓存 ✓）：
+          · **排除我脚下的集合** ✓（不然挑回自己 ⇒ 原地不动 ✗）；
+          · 候选的 y 跨度必须**整段落在"怪那一侧"** ✓（`dy > 0` = 怪在**下面** ⇒ 要 `y0 >= 我`）；
+          · x 要和「我 ↔ 怪」这段有交 ✓（否则会挑到地图另一头那层 ✗）；
+          · 取**沿方向最近**的那个 ✓（`dy > 0` ⇒ 比 `y0`、否则比 `y1`）。
+        ⚠ `|dy|` 太小（怪和我在同一高度 ✓）⇒ 返回 `None` ✓ —— 那是"纯水平"，不该上下跑 ✓。
+        """
+        def resolve(player, mob):
+            mid = str(getattr(self, "_mmap_mid", "") or "")
+            if not mid:
+                return None
+            t, z = self._route_ctx(mid)
+            if t is None or z is None:
+                return None
+            from perception import minimap as mm
+            from decision import route as route_mod
+
+            sy = float(getattr(mob, "y", 0.0) or 0.0) + float(getattr(mob, "h", 0.0) or 0.0) / 2.0
+            w = mm.screen_to_world(player, float(getattr(mob, "x", 0.0) or 0.0), sy)
+            if w is None:
+                return None
+            px = float(getattr(player, "world_x", 0.0) or 0.0)
+            py = float(getattr(player, "world_y", 0.0) or 0.0)
+            dx = float(w[0]) - px
+            dy = float(w[1]) - py
+            if abs(dy) < TOWARD_MIN_DY:
+                return None                     # 同一高度 ⇒ 不该上下跑 ✓
+            here = set(str(s) for s in (getattr(player, "here_sets", None) or []))
+            lo_x, hi_x = min(px, float(w[0])), max(px, float(w[0]))
+            best, best_d = None, None
+            for name in (z.sets or {}):
+                nm = str(name)
+                if nm in here:
+                    continue                    # 排除自己脚下 ✓
+                # ⛔⛔ **这里原来是 `set_span` + 四元组解包 ⇒ 每次都 IndexError** ✗✗
+                #   （2026-09-28 现场修：`set_span` 只给 `(左, 右)` 两个值 ✗，而下面按
+                #    `sp[2]`/`sp[3]` 取 y 范围 ⇒ 越界 ⇒ 这条"朝方向最近集合"的降级
+                #    **从上线起一次都没成功过** ✓；异常又被 `agent._mob_goto_towards` 的
+                #    `except` 吞掉 ⇒ **一条痕迹都没有** ✗ —— 现场现象 = "怪判不出集合时
+                #    原地卡住、也不下任务"（用户："**没找到也没根据向量下达寻路任务**"✓）。
+                #   ⇒ 用 `route.set_box`（集合的**包围盒** = 左/右 + 上y/下y ✓ 同一份
+                #     `_set_spans` ✓）。
+                box = route_mod.set_box(t, z, nm)
+                if not box:
+                    continue
+                x0, x1, y0, y1 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+                if x1 < lo_x - 1.0 or x0 > hi_x + 1.0:
+                    continue                    # x 完全不相干 ⇒ 不是"这条路上的层" ✗
+                if dy > 0:
+                    if y0 < py:                 # 得整个落在我下面 ✓
+                        continue
+                    d = y0 - py
+                else:
+                    if y1 > py:                 # 得整个落在我上面 ✓
+                        continue
+                    d = py - y1
+                if best_d is None or d < best_d:
+                    best, best_d = nm, d
+            return best
+
+        return resolve
+
+    def _make_foothold_x_resolver(self):
+        """给 agent 装的「**这条 foothold 的世界中心 x**」解析器（用户 2026-09-28 要求）。
+
+        用途：「**idle 回归**」—— 区域项里的 `idle_foothold`（一条 foothold 的 **id** ✓）
+        要说清"往哪边走、走到哪算到" ✓，而 agent **不持有地形** ✓ ⇒ 和 `mob_sets_of` /
+        `route_plan` 一样由这里给（同一份 `_route_ctx` 2 秒缓存 ✓）。
+
+        回值：`float`（世界 x 中心 ✓）/ `None`（没这个 id / 它是墙 / 读不到地形 ✓）。
+        ⚠ **只给横向**：调用方（`agent._idle_walk_beat`）拿它算 `dx` 再按 ←/→ ✓ ——
+          「**不跨层**」是那边的口径 ✓，这里不给 y ✗（要跨层是 `fight_dst` 那种"前往"的事 ✓）。
+        """
+        def resolve(fid):
+            mid = str(getattr(self, "_mmap_mid", "") or "")
+            want = str(fid or "").strip()
+            if not mid or not want:
+                return None
+            t = self._route_ctx(mid)[0]
+            if t is None:
+                return None
+            try:
+                for f in (t.footholds or ()):
+                    if str(getattr(f, "fid", "")) != want:
+                        continue
+                    if getattr(f, "is_wall", False):
+                        return None              # 墙站不上去 ⇒ 当作没有 ✓
+                    return (float(f.x1) + float(f.x2)) / 2.0
+            except Exception:                    # noqa: BLE001
+                return None
+            return None
+
+        return resolve
+
+    def pos_state(self):
+        """本线程的**位置状态机**（位置状态广播的**唯一写者** ✓）。
+
+        给界面读广播事实用（例：`route_panel` 的「位置状态」那行要显示 `at_ladder_top` ✓）
+        —— ⚠ **别拿它当第二个写者** ✗，界面只读 ✓（用户 2026-09-27 定的架构 ✓）。
+        """
+        return self._pos_state
+
+    def _fill_route_ctx(self, player, loc, hold_vert=False):
+        """把**位置状态**写进 `Player` —— ⭐ **全部交给位置状态机算**（见它的模块说明 ✓）。
+
+        用户 2026-09-27 定："开始进行我说的**位置状态广播**架构（**所有的位置状态更新由
+        位置状态机自治**）" ⇒ 这里**只做接线**：
+          · 本拍的读数（`loc` ✓）与**执行器通知**（`hold_vert` 参数 ✓ —— 由调用方给的
+            `agent.climbing_vertical()`：climb 执行器按住 ↑/↓ 后发起的通知，替代
+            "本机按键状态"）喂进机器；
+          · 机器把 `here_sets` / `ladder_id` / **`at_ladder_top`** 算好——这里照抄进 `Player` ✓
+            （`Player` 就是**广播载体** ✓）；
+          · 执行器**只读不算** ✗（`ClimbJob._arrived` 已经改成读 `at_ladder_top` ✓）。
+
+        口径（**别在这里再算一遍** ✗）：
+          · `here_sets` = 脚下 foothold 属于哪些命名集合（`core.zones.set_of` ✓）；
+          · `ladder_id` = 贴着哪根绳（**许可入口 = climb 执行器按住 ↑/↓ 后发起的通知** ✓ ——
+            用户 2026-09-27："除非按住了 ↑ 或 ↓，不能主动判定为在绳梯上，不然角色碰到绳子就
+            卡住不走"；2026-09-28 诉求 1：这个"按住 ↑/↓"改由执行器通知（`climbing_vertical`），
+            不再是本机按键状态 ✓）；
+          · `at_ladder_top` = 上爬的**到达**判据（y ≤ 绳上端 + 「坐标对齐误差范围」且 y 在
+            「移动操作尝试间隔」内没再变小 ✓，判据原文在 `perception/pos_state.py` ✓）。
+        定位没输出时**一律清空**（空 = 判不出来，别拿旧值骗执行器 ✗）。
         """
         x, y = getattr(player, "world_x", None), getattr(player, "world_y", None)
-        fid = str((loc or {}).get("foothold_id") or "")
         mid = str(getattr(self, "_mmap_mid", "") or "")
+        # ⭐⭐⭐ **换图检测必须在最前面**（2026-09-28 现场修 ✗✗）。
+        #   ⚠ 上一版把它放在"定位没输出"那条早退**之后** ⇒ **那条路根本走不到它** ✗：
+        #     用户中途切过图（106010105 ⇄ 105090600 ✓ `behavior.log` 里 `task_begin dst=一楼/二楼/三楼`
+        #     就是那张图的集合名 ✓），于是"沿用上一次位置状态"把**上一张图的集合名**留了下来
+        #     （`_player_here = ['小平台']` ✗）⇒ 择路拿它当**起点** ⇒
+        #     `core/zones.py` 报 `集合不存在：小平台` ⇒ 「回左上 / 右下→左上」**永远造不出路线**
+        #     ⇒ `zone_goto_fail` 每 3 秒重试 ⇒ **卡死** ✗✗✗（用户报的"右下到左上的寻路报错了"✓）。
+        #   ⇒ 三样一起清：机器内部那份 + `_player_here` + `_player_at` ✓（**同图内**才允许沿用 ✗）。
+        if mid != getattr(self, "_pos_state_mid", None):
+            self._pos_state_mid = mid
+            self._pos_state.reset()
+            self._player_here = []      # ⚠ 上一版的漏网之鱼：起点集合**也要跟着换图清** ✗
+            self._player_at = None
         if x is None or y is None or not mid:
-            player.here_sets = []
+            # ⚠⚠ 2026-09-28 改（用户："位置状态给容错：**不许存在没站在平台上这种空类**，
+            #   如果找不到就**按上一个位置状态**"✓）：这里原来**手动把七个字段清空** ✗
+            #   ⇒ 定位掉一帧 / 判不出脚下集合 ⇒ `here_sets` 空 ⇒ 「战斗区域」判成"不在能打区"
+            #   ⇒ 每拍下「回能打区」⇒ 那条路又造不出来 ⇒ **每 3 秒重试、卡死** ✗✗。
+            #   ⇒ 现在**一律照抄机器的广播** ✓（`here_sets`/`here_span` 由机器**沿用上一次** ✓，
+            #     "这一拍的事实"（绳/到顶/地面 y）仍然清 ✓ —— 机器内部就这么分的 ✓ 一处口径 ✓）。
+            _snap = self._pos_state.update(None, loc=None, terrain=None, zones=None,
+                                           hold_vert=False)
+            player.here_sets = list(_snap.here_sets)
+            player.here_span = _snap.here_span
             player.ladder_id = None
-            self._player_here = []          # 定位没有输出 ⇒ 起点也不知道（别留旧值骗解析器）
-            return
+            player.at_ladder_top = None
+            player.at_ladder_bottom = None
+            player.on_rope_pos = None
+            player.ground_y = None
+            # ⭐ "起点集合"**也沿用**（同一份 ✓）：清掉的话「定点休息 / 回能打区」会报
+            #   "你现在站的这块没圈进任何集合"⇒ 角色根本不过去 ✗（`t_route_resolver_...` 那条
+            #   老用例钉的是"必须忘掉旧值"✗ —— 那条按用户 2026-09-28 的新口径**已同步翻转** ✓）。
+            self._player_here = list(_snap.here_sets)
+            self._player_at = None          # ⚠ 世界坐标**照旧清掉**（那是"这一拍的真实位置" ✓
+            return                          #   拿旧坐标去挑最近的绳会挑错 ✗）
         t, z = self._route_ctx(mid)
-        player.here_sets = list(z.set_of(fid)) if (z is not None and fid) else []
+        # ⭐ 诉求 1（用户 2026-09-28）：ladder_id 的许可从「**按住 ↑**」（本机按键状态）改成
+        #   「**climb 执行器按住 ↑ 后发起通知**」（= 执行器上一拍发了 ↑/↓，`ClimbJob._last_vert`）。
+        #   —— 执行器发键 → 远端角色真爬之间有端到端延迟/丢键，本机按键状态会跟执行器意图
+        #   飘开 ✗；机器只吃**执行器通知**这个事实、自己不下发按键 ✓。
+        # ⛔ **别在这儿自己去找 agent**（2026-09-28 踩的坑）：原来写成
+        #   `getattr(self, "agent", None)`，而 `self.agent` **从来没人赋过值** ✗ ⇒ 恒
+        #   `None` ⇒ `_hold_vert` 恒 `False` ⇒ `pos_state.ladder_id` **恒 `None`** ⇒
+        #   执行器永远判不出"在绳上"（爬绳全废 / 位置状态判定失误 ✗ —— 用户 2026-09-28
+        #   报的"**之前没有限制绳梯判定入口的时候是很准确及时的**"正是它 ✓，与几何尺
+        #   `mapdata.LADDER_PAD` **无关** ✗）。⇒ 改成**调用方显式传进来** ✓：`run()` 里
+        #   那个局部 `agent` 才是**真跑 tick** 的那个 ✓。
+        _hold_vert = bool(hold_vert)
+        # 设置**每拍现取**（用户随时会改「坐标对齐误差范围」/「移动操作尝试间隔」⇒ 下一拍生效 ✓）
+        from decision.agent import settings as _stg
+        # ⭐ **位置状态机自治**（用户 2026-09-27 ✓）：算好 → 直接广播到 `Player` ✓
+        # ⚠ 世界坐标以 `Player` 上那份为准（就是定位写进去的 ✓）：把 `x/y` 并进 `loc` 再喂机器 ——
+        #   机器只认"读数里带没带世界坐标"，这样它的入参**自洽**（不依赖调用方另传一份 ✓）。
+        _snap = self._pos_state.update(
+            None, loc=dict(loc or {}, world_x=x, world_y=y),
+            terrain=t, zones=z, hold_vert=_hold_vert,
+            align_tol_px=float(getattr(_stg, "align_tol_px", 10) or 10),
+            move_retry_ms=float(getattr(_stg, "move_retry_ms", 3000) or 0),
+            # "集合名 → (左, 右)"的查询：**机器在感知层，不 import 决策层** ✗ ⇒ 由这边
+            # 把自己那个闭包喂进去（`route.set_span` = "集合里有哪些非墙 foothold"的
+            # **唯一**口径 ✓，见 `_make_set_span_resolver` ✓）。
+            # ⚠ `getattr` 兜底：用例里有时候拿个替身线程跑这一路（没有那个方法 ✓），
+            #   宁可"这拍没有平台宽度"也不要当场 AttributeError 把整条链弄掉 ✗。
+            span_of=self._make_set_span_resolver()
+            if hasattr(self, "_make_set_span_resolver") else None)
+        # ⭐ 快照**展开**进 `Player` 的七个扁平字段（它们才是唯一存储 ✓；要"整份"时用
+        #   `PosSnapshot.of(player)` 在**一处**拼 ✓）—— 用户 2026-09-27："重新整理…**状态通信**、
+        #   提高内聚降低耦合" ✓：字段名与快照字段**一一对应**，加字段只动 `PosSnapshot` ✓。
+        player.here_sets = list(_snap.here_sets)
+        player.ladder_id = _snap.ladder_id
+        player.at_ladder_top = _snap.at_ladder_top
+        player.at_ladder_bottom = _snap.at_ladder_bottom
+        player.ground_y = _snap.ground_y
+        player.on_rope_pos = _snap.on_rope_pos
+        player.here_span = _snap.here_span
+        player.climb_failed = _snap.climb_failed
+        player.climb_stalled = _snap.climb_stalled
         # 「我现在站哪个集合」也给**路径解析器**留一份（`_make_route_resolver` 要用它当起点）。
         # ⚠ 2026-09-26 漏了这一步 ⇒ 解析器只能退回 `settings.route_goto_set`（那是路线面板
         #   在跟踪玩家时才写的东西 ✗），于是「定点休息」经常报"你现在站的这块没圈进任何集合"
         #   ⇒ **根本不过去** ✗（用户在右下点手动休息，角色原地不动就是这么来的）。
         self._player_here = list(player.here_sets)
-        lad = t.ladder_at(float(x), float(y)) if t is not None else None
-        if lad is None:
-            player.ladder_id = None
-        else:
-            try:
-                from core import zones as zones_mod
-                player.ladder_id = zones_mod.ladder_ids(t).get(id(lad))
-            except Exception:                   # noqa: BLE001
-                player.ladder_id = None
+        # 玩家世界坐标也留一份：**择路**要用它（"到目标集合有多条绳 ⇒ 挑最近的"，
+        # 见 `decision.route.pick_edge` ✓）。解析器是闭包、拿不到每一帧的 WorldState，
+        # 所以和 `_player_here` 一样存在线程上（都是"最近一次的定位结果" ✓）。
+        self._player_at = (float(x), float(y))
 
     def _locate_mmap(self, panel):
         """这一拍定位一次玩家 → 结论 dict；没在用/没地图 → None。
@@ -498,7 +1184,14 @@ class LiveThread(QThread):
             return {"ok": False, "note": ("没有可裁的小地图区域 —— %s"
                                           % ("先框选小地图" if not self._mmap_crop
                                              else "框选区超出当前画面，重框一次"))}
-        return self._locator.update(panel, src=src)
+        # 「脚下的 foothold」也按**设置里的「坐标对齐误差范围」**兜一次（用户 2026-09-26）：
+        # 站在平台边上时黄点会读到边界外几个像素，而老口径 x 一点容差都没有 ⇒ 报
+        # "脚下没有平台 / 未分组" ⇒ 起点与到达判定全废 ✗
+        # （实测 105090600 的 (650,283)：离平台左边界 7px，而设置的容差是 10px ✓）。
+        from decision.agent import settings as decision_settings
+        return self._locator.update(
+            panel, src=src,
+            fh_xtol=int(getattr(decision_settings, "align_tol_px", 0) or 0))
 
     # ---------------- 控制 ----------------
 
@@ -581,9 +1274,44 @@ class LiveThread(QThread):
         # （`start_climb`），而它原本只是本函数的局部变量 ⇒ 面板拿不到（见 decision/agent
         # 的 CURRENT）。只做引用赋值，不加锁 —— 和 settings 一个路子；退出时注销（见 finally）。
         agent_mod.CURRENT = agent
+        # ⭐ **本线程也留一份引用**（`self.agent`）—— 有两处读它：`_mob_query_ttl`
+        #   （「前往重下间隔」那把尺）与 `_fill_route_ctx` 里给位置状态机的 `hold_vert`。
+        #   ⛔ **2026-09-28 修**：这两处一直写 `self.agent`，却**从来没人赋过值** ✗ ⇒
+        #   `getattr(self, "agent", None)` 恒 `None` ⇒ `_hold_vert` 恒 `False` ⇒
+        #   `pos_state.ladder_id` **恒 `None`** ⇒ 执行器永远判不出"在绳上"（爬绳全废、
+        #   位置状态判定失误 —— 用户 2026-09-28 报的"**之前没有限制绳梯判定入口的时候是
+        #   很准确及时的**"正是它 ✓，**不是** `mapdata.LADDER_PAD` 那把几何尺 ✗）；
+        #   顺带 `_mob_query_ttl` 也恒走 except ⇒ 设置里「前往重下间隔(s)」实际不生效 ✗。
+        #   一处赋值两处都好 ✓（退出时注销，见 finally ✓）。
+        self.agent = agent
         # 给 agent 装**路径解析器**：「定点休息」要用它自己走到指定地点。
         # agent 不持有地形 / 集合 ⇒ 解析这一层由这里提供（和 `_fill_route_ctx` 同一处）。
         agent.route_plan = self._make_route_resolver(decision_settings)
+        # 再装一个「**这只怪在哪块平台上**」的解析器（用户 2026-09-27 要求：chase 前先判怪的
+        # foothold 集合，不与玩家同一块 ⇒ 先下「前往」任务 ✓）。agent 同样不持有地形/集合，
+        # 所以和上面那条一样由这里给（同一份 `_route_ctx` 缓存 ✓）。
+        agent.mob_sets_of = self._make_mob_sets_resolver()
+        # 再装一个「**走过去要多少寻路距离**」的解析器（用户 2026-09-27："锁定目标优先级要按
+        # 「寻路距离」最近，而不是旧的应该是绝对距离"）—— 它**复用上面那一个**做"画面→世界 +
+        # 落在哪块面"（一次换算 ✓），只多一步 `route.path_cost`（择路同一套口径 ✓）。
+        agent.mob_cost_of = self._make_mob_cost_resolver(agent.mob_sets_of)
+        # ⭐ **再装一个「集合 → 集合」的代价**（用户 2026-09-28 ✓）：人在**不能打**的平台时，
+        #   要挑一块**代价最低的可战斗区**（`agent._pick_battle_zone` ✓）。底层是**同一个**
+        #   `route.path_cost`（口径一处 ✓）。没装 ⇒ 那边退回"回第一条"的老行为 ✓（不猜 ✗）。
+        agent.set_cost_of = self._make_set_cost_resolver()
+        # ⭐ 再装一个「**这条 foothold 的世界中心 x**」的解析器（用户 2026-09-28：「idle 回归」
+        #    要"位于本集合时**水平走**向 `idle_foothold` 的中心" ✓）—— agent 同样不持有地形 ✓
+        #    （同一份 `_route_ctx` 缓存 ✓）。没装 ⇒ agent 那边什么都不做（照旧站住 ✓）。
+        agent.foothold_x = self._make_foothold_x_resolver()
+        # ⭐ 再装一个「**朝『玩家 → 怪』方向、最近的那个集合**」的解析器（用户 2026-09-28 定稿 ✓）
+        #    —— 给追击的**降级路径**用（怪那层判不出 / 走不到 / 判成"同一集合"但攻击框与怪框
+        #    不相交时，改成"朝方向逐层逼近"✓，绕开"层判定"这个最不稳的环节 ✓）。
+        agent.nearest_set_towards = self._make_toward_set_resolver()
+        # ⚠ 这里原来把「某个集合在世界上占多宽（x 范围）」的解析器挂到 **agent** 上
+        # （`agent.set_span_of`），让 `_reachable_without_path` **自己**算平台宽度 ——
+        # 2026-09-27 用户要求**收编**（"同一件事两处算"是当天连踩两次的根因 ✗）⇒ **已删** ✗：
+        # 这份查询现在喂给**位置状态机**（`_fill_route_ctx` 里的 `span_of=` ✓），
+        # 决策层一律读广播的 `player.here_span` ✓（解析器本身仍是 `route.set_span` 那一份 ✓）。
         mob_tracker = MobTracker()   # 给怪稳定 id，供目标锁定 CD 跨帧匹配
         player_tracker = PlayerTracker()   # 跟住「我」：位置连续性，别把别人认成自己
         # 断线重连状态机（判界面 → 停自动 → 按 Enter/点鼠标走回游戏）
@@ -604,20 +1332,36 @@ class LiveThread(QThread):
         _pot_last = [0.0]
         _pot_vals = [1.0, 1.0]      # (hp, mp) 比例缓存
         _last_player = [None]       # 上一帧玩家框 (cx, cy, bottom, conf)，漏检时兜底
+        #: ⭐ 「玩家位置」组的**框面积滚动基线**（用户 2026-09-28 ✓）：最近若干拍的框面积 ✓。
+        #:   上限写死 600（设置里的窗口 `player_box_area_base_n` **只在算均值时切片** ✓
+        #:   ⇒ 改设置立刻生效，不用重建这颗缓冲 ✓）。
+        _area_hist = []
         #: 最近一次**端到端延迟**（毫秒，探针解出来的）；写进 WorldState 给"对齐保持窗口"
         #: 用（见 decision/agent._climb_tick：窗口 = 设置里的保持时间 + 它）。
         _e2e_ref = [0.0]
-        _vision_box = [None]        # 视野矩形 (left, top, right, bottom)，3s 更新一次
-        _vision_last = [0.0]        # 上次更新时间
+        #: 视野矩形 (left, top, right, bottom) —— **每帧现算** ✓（见收流循环里那段说明：
+        #: 2026-09-27 用户报"视野范围更新太慢"，根因就是它原来是**每 3 秒**才算一次 ✗）。
+        _vision_box = [None]
 
         # 可视化配置：定期重读（颜色改了实时生效，不用重开实时预览）
+        # ⚠ 这几个"框/线"的颜色都走 `hex_to_bgra`（**可能带透明度** ✓，2026-09-27 起
+        #   用户能在颜色弹窗里用拖动条调）：`_blit_alpha` 按 alpha 决定"直画还是混色" ✓。
         _vis_cfg = theme.load_vis()
         _cls_colors = _box_colors()
         _lock_color = theme.hex_to_bgr(_vis_cfg["lock_color"])
-        _attack_color = theme.hex_to_bgr(_vis_cfg["attack_color"])
-        _min_attack_color = theme.hex_to_bgr(_vis_cfg["min_attack_color"])
-        _vision_color = theme.hex_to_bgr(_vis_cfg["vision_color"])
+        _attack_color = theme.hex_to_bgra(_vis_cfg["attack_color"])          # 攻击范围框
+        _min_attack_color = theme.hex_to_bgra(_vis_cfg["min_attack_color"])  # 攻击盲区框
+        _chase_jump_color = theme.hex_to_bgra(_vis_cfg["chase_jump_color"])  # 追击起跳框
+        _vision_color = theme.hex_to_bgra(_vis_cfg["vision_color"])
         _vision_width = int(_vis_cfg["vision_width"])
+        # 每项的**显示开关**（用户 2026-09-27："辅助线与标记组里每项参数前加开关"）——
+        # 关掉 = 这一项不画（颜色还留在配置里 ✓）。⚠ 「跳跃攻击范围框」这里没有对应的
+        # 局部变量：它的**逻辑还没做**（占位项，见 `decision/agent.py` 那条说明）✓。
+        _on_lock = bool(_vis_cfg.get("lock_on", True))
+        _on_attack = bool(_vis_cfg.get("attack_on", True))
+        _on_blind = bool(_vis_cfg.get("min_attack_on", True))
+        _on_chase = bool(_vis_cfg.get("chase_jump_on", True))
+        _on_vision = bool(_vis_cfg.get("vision_on", True))
         _vis_refresh_last = 0.0
 
         # 读线程独立于推理：它拼命读，积压的旧帧在槽位里被直接覆盖丢掉。
@@ -629,8 +1373,12 @@ class LiveThread(QThread):
         # 性能打点：关键路径的耗时留在仓库根 perf.log 里，事后直接看，不用现场加
         # print（开销见 core/perf.py 的说明：常开也只有纳秒级 + 每 30 秒一次落盘）。
         # 开关在「设置 → 性能日志」（存 config/live.yaml 的 perf_log），不在这里。
-        from core import perf
-        perf.configure(bool(self._p.get("perf_log", True)))
+        from core import behavior, perf
+        _b_on = bool(self._p.get("perf_log", True))
+        perf.configure(_b_on)
+        # 玩家行为打点（`core/behavior.py`）：初版只打"玩家的任务"事件，落 behavior.log。
+        # 开关**跟性能日志共用**（`perf_log`）—— 用户没要求单开一格；将来要分开就加一格参数。
+        behavior.configure(_b_on)
 
         slot = _LatestSlot()
         reader_done = threading.Event()
@@ -942,6 +1690,20 @@ class LiveThread(QThread):
                 _t_pipe = time.perf_counter()   # 「收到这一帧 → 决策完」的总耗时
                 perf.frame_arrived(_t_pipe)     # 记下这帧被取走的时刻（算 out_key_ms）
                 vis = f.image          # BGR（decode_format="bgr24" 直出）
+                # **再留一份原生帧**（`raw_frame_ready` 发出去的那份）：下面会往 `vis`
+                # 上**就地**画玩家蓝框/怪物绿框/攻击线/**视野虚线**，而取帧做测量的那几个
+                # 功能（探针标定、HP/MP 条框选、小地图框选、标定弹窗、叠图核对）量的都是
+                # **像素**，被画过就全毁 —— 用户 2026-09-27 现场正是这么撞上的
+                #（"框选小地图时把视野灰色虚线一起框进去了"）。
+                # ⚠ 为什么是"先拷再画"而不是"不画"：cv2 的绘制是**原地**改数组，
+                #   `vis` 一旦画过，原始像素就找不回来了（下面 `_mmap_panel_from_frame`
+                #   那条注释记的是同一个坑，只是它只护住了小地图那一小块）。
+                # ⚠ 只在**真要画**的时候拷：本文件里所有 `cv2.*(vis, …)` 都在下面
+                #   `if self._infer.is_set():` 那一块里 ⇒ 收画面阶段零开销 ✓
+                #   （用例 `t_raw_frame_before_draw` 钉着这条，加绘制时顺手看它一眼）。
+                # 代价：一次全帧 memcpy（1920×1080 ≈ 0.5 ms），在**收流/标注线程**里，
+                # 不在决策那一条链上 ✓。
+                raw = vis.copy() if self._infer.is_set() else vis
                 # 小地图那块面板**趁现在裁**（复制一份）：下面会往 vis 上就地画
                 # 玩家蓝框/攻击线，画过的像素会串进黄点识别里。见
                 # _mmap_panel_from_frame 的说明。来源=收流时这里是 None（那一帧
@@ -964,10 +1726,16 @@ class LiveThread(QThread):
                     _m_label = CLASS_NAMES.get(_mob_class,
                                                CLASS_NAMES[CLASS_MOB])
                     _lock_color = theme.hex_to_bgr(_vis_cfg["lock_color"])
-                    _attack_color = theme.hex_to_bgr(_vis_cfg["attack_color"])
-                    _min_attack_color = theme.hex_to_bgr(_vis_cfg["min_attack_color"])
-                    _vision_color = theme.hex_to_bgr(_vis_cfg["vision_color"])
+                    _attack_color = theme.hex_to_bgra(_vis_cfg["attack_color"])
+                    _min_attack_color = theme.hex_to_bgra(_vis_cfg["min_attack_color"])
+                    _chase_jump_color = theme.hex_to_bgra(_vis_cfg["chase_jump_color"])
+                    _vision_color = theme.hex_to_bgra(_vis_cfg["vision_color"])
                     _vision_width = int(_vis_cfg["vision_width"])
+                    _on_lock = bool(_vis_cfg.get("lock_on", True))
+                    _on_attack = bool(_vis_cfg.get("attack_on", True))
+                    _on_blind = bool(_vis_cfg.get("min_attack_on", True))
+                    _on_chase = bool(_vis_cfg.get("chase_jump_on", True))
+                    _on_vision = bool(_vis_cfg.get("vision_on", True))
                     # conf 也实时生效：重读 config/live.yaml（UI 改动会即时写入）
                     try:
                         _live = load_live()
@@ -1057,12 +1825,18 @@ class LiveThread(QThread):
                         if "mob" in _by_name:
                             _mob_class = _by_name["mob"]
 
-                    # 视野框：只用于画虚线 + 决策层过滤（agent._filter_mobs），
-                    # 不裁剪推理区域 —— 检测走全图，玩家和怪都从全图出。
-                    if time.perf_counter() - _vision_last[0] >= 3.0:
-                        _vision_last[0] = time.perf_counter()
-                        _vision_box[0] = _vision_box_for(vis, _last_player[0],
-                                                         decision_settings)
+                    # 视野框：只用于**画那四条虚线**（决策层的过滤在 agent 里直接用
+                    # `settings.vision_*`，不读这个框 ✓），不裁剪推理区域 —— 检测走全图 ✓。
+                    #
+                    # ⚠ **每帧现算**（2026-09-27 用户："视野范围的更新速度太慢了（至少虚线框
+                    #   看起来是这样）"）：原来这里是 `if perf_counter() - _vision_last >= 3.0`
+                    #   ⇒ 角色/镜头一直在动、而这个框**每 3 秒才动一次** ⇒ 看上去就是"卡住
+                    #   的虚线"✗。`_vision_box_for` 只是几次整数加减（微秒级），比画它那四条
+                    #   虚线本身还便宜 ⇒ 没有任何理由节流 ✓。
+                    #   顺带：改成每帧算之后，设置里改「视野」那几个数**当场生效**（以前最多
+                    #   滞后 3 秒 ✓）。
+                    _vision_box[0] = _vision_box_for(vis, _last_player[0],
+                                                     decision_settings)
 
                     # ---- 一次全图推理：玩家（class 0）+ 怪（class 1）----
                     t0 = time.perf_counter()
@@ -1105,9 +1879,69 @@ class LiveThread(QThread):
                     # 用位置连续性（离预测位置最近）挑出操作者的框，避免「画面里多个
                     # 玩家时取置信度最高的、把别人当成自己」；漏检用速度外推补框，
                     # 连续跟丢才解锁重锁。max_jump 就是「玩家追踪阈值」参数。
+                    # ---- 小地图定位**先算一遍**（在挑玩家框之前）----
+                    # 用户 2026-09-27 提的："用小地图的玩家世界坐标辅助玩家框防抖" ⇒ 黄点是
+                    # **独立于 YOLO 的第二个传感器**（一个认画面、一个读小地图 ✓）⇒ 挑框时
+                    # 可以拿"**本帧我到底在哪**"当尺子 ✓（`PlayerTracker.update(world=…)` ✓）。
+                    # ⚠ 必须"**本帧黄点 + 上一帧的框/相机**"才成立：同一帧的 world 与 box 相减
+                    #   会退化成"离上一帧框多远"（= 老判据），等于没加 ✗ —— 所以定位得先跑 ✓。
+                    # 算不出来时 `_world_now` 就是 None ⇒ 追踪器**自动退回老判据** ✓（不猜 ✗）。
+                    # ---- ⭐⭐ **「玩家位置」组：每帧现读**（用户 2026-09-28 ✓）----
+                    #   ① **脚底偏移**灌进 `world_state` 的镜像（那边不做反向 import，说明在
+                    #      `perception/world_state.py` 的 `FOOT_OFFSET_PX` 上 ✓）；
+                    _ploc_fo = float(getattr(decision_settings,
+                                             "player_foot_offset_px", 0) or 0)
+                    try:
+                        from perception import world_state as _ws_mod
+                        _ws_mod.FOOT_OFFSET_PX = _ploc_fo
+                    except Exception:
+                        pass
+                    #   ②③④ **框面积闸**（用户原话："当前框面积 ≤ 近期滚动基线 × (1 − 容差%)
+                    #      ⇒ 这一拍推迟 / 不做查询 ✓（**拦在查询之前**，而不是靠放宽挑面 ✗）"）。
+                    #      ⚠ 只能拿**上一拍锁定的框**说事：本帧的框要等 `_locate_mmap` 的出参才
+                    #        挑得出来（黄点是"辅助挑框"的尺子 ✓ 见上面那段）⇒ 这一拍先判、再查 ✓。
+                    #      ⚠ 两个"关"的口子：**容差 0** / **基线还没攒够 3 拍** ⇒ 照常查询 ✓
+                    #        （老行为一字不变 ✓）；**框面积最小占比 0** ⇒ 那条也关 ✓。
+                    _gate_closed = False
+                    _area_prev = 0.0
+                    _pb_prev = _last_player[0]
+                    if _pb_prev is not None and len(_pb_prev) >= 6:
+                        _area_prev = float(_pb_prev[4]) * float(_pb_prev[5])
+                    if _area_prev > 0.0:
+                        _area_hist.append(_area_prev)
+                        if len(_area_hist) > 600:
+                            del _area_hist[0]
+                        _pm = float(getattr(decision_settings,
+                                            "player_box_min_area_pct", 0.0) or 0.0)
+                        _pt = float(getattr(decision_settings,
+                                            "player_box_area_tol_pct", 0.0) or 0.0)
+                        if _pm > 0.0:
+                            _fa = float(vis.shape[0]) * float(vis.shape[1])
+                            if _fa > 0.0 and _area_prev < _fa * _pm / 100.0:
+                                _gate_closed = True          # 框太小 ⇒ 这一拍不算有效检测
+                                perf.count("player_box_too_small")
+                        if not _gate_closed and _pt > 0.0 and len(_area_hist) >= 3:
+                            _bn = max(1, int(getattr(
+                                decision_settings, "player_box_area_base_n", 30) or 30))
+                            _tail = _area_hist[-_bn:]
+                            _base = sum(_tail) / float(len(_tail))
+                            if _base > 0.0 and _area_prev <= _base * (1.0 - _pt / 100.0):
+                                _gate_closed = True      # 比近期基线小太多 ⇒ 这一拍不查
+                                perf.count("player_area_below_base")
+                    #      ⚠ 拦住时 `_loc = None` ⇒ 下面 `apply_to_player` 不跑 ⇒ **世界坐标沿
+                    #        用上一拍** = 这一拍"**不定位**"✓（而不是"定到错的地方"✗）。
+                    _loc = None if _gate_closed else self._locate_mmap(_mmap_panel)
+                    if _loc is not None:
+                        perf.count("mmap_ok" if _loc.get("ok") else "mmap_miss")
+                    _world_now = None
+                    if _loc is not None:
+                        _wx0, _wy0 = _loc.get("world_x"), _loc.get("world_y")
+                        if _wx0 is not None and _wy0 is not None:
+                            _world_now = (float(_wx0), float(_wy0))
+
                     player_tracker.max_jump = max(
                         1.0, float(decision_settings.player_track_jump))
-                    player_box = player_tracker.update(player_cands)
+                    player_box = player_tracker.update(player_cands, world=_world_now)
                     n_boxes = k
 
                     # ---- 断线判断 / 自动重连 ----
@@ -1187,14 +2021,17 @@ class LiveThread(QThread):
                     # 「命令前往」要它才知道"我在哪块平台上"（`_fh_seen` 的读数就是它）。
                     # 算不出来时写 None（**不是 0**，0 是地图西北角这个合法坐标，
                     # 见 perception/world_state.py）。
-                    _loc = self._locate_mmap(_mmap_panel)
+                    # （`_loc` 上面已经算过了 —— 它得先算，才能辅助挑玩家框 ✓）
                     if _loc is not None:
                         mm.apply_to_player(ws.player, _loc)
-                        perf.count("mmap_ok" if _loc.get("ok") else "mmap_miss")
                     # 「脚下属于哪些集合 / 贴在哪根绳上」也写进去（上绳执行器要用）——
                     # 2026-09-26 补：以前**没有任何地方写**，于是"到了"判不出来、
                     # "从绳上掉下来"每 2 秒误判一次 ⇒ 任务不停失败重试。
-                    self._fill_route_ctx(ws.player, _loc)
+                    # ⭐ **执行器通知显式传进去**（`agent.climbing_vertical()` = 上一拍
+                    #   climb/drop 执行器真发了 ↑/↓ ✓）—— 别让 `_fill_route_ctx` 自己去
+                    #   找 agent（2026-09-28 踩过：找的是个**根本不存在**的 `self.agent`
+                    #   ✗ ⇒ `ladder_id` 恒 None ⇒ 爬绳全废）。
+                    self._fill_route_ctx(ws.player, _loc, agent.climbing_vertical())
                     _t = time.perf_counter()
                     action = agent.tick(ws)
                     perf.ms("agent_ms", _t)
@@ -1240,48 +2077,79 @@ class LiveThread(QThread):
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                                 (255, 255, 255), 2, cv2.LINE_AA)
 
-                    # 攻击距离可视化：
-                    #   角色中心 → 最小攻击距离：橙色线（太近的规避范围）
-                    #   最小 → 最大攻击距离：黄色线（可攻击范围）
+                    # **攻击范围 = 矩形**（用户 2026-09-27：以前只画一条水平线）：
+                    #   攻击范围框 = 角色中心 → 最大攻击距离（含**上下攻击距离**）
+                    #   攻击盲区框 = 角色中心 → 最小攻击距离（最小距离 = 0 ⇒ 没有盲区 ⇒ 不画）
+                    # ⚠ 四条边怎么算**只有一处**：`decision.agent.attack_box_rect`
+                    #   （和判据 `DecisionAgent._in_box` 同源 ✓）—— 这儿自己再算一套的话，
+                    #   画出来的框和真能打到的范围迟早对不上 ✗。
+                    # ⚠ 竖直方向 **0 = 不限** ⇒ `attack_box_rect` 会画到画面边（把"不限"
+                    #   如实画出来 ✓）；两个都 0（老配置）就是整幅高度 ✓ = 老行为 ✓。
                     if player_box is not None:
                         cx, cy = int(player_box[0]), int(player_box[1])
                         facing = action.get("facing", 1)
                         dirn = 1 if facing > 0 else -1
                         max_ad = max(1, int(decision_settings.attack_dist))
                         min_ad = max(0, int(decision_settings.min_attack_dist))
-                        # 起算点 = **角色中心**（ex = cx），和 agent 的 _center_dist
+                        # ⚠ **负数 = 该方向不限、0 = 就是 0**（用户 2026-09-27 纠正的口径）
+                        #   ⇒ 这里**原样传**，**不许 clamp 成 0**（clamp 会把"不限"偷偷变成
+                        #   "打不到" ✗）。哪些情况是空集 / 哪些是"不限"、边界怎么画，
+                        #   全在 `agent.attack_box_rect` 一处判 ✓。
+                        _up_raw = getattr(decision_settings, "attack_up_dist", -1)
+                        _dn_raw = getattr(decision_settings, "attack_down_dist", -1)
+                        up_ad = -1 if _up_raw is None else int(_up_raw)
+                        down_ad = -1 if _dn_raw is None else int(_dn_raw)
+                        # 起算点 = **角色中心**（ex = cx），和 agent 的 `_center_dist`
                         # 口径一致（中心 → 怪框最近的边）。画在朝向边缘就会差半个
-                        # 框宽：怪框碰到黄线时其实还没进攻击范围，看着像坏掉。
+                        # 框宽：怪框碰到框线时其实还没进攻击范围，看着像坏掉。
                         # OpenCV 5 的 line/arrowedLine 不接受 float 坐标，必须取整。
                         ex = cx
                         max_x = ex + dirn * max_ad
-                        yellow = _attack_color        # 最大攻击距离线颜色
-                        orange = _min_attack_color    # 最小攻击距离/规避范围线颜色
-                        if min_ad > 0:
-                            min_x = ex + dirn * min_ad
-                            cv2.line(vis, (ex, cy), (min_x, cy), orange, 2)
-                            cv2.line(vis, (min_x, cy), (max_x, cy), yellow, 2)
-                            # 最小攻击距离处加橙色小刻度
-                            cv2.line(vis, (min_x, cy - 8), (min_x, cy + 8), orange, 2)
-                        else:
-                            cv2.line(vis, (ex, cy), (max_x, cy), yellow, 2)
-                        cv2.circle(vis, (cx, cy), 4, yellow, -1)
-                        cv2.line(vis, (max_x, cy - 8), (max_x, cy + 8), yellow, 2)
+                        yellow = _attack_color[:3]        # 「攻击范围框」颜色（画箭头用）
+                        orange = _min_attack_color[:3]
+                        _fh, _fw = vis.shape[:2]
 
-                        # 追击起跳区间：绿色线段（以最大攻击距离为基准偏移 min~max）
-                        if decision_settings.chase_jump_enabled:
+                        def _draw_box(ad, color, on, from_d=0.0):
+                            """按四条边画一个框；**空集（面积 0）⇒ 不画** ✓（用户 2026-09-27）。
+
+                            `from_d` = 水平方向的**起点距离**（默认 0 = 从角色中心起 ✓）——
+                            「攻击范围框」传 `min_ad`（它画的是**可攻击区**，不含盲区 ✓）、
+                            「追击起跳框」传 `max_ad + min` ✓。
+                            """
+                            if not on:
+                                return
+                            rect = agent_mod.attack_box_rect(
+                                cx, cy, ad, up=up_ad, down=down_ad, facing=facing,
+                                frame_w=_fw, frame_h=_fh, from_d=from_d)
+                            if rect is None:
+                                return          # 空集：判定跳过、这里也不画 ✓
+                            x0, y0, x1, y1 = rect
+                            p0 = (int(round(x0)), int(round(y0)))
+                            p1 = (int(round(x1)), int(round(y1)))
+                            _blit_alpha(vis, color,
+                                        lambda t, c: cv2.rectangle(t, p0, p1, c, 2))
+
+                        # 「攻击范围框」= **可攻击区**（最小 → 最大，**不含盲区**那块 ✓，
+                        # 用户 2026-09-27 的图上就是这么并排的）；盲区框 = 中心 → 最小 ✓
+                        _draw_box(max_ad, _attack_color, _on_attack, from_d=min_ad)
+                        _draw_box(min_ad, _min_attack_color, _on_blind)
+                        cv2.circle(vis, (cx, cy), 4, yellow, -1)       # 角色中心（起算点）
+
+                        # 「**追击起跳框**」（用户 2026-09-27：以前是条**绿线**、颜色还写死
+                        # 在这儿 ✗）：区间 = [最大攻击距离 + min, 最大攻击距离 + max] ✓，
+                        # 颜色/开关现在也在「设置 → 外观 → 辅助线与标记」里 ✓。
+                        # ⚠ **高度先跟「攻击范围框」一样**：用户说"后续需要算上**跳跃攻击范围**
+                        #   的高度（**当前先不算**）" ✓ ⇒ 那时这里是 `up_ad`/`down_ad` 再加上
+                        #   跳跃范围的高度 ✓（现在别自己编一个 ✗）。
+                        # ⚠ 它的**判定**仍是**水平距离**（`agent._in_chase_jump_range`）✓
+                        #   —— 画成框只是为了让人看得见，判据没变 ✓（用例 `t_chase_jump_*` 钉着）。
+                        if decision_settings.chase_jump_enabled and _on_chase:
                             jlo = int(decision_settings.chase_jump_min)
                             jhi = int(decision_settings.chase_jump_max)
                             if jlo > jhi:
                                 jlo, jhi = jhi, jlo
-                            if jlo != jhi:
-                                jx1 = max_x + dirn * jlo
-                                jx2 = max_x + dirn * jhi
-                                # 内侧部分会和黄色攻击线段重叠，下移几像素错开
-                                jy = cy + 6 if jlo < 0 else cy
-                                green = (0, 200, 0)
-                                cv2.line(vis, (jx1, jy), (jx2, jy), green, 2)
-                                cv2.line(vis, (jx2, jy - 8), (jx2, jy + 8), green, 2)
+                            _draw_box(max_ad + jhi, _chase_jump_color, True,
+                                      from_d=max_ad + jlo)
 
                         # 扫平台倾向朝向箭头：位于攻击距离上方，指向朝向方向，
                         # 尾巴延长至背后锁定距离（back_range）。back_range 也是
@@ -1295,26 +2163,64 @@ class LiveThread(QThread):
                                             (ex + dirn * arrow_len, arrow_y),
                                             yellow, 3, tipLength=0.35)
 
+                    # ---- ⭐⭐ **「玩家位置」箭头**（用户 2026-09-28 ✓）----
+                    #   用户原话："以玩家位置为原点画「向前箭头 + 向上箭头」，颜色、线段长度
+                    #   可配 ✓（画在实时预览上 ✓ 正好用它调试脚底偏移）"。
+                    #   ⇒ 以**脚底**（`框底 + 脚底偏移` ✓ 与相机 y 同一口径 ✓）为原点画两根：
+                    #      · 一根沿**世界 x 正方向**（画面上朝右 ✓）；
+                    #      · 一根沿**世界 y 正方向**（画面上朝上 ✓）。
+                    #   ⚠ 两根**同一个颜色**（用户 2026-09-28 改口径："x 箭头和 y 箭头应该是
+                    #     一个颜色"✓）＋**同一个粗细**（`player_arrow_width_px` ✓ 就在色块右边
+                    #     那一格调 ✓）；`箭头长度(px)` = 0 ⇒ 两根都不画 ✓。
+                    #   ⚠ 它**不参与任何决策**，纯粹给人看："箭头根部该正好落在脚底" ✓
+                    #     —— 偏上/偏下就是 `脚底偏移(px)` 没调对 ✓（这正是要它干的事 ✓）。
+                    #   ⚠ `箭头长度(px)` = 0 ⇒ **不画**（老行为 = 画面上没有任何新增 ✓）。
+                    #   ⚠ 原点取 `_last_player[0]` 的**框底**（和第 ① 条闸用同一份上一拍框 ✓
+                    #     —— 它在同一帧的玩家框算出来之前就已经有了 ✓）。
+                    _al = int(getattr(decision_settings, "player_arrow_len_px", 0) or 0)
+                    _aw = max(1, int(getattr(
+                        decision_settings, "player_arrow_width_px", 2) or 2))
+                    _pb_arrow = _last_player[0]
+                    if _al > 0 and _pb_arrow is not None and len(_pb_arrow) >= 6:
+                        try:
+                            from perception.world_state import hex_to_bgr
+                            # ⚠ 两根箭头**同一个颜色**（用户 2026-09-28："x 箭头和 y 箭头应该
+                            #   是一个颜色"✓）；粗细也是同一个值 ✓（可配 ✓）。
+                            _acol = hex_to_bgr(str(getattr(
+                                decision_settings, "player_arrow_color", "")))
+                            _ox = int(_pb_arrow[0])
+                            _oy = int(float(_pb_arrow[2]) + _ploc_fo)
+                            _h, _w = vis.shape[:2]
+                            if 0 <= _ox < _w and 0 <= _oy < _h:
+                                _ax = max(0, min(_ox + _al, _w - 1))
+                                _ay = max(0, _oy - _al)
+                                cv2.arrowedLine(vis, (_ox, _oy), (_ax, _oy),
+                                                _acol, _aw, tipLength=0.25)
+                                cv2.arrowedLine(vis, (_ox, _oy), (_ox, _ay),
+                                                _acol, _aw, tipLength=0.25)
+                        except Exception:
+                            pass
+
                     # 视野矩形：黑色虚线画出上下左右四条边。
-                    # 某方向 <0（不限制）则该边不画。
-                    if _vision_box[0] is not None:
+                    # 某方向 <0（不限制）则该边不画；`_on_vision` = 设置里那项的**开关** ✓。
+                    if _vision_box[0] is not None and _on_vision:
                         vleft, vtop, vright, vbottom = _vision_box[0]
                         vleft = max(0, min(vleft, vis.shape[1] - 1))
                         vright = max(0, min(vright, vis.shape[1] - 1))
                         vtop = max(0, min(vtop, vis.shape[0] - 1))
                         vbottom = max(0, min(vbottom, vis.shape[0] - 1))
                         if decision_settings.vision_top >= 0:
-                            _draw_dashed_line(vis, vtop, _vision_color,
-                                              thickness=_vision_width, x0=vleft, x1=vright)
+                            _blit_alpha(vis, _vision_color, lambda t, c: _draw_dashed_line(
+                                t, vtop, c, thickness=_vision_width, x0=vleft, x1=vright))
                         if decision_settings.vision_bottom >= 0:
-                            _draw_dashed_line(vis, vbottom, _vision_color,
-                                              thickness=_vision_width, x0=vleft, x1=vright)
+                            _blit_alpha(vis, _vision_color, lambda t, c: _draw_dashed_line(
+                                t, vbottom, c, thickness=_vision_width, x0=vleft, x1=vright))
                         if decision_settings.vision_left >= 0:
-                            _draw_dashed_vline(vis, vleft, _vision_color,
-                                               thickness=_vision_width, y0=vtop, y1=vbottom)
+                            _blit_alpha(vis, _vision_color, lambda t, c: _draw_dashed_vline(
+                                t, vleft, c, thickness=_vision_width, y0=vtop, y1=vbottom))
                         if decision_settings.vision_right >= 0:
-                            _draw_dashed_vline(vis, vright, _vision_color,
-                                               thickness=_vision_width, y0=vtop, y1=vbottom)
+                            _blit_alpha(vis, _vision_color, lambda t, c: _draw_dashed_vline(
+                                t, vright, c, thickness=_vision_width, y0=vtop, y1=vbottom))
 
                     # 怪物绿框：用 ws.mobs（含防抖幽灵目标），漏检后延迟防抖时间才消失
                     for m in ws.mobs:
@@ -1329,9 +2235,9 @@ class LiveThread(QThread):
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                                     _m_color, 1, cv2.LINE_AA)
 
-                    # 锁定目标怪：框标红（加粗），方便观测
+                    # 锁定目标怪：框标红（加粗），方便观测（`_on_lock` = 设置里那项开关 ✓）
                     tid = action.get("target")
-                    if tid is not None:
+                    if tid is not None and _on_lock:
                         for m in ws.mobs:
                             if m.id == tid:
                                 tx1 = int(m.x - m.w / 2)
@@ -1340,11 +2246,56 @@ class LiveThread(QThread):
                                 ty2 = int(m.y + m.h / 2)
                                 cv2.rectangle(vis, (tx1, ty1), (tx2, ty2),
                                               _lock_color, 3)
+                                # ⛔ 锁定框**只画框、不写地点**（用户 2026-09-27 明确：
+                                #   "**以前的锁定框表地点就不要了**" ✗）。
+                                #   ⚠ 以前这里读 `agent.current_target_sets()`（挑目标时顺手缓存
+                                #   的那份集合 ✓）画在"框下方靠左" —— 用户否掉之后那份缓存
+                                #   **也成了死数据** ⇒ 连同 `agent.current_target_sets()` 一起删了 ✗
+                                #   （"死数据不留" ✓）；地点现在只在**查过的怪框**那一行上 ✓。
                                 break
+
+                # ⭐ **"查过的怪框"标出来**（用户 2026-09-27："只要是**查询到的怪框地点**，
+                #   就标出来，**缓存失效再移除**" ✓）—— 数据来自解析器那个**唯一漏斗**记的账
+                #   （`_mark_mob_query` ✓，见 `mob_sets_of` 的说明 ✓）⇒ "**查过**"和"画面上有框"
+                #   是两件事：**只有真查过的才画** ✓（不是每只怪都画 ✗）。
+                #   画法：细框 + `查#id 集合名`（查了却判不出集合 ⇒ 把 `why` 写出来 ✓，
+                #   那正是最该看见的一档 ✗）；时间一到 `queried_mob_boxes()` 就把它剪掉 ✓。
+                #   ⭐ **地点（集合名）写在框下方靠左**（用户 2026-09-27 要求 ✓）——
+                #   以前画在**框上方** ✗；贴到画面下沿放不下时才翻回框上方 ✓。
+                #   ⚠ 颜色复用 `_lock_color`（和锁定框同一个开关 ✓，满足 UI 规范
+                #   "不许在绘制里写死颜色" ✗）；要独立颜色我再往 ui.yaml 加一行 ✓。
+                if _on_lock:
+                    for _qid, (_qbox, _qnames, _qwhy, _qsince, _qexp) in self.queried_mob_boxes():
+                        _qx, _qy, _qw, _qh = _qbox
+                        _qx1, _qy1 = int(_qx - _qw / 2), int(_qy - _qh / 2)
+                        _qx2, _qy2 = int(_qx + _qw / 2), int(_qy + _qh / 2)
+                        cv2.rectangle(vis, (_qx1, _qy1), (_qx2, _qy2), _lock_color, 1)
+                        # ⛔ **判不出时只写「失败」**（用户 2026-09-28：*"这样太丑了，不要显示
+                        #   这么长，**失败就写失败**，log 里会留痕迹"* ✗）。原来把**整句 `why`**
+                        #   拼在框下方 ⇒ 那句又长又套娃（`_lvl` 分档说明 + "它可能在半空 / 或那片
+                        #   没圈地形" ⇒ 70+ 字 ✗），而且**框一多就糊满半屏** ✗。
+                        # ✅ 详情**本来就有地方去**：`mob_fh` 事件带 `why`（那里**已截断 60 字** ✓
+                        #   够看到 `_lvl` 分到哪一级 ✓）⇒ 要排查去翻 log ✓，画面上只要"成没成" ✓。
+                        # ⚠ **成功时照旧写集合名**（那是"地点"，用户 2026-09-27 明确要的 ✓ 且短 ✓）。
+                        _qlbl = ("查#%s %s" % (_qid, "／".join(_qnames)) if _qnames
+                                 else "查#%s 失败" % (_qid,))
+                        # x 贴**框左边**（"靠左" ✓，留 2px 内缩）；y 在**框下沿往下 14px**
+                        _qly = _qy2 + 14
+                        if _qly > vis.shape[0] - 3:      # 贴画面下沿 ⇒ 翻到框上方 ✓
+                            _qly = max(10, _qy1 - 6)
+                        cv2.putText(vis, _qlbl, (_qx1 + 2, _qly),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, _lock_color, 1,
+                                    cv2.LINE_AA)
 
                 # 画框耗时：没画框的帧这里接近 0（大部分帧是不画的），
                 # 所以看 p95 / 最大才是真实开销。
                 perf.ms("draw_ms", _t_draw)
+
+                # **原生帧先发**（不受显示限流/合并影响）：框选/测量要的永远是**最新**
+                # 那一帧 —— 显示限流只该影响"画面上多久刷一次"，不该影响"取帧拿到多新"
+                #（面板那边只存个引用，几微秒，不画 ✓）。同一个线程发的两个队列信号按
+                # 发射顺序到达 ⇒ 面板先收到原生帧、再收到显示帧 ✓。
+                self.raw_frame_ready.emit(raw)
 
                 # 显示限流：到点了才推一帧。emit 是队列信号，不阻塞推理，
                 # 所以推理始终按自己的速度跑。
@@ -1460,6 +2411,7 @@ class LiveThread(QThread):
         finally:
             reader_done.set()
             agent_mod.CURRENT = None     # 注销：别再往一个停了的 agent 下命令
+            self.agent = None            # 本线程那份也摘掉（同上一行：停了的 agent 不留引用 ✓）
             agent.route_plan = None      # 顺手摘掉路径解析器（它的闭包持有本线程）
             try:
                 agent.shutdown()     # 释放所有按键，避免游戏里键一直按着

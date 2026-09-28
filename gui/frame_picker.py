@@ -27,7 +27,7 @@ from PyQt5.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QHBoxLayout,
                              QLabel, QLineEdit, QListWidget, QListWidgetItem,
                              QPushButton, QShortcut, QVBoxLayout, QWidget)
 
-from gui import labelio
+from gui import labelio, theme         # theme：弹窗几何按客户端存（config/ui.yaml）✓
 from gui.widgets import NoWheelComboBox
 
 # 显示用：框数只列「玩家 / 怪物」，其余有才列（和质检台信息行同一套规矩）
@@ -135,8 +135,9 @@ class FramePickDialog(QDialog):
         foot.addWidget(bb)
         root.addLayout(foot)
 
-        self.resize(720, 560)
+        self.resize(720, 560)          # 第一次打开用这个；之后按客户端记住的来 ✓
         self._populate()
+        theme.bind_window_state(self, "frame_picker")
 
     # ---------------- 列表 ----------------
 

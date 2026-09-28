@@ -1,13 +1,13 @@
 {
-  "frames": 27,
-  "boxes": 135,
-  "from_model": 23,
-  "boxes_from_model": 127,
-  "protected": 151,
-  "kept_orig": 4,
-  "boxes_kept": 8,
+  "frames": 21,
+  "boxes": 117,
+  "from_model": 18,
+  "boxes_from_model": 110,
+  "protected": 297,
+  "kept_orig": 3,
+  "boxes_kept": 7,
   "cleared": 0,
   "median_boxes": 6.0,
-  "conf_thr": 0.1,
-  "weights": "E:\\MyPrograms\\playerSimu\\projects\\寺院通道2\\models\\detect_v2.pt"
+  "conf_thr": 0.15,
+  "weights": "E:\\MyPrograms\\playerSimu\\projects\\寺院通道2\\models\\detect_v4.pt"
 }

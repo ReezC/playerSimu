@@ -1,7 +1,6 @@
 {
   "mob": {
     "frames": [
-      "frame_00000",
       "frame_00001",
       "frame_00002",
       "frame_00003",
@@ -264,9 +263,7 @@
       "frame_00260",
       "frame_00261",
       "frame_00262",
-      "frame_00263",
-      "frame_00264",
-      "frame_00265"
+      "frame_00263"
     ],
     "last_run": "2026-09-25 00:01"
   }

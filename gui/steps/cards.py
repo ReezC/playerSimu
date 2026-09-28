@@ -12,10 +12,12 @@ from pathlib import Path
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtWidgets import (QCheckBox, QDialog, QDoubleSpinBox, QHBoxLayout,
-                             QLabel, QMessageBox, QPushButton, QVBoxLayout)
+from PyQt5.QtWidgets import (QCheckBox, QDialog, QDoubleSpinBox, QFileDialog,
+                             QHBoxLayout, QLabel, QMessageBox, QPushButton,
+                             QVBoxLayout)
 
 from core import wincap, wzexport
+from gui import theme
 from gui.widgets import NoWheelComboBox, NoWheelDoubleSpinBox
 
 from .base import StepCard
@@ -1219,6 +1221,14 @@ class EditorCard(StepCard):
 
         self.btn_run.setVisible(False)          # 人工环节，无可运行任务
         self.btn_view.setText("打开质检台")      # 「查看」在这里的实际含义
+        # ---- **换个颜色把它拎出来**（用户 2026-09-27 要求）----
+        # 别的卡片的「查看」是"看结果"，这一个不一样：它是**进入人工环节的入口**——
+        # 点下去是**去干活**（翻帧、修框、剔除坏帧），而这一步"决定模型的上限"（见 hint ✓）。
+        # 用 `theme.ENTRY_BTN_QSS` = 和「寻路编辑器」**同一个角色**（色值只写一处 ✓）：
+        # 那套配色的角色划分是 蓝=运行/主按钮、靛蓝=**打开一个干活的地方**、绿=通过、
+        # 橙=提醒、红=错误 —— 用主按钮蓝会和「运行」混在一起 ✗（那张卡片上恰好没有
+        # 「运行」，蓝色会变成"这里是主操作"的错觉：它的主操作其实是**人去看**✓）。
+        self.btn_view.setStyleSheet(theme.ENTRY_BTN_QSS)
 
     def build_params(self, form):
         note = QLabel(
@@ -1457,13 +1467,34 @@ class TrainCard(StepCard):
             "下一步做什么。")
         self.btn_report.clicked.connect(self._open_report)
         foot.addWidget(self.btn_report)
+        #: 「基础权重」下拉里**上一次的合法取值**：选了「（自定义 / 浏览…）」之后又取消时，
+        #: 靠它把选择还原（别停在那一项上 —— 它不是个真的权重 ✗）。
+        self._model_prev = None
+
+    #: 「基础权重」下拉里"自定义"那一项的 userData（选中它会弹文件选择器 —— 不是权重名 ✓）
+    MODEL_CUSTOM = "\x00custom"
 
     def build_params(self, form):
-        self.field(form, "model", "基础权重", "str", "yolo26n.pt")
-        self.widgets["model"][0].setToolTip(
-            "预训练模型，决定速度和精度。\n"
+        # ---- 基础权重：**下拉**（2026-09-27 用户要求"整理一下"）----
+        # 以前是**文本框**：人根本不知道有哪些能选、该填什么 ✗。候选三组（见 `_fill_model_options`）：
+        #   官方预训练 / **各项目已经练好的权重** / 自定义路径。
+        # 为什么值得单独做：新开的项目和旧项目**背景、怪都很像**时，直接挑**旧项目那一版**
+        # 当起点微调，比从 `yolo26n.pt` 从零学省得多 ✓（模型学的是外观特征，跨图能用 ——
+        # ④ 的「YOLO 权重」下拉当初就是为这件事做的 ✓）。
+        self.field(form, "model", "基础权重", "combo")
+        cmb = self.widgets["model"][0]
+        cmb.setMaxVisibleItems(20)
+        cmb.setToolTip(
+            "拿哪个权重当**起点**训练（决定速度和精度，也决定起步有多好）。\n\n"
+            "· **官方预训练**（yolo26n.pt / yolov8n.pt…）：从零学，最慢、也最「干净」；\n"
+            "· **各项目练好的**（项目名 / 权重名）：新图和那张图**背景、怪很像**时选它 ——\n"
+            "  拿旧模型微调，比从零学快得多也更准 ✓（本项目上一版也在这一组里）；\n"
+            "· **（自定义 / 浏览…）**：挑任意 .pt（例如 runs 里某一版 best.pt）。\n\n"
             "n 最小最快（数据少/显存小选它），s/m/l/x 越来越准也越来越慢。\n"
-            "本地没有会自动联网下载。")
+            "本地没有的官方权重会自动联网下载。\n"
+            "⚠ 换了基础权重，这一版的 mAP 就不能和上一版直接比了（起点不同 —— "
+            "「查看报告」里会写出每版用的基础权重 ✓）。")
+        cmb.activated[int].connect(self._on_model_pick)
 
         self.field(form, "epochs", "轮数", "int", 120, minimum=1, maximum=5000)
         self.widgets["epochs"][0].setToolTip(
@@ -1486,8 +1517,92 @@ class TrainCard(StepCard):
             "0 = 第一块 GPU，cpu = 用 CPU（会很慢）。\n"
             "多卡时写 0,1 或 0,1,2。")
 
+    def _fill_model_options(self, p=None, cur=None):
+        """填「基础权重」下拉：官方预训练 + **所有项目**已训好的权重 + 自定义。
+
+        候选来自两处**现成**设施（不新写一份扫描 ✗）：
+          · 仓库根目录的 `*.pt` —— 官方预训练（本机实测有 `yolo26n.pt` / `yolov8n.pt` ✓）；
+          · `tools.yolo_augment.list_weights()` —— 每个项目 `models/*.pt`（④ 那张卡的
+            「YOLO 权重」下拉就是它，**同一处口径** ✓；顺带带出该项目的角色 id ✓）。
+
+        ⚠ **当前值一定要在列表里**（连"老项目里手打过的怪路径"也算一项 ✓）：`set_value`
+          是按 userData `findData` 匹配的，不在列表里就**静默不选中** ⇒ 界面显示的和你
+          实际拿去训练的会不一致 ✗（这类不一致最难查）。
+        """
+        w = self.widgets.get("model", (None, None))[0]
+        if w is None:
+            return
+        if cur is None:
+            cur = w.currentData()
+        root = Path(__file__).resolve().parents[2]      # gui/steps/cards.py → 仓库根
+        official = sorted(q.name for q in root.glob("*.pt"))
+        if "yolo26n.pt" not in official:
+            official.insert(0, "yolo26n.pt")            # 默认值永远要有（没有会联网下载 ✓）
+        try:
+            from tools.yolo_augment import list_weights
+            trained = list_weights()
+        except Exception:                               # noqa: BLE001
+            trained = []
+
+        w.blockSignals(True)
+        w.clear()
+        for nm in official:
+            w.addItem("%s%s" % (nm, "（默认）" if nm == "yolo26n.pt" else ""), nm)
+        if trained:
+            w.insertSeparator(w.count())
+        # 当前项目的名字：**目录名优先**（`list_weights` 的标签前缀就是目录名 ✓；
+        # `Project.name` 读的是 project.yaml 里那格 `name`，没填过就是空的 ⇒ 只认它会漏标 ✗）
+        mine = str(getattr(getattr(p, "root", None), "name", "")
+                   or getattr(p, "name", "") or "")
+        for label, path, pid in trained:
+            tail = ("　· 玩家:%s" % pid) if pid else ""
+            if mine and label.startswith(mine + " / "):
+                tail += "　（本项目）"
+            w.addItem(label + tail, path)
+        w.insertSeparator(w.count())
+        w.addItem("（自定义 / 浏览…）", self.MODEL_CUSTOM)
+        if cur and w.findData(cur) < 0:
+            # 存着的值不在候选里（手打过的路径 / 已删掉的旧版本…）⇒ 补一项，**别吞掉** ✗
+            w.insertItem(0, "（当前填写）%s" % cur, cur)
+        i = w.findData(cur) if cur else -1
+        if i >= 0:
+            w.setCurrentIndex(i)
+        w.blockSignals(False)
+        self._model_prev = cur
+
+    def _on_model_pick(self, idx):
+        """下拉里选了「（自定义 / 浏览…）」⇒ 弹文件选择；选别的只记住它（供取消时还原 ✓）。
+
+        为什么留这个逃生口：下拉**只能选候选**，而"别的机器上训的 / 手头的实验权重"也该
+        填得进去 —— 不给口子就等于把原来"随便填"的能力弄丢了 ✗（用户明确要的是"整理"，
+        不是"限制"）。
+        """
+        w = self.widgets.get("model", (None, None))[0]
+        if w is None:
+            return
+        data = w.itemData(idx)
+        if data != self.MODEL_CUSTOM:
+            self._model_prev = data
+            return
+        start = str(self._model_prev or "")
+        path, _f = QFileDialog.getOpenFileName(
+            self, "选一个 .pt 当基础权重",
+            (str(Path(start).parent) if start else ""),
+            "PyTorch 权重 (*.pt);;所有文件 (*)")
+        if not path:
+            i = w.findData(self._model_prev)            # 取消 ⇒ 还原（别停在"自定义"上 ✗）
+            w.setCurrentIndex(i if i >= 0 else 0)
+            return
+        if w.findData(path) < 0:
+            w.insertItem(w.count() - 1, "（自定义）%s" % path, path)
+        w.setCurrentIndex(w.findData(path))
+        self._model_prev = path
+
     def load_from_project(self, p):
         sec = p.sec("train")
+        # ⚠ 顺序：**先填候选、再回填取值** —— `set_value("model", …)` 是按 userData 找项，
+        # 列表里没有那一项就静默不选中（界面上显示的是别的权重，训练却用存的那个 ✗）。
+        self._fill_model_options(p, cur=sec.get("model") or "yolo26n.pt")
         for k in ("model", "epochs", "imgsz", "batch", "device"):
             self.set_value(k, sec.get(k))
 

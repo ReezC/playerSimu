@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
                              QPushButton, QSplitter, QVBoxLayout, QWidget)
 
 from core import wzexport
+from gui import theme                  # 弹窗几何按客户端存（config/ui.yaml）✓
 
 _THUMB = 48
 _MAX_CANDIDATES = 200   # 单次筛选最多展示的候选数，避免候选爆炸拖慢界面
@@ -128,6 +129,7 @@ class MobPickDialog(QDialog):
 
         self._refresh_list()
         self._refilter()
+        theme.bind_window_state(self, "mob_picker")    # 拉过的大小/位置按客户端记住 ✓
 
     _LIST_QSS = ("QListWidget { border: 1px solid #dadce0; border-radius: 6px;"
                  " background: #fafbfc; }"

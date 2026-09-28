@@ -15,12 +15,14 @@ calib:
   step: 0.1
   sample: 5
 bars: {}
+mmap_crop: null
 decision:
-  attack_dist: 400.0
-  min_attack_dist: 50
+  attack_dist: 80.0
+  min_attack_dist: 0
   chase_jump_enabled: true
-  chase_jump_min: -30
+  chase_jump_min: -10
   chase_jump_max: 5
+  chase_jump_dash_ms: 0
   mouse_speed: 1.8000000000000005
   evade_type: jump
   jump_interval: 0
@@ -50,12 +52,6 @@ decision:
     key: forward
   output_seq:
   - type: down
-    key: jump
-    prob: 10
-    then:
-    - type: up
-      key: jump
-  - type: down
     key: attack
   - type: up
     key: attack
@@ -65,7 +61,7 @@ decision:
     right: right
     up: up
     down: down
-    attack: s
+    attack: t
     jump: D
     hp_pot: g
     mp_pot: null
@@ -75,32 +71,37 @@ decision:
   target_cd:
   - 1500
   - 2500
-  input_device: local
-  input_delay:
-  - 0
-  - 50
-  attack_cd: 200
+  input_device: remote
+  attack_cd: 300
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 1000
   turn_output_delay_ms: 200
   player_track_jump: 200
-  hp_bar: null
-  mp_bar: null
+  hp_bar:
+  - 0.341142
+  - 0.971354
+  - 0.120791
+  - 0.022135
+  mp_bar:
+  - 0.462665
+  - 0.970052
+  - 0.122987
+  - 0.02474
   probe_calib: {}
   hp_color:
   - - 0
     - 0
-    - 137
-  - - 78
-    - 80
+    - 135
+  - - 89
+    - 91
     - 255
   mp_color:
-  - - 144
-    - 78
+  - - 136
+    - 81
     - 0
   - - 255
-    - 198
-    - 77
+    - 201
+    - 102
   hp_threshold: 30
   mp_threshold: 7
   pot_cd: 1500
@@ -111,22 +112,47 @@ decision:
   vision_bottom: 200
   vision_left: -1
   vision_right: -1
-  vision_center: true
+  vision_center: false
   vision_off_x: 0
   vision_off_y: 0
-  sweep_turn_cd: 1000
-  back_range: 200
-  route_enabled: false
-  debounce_conf: 0.45
+  sweep_turn_cd: 500
+  back_range: 150
+  route_goto_set: ''
+  align_tol_px: 10
+  align_hold_ms: 250
+  climb_align_gap_ms: 180
+  climb_align_near_px: 20
+  climb_retry_delay_s: 1.0
+  climb_retry_delay_inc_s: 1.0
+  goto_timeout_s: 30.0
+  stall_s: 3.0
+  climb_reassert_s: 3.0
+  battle_zone_sets: []
+  debounce_conf: 0.6
   debounce_ms: 2000
-  auto_feed_pet: true
-  feed_interval_min: 6.0
-  feed_interval_max: 8.0
-  custom_timers: []
-  facing_timeout_min: 2.0
+  custom_timers:
+  - name: 自动回避药水
+    seq:
+    - type: down
+      key: 回避药水
+    - type: up
+      key: 回避药水
+    interval:
+    - 3.0
+    - 3.0
+  - name: 无语表情
+    seq:
+    - type: down
+      key: 表情_无语
+    - type: up
+      key: 表情_无语
+    interval:
+    - 5.0
+    - 10.0
+  facing_timeout_min: 0.0
   player_lost_timeout_min: 3.0
   resetall_interval: 60
-  anti_afk_enabled: false
+  anti_afk_enabled: true
   anti_afk_type: hidden_rest
   anti_afk_min: 25.0
   anti_afk_max: 30.0
@@ -178,6 +204,11 @@ decision:
     key: 普攻
   anti_afk_rest_min: 4.5
   anti_afk_rest_max: 5.5
+  anti_afk_spot_set: ''
+  anti_afk_spot_seq: []
+  anti_afk_spot_after: ''
+  anti_afk_retry_on_interrupt: false
+  anti_afk_retry_sec: 60.0
   reconnect_enabled: false
   reconnect_probe_after_lost_sec: 0.0
   reconnect_step_timeout_ms: 3000

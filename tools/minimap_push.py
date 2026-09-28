@@ -7,7 +7,7 @@
 
     python -m tools.minimap_push --pick            # 先在屏幕上框一次小地图区域
     python -m tools.minimap_push --x 100 --y 40 --w 200 --h 150
-    python -m tools.minimap_push --zoom 4 --fps 10
+    python -m tools.minimap_push --zoom 4 --fps 30
 
 **为什么要单独推一路**（而不是从主画面里抠）：
   · 主画面是 H.264 压过的，小地图上的黄点只有 2~5 像素，压完就糊了；
@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 ROOT = Path(__file__).resolve().parent.parent
 REGION_FILE = ROOT / "config" / "minimap_region.json"
 
-DEFAULTS = {"bind": "0.0.0.0", "port": 5003, "zoom": 3, "fps": 10,
+DEFAULTS = {"bind": "0.0.0.0", "port": 5003, "zoom": 3, "fps": 30,
             "quality": 100, "region": None}
 
 

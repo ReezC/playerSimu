@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (QDialog, QFileDialog, QHBoxLayout, QLabel,
                              QProgressBar, QPushButton, QVBoxLayout)
 
 from core import wzexport
+from gui import theme                  # 弹窗几何按客户端存（config/ui.yaml）✓
 from gui.worker import TaskThread, safe_slot
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -30,6 +31,7 @@ class ExportDialog(QDialog):
         self.task = None
         self._build()
         self._load()
+        theme.bind_window_state(self, "export")        # 拉过的大小/位置按客户端记住 ✓
 
     # ---------------- 界面 ----------------
 

@@ -56,7 +56,7 @@ DEFAULTS = {
         "bind": "0.0.0.0",
         "port": 5003,    # 与 link.yaml 的 minimap.port 一致
         "zoom": 3,
-        "fps": 10,
+        "fps": 30,
         "quality": 100,
         # 小地图面板在 A 机屏幕上的矩形（屏幕坐标）。None = 还没框选，
         # 界面上的「框选…」按钮就是往这四个键里写。

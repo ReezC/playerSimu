@@ -19,9 +19,9 @@
 """
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QPixmap
+from PyQt5.QtGui import QKeySequence, QPixmap
 from PyQt5.QtWidgets import (QHBoxLayout, QLabel, QMessageBox, QPushButton,
-                             QSizePolicy, QVBoxLayout, QWidget)
+                             QShortcut, QSizePolicy, QVBoxLayout, QWidget)
 
 from gui import labelio
 from gui.canvas import ImageCanvas
@@ -54,6 +54,11 @@ class ReviewPanel(QWidget):
         self._undo = []         # 撤销栈 [(stem, snapshot), ...]，snapshot 是操作前框列表
         self._clipboard = []    # 复制的框 [(cls, x, y, w, h, manual), ...]
 
+        # 「聚焦质检台」= 焦点在**本面板或其子控件**上（见 `_build` 里那对方向键快捷键）。
+        # QWidget 默认是 NoFocus ⇒ 不设这个的话，**点空白处**焦点还留在别的页签上，
+        # 人在面板里按 ←→ 却是别处在响应 ✗（画布本身有焦点 ✓，但空手点一下就丢了）。
+        self.setFocusPolicy(Qt.StrongFocus)
+
         self._build()
 
     # ══════════════════════════════════════════════════
@@ -72,6 +77,8 @@ class ReviewPanel(QWidget):
             b = QPushButton(text)
             b.setFixedWidth(36)
             b.setStyleSheet("padding: 2px 4px;")
+            # 快捷键写在按钮 tooltip 上（和这一页其它按钮一个规矩 ✓）：不写出来没人知道
+            b.setToolTip("上一帧（←）" if delta < 0 else "下一帧（→）")
             b.clicked.connect(lambda _, d=delta: self.step(d))
             bar.addWidget(b)
             if delta < 0:
@@ -101,6 +108,22 @@ class ReviewPanel(QWidget):
         bar.addWidget(b)
 
         root.addLayout(bar)
+
+        # ---- 键盘：← / → 切帧（2026-09-27 用户要求："聚焦质检台时，希望能按←→切换帧"）----
+        # 为什么是 `QShortcut` + `WidgetWithChildrenShortcut`，而不是 `keyPressEvent`：
+        #   这一页是**多控件**面板（画布 / 筛选下拉 / 滑块 / 按钮），焦点几乎从来不在面板
+        #   本身 ⇒ `keyPressEvent` 基本收不到 ✗（症状正是"有时候能切、有时候不能"）。
+        #   而这个 context 的语义恰好是"焦点在本面板**或其任何子控件**上都算聚焦质检台" ✓，
+        #   它**不会溢到别的页签**（主窗口还挂着实时 / 路线识别那些页 ✓）—— 这正是用户
+        #   说的"**聚焦质检台时**" ✓（`WindowShortcut` 就是错的：在别的页签上也会抢 ←→ ✗）。
+        # ⚠ 交互取舍：焦点在**滑块**上时 ←→ 也归切帧 —— 滑块本来就用 ←→ 挪一格，而那一格
+        #   正好也是一帧 ⇒ 行为一致 ✓；焦点在**筛选下拉**上时同理（它还有上下键和鼠标 ✓）。
+        #   质检是"一帧一帧过"的活，切帧是主意图 ✓。
+        # ⚠ 按住不放会**自动重复**（`QShortcut` 默认行为）= 连切 ✓。
+        for key, delta in ((Qt.Key_Left, -1), (Qt.Key_Right, 1)):
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.WidgetWithChildrenShortcut)
+            sc.activated.connect(lambda d=delta: self.step(d))
 
         # ---- 画布 ----
         self.canvas = ImageCanvas()
@@ -161,10 +184,12 @@ class ReviewPanel(QWidget):
 
         # ---- 操作提示：只留「手上要用的」，快捷键细节放按钮 tooltip，别挤成一长条 ----
         hint = QLabel("空白拖=建框（按住 Ctrl 拖 = 玩家框）　框边拖=缩放　"
-                      "Del=删框　滚轮=缩放　中键拖=平移　双击=适应窗口")
+                      "Del=删框　滚轮=缩放　中键拖=平移　双击=适应窗口　"
+                      "←/→=上一帧/下一帧")
         hint.setStyleSheet("color: #80868b;")
         hint.setToolTip("复制 / 粘贴 / 撤销：Ctrl+C / Ctrl+V / Ctrl+Z（也可用上面的按钮）\n"
-                        "按住 Ctrl 拖空白处 = 按「玩家」类建框，松开 Ctrl 后回到下拉框选的类")
+                        "按住 Ctrl 拖空白处 = 按「玩家」类建框，松开 Ctrl 后回到下拉框选的类\n"
+                        "← / →：上一帧 / 下一帧（焦点在这个面板里就行，按着不放会连切 ✓）")
         root.addWidget(hint)
 
     # ══════════════════════════════════════════════════

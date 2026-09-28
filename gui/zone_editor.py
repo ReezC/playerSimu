@@ -34,19 +34,20 @@ from PyQt5.QtGui import (QAbstractTextDocumentLayout, QBrush, QColor, QFont,
                          QPainterPathStroker, QPen, QPixmap, QPolygonF,
                          QTextDocument, QTextOption)
 from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
-                             QDialog, QDialogButtonBox, QFormLayout, QFrame,
+                             QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QFrame,
                              QGraphicsLineItem, QGraphicsPixmapItem,
                              QGraphicsScene, QGraphicsSimpleTextItem,
-                             QHBoxLayout, QInputDialog, QLabel, QListWidget,
-                             QListWidgetItem, QMessageBox, QPushButton,
-                             QScrollArea, QSizePolicy, QStyle,
-                             QStyledItemDelegate, QStyleOptionViewItem,
+                             QGridLayout, QGroupBox, QHBoxLayout, QInputDialog,
+                             QLabel, QListWidget, QListWidgetItem, QMessageBox,
+                             QPushButton, QScrollArea, QSizePolicy, QSplitter,
+                             QStyle, QStyledItemDelegate, QStyleOptionViewItem,
                              QVBoxLayout, QWidget)
 
 from core import mapdata, zones
 from gui import theme
 from gui.canvas import ZoomPanView
-from gui.widgets import NoWheelComboBox, NoWheelSlider
+from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSlider,
+                         scroll_area)
 
 #: 点选的拾取半径（**屏幕像素 ÷ 当前缩放**，见 _ZoneView）：线段很细，
 #: 要求"正好点在线上"是不可能的 —— 矢量编辑器都带这个容差。
@@ -138,8 +139,9 @@ def edge_row_key(e, focus):
     中文按**码点**排（不是拼音）：只求稳定可预期，不求像字典。
     """
     other = e.get("from") if e.get("to") == focus else e.get("to")
+    # ⚠ 排序键里原来还有 `portal`（走哪个门）那一格 —— 2026-09-27 随「传送门」移除 ✓
     return (str(other or ""), _KIND_ORDER.get(e.get("kind") or "?", 99),
-            str(e.get("ladder") or ""), str(e.get("portal") or ""))
+            str(e.get("ladder") or ""))
 
 
 #: 列表行里"非名字"部分的文字颜色：交给调色板（**不是**写死的黑）——
@@ -151,6 +153,10 @@ def edge_row_key(e, focus):
 #: （见 C_SETNAME）。编号不是集合名，用蓝就会误导（第一版就是蓝的 ✗）。
 #: 注：绳梯那根**线**仍是蓝的点线（C_LADDER）—— 规矩管的是**字**。
 C_LADDER_ID = "#f1f3f4"
+
+#: 同一对集合里**后续行**的缩进（两个全角空格 —— 和组头 `名字 → ` 后面那个同宽 ✓）。
+#: 为什么用全角：这一栏是中文界面，半角空格在比例字体里几乎看不见（等于没缩进 ✗）。
+EDGE_INDENT = "　　"
 
 
 # ══════════════════════════════════════════
@@ -186,6 +192,27 @@ def pick_at(terrain, x, y, tol):
         d = dist_to(f, x, y)
         if d <= tol and (best_d is None or d < best_d):
             best, best_d = f, d
+    return best
+
+
+def dist_to_ladder(L, x, y):
+    """点到某根绳梯的距离（绳梯是**竖直线段** `(L.x, L.y1)…(L.x, L.y2)` ✓）。"""
+    return dist_point_seg(x, y, float(L.x), float(L.y1), float(L.x), float(L.y2))
+
+
+def pick_ladder(terrain, x, y, tol):
+    """(x, y) 附近最近的**绳梯** → Ladder / None（口径与 `pick_at` **同一把尺** ✓）。
+
+    用户 2026-09-27 要求："foothold 编辑器希望能**点选绳梯**（为了快速查看它的信息），
+    **不用接逻辑**" ⇒ 它只用来"**看**" ✓：不进选择集、不写文件、不进撤销栈 ✗。
+    `tol` 与 `pick_at` 同源 —— 由调用方按当前缩放换算（`PICK_PX` ✓），
+    保证"看着点中了 = 真的点中了" ✓（细线本来点不中，容差是功能不是手感 ✓）。
+    """
+    best, best_d = None, None
+    for L in (getattr(terrain, "ladders", None) or []):
+        d = dist_to_ladder(L, x, y)
+        if d <= tol and (best_d is None or d < best_d):
+            best, best_d = L, d
     return best
 
 
@@ -500,7 +527,7 @@ class AddReachDialog(QDialog):
     #: 所以必须主动通知外面（外面据此真的加/改那条边）。
     applied = pyqtSignal(dict)
 
-    def __init__(self, parent, src, dst_all, dst_related=(), ladders=(), portals=(),
+    def __init__(self, parent, src, dst_all, dst_related=(), ladders=(),
                  drop_choices=(), init=None):
         super().__init__(parent)
         self.src = str(src)                 # 起点（外面加边时要用）
@@ -510,6 +537,10 @@ class AddReachDialog(QDialog):
         self._init = dict(init) if init else None
         self.setWindowTitle(("%s可达 —— %s" % ("编辑" if self._init else "增加", src)))
         self.setMinimumWidth(440)
+        # ⭐ 跟**其它弹窗同一套**（用户 2026-09-28："居中、放弃位置记忆，我期望的是调整过的
+        #   缩放数据记忆要有"✓ ⇒ 每次显示都**居中到主窗口** ✓、尺寸沿用拉过的那份 ✓）。
+        #   ⚠ 这个窗原来**漏在规范外**（既没接几何、也没人发现 ✗）—— 这一轮补齐 ✓。
+        theme.bind_window_state(self, "add_reach")
         self.result_dict = None
         self._src = str(src)
         # 终点候选**排序**（2026-09-26 要求"自动 sort"）：原来按注册顺序列，
@@ -554,8 +585,7 @@ class AddReachDialog(QDialog):
             "  走       —— 走过去（同层、无缝）\n"
             "  爬（绳梯）—— 爬绳 / 梯子（要指名哪根绳）\n"
             "  跳       —— 站在 foothold **边缘按跳键**，平着 / 斜着蹦过去\n"
-            "  下跳     —— **按住 ↓ 再按跳**，从平台上穿下去、落到下一层\n"
-            "  传送门   —— 走哪个门（要指名哪个门）\n\n"
+            "  下跳     —— **按住 ↓ 再按跳**，从平台上穿下去、落到下一层\n\n"
             "⚠ 「跳」和「下跳」是**两种不同的按法**，别混：跳是往前蹦，下跳是往下穿。\n"
             "这两种都要用到跳键 ⇒ 真执行前得先做**跳跃标定**（现在先把位置标出来即可）。")
         form.addRow("通行方式", self.cmb_kind)
@@ -569,11 +599,8 @@ class AddReachDialog(QDialog):
             self.cmb_lad.addItem(text, lid)
         form.addRow(self.lbl_lad, self.cmb_lad)
 
-        self.lbl_por = QLabel("走哪个门")
-        self.cmb_por = NoWheelComboBox()
-        for pn, text in sorted(portals, key=lambda x: _natural(x[0])):
-            self.cmb_por.addItem(text, pn)
-        form.addRow(self.lbl_por, self.cmb_por)
+        # ⚠ 这里原来还有「走哪个门」（传送门）那一行 —— 2026-09-27 随「传送门」这种
+        #   通行方式一起**移除**了（`zones.EDGE_KINDS` 现在只有走/爬/下跳/跳 ✓）。
 
         # ---- 走(walk) 的方向类型（2026-09-26 用户要求）----
         self.lbl_wd = QLabel("类型")
@@ -581,10 +608,46 @@ class AddReachDialog(QDialog):
         for v in zones.WALK_DIRS:
             self.cmb_wd.addItem(zones.WALK_DIR_LABELS[v], v)
         self.cmb_wd.setToolTip(
-            "「走」的方向类型：**默认方向**（朝目标走）/ **仅向左** / **仅向右**。\n\n"
-            "⚠ 现在**只是配置占位**：执行器还没有「走到 x」那一步，这三个值暂时\n"
-            "不影响任何行为 —— 先填着、能存住，逻辑后面再做。")
+            "「走」的方向类型（**逐边**配，2026-09-27 起真的生效）：\n"
+            "· 默认方向 = 朝**目标集合所有落点 x 的中点**走；\n"
+            "· 仅向左 / 仅向右 = **只按那一边**，一直按到踏上目标集合（不看中点）——\n"
+            "  适合「从平台边缘往左走出去、掉到下面那层」这种边。\n\n"
+            "⚠ 只按一边时若 x 一直不动（被墙挡住 / 方向配反了），会在「走不动了」\n"
+            "那一刻如实报出来，不会干等到超时。")
         form.addRow(self.lbl_wd, self.cmb_wd)
+
+        # ---- 「爬（绳梯）」的**中途跳下**（2026-09-28 用户要求 ✓）----
+        # ⭐ **二级联动**：先选方向（`cmb_mid`）⇒ 选了**非空**才出现「高度」（`spn_mid_y`）✓。
+        # ⚠ 这是全项目**第一个"下拉引起的二级显隐"** ⇒ 一级样板是 `cmb_kind`/`_sync_kind` ✓
+        #   （⚠ 别忘把 `cmb_mid` 的变化也接进 `_sync_kind` ✗ —— 不然改了下拉、"高度"那行不跟着动 ✓）。
+        self.lbl_mid = QLabel("中途跳下")
+        self.cmb_mid = NoWheelComboBox()
+        for _v in zones.MID_JUMP_DIRS:
+            self.cmb_mid.addItem(zones.MID_JUMP_LABELS[_v], _v)
+        self.cmb_mid.setToolTip(
+            "「爬」的**中途跳下**（**逐边**配，2026-09-28 用户要求）：\n"
+            "· **（不中途跳下）** = 老行为，整段爬到底（一个字不变 ✓）；\n"
+            "· **默认（向目标中心）/ 仅向左 / 仅向右** = 爬到某一点就跳下，方向按这里选的 ✓"
+            "（向目标中心 = 朝目标集合的 x 中点；仅向左 / 仅向右 = 只按那一边 ✓）。\n"
+            "选了非空的方向后，下面会多出「**高度**」一格 ✓。")
+        form.addRow(self.lbl_mid, self.cmb_mid)
+
+        # 「高度」= 中途跳下那一处的**世界坐标 y（⚠ 越小越靠上）**；只有方向非空才出现 ✓。
+        self.lbl_mid_y = QLabel("高度")
+        # ⚠ 必须用 `NoWheelDoubleSpinBox`（UI 规范：**滚轮不许改参数** ✗ `check_ui` 会拦 ✓）
+        self.spn_mid_y = NoWheelDoubleSpinBox()
+        self.spn_mid_y.setRange(-4000.0, 4000.0)
+        self.spn_mid_y.setDecimals(0)
+        self.spn_mid_y.setValue(0.0)
+        self.spn_mid_y.setToolTip(
+            "「中途跳下」的**高度** —— 世界坐标 **y**（⚠ **越小越靠上**）\n"
+            "（就是小地图算出来的那套坐标 ✓，和「寻路编辑器」里 foothold 的 y 同一套 ✓）。\n\n"
+            "执行器那边的判据是「**人已经爬到该高度或更高**」（`py ≤ 高度` ✓ —— 世界 y 越小越靠上）：\n"
+            "· 往上爬时人**从绳下端**出发 ⇒ 爬到你这儿配的高度**就跳下去** ✓；\n"
+            "· 想「**永不触发**」得配得比这根绳的**上端**还小 ✓。\n\n"
+            "⚠ 这条判据**改过一次**（2026-09-28）：原来是「人的 y ≥ 高度」（= 人在这点的**下方**）"
+            "⇒ 一上绳就满足 ⇒ 一触发就把机会用掉 ⇒ **之后爬到顶也不跳** ✗（现场就是这么坏的 ✓）。")
+        form.addRow(self.lbl_mid_y, self.spn_mid_y)
         root.addLayout(form)
 
         # ---- 下跳：**从哪些 foothold 起跳**（2026-09-26 用户要求）----
@@ -641,8 +704,24 @@ class AddReachDialog(QDialog):
 
         self.ck_all.toggled.connect(lambda *_: self._fill_dst())
         self.cmb_kind.currentIndexChanged.connect(lambda *_: self._sync_kind())
+        # ⚠ 「中途跳下」**自己变了也要重算显隐**（二级联动 ✓）：它决定「高度」那一行出不出现 ✓
+        #   （只接 `cmb_kind` 的话，改完下拉「高度」不跟着动 ✗ —— 这类漏接只能靠这条说明防 ✓）
+        self.cmb_mid.currentIndexChanged.connect(lambda *_: self._sync_kind())
         self._fill_dst()
         self._fill_drop()
+        # ⭐ 爬的「中途跳下」**回填**（2026-09-28 ✓）—— 放在 `_sync_kind()` **之前** ✗：
+        #   那样它会按**刚填进去**的值决定「高度」那一行显示不显示 ✓（顺序反了会一直是隐藏 ✓）
+        if self._init:
+            _d0 = (self._init.get("mid_dir")
+                   if isinstance(self._init, dict) else None)
+            _k0 = self.cmb_mid.findData(zones.mid_jump_dir({"mid_dir": _d0}))
+            if _k0 >= 0:
+                self.cmb_mid.setCurrentIndex(_k0)
+            try:
+                if _d0:
+                    self.spn_mid_y.setValue(float(self._init.get("mid_y") or 0.0))
+            except (TypeError, ValueError):
+                pass
         self._sync_kind()
         if self._init:
             self._apply_init()
@@ -668,8 +747,8 @@ class AddReachDialog(QDialog):
                 self.cmb_dst.setCurrentIndex(j)
         j = self.cmb_kind.findData(d.get("kind"))
         if j >= 0:
-            self.cmb_kind.setCurrentIndex(j)     # 触发 _sync_kind ⇒ 绳/门行跟着显隐
-        for cmb, key in ((self.cmb_lad, "ladder"), (self.cmb_por, "portal")):
+            self.cmb_kind.setCurrentIndex(j)     # 触发 _sync_kind ⇒ 绳那一行跟着显隐
+        for cmb, key in ((self.cmb_lad, "ladder"),):
             v = d.get(key)
             if v:
                 k = cmb.findData(v)
@@ -697,21 +776,24 @@ class AddReachDialog(QDialog):
         self.ck_all.blockSignals(False)
 
     def _sync_kind(self):
-        """按类型显隐"绳 / 门 / 可下跳 foothold"那几行，并在缺料时说清**为什么不能加**。"""
+        """按类型显隐"绳 / 可下跳 foothold"那几行，并在缺料时说清**为什么不能加**。"""
         kind = self.cmb_kind.currentData()
         self.lbl_lad.setVisible(kind == "climb")
         self.cmb_lad.setVisible(kind == "climb")
-        self.lbl_por.setVisible(kind == "portal")
-        self.cmb_por.setVisible(kind == "portal")
         self.lbl_wd.setVisible(kind == "walk")      # 「类型」只对「走」有意义
         self.cmb_wd.setVisible(kind == "walk")
+        # ⭐ 「中途跳下」只对「爬」有意义；⚠ 「高度」还要**方向非空**才出现（**二级联动** ✓ ——
+        #   全项目第一处：一级是 `cmb_kind`，二级是 `cmb_mid` ✓）
+        self.lbl_mid.setVisible(kind == "climb")
+        self.cmb_mid.setVisible(kind == "climb")
+        _show_y = (kind == "climb" and bool(self.cmb_mid.currentData()))
+        self.lbl_mid_y.setVisible(_show_y)
+        self.spn_mid_y.setVisible(_show_y)
         self.drop_host.setVisible(kind == "drop")
         why = ""
         if kind == "climb" and self.cmb_lad.count() == 0:
             why = ("「%s」附近没有可爬的绳 —— 换个类型，或者先把绳另一端那块地形"
                    "圈成集合。" % self._src)
-        if kind == "portal" and self.cmb_por.count() == 0:
-            why = "「%s」范围内没有可用的传送门（出生点不算门）。" % self._src
         if kind == "drop" and not self._drop_ids:
             why = "一个可下跳的 foothold 都没有了 —— 至少留一个（点「加一个…」）。"
         self.lbl_note.setText(why)
@@ -790,12 +872,18 @@ class AddReachDialog(QDialog):
             "dst": self.cmb_dst.currentData(),
             "kind": kind,
             "ladder": (self.cmb_lad.currentData() if kind == "climb" else None),
-            "portal": (self.cmb_por.currentData() if kind == "portal" else None),
             # 下跳：**只有人工改过才带这一格**（没改 = 用起点集合的全部 ⇒ 不写文件）
             "footholds": (list(self._drop_ids)
                           if kind == "drop" and self._drop_changed() else None),
             # 走：方向类型（默认方向 = None ⇒ 不写文件）
             "dir": (self.cmb_wd.currentData() or None) if kind == "walk" else None,
+            # ⭐ 爬：**中途跳下**（2026-09-28 ✓）—— 与 `dir` 同款写法：**非爬一律 None** ✓；
+            # ⚠ 「高度」只在**方向非空**时才算数（方向空 = 不启用 ⇒ 高度没意义 ✓）
+            "mid_dir": ((self.cmb_mid.currentData() or None)
+                        if kind == "climb" else None),
+            "mid_y": ((float(self.spn_mid_y.value())
+                       if self.cmb_mid.currentData() else None)
+                      if kind == "climb" else None),
         }
         # 非模态 ⇒ 调用方拿不到 `exec_()` 的返回值，用信号把结果送出去
         self.applied.emit(dict(self.result_dict))
@@ -830,7 +918,8 @@ class ZoneEditorDialog(QDialog):
         # 实测 = 222px，离屏环境 211px）。
         # ⚠ 这里踩过一次：上一版写了 `setMinimumSize(720, 420)` —— 本意是"允许缩到比较小"，
         # 实际是给纵向钉了 420 的**地板**，比布局需要的 222 大一倍，于是"还是缩不下去"。
-        # 窗口能缩多矮由**子控件的最小尺寸**决定（右栏已在滚动区里，画布最小 120），
+        # 窗口能缩多矮由**子控件的最小尺寸**决定（现在三栏：另外两栏在滚动区里，
+        # 画布那栏最小 120，见 `_build` 里的 `_panel`），
         # 想放宽就放宽那边，别在这里加硬地板。
         # ⚠⚠ 更坑的是：删掉这行**旧窗口照样缩不下去** —— 编辑器非模态单实例，`close()`
         # 只是隐藏、对象还活着，那个 420 一直挂在它身上（见 _drop_stale_min_height）。
@@ -843,6 +932,13 @@ class ZoneEditorDialog(QDialog):
         self._zones_path = Path(zones_path) if zones_path else zones.zones_path(self.map_id)
         self.zones = self._load_zones()
         self._sel = set()                   # 当前选中的 foothold id（字符串）
+        #: 「**点选着的绳梯**」（存 `Ladder` 对象本身；`None` = 没选）——
+        #: 用户 2026-09-27 要求："foothold 编辑器希望能**点选绳梯**（为了快速查看它的信息），
+        #: **不用接逻辑**"。
+        #: ⚠ 它是**只读的"看着它"**：**不进 `_sel`**（那套是 foothold 编辑用的 ✓）、
+        #: 不参与 `register` / 增删成员 / 写文件 / 撤销栈 ✗ —— 只影响状态行那几行字
+        #: 与画布上那根绳的颜色/呼吸 ✓（见 `_pick_ladder` / `_refresh_status`）。
+        self._sel_ladder = None
         self._undo, self._redo = [], []
         self._highlight = None              # 当前高亮的集合名
         self._items = {}
@@ -866,6 +962,10 @@ class ZoneEditorDialog(QDialog):
         self._build()
         self._rebuild_scene()
         self._refresh_list()
+        theme.bind_window_state(self, "zone_editor")   # 拉过的大小/位置按客户端记住 ✓
+        # 画布的**缩放**也记住（用户 2026-09-27："每次打开弹窗都要重新调缩放"✗ ——
+        # 窗口尺寸那件事早就记了，他每次重调的是画布里的 zoom ✓ 见 `theme.bind_view_zoom`）
+        theme.bind_view_zoom(self.view, "zone_editor_view")
 
     # ---------------- 数据 ----------------
 
@@ -938,7 +1038,11 @@ class ZoneEditorDialog(QDialog):
         # _on_pick_set 的规则）。留着选择会让「选中的」（C_SEL）和「集合的」（C_IN_SET）
         # 两套颜色同时在呼吸，看不出谁是谁。
         self._sel = set()
+        # 「看着的绳梯」同理要收掉：它用的是**同一个选中色**（`C_SEL` ✓），留着就又是
+        # "两样东西一起亮" ✗（用户 2026-09-26 定的"一次只编辑一样"✓）。
+        self._sel_ladder = None
         self._commit(snap)
+        self._refresh_status()
         return out
 
     def delete_set(self, name):
@@ -988,20 +1092,51 @@ class ZoneEditorDialog(QDialog):
 
     # ---------------- 界面 ----------------
 
+    def _panel(self, inner, min_w):
+        """把一栏的控件装进 `QScrollArea` ⇒ 返回那个滚动区（给分栏用）。
+
+        docs/UI规范.md §4：**长面板进滚动区**。三栏各一个滚动区，好处有两条：
+          · 窗口矮下来时**各栏自己出滚动条**，而不是把按钮压没（看不见的按钮没法点 ✗）；
+          · 滚动区是**可压缩**的 ⇒ 窗口的最小高度只由画布那栏决定
+            （地板只许来自当前布局，见 `_drop_stale_min_height`）。
+        `min_w` 是这一栏的**最小宽度**（分栏拖到最窄就停在这）：它由**人**定、不是由内容
+        定 —— 内容需要的宽度（集合栏 ≈256、可达栏 ≈276，探针量过）比它能拖到的最窄要宽，
+        所以拖到 160/170 时**栏里出横向滚动条**（而不是把按钮切掉看不见 ✗）。
+        为什么必须自己定小一点：`QSplitter` 的最小宽度 = **各栏最小宽度之和**，三栏最小
+        宽度加起来要留在对话框的 620 以内（用例 `t_window_can_shrink_vertically` 钉着
+        `minimumWidth() <= 620`）；按内容算就会到 770+ ✗。
+        """
+        # 滚动区**只有一处实现**：`gui.widgets.scroll_area`（2026-09-27 收口）——
+        # 这里是唯一"滚动区自己要当控件交出去"的场景（它是 `QSplitter` 的一栏 ✓），
+        # 所以直接拿它，而不是 `scroll_page`（那个要一个容器 widget ✓）。
+        # 纵向按需；横向**也按需**（拖窄了要给得出滚动条，见上面的 `min_w` 说明）
+        return scroll_area(inner, h_scroll=True, min_width=min_w)
+
+    def _row_tag(self, text):
+        """表单行的**行首小标签**（灰、右对齐）—— 说明"这一行在干什么"。"""
+        lb = QLabel(text)
+        lb.setStyleSheet("color: #5f6368;")
+        lb.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        return lb
+
     def _build(self):
-        # 最上面一条**常驻**的顶栏：只放「保存」（2026-09-26 用户要求：放最上面 + 换颜色）。
-        # 为什么非要搬上来：它原来在右栏**最底下**，而右栏是滚动区 ⇒ 窗口一矮、或者往下滚
+        # 最上面一条**常驻**的顶栏：放**文档级**动作 —— 保存 / 撤销 / 重做。
+        # 为什么搬上来：保存原来在右栏**最底下**、而右栏是滚动区 ⇒ 窗口一矮、或者往下滚
         # 两下，这个最要紧的按钮就**看不见**了 ✗（"找不到保存"比任何交互细节都糟）；
         # 顶栏在滚动区**外面** ⇒ 永远看得见 ✓。
+        # 撤销/重做 **2026-09-26 布局重构时一起搬上来**：它们和「保存」是**一类**
+        # （对整个文档动手，不属于"集合"也不属于"可达"任何一栏），原来挤在右栏末尾
+        # 既不好找、又白占三栏本就不多的纵向空间（用户："信息全挤在一起"）。
         outer = QVBoxLayout(self)
         # ⚠ 顶栏要**够矮**：它长在滚动区外面 ⇒ 高度会直接顶起窗口的最小高度，
         # 而本窗口有一条既要满足的要求 —— 窗口能一路缩到 **240** 高（用例钉着：
         # `t_dialog_background_breathing_and_size` 会 resize 到 240 并断言不被顶回去 ✗）。
-        # 所以这里零边距、零间距、按钮内边距也压到最小，只留醒目配色 ✓。
+        # 所以这里零边距、零间距、按钮内边距也压到最小，只留醒目配色 ✓；
+        # 几个按钮**横着排**（横排不加高度 ✓）。
         outer.setSpacing(2)
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
-        top.setSpacing(0)
+        top.setSpacing(6)
         self.btn_save = QPushButton("保存")
         self.btn_save.setObjectName("saveZones")
         # 换色：深绿底 + 白字（本仓库的主操作/成功色 —— 和"跳"、"已保存"同一档绿）
@@ -1014,12 +1149,40 @@ class ZoneEditorDialog(QDialog):
         self.btn_save.setToolTip("写入 %s（快捷键 Ctrl+S）" % self._zones_path.name)
         self.btn_save.clicked.connect(self._on_save)
         top.addWidget(self.btn_save)
+        # 撤销 / 重做（和保存同一类：文档级动作；快捷键 Ctrl+Z / Ctrl+Y 在 keyPressEvent）
+        self.btn_undo = QPushButton("撤销")
+        self.btn_undo.setToolTip(
+            "回退上一步改动（Ctrl+Z）。\n\n"
+            "放在顶栏：它和「保存」一样是**文档级**动作 —— 既不属于「集合」那一栏，\n"
+            "也不属于「可达」那一栏。")
+        self.btn_undo.clicked.connect(self.undo)
+        self.btn_redo = QPushButton("重做")
+        self.btn_redo.setToolTip("重做刚被撤销的那一步（Ctrl+Y）。")
+        self.btn_redo.clicked.connect(self.redo)
+        top.addWidget(self.btn_undo)
+        top.addWidget(self.btn_redo)
         top.addStretch(1)
         outer.addLayout(top)
 
-        root = QHBoxLayout()          # 原来的左右两栏（左=画布，右=集合/可达那一列）
+        # ---- 三栏：画布 ｜ 集合 ｜ 可达·可被到达 ----
+        # 2026-09-26 用户要求（原话："现在感觉信息全挤在一起，也不能缩放调整，希望将集合
+        # 编辑与可达、可被到达的布局分列，以省去滑动过程"）：
+        #   · **分列**：原来是**一根**竖排滚动条 —— 集合在上面、可达 / 可被到达堆在下面
+        #     ⇒ 窗口一矮就得上下滚着对照（"我选中这个集合，它能去哪儿 / 谁来过"本来就该
+        #     同屏 ✗）。现在「集合」一栏、「可达 / 可被到达」一栏，各自独立滚动 ✓。
+        #   · **能缩放调整**：用 `QSplitter` —— 栏宽可以用鼠标拖（原来右栏钉死 250~420 宽，
+        #     画布和它之间没有分隔条，用户只能忍着 ✗）。
+        # 分工按"手上正在改什么"分：画布 = 看与选，集合 = 圈范围，关系 = 连边。
+        split = QSplitter(Qt.Horizontal)
+        split.setHandleWidth(6)               # 拖得动、又不吃掉太多栏宽
+        # 不许把某一栏拖成 0 宽：拖没了得靠拖回来才发现，而且那栏里的按钮就点不到了 ✗
+        split.setChildrenCollapsible(False)
 
-        left = QVBoxLayout()
+        # 画布那栏：**不套滚动区** —— 视图自己会缩放 / 平移（滚轮 / 中键）
+        col_view = QWidget()
+        left = QVBoxLayout(col_view)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(6)
         self.scene = QGraphicsScene(self)
         self.view = _ZoneView(self)
         self.view.setScene(self.scene)
@@ -1030,8 +1193,11 @@ class ZoneEditorDialog(QDialog):
         # 对话框的最小尺寸反过来推着窗口长 —— 用户看到的就是"点个集合窗口变大了"。
         # 视图只要最小尺寸很小 + 可伸缩，聚焦（fitInView）就纯粹是视口内的事。
         self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        # 画布的最小尺寸压小：它是"窗口能缩多矮"的实际决定者（右栏已经进滚动区了）
-        self.view.setMinimumSize(240, 120)
+        # 画布的最小尺寸压小：它是"窗口能缩多矮"的实际决定者（另外两栏都在滚动区里）。
+        # 宽 200（原 240）：三栏的最小宽度之和必须留在 620 以内，否则
+        # `t_window_can_shrink_vertically` 那条「残留最小宽度清掉后不许超过 620」会红 ✗
+        #（200 + 170 + 190 + 分隔条与边距 ≈ 590 ✓）。
+        self.view.setMinimumSize(200, 120)
         # 线条宽度来自「设置 → foothold 编辑器线条宽度」（config/ui.yaml）
         self.view.set_line_width(theme.load_foothold_width())
         left.addWidget(self.view, 1)
@@ -1044,7 +1210,13 @@ class ZoneEditorDialog(QDialog):
         self.sl_bg = NoWheelSlider(Qt.Horizontal)
         self.sl_bg.setRange(0, 100)
         self.sl_bg.setValue(BG_OPACITY_DEF)
-        self.sl_bg.setFixedWidth(160)
+        # ⚠ 用「最小 + 最大」而不是 `setFixedWidth(160)`（2026-09-26 三栏重构）：
+        # 固定宽度会把**这一行**的最小宽度钉成 160+标签+百分数 ≈ 300，而画布那栏的最小
+        # 宽度又直接决定整个对话框的最小宽度（探针实测：这一处就把对话框顶到 702，
+        # 而 `t_window_can_shrink_vertically` 要求 ≤ 620 ✗）。
+        # 现在：宽的时候还是 160（和以前一样），栏被拖窄时滑条跟着缩到 96 ✓。
+        self.sl_bg.setMinimumWidth(96)
+        self.sl_bg.setMaximumWidth(160)
         self.sl_bg.setToolTip(
             "小地图底图的不透明度（0~100%%）。\n\n"
             "底图是深蓝的示意图、线是亮绿：调低 = 底图更淡、线段更清楚；\n"
@@ -1069,15 +1241,18 @@ class ZoneEditorDialog(QDialog):
         hint.setStyleSheet("color: #80868b;")
         hint.setWordWrap(True)
         left.addWidget(hint)
-        root.addLayout(left, 1)
+        split.addWidget(col_view)             # 第 1 栏：画布
 
-        # 右侧那一列放进 QScrollArea（docs/UI规范.md §4：长面板进滚动区）——
-        # 窗口一矮，这十几个控件就会被压扁/挤没（按钮看不见就没法干活了），
-        # 有了滚动区是"出滚动条"，而不是"控件消失"。
-        right_host = QWidget()
-        right = QVBoxLayout(right_host)
-        right.setContentsMargins(0, 0, 0, 0)
-        right.addWidget(QLabel("集合"))
+        # 第 2 栏「集合」：**只放集合自己的事**（列表 + 建 / 改 / 删）。
+        # 标题交给 QGroupBox（白底圆角 + 灰标题由主窗口的全局 QSS 给，见 gui/main_window.py）
+        # —— 三栏各自一个分组框，一眼看出"这一栏管什么"，比原来那三行裸 QLabel 标题清楚 ✓。
+        col_sets = QWidget()
+        cs = QVBoxLayout(col_sets)
+        cs.setContentsMargins(0, 0, 0, 0)
+        cs.setSpacing(6)
+        grp_sets = QGroupBox("集合")
+        cs.addWidget(grp_sets, 1)
+        right = QVBoxLayout(grp_sets)         # ⚠ 本节里 `right` = 「集合」组**内部**的布局
         # 三个列表共用一份委托：只给"集合名"上色，其它字保持正常色（见 _RichRowDelegate）
         self._rich = _RichRowDelegate(self)
         self.lst = QListWidget()
@@ -1094,31 +1269,77 @@ class ZoneEditorDialog(QDialog):
         self.lst.setMinimumHeight(110)
         right.addWidget(self.lst, 1)
 
-        for text, slot, tip in (
-                ("注册为集合…", self._on_register,
-                 "把当前选中的 foothold 注册成一个命名集合（按地图存 id 列表）。"),
-                ("加入集合…", self._on_add_to,
-                 "把当前选中的 foothold 加入某个集合（弹窗默认当前高亮的那个）。\n\n"
-                 "两种顺序都行：① 先在视窗里选 foothold → 这里选集合；\n"
-                 "② 先点集合 → **按住 Shift** 在视窗里加选 → 这里选集合。"),
-                ("移出集合…", self._on_remove_from,
-                 "把当前选中的 foothold 从某个集合里移出（弹窗默认当前高亮的那个）。\n"
-                 "顺序同「加入集合…」。"),
-                ("改名…", self._on_rename, "改集合名（引用它的地方会一起改）。"),
-                ("删除", self._on_delete, "删掉这个集合（**会二次确认**）。"),
-        ):
+        # 按钮按**功能**分三行（2026-09-26 布局重构）：
+        #   新建 = 造一个新集合；成员 = 往集合里加 / 减 foothold；管理 = 改名 / 删除。
+        # 原来五个按钮一字排开往下叠 —— 既看不出"谁和谁是一件事"，又白占纵向 ✗。
+        # ⚠ 用 QGridLayout（docs/UI规范.md §4：多列用 QGridLayout，别靠固定宽度对齐）。
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+        grid.setColumnStretch(1, 1)          # 按钮那一列吃掉宽度，标签列只占需要的
+
+        def _btn(text, slot, tip):
             b = QPushButton(text)
             b.setToolTip(tip)
             b.clicked.connect(slot)
-            right.addWidget(b)
+            return b
 
-        # ---- 可到达（有向；§12.3 B5）----
-        # 摆在集合下面：**先圈集合、再把它们连起来**，这个顺序就是干活的顺序。
+        self.btn_register = _btn(
+            "注册为集合…", self._on_register,
+            "把当前选中的 foothold 注册成一个命名集合（按地图存 id 列表）。")
+        grid.addWidget(self._row_tag("新建"), 0, 0)
+        grid.addWidget(self.btn_register, 0, 1)
+
+        # 成员那一行：加 / 减 是一件事的两个方向 ⇒ 并排，一眼看出是一对
+        self.btn_add_to = _btn(
+            "加入集合…", self._on_add_to,
+            "把当前选中的 foothold 加入某个集合（弹窗默认当前高亮的那个）。\n\n"
+            "两种顺序都行：① 先在视窗里选 foothold → 这里选集合；\n"
+            "② 先点集合 → **按住 Shift** 在视窗里加选 → 这里选集合。")
+        self.btn_remove = _btn(
+            "移出集合…", self._on_remove_from,
+            "把当前选中的 foothold 从某个集合里移出（弹窗默认当前高亮的那个）。\n"
+            "顺序同「加入集合…」。")
+        row_members = QHBoxLayout()
+        row_members.setSpacing(6)
+        row_members.addWidget(self.btn_add_to)
+        row_members.addWidget(self.btn_remove)
+        grid.addWidget(self._row_tag("成员"), 1, 0)
+        grid.addLayout(row_members, 1, 1)
+
+        # 管理那一行：改名 / 删除 —— 动的是"集合"这个东西本身，和成员编辑不是一回事
+        self.btn_rename = _btn("改名…", self._on_rename,
+                               "改集合名（引用它的地方会一起改）。")
+        self.btn_delete = _btn("删除", self._on_delete,
+                               "删掉这个集合（**会二次确认**）。")
+        row_manage = QHBoxLayout()
+        row_manage.setSpacing(6)
+        row_manage.addWidget(self.btn_rename)
+        row_manage.addWidget(self.btn_delete)
+        grid.addWidget(self._row_tag("管理"), 2, 0)
+        grid.addLayout(row_manage, 2, 1)
+        right.addLayout(grid)
+
+        # ---- 第 3 栏：可到达 / 可被到达 ----
+        # ⚠ 「集合」栏到上面为止 —— 两栏都建好之后**一起**装滚动区、一起进分栏（见本节末尾）
+        #   ⇒「三栏是什么、什么顺序、各占多宽」集中在一处，不用来回找 ✓。
+        # 为什么和「集合」分成两栏（见上面 split 的说明）：选中一个集合之后，"它能去哪儿"
+        # 和"谁来过"就是**紧接着要看的下一件事** —— 和集合列表放同屏才叫对照 ✓。
         # 叫「可到达」是因为"边"是图论词：这一栏回答的是"从哪个平台能到哪个平台"。
-        right.addSpacing(8)
-        lbl_e = QLabel("可到达：")
-        lbl_e.setStyleSheet("font-weight: 600;")
-        right.addWidget(lbl_e)
+        # 有向（§12.3 B5）：**出去的一栏可编辑、进来的一栏只读**（见 in_host）。
+        col_edges = QWidget()
+        ce = QVBoxLayout(col_edges)
+        ce.setContentsMargins(0, 0, 0, 0)
+        ce.setSpacing(6)
+        grp_e = QGroupBox("可到达 · 从这个集合出去")
+        grp_e.setToolTip(
+            "从**当前在编辑的集合**出去的边（进来的边在下面「可被到达」栏）。\n"
+            "没选中任何集合时列全部边 —— 那是「总览」的位置 ✓。\n"
+            "类型：走 / 爬（绳梯）/ 跳 / 下跳 / 传送门。")
+        ce.addWidget(grp_e, 2)            # 这一组比「可被到达」多，所以分得多一点
+        right = QVBoxLayout(grp_e)        # ⚠ 本节里 `right` = 「可到达」组**内部**的布局
+        right.setSpacing(6)
         # 有没有按"当前在编辑的集合"收窄（收窄时必须**说出来**：静悄悄少几条最难查）
         self.lbl_e_note = QLabel("")
         self.lbl_e_note.setStyleSheet("color: #5f6368;")
@@ -1130,7 +1351,8 @@ class ZoneEditorDialog(QDialog):
         self.lst_e.setMinimumHeight(110)
         self.lst_e.setToolTip(
             "**从当前在编辑的集合出去**的边（别的边在下面「可被到达」栏）。\n"
-            "类型：走 / 爬（绳梯）/ 跳 / 传送门。\n"
+            "没选中任何集合时列**全部边**（总览）。\n"
+            "类型：走 / 爬（绳梯）/ 跳 / 下跳 / 传送门。\n"
             "画布上：连线一律**黑色细虚线**，**箭头三角**按类型着色 ——\n"
             "绿=走、蓝=爬、橙=跳、紫=传送门。\n\n"
             "「反向」是给**选中的这条**加一条反方向的边；它属于对面那个集合，\n"
@@ -1170,23 +1392,23 @@ class ZoneEditorDialog(QDialog):
             "按数据算出**候选边**，由你逐条确认（自动只产建议，不会自己变成边）：\n"
             "  · 走（walk）：两组地形严丝合缝（§12.2 的 Δy=0 且 gap=0）；\n"
             "  · 爬（climb）：同一根绳两端各有一个集合；\n"
-            "  · 传送门（portal）：**本图内**的门，落点在数据里（tn）；\n"
+            "  · 传送门**不是通行方式**（2026-09-27 已移除）；\n"
             "  · 「另一端还没圈」也会列出来 —— 那不是边，是提示你**该圈哪块地形**。")
         self.btn_sug.clicked.connect(self._on_suggest)
         right.addWidget(self.btn_sug)
 
         # ---- 可被到达（进来的边；**只读**，2026-09-26 要求 2）----
-        # 为什么单独一栏：选中 A 时"我从哪儿来"和"A 能去哪儿"是两件事，混在一栏里
-        # 谁都得逐行认方向。这里**不放编辑按钮** —— 要改就选中上面那个集合，
-        # 它的"可到达"里就有这条边（一次只编辑一样东西，见 _refresh_edges）。
-        # 整段套一个 QWidget：用例据此断言"这一栏里一个按钮都没有"。
-        right.addSpacing(8)
-        self.in_host = QWidget()
+        # 和「可到达」各占一个分组框：选中 A 时"我从哪儿来"和"A 能去哪儿"是两件事，
+        # 混在一栏里谁都得逐行认方向。
+        # 这里**不放编辑按钮** —— 要改就把**起点**那个集合选中，它的"可到达"里就有这条边
+        #（一次只编辑一样东西，见 _refresh_edges）。
+        # 整段套一个控件：用例据此断言"这一栏里一个按钮都没有"（`t_reach_ui_filter_and_style`）。
+        self.in_host = QGroupBox("可被到达 · 进入这个集合")
+        self.in_host.setToolTip(
+            "哪几个集合**能到**当前在编辑的这个集合（进入它的边）。\n\n"
+            "这一栏**纯看**：要改就先把**起点**那个集合选中，它的「可到达」里就有这条边。")
         lay_in = QVBoxLayout(self.in_host)
-        lay_in.setContentsMargins(0, 0, 0, 0)
-        lbl_in = QLabel("可被到达：")
-        lbl_in.setStyleSheet("font-weight: 600;")
-        lay_in.addWidget(lbl_in)
+        lay_in.setSpacing(6)
         self.lbl_in_note = QLabel("")
         self.lbl_in_note.setStyleSheet("color: #5f6368;")
         self.lbl_in_note.setWordWrap(True)
@@ -1197,39 +1419,34 @@ class ZoneEditorDialog(QDialog):
         self.lst_in.setMinimumHeight(90)
         self.lst_in.setToolTip(
             "哪几个集合**能到**当前在编辑的这个集合（进入它的边）。\n\n"
-            "这里**纯看**：没有编辑按钮、双击也不进编辑 —— 要改就先把上面那个集合"
+            "这里**纯看**：没有编辑按钮、双击也不进编辑 —— 要改就把**起点**那个集合"
             "选中，\n它的「可到达」里就有这条边（一次只编辑一样东西）。\n\n"
             "画布上按类型着色的是**箭头**（绿=走、蓝=爬、橙=跳、紫=传送门），\n"
             "连线一律是黑细虚线。")
         # 这一栏里选中一行，画布上那条箭头也呼吸（纯看也能定位到是哪条）
         self.lst_in.currentItemChanged.connect(lambda *_: self._on_pick_edge(self.lst_in))
         lay_in.addWidget(self.lst_in)
-        right.addWidget(self.in_host)
+        ce.addWidget(self.in_host, 1)
 
-        row = QHBoxLayout()
-        self.btn_undo = QPushButton("撤销")
-        self.btn_undo.clicked.connect(self.undo)
-        self.btn_redo = QPushButton("重做")
-        self.btn_redo.clicked.connect(self.redo)
-        row.addWidget(self.btn_undo)
-        row.addWidget(self.btn_redo)
-        right.addLayout(row)
-
-        # ⚠ 「保存」**搬到最上面的顶栏了**（见 `_build` 开头）—— **不在这儿**：
-        # 它原来在右栏最底下、而右栏是滚动区 ⇒ 窗口一矮、或者往下滚两下就看不见 ✗。
-        right.addStretch(1)
-
-        # 滚动区：窗口矮下来时**出滚动条**，而不是把按钮压没
-        area = QScrollArea()
-        area.setWidgetResizable(True)
-        area.setFrameShape(QFrame.NoFrame)      # 别和主布局的边距套两层
-        area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)   # 只滚纵向
-        area.setWidget(right_host)
-        area.setMinimumWidth(250)               # 再窄按钮上的字就挤没了
-        area.setMaximumWidth(420)
-        self.right_area = area                  # 留着（用例要断言"右栏真的在滚动区里"）
-        root.addWidget(area, 0)
-        outer.addLayout(root, 1)                # 左右两栏塞进「顶栏 + 内容」这个外层
+        # 两栏面板装进滚动区，按「画布 → 集合 → 关系」的顺序进分栏
+        #（这个顺序 = 干活的顺序：先看图、再圈范围、最后连边 ✓）
+        self.area_sets = self._panel(col_sets, 160)      # 留着：用例断言"进滚动区了"
+        self.area_edges = self._panel(col_edges, 170)    # 同上
+        split.addWidget(self.area_sets)
+        split.addWidget(self.area_edges)
+        # 只有**画布**那栏跟着窗口长（另外两栏是"工具面板"，宽度由人拖）
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 0)
+        split.setStretchFactor(2, 0)
+        # 初始宽度：**按各栏内容的实际需要给**（探针量的：集合栏内容 280、可达栏的边列表
+        # 329~346 —— 后者随集合名的长短变）⇒ 开局就不该出现横向滚动条 ✓
+        #（用户拖窄了才出，那是他自己的选择）。画布那栏仍然最大，而且窗口变大时
+        # **只有它跟着长**（见上面的 stretchFactor）✓。
+        split.setSizes([480, 290, 390])
+        self.split = split                      # 留着：用例断言"栏宽真的能拖"
+        outer.addWidget(split, 1)               # 三栏塞进「顶栏 + 内容」这个外层
+        # ⚠ 「保存 / 撤销 / 重做」都在**最上面的顶栏**（见 `_build` 开头）—— 这里不再放一份：
+        #   它们原来在右栏最底下、而右栏是滚动区 ⇒ 窗口一矮、或者往下滚两下就看不见 ✗。
 
         # 呼吸高亮的节拍器：只改笔刷，不重排场景（见 _on_pulse）
         self.timer = QTimer(self)
@@ -1274,14 +1491,23 @@ class ZoneEditorDialog(QDialog):
         if not path.exists():
             return None
         try:
+            import cv2
+
             from core.imgio import imread          # 走仓库的读图（中文路径安全）
-            img = imread(path)
+            # ⭐ **带 alpha 读**（用户 2026-09-27："小地图底图…的背景应该透明吧？你自己加的黑色？"）
+            #   —— 底图 PNG 有近一半像素是全透明的（面板之外的圆角 ✓，四角 alpha=0 ✓）；
+            #   原来按 `IMREAD_COLOR` 读 ⇒ 透明区变**纯黑** ✗，看起来就像"给底图加了个黑底" ✗。
+            img = imread(path, cv2.IMREAD_UNCHANGED)
         except Exception:                          # noqa: BLE001
             return None
         if img is None or getattr(img, "size", 0) == 0:
             return None
         h, w = img.shape[:2]
-        qimg = QImage(img.tobytes(), w, h, img.strides[0], QImage.Format_BGR888)
+        # ⚠ 带 alpha 的底图（BGRA ✓）必须走 `Format_ARGB32`（内存序就是 BGRA ✓）；否则透明区变黑 ✗
+        _fmt = (QImage.Format_ARGB32
+                if (getattr(img, "ndim", 0) == 3 and img.shape[2] == 4)
+                else QImage.Format_BGR888)
+        qimg = QImage(img.tobytes(), w, h, img.strides[0], _fmt)
         item = QGraphicsPixmapItem(QPixmap.fromImage(qimg.copy()))
         # 最近邻放大：底图本来只有一百多像素宽，插值只会把它糊成一片
         item.setTransformationMode(Qt.FastTransformation)
@@ -1356,9 +1582,15 @@ class ZoneEditorDialog(QDialog):
         ladders = self.terrain.ladders
         lids = zones.ladder_ids(self.terrain)
         for L in ladders:
+            # 点选着的那根（用户 2026-09-27 ✓）⇒ 用**选中色**（`C_SEL`，和"选中的 foothold"
+            # 同一个黄 ✓，一眼能认出"现在看的是这根"）+ 一起呼吸 ✓。
+            # ⚠ 颜色必须走 `lines` 那一份（`_apply_widths` 每次缩放都会按它重写笔 ✗）——
+            #   所以这里改的是 `color` 变量，而不是画完再 setPen ✓。
+            sel = (L is self._sel_ladder)
+            color = C_SEL if sel else C_LADDER
             it = scene.addLine(L.x, min(L.y1, L.y2), L.x, max(L.y1, L.y2),
-                               self.view._pen(C_LADDER, style=Qt.DotLine))
-            it.setZValue(1)
+                               self.view._pen(color, style=Qt.DotLine))
+            it.setZValue(3 if sel else 1)
             self._ladder_items.append((L, it))
             # 编号标在绳子的**上端右侧**：绳是竖线，标在线上会盖住线；上端是"爬上去
             # 到了哪儿"，和走路的方向一致。编不出来（理论上不会）就不标，别画个空字。
@@ -1370,9 +1602,9 @@ class ZoneEditorDialog(QDialog):
                 # 定位了 —— 要找的是"哪根绳"，编号只需**读得清**。
                 self._text_item(lid, LADDER_PX, C_LADDER_ID,
                                 L.x + LADDER_PX * 0.28, min(L.y1, L.y2))
-            lines.append((it, C_LADDER, Qt.DotLine, hit))
-            if hit:
-                self._hl_items.append((it, C_LADDER))
+            lines.append((it, color, Qt.DotLine, hit or sel))
+            if hit or sel:
+                self._hl_items.append((it, color))
         for p in self.terrain.portals:
             it = scene.addEllipse(p.x - 6, p.y - 6, 12, 12,
                                   self.view._pen(C_PORTAL), QBrush(C_PORTAL))
@@ -1574,7 +1806,7 @@ class ZoneEditorDialog(QDialog):
         """重读「设置 → foothold 编辑器线条宽度」并应用到画布。
 
         为什么要手动调：设置弹窗和编辑器是**两个独立的窗口**，那边改完没人通知这边。
-        调用点有两处 —— `showEvent`（重开编辑器）和 `_on_edit_zones`（点「编辑集合…」
+        调用点有两处 —— `showEvent`（重开编辑器）和 `_on_edit_zones`（点「寻路编辑器」
         把已在开着的窗口提到前面时），所以"改完设置 → 点一次那个按钮"就能生效。
         """
         self.view.set_line_width(theme.load_foothold_width())
@@ -1638,6 +1870,27 @@ class ZoneEditorDialog(QDialog):
 
     # ---------------- 事件 ----------------
 
+    def _pick_ladder(self, L):
+        """点中一根绳梯 ⇒ **只记着它**（状态行出信息 + 画布上那根换选中色并呼吸 ✓）。
+
+        用户 2026-09-27："点选绳梯（为了快速查看它的信息），**不用接逻辑**" ✓ ——
+        所以这里**不碰** `_sel` / 集合高亮 / 文件 / 撤销栈 ✗，只刷新显示 ✓。
+        """
+        if self._sel_ladder is L:
+            self._refresh_status()
+            return
+        self._sel_ladder = L
+        self._rebuild_scene()               # 那根绳要换色 + 呼吸 ✓
+        self._refresh_status()
+
+    def _clear_ladder_sel(self):
+        """取消"点选着的绳梯"（点到别处 / 框选时 ✓）；本来就没选 ⇒ **什么都不做**（别白重建 ✗）。"""
+        if self._sel_ladder is None:
+            return
+        self._sel_ladder = None
+        self._rebuild_scene()
+        self._refresh_status()
+
     def _on_picked(self, what, mode):
         """视窗里的主动选择。**replace 模式（没按修饰键）会让出集合高亮**。
 
@@ -1654,6 +1907,15 @@ class ZoneEditorDialog(QDialog):
         """
         if what[0] == "click":
             _t, x, y, tol = what
+            # ⭐ **先看绳梯**（用户 2026-09-27 ✓）：⚠ 只在**没点到 foothold** 时才认它 ——
+            #   绳脚下那两条 foothold 才是这张图的主业（编辑集合 ✓），别被绳子抢走 ✗；
+            #   而且它**只用来"看信息"** ✓，不动任何选择 ✓。
+            if pick_at(self.terrain, x, y, tol) is None:
+                L = pick_ladder(self.terrain, x, y, tol)
+                if L is not None:
+                    self._pick_ladder(L)
+                    return
+            self._clear_ladder_sel()        # 点到别处 ⇒ 取消"看着的绳梯"（点选语义 ✓）
             f = pick_at(self.terrain, x, y, tol)
             if f is None:
                 if mode == "replace":
@@ -1664,6 +1926,7 @@ class ZoneEditorDialog(QDialog):
             self.select([str(f.fid)], mode)
             return
         _t, rect, box_mode = what
+        self._clear_ladder_sel()            # 框选是明确的编辑动作 ⇒ 取消"看着的绳梯" ✓
         fs = pick_in_rect(self.terrain, rect, box_mode)
         ids = [str(f.fid) for f in fs]
         if not ids and mode == "replace":
@@ -1741,6 +2004,29 @@ class ZoneEditorDialog(QDialog):
                     % (f.fid, "墙" if f.is_wall else "地板", round(f.x1),
                        round(f.x2), round(f.y_at((f.x1 + f.x2) / 2.0)))
                     for f in fs[:40]))
+        # **点选着的绳梯**（用户 2026-09-27："点选绳梯为了快速查看它的信息" ✓）：
+        # 把"它的信息"直接摆出来 —— 绳号 / 位置 / **两端各压着哪条 foothold** /
+        # 那些 foothold 又属于哪些集合（这几样正是要看的 ✓，纯只读 ✓，改集合还是走 foothold ✓）。
+        if self._sel_ladder is not None:
+            _L = self._sel_ladder
+            _lid = zones.ladder_ids(self.terrain).get(id(_L)) or "?"
+            where += ("　｜　绳梯 %s：x=%d　y %d..%d（长 %d）"
+                      % (_lid, round(_L.x), round(min(_L.y1, _L.y2)),
+                         round(max(_L.y1, _L.y2)), round(abs(_L.y2 - _L.y1))))
+            _lt = ["点选绳梯 %s（只读：不动选择集、不写文件 ✓）" % _lid,
+                   "  x=%d　y %d .. %d（长 %d）"
+                   % (round(_L.x), round(min(_L.y1, _L.y2)), round(max(_L.y1, _L.y2)),
+                      round(abs(_L.y2 - _L.y1)))]
+            for _tag, _e in zip(("上端", "下端"),
+                                zones.ladder_ends(self.terrain, _L)):
+                if _e is None:
+                    _lt.append("  %s：**没压到任何 foothold**（该补数据了）" % _tag)
+                    continue
+                _sets = self.zones.set_of(str(_e.fid))
+                _lt.append("  %s：fh #%s　y=%d　集合：%s"
+                           % (_tag, _e.fid, round(_e.y_at((_e.left + _e.right) / 2.0)),
+                              "、".join(_sets) if _sets else "（没圈进任何集合）"))
+            tip = (tip + "\n\n" if tip else "") + "\n".join(_lt)
         self.lbl_status.setText(
             "已选 %d 条 foothold%s%s　｜　鼠标 (%.0f, %.0f)　｜　集合 %d 个"
             % (n, "（点「注册为集合…」给它起名）" if n else "", where,
@@ -1749,25 +2035,38 @@ class ZoneEditorDialog(QDialog):
 
     # ---------------- 边 ----------------
 
-    def add_edge(self, src, dst, kind, ladder=None, portal=None, footholds=None,
-                 walk_dir=None, why=""):
+    def add_edge(self, src, dst, kind, ladder=None, footholds=None,
+                 walk_dir=None, mid_dir=None, mid_y=None, why=""):
         """加一条边（走撤销栈）。失败**不登记撤销点**（见 _commit 的说明）。"""
         snap = self._snapshot()
-        e = self.zones.add_edge(src, dst, kind, ladder=ladder, portal=portal,
-                                footholds=footholds, walk_dir=walk_dir, why=why)
+        e = self.zones.add_edge(src, dst, kind, ladder=ladder,
+                                footholds=footholds, walk_dir=walk_dir,
+                                mid_dir=mid_dir, mid_y=mid_y, why=why)
         self._commit(snap)
         return e
 
     def del_edge(self, edge):
-        """删掉一条边（按 from/to/kind/portal 匹配，避免拿错对象）。"""
+        """删掉一条边（按 from/to/kind/portal/**ladder** 匹配，避免拿错对象）。
+
+        ⚠ 绳号也要进判据（2026-09-27）：同一对集合、同一类型、**不同绳**是两条不同的边
+          （`二楼 →(爬 L3)→ 三楼` 与 `二楼 →(爬 L7)→ 三楼`）—— 少了这一格，删其中一条
+          会把**两条一起删掉** ✗（与 `core.zones.add_edge` 的去重判据必须是同一套 ✓）。
+        """
         snap = self._snapshot()
-        key = (edge.get("from"), edge.get("to"), edge.get("kind"),
-               str(edge.get("portal") or ""))
-        self.zones.edges = [
-            e for e in self.zones.edges
-            if (e.get("from"), e.get("to"), e.get("kind"),
-                str(e.get("portal") or "")) != key]
+        key = self._edge_key(edge)
+        self.zones.edges = [e for e in self.zones.edges if self._edge_key(e) != key]
         self._commit(snap)
+
+    @staticmethod
+    def _edge_key(e):
+        """边的**身份**：`(from, to, kind, ladder)`。
+
+        **一处实现**：`del_edge` / `edit_edge` 的匹配都用它 —— 各写一份必然分叉
+        （`core.zones.add_edge` 的去重判据与此同义 ✓）。
+        ⚠ 原来还有 `portal` 那一格（走哪个门）—— 2026-09-27 随「传送门」一起移除 ✓。
+        """
+        return (e.get("from"), e.get("to"), e.get("kind"),
+                str(e.get("ladder") or ""))
 
     def rev_edge(self, edge):
         """反向复制一条边 → 新边（已经有了就返回 None）。"""
@@ -1777,28 +2076,26 @@ class ZoneEditorDialog(QDialog):
         snap = self._snapshot()
         e = self.zones.add_edge(src, dst, edge.get("kind"),
                                 ladder=edge.get("ladder"),
-                                portal=edge.get("portal"),
                                 why=(edge.get("why") or "") + "（反向复制）")
         self._commit(snap)
         return e
 
-    def edit_edge(self, edge, dst, kind, ladder=None, portal=None, footholds=None,
-                  walk_dir=None):
-        """改一条边（**终点 / 类型 / 绳 / 门**）。失败抛 ValueError。
+    def edit_edge(self, edge, dst, kind, ladder=None, footholds=None,
+                  walk_dir=None, mid_dir=None, mid_y=None):
+        """改一条边（**终点 / 类型 / 绳**）。失败抛 ValueError。
 
-        按 (from,to,kind,portal) 匹配（与 `del_edge` 同一套）：列表里拿到的是 Qt 转过
-        的**副本**，不能按对象身份找。**起点在这里不动** —— 见 `_on_edit_edge`。
+        按 `_edge_key`（from/to/kind/**ladder**）匹配（与 `del_edge` 同一套）：
+        列表里拿到的是 Qt 转过的**副本**，不能按对象身份找。**起点在这里不动** ——
+        见 `_on_edit_edge`。
 
         类型换了要把**不再需要的那一格删掉**：走/跳不该留着上一任的绳号。保存时的校验
         只认当前类型，留着不至于报错，但会在下次改回"爬"时**突然复活**（那是上次的绳）。
         """
         snap = self._snapshot()
-        key = (edge.get("from"), edge.get("to"), edge.get("kind"),
-               str(edge.get("portal") or ""))
+        key = self._edge_key(edge)
         hit = None
         for e in self.zones.edges:
-            if (e.get("from"), e.get("to"), e.get("kind"),
-                    str(e.get("portal") or "")) == key:
+            if self._edge_key(e) == key:
                 hit = e
                 break
         if hit is None:
@@ -1811,15 +2108,17 @@ class ZoneEditorDialog(QDialog):
         for e in self.zones.edges:
             if e is hit:
                 continue
+            # 「改成和另一条一模一样」才算重复：**绳号不同不算**（那是两条不同的边 ✓）
             if (e.get("from") == hit.get("from") and e.get("to") == dst
                     and e.get("kind") == kind
-                    and str(e.get("portal") or "") == str(portal or "")):
-                raise ValueError("已经有一条一样的了（%s → %s，%s）—— 不用改。"
+                    and str(e.get("ladder") or "") == str(ladder or "")):
+                raise ValueError("已经有一条一样的了（%s → %s，%s%s）—— 不用改。"
                                  % (hit.get("from"), dst,
-                                    zones.kind_label(kind)))
+                                    zones.kind_label(kind),
+                                    ("　%s" % ladder) if ladder else ""))
         hit["to"] = dst
         hit["kind"] = kind
-        for k, v in (("ladder", ladder), ("portal", portal)):
+        for k, v in (("ladder", ladder),):
             if v:
                 hit[k] = str(v)
             else:
@@ -1835,6 +2134,15 @@ class ZoneEditorDialog(QDialog):
             hit["dir"] = str(walk_dir)
         else:
             hit.pop("dir", None)
+        # ⭐ 爬的**中途跳下**：给了就存、**没给（None / 空）就删** ✓（= 回到"不中途跳下" ✓
+        #   与上面 `dir` 那段同一套写法 ✓）
+        if mid_dir:
+            hit["mid_dir"] = str(mid_dir)
+            if mid_y is not None:
+                hit["mid_y"] = float(mid_y)
+        else:
+            hit.pop("mid_dir", None)
+            hit.pop("mid_y", None)
         self._commit(snap)
         return hit
 
@@ -1842,36 +2150,46 @@ class ZoneEditorDialog(QDialog):
         it = self.lst_e.currentItem()
         return it.data(Qt.UserRole) if it is not None else None
 
-    def _edge_row(self, e, fmt):
-        """一条边 → 列表行。**只有两个集合名是蓝字**，`→`、类型、绳号都是正常黑字
-        （用户 2026-09-26 的要求）；悬空边（指向已删除/改名的集合）那两个名字标红 ——
-        那种边看着没事、跑起来才会在路径里断掉，必须在界面上就扎眼。
+    def _edge_row(self, e, first=True):
+        """一条边 → 列表行（**一行仍是一条边**：选中 / 高亮 / 删除都按行 ✓）。
 
+        ⚠ 2026-09-27 用户要求：**同一对集合的多种走法合成一组** —— 组里**第一条写全**
+          （`小平台 → 一楼　[跳(jump)]`），后面的行**缩进 + 只写方式和条件**
+          （`　　[走(walk)]（仅向左）`）；「可到达」与「可被到达」两栏用**同一套**写法 ✓，
+          连参数都只剩一个 `first`（两栏原来各传一次 `fmt`，其实永远是 `%s → %s` ✗）。
+        为什么要合并：同一对集合常有好几条边（走 + 跳、两根绳…），原来一个终点铺开三四行、
+          每行都要从头读一遍名字 ✗；而**条件**（方向 / 绳号 / 起跳点）原来在列表里
+          **看不见**（用户要的"扩展更多信息"就是它 —— 见 `zones.edge_cond` ✓）。
+        **只有两个集合名是蓝字**，`→`、类型、条件都是正常黑字（用户 2026-09-26 的要求 ✓）；
+        悬空边（指向已删除/改名的集合）那两个名字标红 —— 那种边看着没事、跑起来才会在
+        路径里断掉，必须在界面上就扎眼 ✓。
         `DisplayRole` 仍是**纯文本**（tooltip / 自检 / `text()` 从它取），
-        分色那版放 `ROLE_HTML` 给 `_RichRowDelegate` 画。
+        分色那版放 `ROLE_HTML` 给 `_RichRowDelegate` 画 ✓。
         """
         kind = e.get("kind") or "?"
         zh, _color = zones.EDGE_LABELS.get(kind, (kind, "#9aa0a6"))
-        extra = ""
-        if kind == "climb":
-            extra = "　绳 %s" % (e.get("ladder") or "?")
-        elif kind == "portal":
-            extra = "　门 %s" % (e.get("portal") or "?")
+        cond = zones.edge_cond(e)
+        tail = "[%s]%s" % (zh, "（%s）" % cond if cond else "")
         bad = (e.get("from") not in self.zones.sets
                or e.get("to") not in self.zones.sets)
-        it = QListWidgetItem("%s　[%s]%s%s"
-                             % (fmt % (e.get("from"), e.get("to")), zh, extra,
-                                "　⚠ 悬空" if bad else ""))
+        warn = "　⚠ 悬空" if bad else ""
+        head = "" if first else EDGE_INDENT          # 同组后续行：缩进、不重复写名字 ✓
+        if first:
+            text = "%s → %s　%s%s" % (e.get("from"), e.get("to"), tail, warn)
+        else:
+            text = "%s%s%s" % (head, tail, warn)
+        it = QListWidgetItem(text)
         it.setData(Qt.UserRole, e)
         nm_col = "#c5221f" if bad else C_SETNAME          # 悬空⇒红；正常⇒蓝（集合名专属）
 
         def nm(s):
             return '<span style="color:%s">%s</span>' % (nm_col, escape(str(s)))
 
-        tail = '[%s]%s' % (zh, extra)                     # 不带颜色 ⇒ 正常黑字
-        it.setData(ROLE_HTML, "%s → %s　%s%s"
-                   % (nm(e.get("from")), nm(e.get("to")), tail,
-                      '　<span style="color:#c5221f">⚠ 悬空</span>' if bad else ""))
+        warn_html = ('　<span style="color:#c5221f">⚠ 悬空</span>' if bad else "")
+        it.setData(ROLE_HTML,
+                   ("%s → %s　%s%s" % (nm(e.get("from")), nm(e.get("to")), tail,
+                                       warn_html)) if first
+                   else ("%s%s%s" % (head, tail, warn_html)))
         it.setToolTip((e.get("why") or "（没写理由）")
                       + ("\n\n⚠ 悬空边：指向的集合已经不在 —— 删掉它，或把集合名改回来。"
                          if bad else ""))
@@ -1884,6 +2202,11 @@ class ZoneEditorDialog(QDialog):
         延伸 —— 选中 A 时它回答的是"A 能去哪儿"。原来把进来的边也一起列，于是点
         「反向」之后，那条反向边（**起点是别人**）会当场多出一行，而它并不属于
         "A 能去哪儿"，看着就像"反向生成了一个不该出现在这儿的东西"。
+        ⚠ **2026-09-27 一度改成"有多少列多少"（列全部边、相关的排最前），当天用户判定
+          是**误修** ⇒ 已改回收窄**。别再往"列全部"改 ✗ —— 用户要的是"这一栏 = 它能去哪儿"，
+          总览看"没选中任何集合"那种状态（那时两栏都列全部 ✓）。改回收窄后，
+          加边/改边**要把那一行选出来并滚到可见**（`_focus_edge_row` ✓）——
+          不然新加的那条可能不在收窄后的列表里，看着又像"没加进去" ✗。
 
         进来的边在下面**「可被到达」**栏里看（2026-09-26 要求 2）—— 那一栏
         **没有编辑按钮**：要改就选中那边的集合，它的"可到达"里就有这条边。
@@ -1905,12 +2228,23 @@ class ZoneEditorDialog(QDialog):
                 in_edges.append(e)
         # **两栏都自动排序**（2026-09-26 要求）：按"另一端的集合名 → 类型 → 绳/门"。
         # 原来是文件顺序 ⇒ 编辑一次（改终点/改类型）行的位置就乱一次，每次都得重新找。
-        for e in sorted(out_edges, key=lambda x: edge_row_key(x, focus)):
-            self.lst_e.addItem(self._edge_row(e, "%s → %s"))
-        for e in sorted(in_edges, key=lambda x: edge_row_key(x, focus)):
-            # 进来的边也写成「起点 → 终点」：这一栏的标题已经说了终点是谁
-            # （能到「X」的），行里再写一遍反而绕。
-            self.lst_in.addItem(self._edge_row(e, "%s → %s"))
+        # **同一对集合合成一组**（组头写全、后续行缩进简写，见 `_edge_row` ✓）。
+        # 分组键就是排序键的头一段（"另一端的集合名"✓）再补上 `(from, to)` ——
+        # 排序键本身只保证"同另一端的相邻"，补上这一对才保证**同一对**连续
+        # （总览时同一个终点可能有不同起点，不补就会把 A→B 和 C→B 混在一组里 ✗）。
+        def _rows(edges, lst):
+            pair = None
+            for e in sorted(edges, key=lambda x: (edge_row_key(x, focus),
+                                                  str(x.get("from") or ""),
+                                                  str(x.get("to") or ""))):
+                key = (e.get("from"), e.get("to"))
+                lst.addItem(self._edge_row(e, first=(key != pair)))
+                pair = key
+
+        _rows(out_edges, self.lst_e)
+        # 进来的边也写成「起点 → 终点」：这一栏的标题已经说了终点是谁
+        # （能到「X」的），行里再写一遍反而绕。
+        _rows(in_edges, self.lst_in)
         n_out, n_in = len(out_edges), len(in_edges)
         for lst in (self.lst_e, self.lst_in):
             lst.blockSignals(False)
@@ -1962,12 +2296,18 @@ class ZoneEditorDialog(QDialog):
 
     def _on_suggest(self):
         """建议队列：算一遍候选边，**由人逐条采纳**（自动只产建议，边不会自动可用）。"""
+        # ⚠ 2026-09-27：「传送门」这种通行方式连同 `portal_suggestions()` 一起**移除**了
+        # ⇒ 建议只剩两种「走」和「爬」（四种通行方式里，跳/下跳都给不出可信建议 ✓）。
         sug = list(zones.walk_suggestions(self.zones, self.terrain))
         sug += zones.climb_suggestions(self.zones, self.terrain)
-        sug += zones.portal_suggestions(self.zones, self.terrain)
-        have = {(e.get("from"), e.get("to"), e.get("kind")) for e in self.zones.edges}
+        # ⚠ 判"有没有采纳过"的判据要和 `core.zones.add_edge` **同一套**
+        #（from/to/kind/ladder）：少了**绳号**，"同一对集合、另一根绳"的建议会被
+        # 当成"已经采纳过了"吞掉 ✗（爬边尤其 —— 一张图上两根绳接同一对平台很常见）。
+        have = {(e.get("from"), e.get("to"), e.get("kind"),
+                 str(e.get("ladder") or "")) for e in self.zones.edges}
         sug = [s for s in sug
-               if s.get("to") is None or (s["from"], s["to"], s["kind"]) not in have]
+               if s.get("to") is None or (s["from"], s["to"], s["kind"],
+                                          str(s.get("ladder") or "")) not in have]
         # **收窄**：选中了某个集合（或它的一段 foothold）⇒ 只给与它有关的候选。
         # 收窄后一条都没有就退回全部 —— 那也是"总览"的入口（不然人会以为建议没了）。
         focus = self._focus_set()
@@ -2002,32 +2342,26 @@ class ZoneEditorDialog(QDialog):
                 continue
             try:
                 self.add_edge(s["from"], s["to"], s["kind"],
-                              ladder=s.get("ladder"), portal=s.get("portal"),
+                              ladder=s.get("ladder"),
                               why="采纳建议：" + (s.get("why") or ""))
             except ValueError as ex:                    # noqa: BLE001
                 QMessageBox.warning(self, "采纳失败", str(ex))
 
     def _reach_ladder_choices(self, src):
-        """(绳, 门) 两串候选 → [(值, 界面上那行字)]，给「增加可达」那个弹窗用。
+        """「爬哪根绳」的候选 → [(绳号, 界面上那行字)]，给「增加可达」那个弹窗用。
 
-        绳用 `ladders_touching`（本集合的绳 ∪ **绳端通到本集合**的绳）：这里问的是
-        "能爬上去的有哪些"，绳端离平台几十像素的那种也要能选到。
-        门排除 `pt=0`（那是**出生点**，不是门）。
+        用 `ladders_touching`（本集合的绳 ∪ **绳端通到本集合**的绳）：这里问的是
+        "能爬上去的有哪些"，绳端离平台几十像素的那种也要能选到 ✓。
+        ⚠ 这里原来还返回"走哪个门"（传送门）那一串 —— **2026-09-27 随「传送门」一起
+          移除**了（`zones.EDGE_KINDS` 现在只有走/爬/下跳/跳 ✓）。
         """
         lids = zones.ladder_ids(self.terrain)
-        lads = [(lids.get(id(L), "?"),
+        return [(lids.get(id(L), "?"),
                  "%s  x=%d  y[%d..%d]  %s"
                  % (lids.get(id(L), "?"), L.x, min(L.y1, L.y2), max(L.y1, L.y2),
                     "绳子" if L.l else "梯子"))
                 for L in zones.ladders_touching(self.terrain,
                                                 self.zones.sets[src]["footholds"])]
-        pors = [(p.pn, "%s  (%d,%d)%s"
-                 % (p.pn, p.x, p.y,
-                    "  → 跨图 %s" % p.tm if p.tm != 999999999 else "  → 本图内"))
-                for p in zones.portals_of(self.terrain,
-                                          self.zones.sets[src]["footholds"])
-                if p.pt != 0]
-        return lads, pors
 
     def _open_reach(self, dlg, key):
         """开「增加 / 编辑可达」窗口：**非模态 + 单实例**（2026-09-26 用户要求）。
@@ -2065,20 +2399,59 @@ class ZoneEditorDialog(QDialog):
 
         `exec_()` 那条返回值在非模态下没有了，所以"确定"之后干什么必须挪到这里
         （和 `ZoneEditorDialog.saved_now` 同一个路子）。
+
+        ⚠ **加了没加都要说话**（2026-09-27 用户报"点了增加后无添加项目"）：`add_edge`
+          对**完全一样**的边是幂等的（返回老那条、不新增）⇒ 原来界面上一点动静都没有，
+          看着就像程序坏了 ✗。这里比对条数：没新增就弹一句说清"已经有这条了、想改绳
+          就双击那一行"，并且**把那条选出来**（一眼看见它到底在哪 ✓）。
         """
         dlg = self.sender()
         try:
             if getattr(dlg, "mode", "add") == "edit" and getattr(dlg, "edge", None):
-                self.edit_edge(dlg.edge, r["dst"], r["kind"], ladder=r["ladder"],
-                               portal=r["portal"], footholds=r.get("footholds"),
-                               walk_dir=r.get("dir"))
+                e = self.edit_edge(dlg.edge, r["dst"], r["kind"], ladder=r["ladder"],
+                                   footholds=r.get("footholds"),
+                                   walk_dir=r.get("dir"),
+                                   mid_dir=r.get("mid_dir"),
+                                   mid_y=r.get("mid_y"))
             else:
-                self.add_edge(dlg.src, r["dst"], r["kind"], ladder=r["ladder"],
-                              portal=r["portal"], footholds=r.get("footholds"),
-                              walk_dir=r.get("dir"),
-                              why="手工加的（%s → %s）" % (dlg.src, r["dst"]))
+                n0 = len(self.zones.edges)
+                e = self.add_edge(dlg.src, r["dst"], r["kind"], ladder=r["ladder"],
+                                  footholds=r.get("footholds"),
+                                  walk_dir=r.get("dir"),
+                                  mid_dir=r.get("mid_dir"),
+                                  mid_y=r.get("mid_y"),
+                                  why="手工加的（%s → %s）" % (dlg.src, r["dst"]))
+                if len(self.zones.edges) == n0:
+                    extra = str(e.get("ladder") or e.get("portal") or "")
+                    QMessageBox.information(
+                        self, "这一条已经有了",
+                        "「%s → %s」已经有一条「%s」了（%s）—— 所以没有重复加。\n\n"
+                        "· 想把绳/门**换成**你刚选的那个：在上面的「可到达」栏里"
+                        "**双击那一行**改（起点不会变）；\n"
+                        "· 想要**另一根绳**（两条不同的走法）：绳号不一样就会各自加一条 ✓ "
+                        "—— 如果刚才选的绳号确实不同却看到这句话，说明列表里那份还没刷新，"
+                        "点一下集合或重开这一栏看看。"
+                        % (dlg.src, r["dst"], zones.kind_label(r["kind"]),
+                           ("绳 " + extra) if r.get("ladder") else
+                           (("门 " + extra) if extra else "没有绳/门")))
+            self._focus_edge_row(e)     # 加/改完把那一行**选中并滚到可见**（不然在长列表里找不着 ✗）
         except ValueError as ex:                        # noqa: BLE001
             QMessageBox.warning(self, "没加成", str(ex))
+
+    def _focus_edge_row(self, e):
+        """把某条边在「可到达」列表里**选中并滚到看得见**。
+
+        为什么需要：那一栏现在列**全部边**（"有多少列多少" ✓），新建/刚改的那条很可能在
+        十几行里靠下 ⇒ 不选出来、不滚过去，人只会看到"点了没反应" ✗（2026-09-27 用户
+        报的就是这个形状）。选中走既有的 `_edge_hl`（`_refresh_edges` 会按它把那行选回来 ✓）。
+        """
+        if e is None:
+            return
+        self._edge_hl = dict(e)
+        self._refresh_edges()
+        it = self.lst_e.currentItem()
+        if it is not None:
+            self.lst_e.scrollToItem(it)
 
     def _drop_choices(self, src):
         """起点集合的 foothold → [(id, 界面上那行字)]，给「可下跳 foothold」那张表用。
@@ -2124,9 +2497,9 @@ class ZoneEditorDialog(QDialog):
             QMessageBox.information(self, "只有一个集合",
                                     "至少要两个集合才谈得上可达。")
             return
-        lads, pors = self._reach_ladder_choices(src)
+        lads = self._reach_ladder_choices(src)
         dlg = AddReachDialog(self, src, others, self._related_sets(src),
-                             ladders=lads, portals=pors,
+                             ladders=lads,
                              drop_choices=self._drop_choices(src))
         # **非模态 + 单实例**（见 _open_reach）：同一个起点再点一次 ⇒ 只聚焦，不新开
         self._open_reach(dlg, ("add", src))
@@ -2168,9 +2541,9 @@ class ZoneEditorDialog(QDialog):
                 "或者把这条边删掉。" % src)
             return
         others = [n for n in self.zones.sets if n != src]
-        lads, pors = self._reach_ladder_choices(src)
+        lads = self._reach_ladder_choices(src)
         dlg = AddReachDialog(self, src, others, self._related_sets(src),
-                             ladders=lads, portals=pors,
+                             ladders=lads,
                              drop_choices=self._drop_choices(src), init=e)
         dlg.mode = "edit"
         dlg.edge = e
@@ -2241,8 +2614,7 @@ class ZoneEditorDialog(QDialog):
         have = {(e.get("from"), e.get("to"), e.get("kind"))
                 for e in self.zones.edges}
         for s in (zones.walk_suggestions(self.zones, self.terrain)
-                  + zones.climb_suggestions(self.zones, self.terrain)
-                  + zones.portal_suggestions(self.zones, self.terrain)):
+                  + zones.climb_suggestions(self.zones, self.terrain)):
             if not s.get("to") or (s["from"], s["to"], s["kind"]) in have:
                 continue            # 「另一端没圈」不是边；已采纳的也不用再列
             if s["from"] == name:
@@ -2268,7 +2640,9 @@ class ZoneEditorDialog(QDialog):
         # 所以两种顺序都能用。
         if name:
             self._sel = set()
+            self._sel_ladder = None         # 同上：别让"看着的绳梯"和集合高亮一起亮 ✓
         self._rebuild_scene()
+        self._refresh_status()
         self._refresh_edges()       # 焦点变了 ⇒ 可达列表跟着收窄/放开
         if name:
             self.focus_ids(self.zones.sets[name]["footholds"])

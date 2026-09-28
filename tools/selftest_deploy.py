@@ -30,7 +30,7 @@ from deploy import config as dcfg                        # noqa: E402
 from deploy import selfcheck, services                   # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-MMAP = {"bind": "0.0.0.0", "port": 5003, "zoom": 3, "fps": 10, "quality": 100,
+MMAP = {"bind": "0.0.0.0", "port": 5003, "zoom": 3, "fps": 30, "quality": 100,
         "x": 100, "y": 40, "w": 200, "h": 150}
 MMAP_NO_REGION = dict(MMAP, x=None, y=None, w=None, h=None)
 
@@ -66,7 +66,7 @@ def t_mmap_cmd():
     cmd = services.build_cmd("mmap", MMAP)
     txt = " ".join(cmd)
     check("tools.minimap_push" in txt, "没拼上 tools.minimap_push")
-    for want in ("--port 5003", "--zoom 3", "--fps 10", "--quality 100",
+    for want in ("--port 5003", "--zoom 3", "--fps 30", "--quality 100",
                  "--x 100", "--y 40", "--w 200", "--h 150"):
         check(want in txt, "命令行里缺 %r：%s" % (want, txt))
     check("--bind 0.0.0.0" in txt, "命令行里没带监听地址")

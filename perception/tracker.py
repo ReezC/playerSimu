@@ -339,6 +339,11 @@ class PlayerTracker:
         self._vx = 0.0
         self._vy = 0.0
         self._missed = 0
+        #: 上一次**喂进来的黄点世界坐标** `(world_x, world_y)`（None = 那几拍没有）
+        self._last_world = None
+        #: 上一次**拿到的框**（解锁也不清 —— 它只用来算"上一帧的相机" ✓，
+        #: 见 `_world_dist`；相机对**所有候选是同一次平移** ⇒ 旧一点也只影响刻度、不影响排序 ✓）
+        self._last_box = None
 
     @property
     def locked(self):
@@ -349,29 +354,89 @@ class PlayerTracker:
         x1, y1, x2, y2, conf = c
         return ((x1 + x2) / 2.0, (y1 + y2) / 2.0, y2, conf, x2 - x1, y2 - y1)
 
-    def update(self, cands):
-        """喂本帧的玩家候选框，返回跟住的 player_box（或 None）。"""
+    def _world_dist(self, cx, bottom, world):
+        """候选框 → **世界坐标**、再量到「本帧黄点」的距离；缺数据 ⇒ `None` ✓。
+
+        相机（**上一帧**的）= `上一次的 world − 上一次的框`：
+        x 用框中心、y 用**框底**（`_last_box[2]`）—— 和 `perception.minimap.screen_to_world`
+        的口径完全一致（那边玩家也是 `x` / `bottom` ✓ 约定 10）。
+        ⚠ 拿不到任何一边（没有 world / 还没有框）⇒ `None`（调用方退回像素判据 ✓ 不猜 ✗）。
+        """
+        if world is None or self._last_world is None or self._last_box is None:
+            return None
+        try:
+            cam_x = float(self._last_world[0]) - float(self._last_box[0])
+            # ⭐ 脚底偏移（用户 2026-09-28 ✓）—— 与 `screen_to_world` **同一份口径** ✓
+            #   （读 `world_state` 的镜像 ✓ 那边不做反向 import ✓）。
+            from perception import world_state as _ws
+            cam_y = (float(self._last_world[1])
+                     - (float(self._last_box[2]) + float(_ws.FOOT_OFFSET_PX)))
+            dx = (float(cx) + cam_x) - float(world[0])
+            dy = (float(bottom) + cam_y) - float(world[1])
+        except (TypeError, ValueError):
+            return None
+        return (dx * dx + dy * dy) ** 0.5
+
+    def update(self, cands, world=None):
+        """喂本帧的玩家候选框，返回跟住的 player_box（或 None）。
+
+        `world`（可选；用户 2026-09-27 提的"用小地图的玩家世界坐标辅助玩家框防抖"）=
+        **本帧黄点的世界坐标** `(world_x, world_y)`。黄点是**独立于 YOLO 的第二个传感器**
+        （一个认画面、一个读小地图 ✓）⇒ 除了"位置连续性"，还能问一句"**它现在到底在哪**"：
+        每个候选按上一帧的相机换算成世界坐标，**离本帧黄点最近的那个才是「我」** ✓
+        （别人贴着一起走、或者自己被打飞时，这一把尺比外推的像素位置靠谱 ✓）。
+
+        ⚠ **一定要"本帧黄点 + 上一帧的框"**：同一帧的 world 和 box 相减会退化成
+          "离上一帧框多远"（就是老判据），等于没加 ✗ —— 所以调用方得**先算黄点定位**再挑框
+          （见 `gui/live_thread.py` 挑框那一段 ✓）。
+        ⚠ `world` 没给 / 上一次也没给 / 两个候选不等价 ⇒ **退回老判据**（像素连续性 ✓），
+          绝不因为"世界数据缺"就把锁丢了 ✗。
+        """
         if self._box is None:
-            # 未锁定：取置信度最高的（开局 / 跟丢后重新锁）
+            # 未锁定（开局 / 跟丢后）：老口径 = 取**置信度最高**的 ✓；有世界数据时先用它挑一遍
+            # （`_last_world` + `_last_box` 都还在的话 ✓），挑不出来再回老口径 ✓。
             if not cands:
                 return None
-            self._box = self._cand_to_box(max(cands, key=lambda c: c[4]))
+            pick = None
+            if world is not None and self._last_world is not None \
+                    and self._last_box is not None:
+                ranked = [(self._world_dist((c[0] + c[2]) / 2.0, c[3], world), c)
+                          for c in cands]
+                ranked = [(d, c) for d, c in ranked if d is not None]
+                if ranked:
+                    pick = min(ranked, key=lambda t: t[0])[1]
+            if pick is None:
+                pick = max(cands, key=lambda c: c[4])
+            self._box = self._cand_to_box(pick)
             self._vx = self._vy = 0.0
             self._missed = 0
+            self._last_box = self._box
+            if world is not None:
+                self._last_world = (float(world[0]), float(world[1]))
             return self._box
 
         px = self._box[0] + self._vx   # 预测位置（位置 + 速度外推）
         py = self._box[1] + self._vy
 
-        best, best_d = None, None
+        best, best_d, best_w = None, None, None
         for c in cands:
             cx = (c[0] + c[2]) / 2.0
             cy = (c[1] + c[3]) / 2.0
             d = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
             if d > self.max_jump:
                 continue               # 太远：不是「我」（可能是别人经过 / 已传送）
-            if best_d is None or d < best_d:
-                best_d, best = d, c
+            wd = self._world_dist(cx, c[3], world)     # 到"本帧黄点"的世界距离（可为 None ✓）
+            if best is None:
+                best, best_d, best_w = c, d, wd
+            elif wd is not None and best_w is not None:
+                # 两边都能量 ⇒ **世界距离优先**（小地图是独立观测 ✓）
+                if wd < best_w:
+                    best, best_d, best_w = c, d, wd
+            elif d < best_d:
+                # 缺世界数据 ⇒ 退回老判据（像素连续性 ✓）
+                best, best_d, best_w = c, d, wd
+        if world is not None:
+            self._last_world = (float(world[0]), float(world[1]))
 
         if best is not None:
             nb = self._cand_to_box(best)
@@ -379,6 +444,7 @@ class PlayerTracker:
             self._vx = a * self._vx + (1 - a) * (nb[0] - self._box[0])
             self._vy = a * self._vy + (1 - a) * (nb[1] - self._box[1])
             self._box = nb
+            self._last_box = nb         # 相机那一份也更新（下一帧要用它 ✓）
             self._missed = 0
             return nb
 
@@ -390,4 +456,5 @@ class PlayerTracker:
             return None
         cx, cy, bottom, conf, bw, bh = self._box
         self._box = (px, py, bottom + (py - cy), conf, bw, bh)
+        self._last_box = self._box    # 外推的这一份也是"我最好的估计" ⇒ 相机照它算 ✓
         return self._box

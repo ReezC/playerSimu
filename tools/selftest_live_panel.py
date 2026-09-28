@@ -38,6 +38,16 @@ def _frame(n):
     return img
 
 
+def _feed(p, img, raw=None):
+    """按**真线程的顺序**喂一帧：先**原生帧**、再**显示帧**（两个信号，见 live_thread）。
+
+    真线程里是两次队列信号（`raw_frame_ready` → `frame_ready`）；测试直接调槽 ✓。
+    `raw=None` ⇒ 用 `img` 自己（线程里"没画东西"时就是同一个对象：收画面阶段 ✓）。
+    """
+    p._on_raw_frame(img if raw is None else raw)
+    p._on_frame(img)
+
+
 def _panel():
     from PyQt5.QtWidgets import QApplication
     from gui import live_panel as lp
@@ -66,13 +76,18 @@ def t_coalesce():
         last = None
         for i in range(10):
             last = _frame(i)
-            p._on_frame(last)
+            # ⚠ 原生帧故意用**另一个**像素值（10 + i ⇒ 和显示帧 i 分得开）：
+            #   `current_frame()` 必须是**原生**那份，不能被显示帧盖掉 ✓
+            _feed(p, last, raw=_frame(10 + i))
         check(p._disp_merged == 9,
               "连推 10 帧应当合并掉 9 帧，实际合并 %d 帧" % p._disp_merged)
         check(made["n"] == 0,
               "事件循环还没跑就画了 %d 次（说明没合并，直接每帧都画）" % made["n"])
-        check(p.current_frame() is last,
-              "current_frame() 必须是**最新**那帧（探针标定/血条框选靠它）")
+        cur = p.current_frame()
+        check(cur is not None and int(cur[0, 0, 0]) == 19,
+              "current_frame() 必须是**最新那帧的原生帧**（探针标定/血条框选靠它）："
+              "拿到的是 %r（19 = 原生、9 = 显示帧的行号值）"
+              % (None if cur is None else int(cur[0, 0, 0])))
 
         app.processEvents()
         check(made["n"] == 1, "合并之后应当只画 1 次，实际 %d 次" % made["n"])
@@ -91,13 +106,13 @@ def t_hidden_skips_draw():
     """
     app, lp, p, made, orig = _panel()
     try:
-        p._on_frame(_frame(1))
+        _feed(p, _frame(1))
         app.processEvents()
         drew = p._disp_drawn
         p.hide()
         app.processEvents()
         for _ in range(3):
-            p._on_frame(_frame(11))
+            _feed(p, _frame(11))
             app.processEvents()
         check(p._disp_drawn == drew,
               "不可见时不该画，实际又画了 %d 帧" % (p._disp_drawn - drew))
@@ -267,7 +282,7 @@ def t_minimap_overlay_is_display_only():
         frame[:, :, 2] = 200            # BGR 全红，方便一眼看出哪儿被盖住了
         before = frame.copy()
 
-        p._on_frame(frame)
+        _feed(p, frame)
         app.processEvents()
         pm = p.view.pixmap()
         check(pm is not None and not pm.isNull() and pm.width() > 40
@@ -294,6 +309,23 @@ def t_minimap_overlay_is_display_only():
         check(out.red() > 150 and out.green() < 80,
               "叠加把整幅画面都盖了：角落取到 rgb(%d, %d, %d)"
               % (out.red(), out.green(), out.blue()))
+
+        # ★ 「浓淡」那一格**真的作用在像素上**（用户 2026-09-26 要确认"拖动条是否生效"）。
+        #   上面那条只证明了 alpha=1 会画；这里钉住**0 和中间值**：
+        #   · 0（滑块最左端 = 看不见）⇒ 那块必须还是原本的红底，不能还透出绿 ✗；
+        #   · 50 ⇒ 红绿混出来 —— 证明是**按比例混**，不是"要么全画要么不画"（那样两种
+        #     情形都能骗过只测 0/1 的用例 ✗）。
+        p.set_minimap_overlay(green, None, rect, 0.0)
+        c0 = p.view.pixmap().toImage().pixelColor(cx, cy)
+        check(c0.red() > 150 and c0.green() < 80,
+              "浓淡 0（最左端 = 看不见）却还画着：rgb(%d, %d, %d)"
+              % (c0.red(), c0.green(), c0.blue()))
+        p.set_minimap_overlay(green, None, rect, 0.5)
+        c5 = p.view.pixmap().toImage().pixelColor(cx, cy)
+        check(60 < c5.green() < 200 and c5.red() > 60,
+              "浓淡 50%% 没混色（该是半绿半红底）：rgb(%d, %d, %d)"
+              % (c5.red(), c5.green(), c5.blue()))
+        p.set_minimap_overlay(green, None, rect, 1.0)   # 还原：下面几条按 alpha=1 写的
 
         # ★ 帧数据必须原封不动：它还要喂探针/血条/小地图标定弹窗
         check(p.current_frame() is frame,
@@ -376,6 +408,244 @@ def t_overlay_source_out_of_image():
     finally:
         lp._bgr_to_pixmap = orig
         p.close()
+
+
+def t_vision_box_updates_every_frame():
+    """视野框（那四条虚线）必须**每帧现算** —— 用户 2026-09-27 报"更新速度太慢"。
+
+    根因：它原来是 `if time.perf_counter() - _vision_last[0] >= 3.0:` **每 3 秒**才算一次 ✗
+    —— 角色/镜头一直在动，而框 3 秒才动一下 ⇒ 看上去就是"卡住的虚线"。
+    `_vision_box_for` 只是几次整数加减（微秒级，比画那四条虚线还便宜）⇒ 没有理由节流 ✓。
+
+    行为要真起线程 + 模型才看得到 ⇒ 这条钉**源码**（照 `t_raw_frame_before_draw` 的做法）：
+      ① 那个 3 秒节流的变量（`_vision_last`）必须已经不在；
+      ② 每帧那次调用必须在、而且**紧挨着它的上一行不许是时间比较**（再套回去就红 ✗）。
+    """
+    src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    # ⚠ 只在**代码行**里找（注释里就写着"原来是每 3 秒"这句说明 —— 拿整份源码找会把
+    #   说明文字本身判红 ✗，这个形状踩过好几次了）
+    code = [l for l in src.splitlines() if not l.strip().startswith("#")]
+    joined = "\n".join(code)
+    check("_vision_last" not in joined,
+          "还留着 `_vision_last`（= 那个「每 3 秒算一次」的节流器）⇒ 视野框又会卡 ✗")
+    i = next((n for n, l in enumerate(code)
+              if "_vision_box[0] = _vision_box_for(" in l), None)
+    check(i is not None, "找不到每帧计算视野框那一句（`_vision_box[0] = _vision_box_for(...)`）")
+    prev = code[i - 1].strip() if i else ""
+    check(not prev.startswith("if time.perf_counter()"),
+          "视野框又被套进「每 N 秒算一次」里了（上一行：%r）⇒ 虚线会卡住 ✗" % prev)
+    check("def _vision_box_for" in src,
+          "`_vision_box_for` 没了（它是纯整数运算，不该被别的东西换掉 ✗）")
+
+
+def t_vis_color_alpha_and_toggles():
+    """「外观 → 辅助线与标记」那一组的新行为（用户 2026-09-27 一次提的三条）。
+
+    ① 颜色**支持透明度**（弹窗里有拖动条 ⇒ 存的是 `#AARRGGBB`）⇒ 校验/解析两条路都得认，
+       否则"配好的透明度下次读回来就没了"（会被当非法值静默退回默认色 ✗）；
+    ② 那一组里**每项前面有开关**（`*_on`）⇒ 关掉 = 不画这一项，颜色留着 ✓；
+    ③ 两项"攻击距离线颜色"换成**三个框**（攻击范围框 / 攻击盲区框 / 跳跃攻击范围框）✓，
+       名字末尾的「颜色」两字去掉 ✓。
+
+    钉五件（都在会真出错的地方）：
+      · `_valid_color` 收 7 位与 9 位、拒明显坏值；
+      · `hex_to_bgra` 的**通道顺序**是 (b, g, r, a) —— 写反了整幅画面的颜色都会变 ✗；
+        `hex_to_bgr` 必须与它一致（老调用方一堆 ✓）；
+      · `load_vis` 的开关键缺省/写坏都算 **True**（= 画 = 老行为 ✓），
+        `jump_attack_color` 也存在（占位项也要有 ✓）；
+      · `_blit_alpha`：不透明**原样直画**、半透明按 alpha 混、混不到框外 ✓；
+      · 设置界面源码：老名字一个都不许留、六项各带自己的开关 ✓。
+    """
+    import cv2
+
+    from gui import live_thread as lt
+    from gui import theme
+
+    # ① 颜色合法性：7 位（老配置）与 9 位（带透明度）都收
+    check(theme._valid_color("#f9ab00") and theme._valid_color("#80f9ab00"),
+          "颜色校验收不下 `#AARRGGBB`（配好的透明度下次读回来会丢 ✗）")
+    check(not theme._valid_color("#f9ab0") and not theme._valid_color("f9ab00"),
+          "颜色校验把明显的坏值放进来了")
+
+    # ② 通道顺序（BGR + alpha）
+    check(theme.hex_to_bgra("#f9ab00") == (0, 171, 249, 255),
+          "`hex_to_bgra` 不是 (b, g, r, a)：%r" % (theme.hex_to_bgra("#f9ab00"),))
+    check(theme.hex_to_bgra("#8000abf9") == (249, 171, 0, 128),
+          "带 alpha 的解析不对（该 (249, 171, 0, 128)）：%r"
+          % (theme.hex_to_bgra("#8000abf9"),))
+    check(theme.hex_to_bgr("#8000abf9") == (249, 171, 0),
+          "`hex_to_bgr` 与 `hex_to_bgra` 不一致（老调用方会拿到错的通道 ✗）")
+
+    # ③ 开关默认「画」+ 占位项的颜色键在
+    vis = theme.load_vis()
+    for k in ("lock_on", "attack_on", "min_attack_on", "jump_attack_on",
+              "chase_jump_on", "vision_on", "timer_on"):
+        check(vis.get(k) is True,
+              "「%s」默认该是 True（= 画，老配置里没有这些键 ✓）：%r" % (k, vis.get(k)))
+    check("jump_attack_color" in vis,
+          "「跳跃攻击范围框」的颜色键没进配置（占位项也要能配颜色 ✓）")
+    check("chase_jump_color" in vis,
+          "「追击起跳框」的颜色键没进配置（它现在是个框，颜色不能再写死在 live_thread ✗）")
+
+    # ④ `_blit_alpha`：不透明直画 / 半透明混色 / 不越界
+    img = np.zeros((20, 20, 3), np.uint8)
+    lt._blit_alpha(img, (0, 0, 255, 255),
+                   lambda t, c: cv2.rectangle(t, (0, 0), (9, 9), c, -1))
+    check(tuple(int(v) for v in img[0, 0]) == (0, 0, 255),
+          "不透明时该原样画上去（零开销那条路）：%r" % (tuple(int(v) for v in img[0, 0]),))
+    img2 = np.zeros((20, 20, 3), np.uint8)
+    lt._blit_alpha(img2, (0, 0, 255, 128),
+                   lambda t, c: cv2.rectangle(t, (0, 0), (9, 9), c, -1))
+    _v = int(img2[0, 0, 2])
+    check(110 <= _v <= 145, "半透明混色不对（该 ≈128）：%r" % _v)
+    check(tuple(int(x) for x in img2[0, 15]) == (0, 0, 0),
+          "混色的结果溢到图形外面了 ✗")
+
+    # ⑤ 设置界面源码（控件那层在 settings_dialog 的 `_page_appearance` 里，建整个对话框太重）
+    src = (ROOT / "gui" / "settings_dialog.py").read_text(encoding="utf-8")
+    for bad in ('"锁定框颜色"', '"最大攻击距离线颜色"', '"最小攻击距离线颜色"',
+                '"视野线颜色"', '"定时任务颜色"'):
+        check(bad not in src,
+              "「辅助线与标记」里还留着老名字 %s（用户要求去掉「颜色」两字 ✗）" % bad)
+    for name, key in (("锁定框", "lock_on"), ("攻击范围框", "attack_on"),
+                      ("攻击盲区框", "min_attack_on"),
+                      ("跳跃攻击范围框", "jump_attack_on"),
+                      ("追击起跳框", "chase_jump_on"),
+                      ("视野线", "vision_on"), ("定时任务", "timer_on")):
+        check('"%s"' % name in src and 'on_key="%s"' % key in src,
+              "「%s」这一项没有做出来 / 没带自己的开关 %s ✗" % (name, key))
+    # ⑥ 叠图的**摆法**（源码约定：那些框在 live_thread 的收流循环里画，行为要真起线程 +
+    #    YOLO 才测得到 ⇒ 这里钉源码 ✓）：
+    #    用户 2026-09-27 的图上三个框是**并排、首尾相接**的
+    #    （`玩家 │ 攻击盲区框 │ 攻击范围框 │ 追击起跳框`）✓
+    lsrc = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    check("from_d=min_ad" in lsrc,
+          "「攻击范围框」没带 `from_d=min_ad` ⇒ 会从角色中心一路铺过去，和盲区框重叠 ✗"
+          "（图上两者是并排的）")
+    check("from_d=max_ad + jlo" in lsrc,
+          "「追击起跳框」没按区间画（该是 [最大 + min, 最大 + max] ✓）")
+    check("_chase_jump_color" in lsrc and "_on_chase" in lsrc,
+          "「追击起跳框」没用设置里的颜色/开关 ⇒ 又写死回 live_thread 了 ✗")
+    check("(0, 200, 0)" not in lsrc,
+          "live_thread 里还有写死的那个绿（追击起跳的颜色该只在 `gui/theme.py` 一处 ✗）")
+    check("jump_attack_color" not in lsrc,
+          "「跳跃攻击范围框」被画出来了 —— 它的逻辑还没做、尺寸都没定义 ⇒ 不该画 ✗")
+
+    check("QColorDialog.ShowAlphaChannel" in src
+          and "QColorDialog.DontUseNativeDialog" in src,
+          "颜色弹窗没有开透明度拖动条（`ShowAlphaChannel` 缺了就没法调透明 ✗；"
+          "`DontUseNativeDialog` 缺了在 Windows 上会走**系统**弹窗、同样没有 alpha 条 ✗）")
+    check("HexArgb" in src,
+          "选完颜色没按 `#AARRGGBB` 存 ⇒ 透明度当场丢掉 ✗")
+
+
+def t_current_frame_is_raw():
+    """`current_frame()` 必须是**原生帧**：显示帧（画着检测框/视野虚线）不许进那条路。
+
+    用户 2026-09-27 现场报的 bug：**框选小地图时，视野那条灰色虚线也被框进去** ——
+    虚线/检测框都是收流线程在帧上**原地**画的，而框选拿的原来是同一份 ✗。修法是把两路
+    分开（`raw_frame_ready` / `frame_ready`）。这条钉三件：
+
+      ① 行为：先喂原生、再喂显示 ⇒ `current_frame()` 是**原生**那份（不是显示那份 ✗）；
+      ② 行为：面板**不可见**时原生帧也照更新（不然切回来一眼就框到旧画面 ✗）；
+      ③ 源码：`live_panel.py` 里给 `_last_bgr` 赋值的地方**只有 `_on_raw_frame` 一处**
+         （谁在 `_on_frame` 里再写一次，等于把 bug 写回来 ✗）。
+    """
+    app, lp, p, made, orig = _panel()
+    try:
+        raw = _frame(31)
+        disp = _frame(97)          # 显示帧故意用能区分的像素值
+        p._on_raw_frame(raw)
+        p._on_frame(disp)
+        cur = p.current_frame()
+        check(cur is raw,
+              "current_frame() 不是原生帧 —— 框选会框到画上去的框线/虚线（用户现场那个 bug）")
+        check(int(cur[0, 0, 0]) == 31,
+              "显示帧把原生帧盖掉了（拿到 %d，31 才是原生）" % int(cur[0, 0, 0]))
+
+        p.hide()
+        app.processEvents()
+        raw2 = _frame(32)
+        p._on_frame(_frame(98))    # 显示帧：不可见 ⇒ 连画都不画
+        p._on_raw_frame(raw2)
+        check(p.current_frame() is raw2,
+              "不可见时原生帧没更新 —— 切回来看一眼再框选，框到的是旧画面 ✗")
+
+        # ③ 源码：`_last_bgr` 的赋值只许在 `_on_raw_frame` 里
+        src = (ROOT / "gui" / "live_panel.py").read_text(encoding="utf-8")
+        body_raw = src.split("def _on_raw_frame", 1)[1].split("def _on_frame", 1)[0]
+        body_disp = src.split("def _on_frame", 1)[1].split("def _draw_pending", 1)[0]
+        check("self._last_bgr = " in body_raw,
+              "`_on_raw_frame` 没存下原生帧（current_frame() 就没来源了）")
+        # ⚠ 只找**赋值**（`self._last_bgr = `）：说明文字里就写着"别在这里写
+        #   `_last_bgr = img`"，拿裸名字找会把**解释**一起判红（这个形状踩过好几次 ✗）
+        check("self._last_bgr = " not in body_disp,
+              "`_on_frame`（显示帧）里又在给 `_last_bgr` 赋值 —— 那就是把「框选框到视野"
+              "虚线」那个 bug 写回来了 ✗")
+        n = src.count("self._last_bgr = img")
+        check(n == 1,
+              "给 `_last_bgr` 写 img 的地方有 %d 处（只许 `_on_raw_frame` 那一处）" % n)
+    finally:
+        lp._bgr_to_pixmap = orig
+        p.close()
+
+
+def t_raw_frame_before_draw():
+    """收流线程：**先留原生帧、再就地画** —— 且只有"真要画"时才拷（收画面阶段零开销）。
+
+    这条是源码约定（行为在 `selftest_live_panel` 里验不了：要真起线程 + YOLO）：
+      ① `raw = vis.copy()` 必须在**第一个** `cv2.*(vis` 之前（画过就回不去了 ✗）；
+      ② 所有往 `vis` 上的绘制都在 `if self._infer.is_set():` 那一块里
+         （不然"推理关着就不拷"这个前提不成立 ⇒ 原生帧会被污染 ✗）；
+      ③ `raw_frame_ready.emit(raw)` 必须**在显示限流之外**（`if should_show:` 那层
+         之外）—— 显示可以限流，取帧不许 ✗；
+      ④ `frame_ready.emit(vis)` 仍在（显示那份不许断）。
+    """
+    src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+
+    # ① 先拷再画（画是**原地**改数组 ⇒ 拷晚了原始像素就回不来了）
+    LINE_COPY = "raw = vis.copy() if self._infer.is_set() else vis"
+    i_copy = src.find("raw = vis.copy()")
+    check(i_copy > 0, "没找到 `raw = vis.copy()` —— 原生帧没留（框选会拿到画过的帧）")
+    draws = [src.find(kw) for kw in ("cv2.rectangle(vis,", "cv2.line(vis,",
+                                     "cv2.putText(vis,", "cv2.circle(vis,",
+                                     "cv2.arrowedLine(vis,", "_draw_dashed_line(vis,")]
+    draws = [j for j in draws if j >= 0]
+    check(draws, "一个往 `vis` 上的绘制都没找到（源码约定该改写了？）")
+    check(i_copy < min(draws),
+          "原生帧是在画过之后才拷的（`vis` 是原地改的，那时原始像素已经没了 ✗）")
+
+    # ② 拷贝条件必须**就写在那一行上**：它假设"所有绘制都在下面那道推理门里"
+    check(LINE_COPY in src,
+          "原生帧的拷贝条件不是那一行（`%s`）—— 换了条件就等于假设「别处也会画」✗"
+          % LINE_COPY)
+    i_infer = src.find("if self._infer.is_set():")
+    check(i_infer > 0, "没找到推理那道门（`if self._infer.is_set():`）")
+    for kw in ("cv2.rectangle(vis,", "cv2.line(vis,", "cv2.putText(vis,",
+               "cv2.circle(vis,", "cv2.arrowedLine(vis,", "_draw_dashed_line(vis"):
+        j = src.find(kw)
+        check(j == -1 or j > i_infer,
+              "%s 跑到 `if self._infer.is_set():` 外面了 —— 推理关着时原生帧会被画脏 ✗"
+              % kw)
+
+    # ③ 原生帧的 emit 不受显示限流：它必须**先发**，而且缩进比显示那句**浅**
+    #    （显示那句在 `if should_show:` 里面 ⇒ 缩进更深 ✓；比它深就是被限流包住了 ✗）
+    i_emit_raw = src.find("self.raw_frame_ready.emit(raw)")
+    i_emit_disp = src.find("self.frame_ready.emit(vis)")
+    check(i_emit_raw > 0, "没发原生帧信号（`raw_frame_ready`）—— 框选还是拿到显示帧")
+    check(0 < i_emit_raw < i_emit_disp,
+          "原生帧的 emit 不在显示帧之前（面板要先拿到原生帧 ✓）")
+
+    def _indent(text, pos):
+        b = text.rfind("\n", 0, pos) + 1
+        line = text[b: text.find("\n", pos)]
+        return len(line) - len(line.lstrip())
+
+    check(_indent(src, i_emit_raw) < _indent(src, i_emit_disp),
+          "原生帧的 emit 缩进比显示那句还深 ⇒ 被 `if should_show:` 包住了："
+          "取帧会跟着显示限流一起变旧 ✗")
+    check("self.frame_ready.emit(vis)" in src,
+          "显示帧的 emit 没了（画面就黑了）")
 
 
 def t_probe_box_overlay():
@@ -480,6 +750,24 @@ def t_probe_mono_gate():
         txt2 = p.lbl_stats.text()
         check("142" in txt2 and "几何可疑" not in txt2,
               "单调正常时没正常显示延迟：%r" % txt2)
+
+        # ②b **对时偏置要摆出来**（用户 2026-09-26 要求）：延迟里**整段加着**它，
+        #     它旧了/测偏了，延迟数就整体高或低那么多 —— 实测那次是 1255 ms 显示值
+        #     对 1144.5 ms 偏置（链路其实只有百毫秒级 ✗），光看"锁死 1.25 秒"根本
+        #     看不出来 ⇒ 摆出来才能一眼对上 ✓。
+        p._on_stats(dict(base, delay_ms=1255.0, probe_mono=True, probe_jumpy=0,
+                         probe_samples=20, clock_offset_ms=1144.5))
+        txt2b = p.lbl_stats.text()
+        check("1255" in txt2b and "1144" in txt2b,
+              "延迟旁边没把对时偏置摆出来（这次就是 1255 ≈ 1144 才看出来的）：%r" % txt2b)
+        tip2b = p.lbl_stats.toolTip()
+        check("对时偏置" in tip2b and "clock_sync" in tip2b,
+              "对时偏置的 tooltip 没说清怎么验证/重对：%r" % tip2b[:90])
+        # 老调用方（没给这个键）不许崩、也不许瞎编一个偏置写上去
+        p._on_stats(dict(base, delay_ms=142.0, probe_mono=True, probe_jumpy=0,
+                         probe_samples=20))
+        check("对时偏置" not in p.lbl_stats.text(),
+              "没给偏置却把它写进状态行了：%r" % p.lbl_stats.text())
 
         # ③ 框选保存前那道闸：拿实时流跑几帧验单调性（画对了才放行）
         geo_ok = {"x": 20.0, "y": 20.0, "cell": 16.0, "gap": 2.0}
@@ -612,9 +900,62 @@ def t_pixmap_handles_padded_frame():
           "（白拷一整幅，1080p 约 2 ms/帧，还全在 GUI 主线程上）")
 
 
+def t_mob_box_labels():
+    """怪框上那行「地点」怎么画（用户 2026-09-27 两条要求 ✓）：
+
+      ① **「查询到的怪框」的地点 ⇒ 写在框下方靠左**（原话："查询到的怪框地点标在框下方靠左显示"）✓；
+      ② **锁定框不再写地点**（原话："**以前的锁定框表地点就不要了**" ✗）。
+
+    做法：
+      · ① 那行文字来自 `queried_mob_boxes()`（`mob_sets_of` 那个**唯一漏斗**记的账 ✓）——
+        绘制层**只读** ✓；位置 = x 贴**框左边**、y 在**框下沿 + 14**，贴画面下沿放不下才翻上去 ✓；
+      · ② 锁定框那块**不许**再出现 `current_target_sets(...)` 的**调用** ✓（那份缓存本身也
+        随之删掉了 ✗ —— "死数据不留"）。
+
+    ⚠ 为什么钉这么细：绘制那一支要是自己调 `mob_sets_of` / `foothold_below`
+      ⇒ **每帧扫几百条 foothold** ✗（纪律原文：只对当前那一只调用、每拍最多一次 ✓）。
+      所以两处都按**源码**钉（这一段没有可驱动的最小夹具 ✓）。
+    """
+    src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+
+    # ① 查过的怪框：**框下方靠左**
+    i = src.index("queried_mob_boxes()")
+    # ⚠ 窗口**别卡太死**（2026-09-28 踩过 ✗）：原来 1800，而那段里后来陆续加了注释
+    #   （"判不出只写失败"那段 ✓）⇒ 把 `_qy2 + 14` **挤出窗口** ⇒ 用例**假红** ✗。
+    #   这条钉的是"那几样在不在"，不是"隔多远" ⇒ 给宽一点 ✓。
+    seg = src[i: i + 3000]
+    check("_qlbl" in seg and "putText" in seg, "「查过的怪框」那行地点没了 ✗")
+    check("_qy2 + 14" in seg,
+          "那行没画在**框下方**（用户 2026-09-27 要求「框下方靠左」✗）")
+    check("putText(vis,_qlbl,(_qx1" in seg.replace(" ", ""),
+          "那行没贴**框左边**（「靠左」✗）")
+    check("_qy1 - 6" in seg or "_qy1" in seg,
+          "贴画面下沿时的兜底（翻回框上方）没了 ✗（那样字会掉出画面外）")
+    # ⚠ 只看**真调用**（带括号 ✓）：注释里本来就会提到这两个名字，别把注释算成调用 ✗
+    check("mob_sets_of(" not in seg and "foothold_below(" not in seg,
+          "绘制那一支里自己重算了集合（每帧扫 foothold ✗ 纪律不允许）")
+
+    # ② 锁定框**不再写地点**（钉**真调用** ✓：先把 `#` 注释行丢掉再找 ——
+    #    那一段的注释里本来就会提到 `agent.current_target_sets()`（"以前在这里读过 ✗" ✓），
+    #    不丢注释就会被自己那句话绊倒 ✗）
+    j = src.index("锁定目标怪")
+    lock_code = "\n".join(ln for ln in src[j: j + 1500].splitlines()
+                          if not ln.lstrip().startswith("#"))
+    check("current_target_sets(" not in lock_code,
+          "锁定框那里还在调 `current_target_sets()` 写地点 —— 用户 2026-09-27 明确不要了 ✗")
+
+
 TESTS = (
     ("连推 10 帧只画最新那帧（合并，不排队）", t_coalesce),
     ("不可见时一帧都不画，但帧仍是最新的", t_hidden_skips_draw),
+    ("视野框（虚线）：每帧现算，不许再套「每 N 秒算一次」的节流", 
+     t_vision_box_updates_every_frame),
+    ("辅助线与标记：颜色支持透明度（#AARRGGBB）+ 每项一个开关 + 四个「框」项"
+     "（含追击起跳框）+ 三个框并排的画法", t_vis_color_alpha_and_toggles),
+    ("current_frame() 必须是原生帧：显示帧（框线/视野虚线）不许进那条路",
+     t_current_frame_is_raw),
+    ("收流线程：先留原生帧再就地画，且只有真要画时才拷（收画面阶段零开销）",
+     t_raw_frame_before_draw),
     ("状态行露出「绘制 ms / 合并丢弃」（源码约定）", t_stats_show_draw),
     ("负载告警顶在状态行最前面，恢复后自己消失", t_load_warn_on_status),
     ("积压锁死看门狗：持续高才报、回落自己消失、迟滞不闪", t_lag_watchdog_rules),
@@ -626,6 +967,8 @@ TESTS = (
     ("「卡在谁身上」：输入受限 / 本机受限 / 说不清（纯函数）", t_limit_reason_rules),
     ("显示链路：带 padding 的帧画得对，且不再白拷一整幅", t_pixmap_handles_padded_frame),
     ("静态检查：会当场炸的名字错误（pyflakes）", t_static_check_no_crash_classes),
+    ("怪框那行地点：「查过的怪框」写在框下方靠左；锁定框不再写地点（绘制层不许自己扫 foothold）",
+     t_mob_box_labels),
 )
 
 

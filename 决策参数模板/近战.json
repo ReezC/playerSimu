@@ -1,10 +1,13 @@
 {
   "attack_dist": 80.0,
   "min_attack_dist": 0,
+  "attack_up_dist": 30,
+  "attack_down_dist": 20,
   "chase_jump_enabled": true,
   "chase_jump_min": -10,
   "chase_jump_max": 5,
-  "mouse_speed": 1.8000000000000005,
+  "chase_jump_dash_ms": 50,
+  "mouse_speed": 1.1999999999999995,
   "evade_type": "jump",
   "jump_interval": 0,
   "jump_random_prob": 0.1,
@@ -79,115 +82,73 @@
     "enter": "enter"
   },
   "target_cd": [
-    1500,
+    1000,
     2500
   ],
   "input_device": "remote",
-  "input_delay": [
-    0,
-    30
-  ],
   "attack_cd": 300,
   "attack_lock_debounce_ms": 1000,
   "min_turn_hold_ms": 1000,
-  "turn_output_delay_ms": 200,
+  "turn_output_delay_ms": 500,
   "player_track_jump": 200,
-  "hp_bar": [
-    0.341142,
-    0.971354,
-    0.120791,
-    0.022135
-  ],
-  "mp_bar": [
-    0.462665,
-    0.970052,
-    0.122987,
-    0.02474
-  ],
-  "hp_color": [
-    [
-      0,
-      0,
-      135
-    ],
-    [
-      89,
-      91,
-      255
-    ]
-  ],
-  "mp_color": [
-    [
-      136,
-      81,
-      0
-    ],
-    [
-      255,
-      201,
-      102
-    ]
-  ],
+  "hp_bar": null,
+  "mp_bar": null,
+  "probe_calib": {},
+  "hp_color": null,
+  "mp_color": null,
   "hp_threshold": 30,
   "mp_threshold": 7,
-  "pot_cd": 1500,
+  "pot_cd": 1000,
   "auto_hp_pot": true,
   "auto_mp_pot": false,
   "strategy": "patrol",
-  "vision_top": 200,
-  "vision_bottom": 200,
+  "vision_top": -1,
+  "vision_bottom": -1,
   "vision_left": -1,
   "vision_right": -1,
-  "vision_center": true,
+  "vision_center": false,
   "vision_off_x": 0,
   "vision_off_y": 0,
   "sweep_turn_cd": 500,
   "back_range": 150,
-  "route_enabled": false,
-  "debounce_conf": 0.6,
+  "route_goto_set": "小平台",
+  "align_tol_px": 10,
+  "align_hold_ms": 1000,
+  "climb_align_gap_ms": 180,
+  "climb_align_near_px": 20,
+  "climb_retry_delay_s": 1.0,
+  "climb_retry_delay_inc_s": 1.0,
+  "goto_timeout_s": 10.0,
+  "goto_timeout_key": "表情_无语",
+  "jump_start_px": 80,
+  "move_retry_ms": 1000,
+  "battle_zones": [],
+  "battle_zone_sets": [],
+  "debounce_conf": 0.5,
   "debounce_ms": 2000,
-  "auto_feed_pet": true,
-  "feed_interval_min": 10.0,
-  "feed_interval_max": 15.0,
   "custom_timers": [
     {
-      "name": "自动回避药水",
+      "name": "自动喂宠",
       "seq": [
         {
           "type": "down",
-          "key": "回避药水"
+          "key": "feed_pet"
         },
         {
           "type": "up",
-          "key": "回避药水"
+          "key": "feed_pet"
         }
       ],
       "interval": [
-        3.0,
-        3.0
-      ]
-    },
-    {
-      "name": "无语表情",
-      "seq": [
-        {
-          "type": "down",
-          "key": "表情_无语"
-        },
-        {
-          "type": "up",
-          "key": "表情_无语"
-        }
+        8.0,
+        12.0
       ],
-      "interval": [
-        5.0,
-        10.0
-      ]
+      "pause_on_rest": false
     }
   ],
   "facing_timeout_min": 0.0,
   "player_lost_timeout_min": 3.0,
-  "resetall_interval": 60,
+  "resetall_interval": 30,
   "anti_afk_enabled": true,
   "anti_afk_type": "hidden_rest",
   "anti_afk_min": 25.0,
@@ -239,7 +200,23 @@
     },
     {
       "type": "delay",
-      "ms": 200
+      "ms": 1000
+    },
+    {
+      "type": "down",
+      "key": "隐身术"
+    },
+    {
+      "type": "up",
+      "key": "隐身术"
+    },
+    {
+      "type": "down",
+      "key": "隐身术"
+    },
+    {
+      "type": "up",
+      "key": "隐身术"
     },
     {
       "type": "down",
@@ -286,6 +263,11 @@
   ],
   "anti_afk_rest_min": 4.5,
   "anti_afk_rest_max": 5.5,
+  "anti_afk_spot_set": "",
+  "anti_afk_spot_seq": [],
+  "anti_afk_spot_after": "",
+  "anti_afk_retry_on_interrupt": true,
+  "anti_afk_retry_sec": 10.0,
   "reconnect_enabled": false,
   "reconnect_probe_after_lost_sec": 0.0,
   "reconnect_step_timeout_ms": 3000,

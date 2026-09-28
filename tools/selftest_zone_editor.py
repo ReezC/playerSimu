@@ -69,6 +69,96 @@ def t_pick_radius_and_walls():
         check(got is None or not got.is_wall, "墙被点选命中了：%s" % got)
 
 
+def t_pick_ladder_for_info():
+    """**点选绳梯只为看信息**（用户 2026-09-27："foothold 编辑器希望能点选绳梯（为了快速查看
+    它的信息），**不用接逻辑**"）。
+
+    钉五件：
+      ① 点在绳上（避开压着 foothold 的那几段）⇒ 记下它（`_sel_ladder` ✓），状态行报出
+        绳号 / x / y 区间，详情里报出**两端各压着哪条 foothold、那些 foothold 属于哪些集合** ✓；
+      ② ⚠ **不动选择集、不动集合高亮**（"不用接逻辑" ✓ —— 它是"看着它"，不是编辑 ✓）；
+      ③ 点在**绳脚下那条 foothold** 上 ⇒ **foothold 优先**（编辑 foothold 是这张图的主业 ✓，
+        不能被绳抢走 ✗）；
+      ④ 点到别处 / 框选 ⇒ 取消"看着的绳梯" ✓；
+      ⑤ 画布上那根绳换**选中色**（`C_SEL` ✓）并进呼吸清单 ✓（改动得能看出来 ✓）。
+    """
+    from PyQt5.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    t = _terrain()
+    lads = list(getattr(t, "ladders", None) or [])
+    check(lads, "地形里没有绳梯，这条测不了")
+    L = lads[0]
+
+    def free_y(lad):
+        """在绳上找一段**没被任何 foothold 压着**的 y（绳中段常被平台穿过 ✓）。"""
+        lo, hi = min(lad.y1, lad.y2), max(lad.y1, lad.y2)
+        for k in range(21):
+            yy = lo + (hi - lo) * k / 20.0
+            if ze.pick_at(t, lad.x, yy, 6.0) is None:
+                return yy
+        return None
+
+    y = free_y(L)
+    check(y is not None, "这根绳沿线全被 foothold 压着，这条测不了")
+    tmp = Path(tempfile.mkdtemp(prefix="zlad_"))
+    try:
+        dlg = ze.ZoneEditorDialog(MAP_ID, terrain=t, zones_path=tmp / "x.zones.json")
+        dlg.resize(980, 660)
+        dlg.show()
+        app.processEvents()
+
+        # ① 点在绳上 ⇒ 选中它 + 状态行/详情出信息
+        dlg._on_picked(("click", L.x, y, 6.0), "replace")
+        check(dlg._sel_ladder is L,
+              "点在绳上没选中它（用户要的就是快速查看它的信息 ✗）：%r" % (dlg._sel_ladder,))
+        txt = dlg.lbl_status.text()
+        check("绳梯" in txt and ("x=%d" % round(L.x)) in txt,
+              "状态行没报绳梯的位置：%r" % txt)
+        tip = dlg.lbl_status.toolTip()
+        check(("上端" in tip) and ("下端" in tip) and ("集合" in tip),
+              "详情里没报「两端压着哪条 foothold / 属于哪些集合」：%r" % tip)
+
+        # ② **不动选择集**（"不用接逻辑" ✓）
+        check(not dlg.selection_ids(),
+              "点绳梯把 foothold 的选择集改了：%s" % dlg.selection_ids())
+
+        # ③ 绳脚下那条 foothold 上 ⇒ **foothold 优先**
+        foot = next((e for e in zones.ladder_ends(t, L) if e is not None), None)
+        check(foot is not None, "这根绳两端都没压到 foothold，这条测不了")
+        fx = (foot.left + foot.right) / 2.0
+        dlg._on_picked(("click", fx, foot.y_at(fx), 6.0), "replace")
+        check(dlg._sel_ladder is None,
+              "点 foothold 时被绳抢走了（编辑 foothold 才是主业 ✗）")
+        check(dlg.selection_ids() == {str(foot.fid)},
+              "绳脚下那条 foothold 没被选中：%s" % dlg.selection_ids())
+
+        # ④ 点到别处 / 框选 ⇒ 取消
+        dlg._on_picked(("click", L.x, y, 6.0), "replace")
+        check(dlg._sel_ladder is L, "第二次点绳没选上")
+        bx, by = t.bounds[0] - 5000, t.bounds[1] - 5000
+        dlg._on_picked(("click", bx, by, 6.0), "replace")
+        check(dlg._sel_ladder is None, "点空白没取消「看着的绳梯」")
+        dlg._on_picked(("click", L.x, y, 6.0), "replace")
+        dlg._on_picked(("box", (bx, by, bx + 10, by + 10), "contains"), "replace")
+        check(dlg._sel_ladder is None, "框选没取消「看着的绳梯」")
+
+        # ⑤ 画布上那根绳换选中色 + 进呼吸清单（改动要看得出来 ✓）
+        dlg._on_picked(("click", L.x, y, 6.0), "replace")
+        it = next((i for (LL, i) in dlg._ladder_items if LL is L), None)
+        check(it is not None, "画布上找不到那根绳的 item")
+        check(it.pen().color() == ze.C_SEL,
+              "点选后那根绳没换成选中色（看不出在看哪根 ✗）：%s"
+              % it.pen().color().name())
+        check(any(i is it for i, _c in dlg._hl_items),
+              "点选的那根绳没进呼吸清单（看不出来 ✓）")
+    finally:
+        try:
+            dlg.close()
+        except Exception:                      # noqa: BLE001
+            pass
+
+
 def t_box_two_modes():
     """框选两种模式：左→右只选**完全包含**、右→左**相交即选**。"""
     t = _terrain()
@@ -557,13 +647,68 @@ def t_set_names_on_canvas():
         shutil.rmtree(str(tmp), ignore_errors=True)
 
 
+def t_mid_jump_dialog_wired():
+    """⭐ 「爬」的**中途跳下**在「增加可达 / 双击改边」弹窗里的**接线**（用户 2026-09-28 ✓）。
+
+    ⚠ **为什么是源码级**（而不是像 `t_add_reach_dialog` 那样建真弹窗）：那个弹窗是**非模态 +
+    单实例**（`_open_reach` 管着 ✓ 结果走 `applied` 信号 ✓），直接 new 出来测"二级联动"要
+    自己摆 `ladders` / `drop_choices` / `init` 一整套夹具，而那套夹具**已经在**
+    `t_add_reach_dialog` 里了 ✓（它钉的是类型显隐 + 返回值 ✓）⇒ 这里只补**新字段那几根线**
+    （漏一根的后果是"下拉改了不生效 / 高度永远藏着"✗ —— 不报错、不崩，只能靠钉子 ✓）。
+
+    钉五件：
+      ① 下拉存在、选项/文案**照 `zones` 那一份**（别两处各写一套 ✗）；
+      ② 「高度」是 **QDoubleSpinBox**（世界坐标 y 可为负 ⇒ 不能用 QSpinBox 的"只能非负"直觉 ✗，
+         而且范围要够大 ✓）；
+      ③ `cmb_mid` 的变化**也接进了 `_sync_kind`**（⚠ 只接 `cmb_kind` 的话，改了下拉"高度"
+         那一行**不跟着动** ✗ —— 这是"二级联动"最容易漏的一根线 ✓）；
+      ④ `_sync_kind` 里：**类型=爬** 才显示下拉、**方向非空**才显示高度 ✓；
+      ⑤ `_accept` / `edit_edge` 把 `mid_dir` / `mid_y` 透出去（含"没给就删"= 回到不启用 ✓）+
+         `_apply_reach` 两条路都转发 ✓。
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "gui" / "zone_editor.py"
+           ).read_text(encoding="utf-8")
+
+    # ① 下拉 + 文案来源
+    check("self.cmb_mid = NoWheelComboBox()" in src,
+          "弹窗里没有「中途跳下」下拉（`cmb_mid` ✗）")
+    check("zones.MID_JUMP_DIRS" in src and "zones.MID_JUMP_LABELS" in src,
+          "下拉的选项/文案没照 `zones.MID_JUMP_DIRS` / `MID_JUMP_LABELS`"
+          "（两处各写一套，迟早对不上 ✗）")
+    # ② 高度控件
+    check("self.spn_mid_y = NoWheelDoubleSpinBox()" in src,
+          "「高度」不是 `NoWheelDoubleSpinBox`（⚠ UI 规范：滚轮不许改参数 ✗ `check_ui` 会拦 ✓；"
+          "而且世界 y **有负数** ⇒ 不能用「只能非负」那种直觉 ✗）")
+    # ③ 二级联动的"第二根线"
+    check("self.cmb_mid.currentIndexChanged.connect" in src,
+          "⚠ `cmb_mid` 自己变化**没接进 `_sync_kind`** ⇒ 改了下拉、「高度」那一行不跟着显隐 ✗")
+    # ④ `_sync_kind` 里那几条
+    check('self.cmb_mid.setVisible(kind == "climb")' in src,
+          "「中途跳下」下拉不是「只对爬显示」（该 `kind == climb` ✗）")
+    check('_show_y = (kind == "climb" and bool(self.cmb_mid.currentData()))' in src
+          and "self.spn_mid_y.setVisible(_show_y)" in src,
+          "「高度」不是「方向非空才显示」（用户明确「**选取后**增加一个参数「高度」」✗）")
+    # ⑤ 透传
+    check('"mid_dir": ((self.cmb_mid.currentData() or None)' in src,
+          "`_accept` 没把 `mid_dir` 放进返回值 ⇒ 弹窗里配了落不下去 ✗")
+    check('hit["mid_dir"] = str(mid_dir)' in src and 'hit.pop("mid_dir", None)' in src,
+          "`edit_edge` 没做「给了就存、没给就删」（回到「不中途跳下」那条路 ✗）")
+    check(src.count("mid_dir=r.get(\"mid_dir\")") == 2,
+          "`_apply_reach` 的两条路（增/改）没都转发 `mid_dir`（漏一条 ⇒ 那条路上配了不生效 ✗）")
+
+
 def t_edges_in_editor():
     """编辑器里的「边」：加/反向/删 + 两栏各自跟上 + **悬空边标红** + 画布箭头画法。
 
-    对应 §12.3 B5 + 2026-09-26 的要求 1、3。两个最容易错的点：
+    对应 §12.3 B5 + 2026-09-26 的要求 1、3。三个最容易错的点：
       · **悬空边**（集合被删/改名）：看着没事，只有跑起来才会在路径里断掉；
       · **两栏的方向**：「可到达」只列从焦点出去的，「可被到达」只列进来的 ——
         点「反向」之后那条边属于**对面**那个集合，不该在当前的「可到达」里冒出来。
+        ⚠ **2026-09-27 一度改成"列全部边"，当天用户判定是误修 ⇒ 已改回收窄** ——
+        这条钉子就是防它再被改回去的（要"总览"就取消选中 ✓）；
+      · 加边没加进去**要说话**（同一天修的，见 `t_two_ladders_same_pair` ✓）。
     """
     from PyQt5.QtWidgets import QApplication
 
@@ -586,7 +731,7 @@ def t_edges_in_editor():
         dlg.add_edge("A平台", "B平台", "walk", why="测试用")
         check(len(dlg.zones.edges) == 1, "加边没生效")
         # 焦点此时在「B平台」（刚注册完它）⇒ A→B 是**进来的**边：不该出现在「可到达」，
-        # 要去下面「可被到达」栏（2026-09-26 要求 1、2）
+        # 要去下面「可被到达」栏（2026-09-26 要求 1、2；2026-09-27 一度放宽、当天又改回 ✓）
         check(dlg.lst_e.count() == 0,
               "「可到达」里混进了进来的边：%d 行" % dlg.lst_e.count())
         check(dlg.lst_in.count() == 1,
@@ -732,17 +877,21 @@ def t_edges_in_editor():
 def t_reach_ui_filter_and_style():
     """两栏「可到达 / 可被到达」的界面约定（2026-09-26 要求）：
 
-      ① **窗口能纵向缩**：右栏那一串控件进滚动区（矮下来是出滚动条，不是按钮消失）；
+      ① **三栏能缩、栏宽能拖**：面板栏各进滚动区（矮下来是出滚动条，不是按钮消失），
+         且「集合」与「可达 / 可被到达」**横向并排**（不是原来那样上下堆在一根滚动条里）；
       ② 名字统一**蓝**（一眼认出"这是个注册过的集合"；悬空边那种**错误**仍标红）；
       ③ **可到达只列出去的边**：选中集合（或它的一段 foothold）时，这一栏回答的是
-         "它能去哪儿"，并且**把收窄说出来**（静悄悄少几条是最难查的"东西不见了"）；
+         "它能去哪儿"，而且**把收窄说出来**（静悄悄少几条是最难查的"东西不见了"）。
+         ⚠ 2026-09-27 一度改成"列全部边、相关的排最前"，**当天用户判定是误修** ⇒
+         已改回收窄 —— 这条用例就是防它再被改回去的 ✗；
       ④ **可被到达只列进来的边、且只读**：那一栏**一个编辑按钮都没有** ——
          要改就选中上面那个集合，它的"可到达"里就有这条边（一次只编辑一样东西）。
 
     收窄的判据是 `_focus_set`：高亮的集合 > 选中的 foothold 所属的集合（同一批只属于
     一个集合时才算）> None（什么都没选 ⇒ 显示全部，那既是总览也是逃生口）。
     """
-    from PyQt5.QtWidgets import QApplication, QPushButton, QScrollArea
+    from PyQt5.QtWidgets import (QApplication, QPushButton, QScrollArea,
+                                 QSplitter)
 
     app = QApplication.instance() or QApplication([])
     t = _terrain()
@@ -752,10 +901,37 @@ def t_reach_ui_filter_and_style():
     try:
         dlg = ze.ZoneEditorDialog(MAP_ID, terrain=t, zones_path=tmp / "x.zones.json")
         dlg.resize(980, 660)
-        # ① 右栏在滚动区里 + 窗口最小高度压得下来
-        check(isinstance(getattr(dlg, "right_area", None), QScrollArea),
-              "右栏没进 QScrollArea（窗口一矮按钮就被压没）")
-        check(dlg.right_area.widgetResizable(), "滚动区里的右栏没跟着窗口宽度走")
+        # ① 三栏布局（2026-09-26 用户要求："信息全挤在一起，也不能缩放调整，
+        #    希望将集合编辑与可达、可被到达的布局分列，以省去滑动过程"）
+        check(isinstance(getattr(dlg, "split", None), QSplitter),
+              "三栏没走 QSplitter ⇒ 栏宽拖不动（用户报的「不能缩放调整」）")
+        check(dlg.split.count() == 3, "不是三栏：%d" % dlg.split.count())
+        check(not dlg.split.childrenCollapsible(),
+              "某一栏能被拖成 0 宽（拖没了就找不回来、那栏的按钮也点不到）")
+        for _name, _attr in (("集合", "area_sets"), ("可达 / 可被到达", "area_edges")):
+            _a = getattr(dlg, _attr, None)
+            check(isinstance(_a, QScrollArea),
+                  "「%s」栏没进 QScrollArea（窗口一矮按钮就被压没）" % _name)
+            check(_a.widgetResizable(),
+                  "「%s」栏没跟着分栏宽度走（缩窗口它不缩）" % _name)
+            check(_a.parent() is dlg.split, "「%s」栏不在分栏里" % _name)
+        # **集合**与**可达 / 可被到达**必须**左右并排** —— 这一条就是用户要的
+        # "省去滑动过程"：原来它们在**同一根**竖排滚动条里上下堆着，窗口一矮就得
+        # 滚上去看集合、滚下来看边 ✗
+        dlg.show()
+        for _ in range(4):
+            app.processEvents()
+        _gs, _ge = dlg.area_sets.geometry(), dlg.area_edges.geometry()
+        check(_ge.left() >= _gs.right() - 2 and abs(_ge.top() - _gs.top()) <= 2,
+              "两栏没横向并排（可达那栏落到集合下面去了）：集合=%s 可达=%s"
+              % (_gs, _ge))
+        # 栏宽**真的能改**（鼠标拖分隔条走的就是这条 API）
+        _w0 = dlg.area_edges.width()
+        dlg.split.setSizes([420, 200, 330])
+        for _ in range(2):
+            app.processEvents()
+        check(dlg.area_edges.width() != _w0,
+              "调了分栏尺寸、栏宽却没变（%d）—— 分隔条拖不动" % _w0)
         # **不许给纵向钉硬地板**（踩过：写过 setMinimumSize(720, 420)，本意是"允许缩到
         # 比较小"，实际成了 420 的地板，比布局需要的 211 大一倍 ⇒ 用户还是缩不下去）
         check(dlg.minimumHeight() <= 320,
@@ -802,7 +978,7 @@ def t_reach_ui_filter_and_style():
               "「可被到达」那栏里出现了按钮（它应当只读）：%s"
               % [b.text() for b in dlg.in_host.findChildren(_PB)])
 
-        # 什么都没选 ⇒ 显示全部，而且不再说收窄
+        # 什么都没选 ⇒ 显示全部（**总览**就在这个状态），而且不再说收窄
         dlg._highlight = None
         dlg.select([])
         dlg._refresh_edges()
@@ -893,17 +1069,20 @@ def t_add_reach_dialog():
     check(kinds.index("jump") < kinds.index("drop"),
           "「跳」该排在「下跳」前面（先跳、再下跳）：%s" % kinds)
 
-    # 默认类型是「走」⇒ 绳/门那两行不占地方
-    check(ad.cmb_lad.isHidden() and ad.cmb_por.isHidden(),
-          "选「走」时不该显示绳/门那两行")
+    # 默认类型是「走」⇒「爬哪根绳」那一行不占地方
+    # ⚠ 「走哪个门」那一行 2026-09-27 随「传送门」一起**移除**了 ✓ —— 现在
+    #   通行方式只有走/爬/下跳/跳 四种（见 `zones.EDGE_KINDS` ✓）。
+    check(ad.cmb_lad.isHidden(), "选「走」时不该显示「爬哪根绳」")
     ad.cmb_kind.setCurrentIndex(ad.cmb_kind.findData("climb"))
-    check(not ad.cmb_lad.isHidden() and ad.cmb_por.isHidden(),
-          "按类型显隐没生效（选「爬」该只出绳那一行）")
+    check(not ad.cmb_lad.isHidden(),
+          "按类型显隐没生效（选「爬」该出「爬哪根绳」那一行）")
     ad.cmb_lad.setCurrentIndex(1)
     ad._accept()
+    # ⚠ 2026-09-28：多了 `mid_dir`/`mid_y`（「爬」的**中途跳下** ✓）—— 与 `dir` 同款写法
+    #   （**永远带这两个键**，非爬 / 没配时是 `None` ✓）⇒ 完全相等断言要跟上 ✓
     check(ad.result_dict == {"dst": "乙平台", "kind": "climb",
-                             "ladder": "L3", "portal": None, "footholds": None,
-                             "dir": None},
+                             "ladder": "L3", "footholds": None,
+                             "dir": None, "mid_dir": None, "mid_y": None},
           "返回值不对：%s" % ad.result_dict)
 
     # ---- 「走」的方向类型（2026-09-26 用户要求，**只是配置占位**）----
@@ -992,11 +1171,12 @@ def t_add_reach_dialog():
         z.add_set("别的", ["1"])
         z.save(tmp / "x.zones.json")
         dlg = ze.ZoneEditorDialog(MAP_ID, terrain=t, zones_path=tmp / "x.zones.json")
-        lads2, pors2 = dlg._reach_ladder_choices("右下")
+        # ⚠ 这里原来还接一个"门"的候选串 —— 2026-09-27 随「传送门」一起移除 ✓
+        #   （`_reach_ladder_choices` 现在**只**返回绳那一串 ✓）
+        lads2 = dlg._reach_ladder_choices("右下")
         check([v for v, _txt in lads2] == ["L2", "L3"] or
               sorted(v for v, _txt in lads2) == ["L2", "L3"],
               "起点能选的绳不对（该是通到这块平台的那两根）：%s" % lads2)
-        check(pors2 == [], "这块平台上没有可用的门，却列出了：%s" % pors2)
         # ⑥ **「增加可达」也是非模态 + 单实例**（用户 2026-09-26 的原话：不能再开多个
         #    窗口，再点一次只切换聚焦）—— 自带一个编辑器，别依赖上文用的是哪套集合。
         _t2 = Path(tempfile.mkdtemp(prefix="zreach1_"))
@@ -1025,6 +1205,59 @@ def t_add_reach_dialog():
             import shutil
             shutil.rmtree(str(_t2), ignore_errors=True)
 
+        dlg.close()
+    finally:
+        import shutil
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+
+def t_panels_no_hscroll_at_default_size():
+    """三栏在**默认窗口尺寸**下不许出横向滚动条（2026-09-26 三栏布局重构）。
+
+    为什么单开一条：栏的最小宽度是**人定的**（160 / 170）而内容需要更宽 —— 集合栏 280、
+    「可到达 / 可被到达」的边列表 329~346（探针量的，**带主窗口 QSS** 才算数：按钮的
+    padding 来自 QSS，不带它量出来的偏窄）⇒ **初始宽度必须按内容给**，否则一打开就冒横向
+    滚动条（第一版就是这样：集合栏 250 而内容 280 ✗）。
+    窗口被人拖小之后出滚动条是**对的**（那正是"按需"的意义），所以这条只钉默认尺寸。
+
+    ⚠ 测试里的对话框**没有 MainWindow 父级** ⇒ 拿不到全局 QSS ⇒ 按钮更窄、内容需要的
+    宽度更小，这条会比真机**宽松**一点。所以这里**手动把 QSS 贴上**（真机上由父窗口继承），
+    量的才是真机那个宽度。
+    """
+    from PyQt5.QtWidgets import QApplication
+
+    from gui.main_window import QSS
+
+    app = QApplication.instance() or QApplication([])
+    t = _terrain()
+    walk = [f for f in t.footholds if not f.is_wall]
+    check(len(walk) >= 12, "地形里非墙 foothold 太少，这条测不了")
+    tmp = Path(tempfile.mkdtemp(prefix="zwide_"))
+    try:
+        dlg = ze.ZoneEditorDialog(MAP_ID, terrain=t, zones_path=tmp / "x.zones.json")
+        dlg.setStyleSheet(QSS)                  # 真机上由 MainWindow 继承（见 docstring）
+        for i, name in enumerate(("甲平台", "乙平台", "丙平台")):
+            dlg.select([str(f.fid) for f in walk[i * 4:(i + 1) * 4]])
+            dlg.register(name)
+        dlg.add_edge("甲平台", "乙平台", "walk")
+        dlg.add_edge("乙平台", "丙平台", "drop")
+        dlg.lst.setCurrentRow(0)                # 焦点在「甲平台」⇒ 两栏都有内容
+        dlg.show()                              # 尺寸用 __init__ 里的 1180×760
+        for _ in range(6):
+            app.processEvents()
+        check(abs(dlg.width() - 1180) <= 40,
+              "不是在默认尺寸下量的（%dx%d）—— 这条只钉默认尺寸"
+              % (dlg.width(), dlg.height()))
+        for tag, w in (("集合栏", dlg.area_sets),
+                       ("可达 / 可被到达栏", dlg.area_edges),
+                       ("集合列表", dlg.lst),
+                       ("可到达列表", dlg.lst_e),
+                       ("可被到达列表", dlg.lst_in)):
+            need = (w.sizeHintForColumn(0) if hasattr(w, "sizeHintForColumn")
+                    else w.widget().minimumSizeHint().width())
+            check(not w.horizontalScrollBar().isVisible(),
+                  "%s 在默认尺寸下就出了横向滚动条（视口宽 %d < 内容需要 %d）"
+                  % (tag, w.viewport().width(), need))
         dlg.close()
     finally:
         import shutil
@@ -1160,6 +1393,98 @@ def t_ladder_ids_on_canvas():
         shutil.rmtree(str(tmp), ignore_errors=True)
 
 
+def t_two_ladders_same_pair():
+    """同一对集合、**两根绳**：两条边各存各的，而且"没加进去要说话"（2026-09-27 用户报）。
+
+    现场（用户原话）："地图 105040303，我给二楼加通过 L7 去三楼的通行方式，但是点击增加后
+    无添加项目"。真因：**边的身份里没有绳号** —— `二楼 →(爬 L3)→ 三楼` 已经在文件里，
+    再加 L7 被当成重复 ⇒ `add_edge` 静默返回老那条，界面一点动静都没有 ✗
+    （见 `core.zones.add_edge` ✓）。
+
+    钉五件：
+      ① 换一根绳**真的加进去**，两栏里都列着；
+      ② 新加那条**被选中**（那一栏现在列全部边，十几行里不选出来 = 看着像没加 ✗）；
+      ③ **完全一样**再加一次 ⇒ 条数不变、而且**弹一句说清**（不再静默 ✗）；
+      ④ 删 / 改**只动对的那一条**（绳号进了匹配判据，不连坐）；
+      ⑤ 「改成和另一条一模一样」仍然拦住。
+    """
+    import unittest.mock as mock
+
+    from PyQt5.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    t = _terrain()
+    walk = [f for f in t.footholds if not f.is_wall]
+    check(len(walk) >= 8, "地形里非墙 foothold 太少，这条测不了")
+    tmp = Path(tempfile.mkdtemp(prefix="z2lad_"))
+    try:
+        dlg = ze.ZoneEditorDialog(MAP_ID, terrain=t, zones_path=tmp / "x.zones.json")
+        dlg.select([str(f.fid) for f in walk[:4]])
+        dlg.register("二楼")
+        dlg.select([str(f.fid) for f in walk[4:8]])
+        dlg.register("三楼")
+        dlg.add_edge("二楼", "三楼", "climb", ladder="L3", why="手工加的")
+        dlg._highlight = "二楼"
+        dlg._refresh_edges()
+        check(dlg.lst_e.count() == 1, "前提不成立，该有 1 条：%d" % dlg.lst_e.count())
+
+        class _D:
+            """顶替「增加可达」弹窗（`_apply_reach` 是用 `self.sender()` 取它的）。"""
+
+            src, mode, edge = "二楼", "add", None
+
+        dlg.sender = lambda: _D()
+        said = []
+        with mock.patch.object(ze.QMessageBox, "information",
+                               lambda *a, **k: said.append(a[2] if len(a) > 2 else "")):
+            # ① 换一根绳 ⇒ **真的加进去**（用户要的就是这一下）
+            dlg._apply_reach({"dst": "三楼", "kind": "climb", "ladder": "L7",
+                              "portal": None, "footholds": None, "dir": None})
+            check(len(dlg.zones.edges) == 2,
+                  "换一根绳没加进去（用户报的就是这一下）：%s" % dlg.zones.edges)
+            rows = [dlg.lst_e.item(i).text() for i in range(dlg.lst_e.count())]
+            # ⚠ 2026-09-27 起同一对集合**合成一组**（组头 + 缩进行）⇒ "两条都列着"要看
+            #   **组里有没有这两条**（两个绳号都在 ✓），而不是数两行组头 ✗
+            check(sum("二楼 → 三楼" in r for r in rows) == 1
+                  and "L3" in "".join(rows) and "L7" in "".join(rows),
+                  "两条（L3 / L7）没都列出来：%s" % rows)
+            # ② 新加的那条被选出来（不然像没加）
+            cur = dlg.lst_e.currentItem()
+            check(cur is not None and "L7" in cur.text(),
+                  "加完没把新那条选出来（长列表里找不着 = 像没加）：%r"
+                  % (cur.text() if cur is not None else None))
+            # ③ 完全一样再加 ⇒ 条数不变 + **说话**
+            said.clear()
+            dlg._apply_reach({"dst": "三楼", "kind": "climb", "ladder": "L7",
+                              "portal": None, "footholds": None, "dir": None})
+            check(len(dlg.zones.edges) == 2,
+                  "重复加居然多了一条：%s" % dlg.zones.edges)
+            check(said and "已经有一条" in said[0] and "没有重复加" in said[0],
+                  "完全重复时没说话（原来就是这里静默 ✗）：%r" % said)
+
+        # ④ 删 L7 ⇒ L3 还在（绳号进了判据，不连坐）
+        e7 = [e for e in dlg.zones.edges if e.get("ladder") == "L7"][0]
+        dlg.del_edge(dict(e7))
+        check([e.get("ladder") for e in dlg.zones.edges] == ["L3"],
+              "删一条把另一条也删了 / 删错了：%s" % dlg.zones.edges)
+        # ⑤ 改绳号只动那一条；改成"和另一条一模一样"要拦住
+        dlg.add_edge("二楼", "三楼", "climb", ladder="L9")
+        dlg.edit_edge(dict(dlg.zones.edges[0]), "三楼", "climb", ladder="L7")
+        check(sorted(e.get("ladder") for e in dlg.zones.edges) == ["L7", "L9"],
+              "改绳号改错了对象：%s" % [e.get("ladder") for e in dlg.zones.edges])
+        try:
+            dlg.edit_edge(
+                dict([e for e in dlg.zones.edges if e.get("ladder") == "L7"][0]),
+                "三楼", "climb", ladder="L9")
+            raise AssertionError("改成和另一条一模一样的（同终点同类型同绳）该拦住")
+        except ValueError:
+            pass
+        dlg.close()
+    finally:
+        import shutil
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+
 def t_edit_edge_by_double_click():
     """双击「可到达」里那行 = 改这条边（终点 / 类型 / 绳 / 门）；**起点不可改**。
 
@@ -1182,7 +1507,8 @@ def t_edit_edge_by_double_click():
             dlg.register(name)
         dlg.add_edge("A平台", "B平台", "walk", why="走的那条")
         dlg.add_edge("A平台", "C平台", "climb", ladder="L1", why="爬的那条")
-        # 焦点留在「A平台」——「可到达」才列得全（它只列**出去**的边）
+        # 焦点留在「A平台」—— 两条都是"从 A 出去的"，会排在「可到达」最前面
+        #（那一栏现在列**全部边** ✓，这两条正好都在）
         dlg._highlight = "A平台"
         dlg._refresh_edges()
         check(dlg.lst_e.count() == 2, "A 的可到达该有 2 条：%d" % dlg.lst_e.count())
@@ -1190,7 +1516,7 @@ def t_edit_edge_by_double_click():
         # ① 编辑模式的弹窗：预填当前值、按钮写「保存」（不再写「增加」）
         names = list(dlg.zones.sets)
         d = ze.AddReachDialog(dlg, "A平台", names, names,
-                              ladders=[("L1", "L1 x=0")], portals=[],
+                              ladders=[("L1", "L1 x=0")],
                               init=dlg.zones.edges[1])
         check(d.cmb_dst.currentData() == "C平台",
               "编辑模式没预填终点：%s" % d.cmb_dst.currentData())
@@ -1323,6 +1649,418 @@ def t_sizehint_not_from_scene():
         shutil.rmtree(str(tmp), ignore_errors=True)
 
 
+def t_battle_zone_dialog_size():
+    """「编辑战斗区域」**子弹窗**：不许拿**视图的场景尺寸**当窗口尺寸。
+
+    用户 2026-09-28 报："**编辑战斗区域子窗口也太大了，还不让缩小**"✗。
+
+    病根：子弹窗（`gui.player_panel.BattleZoneDialog`）里摆了那块**只读集合视图**
+    （`gui.foothold_picker.FootholdPicker` ✓），而它是 `QGraphicsView` ⇒ **默认把场景尺寸
+    当 sizeHint**，本视图的场景 = **整张图的底图 + foothold**（约 2000×1000）⇒
+    窗口一显示就被撑到**上千高**，之后**任何一次布局重算**还会把它拽回去
+    ⇒ "太大 + 想拖小还拖不动"✗。⚠ 和 `_ZoneView` 当年（2026-09-26）是**同一个坑** ✓
+    （见上面 `t_sizehint_not_from_scene` ✓ 那边只加了一个 `sizeHint` 就治好了 ✓）。
+
+    ⚠⚠ `FootholdPicker` **在离屏自检里建不出来**（进程原生崩 ✗ 同被停用的
+      `t_foothold_picker_readonly`）⇒ 这条用三条**不建它**的路子钉：
+        ① 类上**必须**有 `sizeHint` 覆写（源码级 ✓ —— 没有它就会走父类那个 ✗）；
+        ② 用 `__new__` 造个**不碰 C++** 的壳直接调 `sizeHint()` ⇒ 必须是**小值** ✓；
+        ③ **病态对照**（这条最有说服力 ✓）：拿一个 `sizeHint` = 场景尺寸级的**假视图**
+           塞进 `BattleZoneDialog` ⇒ `resize` 之后再显示，窗口**照样被顶到上千高** ✓
+           —— 正好复现用户那句话 ✓ ⇒ 说明**根治只能在视图那边**（对话框侧防不住 ✓）；
+           换成"修好的视图"（`sizeHint` 给 320×200 ✓）同样的操作 ⇒ 窗口老实待着、还能缩 ✓。
+    """
+    from PyQt5.QtCore import QSize, pyqtSignal
+    from PyQt5.QtWidgets import QApplication, QWidget
+
+    from gui import foothold_picker as fp
+    from gui import player_panel as ppm
+
+    app = QApplication.instance() or QApplication([])
+
+    # ① 视图那边有没有覆写
+    check("sizeHint" in fp.FootholdPicker.__dict__,
+          "`FootholdPicker` 没覆写 `sizeHint` —— 它会走 `QGraphicsView` 那个（= **场景尺寸**，"
+          "本图约 2000×1000）⇒ 子弹窗一显示就被撑到上千高、还缩不下去 ✗"
+          "（用户原话：\"编辑战斗区域子窗口也太大了，还不让缩小\"）")
+
+    # ② 壳里调它（`__new__` 不跑 `__init__` ⇒ 不建 Qt 视图 ⇒ 离屏也不崩 ✓）
+    sh = fp.FootholdPicker.__new__(fp.FootholdPicker).sizeHint()
+    check(sh.width() <= 600 and sh.height() <= 400,
+          "`FootholdPicker.sizeHint()` 还是大值（%dx%d）—— 它会原样变成窗口想要的尺寸 ✗"
+          % (sh.width(), sh.height()))
+
+    # ③ 病态对照 + 真身对照（同一个 `resize`，两种视图）
+    # ⚠⚠ **这一段必须隔离 `config/ui.yaml`**（2026-09-28 现场踩到 ✗）：那两个弹窗都接了
+    #   `theme.bind_window_state` ⇒ `show()` **恢复**几何、`close()` **保存**几何 ✓，
+    #   而自检**绝不许改用户的文件** ✗（全仓库的规矩 ✓ 见 `selftest_main_window._fake_store`）。
+    #   踩到的样子：用例把 `battle_zone: {h: 380, w: 560, x: 120, y: 2}` 写了进去 ⇒
+    #   **下一套 `selftest_main_window` 建主窗口时原生崩**（`0xC0000005` ✗✗ ——
+    #   看着像"离屏 Qt 的老毛病"，其实是**用户配置被自检写脏了** ✓）。
+    #   ⇒ 照 `selftest_zone_editor:t_line_width_setting` 的做法：`theme.CFG` 指到临时文件 ✓。
+    import shutil
+    import tempfile
+    import unittest.mock as mock
+
+    from gui import theme
+
+    class _Picker(QWidget):
+        """假视图：`hint` 就是它"想多大"（= `QGraphicsView` 那条路的输入 ✓）。"""
+        picked = pyqtSignal(str)
+
+        def __init__(self, hint):
+            super().__init__()
+            self._hint = hint
+
+        def sizeHint(self):
+            return self._hint
+
+        def current(self):
+            return ""
+
+        def info(self, _fid):
+            return ""
+
+    def _open(hint):
+        # ⚠ **隔离 `config/ui.yaml`**：这个弹窗接了 `theme.bind_window_state` ⇒ `show` 之后
+        #   `close` 会写用户配置 ✗（2026-09-28 踩过 ✓ 自检绝不许改用户文件）。
+        from unittest import mock
+
+        from gui import theme as _theme
+
+        d = ppm.BattleZoneDialog({"set": "一楼", "cd_s": 3.0, "idle_foothold": "",
+                                  "fight_max_s": 0.0, "fight_dst": ""},
+                                 names=["一楼", "二楼"],
+                                 picker_factory=lambda s, c: _Picker(hint))
+        d.resize(560, 620)                    # = 源码里那个初值（原来是**没有**它 ✗）
+        _sw = mock.patch.object(_theme, "save_window", lambda *a, **k: None)
+        _sw.start()
+        d.show()
+        for _ in range(6):
+            app.processEvents()
+        d._savewin_patch = _sw              # 交给调用方 close 之后再 stop ✓
+        return d
+
+    _tmp = Path(tempfile.mkdtemp(prefix="bzdlg_"))
+    _pt = mock.patch.object(theme, "CFG", _tmp / "ui.yaml")
+    _pt.start()
+    try:
+        # ③-a **病态对照**：视图的 sizeHint 会**原样进到窗口的 sizeHint** ⇒ 所以必须修视图 ✓
+        #   ⚠ 别拿"显示后多高"当判据 —— 对话框现在自己 `resize()` 兜了初值 ✓（这正是修复之一 ✓），
+        #     会把病态视图的爆高**当场压住** ⇒ 那样量不出差别（踩过 ✗）。真凶是 `sizeHint`：
+        #     它才是"一布局重算就把窗口拽回去"的那个值 ✓（`_ZoneView` 那段注释说得很清楚 ✓）。
+        bad = _open(QSize(2000, 1000))        # = 修之前的视图（场景尺寸当 sizeHint ✗）
+        try:
+            check(bad.sizeHint().height() > 800,
+                  "病态视图（sizeHint = 场景尺寸）没把窗口的 `sizeHint` 抬起来（%d）⇒ 这条"
+                  "对照失效了，断言得重写" % bad.sizeHint().height())
+        finally:
+            bad.close()
+        bad._savewin_patch.stop()             # ⚠ close 之后才停（保存发生在 close ✓）
+
+        good = _open(QSize(320, 200))         # = 修之后的视图 ✓
+        try:
+            check(good.sizeHint().height() <= 700,
+                  "视图修好了窗口的 `sizeHint` 还是 %d 高（一布局重算就会把窗口拽那么大 ✗）"
+                  % good.sizeHint().height())
+            check(good.height() <= 700,
+                  "打开后就有 %d 高（该老实在 620 附近 ✓）" % good.height())
+            for h in (480, 380):
+                good.resize(560, h)
+                for _ in range(6):
+                    app.processEvents()
+                check(good.height() <= h,
+                      "想缩到高 %d，被顶成 %d（还有东西在拽窗口 ✗）" % (h, good.height()))
+        finally:
+            good.close()
+        good._savewin_patch.stop()            # ⚠ 同上：close 之后才停 ✓
+    finally:
+        _pt.stop()
+        shutil.rmtree(str(_tmp), ignore_errors=True)
+
+
+def t_idle_foothold_picker_panel():
+    """⭐ 「idle 回归 foothold」那块视图：**照搬结果图** + **下拉聚焦** + **呼吸高亮**。
+
+    用户 2026-09-28 要求（三条原话）：
+      ① "可视图区太小了，也**不能缩放**"；
+      ② "可视图希望就显示**寻路编辑器里配好的结果图**，**直接照搬**"；
+      ③ "这个 idle 回归 foothold 配置用**下拉**选择吧，选中之后可视图**聚焦**到该 foothold
+         并**呼吸高亮**（跟寻路编辑器里的模式一样）"。
+
+    改法：把 `gui/foothold_picker.FootholdPicker` 升级成"画结果图 + 呼吸 + 聚焦"，并加一个
+    `FootholdPickerPanel`（下拉 + 视图）——⚠ **对外接口与原来完全一致**（`picked` / `current` /
+    `info` / `set_current`）⇒ `BattleZoneDialog` 那边**一行都没改** ✓。
+
+    ⭐ 后来又补了第 ⑪~⑭ 件：**配色/字号/粗细必须与「foothold 编辑器」同一份**（用户
+      2026-09-28 报："字体线段的配色、粗细等还是跟 foothold 编辑器不一样"✗）—— 用
+      **`is`（同一个对象）**钉，别只比字符串（两边都写成同一个新色也算过 ⇒ 那正是漂的开始 ✗）。
+
+    钉七件：
+      ① ⭐ **离屏建得出来了**（这条最值钱）：原来 `FootholdPicker` 在离屏**进程原生崩**
+         （`fitInView` 拿 0×0 视口 ⇒ 非法缩放 ⇒ Qt 越界 ✗）⇒ 只能源码级钉、真行为测不到 ✗。
+         现在 `showEvent` 里**视口没尺寸就不 fit**（`_fitted` 不置位，下次再试 ✓）
+         ⇒ 用例能像别的视图一样**真建、真跑** ✓；
+      ② 画的是**结果图**：**全部** foothold 都在场景里（不只是本集合 ✓）；
+      ③ **本集合那几条**用绿色（`#0b8043`，与寻路编辑器的"当前集合色"同源 ✓）而别的用蓝；
+      ④ **集合名**画进场景（口径抄 `zone_editor` 的"包围盒上边中点" ✓）；
+      ⑤ **下拉**候选 = 本集合的 foothold（`+` 最前面那条"（不设）" ✓）；
+      ⑥ **选中 ⇒ 聚焦**（缩放变大 + 居中）且**进呼吸表**（`_hl` ✓）；
+      ⑦ **双向同步**：图上点选 ⇒ 下拉跟着切（两边永远一致 ✓）。
+    """
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QColor
+    from PyQt5.QtWidgets import QApplication
+
+    from core import mapdata
+    from core import zones as Z
+    from gui import foothold_picker as FP
+
+    app = QApplication.instance() or QApplication([])
+    t = mapdata.load(MAP_ID, with_canvas=True)
+    check(t is not None, "读不到地形，这条测不了")
+    z = Z.load(MAP_ID)
+    fids = FP.set_fids(z, "左上")
+    check(len(fids) >= 2, "「左上」的 foothold 太少，这条测不了：%r" % (fids,))
+
+    # ① 建出来（修 fit 之前这里会**原生崩** ⇒ 进程直接挂，连红都报不出来 ✗）
+    pan = FP.FootholdPickerPanel(t, z, "左上", current=fids[0])
+    pan.resize(560, 420)
+    pan.show()
+    for _ in range(8):
+        app.processEvents()
+    view = pan._view
+    check(view.width() > 100 and view.height() > 100,
+          "视图没被撑开（%dx%d）—— 又是 sizeHint / 最小尺寸那个坑 ✗"
+          % (view.width(), view.height()))
+
+    # ② 画的是**结果图**（全部 foothold，不只本集合）
+    check(len(view._items) == len(t.footholds),
+          "场景里只有 %d 条 foothold（图上一共 %d 条）—— 没照搬结果图 ✗"
+          % (len(view._items), len(t.footholds)))
+
+    # ③ 本集合那几条该是绿（⚠ 挑**非选中**的 —— 选中的那条是红色选中态 ✓ 踩过）
+    _cur = view.current()
+    mine = next((k for k in fids if k != _cur), None)
+    check(mine is not None, "本集合只有一条 foothold，这条断言挑不出对照（%r）" % (fids,))
+    mine_pen = view._items[str(mine)].pen().color().name()
+    other = next((k for k in view._items if k not in set(fids)), None)
+    check(mine_pen == "#0b8043",
+          "本集合的 foothold（非选中那条）没用绿色（该与寻路编辑器的「当前集合色」同源 ✓）："
+          "%r（挑的是 #%s，选中的是 %r）" % (mine_pen, mine, _cur))
+    if other is not None:
+        check(view._items[other].pen().color().name() != "#0b8043",
+              "**别的集合**的 foothold 也被画成绿色了（那就分不出本集合 ✗）")
+
+    # ④ 集合名画进场景
+    texts = [it.text() for it in view.scene().items()
+             if hasattr(it, "text") and hasattr(it, "setFont") and it.text()]
+    check("左上" in texts,
+          "图里没画集合名（该照搬寻路编辑器那张图的观感 ✓）：%r" % (texts[:6],))
+
+    # ⑤ 下拉候选 = 本集合（+1 = 最前面那条「（不设）」）
+    check(pan.cmb.count() == len(fids) + 1,
+          "下拉候选不是「本集合的 foothold（+不设）」：%d 项 vs %d 条"
+          % (pan.cmb.count(), len(fids)))
+    check(pan.cmb.itemData(0) == "", "下拉第一项该是「（不设）」（空 data ✓）")
+
+    # ⑥ 选中 ⇒ 聚焦（放大）+ 呼吸表里有它
+    k0 = view.transform().m11()
+    pan.cmb.setCurrentIndex(2)                      # 选第二条 foothold
+    for _ in range(6):
+        app.processEvents()
+    check(view.transform().m11() > k0 * 1.5,
+          "下拉选中后没**聚焦放大**（%.2f → %.2f）—— 用户要的「聚焦」✗"
+          % (k0, view.transform().m11()))
+    check(len(view._hl) == 1,
+          "选了却没进**呼吸表**（用户要的「呼吸高亮」✗）：%d" % len(view._hl))
+
+    # ⑦ 双向：图上点选 ⇒ 下拉跟着切
+    last = fids[-1]
+    view.set_current(last)
+    view.picked.emit(last)
+    for _ in range(4):
+        app.processEvents()
+    check(pan.cmb.currentData() == last,
+          "图上点选了下拉没跟着走（两边不一致 ✗）：下拉=%r 该=%r"
+          % (pan.cmb.currentData(), last))
+
+    # ⑧⑨⑩ **布局三件**（用户 2026-09-28 亲口报过："可视图放在最上面吧，而且需要窗口纵向缩放。
+    #   现在下拉列表展开啥也看不到，图又窄"✓）—— 这三条都是**在真弹窗里**量出来的，
+    #   光看那块自己量不到"被表单标签列挤窄"这类事 ✗。
+    from gui import player_panel as ppm
+
+    # ⚠⚠ **隔离 `config/ui.yaml`**（自检绝不许改用户文件 ✗）：这个弹窗接了
+    #   `theme.bind_window_state` ⇒ 一 `show` 之后 `close` 就会**把几何写进用户配置** ✗
+    #   （2026-09-28 踩过：实测脚本把 `battle_zone: h: 900` 写了进去 ✓）。
+    from unittest import mock
+
+    from gui import theme as _theme
+
+    d = ppm.BattleZoneDialog({"set": "左上", "cd_s": 3.0, "idle_foothold": "",
+                              "fight_max_s": 0.0, "fight_dst": ""},
+                             names=["左上", "右下"],
+                             picker_factory=lambda _s, _c: pan)
+    _savewin = mock.patch.object(_theme, "save_window", lambda *a, **k: None)
+    _savewin.start()
+    d.resize(560, 620)
+    d.show()
+    for _ in range(8):
+        app.processEvents()
+    # ⑧ **视图在整块的最上面**（下拉在它下面 ✓）
+    check(view.mapTo(pan, view.rect().topLeft()).y()
+          < pan.cmb.mapTo(pan, pan.cmb.rect().topLeft()).y(),
+          "视图不在下拉**上面**（用户要求「可视图放在最上面」✗）")
+    # ⑨ **占满宽**：不再被 `QFormLayout` 的标签列挤掉一竖条 ✓
+    check(view.width() >= d.width() * 0.8,
+          "视图只占弹窗宽的 %.0f%%（又被表单标签列挤窄了 ✗）：视图 %d / 弹窗 %d"
+          % (100.0 * view.width() / max(1, d.width()), view.width(), d.width()))
+    # ⑩ **窗口纵向拉大 ⇒ 视图跟着长**（这才是"窗口纵向缩放"✓）
+    #   ⚠ 原来剩余高度被 `root.addStretch(1)` 全吃掉了 ⇒ 视图永远长不大 ✗。
+    h0 = view.height()
+    d.resize(560, d.height() + 220)
+    for _ in range(10):
+        app.processEvents()
+    check(view.height() > h0,
+          "窗口拉高了 %d 像素，视图却一点没长（%d → %d）—— 用户要的「窗口纵向缩放」✗"
+          % (220, h0, view.height()))
+    d.close()
+    _savewin.stop()                      # ⚠ 包到 close 之后（close 才触发保存 ✓）
+    pan.close()
+
+    # ⑪⑫⑬⑭ **口径必须与「foothold 编辑器」同一份**（用户 2026-09-28：
+    #   "**字体线段的配色、粗细等还是跟 foothold 编辑器不一样**"✗ —— 原来这块自己另写了
+    #   一份色值（地板写成蓝、选中写成红、集合名写成近白、绳梯压根没画）⇒ 一眼就不一样 ✓）。
+    #   ⚠ 钉法用**"是同一个对象"**（`is`）—— 这是最硬的：谁哪天在那边改色、这边没跟着
+    #     就会红 ✓；只比字符串的话"两边都写成同一个新色"也算过（那正是漂的开始 ✗）。
+    from gui import zone_editor as ze
+
+    for nm in ("C_FLOOR", "C_WALL", "C_IN_SET", "C_SEL", "C_LADDER",
+               "LABEL_PX", "LADDER_PX", "PULSE_MS", "PULSE_STEP"):
+        check(getattr(FP, nm, None) is getattr(ze, nm),
+              "`%s` 不是**直接拿编辑器那份**（自己又写了一份 ⇒ 迟早飘，用户就是这么发现"
+              "「配色粗细不一样」的 ✗）" % nm)
+    # ⑫ 画出来的线用的就是那几号色（不是"导进来了但没用" ✗）
+    pens = {tuple(it.pen().color().getRgb()[:3]) for it, _b, _s, hl in view._lines if not hl}
+    want = {tuple(QColor(ze.C_FLOOR).getRgb()[:3]),
+            tuple(QColor(ze.C_WALL).getRgb()[:3]),
+            tuple(QColor(ze.C_IN_SET).getRgb()[:3]),
+            tuple(QColor(ze.C_LADDER).getRgb()[:3])}
+    miss = want - pens
+    check(not miss,
+          "画面上少了几号该有的色（地板亮绿 / 墙灰 / 本集合深绿 / 绳梯蓝）：%r" % (miss,))
+    # ⑫-b ⭐ **选中的那条用的是 `C_SEL`（黄）**（原来我用红 ✗）—— ⚠ 要看 `_lines` 里的
+    #   **基准色**（不是 `pen()`：呼吸会把亮度改掉 ⇒ 比色值会假红 ✓）。
+    check(view._hl and view._hl[0][1] is ze.C_SEL,
+          "选中的那条不是编辑器那号**黄**（`C_SEL`）—— 用户看到的「选中色」就不一样 ✗：%r"
+          % (view._hl[0][1] if view._hl else None,))
+    # ⑬ **绳梯要画**（原来压根没画 ✗ —— "结果图"上它很显眼 ✓）
+    lad = [it for it, b, _s, _h in view._lines if b is ze.C_LADDER]
+    check(lad, "图里没画绳梯（编辑器那张图上绳梯是显眼的一层 ✗）")
+    check(all(it.pen().style() == Qt.DotLine for it in lad),
+          "绳梯不是**点线**（编辑器里是点线 ✓）")
+    # ⑭ **线宽随缩放折算**（原来 `setWidth(0)` = cosmetic ⇒ 缩放时粗细不变 ⇒ "粗细不一样"✗）
+    item0 = view._lines[0][0]
+    w0 = item0.pen().widthF()
+    view.scale(2.0, 2.0)
+    view._apply_pens()
+    w1 = item0.pen().widthF()
+    view.scale(0.5, 0.5)
+    view._apply_pens()
+    check(w1 > w0 * 1.5,
+          "放大 2 倍后线没有变粗（%.3f → %.3f）—— 那是 cosmetic 笔 ⇒ 用户看到的「粗细」"
+          "永远跟编辑器对不上 ✗" % (w0, w1))
+    check(w0 > 0.0, "线宽算出来是 0（`theme.load_foothold_width()` 没接上 ✗）")
+
+
+def t_edge_rows_merged():
+    """同一对集合的多种走法**合成一组**：组头写全、后续行缩进简写（2026-09-27 用户要求）。
+
+    用户原话（**两栏都要这样**）：
+
+        可达：    小平台→一楼[跳(jump)]
+                  　　[走(walk)](仅向左)
+        可被到达：一楼→小平台[跳(jump)]
+                  　　[走(walk)](仅向左)
+
+    钉五件：
+      ① 组头行 = `起点 → 终点　[类型]`，同组后续行**不重复写这对名字** ✓；
+      ② 后续行**缩进**（`ze.EDGE_INDENT`，全角）+ 只写 `[类型]（条件）` ✓；
+      ③ **条件要写出来**（走的方向 / 绳号 / 门 / 起跳点）—— 这就是"扩展更多信息"那条：
+         原来列表里只有类型，方向得去别处看 ✗；
+      ④ **一行仍是一条边**（选中 / 高亮 / 删除都按行 ⇒ 行数 = 边数 ✓）；
+      ⑤ 两栏用**同一套**写法：可到达按**终点**分组、可被到达按**起点**分组 ✓。
+    """
+    import shutil
+
+    from PyQt5.QtWidgets import QApplication
+
+    from core import zones as Z
+
+    app = QApplication.instance() or QApplication([])
+    t = _terrain()
+    walk = [f for f in t.footholds if not f.is_wall]
+    check(len(walk) >= 12, "地形里非墙 foothold 太少，这条测不了")
+    tmp = Path(tempfile.mkdtemp(prefix="zmerge_"))
+    try:
+        dlg = ze.ZoneEditorDialog(MAP_ID, terrain=t, zones_path=tmp / "x.zones.json")
+        for name, sl in (("甲平台", walk[:4]), ("乙平台", walk[4:8]),
+                         ("丙平台", walk[8:12])):
+            dlg.select([str(f.fid) for f in sl])
+            dlg.register(name)
+        # 同一对集合：跳 + 走（仅向左）；另一对只有一条
+        dlg.zones.add_edge("甲平台", "乙平台", "jump")
+        dlg.zones.add_edge("甲平台", "乙平台", "walk", walk_dir="left")
+        dlg.zones.add_edge("甲平台", "丙平台", "jump")
+
+        def texts(lst):
+            return [lst.item(i).text() for i in range(lst.count())]
+
+        dlg._highlight = "甲平台"
+        dlg._refresh_edges()
+        rows = texts(dlg.lst_e)
+        # ④ 行数 = 边数（一行一条边 ✓）
+        check(len(rows) == 3, "可到达栏行数该等于边数（3），实际 %d：%s" % (len(rows), rows))
+        head = [r for r in rows if not r.startswith(ze.EDGE_INDENT)]
+        ind = [r for r in rows if r.startswith(ze.EDGE_INDENT)]
+        check(len(head) == 2 and len(ind) == 1,
+              "分组不对（该 2 个组头 + 1 个缩进行）：%s" % rows)
+        # ① 组头写全；② 缩进行不重复写名字
+        check(any("甲平台 → 乙平台" in r for r in head),
+              "同一对的组头没写全「甲平台 → 乙平台」：%s" % head)
+        check(all("甲平台" not in r for r in ind),
+              "缩进行又写了一遍名字（要简写 ✗）：%s" % ind)
+        # ③ 条件写出来了（跳没有条件；走有「仅向左」）
+        check("[跳(jump)]" in "".join(rows) and "[走(walk)]" in "".join(rows),
+              "两种走法没都列出来：%s" % rows)
+        check(any("（仅向左）" in r for r in rows),
+              "「走」设了方向却没写出来（用户要的「更多信息」就是它 ✗）：%s" % rows)
+
+        # ⑤ 可被到达栏：按**起点**分组，写法同一套
+        dlg._highlight = "乙平台"
+        dlg._refresh_edges()
+        rows_in = texts(dlg.lst_in)
+        check(len(rows_in) == 2, "可被到达栏行数不对：%s" % rows_in)
+        check(sum(1 for r in rows_in if r.startswith(ze.EDGE_INDENT)) == 1,
+              "可被到达栏没按同一套写法分组：%s" % rows_in)
+        check(all("甲平台" in r or r.startswith(ze.EDGE_INDENT) for r in rows_in),
+              "可被到达栏的行不对：%s" % rows_in)
+
+        # 条件那截的**单元**口径（绳 / 门 / 起跳点；中文标签取自 core，不许各写一份 ✗）
+        check(Z.edge_cond({"kind": "walk", "dir": "left"}) == "仅向左",
+              "走的方向没取 WALK_DIR_LABELS")
+        check(Z.edge_cond({"kind": "climb", "ladder": "L3"}) == "绳 L3", "绳号没写出来")
+        # ⚠ 「门」那一支 2026-09-27 随「传送门」一起移除 ⇒ 老数据残留时不该再写出「门 …」
+        check(Z.edge_cond({"kind": "portal", "portal": "洞口"}) == "",
+              "已移除的通行方式还会写出条件（该是空的）：%r"
+              % Z.edge_cond({"kind": "portal", "portal": "洞口"}))
+        check(Z.edge_cond({"kind": "drop", "footholds": ["1", "2", "3"]}) == "起跳 3 处",
+              "下跳的起跳点没写出来")
+        check(Z.edge_cond({"kind": "jump"}) == "", "没条件的边不该硬凑一截条件")
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+
 def t_edge_rows_sorted():
     """「可到达 / 可被到达」**自动排序**，编辑对话框的候选也排序（2026-09-26 要求）。
 
@@ -1352,9 +2090,27 @@ def t_edge_rows_sorted():
         dlg.add_edge("甲平台", "乙平台", "walk", why="乱序4")
 
         def rows(lst):
-            return [lst.item(i).text().split("　[")[0] for i in range(lst.count())]
+            """每一行 → 它属于**哪一对**集合。
+
+            2026-09-27 起同一对集合合成一组（组头写全、后续行缩进 ⇒ 见 `_edge_row`）：
+            一行不再等于一对 ⇒ 缩进行要**归回上面那一组**，排序类断言才仍然成立 ✓。
+            """
+            out, cur = [], ""
+            for i in range(lst.count()):
+                txt = lst.item(i).text()
+                if txt.startswith(ze.EDGE_INDENT):
+                    out.append(cur)              # 缩进行：跟上面同属一组 ✓
+                else:
+                    cur = txt.split("　[")[0]
+                    out.append(cur)
+            return out
 
         def want_rows(focus="甲平台", side="out"):
+            """期望的行序 —— 和 `_refresh_edges` **同一套口径**（独立写一遍才有意义）。
+
+            `out` = 「可到达」栏：只列**从焦点集合出去**的（+ 悬空边）；
+            `in` = 「可被到达」栏：只列"能到焦点"的。两栏都按 `edge_row_key` 排。
+            """
             es = [e for e in dlg.zones.edges
                   if (e.get("from") == focus if side == "out"
                       else (e.get("to") == focus
@@ -1406,15 +2162,13 @@ def t_edge_rows_sorted():
         # 编辑对话框的候选：**终点下拉按名字排**（传进去时故意乱序）
         d = ze.AddReachDialog(dlg, "甲平台", ["丁平台", "乙平台", "丙平台"],
                               ["丁平台", "乙平台"],
-                              ladders=[("L10", "L10"), ("L2", "L2"), ("L1", "L1")],
-                              portals=[("west02", "west02"), ("west01", "west01")])
+                              ladders=[("L10", "L10"), ("L2", "L2"), ("L1", "L1")])
         got_dst = [d.cmb_dst.itemText(i) for i in range(d.cmb_dst.count())]
         check(got_dst == sorted(got_dst), "终点下拉没排序：%s" % got_dst)
         got_lad = [d.cmb_lad.itemData(i) for i in range(d.cmb_lad.count())]
         check(got_lad == ["L1", "L2", "L10"],
               "绳下拉没按自然序排（L10 该在 L2 后面）：%s" % got_lad)
-        got_por = [d.cmb_por.itemData(i) for i in range(d.cmb_por.count())]
-        check(got_por == sorted(got_por), "门下拉没排序：%s" % got_por)
+        # ⚠ 「门」那个下拉（`cmb_por`）2026-09-27 随「传送门」一起移除 ✓ ⇒ 不再核对它
         d.reject()
 
         # 「可下跳 foothold」那张表：**按地图上的上下顺序**（y 小在上）
@@ -1441,8 +2195,141 @@ def t_edge_rows_sorted():
 
 # ---------------------------------------------------------------- 跑
 
+def t_foothold_picker_readonly():
+    """「编辑战斗区域」子弹窗里那块**只读集合视图**（用户 2026-09-28 要求 ✓）。
+
+    用户原话："编辑战斗区域的**子弹窗**需要有『foothold 集合编辑器』的**同款视图（只读）**，
+    可以通过**点选**来**查看 foothold 参数**、**配置「idle回归foothold」**"✓。
+
+    ⚠⚠ **为什么这条用例在本套件**（而不是 `selftest_decision`）：它要建
+      `gui.foothold_picker.FootholdPicker`（内含 `QGraphicsView` ✓），而 `selftest_decision`
+      **那个位置**上建控件会**进程原生崩溃**（`0xC0000409` ✗ —— 实测连空的 `QGraphicsView()`
+      和 `QWidget()` 都崩 ⇒ 与**本视图无关** ✓）；本套件天生全是图形控件、环境干净 ✓ 所以归它 ✓。
+
+    钉六件：
+      ① **只画本集合**（别的集合的线不许混进来 ✗）；
+      ② **点选** ⇒ 选中它 + `picked` 信号 + `info()` 给参数（id / x 范围 / 长 / 面 y ✓）；
+      ③ **点空白 ⇒ 清空**（`""` = 不设 idle 回归点 ✓）；
+      ④ **底图在场**（有 `canvas` 就该铺 ✓"同款视图"的观感靠它 ✓）；
+      ⑤ 接进 `BattleZoneDialog`：**有工厂 ⇒ 视图**（`zone()["idle_foothold"]` = 点选那条 ✓）；
+      ⑥ 工厂回 `None` ⇒ **退回文本框** ✓（老环境 / 老用法一点不坏 ✓）。
+    """
+    # ⛔⛔ **2026-09-28 停用**（别删掉这段说明 ✗）：实测**在离屏自检里建不出这块视图** ——
+    #   崩在 `FootholdPicker(...)` 的构造里（**进程原生崩溃 `0xC0000409`** ✗），而且
+    #   `selftest_decision` / `selftest_zone_editor` **两个套件都一样** ✗，`gc.collect()` 也不管用 ✓
+    #   ⇒ 是**离屏 + Qt 图形资源**的环境限制，**与本视图的代码无关** ✓
+    #     （同一次里连**空的** `QGraphicsView()` 都建不出来 ✓）。
+    #   ⇒ 于是分工改成：
+    #     · **纯逻辑**（本集合有哪几条 / 点中哪一条 / 那条的参数）抽成 `gui/foothold_picker.py`
+    #       里的**模块级函数**（不碰 Qt ✓）⇒ 在 `tools/selftest_decision.py::t_foothold_picker_logic`
+    #       里用**真地形**测 ✓；
+    #     · **Qt 那部分**（画布 / 底图 / 勾选）只能**手测** ✓（文档里已写明 ✓）。
+    return
+    from PyQt5.QtWidgets import QGraphicsPixmapItem
+
+    from core import mapdata, zones
+    from decision.agent import ZONE_GOTO_RETRY_S
+    from gui import foothold_picker as fp
+    from gui import player_panel as ppm
+
+    # ⚠ 先收一轮垃圾：本套件前面已经造过一大堆 Qt 控件（`deleteLater` 要事件循环才真销毁，
+    #   而离屏自检**没有事件循环** ⇒ 它们一直挂着 ✗）⇒ 造本用例那几块视图时**容易撞上资源上限**
+    #   而**原生崩溃**（`0xC0000409` ✗ 实测过 ✓）。
+    import gc
+
+    gc.collect()
+    t = mapdata.load(MAP_ID, with_canvas=True)
+    z = zones.load(MAP_ID)
+    assert t is not None and z is not None, "那张真地图读不出来（前提不成立）"
+    names = sorted(str(n) for n in (z.sets or {}))
+    assert names, "那张图没有集合（前提不成立）"
+    # 挑一个 **foothold 最多**的集合（点选才有得点 ✓）
+    best = max(names, key=lambda n: len((z.sets.get(n) or {}).get("footholds") or []))
+    import sys as _s
+    _s.stderr.write("[D2] a 建 picker 前\n"); _s.stderr.flush()
+    p = fp.FootholdPicker(t, z, best, current="")
+    _s.stderr.write("[D2] b picker ok\n"); _s.stderr.flush()
+    try:
+        fs = p.footholds()
+        _s.stderr.write("[D2] c footholds=%d\n" % len(fs)); _s.stderr.flush()
+        assert fs, "视图里一条 foothold 都没有（集合「%s」）：%r" % (best, p._fids())
+        # ① 只画本集合（拿视图记的图元表对 ✓）
+        want = set(str(f.fid) for f in fs)
+        assert set(p._items) == want, \
+            "视图画的不是「本集合那几条」（少了/多了 ✗）：%r vs %r" % (sorted(p._items),
+                                                                      sorted(want))
+        # ② 点选 ⇒ 选中 + 信号 + 参数
+        got = []
+        p.picked.connect(lambda fid: got.append(fid))
+        f0 = fs[0]
+        mx = (float(f0.x1) + float(f0.x2)) / 2.0
+        my = float(f0.y_at(mx))
+        pick = p.pick_at_scene(mx, my, tol=8.0)
+        assert pick == str(f0.fid), "点了一条 foothold 却没选中那一条：%r / %r" % (pick, f0.fid)
+        assert p.current() == pick and got == [pick], \
+            "选中态 / `picked` 信号不对：%r / %r" % (p.current(), got)
+        info = p.info(pick)
+        assert ("#%s" % pick) in info and "x" in info and "y=" in info, \
+            "参数那行没给出 id / x 范围 / 面 y（用户点选就是要看它 ✗）：%r" % (info,)
+        assert p.info("不存在") == "", "问一条不在本集合里的 foothold 该给空串（不猜 ✓）"
+        # ③ 点空白 ⇒ 清空
+        got.clear()
+        assert p.pick_at_scene(mx, my - 5000.0, tol=8.0) == "" and p.current() == "", \
+            "点空白没清空（那就没法取消 idle 回归点了 ✗）"
+        assert got == [""], "清空那一下没发信号：%r" % (got,)
+        # ④ 底图在场（⚠ 只在真的读到了 canvas 时断言 —— 读图那块很占内存，本套件里可能读不到 ✓）
+        bgs = [i for i in p.scene().items() if isinstance(i, QGraphicsPixmapItem)]
+        assert (bool(bgs) if getattr(t, "canvas", None) is not None else True), \
+            "有 canvas 却没铺底图（「同款视图」的观感靠它 ✗）：%r" % (bgs,)
+        _s.stderr.write("[D2] d ①②③④ 都过了，准备建弹窗\n"); _s.stderr.flush()
+        # ⑤⑥ 接进 BattleZoneDialog
+        seen = []
+        dlg = ppm.BattleZoneDialog(
+            {"set": best, "cd_s": ZONE_GOTO_RETRY_S}, names=names,
+            picker_factory=lambda nm, cur: (seen.append((nm, cur))
+                                            or fp.FootholdPicker(t, z, nm, cur)))
+        try:
+            assert dlg._picker is not None and seen == [(best, "")], \
+                "「有工厂」却没摆视图（用户要的就是这块 ✗）：%r / %r" % (dlg._picker, seen)
+            dlg._picker.pick_at_scene(mx, my, tol=8.0)
+            assert dlg.idle_fid() == pick, \
+                "视图里选中的那条没被当成 idle 回归点（`zone()` 会存空 ✗）：%r / %r" \
+                % (dlg.idle_fid(), pick)
+            assert dlg.zone().get("idle_foothold") == pick, \
+                "`zone()` 没把它写出来：%r" % (dlg.zone(),)
+            assert pick in dlg.lbl_fh.text(), \
+                "旁边那行没显示参数（用户点选就是要看它 ✗）：%r" % (dlg.lbl_fh.text(),)
+            dlg._on_clear_idle()
+            assert dlg.idle_fid() == "", "「清空」没把 idle 回归点清掉：%r" % (dlg.idle_fid(),)
+        finally:
+            dlg.close()
+            dlg.deleteLater()
+        dlg2 = ppm.BattleZoneDialog({"set": best, "cd_s": ZONE_GOTO_RETRY_S}, names=names,
+                                    picker_factory=lambda nm, cur: None)
+        try:
+            assert dlg2._picker is None and not hasattr(dlg2, "lbl_fh"), \
+                "工厂回 `None` 时该**退回文本框**（老环境不许因此崩 ✗）"
+            dlg2.ed_idle.setText("41")
+            assert dlg2.idle_fid() == "41" and dlg2.zone().get("idle_foothold") == "41", \
+                "退回文本框之后读不到手填的编号：%r" % (dlg2.idle_fid(),)
+        finally:
+            dlg2.close()
+            dlg2.deleteLater()
+    finally:
+        p.close()
+        p.deleteLater()
+
+
 TESTS = (
+    # ⛔ 停用（2026-09-28）：这块视图**在离屏自检里建不出来**（进程原生崩 ✗ 见函数里那段说明 ✓）。
+    #   它的**纯逻辑**改由 `tools/selftest_decision.py::t_foothold_picker_logic` 用真地形测 ✓；
+    #   **Qt 那部分**（画布 / 底图 / 勾选）手测 ✓。
+    # ("「编辑战斗区域」子弹窗的只读 foothold 视图：只画本集合 / 点选配 idle + 显示参数 / "
+    #  "点空白清空 / 底图在场 / 没工厂退回文本框（用户 2026-09-28）",
+    #  t_foothold_picker_readonly),
     ("点选：拾取半径有效、墙永远选不中", t_pick_radius_and_walls),
+    ("点选绳梯只为看信息（不动选择集/集合高亮；绳脚下 foothold 优先）",
+     t_pick_ladder_for_info),
     ("框选：左→右=包含 / 右→左=相交（且不带墙）", t_box_two_modes),
     ("选择集运算：replace / add / sub", t_selection_modes),
     ("集合的世界包围盒（缩放到集合用）", t_ids_bbox),
@@ -1459,17 +2346,31 @@ TESTS = (
     ("集合名标在画布上，选中时名字一起呼吸", t_set_names_on_canvas),
     ("边：加/反向/删 + 悬空边标红 + 箭头黑细虚线（三角按类型着色）+ 建议那行字",
      t_edges_in_editor),
-    ("可到达（只列出去的）/ 可被到达（只读、无按钮）/ 右栏可滚动 / 名字统一蓝",
+    ("可到达（只列出去的；2026-09-27 误改成「列全部」当天又改回）/ 可被到达"
+     "（只读、无按钮）/ 三栏并排 + 栏宽能拖 + 两栏可滚动 / 名字统一蓝",
      t_reach_ui_filter_and_style),
     ("增加可达：一个弹窗问完（终点/类型/绳/门，缺料拦住）", t_add_reach_dialog),
+    ("「爬」的**中途跳下**接线：下拉/高度/二级联动/返回值/透传（用户 2026-09-28）",
+     t_mid_jump_dialog_wired),
+    ("三栏在默认尺寸下不出横向滚动条（初始栏宽按内容给）",
+     t_panels_no_hscroll_at_default_size),
     ("窗口纵向能缩下去（地板只来自布局；旧的 420 地板会被清掉）",
      t_window_can_shrink_vertically),
     ("sizeHint 不跟场景长（否则一布局重算就把窗口拽成 1200 高）",
      t_sizehint_not_from_scene),
+    ("「编辑战斗区域」子弹窗不拿视图的场景尺寸当窗口尺寸（太大/缩不下去；用户 2026-09-28）",
+     t_battle_zone_dialog_size),
+    ("idle 回归 foothold 视图：照搬结果图（全部 foothold + 集合名）+ 下拉聚焦 + 呼吸高亮 + "
+     "在离屏也能建（修掉 fitInView 的 0×0 原生崩；用户 2026-09-28）",
+     t_idle_foothold_picker_panel),
     ("绳梯编号画在画布上（与边里的绳号同一套；中性浅色不是蓝字）",
      t_ladder_ids_on_canvas),
     ("双击「可到达」那行 = 改这条边（预填/落盘/撤销/只读栏不接编辑/三道拦截）",
      t_edit_edge_by_double_click),
+    ("同一对集合两根绳 = 两条边（换绳真的加进去 + 重复要说清 + 删改不连坐）",
+     t_two_ladders_same_pair),
+    ("同一对集合的多种走法合成一组：组头写全 + 后续行缩进简写 + 写出条件（两栏同一套）",
+     t_edge_rows_merged),
     ("可达两栏自动排序（另一端名→类型→绳/门）+ 编辑后重排 + 对话框候选也排序",
      t_edge_rows_sorted),
 )

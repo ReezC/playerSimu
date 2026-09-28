@@ -161,7 +161,17 @@ def t_degrades_without_psutil():
           "没有 psutil 时不许编出子进程：%s" % d)
     check(d["avail_gb"] is not None,
           "没有 psutil 也必须能报内存（那是 ctypes 直接读的，不依赖它）")
-    check(machineload.warn(d) == "", "只剩内存且内存充足时不该告警")
+    # ⚠ **这一条不许拿真实内存当输入**（2026-09-27 改）：本机忙起来的时候
+    #   （实测：12 个训练子进程、可用内存只剩 0.71GB）`warn()` **本来就该报内存告警** ——
+    #   拿真实读数断言"不该告警"，等于把一个**环境变量**当成前提：机器一忙这条就红，
+    #   而它红的时候代码其实是**对的** ✗（现场就撞上过：8/9，重跑还是 8/9）。
+    #   要钉的是**降级路径的逻辑**：喂一个"内存充足"的读数 ⇒ 它必须闭嘴 ✓。
+    ok = dict(d, avail_gb=24.0)
+    check(machineload.warn(ok) == "",
+          "只剩内存且内存充足时不该告警：%r" % machineload.warn(ok))
+    # 降级路径永远不许编出子进程占用（那个数只有 psutil 才拿得到 ✓）
+    check("并行子进程" not in machineload.warn(d),
+          "没有 psutil 却报出了并行子进程占用：%s" % machineload.warn(d))
 
 
 def t_census_does_not_read_all_memory():

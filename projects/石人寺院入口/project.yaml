@@ -77,9 +77,6 @@ decision:
   - 1500
   - 2500
   input_device: local
-  input_delay:
-  - 0
-  - 50
   attack_cd: 200
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 1000

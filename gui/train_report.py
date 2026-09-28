@@ -23,6 +23,7 @@ from PyQt5.QtWidgets import (QDialog, QHBoxLayout, QLabel, QListWidget,
                              QSplitter, QVBoxLayout)
 from PyQt5.QtCore import Qt
 
+from gui import theme                  # 弹窗几何按客户端存（config/ui.yaml）✓
 from gui.steps.cards import _fmt3, _model_files, _run_dirs
 from perception.metrics import (ACCEPT, BALANCED, BOX, COMPARE, FALSE, FIRST,
                                 METRICS, MISSED, NOBASE, advise_items)
@@ -73,6 +74,7 @@ class TrainReportDialog(QDialog):
         self.resize(760, 560)
         self._build()
         self._fill(current)
+        theme.bind_window_state(self, "train_report")  # 拉过的大小/位置按客户端记住 ✓
 
     # ---------------- 界面 ----------------
 

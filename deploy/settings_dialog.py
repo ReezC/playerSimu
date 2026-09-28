@@ -29,7 +29,7 @@ from PyQt5.QtWidgets import (QDialog, QDialogButtonBox, QFrame, QHBoxLayout,
 from gui import theme
 # NoWheel* 必须模块级导入：控件在 __init__ 里建，方法里的懒导入到不了那儿。
 # （详见 docs/UI规范.md：滚轮不许改参数）
-from gui.widgets import NoWheelSlider, NoWheelSpinBox
+from gui.widgets import NoWheelSlider, NoWheelSpinBox, scroll_page
 
 #: 页签名（顺序 = 显示顺序）。
 TAB_NAMES = ("界面", "日志")
@@ -79,20 +79,11 @@ class DeploySettingsDialog(QDialog):
 
         套一层 QScrollArea：字号调到最大时内容会明显变高，不套就可能超出小屏
         （docs/UI规范.md §4：长面板放进 QScrollArea）。
+        ⚠ 滚动区**只有一处实现**：`gui.widgets.scroll_page`（2026-09-27 收口，和工作台设置
+        同一份 —— 两处以前是一模一样的手写副本 ✗）。
         """
         page = QWidget()
-        outer = QVBoxLayout(page)
-        outer.setContentsMargins(0, 0, 0, 0)
-
-        area = QScrollArea()
-        area.setWidgetResizable(True)
-        area.setFrameShape(QFrame.NoFrame)      # 页签已经有边框了，别套两层
-        inner = QWidget()
-        lay = QVBoxLayout(inner)
-        lay.setSpacing(8)
-        lay.setContentsMargins(10, 10, 10, 10)
-        area.setWidget(inner)
-        outer.addWidget(area)
+        lay = scroll_page(page, margins=(10, 10, 10, 10), spacing=8)
         return page, lay
 
     @staticmethod

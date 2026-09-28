@@ -184,13 +184,33 @@ class Terrain:
     #: 传送点/绳梯的判定容差（口径抄 MapleNecrocer 的两个 Find：
     #  portal |dx|<15 且 |dy|<12；ladder |dx|<10 且 y 在 [y1-12, y2+12]）
     PORTAL_DX, PORTAL_DY = 15, 12
-    LADDER_DX, LADDER_PAD = 10, 12
+    #: ⚠ 绳梯的 **x 容差从 10 放宽到 24**（2026-09-27 用户报"这里上绳子了，但是位置状态说没上"）：
+    #  原值 10 是抄 MapleNecrocer 的 `|dx| < 10`，但它跟**上绳执行器自己的对齐容差**
+    #  （「坐标对齐误差范围」= `decision.route.ALIGN_TOL_PX` 默认 **10**）**卡在同一个数上、
+    #  边界却相反** ✗ —— 对齐判的是 `|dx| <= 10`（**含** ✓），这里判的是 `|dx| < 10`（**不含** ✗）。
+    #  实测用户那张图（`106010105`：绳 `x=1189`、人 `(1179, -17)` ⇒ **Δx 正好 = 10.0**）：
+    #  执行器认为"对齐好了 ✓"、位置状态却报"**没在绳上** ✗" ⇒ 上绳那一支永远等不到"吸上绳"
+    #  （`ladder_id` 一直 `None`）⇒ 来回重跳 / 报"还没上绳" ✗。
+    #  24 = 那个默认容差(10) + 绳子的视觉半宽与读数误差（≈14）⇒ **保证不比对齐容差更紧** ✓
+    #  ⚠ 放宽它是安全的：真正"算不算在绳上"还有一道**按键许可**
+    #    （`agent.holding_vertical()`：没按 ↑/↓ 一律不算 ✓，见 `gui/live_thread._fill_route_ctx`）
+    #    ⇒ 走路路过绳口不会被粘住 ✓（那才是当初把容差收紧的顾虑 ✓）。
+    LADDER_DX, LADDER_PAD = 24, 12
 
-    def __init__(self, map_id, data, canvas=None):
+    def __init__(self, map_id, data, canvas=None, canvas_alpha=None):
         self.id = str(map_id)
         self.info = dict(data.get("info") or {})
         self.mini = dict(data.get("miniMap") or {})
+        #: 小地图底图（**numpy BGR，永远是 3 通道** ✓ —— 全仓的匹配/拼接都按它写 ✓）。
         self.canvas = canvas
+        #: ⭐ 底图自己的 **alpha**（`uint8` 单通道；底图 PNG 没有透明区 = `None` ✓）——
+        #: 2026-09-27 加：底图 PNG 有近一半像素是全透明的（面板之外的圆角 ✓），
+        #: 而 `cv2.imread(IMREAD_COLOR)` 会把它们读成**纯黑** ✗ ⇒ 编辑器底图与「地形叠加图」
+        #: 都带一块黑底 ✗（用户："小地图底图、地形叠加图的背景应该透明吧？**你自己加的黑色**？"）。
+        #: ⇒ 现在**分开存**：`canvas` 仍旧 3 通道（不动任何现有代码 ✓），透明区要用的人自己
+        #: 拿这份 alpha 合回去（`tools/map_terrain_view.render` / `gui/zone_editor._add_background` /
+        #: `gui/minimap_calib` 的底图参照 ✓）。
+        self.canvas_alpha = canvas_alpha
 
         self.footholds = [Foothold(d) for d in (data.get("footholds") or [])]
         self.portals = [Portal(d) for d in (data.get("portals") or [])]
@@ -247,7 +267,7 @@ class Terrain:
 
     # ---------------- 查询（Agent 用这几个） ----------------
 
-    def foothold_below(self, x, y, tol=40):
+    def foothold_below(self, x, y, tol=40, xtol=0, above_tol=None, band=None):
         """脚下那条**可站立**的 foothold（跳过墙）→ Foothold 或 None。
 
         **与 `find_below` 同一套口径**（同一容差、同样跳过竖向的墙、同样取最近那条），
@@ -257,23 +277,123 @@ class Terrain:
         为什么不复用"段"：自动串段会把**要跳/攀才能互通**的 foothold 并成同一段
         （实测 105090600 的第 0 段把一面 388 像素高的悬崖当成了平台边缘 ✗）——
         集合改由人工分组，判定只认 foothold，见 docs/寻路设计.md §12。
-        """
-        best, best_f = None, None
-        for f in self.footholds:
-            if f.is_wall or not (f.left <= x <= f.right):
-                continue
-            fy = f.y_at(x)
-            if fy < y - tol:          # 在头顶上方（容差内不算）
-                continue
-            if best is None or fy < best:
-                best, best_f = fy, f
-        return best_f
 
-    def find_below(self, x, y, tol=40):
+        `xtol` = **x 方向容差**（0 = 老行为；调用方传设置里的「坐标对齐误差范围」✓）：
+        人站在平台**边上**时，小地图黄点（画的是玩家中心）会读到边界外几个像素 ——
+        实测 105090600 的 (650, 283)：人明明站在 id=41 那块平台上（面 y=280，差 3px ✓），
+        可 x=650 在它左边界 **657 的外面 7px** ✗ ⇒ 老口径一个字都不认 ⇒
+        `foothold_id=None` ⇒「脚下没有平台 / 未分组 / 起点不知道」⇒ 起点与到达判定①全瘫 ✗
+        （用户 2026-09-26 报的正是这个坐标）。y 有 40px 容差、x 却**一点都没有**，
+        这个不对称本来就没道理。
+
+        ⚠ **`xtol` 怎么用（2026-09-28 改过一次，别走回去 ✗）**：
+          · 先按 `dx=0` 比一遍（老口径 ✓）；
+          · 有 `xtol` ⇒ 再按 `dx=xtol` 比一遍，**只有放宽后能找到更近的那条时才改判** ✓
+            （严格 `<`）。
+          ⛔ 原来写的是"**只在 dx=0 一条都找不到时**才按 `xtol` 找一遍 ⇒ 不可能改变任何
+            原本判得出来的结果（风险为 0）"✗ —— 那条口径**保护不了真现场**：人站在
+            「小平台」右边界**外 3px**、而 23px 之下的「底层」x 范围正好罩住他 ⇒ 老口径
+            **判得出**（判成「底层」✗）⇒ 放宽那一遍**永远不会跑** ⇒ `foothold_id` 错 ⇒
+            `here_sets` 错 ⇒ 归属集合 / 限制战斗区域 / 起点判定全错 ✗
+            （用户 2026-09-28 报的 "(594,162) 应该属于小平台、却被解析成了底层" ✓）。
+            ⇒ "风险为 0"让位给"判对" ✓；**老结果里本来就对的那些仍然一点没动** ✓
+            （放宽只在"更近"时生效 ✓）。
+
+        ⚠ **y 判据的取向**（用户 2026-09-27 连着两次报"位置状态判错了"）：**取 |Δy| 最小的那条**
+          ✓（容差之内一律平等比较 —— "身下"不再是加分项 ✓）。
+          · (577,193)：`#12 小平台` Δ=−38 ／ `#47 底层` Δ=−8 ⇒ 判 **#47「底层」** ✓；
+          · (459,154)：更近的那条在中心**上方**几像素 ⇒ 就判它 ✓。
+        ⭐ **`above_tol`**（2026-09-28 加，给**怪**用 ✓）：`None` ⇒ 沿用 `tol`（**老行为一字
+          不变** ✓）；传了值 ⇒ 上面那句"头顶上方超过容差就跳过"改用**它** ✓。
+          ⚠ 为什么必须有它（现场）：给怪算的是"**怪框底**换算的世界 y"（`gui/live_thread.py`
+            的 `_resolve` ✓），而**大怪的检测框并不包住脚** —— 实测那只二楼石人，框底比它
+            真正站的二楼面**高 84 像素** ✗ ⇒ 老口径（上方只给 40）**直接跳过那条面** ⇒
+            只剩"下方最近"的**一楼** ⇒ 怪被判成在下一层 ✗ ⇒ 追击下"前往一楼"、
+            到了又判"底层"⇒ **来回走 + 卡死** ✗
+            （用户现场："**查#171 一个二楼的怪显示在底层，现在已经卡住了**"✓）。
+          ⚠ 放宽**不会**把原本判对的弄错：比较始终是"**|Δy| 最小**"✓ ⇒ 怪真站在一楼
+            （框底就是脚）时一楼 Δ≈0 照样赢 ✓。
+        ⭐⭐ **`band=(lo, hi)`**（2026-09-28 再加，**给怪用的最终口径** ✓）：直接给一个**绝对
+          y 区间**，面的 y 落进去才算候选 ✓；给了它，上面那条"上方容差"**就不看了** ✓。
+          ⚠ 为什么"固定容差"这条路走不通（用户当天又报"**又把顶层怪判成底层怪了**"✓）：
+            **层距会到 540** —— 实测图 105040303：顶层 375 / 三楼 915 / 二楼 1455 /
+            底层 1995 ⇒ 相邻层就差 **540** ✗ ⇒ `above_tol=200` 那种固定值**连半层都盖不住**
+            ⇒ 照样跨层 ✗。
+          ⇒ 口径改成"用**怪框自己的高度**当区间"（调用方 `gui/live_thread.py` 给 ✓）：
+            区间 = `[框底世界 y − 框高, 框底世界 y + 框高]` ✓ ——
+            · "框底 ≠ 脚底"**两个方向都会偏**（框没包住脚 ⇒ 面在框底**上方**；框包过头 ⇒
+              面在**下方** ✓）⇒ 所以要**对称** ✓；
+            · 身体高是**检测框直接给的** ⇒ **不新造魔数** ✓，而且**自适应**：小怪 `h≈40`
+              ⇒ ±40（比老的 ±200 **更严** ✓）；大怪 `h≈300` ⇒ ±300（盖得住 540 ✓）。
+          ⚠ 区间里一条面都没有 ⇒ 调用方会**退回**"只看 `above_tol`"那一版（不瞎判 ✓）。
+          两版历史（都别再走回去 ✗）：① 最早"容差内一律取 fy 最小"= 偏好**玩家胸口以上**那块 ✗；
+          ② 我中途加的"优先认身下那条"✗ —— 被第二次现场推翻 ✓。
+          （"我在哪块平台上"一错，归属集合 / 限制战斗区域 / 起点判定全跟着错 ✗。）
+        """
+        def _pick(dx):
+            best_d, best_f = None, None
+            for f in self.footholds:
+                if f.is_wall or not (f.left - dx <= x <= f.right + dx):
+                    continue
+                # x 在区间外时用**最近的端点**求高度：`y_at` 是按直线外推的，
+                # 斜平台会一路跑偏（那样 y 判据就会把整条误杀掉 ✗）。
+                fx = min(max(x, f.left), f.right)
+                fy = f.y_at(fx)
+                # ⭐ 面比给的 y 高多少算"还在考虑范围内"：默认 `tol`（40 ✓ **老行为一字不变** ✓）；
+                #   传了 `above_tol` 就用它（见下面那段与 `above_tol` 的说明 ✓）。
+                # ⭐⭐ `band`（2026-09-28 再加，**给怪用的最终口径** ✓）：直接给一个**绝对
+                #   y 区间** `(lo, hi)`，面的 y 落进去才算候选 ✓ —— 见下面 `band` 的说明
+                #   （为什么"固定容差"这条路走不通 ✓）。
+                if band is not None:
+                    if not (float(band[0]) <= fy <= float(band[1])):
+                        continue
+                elif fy < y - (tol if above_tol is None else float(above_tol)):
+                    continue
+                # **离玩家最近的那条**（|Δy| 最小 ✓，容差内一律平等比较）——
+                # 用户 2026-09-27 连着两次报的都是这条口径：
+                #   · (577,193)：`#12 小平台` Δ=−38 ／ `#47 底层` Δ=−8 ⇒ 该判 **#47** ✓；
+                #   · (459,154)：`#12` 更近 ／ 某条「底层」更远 ⇒ 该判 **#12** ✓。
+                # ⚠ 我中途自己加过一版"**优先认身下那条**"（fy ≥ y 优先）✗ —— 被第二次现场
+                #   推翻 ✗（那次更近的那条恰好在中心**上方**几像素）⇒ **已去掉**，别再自作聪明 ✗。
+                _d = abs(fy - float(y))
+                if best_d is None or _d < best_d:
+                    best_d, best_f = _d, f
+            return best_f, best_d
+
+        # ⭐ **`xtol` 内的候选也参与比较**（2026-09-28 修，用户报 "(594,162) 应该属于小平台、
+        #   却被解析成了底层"✗）。实测（图 106010105，真数据）：
+        #     · `_pick(0)`  ⇒ **fh=46「底层」**（x 范围 585~675 把它罩住了）Δy=**+23** ✗
+        #     · `_pick(10)` ⇒ **fh=13「小平台」**（面 y=155，x 范围 579~591）Δy=**−7** ✓
+        #   人的世界 x=594 只在「小平台」右边界 **外 3px**（定位的抖动就这个量级 ⇒ 这正是
+        #   `xtol` 存在的理由 ✓），而原来那句是"**只在 dx=0 一条都找不到时**才放宽"✗
+        #   ⇒ **小平台压根没参与比较** ⇒ 判给了 23px 之下的「底层」✗ —— 一笔错到底：
+        #   `foothold_id` 错 ⇒ `here_sets` 错 ⇒ 归属集合 / 限制战斗区域 / 起点判定全跟着错 ✗。
+        # ⇒ 现在：**先按老口径比一遍（dx=0），再按放宽口径比一遍（dx=xtol）**，
+        #   **只有在放宽后能找到"更近"的那条时才改判** ✓（严格 `<`，不是 `<=`）。
+        #   ⚠ 这样**只多认"原来认不出或明显更差"的情形**，不动"原本就判得对"的结果 ✓：
+        #     · 人真站在 `46` 上（y≈185）：13 的 Δ=30 > 46 的 Δ=0 ⇒ **照样判 46** ✓；
+        #     · 人站在「小平台」上（y≈155）：dx=0 时 594 落空 ⇒ 老口径会判 46（Δ=30）✗，
+        #       放宽后 13（Δ≈0）更近 ⇒ 判 13 ✓（这就是本条的修法 ✓）。
+        #   ⚠ 与上面 `xtol` 那段注释里"**不可能改变**任何原本判得出来的结果"（2026-09-26 口径）
+        #     有冲突 ✗ —— 用户 2026-09-28 看到的正是"原本判出来了、但判错了"，所以那条
+        #     "风险为 0"的口径**让位给"判对"** ✓（`t_foothold_below_prefers_nearer_within_xtol`
+        #     两边都钉着：`xtol=0` 的老结果一字不变 ✓、`xtol>0` 时更近的赢 ✓）。
+        got, bd = _pick(0.0)
+        if xtol > 0:
+            got2, d2 = _pick(float(xtol))     # 放宽那一次：候选更多，比法照旧（|Δy| 最小 ✓）
+            if got2 is not None and (got is None or d2 < bd):
+                got, bd = got2, d2
+        return got
+
+    def find_below(self, x, y, tol=40, xtol=0):
         """脚下最近的可站立平台 → (x, y_on_line) 或 None。
 
         口径抄 MapleNecrocer 的 `Footholds.FindBelow`：在 x 覆盖范围内的**非墙**
         foothold 里，取 y 不小于给定 y（允许 tol 容差）中**最小**的那个，再按直线插值。
+        ⚠ 2026-09-27 起 y 判据更细一层（用户报"位置状态判错"）：**先认"在身下"的**
+          （`fy >= y` 取最小 fy ✓）；**一条身下的都没有**时才退到"容差内比中心高"的那几条、
+          取**离玩家最近的**（fy 最大 ✓）。理由与实测见 `foothold_below` 的说明 ✓ ——
+          两边**仍是同一套口径**（这里只是转调它 ✓）。
 
         **tol 默认 40 而不是 2**：小地图上的黄点画的是玩家**中心**
         （`MiniMap.cs` 用的是 `Game.Player.X/Y`），而地面在脚底 —— 实测 105090700
@@ -283,17 +403,17 @@ class Terrain:
         实现在 `foothold_below`（**一份口径，别各写一份** —— 两边容差一旦不同，
         就会出现"工具说在这条上、界面说在那条上"这种最难查的分歧）。
         """
-        f = self.foothold_below(x, y, tol)
+        f = self.foothold_below(x, y, tol, xtol)
         return None if f is None else (x, f.y_at(x))
 
-    def segment_of(self, x, y, tol=40):
+    def segment_of(self, x, y, tol=40, xtol=0):
         """点 (x, y) 落在哪条段上（判定"我现在站在哪块平台"）→ Segment 或 None。
 
         **按 foothold_below 的口径实现**：先问脚下是哪条 foothold，再反查它在哪条段里。
         （原先靠"y 差 ≤0.51"反查，是为没有 foothold 返回值时打的补丁；现在直接认对象。）
         注意：**语义判定一律走集合**（`core/zones.py`），段只留作显示/辅助选择。
         """
-        f = self.foothold_below(x, y, tol)
+        f = self.foothold_below(x, y, tol, xtol)
         if f is None:
             return None
         for seg in self.segments:
@@ -406,7 +526,8 @@ class Terrain:
 def load(map_id, with_canvas=False):
     """读一张图的地形；文件不存在返回 None。
 
-    with_canvas=True 时顺便把小地图底图读进 `Terrain.canvas`（numpy BGR，可能要 cv2）。
+    with_canvas=True 时顺便把小地图底图读进 `Terrain.canvas`（**numpy BGR；底图 PNG 带 alpha
+    时是 4 通道 BGRA** ✓ —— 见下面 `IMREAD_UNCHANGED` 那段的说明）。
     """
     d = map_dir()
     try:
@@ -415,20 +536,42 @@ def load(map_id, with_canvas=False):
         return None
 
     canvas = None
+    canvas_alpha = None
     if with_canvas:
         name = (data.get("miniMap") or {}).get("canvas")
         if name:
             import cv2
-            canvas = cv2.imread(str(d / name), cv2.IMREAD_COLOR)
-    return Terrain(map_id, data, canvas)
+            import numpy as np
+            # ⭐ **alpha 必须留住**（2026-09-27 用户："小地图底图、**地形叠加图**的背景应该透明
+            #   吧？**你自己加的黑色**？"）：WZ 那张底图 PNG 有**近一半像素是全透明的**（小地图
+            #   面板之外的圆角区域，四角 alpha=0 ✓，实测 106010105：透明 49.2% / 不透明 46.5%），
+            #   而 `IMREAD_COLOR` 会把它们**读成纯黑** ✗ ⇒ 编辑器底图、以及叠在实时画面上的
+            #   「地形叠加图」都会带一块黑底 ✗。
+            #   ⚠ 所以"黑底"**不是谁画上去的**，是**读图时丢掉的 alpha** ✗（别去绘制代码里找 ✗）。
+            # ⇒ 读**原样**：带 alpha 就是 4 通道 BGRA ✓。按 `shape[2] == 4` 判、各走各的：
+            #   `tools/map_terrain_view.render`（画线在 BGR 上、alpha 合并回去 ✓）、
+            #   `gui/minimap_calib.np_to_pixmap`（BGRA ⇒ Format_ARGB32 ✓）、
+            #   `gui/zone_editor._add_background`（同上 ✓）。
+            img = cv2.imread(str(d / name), cv2.IMREAD_UNCHANGED)
+            if img is not None and getattr(img, "ndim", 0) == 3 and img.shape[2] == 4:
+                # 带 alpha ⇒ **分开存**：`canvas` 保持 3 通道（全仓都按 BGR 写 ✓），
+                # alpha 单独给 `canvas_alpha` ✓（谁要透明谁自己合 ✓）
+                canvas = np.ascontiguousarray(img[:, :, :3])
+                canvas_alpha = np.ascontiguousarray(img[:, :, 3])
+            else:
+                canvas = img
+    return Terrain(map_id, data, canvas, canvas_alpha)
 
 
 def calib_path(map_id):
     """小地图标定文件：`datasets/map/<id>.mapcalib.json`（每张图一份）。
 
     存的是「面板 → 底图 → 世界」的换算参数（见 `perception/minimap.py`）：
-        {"mode": "fit" | "crop", "scale": …, "offset": [x, y],
-         "view": [x, y], "score": …, "note": "…"}
+        {"mode": "fit" | "crop", "scale": …, "scale_y": …（可选，缺省 = 同 scale）,
+         "offset": [x, y], "view": [x, y], "score": …, "src": …, "note": "…"}
+    `scale_y` = y 轴自己的缩放（2026-09-27「双点标定」加的）：读两轴一律走
+    `perception.minimap.scales_of()`，别各处自己 `cal["scale"]` —— 那是"换算用 x、
+    画图用 y"这种最难查的分歧的来源。
     **为什么每张图一份**：不同的图客户端可能用不同显示方式（装得下就整张缩放、
     装不下就 1:1 裁剪滚动），而且缩放/偏移也各不相同。
 

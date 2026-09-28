@@ -57,7 +57,7 @@ class MiniMapClient:
         self._t = 0.0               # 收到它的时刻（perf_counter）
         # 最近若干帧的到达时刻：算"拍/秒"要用它。**不能用 1/(现在-最后一帧时刻)**
         # ——那算的是"距上一帧过了多久"，界面每 100ms 取一次值，会看到 52 这种
-        # 假数字（真实推流是 10 fps）。
+        # 假数字（默认推 30 fps，见 tools.minimap_push.DEFAULTS）。
         self._times = deque(maxlen=40)
         self._stop = threading.Event()
         self._th = None
@@ -184,7 +184,12 @@ def offset_of(calib):
     foothold / ladder 的 x、y）**本来就在这个系里**（例：105090600 的 fh44 地形 y=-208，
     它的世界 y 就是 -208）。⇒ 判据里拿玩家读数与地形坐标比大小是**直接比**，
     **不要**给地形坐标再加偏移（我犯过这个错：把"到达目标平台面"从 -208 放宽成 -175 ✗）。
-    这个偏移修的是"黄点重心 ↔ 玩家原点"那层对应，不是坐标系换算。
+    这个偏移修的是"黄点上的那个锚点 ↔ 玩家原点"那层对应，不是坐标系换算。
+
+    ⚠ **2026-09-27 起，锚点是黄点的「下沿（脚底）」**（`dot_feet`，见那儿的口径说明）：
+    双点标定采样的也是下沿 ⇒ 这一项从"重心 ↔ 原点"（≈ 半个点高，现场是 (7,33)）
+    变成"下沿 ↔ 原点"的**残差**，正常应该接近 **(0, 0)** ✓。
+    ⇒ 老的 (7,33) 那份是**重心口径**的，别搬进新标定（那是双重补偿，会凭白偏 33 世界像素 ✗）。
     """
     v = (calib or {}).get("world_offset") or []
     if len(v) == 2:
@@ -244,6 +249,15 @@ MODE_CROP = "crop"
 #: 为什么放在 live.yaml 而不是每张图的标定里：它取决于本机的推流/画面几何，与地图无关。
 SRC_STREAM = "stream"
 SRC_LIVE = "live"
+
+#: **匹配分到多少才算"这把尺子可信"**（0~1）。两个地方共用这一份，别再各写一个数 ✗：
+#:   · `region_match_score`（框完当场验证：这个框对不对）；
+#:   · `check_calib`（核对当前标定：**尺子自己可信吗**）。
+#: 0.8 是原来就写着的值（`locate_fit`/`locate_crop` 那条 `min_score` 0.55 是"低于它
+#: 连试都不用试"，比它高一档才是"可信"✓）；实测参考：面板里混着游戏 UI、或底图压过时，
+#: 分数会掉到 0.62~0.70 一带 ⇒ 那种分数下的定位结果只能当参考 ✗。
+TRUST_SCORE = 0.8
+
 #: 来源的中文名 —— 界面、提示、报告共用这一份，别一处写「独立推流」另一处写
 #: 「收流」：标定是按来源分开存的，名字对不上就没人搞得清哪份是哪份。
 SRC_LABEL = {SRC_STREAM: "独立推流", SRC_LIVE: "从实时画面"}
@@ -252,6 +266,15 @@ SRC_LABEL = {SRC_STREAM: "独立推流", SRC_LIVE: "从实时画面"}
 #:   mode/scale/offset  —— 面板像素 → 底图像素：canvas = (panel - offset) / scale
 #:   view               —— crop 模式专用：当前显示的是底图从 (view) 开始的那一块
 #:   score              —— 标定时匹配得有多好（>0.8 才可信）
+#:   scale_y            —— **可选**：y 轴自己的缩放（2026-09-27「双点标定」加的）。
+#:                         ⚠ 为什么是"另开一个键"而不是把 `scale` 改成 `[sx, sy]`：
+#:                         改类型会让**所有老读法**（`float(cal["scale"])`、模板匹配
+#:                         存下来的那些、命令行工具）在读到新文件时当场炸 ✗；而
+#:                         "`scale` = x 轴、`scale_y` 缺省 = 跟 x 一样"这套写法，
+#:                         两个方向都兼容 —— 老代码读新文件只是把 y 也当成 x（两轴
+#:                         本来就该几乎相等），新代码读老文件**精确**（缺省即同轴）✓。
+#:                         取两轴一律走 `scales_of()`，别各处自己读（少一处就是
+#:                         "换算用 x、画图用 y"这种最难查的分歧 ✗）。
 
 
 def _crop_scales(canvas_wh, panel_wh):
@@ -266,8 +289,179 @@ def _crop_scales(canvas_wh, panel_wh):
     return sorted(c for c in cand if 0.5 <= c <= 12.0)
 
 
-def locate_fit(frame, canvas, scales=None, min_score=0.55):
-    """方式 1：整张底图缩放到面板 → 标定 dict 或 None。"""
+#: 标定文件里没写 `alpha` 时的叠图浓淡（%）。**默认值只有这一处** —— 设置窗口、
+#: 标定弹窗、路线识别面板都走 `overlay_alpha_pct()`，谁也别再写 `or 55` ✗。
+DEFAULT_ALPHA_PCT = 55
+
+
+def overlay_alpha_pct(calib):
+    """标定里的叠图浓淡（0~100）。**0 就是 0** ✓。
+
+    ⚠ 2026-09-26 修：原来是 `int(cal.get("alpha") or 55)` ⇒ **0 是 falsy** ⇒ 滑块拉到
+    最左端（0 = 完全看不见）会被 `or` 换成 55 ✗（用户报"拖动条在最左端时透明度是
+    55% 而不是 0%"）。判"有没有这个键"只能用 `is None`，不能用 `or` —— 这个值**特意
+    要 0**，而 `or` 恰恰把 0 当"没填"。
+    """
+    v = (calib or {}).get("alpha")
+    if v is None:
+        return DEFAULT_ALPHA_PCT
+    try:
+        return max(0, min(100, int(round(float(v)))))
+    except (TypeError, ValueError):
+        return DEFAULT_ALPHA_PCT
+
+
+def overlay_alpha(calib):
+    """同上，但给 Qt / 绘制用的 0.0~1.0 透明度（`setOpacity` 那种）。"""
+    return overlay_alpha_pct(calib) / 100.0
+
+
+def live_src(cfg=None):
+    """`config/live.yaml` 里的 `mmap_src`（非法或缺省 ⇒ 收流）。
+
+    **一份口径**：路线识别面板和设置窗口（浓淡那一项按来源存 ✓）都从这儿取，
+    不然两边各判一次"哪个来源合法"迟早分叉。
+    """
+    v = (cfg or {}).get("mmap_src")
+    return v if v in (SRC_STREAM, SRC_LIVE) else SRC_STREAM
+
+
+def crop_of(project, cfg=None):
+    """小地图面板在**实时画面**里的位置 `[x, y, w, h]`；取不到给 None。
+
+    **按项目（地图）存** —— `projects/<名>/project.yaml` 的 `mmap_crop`。用户 2026-09-27
+    现场：不同地图的小地图面板**尺寸/位置完全不同**，而这个值原来只有全局一份
+    （`config/live.yaml`）⇒ 换个项目还是上一张图的框 ⇒ 叠图/定位全错 ✗。所以它和
+    「寻路编辑器 / 集合 / 地形图」是同一类东西（跟项目走 ✓），入口也在那一页
+    （「路线识别 → 寻路配置 → 框选小地图」，就在「寻路编辑器」下面 ✓）。
+
+    ⚠ **兜底**：本项目**还没框过**时读老的那份全局值（`cfg` 里的 `mmap_crop`，那是
+      2026-09-27 之前唯一的一份）—— 升级后不用重框就能接着用；**按本项目框过一次之后
+      它就不再起作用** ✓。这是"读"的便利，**不是第二处存储**：谁都不许再往
+      `live.yaml` 写它 ✗（那正是"换项目就错"的来源）。
+    ⚠ `project` 传 `gui.project.Project`（或任何有 `.get()` 的映射）；没打开项目就传 None
+      ⇒ 只剩兜底那条路 ✓。
+    ⚠ **一条口径只有这一处**：路线识别面板（`_mmap_crop`）、命令行取证工具都用它，
+      别再各写一份"项目优先还是全局优先" ✗。
+    """
+    for src in (project, cfg):
+        if src is None:
+            continue
+        r = src.get("mmap_crop")
+        if isinstance(r, (list, tuple)) and len(r) == 4:
+            return [int(v) for v in r]
+    return None
+
+
+def _subpixel_peak(res, ml):
+    """`matchTemplate` 结果图上的峰值 → **亚像素**位置 `(fx, fy)`。
+
+    **为什么不能只用 `minMaxLoc`**（2026-09-27）：它给的是**整数**像素，而这张图上
+    1 个面板像素 = 8.5 世界像素 ⇒ 取整等于白送最多半个像素的系统偏差（4 个世界像素
+    —— 现场"看着像点没点准"那个量级 ✗）。做法是标准的三点抛物线插值（x / y 各一次），
+    只在峰值邻域 ±1 里做；邻域越界（贴边）就退回整数 ✓。
+    插出来的偏移**夹在 ±0.5 内**：噪声大时抛物线会外推到离谱的位置 ✗。
+    """
+    mx, my = int(ml[0]), int(ml[1])
+    h, w = res.shape[:2]
+    fx, fy = float(mx), float(my)
+
+    def _one(a, b, c):
+        """三点 (a, b, c) 中间那个是最大 ⇒ 峰相对中间偏多少（±0.5 内）。"""
+        den = a - 2.0 * b + c
+        if abs(den) < 1e-12:
+            return 0.0
+        return max(-0.5, min(0.5, 0.5 * (a - c) / den))
+
+    if 0 < mx < w - 1:
+        fx = mx + _one(float(res[my, mx - 1]), float(res[my, mx]),
+                       float(res[my, mx + 1]))
+    if 0 < my < h - 1:
+        fy = my + _one(float(res[my - 1, mx]), float(res[my, mx]),
+                       float(res[my + 1, mx]))
+    return fx, fy
+
+
+def _fit_at(fg, cg, s):
+    """按缩放 `s` 把底图缩到面板大小匹配一次 → `(分数, 峰值, 结果图)`；放不下 ⇒ None。"""
+    if not s or s <= 0:
+        return None
+    tw, th = int(round(cg.shape[1] * s)), int(round(cg.shape[0] * s))
+    if tw < 8 or th < 8 or tw > fg.shape[1] or th > fg.shape[0]:
+        return None
+    t = cv2.resize(cg, (tw, th), interpolation=cv2.INTER_AREA)
+    r = np.nan_to_num(cv2.matchTemplate(fg, t, cv2.TM_CCOEFF_NORMED))
+    _, mx, _, ml = cv2.minMaxLoc(r)
+    return float(mx), ml, r
+
+
+def refine_fit(fg, cg, best, rounds=6, span0=0.25, steps=7):
+    """把 `locate_fit` 的**粗**结果细化：连续尺度 + 亚像素偏移（2026-09-27 新增）。
+
+    **为什么非有不可**（"把全局小地图弄准"的第一步就是先把尺子弄准）：
+      · 粗搜的尺度是**离散**的（`1.00~6.00` 每 0.25 一档，往上每 0.5 一档）；
+      · 峰值是**整数**像素（`minMaxLoc`）。
+      合成面板实测：真值 `scale=1.874` 时粗搜给 1.933（差 3.1%）⇒ **最远角差 11 个面板
+      像素 ≈ 93 世界像素**。拿这种尺子去说"标定偏了多少"，尺子自己就是噪声 ✗。
+    做法：先把偏移换成同一档的**亚像素**结果；再逐轮以**上一轮最优为中心**均匀取
+    `steps` 档（`span` 每轮减半），取分最高的那档 —— **分数是单调判据，改进不了就停**
+    （不然细化可能越弄越差 ✗）。**代价**：约 `rounds × steps` 次匹配（默认 6×7 ≈ 40 次，
+    几十毫秒，一次性按钮操作 ✓）。
+    ⚠ **不许离开粗搜那一档的窗口**（`±span0/2` = 粗搜格子的一半）：分数面很平时
+      （面板里混着游戏 UI / 底图压过 / 分辨率对不上）"只挑更高的分"会**一路漂走** ——
+      实测踩过：从 1.25 漂到 0.84，两套几何最远角差 6600 世界像素，全是噪声 ✗。
+      窗口 = "真值确实在粗搜那一档附近"这个前提的边界 ✓。
+    ⚠ **粗搜分数低也要细化**（`locate_fit` 里细化在门槛之前判 ✓）：真值落在两档中间时，
+      粗搜每一档都差 6% 以上 ⇒ 分数能低到 0.27，但细化到 0.03 的格子就接近满分 ✓。
+    """
+    if best is None:
+        return best
+    steps = max(3, int(steps))
+    base_s = float(best["scale"])          # 粗搜那一档（窗口的中心）
+    lo, hi = base_s - span0 / 2.0, base_s + span0 / 2.0
+    b_score = float(best["score"])
+    b_off = [float(v) for v in best["offset"]]
+    s0 = base_s
+
+    def _eval(s):
+        got = _fit_at(fg, cg, s)
+        if got is None:
+            return None
+        sc, ml, r = got
+        return sc, list(_subpixel_peak(r, ml))
+
+    # ① 同一档，偏移换成亚像素（尺度不动也可能立刻改善 ✓）
+    cur = _eval(s0)
+    if cur is not None and cur[0] >= b_score:
+        b_score, b_off = cur[0], cur[1]
+    # ② 逐轮细化尺度：以上一轮最优为中心，但不许出窗口 ✓
+    for rd in range(int(rounds)):
+        span = span0 / (2.0 ** rd)
+        center = min(max(s0, lo), hi)
+        cand = None
+        for i in range(steps):
+            s = min(max(center + span * (2.0 * i / (steps - 1) - 1.0), lo), hi)
+            got = _eval(s)
+            if got is None:
+                continue
+            if cand is None or got[0] > cand[0]:
+                cand = (got[0], s, got[1])
+        if cand is None or cand[0] <= b_score + 1e-9:
+            break                      # 这一轮没有改进 ⇒ 停（别越弄越差 ✗）
+        b_score, s0, b_off = cand
+    return {"mode": best.get("mode", MODE_FIT), "scale": float(s0),
+            "offset": [float(v) for v in b_off], "score": float(b_score),
+            "view": list(best.get("view") or [0, 0]), "refined": True}
+
+
+def locate_fit(frame, canvas, scales=None, min_score=0.55, refine=True):
+    """方式 1：整张底图缩放到面板 → 标定 dict 或 None。
+
+    ⚠ 默认**细化**（`refine_fit`，2026-09-27 加）：粗搜是离散尺度 + 整数峰值，不够当
+      一把"量精度的尺子"（见 `refine_fit` 的说明）。要老行为（纯粗搜、整数偏移）
+      就传 `refine=False` ✓（`locate_crop` 那份暂时仍是粗搜 —— crop 的自动标定
+      用户明确暂缓 ✓）。
+    """
     fg = _gray(frame)
     cg = _gray(canvas)
     if scales is None:
@@ -284,19 +478,23 @@ def locate_fit(frame, canvas, scales=None, min_score=0.55):
 
     best = None
     for s in scales:
-        if s <= 0:
+        got = _fit_at(fg, cg, s)
+        if got is None:
             continue
-        tw, th = int(round(cg.shape[1] * s)), int(round(cg.shape[0] * s))
-        if tw < 8 or th < 8 or tw > fg.shape[1] or th > fg.shape[0]:
-            continue
-        t = cv2.resize(cg, (tw, th), interpolation=cv2.INTER_AREA)
-        r = np.nan_to_num(cv2.matchTemplate(fg, t, cv2.TM_CCOEFF_NORMED))
-        _, mx, _, ml = cv2.minMaxLoc(r)
+        mx, ml = got[0], got[1]
         if best is None or mx > best["score"]:
             best = {"mode": MODE_FIT, "scale": float(s),
                     "offset": [int(ml[0]), int(ml[1])], "score": float(mx),
                     "view": [0, 0]}
-    if best is None or best["score"] < min_score:
+    if best is None:
+        return None
+    if refine:
+        # ⚠ **先细化再判门槛**（2026-09-27）：粗搜的格子是 0.25 ⇒ 真值落在两档中间
+        #   时**每一档都差 6% 以上**，粗搜的分数可以低到 0.27（合成面板实测：真值
+        #   1.874、粗搜 1.75/2.0 都只有 0.2~0.3）⇒ 拿粗分数去卡 0.55 会直接判"量不出来" ✗。
+        #   先细化到 0.0625 的格子 ⇒ 真值那一档分数接近 1.0 ✓，再拿它和市场门槛比才有意义。
+        best = refine_fit(fg, cg, best)
+    if best["score"] < min_score:
         return None
     return best
 
@@ -384,15 +582,217 @@ def locate(frame, canvas, mode):
     return None
 
 
+def region_match_score(frame, rect, terrain, mode=None, ok_score=TRUST_SCORE):
+    """框出来的那一块画面 ↔ 底图，对一次分（**框完当场验证**的唯一一份实现）。
+
+    **为什么抽到这里**（2026-09-27）：「框选小地图」按钮按用户要求从「路线识别」页搬进
+    设置的「实时画面 · 地形叠加」组，而这个"当场验证"原来长在
+    `route_panel._verify_mmap_region` 里 —— 不抽出来就是两处各写一份（README
+    「口径只有一处」那条 ✗）。现在设置窗（和任何要验证的调用方）都走它。
+
+    验证什么：框大了（把血条/聊天栏框进去）、面板被游戏 UI 挡住、「显示方式」选错 ——
+    这三种的现象都是"寻路看起来坏了"，而在这里（匹配分）一眼能看出来。
+
+    `ok_score` 沿用的就是 `locate_fit` / `locate_crop` 内部那条 `min_score` 0.8，
+    **不是这里新拍的一个数** ✓。
+    返回 `{"ok", "score": float|None, "why": str, "mode": str}`；`why` 是人话。
+    """
+    mode = mode or MODE_FIT
+    if terrain is None or getattr(terrain, "canvas", None) is None:
+        return {"ok": False, "score": None, "mode": mode,
+                "why": "这张图还没有底图（先「生成地形图」）"}
+    if not rect or len(list(rect)) != 4:
+        return {"ok": False, "score": None, "mode": mode, "why": "还没框选区域"}
+    x, y, w, h = (int(v) for v in rect)
+    if w < 1 or h < 1:
+        return {"ok": False, "score": None, "mode": mode, "why": "框选区域是空的"}
+    fh_, fw_ = frame.shape[:2]
+    if x < 0 or y < 0 or x + w > fw_ or y + h > fh_:
+        # 画面尺寸变过（换分辨率 / 改推流参数）⇒ 旧框选区越界，说清并让它重框 ✓
+        return {"ok": False, "score": None, "mode": mode,
+                "why": "框选区域超出当前画面（%d×%d）—— 画面尺寸变过，重框一次" % (fw_, fh_)}
+    loc = locate(frame[y:y + h, x:x + w], terrain.canvas, mode)
+    if loc is None:
+        return {"ok": False, "score": None, "mode": mode,
+                "why": "匹配不上 —— 可能框大了（含血条/聊天栏）、面板被游戏 UI 挡住，"
+                       "或「显示方式」选错了"}
+    sc = float(loc["score"])
+    return {"ok": sc >= ok_score, "score": sc, "mode": mode,
+            "why": "" if sc >= ok_score else "偏低（%.1f 以上才算对上）" % ok_score}
+
+
+def check_calib(panel, terrain, calib, mode=None, min_score=0.55,
+                ok_world_px=10.0):
+    """量一遍「**当前这份标定到底差多少**」—— 拿真帧，一律报**世界像素**。
+
+    用户 2026-09-27 要求"先把全局小地图弄准"，而**在此之前根本问不出这个数** ✗：
+      · `score` 是无量纲的"像不像"（模板匹配才有，两点/手工标定一律没有）；
+      · `resid_px` / `axis_gap_pct` 只长在两点法里、而且是**面板像素**；
+      · `tools/mmap_dot_probe.py` 量的是**黄点认不认得出来**（识别率），不是标定误差。
+    ⇒ 这里补上那把尺子。用户决策④：容差按像素定值、**表述一律世界坐标** ✓。
+
+    **怎么量**：模板匹配当**独立的**尺子 —— 同一张真帧，把底图压进去另解一份几何
+    （`locate` → `refine_fit` ✓），再看"**同一个面板像素，两套几何映射到世界差多少**"，
+    四个角都算、报最坏的那个 ✓。尺子自己的可信度一并报出来（`score` / `px_per_world` /
+    `refined`）：不报的话，人会把"尺子抖"当成"标定偏" ✗。
+
+    ⚠ **只报数、不改任何东西**（核对不是标定 —— 要改走「双点标定」✓）。
+    ⚠ `mode` 缺省取标定里那份；**crop 的尺子仍是粗搜**（`locate_crop` 没细化，用户明确
+      把 crop 的自动标定暂缓 ✓）⇒ 那种情况下 `refined=False`，读数时要心里有数 ✓。
+    ⚠ `ok_world_px` 默认 **10** = 和「坐标对齐误差范围」（`route.ALIGN_TOL_PX`）**同一把
+      尺**：寻路判据能容忍的偏差，标定就不该更差 ✓（不是这里新拍的数 ✓）。
+
+    返回（除带 `_px` 的，其余都是**世界像素**）：
+      ok / why / verdict（人话，界面/命令行直接用）/ score / refined
+      err_world（四角最大偏差）/ err_world_x / err_world_y（那个角的分量）
+      err_px（换成**实时面板像素** —— 现场最直观 ✓）/ worst_panel（那个角的面板像素）
+      px_per_world（1 面板像素 = 多少世界像素）
+      scale_cur / scale_ref / scale_delta_pct、offset_cur / offset_ref
+    """
+    #: 四角的名字（只为了把"最坏在哪个角"说成人话 ✓）
+    _corner_name = {(0, 0): "左上", (1, 0): "右上", (0, 1): "左下", (1, 1): "右下"}
+    base = {"ok": False, "why": "", "verdict": "", "score": None,
+            "refined": False, "err_world": None, "err_world_x": None,
+            "err_world_y": None, "err_px": None, "worst_panel": None,
+            "px_per_world": None, "scale_cur": None, "scale_ref": None,
+            "scale_delta_pct": None, "offset_cur": None, "offset_ref": None}
+    if panel is None or terrain is None or getattr(terrain, "canvas", None) is None:
+        return dict(base, why="没有画面 / 这张图还没有底图（先「生成地形图」）")
+    if not calib or not has_geometry(calib):
+        return dict(base, why="这份标定还没有几何 —— 先标一次（双点标定 / 自动定位）")
+    mode = mode or calib.get("mode") or MODE_FIT
+    ref = locate(panel, terrain.canvas, mode)
+    if ref is None:
+        return dict(base, why="尺子没量出来（匹配分低于 %.2f）：画面里小地图没框全、"
+                              "被游戏 UI 挡住，或「显示方式」选错了" % min_score)
+
+    fh, fw = panel.shape[:2]
+    ppw = float(terrain.px_per_world) or 1.0
+    worst = None                                  # (世界误差, 角名, dx, dy, (px,py))
+    for kx in (0, 1):
+        for ky in (0, 1):
+            px, py = float(kx * fw), float(ky * fh)
+            ax, ay = panel_to_world(px, py, calib, terrain)
+            bx, by = panel_to_world(px, py, ref, terrain)
+            dx, dy = float(bx - ax), float(by - ay)
+            d = float(np.hypot(dx, dy))
+            if worst is None or d > worst[0]:
+                worst = (d, _corner_name[(kx, ky)], dx, dy, (px, py))
+    err, cname, dx, dy, wpt = worst
+    sx_c, _sy_c = scales_of(calib)
+    sx_r, _sy_r = scales_of(ref)
+    err_px = err / ppw
+    dlt = None if not sx_c else (sx_r - sx_c) / sx_c * 100.0
+    # 「主要差在哪个方向」：分量差值说话（只报数不说话，人还得自己算一遍 ✗）
+    axis = "x" if abs(dx) >= abs(dy) else "y"
+    # ⚠ **尺子自己也可能是错的**：匹配分低（画面里混着游戏 UI / 面板被挡 / 显示方式选错）
+    #   时上面那套搜索只是"矮子里拔高个" ⇒ 必须把可信度说出来，否则人会把"尺子抖"
+    #   当成"标定偏"（`TRUST_SCORE` 与 `region_match_score` 的 `ok_score` 同一个口径 ✓）。
+    score = float(ref["score"])
+    trust = score >= TRUST_SCORE
+    verdict = ("最大偏差 **%.0f 世界像素**（≈ %.1f 实时像素，%s角，主要差在 %s）；"
+               "尺子匹配分 %.2f%s"
+               % (err, err_px, cname, axis, score,
+                  "" if trust else "（**偏低，这个数只能当参考**）"))
+    ok = trust and err <= float(ok_world_px)
+    if not trust:
+        why = ("尺子本身不可信（匹配分 %.2f < %.2f）⇒ 偏差只能当参考：画面里小地图"
+               "没框全、被游戏 UI 挡住，或「显示方式」选错了" % (score, TRUST_SCORE))
+    elif not ok:
+        why = "偏差 %.0f 世界像素 > %.0f（≈1 个实时像素）" % (err, ok_world_px)
+    else:
+        why = ""
+    return {"ok": ok,
+            "why": why,
+            "verdict": verdict,
+            "trust": trust,
+            "score": float(ref["score"]),
+            "refined": bool(ref.get("refined")),
+            "err_world": err, "err_world_x": dx, "err_world_y": dy,
+            "err_px": err_px, "worst_panel": [wpt[0], wpt[1]],
+            "px_per_world": ppw,
+            "scale_cur": float(sx_c), "scale_ref": float(sx_r),
+            "scale_delta_pct": dlt,
+            "offset_cur": [float(v) for v in (calib.get("offset") or (0, 0))],
+            "offset_ref": [float(v) for v in (ref.get("offset") or (0, 0))]}
+
+
+def stream_panel(timeout=5.0):
+    """从 A 机的「小地图推流」取**一帧**面板（BGR ndarray）→ `(帧, 原因)`。
+
+    **一处实现**：工作台的「实测精度」按钮（来源选「独立推流」时要拿一帧来核对 ✓）和
+    命令行工具（`tools/mmap_dot_probe.grab_stream` / `tools/mmap_calib_check`）都要它 ——
+    各写一遍"连哪口 / 最多等多久 / 清了没有"迟早分叉 ✗（和 `crop_of` 同一个理由 ✓）。
+    取不到时 `原因` 是人话（没配 a_host / 超时没收到 ✓），调用方直接显示 ✓。
+    """
+    from tools.config import get                    # 本模块只在用到处局部 import ✓
+    host = get("a_host")                            # link.yaml 顶层
+    port = get("minimap", "port", 5003)
+    if not host:
+        return None, "link.yaml 里没读到 a_host（A 机地址）"
+    cli = MiniMapClient(host, port=port, timeout=float(timeout)).start()
+    deadline = time.time() + max(0.5, float(timeout))
+    try:
+        while time.time() < deadline:
+            f, _t = cli.latest(clear=True)
+            if f is not None:
+                return f, ""
+            time.sleep(0.02)
+    finally:
+        try:
+            cli.stop()
+        except Exception:                           # noqa: BLE001
+            pass
+    return None, ("%.0f 秒内没收到小地图推流 —— A 机的「小地图推流」开了吗？"
+                  % float(timeout))
+
+
 def _gray(img):
     return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
 
+def scales_of(calib):
+    """标定里的**两轴缩放** → `(sx, sy)`。
+
+    `scale` = x 轴；`scale_y` **缺省 = 跟 x 一样**（老文件就是这么写的，见
+    `perception/minimap.py` 顶部那个形状说明）。读两轴一律走这里 —— 各处自己读
+    迟早出现"换算用 x、画图用 y"的分歧，而那种偏只有拿尺子量才看得出来 ✗。
+    """
+    cal = calib or {}
+    try:
+        sx = float(cal.get("scale") or 1.0)
+    except (TypeError, ValueError):
+        sx = 1.0
+    sy = cal.get("scale_y")
+    if sy is None:
+        return sx, sx
+    try:
+        sy = float(sy)
+    except (TypeError, ValueError):
+        return sx, sx
+    return (sx, sy) if sy > 0 else (sx, sx)
+
+
+def with_scales(calib, sx, sy=None):
+    """把两轴缩放写进一份标定（copy）—— **两轴一样时不留 `scale_y`**。
+
+    为什么不留：老文件里就没有这个键，而"缺省 = 同 x"这条口径已经够表达"等比" ✓；
+    留着 `scale_y == scale` 只会让 diff 看起来像改过、也让人以为这份标定是量过两轴的。
+    """
+    out = dict(calib or {})
+    out["scale"] = float(sx)
+    if sy is None or abs(float(sy) - float(sx)) < 1e-9:
+        out.pop("scale_y", None)
+    else:
+        out["scale_y"] = float(sy)
+    return out
+
+
 def panel_to_canvas(px, py, calib):
     """面板像素 → 底图像素（calib 来自 locate / 标定文件）。"""
-    s = float(calib.get("scale") or 1.0)
+    sx, sy = scales_of(calib)
     ox, oy = calib.get("offset") or (0, 0)
-    cx, cy = (px - ox) / s, (py - oy) / s
+    cx, cy = (px - ox) / sx, (py - oy) / sy
     if calib.get("mode") == MODE_CROP:
         vx, vy = calib.get("view") or (0, 0)
         cx, cy = cx + vx, cy + vy
@@ -402,6 +802,249 @@ def panel_to_canvas(px, py, calib):
 def panel_to_world(px, py, calib, terrain):
     """面板像素 → **世界坐标**。"""
     return terrain.canvas_to_world(*panel_to_canvas(px, py, calib))
+
+
+def world_to_panel(wx, wy, calib, terrain):
+    """世界坐标 → **面板像素**（`panel_to_world` 的逆；**一处实现**）。
+
+    为什么要单开一个（2026-09-27）：反向换算原来**散在三处** —— 双点标定窗的 `_uv`、
+    地形视图 `image_xy`、编辑器的 `_add_background` ⇒ 谁改一处就分叉（约定 10 ✗）。
+    而"把已知地标（portal / 绳梯 / 集合）投到面板像素上做核对"要用它（用户 2026-09-27
+    决策③：投影产物按项目持久存 ✓）。
+    ⚠ 与 `panel_to_world` **必须互逆**（crop 下 `view` 的加减号最容易写反）——
+      用例 `t_world_to_panel_roundtrip` 钉着这条 ✓。
+    """
+    cx, cy = terrain.world_to_canvas(wx, wy)
+    sx, sy = scales_of(calib)
+    ox, oy = calib.get("offset") or (0, 0)
+    if calib.get("mode") == MODE_CROP:
+        vx, vy = calib.get("view") or (0, 0)
+        cx, cy = cx - vx, cy - vy
+    return cx * sx + ox, cy * sy + oy
+
+
+def dot_feet(r):
+    """黄点结论（`find_player_dot` 的返回）→ 面板像素 **(x, 下沿 y)**。
+
+    ⚠ **这是"黄点在面板里算哪个位置"的唯一口径：采样（双点标定）和读数
+      （`PlayerLocator.update`）必须都走这里**。用户 2026-09-27 现场验过：
+      只统一一边就凭空差半个点 —— 这张图 1 个面板像素 = 7.9 世界像素，6 像素高的点
+      差 12 世界像素（实测：站在 L1 上端报 (48,-222)，而真值是 (56,-205)）。
+
+    为什么是**下沿**：游戏把小地图上的玩家标记画成一个小黄点、**下沿对着脚下**，
+    所以下沿才是"这个人在地图上的位置"；重心比它高半个点，直接拿重心换算会整体抬高，
+    而且和「坐标系偏移」补的那点差撞在一起、谁也说不清哪边错了 ✗。
+
+    ⚠⚠ **不许取整**（2026-09-27 改；用户报的"同一个位置读数差 9"）：
+      `find_player_dot` 给的 `x/y` 本来就是**亚像素**浮点（`cv2` 的质心），取整等于把
+      读数量化成"整面板像素"一格一格跳 —— 而这张图上
+      **1 个面板像素 = 8.55 世界单位**（`px_per_world / scale` = 16.082 / 1.880076）
+      ⇒ **形状半个像素的变化**（抗锯齿、压缩噪声、**人在绳上/地上时那个点的画法略有
+      差别** —— 眼睛看着就是"没动"）能让读数跳 **9 个世界单位** ✗✗。
+      **现场**：站在 L1 上（x=56）顺着绳下来后显示 x=47（正好差一格），而他盯着收流
+      小地图确认黄点**没有水平位移** —— 差的正是这一格。
+      分辨率的上限消不掉（±0.5 面板像素 ≈ ±4.3 世界单位，那是**测量**本身的分辨率）；
+      能消的是这层**白送的量化** ✓。
+    ⚠ 脚底锚点本身不变：还是"重心 + (h-1)/2"（h=6 的点占 88..93 行 ⇒ 91+2.5 = 93.5，
+      正好压在最后一行上 ✓）。原来这里 `int()` 向下取整的理由是"重心已经被取整过、
+      +半个点会落到 x.5 上 ⇒ `round` 会多走一格"，可现在重心**不再被取整**了，
+      那条理由也就不成立了 ✓。
+    ⚠ 采样那一侧（双点标定）填的是**整数框**，`int(round())` 在那儿照旧 —— 那不是口径
+      分叉：口径管的是"取哪个锚点"（下沿），取整只是**界面**的显示精度 ✓。
+    """
+    h = int(r.get("h") or 1)
+    return (float(r.get("x") or 0.0), float(r.get("y") or 0.0) + (h - 1) / 2.0)
+
+
+def solve_two_point(c1, p1, c2, p2):
+    """两点标定：两对「底图像素 ↔ 面板像素」→ **两轴缩放 + 偏移 + 自查**。
+
+    这是标定文件里 `scale` / `scale_y` / `offset` 的算法（用户 2026-09-27 要的
+    「双点标定」；也就是 `docs/寻路设计.md` §5「地标法」那条的落地）。
+
+    公式就是 `panel_to_canvas` 的反函数：`面板 = 底图 × scale + offset`，两轴各一套 ⇒
+    每轴两个点给两个方程、解两个未知量（缩放、偏移）—— **恰好定解**。
+
+    ⚠ **所以这里不能拿残差当自查**（两轴各自解的话它恒为 0，等于没查）—— 这条是
+      写这个函数时才想透的，记在这儿：真正的自查是
+        · `axis_gap_pct` = **两轴一致性**：游戏把整张小地图**等比**缩放 ⇒ `sx` 与
+          `sy` 本该几乎相等；差得多就说明**两点没点在同一个地标上**（或画面被非等比
+          拉过）⇒ 这就是用户要的"x/y 缩放不一致"那个提示 ✓；
+        · `resid_px` = **按等比再拟合一次**（三个未知量、四个方程）的最大残差 ——
+          这个数才有诊断价值（"如果两轴相同，最合适的几何差几个像素"）✓。
+
+    **退化要拦住**（不能给个假数）：两点的底图 x 相同 ⇒ x 轴解不出来（分母 0）；
+    y 相同 ⇒ y 轴解不出来；两点完全相同 ⇒ 两条都不成立。
+
+    返回 `{"ok", "why", "scale", "scale_y", "offset", "iso_scale", "iso_offset",
+    "resid_px", "axis_gap_pct"}`；`ok=False` 时 `why` 是人话（直接可以显示给人看）。
+    """
+    try:
+        c1, p1 = [float(v) for v in c1], [float(v) for v in p1]
+        c2, p2 = [float(v) for v in c2], [float(v) for v in p2]
+        if not (len(c1) == len(p1) == len(c2) == len(p2) == 2):
+            raise ValueError("不是两个坐标")
+    except (TypeError, ValueError, IndexError):
+        return {"ok": False, "why": "坐标要是四个数（x、y）：%r %r %r %r"
+                                    % (c1, p1, c2, p2)}
+    dcx, dcy = c2[0] - c1[0], c2[1] - c1[1]
+    if abs(dcx) < 1e-6 and abs(dcy) < 1e-6:
+        return {"ok": False, "why": "两点的底图坐标完全一样 —— 这是同一个点，量不出缩放"}
+    if abs(dcx) < 1e-6:
+        return {"ok": False, "why": "两点的底图 x 相同（同一列）⇒ x 轴的缩放解不出来，"
+                                    "请把两点取成既不同列、也不同行"}
+    if abs(dcy) < 1e-6:
+        return {"ok": False, "why": "两点的底图 y 相同（同一行）⇒ y 轴的缩放解不出来，"
+                                    "请把两点取成既不同列、也不同行"}
+    sx = (p2[0] - p1[0]) / dcx
+    sy = (p2[1] - p1[1]) / dcy
+    if sx <= 0 or sy <= 0:
+        return {"ok": False, "why": "算出来的缩放是负的（x %.3f / y %.3f）—— 两点多半"
+                                    "左右（上下）对调了：实时图上那个地标应当由底图上"
+                                    "**同一个**地标放大而来" % (sx, sy)}
+    ox, oy = p1[0] - c1[0] * sx, p1[1] - c1[1] * sy
+    # 按「等比」再拟合一次（3 个未知量、4 个方程 ⇒ 有残差）——抵消共用的那一个 s，
+    # 偏移取两轴各自的均值（给定 s 时这才是最小二乘解）。
+    mcx, mcy = (c1[0] + c2[0]) / 2.0, (c1[1] + c2[1]) / 2.0
+    mpx, mpy = (p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0
+    num = ((c1[0] - mcx) * (p1[0] - mpx) + (c2[0] - mcx) * (p2[0] - mpx)
+           + (c1[1] - mcy) * (p1[1] - mpy) + (c2[1] - mcy) * (p2[1] - mpy))
+    den = ((c1[0] - mcx) ** 2 + (c2[0] - mcx) ** 2
+           + (c1[1] - mcy) ** 2 + (c2[1] - mcy) ** 2)
+    s_iso = (num / den) if den > 0 else sx
+    iox, ioy = mpx - s_iso * mcx, mpy - s_iso * mcy
+    resid = max(float(np.hypot(p1[0] - (c1[0] * s_iso + iox),
+                               p1[1] - (c1[1] * s_iso + ioy))),
+                float(np.hypot(p2[0] - (c2[0] * s_iso + iox),
+                               p2[1] - (c2[1] * s_iso + ioy))))
+    return {"ok": True, "why": "",
+            "scale": float(sx), "scale_y": float(sy), "offset": [float(ox), float(oy)],
+            "iso_scale": float(s_iso), "iso_offset": [float(iox), float(ioy)],
+            "resid_px": resid,
+            "axis_gap_pct": float(abs(sy - sx) / sx * 100.0)}
+
+
+def drop_stale_world_offset(calib):
+    """**重新量几何**之前：把遗留的「坐标系偏移」清掉（下沿锚点之后它该是 (0, 0) ✓）。
+
+    为什么必须清（2026-09-27 查出来的一个真 bug，33 个世界像素就这么来的）：
+      · 2026-09-27 之前锚点是黄点**重心** ⇒ 那时量出来的 `world_offset` 是"重心 ↔ 原点"
+        的补偿（105040303 里现存 `[7, 33]` ✓）；
+      · 现在锚点是**下沿（脚底）**（见 `dot_feet`）⇒ 同一项的正常值就是 (0, 0)；
+      · 而"保存新几何"那条路是 `out = dict(老的 calib)` 再改几个键（`calib_from_two_point` /
+        `minimap_calib._on_save` 都是）⇒ **老值会被原样带过去** ✗ ⇒ 读完标定、算世界坐标时
+        凭空偏 33 像素 —— 而 33 世界像素 ≈ 4 个面板像素，正好落在"看着像标定没量准"的量级 ✗。
+    ⇒ 结论：任何一次**重新量几何**（双点标定 / 对着底图手工对齐 / 自动匹配）都把这一项归零；
+      真要单独量它得走专门的采样办法（`world_offset_advice`，目前不在界面上 ✓）。
+    """
+    out = dict(calib or {})
+    if out.get("world_offset"):
+        out.pop("world_offset", None)
+    return out
+
+
+def calib_from_two_point(calib, r, inset=4):
+    """把 `solve_two_point` 的结果写进一份标定 dict（**保留** mode/alpha/ref/…）。
+
+    ⚠ 两种显示方式的写法**不一样**，这是这个函数唯一存在的理由：
+      · fit ：`canvas = (面板 - offset) / scale` ⇒ 解出来的 `offset` 就是它，直接用 ✓；
+      · crop：同一层关系，但 `offset` 在这套约定里**必须是 inset**（它是"模板从面板
+        边缘往里缩了多少"，见 `locate_crop`/`panel_to_canvas`）⇒ 得把解出来的"面板系
+        截距"换算成 `view`：`(面板 - inset)/scale + view = (面板 - o)/scale`
+        ⇒ `view = (inset - o) / scale`（逐轴）✓。
+    写错这一处的现象很隐蔽：读数**整体平移** inset 个底图像素（≈ 几十世界像素），
+    看着"差不多对"（`t_two_point_save_roundtrip` 钉着这条）。
+
+    顺带：`src` 标成 `"two_point"`（这份几何是两点解出来的，不是模板匹配也不是目测），
+    **不带 `score`**（它没有匹配分 —— 留着上一次的分数只会让人以为这份是自动量出来的）。
+
+    ⚠ 走 `drop_stale_world_offset`：**重新量几何时把遗留的「坐标系偏移」清掉**（锚点换成
+      下沿之后它该是 (0, 0)；老的 (7, 33) 是重心口径的，带过去就是凭空偏 33 像素 ✗）。
+    """
+    out = drop_stale_world_offset(calib)
+    sx, sy = float(r["scale"]), float(r.get("scale_y", r["scale"]))
+    ox, oy = (float(v) for v in r["offset"])
+    out = with_scales(out, sx, sy)
+    if out.get("mode") == MODE_CROP:
+        out["offset"] = [int(inset), int(inset)]
+        out["view"] = [int(round((inset - ox) / sx)), int(round((inset - oy) / sy))]
+    else:
+        out["mode"] = out.get("mode") or MODE_FIT
+        # ⚠ **别取整**（2026-09-27 改）：这张图上 1 个面板像素 = 7.9~8.6 世界像素 ⇒
+        #   取整就是系统性偏最多半个像素。实测：解出来的 -0.452 / -10.507 被存成
+        #   0 / -11 ⇒ 读数的 x 永远差 4 个世界像素、y 永远差 4 个，**看着像点没点准**
+        #   （用户 2026-09-27 那个 (48,-222) 里就有这 4 个像素 ✗）。存 3 位小数就够
+        #   （0.001 面板像素 = 0.009 世界像素，远小于任何读数误差）。
+        out["offset"] = [round(ox, 3), round(oy, 3)]
+        out["view"] = [0, 0]
+    out["src"] = "two_point"
+    out.pop("score", None)
+    return out
+
+
+def world_offset_advice(pairs, calib, cur_offset, terrain):
+    """「坐标系偏移」核对：**黄点采样**（面板坐标 + 那块像素站着的世界坐标）→ 建议值。
+
+    ⚠ **必须是"面板坐标 + 世界坐标"，而且面板坐标要是黄点（玩家标记）的位置** ——
+      这条是写第一版时实算过的，记在这儿免得以后有人再走一遍：
+        · 「坐标系偏移」加在**世界坐标**那一层（`panel_to_canvas` 之后）；
+        · 而"底图像素 ↔ 世界坐标"那层由**地图数据**自己说了算（`world_to_canvas` 的逆）；
+        · 拿**平台角那种地标**（底图坐标）+ 它的世界坐标去算 ⇒ 两者都由地图数据定死
+          ⇒ 结果**恒等于 0**，是个死结论 ✗（除非你是要查"点歪了没"，那是另一件事）。
+      黄点不一样：它是"玩家原点 + 偏移"画出来的 ⇒ 才带得出偏移 ✓。
+
+    算式（就是「坐标系偏移」那个 tooltip 里让人手动做的那件事）：
+
+        偏移_i = 世界_i - panel_to_world(黄点面板_i, 标定, 地图数据)
+
+    两次采样给两个**独立**估计：互相一致 ⇒ 就是真实偏移，和现在存的一比就知道
+    "该改成多少"（`suggest` / `delta`）✓；互相差很多 ⇒ 采样那一下人不在你说的那个
+    地方（或标定不对）⇒ 把 `spread`（差多少世界像素）摆出来让人自己判 ✓。
+
+    ⚠ 本函数**不设**"差多少算不一致"的阈值 —— 那是拍脑袋的常数（用户规矩：加常数要
+      先说明来历）。所以它把数全摆出来、由界面决定怎么说。
+    ⚠ **只给建议，不写配置**（用户 2026-09-27 定的口径：核对但不自动改）。
+
+    `pairs` = `[((面板 x, 面板 y), (世界 x, 世界 y)), …]`。
+    返回 `{"ok", "why", "per_point": [(ox, oy), …], "suggest": (ox, oy) | None,
+    "cur": (cx, cy) | None, "delta": (dx, dy) | None, "spread": float}`。
+    """
+    if terrain is None or getattr(terrain, "px_per_world", None) in (None, 0):
+        return {"ok": False, "why": "这张图没有底图/换算数据（先「生成地形图」）",
+                "per_point": [], "suggest": None, "cur": None, "delta": None,
+                "spread": 0.0}
+    pts = []
+    for item in pairs or []:
+        try:
+            p, w = item
+            p = [float(v) for v in p]
+            w = [float(v) for v in w]
+            if len(p) != 2 or len(w) != 2:
+                raise ValueError("不是两个坐标")
+        except (TypeError, ValueError, IndexError):
+            continue
+        wx, wy = panel_to_world(p[0], p[1], calib, terrain)
+        pts.append((w[0] - wx, w[1] - wy))
+    if not pts:
+        return {"ok": False, "why": "没填黄点的位置和它站着的世界坐标（或格式不对）"
+                                    "⇒ 没有可核对的", "per_point": [], "suggest": None,
+                "cur": None, "delta": None, "spread": 0.0}
+    spread = 0.0
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            spread = max(spread, float(np.hypot(pts[i][0] - pts[j][0],
+                                                pts[i][1] - pts[j][1])))
+    suggest = (int(round(sum(p[0] for p in pts) / len(pts))),
+               int(round(sum(p[1] for p in pts) / len(pts))))   # 设置里存整数 ✓
+    cur = delta = None
+    try:
+        if cur_offset is not None and len(list(cur_offset)) == 2:
+            cur = (int(cur_offset[0]), int(cur_offset[1]))
+            delta = (suggest[0] - cur[0], suggest[1] - cur[1])
+    except (TypeError, ValueError):
+        cur = delta = None
+    return {"ok": True, "why": "", "per_point": pts, "suggest": suggest,
+            "cur": cur, "delta": delta, "spread": spread}
 
 
 def has_geometry(calib):
@@ -650,14 +1293,14 @@ def _calib_roi(panel_shape, calib, terrain):
     cv_ = getattr(terrain, "canvas", None)
     if cv_ is None:
         return None
-    s = float(calib.get("scale") or 1.0)
+    sx, sy = scales_of(calib)                  # 两轴各自（老文件 ⇒ 两个一样 ✓）
     ox, oy = calib.get("offset") or (0, 0)
     ch, cw = cv_.shape[:2]
     # ⚠ 参数是 numpy 的 `.shape`（**高在前**）：按 (宽, 高) 解会把宽高弄反，
     # 搜索结果区被裁成正方形的一角 —— 实测表现是「底图相减明明减掉了，却找不到点」。
     h, w = panel_shape[:2]
     x0, y0 = max(0, int(ox)), max(0, int(oy))
-    x1, y1 = min(w, int(ox + cw * s)), min(h, int(oy + ch * s))
+    x1, y1 = min(w, int(ox + cw * sx)), min(h, int(oy + ch * sy))
     if x1 - x0 < 8 or y1 - y0 < 8:
         return None
     return (x0, y0, x1, y1)
@@ -682,16 +1325,18 @@ def _basemap_extra_mask(panel, calib, terrain, m, family=None):
     尺寸/方形度和跨帧跟踪再筛）。底图与面板有几何误差，减之前把底图掩码**胀**开
     几个像素，宁可信底图（少留几个候选）也别把底图的纹理当标记。
     """
-    s = float(calib.get("scale") or 1.0)
+    sx, sy = scales_of(calib)
     ox, oy = calib.get("offset") or (0, 0)
     vx, vy = (calib.get("view") or (0, 0)) if calib.get("mode") == MODE_CROP else (0, 0)
     h, w = panel.shape[:2]
     # canvas = (panel - offset)/scale + view  ⇒  panel = (canvas - view)*scale + offset
-    mat = np.float32([[s, 0, ox - vx * s], [0, s, oy - vy * s]])
+    mat = np.float32([[sx, 0, ox - vx * sx], [0, sy, oy - vy * sy]])
     warped = cv2.warpAffine(terrain.canvas, mat, (w, h),
                             flags=cv2.INTER_NEAREST, borderValue=(0, 0, 0))
     base = dot_mask(warped, family)
-    k = max(3, int(round(s * 2))) | 1        # 奇数核
+    # 膨胀核跟着缩放走（2026-09-27 改两轴后取两轴里**大的那个**：宁可多胀一点，
+    # 也不要比原来胀得少 —— 这条本来就是"宁可信底图"）
+    k = max(3, int(round(max(sx, sy) * 2))) | 1        # 奇数核
     base = cv2.dilate(base, np.ones((k, k), np.uint8))
     return (m & (1 - base)).astype(np.uint8)
 
@@ -1021,13 +1666,25 @@ class PlayerLocator:
         self._calib_cache[src] = (now, cal)
         return cal
 
+    def forget_calib(self):
+        """忘掉标定缓存 —— **标定刚被改过**（弹窗保存/重标）时叫它，下一拍立刻用新的。
+
+        为什么要有这个入口：`calib_for` 带 1 秒缓存（实时回路 30 拍/秒，每拍读一次 JSON
+        不值当）。那是给"一直跑着的回路"用的；而**人刚点完保存**时，那 1 秒的延迟会让人
+        以为"保存没生效 / 读数根本没变"（用户 2026-09-27 报的就是这个形状），所以保存
+        那条路上显式忘一次 ✓。别改成"每次都不缓存"：那是把 30 拍/秒的读盘成本还给实时回路。
+        """
+        self._calib_cache = {}
+        return self
+
     def _world_offset(self, calib):
         """「坐标系偏移」(x, y)：算出来的世界坐标**加上**它（用户 2026-09-26 要求）。
 
-        为什么要它：坐标是按**黄点重心**算的（见 `find_player_dot` 的 `x, y`），而
-        "黄点重心 ↔ 游戏里的玩家原点"这层对应是游戏自己定的 —— 与其猜（按中心还是
-        按脚下），不如给一个显式偏移让人自己量一次。读数、段号、foothold、绳梯判据
-        都在**加完之后**算（见 `update`），所以寻路的"我在哪块平台上"也跟着准。
+        为什么要它：坐标是按**黄点的下沿（脚底）**算的（见 `dot_feet`），而
+        "那个下沿 ↔ 游戏里的玩家原点"这层对应是游戏自己定的 —— 与其猜，不如给一个
+        显式偏移让人自己量一次。读数、段号、foothold、绳梯判据都在**加完之后**算
+        （见 `update`），所以寻路的"我在哪块平台上"也跟着准。
+        ⚠ 锚点是下沿时（2026-09-27 起），这一项的正常值接近 **(0, 0)**（见 `offset_of`）。
 
         **按地图 id 存**（用户 2026-09-26 定的口径）：它跟标定走 —— 存在
         `datasets/map/<id>.mapcalib.json` 的 `sources.<来源>.world_offset`，
@@ -1036,14 +1693,17 @@ class PlayerLocator:
         """
         return offset_of(calib)
 
-    def update(self, panel, src=None, calib=None, terrain=None):
+    def update(self, panel, src=None, calib=None, terrain=None, fh_xtol=0):
         """面板画面（BGR）→ 定位结论 dict。
 
         返回：
             ok         这一拍**拿到了世界坐标**（认不出点 / 没标定 → False）
             confirmed  黄点是"连续两拍都在附近"确认过的（决策层该只认这种）
-            px, py     黄点在面板里的像素（重心；认不出时是上一次的残值，别用）
+            px, py     黄点在面板里的像素（**重心** —— 画标记用；认不出时是上一次的残值，别用）
             world_x/world_y  世界坐标；没算出来是 None
+                       ⚠ 它取的是黄点**下沿（脚底）**换算出来的那个点（`dot_feet`）+
+                       「坐标系偏移」，**不是** `px/py` 直接换算 —— 采样（双点标定）
+                       用的也是下沿，两边同一口径读数才对得上（见 `dot_feet`）
             segment_id 站在哪条段（None = 没落在平台上）
             foothold_id      踩着哪条 foothold（字符串 id；None = 没落在平台上）。
                        **"我在不在某个 foothold 集合里"用这个，不用 segment_id**：
@@ -1061,6 +1721,10 @@ class PlayerLocator:
         """
         src = src or SRC_STREAM
         terrain = terrain if terrain is not None else self.terrain
+        # `fh_xtol`：「脚下是哪条 foothold / 哪条段」的 **x 方向容差**，由调用方从
+        # 设置里的「坐标对齐误差范围」传进来（0 = 老行为）。只兜"原本找不到"的情形，
+        # 详见 `core.mapdata.Terrain.foothold_below` 的 xtol 说明 ✓。
+        _xt = max(0, int(fh_xtol or 0))
         if calib is None:
             calib = self.calib_for(src)
         r = self.tracker.update(panel, calib=calib, terrain=terrain)
@@ -1085,9 +1749,15 @@ class PlayerLocator:
             out["short"] = "还没标定"
             return out
 
-        wx, wy = panel_to_world(r["x"], r["y"], calib, terrain)
+        # ⚠ **取黄点的下沿（脚底），不是重心**（2026-09-27 改，见 `dot_feet`）：
+        #   双点标定采样时填的就是下沿 ⇒ 两边不同口径的话，站回同一个地方读数却
+        #   差 (h-1)/2 个面板像素（实测 6 像素高的点 = 12 世界像素，用户报过），
+        #   而那个差**看着像标定不准**、最难查 ✗。`px/py`（画标记用）仍是重心 ✓。
+        fx, fy = dot_feet(r)
+        wx, wy = panel_to_world(fx, fy, calib, terrain)
         # 「坐标系偏移」：**在这一步加**（用户自己精确标定用）—— 后面的范围检查、
         # 段号、foothold、绳梯判据全都用加完之后的坐标，口径才是一份。
+        # 锚点换成下沿之后，这一项的含义就是"下沿 → 玩家原点"的**残差**（正常接近 0）。
         ox, oy = self._world_offset(calib)
         if ox or oy:
             wx, wy = wx + ox, wy + oy
@@ -1100,11 +1770,11 @@ class PlayerLocator:
                            % (wx, wy))
             out["short"] = "算到图外了"
             return out
-        seg = terrain.segment_of(wx, wy)
+        seg = terrain.segment_of(wx, wy, xtol=_xt)
         out["segment_id"] = seg.index if seg is not None else None
         # 脚下**那条** foothold 的 id（字符串，和 zones 文件里的写法一致）。
         # 与 segment_of 是同一套口径（都走 foothold_below），多算一次可忽略。
-        f = terrain.foothold_below(wx, wy)
+        f = terrain.foothold_below(wx, wy, xtol=_xt)
         out["foothold_id"] = str(f.fid) if f is not None else None
         # **在不在绳梯上**（2026-09-26 用户要求：小地图那行要能报「绳梯：L2」）。
         # 判据用 mapdata 现成的 `ladder_at`（绳的 x ± LADDER_DX、y 在绳段 ± LADDER_PAD）；
@@ -1126,6 +1796,40 @@ class PlayerLocator:
         else:
             out["short"] = ""
         return out
+
+
+def screen_to_world(player, sx, sy):
+    """**游戏画面坐标 → 世界坐标**（用**玩家做锚**：`画面 = 世界 − Camera` ✓）。
+
+    为什么要有它（用户 2026-09-27："chase状态需要判定一下怪物位于的foothold集合，若不与
+    玩家处于同一个，需要先下达前往任务"）：**怪只有画面坐标**（`perception.world_state.Mob`
+    的 `x/y` = 框中心、画面像素 ✓），而查"怪站哪块 foothold / 属于哪些集合"（
+    `core.mapdata.Terrain.foothold_below` + `core.zones.Zones.set_of` ✓）**要世界坐标**
+    ⇒ 中间这一跳就是本函数 ✓（全仓**唯一**一处"画面 → 世界" ✓）。
+
+    原理（`docs/寻路设计.md`）：世界 → 屏幕是 `屏幕 = 世界 − Camera`；
+    ⚠ 那条公式**没有比例尺** ⇒ 它的前提就是「**画面 1 像素 = 世界 1 像素**」（推流按原始
+      分辨率抓、没有缩放 ✓）。这条前提不成立时本函数只是**刻度不对** ⇒ 调用方要把推出来的
+      世界坐标**留痕**（写进 note / 打点 ✓），别当精密测量用 ✗。
+    Camera 不用另外找：玩家**同时**有画面坐标（`player.x` / `player.bottom`）和世界坐标
+    （`player.world_x/world_y`，来自小地图黄点 ✓）⇒ `Camera = 世界 − 画面`，直接相减 ✓。
+    ⚠ 口径与「黄点脚底」对齐（约定 10）：`sy` 要给**脚底**的画面 y —— 怪是
+      `mob.y + mob.h / 2` ✓、玩家那头用 `player.bottom`（框底 ✓，`world_y` 也是脚底 ✓）；
+      x 两边都用中心 ✓（`player.x` ↔ `world_x` ✓）。
+    ⚠ 拿不到玩家的世界坐标（没定位）⇒ 返回 `None`（**不猜** ✓，调用方退回老行为 ✓）。
+    """
+    wx0 = getattr(player, "world_x", None)
+    wy0 = getattr(player, "world_y", None)
+    if wx0 is None or wy0 is None:
+        return None
+    cam_x = float(wx0) - float(getattr(player, "x", 0.0) or 0.0)
+    # ⭐ **脚底偏移**（用户 2026-09-28 ✓）：框底不一定正好压在脚底（鞋底阴影 / 披风 /
+    #   特效会让框多出一截 ✗）⇒ 用镜像值补正 ✓（`live_thread` 每帧灌进 `world_state` ✓
+    #   —— 这边**不能**反过来 import decision，会绕成循环依赖 ✗）。
+    from perception import world_state as _ws
+    cam_y = (float(wy0) - (float(getattr(player, "bottom", 0.0) or 0.0)
+                           + float(_ws.FOOT_OFFSET_PX)))
+    return (float(sx) + cam_x, float(sy) + cam_y)
 
 
 def apply_to_player(player, loc):
@@ -1168,11 +1872,11 @@ def view_rects(loc, panel_wh, canvas_wh):
     匹配时面板已经按 1/s 缩回去了，所以 view 就是底图坐标，**不要再折算一次**。
     """
     pw, ph = panel_wh
-    s = float(loc.get("scale") or 1.0)
+    sx, sy = scales_of(loc)
     inset = float((loc.get("offset") or [4, 4])[0])
     vx, vy = loc.get("view") or (0, 0)
-    x0, y0 = vx - inset / s, vy - inset / s
-    x1, y1 = x0 + pw / s, y0 + ph / s
+    x0, y0 = vx - inset / sx, vy - inset / sy
+    x1, y1 = x0 + pw / sx, y0 + ph / sy
     z = overlay_zoom(canvas_wh[0])
     return ((int(x0), int(y0), int(x1), int(y1)),
             (int(x0 * z), int(y0 * z), int(x1 * z), int(y1 * z)))
@@ -1198,10 +1902,10 @@ def overlay_draw_rects(loc, panel_wh, canvas_wh):
     if loc.get("mode") == MODE_CROP:
         _canvas_rect, img_rect = view_rects(loc, panel_wh, canvas_wh)
         return img_rect, (0, 0, int(pw), int(ph))
-    s = float(loc.get("scale") or 1.0)
+    sx, sy = scales_of(loc)
     ox, oy = loc.get("offset") or (0, 0)
     return None, (int(ox), int(oy),
-                  int(round(cw * s)), int(round(ch * s)))
+                  int(round(cw * sx)), int(round(ch * sy)))
 
 
 def frame_overlay_rects(loc, frame_rect, canvas_wh, calib_panel=None):
@@ -1232,8 +1936,8 @@ def frame_overlay_rects(loc, frame_rect, canvas_wh, calib_panel=None):
             pw = 0.0
         if pw > 0 and fw > 0 and abs(pw / float(fw) - 1.0) > 1e-6:
             z = pw / float(fw)                  # 标定面板 → 当前那块画面 的比例
-            loc2 = dict(loc)
-            loc2["scale"] = (float(loc.get("scale") or 1.0) / z)
+            sx, sy = scales_of(loc)             # 两轴都要折算（比例 z 本身是等比的 ✓）
+            loc2 = with_scales(loc, sx / z, sy / z)
             loc2["offset"] = [float(v) / z for v in (loc.get("offset") or (0, 0))]
             loc2["view"] = [float(v) / z for v in (loc.get("view") or (0, 0))]
     src, (dx, dy, dw, dh) = overlay_draw_rects(loc2, (fw, fh), canvas_wh)
@@ -1282,9 +1986,12 @@ def draw_on_overlay(map_id, rect, out=None):
 # ══════════════════════════════════════════════════════════════
 
 def _desc(calib):
+    sx, sy = scales_of(calib)
+    s = ("scale=%.3f" % sx if abs(sy - sx) < 1e-9
+         else "scale x=%.3f y=%.3f" % (sx, sy))     # 两轴不同时必须说出来（不然像量过一样）
     if calib["mode"] == MODE_FIT:
-        return "fit  scale=%.3f offset=%s" % (calib["scale"], calib["offset"])
-    return "crop view=%s" % (calib["view"],)
+        return "fit  %s offset=%s" % (s, calib["offset"])
+    return "crop %s view=%s" % (s, calib["view"])
 
 
 def _mode_zh(mode):
@@ -1347,13 +2054,14 @@ def diagnose(map_id, host, port=5003, wait=8.0, out=None, mode="saved", save=Tru
         cli.stop()
         return 1
 
-    s = float(loc["scale"])
+    sx, sy = scales_of(loc)          # 模板匹配只有**一个**尺度 ⇒ 这里两轴必然相同 ✓
+    s = sx
     ox, oy = loc["offset"]
     cw, ch = t.canvas.shape[1], t.canvas.shape[0]
     print("采用: %s  匹配分=%.3f" % (_desc(loc), loc["score"]))
     if loc["mode"] == MODE_FIT:
         print("  底图 %dx%d → 面板里 %dx%d，位置 (%d,%d)"
-              % (cw, ch, int(cw * s), int(ch * s), ox, oy))
+              % (cw, ch, int(cw * sx), int(ch * sy), ox, oy))
         print("  换算：底图像素 = (面板像素 - 偏移) / %.3f" % s)
     else:
         print("  面板 1:1 显示底图的一块，当前那块从底图的 %s 开始" % (loc["view"],))
@@ -1370,7 +2078,11 @@ def diagnose(map_id, host, port=5003, wait=8.0, out=None, mode="saved", save=Tru
 
     if save:
         # 只把**量出来的几何**存进去，**方式保持你选的那个**（不覆盖）。
-        cal.update({k: loc[k] for k in ("scale", "offset", "view", "score")})
+        # ⚠ 走 `with_scales`：这个工具量不出两轴差别（模板匹配只有一个尺度）⇒ 存完
+        #   两轴视为相同、顺手清掉旧的 `scale_y`（留着就是一份**改过的**几何里混着
+        #   上一轮的 y 缩放 ✗）。
+        cal = with_scales(cal, sx, sy)
+        cal.update({k: loc[k] for k in ("offset", "view", "score")})
         cal["mode"] = loc["mode"]
         mapdata.save_calib(map_id, cal)
         print("已保存标定: %s（显示方式 = %s，你在 GUI 里选的那个）"
