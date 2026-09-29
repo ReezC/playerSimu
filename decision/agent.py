@@ -1274,6 +1274,10 @@ class CombatAgent:
         #: 见 `_note_chase_skip`（用户 2026-09-28："**依旧没有走『取向量 → … → 下达寻路任务』**"✓
         #: —— 这类"静默早退"已经让同一个 bug 查了三轮 ✓）。
         self._last_chase_skip = None
+        #: **idle 回归**「静默 no-op」的原因去重（2026-09-29：`foothold_x` 解析失败原来
+        #: 一声不吭 ⇒ 用户"站在区域上却不动"时无从查起 ✗）—— 只在原因变化时记一条
+        #: `idle_walk_skip`（同 `_note_chase_skip` 的手法 ✓）。
+        self._last_idle_walk_skip = None
         #: ⭐⭐ **这条路线「因为什么」下的**（用户 2026-09-28 的「**来源签名**」✓）——
         #: `why` 是一句**人话**（给日志 / 界面看 ✓），这个是给**逻辑**看的结构化那份 ✓。
         #:   `{"kind": "chase", "mob_id": 123}`（见 `plan_and_start_route` 的 `origin` ✓）
@@ -3666,20 +3670,35 @@ class CombatAgent:
         """
         z = self._zone_of_sets(getattr(getattr(ws, "player", None), "here_sets", None))
         fid = str((z or {}).get("idle_foothold") or "")
+        if not fid:
+            return                            # 没配 idle 回归 ⇒ 正常 no-op（不打点 ✓）
         fx = getattr(self, "foothold_x", None)
-        if not fid or fx is None:
-            return
-        try:
-            cx = fx(str(fid))
-        except Exception:                     # noqa: BLE001 —— 解析器坏了就照旧站住 ✓
-            return
-        wx = getattr(getattr(ws, "player", None), "world_x", None)
-        if cx is None or wx is None:
-            return
-        dx = float(cx) - float(wx)
-        if abs(dx) <= float(self._deadzone):
-            return                            # 到中心了 ⇒ 站住（一个键都不按 ✓）
-        self._steer(dx, keys)
+        why = ""
+        if fx is None:
+            why = "没注入 foothold_x（实时线程没装解析器）"
+        else:
+            try:
+                cx = fx(str(fid))
+            except Exception:                 # noqa: BLE001 —— 解析器坏了就照旧站住 ✓
+                cx = None
+            if cx is None:
+                why = "foothold_x(%s) 解析不出（地图没加载 / 没这条 foothold）" % fid
+            else:
+                wx = getattr(getattr(ws, "player", None), "world_x", None)
+                if wx is None:
+                    why = "没玩家世界坐标（小地图没定位到）"
+                else:
+                    dx = float(cx) - float(wx)
+                    if abs(dx) <= float(self._deadzone):
+                        return                # 到中心了 ⇒ 站住（一个键都不按 ✓）
+                    self._steer(dx, keys)
+                    return
+        # 走到这儿 = **配了** idle 回归却静默 no-op ⇒ 打点（只在原因变化时记一条 ✓ ——
+        # 这类早退每拍都命中，全记会淹 log ✗；手法同 `_note_chase_skip` ✓）
+        if why != getattr(self, "_last_idle_walk_skip", None):
+            self._last_idle_walk_skip = why
+            behavior.event("idle_walk_skip", zone=str((z or {}).get("set") or ""),
+                           fid=fid, why=why)
 
     def _zone_only(self, mobs, ws, now):
         """把**不在「限制战斗区域」里**的怪筛掉（用户 2026-09-27 要求 1）；判不了就不筛 ✓。

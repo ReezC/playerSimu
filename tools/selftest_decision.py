@@ -9466,21 +9466,51 @@ def t_battle_zone_item_behaviors():
     a._idle_walk_beat(_keys, ws)
     check(not _keys, "到中心了还在按（该站住 ✓）：%r" % (_keys,))
     # ③ 没注入解析器 / 没配 ⇒ 老行为（不按键 ✓）
+    # ③' 解析失败要**留痕**（2026-09-29：`foothold_x` 解析失败原来是静默 no-op ⇒
+    #     "站在区域上却不动"无从查起 ✗）—— 只在原因变化时记一条 `idle_walk_skip` ✓；
+    #     正常 no-op（没配 idle_foothold / 已到中心）**不打点** ✓
+    import tempfile as _tmpmod
+
+    from core import behavior as _beh
+
+    _old_blog, _old_ben = _beh.LOG, _beh.ENABLED
+    _blogf = Path(_tmpmod.mkdtemp(prefix="behavior_idlewalk_")) / "behavior.log"
+
+    def _blog():
+        # ⚠ behavior 一行一次落盘、没记过事件时**文件不存在** ⇒ 读要兜底成空 ✓
+        return _blogf.read_text(encoding="utf-8") if _blogf.exists() else ""
+
     a.foothold_x = None
     ws.player.world_x = 500.0
-    _keys = set()
-    a._idle_walk_beat(_keys, ws)
-    check(not _keys, "没注入 `foothold_x` 却按键了（老行为被改坏 ✗）：%r" % (_keys,))
-    a.foothold_x = lambda fid: 700.0 if str(fid) == "41" else None
-    a.settings.battle_zones = [{"set": "乙平台", "cd_s": 3.0, "idle_foothold": "",
-                                "fight_max_s": 0.0, "fight_dst": ""}]
-    a.settings.sync_battle_zone_sets()
-    _keys = set()
-    a._idle_walk_beat(_keys, ws)
-    check(not _keys, "没配 `idle_foothold` 却按键了（空 = 无 ✗）：%r" % (_keys,))
-    # 把全局设置恢复干净（`settings` 是模块级单例，别的用例也在用 ✓）
-    a.settings.battle_zones = []
-    a.settings.sync_battle_zone_sets()
+    try:
+        _beh.configure(True, log=_blogf)
+        a._last_idle_walk_skip = None
+        _keys = set()
+        a._idle_walk_beat(_keys, ws)
+        check(not _keys, "没注入 `foothold_x` 却按键了（老行为被改坏 ✗）：%r" % (_keys,))
+        check("idle_walk_skip" in _blog() and "没注入 foothold_x" in _blog(),
+              "解析失败没留痕（「站着不动」依旧无从查起 ✗）：%r" % (_blog(),))
+        a._idle_walk_beat(set(), ws)          # 原因没变 ⇒ 不重复记 ✓
+        check(_blog().count("idle_walk_skip") == 1,
+              "原因没变却重复打点（会淹 log ✗）：\n%s" % (_blog(),))
+        a.foothold_x = lambda fid: None       # 换个原因（解析不出）⇒ 记新的一条 ✓
+        a._idle_walk_beat(set(), ws)
+        check(_blog().count("idle_walk_skip") == 2 and "解析不出" in _blog(),
+              "换了原因却没记新的一条 ✗：\n%s" % (_blog(),))
+        a.foothold_x = lambda fid: 700.0 if str(fid) == "41" else None
+        a.settings.battle_zones = [{"set": "乙平台", "cd_s": 3.0, "idle_foothold": "",
+                                    "fight_max_s": 0.0, "fight_dst": ""}]
+        a.settings.sync_battle_zone_sets()
+        _keys = set()
+        a._idle_walk_beat(_keys, ws)
+        check(not _keys, "没配 `idle_foothold` 却按键了（空 = 无 ✗）：%r" % (_keys,))
+        check(_blog().count("idle_walk_skip") == 2,
+              "没配 `idle_foothold`（正常 no-op）也打了点 ✗：\n%s" % (_blog(),))
+    finally:
+        _beh.configure(_old_ben, log=_old_blog)
+        # 把全局设置恢复干净（`settings` 是模块级单例，别的用例也在用 ✓）
+        a.settings.battle_zones = []
+        a.settings.sync_battle_zone_sets()
 
 
 def t_zone_cd_setting():
