@@ -945,7 +945,97 @@ def t_mob_box_labels():
           "锁定框那里还在调 `current_target_sets()` 写地点 —— 用户 2026-09-27 明确不要了 ✗")
 
 
+def t_auto_precheck():
+    """⭐⭐ **开自动前的体检**（用户 2026-09-29 ✓ 原话："开启自动前，检查一下条件吧，
+    然后出弹窗提示"）。
+
+    背景（这次踩的坑）：`森林迷宫III` 的小地图标定**只做了一半**
+    （`datasets/map/105040303.mapcalib.json` 里只有 `world_offset`/`alpha`/`mode`，
+    **缺 `scale`/`offset`** = 没有「面板 → 底图」换算 ✗）⇒ 玩家世界坐标恒为 `None`
+    ⇒ 决策层判"没有玩家位置"（`decision/agent.py:4789`）⇒ 3 分钟后**自己把自动停了**
+    （`player_lost_stop`）⇒ 表现成"开自动却只站着不打"✗ —— 查了半天 ✓。
+    ⇒ 这几件事**开之前就查得出来** ⇒ 所以做在 `_toggle_auto` 里 ✓。
+
+    钉三件：
+      ① 没选地图 ⇒ 只报「没选地图」并**立刻返回**（不再往下判 ✓）；
+      ② 地图不存在 ⇒ 报「没标定」+「没地形」，**两条都要带"→ 去哪修"** ✓；
+      ③ ⭐ **源码级**：`_toggle_auto` 里真的在"开"之前调了体检、且不通过会**把按钮拨回去** ✓
+         —— ⚠ 这条最要紧：**光有体检函数、没接上就等于没有** ✗。
+    """
+    from gui.player_panel import PlayerPanel
+
+    _none = PlayerPanel._precheck_problems("")
+    check(len(_none) == 1 and "没选地图" in _none[0],
+          "没选地图时该只报「没选地图」并立刻返回 ✗：%r" % (_none,))
+
+    # 一个**根本不存在**的地图 id ⇒ 标定 + 地形都该报，且都要写清去哪修 ✓
+    _bad = PlayerPanel._precheck_problems("999999999")
+    check(len(_bad) == 2,
+          "不存在的地图该报「没标定」+「没地形」两条 ✗：%r" % (_bad,))
+    check(any("标定" in x for x in _bad) and any("地形" in x for x in _bad),
+          "少报了标定 / 地形其中一项 ✗：%r" % (_bad,))
+    check(all("→" in x for x in _bad),
+          "报问题却没写「→ 去哪修」⇒ 用户只知道不行、不知道怎么办 ✗：%r" % (_bad,))
+
+    # ⚠ **不写"某个具体 map_id 必须通过"** —— 那是**本机数据**（换台机器 / 换项目就红 ✗）。
+    #   改成"对任何输入都不许崩、结论必须是「非空字符串列表」" ✓
+    #   （体检自己炸掉会把"开自动"也一起带崩 ✗，那比不体检更糟）。
+    for _mid in ("", "999999999", "105040303", None, 12345):
+        _r = PlayerPanel._precheck_problems(_mid)
+        check(isinstance(_r, list) and all(isinstance(x, str) and x for x in _r),
+              "体检对 %r 的结论不是「非空字符串列表」⇒ 会崩或弹出空窗 ✗：%r" % (_mid, _r))
+
+    _src = (Path(__file__).resolve().parent.parent
+            / "gui" / "player_panel.py").read_text(encoding="utf-8")
+    check("if on and not self._precheck_auto():" in _src,
+          "`_precheck_auto` 没接进 `_toggle_auto` ⇒ 体检等于没有（用户点了开、条件不齐、"
+          "照样开 ⇒ 过几分钟自己停）✗")
+    check("def _precheck_problems(" in _src and "@staticmethod" in _src,
+          "判据没抽成 `@staticmethod` ⇒ 没法像这条用例这样单测 ✗")
+    check("QMessageBox.warning(" in _src and "开自动前的检查没通过" in _src,
+          "没弹窗 / 弹窗标题丢了 ⇒ 用户不知道发生了什么 ✗")
+
+
+def t_capture_est_frames():
+    """⭐⭐ 采集卡片「**选中文件后显示预估多少帧**」（用户 2026-09-29 ✓ 原话："采集、选中
+    文件后，能否在下面显示预估多少帧？"）。
+
+    钉四件：
+      ① `path` 控件要支持 **`on_pick` 回调**（`gui/steps/base.py`，**选完文件**才触发 ✓
+         —— 取消选择不许把上一次的预估刷掉 ✗）；
+      ② ⭐ **预估公式必须和真正抽帧的那份一模一样**（`tools/extract_frames` 的
+         `总帧数 // stride + 1` ✓）—— 两处不一致就会出现"预估 100、实际 97"，
+         人的第一反应是"是不是抽漏了"✗；
+      ③ **拿不到总帧数时要兜底**：MKV 录屏（OBS 之类）`stream.frames` 和 `stream.duration`
+        常常**都是 0** ✗ ⇒ 靠 `container.duration ÷ av.time_base × fps` 兜 ✓
+         （实测 `plain02.mkv`：3579 vs 真值 3580 ✓）；
+      ④ 估算要有**说明**（"是估的" / "被最多张数封顶"）⇒ 别让人当成精确值 ✗。
+
+    ⚠ 用**源码级**钉（真拿视频文件来测 ⇒ 换台机器 / 没录屏就红 ✗）；行为侧已实测
+    （mp4 8422 帧、mkv 3579 帧、改 stride/limit 会重算、坏路径不崩、耗时 66~73ms ✓）。
+    """
+    _root = Path(__file__).resolve().parent.parent
+    _b = (_root / "gui" / "steps" / "base.py").read_text(encoding="utf-8")
+    _c = (_root / "gui" / "steps" / "cards.py").read_text(encoding="utf-8")
+    check('on_pick=kw.get("on_pick")' in _b and "if callable(on_pick):" in _b,
+          "`path` 控件没有 `on_pick` 钩子 ⇒ 选完文件不会刷新预估 ✗")
+    check("total // stride + 1" in _c,
+          "采集预估的公式和 `tools/extract_frames` 那份不一致（那边是 "
+          "`total_frames // stride + 1`）⇒ 「预估/实际」会对不上 ✗")
+    check("_cd / float(av.time_base)" in _c,
+          "没做**容器级时长**的兜底 ⇒ MKV 录屏（`frames`/`duration` 都是 0）会永远显示"
+          "「这个文件没报总帧数」✗")
+    check('已被「最多张数」封顶' in _c and "按容器时长×帧率估的" in _c,
+          "「是估的」/「被封顶」没标出来 ⇒ 用户会把估算当精确值 ✗")
+    check("for _k in (\"stride\", \"limit\")" in _c,
+          "`stride`/`limit` 改了没重算 ⇒ 标签会停在旧数字上 ✗")
+
+
 TESTS = (
+    ("⭐⭐ 采集：选中文件后显示预估张数（公式与 extract_frames 一份 + MKV 容器时长兜底）",
+     t_capture_est_frames),
+    ("⭐⭐ 开自动前体检：标定/地形没凑齐要先弹窗说清（用户 2026-09-29；⚠ 光有函数没接上=没有）",
+     t_auto_precheck),
     ("连推 10 帧只画最新那帧（合并，不排队）", t_coalesce),
     ("不可见时一帧都不画，但帧仍是最新的", t_hidden_skips_draw),
     ("视野框（虚线）：每帧现算，不许再套「每 N 秒算一次」的节流", 

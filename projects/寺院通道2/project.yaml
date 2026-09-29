@@ -107,6 +107,10 @@ decision:
   min_turn_hold_ms: 1000
   turn_output_delay_ms: 500
   player_track_jump: 200
+  player_foot_offset_px: 0
+  player_box_min_area_pct: 0.0
+  player_box_area_base_s: 3.0
+  player_box_area_tol_pct: 0.0
   hp_bar:
   - 0.341142
   - 0.973958
@@ -123,6 +127,7 @@ decision:
   hp_threshold: 63
   mp_threshold: 7
   pot_cd: 1001
+  mob_sets_ttl_s: 3.0
   auto_hp_pot: true
   auto_mp_pot: false
   strategy: patrol
@@ -135,7 +140,7 @@ decision:
   vision_off_y: 0
   sweep_turn_cd: 500
   back_range: 150
-  route_goto_set: 左传送门平台
+  route_goto_set: 右下
   align_tol_px: 10
   align_hold_ms: 1000
   climb_align_gap_ms: 180
@@ -143,9 +148,10 @@ decision:
   climb_retry_delay_s: 1.0
   climb_retry_delay_inc_s: 1.0
   goto_timeout_s: 10.0
+  chase_goto_max_s: 0.0
   goto_timeout_key: 表情_无语
   disable_chase_pathfinding: true
-  jump_start_px: 80
+  jump_start_px: 100
   move_retry_ms: 1000
   battle_zones:
   - set: 左上
@@ -194,6 +200,8 @@ decision:
     interval:
     - 3.0
     - 5.0
+    paused: true
+    paused_left: 179.95438051701058
   facing_timeout_min: 0.0
   player_lost_timeout_min: 3.0
   resetall_interval: 30
@@ -265,8 +273,8 @@ decision:
     key: 椅子
   - type: up
     key: 椅子
-  anti_afk_spot_after: ''
-  anti_afk_spot_loop: true
+  anti_afk_spot_after: 右下
+  anti_afk_spot_loop: false
   anti_afk_spot_loop_items:
   - name: 喊话1
     seq:
@@ -333,10 +341,10 @@ decision:
 notes: ''
 capture:
   source: file
-  file: D:/Media/record/mxd/晕牛.mp4
+  file: D:/Media/record/mxd/寺院通道2补充.mp4
   url: udp://0.0.0.0:5000
   fps: 5.0
-  stride: 30
+  stride: 50
   seconds: 120.0
   dedup: 0.01
   limit: 200
@@ -354,12 +362,13 @@ dataset:
   min_boxes: 1
   quality: 92
 train:
-  model: yolo26n.pt
+  model: E:\MyPrograms\playerSimu\projects\寺院通道2\models\detect_v4.pt
   epochs: 200
   imgsz: 1280
   batch: 8
   device: '0'
   patience: 40
+  resume: false
 player_id: 数值策划
 verify:
   model: ''

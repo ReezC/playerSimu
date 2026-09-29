@@ -429,7 +429,8 @@ class CaptureCard(StepCard):
                    choices=["window", "file", "stream"])
 
         self.field(form, "file", "文件", "path", "",
-                   filter="视频文件 (*.mkv *.mp4 *.avi *.mov);;所有文件 (*)")
+                   filter="视频文件 (*.mkv *.mp4 *.avi *.mov);;所有文件 (*)",
+                   on_pick=self._on_file_picked)
 
         self.cmb_win = NoWheelComboBox()
         self.cmb_win.setMinimumWidth(230)
@@ -461,6 +462,17 @@ class CaptureCard(StepCard):
         self.field(form, "fps", "抓帧频率", "float", 5.0,
                    minimum=0.5, maximum=60.0, decimals=1, step=0.5)
         self.field(form, "stride", "抽帧间隔", "int", 6, minimum=1, maximum=1000)
+
+        # ⭐⭐ **预估多少张**（用户 2026-09-29 ✓ 原话："采集、选中文件后，能否在下面显示
+        #   预估多少帧？" ⇒ 又要求"信息应该写在「抽帧间隔」参数下面"✓）—— 所以这行就摆在
+        #   **「抽帧间隔」的正下方** ✓（它本来就是"÷ 这个间隔"的结果，摆这儿最顺 ✓）。
+        #   ⚠ **公式必须和 `tools/extract_frames` 一模一样**（`总帧数 // stride + 1` ✓）：
+        #     真正抽多少张是那边决定的 ⇒ 两处口径不一致会出现"预估 100、实际 97"，
+        #     人的第一反应是"是不是抽漏了" ✗。
+        self.lbl_est = QLabel("—")
+        self.lbl_est.setStyleSheet("color:#80868b;")
+        self.lbl_est.setWordWrap(True)
+        form.addRow("", self.lbl_est)
         self.field(form, "seconds", "时长(秒)", "float", 120.0,
                    minimum=0, maximum=36000, decimals=0, step=30)
         w = self.field(form, "dedup", "去重阈值", "float", 0.01,
@@ -474,8 +486,97 @@ class CaptureCard(StepCard):
         w.setToolTip("勾上：先删掉输出目录里旧的 frame_*.png 再抽。\n"
                      "不勾：只覆盖同编号的文件，新视频较短时会残留旧帧。")
 
+        # ⚠⚠ **信号连接必须放在这里（`build_params` 末尾）** ——
+        #   不能在加标签那一刻就连：`stride` / `limit` 两个控件在**下面**才被 `field()`
+        #   创建 ⇒ 那时 `self.widgets` 里还没有它们 ⇒ `widgets.get(...)` 拿到 `None`
+        #   ⇒ **连接静默失效** ✗（表现就是用户报的"我改了抽帧间隔，这个数字不变"✓
+        #     2026-09-29 踩过 ✓）。放在末尾 ⇒ 两个控件都已经在 `widgets` 里 ✓。
+        for _k in ("stride", "limit"):
+            _w = self.widgets.get(_k, (None, None))[0]
+            if _w is not None:
+                _w.valueChanged.connect(lambda *_a: self._refresh_est())
+
         self.widgets["source"][0].currentTextChanged.connect(self._on_source)
         self._on_source("window")     # 初始状态（此时还没绑定项目）
+
+    def _on_file_picked(self, path):
+        """选完文件 ⇒ 刷新「预估多少张」✓（`field(..., "path", on_pick=...)` 的回调 ✓）。"""
+        self._refresh_est(path)
+
+    def _refresh_est(self, path=None):
+        """算「大概能抽出多少张」写进 `self.lbl_est`（文件行下面那行灰字 ✓）。
+
+        ⭐ 用户 2026-09-29 ✓："采集、选中文件后，能否在下面显示预估多少帧？"
+
+        ⚠ **公式照抄 `tools/extract_frames`**（`总帧数 // stride + 1` ✓ 见那边 `:127-130`）：
+        真正抽多少张由那边决定 ⇒ 两处口径一份，否则"预估/实际"对不上，人会以为漏帧 ✗。
+        ⚠ 用 **PyAV**（`av`，和 `extract_frames` **同一个库** ✓ 别为这事再引入 cv2 那套 ✗）
+        读**容器元数据** —— 只读头部、**不解码** ⇒ 本地文件**毫秒级** ✓ 放 UI 线程可以 ✓。
+        ⚠ 网络盘 / 超大文件可能慢一点 ⇒ 整体包 `try`，失败就直说"量不出来" ✓
+        **绝不抛异常、绝不卡住卡片** ✗（估算而已，量不出来不影响抽帧 ✓）。
+        """
+        lbl = getattr(self, "lbl_est", None)
+        if lbl is None:
+            return
+        if path is None:
+            path = self.value("file")
+        if not path:
+            lbl.setText("—")
+            return
+        total = 0
+        note = ""
+        try:
+            import av
+            c = av.open(str(path), mode="r")
+            try:
+                vs = list(getattr(c, "streams", None).video) if c.streams else []
+                st = vs[0] if vs else None
+                if st is not None:
+                    fps = float(getattr(st, "average_rate", 0) or 0)
+                    _tb = float(getattr(st, "time_base", 0) or 0)
+                    # ① 容器直接报的总帧数（最准 ✓ 实测 mp4 一般都有）
+                    total = int(getattr(st, "frames", 0) or 0)
+                    # ② 流自己的时长 × 帧率（有的容器 `frames` 是 0 但 `duration` 有值 ✓）
+                    if not total and fps and _tb:
+                        _d = float(getattr(st, "duration", 0) or 0)
+                        if _d > 0:
+                            total = int(_d * _tb * fps)
+                            note = "（按时长×帧率估的）"
+                    # ③ ⭐ **容器级时长**兜底 —— **MKV 录屏（OBS 之类）常常 ①② 都拿不到** ✗，
+                    #    但 `container.duration / av.time_base` 有值 ✓。
+                    #    实测 `data/recordings/plain02.mkv`：99.4 秒 × 36 fps ≈ **3579** 帧，
+                    #    真值（数包）**3580** ⇒ 只差 1 ✓ 够用了 ✓
+                    #    （⚠ 别改成"数包"：实测 3580 包要 0.49s、14471 包要 1.22s ⇒ 卡 UI ✗）
+                    if not total and fps:
+                        _cd = float(getattr(c, "duration", 0) or 0)
+                        if _cd > 0:
+                            total = int(_cd / float(av.time_base) * fps)
+                            note = "（按容器时长×帧率估的）"
+                else:
+                    note = "（文件里没有视频轨）"
+            finally:
+                c.close()
+        except Exception as e:                  # noqa: BLE001 —— 估算失败不该影响任何事 ✓
+            lbl.setText("预估：读不出这个文件的信息（%s）" % e)
+            return
+        try:
+            stride = max(1, int(self.value("stride") or 1))
+            limit = int(self.value("limit") or 0)
+        except (TypeError, ValueError):
+            stride, limit = 1, 0
+        if not total:
+            lbl.setText("预估：这个文件没报总帧数（抽的时候才知道%s）" % note)
+            return
+        est = total // stride + 1
+        capped = bool(limit > 0 and est > limit)
+        if capped:
+            est = limit
+        lbl.setText("预估约 **%d** 张  ←  总 %d 帧 ÷ 每 %d 帧抽 1 张%s%s"
+                    % (est, total, stride, note,
+                       "，已被「最多张数」封顶" if capped else ""))
+        lbl.setToolTip(
+            "这只是**按容器元数据**算的上限估计（和真正抽帧用的是同一个公式 ✓）。\n"
+            "实际张数还会少一些，因为「去重阈值」会把相似帧跳掉。")
 
     def _on_source(self, txt):
         """按来源切换参数：不相关的整行藏掉，界面只留当前来源要填的。"""
@@ -497,6 +598,11 @@ class CaptureCard(StepCard):
         # 刷新/预览行没注册 key，单独控制
         for w in self._win_extras:
             w.setVisible(is_win)
+        # ⭐ 预估那行也要跟来源走（它不是 `field` ⇒ 不会被 `set_row_visible` 管到 ✗）：
+        #   窗口 / 流模式下没有"既定帧数"可估 ⇒ 必须藏掉，否则会留上一次的残留数字 ✗
+        lbl = getattr(self, "lbl_est", None)
+        if lbl is not None:
+            lbl.setVisible(is_file)
 
         if is_win and self.cmb_win.count() == 0:
             self.reload_windows()
@@ -558,6 +664,16 @@ class CaptureCard(StepCard):
         for k in self._KEYS:
             self.set_value(k, sec.get(k))
         self._on_source(self.value("source"))
+        # ⭐ 回填完**顺手刷一次预估**（用户 2026-09-29 的连带项 ✓）。
+        #   ⚠ **为什么必须补这一下**：`on_pick` 只在**用户点「浏览」选文件**时触发 ⇒
+        #     从项目文件**回填**上次选的那个视频时**不会**触发 ⇒ 标签一直停在 `—` 上 ✗
+        #     （明明有文件却不显示，看着像功能没做 ✓ 2026-09-29 实测到的 ✓）。
+        #   ⚠ 必须加在**这个**方法里 —— 卡片里本来就有 `load_from_project`，
+        #     另起一个同名方法会把它**整个顶掉**（回填就废了 ✗ 2026-09-29 踩过 ✓）。
+        try:
+            self._refresh_est()
+        except Exception:                   # noqa: BLE001 —— 估算不许把回填搞崩 ✓
+            pass
 
     def sync(self, p):
         p.sec("capture").update(self.values(self._KEYS))
@@ -1381,6 +1497,24 @@ def _read_json(path):
         return None
 
 
+def _frames_newer_than_dataset(project, data_yaml):
+    """`frames/` 里有几张**比数据集新**的帧（= 还没进数据集的）→ N（数不出来就 0 ✓）。
+
+    **为什么用 mtime 而不是比张数**：⑥ 每次都会重写 `data.yaml` ✓，所以"比它新"= "上次准备
+    数据集之后又补了帧" ✓；而比张数天然对不上 —— ⑥ 会按 `min_boxes` 过滤掉一部分帧 ✗。
+    ⚠ 数不出来（目录不在 / 权限问题）**一律返回 0**：这是"挡人"的前置检查，
+      宁可漏挡也不能因为数不出来就把人锁在门外 ✗。
+    """
+    try:
+        t = data_yaml.stat().st_mtime
+        fr = project.dir_of("frames")
+        if not fr.is_dir():
+            return 0
+        return sum(1 for f in fr.glob("*") if f.is_file() and f.stat().st_mtime > t)
+    except Exception:                       # noqa: BLE001
+        return 0
+
+
 def _run_dirs(project):
     """项目里训过的版本 [(版本号, 名字, run 目录, run.json 内容)]，新的在前。"""
     got = []
@@ -1517,6 +1651,26 @@ class TrainCard(StepCard):
             "0 = 第一块 GPU，cpu = 用 CPU（会很慢）。\n"
             "多卡时写 0,1 或 0,1,2。")
 
+        # ⭐⭐ **接着上次跑**（用户 2026-09-29 ✓ 原话："自动找最近一个 run 的 last.pt、崩了
+        #    能一键续、并且在续之前先报一句当前显存够不够"）。
+        #  · 勾上 ⇒ 自动找本项目 `runs/` 里**最近**一个带 `last.pt` 的 run（按文件 mtime，
+        #    不是目录名 —— `detect_v10` 会排到 `detect_v9` 前面 ✗）⇒ 从那个 epoch 接着训 ✓；
+        #  · ⚠ **上面那些参数全部不生效**（轮数 / 尺寸 / 批 / 基础权重）—— ultralytics 续训时
+        #    只认检查点里那套 ✓。**尤其是"想续训顺便把批改小"是做不到的** ✗：显存不够就得
+        #    不勾它、换个批大小从头跑 ✓（上面那句提醒就是为这件事）。
+        #  · 训练崩了（比如 cuDNN / OOM）进度**不会丢** —— `last.pt` 每个 epoch 都写 ✓，
+        #    回来勾上它再跑一次就行 ✓。
+        self.field(form, "resume", "接着上次跑", "bool", False)
+        self.widgets["resume"][0].setToolTip(
+            "从本项目**最近一次**训练断掉的地方接着训（自动找最后一个 last.pt）。\n\n"
+            "· 训练中途崩了（显存不足 / cuDNN 报错）⇒ 勾上它再跑一次，进度不丢 ✓；\n"
+            "· ⚠ 勾上之后**上面那些参数都不生效**（轮数 / 尺寸 / 批 / 基础权重都沿用\n"
+            "  上次那套）—— 尤其「想续训顺便把批改小」是做不到的，显存不够就得\n"
+            "  不勾它、换个批大小从头跑；\n"
+            "· 续训前日志里会先报一句**当前显存够不够**，不够会提醒你先关掉\n"
+            "  Edge / QQ / 微信 / Steam 这些占显存的程序；\n"
+            "· 本项目还没跑过训练、或 runs 里那个 run 被删了 ⇒ 会直接报错告诉你。")
+
     def _fill_model_options(self, p=None, cur=None):
         """填「基础权重」下拉：官方预训练 + **所有项目**已训好的权重 + 自定义。
 
@@ -1603,12 +1757,12 @@ class TrainCard(StepCard):
         # ⚠ 顺序：**先填候选、再回填取值** —— `set_value("model", …)` 是按 userData 找项，
         # 列表里没有那一项就静默不选中（界面上显示的是别的权重，训练却用存的那个 ✗）。
         self._fill_model_options(p, cur=sec.get("model") or "yolo26n.pt")
-        for k in ("model", "epochs", "imgsz", "batch", "device"):
+        for k in ("model", "epochs", "imgsz", "batch", "device", "resume"):
             self.set_value(k, sec.get(k))
 
     def sync(self, p):
         p.sec("train").update(
-            self.values(["model", "epochs", "imgsz", "batch", "device"]))
+            self.values(["model", "epochs", "imgsz", "batch", "device", "resume"]))
 
     def _open_report(self):
         """开「训练报告」弹窗（懒导入：弹窗不该在卡片模块里被 import 进来）。"""
@@ -1690,8 +1844,23 @@ class TrainCard(StepCard):
         return ("done", "已训练")
 
     def check_deps(self, p):
-        if not (p.dataset / "data.yaml").exists():
+        y = p.dataset / "data.yaml"
+        if not y.exists():
             return False, "缺少数据集，请先完成 ⑥ 数据集"
+        # ⭐⭐ **补了帧但没重跑 ⑥** 要**当场挡住**（用户 2026-09-29 ✓ 原话："我后补的帧数据
+        #   训练，它如果早退了那是不是白补了？"）：训练只吃 `dataset/images/{train,val}` 这份
+        #   **物理拷贝**（`perception/train.py` 全文不扫 `frames/`、不读 `split.json` ✗）⇒
+        #   忘了跑 ⑥ 时那批帧**一张都用不上** ✗✗。原来只有一条"数据集已更新"的弱提示
+        #   （纯 mtime 比较，而且**训练完之后**才显示 ✗）⇒ 现在开跑前就挡 ✓。
+        #   ⚠ 判据是"**比 data.yaml 新**"（⑥ 每次都会重写它 ✓），不是比张数 —— ⑥ 会按
+        #     `min_boxes` 过滤掉一部分帧，张数天然对不上 ✗。
+        n = _frames_newer_than_dataset(p, y)
+        if n:
+            return False, (
+                "有 %d 张新帧还没进数据集（frames/ 里有比 data.yaml 更新的帧）——\n"
+                "训练只读数据集里那份拷贝，**不会**自动带上它们 ⇒ 直接训练等于这批帧白补。\n\n"
+                "先跑一次 ⑥ 数据集（没标注/框太少的会被自动跳过 ✓），然后再训练 ✓。"
+                % n)
         return True, ""
 
     def _next_run_name(self, p):
@@ -1728,6 +1897,9 @@ class TrainCard(StepCard):
             "batch": sec.get("batch", 8),
             "device": sec.get("device", "0"),
             "patience": sec.get("patience", 40),
+            # ⭐ 「接着上次跑」（用户 2026-09-29 ✓）—— `run_train` 见到它 ⇒ 忽略上面那些参数、
+            #   改去续训最近一个 run 的 `last.pt` ✓（一并报显存够不够 ✓）
+            "resume": bool(sec.get("resume")),
             # 输出落在项目里，不是全局 runs/ —— 项目要能整个拷走
             "project_dir": str(p.dir_of("runs")),
             "name": self._next_run_name(p),     # 不覆盖上一版，留下可对比的历史

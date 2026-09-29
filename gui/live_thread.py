@@ -288,6 +288,36 @@ def _vision_box_for(vis, player_box, s):
     return left, top, right, bottom
 
 
+def _limit_cpu_threads():
+    """把 **torch / OpenCV 的线程池按死在 1**（用户 2026-09-29 链路提效 ✓）。
+
+    **为什么**（这是"上游 98 ms"最可能的一截）：实时回路有三条线程在同几颗核上抢 ——
+    推理主回路、收流的读线程（`_boost_reader` 那条 ✓）、以及 GUI。而 **torch / cv2 默认按
+    核数开线程池**（128 核的机器就开上百条 ✗），GPU 推理时那些线程纯属空转抢 CPU ✗：
+      · `model.predict` 走的是 CUDA，CPU 侧只做前/后处理 ⇒ 多线程**没有收益**，
+        却会和读线程抢核 ⇒ 读线程被饿住 ⇒ 积压堆在 ffmpeg 队列 / 内核 UDP 缓冲里
+        （见 `_boost_reader` 那段说明 ✓）⇒ **直接变成端到端延迟**（`e2e_probe_ms`）✗✗；
+      · `cv2` 同理：`cvtColor(1080p)` / `resize` 默认多线程，和读线程抢同一批核 ✗。
+    ⇒ 各按 1 跑，把核让给"每帧都有硬期限"的读线程 ✓（代价：cv2 那几个大操作各慢 ~1 ms
+       —— 但那 1 ms 在**主回路**里，而省下来的是**上游排队**，那才是 e2e 的大头 ✓）。
+
+    ⚠ 只对**实时这条链**生效（在 `run()` 里、开推理那一刻调 ✓）—— **训练 / 标注**那些
+      工具不受影响（它们各自需要多线程 ✓；`tools/detect_*.py` 里本来就自己设了 cv2=1 ✓）。
+    ⚠ 覆盖不了"外面已经设过"的情况：torch 的线程数若被环境变量（`OMP_NUM_THREADS` 等）
+      改过，这里仍是最后一次说了算 ✓（本函数就在模型加载之前 ✓）。
+    """
+    try:
+        import torch
+        torch.set_num_threads(1)
+    except Exception:                       # noqa: BLE001 —— 没有 torch / 老版本 ⇒ 算了 ✓
+        pass
+    try:
+        import cv2
+        cv2.setNumThreads(1)
+    except Exception:                       # noqa: BLE001
+        pass
+
+
 class _LatestSlot:
     """只保留最新一帧的槽位。
 
@@ -551,6 +581,14 @@ class LiveThread(QThread):
             #     反过来 import decision（会绕成循环依赖 ✗ 见 world_state 那段说明 ✓）。
             from perception import world_state as _ws_mod
             _cy_raw = float(_wy0) - (float(_bt0) + float(_ws_mod.FOOT_OFFSET_PX))
+            # ⭐⭐ **优先用「可信相机」**（用户 2026-09-29 任务 2 ✓）：上面那两份是**每拍现算**
+            #   的（玩家框抖 Δ ⇒ 每只怪的世界坐标同量平移 Δ ✗）；`PlayerTracker` 已经把
+            #   "跟黄点对得上的那几拍"挑出来存在 `player.cam_x/cam_y` 上（口径与这里一致 ✓）
+            #   ⇒ 有它就用它，**没有（None）就退回老口径**（行为一字不变 ✓，不许当成 0 ✗）。
+            _pcx = getattr(player, "cam_x", None)
+            _pcy = getattr(player, "cam_y", None)
+            if _pcx is not None and _pcy is not None:
+                _cx, _cy_raw = float(_pcx), float(_pcy)
             # ⚠⚠ **相机 y 必须做 EMA 平滑**（2026-09-28 治本 ✓ —— 用户报"**#159 没找到，理由是什么？**"✓）：
             #   实测 `behavior.log` 的 `mob_fh`：`ply_wy`（玩家世界 y）在 **−91 ~ +197** 之间摆
             #   **288 像素** ✗（图 105040303 的层距才 **540** ⇒ 摆了半层多 ✗）⇒ 换算出的怪世界
@@ -798,8 +836,19 @@ class LiveThread(QThread):
         """记下"**这只怪的框被查过**"（画面上要标出来 ✓），时效见 `_mob_query_ttl` ✓。
 
         存的是**画面坐标框**（怪每拍都在动 ⇒ 标记要跟着它走 ✓）与这次查到的集合名 ✓；
-        查不出集合（`names` 空 ✓）**也照记** ✓ —— 用户要的是"**查询到**"就标 ✓，
-        正是这种情况最该看见（"查了、但判不出它在哪块平台" ✗）。
+        查不出集合（`names` 空 ✓）**也照记** ✓ —— 用户要的是"**查询到**"就标 ✓。
+
+        ⭐⭐ **"有 → 失败"时沿用上次有效结果 + 续期**（用户 2026-09-28 ✓ 原话："如果怪物
+        查询从 有→失败，那么其应该使用使上次有效的数据缓存并刷新缓存时间而不是空"）：
+          · 本次 `names` 空、而**上次存着非空集合** ⇒ **集合名沿用上次那份** ✓，失效时刻按
+            `now + ttl` **续期** ✓ ⇒ 框不会因为一次判不出来就消失 ✗、也不会"查到过又变空" ✗；
+          · **框坐标永远用本次的** ✓（怪在动，标记得跟着它走 ✗ 别用旧框）；
+          · 本次的 `why`（失败原因）**照记** ✓ —— 它给 `mob_fh` 那条 log 看，而那边用的是
+            `resolve` 里的**真值**（不受这里影响 ✓）⇒ 画面显示上次结果、log 里仍能看到
+            "这次为什么没查到" ✓ **两边都不丢** ✓；
+          · ⚠ 与用户**当天早些**那条要求（"失败就写失败、不要显示这么长"）的取舍：现在只要
+            成功过一次，画面就**不再出现**「查#id 失败」✗ ⇒ "这次没查到"要去 log 的
+            `mob_fh` 里看（它带 `why` ✓）。用户 2026-09-28 的新口径明确要"**不要空**"✓ 照办 ✓。
         """
         mid = getattr(mob, "id", None)
         if mid is None:
@@ -807,12 +856,15 @@ class LiveThread(QThread):
         now = time.monotonic() if now is None else float(now)
         key = str(mid)
         prev = self._mob_queries.get(key)
+        _names = [str(n) for n in (names or [])]
+        if not _names and prev and prev[1]:
+            _names = list(prev[1])      # ⭐ 沿用上次有效集合（用户 2026-09-28："不要空" ✓）
         self._mob_queries[key] = (
             (float(getattr(mob, "x", 0.0) or 0.0), float(getattr(mob, "y", 0.0) or 0.0),
              float(getattr(mob, "w", 0.0) or 0.0), float(getattr(mob, "h", 0.0) or 0.0)),
-            [str(n) for n in (names or [])], str(why or ""),
+            _names, str(why or ""),
             float(prev[3]) if prev else now,          # 首次查到时刻（"多久前查的" ✓）
-            now + self._mob_query_ttl())              # 失效时刻 ⇒ 到点就移除 ✓
+            now + self._mob_query_ttl())              # 失效时刻 ⇒ 到点就移除 ✓（沿用也照续期 ✓）
 
     def queried_mob_boxes(self, now=None):
         """还没失效的"查过的怪框" → `[(怪号, (框, 集合名, why, 首查时刻, 失效时刻)), …]`。
@@ -1189,9 +1241,16 @@ class LiveThread(QThread):
         # "脚下没有平台 / 未分组" ⇒ 起点与到达判定全废 ✗
         # （实测 105090600 的 (650,283)：离平台左边界 7px，而设置的容差是 10px ✓）。
         from decision.agent import settings as decision_settings
-        return self._locator.update(
+        loc = self._locator.update(
             panel, src=src,
             fh_xtol=int(getattr(decision_settings, "align_tol_px", 0) or 0))
+        # ⭐ 局部小地图（crop）的 view 跟踪成败**打点**（用户 2026-09-29 任务 1 ✓）：
+        #   它不是 crop 时是 `None`（没这回事，不打点 ✓）。"跟不住"占比高 ⇒ 面板被挡 /
+        #   方式选错 / 标定不对 ⇒ 那一拍的世界坐标是拿标定里那个位置算的（可能整体偏 ✗）。
+        if loc.get("view_ok") is not None:
+            from core import perf
+            perf.count("crop_view_ok" if loc.get("view_ok") else "crop_view_miss")
+        return loc
 
     # ---------------- 控制 ----------------
 
@@ -1670,6 +1729,7 @@ class LiveThread(QThread):
                     timeout = min(timeout,
                                   max(_timing_tick, deadline - time.perf_counter()))
                 f = slot.take(timeout)
+                _t_take = time.perf_counter()
                 if f is None:
                     if reader_done.is_set():
                         break          # 流结束了
@@ -1687,6 +1747,14 @@ class LiveThread(QThread):
                     if len(gaps) > 60:      # 下面只用得到最近 60 个（见 stats_ready）
                         del gaps[0]
                 last_mono = f.t_recv_mono
+                # ⭐ **这一帧在槽里等了多久**（用户 2026-09-29 链路提效 ✓）：
+                #   `_LatestSlot` 只丢"已经解码出来"的帧 ⇒ 回路一慢，帧就在这儿**变旧**
+                #   ⇒ 这是"控制延迟"里 B 机自己造的那一段，和 `e2e_probe_ms`（上游）合起来
+                #   才能把闭环拆开：`闭环 ≈ 上游 + 槽等待 + pipe + 发送 + A 机执行` ✓。
+                #   ⚠ 用 `t_recv_mono`（读线程解码完成那一刻，同一个 `perf_counter` 时钟 ✓）
+                #     —— 取负说明时钟被跳过 ⇒ 夹到 0，别把负数喂进分位数 ✗。
+                perf.sample("slot_wait_ms",
+                            max(0.0, (_t_take - float(f.t_recv_mono)) * 1000.0))
                 _t_pipe = time.perf_counter()   # 「收到这一帧 → 决策完」的总耗时
                 perf.frame_arrived(_t_pipe)     # 记下这帧被取走的时刻（算 out_key_ms）
                 vis = f.image          # BGR（decode_format="bgr24" 直出）
@@ -1731,6 +1799,14 @@ class LiveThread(QThread):
                     _chase_jump_color = theme.hex_to_bgra(_vis_cfg["chase_jump_color"])
                     _vision_color = theme.hex_to_bgra(_vis_cfg["vision_color"])
                     _vision_width = int(_vis_cfg["vision_width"])
+                    # ⭐⭐ **各框线宽**（用户 2026-09-28 ✓"给其他的粗细也加配置"）—— 就在
+                    #   「界面 → 辅助线与标记」里**色块右边那一格**调 ✓；⚠ **默认值 = 原来
+                    #   在下面写死的那个数**（锁定框 3、其余 2 ✓ 观感一字不变 ✓）。
+                    _lock_width = int(_vis_cfg.get("lock_width", 3) or 3)
+                    _attack_width = int(_vis_cfg.get("attack_width", 2) or 2)
+                    _min_attack_width = int(_vis_cfg.get("min_attack_width", 2) or 2)
+                    _jump_attack_width = int(_vis_cfg.get("jump_attack_width", 2) or 2)
+                    _chase_jump_width = int(_vis_cfg.get("chase_jump_width", 2) or 2)
                     _on_lock = bool(_vis_cfg.get("lock_on", True))
                     _on_attack = bool(_vis_cfg.get("attack_on", True))
                     _on_blind = bool(_vis_cfg.get("min_attack_on", True))
@@ -1814,6 +1890,7 @@ class LiveThread(QThread):
                 if self._infer.is_set():
                     if model is None:
                         # 首次开推理才加载模型（收画面阶段不加载，秒出纯画面）
+                        _limit_cpu_threads()
                         model = YOLO(weights)
                         # 类别 id 以**模型自己声明的类别名**为准：类别表给的是我们
                         # 训练时的顺序，但权重可能是别处训的 —— 按名字对齐，怎么都
@@ -1908,25 +1985,33 @@ class LiveThread(QThread):
                     if _pb_prev is not None and len(_pb_prev) >= 6:
                         _area_prev = float(_pb_prev[4]) * float(_pb_prev[5])
                     if _area_prev > 0.0:
-                        _area_hist.append(_area_prev)
-                        if len(_area_hist) > 600:
-                            del _area_hist[0]
+                        # ⭐⭐ **基线窗口改成"过去 N 秒"**（用户 2026-09-28 ✓ 原话："『面积基线
+                        #   窗口』，这个『拍』是什么？是多久？**需要可量化的描述**"✓）——
+                        #   存 `(时刻, 面积)` 并按**时间窗**筛 ✓：**拍数依赖帧率** ✗
+                        #   （30 拍在 30fps 是 1 秒、在 15fps 是 2 秒 ⇒ 说不清多久 ✗），秒才可量化 ✓。
+                        _t_now = time.monotonic()
+                        _area_hist.append((_t_now, _area_prev))
+                        if len(_area_hist) > 2000:      # 只当内存上限（真筛选靠时间窗 ✓）
+                            del _area_hist[:1000]
                         _pm = float(getattr(decision_settings,
                                             "player_box_min_area_pct", 0.0) or 0.0)
                         _pt = float(getattr(decision_settings,
                                             "player_box_area_tol_pct", 0.0) or 0.0)
-                        if _pm > 0.0:
-                            _fa = float(vis.shape[0]) * float(vis.shape[1])
-                            if _fa > 0.0 and _area_prev < _fa * _pm / 100.0:
-                                _gate_closed = True          # 框太小 ⇒ 这一拍不算有效检测
+                        _bs = max(0.5, float(getattr(
+                            decision_settings, "player_box_area_base_s", 3.0) or 3.0))
+                        _win = [_a for _t, _a in _area_hist if _t_now - _t <= _bs]
+                        _base = (sum(_win) / float(len(_win))) if _win else 0.0
+                        # ⭐⭐ **「框面积最小占比」改成"占基线"**（用户 2026-09-28 ✓ 原话：
+                        #   "『框面积最小占比』应该是占**过去 n 秒内平均面积**的比例"✓）——
+                        #   原来跟**画面面积**比 ✗（不同地图 / 分辨率下人物框本来就不一样大 ⇒
+                        #   跟画面比**没有可比性** ✗）。
+                        if _pm > 0.0 and _base > 0.0:
+                            if _area_prev < _base * _pm / 100.0:
+                                _gate_closed = True      # 比基线小太多 ⇒ 这一帧**检测无效** ✓
                                 perf.count("player_box_too_small")
-                        if not _gate_closed and _pt > 0.0 and len(_area_hist) >= 3:
-                            _bn = max(1, int(getattr(
-                                decision_settings, "player_box_area_base_n", 30) or 30))
-                            _tail = _area_hist[-_bn:]
-                            _base = sum(_tail) / float(len(_tail))
+                        if not _gate_closed and _pt > 0.0 and len(_win) >= 3:
                             if _base > 0.0 and _area_prev <= _base * (1.0 - _pt / 100.0):
-                                _gate_closed = True      # 比近期基线小太多 ⇒ 这一拍不查
+                                _gate_closed = True      # 比近期基线小 ⇒ 这一拍不查
                                 perf.count("player_area_below_base")
                     #      ⚠ 拦住时 `_loc = None` ⇒ 下面 `apply_to_player` 不跑 ⇒ **世界坐标沿
                     #        用上一拍** = 这一拍"**不定位**"✓（而不是"定到错的地方"✗）。
@@ -1942,6 +2027,25 @@ class LiveThread(QThread):
                     player_tracker.max_jump = max(
                         1.0, float(decision_settings.player_track_jump))
                     player_box = player_tracker.update(player_cands, world=_world_now)
+                    # ⭐ **可信相机**（用户 2026-09-29 任务 2 ✓）：追踪器拿黄点的**权威世界
+                    #   坐标**核对过玩家框，只把"对得上"那几拍采纳成相机 ✓ ⇒ 下游所有
+                    #   "画面 → 世界"都用它（`screen_to_world` / 怪的集合解析器 ✓），
+                    #   玩家框抖 Δ 时不再把 Δ 原样灌进每只怪的世界坐标 ✓。
+                    #   ⚠ `None` = 还没建立 ⇒ 下游退回老口径现算，行为一字不变 ✓（不许当 0 ✗）。
+                    _cam_now = player_tracker.camera()
+                    if player_tracker.cam_rejected:
+                        # 这一拍"框与黄点对不上" ⇒ 相机冻着用旧的（**打点**，排查要用：
+                        # 一直涨说明玩家框锁错了 / 标定偏了 / 黄点在骗人 ✓）
+                        perf.count("cam_reject")
+                    # ⭐ 相机与"两个传感器差多少"也写进**行为日志**（用户 2026-09-29 任务 2）：
+                    #   `cam_resid`（世界像素）是"玩家框那一路稳不稳"唯一的数；"世界坐标
+                    #   整体偏"那类排查要看的就是它（差几十像素 ⇒ 就是它把怪推了一层 ✓）。
+                    if _cam_now is not None:
+                        behavior.sample("cam_x", float(_cam_now[0]), min_gap=1.0)
+                        behavior.sample("cam_y", float(_cam_now[1]), min_gap=1.0)
+                    if player_tracker.cam_resid is not None:
+                        behavior.sample("cam_resid", float(player_tracker.cam_resid),
+                                        min_gap=1.0)
                     n_boxes = k
 
                     # ---- 断线判断 / 自动重连 ----
@@ -1982,6 +2086,11 @@ class LiveThread(QThread):
                         ws.player.bottom = player_box[2]
                         ws.player.w, ws.player.h = player_box[4], player_box[5]
                         ws.player.found = True
+                    # ⭐ 可信相机跟着 WorldState 走（**一处口径**：谁要"画面 → 世界"都读它 ✓）——
+                    #   它是"最近一次与黄点对得上的那一拍"的相机，与 `player_box` 是不是这一帧
+                    #   新挑的无关（跟丢时也照样能用 ✓）。
+                    if _cam_now is not None:
+                        ws.player.cam_x, ws.player.cam_y = _cam_now
 
                     # 读 HP/MP 条：从当前画面帧 vis 里按「画面比例」截取（不再抓本机屏幕），
                     # 限流 0.1s。收流/窗口两种模式都从 vis 截，游戏机上不再有抓屏行为。
@@ -2109,8 +2218,11 @@ class LiveThread(QThread):
                         orange = _min_attack_color[:3]
                         _fh, _fw = vis.shape[:2]
 
-                        def _draw_box(ad, color, on, from_d=0.0):
+                        def _draw_box(ad, color, on, from_d=0.0, width=2):
                             """按四条边画一个框；**空集（面积 0）⇒ 不画** ✓（用户 2026-09-27）。
+
+                            `width` = 线宽（用户 2026-09-28 ✓"给其他的粗细也加配置"）——
+                            由调用方传「辅助线与标记」里那一格的值 ✓。
 
                             `from_d` = 水平方向的**起点距离**（默认 0 = 从角色中心起 ✓）——
                             「攻击范围框」传 `min_ad`（它画的是**可攻击区**，不含盲区 ✓）、
@@ -2127,12 +2239,14 @@ class LiveThread(QThread):
                             p0 = (int(round(x0)), int(round(y0)))
                             p1 = (int(round(x1)), int(round(y1)))
                             _blit_alpha(vis, color,
-                                        lambda t, c: cv2.rectangle(t, p0, p1, c, 2))
+                                        lambda t, c: cv2.rectangle(t, p0, p1, c, width))
 
                         # 「攻击范围框」= **可攻击区**（最小 → 最大，**不含盲区**那块 ✓，
                         # 用户 2026-09-27 的图上就是这么并排的）；盲区框 = 中心 → 最小 ✓
-                        _draw_box(max_ad, _attack_color, _on_attack, from_d=min_ad)
-                        _draw_box(min_ad, _min_attack_color, _on_blind)
+                        _draw_box(max_ad, _attack_color, _on_attack, from_d=min_ad,
+                                  width=_attack_width)
+                        _draw_box(min_ad, _min_attack_color, _on_blind,
+                                  width=_min_attack_width)
                         cv2.circle(vis, (cx, cy), 4, yellow, -1)       # 角色中心（起算点）
 
                         # 「**追击起跳框**」（用户 2026-09-27：以前是条**绿线**、颜色还写死
@@ -2149,7 +2263,8 @@ class LiveThread(QThread):
                             if jlo > jhi:
                                 jlo, jhi = jhi, jlo
                             _draw_box(max_ad + jhi, _chase_jump_color, True,
-                                      from_d=max_ad + jlo)
+                                      from_d=max_ad + jlo,
+                                      width=_chase_jump_width)
 
                         # 扫平台倾向朝向箭头：位于攻击距离上方，指向朝向方向，
                         # 尾巴延长至背后锁定距离（back_range）。back_range 也是
@@ -2177,17 +2292,27 @@ class LiveThread(QThread):
                     #   ⚠ `箭头长度(px)` = 0 ⇒ **不画**（老行为 = 画面上没有任何新增 ✓）。
                     #   ⚠ 原点取 `_last_player[0]` 的**框底**（和第 ① 条闸用同一份上一拍框 ✓
                     #     —— 它在同一帧的玩家框算出来之前就已经有了 ✓）。
-                    _al = int(getattr(decision_settings, "player_arrow_len_px", 0) or 0)
-                    _aw = max(1, int(getattr(
-                        decision_settings, "player_arrow_width_px", 2) or 2))
+                    # ⭐⭐ **玩家坐标箭头** —— 配置在 **设置 → 界面 → 辅助线与标记（实时预览）** ✓
+                    #   （用户 2026-09-28 要求搬过去 ✓：它属于"画面上可显示的东西"，规范 §4 ✓）。
+                    #   颜色 / 粗细 / 长度都从 `vis` 段读（`theme.load_vis()` ✓ 那份是**定期重读**
+                    #   ⇒ 改完**不用重启**就生效 ✓）；`player_arrow_on` 关掉 ⇒ 不画（颜色留着 ✓）。
+                    _al = int(_vis_cfg.get("player_arrow_len", 60) or 0)
+                    _aw = max(1, int(_vis_cfg.get("player_arrow_width", 2) or 2))
+                    # ⭐ **箭头尖大小**（用户 2026-09-28 ✓"再加个箭头 size 配置"）——
+                    #   存的是**占线段长的百分比** ⇒ 这里 `/100` 变成 `cv2.arrowedLine`
+                    #   要的 `tipLength`（默认 25 ⇒ 0.25 = **原来写死的那个值** ✓ 观感不变 ✓）。
+                    _atip = (max(5, min(100, int(
+                        _vis_cfg.get("player_arrow_tip_pct", 25) or 25))) / 100.0)
+                    if not bool(_vis_cfg.get("player_arrow_on", True)):
+                        _al = 0                      # 开关关掉 ⇒ 不画 ✓
                     _pb_arrow = _last_player[0]
                     if _al > 0 and _pb_arrow is not None and len(_pb_arrow) >= 6:
                         try:
                             from perception.world_state import hex_to_bgr
-                            # ⚠ 两根箭头**同一个颜色**（用户 2026-09-28："x 箭头和 y 箭头应该
-                            #   是一个颜色"✓）；粗细也是同一个值 ✓（可配 ✓）。
-                            _acol = hex_to_bgr(str(getattr(
-                                decision_settings, "player_arrow_color", "")))
+                            # 两根箭头**同一个颜色**（用户 2026-09-28："x 箭头和 y 箭头应该是
+                            # 一个颜色"✓）；粗细也是同一个值 ✓（可配 ✓）。
+                            _acol = hex_to_bgr(str(
+                                _vis_cfg.get("player_arrow_color", "")))
                             _ox = int(_pb_arrow[0])
                             _oy = int(float(_pb_arrow[2]) + _ploc_fo)
                             _h, _w = vis.shape[:2]
@@ -2195,9 +2320,9 @@ class LiveThread(QThread):
                                 _ax = max(0, min(_ox + _al, _w - 1))
                                 _ay = max(0, _oy - _al)
                                 cv2.arrowedLine(vis, (_ox, _oy), (_ax, _oy),
-                                                _acol, _aw, tipLength=0.25)
+                                                _acol, _aw, tipLength=_atip)
                                 cv2.arrowedLine(vis, (_ox, _oy), (_ox, _ay),
-                                                _acol, _aw, tipLength=0.25)
+                                                _acol, _aw, tipLength=_atip)
                         except Exception:
                             pass
 
@@ -2245,7 +2370,7 @@ class LiveThread(QThread):
                                 tx2 = int(m.x + m.w / 2)
                                 ty2 = int(m.y + m.h / 2)
                                 cv2.rectangle(vis, (tx1, ty1), (tx2, ty2),
-                                              _lock_color, 3)
+                                              _lock_color, _lock_width)
                                 # ⛔ 锁定框**只画框、不写地点**（用户 2026-09-27 明确：
                                 #   "**以前的锁定框表地点就不要了**" ✗）。
                                 #   ⚠ 以前这里读 `agent.current_target_sets()`（挑目标时顺手缓存

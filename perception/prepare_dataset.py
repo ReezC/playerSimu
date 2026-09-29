@@ -61,10 +61,12 @@ def _merge_label_lines(stem, label_dirs, drop_classes=()):
     drop_classes：要丢弃的类（默认丢弃 player，玩家走模板匹配不进训练）。
     """
     per_dir = []  # [(dir, lines)]，保持 label_dirs 传入的优先级顺序
+    _found = False                          # ⭐ 有没有**找到过**标注文件（内容可以是空的 ✓）
     for d in label_dirs:
         cand = Path(d) / (stem + ".txt")
         if not cand.exists():
             continue
+        _found = True
         try:
             lines = [ln for ln in cand.read_text(encoding="utf-8").splitlines()
                      if ln.strip()]
@@ -74,7 +76,16 @@ def _merge_label_lines(stem, label_dirs, drop_classes=()):
             per_dir.append((d, lines))
 
     if not per_dir:
-        return None
+        # ⭐⭐ **区分两件事**（用户 2026-09-28 ✓ 原话："frame_00381 画面里没有东西，他对训练
+        #   有益无害就加"）：
+        #   · **一个文件都没找到** ⇒ `None` = "这帧**没标注过**" ⇒ `_collect_pairs` 记
+        #     `no_label`、跳过 ✓；
+        #   · **找到了文件、但（过滤后）是空的** ⇒ `[]` = "**标过，确认没东西**" ⇒
+        #     这是**负样本** ✓ —— 配 `min_boxes=0` 就该收进训练 ✓。
+        # ⚠ 原来两种都返回 `None` ✗ ⇒ 本文件第 188 行那句"**0 = 保留空帧（当负样本）**"
+        #   其实**从来没生效过** ✗（空标注文件也永远被当成"没标注"丢掉 ✓）—— 这是**真 bug** ✓。
+        # ⚠ 全仓只有 `_collect_pairs` 一个调用点（`:113` ✓）⇒ 改这个语义是安全的 ✓。
+        return [] if _found else None
 
     all_cls = set()
     for _d, lines in per_dir:

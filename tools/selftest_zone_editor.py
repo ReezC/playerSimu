@@ -21,7 +21,18 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core import mapdata, zones                              # noqa: E402
+from gui import theme as _theme                              # noqa: E402
 from gui import zone_editor as ze                            # noqa: E402
+
+# --------------------------------------------------------------- 自检不许改用户文件
+# ⛔ `config/ui.yaml` 是**用户的**文件（窗口几何 / 字号 / 颜色）⇒ 自检**绝不许**写它 ✗
+#    （全仓库规矩 ✓，见 `selftest_main_window._fake_store` 的说明）。
+#    本套件会建/关编辑器弹窗（它们接了 `theme.bind_window_state` / `bind_view_zoom`
+#    ⇒ 一 show/hide 就把几何写进用户的文件 ✗ —— 2026-09-29 逐个套件量出来本套件写
+#    `windows.add_reach` / `windows.zone_editor` / `views.zone_editor_view`）
+#    ⇒ 把 theme 的**落点**指到临时文件，一个字节都不碰用户的 ✓
+#    （个别用例另有 `patch.object(theme, "save_window", …)`，那是更细的一道，不冲突 ✓）。
+_theme.CFG = Path(tempfile.mkdtemp(prefix="psimu_ui_")) / "ui.yaml"
 
 ROOT = Path(__file__).resolve().parent.parent
 MAP_ID = "105090600"

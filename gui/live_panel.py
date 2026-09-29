@@ -1028,28 +1028,50 @@ class LivePanel(QWidget):
             return
         lines = list(note) if isinstance(note, (list, tuple)) else [note]
         p.setOpacity(1.0)
+        #: 基准字号（原来的那个，**没点名要变大的行**都用它 ✓）。
+        _BASE_PT = 9
+        #: ⭐ **「当前任务」+ 它下面那行说明的字号**（用户 2026-09-28 要求 ✓ 原话：
+        #:   "当前任务以及下一行缩进的说明字体稍微大点"）—— 原 9 ⇒ 抬到 11（"稍微"✓，
+        #:   再大就顶到画面了 ✗）。
+        _TASK_PT = 11
         f = QFont()
-        f.setPointSize(9)
+        f.setPointSize(_BASE_PT)
         f.setBold(True)
+        # ⭐ **逐行字号**（用户 2026-09-28 ✓）：行元组从 3 项变 **4 项** ——
+        #   `(文本, 颜色, 是否铺底, 字号pt)` ✓；老的三项 / 纯 `str` 照旧 ✓（没给字号 ⇒
+        #   用基准 9 ✓ **向后兼容**，别的调用点一个字都不用改 ✓）。
+        #   · 只让**任务那两行**变大：世界坐标那行是**读数**（黑底白字、用来排查），
+        #     跟着变大反而是噪音 ✗（用户只点名了任务那两行 ✓）。
+        #   · 行高 `lh` 按**大字**算 ⇒ 所有行的格子一样高、各自垂直居中 ✓
+        #     上下不会挤在一起 ✓（不这么算的话，大字那行会压住下面那行 ✗）。
+        fbig = QFont(f)
+        fbig.setPointSize(_TASK_PT)
+        p.setFont(fbig)
+        lh = p.fontMetrics().height() + 2
         p.setFont(f)
         fm = p.fontMetrics()
+        _cur_pt = _BASE_PT
         x = max(0, int(dst.left()))
         y = int(dst.bottom()) + 4
         # 兜一道：每行都**不换行**，太长会横穿整个画面还看不清。调用方本来就该只给
         # 短句（见 route_panel._tick_world 的 _say），但这里也不能靠"上游会给短的"活着。
         max_w = max(60, p.device().width() - x - 2)
-        lh = fm.height() + 2
         if y + lh * len(lines) > p.device().height():
             y = max(0, int(dst.top()) - lh * len(lines) - 4)   # 下方放不下 → 翻到上面
         for i, row in enumerate(lines):
             if isinstance(row, str):
-                text, color, bg = row, None, True
+                text, color, bg, pt = row, None, True, 0
             else:
                 text = str(row[0])
                 color = row[1] if len(row) > 1 else None
                 bg = bool(row[2]) if len(row) > 2 else True
+                pt = int(row[3]) if len(row) > 3 else 0
             if not text:
                 continue
+            if (pt or _BASE_PT) != _cur_pt:         # ← 这行换字号了 ⇒ 换字体 + 重量宽度 ✓
+                p.setFont(fbig if pt else f)
+                fm = p.fontMetrics()
+                _cur_pt = pt or _BASE_PT
             if fm.horizontalAdvance(text) + 8 > max_w:
                 text = fm.elidedText(text, Qt.ElideRight, max(20, max_w - 8))
             box = QRect(x, y + i * lh, fm.horizontalAdvance(text) + 8, lh)

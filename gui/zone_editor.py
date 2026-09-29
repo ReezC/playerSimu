@@ -698,6 +698,8 @@ class AddReachDialog(QDialog):
         self.btn_ok = box.button(QDialogButtonBox.Ok)
         self.btn_ok.setText("保存" if self._init else "增加")
         box.button(QDialogButtonBox.Cancel).setText("取消")
+        theme.unify_ok_cancel(box.button(QDialogButtonBox.Ok),
+                              box.button(QDialogButtonBox.Cancel))
         box.accepted.connect(self._accept)
         box.rejected.connect(self.reject)
         root.addWidget(box)

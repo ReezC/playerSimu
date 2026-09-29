@@ -1011,9 +1011,19 @@ class ClimbJob(_PausableJob):
             # ⚠ **一轮只斜跳一次**（`_diag_done` ✓）：跳完继续朝绳走 ⇒ 近了自然交回老逻辑；
             #   每拍都按跳就成了"一路乱跳" ✗（`retry()` / 被打断重走时会重新武装 ✓）。
             # ⚠ `jump_start_px` = 0（默认）⇒ 整条**关掉** ⇒ 与加这个功能之前**完全一致** ✓。
+            # ⛔⛔ **2026-09-28 去掉 `and not self._diag_done`**（用户原话："我从未提过
+            #   「一轮只斜跳一次」这个限制，**只要满足条件就可以无限斜跳**"✗）。
+            #   ⚠ 那条限制的**后果**（用户当场报的 bug ✓）：本轮斜跳过一次之后 `_diag_done`
+            #     为 True ⇒ 这一档被挡住 ⇒ 流程落到下面"先朝绳点按一次"那支 ⇒ 画面上显示成
+            #     "**在对齐 x 范围外触发了对齐**"✗（本该斜跳 ✓）。
+            #   ⚠ **不会因此每拍都跳**：斜跳本身是"第 1 拍只发方向、第 2 拍才按跳"✓，按下
+            #     那一拍就进 `_diag_flying`（斜跳飞行中）⇒ **由它防重入** ✓；落回 / 吸上才
+            #     结束 ⇒ 之后只要**再次满足** `near_px < |dx| ≤ jump_start_px` 就**再斜跳一次** ✓
+            #     （这正是用户要的"无限斜跳"✓）。
+            #   ⚠ `_diag_done` 的**写点暂时留着**（`retry` / 复位那几处）—— 它**已不再被读**，
+            #     不影响任何行为 ✗；清它面比较大（7 处），下次顺手清 ✓。
             if (self.jump_start_px and abs(dx) > self.near_px
-                    and abs(dx) <= self.jump_start_px
-                    and not self._diag_done):
+                    and abs(dx) <= self.jump_start_px):
                 # ⭐ **第 1 拍：只发"朝绳走"**（用户 2026-09-28 要求："斜跳也**先发方向键、
                 #   下一拍再按跳**" ✓）—— 同一次 tick 里把"方向"和"跳"一起发，游戏里未必算
                 #   "按住方向再跳"（`KeyState` 一次下发多个键**不保证顺序** ✗），与
@@ -1687,6 +1697,11 @@ class DropJob(_PausableJob):
         #: ⚠ 2026-09-27 之前 DropJob **没继承** `_PausableJob`（所以它从不跳过打架时长 ✗，
         #:   还吃不到 `_result` 那套统一回值 ✗ —— 本轮补齐 ✓）。`_y0/_y_base` 是 **y 值**不是
         #:   时刻 ⇒ 不在里面 ✓。
+        #: ⭐ **补按「按住 ↓」发了几次**（用户 2026-09-28 报 bug 之后加的**打点** ✓）——
+        #:   现场形状是"**没有补按「按下 ↓」、只补按了跳，然后超时**"✗，而"补按 ↓"这件事
+        #:   原来**在日志里看不出来**（`act keys=down` 只报键集、不报"发了几次 PRESS" ✗）
+        #:   ⇒ 加这个计数，跟 `drop_taps` 并排看：**一个涨、一个不涨** ⇒ 一眼定位 ✓。
+        self._reassert_n = 0
         self._ANCHORS = ("_in_tol_since", "_armed_at", "_attempt_at", "_jump_at",
                          "_landing_at", "_next_round_at", "_reassert_at",
                          "_jump_reassert_at", "_detach_tap_at")
@@ -1870,14 +1885,13 @@ class DropJob(_PausableJob):
             #   一轮窗口 = 「**卡住判定时长**」(`stall_s` ✓ 用户指定用它连按)：窗口内一直连按；
             #   到点 Y 还没动 ⇒ **松开 ↓ 一拍**（起身）⇒ 隔「移动操作尝试间隔」(`retry_ms`)
             #   再按住 ↓ 连按（下一轮 ✓；`0` = **不重试** ⇒ 一直按住连按，交给「寻路超时」✓）。
-            if self._attempt_at is None:                  # 新一轮开始（要等过「尝试间隔」✓）
-                self._falling = False                     # 新一轮 ⇒ "已经在掉"清掉 ✓
+            if self._attempt_at is None:                  # 刚进 DROP（第一拍 ✓）
+                self._falling = False                     # "已经在掉"从零开始 ✓
                 self._jump_reassert_at = None             # （下行补按跳那笔账也重新记 ✓）
-                if (self._next_round_at is not None
-                        and float(now) < self._next_round_at):
-                    self.note = ("松着 ↓ 等「移动操作尝试间隔」到点（%.0f ms）"
-                                 "再按住 ↓ 连按跳" % self.retry_ms)
-                    return self._out(0, False)            # ← 这几拍**一个键都不按**（真站直 ✓）
+                # ⛔ **2026-09-28 删掉**：这里原来有"松着 ↓ 等「移动操作尝试间隔」到点再按住"
+                #    那几拍（`_next_round_at` ✓）—— 用户口径是"**进了 DROP 就一路按住 ↓，
+                #    只有判定 drop 上绳梯了才松开 ↓，其他只有补按**"✓ ⇒ **不许有空等的几拍** ✗
+                #    （那几拍人是站直的 ⇒ 又要重新趴 ⇒ 永远趴不下去 ✓）。
                 self._next_round_at = None
                 self._attempt_at = now
                 self._y_base = None                       # 基准 = "跳之前"的 y（下面那一小段拿 ✓）
@@ -1921,24 +1935,22 @@ class DropJob(_PausableJob):
                 jp = self._falling_jump(now)
                 return self._out(0, jp, hold_dir=True,
                                  reassert=self._hold_reassert(now))
-            # ③' **一轮窗口（「卡住判定时长」）到点、Y 还没动 ⇒ 松开 ↓ 起身**，准备下一轮 ✓
-            #   ⚠ **先判窗口、再判连按**：不然"窗口到点"那一拍会被"又该按一下了"抢走 ⇒
-            #   一轮里会**多按一下**才松手（多按的那一下可能正好把人按起来 ✗，而且不好测 ✓）。
-            if (float(now) - self._attempt_at) >= self.stall_s:
-                if self.retry_ms <= 0:
-                    # 不重试（老行为）：一直按住 ↓ 连按，交给「寻路超时时间」兜底 ✓
-                    self.note = ("按住 ↓ + 连按跳：一轮 %.1f s 没把 Y 按下去，"
-                                 "但「移动操作尝试间隔」= 0 ⇒ 不重试，继续连按"
-                                 % self.stall_s)
-                    return self._out(0, False, hold_dir=True,
-                                     reassert=self._hold_reassert(now))
-                self._attempt_at = None
-                self._tap_n += 1
-                self._next_round_at = float(now) + self.retry_ms / 1000.0
-                self.note = ("%.1f s 内连按跳都没把 Y 按下去 ⇒ 松开 ↓ 起身，"
-                             "隔 %.0f ms 再按住 ↓ 连按（第 %d 轮）"
-                             % (self.stall_s, self.retry_ms, self._tap_n))
-                return self._out(0, False)                # ← 这一拍真的把 ↓ 松开 ✓
+            # ⛔⛔ **2026-09-28 整段删掉**：这里原来有"**一轮窗口（「卡住判定时长」`stall_s`）
+            #   到点、Y 还没动 ⇒ 松开 ↓ 起身** ⇒ 隔「移动操作尝试间隔」再来一轮"✗。
+            #   用户口径（2026-09-28 ✓ 原话）："**到点 Y 还没动，也不应该松开 ↓ 起身，只要进了
+            #   DROP 就一路按住 ↓**"／"**流程中，只有判定 drop 上绳梯了才松开 ↓，其他只有补按**"✓
+            #   ⇒ 那段"松手起身"**正是永远趴不下去的根因** ✗：每一轮只活 ~0.35 s 就站直一次
+            #     （日志里 `drop_round` 3→9 ✓），游戏里**根本来不及趴** ⇒ 每一下跳都是**站着
+            #     原地跳** ✓ —— 现场（用户 2026-09-28 报"又卡了、在原地跳"）就是这个 ✓。
+            #   ⇒ 现在这一相**只剩两件事**：
+            #     ① `_falling`（真开始落了 ⇒ 继续补按跳 ✓，见上面那段）；
+            #     ② ③''「连按跳」（按 `TAP_ON_S` / `TAP_PERIOD_S` 的节奏 ✓）。
+            #   ⚠ **↓ 松手的时机只剩两处**（与用户流程图**一致** ✓）：
+            #     · 落地 `DONE` / `FAILED`（`_arrive_step` / `_fail` ✓ 该松了 ✓）；
+            #     · `_detach_step`（**判定上绳梯** ⇒ 脱离，那几拍传 `vert=0` **主动松 ↓** ✓）——
+            #       这正是用户说的"**只有判定 drop 上绳梯了才松开 ↓**"✓。
+            #   ⚠ `stall_s` / `_tap_n` 从这一刻起**不再参与决策**（留着字段只为日志/用例 ✗
+            #     不删定义：设置里那两项还在，别让别的调用方当场炸 ✗）。
             # ③'' **连按**：到「点按周期」就**再按一下**（`_jump_at` = 这一下的起点 ✓）——
             #     用户口径的重点：下跳要"**趴着时按跳**"才触发，而趴下去要一点点时间 ⇒
             #     那一下要是按早了就白按 ⇒ **一遍遍连按**，总有一下落在趴着的时候 ✓。
@@ -2007,9 +2019,22 @@ class DropJob(_PausableJob):
             return False
         if self._reassert_at is None:
             self._reassert_at = float(now)
-            return False
+            # ⭐⭐ **第一拍就补发一次 ↓**（用户 2026-09-28 报的 bug ✓ 原话："刚才出现 drop
+            #   没有补按『按下 ↓』只补按了跳的情况，然后超时了"）。
+            #   ⚠ 原来这一支**只记时、返回 `False`** ⇒ 要**等满** `retry_ms`（「移动操作尝试
+            #     间隔」，默认 **3000ms**）才第一次补 ✗ —— 而一个 drop 任务常常**活不到 3 秒**
+            #     （一轮 `stall_s` 到了没动静就松 ↓ / 整个任务被重下 ⇒ `_reassert_at` 跟着新
+            #     任务从 `None` 重算 ✗）⇒ **那一次补按永远等不到** ✗✗。
+            #     于是现场就正好是用户看到的形状：**跳那边是"第一下就按"**（连按跳、
+            #     `_falling_jump` 都不等间隔 ✓）⇒ 只有跳看得出在补、↓ 从头到尾没补过一次 ✗。
+            #   ⚠ 重复 PRESS 是**幂等**的（固件侧 `addHeld` 去重、本地后端幂等 ✓，见上面那段
+            #     注释 ✓）⇒ 第一拍多发一次**无害**，而且正好治"首按被对面丢了"那个病根 ✓
+            #     —— 那才是本函数存在的理由 ✓。
+            self._reassert_n += 1
+            return True
         if (float(now) - self._reassert_at) * 1000.0 >= self.retry_ms:
             self._reassert_at = float(now)
+            self._reassert_n += 1              # ⭐ 打点：又补了一次（见 `_reassert_n` 的说明 ✓）
             return True
         return False
 
@@ -2083,6 +2108,7 @@ class DropJob(_PausableJob):
         self._tap_n = 1
         self._next_round_at = None      # "松着 ↓ 等间隔"也收干净（新的一轮从对齐开始 ✓）
         self._reassert_at = None        # "按住 ↓ 的重发窗"同理（下次按住时重新计 ✓）
+        self._reassert_n = 0            # ⭐ 打点也重新计（新任务从头数 ✓，见 `_reassert_n` 说明）
         self._falling = False           # "已经在掉"同样收干净 ✓
         self._detach_tap_at = None      # "被绳吸住、正在脱离"同理收干净 ✓
         # ⚠ 不写分母（同 `ClimbJob.retry`：没有"最多试几次"了 ✓）
@@ -2145,9 +2171,26 @@ class DropJob(_PausableJob):
     def _detach_dir(self, px):
         """脱离时按住哪个**水平方向**（±1）。
 
-        用户口径是"**任意方向按住**"（都行 ✓）；这里取一个**确定性**的：**背离下跳点中心**
-        —— 顺手离它远一点，别刚松手又被吸回去 ✓。还没挑定下跳点（或 x 正好在中心）⇒ 向右 ✓。
+        ⭐ **用户 2026-09-28 按流程图定的口径**（原话："跳下绳子：按**任意方向**+跳（**若有锁定
+        目标则是锁定目标方向**）"）：
+          · **有锁定目标** ⇒ **朝它**（读注入的 `_target_dir_fn()` ✓：`+1` 右 / `-1` 左 / `0`
+            没有目标或同列 ⇒ 落到下面那条 ✓）；
+          · **其余情况** ⇒ **任意方向**（取一个**确定性**的：**背离下跳点中心** ✓ —— 顺手离它
+            远一点，别刚松手又被吸回去 ✓）；还没挑定下跳点（或 x 正好在中心）⇒ 向右 ✓。
+        ⚠ 注入位用 `getattr` 兜底：**没有注入 / 注入的回调抛异常** ⇒ 都当成"没有目标" ✓
+          （**绝不许**因为拿不到目标就报错或停住 ✗ —— 脱离那几拍按不出方向就等于卡死在绳上）。
         """
+        _td = 0
+        _fn = getattr(self, "_target_dir_fn", None)
+        if _fn is not None:
+            try:
+                _td = int(_fn() or 0)
+            except Exception:                 # noqa: BLE001 —— 回调坏了 ⇒ 退回"任意方向" ✓
+                _td = 0
+        if _td > 0:
+            return 1                          # ⭐ 锁定目标在右边 ⇒ 朝它 ✓
+        if _td < 0:
+            return -1                         # ⭐ 锁定目标在左边 ⇒ 朝它 ✓
         if self._pick is None:
             return 1
         return -1 if float(px) > float(self._pick[0]) else 1
@@ -2203,6 +2246,17 @@ class DropJob(_PausableJob):
         （那几拍一个键都不按 ✓，见 `update` 的 DROP 相 ✓）。
         """
         return int(self._tap_n)
+
+    def reassert_count(self):
+        """⭐ **补按「按住 ↓」发了几次**（打点用 ✓，照 `tap_count` 的样式 ✓ —— 
+        ⚠ 它俩都是**普通方法**、不是 `@property` ✓ 调用方要 `()` ✗ 写成属性会
+        `TypeError: 'int' object is not callable` ✓ 2026-09-28 刚踩过 ✓）。
+
+        用途：`behavior.log` 里跟 `drop_taps` **并排**看 —— 跳在涨、它不涨 ⇒
+        "只有跳在补、↓ 没补"那种形状**一眼定位** ✓（用户 2026-09-28 报的那个 bug
+        原来在日志里**看不出来**，因为 `act keys=down` 只报键集、不报"发了几次 PRESS" ✗）。
+        """
+        return int(self._reassert_n)
 
     def _out(self, move, jump, hold_dir=False, reassert=False, vert=None):
         """`vert`：这一拍要不要发 ↓（`None` = 老规则：按跳或 `hold_dir` 时发 `self.dir`=↓ ✓）。

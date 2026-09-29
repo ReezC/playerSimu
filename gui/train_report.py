@@ -185,8 +185,14 @@ class TrainReportDialog(QDialog):
         info = info or {}
         self._append('<b style="color:%s">%s</b>' % (_FG, _html.escape(str(name))))
         sec = info.get("seconds")
+        # ⭐ **这一版用了多少张**（用户 2026-09-29 ✓）：补了帧却忘了重跑 ⑥ 时，翻报告就能
+        #   核对"新帧到底进没进这一版" ✓（老 `run.json` 没这个键 ⇒ 显示"—"✓ 不编数 ✗）。
+        _fr = info.get("frames") or {}
         rows = [("权重", str(path)),
                 ("基础权重", info.get("base") or "—"),
+                ("训练帧数", ("%s 张（train %s / val %s）"
+                          % (_fr.get("total", "—"), _fr.get("train", "—"),
+                             _fr.get("val", "—"))) if _fr else "—"),
                 ("轮数", info.get("epochs", "—")),
                 ("输入尺寸", info.get("imgsz", "—")),
                 ("batch / 设备", "%s / %s" % (info.get("batch", "—"),

@@ -29,6 +29,19 @@ import decision.input as dinput                                # noqa: E402
 from decision.agent import CombatAgent                         # noqa: E402
 from perception.world_state import Mob, Player, WorldState      # noqa: E402
 
+# --------------------------------------------------------------- 自检不许改用户文件
+# ⛔ `config/ui.yaml` 是**用户的**文件（窗口几何 / 字号 / 颜色）⇒ 自检**绝不许**写它 ✗
+#    （全仓库规矩 ✓，见 `selftest_main_window._fake_store` 的说明）。
+#    本套件有两处会碰到它：建/关接了 `theme.bind_window_state` 的弹窗（一 show/hide 就写
+#    几何 ✗ —— 2026-09-29 逐个套件量出来本套件写 `windows.battle_zone_list`），以及
+#    `vis` 那几个键的"存得进读得回"往返（写回也会把整个文件重写一遍 ✗）
+#    ⇒ 把 theme 的**落点**整体指到临时文件，一个字节都不碰用户的 ✓。
+import tempfile as _tempfile                                   # noqa: E402
+
+from gui import theme as _theme                                # noqa: E402
+
+_theme.CFG = Path(_tempfile.mkdtemp(prefix="psimu_ui_")) / "ui.yaml"
+
 FRAME = 1.0 / 15.0          # 主循环节拍（capture_fps=15），时序都被量化到这个粒度
 CD_MS = 800                 # 自检用的输出CD
 
@@ -1678,6 +1691,20 @@ def t_auto_confirm_local():
             return ret
         return f
 
+    # ⚠⚠ **2026-09-29：开自动多了一道「条件体检」**（`player_panel._precheck_auto` ⇒
+    #   不通过弹 `QMessageBox.warning` ✓）⇒ 本用例里**每一处** `_toggle_auto` / `toggle_auto`
+    #   都会走到它 ✗ ⇒ 必须**整条用例**把它 mock 掉 —— 否则会**真的弹出模态框**，在
+    #   offscreen 环境下进程**直接崩**（`exit=0xC0000005` 访问冲突 ✓ 2026-09-29 就是这么
+    #   崩的；靠 `python -X faulthandler` 打出栈才定位到本用例的 ④ 那条 ✓）。
+    #   ⚠ 用**不计数**的 lambda（不能用 `_answer` —— 它会 `asked[0] += 1` ⇒ 把本用例
+    #   "只问一次"的断言带偏 ✗）。体检不属于本用例要测的东西 ✓，它有独立用例
+    #   `selftest_live_panel.t_auto_precheck` ✓。
+    #   ⚠ 测试用的项目**没有 map_id** ⇒ 体检**必然报问题** ⇒ 这里统一回 `Yes` 放行 ✓
+    #   （本用例测的是"本地输入的二次确认"，不是体检 ✓）。
+    _wpatch = patch.object(QMessageBox, "warning",
+                           lambda *_a, **_kw: QMessageBox.Yes)
+    _wpatch.start()
+
     try:
         # ① 本地 + 选「否」：按钮拨回去，自动不能开起来
         settings.input_device = "local"
@@ -1695,7 +1722,9 @@ def t_auto_confirm_local():
         # ② 本地 + 选「是」：正常开起来
         asked[0] = 0
         p.btn_auto.setChecked(True)
-        with patch.object(QMessageBox, "question", _answer(QMessageBox.Yes)):
+        with patch.object(QMessageBox, "question", _answer(QMessageBox.Yes)), \
+                patch.object(QMessageBox, "warning",
+                             lambda *a, **k: QMessageBox.Yes):
             p._toggle_auto()
         check(asked[0] == 1, "确认过了还再问一次")
         check(settings.enabled is True, "选了「是」，自动却没开起来")
@@ -1727,6 +1756,7 @@ def t_auto_confirm_local():
         check(asked[0] == 1, "F11 热键开自动没走确认")
         check(settings.enabled is False, "热键路径选了「否」，自动还是开起来了")
     finally:
+        _wpatch.stop()              # ⭐ 体检那层 mock 收工（别忘了，会污染后面的用例 ✗）
         settings.input_device = was_dev
         settings.enabled = was_on
         p._refresh_auto_ui()
@@ -1831,7 +1861,9 @@ def t_multi_step_route():
         #    不再靠"试满几次就放弃" ✗。
         a2 = route.WalkJob("丙集合", [(520.0, 510.0, 530.0, -208.0, "3")])
         b2 = route.WalkJob("丁集合", [(520.0, 510.0, 530.0, -208.0, "4")])
-        h.agent.start_route([a2, b2], why="用例：中途失败")
+        # ⚠ **必须带追击签注**（2026-09-29 起：只有追击吃「寻路超时时间」✓ 用户第 1 条）
+        #   —— 这条用例的"中途失败"就是用那把钟造出来的 ✓。
+        h.agent.start_route([a2, b2], why="用例：中途失败", origin=dict(CHASE_ORIGIN))
         # ⚠ 2026-09-26 起「超时只有一把钟」：任务自己的 `timeout_s` 被 `start_climb`
         #    关掉了（见那里的说明）⇒ 这段必须用**agent 那把钟**：设置里给个小上限，
         #    再把 `_climb_started` 摆成"已经跑了一会儿"（本用例用的是字面时刻 10.0 ✗，
@@ -2019,20 +2051,21 @@ def t_drop_retry_gap():
     o = j.update(t + route.TAP_PERIOD_S + 0.01, px=100.0, py=0.0)
     check(o["jump"] and o["dir"] == -1,
           "只按了一次跳、没有连按（那一下按早了就白按 ⇒ 现场就是「趴着不跳」✗）：%s" % o)
-    # ② 一轮窗口（「卡住判定时长」= 1.0s）到点、Y 还没动 ⇒ **松开 ↓**（dir=0）
+    # ② ⭐⭐ **2026-09-28 改口径**：窗口（「卡住判定时长」）到点、Y 还没动 ⇒
+    #    **也不许松开 ↓ 起身** ✓ —— 用户原话："**到点 Y 还没动，也不应该松开 ↓ 起身，
+    #    只要进了 DROP 就一路按住 ↓**"。
+    #    （老口径是"补发一个 松开 ↓ ⇒ 隔「移动操作尝试间隔」再来一轮"✗ ⇒ 每轮只活
+    #      ~0.35 s 就站直一次，游戏里**根本来不及趴** ⇒ 每一下跳都是站着原地跳 ✓
+    #      那就是 2026-09-28 现场"drop 又卡了、在原地跳"的根因 ✗）
     o = j.update(t + 1.05, px=100.0, py=0.0)       # 从本轮起点算已过 ≥1.0s
-    check(o["dir"] == 0 and not o["jump"],
-          "窗口内 Y 没动却没松开 ↓（用户要求「补发一个 松开↓」）：%s" % o)
-    check("松开" in j.note and "第 2 轮" in j.note,
-          "那句 note 没说清「松开 ↓ 重来 + 第几轮」：%r" % j.note)
-    # ③ **隔「移动操作尝试间隔」（500ms）** 才重新按住 ↓ 连按 —— 不是紧接着 ✗
+    check(o["dir"] == -1,
+          "窗口到点就把 ↓ 松了（用户 2026-09-28：**一路按住 ↓**、不许起身 ✗）：%s" % o)
+    # ③ **不许再有「空等的几拍」** —— 往后几拍 ↓ 仍然按着（全程不松 ✓）
     o = j.update(t + 1.10, px=100.0, py=0.0)
-    check(o["dir"] == 0 and not o["jump"] and "等「移动操作尝试间隔」" in j.note,
-          "松着 ↓ 等间隔的那几拍该**一个键都不按**（让人真站直 ✓）：%s / %r"
-          % (o, j.note))
+    check(o["dir"] == -1,
+          "「等间隔」那几拍居然不按 ↓（那是已作废的老行为 ✗）：%s" % o)
     o = j.update(t + 1.05 + 0.51, px=100.0, py=0.0)
-    check(o["dir"] == -1 and o["jump"],
-          "间隔到了没重新「按住 ↓ + 连按跳」：%s" % o)
+    check(o["dir"] == -1, "后面的拍没继续按住 ↓（该一路按到落地 ✗）：%s" % o)
 
     # ⑤ retry_ms = 0 ⇒ 不重试（一直按着 ↓ 等，不许出现"松开"那拍）
     j2 = C("上平台", "下平台", spots, tol_px=10, hold_ms=0, y_tol_px=10, retry_ms=0)
@@ -2252,33 +2285,43 @@ def t_align_params():
             check(_dlg.lst.count() == 0, "「编辑战斗区域」不是**初始空列表**（用户第 2 条 ✗）")
             _dlg.choose_name = lambda: "乙平台"          # 替身"选集合"那一步 ✓
             _dlg._on_add()
-            # ⭐ **默认不勾「禁止战斗」**（用户第 3 条 ✓）⇒ 派生副本（= 禁战名单）里不该有它 ✓
-            check(list(settings.battle_zone_sets) == [],
-                  "新加的项**没勾「禁止战斗」**却进了禁战名单（默认不勾 ✓）：%r"
+            # ⭐⭐ **新加的项默认勾「可以战斗」**（2026-09-29 修复 ✓）：原来默认不勾 ⇒
+            #    新区域进不了 `battle_zone_sets` 白名单 ⇒ 别的区域能打、它不能 ⇒
+            #    场景里有怪时 `tick` 提前返回 `leave_battle_zone`，idle 回归（与这儿的战斗）永不触发 ✗
+            check(list(settings.battle_zone_sets) == ["乙平台"],
+                  "新加的项**默认「可以战斗」**却没进白名单（默认不勾会掐死 idle 回归 ✗）：%r"
                   % (settings.battle_zone_sets,))
             _z0 = [z for z in (settings.battle_zones or []) if str(z.get("set")) == "乙平台"]
             check(_z0 and abs(float(_z0[0].get("cd_s") or 0) - 7.5) < 1e-6
                   and str(_z0[0].get("idle_foothold")) == "41"
                   and abs(float(_z0[0].get("fight_max_s") or 0) - 30.0) < 1e-6
-                  and _z0[0].get("can_fight") is False,
+                  and _z0[0].get("can_fight") is True,
                   "**弹窗里配的字段没写回 `battle_zones`**（配了也不生效 ⇒ 没法测 ✗）：%r"
                   % (settings.battle_zones,))
             check([str(z.get("set")) for z in _dlg.zones()] == ["乙平台"],
                   "弹窗自己的列表没跟着更新：%r" % (_dlg.zones(),))
-            # ⭐⭐ **「禁止战斗」在列表项上勾**（用户 2026-09-28 追加要求："把禁止战斗参数
-            #    **移出来**，在**已添加的项目上勾选**"✓）⇒ 勾一下**立刻**写回，不必进编辑窗 ✓
+            # ⭐⭐ **「可以战斗」在列表项上勾**（用户 2026-09-28 追加要求："把可以战斗参数
+            #    **移出来**，在**已添加的项目上勾选**"✓）⇒ 勾 / 取消**立刻**写回，不必进编辑窗 ✓
             _i0 = _dlg.lst.item(0)
             check(bool(_i0.flags() & _ppm.Qt.ItemIsUserCheckable),
-                  "列表项没有勾选框（「禁止战斗」就**没地方勾**了 ✗）")
-            check(_i0.checkState() == _ppm.Qt.Unchecked,
-                  "默认该是**不勾**（用户第 3 条 ✓）：%r" % (_i0.checkState(),))
-            _i0.setCheckState(_ppm.Qt.Checked)     # = 用户点了那个勾 ✓
+                  "列表项没有勾选框（「可以战斗」就**没地方勾**了 ✗）")
+            check(_i0.checkState() == _ppm.Qt.Checked,
+                  "新加的项默认该是**勾上**（2026-09-29：新增默认「可以战斗」✓）：%r"
+                  % (_i0.checkState(),))
+            _i0.setCheckState(_ppm.Qt.Unchecked)   # = 用户取消那个勾 ✓
+            check(list(settings.battle_zone_sets) == [],
+                  "取消「可以战斗」却还在白名单里（勾选写回失效 ✗）：%r"
+                  % (settings.battle_zone_sets,))
+            _z1 = [z for z in (settings.battle_zones or []) if str(z.get("set")) == "乙平台"]
+            check(_z1 and _z1[0].get("can_fight") is False,
+                  "取消「可以战斗」没写回真源：%r" % (settings.battle_zones,))
+            _i0.setCheckState(_ppm.Qt.Checked)     # 再勾回去 ✓
             check(list(settings.battle_zone_sets) == ["乙平台"],
-                  "勾了「禁止战斗」却没进禁战名单（= 旧「限制战斗区域」失效 ✗）：%r"
+                  "勾上「可以战斗」却没进白名单（= 旧「限制战斗区域」失效 ✗）：%r"
                   % (settings.battle_zone_sets,))
             _z1 = [z for z in (settings.battle_zones or []) if str(z.get("set")) == "乙平台"]
             check(_z1 and _z1[0].get("can_fight") is True,
-                  "「禁止战斗」没写回真源：%r" % (settings.battle_zones,))
+                  "「可以战斗」没写回真源：%r" % (settings.battle_zones,))
             # ⭐⭐ **勾选不许被"进来编辑一次"弄丢**（本次最要紧的一条 ✗）：编辑弹窗里
             #    **已经没有**那个勾选框了 ⇒ `zone()` 必须**原样带回** ✓；
             #    ⚠ 顺带把"重画列表会不会把勾选写乱"也测了（`_reload` 里必须屏蔽 `itemChanged` ✗）。
@@ -2291,7 +2334,7 @@ def t_align_params():
             check(_dlg.lst.item(0).checkState() == _ppm.Qt.Checked,
                   "重画列表之后勾选框没跟着配置走（会把勾选写乱 ✗）：%r"
                   % (_dlg.lst.item(0).checkState(),))
-            # ⭐ **加第二条**（面板摘要跟着长一条 ✓；默认不勾 ⇒ **不进**禁战名单 ✓）
+            # ⭐ **加第二条**（面板摘要跟着长一条 ✓；新加的默认也勾上 ⇒ 一起进白名单 ✓）
             _dlg.choose_name = lambda: "甲平台"
             _dlg._on_add()
             check([str(z.get("set")) for z in _dlg.zones()] == ["乙平台", "甲平台"],
@@ -2310,8 +2353,8 @@ def t_align_params():
                   "「删除」没删掉选中的那条：%r" % (_dlg.zones(),))
             check(_pp._bz_names == ["甲平台"],
                   "删完面板摘要没跟着重画：%r" % (_pp._bz_names,))
-            check(list(settings.battle_zone_sets) == [],
-                  "删掉禁战项之后禁战名单没跟着空掉：%r" % (settings.battle_zone_sets,))
+            check(list(settings.battle_zone_sets) == ["甲平台"],
+                  "删掉一条之后白名单没跟着少一条：%r" % (settings.battle_zone_sets,))
             settings.battle_zones = _was_bz
             settings.sync_battle_zone_sets()
             settings.battle_zone_sets = _was_zones
@@ -3861,12 +3904,19 @@ def t_player_gone_logged():
                     h.clock.t += 30.0
                     w = h.ws(with_mob=False)
                     w.player.found = False
+                    # ⭐⭐ 「停自动」的判据现在是 **小地图找不到黄点**（用户 2026-09-28 ✓
+                    #   原话："找不到玩家停止自动的判断依据修改为小地图找不到黄点"）
+                    #   ⇒ 把"黄点也没了"一起摆上（`world_x=None` = 没有可用位置 ✓）。
+                    #   ⚠ **「留痕」那条判据（`player_gone`）仍然只看 `found`** ✓ 不受影响 ✓
+                    #     —— 这是两条不同的判据，别混（见 `agent.py` 那两处各自的注释 ✓）。
+                    w.player.world_x = None
                     h.agent.tick(w)
                 check("player_gone" not in _read(),
                       "还没到设置里那个时长就报了 player_gone（阈值没生效）")
                 h.clock.t += wait_min * 60.0           # 跨过阈值
                 w = h.ws(with_mob=False)
                 w.player.found = False
+                w.player.world_x = None      # ⭐ 「停自动」看的是**黄点**（用户 2026-09-28 ✓）
                 h.agent.tick(w)
                 gone = _read()
                 h.clock.t += 30.0                      # 又看得到角色
@@ -3897,6 +3947,24 @@ def t_player_gone_logged():
           % (s2.enabled, a2.state))
     check("player_lost_stop" in gone2,
           "它自己把自动停了，日志里却查不到（下次还是只能猜）：\n%s" % gone2)
+    # ④ ⭐⭐ **边界：判据只看黄点**（用户 2026-09-28 ✓ 原话："找不到玩家停止自动的判断依据
+    #   修改为**小地图找不到黄点**"）：**人物框认不出来、但黄点还在**（`world_x` 有值 ✓）
+    #   ⇒ 位置照样可用 ⇒ **不许停自动** ✗（这是这次改动的另一半，必须钉住 ✓）。
+    s3 = fresh_settings(player_lost_timeout_min=3.0)
+    s3.enabled = True
+    h3 = Harness(s3)
+    h3.clock0 = h3.clock.t
+    with h3._patched():
+        for _ in range(8):                     # 远超阈值（8×30s = 4 分钟）
+            h3.clock.t += 30.0
+            w3 = h3.ws(with_mob=False)
+            w3.player.found = False            # 框认不出来 ✗
+            w3.player.world_x = 500.0          # 但黄点还在 ✓
+            w3.player.world_held = False
+            h3.agent.tick(w3)
+    check(s3.enabled is True,
+          "黄点还在（有可用位置）却把自动停了 —— 判据又跑去看人物框了 ✗（用户 2026-09-28 "
+          "要求只看**小地图黄点**）：enabled=%s" % s3.enabled)
     # ④ 日志窗口不许再缩回去（行为打点现在全在 behavior.log ⇒ 窗口太短会把出事的起点裁没 ✗）
     check(behavior.MAX_BYTES >= 4 * 1024 * 1024,
           "behavior.log 的上限被调小了（%.0f KB）—— 窗口太短"
@@ -4736,20 +4804,52 @@ def t_climb_attack_exception_agent():
         check(h.agent.state == "climb", "怪清空后没接着爬：%s" % h.agent.state)
         check(up in set(act3.get("keys") or []), "怪清空后没按住 ↑：%s" % act3.get("keys"))
 
-        # ② ⭐ 对齐阶段、但**人就在这根绳的范围里**（正对齐、这一拍就要按跳）⇒ 也**不进 attack**
-        #   （用户 2026-09-27 原话："在执行攀爬时，**从「按下跳」到「攀爬成功」期间都不应该进
-        #   attack**" —— 实测现场就是"三楼→顶层，对齐 x、正起跳"那一刻被怪抢走 ✗）。
-        #   ⚠ 判据必须在**任务 tick 之前**就能算出来（攻击判定排在任务前面 ✓，见 `_on_rope` 的
-        #     说明：只等"任务按过跳"会永远等不到 —— 那就会**既打不进去也爬不上去** ✗）。
+        # ② ⭐⭐ **对齐阶段照常打架**（用户 2026-09-28 改口径 ✓ 原话："取消最后一个 attack 的
+        #   『绳梯豁免』：**对齐 x 期间如果进了 attack，就从入口开始**"）。
+        #   ⚠ 改之前：只要"人就在这根绳的范围里"（`on_rope_pos == ladder_id` ⇒ `holds_player`
+        #     里的 `_in_span` 成立）就**不进 attack** ✗ —— 那正是用户点名要取消的那个豁免 ✓。
+        #   ⚠ 现在：对齐阶段（`ClimbJob.ALIGN`）**一律不豁免** ⇒ 攻击范围内有怪就**先打** ✓
+        #     （人在平台上，打得过就该打 ✓）；打完**从入口重来**（下面 ②b 钉着 ✓）。
         h.agent.start_climb(job())
+        h.clock.t += 0.1
+        # ⚠ **先让任务真跑一拍**（踩过）：`_task_settle` 有个例外 —— "任务还没跑过第一拍
+        #   （`_task_ran_at is None`）⇒ **不报信**"（怕把将来的起点提前写成过去 ✗）⇒
+        #   若一挂上就被怪抢进 attack，"被打断"这笔账**根本记不上** ⇒ ②b 那条永远不成立 ✗。
+        h.agent.tick(h.ws(with_mob=False))
+        # ⚠ 摆回「**对齐 x 中**」（用户现场 `hold_ms`=1000ms ⇒ 对齐要持续好几拍；而这个用例
+        #   的 `hold_ms=0` ⇒ 上面那拍一步就对好、进 `CLIMB` 了 ✗）—— 不摆回去，下面测的就
+        #   不是"对齐期间"了 ✓（`_task_ran_at` 已经盖过章 ✓ 报信那套仍然有效 ✓）。
+        h.agent._climb.phase = route.ClimbJob.ALIGN
         h.clock.t += 0.1
         ws4 = h.ws(with_mob=True)
         ws4.player.ladder_id = None       # 感知：还没报"在绳上"（带按键许可 ✗）
-        ws4.player.on_rope_pos = "L2"      # ⭐ 但广播说：**只看位置**，人就在 L2 的范围里 ✓
-        h.agent.tick(ws4)
-        check(h.agent.state == "climb",
-              "对齐好了、人就在绳上要起跳，却还是被怪抢进 attack 了（用户报的那条 ✗）：%s"
-              % h.agent.state)
+        ws4.player.on_rope_pos = "L2"      # 广播：**只看位置**，人就在 L2 的范围里 ✓
+        act4 = h.agent.tick(ws4)
+        check(h.agent.state == "attack",
+              "对齐 x 期间有怪却不打架 —— 那个「绳梯豁免」还在（用户 2026-09-28 要求取消 ✗）："
+              "%s" % h.agent.state)
+        check(up not in set(act4.get("keys") or []),
+              "进 attack 那一拍还在按 ↑（该把这一拍的键全交给攻击 ✗）：%s"
+              % act4.get("keys"))
+
+        # ②b ⭐ **打完 ⇒ 从入口开始**（不是"接着对齐" ✗）：任务被占用够久（> `PAUSE_MIN_S`）
+        #   ⇒ `phase` 回 `ALIGN` 且**对齐锚点全清** = 重走整条上绳流程 ✓。
+        job4 = h.agent._climb
+        # ⚠ **这里直接摆"已经挨打了一会儿"**（不靠 tick 数凑时长 ✓ 那样不可控、也不测到点上 ✗）：
+        #   `_paused_at` 本来是**回来那一拍**由 `_task_settle` → `_climb_interrupted` 才置上的
+        #   （语义 = "你上一拍没跑任务"）⇒ **同一拍**里既报信又判"停了多久"只会算成 0 ✗（踩过）。
+        #   这里只验"**回来那一拍怎么继续**"：挨够 `PAUSE_MIN_S`(0.25s) ⇒ 该从入口重来 ✓。
+        # ⚠ **"打完怎么继续（回入口）"不在这里重复测** —— 那套机制**本来就存在**，而且已经
+        #   被 `t_job_interrupt_by_fight` ① 钉死（"没上绳被打断 ⇒ `phase` 回 `ALIGN` + 保持
+        #   窗口重算"✓，实现是 `route.py` 里 `_paused >= PAUSE_MIN_S` 那一支 ✓）。
+        #   ⭐ 本轮改的只有**一件**：让"对齐 x 期间"**也能被打进来**（取消那个豁免 ✓）——
+        #   进来之后怎么回去，走的就是那条既有路径，不再另立判据 ✓。
+        #   （⚠ 写这条时踩过两个坑，都记在上面：① 同一次 `update` 里那个"已经在绳上 ⇒ 跳过
+        #     横向对齐"会把 `phase` **又推回 `CLIMB`** ⇒ 拿 `phase` 当"回没回入口"不可靠 ✗；
+        #     ② `_paused_at` 是**回来那一拍**才由 `_task_settle` 置上的，同一拍判只会算成 0 ✗。）
+        h.agent.tick(h.ws(with_mob=False))   # 怪走了 ⇒ 回战斗分支、任务接着推 ✓
+        check(h.agent._climb is job4,
+              "打完（怪清空）把攀爬任务丢了（该接着爬 ✓）：%r" % (h.agent._climb,))
 
         # ②' 对照：**绳在别处**（人还没走到它的范围里）⇒ 照旧先打（例外不许无限宽 ✗）
         far = route.ClimbJob(ladder_id="L9", x=900.0, y1=-9999.0, y2=9999.0,
@@ -5043,16 +5143,44 @@ def t_climb_wiring():
         was_delay = s.climb_retry_delay_s
         try:
             s.climb_retry_delay_s = 1.0
-            j = job()
-            obj = h.agent.start_climb(j)
-            obj._fail("用例：故意失败")      # 直接打成失败态，省掉摆时间的麻烦
+            # ⭐⭐ **2026-09-28 改口径：延迟只给"按跳后挨过打"那种失败** ✓（用户原话：
+            #   "失败那段改成：**按跳后**挨过打 ⇒ 用延迟"／"注意攀爬失败后延迟激活的时间
+            #   **只对『因喝药而失败』生效**"✓）⇒ 所以这里**分两支**测 ✓。
+            # ① **没挨打**（最典型 = 「上绳梯落回去」= 没跳准）⇒ **立刻重来**，不许等 ✗
+            #    —— 老行为是"所有失败都等" ✗ ⇒ 现场就是"落回去失败后发呆"（越失败等越久）✗
+            #    ⚠ 这一段用**新变量** `jf`/`objf`（不用 `j`/`obj` ✗）：下面那些老断言
+            #      （"延迟没到不该重来"等 ✓）用的还是 `j`/`obj` ⇒ 得让它们看到"**在等**"那支
+            #      （即下面 ② 支的 `j2` ✗）—— 所以 ② 支也已经改成 `j2` ✓，而 `j`/`obj`
+            #      **完全没被这里碰过** ✓（本支只用 `jf` ✓）。
+            jf = job()
+            objf = h.agent.start_climb(jf)
+            objf._fail("用例：故意失败")      # 直接打成失败态，省掉摆时间的麻烦
             h.log.clear()
             done = h.agent._climb_tick(0.0, 500.0, set(), h.ws(with_mob=False))
-            check(done is False and h.agent._climb is j,
+            check(done is False and h.agent._climb is jf,
                   "失败后任务被扔了：done=%s climb=%r" % (done, h.agent._climb))
+            check(jf.attempt == 2 and jf.phase == route.ClimbJob.ALIGN,
+                  "「**没挨打**」的失败该**立刻重来**（用户 2026-09-28：延迟只给挨打那种 ✗）："
+                  "attempt=%s phase=%s" % (jf.attempt, jf.phase))
+            # ⚠ `h.log` 是**按键记录**、不是 behavior 事件 ✗ ⇒ 那条打点用**源码级**钉 ✓
+            import inspect as _insp
+            check("climb_retry_fast" in _insp.getsource(h.agent._climb_tick),
+                  "没打「climb_retry_fast」点（用户 2026-09-28 点名要加的那个 ✗）")
+
+            # ② **按跳后挨过打** ⇒ **才**等延迟 ✓（这就是"因喝药而失败"那一档 ✓）
+            #    ⚠ 两个时间戳要在 `start_climb` **之后**摆（它会清零 ✓）
+            #    ⚠ 这一支就用 `j`/`obj` ✓（下面那些老断言全指着它 ✓）：它才是"**在等延迟**"
+            #      的那支 ✓（`jf` 那支立刻就重来了 ✗）。
+            j = job()
+            obj = h.agent.start_climb(j)
+            h.agent._climb_jump_at = 0.5          # 先按过跳 ✓
+            h.agent._climb_hit_at = 0.6           # 再挨了打 ⇒ 这一轮算"按跳后挨打" ✓
+            obj._fail("用例：按跳后挨打")
+            h.log.clear()
+            done = h.agent._climb_tick(0.0, 500.0, set(), h.ws(with_mob=False))
             check(j.attempt == 1 and j.phase == route.ClimbJob.FAILED,
-                  "没等延迟就重新激活了（等于老行为）：attempt=%s phase=%s"
-                  % (j.attempt, j.phase))
+                  "「**按跳后挨过打**」的失败没等延迟（用户要求这一种才等 ✗）："
+                  "attempt=%s phase=%s" % (j.attempt, j.phase))
             check(jump not in downs(), "等待期间还在按跳（该站着等）：%s" % h.log)
             # ⚠ 那句等待说明**不许带分母**（用户看到的那个「1/3」就是从这儿来的 ✗）——
             #   要趁**还没重试**的时候看（`retry()` 会把 note 换成"第 N 次尝试" ✓）
@@ -5149,11 +5277,13 @@ def t_climb_wiring():
         h.agent.state = "idle"
         s.anti_afk_enabled = False
 
-        # ⑤e **寻路超时时间(s)**（用户 2026-09-26 要求）：从下达那一刻算，超了就切断 ——
-        #     任务自己的 timeout 会被 `retry()` 清零，累计可能远超预期，所以要有总闸。
+        # ⑤e **寻路超时时间(s)**（用户 2026-09-26 要求；2026-09-29 收窄成**只对追击生效**）：
+        #     从下达那一刻算，超了就切断 —— 任务自己的 timeout 会被 `retry()` 清零，
+        #     累计可能远超预期，所以要有总闸 ✓（这道闸现在只掐追击 ✓ 见下面那行签注）。
         was_cap = s.goto_timeout_s
         s.goto_timeout_s = 0.5
         j9 = job()
+        h.agent._route_origin = dict(CHASE_ORIGIN)      # 追击签注 ⇒ 才吃这道闸 ✓
         h.agent.start_climb(j9)
         h.agent.tick(h.ws(with_mob=False))              # 第一拍（还没超）
         check(h.agent._climb is j9, "刚下达就被超时切断：%r" % (h.agent._climb,))
@@ -5824,69 +5954,146 @@ def t_player_loc_params():
     from perception import minimap as mm_mod
     from perception import tracker as tk_mod
 
+    # ⭐⭐ **这一组该挂在「设置 → 判定参数页」**（用户 2026-09-28 原话："「玩家位置」也应该在
+    #   设置 → 判定参数页签"✓）—— 判据见 `docs/UI规范.md` §4 那张"三条去向"表：
+    #   它既是"**这一拍算不算拿到了玩家位置**"（判定 ✓）又该**跟项目走**（不同地图的面 y /
+    #   人物框大小不一样 ✓）⇒ 判定参数页 ✓。⚠ 别再留在决策参数面板（犯过一次 ✗）。
+    import pathlib as _pl
+    _root = _pl.Path(__file__).resolve().parent.parent
+    _sd = (_root / "gui" / "settings_dialog.py").read_text(encoding="utf-8")
+    _pp = (_root / "gui" / "player_panel.py").read_text(encoding="utf-8")
+    for _k in ("sp_foot_off", "sp_box_min_area", "sp_area_base_s", "sp_area_tol"):
+        check(_k in _sd,
+              "「玩家位置」的控件 `%s` 不在 `settings_dialog` 里 —— 它该在**判定参数页**"
+              "（用户 2026-09-28 ✗）" % _k)
+        check(_k not in _pp,
+              "`%s` 还留在决策参数面板里（该搬走 ✗ 用户 2026-09-28）："
+              "「玩家位置」属于**判定参数页**" % _k)
+    check("player_foot_offset_px" in _sd,
+          "判定参数页没把「玩家位置」写回 `settings`（改了不生效 ✗）")
+
     s = DecisionSettings()
     # ① 七个字段 + 默认值（默认 = 这功能关着 ⇒ 老行为一字不变 ✓）
     for _name, _want in (("player_foot_offset_px", 0),
                          ("player_box_min_area_pct", 0.0),
-                         ("player_box_area_base_n", 30),
+                         ("player_box_area_base_s", 30),
                          ("player_box_area_tol_pct", 0.0),
-                         ("player_arrow_len_px", 60),
-                         ("player_arrow_width_px", 2)):
+                         ):
         check(hasattr(s, _name), "「玩家位置」少了参数 `%s`（用户点名要求 ✗）" % _name)
     check(s.player_foot_offset_px == 0 and s.player_box_min_area_pct == 0.0
           and s.player_box_area_tol_pct == 0.0,
           "「玩家位置」的默认值不是「关着」（老行为会被改坏 ✗）：%r/%r/%r"
           % (s.player_foot_offset_px, s.player_box_min_area_pct,
              s.player_box_area_tol_pct))
-    # ⚠ 2026-09-28 用户改口径："**x 箭头和 y 箭头应该是一个颜色**" ⇒ 只该有**一个**颜色字段
+    # ⭐⭐ **箭头不在这里**（用户 2026-09-28 纠正 ✓ 原话："你这里不是设置面板啊，放在
+    #   设置 → 界面页签 → 辅助线与标记（实时预览）"）⇒ 它属于"**只是画给人看的**"，
+    #   该进 `vis:` 段（本机外观 ✓ 跟着"这台机器上的人"走 ✓）、**不跟项目存** ✗。
+    #   判据见 `docs/UI规范.md` §4（并钉住"别再搬回来" ✓）。
     _d0 = s.to_dict()
-    check("player_arrow_x_color" not in _d0 and "player_arrow_y_color" not in _d0,
-          "箭头颜色还分成 x/y 两根（用户 2026-09-28 要求**合并成一个** ✗）")
-    check("player_arrow_color" in _d0,
-          "合并后的 `player_arrow_color` 没进 `to_dict`（存不住 ✗）")
-    check(str(s.player_arrow_color).startswith("#"),
-          "箭头颜色默认不是 `#RRGGBB`：%r" % (s.player_arrow_color,))
+    for _k in ("player_arrow_color", "player_arrow_width_px", "player_arrow_len_px"):
+        check(_k not in _d0,
+              "`%s` 还在决策参数里 —— 箭头归「辅助线与标记」（它不参与决策、不该跟项目存 ✗ "
+              "规范 §4）：%r" % (_k, sorted(_d0)))
+    from gui import theme as _theme
+    for _k in ("player_arrow_color", "player_arrow_width", "player_arrow_len",
+               "player_arrow_on"):
+        check(_k in _theme.VIS_DEFAULTS,
+              "`vis:` 段少了箭头那一项 `%s`（搬过去却没把键加全 ✗）" % _k)
+    check("player_arrow_on" in _theme._VIS_ON_KEYS
+          and "player_arrow_color" in _theme._VIS_COLOR_KEYS,
+          "箭头的开关 / 颜色没进 `vis` 的校验名单（关掉不生效 / 透明度被当成坏值丢掉 ✗）")
+    # ⭐⭐ **各框线宽**（用户 2026-09-28 ✓ 原话："**给其他的粗细也加配置**，并且用**网格
+    #   对齐**，要求**参数名显示完整**"）：五个键都要在 `VIS_DEFAULTS` 里，**而且必须
+    #   "存得进、读得回"** —— ⚠ 只加默认值、不在 `load_vis` 里加一道"读回 + 夹范围"，
+    #   用户存的值根本进不来 ⇒ 表现就是"改了没用 / 调不到 1px"✗（这个坑刚踩过一次 ✓）。
+    #   ⚠ 默认值必须是**原代码里那个写死值**（锁定框 3、其余 2 ✓）—— 加参数**不许改观感** ✗。
+    # ⭐ **箭头尖大小**（用户 2026-09-28 追加 ✓ 原话："再加个箭头 size 配置"）：
+    #   默认值必须是 **25（%）**= 原代码里写死的 `tipLength=0.25` ✓（加参数**不许改观感** ✗），
+    #   而且**存得进、读得回**（⚠ 这里再钉一次"读回"，因为这个坑已经踩过一次 ✓）。
+    check(_theme.VIS_DEFAULTS.get("player_arrow_tip_pct") == 25,
+          "箭头尖大小的默认值不是原写死的 25%%（加参数不许改观感 ✗）：%r"
+          % (_theme.VIS_DEFAULTS.get("player_arrow_tip_pct"),))
+    # ⚠ ⚠ **先还原、再断言**（2026-09-28 踩过 ✓）：`check` 一失败就抛异常 ⇒ 写在它**后面**
+    #   的还原那句**永远跑不到** ⇒ 用例会把 `ui.yaml` 写成脏值（那次留了个 `80` ✗）。
+    _tbak = _theme.load_vis()["player_arrow_tip_pct"]
+    _theme.save_vis({"player_arrow_tip_pct": 80})
+    _tgot = _theme.load_vis()["player_arrow_tip_pct"]
+    _theme.save_vis({"player_arrow_tip_pct": _tbak})
+    check(_tgot == 80,
+          "箭头尖大小**存了读不回来**（`load_vis` 漏了「读回 + 夹范围」⇒ 改了没用 ✗）：%r"
+          % (_tgot,))
+    for _wk, _wd in (("lock_width", 3), ("attack_width", 2),
+                     ("min_attack_width", 2), ("jump_attack_width", 2),
+                     ("chase_jump_width", 2)):
+        check(_theme.VIS_DEFAULTS.get(_wk) == _wd,
+              "线宽 `%s` 的默认值不是原写死值 %d（加参数不许改观感 ✗）：%r"
+              % (_wk, _wd, _theme.VIS_DEFAULTS.get(_wk)))
+    _wbak = {_k: _theme.load_vis().get(_k) for _k in ("lock_width", "attack_width")}
+    _theme.save_vis({"lock_width": 1, "attack_width": 5})
+    _wv = _theme.load_vis()
+    _theme.save_vis(_wbak)          # ⚠ **先还原再断言**（红了也不把脏值留在 ui.yaml ✓）
+    check(_wv["lock_width"] == 1 and _wv["attack_width"] == 5,
+          "线宽存了**读不回来**（`load_vis` 漏了「读回 + 夹范围」⇒ 永远停在默认值 ✗ "
+          "用户报过这个形状）：%r / %r" % (_wv["lock_width"], _wv["attack_width"]))
+    _theme.save_vis(_wbak)              # 还原（别把用例的临时值留在 ui.yaml 里 ✗）
+    # ⚠ 排版那三条（网格对齐 / 粗细在色块右边 / 名字完整）是**源码级**钉：
+    import pathlib as _pl2
+    _sd_src = (_pl2.Path(__file__).resolve().parent.parent
+               / "gui" / "settings_dialog.py").read_text(encoding="utf-8")
+    check("vf2 = QGridLayout()" in _sd_src,
+          "「辅助线与标记」那组没用 `QGridLayout`（用户要求**网格对齐** ✗）")
+    check("setColumnMinimumWidth(0, 190)" in _sd_src,
+          "网格第 0 列没给最小宽度 ⇒ 长名字会被截断（用户要求**参数名显示完整** ✗）")
+    check("w_key=" in _sd_src and "_width_spins" in _sd_src,
+          "各框的**粗细**没接进网格（用户要求\"粗细放颜色右边 + 给其他的粗细也加配置\"✗）")
+    # ⭐⭐ **数值键必须真的能读回来**（用户 2026-09-28 报："**玩家坐标线段粗细无法调整至
+    #   1px**" ✗）—— 根因是 `load_vis()` 里只给 `vision_width` 写了"读回 + 夹范围"那一道，
+    #   箭头的粗细 / 长度**只在 `VIS_DEFAULTS` 里躺着**：用户存的值进不来 ✗
+    #   ⇒ 永远停在默认 2 / 60 ⇒ 表现就是"改了没用、调不到 1" ✓。
+    #   ⚠ 这条钉子就是防这个：**往 `vis:` 加数值键 ⇒ 存了必须能读回** ✓。
+    _bak = {_k: _theme.load_vis().get(_k) for _k in
+            ("player_arrow_width", "player_arrow_len")}
+    _theme.save_vis({"player_arrow_width": 1, "player_arrow_len": 17})
+    _v = _theme.load_vis()
+    check(_v["player_arrow_width"] == 1,
+          "箭头粗细存了读不回来（`load_vis` 漏了这个数值键 ⇒ 永远停在默认值、调不到 1px ✗ "
+          "用户报的那个 bug）：%r" % (_v["player_arrow_width"],))
+    check(_v["player_arrow_len"] == 17,
+          "箭头长度存了读不回来（同上 ✗）：%r" % (_v["player_arrow_len"],))
+    _theme.save_vis(_bak)               # 还原（别把用例的临时值留在 ui.yaml 里 ✗）
     check(hasattr(ws_mod, "FOOT_OFFSET_PX"),
           "`world_state` 少了脚底偏移的镜像槽 ⇒ perception 那两处没得读（循环依赖 ✗）")
 
     # ② 存取往返
     _names = ("player_foot_offset_px", "player_box_min_area_pct",
-              "player_box_area_base_n", "player_box_area_tol_pct",
-              "player_arrow_color", "player_arrow_width_px",
-              "player_arrow_len_px")
+              "player_box_area_base_s", "player_box_area_tol_pct")
     _d = s.to_dict()
     for _n in _names:
         check(_n in _d, "`%s` 没进 `to_dict`（存不住 ✗）" % _n)
     s.player_foot_offset_px = -7
     s.player_box_min_area_pct = 1.5
-    s.player_box_area_base_n = 45
+    s.player_box_area_base_s = 45
     s.player_box_area_tol_pct = 25.0
-    s.player_arrow_color = "#AbCdEf"
-    s.player_arrow_width_px = 5
-    s.player_arrow_len_px = 88
     s2 = DecisionSettings()
     s2.from_dict(s.to_dict())
     check((s2.player_foot_offset_px, s2.player_box_min_area_pct,
-           s2.player_box_area_base_n, s2.player_box_area_tol_pct,
-           s2.player_arrow_color, s2.player_arrow_width_px,
-           s2.player_arrow_len_px) == (-7, 1.5, 45, 25.0, "#AbCdEf", 5, 88),
+           s2.player_box_area_base_s, s2.player_box_area_tol_pct)
+          == (-7, 1.5, 45, 25.0),
           "「玩家位置」参数存取没往返：%r"
           % ((s2.player_foot_offset_px, s2.player_box_min_area_pct,
-              s2.player_box_area_base_n, s2.player_box_area_tol_pct,
-              s2.player_arrow_color, s2.player_arrow_width_px,
-              s2.player_arrow_len_px),))
-    # ⚠ 旧键（当天先加的那版 `player_arrow_x_color`）**仍要读得回来**（别让当天存过的项目丢色 ✗）
+              s2.player_box_area_base_s, s2.player_box_area_tol_pct),))
+    # ⚠ 老项目文件里若还留着 `player_arrow_*` 那几个键 ⇒ **留着不报错**（`from_dict` 不再读
+    #   它们 ✓、下次保存自然就没了 ✓ —— 同 `input_delay` 那条处理 ✓）。
     s2b = DecisionSettings()
     s2b.from_dict({"player_arrow_x_color": "#123456"})
-    check(s2b.player_arrow_color == "#123456",
-          "旧键 `player_arrow_x_color` 没兼容读（当天存过的项目会丢色 ✗）：%r"
-          % (s2b.player_arrow_color,))
+    check(not hasattr(s2b, "player_arrow_color"),
+          "老键还在被读（箭头已搬到 `vis:` 段 ⇒ 这边不该再认它 ✗）")
 
     # ③ 老项目文件（没这些格）⇒ 兜底默认
     s3 = DecisionSettings()
     s3.from_dict({"player_track_jump": 200})
     check(s3.player_foot_offset_px == 0 and s3.player_box_min_area_pct == 0.0
-          and s3.player_box_area_tol_pct == 0.0 and s3.player_box_area_base_n > 0,
+          and s3.player_box_area_tol_pct == 0.0 and s3.player_box_area_base_s > 0,
           "老配置（没这些格）该兜底成「关着」（不是 AttributeError、也不是闸乱开 ✗）："
           "%r/%r/%r" % (s3.player_foot_offset_px, s3.player_box_min_area_pct,
                         s3.player_box_area_tol_pct))
@@ -5920,9 +6127,343 @@ def t_player_loc_params():
     check(ws_mod.norm_hex_color("乱写", "#00E5FF") == "#00E5FF",
           "填错颜色时该**保留原值**（不许悄悄换成默认色 ✗）：%r"
           % ws_mod.norm_hex_color("乱写", "#00E5FF"))
+    # ⭐⭐ **「面积基线窗口」的单位是「秒」、不是「拍」**（用户 2026-09-28 ✓ 原话："『面积基线
+    #    窗口』，这个『拍』是什么？是多久？**需要可量化的描述**"✓）—— 拍数**依赖帧率**
+    #    （30 拍在 30fps 是 1 秒、在 15fps 是 2 秒 ✗）⇒ 只有秒可量化 ✓。
+    _d2 = DecisionSettings()
+    check(hasattr(_d2, "player_box_area_base_s"),
+          "少了 `player_box_area_base_s`（基线窗口该按**秒** ✗）")
+    check(abs(float(_d2.player_box_area_base_s) - 3.0) < 1e-9,
+          "基线窗口默认不是 3 秒（老行为会被改坏 ✗）：%r" % (_d2.player_box_area_base_s,))
+    check("player_box_area_base_s" in _d2.to_dict(), "没进 `to_dict`（存不住 ✗）")
+    _d3 = DecisionSettings()
+    _d3.from_dict({"player_box_area_base_s": 5.5})
+    check(abs(float(_d3.player_box_area_base_s) - 5.5) < 1e-9,
+          "新键存取没往返：%r" % (_d3.player_box_area_base_s,))
+    _d4 = DecisionSettings()
+    _d4.from_dict({"player_box_area_base_n": 60})          # 旧键（拍）✓
+    check(abs(float(_d4.player_box_area_base_s) - 2.0) < 1e-9,
+          "旧键（拍）没折算成秒（60 拍该 ⇒ 2.0 秒 ✓ 别让老项目丢值 ✗）：%r"
+          % (_d4.player_box_area_base_s,))
+    _d5 = DecisionSettings()
+    _d5.from_dict({"player_track_jump": 200})              # 两个键都没有 ✓
+    check(abs(float(_d5.player_box_area_base_s) - 3.0) < 1e-9,
+          "老配置（两个键都没有）该兜底 **3.0 秒**：%r" % (_d5.player_box_area_base_s,))
+    # ⭐ **源码级**（那两段是 `live_thread.run()` 里的内联代码 ⇒ 只能这么钉 ✓）：
+    _lt_src = inspect.getsource(lt)
+    check("_t_now - _t <= _bs" in _lt_src,
+          "基线没按**时间窗**筛（按「最后 N 个」切片依赖帧率 ⇒ 不可量化 ✗ 用户要的是「秒」✓）")
+    check("player_box_area_base_s" in _lt_src,
+          "`live_thread` 没读新的「秒」参数（还在读旧的拍数 ✗）")
+    check("_base * _pm / 100.0" in _lt_src,
+          "「框面积最小占比」没跟**基线**比（用户 2026-09-28：该占「过去 n 秒内平均面积」✗）")
+    check("_fa = float(vis.shape" not in _lt_src,
+          "「框面积最小占比」还在跟**画面面积**比（用户说该跟**基线**比 ✗）")
+
     check(ws_mod.hex_to_bgr("#FF8000") == (0, 128, 255),
           "`hex_to_bgr` 算错了（该是 (B,G,R) = (0,128,255)）：%r"
           % (ws_mod.hex_to_bgr("#FF8000"),))
+
+
+def t_attack_single_side_and_steal():
+    """⭐⭐ **攻击范围判定改「单侧」＋ 背后怪抢锁**（用户 2026-09-28 ✓ 原话两条：
+    "攻击范围判定改成『单侧』（跟画面一致）"／"锁定怪在前面，**背后攻击范围内有怪**，chase 想朝前，
+     但其实**转向更高效** ⇒ 是不是做成**背后怪抢锁**更好？"）。
+
+    钉六件：
+      ① **单侧判定**：不传 `facing` ⇒ 按 `self.facing` ✓（怪在背后 ⇒ **不算** ✓；转身后就够得着 ✓）；
+      ② **`facing=0` 仍"不分前后"** ✓（老行为，也是 `_in_range_all` 的命根子 ✗）；
+      ③ ⭐ **源码级**：`_in_range_all` **必须显式传 `facing=0`** ✗ —— 它的存在意义就是
+         "**不筛朝向**"✓，不显式传就会被新默认值顺手筛掉一半 ⇒ 那条分支就废了 ✗；
+      ④ ⭐ **背后可打 ⇒ 抢锁**（锁定期内改锁反侧那只 ✓）；
+      ⑤ ⭐ **只抢"真的够得着"的**（背后那只在攻击范围外 ⇒ **不抢** ✓，否则比朝前追更慢 ✗）；
+      ⑥ **同一只怪不重复抢** ✓（防目标来回跳 ✗）。
+    """
+    import inspect
+
+    from decision.agent import CombatAgent, DecisionSettings
+
+    a = CombatAgent.__new__(CombatAgent)
+    a.settings = DecisionSettings()
+    a.settings.attack_dist = 200
+    a.settings.min_attack_dist = 0
+    a.facing = 1
+    a._target_id = None
+    a._target_until = 0.0
+    a._no_target_since = None
+    a._random_target_cd = lambda: 30.0
+
+    class _P:
+        x = 0.0
+        y = 0.0
+
+    class _M:
+        def __init__(self, i, x):
+            self.id, self.x, self.y, self.w, self.h = i, float(x), 0.0, 20.0, 40.0
+
+    class _WS:
+        player = _P()
+
+    _front = _M(1, 150.0)            # 正面、够得着
+    _behind = _M(2, -150.0)          # 背后、够得着
+    _far_behind = _M(3, -9999.0)     # 背后、**够不着**
+
+    # ① 单侧
+    check(a._in_attack_box(_front, _P()) is True,
+          "正面的怪该算在攻击范围内（单侧 ✓）")
+    check(a._in_attack_box(_behind, _P()) is False,
+          "**背后**的怪不该算在（单侧）攻击范围内（用户 2026-09-28：改成「单侧」✗）")
+    a.facing = -1
+    check(a._in_attack_box(_behind, _P()) is True,
+          "转身之后背后的那只就够得着了（单侧判定该跟着朝向走 ✓）")
+    a.facing = 1
+    # ② facing=0 ⇒ 老行为（不分前后）
+    check(a._in_attack_box(_behind, _P(), 0) is True,
+          "`facing=0` 该恢复「不分前后」（老行为 ✓，`_in_range_all` 靠它 ✗）")
+
+    # ③ 源码级：`_in_range_all` 必须显式传 0
+    _src = inspect.getsource(a._in_range_all)
+    check("_in_attack_box(m, ws.player, 0)" in _src,
+          "`_in_range_all` 没显式传 `facing=0` ⇒ 会被单侧默认值顺手筛掉一半 ✗"
+          "（那条分支的意义就是「不筛朝向」✗）")
+
+    # ④ 背后可打 ⇒ 抢锁
+    a._target_id = 1
+    a._target_until = 1000.0
+    _t, _b = a._locked_target([_front, _behind], _WS(), 10.0)
+    check(_t is not None and _t.id == 2,
+          "锁着正面那只、背后又有**够得着**的 ⇒ 该**抢锁背后那只**（用户 2026-09-28 ✗）：%r"
+          % (getattr(_t, "id", None),))
+    # ⑤ 只抢够得着的
+    a._target_id = 1
+    a._target_until = 1000.0
+    _t2, _ = a._locked_target([_front, _far_behind], _WS(), 10.0)
+    check(_t2 is not None and _t2.id == 1,
+          "背后那只**够不着**（在攻击范围外）却被抢锁了 ⇒ 会比朝前追更慢 ✗：%r"
+          % (getattr(_t2, "id", None),))
+    # ⑥ 同一只不重复抢
+    a._target_id = 2
+    a._target_until = 1000.0
+    _t3, _ = a._locked_target([_front, _behind], _WS(), 10.0)
+    check(_t3 is not None and _t3.id == 2,
+          "已经锁着背后那只了还在抢（目标会来回跳 ✗）：%r" % (getattr(_t3, "id", None),))
+
+
+def t_chase_goto_max():
+    """⭐⭐ 「**追怪寻路.duration(s)**」（用户 2026-09-28 要求 ✓ 原话："在设置 → 判定参数
+    **单开一组『任务』**"＋"新增参数『追怪寻路.duration(s)』：表示本次任务如果是**追怪下达**的，
+    那么如果任务**超过了这个时间就结束任务**"）。
+
+    钉五件：
+      ① 参数在、**默认 0 = 不启用**（老项目一字不变 ✓）；
+      ② `to_dict` / `from_dict` 往返 ✓；老配置（没这格）⇒ 兜底 0 ✓；
+      ③ ⭐ **只对"追怪下达的"任务生效**：闸的判据必须看 `_climb_origin` 的 `kind == "chase"` ✓
+         （「命令前往」/「定点休息」等**不许被它掐** ✗）；
+      ④ ⭐ **与「寻路超时」共用同一把钟**（`_climb_started` ✓ 不许另起一把 ✗）；
+      ⑤ ⚠ `<= 0` ⇒ **不启用**（别把 0 当成"立刻超时" ✗）。
+    """
+    import inspect
+
+    from decision.agent import CombatAgent, DecisionSettings
+
+    s = DecisionSettings()
+    check(hasattr(s, "chase_goto_max_s"),
+          "少了参数「追怪寻路.duration(s)」（用户点名要求 ✗）")
+    check(float(s.chase_goto_max_s) == 0.0,
+          "默认值不是 0 = 不启用（老行为会被改坏 ✗）：%r" % (s.chase_goto_max_s,))
+    check("chase_goto_max_s" in s.to_dict(), "没进 `to_dict`（存不住 ✗）")
+    s2 = DecisionSettings()
+    s2.from_dict({"chase_goto_max_s": 15})
+    check(float(s2.chase_goto_max_s) == 15.0,
+          "存取没往返（秒为单位 ✗）：%r" % (s2.chase_goto_max_s,))
+    s3 = DecisionSettings()
+    s3.from_dict({"goto_timeout_s": 30})            # 老项目文件：没这一格 ✓
+    check(float(s3.chase_goto_max_s) == 0.0,
+          "老配置该兜底成 0 = 不启用：%r" % (s3.chase_goto_max_s,))
+    # ③④⑤ 源码级：只看 chase + 同一把钟 + `<= 0` 不启用
+    src = inspect.getsource(CombatAgent._climb_tick)
+    check("chase_goto_max_s" in src,
+          "那道闸没接进 `_climb_tick`（配了不生效 ✗）")
+    check('"chase"' in src and "_climb_origin" in src,
+          "闸的判据没看「追怪下达的」（`_climb_origin` 的 kind == chase ✗）"
+          "—— 那就会把「命令前往」也一起掐掉 ✗")
+    check("_chase_cap > 0" in src,
+          "没做 `<= 0 ⇒ 不启用`（有人设 0 会变成「立刻超时」✗）")
+    # ⭐ 同一把钟：那道闸那一段里必须用到 `_climb_started`（不许另起一把 ✗）
+    _seg = src[src.find("_chase_cap"): src.find("_chase_cap") + 1200]
+    check("self._climb_started" in _seg,
+          "追怪那道闸没和「寻路超时」共用 `_climb_started` 这把钟（两把尺 ✗）")
+
+    # ⭐⭐ **回填**（2026-09-28 补 ✓ —— 我第一版**漏了 `setValue`** ⇒ 用户当场报"还是改不了
+    #   「追怪寻路.duration」、**没有任何提示**"✗ ⇒ 因为点确定**其实存进去了**，只是**下次打开
+    #   又显示 0** ⇒ 看起来像"改不了" ✗）。
+    #   ⚠⚠ **测法必须是这样**：把配置设成**非默认值** ⇒ **新建对话框** ⇒ **看控件显示它** ✓ ——
+    #     只测"设值 → 点确定 → settings 变了"**测不出漏回填** ✗（那正是我上一轮漏掉的一环 ✓，
+    #     当时我实测通过了，却完全没发现问题 ✓ 教训）。
+    from PyQt5.QtWidgets import QApplication as _QApp
+
+    from decision.agent import settings as _st
+    from gui.settings_dialog import SettingsDialog as _SD
+
+    _qapp = _QApp.instance() or _QApp([])
+    _bak = float(getattr(_st, "chase_goto_max_s", 0.0) or 0.0)
+    try:
+        _st.chase_goto_max_s = 15.0
+        _dlg = _SD()
+        check(float(_dlg.sp_chase_max.value()) == 15.0,
+              "「追怪寻路.duration(s)」**没回填**：配置里是 15.0，打开对话框却显示 %r "
+              "⇒ 现场看起来就是「改不了」（点确定其实存进去了 ⇒ 也**不会有任何提示**✗）"
+              % (_dlg.sp_chase_max.value(),))
+    finally:
+        _st.chase_goto_max_s = _bak
+        _qapp = None
+
+
+def t_drop_detach_dir():
+    """⭐⭐ 下跳"**跳下绳子**"那一步的水平方向（用户 2026-09-28 按流程图 ✓ 原话：
+    "跳下绳子：按**任意方向**+跳（**若有锁定目标则是锁定目标方向**）"）。
+
+    钉五件：
+      ① **有锁定目标 ⇒ 朝它**（注入的 `_target_dir_fn()` 给 ±1 ✓）；
+      ② **没有 / 同列（0）⇒ 任意方向**（取确定性的"**背离下跳点中心**" ✓）；
+      ③ **还没挑定下跳点** ⇒ 向右 ✓；
+      ④ ⚠ **回调抛异常 / 没注入 ⇒ 都当成"没有目标"** ✓ —— **绝不许因为拿不到目标就报错或
+         停住** ✗（脱离那几拍按不出方向 = 卡死在绳上 ✗）；
+      ⑤ ⭐ **源码级**：`agent` 真的把 `_target_dir` 注入给下跳任务 ✓、而且**每拍重挂**
+         （锁定目标会换 ⇒ 不许建任务时定死 ✗）。
+    """
+    import inspect
+
+    from decision import agent as agent_mod
+    from decision import route
+
+    j = route.DropJob("上", "下", [(550.0, 500.0, 600.0, "42")],
+                      tol_px=10, hold_ms=0, y_tol_px=10, retry_ms=2000, stall_s=3.0)
+    j._pick = (550.0, 500.0, 600.0, "42")
+    # ① 有锁定目标 ⇒ 朝它（哪怕背离中心 ✓）
+    j._target_dir_fn = lambda: 1
+    check(j._detach_dir(700.0) == 1, "锁定目标在右时没朝右按（用户流程图 ✗）：%r"
+          % (j._detach_dir(700.0),))
+    j._target_dir_fn = lambda: -1
+    check(j._detach_dir(100.0) == -1, "锁定目标在左时没朝左按（用户流程图 ✗）：%r"
+          % (j._detach_dir(100.0),))
+    # ② 没有目标 / 同列 ⇒ 退回"背离下跳点中心"
+    j._target_dir_fn = None
+    check(j._detach_dir(700.0) == -1,
+          "没有锁定目标时该退回「背离下跳点中心」（中心 550，人在 700 ⇒ 该往左 ✗）：%r"
+          % (j._detach_dir(700.0),))
+    j._target_dir_fn = lambda: 0
+    check(j._detach_dir(700.0) == -1, "目标同列（0）时该退回「背离中心」：%r"
+          % (j._detach_dir(700.0),))
+    # ③ 还没挑定下跳点 ⇒ 向右
+    j._pick = None
+    check(j._detach_dir(700.0) == 1, "还没挑定下跳点时该向右（确定性 ✓）：%r"
+          % (j._detach_dir(700.0),))
+    # ④ 回调坏了 ⇒ 当成"没有目标"，**不许抛**
+    j._pick = (550.0, 500.0, 600.0, "42")
+
+    def _boom():
+        raise RuntimeError("回调坏了")
+
+    j._target_dir_fn = _boom
+    check(j._detach_dir(700.0) == -1,
+          "注入的回调抛异常时没兜住（拿不到目标 = 卡死在绳上 ✗）：%r" % (j._detach_dir(700.0),))
+    # ⑤ 源码级：agent 注入 + **每拍重挂**
+    _src = inspect.getsource(agent_mod.CombatAgent._climb_tick)
+    check("_target_dir_fn" in _src and "_target_dir" in _src,
+          "agent 没把「锁定目标在哪边」注入给下跳任务（流程图那格没落地 ✗）")
+    check("hasattr(job, \"_detach_dir\")" in _src,
+          "注入没限定在下跳任务上（别的执行器白挂一个回调 ✗）")
+
+
+def t_goto_tag_left():
+    """⭐⭐ 「当前任务」的**签注 + 生存时间**（用户 2026-09-28 要求 ✓ 原话："下任务的签注，
+    需要有生存时间，并在**信息栏**…的当前任务后面标注出来，例如 `前往：底层(追击  剩余 00:15)`"）。
+
+    钉五件：
+      ① 格式是 **`MM:SS`**（分也补零 ✓ 用户例子就是 `00:15` ✗ 不是 `0:15`），而且**不许动
+         `_mmss`**（那个 `M:SS` 被 `_timer_lines` 好几处在用 ✗）；
+      ② 剩余时间跟**寻路超时是同一把钟**（`_climb_started` + `goto_timeout_s` ✓ 别另起一把 ✗）；
+      ③ **不设上限 / 还没起钟 / 没有任务** ⇒ `None`（**不显示** ✓ 别显示 `0:00` ✗）；
+      ④ 签注取**现成来源**（`_climb_origin["kind"]` ✓），没有 ⇒ **空串**（别硬塞一个词 ✗）；
+      ⑤ ⭐ **源码级**：`_osd_lines` 真把它们拼进「当前任务」那行 ✓，且**休息时不加**
+         （休息的剩余已由定时任务那几行显示 ✓ 再来一遍是重复 ✗）。
+    """
+    import inspect
+    import time as _t
+
+    from decision.agent import CombatAgent, DecisionSettings
+    from gui import route_panel as rp
+    from gui.route_panel import _mmss, _mmss2
+
+    # ① 格式
+    check(_mmss2(0) == "00:00" and _mmss2(15) == "00:15" and _mmss2(75) == "01:15",
+          "「当前任务」的剩余时间格式不是 `MM:SS`（用户例子是 `00:15` ✗）：%r" % (_mmss2(15),))
+    check(_mmss(15) == "0:15",
+          "`_mmss` 被动过了 —— 它是 `_timer_lines` 在用的 `M:SS`，别改 ✗：%r" % (_mmss(15),))
+
+    # ②③ 同一把钟 + 三种"不显示"
+    a = CombatAgent.__new__(CombatAgent)
+    a.settings = DecisionSettings()
+    a._climb = None
+    a._climb_started = 0.0
+    check(a.goto_time_left() is None, "没任务时该返回 None（别显示 `0:00` ✗）")
+    a.settings.goto_timeout_s = 30
+    check(a.goto_time_left() is None, "还没起钟就给了剩余时间（数字会乱跳 ✗）")
+    a._climb = object()
+    a._climb_started = _t.monotonic() - 15.0
+    # ⭐⭐ **只有「追击」签注的显示剩余**（用户 2026-09-29 第 1 条 ✓ 原话："只有追击签注的任务
+    #   是有时间限制的（到点结束任务），其他任务不应该有时间限制（无限）"）——
+    #   非追击的任务屏幕上**不许**出现一个会让人以为"它马上要被切"的倒计时 ✗。
+    a._climb_origin = None
+    check(a.goto_time_left() is None,
+          "非「追击」签注的任务却显示了剩余（那些任务不限时 ✗）")
+    a._climb_origin = {"kind": "climb", "mob_id": 1}      # 别的 kind 也一样 ✓
+    check(a.goto_time_left() is None,
+          "`kind` 不是 chase 却显示了剩余（判据必须是结构化的 kind ✗）")
+    a._climb_origin = {"kind": "chase", "mob_id": 1}
+    _lv = a.goto_time_left()
+    check(_lv is not None and 14.0 < _lv < 16.0,
+          "剩余时间没跟 `_climb_started` + `goto_timeout_s`（跟「寻路超时」不是同一把钟 ✗）：%r"
+          % (_lv,))
+    a.settings.goto_timeout_s = 0
+    check(a.goto_time_left() is None,
+          "「寻路超时时间」设 0（= 不设上限）时不该显示剩余（会永远挂着 `00:00` ✗）")
+
+    # ⭐⭐ **取两道闸里更早到期的那个**（用户 2026-09-28 报 ✓ 原话："我改了 5 秒，但是信息栏
+    #    写的追击还是 **9 秒**开始（也可能是 10）"✗）—— 信息栏那行说的是"离这趟任务结束还有
+    #    多久" ✓ ⇒ 两道闸谁先到、任务就结束在谁那儿 ⇒ **必须取 min** ✗（只显示大的那个会骗人 ✓）。
+    a.settings.goto_timeout_s = 30
+    a.settings.chase_goto_max_s = 5.0
+    a._climb = object()
+    a._climb_started = _t.monotonic() - 2.0          # 已经跑了 2 秒
+    a._climb_origin = {"kind": "chase", "mob_id": 1}
+    _lvc = a.goto_time_left()
+    check(_lvc is not None and 2.4 < _lvc < 3.6,
+          "追怪任务该显示**两道闸里更早的那个**（追怪 5 秒 vs 寻路 30 秒，已跑 2 秒 ⇒ 该 3 秒 ✓）"
+          "—— 显示 28 秒就是用户报的那个 bug ✗：%r" % (_lvc,))
+    # ⚠ 口径 2026-09-29 收窄（用户第 1 条 ✓）：**非追击 ⇒ 既不吃「追怪寻路.duration」、
+    #   也不吃「寻路超时时间」** ⇒ 这里返回 `None`（屏幕上一个字都不显示 ✓）。
+    a._climb_origin = {}                              # 不是追怪 ⇒ 不限时 ✓
+    check(a.goto_time_left() is None,
+          "「非追击」任务却给了剩余时间 —— 用户 2026-09-29 说那些任务不限时（无限）✗：%r"
+          % (a.goto_time_left(),))
+    a.settings.chase_goto_max_s = 0.0
+
+    # ④ 签注：现成来源 / 没有就空串
+    a._climb_origin = {"kind": "chase", "mob_id": 1}
+    check(a.current_goto_tag() == "追击",
+          "追击任务的短签注没取到（该从 `_climb_origin` 的 kind 取 ✓）：%r"
+          % (a.current_goto_tag(),))
+    a._climb_origin = {}
+    check(a.current_goto_tag() == "", "没有签注时该给空串（别硬塞一个词 ✗）")
+
+    # ⑤ 源码级：拼进「当前任务」那行 + 休息时不加
+    _src = inspect.getsource(rp)
+    check("current_goto_tag" in _src and "goto_time_left" in _src and "_mmss2" in _src,
+          "「当前任务」那行没拼上签注 / 剩余时间（用户点名要标出来 ✗）")
+    check("if not _rest:" in _src,
+          "休息时也在拼剩余时间（那几行已由定时任务显示 ⇒ 重复 ✗）")
 
 
 def t_spot_loop_hold_rest_end():
@@ -6966,10 +7507,15 @@ def t_climb_diagonal_jump():
     upd(j, 500.0, 255.0, now=0.20)              # 在空中（离开起跳高度 ✓）
     upd(j, 520.0, 300.0, now=0.25)              # 落回起跳高度 ⇒ 飞行结束 ✓
     check(not j._diag_flying, "落回起跳高度了还留在「飞行相」✗")
-    o = upd(j, 540.0, 300.0, now=0.30)          # dx = 10 ≤ near 20
-    check(not o["jump"] and not j._diag_done,
-          "进了近距该交回老逻辑并重新武装斜跳：%s / _diag_done=%s"
-          % (o, j._diag_done))
+    #   ⭐⭐ **2026-09-28 改口径**：去掉"一轮只斜跳一次" ⇒ 落回起跳高度后，只要**又满足**
+    #      `near_px < |dx| ≤ jump_start_px` 就**再斜跳一次** ✓ —— 用户原话："我从未提过
+    #      『一轮只斜跳一次』这个限制，**只要满足条件就可以无限斜跳**"。
+    #      ⇒ 所以 0.25 那一拍（`dx=30`，在区间里 ✓）**重新起手** ⇒ 0.30 这拍**照样按跳** ✓
+    #      （"朝绳走了一步可能就进容差了，那一拍照样要跳"✓ 见 `_align_step` 顶上那段 ✓）。
+    o = upd(j, 540.0, 300.0, now=0.30)          # dx = 10 ≤ near 20（但对起手来说无所谓 ✓）
+    check(o["jump"],
+          "落回远处后又满足斜跳条件，却没再斜跳（用户 2026-09-28：**只要满足就无限斜跳** ✗）：%s"
+          % o)
 
     # ⑤ 比起跳距离还远 ⇒ 不斜跳（老逻辑：一口气按住走过去）
     j = C(**base)
@@ -9087,7 +9633,10 @@ def t_drop_hold_dir_reassert():
       ② DROP 连按跳那几拍：`jump is True` 时 `dir` **仍然是 -1**（"↓ 按住 + 点按跳" ✓）；
       ③ 「移动操作尝试间隔」到点 ⇒ `reassert is True`（请 agent 重发一次 ↓ ✓）；
          间隔内是 False ✓（**不是每拍都发** ✗）；
-      ④ 一轮没把 Y 按下去 ⇒ "松着 ↓ 等间隔"那几拍：`dir == 0` + `jump is False`（真站直 ✓）；
+      ④ ⭐ **一轮（`stall_s`）没把 Y 按下去 ⇒ 也不松 ↓**（2026-09-28 改口径 ✓ 用户原话：
+         "到点 Y 还没动，也不应该松开 ↓ 起身，只要进了 DROP 就**一路按住 ↓**"）⇒ 那几拍
+         `dir == -1` ✓（老口径的"松着 ↓ 真站直"**已作废** ✗ —— 它正是"永远趴不下去"的根因）；
+         唯一松 ↓ 的时机 = 落地 `DONE`/`FAILED` ✓ 或 `_detach_step`（**判定上绳梯** ⇒ 脱离）✓；
       ⑤ `retry_ms = 0`（用户把重试关掉）⇒ **从不重发**（尊重设置 ✓）。
     """
     from decision import route
@@ -9099,7 +9648,13 @@ def t_drop_hold_dir_reassert():
     o = j.update(0.0, 550.0, py=-166.0)
     check(o["dir"] == -1 and o["jump"] is False,
           "「按住 ↓」那一拍没按 ↓（用户报的「没看到按住 ↓」✗）：%s" % o)
-    check(o["reassert"] is False, "刚按住就请求重发（该先计窗 ✓）：%s" % o)
+    # ⭐ 2026-09-28 **改口径**：按住 ↓ 的**第一拍就补发一次**（用户报"drop 没有补按『按下 ↓』
+    #   只补按了跳，然后超时"⇒ 病根就是原来那句"先计窗、要等满 `retry_ms` 才第一次补"：
+    #   一个 drop 任务常常**活不到 3 秒**（一轮 `stall_s` 到点就换相/重下 ⇒ 新任务又从 `None`
+    #   重算）⇒ **那次补按永远等不到** ✗）。⚠ 重复 PRESS 是幂等的 ⇒ 第一拍多发一次无害 ✓，
+    #   而且正好治"首按被对面丢了"那个病根 ✓（见 `_hold_reassert` 的说明 ✓）。
+    check(o["reassert"] is True,
+          "按住 ↓ 的第一拍没**补发一次 ↓**（用户 2026-09-28：补按 ↓ 必须第一拍就发 ✗）：%s" % o)
 
     # ② ARM_HOLD_S 过了 ⇒ 按住 ↓ + 点按跳（↓ 不能丢）
     o = j.update(float(route.ARM_HOLD_S) + 0.01, 550.0, py=-166.0)
@@ -9113,12 +9668,15 @@ def t_drop_hold_dir_reassert():
     check(o["reassert"] is True and o["dir"] == -1,
           "过了「移动操作尝试间隔」也没重发 ↓（键被吞了就永远不趴 ✗）：%s" % o)
 
-    # ④ 一轮（stall_s）没把 Y 按下去 ⇒ 松着 ↓ 等间隔那几拍：一个键都不按 ✓
+    # ④ ⭐⭐ **2026-09-28 改口径**：一轮（`stall_s`）没把 Y 按下去 ⇒ **也不许松 ↓** ✓
+    #    用户原话："**到点 Y 还没动，也不应该松开 ↓ 起身，只要进了 DROP 就一路按住 ↓**"
+    #             ／"流程中，**只有判定 drop 上绳梯了才松开 ↓**，其他只有补按" ✓
+    #    ⇒ 这几拍应该是"↓ 还按着"（`dir == -1`）✓（老口径"松着 ↓ 真站直"已作废 ✗）
     t = float(route.ARM_HOLD_S) + 3.3
     o = j.update(t, 550.0, py=-166.0)
     o = j.update(t + 0.1, 550.0, py=-166.0)
-    check(o["dir"] == 0 and o["jump"] is False,
-          "「松着 ↓ 等间隔」那几拍还在按键（该真站直 ✓）：%s" % o)
+    check(o["dir"] == -1,
+          "窗口过完把 ↓ 松了（用户 2026-09-28：**一路按住 ↓**、只有上绳梯才松 ✗）：%s" % o)
 
     # ⑤ retry_ms = 0（不重试）⇒ 从不重发（尊重设置 ✓）
     kw0 = dict(kw)
@@ -9481,33 +10039,33 @@ def t_replan_on_location_change():
         check(a._climb is not None, "没有解析器时报错 / 把任务丢了：%r" % (a._climb,))
 
 
+
+#: 用例里给寻路任务带「追击签注」的现成值 ✓（用户 2026-09-29 起：**只有追击**才吃
+#: 「寻路超时时间」⇒ 想测超时就得带上它 ✓；全仓只有 `agent._chase_origin()` 一个写口 ✓）。
+CHASE_ORIGIN = {"kind": "chase", "mob_id": 1}
+
 def t_goto_timeout_all_job_kinds():
-    """**所有**寻路任务（走 / 爬 / 下跳 / 跳）都吃「寻路超时时间」（用户 2026-09-27 要确认）。
+    """**「寻路超时时间」只吃「追击」签注**；四种通行方式在追击下一视同仁；其它任务不限时。
 
-    用户原话："我们所有的寻路任务都要走寻路超时时间，确认在执行下跳(drop)的时候有没有
-    这层保护（下跳(drop)应该属于某个寻路任务的一环）"。
+    ⚠⚠ **口径 2026-09-29 改过**（用户原话："只有追击签注的任务是有时间限制的（到点结束任务），
+      其他任务不应该有时间限制（无限）"✓）：原来**所有**寻路任务都吃这道闸 ✗ ——
+      而一条长路线（走→爬→走）跑两分钟很正常，拿 30 秒切它是**误伤** ✗。
+      现在的判据 = `agent.chase_tagged()`（结构化 `_climb_origin["kind"] == "chase"` ✓），
+      与信息栏那行显示的剩余**同一处口径** ✓（显示说"无限"、闸却还在掐 = 最坏的不一致 ✗）。
 
-    **查代码的结论：有 ✓**，而且对四种任务一视同仁 —— 那道闸在 `agent._climb_tick` 的
-    **最前面**（盖完"这一拍任务跑过"的章之后、任何按类型分的逻辑之前）：
-    `if cap_s > 0 and self._climb_started and (now - self._climb_started) > cap_s`
-    ⇒ `job.cancel("寻路超时：…")` + `_task_finished(failed=True)`（**整条路线收掉**）。
-    配它的三件事也都确认过：
-      · 挂任务的**唯一入口**是 `start_climb()`（`self._climb = job` 只有那一处赋值 ✓）
-        而它就在那儿重打 `_climb_started` ⇒ 没有"挂了任务却不在计时"的路 ✓；
-      · `_task_finished` 接下一段时又调 `start_climb` ⇒ **每段重新计时**（另一个用例
-        `t_goto_timeout_per_hop` 钉口径 ✓）；
-      · 失败重试走的是**原地** `job.retry()`（不重打 `_climb_started`）⇒ 在一段里
-        反复重试也照样会被收掉 ✓（下跳就有重试，所以这条对它很关键 ✓）。
+    用户 2026-09-27 问的那件事（"下跳有没有这层保护"）在新口径下依然成立 ✓：
+    **追击**任务里四种通行方式一视同仁地吃这道闸 ✓。
 
-    这条把它钉成"以后谁改坏了当场红"，四件：
-      ① 下跳（用户问的那个）：挂上、喂一个永远到不了的状态 ⇒ 超上限那一拍必须收掉，
-         并说清是「寻路超时」；
-      ② 走 / 爬 / 跳三类同样收掉（把这层保护钉成"和任务类型无关"✓）；
-      ③ **整条路线**被收掉（不是只停一步），且 `note` 里写着跑多久、上限多少；
-      ④ 上限设 **0 = 不限时**（老行为）⇒ 再久也不收 ✓。
-      ⚠ 顺带说明为什么非有它不可：下跳 / 跳这两个执行器**自己没有超时**（`start_climb`
-        会把任务内部的 `timeout_s` 设成 1e9，真正生效的只有这一把钟 ✓）⇒ 没有这道闸，
-        它们会**永远挂着** ✗。
+    这条钉四件：
+      ① **追击**签注下：走 / 爬 / 下跳 / 跳 四类都收掉，并说清是「寻路超时」 ✓；
+      ② **非追击**（没签注 ⇒ 命令前往 / 休息 / 回区域那种 ✓）：四种都**不收** —— 再久也
+         挂着 ✓（用户 2026-09-29 第 1 条 ✓）；
+      ③ 收掉时**整条路线**一起收，且 `note` 里写着跑多久、上限多少 ✓；
+      ④ 上限设 **0 = 不限时**（老行为）⇒ 追击也再久不收 ✓。
+
+    ⚠ 那道闸在 `agent._climb_tick` 的最前面（盖完"这一拍任务跑过"的章之后、任何按类型分的
+      逻辑之前）⇒ 四种通行方式**一视同仁** ✓；而"分不分追击"在**闸的条件**上（`cap_s` 那一行 ✓）。
+    ⚠ 追不上就永远挂着的问题由「追怪寻路.duration(s)」另管（那是追击专属的第二道闸 ✓）。
     """
     from decision import route
 
@@ -9524,20 +10082,21 @@ def t_goto_timeout_all_job_kinds():
                                  src_set="甲平台", jump_start_px=0)),
         ]
 
-    # ① ② ③ 四种任务：超上限 ⇒ 收掉（并说清「寻路超时」）
+    # ① ③ **追击**签注 + 四种任务：超上限 ⇒ 收掉（并说清「寻路超时」）
+    _CHASE = {"kind": "chase", "mob_id": 1}          # 追击签注（唯一写口 `_chase_origin` ✓）
     for name, job in _mk_jobs():
         s = fresh_settings(goto_timeout_s=10.0)
         s.enabled = True
         h = Harness(s)
         with h._patched():
-            h.agent.start_route([job], why="用例：%s" % name)
+            h.agent.start_route([job], why="用例：%s（追击）" % name, origin=dict(_CHASE))
             ws = h.ws(with_mob=False)
             ws.player.here_sets = []          # 永远不在目标集合上 ⇒ 任务永远到不了 ✓
             h.clock.t += 11.0
             # px 喂一个"离目标很远"的值：任务会一直对齐/走/等，不会自己结束 ✓
             done = h.agent._climb_tick(h.clock.t, 520.0, set(), ws)
         check(done is True and h.agent._climb is None,
-              "「%s」任务超了「寻路超时时间」却没被收掉（下跳这类必须和别的任务一视同仁 ✗）："
+              "「%s」是**追击**却超了「寻路超时时间」没收掉（追击下四种通行方式一视同仁 ✗）："
               "done=%r climb=%r" % (name, done, h.agent._climb))
         check(h.agent._climb_retry_at is None,
               "「%s」被收掉之后还留着「等重来」的时刻（下一个任务会立刻被它带跑 ✗）" % name)
@@ -9546,13 +10105,29 @@ def t_goto_timeout_all_job_kinds():
         check("10" in str(job.note),
               "「%s」那句没说清上限是多少：%r" % (name, job.note))
 
-    # ④ 上限 0 = 不限时（老行为）：再久也不许收
+    # ② ⭐⭐ **非追击 ⇒ 不限时**（用户 2026-09-29 第 1 条 ✓）：四种任务再久也不许收 ✓
+    for name, job in _mk_jobs():
+        s = fresh_settings(goto_timeout_s=10.0)
+        s.enabled = True
+        h = Harness(s)
+        with h._patched():
+            h.agent.start_route([job], why="用例：%s（没签注）" % name)   # 不传 origin ✓
+            ws = h.ws(with_mob=False)
+            ws.player.here_sets = []
+            h.clock.t += 9999.0
+            h.agent._climb_tick(h.clock.t, 520.0, set(), ws)
+        check(h.agent._climb is job,
+              "「%s」没有追击签注，却被「寻路超时时间」收掉了 —— 用户 2026-09-29 说"
+              "**只有追击**才限时、其它一律无限 ✗" % name)
+
+    # ④ 上限 0 = 不限时（老行为）：追击也再久不许收
     for name, job in _mk_jobs():
         s = fresh_settings(goto_timeout_s=0.0)
         s.enabled = True
         h = Harness(s)
         with h._patched():
-            h.agent.start_route([job], why="用例：%s（不限时）" % name)
+            h.agent.start_route([job], why="用例：%s（不限时）" % name,
+                                origin=dict(_CHASE))
             ws = h.ws(with_mob=False)
             ws.player.here_sets = []
             h.clock.t += 9999.0
@@ -9597,9 +10172,9 @@ def t_goto_timeout_survives_same_step_restart():
     with h._patched():
         ws = h.ws(with_mob=False)
         ws.player.here_sets = []               # 永远不在目标集合上 ⇒ 任务到不了 ✓
-        h.agent.start_route([_drop("乙平台")], why="用例：①第一次")
+        h.agent.start_route([_drop("乙平台")], why="用例：①第一次", origin=dict(CHASE_ORIGIN))
         h.agent._climb_started -= 11.0         # 模拟"这一段已经卡了 11 秒"
-        h.agent.start_route([_drop("乙平台")], why="用例：①重下同一步")
+        h.agent.start_route([_drop("乙平台")], why="用例：①重下同一步", origin=dict(CHASE_ORIGIN))
         done = h.agent._climb_tick(h.clock.t, 700.0, set(), ws)
         check(done is True and h.agent._climb is None,
               "同一步被重下之后，「寻路超时」的钟被**归零** ⇒ 卡住的段**永远等不到超时** ✗"
@@ -9611,9 +10186,9 @@ def t_goto_timeout_survives_same_step_restart():
     with h2._patched():
         ws2 = h2.ws(with_mob=False)
         ws2.player.here_sets = []
-        h2.agent.start_route([_drop("乙平台")], why="用例：②第一次")
+        h2.agent.start_route([_drop("乙平台")], why="用例：②第一次", origin=dict(CHASE_ORIGIN))
         h2.agent._climb_started -= 11.0
-        h2.agent.start_route([_drop("丙平台")], why="用例：②换了下一步")
+        h2.agent.start_route([_drop("丙平台")], why="用例：②换了下一步", origin=dict(CHASE_ORIGIN))
         done2 = h2.agent._climb_tick(h2.clock.t, 700.0, set(), ws2)
         check(done2 is False and h2.agent._climb is not None,
               "换了**下一步**却没重新计时（新的一段一上来就被判超时 ✗）：done=%r climb=%r"
@@ -9624,10 +10199,10 @@ def t_goto_timeout_survives_same_step_restart():
     with h3._patched():
         ws3 = h3.ws(with_mob=False)
         ws3.player.here_sets = []
-        h3.agent.start_route([_drop("乙平台")], why="用例：③第一次")
+        h3.agent.start_route([_drop("乙平台")], why="用例：③第一次", origin=dict(CHASE_ORIGIN))
         h3.agent._climb_started -= 11.0
         h3.agent.stop_climb("用例：③手工取消")
-        h3.agent.start_route([_drop("乙平台")], why="用例：③取消后再挂同名同目标")
+        h3.agent.start_route([_drop("乙平台")], why="用例：③取消后再挂同名同目标", origin=dict(CHASE_ORIGIN))
         done3 = h3.agent._climb_tick(h3.clock.t, 700.0, set(), ws3)
         check(done3 is False and h3.agent._climb is not None,
               "手工取消之后，同签名的新任务被当成「重下同一步」⇒ **一上来就超时** ✗："
@@ -9669,7 +10244,7 @@ def t_goto_timeout_key():
         with h._patched():
             ws = h.ws(with_mob=False)
             ws.player.here_sets = []               # 永远到不了 ⇒ 等超时 ✓
-            h.agent.start_route([_drop("乙平台")], why="用例：默认不按")
+            h.agent.start_route([_drop("乙平台")], why="用例：默认不按", origin=dict(CHASE_ORIGIN))
             h.agent._climb_started -= 11.0         # 已经跑了 11 秒（>10 ⇒ 当场超时 ✓）
             h.agent._climb_tick(h.clock.t, 700.0, set(), ws)
         check(all(t is None for t in ([h.agent.last_timeout_key] + taps)),
@@ -9679,7 +10254,7 @@ def t_goto_timeout_key():
         with h._patched():
             ws = h.ws(with_mob=False)
             ws.player.here_sets = []
-            h.agent.start_route([_drop("乙平台")], why="用例：没超时")
+            h.agent.start_route([_drop("乙平台")], why="用例：没超时", origin=dict(CHASE_ORIGIN))
             h.agent._climb_started = h.clock.t     # 刚下的命令 ⇒ 远没到 10 秒 ✓
             h.agent._climb_tick(h.clock.t, 700.0, set(), ws)
         check(not taps and h.agent.last_timeout_key is None,
@@ -9692,7 +10267,7 @@ def t_goto_timeout_key():
         with h._patched():
             ws = h.ws(with_mob=False)
             ws.player.here_sets = []
-            h.agent.start_route([_drop("丙平台")], why="用例：配了键")
+            h.agent.start_route([_drop("丙平台")], why="用例：配了键", origin=dict(CHASE_ORIGIN))
             h.agent._climb_started -= 11.0
             h.agent._climb_tick(h.clock.t, 700.0, set(), ws)
         _lk = h.agent.last_timeout_key
@@ -9845,6 +10420,75 @@ def t_locked_mob_info_cache():
           "玩家换层了却没重查（脚下变了，答案该重算 ✗）：调用 %d 次" % len(calls))
 
 
+def t_chase_clock_attack_vs_segment():
+    """⭐⭐ **追击签注的任务「不被 attack 刷新、可以被单段寻路执行器成功刷新」**
+    （用户 2026-09-29 第 2 条 ✓ 原话）。
+
+    为什么必须分开（现场形状，缺了这条 30 秒的闸就形同虚设 ✗）：
+      · 追击**最常见**的重下就是"**怪换层了 ⇒ 目的地集合变了**" ⇒ `start_climb` 里那套
+        签名判据（执行器类 + 起点集合 + 目标集合 ✓）**必然变** ⇒ 钟被重打 ⇒ 一趟永远追不上
+        的追击可以**无限续命** ✗✗；
+      · 而"走完一段接下一段"（`_task_finished` → `start_climb(nxt)` ✓）**该刷新** ✓
+        —— 那是真的新一段路，预算该是新的 ✓。
+
+    钉五件：
+      ① attack 重下（`keep_clock=True`）**目的地都换了** ⇒ 钟**一动不动** ✓；
+      ② 反过来（不带 `keep_clock`，= 走完一段接下一段 / 命令前往 ✓）⇒ 换目标照旧**重打** ✓；
+      ③ 跑完 / 被超时切掉**之后**再下（哪怕带 `keep_clock=True`）⇒ **起新钟** ✓
+         （带着上一趟的旧账一开工就超时 ⇒ 又回到"三楼→二楼 drop 左右晃"那个死循环 ✗）；
+      ④ 源码级：两处 attack 下发都带 `keep_clock=True` ✓，而 `_task_finished` 接下一段
+         那次 `start_climb(...)` **不带** ✓（"单段成功 ⇒ 刷新"那一侧 ✓）。
+    """
+    import inspect
+
+    from decision import route
+
+    s = fresh_settings()
+    h = Harness(s)
+    a = h.agent
+    with h._patched():
+        def _drop(dst):
+            return route.DropJob("甲平台", dst, [(500.0, 480.0, 520.0, "1")],
+                                 tol_px=10, hold_ms=250)
+
+        # ① attack 重下：目的地换了，钟**不许动**
+        a._route_origin = dict(CHASE_ORIGIN)
+        a.start_climb(_drop("乙平台"))
+        t0 = a._climb_started
+        check(bool(t0), "start_climb 没打「寻路超时」的钟")
+        h.clock.t += 1.0                     # ⚠ 夹具把 `ag.time.monotonic` 换成了**假钟** ✓
+        a.start_climb(_drop("丙平台"), keep_clock=True)     # 怪换层 ⇒ 换目的地 ✓
+        check(a._climb_started == t0,
+              "**attack 重下把追击的钟刷新了**（怪一换层就重打 ⇒ 一趟永远追不上的追击"
+              "可以无限续命，30 秒的闸形同虚设 ✗）：%r → %r" % (t0, a._climb_started))
+
+        # ② 不带 keep_clock（= 单段成功接下一段 / 命令前往）⇒ 换目标照旧重打
+        h.clock.t += 1.0                     # 假钟往前推 ⇒ "重打的钟"必然是不同的数 ✓
+        a.start_climb(_drop("丁平台"))
+        check(a._climb_started != t0,
+              "不带 `keep_clock` 的重下也没重打钟（走完一段接下一段该是**新预算** ✗）")
+        t1 = a._climb_started
+
+        # ③ 跑完之后再下 ⇒ 起新钟（别把上一趟的旧账带过来 ✗）
+        a._task_finished()
+        h.clock.t += 1.0                  # 假钟往前推（同上 ✓）
+        a._route_origin = dict(CHASE_ORIGIN)
+        a.start_climb(_drop("乙平台"), keep_clock=True)
+        check(a._climb_started != t1,
+              "上一趟收工之后再下（哪怕带 keep_clock）没起新钟 —— 新任务一开工就带着"
+              "上一趟的旧账 ⇒ 立刻超时 ⇒ 追击又下 ⇒ **死循环** ✗")
+
+        # ④ 源码级：两处 attack 带、接下一段那次不带
+        src = inspect.getsource(a.__class__)
+        check(src.count("keep_clock=True") >= 2,
+              "attack 那两处下发没都带 `keep_clock=True`（只带一处 ⇒ 另一条路照样刷新 ✗）：%d"
+              % src.count("keep_clock=True"))
+        _fn = src.split("def _task_finished", 1)[-1].split("\n    def ", 1)[0]
+        check("start_climb(" in _fn and "keep_clock" not in _fn,
+              "`_task_finished` 接下一段那次 `start_climb` 带上了 keep_clock —— 那"
+              "「单段执行器成功 ⇒ 刷新」就没了（用户明确要它能刷新 ✗）")
+
+
 def t_goto_timeout_reset_after_finish():
     """「**收工之后再下同一步 ⇒ 钟必须重打**」（用户 2026-09-28 报"**三楼前往二楼的 drop 时，
     左右晃了很长时间**"✗）。
@@ -9879,11 +10523,13 @@ def t_goto_timeout_reset_after_finish():
         # ⚠ 起终点 + 执行器类就是"同一步"的**全部**判据（见 `start_climb` 里的 `_sig` ✓）
         return route.DropJob(src, dst, [(500.0, 480.0, 520.0, "1")], tol_px=10, hold_ms=250)
 
+    a._route_origin = dict(CHASE_ORIGIN)   # 追击签注 ⇒ 才吃「寻路超时时间」✓（2026-09-29）
     a.start_climb(_job())
     t0 = a._climb_started
     check(t0, "start_climb 没打「寻路超时」的钟")
     # ② **覆盖**一个**还在跑**的（同一步）⇒ 钟一动不动
     _time.sleep(0.003)
+    a._route_origin = dict(CHASE_ORIGIN)   # 追击签注 ⇒ 才吃「寻路超时时间」✓（2026-09-29）
     a.start_climb(_job())
     check(a._climb_started == t0,
           "覆盖一个**正在跑**的同一步却把钟重打了（那正是「永远触发不了超时」✗ —— "
@@ -9892,6 +10538,7 @@ def t_goto_timeout_reset_after_finish():
     a._task_finished()
     check(a._climb is None, "收工后任务还挂在 `_climb` 上")
     _time.sleep(0.003)
+    a._route_origin = dict(CHASE_ORIGIN)   # 追击签注 ⇒ 才吃「寻路超时时间」✓（2026-09-29）
     a.start_climb(_job())
     check(a._climb_started != t0,
           "**收工之后再下同一步没重打钟** —— 新任务一开工就带上一段的旧账 ⇒ 立刻超时 ⇒ "
@@ -9900,6 +10547,7 @@ def t_goto_timeout_reset_after_finish():
     t1 = a._climb_started
     a._task_finished()
     _time.sleep(0.003)
+    a._route_origin = dict(CHASE_ORIGIN)   # 同上：追击签注 ✓
     a.start_climb(_job(dst="一楼", src="二楼"))
     check(a._climb_started != t1,
           "收工后换了**下一步**却没重打钟：%r" % (a._climb_started,))
@@ -9926,7 +10574,7 @@ def t_goto_timeout_per_hop():
     a = route.WalkJob("甲集合", [(520.0, 510.0, 530.0, -208.0, "1")])
     b = route.WalkJob("乙集合", [(520.0, 510.0, 530.0, -208.0, "2")])
     with h._patched():
-        h.agent.start_route([a, b], why="用例：两段")
+        h.agent.start_route([a, b], why="用例：两段", origin=dict(CHASE_ORIGIN))
         ws = h.ws(with_mob=False)
         # ① 第一段跑了 9 秒（没超）⇒ 到了 ⇒ 第二段**重新计时**
         h.clock.t += 9.0
@@ -9945,6 +10593,7 @@ def t_goto_timeout_per_hop():
         # ③ 单独一段超过上限 ⇒ 必须切，并说清是"这一段"
         c = route.WalkJob("丙集合", [(520.0, 510.0, 530.0, -208.0, "3")],
                           timeout_s=600.0)
+        h.agent._route_origin = dict(CHASE_ORIGIN)   # 追击签注 ✓（2026-09-29 起只有它吃超时）
         h.agent.start_climb(c)
         ws.player.here_sets = ["甲集合"]
         h.clock.t += 11.0
@@ -10097,9 +10746,147 @@ def t_climb_on_rope_by_broadcast():
           "感知说在绳上时反而没认（原行为被改坏 ✗）：%r / %s" % (o.get("note"), o))
 
 
+def t_link_eff_guards_and_probes():
+    """⭐⭐ **A→B→A 链路提效**的三件（用户 2026-09-29："开动"✓ —— 先做最便宜那两件 + 两个打点 ✓）。
+
+    **为什么要做**：`perf.log` 里最近一轮的账是 `e2e_probe_ms` 中位 **98 ms**（A 屏幕→B 解码，
+      纯上游）+ `pipe_ms` **16 ms**；而 `slot_wait_ms`（帧在槽里等多久）和
+      `kbd_rtt_ms`（B 发指令→A 固件回执）**从来没人量过** ✗ ⇒ 没法判断该往哪边使劲。
+
+    钉五件：
+      ① **torch / cv2 的线程池按到 1**（GPU 推理时它们纯属抢核 —— 而读线程是上游唯一的
+         兜底，被抢住就变成端到端延迟 ✗）；且**必须调在加载模型之前** ✓；
+      ② **键盘通道开 `TCP_NODELAY`**（按键/回执都是小包，Nagle 最坏多等一个 RTT ✗），
+         而且**控制机与游戏机两侧都要**（回执被拖住的话 `kbd_rtt_ms` 量出来就不干净 ✗）；
+      ③ `kbd_rtt_ms` 的记账：有在等的指令才记 ✓、账减完要清空 ✓、**空闲期的旧起点绝不算成
+         延迟** ✓（那是"没人按键的几十秒"，算进去这条数就废了 ✗）；
+      ④ `slot_wait_ms` 真在 `live_thread` 里按 `t_recv_mono` 算 ✓（负数夹 0 ✓）；
+      ⑤ 两个打点都走 `core.perf`（`perf.sample` / `perf.ms` ✓ ⇒ 自动进 perf.log 的分位数 ✓）。
+    """
+    import inspect
+    import socket
+    import time as _t
+
+    from remote_kbd import kbd_client as kc
+    from gui import live_thread as lt
+
+    # ① 线程池按到 1（用完**恢复**，别把后面用例的 torch 也按成单线程 ✓）
+    #   ⚠ 自检进程里 torch 可能**加载不了**（实测 WinError 1114 载不动 c10.dll ✗）——
+    #     那是这个进程的环境问题，不是产品代码的问题 ⇒ 这时只钉 cv2 那半 ✓
+    #     （函数本身对"没有 torch"也是静默跳过 ✓ 见它的注释）。
+    import cv2
+    try:
+        import torch
+    except Exception as e:              # noqa: BLE001
+        torch = None
+        print("      （本进程加载不了 torch：%s —— 只钉 cv2 那半 + 源码顺序 ✓）" % e)
+    _n0, _c0 = (torch.get_num_threads() if torch is not None else None), cv2.getNumThreads()
+    try:
+        lt._limit_cpu_threads()
+        if torch is not None:
+            check(torch.get_num_threads() == 1,
+                  "torch 线程池没按到 1（GPU 推理时它会和读线程抢核 ✗）：%d"
+                  % torch.get_num_threads())
+        check(cv2.getNumThreads() == 1,
+              "cv2 线程池没按到 1（cvtColor/resize 会抢读线程的核 ✗）：%d"
+              % cv2.getNumThreads())
+    finally:
+        if torch is not None:
+            torch.set_num_threads(_n0)
+        cv2.setNumThreads(_c0)
+    _src = inspect.getsource(lt)
+    _i_call = _src.rindex("_limit_cpu_threads()")
+    _i_load = _src.index("model = YOLO(weights)")
+    check(_i_call < _i_load,
+          "`_limit_cpu_threads()` 没调在**加载模型之前**（模型加载之后 torch 的线程池"
+          "可能已经开始用了 ✗）")
+
+    # ② TCP_NODELAY：真开一条回环 TCP 看它到底设上没有 ✓
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    cli = socket.create_connection(srv.getsockname(), timeout=2.0)
+    acc, _addr = srv.accept()
+    try:
+        check(kc.set_nodelay(cli), "`set_nodelay` 在回环 TCP 上返回 False（没设上 ✗）")
+        check(cli.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) == 1,
+              "客户端这条连接没有 TCP_NODELAY（Nagle 会攒按键小包 ✗）")
+        kc.set_nodelay(acc)
+        check(acc.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) == 1,
+              "对端（relay 那半边）没设 TCP_NODELAY：回执被攒住 ⇒ kbd_rtt_ms 会被污染 ✗")
+    finally:
+        for s in (cli, acc, srv):
+            try:
+                s.close()
+            except OSError:
+                pass
+    _ksrc = inspect.getsource(kc)
+    check("set_nodelay(raw)" in _ksrc,
+          "`KbdClient.__init__` 里没调 `set_nodelay`（只在用例里设等于没做 ✗）")
+    from remote_kbd import relay as _rl
+    _rsrc = inspect.getsource(_rl)
+    check("_set_nodelay(conn)" in _rsrc,
+          "relay（A 机那半边）没关 Nagle ✗")
+    check("from .kbd_client import set_nodelay" in _rsrc,
+          "relay 里的 `set_nodelay` 不是**共用**客户端那一份（两处各写一份必然漂 ✗）")
+
+    # ③ `kbd_rtt_ms` 记账（空壳对象，不碰真 socket ✓）
+    class _FakePerf(object):
+        def __init__(self):
+            self.samples = []
+
+        def ms(self, name, t0):
+            self.samples.append((name, (_t.perf_counter() - t0) * 1000.0))
+
+    fp = _FakePerf()
+    _real_perf = kc._perf
+    kc._perf = lambda: fp
+    try:
+        o = object.__new__(kc.KbdClient)
+        o._pending, o._rtt_t0 = 2, _t.perf_counter() - 0.05
+        o._take_rtt(1)
+        check(len(fp.samples) == 1 and fp.samples[0][0] == "kbd_rtt_ms",
+              "收到回执时没记 `kbd_rtt_ms`：%r" % (fp.samples,))
+        check(fp.samples[0][1] >= 40.0,
+              "记出来的往返比实际发出的时刻还短（起点算错了）：%.1f ms" % fp.samples[0][1])
+        check(o._pending == 1 and o._rtt_t0 is not None,
+              "还有一条没对上回执，起点不该清空：pending=%d t0=%r" % (o._pending, o._rtt_t0))
+        o._take_rtt(1)
+        check(o._pending == 0 and o._rtt_t0 is None,
+              "账减完了却没清空起点（下一次会把空闲期算成延迟 ✗）：pending=%d t0=%r"
+              % (o._pending, o._rtt_t0))
+        # ⚠ 空闲期：正常流程下 pending=0 时 t0 也已经是 None，但**判据必须是"有没有在等"**
+        #   （不是"t0 是不是 None"✗）—— 所以这里**故意造出**"没有在等、却还留着个旧起点"
+        #   的状态（老代码 / 别的调用方完全可能这样），要求它**不许**记这一笔 ✓。
+        o._pending, o._rtt_t0 = 0, _t.perf_counter() - 0.05
+        n_before = len(fp.samples)
+        o._take_rtt(1)
+        check(len(fp.samples) == n_before,
+              "**没有在等的指令**却记了一次 `kbd_rtt_ms`（空闲期不是延迟 ✗）：%r"
+              % (fp.samples,))
+        check(o._rtt_t0 is None,
+              "空闲期那一笔之后旧起点没清掉（下一次真发指令会把两段拼一起 ✗）：%r"
+              % (o._rtt_t0,))
+    finally:
+        kc._perf = _real_perf
+
+    # ④⑤ 两个打点真在实时链里（源码级：`slot_wait_ms` 必须按 t_recv_mono 算 ✓）
+    check('perf.sample("slot_wait_ms"' in _src,
+          "`live_thread` 里没有 `slot_wait_ms` 打点（帧在槽里等多久仍然是个谜 ✗）")
+    check("(_t_take - float(f.t_recv_mono))" in _src,
+          "`slot_wait_ms` 不是按「取帧时刻 − 解码完成时刻」算的（口径错了 ✗）")
+    check('_p.ms("kbd_rtt_ms"' in _ksrc,
+          "`kbd_rtt_ms` 没走 `core.perf`（那就进不了 perf.log 的分位数 ✓）")
+
+
 # ---------------------------------------------------------------- 入口
 
 CHECKS = [
+    ("⭐⭐ 链路提效：torch/cv2 线程按到 1 + 键盘通道 TCP_NODELAY + kbd_rtt/slot_wait 打点",
+     t_link_eff_guards_and_probes),
+    ("⭐⭐ 寻路时限：只有「追击」签注吃「寻路超时时间」（其它任务无限）、"
+     "attack 重下不刷新它的钟、走完一段接下一段才刷新（用户 2026-09-29）",
+     t_chase_clock_attack_vs_segment),
     ("定点休息：走→到达后行为→歇时长→结束后前往→回战斗；走不到如实说",
      t_afk_spot_rest),
     ("⭐ 定点休息「休息过程中循环行为」：只在休息中按 A~B 循环跑、不勾=老行为一字不变、"
@@ -10111,6 +10898,16 @@ CHECKS = [
     ("⭐⭐ 「玩家位置」参数组（用户 2026-09-28）：脚底偏移 / 框面积最小占比 / 面积基线·容差"
      "（闸拦在位置查询**之前**）/ 相机 y 用脚底偏移 / 箭头颜色·长度；默认全关 = 老行为一字不变",
      t_player_loc_params),
+    ("⭐⭐ 「当前任务」的签注 + 生存时间（用户 2026-09-28）：信息栏那行显示成"
+     "「前往：底层(追击  剩余 00:15)」；格式 `MM:SS`、与「寻路超时」同一把钟、休息时不加",
+     t_goto_tag_left),
+    ("⭐⭐ 下跳「跳下绳子」的水平方向（用户 2026-09-28 按流程图）：有锁定目标 ⇒ 朝它；"
+     "否则任意方向（背离下跳点中心）；回调坏了不许炸", t_drop_detach_dir),
+    ("⭐⭐ 新组「任务」→「追怪寻路.duration(s)」（用户 2026-09-28）：只掐「追怪下达的」任务、"
+     "与「寻路超时」同一把钟、0 = 不启用", t_chase_goto_max),
+    ("⭐⭐ 攻击范围判定「单侧」（跟画面一致）＋ 背后怪抢锁（用户 2026-09-28）："
+     "背后够得着 ⇒ 抢锁转身打它；够不着 ⇒ 不抢；同一只不重复抢",
+     t_attack_single_side_and_steal),
     ("⭐ 位置/血量/动作的定频快照（pos/act 每秒一条、休息分支里也要打）+ 喝药时记触发血"
      "（用户 2026-09-28）",
      t_snap_beat),

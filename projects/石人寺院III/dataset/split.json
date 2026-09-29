@@ -406,6 +406,7 @@
     "frame_00378",
     "frame_00379",
     "frame_00380",
+    "frame_00381",
     "frame_00382",
     "frame_00384",
     "frame_00385",
@@ -500,7 +501,8 @@
     "frame_00496",
     "frame_00497",
     "frame_00498",
-    "frame_00499"
+    "frame_00499",
+    "frame_00501"
   ],
   "val_ratio": 0.2,
   "seed": 42

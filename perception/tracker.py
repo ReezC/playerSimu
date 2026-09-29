@@ -326,6 +326,15 @@ class PlayerTracker:
     这样别的玩家从旁边经过时不会被「抢锁」（只要他离预测位置更远），
     比「每帧取置信度最高」稳得多。
 
+    ⭐ **另一个传感器：小地图上那颗黄点**（用户 2026-09-27/29）—— 黄点的**世界坐标**
+    是**权威**的（来自 `perception/minimap.py`，不经过 YOLO ✓）。除了上面那套"挑哪个框是
+    我"，它还让本类能做一件事：**把一个"可信的相机"记下来**（`camera()` ✓）。
+    为什么需要它（用户 2026-09-29 任务 2："玩家坐标改用 / 用小地图的权威世界坐标核对"）：
+    所有"**画面 → 世界**"的换算都要减掉相机，而老口径的相机是**每拍现算**的
+    `玩家世界坐标 − 玩家画面框` ⇒ **玩家框抖 Δ，每只怪的世界坐标就同量平移 Δ** ✗
+    （`docs/交接.md` §2 那条）。这里改成：**只在"框与黄点对得上"的那一拍**更新相机
+    （判据见 `_cam_step`），并把它交给下游用（`world_state.Player.cam_x/cam_y` ✓）。
+
     cands 形如 [(x1, y1, x2, y2, conf), ...]（画面坐标 xyxy）。
     返回 player_box = (cx, cy, bottom, conf, bw, bh)，和 live_thread 原格式一致；
     无框返回 None。
@@ -344,6 +353,72 @@ class PlayerTracker:
         #: 上一次**拿到的框**（解锁也不清 —— 它只用来算"上一帧的相机" ✓，
         #: 见 `_world_dist`；相机对**所有候选是同一次平移** ⇒ 旧一点也只影响刻度、不影响排序 ✓）
         self._last_box = None
+        #: ⭐ **可信相机** `(cam_x, cam_y)`：`世界 = 画面 + 相机`（见 `camera()`）；
+        #: `None` = 还没建立（此时下游一律退回老口径"世界坐标 − 画面坐标"现算 ✓）
+        self.cam = None
+        #: 连续几拍"框与黄点对不上"（对得上就归零）—— 只用来决定"还冻着还是该认账"
+        self.cam_missed = 0
+        #: 这一拍**是不是**因为"对不上"而没更新相机（打点/界面用 ✓）
+        self.cam_rejected = False
+        #: ⭐ 这一拍两个传感器差了多少（**世界像素**；判不出来 = `None`）—— 它是个可读的数：
+        #: "玩家框那一路到底稳不稳"。"世界坐标整体偏"那类排查要的就是它 ✓
+        #: （1 个实时小地图像素 ≈ 8.5 世界像素 ⇒ 差几个像素 = 差零点几个面板格子 ✓）。
+        self.cam_resid = None
+
+    def camera(self):
+        """**可信相机** `(cam_x, cam_y)` 或 `None` —— 把画面坐标换算成世界坐标要减掉的那个量。
+
+        口径与 `perception.minimap.screen_to_world` **完全一致**（x 用框中心、y 用**框底** +
+        `world_state.FOOT_OFFSET_PX` ✓），下游别自己再减一遍（约定 10：一条口径一处实现 ✓）。
+        ⚠ `None` = **还没建立** ⇒ 调用方必须退回老口径（现算 `世界 − 画面` ✗ 不许当成 0 ✗）。
+        """
+        return self.cam
+
+    @staticmethod
+    def _cam_of(cx, bottom, world):
+        """(框, 本帧黄点) → 隐含的相机；缺数据 ⇒ `None`（**不猜** ✗）。"""
+        if world is None:
+            return None
+        try:
+            from perception import world_state as _ws
+            return (float(world[0]) - float(cx),
+                    float(world[1]) - (float(bottom) + float(_ws.FOOT_OFFSET_PX)))
+        except (TypeError, ValueError):
+            return None
+
+    def _cam_step(self, cx, bottom, world):
+        """按"**框与黄点对不对得上**"决定要不要更新可信相机 → `True` = 这一拍对不上。
+
+        **为什么用"和上一次采纳的相机差多少"当判据**：两个传感器（YOLO 认画面 / 小地图读
+        黄点）各自给"我在哪"，它们**不一致**的唯一表现就是"隐含的相机跳了"——
+        阈值直接复用 `max_jump`（本类"位置突变"的容忍量 ✓），**不新造常数** ✓。
+        ⚠ 它管的**不是**"框自己抖"：框抖超过 `max_jump` 的那一下**根本走不到这里**
+          （`update` 里第一道闸就把它扔了 ✓）⇒ 这里剩下的是"**两个传感器各说各的**"
+          （典型：黄点自己被认错、或者框锁到别人身上了）✓ —— 那是纯连续性判据看不见的
+          一类错误 ✓（`cam_resid` 就是它的读数 ✓）。
+
+        **对不上时怎么办**：**这一拍不更新相机**（继续用上次那个）—— 宁可旧一点，
+        也不要把一个抖出来的 Δ 灌进所有"画面 → 世界"的换算 ✓（怪的世界坐标、
+        "脚下属于哪块集合"全都会跟着抖 ✗）。
+        ⚠ **不会永远冻住**：连续 `max_missed` 拍都对不上 ⇒ **认账**（真的传送 / 换图 /
+        框锁到别人身上去了）⇒ 重新采纳 ✓；另外"跟丢 ⇒ 解锁"那条路也会把相机清掉重来 ✓。
+        """
+        imp = self._cam_of(cx, bottom, world)
+        if imp is None:
+            self.cam_resid = None
+            return False                    # 这一拍判不出来 ⇒ 不动（也不算"对不上" ✓）
+        if self.cam is None:
+            self.cam, self.cam_missed, self.cam_resid = imp, 0, 0.0
+            return False
+        dx = imp[0] - self.cam[0]
+        dy = imp[1] - self.cam[1]
+        self.cam_resid = (dx * dx + dy * dy) ** 0.5
+        if self.cam_resid <= self.max_jump \
+                or self.cam_missed + 1 >= max(1, self.max_missed):
+            self.cam, self.cam_missed = imp, 0
+            return False
+        self.cam_missed += 1
+        return True
 
     @property
     def locked(self):
@@ -391,7 +466,12 @@ class PlayerTracker:
           （见 `gui/live_thread.py` 挑框那一段 ✓）。
         ⚠ `world` 没给 / 上一次也没给 / 两个候选不等价 ⇒ **退回老判据**（像素连续性 ✓），
           绝不因为"世界数据缺"就把锁丢了 ✗。
+
+        ⭐ 顺带维护**可信相机**（`camera()` ✓）：挑中的那一只按 `_cam_step` 与黄点对一次
+        账 —— 对得上才更新相机；对不上就**冻着用旧的**（`cam_rejected=True`，
+        打点 `cam_reject` ✓，理由见 `_cam_step`）。
         """
+        self.cam_rejected = False
         if self._box is None:
             # 未锁定（开局 / 跟丢后）：老口径 = 取**置信度最高**的 ✓；有世界数据时先用它挑一遍
             # （`_last_world` + `_last_box` 都还在的话 ✓），挑不出来再回老口径 ✓。
@@ -413,6 +493,11 @@ class PlayerTracker:
             self._last_box = self._box
             if world is not None:
                 self._last_world = (float(world[0]), float(world[1]))
+            # ⭐ **重新锁定 = 重新建立相机**（`cam=None` ⇒ `_cam_step` 直接采纳这一拍 ✓）：
+            #   跟丢/传送/换图之后相机本来就该重来（旧那个是上一段的，沿用只会把它带偏 ✗）。
+            self.cam = None
+            self.cam_missed = 0
+            self._cam_step(self._box[0], self._box[2], world)
             return self._box
 
         px = self._box[0] + self._vx   # 预测位置（位置 + 速度外推）
@@ -446,6 +531,9 @@ class PlayerTracker:
             self._box = nb
             self._last_box = nb         # 相机那一份也更新（下一帧要用它 ✓）
             self._missed = 0
+            # ⭐ 可信相机：**这一拍跟黄点对得上才更新**（对不上就冻着用旧的 ✓ —— 理由、
+            #   以及"不会永远冻着"那两条出口都在 `_cam_step` 里 ✓）。
+            self.cam_rejected = self._cam_step(nb[0], nb[2], world)
             return nb
 
         # 没匹配到 / 本帧没候选：外推一个框，累计漏检

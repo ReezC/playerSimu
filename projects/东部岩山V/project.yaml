@@ -89,22 +89,25 @@ decision:
   player_track_jump: 200
   player_foot_offset_px: 0
   player_box_min_area_pct: 0.0
-  player_box_area_base_n: 30
+  player_box_area_base_s: 1.0
   player_box_area_tol_pct: 0.0
-  player_arrow_color: '#00E5FF'
-  player_arrow_width_px: 2
-  player_arrow_len_px: 60
   hp_bar: null
   mp_bar: null
   probe_calib: {}
   hp_color:
   - - 0
     - 0
-    - 135
-  - - 79
-    - 82
+    - 137
+  - - 77
+    - 80
     - 255
-  mp_color: null
+  mp_color:
+  - - 146
+    - 79
+    - 0
+  - - 255
+    - 199
+    - 79
   hp_threshold: 30
   mp_threshold: 7
   pot_cd: 1500
@@ -129,6 +132,7 @@ decision:
   climb_retry_delay_s: 1.0
   climb_retry_delay_inc_s: 1.0
   goto_timeout_s: 30.0
+  chase_goto_max_s: 0.0
   goto_timeout_key: null
   disable_chase_pathfinding: false
   jump_start_px: 0

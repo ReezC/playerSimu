@@ -157,9 +157,11 @@ class PositionStateMachine:
         self._last_span = None
         #: 这一拍广播的 `here_sets` 是不是**沿用**来的（给界面/排查用 ✓；同图内抖一下很正常 ✓）。
         self.here_sticky = False
-        self._best = {}                     # lid -> (best_y, best_at)
+        # ⚠ 上爬**不再**记「y 到过的最小值 + 它最后一次变小的时刻」了（用户 2026-09-28 ✓
+        #   原话："移除这一项『y 在「移动操作尝试间隔」内不再变小』，用『广播"到顶"之后还会
+        #   再按住 ↑ 250ms』仅此一项兜底"）⇒ 判到顶只看"y ≤ 绳顶 + 容差"✓。
         #: 每根绳「y 到过的**最大值** + 它**最后一次变大**的时刻」—— 下爬到**下端**要用 ✓
-        #: （与上面那份对称 ✓；两份分开记，上下爬互不干扰 ✓）。
+        #: ⚠ **只保留下爬这一份**（上爬那份已按用户要求删掉 ✗ 别再加回来）。
         self._best_bot = {}
         #: 广播字段（读 `update` 的返回值；也留着方便用例直接看 ✓）
         self.here_sets = []
@@ -193,11 +195,19 @@ class PositionStateMachine:
         `hold_vert` = 这一拍**按没按 ↑/↓**（事实 ✓，由调用方提供 ✓）。
         `span_of` = "集合名 → `(左, 右)`"的**回调查询**（调用方给 ✓ —— 机器在感知层，
           **不 import 决策层** ✗；`gui.live_thread` 那边本来就有这个闭包 ✓）。
-        判据（**照抄用户 2026-09-27 给的定义**，一个字不自己加）：
-          「世界坐标 `y ≤ 绳梯上端的 y + 「坐标对齐误差范围」`」**且**
-          「`y` 在「移动操作尝试间隔」时间内**不再变小**」⇒ 判**到顶** ✓；
-          下爬**对称**过来：「`y ≥ 绳梯下端的 y - 「坐标对齐误差范围」`」**且**
-          「`y` 在「移动操作尝试间隔」时间内**不再变大**」⇒ 判**到底** ✓。
+        判据：
+          ⭐ **上端（到顶）**：「世界坐标 `y ≤ 绳梯上端的 y + 「坐标对齐误差范围」`」⇒ 判**到顶** ✓
+          —— 2026-09-28 用户**删掉了原来并列的第二条**「`y` 在「移动操作尝试间隔」时间内
+          **不再变小**」✗（原话："移除这一项『y 在「移动操作尝试间隔」内不再变小』，用『广播
+          "到顶"之后还会再按住 ↑ 250ms』**仅此一项**兜底"）。那条要**干等**「移动操作尝试
+          间隔」（默认 **3000ms**）才认到顶 ⇒ 现场就是"人早停在绳顶了、状态还写着没到"✗。
+          ⚠ 误判的兜底**不在感知层**：执行器判到到达后**不立刻松手**，会再按住 ↑
+            `base_hold_ms`（=「坐标对齐误差时间」，默认 **250ms**）才收工 ✓
+           （`decision/route.py` 的 `ClimbJob._arrived_hold` ✓）—— 那一步本来就是"迈上平台"
+            要按着 ↑ ✓ ⇒ **一箭双雕**：既是游戏机制，又接住了"y 抖一下误判到顶" ✓。
+          **下端（到底）**：仍然**两条**：「`y ≥ 绳梯下端的 y - 「坐标对齐误差范围」`」**且**
+          「`y` 在「移动操作尝试间隔」时间内**不再变大**」⇒ 判**到底** ✓
+          （⚠ 下爬这次**没动** —— 用户只点了上爬那一项 ✓ 要动说一声）。
         ⚠ 判不了（这一拍没有世界坐标 / 没有地形）⇒ **一律给空**（`here_sets=[]`、
           `ladder_id=None`、`at_ladder_top=None`、… ✓）—— 绝不留旧值骗执行器 ✗。
         """
@@ -247,27 +257,28 @@ class PositionStateMachine:
         self.at_ladder_top = ""
         self.at_ladder_bottom = ""
         if not self.ladder_id:
-            self._best.clear()                  # 不在绳上（或没按 ↑/↓）⇒ 极值重来（下一根绳从零算 ✓）
-            self._best_bot.clear()
+            self._best_bot.clear()              # 不在绳上（或没按 ↑/↓）⇒ 极值重来（下一根绳从零算 ✓）
             self._moved.clear()
             self.climb_failed = False
             self.climb_stalled = False
             self.note = ""
             return self._broadcast()
         lid = self.ladder_id
-        if list(self._best) != [lid]:           # 换了根绳（或刚贴上来）⇒ 只留当前这根 ✓
-            self._best = {}
-        if list(self._best_bot) != [lid]:
+        if list(self._best_bot) != [lid]:       # 换了根绳（或刚贴上来）⇒ 只留当前这根 ✓
             self._best_bot = {}
         if list(self._moved) != [lid]:
             self._moved = {}
         retain = max(0.0, float(move_retry_ms or 0.0)) / 1000.0
-        # ③a 上端：y 越**小**越靠上 ⇒ 记"y 到过的最小值 + 最后一次变小的时刻" ✓
-        b = self._best.get(lid)
-        if b is None or float(y) < b[0]:
-            self._best[lid] = (float(y), now)
-            b = self._best[lid]
-        if top is not None and float(y) <= top + tol and (now - b[1]) >= retain:
+        # ③a 上端：⭐ **只看"够不够高"**（用户 2026-09-28 ✓ 原话："移除这一项『y 在「移动操作
+        #   尝试间隔」内不再变小』，用『广播"到顶"之后还会再按住 ↑ 250ms』**仅此一项**兜底"）
+        #   ⇒ 从这里**删掉**了原来的 `(now - b[1]) >= retain` —— 那一项要**干等**
+        #   「移动操作尝试间隔」（默认 3000ms）才认到顶 ⇒ 现场就是"人早停在绳顶了、状态还写着
+        #   没到"（用户 2026-09-28 问的"攀爬到顶后还发呆一段时间"✗ 主因就是它 ✓）。
+        #   ⚠ 误判（y 抖一下就够高）的兜底**不在这一层**：执行器判到到达后**不立刻松手**，
+        #     会再按住 ↑ `base_hold_ms`（「坐标对齐误差时间」，默认 250ms）才收工 ✓
+        #     （`ClimbJob._arrived_hold` ✓）—— 那本来就是"迈上平台"要按着 ↑ ✓ **一箭双雕** ✓。
+        #   ⚠ 所以这里**故意不再记 y 极值**（上面那份 `_best` 随之删掉 ✓ 死数据不留 ✗）。
+        if top is not None and float(y) <= top + tol:
             self.at_ladder_top = lid
         # ③b 下端：y 越**大**越靠下 ⇒ 记"y 到过的最大值 + 最后一次变大的时刻" ✓（对称 ✓）
         bb = self._best_bot.get(lid)
@@ -369,7 +380,6 @@ class PositionStateMachine:
         self.ground_y = None
         self.climb_failed = False
         self.climb_stalled = False
-        self._best.clear()
         self._best_bot.clear()
         self._moved.clear()
 

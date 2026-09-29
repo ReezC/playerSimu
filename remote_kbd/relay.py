@@ -18,6 +18,14 @@ from pathlib import Path
 
 import serial
 
+# `set_nodelay` 与客户端**共用一份实现** ✓。两种跑法都要能用：
+#   · 部署时是 `python relay.py …`（脚本，同目录 import ✓）；
+#   · 从仓库根 `python -m remote_kbd.relay`（包内相对 import ✓）。
+try:
+    from .kbd_client import set_nodelay as _set_nodelay
+except ImportError:                       # noqa: BLE001 —— 当脚本跑时走这条 ✓
+    from kbd_client import set_nodelay as _set_nodelay
+
 # ---- 崩溃取证 ---------------------------------------------------------------
 #
 # 这个进程曾经以 3221225477（0xC0000005 访问违规）**原生崩死**过：Python 的
@@ -184,6 +192,10 @@ def bridge(conn, link):
     """
     stop = threading.Event()
     conn.settimeout(5.0)          # 客户端不读时别永久阻塞
+    # ⭐ 回执（DONE/ERR）也是**小包 + 实时**：不关 Nagle 就会攒着等 ACK（最坏 ~40 ms ✗），
+    #   而控制机正是拿"发指令→收到回执"在算 `kbd_rtt_ms`（用户 2026-09-29 链路提效 ✓）
+    #   —— 让回执被 Nagle 拖住，量出来的往返就不干净了 ✗（`set_nodelay` 一处实现 ✓）。
+    _set_nodelay(conn)
 
     def ser_to_tcp():
         while not stop.is_set():

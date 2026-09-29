@@ -395,7 +395,11 @@ class BattleZoneDialog(QDialog):
         #:   原话："把可以战斗参数**移出来**，在**已添加的项目上勾选**"✓）——
         #:   这里只把它**记下来**，`zone()` 时**原样带回** ✓
         #:   ⇒ 免得"进来编辑一次就把勾选弄丢" ✗✗（这一句是本次最要紧的一步 ✓）。
-        self._can_fight = bool(z0.get("can_fight"))
+        # ⚠ 新增区域（列表"添加"传来的 z0 没有 can_fight 键）默认「可以战斗」；
+        # 否则新加的战斗区域会被排除出 battle_zone_sets 白名单，导致玩家站在它上面、
+        # 场景里又有怪时 tick 提前返回 leave_battle_zone，idle 回归（以及战斗）都不触发。
+        # 编辑已有区域时，显式的值会被原样保留（get 的第二参数只兜底"没有该键"的情况）。
+        self._can_fight = bool(z0.get("can_fight", True))
         self.setWindowTitle(("编辑战斗区域「%s」" % self._set) if self._set
                             else "添加战斗区域")
         # ⚠ 只钉**宽度**、不钉高度，并给一个**打开的尺寸**（2026-09-28 现场修 ✗ ——
@@ -529,6 +533,7 @@ class BattleZoneDialog(QDialog):
         btn_ok = QPushButton("确定")
         btn_ok.clicked.connect(self.accept)
         btn_cancel = QPushButton("取消")
+        theme.unify_ok_cancel(btn_ok, btn_cancel)
         btn_cancel.clicked.connect(self.reject)
         row.addWidget(btn_cancel)
         row.addWidget(btn_ok)
@@ -904,76 +909,17 @@ class PlayerPanel(QWidget):
 
         root.addLayout(top_form)
 
-        # ---- ⭐⭐ 「玩家位置」组（用户 2026-09-28 要求 ✓ —— **单开一组**）----
-        #  ① **脚底偏移**：人物框的底边不一定正好压在脚底（鞋底阴影 / 披风 / 特效会让框多出
-        #     一截 ✗）⇒ 差多少由这儿补正；**在实时预览上对着那对箭头调** ✓（正好用它调 ✓）。
-        #  ②③④ **框面积闸**：拿最近 N 拍的框面积**滚动均值**当"正常大小"，当前框比它小太多
-        #     （≤ 基线 ×(1−容差%)）⇒ 这一拍**不做位置查询** ✓ —— ⚠ 用户明确："**拦在查询
-        #     之前**，而不是靠放宽挑面"✗（见 `gui/live_thread` 里 `_locate_mmap` 之前那道闸 ✓）。
-        #     **0 = 关**（老行为一字不变 ✓）。
-        #  ⑤ **实时预览上的箭头**：以玩家位置为原点，一根沿世界 x、一根沿世界 y（画面上"向上"）
-        #     ⇒ 一眼看出"定位 / 脚底偏移到底对不对" ✓。颜色、长度都可配 ✓。
-        loc_grp = QGroupBox("玩家位置")
-        lg = QFormLayout(loc_grp)
-        lg.setContentsMargins(6, 6, 6, 6)
-
-        self.sp_foot_off = self._spin(-500, 500, 0, 0)
-        self.sp_foot_off.setToolTip(
-            "脚底偏移（像素）：算「脚底 / 相机 y」时用「框底 + 这个值」（正数 = 往下挪）。\n"
-            "人物框的底边不一定正好压在脚底（鞋底阴影 / 披风 / 特效会让框多出一截）。\n"
-            "在实时预览上对着那对箭头调：箭头根部该正好落在脚底。")
-        self.sp_foot_off.valueChanged.connect(self._on_player_loc_params)
-        lg.addRow("脚底偏移(px)", self.sp_foot_off)
-
-        self.sp_box_min_area = self._spin(0, 100, 0, 3, 0.1)
-        self.sp_box_min_area.setToolTip(
-            "框面积最小占比(%)：框面积小于「画面面积 × 这个比例」⇒ 这一拍不算有效检测。\n"
-            "人太小 / 框抖掉了 ⇒ 位置不可信，宁可这一拍不定位。\n0 = 不启用。")
-        self.sp_box_min_area.valueChanged.connect(self._on_player_loc_params)
-        lg.addRow("框面积最小占比(%)", self.sp_box_min_area)
-
-        self.sp_area_base_n = self._spin(1, 600, 30, 0)
-        self.sp_area_base_n.setToolTip(
-            "面积基线窗口（拍）：拿最近这么多拍的框面积求均值当「正常大小」。")
-        self.sp_area_base_n.valueChanged.connect(self._on_player_loc_params)
-        lg.addRow("面积基线窗口(拍)", self.sp_area_base_n)
-
-        self.sp_area_tol = self._spin(0, 90, 0, 1, 1)
-        self.sp_area_tol.setToolTip(
-            "面积容差(%)：当前框面积 ≤ 基线 ×(1−容差%) ⇒ 这一拍**推迟 / 不做**位置查询。\n"
-            "0 = 关掉这道闸（老行为）。")
-        self.sp_area_tol.valueChanged.connect(self._on_player_loc_params)
-        lg.addRow("面积容差(%)", self.sp_area_tol)
-
-        # ⭐ 箭头：**一个颜色**（x/y 同色 —— 用户 2026-09-28 改的口径："x 箭头和 y 箭头应该是
-        #   一个颜色"✓）＋ **线条粗细**（用户："选择颜色弹窗里需要能调整线条粗细"✓）。
-        #   ⚠ Qt 的 `QColorDialog` **塞不进自定义控件** ✗ ⇒ 粗细做成**紧挨着色块的那一格** ✓
-        #     （同一排 ⇒ "选色 + 定粗细"一个动作做完 ✓ 与「视野线宽度」同一排版 ✓）。
-        self._arrow_color = "#00E5FF"
-        _arrow_row = QWidget()
-        _ar = QHBoxLayout(_arrow_row)
-        _ar.setContentsMargins(0, 0, 0, 0)
-        _ar.setSpacing(6)
-        self.btn_arrow_color = QPushButton("#00E5FF")
-        self.btn_arrow_color.setFixedWidth(64)
-        self.btn_arrow_color.setToolTip(
-            "点开取色弹窗（可调透明度）；右边那格是**线条粗细**。\n"
-            "箭头以玩家脚底为原点：一根朝画面右（世界 x 正方向）、一根朝上（世界 y 正方向）。")
-        self.btn_arrow_color.clicked.connect(self._pick_arrow_color)
-        self.sp_arrow_width = self._spin(1, 20, 2, 0)
-        self.sp_arrow_width.setToolTip("箭头线条粗细（像素）。")
-        self.sp_arrow_width.valueChanged.connect(self._on_player_loc_params)
-        _ar.addWidget(self.btn_arrow_color)
-        _ar.addWidget(self.sp_arrow_width)
-        _ar.addStretch(1)
-        lg.addRow("箭头色 / 粗细", _arrow_row)
-
-        self.sp_arrow_len = self._spin(0, 2000, 60, 0)
-        self.sp_arrow_len.setToolTip("箭头的线段长度（像素）。0 = 不画箭头。")
-        self.sp_arrow_len.valueChanged.connect(self._on_player_loc_params)
-        lg.addRow("箭头长度(px)", self.sp_arrow_len)
-
-        root.addWidget(loc_grp)
+        # ⭐⭐ 「玩家位置」（脚底偏移 / 框面积最小占比 / 面积基线·容差）**已搬到
+        #   「**设置 → 判定参数页**」**（用户 2026-09-28 ✓ 原话："「玩家位置」也应该在
+        #   设置 → 判定参数页签"）。
+        #   为什么它不属于**这一页**（决策参数面板）：那几个数既是"**这一拍算不算拿到了
+        #   玩家位置**"（脚底偏移改「画面 → 世界」的换算 ✓；面积闸决定这一拍要不要**跳过
+        #   定位查询** ✓）、又该**跟项目走**（不同地图的面 y / 人物框大小都不一样 ✓）
+        #   ⇒ 两条都指向「**判定参数**」页 ✓。
+        #   ⚠ 判据（规范 §4）：**"怎么说算数" + "跟项目走" ⇒ 进设置弹窗的判定参数页**；
+        #     **"本机外观"（只是画给人看）⇒ 进 界面 → 辅助线与标记** ✓。
+        #   ⛔ **别再搬回来**（2026-09-28 犯过一次 ✗）；后端字段没动
+        #     （仍是 `decision.settings.player_*` ⇒ 仍跟着项目存 ✓）。
 
         # ---- 参数模板（轻量一行，不套 groupbox：只有两个按钮，边框标题纯占地方）----
         tpl_row = QHBoxLayout()
@@ -1749,12 +1695,116 @@ class PlayerPanel(QWidget):
 
     # ---------------- 事件 ----------------
 
+    #: ⭐ **开自动前的体检**：上一次的结论（`None` 还没查过 / `True` 通过 / `False` 用户选了否）
+    _precheck_ok = None
+
+    @staticmethod
+    def _precheck_problems(map_id, src=None):
+        """⭐ 开自动前的**条件体检**（用户 2026-09-29 ✓ 原话："开启自动前，检查一下条件吧，
+        然后出弹窗提示"）。返回**问题清单**（空列表 = 通过 ✓）。
+
+        **为什么要有它**：2026-09-29 那次「开自动却不打怪、只站着」查了半天，根因是
+        `森林迷宫III` 的小地图标定**只做了一半** —— `datasets/map/105040303.mapcalib.json`
+        里只有 `world_offset`/`alpha`/`mode`（叠加显示用的），**缺 `scale`/`offset`**
+        （=「面板 → 底图」换算没做 ✗）⇒ 玩家世界坐标恒为 `None` ⇒ 决策层判"没有玩家位置"
+        （`decision/agent.py:4789`）⇒ 你设的 3 分钟一到就**自己把自动停了** ✗。
+        而这些事**开之前就查得出来** ✓ ⇒ 所以做在这儿 ✓。
+
+        ⚠ **只判"纯读文件、毫秒级"的项**（地图 id / 标定几何 / 地形底图）✓ —— 能在 UI 线程
+        直接调 ✓。**故意不去抓一帧跑定位** ✗：独立推流那条路要**阻塞最多 5 秒**
+        （`mm.stream_panel`）⇒ 开个自动先卡 5 秒不能接受 ✓（"黄点认不认得出"那类信息，
+          实时页小地图那行本来就在实时显示 ✓ 见 `minimap.PlayerLocator` 的 `short`/`note`）。
+
+        ⚠ 抽成 **`@staticmethod` 且只吃 `map_id`** 是为了**能单测**（不吃 self / 不弹窗 ✓）；
+        弹窗那步交给调用方 `_precheck_auto` ✓。
+        """
+        probs = []
+        mid = str(map_id or "").strip()
+        if not mid:
+            probs.append("· **没选地图** —— 本项目还没在 ①「识别目标选项」里选地图。")
+            return probs
+        try:
+            from core import mapdata
+            from perception import minimap as mm
+            _src = str(src or mm.live_src())    # 与实时层**同一口径**（live.yaml 的 mmap_src ✓）
+            # ① 标定几何：⚠ 就用 `has_geometry`（它**不看 score**、只问"几何量出来没有"✓，
+            #    缺 `scale`/`offset` 即 False ⇒ 正是本次踩的坑 ✓）
+            calib = None
+            try:
+                calib = mapdata.load_calib(mid, _src)
+            except Exception:
+                calib = None
+            if not mm.has_geometry(calib or {}):
+                probs.append(
+                    "· **地图「%s」在来源「%s」下还没标定**（缺「面板 → 底图」换算）\n"
+                    "  ⇒ 玩家坐标会一直是空的 ⇒ 开一会儿自动自己就会停掉\n"
+                    "  → 去「路线识别」页点「标定…」量一次并**保存**。" % (mid, _src))
+            # ② 地形 / 底图：`canvas is None` = 没生成过地形图（同 route_panel 的口径 ✓）
+            try:
+                t = mapdata.load(mid, with_canvas=True)
+            except Exception:
+                t = None
+            if t is None or getattr(t, "canvas", None) is None:
+                probs.append(
+                    "· **地图「%s」还没有地形图 / 底图**\n"
+                    "  → 去「路线识别」页点「生成地形图」。" % mid)
+        except Exception as e:                  # noqa: BLE001 —— 体检本身不许把开自动搞崩 ✗
+            probs.append("· 检查标定 / 地形时出错：%s" % e)
+        return probs
+
+    def _precheck_auto(self):
+        """开自动前的体检 + 弹窗。返回 `True` = 放行 ✓。
+
+        ⚠ **只"提示"不"禁止"**（用户说的是"**出弹窗提示**"✓）：提示完让人自己决定 ——
+        但**默认按钮给「否」** ✓（这次要拦的是"条件没凑齐就开"✓，安全的一侧才是默认 ✓，
+        和 `_confirm_local_auto` 同一个道理 ✓）。
+        """
+        if self._auto_confirming:
+            return True                         # 已经在问别的了，别叠对话框 ✗
+        probs = self._precheck_problems(
+            getattr(self, "_map_id_for_check", lambda: "")())
+        if not probs:
+            return True
+        self._auto_confirming = True
+        try:
+            r = QMessageBox.warning(
+                self, "开自动前的检查没通过",
+                "下面这些条件没凑齐，开了自动很可能**不动**、或者过一会儿**自己停掉**：\n\n"
+                + "\n\n".join(probs)
+                + "\n\n（这只是提醒，不是禁止 —— 确认现在就要开吗？）",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        finally:
+            self._auto_confirming = False
+        return r == QMessageBox.Yes
+
+    def _map_id_for_check(self):
+        """本项目的地图 id（体检用 ✓ 口径同 `route_panel._map_id`：`project.get("map_id")`）。"""
+        try:
+            p = getattr(self, "project", None)
+            if p is None:
+                return ""
+            get = getattr(p, "get", None)
+            return str((get("map_id") if callable(get) else "") or "").strip()
+        except Exception:
+            return ""
+
     def _toggle_auto(self, checked=None):
         on = self.btn_auto.isChecked()
         if on and not self._confirm_local_auto():
             # 在确认框上选了「否」：把按钮拨回去，**不碰 settings.enabled**。
             # blockSignals 只是防御（clicked 不会因为 setChecked 再发一次，
             # 但以后万一有人把它接到 toggled 上，这里就会自己叫自己）。
+            self.btn_auto.blockSignals(True)
+            self.btn_auto.setChecked(False)
+            self.btn_auto.blockSignals(False)
+            self._refresh_auto_ui()
+            return
+        # ⭐⭐ **开之前先体检**（用户 2026-09-29 ✓ 原话："开启自动前，检查一下条件吧，然后
+        #   出弹窗提示"）。少了这一步，条件没凑齐时会表现成"开自动却只站着不打"、
+        #   或者过几分钟**自己停掉**（`player_lost_stop`）✗ —— 那时候再回头查就要花掉半天
+        #   （2026-09-29 就是这么查的 ✓ 根因是"小地图标定只做了一半"）。
+        #   顺序放在本地输入确认**之后**：那个是安全确认（先问），这个是条件说明 ✓。
+        if on and not self._precheck_auto():
             self.btn_auto.blockSignals(True)
             self.btn_auto.setChecked(False)
             self.btn_auto.blockSignals(False)
@@ -2413,7 +2463,9 @@ class PlayerPanel(QWidget):
             "「可以战斗」= **旧的「限制战斗区域」**（用户 2026-09-28 搬进每一项 ✓）：\n"
             "  勾上 ⇒ 人**不在这块集合上**时这一拍**不打架**、先下「前往」回去 ✓，\n"
             "          而且只打**本集合里**的怪 ✓；\n"
-            "  不勾（默认）⇒ 这块区域**只管它自己那几项参数**，不影响在哪打架 ✓。\n\n"
+            "  不勾 ⇒ 这块区域**只管它自己那几项参数**，不影响在哪打架 ✓\n"
+            "          （**新加的项默认勾上** ✓ —— 不勾的话它进不了能打名单，\n"
+            "            别的区域能打时人会被请出去，idle 回归也起不来 ✗）。\n\n"
             "一个都没勾 = **不限制**（任何地方都打 ✓ 老行为）。\n\n"
             "怎么配：点「**编辑**」⇒ 打开「编辑战斗区域」列表 ——\n"
             "  点「添加」选一块集合 ⇒ 立刻弹出它的参数窗 ✓；\n"
@@ -2615,57 +2667,14 @@ class PlayerPanel(QWidget):
         settings.player_track_jump = int(val)
         settings.save()
 
-    def _on_player_loc_params(self, _v=None):
-        """「玩家位置」组（用户 2026-09-28 ✓）：**一个槽写全这一组** ✓。
+    # ⚠ 原来这里有个槽（`_on_player_loc_params`）—— 「玩家位置」搬去**设置 → 判定参数页**
+    #   之后**整块删掉** ✓：那几项的写回在 `settings_dialog._accept` 里（和「坐标对齐误差
+    #   范围」那批**同一段** ✓ 都是跟着项目存 ✓ 一份实现、一处维护 ✓）。
 
-        ⚠ 它只往 `settings` 里写 + 存盘 —— **运行期不用做任何"立刻生效"的动作**：
-          · 脚底偏移 / 面积闸在 `live_thread` 里**每帧现读** ✓；
-          · 箭头颜色、长度同理 ✓。
-        ⚠ 颜色**自己校验**：只认 `#RRGGBB`（大小写都行 ✓）；写得不对 ⇒ **保留原值** ✓
-          （悄悄换成默认色，反而让人看不出自己填错了 ✗）。
-        """
-        settings.player_foot_offset_px = int(self.sp_foot_off.value())
-        settings.player_box_min_area_pct = float(self.sp_box_min_area.value())
-        settings.player_box_area_base_n = max(1, int(self.sp_area_base_n.value()))
-        settings.player_box_area_tol_pct = float(self.sp_area_tol.value())
-        settings.player_arrow_color = str(getattr(
-            self, "_arrow_color", "") or "#00E5FF")
-        settings.player_arrow_width_px = max(1, int(self.sp_arrow_width.value()))
-        settings.player_arrow_len_px = int(self.sp_arrow_len.value())
-        settings.save()
-
-    def _refresh_arrow_btn(self):
-        """把当前箭头色刷到那个色块按钮上（一眼看出是什么色 ✓）。"""
-        from PyQt5.QtGui import QColor
-        c = str(getattr(self, "_arrow_color", "") or "#00E5FF")
-        self.btn_arrow_color.setText(c)
-        try:
-            self.btn_arrow_color.setStyleSheet(
-                "background-color:%s; color:%s;"
-                % (c, "#000000" if QColor(c).lightness() > 128 else "#ffffff"))
-        except Exception:
-            pass
-
-    def _pick_arrow_color(self):
-        """点色块 ⇒ 开**取色弹窗**（可调透明度 ✓ 与设置里其它颜色块同一套 ✓）。
-
-        ⚠ 用户要"选择颜色弹窗里需要能调整线条粗细" —— 但 `QColorDialog` 是 **Qt 内置控件**，
-          **塞不进自定义控件** ✗ ⇒ 粗细做成它**右边紧挨着的那一格** ✓（同一排 ⇒ "选色 + 定
-          粗细"一个动作里做完 ✓，排版与设置里的「视野线宽度」一致 ✓）。
-        ⚠ 存 `#AARRGGBB`（9 位，与设置里其它颜色一致 ✓）；画的时候 `hex_to_bgr` 只取后 6 位 ✓。
-        """
-        from PyQt5.QtWidgets import QColorDialog
-        from PyQt5.QtGui import QColor
-        from perception.world_state import norm_hex_color
-        c = QColorDialog.getColor(
-            QColor(str(self._arrow_color or "#00E5FF")), self,
-            "选择箭头颜色（可调透明度）",
-            QColorDialog.ShowAlphaChannel | QColorDialog.DontUseNativeDialog)
-        if not c.isValid():
-            return
-        self._arrow_color = norm_hex_color(c.name(QColor.HexArgb), "#00E5FF")
-        self._refresh_arrow_btn()
-        self._on_player_loc_params()
+    # ⚠ 原来这里有两个方法（`_refresh_arrow_btn` / `_pick_arrow_color`）—— 箭头搬去
+    #   「设置 → 界面 → 辅助线与标记（实时预览）」之后**整块删掉** ✓：那边的色块、取色弹窗
+    #   （带 alpha 拖动条 ✓）、开关都走 `settings_dialog` 里那套现成的 `add_row` ✓
+    #   —— 一份实现、一处维护（规范 §4 ✓）。
 
     def _on_turn_params(self, _val=None):
         """换向相关的两个时间参数一起写（同一组，一个处理器够了）。"""
@@ -3099,24 +3108,51 @@ class PlayerPanel(QWidget):
             cert = get("kbd", "cert", "remote_kbd/certs/cert.pem")
             self.lbl_device_state.setText("正在连接 ProMicro(远程)…")
             def _do_connect():
+                """后台连远端（结果回主线程靠信号 ✓）。
+
+                ⚠⚠ **`emit` 必须兜住 `RuntimeError`**（2026-09-28 查明 ✓ 这是**真实隐患**，
+                  不只在自检里）：这条线程在**连不上时要等好几秒超时**（TCP ✓），而那时
+                  `PlayerPanel` 的 C++ 对象**可能已经销毁**了 —— 用户**把工作台关了** /
+                  离屏自检**跑完了** ✓ ⇒ `self.device_connected.emit(...)` 抛
+                  `RuntimeError: wrapped C/C++ object of type PlayerPanel has been deleted` ✗
+                  ⇒ 而它**在后台线程里、没人接** ⇒ **进程直接段错误 `0xC0000005`** ✗
+                  （症状极迷惑：自检"所有断言都过了"却崩、`faulthandler` 只给别的线程栈 ✓，
+                  而且它是**时机性**的 —— 对面秒拒就连不上、碰巧不崩 ✗）。
+                """
                 try:
                     dinput.use_network(host, port, cert)
-                    self.device_connected.emit("ok")
                 except Exception:
                     dinput.use_local()
-                    self.device_connected.emit("fail")
+                    try:
+                        self.device_connected.emit("fail")
+                    except RuntimeError:
+                        pass                # 窗口已销毁 ⇒ 没人听，别崩 ✓
+                    return
+                try:
+                    self.device_connected.emit("ok")
+                except RuntimeError:
+                    pass
             threading.Thread(target=_do_connect, daemon=True).start()
         elif dev == "serial":
             from tools.config import get
             ser_port = get("kbd", "serial_local", "COM5")
             self.lbl_device_state.setText("正在连接 ProMicro(本地)…")
             def _do_connect():
+                """后台连本地串口 —— ⚠ 同 `remote` 那条：`emit` 要兜 `RuntimeError`
+                （串口打不开也耗时，窗口可能已经没了 ✗ 见上面那段说明 ✓）。"""
                 try:
                     dinput.use_serial(ser_port)
-                    self.device_connected.emit("ok")
                 except Exception:
                     dinput.use_local()
-                    self.device_connected.emit("fail")
+                    try:
+                        self.device_connected.emit("fail")
+                    except RuntimeError:
+                        pass
+                    return
+                try:
+                    self.device_connected.emit("ok")
+                except RuntimeError:
+                    pass
             threading.Thread(target=_do_connect, daemon=True).start()
         else:
             dinput.use_local()
@@ -3422,20 +3458,10 @@ class PlayerPanel(QWidget):
         self.sp_track_jump.setValue(settings.player_track_jump)
         self.sp_track_jump.blockSignals(False)
 
-        # ⭐ 「玩家位置」组（用户 2026-09-28 ✓）—— 回填（老项目里没这些格 ⇒ 用兜底默认 ✓）
-        for _w, _v in ((self.sp_foot_off, settings.player_foot_offset_px),
-                       (self.sp_box_min_area, settings.player_box_min_area_pct),
-                       (self.sp_area_base_n, settings.player_box_area_base_n),
-                       (self.sp_area_tol, settings.player_box_area_tol_pct),
-                       (self.sp_arrow_len, settings.player_arrow_len_px)):
-            _w.blockSignals(True)
-            _w.setValue(_v)
-            _w.blockSignals(False)
-        self._arrow_color = str(settings.player_arrow_color or "#00E5FF")
-        self._refresh_arrow_btn()
-        self.sp_arrow_width.blockSignals(True)
-        self.sp_arrow_width.setValue(max(1, int(settings.player_arrow_width_px)))
-        self.sp_arrow_width.blockSignals(False)
+        # ⚠ 「玩家位置」（脚底偏移 / 框面积闸）已搬到「**设置 → 判定参数页**」✓，
+        #   不在这儿回填（那几项的初值在 `settings_dialog._page_judge` 里现读 settings ✓）。
+        # ⚠ 箭头（颜色 / 粗细 / 长度）已搬到「设置 → 界面 → 辅助线与标记（实时预览）」✓，
+        #   不在这儿回填（本机外观那套在 `settings_dialog` 里读 `theme.load_vis()` ✓）。
 
         self.sp_min_turn_hold.blockSignals(True)
         self.sp_min_turn_hold.setValue(settings.min_turn_hold_ms)

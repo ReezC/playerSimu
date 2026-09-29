@@ -13,11 +13,42 @@ import threading
 import time
 
 
+def _perf():
+    """性能打点（**可选**）：`core.perf` 只在控制机（B）上有 —— 这个模块要保持能单独
+    在别的机器上跑（它是"发指令"那半边 ✓），拿不到就静默不算 ✓（绝不因此报错 ✗）。"""
+    try:
+        from core import perf
+        return perf
+    except Exception:                       # noqa: BLE001
+        return None
+
+
+def set_nodelay(sock):
+    """给一条 TCP 连接打开 **`TCP_NODELAY`** —— 按键这条通道专治 Nagle 攒包 ✓。
+
+    为什么必须有（用户 2026-09-29 链路提效 ✓）：这是**小包 + 实时**的通道（`PRESS L` 就
+    十来个字节 ✗），而 Nagle 的算法正是"小包先攒着、等前面那个 ACK 回来再发" ⇒ 最坏多等
+    **一个 RTT（局域网也有几毫秒，跨交换机几十毫秒级）** ✗，而且它还是**串行累积**的
+    （每条指令都等前一条的回执 ✓）。这条链路上每一条指令都是"现在就要按下"，
+    没有任何理由攒 ✓。
+
+    `OSError` 一律吞掉：老系统 / 非常规套接字上设不上也不该让连接失败 ✓
+    （`kbd_client` 是"发指令"那半边，宁可没有 NODELAY 也不能不发 ✗）。
+    """
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return True
+    except (OSError, AttributeError):
+        return False
+
+
 class KbdClient:
     def __init__(self, host, port, cafile, timeout=5.0):
         ctx = ssl.create_default_context(cafile=cafile)
         ctx.check_hostname = False          # 自签证书不校主机名
         raw = socket.create_connection((host, port), timeout=timeout)
+        # ⭐ **在包 TLS 之前设**（`setsockopt` 对 TLS 包装后的对象也能用，但放在这儿更直白 ✓）
+        set_nodelay(raw)
         self._sock = ctx.wrap_socket(raw, server_hostname=host)
         # **超时只在这里设一次**：原来 send() 每次都调 settimeout(2.0)，而读线程
         # 同时在这个 socket 上 recv —— 多线程改同一个 socket 的超时会打乱正在进行的
@@ -36,6 +67,13 @@ class KbdClient:
         self.replies = 0
         self.last_send_at = 0.0
         self.last_reply_at = 0.0
+        #: ⭐ **还没等到回执的指令条数 + 最早那条发出的时刻** —— 用来算
+        #: 「B 发出 → A 机固件执行完回执」的**往返延迟**（用户 2026-09-29 链路提效 ✓）。
+        #: 这是 A→B→A 闭环里**唯一从没量过**的一段：`send_ms` 只说明"交给内核"花了多久，
+        #: 真正决定"按键什么时候生效"的是这段往返（+ 游戏的输入响应）✓。
+        #: 固件对**每条**指令回一条 `DONE`/`ERR`（见 `_drain` ✓）⇒ 一对一，账能对上 ✓。
+        self._pending = 0
+        self._rtt_t0 = None
         # 后台读线程：relay 会把固件的 DONE 应答回传，这里持续读走丢弃，
         # 否则回传缓冲被 DONE 塞满后，relay/固件/控制机整条链路会连锁卡死
         # （表现为：按键发不出、推理丢帧暴增、RELEASE 丢失导致卡键）。
@@ -63,6 +101,11 @@ class KbdClient:
                 self.ok = True
                 self.sent += 1
                 self.last_send_at = time.monotonic()
+                # RTT 起点：只记**最早那条还没对上回执的**（这样量到的就是窗口里最久的
+                # 那一条 ⇒ 天然偏保守 ✓，不会把"刚发出去"当成整段往返 ✗）
+                self._pending += 1
+                if self._rtt_t0 is None:
+                    self._rtt_t0 = time.perf_counter()
                 return True
             except Exception as e:
                 self._dirty = True
@@ -88,6 +131,23 @@ class KbdClient:
             return 0.0          # 最后一条指令有回执 → 正常
         return now - self.last_send_at
 
+    def _take_rtt(self, n):
+        """收到 n 条回执 ⇒ 记一次往返延迟 + 把"还没对上回执"的账减掉 ✓（一处口径 ✓）。
+
+        · 有在等的指令 ⇒ `perf.ms("kbd_rtt_ms", 最早那条发出时刻)` ✓；
+        · 减完之后**还有**没对的 ⇒ 起点挪到"现在"（剩下的最早那条 ≈ 此刻刚发 ✓，
+          误差 ≤ 一次采样间隔，可接受 ✓）；没有 ⇒ 清空，等下一次真发指令再起算 ✓
+          （**绝不用空闲期的旧起点** ✗：那会把"没人按键的几十秒"算成延迟 ✗）。
+        """
+        if n <= 0:
+            return
+        if self._pending > 0 and self._rtt_t0 is not None:
+            _p = _perf()
+            if _p is not None:
+                _p.ms("kbd_rtt_ms", self._rtt_t0)
+        self._pending = max(0, self._pending - n)
+        self._rtt_t0 = time.perf_counter() if self._pending > 0 else None
+
     def _drain(self):
         """读走 relay 回传的应答，避免回传缓冲堆积。
 
@@ -106,6 +166,7 @@ class KbdClient:
                 if n:
                     self.replies += n
                     self.last_reply_at = time.monotonic()
+                    self._take_rtt(n)
             except socket.timeout:
                 continue                # 空闲超时：继续等，别退出
             except Exception as e:

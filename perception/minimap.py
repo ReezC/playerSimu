@@ -258,6 +258,33 @@ SRC_LIVE = "live"
 #: 分数会掉到 0.62~0.70 一带 ⇒ 那种分数下的定位结果只能当参考 ✗。
 TRUST_SCORE = 0.8
 
+#: **匹配分低到多少就"量不出来"**（0~1）—— 「标定时能不能量出来」与「运行时跟不跟得住」
+#: 共用这一份，别再各写一个 0.55 ✗（两处各写一个数迟早分叉，而这两件事说的是同一件事：
+#: "这块面板和底图对上了没有" ✓）。它比 `TRUST_SCORE` 低一档：0.55 是"低于它连试都
+#: 不用试"，0.8 才是"这份几何可信" ✓。
+LOCATE_MIN_SCORE = 0.55
+
+#: `locate_crop` 的模板（缩回底图尺度之后）**最多取底图的多少**（0~1，按边长）。
+#: **为什么要有这个上限**：面板比底图宽时（crop 的常态 —— 实测 105040303 = 502×408 的
+#: 面板 + **82×218** 的底图，真倍数 5.645 缩回来 **87.5 > 82** ✗），整块模板**放不进底图**；
+#: 能放进去的位置只剩 0 个 ⇒ 位置根本量不出来 ✗。取中间一块、留够可放的位置才行 ✓。
+CROP_TPL_FRAC = 0.6
+
+#: 同上，**备一档更小的**：面板贴到底图外沿时（面板的可见部分很窄），0.6 那块
+#: 仍然"放不进去"（实测：116×79 的底图 + 100 高的面板，可见的只有 43 行 ⇒ 0.6×79 = 47
+#: 的块放不下 ✗）⇒ 小一档才有块落得进去 ✓（大小只影响"搜得到搜不到"，不影响谁胜出 ✓）。
+CROP_TPL_FRAC_SMALL = 0.35
+
+#: 模板**最小的边长**（底图像素）—— 再小就"哪儿都像"：`TM_CCOEFF_NORMED` 在
+#: 42×34 那种小模板上碰巧就能到 0.48 ✗（实测：真倍数 5.645 的面板，自动定位给出
+#: **scale=12.000** —— 就是"小模板碰巧高分"把候选带跑的 ✓）。小于这个数不参选。
+CROP_TPL_MIN = 12
+
+#: 面板缩回底图之后**最多允许比底图大多少倍**才算候选（超过 ⇒ 面板覆盖的范围远超
+#: 底图，几何上讲不通：不是这个倍数）。比 1 大是因为面板里常含游戏 UI 边框，
+#: 它映到底图上是"负数那一圈"（实测用户那份：x ∈ [-12.2, 76.7] ✓）。
+CROP_FOOT_MAX = 1.6
+
 #: 来源的中文名 —— 界面、提示、报告共用这一份，别一处写「独立推流」另一处写
 #: 「收流」：标定是按来源分开存的，名字对不上就没人搞得清哪份是哪份。
 SRC_LABEL = {SRC_STREAM: "独立推流", SRC_LIVE: "从实时画面"}
@@ -454,7 +481,7 @@ def refine_fit(fg, cg, best, rounds=6, span0=0.25, steps=7):
             "view": list(best.get("view") or [0, 0]), "refined": True}
 
 
-def locate_fit(frame, canvas, scales=None, min_score=0.55, refine=True):
+def locate_fit(frame, canvas, scales=None, min_score=LOCATE_MIN_SCORE, refine=True):
     """方式 1：整张底图缩放到面板 → 标定 dict 或 None。
 
     ⚠ 默认**细化**（`refine_fit`，2026-09-27 加）：粗搜是离散尺度 + 整数峰值，不够当
@@ -499,7 +526,310 @@ def locate_fit(frame, canvas, scales=None, min_score=0.55, refine=True):
     return best
 
 
-def locate_crop(frame, canvas, inset=4, min_score=0.55, scales=None):
+def _crop_blocks(f, inset, s, cw, ch):
+    """按倍数 `s` 从面板上取**几块**当模板 → `[(面板上的左上角, 模板, 真正实现的倍数), ...]`。
+
+    每块都缩回**底图尺度**（`cv2.resize(INTER_AREA)` ✓），且缩回后 ≤
+    `CROP_TPL_FRAC`×底图（大块才有约束力、且要留得出可放的位置 ✓）。
+
+    ⚠⚠ **为什么要好几块**（用户 2026-09-29："自动定位按钮 好像对于局部地图来说不好用"✗）：
+    **到底哪一块落在底图里，事先不知道** —— 那正是要求的东西 ✗（实测用户那份：
+    面板映到底图 x ∈ [−12.2, 76.7]，而底图只有 82 宽 ⇒ 面板右侧一大截在底图之外，
+    只有**靠左**的那块才落得进去 ⇒ 只取"正中间那块"会**整块放不进底图**、
+    匹配位置贴着边界 ✗ ⇒ 量出来的倍数是错的 8.4（真 5.645）✗✗）。
+    ⇒ 面板在某个轴上比底图宽（或差不多）时，那个轴给**左 / 中 / 右**三个位置 ✓，
+    轴向上装得下就只给中间一个 ✓（省时间：多数情况只有 1~3 块 ✓）。
+    """
+    h, w = f.shape[:2]
+    ax0, ay0 = inset, inset
+    ax1, ay1 = w - inset, h - inset
+    if ax1 - ax0 < 8 or ay1 - ay0 < 8:
+        ax0, ay0, ax1, ay1 = 0, 0, w, h
+    if ax1 - ax0 < 8 or ay1 - ay0 < 8:
+        return []
+    foot_w = (ax1 - ax0) / float(s)          # 这个倍数下面板映到底图有多大
+    foot_h = (ay1 - ay0) / float(s)
+    # 那个轴上**装不下整个面板**（crop 的常态）⇒ 只能挪着试（哪块在底图里事先不知道 ✓）；
+    # 装得下就只取中间一块（省时间 ✓）
+    out = []
+    for frac in ((CROP_TPL_FRAC, CROP_TPL_FRAC_SMALL)
+                 if (foot_w >= cw * 0.98 or foot_h >= ch * 0.98)
+                 else (CROP_TPL_FRAC,)):
+        tw = int(min(foot_w, cw * frac))
+        th = int(min(foot_h, ch * frac))
+        if tw < CROP_TPL_MIN or th < CROP_TPL_MIN:
+            continue
+        if tw >= cw or th >= ch:        # 必须**严格小于**底图，否则只有一个位置可放
+            continue
+        wq = max(CROP_TPL_MIN, min(int(round(tw * s)), ax1 - ax0))
+        hq = max(CROP_TPL_MIN, min(int(round(th * s)), ay1 - ay0))
+        xs = [ax0 + ((ax1 - ax0) - wq) // 2]
+        ys = [ay0 + ((ay1 - ay0) - hq) // 2]
+        # ⚠ **面板**装不下那个轴 ⇒ 左 / 中 / 右都试：面板贴到底图外沿时，只有靠边那块
+        #   落得进去（实测用户那份面板映到底图 x ∈ [−12.2, 76.7] ⇒ 只有靠左那块 ✓）
+        if foot_w >= cw * 0.98:
+            xs = sorted({ax0, ax0 + ((ax1 - ax0) - wq) // 2, ax1 - wq})
+        if foot_h >= ch * 0.98:
+            ys = sorted({ay0, ay0 + ((ay1 - ay0) - hq) // 2, ay1 - hq})
+        for px0 in xs:
+            for py0 in ys:
+                if any(v[0] == (px0, py0) for v in out):
+                    continue                     # 两档 frac 撞在一起 ⇒ 别重复算 ✓
+                sub = f[py0:py0 + hq, px0:px0 + wq]
+                if getattr(sub, "size", 0) == 0:
+                    continue
+                tpl = cv2.resize(sub, (max(1, int(round(wq / s))),
+                                       max(1, int(round(hq / s)))),
+                                 interpolation=cv2.INTER_AREA)
+                if tpl.shape[0] < CROP_TPL_MIN or tpl.shape[1] < CROP_TPL_MIN:
+                    continue
+                if tpl.shape[0] >= ch or tpl.shape[1] >= cw:
+                    continue
+                # ⚠ `eff` 一律取**真正实现出来的倍数**（按实际输出尺寸算），不写"想要的那个 s" ——
+                #   否则 view 是对的、scale 是错的（`t_crop_scale_not_faked` 钉着 ✓）
+                out.append(((px0, py0), tpl, wq / float(tpl.shape[1])))
+    return out
+
+
+def _peak_subpix(r, x, y):
+    """相关图峰值的**亚像素**位置（抛物线拟合）→ `(fx, fy)` 浮点。
+
+    面板放大 5~10 倍很常见 ⇒ **1 个底图像素的量化误差 = 5~10 个面板像素** ✗
+    （实测 105040303：一个底图像素 ≈ 7.4 个世界像素 ⇒ 那点误差直接进世界坐标 ✓）。
+    峰值贴着边界（拟合不了）就返回整数 ✓。
+    """
+    out = [float(x), float(y)]
+    h, w = r.shape[:2]
+    if 0 < x < w - 1:
+        l, m, rr = float(r[y, x - 1]), float(r[y, x]), float(r[y, x + 1])
+        d = l - 2.0 * m + rr
+        if abs(d) > 1e-9:
+            out[0] = x + max(-0.5, min(0.5, 0.5 * (l - rr) / d))
+    if 0 < y < h - 1:
+        l, m, rr = float(r[y - 1, x]), float(r[y, x]), float(r[y + 1, x])
+        d = l - 2.0 * m + rr
+        if abs(d) > 1e-9:
+            out[1] = y + max(-0.5, min(0.5, 0.5 * (l - rr) / d))
+    return out[0], out[1]
+
+
+#: ⭐ **「滚动方向」** = 这条小地图面板**会往哪个轴滚**（用户 2026-09-29 追加：
+#: "局部小地图也应该分滚动类型：'仅X''仅Y''双轴'，这样在对于单轴滚动的小地图，
+#: 实时匹配时可以提高速度"✓）。
+#: 它**不改换算**（`panel_to_canvas` 一字不变 ✓），只改两件事：
+#:   · **搜索只在会动的那根轴上做** ⇒ 单轴图上快好几倍 ✓（全图找只扫一条**带**
+#:     hmm：仅 X ⇒ 高只有模板那么高的一条横带 ✓、仅 Y ⇒ 竖带 ✓；拟合也只试那一轴 ✓）；
+#:   · **不会动的那根轴"不许跟歪"** ⇒ 那一轴由标定定死 ✓（面板在那一轴上的小抖动
+#:     不会变成显示区漂移 ✓）。
+#: ⚠ 老标定里**没有这个键** ⇒ 双轴（= 今天的行为一字不变 ✓）。
+SCROLL_XY = "xy"
+SCROLL_X = "x"
+SCROLL_Y = "y"
+#: 界面上那个下拉的文案（`gui/minimap_calib.py` 用它 ✓ 一处口径 ✓）
+SCROLL_LABEL = ((SCROLL_XY, "双轴（上下左右都会滚）"),
+                (SCROLL_X, "仅 X（地图只左右滚）"),
+                (SCROLL_Y, "仅 Y（地图只上下滚）"))
+
+
+def scroll_of(calib):
+    """标定里写的滚动方向 → `"x" | "y" | "xy"`（没写 / 写错 ⇒ 双轴 = 老行为 ✓）。"""
+    v = str((calib or {}).get("scroll") or SCROLL_XY).strip().lower()
+    if v in ("x", "h", "horizontal", "仅x"):
+        return SCROLL_X
+    if v in ("y", "v", "vertical", "仅y"):
+        return SCROLL_Y
+    return SCROLL_XY
+
+
+def scroll_axes(calib):
+    """→ `(能动的轴 X, 能动的轴 Y)`（`(True, True)` = 双轴 ✓）。
+
+    调用方一律用这一对布尔判"这根轴要不要搜 / 要不要动" ✓（别在别处再解析一遍字符串 ✗）。
+    """
+    s = scroll_of(calib)
+    return (s in (SCROLL_XY, SCROLL_X), s in (SCROLL_XY, SCROLL_Y))
+
+
+def _crop_calib_from(tpl_pos, sub_xy, eff, inset):
+    """"模板落在底图哪里" → 标定 dict（`view` = 面板 (inset, inset) 对应的底图坐标 ✓）。
+
+    ⚠ 口径照抄 `panel_to_canvas`：`canvas = (panel − offset)/scale + view`
+      ⇒ 面板上 `sub_xy` 那个点映到 `tpl_pos` ⇒ `view = tpl_pos − (sub_xy − offset)/scale` ✓
+      （整块模板时 `sub_xy == offset` ⇒ `view == tpl_pos`，和老行为**一字不差** ✓）。
+    """
+    fx, fy = tpl_pos
+    vx = fx - (sub_xy[0] - inset) / eff
+    vy = fy - (sub_xy[1] - inset) / eff
+    return {"mode": MODE_CROP, "scale": float(eff), "offset": [inset, inset],
+            "view": [float(vx), float(vy)]}
+
+
+def _crop_score(frame, canvas, calib, max_samples=2000):
+    """一套 crop 几何的贴合分（**只在重叠够多时才算数**）→ `(score|None, overlap)`。
+
+    ⚠ 搜索时采样取 **2000**（不是显示那个 6000）：拟合要算几百次，2000 点足够分辨
+      "哪套几何更好" ✓，反而快 ~2.5 倍 ✓；**给人看的那个分**仍走 `align_score` 的 6000 ✓
+      （两者同一个函数、同一个几何族，只是采样密度不同 ⇒ 差别在小数点后第三位 ✓）。
+    """
+    sc, ov, _why = overlap_pearson(frame, canvas, calib, max_samples=max_samples)
+    if sc is None or ov < 0.08:
+        # 面板几乎全在底图外面 ⇒ 那几个采样点说明不了什么 ✗（容易碰巧高分）
+        return None, ov
+    return sc, ov
+
+
+def _crop_pos_fit(frame, canvas, calib, steps=(8.0, 4.0, 2.0, 1.0, 0.5, 0.25),
+                  axes=None):
+    """**固定缩放**，只挪位移（每一步试 8 个方向，逐级细化到 0.25 底图像素）→ 最好的那份。
+
+    ⚠ 为什么要"固定缩放"分开做（实测踩到）：位移和缩放**不是可分的** —— 缩放差 2%
+      时，把它单独往真值挪是**下坡**（位移能补偿一部分）⇒ 一起坐标下降会**卡在这条山脊上**
+      （实测：9.0/7.0 那份真几何贴合分 1.0000，可从 9.54/7.41 出发一起爬只能到
+      9.25/7.41 的 0.9298 就动不了了 ✗）。固定缩放时位移那一维是**单峰**的 ⇒ 稳 ✓。
+
+    ⚠⚠ **细档（≤1 像素）要用高采样**（6000），粗档（≥2）才用 2000：采样稀了分数面会
+       "阶梯化"（实测：1:1 的合成面板在 2000 采样下，8.00 / 8.25 / 7.75 都是 1.0000、
+       8.50 掉到 0.8606 ⇒ 爬坡最多只能保证 ±0.25，再叠加"只许严格变好"就**停在偏
+       0.5 像素的地方** ✗ —— 那 0.5 底图像素在这张图上是 ~4 个世界像素 ✓）。
+      细档的eval 只有几十次 ⇒ 多花十几毫秒，换回来的是"跟出来的显示区真的准" ✓。
+    """
+    ms = 6000 if max(steps) <= 1.0 else 2000
+    # ⭐ **单轴的图只试那根轴**（"仅 X" ⇒ 不试 dy ✓）：那些 dy ≠ 0 的探针要么被算出来是
+    #    下坡（白花），要么会把"根本不会动的那根轴"跟歪 ✗ ⇒ 2/3 的探针直接省掉 ✓
+    ax_on, ay_on = (True, True) if axes is None else axes
+    best_sc, _ov = _crop_score(frame, canvas, calib, max_samples=ms)
+    if best_sc is None:
+        return None
+    best = {"calib": dict(calib), "score": float(best_sc)}
+    for step in steps:
+        moved = True
+        while moved:
+            moved = False
+            base = best["calib"]
+            v = list(base.get("view") or (0, 0))
+            for dx in ((step, 0.0, -step) if ax_on else (0.0,)):
+                for dy in ((step, 0.0, -step) if ay_on else (0.0,)):
+                    if dx == 0.0 and dy == 0.0:
+                        continue
+                    probe = dict(base, view=[v[0] + dx, v[1] + dy])
+                    sc, _ov = _crop_score(frame, canvas, probe, max_samples=ms)
+                    if sc is not None and sc > best["score"] + 1e-4:
+                        best = {"calib": probe, "score": float(sc)}
+                        moved = True
+                        break
+                if moved:
+                    break
+    return best
+
+
+def _fit_crop(frame, canvas, calib, axes=None):
+    """位移 + 缩放一起定：**缩放扫网格、每个缩放都把位移归位**，再收窄重来一遍 ✓。
+
+    为什么这么绕（见 `_crop_pos_fit` 的说明）：两者不可分 ⇒ 只能"固定一个、优化另一个"
+    交替 ✓。两轮足够（第一轮 ±8% 步 1%，第二轮在最好的附近 ±1% 步 0.12% ✓）。
+
+    ⚠ 为什么不用模板匹配把这件事做完：它只能给**整像素**峰值，而面板放大 5 倍时
+      **1 底图像素 = 5~10 个面板像素** ✗；贴合分是连续的 ⇒ 能定到 0.25 底图像素 ✓
+      （而且它**就是判据那行显示的那个数** —— 把它做到最好，就是"自动定位"该干的事 ✓）。
+    """
+    fit = _crop_pos_fit(frame, canvas, calib, axes=axes)
+    if fit is None:
+        return None
+    best = fit
+    # 三段：先 ±20%（粗，位置只粗定）→ ±4% → ±0.8%（细，位置抠到 0.25 ✓）
+    # ⚠ 第一段要**宽**：种子可能离真值 10%~20%（模板匹配在小块上给不准 ✓），
+    #   而收窄之后就只能在本山头上找 ⇒ 太窄会把对的那份关在外面 ✗
+    for span, step, steps in ((0.20, 0.04, (4.0, 2.0)),
+                              (0.04, 0.008, (2.0, 1.0)),
+                              (0.008, 0.0016, (1.0, 0.5, 0.25))):
+        s0 = float(scales_of(best["calib"])[0])
+        if s0 <= 0:
+            break
+        n = max(2, int(round(span / step)))
+        for k in range(-n, n + 1):
+            if k == 0:
+                continue
+            cand = with_scales(best["calib"], s0 * (1.0 + step * k),
+                               s0 * (1.0 + step * k))
+            got = _crop_pos_fit(frame, canvas, cand, steps=steps, axes=axes)
+            if got is not None and got["score"] > best["score"] + 1e-4:
+                best = got
+    return best
+
+
+def refine_crop(panel, canvas, calib, move_scale=True):
+    """在**现有几何**附近抠一抠 ⇒ 更好的那一份（`{"calib", "score", "before", "gain"}`）。
+
+    用途：手工对齐之后想"再抠一点"（用户 2026-09-29："我已经手工对的很好了"✓ —— 那就
+    量一量**还能不能更好**：好多少、往哪边 ✓）。**只接受更好的** ⟹ 绝不会把对的改坏 ✓
+    （所以它可以放心地做成一个按钮 ✓）。算不出来 ⇒ `None`。
+
+    `move_scale=False` ⇒ **只挪位移、缩放一个字不动** —— 界面上那个「不改缩放」就是它 ✓
+    （"我已经量好缩放、只想知道位置"那条路 ✓）。
+    """
+    cal = dict(calib or {})
+    if cal.get("mode") != MODE_CROP or not has_geometry(cal):
+        return None
+    if float(scales_of(cal)[0]) <= 0:
+        return None
+    axes = scroll_axes(cal)          # ⭐ 单轴 ⇒ 只跟会动的那根轴（见 `scroll_axes` ✓）
+    got = _fit_crop(panel, canvas, cal, axes=axes) if move_scale \
+        else _crop_pos_fit(panel, canvas, cal, axes=axes)
+    if not move_scale:
+        # ⚠ 只挪位移时**光靠"手上那套"当起点不够**：它可能整块是错的（首次标定时就是）
+        #   ⇒ 再把"就按这个缩放、用模板匹配粗定一遍"那份当第二号起点 ✓
+        #   ⛔ 但**缩放必须锁死在调用方给的那个**：粗定那份的 `eff` 是"真正实现出来的
+        #     倍数"（可能 5.652 ≠ 输入的 5.645）⇒ 直接用它就等于偷偷改了缩放 ✗✗
+        #     （`t_crop_locate_real_shape` 里钉着这一条 ✓）。
+        s_lock = float(scales_of(cal)[0])
+        alt = crop_seed_at(panel, canvas, s_lock,
+                           int(cal.get("offset", [4, 4])[0]))
+        if alt is not None:
+            alt2 = _crop_pos_fit(panel, canvas,
+                                 with_scales(alt["calib"], s_lock, s_lock),
+                                 axes=axes)
+            if alt2 is not None and (got is None or alt2["score"] > got["score"]):
+                got = {"calib": with_scales(alt2["calib"], s_lock, s_lock),
+                       "score": alt2["score"]}
+    if got is None:
+        return None
+    before, _ov = _crop_score(panel, canvas, cal)
+    before = 0.0 if before is None else float(before)
+    return {"calib": got["calib"], "score": float(got["score"]), "before": before,
+            "gain": float(got["score"] - before)}
+
+
+def crop_seed_at(frame, canvas, s, inset=4):
+    """**某个倍数**下用模板匹配粗定一份几何 → `{"calib", "score"}`（都不行 ⇒ `None`）。
+
+    ⚠ 块取自**面板**（`_crop_blocks` ✓）、分数一律是**整张面板的贴合分**（`_crop_score`
+    ✓）—— 于是"取哪块模板"只影响**能不能搜到**，不影响"谁胜出" ✓（全世界同一把尺 ✓）。
+    `locate_crop`（撒种子）与 `refine_crop`（"不改缩放"那条路也用它）共用这一处 ✓。
+    """
+    f = _gray(frame) if getattr(frame, "ndim", 3) == 3 else frame
+    c = _gray(canvas) if getattr(canvas, "ndim", 3) == 3 else canvas
+    ch, cw = c.shape[:2]
+    h, w = f.shape[:2]
+    if not (s > 0):
+        return None
+    # 面板缩回底图后盖住多大：远超底图 ⇒ 几何上讲不通，不是这个倍数
+    if w / float(s) > cw * CROP_FOOT_MAX or h / float(s) > ch * CROP_FOOT_MAX:
+        return None
+    out = None
+    for sub_xy, tpl, eff in _crop_blocks(f, inset, s, cw, ch):
+        r = np.nan_to_num(cv2.matchTemplate(c, tpl, cv2.TM_CCOEFF_NORMED))
+        _mx, _y, _z, ml = cv2.minMaxLoc(r)
+        cal = _crop_calib_from(_peak_subpix(r, ml[0], ml[1]), sub_xy, eff, inset)
+        sc, _ov = _crop_score(frame, canvas, cal)
+        if sc is None:
+            continue
+        if out is None or sc > out["score"]:
+            out = {"calib": cal, "score": float(sc)}
+    return out
+
+
+def locate_crop(frame, canvas, inset=4, min_score=LOCATE_MIN_SCORE, scales=None,
+                refine=True, seed=None, scroll=None):
     """方式 2：面板是底图的**一块**（可能先放大了若干倍）→ 标定 dict 或 None。
 
     **为什么不能只按 1:1 找**（实测踩到）：客户端把小地图放大后再切块很常见。
@@ -507,64 +837,108 @@ def locate_crop(frame, canvas, inset=4, min_score=0.55, scales=None):
     「整张缩放进面板」（fit）和「1:1 取一块」**两种都量不出来**，人手动把叠加层
     拖到 4 倍也不够（缩放上限），表现就是「匹配分 0.7 上下、怎么看都不对」。
 
-    **做法**：对每个候选放大倍数 s，把**面板按 1/s 缩回去**（缩回底图尺度），
-    再在**原尺寸底图**里找它 —— 一次 matchTemplate 得到「显示的是底图哪一块」。
+    **怎么做**（用户 2026-09-29 报"自动定位对局部地图不好用"✗ 之后重写的一版）：
+      ① **撒种子**（`_crop_blocks` + `matchTemplate`）：对每个候选倍数，从面板上取
+         **中间 / 左 / 右**几块缩回底图尺度、在底图里找它 ⇒ 一批**粗略**的 (倍数, 位置)；
+         有 `seed`（**手上现有那套几何**）时它就是第一号种子 ✓ —— 手工对齐过的那份
+         离答案最近，从它爬最省事 ✓；
+      ② **按贴合分拟合**（`_crop_pos_fit` + `_fit_crop`）：沿着**判据那行显示的那个分**
+         （位移 → ±0.25 底图像素、缩放 → ±0.2% ✓）。⚠ 模板匹配只能给**整像素**峰值，
+         而面板放大 5 倍时 **1 底图像素 = 5~10 个面板像素** ⇒ 只靠它，几何天生差那么
+         一截 ✗；贴合分是连续的 ⇒ 能爬到那一截里面 ✓；
+      ③ 谁胜出**一律由贴合分说了算**（`overlap_pearson` = 判据那行**同一个函数** ✓）。
 
-    缩回去有两种实现，**按 s 分开用**（这里踩过一个静默的坑）：
-      · s ≥ 1（客户端把地图**放大**了，最常见）：**抽样**（`[::step]`），不插值 ——
-        客户端放大就是复制像素，抽样正好把它还原回去，计算量还降到 1/s²；
-      · s < 1（客户端把地图**缩小**着显示）：只能**插值**（`cv2.resize`）。
-        ⚠ 以前不分这两种：`step = max(1, round(0.54)) = 1` → 模板其实还是 1:1 那张，
-        分数照样 1.0，却把 scale 记成 0.54 —— view 是对的、scale 是错的，
-        换算整体偏 1/s 倍（`t_crop_roundtrip` 系的一条回归逮到过）。
-        另外 `eff` 一律取**真正实现出来的倍数**（抽样就是 step，插值就按实际输出尺寸算），
-        不写"想要的那个 s"。
+    ⚠⚠ 老版（2026-09-29 之前）**三条毛病凑成一件事**：自动定位对 crop 图**永远给不出
+    正确的那份几何**（实测森林迷宫III / 105040303：给的是 scale=12.000，真值 5.645 ✗）：
+      ① **缩放只有整数 + 半档**（`abs(s − round(s)) > 0.3 ⇒ 跳过`）⇒ 5.645 这种值
+         **一个候选都够不着** ✗（而差 3% 就能让分数从 0.95 掉到 0.2 一带 ✓）；
+      ② **整块模板放不进底图就跳过**（`tt.shape[1] > c.shape[1]: continue`）——
+         而那份真倍数缩回来是 **87.5 宽 > 底图 82** ✗ ⇒ **唯一正确的倍数被扔掉** ✗✗；
+      ③ **候选之间比分**：`TM_CCOEFF_NORMED` 在不同大小的模板之间**不可比**（实测
+         42×34 的小模板碰巧 0.479 > 真倍数那块 0.2 一带）⇒ 一比就选那个离谱的 12 ✗。
+      ⇒ 现在：**连续缩放 + 多块模板 + 统一口径排序 + 爬坡细化** ✓。
 
     于是标定里同时有 `scale`（面板像素 / 底图像素）和 `view`（面板左上角对应的
     底图坐标），换算仍是 `canvas = (panel - offset) / scale + view`。
+
+    ⭐ `scroll`（`"x"|"y"|"xy"`，默认从 `seed` 里读 ✓）—— **单轴的图只跟会动的那根轴**
+    （用户 2026-09-29：滚动类型"仅X/仅Y/双轴"，单轴图上实时匹配要快 ✓）：拟合少 2/3 的
+    探针 ✓，而且**不会动的那根轴一个字都不改**（由标定定死 ✓）。第一次标这张图（没种子）
+    时不带它 ⇒ 两轴都搜 ✓。
     """
     f = _gray(frame)
     c = _gray(canvas)
     h, w = f.shape[:2]
-    # 面板可能有边框/外圈，用中间部分当模板更稳（分数不会被边框拉低）
-    t = f[inset:h - inset, inset:w - inset] if (h > 2 * inset and w > 2 * inset) else f
-
+    ch, cw = c.shape[:2]
     if scales is None:
-        scales = _crop_scales((c.shape[1], c.shape[0]), (w, h))
+        scales = _crop_scales((cw, ch), (w, h))
+    # ⭐ **滚动方向**：手上这套几何（`seed`）或调用方显式给的都算数（用户 2026-09-29 ✓）。
+    #   单轴 ⇒ 拟合只在会动的那根轴上走（少 2/3 的探针 ✓），而且**不会动的那根轴一个
+    #   字都不改** ✓（它由标定定死；seed 给的 y 就是对的 ✓）。
+    #   ⚠ 没有种子（第一次标这张图）时不带 `scroll` ⇒ 两根轴都得搜 ✓（那时还不知道该定死哪轴 ✗）。
+    axes = scroll_axes(seed if seed is not None else {"scroll": scroll})
 
-    best = None
+    # ⭐ **单轴图：不动的那根轴"一个字都不改"** —— 种子阶段就要钉住（`_fit_crop` 只保证
+    #   "拟合时不往那根轴动"，可粗搜出来的那些种子**那根轴是随便的** ✗ ⇒ 它们一旦比分
+    #   胜出，y（比如）就被悄悄改了 ✗✗。参考值 = 调用方给的 `seed` 里那个 ✓
+    #   （没有 seed 就没有参考 —— 第一次标这张图时两轴都得搜 ✓）。
+    ref = None
+    if (seed and seed.get("mode") == MODE_CROP and has_geometry(seed)
+            and not (axes[0] and axes[1])):
+        _v = seed.get("view") or [0.0, 0.0]
+        ref = (float(_v[0]), float(_v[1]))
+
+    def _pin(cal):
+        """把"不动的那根轴"钉回 `ref` ✓（双轴 / 没参考 ⇒ 原样返回 ✓）。"""
+        if ref is None:
+            return cal
+        v = list(cal.get("view") or (0.0, 0.0))
+        if not axes[0]:
+            v[0] = ref[0]
+        if not axes[1]:
+            v[1] = ref[1]
+        return dict(cal, view=[float(v[0]), float(v[1])])
+
+    seeds = []
+    # ① 手上这套几何（有的话）**最先**：手工对着的那份离答案最近 ✓
+    if seed and seed.get("mode") == MODE_CROP and float(scales_of(seed)[0]) > 0:
+        seeds.append(dict(seed))
+        # 它附近也撒两个（缩放 ±3%、±6%）：手工缩放差一点点很常见 ✓
+        s0 = float(scales_of(seed)[0])
+        for fct in (0.94, 0.97, 1.03, 1.06):
+            seeds.append(with_scales(seed, s0 * fct, s0 * fct))
+    # ② 再靠粗搜：多块模板 + 贴合分排序 ✓（第一次标定这张图时只走这一路 ✓）
+    got = []
     for s in scales:
         if s <= 0:
             continue
-        if s < 1.0:
-            # 缩小：抽样做不到（step 最小是 1），必须插值。
-            # ⚠ 别在这里偷懒用 step=1 顶替 —— 那样模板是 1:1 的、分数满分，
-            # 却把 scale 记成 s，等于给出一份"看着很准其实偏一倍"的换算。
-            tt = cv2.resize(t, (max(1, int(round(t.shape[1] * s))),
-                                max(1, int(round(t.shape[0] * s)))),
-                            interpolation=cv2.INTER_AREA)
-            eff = t.shape[1] / float(tt.shape[1])      # 真正实现出来的倍数
-        else:
-            step = max(1, int(round(s)))
-            if abs(s - step) > 0.3:
-                continue        # 抽样实现不出这个倍数（相邻整数档已经在候选里了）
-            tt = t[::step, ::step] if step > 1 else t
-            eff = float(step)
-        if tt.shape[0] < 6 or tt.shape[1] < 6:
-            continue
-        if tt.shape[0] > c.shape[0] or tt.shape[1] > c.shape[1]:
-            continue                    # 缩回去还是比底图大 → 不是这个倍数
-        r = np.nan_to_num(cv2.matchTemplate(c, tt, cv2.TM_CCOEFF_NORMED))
-        _, mx, _, ml = cv2.minMaxLoc(r)
-        if best is None or mx > best["score"]:
-            # view 是「面板左上角(去掉 inset 之后)对应的底图坐标」——
-            # 匹配位置本身就是这个坐标，所以**不要再按 s 折算**（换算里已经除了 s）。
-            best = {"mode": MODE_CROP, "scale": eff,
-                    "offset": [inset, inset],
-                    "view": [int(ml[0]), int(ml[1])], "score": float(mx)}
+        ev = crop_seed_at(f, c, s, inset)
+        if ev is not None:
+            got.append(ev)
+    got.sort(key=lambda v: -v["score"])
+    seeds.extend(_pin(v["calib"]) for v in got[:6])
+    if not seeds:
+        return None
+    # ③ 排名靠前的几号种子做**完整拟合**（位移 + 缩放分开定，见 `_fit_crop` ✓），
+    #   其余的只按原样比分 —— 拟合一次 ~200 ms ⇒ 只给前两号，免得点一下等两秒 ✗
+    ranked = []
+    for cal in seeds:
+        sc, _ov = _crop_score(frame, canvas, cal)
+        if sc is not None:
+            ranked.append({"calib": dict(cal), "score": float(sc)})
+    if not ranked:
+        return None
+    ranked.sort(key=lambda v: -v["score"])
+    best = ranked[0]
+    for seed_cal in ([v["calib"] for v in ranked[:2]] if refine else []):
+        got = _fit_crop(frame, canvas, seed_cal, axes=axes)
+        if got is not None and got["score"] > best["score"]:
+            best = got
     if best is None or best["score"] < min_score:
         return None
-    return best
+    out = dict(best["calib"])
+    out["score"] = float(best["score"])       # ⚠ 报**贴合分**（口径同判据那行 ✓）
+    return out
 
 
 def locate(frame, canvas, mode):
@@ -580,6 +954,402 @@ def locate(frame, canvas, mode):
     if mode == MODE_CROP:
         return locate_crop(frame, canvas)
     return None
+
+
+class CropViewTracker:
+    """crop（局部小地图）**运行时跟踪**「现在显示的是底图哪一块」→ `view`（底图像素）。
+
+    **为什么非有不可**（用户 2026-09-29 指定的下一步："开发「**局部小地图**」的世界坐标
+    相关功能" ✓）：
+      · `fit`（全局小地图）**没这个问题** —— 整张底图永远都在面板里、**地形不随人动**，
+        标定文件里那份几何量一次就永久有效 ✓；
+      · `crop`（局部小地图）**面板只是底图的一块、而且随玩家滚动** ✓（本模块顶部与
+        `docs/寻路设计.md` §5 都写着"随玩家滚动 / 随人滚动"）⇒ 标定文件里存的 `view`
+        只是**标定那一刻**的位置 ⇒ 人一走，`panel_to_world` 就整体偏"滚了多少 ×
+        底图刻度"（量级：这张图 **1 底图像素 ≈ 7.4 世界像素** ⇒ 滚 50 像素就偏 ~370
+        世界像素 ✗）⇒ 世界坐标 / `here_sets` /"怪在哪一层"**全错**，
+        而现场看着像"标定没量准"或"怪在天上" ✗。
+      ⇒ 所以每拍得重新问一遍"现在显示的是哪一块"，这就是本类 ✓。
+
+    **怎么跟**：拿**面板正中间那一块**当模板（⚠ 为什么是正中间、而不是"起点算出来的那一段"，
+    见 `_patch` 的说明 —— 那是最容易写错、且**一错就再也回不来**的一处 ✗），缩回
+    **底图尺度**后在底图上找它落在哪 ⇒ 那就是新的 `view` ✓ ——
+    换算与 `locate_crop` 同一套：`view = 匹配到的位置 − 模板在面板里的偏移 / scale` ✓
+    （`offset` 在 crop 下就是模板从面板边缘往里缩了多少，见 `locate_crop` 的说明 ✓）。
+
+    **在哪找**：
+      · 有历史 ⇒ **先在上一拍附近找**（`±pad`，`pad = max(PAD_MIN, PAD_GAIN × 上一拍滚了多少)`）：
+        滚动是连续的 ⇒ 附近找又快、又不容易认错到另一处相似的地形上 ✓；
+        `PAD_GAIN` 是留给"突然加速"的余量 —— 真追不上时匹配分会掉 ⇒ **这一拍就自动
+        全图重找** ✓（自愈，不需要额外的状态机 ✓）；
+      · 没有历史（第一拍）/ 附近没找到 ⇒ **全图重找**，而且**门槛分两档**（见 `update` ②）：
+        第一拍用"量得出来"那条线（`LOCATE_MIN_SCORE` = 标定时同一把尺 ✓），
+        已经在跟的时候重找要 `TRUST_SCORE`（0.8）—— 因为此刻**错一次就会被当成"跟住了"、
+        之后都在那一带附近找 ⇒ 再也不会自我纠正** ✗（实测：拿另一张图的底图能到 0.555、
+        面板被挡一半也有 0.6 上下 ⇒ 0.55 挡不住"像但不是"）。
+      实测（本机基准）：82×218 的底图 + 41×36 的模板，全图找 **~1 ms**、附近找 **~0.5 ms**
+      ⇒ 30 拍/秒的实时回路扛得住 ✓（比一帧推理便宜几十倍 ✓）。
+
+    **跟不住时绝不猜** ✗（本项目反复吃过的亏）：保留上一拍跟住的那个（没有就用标定里
+    那个），`ok=False` + `why` 说清 —— `PlayerLocator.update` 会把这条写进 `note`/`short`，
+    界面那一行看得见 ✓（"我这一拍的世界坐标可不可信"必须当场说得出口 ✓）。
+    """
+
+    #: 「附近找」最少给多少余量（底图像素）。2 ≈ 黄点本身的分辨率（亚像素 ±0.5 面板像素
+    #: ÷ 缩放）—— 再小就成了"要求零位移"，人一走就掉进全图重找 ✓。
+    PAD_MIN = 2.0
+    #: 速度余量：上一拍滚了 d ⇒ 这一拍允许 3d（滚动是连续的，允许它加速到 3 倍）
+    PAD_GAIN = 3.0
+    #: 模板最小边长（底图像素）：太小的模板"配什么都能得高分" ⇒ 等于没量 ✗
+    MIN_TPL = 6
+
+    def __init__(self, min_score=None):
+        self.min_score = float(LOCATE_MIN_SCORE if min_score is None else min_score)
+        #: 最近一次**跟住**的 view（底图像素，float 二元组）；**没跟住过 = None**
+        #: （⚠ 只由"跟住"那一拍写 —— 没跟住时给的"标定里那个"只进返回值，不进这里 ✗，
+        #:   否则下一拍会以为"已经在跟"，全图重找的门槛就抬不起来了 ✓）
+        self.view = None
+        #: 这一轮**跟住过**没有（`reset` 清掉）—— 决定全图重找用哪条门槛（见 `update` ② ✓）
+        self.tracked = False
+        #: 最近一次的匹配分（0 = 还没跟住过）
+        self.score = 0.0
+        #: 连续没跟住几拍（跟住就归零）—— 界面/打点用它说"已经晃了多久"
+        self.missed = 0
+        #: 这一拍为什么没跟住（跟住时是空串）
+        self.why = ""
+        #: 这一拍在哪找到的（near / full；排查用）—— 老在 full 上说明"附近找"失灵了
+        self.where = ""
+        #: 上一拍 view 滚了多少（底图像素）—— 给"附近找"定余量
+        self._step = None
+        #: 底图灰度缓存（每拍转一次纯属浪费；底图对象在一次会话里不变 ✓）
+        self._cg = None
+        self._cg_key = None
+
+    def reset(self, view=None):
+        """换图 / 重标定：忘掉跟过的位置（给了 `view` 就以它当起点 ✓）。"""
+        self.view = (float(view[0]), float(view[1])) if view else None
+        self.tracked = bool(view)
+        self.score = 0.0
+        self.missed = 0
+        self.why = ""
+        self.where = ""
+        self._step = None
+        return self
+
+    def _gray_canvas(self, canvas):
+        """底图灰度（**按对象缓存** —— 底图对象在一次会话里不变 ✓）。"""
+        key = (id(canvas), canvas.shape[0], canvas.shape[1])
+        if self._cg is None or self._cg_key != key:
+            self._cg = _gray(canvas)
+            self._cg_key = key
+        return self._cg
+
+    @staticmethod
+    def _inset(calib):
+        """crop 下的面板内缩量 `(x, y)`（= `offset`，见 `locate_crop` 的口径 ✓）。"""
+        try:
+            ox, oy = calib.get("offset") or (0, 0)
+            return float(ox), float(oy)
+        except (TypeError, ValueError):
+            return 0.0, 0.0
+
+    def _patch(self, panel, canvas, calib, seed, clip=True):
+        """取模板 → `(模板灰度, 面板左上角, 底图上的期望位置)`；取不出 ⇒ `None`。
+
+        两种取法（`clip`），**都必须有**（各有各挡不住的情况 ✓，见 `update`）：
+          · `clip=True` —— **按起点算"面板哪一段落在底图上"**，再往里收掉"起点可能已经
+            错掉"的那点余量、并**不超过底图的一半**，在剩下那段里居中取。它最干净
+            （一点面板边/底色都不含 ✓），但**依赖起点**：起点旧了就会把"面板边 / 底图外的
+            底色"取进来 ✗（那种像素在底图上没有对应 ⇒ 分数掉下去 ⇒ 全图重找也救不回来 ✗）；
+          · `clip=False` —— **面板正中间那一半**，完全不看起点 ✓（起点很旧时靠它救回来 ✓），
+            代价是：面板边/底色落在正中间时（人贴着地图上/下边缘走）它会含到 ✗。
+
+        ⚠ **上限：不超过底图的一半**（两种取法都要）—— 再大，能放它的位置就只剩几像素 ⇒
+        位置根本量不出来（实测：面板比底图**宽**时，77×77 的模板在 82×218 的底图上只有
+        **5 个水平位置** ⇒ 匹配永远贴着边界、x 一动不动 ✗ —— 而"面板比底图宽"正是局部
+        小地图的常态：实测 105040303 是 82×218 的底图 + 502×408 的面板 ✓）。
+        """
+        sx, sy = scales_of(calib)
+        if sx <= 0 or sy <= 0:
+            return None
+        ph, pw = panel.shape[:2]
+        ch, cw = canvas.shape[:2]
+        vx, vy = float(seed[0]), float(seed[1])
+        ox, oy = self._inset(calib)
+        if clip:
+            # 面板四边换到底图坐标、和底图求交（超出底图的那一圈在底图上没有对应 ✓）
+            bx0 = max(0.0, vx - ox / sx)
+            bx1 = min(float(cw), vx + (pw - ox) / sx)
+            by0 = max(0.0, vy - oy / sy)
+            by1 = min(float(ch), vy + (ph - oy) / sy)
+            # **收掉"起点可能已经错掉"的那点余量**：上一拍滚过多少就是它最可能错多少
+            # （附近找的窗口也是按它开的 ✓ 两处同一个量 ✓）。
+            mpx = (max(self.PAD_MIN, self.PAD_GAIN * abs(self._step[0]))
+                   if self._step else self.PAD_MIN)
+            mpy = (max(self.PAD_MIN, self.PAD_GAIN * abs(self._step[1]))
+                   if self._step else self.PAD_MIN)
+            bx0, bx1 = bx0 + mpx, bx1 - mpx
+            by0, by1 = by0 + mpy, by1 - mpy
+            if bx1 - bx0 < self.MIN_TPL or by1 - by0 < self.MIN_TPL:
+                return None
+        else:
+            bx0, bx1 = vx, vx + pw / sx
+            by0, by1 = vy, vy + ph / sy
+        # 上限 + 居中
+        w = min(bx1 - bx0, max(float(self.MIN_TPL), cw / 2.0))
+        h = min(by1 - by0, max(float(self.MIN_TPL), ch / 2.0))
+        tw = int(round(w))
+        th = int(round(h))
+        if tw < self.MIN_TPL or th < self.MIN_TPL:
+            return None
+        if tw >= cw or th >= ch:      # 必须**严格小于**底图：否则只有一个位置可放 ⇒ 量不出来
+            return None
+        cx0 = bx0 + (bx1 - bx0 - w) / 2.0
+        cy0 = by0 + (by1 - by0 - h) / 2.0
+        px0 = int(max(0, min(pw - 1, int(np.floor((cx0 - vx) * sx + ox)))))
+        px1 = int(max(px0 + 1, min(pw, int(np.ceil((cx0 + w - vx) * sx + ox)))))
+        py0 = int(max(0, min(ph - 1, int(np.floor((cy0 - vy) * sy + oy)))))
+        py1 = int(max(py0 + 1, min(ph, int(np.ceil((cy0 + h - vy) * sy + oy)))))
+        sub = panel[py0:py1, px0:px1]
+        if getattr(sub, "size", 0) == 0:
+            return None
+        tpl = cv2.resize(_gray(sub), (tw, th), interpolation=cv2.INTER_AREA)
+        # 这个模板在**底图上的期望位置**（按起点算）：附近找的窗口围着它 ✓
+        ax = (px0 - ox) / sx + vx
+        ay = (py0 - oy) / sy + vy
+        return tpl, (px0, py0), (ax, ay)
+
+    def _match(self, region, tpl, ox, oy, where):
+        """在 `region`（底图灰度的一段）里找 `tpl` → `(分数, 绝对位置 x, y, 在哪找的)`。"""
+        rh, rw = region.shape[:2]
+        th, tw = tpl.shape[:2]
+        if tw > rw or th > rh or tw < 1 or th < 1:
+            return None
+        res = np.nan_to_num(cv2.matchTemplate(region, tpl, cv2.TM_CCOEFF_NORMED))
+        _, mx, _, ml = cv2.minMaxLoc(res)
+        fx, fy = _subpixel_peak(res, ml)
+        return float(mx), float(fx) + float(ox), float(fy) + float(oy), where
+
+    def _search(self, cg, patch, cw, ch, axes=(True, True)):
+        """在一个模板上跑「**附近找 → 全图重找**」→ `((分数, x, y, where)|None, 见过的最好分)`。
+
+        `axes` = `(能动 X, 能动 Y)`（`scroll_axes(calib)` ✓ **单轴的图只搜那根轴** ——
+        用户 2026-09-29："仅X/仅Y"的图上实时匹配要快 ✓）：
+          · **附近找**：不动的那根轴 `pad = 0` ⇒ 窗口在那一轴上**只有模板那么宽** ✓
+            （面板在那一轴上的小抖动不会把结果带偏 ✓），而且那根轴的搜索面积直接没了 ✓；
+          · **全图重找**：不动的那根轴收成一条**带**（横带 / 竖带，高/宽 = 模板 + 一点余量 ✓）
+            ⇒ matchTemplate 的面积少掉一大截（实测：底图 82×218、模板 41×36 时，
+            仅 X 那条横带的面积是整图的 ~20% ✓ ~5 倍 ✓）。
+          · ⚠ 只在**有先验**时才能收成带（`ax/ay` = 模板按当前 view 该落在哪儿 ✓）；
+            先验不可信（还没跟住过 / 落在底图外）⇒ 老实全图找 ✓（宁慢不猜 ✗）。
+
+        门槛**分两档**（用户 2026-09-29 ✓ 实测定的）：
+          · **附近找**（有历史才走）⇒ 用「量得出来」那条线（`min_score` = 标定时同一把尺 ✓）。
+            滚动是连续的 ⇒ 附近找**认错也只能错在 pad 之内**（几个底图像素 ✓）；
+          · **全图重找** ⇒ 第一拍（还没跟住过）仍是 `min_score`（标定那一刻人刚好站在
+            那儿 ⇒ 标定里那个 `view` 就是先验 ✓）；**已经在跟**的时候要 `TRUST_SCORE`
+            （0.8，"这份几何可信"那档）。为什么必须抬：此刻错一次就会被当成"跟住了"、
+            之后每拍都围着那一带找 ⇒ **再也不会自我纠正** ✗。
+            实测：拿**另一张图**的底图去匹配能到 **0.555**、面板被挡掉一半（重复花纹那种
+            图）也有 **0.6** 上下 ⇒ 0.55 这条线挡不住"像但不是" ✗。
+
+        ⚠⚠ **附近找的结果"不太像"时要再全图找一次**（2026-09-29 实测踩到）：窗口只有
+          `pad`（冷启动是 `PAD_MIN` = 2 个底图像素）⇒ 人**站着不动之后猛一走**
+          （或传送/跳一下）真位置落在窗口外 ⇒ 匹配就贴着窗口边给个 0.6~0.7 的结果
+          （过得了 0.55 ✓）⇒ 那一拍的世界坐标偏 pad 那么多，而且**看着像跟住了** ✗。
+          ⇒ 采纳条件加一条：**已经在跟**的时候，附近找的分要到 `TRUST_SCORE` 才直接算数；
+          不够就**再全图找一次**，谁分高用谁 ✓（全图找 ~1 ms，只在"不太像"那拍多花 ✓）。
+        """
+        ax_on, ay_on = axes
+        tpl, _pq, (ax, ay) = patch
+        th, tw = tpl.shape[:2]
+        best, seen = None, 0.0
+        # 门槛：附近找要够像才算数（不够 ⇒ 走下面那次全图找 ✓）
+        bar = (self.min_score if not self.tracked
+               else max(self.min_score, TRUST_SCORE))
+        if self._step is not None and self.view is not None:
+            # ⭐ 不动的那根轴**余量为 0**（单轴的图：面板在那一轴上不会滚 ✓）
+            padx = (max(self.PAD_MIN, self.PAD_GAIN * abs(self._step[0]))
+                    if ax_on else 0.0)
+            pady = (max(self.PAD_MIN, self.PAD_GAIN * abs(self._step[1]))
+                    if ay_on else 0.0)
+            wx0 = int(max(0, np.floor(ax - padx)))
+            wy0 = int(max(0, np.floor(ay - pady)))
+            wx1 = int(min(cw, np.ceil(ax + padx) + tw))
+            wy1 = int(min(ch, np.ceil(ay + pady) + th))
+            if wx1 - wx0 >= tw and wy1 - wy0 >= th:
+                near = self._match(cg[wy0:wy1, wx0:wx1], tpl, wx0, wy0, "near")
+                if near is not None:
+                    seen = max(seen, near[0])
+                    if near[0] >= bar:
+                        best = near
+        if best is None:
+            # ⭐ 全图重找：不动的那根轴收成**一条带**（先验 = 模板按当前 view 该落在哪儿 ✓，
+            #    由 `_patch` 给的那个 `ax/ay` ✓）。带子比整图小一大截 ⇒ 单轴图上快好几倍 ✓。
+            #    ⚠ **带里没找到像的 ⇒ 再老实全图找一次**（多花 ~1 ms，但"先验恰好是错的"
+            #    —— 标定里的位置不准 / 刚换图 —— 那一拍就不会白丢 ✓ 宁慢不猜 ✗）。
+            for _try_band in (True, False):
+                got, sc = self._search_full(cg, tpl, cw, ch, bar,
+                                            (ax, ay) if _try_band else None, axes)
+                seen = max(seen, sc)
+                if got is not None:
+                    best = got
+                    break
+                if not _try_band:
+                    break
+        return best, seen
+
+    def _search_full(self, cg, tpl, cw, ch, bar, prior, axes):
+        """全图（或单轴时的**一条带**）里找 → `(分数, x, y, where)|None`（不够好 ⇒ None ✓）。
+
+        `prior = (ax, ay)`（模板按当前 view 该落在哪儿 ✓）：给了它、而且是**单轴**的图
+        ⇒ 只扫不动的那根轴上的一条带 ✓；`prior=None` ⇒ 整图 ✓（宁慢不猜 ✗）。
+        """
+        ax_on, ay_on = axes
+        th, tw = tpl.shape[:2]
+        reg, rx0, ry0 = cg, 0, 0
+        if prior is not None and not (ax_on and ay_on):
+            ax, ay = prior
+            band = int(self.PAD_MIN) + 2          # 容忍先验自己差几个像素 ✓
+            if not ay_on:
+                ry0 = int(max(0, np.floor(ay) - band))
+                ry1 = int(min(ch, np.ceil(ay) + th + band))
+                if ry1 - ry0 >= th:
+                    reg = cg[ry0:ry1, :]
+            if not ax_on:
+                rx0 = int(max(0, np.floor(ax) - band))
+                rx1 = int(min(cw, np.ceil(ax) + tw + band))
+                if rx1 - rx0 >= tw:
+                    reg = reg[:, rx0:rx1]
+            if (not ay_on and reg.shape[0] < th) or (not ax_on and reg.shape[1] < tw):
+                reg, rx0, ry0 = cg, 0, 0            # 带子装不下 ⇒ 退回整图 ✓
+        full = self._match(reg, tpl, rx0, ry0, "full")
+        if full is None:
+            return None, 0.0
+        return (full if full[0] >= bar else None), float(full[0])
+
+    def update(self, panel, canvas, calib=None):
+        """这一拍的面板 → `view` 跟踪结论 dict。
+
+        返回 `{"ok", "view": [x, y]|None, "score", "trust", "why", "missed", "where"}`；
+        `view` 是**可以用的那个**：跟住 ⇒ 新跟出来的；没跟住 ⇒ 上一拍跟住的那个
+        （都没有 ⇒ 标定里那个）⇒ 调用方只在 `ok` 时才该改几何 ✓（没跟住时
+        标定里那份就是今天的行为，一字不变 ✓）。
+        `trust` = 这一拍的匹配分到没到**可信**那一档（`TRUST_SCORE`）—— 面板被挡掉一块时
+        分会落在中间那带（`trust=False`），**照样能用**，但界面该说一句"不太稳" ✓。
+        """
+        out = {"ok": False, "view": None, "score": 0.0, "why": "", "where": ""}
+        if panel is None or canvas is None or getattr(canvas, "size", 0) == 0:
+            out["why"] = "没有面板画面 / 没有底图"
+            return self._done(out, calib)
+        if (calib or {}).get("mode") != MODE_CROP:
+            out["why"] = "这份标定不是「局部小地图」"
+            return self._done(out, calib)
+        if not has_geometry(calib):
+            out["why"] = "标定里还没有几何（缩放 / 显示区起点）"
+            return self._done(out, calib)
+        cg = self._gray_canvas(canvas)
+        ch, cw = cg.shape[:2]
+        sx, sy = scales_of(calib)
+        ox, oy = self._inset(calib)
+        # 起点候选：优先"上一拍跟住的那个"（连续 ✓），其次**标定里那个**（第一拍 / 人刚
+        # 重标过 ✓）。它决定两件事：模板取哪一段（`clip=True` 那路 ✓）与"附近找"的窗口 ✓。
+        seeds = []
+        for cand in (self.view, (calib.get("view") or (0, 0))):
+            if cand is None:
+                continue
+            cc = (float(cand[0]), float(cand[1]))
+            if cc not in seeds:
+                seeds.append(cc)
+        # 模板候选（顺序 = 优先尝试的顺序）：先按起点裁出来的（最干净），再**面板正中间**
+        # 那块（不看起点 ⇒ 起点很旧 / 跟丢一阵时靠它救回来 ✓）。两者可能一样 ⇒ 去重 ✓
+        # （按"面板上哪个矩形"去重 —— 同样的方块跑两遍纯属浪费 ✗）。
+        patches = []
+        for seed in seeds:
+            pt = self._patch(panel, canvas, calib, seed, clip=True)
+            if pt is not None and all(p[1] != pt[1] for p in patches):
+                patches.append(pt)
+        pt2 = self._patch(panel, canvas, calib, seeds[0] if seeds else (0, 0),
+                          clip=False)
+        if pt2 is not None and all(p[1] != pt2[1] for p in patches):
+            patches.append(pt2)
+        if not patches:
+            out["why"] = ("面板里能对到底图的那一段太小 —— 面板没框全 / 标定的缩放或"
+                          "显示区起点不对")
+            return self._done(out, calib)
+        seen = 0.0               # 这一拍见过的最好分数（只为把"差多少"说清楚 ✓）
+        best = None
+        pick = None
+        # ⭐ **滚动方向**（用户 2026-09-29 ✓）：单轴的图只搜会动的那根轴 ⇒ 又快、又不会
+        #   把"根本不动的轴"跟歪 ✓（面板在那一轴上的抖动 / 匹配噪声都进不来 ✓）。
+        axes = scroll_axes(calib)
+        for pt in patches:
+            got, sc = self._search(cg, pt, cw, ch, axes=axes)
+            seen = max(seen, sc)
+            if got is not None:
+                best, pick = got, pt
+                break
+        if best is None:
+            out["score"] = float(seen)
+            out["why"] = ("没在底图上找到这块面板（最好的一次匹配分只有 %.2f）—— 面板被挡住 / "
+                          "换了图 / 「显示方式」选错，或标定的缩放不对"
+                          % seen)
+            return self._done(out, calib)
+        tpl, (px0, py0), (ax, ay) = pick
+        score, mx, my, where = best
+        # 匹配到的位置 → view：**模板左上角对应面板的 (px0, py0)**（同一套换算，
+        # ⚠ 别再加一次 inset —— `locate_crop` 那条"view 里已经含 inset"的约定在这边
+        #   由 `(px0 - ox)` 抵消掉 ✓，`t_crop_roundtrip` 钉着同一个口径 ✓）。
+        nvx = float(mx) - (float(px0) - ox) / sx
+        nvy = float(my) - (float(py0) - oy) / sy
+        # ⭐ 单轴：不动的那根轴**一个字都不改**（照上一拍/标定里那个 ✓）—— 带子搜索给回来的
+        #   那个坐标本来就带着几个像素的余量 ⇒ 直接采纳就会让显示区在那一轴上慢慢漂 ✗。
+        ax_on, ay_on = axes
+        if seeds and not (ax_on and ay_on):
+            if not ay_on:
+                nvy = float(seeds[0][1])
+            if not ax_on:
+                nvx = float(seeds[0][0])
+        prev = self.view
+        self.view = (nvx, nvy)
+        self.tracked = True
+        self.score = float(score)
+        self.missed = 0
+        self.why = ""
+        self.where = where
+        # 下一拍的"附近"余量按这一拍真滚了多少来定（自己标定自己 ⇒ 不用拍一个速度常数 ✓）
+        self._step = ((nvx - prev[0], nvy - prev[1]) if prev is not None else None)
+        # 「可信吗」也一起报（口径同 `TRUST_SCORE`：0.55 那档只说明"量得出来"，0.8 才是
+        # "这份几何可信"✓）。面板被挡掉一块时分数就落在中间那一带，而**平掉的那半不贡献
+        # 方差** ⇒ 分数会虚高（实测：上半被挡 ⇒ 0.6~0.7，位置还差几个底图像素）
+        # ⇒ 界面那行要能说"跟住但不太稳"，别让人以为这拍的位置和干净那拍一样准 ✓。
+        out.update(ok=True, view=[nvx, nvy], score=float(score), where=where,
+                   trust=bool(float(score) >= TRUST_SCORE))
+        return out
+
+    def _done(self, out, calib):
+        """没跟住这一拍：**保留**上一拍跟住的那个（没有就用标定里那个），只记一笔 ✓。
+
+        ⚠ `self.view` **只由"跟住"那一拍写** —— 这里只是把"这一拍该用哪个 view"
+        填进返回值（标定里那个是兜底，不是"跟住了"✗，见 `tracked` 的说明 ✓）。
+        """
+        if out.get("ok"):
+            return out
+        self.missed += 1
+        self.why = out.get("why") or ""
+        self.where = out.get("where") or ""
+        if out.get("view") is None:
+            v = self.view
+            if v is None:
+                v = (calib or {}).get("view")
+                try:
+                    v = (float(v[0]), float(v[1])) if v else None
+                except (TypeError, ValueError, IndexError):
+                    v = None
+            if v is not None:
+                out["view"] = [v[0], v[1]]
+        out["missed"] = self.missed
+        return out
 
 
 def region_match_score(frame, rect, terrain, mode=None, ok_score=TRUST_SCORE):
@@ -621,7 +1391,7 @@ def region_match_score(frame, rect, terrain, mode=None, ok_score=TRUST_SCORE):
             "why": "" if sc >= ok_score else "偏低（%.1f 以上才算对上）" % ok_score}
 
 
-def check_calib(panel, terrain, calib, mode=None, min_score=0.55,
+def check_calib(panel, terrain, calib, mode=None, min_score=LOCATE_MIN_SCORE,
                 ok_world_px=10.0):
     """量一遍「**当前这份标定到底差多少**」—— 拿真帧，一律报**世界像素**。
 
@@ -1614,6 +2384,12 @@ class PlayerLocator:
         self._calib_cache = {}
         #: 「坐标系偏移」缓存（见 _world_offset）：(时刻, (x, y))
         self._off_cache = None
+        #: ⭐ **局部小地图（crop）的运行时 view 跟踪**（用户 2026-09-29 任务 1 ✓）——
+        #: crop 的面板**随玩家滚动**，标定文件里那个 `view` 只在标定那一刻成立
+        #: ⇒ 每拍得重新问"现在显示的是哪一块"（理由详见 `CropViewTracker` ✓）。
+        #: 挂在 locator 上（**有状态**：跨帧记"上一拍滚了多少"给附近找定余量 ✓），
+        #: 与 locator 同寿命；`load()`（换图）时清掉 ✓。
+        self._view_track = CropViewTracker()
         self._new_tracker()
         self.load(map_id)
 
@@ -1649,6 +2425,8 @@ class PlayerLocator:
         # ⚠ 重建时把界面调的跟踪参数带上（见 self.track）。
         self._new_tracker()
         self._calib_cache = {}
+        # 换图 ⇒ "现在显示的是底图哪一块"整个换了一套（底图都不一样）⇒ 忘掉跟过的位置 ✓
+        self._view_track.reset()
         return self
 
     def calib_for(self, src, ttl=1.0):
@@ -1715,6 +2493,15 @@ class PlayerLocator:
                        边里写的绳号**同一套**。判据是几何的（`mapdata.ladder_at`），
                        和执行器"对齐到绳的 x"用的**判定参数**是两回事（见设置→判定参数）
             dot        黄点那一层给的说明（认不出时就是原因）
+            view/view_ok/view_score/view_trust/view_why
+                       ⭐ **局部小地图（crop）的运行时跟踪**（用户 2026-09-29 任务 1 ✓）：
+                       `view` = **这一拍算坐标时用的**「显示区起点」（底图像素）；`view_ok` =
+                       这一拍真的**跟住了**吗（`None` = 不是 crop，没这回事 ✓）；
+                       `view_score` = 跟的匹配分；`view_trust` = 到没到 `TRUST_SCORE`
+                       那档（`False` = 跟住了不太稳，典型是面板被挡掉一块 ✓）；
+                       `view_why` = 没跟住的原因。
+                       ⚠ 跟不住时用的是**标定里那份**（= 老行为）⇒ `view_ok=False` 就意味着
+                       "这一拍的世界坐标可能整体偏"（crop 会滚动！见 `CropViewTracker` ✓）。
             note       没算出坐标 / 没落平台的原因（**可能很长**，给 tooltip/日志）
             short      `note` 的一句话版本（正常时是空串）——给**贴在画面上**的
                        读数用：那是一行不换行的字，塞下 `note` 会横穿整个画面
@@ -1727,6 +2514,30 @@ class PlayerLocator:
         _xt = max(0, int(fh_xtol or 0))
         if calib is None:
             calib = self.calib_for(src)
+        # ⭐⭐ **局部小地图（crop）：先把"现在显示的是底图哪一块"量出来**（用户 2026-09-29
+        #   任务 1 ✓）。crop 的面板**随玩家滚动** ⇒ 标定文件里那个 `view` 只在标定那一刻
+        #   成立，人一走后面所有换算都是整体平移的 ✗（理由与量级见 `CropViewTracker` ✓）。
+        #   ⚠ **跟住才改几何**：没跟住时用标定里那份 = 今天的行为一字不变 ✓，只把
+        #     "这一拍没跟住"写进 note/short（否则人会拿着一个偏了 370 世界像素的读数
+        #     当准的用 ✗ —— 那正是"世界坐标整体偏"那类问题的样子 ✓）。
+        #   ⚠ 必须在**黄点识别之前**跑：黄点的搜索 ROI / 底图遮罩都吃 `view`
+        #     （`_calib_roi` / `_basemap_extra_mask` ✓）⇒ 跟住了连"认黄点"都更准 ✓。
+        _vt = {"ok": None, "view": None, "score": None, "why": ""}
+        _crop_note = ""
+        if (calib or {}).get("mode") == MODE_CROP \
+                and terrain is not None and getattr(terrain, "canvas", None) is not None:
+            _vt = self._view_track.update(panel, terrain.canvas, calib)
+            if _vt.get("ok") and _vt.get("view"):
+                calib = dict(calib, view=[float(v) for v in _vt["view"]])
+                if not _vt.get("trust"):
+                    # 跟住了但不够可信（典型：面板被挡掉一块 —— 平掉的那半不贡献方差，
+                    # 分数会虚高 ✓）。**照样用**（比拿标定里那个旧位置强 ✓），但要说出来 ✓。
+                    _crop_note = ("局部小地图：这一拍跟住了，但匹配分只有 %.2f（不太稳，"
+                                  "面板被挡住 / 画面糊了？）"
+                                  % float(_vt.get("score") or 0.0))
+            else:
+                _crop_note = ("局部小地图：这一拍没跟住显示区（%s）⇒ 用的是标定里那个"
+                              "位置，世界坐标可能整体偏" % (_vt.get("why") or "说不清"))
         r = self.tracker.update(panel, calib=calib, terrain=terrain)
         out = {"ok": False, "confirmed": bool(r.get("confirmed")),
                # held：这一拍没认出黄点，位置是**上一帧**的（防抖窗口内沿用）。
@@ -1734,6 +2545,10 @@ class PlayerLocator:
                "held": bool(r.get("held")), "missed": int(r.get("missed") or 0),
                "px": r["x"], "py": r["y"], "world_x": None, "world_y": None,
                "segment_id": None, "foothold_id": None, "src": src,
+               # 局部小地图（crop）的运行时跟踪（见上面那段；不是 crop 时一律 None ✓）
+               "view": _vt.get("view"), "view_ok": _vt.get("ok"),
+               "view_score": _vt.get("score"), "view_why": _vt.get("why") or "",
+               "view_trust": _vt.get("trust"),
                "dot": r["reason"], "note": "", "short": "认不出黄点"}
         if not r["ok"]:
             out["note"] = r["reason"]
@@ -1795,6 +2610,13 @@ class PlayerLocator:
             out["short"] = "上一帧位置"
         else:
             out["short"] = ""
+        if _crop_note:
+            # 局部小地图没跟住 ⇒ **必须说出来**（这一拍的世界坐标可能整体偏了"滚了多少"✗）：
+            # 拼在已有 note 后面（原来那句可能是"脚下没有平台"，两条都要看得见 ✓）；
+            # short 只在还没有话说的时候顶上（画面上那行越短越好，见它的说明 ✓）。
+            out["note"] = (out["note"] + "；" if out["note"] else "") + _crop_note
+            if not out["short"]:
+                out["short"] = "局部小地图没跟住"
         return out
 
 
@@ -1817,19 +2639,30 @@ def screen_to_world(player, sx, sy):
       `mob.y + mob.h / 2` ✓、玩家那头用 `player.bottom`（框底 ✓，`world_y` 也是脚底 ✓）；
       x 两边都用中心 ✓（`player.x` ↔ `world_x` ✓）。
     ⚠ 拿不到玩家的世界坐标（没定位）⇒ 返回 `None`（**不猜** ✓，调用方退回老行为 ✓）。
+
+    ⭐⭐ **优先用「可信相机」**（`player.cam_x/cam_y`，用户 2026-09-29 任务 2 ✓）：
+    上面那个"现算"的相机**每一拍都在动**，而它的两个来源一个是权威的（黄点世界坐标 ✓）、
+    一个不稳（YOLO 玩家框 ⇒ 框抖 Δ ⇒ 每只怪的世界坐标同量平移 Δ ✗）。
+    `PlayerTracker` 已经把"跟黄点对得上的那几拍"挑出来存在 `player.cam_x/cam_y` 上
+    （口径与这里**完全一致** ✓ 见 `perception/tracker._cam_of`）⇒ 这里照用，全仓
+    "画面 → 世界"因此走**同一份相机** ✓。
+    ⚠ 没有它（`None` ⇒ 还没建立）⇒ **老口径现算**，行为一字不变 ✓。
     """
     wx0 = getattr(player, "world_x", None)
     wy0 = getattr(player, "world_y", None)
     if wx0 is None or wy0 is None:
         return None
-    cam_x = float(wx0) - float(getattr(player, "x", 0.0) or 0.0)
     # ⭐ **脚底偏移**（用户 2026-09-28 ✓）：框底不一定正好压在脚底（鞋底阴影 / 披风 /
     #   特效会让框多出一截 ✗）⇒ 用镜像值补正 ✓（`live_thread` 每帧灌进 `world_state` ✓
     #   —— 这边**不能**反过来 import decision，会绕成循环依赖 ✗）。
     from perception import world_state as _ws
-    cam_y = (float(wy0) - (float(getattr(player, "bottom", 0.0) or 0.0)
-                           + float(_ws.FOOT_OFFSET_PX)))
-    return (float(sx) + cam_x, float(sy) + cam_y)
+    cam_x = getattr(player, "cam_x", None)
+    cam_y = getattr(player, "cam_y", None)
+    if cam_x is None or cam_y is None:
+        cam_x = float(wx0) - float(getattr(player, "x", 0.0) or 0.0)
+        cam_y = (float(wy0) - (float(getattr(player, "bottom", 0.0) or 0.0)
+                               + float(_ws.FOOT_OFFSET_PX)))
+    return (float(sx) + float(cam_x), float(sy) + float(cam_y))
 
 
 def apply_to_player(player, loc):
@@ -1926,6 +2759,19 @@ def frame_overlay_rects(loc, frame_rect, canvas_wh, calib_panel=None):
     叠图会被整块放大：`底图 134 × scale 5.63 = 754` 的方块糊在 251px 的小地图上。
     传了它，就按 `标定面板 ÷ 当前那块画面` 的比例把几何先换算过去再画 ——
     于是 A 机改 zoom、或面板尺寸变了，叠图都不会再被放大。
+
+    ⚠⚠ **折算哪些量**（2026-09-29 修，用户报"**刚标定完叠加图显示就不对**"✓）：
+      标定那份说的是 `底图 = (p标定 − offset) / scale + view`，而框选那块面板与它
+      **看的是同一块地图**、只是像素尺寸差 z 倍（`p标定 = z · p框选`）⇒ 代进去：
+      `底图 = (p框选 − offset/z) / (scale/z) + view` ⇒
+      **`scale` 与 `offset` 要除以 z，`view` 不动** ✓（`view` 是**底图坐标**，跟面板
+      放大几倍无关）。
+      ⛔ 以前把 `view` 也除了 z ✗ ⇒ 叠图整块平移 `view × (1 − 1/z)` 个底图像素
+      （实测 105040303：偏 (7.3, 69.8) 个底图像素，而那块面板一共才装得下
+      (58.1, 60.8) 个 ⇒ **叠图跑到地图别处去了** ✗）。
+      **为什么这个错一直没露**：`fit` 的 `view` 恒为 `[0, 0]`（整张底图不动）⇒ 除不除
+      都一样 ✗；只有 `crop` 的 `view` 是"现在显示在地图哪儿"、必然非 0 ⇒ 一除就错 ✓
+      —— 于是现象恰好是"**只有局部小地图**、刚标定完叠图就不对"。
     """
     fx, fy, fw, fh = (int(v) for v in frame_rect)
     loc2 = loc
@@ -1939,9 +2785,151 @@ def frame_overlay_rects(loc, frame_rect, canvas_wh, calib_panel=None):
             sx, sy = scales_of(loc)             # 两轴都要折算（比例 z 本身是等比的 ✓）
             loc2 = with_scales(loc, sx / z, sy / z)
             loc2["offset"] = [float(v) / z for v in (loc.get("offset") or (0, 0))]
-            loc2["view"] = [float(v) / z for v in (loc.get("view") or (0, 0))]
+            # ⛔ **`view` 不折算**（`底图 = (p − offset/z)/(scale/z) + view` ⇒ view 原样 ✓）
+            #    —— 这里原来写的是 `loc2["view"] = [v / z ...]`，crop 图上会让叠图整体
+            #    平移几个到几十个底图像素（见上面那段 ⚠⚠ ✓）。
     src, (dx, dy, dw, dh) = overlay_draw_rects(loc2, (fw, fh), canvas_wh)
     return src, (fx + dx, fy + dy, dw, dh)
+
+
+def overlap_pearson(panel, canvas, calib, max_samples=6000, min_samples=64):
+    """**按重叠区**算面板↔底图的相关 → `(score|None, overlap, why)`。
+
+    **一处口径**：`align_score`（给人看的那行）与 `locate_crop`（自动定位挑候选）都用它 ✓
+    —— 两处各写一个"像不像"的算法，迟早变成"自动定位说 0.9、判据那行说 0.4" ✗。
+    采样点**落在底图里**的才参与 ⇒ 面板边上的游戏 UI / 底图外那圈自然被排除 ✓。
+
+    ⚠ **传灰度图（2 维）也认**：自动定位要算几百次，每次现转一次灰度就是几百毫秒 ✗
+      （实测 675×600 的面板转一次 ~1 ms）⇒ 调用方**自己转一次、反复用** ✓。
+    """
+    if panel is None or getattr(panel, "size", 0) == 0:
+        return None, 0.0, "没有面板画面"
+    if canvas is None or getattr(canvas, "size", 0) == 0:
+        return None, 0.0, "这张图还没有底图（先「生成地形图」）"
+    if not has_geometry(calib):
+        return None, 0.0, "这份标定还没有几何（缩放 / 偏移）"
+    panel = panel if getattr(panel, "ndim", 3) == 2 else _gray(panel)
+    canvas = canvas if getattr(canvas, "ndim", 3) == 2 else _gray(canvas)
+    ch, cw = canvas.shape[:2]
+    sx, sy = scales_of(calib)
+    if sx <= 0 or sy <= 0:
+        return None, 0.0, "标定里的缩放不是正数"
+    # ⚠ 字段口径照抄 `panel_to_canvas`（**唯一那处** ✓）：crop 才加 `view`
+    ox, oy = calib.get("offset") or (0, 0)
+    vx, vy = ((calib.get("view") or (0, 0)) if calib.get("mode") == MODE_CROP
+              else (0, 0))
+    ph, pw = panel.shape[:2]
+    # 采样步长：面板可能 750×800 ⇒ 别一次算几十万像素（1 底图像素就够 ✓）
+    step = max(1, int(round((pw * ph / float(max(1, max_samples))) ** 0.5)))
+    xg, yg = np.meshgrid(np.arange(0, pw, step), np.arange(0, ph, step))
+    bx = np.rint((xg - ox) / sx + vx).astype(np.int64)
+    by = np.rint((yg - oy) / sy + vy).astype(np.int64)
+    inside = (bx >= 0) & (bx < cw) & (by >= 0) & (by < ch)
+    n = int(inside.sum())
+    ov = float(n) / float(max(1, xg.size))
+    if n < max(16, int(min_samples)):
+        return None, ov, ("面板几乎没有落在底图上（只有 %.1f%% 的采样点在里面）—— "
+                          "缩放 / 偏移 / 显示区起点不对？" % (ov * 100.0))
+    try:
+        a = panel[yg[inside], xg[inside]].astype(np.float32)
+        b = canvas[by[inside], bx[inside]].astype(np.float32)
+    except Exception as e:                              # noqa: BLE001
+        return None, ov, "采样失败：%s" % e
+    if float(a.std()) < 1e-3 or float(b.std()) < 1e-3:
+        return None, ov, "面板或底图那一块几乎是纯色（没有可比的纹理）"
+    sc = float(np.corrcoef(a, b)[0, 1])
+    if not np.isfinite(sc):
+        return None, ov, "算不出相关（那一块是平的）"
+    return max(0.0, min(1.0, sc)), ov, ""
+
+
+def align_score(panel, terrain, calib, max_samples=6000, min_samples=64,
+                near=False, near_px=3, near_max=9):
+    """**当前这套几何贴不贴** → `{"score", "overlap", "ok", "why", "near"}`（**不做搜索** ✓）。
+
+    和 `locate*`（找位置）是两件事：这里固定用你**手上这套几何**，只问"面板和底图对得上吗"。
+    为什么要它（用户 2026-09-29 第 ⑤ 条 ✓ 原话："对于局部地图，评判分应该按局部来，
+    必须制定剪裁范围才能让评分合理"）：
+      · `locate` 给的是"**整张面板**在底图里最像哪儿"——crop（局部小地图）下，面板只是
+        底图的一小块，那个分跟"你对齐了没有"没关系 ✗（手工对齐的更干脆：没有分 ✓）；
+      · 这里改成**只算重叠区**：把面板像素按当前几何映到底图上，**落在底图里**的那些
+        才参与打分 ⇒ "剪裁范围"由**这套几何自己定出来**，不需要人再去框一块 ✓
+        （要靠人剪裁才能算分，等于把这件客观的事变主观 ✗）。
+    分数 = 两串像素的**归一化相关**（和 `TM_CCOEFF_NORMED` 的 0~1 同一个口径 ✓）：
+      1.0 = 完全重合；≥ `TRUST_SCORE`(0.8) 基本就是"对上了" ✓。
+    `overlap` = 面板里落在底图上的像素占比 —— **这个数小就说明"框多了"**（把游戏 UI /
+      面板外那圈框进了 crop 区域）⇒ 分再高也别全信 ✓（这也是 `_refresh_judge` 要一起
+      报它的原因 ✓）。
+
+    ⭐⭐ `near=True` ⇒ 多算一圈**邻域**，返回 `near = {"score", "dx", "dy"}`（**相对现在这套
+      几何**平移 `(dx, dy)` 底图像素之后最好的那一档；`(0, 0)` 就是现在 ✓）。
+
+      **为什么非有不可**（用户 2026-09-29 下一句就是："森林迷宫III项目，我已经手工对得很
+      好了**匹配分还是很低**！"✗）：**绝对分不是一把通用的尺** —— 有的图客户端小地图
+      的画法与底图**不同源**（自己另画一套线/底色），那类图**对得再准也只有 0.3~0.5** ✗
+      ⇒ 光看"0.42 低于 0.55"会让人以为"我没对齐"，于是把对的几何改坏 ✗✗（判断贴合分
+      **低不低**，只能和**它自己**比：附近有没有明显更高的一档 ✓）。
+      `near["score"] - score <= 0.02` ⇒ **已经在这一档最好** ✓（这时分数低是"这张图
+      天生如此"，不是你没对齐 ✓）；差得多 ⇒ `near` 里那对 `(dx, dy)` 就是**该往哪挪** ✓。
+
+    ⚠ **只读**：不搜位置、不改标定、不写文件；`near=False` 时每拍 ~0.3 ms，
+      开邻域约 9~13 次 ⇒ ~4 ms（标定弹窗每拍算一次，够用 ✓）。
+    """
+    out = {"score": None, "overlap": 0.0, "ok": False, "why": "", "near": None}
+    canvas = getattr(terrain, "canvas", None) if terrain is not None else None
+    sc, ov, why = overlap_pearson(panel, canvas, calib, max_samples, min_samples)
+    out["overlap"] = ov
+    if sc is None:
+        out["why"] = why
+        return out
+    out["score"] = sc
+    out["ok"] = True
+    if near:
+        out["near"] = _near_best(panel, canvas, calib, sc,
+                                 near_px, near_max, max_samples, min_samples)
+    return out
+
+
+def _near_best(panel, canvas, calib, base, near_px, near_max, max_samples, min_samples):
+    """邻域里最好的一档（**爬坡**：先 3×3，最好的落在边上就再往外走一档）→
+    `{"score", "dx", "dy"}`（`(0,0)` = 现在这套 ✓）。
+
+    ⚠ 只平移 `view`（crop）/ `offset`（fit）—— 也就是**只回答"往哪挪"**；缩放不在里面 ✓
+    （缩放的微调是另一件事，见 `refine_calib` ✓；两者混在一起搜，人读不懂那个数）。
+    """
+    if not has_geometry(calib):
+        return None
+    # 邻域要算十几次 ⇒ 灰度**只转一次**（不然每转一次 675×600 就是 ~1 ms ✗）
+    panel = panel if getattr(panel, "ndim", 3) == 2 else _gray(panel)
+    canvas = canvas if getattr(canvas, "ndim", 3) == 2 else _gray(canvas)
+
+    def at(dx, dy):
+        c = dict(calib)
+        if calib.get("mode") == MODE_CROP:
+            v = list(calib.get("view") or (0, 0))
+            c["view"] = [float(v[0]) + dx, float(v[1]) + dy]
+        else:
+            o = list(calib.get("offset") or (0, 0))
+            c["offset"] = [float(o[0]) - dx * float(scales_of(calib)[0]),
+                           float(o[1]) - dy * float(scales_of(calib)[1])]
+        s, _ov, _w = overlap_pearson(panel, canvas, c, max_samples, min_samples)
+        return s
+
+    best = {"score": float(base), "dx": 0, "dy": 0}
+    for k in range(1, max(1, int(near_max / max(1, near_px))) + 1):
+        r = k * near_px
+        found = False
+        for dx in (-r, 0, r):
+            for dy in (-r, 0, r):
+                if dx == 0 and dy == 0:
+                    continue
+                s = at(dx, dy)
+                if s is not None and s > best["score"]:
+                    best = {"score": float(s), "dx": dx, "dy": dy}
+                    found = True
+        if not found:
+            break                      # 这一圈没有更好的 ⇒ 不再往外走（省时间 ✓）
+    return best
 
 
 def crop_compare(frame, canvas, rect):

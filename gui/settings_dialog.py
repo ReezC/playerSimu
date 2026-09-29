@@ -22,7 +22,7 @@
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (QCheckBox, QColorDialog, QDialog,
                              QDialogButtonBox, QFormLayout, QFrame, QGroupBox,
-                             QHBoxLayout, QLabel, QPushButton,
+                             QGridLayout, QHBoxLayout, QLabel, QPushButton,
                              QScrollArea, QTabWidget, QVBoxLayout, QWidget)
 
 from core import mapdata, perf, winperf
@@ -94,7 +94,12 @@ class SettingsDialog(QDialog):
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         box.button(QDialogButtonBox.Ok).setText("确定")
         box.button(QDialogButtonBox.Cancel).setText("取消")
-        box.accepted.connect(self._accept)
+        theme.unify_ok_cancel(box.button(QDialogButtonBox.Ok),
+                              box.button(QDialogButtonBox.Cancel))
+        # ⚠ 连的是**包了一层**的 `_accept_safe`（不是裸 `_accept` ✓）—— 写回中途出错时
+        #   ①**保证对话框关得掉** ②**把"坏在哪一项"报出来**（用户 2026-09-28 报"点确定
+        #   修改无效、好多次"✓ 以前是静默跳过 + 关不掉 ✗ 见那个方法的说明 ✓）。
+        box.accepted.connect(self._accept_safe)
         box.rejected.connect(self.reject)
         root.addWidget(box)
 
@@ -241,34 +246,71 @@ class SettingsDialog(QDialog):
         # ---- ③ 检测框颜色（按类别表生成）----
         self._vis = theme.load_vis()
         self._color_btns = {}
+        #: ⭐ **各框线宽的 spin**（用户 2026-09-28 ✓"给其他的粗细也加配置"）→ {vis 键: QSpinBox}
+        self._width_spins = {}
         #: 「辅助线与标记」每项前面的**显示开关**（用户 2026-09-27 要求）→ {键: QCheckBox}
         self._vis_on = {}
 
-        def add_row(form, label, key, tip="", on_key=None, on_tip=""):
-            """一行「颜色」（可选：**前面再加一个开关** ✓，用户 2026-09-27 要求）。
+        _grid_rows = [0]          # 网格版的行号（闭包内递增 ✓）
 
-            `on_key` 给了就变成 `[✓] 标签    [色块]` 这种一行 —— 关掉 = **不画这一项**，
-            颜色留着（下次开回来还在 ✓）。开关值存 `config/ui.yaml` 的 `vis:` 段 ✓。
-            ⚠ 标签用**开关的文字**（不再单独摆一个标签）：用户要求"去掉末尾'颜色'两字
-              （是废话占空间）"，那就把名字交给开关、右边只留色块 ✓。
+        def add_row(form, label, key, tip="", on_key=None, on_tip="",
+                    w_key=None, w_tip=""):
+            """一行「颜色（+ 粗细）」（可选：**前面再加一个开关** ✓，用户 2026-09-27 起）。
+
+            ⭐⭐ 2026-09-28 用户四条要求（照办 ✓ 原话）："**粗细调整参数放颜色配置右边**，
+               并**给其他的粗细也加配置**，并且用**网格对齐**，要求**参数名显示完整**"。
+            · **网格版**（`form` 是 `QGridLayout`）⇒ 按**三列**摆：
+              列 0 = 开关（名字写在上头 ✓）／列 1 = 色块／列 2 = 粗细框 ✓
+              —— 网格保证**各行的色块、粗细框上下对齐** ✓，列 0 的**最小宽度**由调用方
+              抬到够长的那个名字 ⇒ **参数名完整显示**（不截断、不省略 ✓）。
+            · **老版**（`form` 是 `QFormLayout`，类别框那一组 ✓）⇒ 走原样（那组没有粗细 ✓）。
+            · `w_key` 给了 ⇒ **多一格粗细**（照样存 `config/ui.yaml` 的 `vis:` 段 ✓，
+              与颜色**同一处**、**同一套** ✓）；没给 ⇒ 只两列 —— 有的项本来就没有线宽
+              （「定时任务」那是**字色** ✗），不该硬塞一格 ✗。
+            · `on_key` 给了 ⇒ 关掉 = **不画这一项**（颜色/粗细都留着，开回来还在 ✓）。
             """
             btn = self._color_btn(self._vis[key])
             if tip:
                 btn.setToolTip(tip)
             self._color_btns[key] = btn
-            if not on_key:
-                form.addRow(label, btn)
+            ws = None
+            if w_key is not None:
+                ws = NoWheelSpinBox()
+                ws.setRange(1, 20)
+                ws.setValue(int(self._vis.get(w_key, 1)))
+                ws.setFixedWidth(56)
+                ws.setToolTip(w_tip or "这一项的**线条粗细(px)**（1 = 最细）。")
+                self._width_spins[w_key] = ws
+            if not isinstance(form, QGridLayout):
+                # ── 老写法（`QFormLayout`：类别框那一组 ✓ 没有粗细）
+                if not on_key:
+                    form.addRow(label, btn)
+                    return
+                ck = QCheckBox(label)
+                ck.setChecked(bool(self._vis.get(on_key, True)))
+                ck.setToolTip(on_tip or "关掉 = **不画**这一项（颜色留着，开回来还在 ✓）")
+                self._vis_on[on_key] = ck
+                row = QHBoxLayout()
+                row.setSpacing(6)
+                row.addWidget(ck)
+                row.addWidget(btn)
+                row.addStretch(1)
+                form.addRow("", row)
                 return
-            ck = QCheckBox(label)
-            ck.setChecked(bool(self._vis.get(on_key, True)))
-            ck.setToolTip(on_tip or "关掉 = **不画**这一项（颜色留着，开回来还在 ✓）")
-            self._vis_on[on_key] = ck
-            row = QHBoxLayout()
-            row.setSpacing(6)
-            row.addWidget(ck)
-            row.addWidget(btn)
-            row.addStretch(1)
-            form.addRow("", row)
+            # ── ⭐ 网格版（辅助线与标记这一组 ✓）
+            r = _grid_rows[0]
+            _grid_rows[0] += 1
+            if on_key:
+                ck = QCheckBox(label)
+                ck.setChecked(bool(self._vis.get(on_key, True)))
+                ck.setToolTip(on_tip or "关掉 = **不画**这一项（颜色留着，开回来还在 ✓）")
+                self._vis_on[on_key] = ck
+                form.addWidget(ck, r, 0)
+            else:
+                form.addWidget(QLabel(label), r, 0)
+            form.addWidget(btn, r, 1)
+            if ws is not None:
+                form.addWidget(ws, r, 2)
 
         grp = QGroupBox("检测框颜色")
         lay = QVBoxLayout(grp)
@@ -292,8 +334,15 @@ class SettingsDialog(QDialog):
         lay = QVBoxLayout(grp)
         lay.setSpacing(6)
         page_lay.addWidget(grp)
-        vf2 = QFormLayout()
-        vf2.setLabelAlignment(Qt.AlignLeft)
+        # ⭐⭐ 这一组用 **QGridLayout**（用户 2026-09-28 四条 ✓ 原话："粗细调整参数放**颜色配置
+        #   右边**，并**给其他的粗细也加配置**，并且用**网格对齐**，要求**参数名显示完整**"）。
+        #   三列：**开关（名字写在上头）| 色块 | 粗细框** ⇒ 各行的色块 / 粗细框**上下对齐** ✓；
+        #   列 0 的最小宽度给够 ⇒ 最长的名字也**完整显示**（不截断、不省略 ✓）。
+        vf2 = QGridLayout()
+        vf2.setHorizontalSpacing(8)
+        vf2.setVerticalSpacing(6)
+        vf2.setColumnMinimumWidth(0, 190)      # ⚠ 名字那一列：够长 ⇒ 不截断 ✓
+        vf2.setColumnStretch(3, 1)             # 右边留白吸收 ✓
         lay.addLayout(vf2)
         # ⚠ 2026-09-27 用户改的三件事（照办）：
         #   ① 名字末尾的「颜色」两字**去掉**（废话、占地方）—— 名字交给左边的**开关**，
@@ -304,7 +353,7 @@ class SettingsDialog(QDialog):
         #      （前两个框的画法见 `gui/live_thread.py`；第三个是占位，逻辑待跳跃物理 ✓）。
         add_row(vf2, "锁定框", "lock_color",
                 "锁定的那个攻击目标（只有它会被红框圈出来 ✓）。",
-                on_key="lock_on")
+                on_key="lock_on", w_key="lock_width")
         add_row(vf2, "攻击范围框", "attack_color",
                 "**攻击范围 = 矩形**（2026-09-27 起）：四个距离在「决策参数 → 战斗参数 →\n"
                 "攻击」里（最大 / 最小 / 向上 / 向下攻击距离）。\n\n"
@@ -312,35 +361,68 @@ class SettingsDialog(QDialog):
                 "（**不含**盲区那一块 —— 盲区由上面那个框画 ✓，两个框并排不重叠）。\n"
                 "竖直那两条的取值：**负数 = 不限**（画到画面边）、**0 = 就是 0**、\n"
                 "上下都配 0（或水平跨度 0）⇒ 框是空集 ⇒ **不画也不判** ✓。",
-                on_key="attack_on")
+                on_key="attack_on", w_key="attack_width")
         add_row(vf2, "攻击盲区框", "min_attack_color",
                 "「最小攻击距离」以内那一块（太近 ⇒ 不算可攻击、并触发规避）。\n"
                 "最小攻击距离 = 0（默认）时**没有盲区** ⇒ 这个框不画 ✓。",
-                on_key="min_attack_on")
+                on_key="min_attack_on", w_key="min_attack_width")
         add_row(vf2, "跳跃攻击范围框", "jump_attack_color",
                 "**占位项**（用户 2026-09-27 记的一笔）：等跳跃物理做好后，它表示\n"
                 "「怪框落在这个范围内 ⇒ 按跳就能把它带进攻击范围框 ⇒ 触发 attack」。\n"
                 "⚠ 逻辑还没实现 ⇒ 现在画面上**不会**出现这个框（先把颜色定下来 ✓）。",
-                on_key="jump_attack_on")
+                on_key="jump_attack_on", w_key="jump_attack_width")
         add_row(vf2, "追击起跳框", "chase_jump_color",
                 "「**追击起跳**」的起跳区间（决策参数 → 战斗参数 → 攻击 → 追击起跳）：\n"
                 "区间 = [最大攻击距离 + min, 最大攻击距离 + max] ✓。\n\n"
                 "⚠ 现在的**高度跟「攻击范围框」一样**；用户 2026-09-27 说：后续要\n"
                 "**算上「跳跃攻击范围」的高度**（框会长高），**当前先不算** ✓。\n"
                 "⚠ 它的**判定**仍然是**水平距离**（不看高度）✓ —— 画成框只是让人看得见 ✓。",
-                on_key="chase_jump_on")
+                on_key="chase_jump_on", w_key="chase_jump_width")
         add_row(vf2, "视野线", "vision_color", "视野矩形那四条虚线。",
-                on_key="vision_on")
+                on_key="vision_on", w_key="vision_width")
         add_row(vf2, "定时任务", "timer_color",
                 "实时画面上「当前任务 / 定时任务」那几行的字色。\n"
                 "那里**没有底色**（只有描边），所以别选太暗的 —— 会压不住游戏画面。",
-                on_key="timer_on")
+                on_key="timer_on")      # ⚠ 这是**字色** ⇒ 没有粗细，不塞那一格 ✓
 
-        self.sp_vision_width = NoWheelSpinBox()
-        self.sp_vision_width.setRange(1, 10)
-        self.sp_vision_width.setValue(int(self._vis["vision_width"]))
-        # 单位写在行标签里（UI 规范 §9：不写进编辑框）
-        vf2.addRow("视野线宽度(px)", self.sp_vision_width)
+        # ⭐⭐ **玩家坐标箭头**（用户 2026-09-28 ✓ 原话："放在**设置 → 界面页签 → 辅助线与标记
+        #   （实时预览）**"）—— ⚠ 它属于**这一组**，不属于「决策参数」✗：
+        #   规范 §4 的判据就是"**画面上每个可显示的东西**都该能在这一组里单独关掉" ✅
+        #   （所以它有 `player_arrow_on` 开关 ✓，颜色走同一套带 alpha 的取色弹窗 ✓）。
+        #   ⚠ 颜色 + **粗细**都照 `add_row`（粗细就在色块右边那一格 ✓ 用户 2026-09-28 要求 ✓）；
+        #     只有「长度」多占一行（网格里跨 3 列 ✓）。
+        add_row(vf2, "玩家坐标箭头", "player_arrow_color",
+                "以**玩家脚底**为原点画两根：一根朝画面右（世界 x 正方向）、一根朝上\n"
+                "（世界 y 正方向）。\n\n"
+                "⚠ 它**不参与任何决策**，就是拿来对着调「决策参数 → 玩家位置 → 脚底偏移(px)」\n"
+                "的：箭头根部该正好落在脚底 ✓（偏上 / 偏下就是偏移没调对 ✓）。",
+                on_key="player_arrow_on", w_key="player_arrow_width")
+
+        self.sp_arrow_len = NoWheelSpinBox()
+        self.sp_arrow_len.setRange(0, 2000)
+        self.sp_arrow_len.setValue(int(self._vis["player_arrow_len"]))
+        # ⚠ 长度另起一行：网格版要**跨 3 列**摆（`addRow` 是 `QFormLayout` 的 API ✗）
+        _lr = _grid_rows[0]
+        _grid_rows[0] += 1
+        vf2.addWidget(QLabel("箭头长度(px)（0 = 不画）"), _lr, 0)
+        vf2.addWidget(self.sp_arrow_len, _lr, 2)
+
+        # ⭐ **箭头尖大小**（用户 2026-09-28 追加 ✓ 原话："再加个箭头 size 配置"）——
+        #   就是**尖端那个三角头**的大小 ✓，单位 = 占**线段长**的百分比（`cv2.arrowedLine`
+        #   的 `tipLength` 只吃比例 ✗ 不吃像素 ✓ 所以按百分比存）。
+        #   ⚠ 与「长度」**同列**摆（列 0 标签 / 列 2 数值 ✓）⇒ 和上面所有行的数值**一条竖线**
+        #     对齐 ✓（用户上一条要求"网格对齐 + 参数名显示完整" ✓ 这行也守着 ✓）。
+        self.sp_arrow_tip = NoWheelSpinBox()
+        self.sp_arrow_tip.setRange(5, 100)
+        self.sp_arrow_tip.setValue(int(self._vis["player_arrow_tip_pct"]))
+        self.sp_arrow_tip.setToolTip(
+            "箭头**尖端那个三角头**的大小，单位 = **占线段长的百分比**\n"
+            "（25 = 尖长正好是线段的 1/4）。调大 ⇒ 箭头越「胖头」；\n"
+            "线段本身太短时这个尖会显得很大 ⇒ 两者搭配着调。")
+        _tr = _grid_rows[0]
+        _grid_rows[0] += 1
+        vf2.addWidget(QLabel("箭头尖大小(%)（占线长）"), _tr, 0)
+        vf2.addWidget(self.sp_arrow_tip, _tr, 2)
 
         # ---- ⑤ foothold 集合编辑器（只管它那个窗口，和实时预览无关 ⇒ 单独一组）----
         grp = QGroupBox("foothold 集合编辑器 · 线宽(px)")
@@ -385,7 +467,10 @@ class SettingsDialog(QDialog):
 
         lay.addSpacing(8)
         self._head(lay, "找不到玩家停止自动（min）",
-                   "连续找不到玩家超过该时长，自动停止（0 = 禁用）。\n"
+                   "**依据 = 小地图找不到黄点**（用户 2026-09-28 ✓）：连续这么多分钟\n"
+                   "**拿不到可用位置**（黄点没认出来 / 位置只能沿用上一帧）⇒ 自动停止。\n"
+                   "⚠ 它**不看**主画面里认没认出人物框 —— 框好好的但黄点糊了 / 被挡住，\n"
+                   "照样没有可用位置 ⇒ 照样算「找不到」✓（0 = 禁用）。\n"
                    "⚠ 这一格同时决定**留痕**：超过该时长时，perf.log 段头会写上"
                    "「画面里看不到角色 N 分钟（死亡界面/弹窗/切图？）」，并记一次 "
                    "player_gone；\n"
@@ -562,6 +647,112 @@ class SettingsDialog(QDialog):
             form.addRow(label, w)
             return w
 
+        # ---- ⭐⭐ 「玩家位置」（用户 2026-09-28 ✓：它属于**判定参数**）----
+        #   为什么在这一页：这几个数决定"**这一拍算不算拿到了玩家位置**" ——
+        #   ① 脚底偏移改的是「画面 → 世界」的换算（相机 y ✓）；②③④ 是**框面积闸**
+        #   （框太小 / 比近期基线小太多 ⇒ 这一拍**不做位置查询** ✓）。
+        #   两条理由都成立：既是"**怎么算数**"（本页的题 ✓）、又是"**跟项目走**"（不同地图的
+        #   面 y、人物框大小都不一样 ✓）⇒ 该在这一页。
+        #   ⛔ **别再留在「决策参数」面板**（2026-09-28 犯过一次 ✗ 用户指出）✓。
+        #   ⚠ 箭头（颜色 / 粗细 / 长度）**不在这儿** —— 那是"本机外观"（不参与决策 ✓），
+        #     归 **设置 → 界面 → 辅助线与标记（实时预览）** ✓（分界判据见 `docs/UI规范.md` §4）。
+        _ploc = QGroupBox("玩家位置")
+        _plf = QFormLayout(_ploc)
+        _plf.setLabelAlignment(Qt.AlignLeft)
+        _plf.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+
+        def pl_row(label, w, tip):
+            w.setToolTip(tip)
+            _plf.addRow(label, w)
+            return w
+
+        self.sp_foot_off = NoWheelSpinBox()
+        self.sp_foot_off.setRange(-500, 500)
+        self.sp_foot_off.setValue(
+            int(getattr(settings, "player_foot_offset_px", 0) or 0))
+        pl_row("脚底偏移(px)", self.sp_foot_off,
+               "算「脚底 / 相机 y」时用「**框底 + 这个值**」（正数 = 往下挪）。\n\n"
+               "人物框的底边**不一定**正好压在脚底（鞋底阴影 / 披风 / 特效会让框多出一截）。\n"
+               "在实时预览上对着「辅助线与标记 → **玩家坐标箭头**」调：\n"
+               "箭头根部该正好落在脚底 ✓")
+
+        # ⭐⭐ **「面积基线窗口(s)」紧挨着「脚底偏移」**（用户 2026-09-28 ✓ 原话："该参数应该
+        #   放在『**脚底偏移**』参数下面"）；⚠ 单位**从「拍」改成「秒」**（用户原话："这个『拍』
+        #   是什么？是多久？**需要可量化的描述**"✓）—— 「拍」依赖帧率：30fps 的 30 拍是 1 秒、
+        #   15fps 就变成 2 秒 ⇒ **说不清到底多久** ✗ ⇒ 只有**秒**是可量化的 ✓。
+        self.sp_area_base_s = NoWheelDoubleSpinBox()
+        self.sp_area_base_s.setRange(0.5, 60.0)
+        self.sp_area_base_s.setDecimals(1)
+        self.sp_area_base_s.setSingleStep(0.5)
+        self.sp_area_base_s.setValue(float(
+            getattr(settings, "player_box_area_base_s", 3.0) or 3.0))
+        pl_row("面积基线窗口(s)", self.sp_area_base_s,
+               "拿**过去这么多秒**里采到的「玩家框面积」求均值，当「**正常大小**」✓。\n\n"
+               "⚠ 单位是**秒**，不是「拍」✗ —— 拍数依赖帧率（30fps 的 30 拍 = 1 秒，"
+               "15fps 就成 2 秒），说不清到底多久 ✓。\n"
+               "默认 3 秒：够长能抹平抖动，又不至于把「人物走近 / 走远导致框变大变小」算进去 ✓。")
+
+        self.sp_box_min_area = NoWheelDoubleSpinBox()
+        self.sp_box_min_area.setRange(0.0, 100.0)
+        self.sp_box_min_area.setDecimals(3)
+        self.sp_box_min_area.setSingleStep(0.1)
+        self.sp_box_min_area.setValue(float(
+            getattr(settings, "player_box_min_area_pct", 0.0) or 0.0))
+        pl_row("框面积最小占比(%)", self.sp_box_min_area,
+               "框面积小于「**上面那个基线 × 这个比例**」⇒ 这一拍**不算有效检测** ✓。\n\n"
+               "⚠ 是**跟基线比**（= 过去若干秒的平均框面积 ✓），**不是**跟画面面积比 ✗ ——\n"
+               "不同地图 / 不同分辨率下人物框本来就不一样大，跟画面比没有可比性 ✓。\n"
+               "人太小 / 框抖掉了 ⇒ 位置不可信，宁可这一拍不定位 ✓。\n0 = 不启用。")
+
+        self.sp_area_tol = NoWheelDoubleSpinBox()
+        self.sp_area_tol.setRange(0.0, 90.0)
+        self.sp_area_tol.setDecimals(1)
+        self.sp_area_tol.setSingleStep(1.0)
+        self.sp_area_tol.setValue(float(
+            getattr(settings, "player_box_area_tol_pct", 0.0) or 0.0))
+        pl_row("面积容差(%)", self.sp_area_tol,
+               "当前框面积 ≤ 基线 ×(1−容差%) ⇒ 这一拍**推迟 / 不做**位置查询。\n\n"
+               "⚠ 与「框面积最小占比」的分工：**最小占比**是**更狠的硬下限**"
+               "（低于它连检测都不算 ✓）；**容差**是**更松的一档**（只让这一拍先别查 ✓）。\n"
+               "一般「最小占比」要**小于**「容差」才有意义（先判更狠的那道 ✓）。\n"
+               "0 = 关掉这道闸（老行为）。")
+
+        form.addRow("", _ploc)
+
+        # ---- ⭐ 子组：**任务**（用户 2026-09-28 要求 ✓ 原话："在设置 → 判定参数**单开一组
+        #      『任务』**"）----
+        # ⚠ 为什么单开一组：它管的**不是某个执行器怎么走**，而是"**这一趟任务该不该继续**"✗
+        #   —— 跟上面那些"怎么走 / 走多快 / 走多久"不是一类 ✓（用户点名要单开 ✓）。
+        # ⚠ 只放**判定参数**这一页（就是本页 ✓）—— 2026-09-28 我自己犯过一次"加到了主界面的
+        #   `route_panel`（决策参数面板）"✗，用户当场找不到 ✓ 别再犯 ✗。
+        _task_grp = QGroupBox("任务")
+        _tf = QFormLayout(_task_grp)
+        _tf.setLabelAlignment(Qt.AlignLeft)
+        _tf.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        self.sp_chase_max = NoWheelDoubleSpinBox()
+        self.sp_chase_max.setRange(0.0, 600.0)
+        self.sp_chase_max.setDecimals(1)
+        self.sp_chase_max.setSingleStep(1.0)
+        # 🔴🔴 **回填**（2026-09-28 补 ✓ —— 我第一版**漏了这一行**，用户当场报"改不了
+        #   追怪寻路.duration、也没有任何提示"✗）。
+        #   ⚠ 漏了它的症状**特别像"写回坏了"**：点确定**其实存进去了**（所以不会弹框 ✓），
+        #     但**下次打开又显示 0** ⇒ 看起来就是"改了没用"✗。
+        #   ⚠ **教训**：新加一个控件，**回填**和**写回**是**两件事**，缺一不可 ✗ ——
+        #     只测"设值 → 点确定 → settings 变了"**是测不出漏回填的** ✓
+        #     必须再测一条："**配置里是非默认值 → 打开对话框 → 控件显示它**" ✓。
+        self.sp_chase_max.setValue(
+            float(getattr(settings, "chase_goto_max_s", 0.0) or 0.0))
+        self.sp_chase_max.setToolTip(
+            "**追怪下达的**寻路任务最多跑这么久（秒），超了就**结束这趟任务**。\n\n"
+            "为什么需要：怪会跑、会换平台，追击有时会变成「一层一层追下去」，\n"
+            "把时间都耗在这一趟上。这条**只掐「追怪」那一类任务** ✓ ——\n"
+            "「命令前往」「定点休息」「回战斗区域」等**都不受它管** ✓。\n\n"
+            "0 = 不启用（**默认**，老行为一字不变）。\n"
+            "⚠ 与「寻路超时时间」是**两道独立的闸**：这道更专（只掐追击），通常设得更短；\n"
+            "   两个用的是**同一把钟**（这一段任务的起点）⇒ 不会互相错位 ✓。")
+        _tf.addRow("追怪寻路.duration(s)", self.sp_chase_max)
+        form.addRow("", _task_grp)
+
         # ① 坐标对齐误差范围
         self.sp_align_tol = NoWheelSpinBox()
         self.sp_align_tol.setRange(1, 200)
@@ -600,16 +791,18 @@ class SettingsDialog(QDialog):
         self.sp_goto_timeout.setValue(int(round(float(
             getattr(settings, "goto_timeout_s", 30.0) or 0.0))))
         row("寻路超时时间(s)", self.sp_goto_timeout,
-            "「**每一段**」寻路（从当前集合走到下一个集合）最多花这么久，超了就切断它\n"
-            "（画面上那行会写明「寻路超时：这一段已经跑了 N 秒」）。\n\n"
-            "⚠ **四种通行方式一视同仁**：走 / 爬绳 / **下跳** / **跳** 都吃它 —— 谁挂着\n"
-            "都照收 ✓（下跳 / 跳**自己没有超时**，没有这道闸会一直挂着 ✗）。\n\n"
-            "⚠ **每完成一段就重新计时**：一条多段路线里每段各自算 ⇒ 整条路线的**总**耗时\n"
-            "可以远超这个值（那**不算**超时 ✓）。它挡的是「某一段卡住了」或者\n"
-            "「在一段里反复重试」。\n\n"
-            "为什么除了任务自己的超时还要它：失败重来会把任务内部的计时**清零**，\n"
-            "同一段里累计下来可能远超预期。\n\n"
-            "0 = 不限时（老行为）。默认 30。")
+            "⭐ **只对「追击」签注的任务生效**（用户 2026-09-29 定的口径 ✓）：\n"
+            "追击是「追不上就别追了」那种语义 ⇒ 到点切断它，画面上会写明\n"
+            "「寻路超时：这一段已经跑了 N 秒」。\n\n"
+            "⛔ **其它任务一律不限时**（命令前往 / 定点休息 / 回战斗区域 / 战斗时长到点\n"
+            "换地方…）：一条长路线（走→爬→走）跑两分钟很正常，拿 30 秒去切它是**误伤** ✗\n"
+            "⇒ 那些任务的「当前任务」那行也**不再显示剩余**（显示剩余 = 让人以为它要被切 ✗）。\n\n"
+            "⚠ 追击任务里**每完成一段就重新计时**（走完一段接下一段 ⇒ 预算是新的 ✓），\n"
+            "但**攻击逻辑重下同一趟追击不重新计时**（怪换层了要改目的地，那不算新任务 ✓）\n"
+            "—— 不然一趟永远追不上的追击会被「重下」无限续命 ✗。\n\n"
+            "⚠ 各执行器自己的「卡住重试 / 放弃」（爬绳补按 ↑、下跳重试…）**不受这里影响** ✓\n"
+            "⇒ 真卡住仍然各自处理 ✓；这道闸只管**总时长**。\n\n"
+            "0 = 不限时。默认 30。")
 
         # ④ ⭐ **寻路超时后按键**（用户 2026-09-28 要求）：寻路**超时切断**那一下，额外
         #    **点按**这个键。类型 = **自定义按键下拉列表**（同行为编辑器：固定键 + 你自己
@@ -760,6 +953,42 @@ class SettingsDialog(QDialog):
 
     # ---------------- 确定 ----------------
 
+    def _accept_safe(self):
+        """⚠ **包一层**：保证「确定」**一定关得掉**、而且写回失败**不许静默**（用户 2026-09-28 报
+        "今天设置里点确定却修改无效的事情发生好多次了"✓）。
+
+        为什么非要有它：`_accept` 从第一项写回一路到最后的 `self.accept()`，**全是裸语句**
+        （没有 try ✗）⇒ 中途**任何一步抛异常**就会：
+          ① 它**后面**那些项的写回**全被跳过** ⇒ 用户看到的"**改了没用**"✗
+          ② `self.accept()` 在**最后** ⇒ **对话框关不掉** ⇒ "点了确定没反应"✗
+        两种症状**交替出现**（取决于哪一项坏了）⇒ 正是用户说的"**好多次、时好时坏**" ✓。
+
+        ⇒ 现在：异常**抓下来**（控制台打堆栈 + 弹框说清是哪一项 ✓）、**并且照样把对话框关掉** ✓。
+        ⚠ 写回**到哪儿为止**是**没法回滚**的（前面几项已经写了 ✓）—— 所以弹框里要提醒用户
+          "后面那几项这次没生效，再点一次确定 / 重设一遍" ✗（别让他以为全都存好了 ✓）。
+        """
+        _ok = False
+        try:
+            self._accept()
+            _ok = True
+        except Exception as _e:                      # noqa: BLE001 —— 坏在哪一项都要报出来 ✓
+            import traceback
+
+            traceback.print_exc()
+            try:
+                from PyQt5.QtWidgets import QMessageBox
+
+                QMessageBox.warning(
+                    self, "设置没能全部写回",
+                    "点「确定」时有一项写回失败了：\n\n%s\n\n"
+                    "⚠ 它**后面**那些项的修改**这次没生效** —— 对话框关掉后再点一次确定，\n"
+                    "或者把那几项重新设一遍。\n\n"
+                    "（详细堆栈在控制台里）" % (_e,))
+            except Exception:                        # noqa: BLE001
+                pass
+        if not _ok:
+            self.accept()                            # ⚠ **出错也必须关得掉** ✓
+
     def _accept(self):
         # ---- 实时画面 · 地形叠加（2026-09-26 从路线识别页搬来的两项）----
         _draw = bool(self.ck_mmap_draw.isChecked())
@@ -825,6 +1054,32 @@ class SettingsDialog(QDialog):
             settings.resetall_interval = t3
             settings.save()
         # 判定参数（和上面那些一样：跟着**当前项目**存）
+        # ⭐ 「玩家位置」（用户 2026-09-28 ✓：搬进**判定参数**页 ✓ —— 这几个数跟项目走 ✓）
+        _fo = int(self.sp_foot_off.value())
+        if _fo != int(getattr(settings, "player_foot_offset_px", 0) or 0):
+            settings.player_foot_offset_px = _fo
+            settings.save()
+        # ⭐ 「**追怪寻路.duration(s)**」（用户 2026-09-28 ✓）—— 单位**秒**（`float` ✓），
+        #   `0` = 不启用 ✓；跟项目存 ✓（与「寻路超时时间」同一口径 ✓）。
+        _cm = float(self.sp_chase_max.value())
+        if abs(_cm - float(getattr(settings, "chase_goto_max_s", 0.0) or 0.0)) > 1e-9:
+            settings.chase_goto_max_s = max(0.0, _cm)
+            settings.save()
+        _ma = float(self.sp_box_min_area.value())
+        if abs(_ma - float(getattr(settings, "player_box_min_area_pct", 0.0) or 0.0)) > 1e-9:
+            settings.player_box_min_area_pct = _ma
+            settings.save()
+        # ⭐ 「面积基线窗口」**单位改成秒**（用户 2026-09-28 ✓："『拍』是什么？是多久？需要可
+        #   量化的描述"✓）⇒ 键名也换成 `player_box_area_base_s` ✓（老键 `_n` 由 `from_dict`
+        #   兜底读一次 ✓ 不让老项目丢值 ✗）。
+        _bs = float(self.sp_area_base_s.value())
+        if abs(_bs - float(getattr(settings, "player_box_area_base_s", 3.0) or 3.0)) > 1e-9:
+            settings.player_box_area_base_s = max(0.5, _bs)
+            settings.save()
+        _at = float(self.sp_area_tol.value())
+        if abs(_at - float(getattr(settings, "player_box_area_tol_pct", 0.0) or 0.0)) > 1e-9:
+            settings.player_box_area_tol_pct = _at
+            settings.save()
         at = int(self.sp_align_tol.value())
         if at != settings.align_tol_px:
             settings.align_tol_px = at
@@ -854,7 +1109,15 @@ class SettingsDialog(QDialog):
         #   「移动操作尝试间隔(ms)」✓）—— 那个键以后不再写；老配置里残留的值也不再读 ✓。
         # 可视化（颜色现在可能是 `#AARRGGBB` —— 带透明度 ✓，见 `_pick_color`）
         vis_cfg = {k: b._color for k, b in self._color_btns.items()}
-        vis_cfg["vision_width"] = self.sp_vision_width.value()
+        # ⭐⭐ **各框线宽**（用户 2026-09-28 ✓"给其他的粗细也加配置"）—— 网格里色块右边那一格
+        #   就是它（`add_row(..., w_key=...)` 造好的 spin，见 `self._width_spins` ✓）；
+        #   键名与 `gui/theme.VIS_DEFAULTS` **一一对应** ✓（`load_vis` 那边也加了同一批的
+        #   "读回 + 夹范围" ✓ —— 只加默认值不加读回 = 改了没用 ✗，上一轮踩过 ✓）。
+        for _wk, _ws in self._width_spins.items():
+            vis_cfg[_wk] = int(_ws.value())
+        vis_cfg["player_arrow_len"] = int(self.sp_arrow_len.value())
+        # ⭐ 箭头**尖大小**（用户 2026-09-28 ✓"再加个箭头 size 配置"）✓ 与长度同一段存 ✓
+        vis_cfg["player_arrow_tip_pct"] = int(self.sp_arrow_tip.value())
         # 每项的**显示开关**（用户 2026-09-27："辅助线与标记组里每项参数前加开关"）：
         # 和颜色存在同一段（`config/ui.yaml` 的 `vis:` ✓），`theme.load_vis` 一并读回 ✓
         vis_cfg.update({k: bool(ck.isChecked()) for k, ck in self._vis_on.items()})

@@ -184,8 +184,11 @@ class StepCard(QFrame):
             btn.setFixedWidth(52)
             btn.setStyleSheet("padding: 2px 6px;")
             # mode="dir" 时选目录而不是文件
+            # ⭐ `on_pick`（用户 2026-09-29 ✓）：选完文件后回调一次 —— 采集卡片用它
+            #   算「预估多少帧」（见 `CaptureCard._on_file_picked` ✓）。
             btn.clicked.connect(lambda: self._pick_path(
-                key, w, kw.get("filter", ""), kw.get("mode", "file")))
+                key, w, kw.get("filter", ""), kw.get("mode", "file"),
+                on_pick=kw.get("on_pick")))
             row.addWidget(btn)
             form.addRow(label, row)
             self.widgets[key] = (w, kind)
@@ -214,7 +217,7 @@ class StepCard(QFrame):
         if extra is not None:
             extra.setVisible(bool(on))
 
-    def _pick_path(self, key, line, filt, mode="file"):
+    def _pick_path(self, key, line, filt, mode="file", on_pick=None):
         start = line.text() or ""
         if mode == "dir":
             path = QFileDialog.getExistingDirectory(self.window(), "选择目录", start)
@@ -224,6 +227,14 @@ class StepCard(QFrame):
                 filt or "视频文件 (*.mkv *.mp4 *.avi);;所有文件 (*)")
         if path:
             line.setText(path)
+            # ⭐ 选完就回调（`on_pick(path)` ✓）—— 采集卡片靠它显示「预估多少帧」✓。
+            # ⚠ **取消选择不进这里**（`if path:` ✓）⇒ 不会把上一次的预估刷成空 ✗。
+            # ⚠ 回调里别做重活（它在 UI 线程 ✓ 见 `CaptureCard._on_file_picked` 的说明 ✓）。
+            if callable(on_pick):
+                try:
+                    on_pick(path)
+                except Exception:
+                    pass
 
     def value(self, key):
         w, kind = self.widgets[key]

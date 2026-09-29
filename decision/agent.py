@@ -234,22 +234,21 @@ class DecisionSettings:
         #: ④ **面积容差（%）**：当前框面积 ≤ 基线 × (1 − 容差%) ⇒ 这一拍**推迟 / 不做位置查询** ✓
         #:   ⚠ 用户明确："**拦在查询之前**，而不是靠放宽挑面"✗ —— 见 `live_thread` 里
         #:     `_locate_mmap` 之前的那道闸 ✓。**容差 0 = 这闸关掉**（老行为 ✓）。
-        self.player_box_area_base_n = 30
+        #: ⭐ **单位是「秒」**（用户 2026-09-28 ✓："『拍』是什么？是多久？需要可量化的
+        #:   描述"✓）—— 原来是「30 拍」：拍数**依赖帧率**（30fps 的 30 拍 = 1 秒、
+        #:   15fps 就成 2 秒）⇒ 说不清到底多久 ✗。默认 **3 秒** ✓。
+        self.player_box_area_base_s = 3.0
         self.player_box_area_tol_pct = 0.0
         #: ⑤ **实时预览上的箭头**（用户 2026-09-28 ✓："以玩家位置为原点画「向前箭头 + 向上
         #:   箭头」，颜色、线段长度可配"）：以**玩家位置**为原点画两根 ——
         #:   水平那根朝**世界 x 正方向**、竖直那根朝**世界 y 正方向**（画面上就是"向上"✓）。
         #:   它只干一件事：**让人肉眼看出"定位 / 脚底偏移到底对不对"** ✓（正好用来调 ① ✓）。
         #:   颜色用 `#RRGGBB`；长度 = 线段的像素长（0 = 不画 ✓）。
-        #: ⚠ 2026-09-28 用户改口径："**x 箭头和 y 箭头应该是一个颜色**" ⇒ 合并成**一个**
-        #:   `player_arrow_color` ✓（旧的 `player_arrow_x_color` / `player_arrow_y_color`
-        #:   在 `from_dict` 里仍能读回来 ✓，只是不再往外写 ✗）。
-        #: ⚠ 再加 `player_arrow_width_px`（**线条粗细**）—— 用户要"选择颜色弹窗里需要能调整
-        #:   线条粗细" ✓；⚠ Qt 的 `QColorDialog` **塞不进自定义控件** ✗ ⇒ 做成"**色块按钮 ＋
-        #:   紧挨着一个粗细框**"那一排（和现有「视野线宽度」同一排版 ✓）。
-        self.player_arrow_color = "#00E5FF"
-        self.player_arrow_width_px = 2
-        self.player_arrow_len_px = 60
+        # ⚠ 玩家坐标箭头（颜色 / 粗细 / 长度）**不在这里** —— 它属于"本机外观"，
+        #   归 **设置 → 界面 → 辅助线与标记（实时预览）**，存在 `config/ui.yaml` 的 `vis:` 段
+        #   （见 `gui/theme.VIS_DEFAULTS` ✓）。⚠ 判据见 `docs/UI规范.md` §4：
+        #   **"只是画给人看的"进那一组，"会影响怎么打 / 怎么走"才进这里** ✓。
+        #   ⛔ 别再加回这一组（2026-09-28 犯过一次 ✗）。
         self.hp_bar = None          # HP 条区域 (x, y, w, h) 或 None
         self.mp_bar = None          # MP 条区域 (x, y, w, h) 或 None
         # 探针框选标定的结果（人工在实时画面上框出来的）。**按项目存** ——
@@ -306,6 +305,14 @@ class DecisionSettings:
         #（`ClimbJob.retry` 清 `_t0`、`WalkJob.retry` 同样）⇒ 累计可能远超预期。
         # 0 = 不限时（老行为）。见 `agent._climb_tick` 里那道总闸。
         self.goto_timeout_s = 30
+        #: ⭐⭐ **「追怪寻路.duration(s)」**（用户 2026-09-28 要求 ✓ 原话："表示本次任务如果是
+        #:   追怪下达的，那么如果任务超过了这个时间就结束任务"）—— 单位**秒** ✓。
+        #:   ⚠ **只对"追怪下达的"任务生效**（`_climb_origin` 的 `kind == "chase"` ✓）：
+        #:     「命令前往」/「定点休息」/「回战斗区域」等都**不受它管** ✗。
+        #:   ⚠ **0（默认）= 不启用** ✓ ⇒ **老项目一字不变** ✓。
+        #:   ⚠ 与「寻路超时时间」是**两道独立的闸**（同一把钟 `_climb_started` ✓ 但各判各的 ✓）：
+        #:     这一道更"专"（只掐追击 ✓），通常设得**比寻路超时更短** ✓。
+        self.chase_goto_max_s = 0.0
         #: ⭐ **「寻路超时后按键」**（用户 2026-09-28 要求）：寻路**超时切断**那一下，额外按一下
         #: 这个键（键名字符串 ✓ —— 与 `keymap` / 自定义按键同一套名义 ✓）；`None` = **不按** ✓
         #: （默认 ✓）。在「设置 → 判定参数」页里选：下拉 = **固定键 + 自定义按键** ✓
@@ -554,11 +561,8 @@ class DecisionSettings:
                 # ⭐ 「玩家位置」参数组（用户 2026-09-28 ✓）—— 跟项目一起存 ✓
                 "player_foot_offset_px": self.player_foot_offset_px,
                 "player_box_min_area_pct": self.player_box_min_area_pct,
-                "player_box_area_base_n": self.player_box_area_base_n,
+                "player_box_area_base_s": self.player_box_area_base_s,
                 "player_box_area_tol_pct": self.player_box_area_tol_pct,
-                "player_arrow_color": self.player_arrow_color,
-                "player_arrow_width_px": self.player_arrow_width_px,
-                "player_arrow_len_px": self.player_arrow_len_px,
                 "hp_bar": self.hp_bar, "mp_bar": self.mp_bar,
                 "probe_calib": self.probe_calib,
                 "hp_color": self.hp_color, "mp_color": self.mp_color,
@@ -586,6 +590,7 @@ class DecisionSettings:
                 "climb_retry_delay_s": self.climb_retry_delay_s,
                 "climb_retry_delay_inc_s": self.climb_retry_delay_inc_s,
                 "goto_timeout_s": self.goto_timeout_s,
+                "chase_goto_max_s": self.chase_goto_max_s,
                 # ⭐ 「寻路超时后按键」（用户 2026-09-28 加 ✓）：None = 不按 ✓
                 "goto_timeout_key": self.goto_timeout_key,
                 # ⛔ 「**禁用杀怪寻路**」（用户 2026-09-28 加 ✓）：跟着项目存 ✓
@@ -697,18 +702,21 @@ class DecisionSettings:
         self.player_foot_offset_px = int(data.get("player_foot_offset_px", 0) or 0)
         self.player_box_min_area_pct = float(
             data.get("player_box_min_area_pct", 0.0) or 0.0)
-        self.player_box_area_base_n = max(
-            1, int(data.get("player_box_area_base_n", 30) or 30))
+        # ⚠ **旧键 `player_box_area_base_n`（拍）仍读一次**（别让老项目把值丢了 ✗）：
+        #   按 30fps 折算成秒 ✓（30 拍 ⇒ 1 秒 ✓）。
+        _bs = data.get("player_box_area_base_s")
+        if _bs is None:
+            _bn = data.get("player_box_area_base_n")
+            # ⚠ 旧键在 ⇒ 按 30fps 折算（30 拍 ⇒ 1 秒 ✓）；**两个都没有 ⇒ 3.0 秒**（默认值 ✓
+            #   别掉到 1.0 ✗ —— `data.get(k, default)` 的 default 是**立即求值**的，写成一行的
+            #   话"没有旧键"也会算出 1.0 ✗ 这个坑当场踩过 ✓）。
+            _bs = (float(_bn) / 30.0) if _bn else 3.0
+        self.player_box_area_base_s = max(0.5, float(_bs or 3.0))
         self.player_box_area_tol_pct = float(
             data.get("player_box_area_tol_pct", 0.0) or 0.0)
-        # ⚠ 旧的 `player_arrow_x_color`（2026-09-28 当天先加的那版）**仍读一次** ✓ ——
-        #   当天就合并成一个色了，别让已经存过的项目文件把色丢了 ✗。
-        self.player_arrow_color = str(
-            data.get("player_arrow_color")
-            or data.get("player_arrow_x_color") or "#00E5FF")
-        self.player_arrow_width_px = max(
-            1, int(data.get("player_arrow_width_px", 2) or 2))
-        self.player_arrow_len_px = int(data.get("player_arrow_len_px", 60) or 0)
+        # ⚠ 箭头那几个键（`player_arrow_*`）**不再读**（2026-09-28 搬到 `config/ui.yaml`
+        #   的 `vis:` 段了 ✓）：老项目文件里若还留着这几个键，**留着不报错**，
+        #   下次保存时自然就没了 ✓（同 `input_delay` 那条的处理 ✓）。
         self.hp_bar = load_rect(data.get("hp_bar"))
         self.mp_bar = load_rect(data.get("mp_bar"))
         self.probe_calib = dict(data.get("probe_calib") or {})
@@ -750,6 +758,10 @@ class DecisionSettings:
         self.climb_retry_delay_s = float(data.get("climb_retry_delay_s", 1.0))
         self.climb_retry_delay_inc_s = float(data.get("climb_retry_delay_inc_s", 1.0))
         self.goto_timeout_s = float(data.get("goto_timeout_s", 30.0))
+        # ⭐ 「追怪寻路.duration(s)」（用户 2026-09-28 ✓）—— ⚠ 老项目文件里**没有**这一格
+        #   ⇒ 兜底成 **0 = 不启用** ✓（老行为一字不变 ✓）。
+        self.chase_goto_max_s = max(
+            0.0, float(data.get("chase_goto_max_s", 0.0) or 0.0))
         # ⭐ 「**寻路超时后按键**」（用户 2026-09-28 加 ✓）：老项目文件里没这个键 ⇒ `None`
         #   （= 不按 ✓ **行为一点不变** ✓）。空串 / 非字符串也当 `None` ✓
         #   （手改坏的项目文件别被带进运行期 ✗ —— 那种值发出去就是"按一个不存在的键" ✗）。
@@ -1221,6 +1233,15 @@ class CombatAgent:
         #: 失败后**等哪一刻再重新激活**（`time.monotonic()` 秒；None = 没在等）。
         #: 由 `_climb_tick` 设/清，延迟长短读 `settings.climb_retry_delay_s`。
         self._climb_retry_at = None
+        #: ⭐⭐ **「刚挨过打」的时刻**（用户 2026-09-28 ✓ 原话："在 `_climb_interrupted` 里打一个
+        #:   『刚挨过打』的时间戳"）—— 只有 `_climb_interrupted`（= 挨打/休息打架导致**任务没跑**
+        #:   的**唯一通知口** ✓）会写它 ✓。
+        self._climb_hit_at = 0.0
+        #: ⭐⭐ **这一轮"按过跳"的时刻**（用户 2026-09-28 ✓ 原话："失败那段改成：**按跳后**挨过打
+        #:   ⇒ 用延迟"）—— 由 `_climb_tick` 看 `out["jump"]` 记 ✓（`route` 侧不用改 ✗）。
+        #:   ⚠ 判据是"**挨打发生在按跳之后**"（`_climb_hit_at >= _climb_jump_at`）✓：
+        #:     还没按跳就被打（比如对齐阶段）⇒ **不算**，该**立刻重来** ✗。
+        self._climb_jump_at = 0.0
         #: 这个寻路任务是**哪一刻**下的命令（给"寻路超时时间"那道总闸用）。
         self._climb_started = 0.0
         #: 「这一步」的签名 `(执行器类名, 起点集合, 目标集合)` —— 判"重下的是不是同一步"，
@@ -1542,8 +1563,14 @@ class CombatAgent:
         down = attack_edge(getattr(self.settings, "attack_down_dist", -1))
         return up is not None and down is not None and (up + down) <= 0
 
-    def _in_box(self, m, player, max_d, min_d=0.0):
+    def _in_box(self, m, player, max_d, min_d=0.0, facing=None):
         """怪框在**「最大/最小距离 + 上下距离」围成的矩形**里吗 —— 判定口径**只有这一处** ✓。
+
+        ⭐ **`facing`（单侧判定，用户 2026-09-28 ✓）**：原话"攻击范围判定改成『**单侧**』
+          （跟画面一致）"✓ —— 不传 ⇒ 用 `self.facing`（朝向那侧 ✓，与绘制 `attack_box_rect`
+          的 `dirn` **同一口径** ✓）；传 `0` ⇒ **左右都算**（老行为 ✓）；传 `±1` ⇒ 显式要那一侧 ✓。
+        ⚠ 原来这里**不看朝向**（只比 `_center_dist` ✗），而绘制是**单侧** ✗ ⇒ 两边不一致 ✗
+          （用户 2026-09-28 当场发现："判定和画面不是一个口径"✓）。
 
         用户 2026-09-27 定的矩形：`attack_dist / min_attack_dist / attack_up_dist /
         attack_down_dist` 四条边（界面上是「战斗参数 → 攻击」那个子组 ✓）。
@@ -1563,6 +1590,19 @@ class CombatAgent:
         """
         if self._box_empty(min_d, max_d):
             return False
+        # ⭐⭐ **单侧**（用户 2026-09-28 ✓ 原话："攻击范围判定改成『单侧』（跟画面一致）"）：
+        #   怪必须在**朝向那一侧** ✓（`dx × dirn ≥ 0`）—— `facing=None` ⇒ 用 `self.facing`
+        #   ✓（与绘制 `attack_box_rect` 的 `dirn` **同一口径** ✓）；`0` ⇒ 两边都算（老行为 ✓）。
+        #   ⚠ 边界 `dx == 0`（正对上）⇒ 算**在范围内** ✓（合理 ✓）。
+        #   ⚠ 这一道和"距离"是**两把尺**：先按方向砍掉一半，再比距离/竖直 ✓。
+        if facing is None:
+            facing = self.facing
+        _f = int(facing or 0)
+        if _f != 0:
+            _dx = (float(getattr(m, "x", 0.0) or 0.0)
+                   - float(getattr(player, "x", 0.0) or 0.0))
+            if _dx * (1 if _f > 0 else -1) < 0:
+                return False              # 在**背后** ⇒ 不算在"这一侧的攻击范围"里 ✓
         d = self._center_dist(m, player)
         if d > float(max_d):
             return False
@@ -1576,8 +1616,12 @@ class CombatAgent:
             lim = attack_edge(getattr(self.settings, "attack_down_dist", -1))
         return True if lim is None else vd <= lim
 
-    def _in_attack_box(self, m, player):
+    def _in_attack_box(self, m, player, facing=None):
         """怪框在**攻击范围框**里吗（够得着）—— 「攻击判定」的唯一入口 ✓。
+
+        ⭐ `facing`（用户 2026-09-28 ✓）：`None` ⇒ **按 `self.facing` 单侧判** ✓（跟画面一致 ✓，
+        也是"正面有怪才打、背后的怪转身"那条口径的基础 ✓）；传 `0` ⇒ **不分前后** ✓
+        （`_in_range_all` 要的就是它 ✓ —— 别把它也筛成单侧 ✗）。
 
         `_in_range` / `_in_range_all` / 「站桩优先」那些判据**全走它**：老代码各自写一遍
         `_center_dist <= attack_dist`，加一维竖直之后必然漏掉某一处 ✗（用户 2026-09-27
@@ -1585,7 +1629,7 @@ class CombatAgent:
         """
         s = self.settings
         return self._in_box(m, player, float(s.attack_dist),
-                            float(s.min_attack_dist))
+                            float(s.min_attack_dist), facing)
 
     def _in_blind_box(self, m, player):
         """怪框在**盲区框**里吗（0 ~ 最小攻击距离，竖直径向同宽）—— 贴脸要规避的那一块 ✓。
@@ -1808,7 +1852,7 @@ class CombatAgent:
 
     # ---------------- 上绳任务（执行器，见 decision/route.py）----------------
 
-    def start_route(self, jobs, why="", origin=None):
+    def start_route(self, jobs, why="", origin=None, keep_clock=False):
         """跑一条**多步路径**（「命令前往」/「定点休息」共用）→ True = 已起跑。
 
         `jobs` 是**已经解析好**的任务列表（每步一个 `route.job_for_edge` 的产物：
@@ -1821,6 +1865,9 @@ class CombatAgent:
         `origin` = **来源签名**（用户 2026-09-28 ✓）：`{"kind": "chase", "mob_id": …}` ——
         只有 **`"chase"`** 会在"对齐完成 / 超时过半"那两个节点被复核（见 `_climb_recheck` ✓）。
         不传 ⇒ `None` ⇒ **天然豁免**（命令前往 / 任务队列 / 定点休息 / 回区域 / 到点去哪 ✓）。
+
+        `keep_clock` = **"这是同一趟追击被攻击逻辑重新下发"** ⇒ 时间钟**接着走、不重打** ✓
+        （用户 2026-09-29 第 2 条 ✓ 见 `start_climb` 里那段说明 ✓）。默认 `False` = 老口径 ✓。
         """
         jobs = list(jobs or [])
         if not jobs:
@@ -1839,7 +1886,7 @@ class CombatAgent:
         #   ⚠ **别和下面那个事件名 `task_begin` 混**：那个说的是"**挂上这一步的执行器**"
         #     （`start_climb` 里 ✓）；这个说的是"**先暂存这条待写的起跑行**" ✓。
         behavior.task_open("task_start", why=self._route_why, steps=len(jobs))
-        self.start_climb(jobs[0])
+        self.start_climb(jobs[0], keep_clock=keep_clock)
         return True
 
     def stop_route(self, why="取消寻路"):
@@ -1892,6 +1939,12 @@ class CombatAgent:
         幂等：同一段战斗里每拍都会被叫一声，任务只记第一次的时刻 ✓。
         """
         job = self._climb
+        # ⭐⭐ **打一个"刚挨过打"的时间戳**（用户 2026-09-28 ✓ 原话："在 `_climb_interrupted` 里
+        #   打一个『刚挨过打』的时间戳"）。
+        #   ⚠ 写在这里的理由：它是"**任务没跑的那段时间**"的**唯一通知口** ✓（注释里写着只有
+        #     `_task_settle` 一处调它 ✓），挨打 / 休息赶路打架那几拍都会走到 ✓ —— 不用另找
+        #     "喝药"信号 ✗；失败那段再和"按跳时刻"比一比就知道是不是"**按跳后挨的打**"✓。
+        self._climb_hit_at = float(now)
         fn = getattr(job, "interrupted", None)
         if callable(fn):
             fn(now)
@@ -1931,7 +1984,7 @@ class CombatAgent:
             return
         self._climb_interrupted(self._task_ran_at)
 
-    def plan_and_start_route(self, dst_set, why="", origin=None):
+    def plan_and_start_route(self, dst_set, why="", origin=None, keep_clock=False):
         """让**实时线程**解析「从现在这儿去 `dst_set`」的多步路径并起跑 ⇒ `(ok, 一句人话)`。
 
         谁在用：防掉线「定点休息」（`_run_rest_spot`）——它要自己走去指定地点，
@@ -1963,7 +2016,7 @@ class CombatAgent:
                 return True, str(res.get("why") or ("已经在「%s」上了" % dst))
             return self._plan_fail(dst, str(res.get("why") or "解析不出路线"))
         if not self.start_route(jobs, why=why or ("前往：%s" % dst),
-                                origin=origin):
+                                origin=origin, keep_clock=keep_clock):
             return self._plan_fail(dst, "路径是空的，没起跑")
         return True, ("已出发：%s" % " → ".join(res.get("path") or [dst]))
 
@@ -2098,14 +2151,29 @@ class CombatAgent:
                                     % (dst, left), time.monotonic())
         return True
 
-    def start_climb(self, job):
+    def start_climb(self, job, keep_clock=False):
         """挂上一个**上绳/下跳任务**（`route.ClimbJob` / `DropJob`）；下一次 tick 开始执行。
 
         谁来调：`gui/route_panel.py` 的「命令前往」（把路线的第一步交过来，2026-09-26）。
         这里**没有"要不要按跳"的开关**了 —— 命令挂上来就是授权，一路做到位。
+
+        `keep_clock=True` = **"这是同一趟追击被攻击逻辑重新下发的"** ⇒ 已有的时间钟
+        **接着走、不重打**（用户 2026-09-29 第 2 条 ✓ 见下面那段说明 ✓）。
+        ⚠ 它只在"**真的有一趟追击正在跑**"时才算数 ✓（见下面 `_keep` 那个判据 ✓）——
+          跑完 / 被超时切掉之后再下新的追击，那是**新的一趟**，预算该是新的 ✓
+          （不然会带着上一趟的旧账一开工就超时 ⇒ 又回到"左右晃"那个死循环 ✗）。
         """
+        # ⚠ 这两件必须在覆盖之前取（下面要用"**被替换掉的是不是一趟在跑的追击**"✓）：
+        _had_climb = self._climb is not None
+        _was_chase = self.chase_tagged()
         self._climb = job
         self._climb_retry_at = None      # 清掉上一个任务留下的"等我到点再重来"
+        # ⭐ 两个"挨打 / 按跳"时间戳也归零（用户 2026-09-28 ✓）：**新任务**必须从"没挨过打、
+        #   没跳过"开始 ✓ —— 不然上一个任务挨的那顿打会被当成本任务的 ⇒ 白等一段延迟 ✗。
+        #   ⚠ 只在这里（新任务）清 ✓：**同一任务失败重来**时**不清** ✗
+        #     （"按跳后挨过打"的记忆要靠它 ✓，清了就永远判成"没挨打"⇒ 该等的也不等了 ✗）。
+        self._climb_hit_at = 0.0
+        self._climb_jump_at = 0.0
         # 位置状态的观察窗**从这一步开始**（`_maybe_replan` ✓）：刚挂上的那一眼不算"变化"，
         # 只比"**这一步执行期间**的变化" ✓。
         self._loc_state = None
@@ -2127,7 +2195,23 @@ class CombatAgent:
         #      的**新任务**误判成同一步 ✗）。
         _sig = (type(job).__name__, str(getattr(job, "src_set", "") or ""),
                 str(getattr(job, "dst_set", "") or ""))
-        if _sig != self._climb_sig or not self._climb_started:
+        # ⭐⭐ **攻击逻辑重下 ⇒ 不许刷新那把钟**（用户 2026-09-29 第 2 条 ✓ 原话："追击签注的
+        #   寻路任务不应该被 attack 刷新，可以被单段寻路执行器成功刷新"）。
+        #   · 上面那套"同一步重下不重置"只挡得住**同一步**（同类执行器 + 同源 + 同目标 ✓）——
+        #     而追击最常见的重下恰恰是**怪换层了 ⇒ 目标集合变了 ⇒ 签名变了** ✗ ⇒ 钟被重打
+        #     ⇒ 一趟永远追不上的追击可以**无限续命** ✗✗（30 秒的闸形同虚设 ✓）。
+        #   · ⇒ 给攻击那两处下发带 `keep_clock=True`（`_chase_goto_if_elsewhere` /
+        #     `_mob_goto_towards` ✓）：**已经有钟就接着走** ✓（这一趟追击的总预算不变 ✓），
+        #     没有钟（第一次下发 / 上一趟已经收工 ✓）才起钟 ✓。
+        #   · ⚠ **"单段寻路执行器成功"那条路不受影响**（用户明确要它能刷新 ✓）：它走的是
+        #     `_task_finished` → `start_climb(nxt)`（**不带**这个参数 ✓）⇒ 照旧按签名重打 ✓
+        #     ⇒ 走完一段、接下一段时预算是新的 ✓（"一段"= 一条边的一个执行器 job ✓）。
+        # ⚠ `_keep` 还要"**被替换掉的那一步正是一趟在跑的追击**"✓：
+        #   · `_had_climb` + `_was_chase` ⇒ 是"同一趟追击在跑、被杀怪逻辑重下" ⇒ 钟接着走 ✓；
+        #   · 跑完 / 被超时切掉之后再下（`_had_climb=False`）⇒ 那是**新的一趟** ⇒ 起新钟 ✓
+        #     （不然带着上一趟的旧账一开工就超时 ⇒ 退回"三楼→二楼 drop 左右晃"那个死循环 ✗）。
+        _keep = bool(keep_clock and _had_climb and _was_chase and self._climb_started)
+        if (not _keep) and (_sig != self._climb_sig or not self._climb_started):
             self._climb_started = time.monotonic()   # 「寻路超时时间」从这一刻算起
         self._climb_sig = _sig
         # ⭐ **「这一步」的来源签名**（用户 2026-09-28 ✓）—— 从**这条路线**那份抄一份
@@ -2342,6 +2426,108 @@ class CombatAgent:
         if note and (time.monotonic() - at) <= GOTO_NOTE_KEEP_S:
             return "刚才：%s" % note
         return ""
+
+    def _target_dir(self, ws):
+        """锁定的目标在玩家的**哪一边**（`+1` 右 / `-1` 左 / `0` 没有目标或同列 ✓）。
+
+        用途：⭐ 下跳"跳下绳子"那一步的**水平方向**（用户 2026-09-28 按流程图定的口径 ✓
+        原话："跳下绳子：按任意方向+跳（**若有锁定目标则是锁定目标方向**）"）——
+        注入给 `DropJob._target_dir_fn` ✓（见 `_climb_tick` 里那一行 ✓）。
+
+        ⚠ **只比画面 x 的左右**（`ws.player.x` vs 怪框 `m.x` ✓）：两边**同一个坐标系**，
+          只判左右 ⇒ **不需要世界坐标** ✓（脱离只要"往哪边按"✓）。
+        ⚠ 拿不到（没锁定 / 目标不在这帧的 `ws.mobs` 里 / 玩家缺失）⇒ `0` ✓
+          ⇒ 调用方退回"任意方向"（背离下跳点中心 ✓），**不许因此报错** ✗。
+        """
+        try:
+            tid = getattr(self, "_target_id", None)
+            if tid is None or ws is None:
+                return 0
+            p = getattr(ws, "player", None)
+            if p is None:
+                return 0
+            for m in (getattr(ws, "mobs", None) or ()):
+                if getattr(m, "id", None) == tid:
+                    _dx = float(getattr(m, "x", 0.0) or 0.0) \
+                        - float(getattr(p, "x", 0.0) or 0.0)
+                    if abs(_dx) < 1.0:
+                        return 0                  # 正好同列 ⇒ 别瞎挑一边 ✓
+                    return 1 if _dx > 0 else -1
+            return 0                              # 目标这一帧没框 ⇒ 不认 ✓
+        except Exception:                         # noqa: BLE001
+            return 0
+
+    def current_goto_tag(self):
+        """「当前任务」的**短签注**（信息栏那行括号里那个词 ✓ 用户 2026-09-28 举例：
+        `前往：底层(追击  剩余 00:15)`）。
+
+        ⚠ 口径：**只从现成的来源取短词，不自造词表** ✗（项目纪律"不许拍脑袋补数"✓）——
+          来源 = `_climb_origin["kind"]`（结构化的"这条任务为什么下"，唯一写口在
+          `_chase_origin` ✓，值如 `{"kind": "chase", "mob_id": 123}` ✓）。
+        ⚠ **没有签注 ⇒ 返回空串** ✓（信息栏就只显示任务名 + 剩余时间，**不硬塞一个词** ✗）；
+          以后新增 kind ⇒ 只要往下面那张小映射加一行即可 ✓。
+        """
+        o = getattr(self, "_climb_origin", None) or {}
+        k = str(o.get("kind") or "")
+        return {"chase": "追击"}.get(k, "")
+
+    def chase_tagged(self):
+        """当前这一步是不是**「追击」签注**的 —— 这是"有没有时间限制"的**唯一判据** ✓
+        （用户 2026-09-29 第 1 条："只有追击签注的任务是有时间限制的（到点结束任务），
+        其他任务不应该有时间限制（无限）"✓）。
+
+        判据用 `_climb_origin` 的结构化 `kind`（唯一写口 `_chase_origin` ✓），**不是**
+        一句话原因 / 执行器类名 ✗ —— 那些"凑巧提到追击"的任务不该被算进来 ✓
+        （见 `current_goto_tag` 的映射表 ✓）。
+        """
+        return str((getattr(self, "_climb_origin", None) or {}).get("kind")
+                   or "") == "chase"
+
+    def goto_time_left(self):
+        """「当前任务」还剩几秒（信息栏用 ✓ 用户 2026-09-28："签注需要有生存时间"）。
+
+        ⚠ 口径**只有一处**：和 `_climb_tick` 判"寻路超时"用的是**同一把钟** ——
+          `self._climb_started`（同一步重下**不重置** ✓、挨打暂停会重打 ✓）
+          ＋ `settings.goto_timeout_s`（「寻路超时时间」✓）
+          ⇒ 显示的"剩余"和真到点那一刻**必然一致** ✓（自己另起一把钟就会对不上 ✗）。
+        ⭐⭐ **只有「追击」签注才有时间限制**（用户 2026-09-29 第 1 条 ✓）：其它任务
+          （命令前往 / 定点休息 / 回战斗区域 / 战斗时长到点换地方…）**一律不限时** ⇒ 这里
+          返回 `None` ✓（信息栏那行**不显示剩余** ✓ 也就不会让人以为"它马上要被切"✗）。
+          ⚠ 与 `_climb_tick` 里那道总闸**同一个判据**（`chase_tagged()` ✓）—— 显示与
+            真到点必须一致 ✓（一处口径 ✗ 别各判各的）。
+        ⭐⭐ **取两道闸里"更早到期的那个"**（2026-09-28 用户报 ✓："我改了 5 秒，但是信息栏写的
+          追击还是 **9 秒**开始（也可能是 10）"✗）：追怪任务（`_climb_origin` 的
+          `kind == "chase"` ✓）且「追怪寻路.duration(s)」> 0 时，把它与「寻路超时时间」**取 min** ✓
+          —— 两道闸**谁先到、任务就结束在谁那儿**，只显示大的那个会**骗人** ✗。
+        ⚠ 返回 `None` 的情况（**都不显示** ✓ 别显示 `0:00` ✗）：
+          · **不是追击签注**（用户 2026-09-29 ✓ "其他任务不限时"）；
+          · **两道闸都没开**（`goto_timeout_s <= 0` **且**（不是追怪 或 追怪值也 <= 0）✓）；
+          · 还没起钟（`_climb_started` 为 0 ✓）；
+          · 当前没有在跑的寻路任务（`_climb` 为空 ✓）。
+        """
+        t0 = float(getattr(self, "_climb_started", 0.0) or 0.0)
+        if t0 <= 0.0 or getattr(self, "_climb", None) is None:
+            return None
+        if not self.chase_tagged():
+            return None                      # 非追击 ⇒ 不限时 ⇒ 不显示剩余 ✓
+        cap = max(0.0, float(getattr(self.settings, "goto_timeout_s", 0.0) or 0.0))
+        # ⭐⭐ **取两道闸里"更早到期的那个"**（用户 2026-09-28 报 ✓ 原话："我改了 5 秒，但是
+        #   信息栏写的追击还是 **9 秒**开始（也可能是 10）"✗）。
+        #   · 信息栏那行说的是"**离这趟任务结束还有多久**" ✓ ⇒ 而两道闸**谁先到、任务就结束在
+        #     谁那儿** ✗ ⇒ 只显示大的那个会**骗人**（用户就是这样被骗的：设了 5 秒，屏上却从
+        #     10 秒开始倒数 ✓）；
+        #   · 追怪任务（`_climb_origin` 的 `kind == "chase"` ✓）且「追怪寻路.duration(s)」> 0
+        #     ⇒ 把它一起算进来 ✓；否则只看「寻路超时时间」✓（老行为一字不变 ✓）。
+        _caps = [cap] if cap > 0.0 else []
+        _chase = max(0.0, float(
+            getattr(self.settings, "chase_goto_max_s", 0.0) or 0.0))
+        if (_chase > 0.0
+                and str((getattr(self, "_climb_origin", None) or {}).get("kind")
+                        or "") == "chase"):
+            _caps.append(_chase)
+        if not _caps:
+            return None                      # 两道闸都没开 ⇒ 不显示 ✓（别显示 0:00 ✗）
+        return max(0.0, min(_caps) - (time.monotonic() - t0))
 
     def resetall_left(self):
         """离下次**定时清键**（RELEASEALL）还有几秒；没排期时给 None。
@@ -2757,7 +2943,38 @@ class CombatAgent:
         # `t_goto_timeout_per_hop` 钉着，别把它改成整条路线一个钟 ✗）。
         # ⇒ 它挡的是"**某一段**卡住 / 在一段里反复重试"，不是"整条路线太久"：
         #    5 段各自都正常的路线，总耗时可以远超这个值，那**不算超时** ✓。
-        cap_s = max(0.0, float(getattr(self.settings, "goto_timeout_s", 0.0) or 0.0))
+        # ⭐⭐ **「追怪寻路.duration(s)」**（用户 2026-09-28 要求 ✓ 原话："表示本次任务如果是
+        #   追怪下达的，那么如果任务超过了这个时间就结束任务"）。
+        #   · **只对"追怪下达的"任务生效**：判据 = `_climb_origin` 的 `kind == "chase"` ✓
+        #     （结构化的"这条任务为什么下"，唯一写口 `_chase_origin` ✓）——
+        #     「命令前往」/「定点休息」/「回战斗区域」等**一律不参与** ✗（它们想跑多久跑多久 ✓）；
+        #   · **与「寻路超时」共用同一把钟**（`_climb_started` ✓ 同一步重下不重置 ✓）⇒
+        #     绝不会出现"一个从开始算、一个从别处算"那种两把尺 ✗；
+        #   · `chase_goto_max_s <= 0`（**默认**）= **不启用** ✓（老行为一字不变 ✓）；
+        #   · ⚠ 放在"寻路超时"**之前**：追怪上限通常**更短**（比如 15 秒 vs 30 秒 ✓）
+        #     ⇒ 让"为了追一只怪而超时"单独报出来，而不是被笼统的「寻路超时」盖掉 ✓。
+        _chase_cap = max(0.0, float(
+            getattr(self.settings, "chase_goto_max_s", 0.0) or 0.0))
+        if (_chase_cap > 0 and self._climb_started
+                and (now - self._climb_started) > _chase_cap
+                and self.chase_tagged()):
+            job.cancel("追怪寻路超时：这趟追击已经跑了 %.0f 秒（上限 %.0f 秒）"
+                       "—— 别为了追一只怪把时间都耗在这上面"
+                       % (now - self._climb_started, _chase_cap))
+            behavior.event("chase_goto_timeout",
+                           secs=round(now - self._climb_started, 1),
+                           cap=round(_chase_cap, 1))
+            return self._task_finished(failed=True)
+        # ⭐⭐ **「寻路超时」只对「追击」签注生效**（用户 2026-09-29 第 1 条 ✓ 原话："只有追击
+        #   签注的任务是有时间限制的（到点结束任务），其他任务不应该有时间限制（无限）"）：
+        #   · 判据 = `chase_tagged()`（结构化 `kind == "chase"` ✓）—— 和 `goto_time_left`
+        #     显示的剩余**同一处口径** ✓（显示说"无限"、闸却还在掐 ⇒ 最坏的那种不一致 ✗）；
+        #   · 为什么其它任务该无限：一条长路线（走→爬→走）跑两分钟很正常，30 秒的闸
+        #     会把**正常**的路线当卡住切掉 ✗；而"追不上就别追了"是追击**独有**的语义 ✓。
+        #   ⚠ 各执行器自己的"卡住重试/放弃"（`stall_s` / `reassert_s` / `retry_ms` ✓）
+        #     **不受影响** ⇒ "真卡住"仍然各自处理 ✓（这一条只管**总时长**那把闸 ✓）。
+        cap_s = (max(0.0, float(getattr(self.settings, "goto_timeout_s", 0.0) or 0.0))
+                 if self.chase_tagged() else 0.0)
         # ⭐ **节点②「寻路超时计时过半」**（用户 2026-09-28 要求 ✓）—— 放在超时判定**之前** ✓。
         #   意义：这一段已经花掉一半预算 ⇒ 主动复核一次"还值不值得往下走"（有更便宜的怪就掐 ✓）；
         #   过了这个节点就只剩"被超时硬切"了 ⇒ 这是最后一次自己拿主意的机会 ✓。
@@ -2866,6 +3083,14 @@ class CombatAgent:
                 _tc = getattr(job, "tap_count", None)
                 if callable(_tc):
                     behavior.sample("drop_taps", float(_tc()), min_gap=1.0)
+                # ⭐ `drop_reassert`：**补按「按住 ↓」发了几次**（2026-09-28 加 ✓）——
+                #   与上面 `drop_taps` **并排看**：跳的计数在涨、它**不涨** ⇒ 就是
+                #   "**只有跳在补、↓ 没补**"那个形状 ✓（用户当天报的 bug 原来在日志里
+                #   **看不出来**：`act keys=down` 只报"键集"，报不出"发了几次 PRESS" ✗）。
+                #   ⚠ `getattr` 兜底：`ClimbJob` 没这个属性 ⇒ 跳过 ✓（别硬塞 ✗）。
+                _rc = getattr(job, "reassert_count", None)
+                if _rc is not None:
+                    behavior.sample("drop_reassert", float(_rc()), min_gap=1.0)
                 _rn = getattr(job, "round_n", None)
                 if callable(_rn):
                     behavior.sample("drop_round", float(_rn()))
@@ -2909,8 +3134,20 @@ class CombatAgent:
             self._recheck_armed_done = True
             if self._climb_recheck(ws, now, "对齐完成"):
                 return True
+        # ⭐ **给下跳任务注入"锁定目标在哪边"**（用户 2026-09-28 按流程图 ✓ 原话："跳下绳子：
+        #   按任意方向+跳（**若有锁定目标则是锁定目标方向**）"）。
+        #   ⚠ 只挂给**下跳任务**（`_detach_dir` 是 `DropJob` 独有 ⇒ 用它当判据，**不必为此在
+        #     热路径 import** ✗）；⚠ **每拍重挂**（锁定目标会换 ⇒ 必须**现读**，不许建任务时
+        #     定死 ✗）；拿不到目标 ⇒ `_target_dir` 给 `0` ⇒ 调用方退回"任意方向" ✓。
+        if hasattr(job, "_detach_dir"):
+            job._target_dir_fn = lambda: self._target_dir(ws)
         out = job.update(now, float(wx), py=py,
                          **PosSnapshot.of(p).as_kwargs())   # 快照 → 参数（**唯一一处映射** ✓）
+        # ⭐⭐ **这一轮"按过跳"记一笔**（用户 2026-09-28 ✓ 原话："失败那段改成：**按跳后**挨过打
+        #   ⇒ 用延迟"）—— `route` 侧**不用改** ✗：`out["jump"]` 就是"这一拍按了跳"✓（点按时
+        #   会连着几拍为真 ⇒ 记最后一次就够 ✓）。
+        if out.get("jump"):
+            self._climb_jump_at = float(now)
         # 任务内部的变化（相切换 / 斜跳 / 失败重来）打进 behavior.log（用户 2026-09-28 要求 ✓）
         self._mark_route_change(job)
         km = self.settings.keymap
@@ -2983,10 +3220,24 @@ class CombatAgent:
             #   它只影响节奏，不影响"能不能放弃" ✓。
             _base = getattr(self.settings, "climb_retry_delay_s", 0.0) or 0.0
             _inc = getattr(self.settings, "climb_retry_delay_inc_s", 0.0) or 0.0
-            delay = retry_delay_s(_base, _inc, job.attempt)
+            # ⭐⭐ **延迟只给"按跳后挨过打"那一种失败**（用户 2026-09-28 ✓ 原话："失败那段改成：
+            #   **按跳后**挨过打 ⇒ 用延迟"／"注意攀爬失败后延迟激活的时间**只对『因喝药而失败』
+            #   生效**"✓）。
+            #   · **按跳后挨过打**（`_climb_hit_at >= _climb_jump_at`、且两个都非 0 ✓）⇒ 用原来的
+            #     延迟（基础 + 增量×已试次数 ✓ —— 挨打之后确实要缓一缓再上 ✓）；
+            #   · **其余失败**（最典型 = **上绳梯落回去 = 没跳准** ✓）⇒ **`delay = 0` ⇒ 立刻重来** ✓。
+            #   ⚠ 这正是用户报的"**落回去失败后发呆**"✗ 的成因：老代码（3094 那段注释"失败不是
+            #     终止…**但要延迟激活**"✗）把**所有失败**都套了那段延迟，**不看原因** ✗，
+            #     而且**越失败等越久**（1s / 2s / 3s…✗）⇒ 等待期间"这一拍不按键"⇒ 角色站着 = 发呆 ✓。
+            _hit_after_jump = (self._climb_hit_at > 0.0 and self._climb_jump_at > 0.0
+                               and self._climb_hit_at >= self._climb_jump_at)
+            delay = retry_delay_s(_base, _inc, job.attempt) if _hit_after_jump else 0.0
             if delay <= 0.0:
-                behavior.event("climb_retry", ladder=getattr(job, "ladder_id", ""),
-                               attempt=job.attempt)
+                # ⭐ **打点 `climb_retry_fast`**（用户 2026-09-28 ✓）："没挨打（或被设为不等）⇒
+                #   **立刻重来**"这一档 ✓ —— 日志里跟 `climb_retry_wait`（挨打后要等的 ✓）
+                #   一眼分清 ✓；带上 `hit` 字段便于分辨是"真没挨打"还是"delay 被设成 0"✓。
+                behavior.event("climb_retry_fast", ladder=getattr(job, "ladder_id", ""),
+                               attempt=job.attempt, hit=bool(_hit_after_jump))
                 job.retry()
                 return False             # 这一帧不算完事，下一帧从"重新对齐"接着走
             if self._climb_retry_at is None:
@@ -3512,7 +3763,11 @@ class CombatAgent:
         **原地转身**把它打掉 ✓，而**不会**走位 ✓。
         """
         return sorted([m for m in mobs
-                       if self._in_attack_box(m, ws.player)],
+                       # ⚠ **必须显式 `facing=0`**（用户 2026-09-28 ✓）：本方法的存在意义就是
+                       #   "**不筛朝向**" ✓（见上面那段注释 ✓）—— 而 `_in_attack_box` 现在
+                       #   **默认按 `self.facing` 单侧判** ✗ ⇒ 不显式传 0 就会被它顺手筛掉一半 ✗
+                       #   （那这条分支就废了：身后怪又没人接 ⇒ 退回"身边有怪却不打"✗）。
+                       if self._in_attack_box(m, ws.player, 0)],
                       key=lambda m: self._center_dist(m, ws.player))
 
     def _in_battle_zone(self, ws):
@@ -3690,8 +3945,11 @@ class CombatAgent:
             return False
         self._mob_goto_at = now
         # ⭐ 来源签名 = 「追击」（用户 2026-09-28 ✓）⇒ 这一步会参与那两个节点的复核 ✓
+        # ⚠ `keep_clock=True`（用户 2026-09-29 第 2 条 ✓）：**攻击重下同一趟追击 ⇒ 不刷新
+        #   时间钟** ✓（不然怪一换层就重打，30 秒的闸永远等不到 ✓）。
         ok, msg = self.plan_and_start_route(dst, why=str(why) % dst,
-                                           origin=self._chase_origin(target))
+                                           origin=self._chase_origin(target),
+                                           keep_clock=True)
         self._last_goto_note = (str(msg), now)
         behavior.event("mob_goto_toward" if ok else "mob_goto_toward_fail", dst=str(dst))
         return bool(ok)
@@ -3790,9 +4048,11 @@ class CombatAgent:
         self._mob_goto_at = now
         ok, msg = False, ""
         for name in msets:
+            # ⚠ `keep_clock=True`（用户 2026-09-29 第 2 条 ✓）：这条正是"怪换层了 ⇒ 目标
+            #   集合变了"的最常见来源 ⇒ 不带上它，签名一变就重打钟 = 被 attack 刷新 ✗。
             ok, msg = self.plan_and_start_route(
                 name, why="追击：怪不在我这块平台上（它在「%s」），先过去" % name,
-                origin=self._chase_origin(target))
+                origin=self._chase_origin(target), keep_clock=True)
             if ok:
                 break
         if not ok:
@@ -4028,8 +4288,32 @@ class CombatAgent:
         if new_state != _prev_state:            # 战斗状态切换（抖动/攻击↔追击一眼可见 ✓）
             behavior.event("battle_state", frm=_prev_state or "-", to=new_state)
 
+    def _best_behind_target(self, mobs, ws):
+        """**背后（反侧）攻击范围内**、离得最近的那只怪（没有 ⇒ `None` ✓）。
+
+        ⭐⭐ 用户 2026-09-28 ✓ 原话："锁定怪在前面，**背后攻击范围内有怪**，chase 想朝前，
+          但其实**转向更高效** ⇒ 是不是做成**背后怪抢锁**更好？" —— 就是给那个抢锁用的 ✓。
+        为什么"抢锁"是对的：背后那只**现在就能打**（转身即可 ✓），而当前锁定那只可能还要
+        **走过去** ⇒ 先转身打掉眼前这只，比一路朝前追更省时间 ✓。
+
+        ⚠ 判据 = `_in_attack_box(m, player, **-self.facing**)` ✓（**反侧**的单侧判定 ✓）——
+          这正是那个 `facing` 参数该用的地方 ✓（`_in_range` 要 `+self.facing`=正面 ✓，
+          这里要**背面** ✓）。
+        ⚠ 正对上（`dx == 0`）两边都算 ⇒ 会和"正面那组"重叠 ✓（无害：抢锁那里还比了 `id` ✓，
+          同一只怪不会自己抢自己 ✓）。
+        """
+        _f = -1 if int(self.facing) >= 0 else 1
+        cands = [m for m in mobs if self._in_attack_box(m, ws.player, _f)]
+        if not cands:
+            return None
+        return min(cands, key=lambda m: self._center_dist(m, ws.player))
+
     def _locked_target(self, lockable, ws, now):
-        """chase 用的锁定目标：target_cd 机制，无抢锁。返回 (target, best)。
+        """chase 用的锁定目标：target_cd 机制 ＋ ⭐ **背后怪抢锁**（2026-09-28 起 ✓）。返回 (target, best)。
+
+        ⭐ **抢锁规则**（用户 2026-09-28 ✓）：锁定还在期内，只要**背后（反侧）攻击范围内有怪**
+          ⇒ **改锁它** ✓（那只现在就能打 ⇒ 转身比继续朝前追更高效 ✓，见 `_best_behind_target` ✓）。
+          ⚠ 只抢"**真的够得着**"的 ✓；抢完**照常续期** `_target_until` ✓（防来回跳 ✗）。
 
         ⚠ `best` 是**画面距离**（下游「追击起跳」的区间 / 打点都用它 ✓）——
           虽然挑谁按「寻路距离」排（`_nearest` ✓），但返回的距离口径没变 ✓。
@@ -4042,8 +4326,26 @@ class CombatAgent:
                     break
 
         if target is not None and now < self._target_until:
-            best = self._center_dist(target, ws.player)
-            self._no_target_since = None
+            # ⭐⭐ **背后怪抢锁**（用户 2026-09-28 ✓ 原话："锁定怪在前面，背后攻击范围内有怪，
+            #   chase 想朝前，但其实转向更高效 ⇒ 是不是做成背后怪抢锁更好？"✓）。
+            #   条件：**背后（反侧）的攻击范围内有怪** ✓ ⇒ 那只**现在就能打**（转身即可 ✓），
+            #   而当前锁定那只可能还要走过去 ⇒ **抢锁更高效** ✓。
+            #   ⚠ **必须"真的够得着"才抢** ✓（`_best_behind_target` 用的就是 `_in_attack_box`
+            #     反侧判定 ✓）—— 否则"随便背后有只远怪"也会被抢过来，反而更慢 ✗。
+            #   ⚠ 抢锁**要按正常 target_cd 续期** ✓（`_target_until = now + cd` ✓ 别绕过它 ✗，
+            #     否则会被反复抢 ⇒ 目标来回跳 ✗）；同一只怪**不重复抢** ✓（比 `id` ✓）。
+            _behind = self._best_behind_target(lockable, ws)
+            if _behind is not None and _behind.id != target.id:
+                target = _behind
+                best = self._center_dist(_behind, ws.player)
+                self._target_id = target.id
+                self._target_until = now + self._random_target_cd()
+                self._no_target_since = None
+                behavior.event("target_steal", mob=self._target_id,
+                               why="背后攻击范围内有怪 ⇒ 抢锁转身打它")
+            else:
+                best = self._center_dist(target, ws.player)
+                self._no_target_since = None
         else:
             target, best = self._nearest(lockable, ws.player, ws=ws)
             if target is not None:
@@ -4536,8 +4838,20 @@ class CombatAgent:
             self._advance_running_seqs(now)
             return None
 
-        if not ws.player.found:
-            # 找不到玩家超时：连续超时就停止自动
+        # ⭐⭐ 「找不到玩家」的判据 = **小地图找不到黄点**（用户 2026-09-28 要求 ✓ 原话：
+        #   "设置里的保护与诊断：**找不到玩家停止自动的判断依据修改为小地图找不到黄点**"）。
+        #   ⚠ 以前看的是 `ws.player.found` —— 那是"**主画面里认没认出人物框**" ✗，与"有没有
+        #     可用的位置"**不是一回事**：框好好的、但小地图那块**黄点糊了 / 被挡住 / 没识别出来**
+        #     ⇒ 照样**没有可用位置** ⇒ 该算"找不到玩家" ✓（反过来，框没认出但黄点还在 ⇒
+        #     位置照样可用、不该停 ✗）。
+        #   · **有可用黄点** ⇔ `world_x` 有值 **且** 这一拍**不是**"沿用上一帧"；
+        #     `world_held` 就是小地图那边给的标记："**这一拍没认出黄点**、位置沿用上一帧"
+        #     （见 `perception/minimap.apply_to_player` ✓）⇒ 它置上也算"没找到" ✓。
+        #   · ⚠ 判据**只看黄点**（用户点名要的依据 ✓），不再看人物框认没认出来 ✓。
+        _mmap_ok = (ws.player.world_x is not None
+                    and not bool(getattr(ws.player, "world_held", False)))
+        if not _mmap_ok:
+            # 小地图找不到黄点：连续超时就停止自动
             lost_timeout = max(0.0, float(s.player_lost_timeout_min)) * 60.0
             if lost_timeout > 0:
                 if self._player_lost_since is None:
@@ -4673,9 +4987,20 @@ class CombatAgent:
         #     攀爬任务** ⇒ 状态停在 attack ⇒ 这道闸**永远不再打开** ⇒ 人明明挂在绳上，却被怪
         #     牵着打（"先上去、上去再打"整条失效 ✗）。⇒ **删掉那一件** ✓（②→❌），
         #     判据只剩「在绳上 + 就是这根绳」⇒ 下一拍立刻恢复爬 ✓。
-        #   ⛔ **别扩大**：对齐阶段（还没上绳）不豁免 —— 那时 `ladder_id` 为空（没按 ↑/↓ ✓）
-        #      ⇒ 天然不豁免 ✓；人站在平台上，打得过就该打 ✓，打完由 `ClimbJob.update` 里
-        #      "被打断"那段**重走一遍上绳流程** ✓（要求 ③）。
+        #   ⭐⭐ **2026-09-28 用户要求：取消"最后一个 attack 的绳梯豁免"**（原话：
+        #     "取消最后一个 attack 的『绳梯豁免』：**对齐 x 期间如果进了 attack，就从入口开始**"）。
+        #     · 之前 `holds_player` 有**两条**：`_jumped_once`（按过跳）**或** `_in_span`
+        #       （人正站在这根绳那一格里）—— 后者就是"**站在绳底对齐 x 时不打架**"那个豁免 ✗；
+        #     · 现在**对齐阶段（`ClimbJob.ALIGN`）一律不豁免** ⇒ 对齐 x 期间攻击范围内有怪
+        #       就**照常进 attack** ✓（人在平台上，打得过就该打 ✓）；
+        #     · **打完怎么继续：从入口开始** ✓（不是"接着对齐" ✗）—— 由 `_task_settle`
+        #       → `_climb_interrupted` → `ClimbJob._resume` 那段把 `phase` 打回 `ALIGN` 并
+        #       **清掉全部对齐锚点**（`route.py` 里 `_paused >= PAUSE_MIN_S` 那一支 ✓）
+        #       ⇒ 等于重走整条上绳流程 ✓。
+        #     ⚠ 为什么敢放开（2026-09-27 那个坑的对称处理）：那时靠"豁免"躲开"**攻击判定在
+        #       任务 tick 之前** ⇒ 有怪就永远轮不到按跳"✗；现在靠"**打完重来**"绕开 ——
+        #       怪被清掉之后天然会走完对齐 ✓。而 **`_jumped_once` 那一条照旧豁免** ✓
+        #       （按下跳之后松手就掉 ✗，那一段不许进 attack ✓）。
         # ⭐ 用户 2026-09-27 补充要求（原话）："**在执行攀爬时，从「按下跳」到「攀爬成功」期间
         #   都不应该进 attack**" —— 实测现场：三楼 → 顶层，正在"对齐 x + 起跳"那一刻还是进了
         #   attack ✗。⇒ 判据加一条**任务自己说了算**的：`ClimbJob.holds_player(px, py)`
@@ -4708,7 +5033,14 @@ class CombatAgent:
         #     2026-09-27 那个坑（攻击判定在任务 tick 之前 ⇒ 附近有怪就永远轮不到按跳 ✗）。
         _in_rope = bool(_pos.on_rope(_lid))
         self._in_rope_now = _in_rope
-        _on_rope = bool(_climb_holds and not _in_rope)
+        # ⭐⭐ **对齐阶段不再豁免**（用户 2026-09-28 ✓ 见上面那段说明）：
+        #   `ClimbJob.ALIGN` 期间 ⇒ `_on_rope` 强制为 False ⇒ **照常进 attack** ✓；
+        #   打完由任务侧的"被打断 ⇒ 回 ALIGN + 清锚点"让它**从入口重来** ✓。
+        #   ⚠ 只有"**按下跳之后**"（`_jumped_once` 那一支）和"**已经在绳上**"仍豁免 ✓。
+        from decision import route as _rmod_p        # 局部 import：避免模块级循环 ✓
+        _align_phase = (str(getattr(self._climb, "phase", ""))
+                        == _rmod_p.ClimbJob.ALIGN)
+        _on_rope = bool(_climb_holds and not _in_rope and not _align_phase)
 
         # 「**添加任务队列**」刚排进来（`queue_goto` 拍的那面旗子）⇒ **这一拍就把第一条
         # 跑起来**（用户 2026-09-27："寻路任务队列要依次执行，现在我排队列都没反应" ——

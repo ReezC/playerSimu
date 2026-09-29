@@ -11,10 +11,11 @@
 """
 
 from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal
-from PyQt5.QtGui import QBrush, QColor, QKeySequence, QPainter, QPen
-from PyQt5.QtWidgets import (QGraphicsItem, QGraphicsRectItem,
-                             QGraphicsScene, QGraphicsSimpleTextItem,
-                             QGraphicsView)
+from PyQt5.QtGui import (QBrush, QColor, QKeySequence, QPainter, QPen,
+                         QTransform)
+from PyQt5.QtWidgets import (QGraphicsItem, QGraphicsPixmapItem,
+                             QGraphicsRectItem, QGraphicsScene,
+                             QGraphicsSimpleTextItem, QGraphicsView)
 
 from gui import theme
 from perception.classes import (CLASS_MOB, CLASS_PLAYER, ZH_NAMES, bgr_to_hex,
@@ -284,6 +285,15 @@ class ImageCanvas(ZoomPanView):
         self._draw_start = None
         self._rubber = None
         self._draw_cls = None     # 正在拉的框用哪个类（按下时定，Ctrl 会临时改）
+        #: ⭐ 「实时小地图」那一层（`set_live_patch` ✓）—— 只在**路线识别 → 地形图**
+        #: 用得上：把 A 机实时小地图面板**按标定摆到地形图上**，方便放大看对齐 ✓。
+        #: ⚠ `load()` 会 `scene_.clear()` ⇒ 每一轮都要**重新挂**（见 load ✓），
+        #: 所以这里只当"有没有"的哨兵，别把它当常驻对象 ✗。
+        self._live_item = None
+        #: 那一层的**浓淡**（0~1；用户 2026-09-29 要的「透明度」参数 ✓）。
+        #: ⚠ 存在这里、`load()` 重挂时**再贴一次** —— 否则换图/重画地形图之后
+        #: 它悄悄回到不透明（看着像"参数没生效" ✗）。
+        self._live_alpha = 0.8
 
     # ---------------- 载入 ----------------
 
@@ -301,6 +311,14 @@ class ImageCanvas(ZoomPanView):
         w, h = pixmap.width(), pixmap.height()
         self.scene_.setSceneRect(0, 0, w, h)
 
+        # ⭐ 实时小地图那层要**重新挂**（上面 `scene_.clear()` 连它一起删了 ✗）——
+        #   落在最上面（ZValue 10）、默认不显示，等 `set_live_patch` 来放 ✓。
+        self._live_item = QGraphicsPixmapItem()
+        self._live_item.setZValue(10)
+        self._live_item.setVisible(False)
+        self._live_item.setOpacity(self._live_alpha)   # 重挂也带着浓淡 ✓（见那个属性）
+        self.scene_.addItem(self._live_item)
+
         self.editable = editable
         self._colors = _box_colors()   # 读一次可视化配置，所有框共用
         for box in boxes:
@@ -316,6 +334,44 @@ class ImageCanvas(ZoomPanView):
             return 0, 0
         pm = self.pix_item.pixmap()
         return pm.width(), pm.height()
+
+    def set_live_patch_alpha(self, alpha):
+        """只改那一层的**浓淡**（不重取帧、不挪位）—— 拖动条要**跟手** ✓。
+
+        为什么单独一条：`set_live_patch` 要重新摆一遍（调用方还得先取一帧面板 ✗）；
+        拖浓淡时人只想要"立刻看得清一点"，不该去动帧 ✓。返回值 = 生效后的浓淡 ✓。
+        """
+        self._live_alpha = max(0.0, min(1.0, float(alpha)))
+        if self._live_item is not None:
+            self._live_item.setOpacity(self._live_alpha)
+        return self._live_alpha
+
+    def set_live_patch(self, pixmap, origin=(0.0, 0.0), kx=1.0, ky=1.0,
+                       opacity=None):
+        """⭐ 放/换/收「**实时小地图**」那一层（用户 2026-09-29 第 ⑦ 条 ✓）。
+
+        用途（原话："现在实时画面小地图比较小很难看清是否对准，可以在路线识别页签→
+        地形图里的图里实时滚动收流图（我自己控制底图），这样我就方便观察局部了"）：
+        把 A 机那块小地图面板**按标定摆到地形图上** —— 于是"面板里的内容"和"它该在
+        底图的哪一块"在**同一张图**上重叠，放大一看就知道标定/滚动对不对 ✓。
+
+        参数都是**这张画布的坐标系**（= 地形图/叠加图像素，见调用方 `_live_map_rect` ✓）：
+        `origin` = 面板图左上角落在哪、`kx/ky` = 面板像素 → 画布像素的倍数。
+        `pixmap=None`（或空图）⇒ **收起来**（不显示，不是留一张空的 ✗）。
+        """
+        if self._live_item is None:          # 还没 load 过地形图：没处放 ✓
+            return False
+        if pixmap is None or pixmap.isNull():
+            self._live_item.setVisible(False)
+            return False
+        self._live_item.setPixmap(pixmap)
+        self._live_item.setTransform(QTransform().scale(float(kx), float(ky)))
+        self._live_item.setPos(float(origin[0]), float(origin[1]))
+        # `opacity=None` ⇒ 用**上次设的那个**（拖动条拖过的 ✓）—— 调用方不必每次都带 ✓
+        if opacity is not None:
+            self.set_live_patch_alpha(opacity)
+        self._live_item.setVisible(True)
+        return True
 
     # ---------------- 框操作 ----------------
 

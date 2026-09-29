@@ -20,8 +20,16 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from gui import theme as _theme                                # noqa: E402
 from gui.steps import cards as cards_mod                       # noqa: E402
 from gui.train_report import TrainReportDialog                 # noqa: E402
+
+# --------------------------------------------------------------- 自检不许改用户文件
+# ⛔ `config/ui.yaml` 是**用户的**文件（窗口几何 / 字号 / 颜色）⇒ 自检**绝不许**写它 ✗
+#    （全仓库规矩 ✓，见 `selftest_main_window._fake_store` 的说明）：本套件会开训练报告
+#    弹窗（接了 `theme.bind_window_state` ⇒ 一 show/hide 就写 `windows.train_report` ✗ ——
+#    2026-09-29 逐个套件量出来的）⇒ 把 theme 的**落点**指到临时文件 ✓。
+_theme.CFG = Path(tempfile.mkdtemp(prefix="psimu_ui_")) / "ui.yaml"
 
 
 def check(cond, msg):
@@ -42,16 +50,22 @@ class _P:
         return d
 
 
-def _mk_run(proj, ver, m, epochs=100, base="yolo26n.pt"):
-    """造一个训练产物目录：runs/detect_v<ver>/{weights/best.pt, run.json}。"""
+def _mk_run(proj, ver, m, epochs=100, base="yolo26n.pt", frames=None):
+    """造一个训练产物目录：runs/detect_v<ver>/{weights/best.pt, run.json}。
+
+    `frames`（可选）= `{"train": 3, "val": 2, "total": 5}` ⇒ 写进 run.json ✓；
+    不传就是**老产物**（没有这一项 ✓ ⇒ 报告该显示 "—" ✓）。
+    """
     d = proj.dir_of("runs") / ("detect_v%d" % ver)
     (d / "weights").mkdir(parents=True, exist_ok=True)
     (d / "weights" / "best.pt").write_bytes(b"stub")      # 内容无所谓，只要存在
-    (d / "run.json").write_text(json.dumps(
-        {"name": "detect_v%d" % ver, "base": base, "epochs": epochs,
-         "imgsz": 960, "batch": 8, "device": "0", "seconds": 600.0,
-         "finished_at": "2026-09-26 12:00:00", "metrics": m},
-        ensure_ascii=False), encoding="utf-8")
+    info = {"name": "detect_v%d" % ver, "base": base, "epochs": epochs,
+            "imgsz": 960, "batch": 8, "device": "0", "seconds": 600.0,
+            "finished_at": "2026-09-26 12:00:00", "metrics": m}
+    if frames is not None:
+        info["frames"] = dict(frames)
+    (d / "run.json").write_text(json.dumps(info, ensure_ascii=False),
+                                encoding="utf-8")
     return d
 
 
@@ -220,7 +234,258 @@ def t_train_card_model_combo():
           "补进来的那一项没标明是「当前填写」：%r" % cmb.currentText())
 
 
+def t_train_resume():
+    """⭐⭐ **「接着上次跑」（resume）**（用户 2026-09-29 ✓ 原话："自动找最近一个 run 的
+    last.pt、崩了能一键续、并且在续之前先报一句当前显存够不够"）。
+
+    钉四件：
+      ① `find_last_ckpt` 按 **`last.pt` 的 mtime** 找最近 —— ⚠ **不是按目录名**：
+         `detect_v10` 的字典序在 `detect_v2` **前面** ⇒ 按名字排会**续错 run** ✗；
+      ② `_run_args` 能从 run 目录的 `args.yaml` 读回**真实参数**（续训时界面上填的
+         一律不生效 ⇒ 日志 / `run.json` / 摘要必须说**真话** ✓）；
+      ③ `_vram_note`：**够就不吵、不够就 warn**（本次训练就是显存不够崩的 ⇒ 先报一句 ✓）；
+      ④ 源码级：`model.train(resume=True)` 真的传下去了、CLI 有 `--resume`、
+         GUI 训练卡片上有这一项且会传给 `run_train` ✓。
+    """
+    import os
+    import tempfile
+    import time
+    from pathlib import Path
+
+    from perception import train as T
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "runs"
+
+        def _mk(name, when, imgsz=1280, batch=8, epochs=200):
+            """造一个 run：`weights/last.pt` + `args.yaml`，mtime 设成 when ✓"""
+            d = root / name
+            (d / "weights").mkdir(parents=True)
+            ck = d / "weights" / "last.pt"
+            ck.write_bytes(b"x")
+            (d / "args.yaml").write_text(
+                "epochs: %d\nimgsz: %d\nbatch: %d\nname: %s\n"
+                % (epochs, imgsz, batch, name), encoding="utf-8")
+            for f in (ck, d / "args.yaml"):
+                os.utime(str(f), (when, when))
+            return ck
+
+        # ⚠ 名字**小**的那个是**旧**的、名字**大**的是**新**的 —— 专门用来抓"按名字排序"这个错 ✗
+        #   （字典序里 `detect_v10` < `detect_v2` ⇒ 按名字排会挑中**旧**的那个 ✓
+        #     这样"反向验证"才咬得住：把按 mtime 改成按名字排 ⇒ 当场红 ✓）。
+        _mk("detect_v2", time.time() - 600, imgsz=960, batch=4, epochs=120)
+        _mk("detect_v10", time.time() - 10)
+
+        _got = T.find_last_ckpt(str(root))
+        check(_got is not None and _got.parent.parent.name == "detect_v10",
+              "「接着上次跑」找错了 run —— 必须按 **last.pt 的修改时间**找最近那个，"
+              "不能按目录名排序（字典序 `detect_v10` 在 `detect_v2` 前面 ⇒ 会续错 run ✗）：%r"
+              % (_got,))
+
+        _a = T._run_args(_got)
+        check(int(_a.get("imgsz") or 0) == 1280 and int(_a.get("batch") or 0) == 8
+              and int(_a.get("epochs") or 0) == 200,
+              "没从 `args.yaml` 读回**真实参数**（续训时界面填的不生效 ⇒ 日志/摘要会说假话 ✗）：%r"
+              % (_a,))
+
+        class _Ctx(object):
+            def __init__(self):
+                self.lines = []
+
+            def log(self, msg, level="info"):
+                self.lines.append((level, msg))
+
+        # ⚠ 「够就不吵」这条**只有在真能读到显存时**才有意义 —— 没有 GPU / 拿不到
+        #   `mem_get_info` 时 `_vram_note` 会**静默跳过**（那是**设计**：查不到就不瞎报 ✗），
+        #   用例不该因此判红 ✗（否则同一份代码在 CI / 没卡的机器上必红 ✓）。
+        # ⚠ `import torch` **本身**也可能失败（DLL / 驱动问题 —— 见过
+        #   `OSError: [WinError 1114] ... c10.dll` ✓），那是**环境**问题、不是这次改动
+        #   的问题 ⇒ 不许让用例因此判红 ✗。
+        # ⭐ **判据三档**（纯函数 ⇒ 能造场景 ✓ —— 2026-09-29 就是这里定错了阈值：
+        #   原来按"八成富余"判 ⇒ 空闲 10.8GB / 需 9.2GB 被误报成"可能不够" ⇒ 把能跑的人
+        #   劝退了 ✗。真实判据是"**要不要得下**"✓）。
+        check(T._vram_verdict(10.8, 9.2) == "ok",
+              "空间明明够（空闲 10.8 / 需 9.2）却报「偏紧 / 不够」⇒ 误报会让提醒变噪音 ✗")
+        check(T._vram_verdict(2.4, 9.2) == "short",
+              "空间明显不够却没报 `short` ✗（这正是 2026-09-28 训练崩掉的现场）")
+        check(T._vram_verdict(10.0, 9.2) == "tight",
+              "余量只剩 0.8GB 却没报「偏紧」✗")
+        check(T._vram_verdict(20.0, 9.2) == "ok" and T._vram_verdict(None, 1) == "ok",
+              "余量充足 / 传了坏值 ⇒ 都该安静返回 `ok`（不许崩 ✗）")
+
+        try:
+            import torch as _torch
+            _has_gpu = bool(_torch.cuda.is_available())
+        except Exception:
+            _has_gpu = False
+        if _has_gpu:
+            _good = _Ctx()
+            T._vram_note(320, 1, _good)      # 320²×1 ⇒ 约 0.07GB ⇒ 肯定够 ✓
+            check(len(_good.lines) == 1,
+                  "显存**明明够**却还在报警（提醒变噪音 ⇒ 以后没人看 ✗）：%r"
+                  % (_good.lines,))
+            _bad = _Ctx()
+            T._vram_note(100000, 9999, _bad)  # 天文数字 ⇒ 必定不够 ✓
+            check(any(lv == "warn" for lv, _ in _bad.lines),
+                  "显存**明显不够**却不提醒（用户 2026-09-29 要的就是「续之前先报一句」✗）")
+        else:
+            _n = _Ctx()
+            T._vram_note(1280, 8, _n)
+            check(_n.lines == [],
+                  "没有可用 GPU 时不该凭空报显存（查不到就静默跳过 ✓）：%r" % (_n.lines,))
+
+        _root = Path(__file__).resolve().parent.parent
+        _src = (_root / "perception" / "train.py").read_text(encoding="utf-8")
+        # ⭐ 早停时"轮数"必须说**实话**（2026-09-29 ✓ 用户看到 `epoch 95/200` 之后直接
+        #   "训练完成"、界面上却写「200 轮」⇒ 来问"怎么回事" ✓）。⚠ 用**源码级钉**
+        #   （真跑一次训练来测不现实 ✗ —— 要十几分钟 + 显存 ✓）。
+        check('"epochs": done_epochs' in _src,
+              "`run.json` 的 `epochs` 又写回**计划值**了 ⇒ 早停时「历次版本」会说假话 ✗")
+        check('"epochs_planned": epochs' in _src
+              and '"early_stopped": early_stopped' in _src,
+              "没把「计划轮数 / 是否早停」另存 ⇒ 信息丢了（改回计划值就没法分辨 ✗）")
+        check("done_epochs < epochs" in _src and "早停" in _src,
+              "没算实际轮数 / 没标早停 ⇒ 界面会从 `epoch 95` 直接跳到「完成」，"
+              "看着像 bug ✗（用户 2026-09-29 就是被这个弄糊涂的）")
+        check('"（早停）" if early_stopped else ""' in _src,
+              "摘要没标出早停 ⇒ 卡片上只看得到「200 轮」✗")
+
+        check("model.train(resume=True)" in _src,
+              "续训分支没把 `resume=True` 真传给 ultralytics（勾了也没用 ✗）")
+        check('ap.add_argument("--resume"' in _src,
+              "CLI 没有 `--resume`（命令行续不了 ✗）")
+        check("find_last_ckpt" in _src and "_vram_note" in _src,
+              "`perception/train.py` 少了续训要用的两个件 ✗")
+        _cards = (_root / "gui" / "steps" / "cards.py").read_text(encoding="utf-8")
+        check('"resume", "接着上次跑", "bool"' in _cards
+              and '"resume": bool(sec.get(' in _cards,
+              "训练卡片上没有「接着上次跑」这一项 / 没把它传给 `run_train` ✗")
+
+
+def t_train_frames_used_and_guard():
+    """⭐⭐「补了帧但没重跑 ⑥」要**看得见**（用户 2026-09-29 ✓ 原话："我后补的帧数据训练，
+    它如果早退了那是不是白补了？"）。
+
+    代码事实（这是这条用例要钉的东西）：`perception/train.py` 全文**不扫 `frames/`、不读
+    `split.json`**，只吃 `dataset/images/{train,val}` 那份**物理拷贝** ⇒ 补了帧却没跑 ⑥ 时，
+    那批帧**一张都用不上** ✗；而原来全仓**没有任何地方**报"这次训练用了多少帧" ✗。
+
+    钉四件：
+      ① `count_dataset_images`：按 `data.yaml` 的 `path` + 相对目录数**磁盘上真有几张** ✓
+         （训练的**唯一**输入就是它 ✓）；坏 yaml / 目录不在 ⇒ `None`（**绝不抛** ✓）；
+      ② 训练开始**打一行**"本次用到 N 张" + `run.json` **记一份**（口径同一处 ✓）；
+      ③ 报告里显示那一份（**老 `run.json` 没有这个键 ⇒ 显示 "—"** ✓ 不编数 ✗）；
+      ④ ⑦ 卡片**开跑前挡住**："frames/ 里有 N 张比 data.yaml 新 ⇒ 先跑 ⑥" ✓
+         （⑥ 会重写 data.yaml ⇒ 挡的条件自动消失 ✓）。
+    """
+    import inspect
+    import os
+
+    from perception import train as train_mod
+
+    # ① 数磁盘（data.yaml 的 path + 相对目录；没有 path 就相对 yaml 自己）
+    tmp = Path(tempfile.mkdtemp(prefix="tr_"))
+    try:
+        ds = tmp / "dataset"
+        for sub, n in (("train", 3), ("val", 2)):
+            d = ds / "images" / sub
+            d.mkdir(parents=True, exist_ok=True)
+            for i in range(n):
+                (d / ("frame_%05d.jpg" % i)).write_bytes(b"x")
+        # ⚠ yaml **故意放在 dataset 外面**（`path` 指进去）—— 这样"必须按 `path` 解析"
+        #   才是被测到的（把 yaml 放在 dataset 里的话，两种写法结果一样 ⇒ 钉不住 ✗）
+        y = tmp / "data.yaml"
+        y.write_text("path: %s\ntrain: images/train\nval: images/val\n"
+                     % ds.as_posix(), encoding="utf-8")
+        check(train_mod.count_dataset_images(y) == (3, 2, 5),
+              "数出来的张数不对（该是 train 3 / val 2）：%r"
+              % (train_mod.count_dataset_images(y),))
+        # 没有 `path` 键 ⇒ 相对 **yaml 自己**那层解析（老 data.yaml 就是这个样子的可能 ✓）
+        y2 = ds / "data2.yaml"
+        y2.write_text("train: images/train\nval: images/val\n", encoding="utf-8")
+        check(train_mod.count_dataset_images(y2) == (3, 2, 5),
+              "没有 `path` 键时没按 yaml 自己那层解析：%r"
+              % (train_mod.count_dataset_images(y2),))
+        # 数不出来（文件不在 / 内容根本不是配置）⇒ 一律 None，**绝不抛** ✓
+        check(train_mod.count_dataset_images(tmp / "根本没有这个.yaml") is None,
+              "文件不在时该返回 None（**绝不抛**：这是给人看的一行字 ✗）")
+        bad = ds / "bad.yaml"
+        bad.write_text("这不是一份配置（就是一个字符串）\n", encoding="utf-8")
+        check(train_mod.count_dataset_images(bad) is None,
+              "yaml 不是配置时该返回 None（**绝不抛**）")
+
+        # ② 源码级：那一行日志 + run.json 里的 frames（口径同一处 ✓）
+        _tsrc = inspect.getsource(train_mod)
+        check("本次用到 %d 张" in _tsrc,
+              "训练开始没报「本次用到 N 张」（那「补了帧没用上」就还是看不见 ✗）")
+        check("count_dataset_images(data)" in _tsrc,
+              "那行数字不是走 `count_dataset_images`（口径该只有一处 ✗）")
+        check('"total": _n[2]' in _tsrc,
+              "`run.json` 没记这一版用了多少张（事后没法核对 ✗）")
+
+        # ③ 报告里显示（有 frames 的显示数字；老产物显示 "—"）
+        p = _P(tmp)
+        _mk_run(p, 1, {"precision": 0.90, "recall": 0.30,
+                       "map50": 0.900, "map": 0.500},
+                frames={"train": 3, "val": 2, "total": 5})
+        dlg = TrainReportDialog(p)
+        try:
+            html = dlg.rendered_html()
+            # ⚠ 判据带上那个全角冒号（标签是 `训练帧数：` ✓）：只查"训练帧数"的话，
+            #   标签被改坏（比如 "训练帧数x"）也照样通过 ✗（反向验证当场抓过这一次 ✓）
+            check("训练帧数：" in html,
+                  "报告里没有「训练帧数」这一行（补帧有没有用上，翻报告也看不出来 ✗）")
+            check("5 张（train 3 / val 2）" in html,
+                  "报告没把帧数写全：\n%s" % html[:600])
+        finally:
+            dlg.close()
+        tmp2 = Path(tempfile.mkdtemp(prefix="tr_"))
+        try:
+            p2 = _P(tmp2)
+            _mk_run(p2, 1, {"precision": 0.90, "recall": 0.30,
+                            "map50": 0.900, "map": 0.500})     # 老产物：没有 frames
+            d2 = TrainReportDialog(p2)
+            try:
+                h2 = d2.rendered_html()
+                check("训练帧数" in h2 and "—" in h2,
+                      "老 run.json（没这一项）该显示「—」，不许编数 ✗：\n%s" % h2[:600])
+            finally:
+                d2.close()
+        finally:
+            shutil.rmtree(str(tmp2), ignore_errors=True)
+
+        # ④ ⑦ 卡片：frames/ 里有比 `dataset/data.yaml` 新的帧 ⇒ **开跑前挡住** ✓
+        #   （卡片看的是**数据集里那一份** data.yaml ✓ 与项目真实布局一致 ✓）
+        p.dataset = ds
+        y_card = ds / "data.yaml"
+        y_card.write_text("path: %s\ntrain: images/train\nval: images/val\n"
+                         % ds.as_posix(), encoding="utf-8")
+        (tmp / "frames").mkdir(exist_ok=True)
+        old = os.stat(y_card).st_mtime
+        (tmp / "frames" / "frame_99999.jpg").write_bytes(b"x")
+        os.utime(tmp / "frames" / "frame_99999.jpg", (old + 10, old + 10))
+        card = cards_mod.TrainCard()
+        try:
+            ok, why = card.check_deps(p)
+            check(not ok, "有 1 张新帧没进数据集，却放行训练了（那批帧会白补 ✗）")
+            check("1 张" in why and "⑥" in why,
+                  "挡住时没说清「有几张 / 该怎么办」：%r" % (why,))
+            # ⑥ 跑过（data.yaml 被重写、比帧新）⇒ 自动放行 ✓
+            os.utime(y_card, (old + 999, old + 999))
+            ok2, why2 = card.check_deps(p)
+            check(ok2 and not why2,
+                  "重跑 ⑥ 之后还被挡着（人会被锁在门外 ✗）：%r / %r" % (ok2, why2))
+        finally:
+            card.deleteLater()
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+
 TESTS = (
+    ("⭐⭐ 「补了帧没跑 ⑥」：训练报帧数 + run.json 记一份 + 报告显示 + ⑦ 卡片开跑前挡住",
+     t_train_frames_used_and_guard),
+    ("⭐⭐ ⑦「接着上次跑」：按 last.pt 的 **mtime** 找最近 run（不是按目录名）+ 读回真实"
+     "参数 + 续前报显存（用户 2026-09-29）", t_train_resume),
     ("弹窗左栏列出本项目所有权重（新的在前、归档优先、不重复）", t_lists_all_weights),
     ("选中哪版显示哪版 + 与上一版比（目录名标签、差值算对）", t_shows_selected_version),
     ("不同颜色区分关键词与重要信息（整行按 kind 上色 + 关键词高亮）", t_colors_and_keywords),

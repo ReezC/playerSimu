@@ -130,6 +130,8 @@ class FramePickDialog(QDialog):
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.button(QDialogButtonBox.Ok).setText("确定")
         bb.button(QDialogButtonBox.Cancel).setText("取消")
+        theme.unify_ok_cancel(bb.button(QDialogButtonBox.Ok),
+                              bb.button(QDialogButtonBox.Cancel))
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         foot.addWidget(bb)

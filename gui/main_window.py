@@ -366,10 +366,11 @@ class MainWindow(QMainWindow):
         sep3.setStyleSheet("color: #dadce0;")
         lay.addWidget(sep3)
 
-        btn_live = QPushButton("实时")
-        btn_live.setToolTip("收 A 机推流并实时推理 —— 在窗口里直接看检测效果和帧率")
-        btn_live.clicked.connect(self._show_live)
-        lay.addWidget(btn_live)
+        # ⛔ **顶栏的「实时」按钮已移除**（用户 2026-09-28 要求 ✓ 原话："做好后把最顶部的
+        #   实时按钮移除"）—— 因为「实时」现在是**常驻页签**（关不掉、且页签栏上一直看得见 ✓）
+        #   ⇒ 顶栏那个按钮就是**重复入口**了 ✗（本文件反复强调"唯一入口"✓ 少一个旁路更好 ✓）。
+        # ⚠ `self._show_live` 方法**保留**（`open_view(self.live_panel, "实时")` 还用它 ✓），
+        #   只是不再从这个按钮进来 ✓。
 
         sep4 = QLabel("│")
         sep4.setStyleSheet("color: #dadce0;")
@@ -421,6 +422,9 @@ class MainWindow(QMainWindow):
             "  ·   检测结果图（⑧）\n\n"
             "点右侧卡片下方的「查看」—— 它会在**这里新开一个页签**（页签上的 × 关闭 ✓）。")
         self.viewer.addTab(self.home_view, "起始")
+        # ⭐ **常驻页签不显示「×」**（用户 2026-09-28 ✓）—— 「起始」是这里**直接 addTab** 的
+        #   （不走 `open_view` ✓）⇒ 得手动刷一次，否则它启动时还带着 × ✗（点它没用、看着别扭 ✓）。
+        self._refresh_tab_close_buttons()
 
         # ---- 四个**常驻工作页**：先不建标签，谁用谁 `open_view` ✓ ----
         # 控件本身**不销毁**：关掉页签只是"从主视区摘下来"，下次打开还是原来那个对象
@@ -428,6 +432,20 @@ class MainWindow(QMainWindow):
         self.review = ReviewPanel()           # 质检台（⑤「查看」）
         self.verify_viewer = VerifyViewer()   # 验证结果浏览器（⑧「查看」）
         self.live_panel = LivePanel()         # 实时预览（工具栏「实时」）
+        # ⭐⭐ **三个常驻页签从"启动"就都在**（用户 2026-09-28 ✓ 原话："起始页签、实时页签、
+        #   质检台页签现在是 **3 个常驻页签**"）。
+        #   ⚠⚠ 这一步**必须**有：以前「实时」「质检台」是**按需打开**的（「实时」靠**顶栏那个
+        #     按钮** ✓、「质检台」靠卡片上的"查看"✓）⇒ 顶栏按钮一移除，「实时」就**没有入口**了
+        #     ✗（用户当场就问"**实时页签呢？质检台页签呢？**"✗）⇒ 现在启动就全建出来 ✓
+        #     —— **"常驻" = 一直在** ✓，不能只靠"关不掉" ✗。
+        #   ⚠ 顺序：`open_view` 会 `setCurrentIndex` ⇒ **最后必须落回「起始」**（默认那一页 ✓）。
+        try:
+            self._show_live()                   # 建「实时」并 bind 当前项目 ✓
+        except Exception:                        # noqa: BLE001 —— 项目还没绑好也**不能**少了这个页签 ✓
+            self.open_view(self.live_panel, "实时")
+        self.open_view(self.review, "质检台")       # 建「质检台」✓（内容仍由卡片"查看"填 ✓）
+        self.open_view(self.home_view, "起始")      # ⭐ 最后切回「起始」✓
+
         self.player_view = PlayerMatchPage()  # 角色匹配验证结果（角色模板 → 匹配验证）
         self.view_widgets = {}                # card.key -> 步骤详情页控件
         return self.viewer
@@ -896,6 +914,34 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════════
     # 主视区
     # ══════════════════════════════════════════════════
+    #: ⭐⭐ **常驻页签**（用户 2026-09-28 要求 ✓ 原话："起始页签、实时页签、质检台页签现在是
+    #:   3 个常驻页签，**不需要关闭按钮**"）—— 它们**关不掉**，而且页签上**不显示「×」** ✓。
+    #:   ⚠ 用**控件身份**判（不是标题 ✗）：标题是可以变的（`_view_title` 那类 ✓），身份不会 ✗。
+    def _resident_views(self):
+        return (self.home_view, self.live_panel, self.review)
+
+    def _refresh_tab_close_buttons(self):
+        """把**常驻页签**上那个「× 关闭按钮」摘掉（用户 2026-09-28 要求 ✓）。
+
+        ⚠ 为什么只能这么干：`QTabWidget.setTabsClosable(True)` 是**整条页签栏**的开关 ✗，
+          **没法**只让某几页不可关 ✗ ⇒ 只能逐页把右侧那个按钮**换掉**
+          （`tabBar().setTabButton(i, QTabBar.RightSide, None)` ✓）。
+        ⚠ 所以**页签一增减就必须重刷**（`open_view` / `close_view` / `_on_view_close` 之后都调 ✓）：
+          页号会随开合变 ⇒ 谁都不能只刷一次 ✗（这正是本文件反复强调的"别按页号做人肉账"✓）。
+        """
+        bar = self.viewer.tabBar()
+        if bar is None:
+            return
+        try:
+            from PyQt5.QtWidgets import QTabBar
+
+            _res = self._resident_views()
+            for _i in range(self.viewer.count()):
+                if self.viewer.widget(_i) in _res:
+                    bar.setTabButton(_i, QTabBar.RightSide, None)
+        except Exception:                      # noqa: BLE001 —— 摘不掉按钮不该拖垮界面 ✓
+            pass
+
     def open_view(self, widget, title):
         """**让一个控件占用主视区**：已经在 ⇒ 切过去；没有 ⇒ 新开一个页签并切过去。
 
@@ -908,6 +954,7 @@ class MainWindow(QMainWindow):
         if idx < 0:
             idx = self.viewer.addTab(widget, title)
         self.viewer.setCurrentIndex(idx)
+        self._refresh_tab_close_buttons()   # ⭐ 页签增减 ⇒ 重刷「×」的显隐 ✓（页号会变 ✗）
         return idx
 
     def close_view(self, widget):
@@ -915,22 +962,28 @@ class MainWindow(QMainWindow):
         idx = self.viewer.indexOf(widget)
         if idx >= 0:
             self.viewer.removeTab(idx)      # removeTab 只是摘下来，不删控件 ✓
+            self._refresh_tab_close_buttons()   # ⭐ 摘掉一个 ⇒ 页号全变 ⇒ 重刷 ✓
 
     def _on_view_close(self, idx):
-        """点了页签上的 × ⇒ 关掉它。**起始页关不掉**（工作页全关掉之后总得有个落脚处 ✓）。
+        """点了页签上的 × ⇒ 关掉它。
 
-        ⚠ 「实时」页签关掉**不会停**收流 / 推理 —— 页签只管"看不看得见"，跑不跑由页面里
-          那个「开始 / 停止」决定 ⇒ 必须当场说一句：不然人会以为关掉 = 机器人停了 ✗
-          （那是很危险的误会）。
+        ⭐⭐ **三个常驻页签一律关不掉**（用户 2026-09-28 要求 ✓ 原话："起始页签、实时页签、
+        质检台页签现在是 **3 个常驻页签，不需要关闭按钮**"）：
+          · 「起始」—— 所有工作页关掉之后总得有个落脚处 ✓（老规矩 ✓）；
+          · 「实时」—— 它是这套东西的**主界面**（顶栏那个「实时」按钮也一起去掉了 ✓）；
+          · 「质检台」—— 同上，常驻 ✓。
+        ⚠ 这三个页签上**也不显示「×」**（`_refresh_tab_close_buttons` ✓）—— 这里是**第二道保险**
+          （万一还有别的路径触发 `tabCloseRequested` ✓，照样关不掉 ✓）。
+
+        ⚠ 「实时」页签**关掉不会停**收流 / 推理（页签只管"看不看得见"✓）—— 现在既然关不掉了，
+          这条提醒也就**不再需要** ✓（原来的那句已随"可关"一起去掉 ✓）。
         """
         w = self.viewer.widget(idx)
-        if w is self.home_view:
-            self.log("「起始」页签不能关 —— 它是所有工作页关掉之后的落脚处", "warn")
+        if w in self._resident_views():
+            self.log("「起始 / 实时 / 质检台」是常驻页签，不能关 ✓", "warn")
             return
-        if w is self.live_panel:
-            self.log("「实时」页签已关（**收流 / 推理还在跑**：要停就重开该页签按「停止」，"
-                     "自动打怪 / 寻路的开关在右侧「决策参数」里）", "warn")
         self.viewer.removeTab(idx)
+        self._refresh_tab_close_buttons()   # ⭐ 关掉一个 ⇒ 页号全变 ⇒ 重刷 ✓
 
     def _view_title(self, card):
         """步骤详情页的**页签标题**（和页面标题同一份说法 ✓，别两处各写一个）。"""

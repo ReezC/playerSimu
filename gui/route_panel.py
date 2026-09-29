@@ -52,6 +52,17 @@ def _mmss(sec):
     return "%d:%02d" % (sec // 60, sec % 60)
 
 
+def _mmss2(sec):
+    """秒 → **`MM:SS`**（分也补零 ✓）—— 「当前任务」那条**生存时间**专用（用户 2026-09-28 ✓
+    举例：`前往：底层(追击  剩余 00:15)` ⇒ 分是**两位** ✓）。
+
+    ⚠ **不复用 `_mmss`** ✗：那个是 `M:SS`（`0:15`），被 `_timer_lines` 好几处用着（休息 /
+    定时行为 ✓），改它会**动到已有的显示** ✗。两套并存、各管一行 ✓。
+    """
+    sec = max(0, int(sec))
+    return "%02d:%02d" % (sec // 60, sec % 60)
+
+
 def _generate_task(params, ctx):
     """后台：缺地形数据就先从 WZ 导，再画叠加图。**不碰任何 Qt 控件。**
 
@@ -297,6 +308,7 @@ class RoutePanel(QWidget):
         # 和上面那些"寻路怎么走 / 跑多快"不是一回事 ✓（缩进 + 边框，一眼看出归属 ✓）。
         # ⚠ 2026-09-27 用户把组名从「攀爬失败保护」改成「**攀爬参数**」—— 组里现在既有
         #   "失败保护"，也有"对齐节奏"（`climb_align_gap_ms`），老名字已经装不下 ✓。
+        # ---- 子组：**攀爬参数**（2026-09-26 成组；2026-09-27 用户改名）----
         grp_guard = QGroupBox("攀爬参数")
         gv = QVBoxLayout(grp_guard)
         gv.setSpacing(6)
@@ -706,9 +718,28 @@ class RoutePanel(QWidget):
         self._world_at = None
         self._world_note = ""           # 这行字（也贴到画面里那块框下面）
         self._ov_pix = None             # 叠图源图缓存（见 _overlay_pix）
+        #: 叠图**当前是按哪个显示区画的**（局部小地图：这一拍跟出来的那个 ✓）。
+        #: 用来"**变了才重画**" —— 250ms 一拍，显示区没动就别白重画一遍 ✓（见 _tick_world）。
+        self._ov_view = None
         self._world_timer = QTimer(self)
         self._world_timer.setInterval(250)      # 4 次/秒：够看，又不占主线程
         self._world_timer.timeout.connect(self._tick_world)
+
+        # 「地形图里叠实时小地图」那条的节拍（用户 2026-09-29 第 ⑦ 条 ✓）：单开一个定时器，
+        # 因为它跟"画面上那层叠图"（`mmap_draw`）是**两件事** —— 那个关着也该能用这个 ✓。
+        self._live_map_timer = QTimer(self)
+        self._live_map_timer.setInterval(250)   # 同上：4 次/秒够看 ✓
+        self._live_map_timer.timeout.connect(safe_slot(self._live_map_tick))
+        #: 那一层的**透明度**（% ；用户 2026-09-29 追加："需要加个参数'透明度'"✓）。
+        #: 落在 `config/live.yaml`（本机外观偏好，和 `mmap_draw` 同一处 ✓）。
+        self._live_alpha = int(load_live().get("live_map_alpha", 75))
+        #: ⭐ **这一层自己的「显示区」跟踪**（局部小地图 ✓ 用户 2026-09-29 追加："实时小地图的
+        #: 位置没有跟着我的移动变化"✗）—— 以前它借的是**画面那层叠图**跟出来的 `_ov_view`
+        #: （见 `_tick_world`），而那条路要求"叠图开着 + 世界坐标那行算得出来"才更新
+        #: ⇒ 认不出黄点时它**根本不更新** ⇒ 面板钉在标定那一刻的位置上 ✗✗。
+        #: 现在这一层自己跟：它手里**本来就有这一拍的面板**（`_live_map_tick` 每 250ms 取一张 ✓）
+        #: ⇒ 不依赖别处的开关与状态 ✓（跟不住才退回 `_ov_view` / 标定里那份 ✓）。
+        self._live_view_track = mm.CropViewTracker()
 
         # ---- 叠图这一行：**只留状态**（开关与浓淡已搬到 设置 → 界面）----
         # 为什么搬走（用户 2026-09-26 要求）："叠不叠、浓淡多少"是**外观偏好**，归设置窗口 ✓；
@@ -743,6 +774,60 @@ class RoutePanel(QWidget):
         self.lbl_map_img.setStyleSheet("color: #80868b;")
         self.lbl_map_img.setWordWrap(True)
         root.addWidget(self.lbl_map_img)
+
+        # ⭐⭐ **「叠加实时小地图」**（用户 2026-09-29 第 ⑦ 条 ✓ 原话："现在实时画面小地图
+        #   比较小很难看清是否对准，可以在路线识别页签→地形图里的图里实时滚动收流图
+        #   （我自己控制底图），这样我就方便观察局部了"）：
+        #   把那块小地图面板**按标定摆到地形图上**（`ImageCanvas.set_live_patch` ✓）——
+        #   于是"面板里画的是什么"和"它该在地图哪一块"**在同一张图上重叠**，放大（滚轮）
+        #   一看就知道标定 / 显示区跟踪对不对 ✓；底图完全由你自己缩放平移（中键拖 ✓）。
+        row_live = QHBoxLayout()
+        row_live.setSpacing(6)
+        self.ck_live_map = QCheckBox("叠加实时小地图")
+        self.ck_live_map.setToolTip(
+            "把当前那块小地图面板**按标定摆到这张地形图上**（半透明），随时跟着滚动 ✓。\n\n"
+            "怎么用：滚轮放大到小地图那一带 —— 面板里的地形和底图**处处重合**就是对的；\n"
+            "整块偏、或者越走越偏，就是标定或「显示区跟踪」的问题 ✓。\n"
+            "（图上那层的浓淡固定，看得清又不挡底图；底图怎么缩放平移由你操作 ✓。）\n\n"
+            "⚠ 面板从哪来跟「小地图来源」走：收流用 A 机那一口（画质好），\n"
+            "从实时画面则按本项目的框选区域裁。")
+        # ⭐⭐ **默认就勾上**（用户 2026-09-29 追加："怎么没在路线识别页签→地形图里的视图区
+        #    看到实时滚动的真实小地图"✗）：这一层存在的**唯一**目的就是"让人一眼看见"，
+        #    默认关着 = 我做了但你看不到 ⇒ 等于没做 ✓。取不到面板时右边那行会写清为什么
+        #    （"还没收到小地图推流"/"这张图还没有标定"…）⇒ 不会静默 ✓。
+        # ⚠ 这里 `setChecked` **必须在 `connect` 之前**：不然构造期就触一次 toggled、
+        #   把 250ms 的节拍在"页面还没显示"的时候就开起来 ✓（要开也由 `showEvent` 开 ✓）。
+        self.ck_live_map.setChecked(True)
+        self.ck_live_map.toggled.connect(safe_slot(self._on_live_map_toggle))
+        row_live.addWidget(self.ck_live_map)
+        # ⭐ **透明度**（用户 2026-09-29 追加："需要加个参数'透明度'，表示实时小地图的透明度"✓）
+        #   —— 它压在底图上：太实看不清底图、太淡看不清面板，所以给一根**跟手**的拖动条 ✓。
+        #   ⚠ 单位（%）写在**框外**（UI规范 ✓ 不许 `setSuffix`）、滚轮不改参数
+        #     （`NoWheelSlider` ✓）。
+        row_live.addWidget(QLabel("透明度"))
+        self.sld_live_alpha = NoWheelSlider(Qt.Horizontal)
+        self.sld_live_alpha.setRange(0, 100)
+        self.sld_live_alpha.setValue(self._live_alpha)
+        self.sld_live_alpha.setMinimumWidth(90)
+        self.sld_live_alpha.setMaximumWidth(150)
+        self.sld_live_alpha.setToolTip(
+            "「叠加实时小地图」那一层的透明度（%）。\n\n"
+            "0% = 完全看不见（等于关掉那一层）；100% = 完全不透明（会盖住底图）。\n"
+            "拖着调，**立刻生效**（不用等下一拍 ✓）。\n"
+            "默认 75%：既看得清面板里的地形，也还能看见底图对不对得上 ✓。")
+        self.sld_live_alpha.valueChanged.connect(safe_slot(self._on_live_alpha))
+        # 松手才落盘（见 `_on_live_alpha` 的说明 ✓）
+        self.sld_live_alpha.sliderReleased.connect(safe_slot(self._save_live_alpha))
+        row_live.addWidget(self.sld_live_alpha)
+        self.lbl_live_alpha = QLabel("%d%%" % self._live_alpha)
+        self.lbl_live_alpha.setMinimumWidth(40)
+        self.lbl_live_alpha.setStyleSheet("color: #5f6368;")
+        row_live.addWidget(self.lbl_live_alpha)
+        self.lbl_live_map = QLabel()
+        self.lbl_live_map.setStyleSheet("color: #80868b;")
+        self.lbl_live_map.setWordWrap(True)
+        row_live.addWidget(self.lbl_live_map, 1)
+        root.addLayout(row_live)
 
         # ---- 选择平台 + 命令前往 ----
         # ⚠ 这一整块**不在本页显示**（2026-09-26 用户要求：搬到「决策参数 → 操控」区 ✓）：
@@ -1130,8 +1215,37 @@ class RoutePanel(QWidget):
                                      else "　未排期"))
         return out
 
+    def _fight_line(self):
+        """「本集合还能打多久」那一行（**没有在计时 ⇒ ""** ✓ 一个字都不画）。
+
+        用户 2026-09-29 原话："将 foothold 集合的**最大战斗时间倒计时**显示在小地图下面的
+        信息栏（当前任务及说明下面，自定义定时行为上面）"✓。
+
+        ⚠ **口径一处**：剩余时间只从 `agent.fight_remain()` 拿 ✓（它和 `_fight_beat` /
+        编辑战斗区域里那行灰字倒计时**同一份账** ✓）—— 这里**不许**自己拿墙钟去减 ✗：
+        时间在寻路打断期间是**暂停累计**的（不清零 ✓），墙钟减会把打断那段也算进去 ⇒
+        显示会莫名跳 ✗（2026-09-28 就是这么错过一次 ✓）。
+        ⚠ **没有**在计时（不在任何一个 `can_fight` 区域 / 那一项 `fight_max_s = 0` = 不限 /
+        自动没在跑）⇒ 返回 `""` ✓ **绝不写 `0:00`** ✗（那会让人以为"马上要换地方了"✓）。
+        """
+        ag = self._live_agent()
+        if ag is None:
+            return ""
+        try:
+            r = ag.fight_remain()
+        except Exception:                       # noqa: BLE001 —— 老环境 / 替身 ⇒ 当没有 ✓
+            return ""
+        if not r:
+            return ""
+        try:
+            name, left, cap = r
+        except (TypeError, ValueError):
+            return ""
+        return "战斗时长　「%s」剩余 %s / %s" % (name, _mmss(left), _mmss(cap))
+
     def _osd_lines(self, first):
-        """画面那几行（小地图框下方，从上到下）：世界坐标 → **当前任务** → 定时任务。
+        """画面那几行（小地图框下方，从上到下）：世界坐标 → **当前任务** → （队列）→
+        **战斗时长倒计时** → 定时任务。
 
         2026-09-26 用户要求 1、2：
           · 「当前任务」默认「战斗」（全权战斗 Agent），有寻路任务时「前往：{集合名}」；
@@ -1156,9 +1270,37 @@ class RoutePanel(QWidget):
         # 那行「前往休息点…「X」」说清 ✓）。
         from decision import agent as agent_mod
         _rest = agent_mod.rest_state_text(getattr(settings, "rest_state", ""))
+        # ⭐⭐ 「当前任务」那一行：**签注 + 生存时间**（用户 2026-09-28 ✓ 原话："下任务的签注，
+        #   需要有生存时间，并在信息栏…的当前任务后面标注出来，例如 `前往：底层(追击  剩余 00:15)`"）。
+        #   · **签注** = `agent.current_goto_tag()`（就是 `_climb_origin["kind"]` 那个**短词** ✓
+        #     不另编词表 ✓）；**剩余** = `agent.goto_time_left()`（与"寻路超时"**同一把钟** ✓
+        #     ⇒ 与真到点那一刻**必然一致** ✓）。两者任一拿不到 ⇒ **整段括号都不出现** ✓（不硬塞 ✗）。
+        #   · ⚠ **休息时不加**（`_rest` ✓）：休息的剩余**已经**在下面「定时任务」那几行里显示着
+        #     （`休息　休息中　剩余 2:05` ✓ 那是 `_timer_lines` 管的 ✓）⇒ 再加一遍是重复 ✗。
+        #   · ⚠ 行元组仍是 **4 项**、字号仍 `11` ✓ ⇒ `gui/live_panel._draw_note` **一个字都不用改** ✓。
+        #   · ⭐⭐ **只有「追击」签注才显示剩余**（用户 2026-09-29 第 1 条 ✓："只有追击签注的
+        #     任务是有时间限制的（到点结束任务），其他任务不应该有时间限制（无限）"）——
+        #     判据在 `goto_time_left()` 里（**一处** ✓）：非追击 ⇒ `None` ⇒ 这儿整段括号不出现 ✓
+        #     （命令前往 / 定点休息 / 回战斗区域那些"想跑多久跑多久"的任务，屏幕上不再出现
+        #     一个会让人以为"它马上要被切掉"的倒计时 ✗）。
+        _tail = ""
+        if not _rest:
+            try:
+                _ag2 = self._live_agent()
+                _tag = str(_ag2.current_goto_tag() or "") if _ag2 is not None else ""
+                _left = _ag2.goto_time_left() if _ag2 is not None else None
+            except Exception:               # noqa: BLE001 —— 老环境 / 替身对象 ⇒ 就当没有 ✓
+                _tag, _left = "", None
+            if _left is not None:
+                _tail = "(%s剩余 %s)" % ((_tag + "  ") if _tag else "", _mmss2(_left))
+        # ⭐ 「当前任务」这一行**字大一号**（用户 2026-09-28 ✓ 原话："当前任务以及下一行
+        #   缩进的说明字体稍微大点"）—— 行元组第 4 项 = 字号标记（非 0 ⇒ 用大字 ✓
+        #   具体字号由 `gui/live_panel._draw_note` 的 `_TASK_PT` 定 ✓ **只此一处**✗别各写各的）。
+        # ⚠ 上面那行 `first`（世界坐标等读数）**不标** ⇒ 保持原字号 ✓。
         lines = [first,                       # str ⇒ 保持黑底白字（读数是排查用的）
-                 ("当前任务　%s" % ("休息" if _rest else
-                                   ("前往：%s" % dst if dst else "战斗")), col, False)]
+                 ("当前任务　%s%s" % ("休息" if _rest else
+                                     ("前往：%s" % dst if dst else "战斗"), _tail),
+                  col, False, 11)]
         # 任务**现在这一步在干什么 / 为什么失败**（2026-09-26 补）：任务里一直写着原因
         #（对齐中差几像素 / 偏离绳 / 爬不动了 / 拿不到世界坐标），以前没人看得到 ⇒
         # 连着两次"角色爬到某个 y 就不动了"都只能靠猜。挂在任务名下面一行，任务结束就消失。
@@ -1174,7 +1316,17 @@ class RoutePanel(QWidget):
         except Exception:                           # noqa: BLE001
             _note = ""
         if _note:
-            lines.append(("　%s" % _note, col, False))
+            # ⭐ **就是这句**（用户 2026-09-28 说的"下一行**缩进**的说明"✓）：`　` 是个全角
+            #   空格 ⇒ 画面上看出"缩进"= 它是「当前任务」的子行 ✓。字号也**跟着大一号** ✓
+            #   （第 4 项非 0 ⇒ `_draw_note` 用 `_TASK_PT` ✓）。
+            lines.append(("　%s" % _note, col, False, 11))
+        # ⭐⭐ **「最大战斗时长」的倒计时**（用户 2026-09-29 ✓ 原话："将 foothold 集合的
+        #   最大战斗时间倒计时显示在小地图下面的信息栏（当前任务及说明下面，自定义定时
+        #   行为上面）"✓）—— 就插在「当前任务 + 它那行说明」**下面**、「休息 / 定时行为」
+        #   那几行**上面** ✓（口径见 `_fight_line` ✓）。
+        _fight = self._fight_line()
+        if _fight:
+            lines.append((_fight, col, False))
         # 「**任务队列**」：排在「当前任务」下方、**一行一个**（用户 2026-09-27 要求 ✓）。
         # ⚠ 只在真有队列时才多这几行（没排队时画面上不多一行 ✓）；实时没在跑时队列是空的
         #   （队列本来就存在 agent 身上 ✓）。
@@ -1469,7 +1621,7 @@ class RoutePanel(QWidget):
 
     # ---------------- 实测精度（只读核对，2026-09-27 用户要求做成一次点击）----------------
 
-    def _mmap_panel_for_check(self):
+    def _mmap_panel_for_check(self, blocking=True):
         """取一帧「小地图面板」给核对用 → `(panel, 问题)`；没问题时 `问题=""`。
 
         **按来源走两条路**（和叠图 / 标定弹窗同一套判断 ✓）：
@@ -1477,8 +1629,21 @@ class RoutePanel(QWidget):
           · **从实时画面** ⇒ 按本项目的框选区域，从**原生帧**上裁一块
             （`current_frame()` = 没画过检测框/视野虚线的那份 ✓，见 docs/UI规范.md §8）。
         每条早退都带回**一句人话**（调用方直接显示 ✓）—— 不许"点了没反应" ✗。
+
+        ⚠ `blocking=False`（**"叠加实时小地图"那条每 250ms 走一次的路** ✓）：收流那一路
+        要用**已经连着的那条客户端**（`_stream_client()`：`latest()` 是非阻塞的 ✓）——
+        `mm.stream_panel()` 每次都会**新建客户端 + 最多等 5 秒** ✗，放到定时器里必卡 ✓。
+        不阻塞时取不到就返回"还没收到帧"，下一拍再来 ✓。
         """
         if self._mmap_src() == mm.SRC_STREAM:
+            if not blocking:
+                cli = self._stream_client()
+                if cli is None:
+                    return None, "小地图推流连不上（link.yaml 里读到 a_host 了吗）"
+                f, _t = cli.latest()
+                if f is None:
+                    return None, "还没收到小地图推流（%s）" % (cli.err or "A 机那一路起了吗？")
+                return f, ""
             panel, why = mm.stream_panel()
             return (None, why) if panel is None else (panel, "")
         lp = getattr(self, "live_panel", None)
@@ -2029,6 +2194,18 @@ class RoutePanel(QWidget):
 
     def _refresh_world(self):
         """世界坐标那行的显隐与节拍：只在勾上「叠地形图」时才跑。"""
+        # 换图 / 重标定 ⇒ 几何换了 ⇒ 这一层那份显示区跟踪**要重新开始**（别带着上一张图的
+        # 状态/上一份几何的先验 ✗）；种子给"现在最可信的那个"（画面那层跟出来的 → 标定里那份）
+        try:
+            _cal0 = (mapdata.load_calib(self._map_id(), self._mmap_src()) or {})
+        except Exception:                       # noqa: BLE001 —— 刷新而已，不许崩 ✗
+            _cal0 = {}
+        if self._ov_view:
+            _seed0 = self._ov_view
+        else:
+            _v0 = _cal0.get("view") or (0.0, 0.0)
+            _seed0 = (float(_v0[0]), float(_v0[1]))
+        self._live_view_track.reset(_seed0)
         on = self._mmap_draw_on()
         self.lbl_mmap_world.setVisible(on)
         if on:
@@ -2089,12 +2266,15 @@ class RoutePanel(QWidget):
                             % (cli.err or "A 机那一路起了吗？"), "#b06000")
         else:
             frame = lp.current_frame()
-            crop = load_live().get("mmap_crop") or []
+            # ⚠ 框选区域**一处口径**（`_mmap_crop`：本项目优先 ✓，同 `_push_mmap`）——
+            #   原来读 `load_live()["mmap_crop"]` ✗ ⇒ 只框了本项目时这里会裁到"老那份"
+            #   的位置上，读数就是错的。
+            crop = self._mmap_crop() or []
             if frame is None:
                 return _say("玩家世界坐标：先到「实时」页点「开始」预览")
             if len(crop) != 4:
                 return _say("玩家世界坐标：先框选小地图（读数要从那块画面算）"
-                        "　→ 设置 → 界面 → 实时画面 · 地形叠加")
+                        "　→ 路线识别 → 小地图定位 → 「框选小地图」")
             x, y, w, h = [int(v) for v in crop]
             H, W = frame.shape[:2]
             if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > W or y + h > H:
@@ -2108,6 +2288,19 @@ class RoutePanel(QWidget):
         # （站平台边上读数会偏出边界几像素 —— 见 `core.mapdata.foothold_below` 的 xtol 说明）
         r = loc.update(panel, src=src,
                        fh_xtol=int(getattr(settings, "align_tol_px", 0) or 0))
+        # ⭐⭐ **「显示区跟住了没有」要先取出来**（用户 2026-09-29："实时小地图的位置没有跟着
+        #   我的移动变化"✗ 的直接原因之一）：
+        #   它和"认不认得出黄点"是**两件事** —— 面板随人滚动 ⇒ 这一拍显示的底图范围变了没，
+        #   光看面板就知道 ✓（`PlayerLocator.update` 里**在黄点之前**就跟了一遍 ✓）。
+        #   而下面 `if not r["ok"]` 会**提前 return** ⇒ 认不出黄点时这条信息被丢掉 ✗
+        #   ⇒ `_ov_view` 一直是 None ⇒ 画面那层叠图 + 地形图里那块实时小地图都**钉死**
+        #   在标定那一刻的位置上 ✗✗。所以这里先处理、再管黄点 ✓。
+        _vw_now = r.get("view")
+        if r.get("view_ok") and _vw_now:
+            _vw_now = (float(_vw_now[0]), float(_vw_now[1]))
+            if _vw_now != self._ov_view:
+                self._ov_view = _vw_now
+                self._refresh_overlay(view=_vw_now)
         if not r["ok"]:
             # 面板上写一句话，**详情进 tooltip**；画面上那行更短（见 _say 的说明）——
             # 完整诊断有一百多字，贴到画面上就是一条横穿半屏的黑带。
@@ -2161,24 +2354,62 @@ class RoutePanel(QWidget):
         # 贴到画面上的那行**必须短**（它不换行，长了横穿半屏）—— 集合名可以很长
         # （"右下休息平台"就是 6 个字），所以那里截断，面板那一行保留全名
         zone_s = zone if len(zone) <= 8 else zone[:7] + "…"
+        # ⭐⭐ **局部小地图（crop）的「显示区」跟踪状态**（用户 2026-09-29 任务 1 ✓）：
+        #   crop 的面板**随玩家滚动** ⇒ 标定文件里那个显示区起点只在**标定那一刻**成立 ✗
+        #   ⇒ 实时回路每拍都重新跟一次（`perception.minimap.CropViewTracker` ✓）。
+        #   这里把"这一拍跟住没有"摆出来 —— 它是"世界坐标整体偏"那类现场的第一现场证据 ✓：
+        #     · 跟住了 ⇒ 报**现在**那块底图的起点 + 匹配分（起点随着人走而变，这是对的 ✓）；
+        #     · 没跟住 ⇒ **橙色警告**（那一拍用的是标定里那个位置，可能整体偏 ✗）。
+        #   ⚠ 不是 crop 时 `view_ok` 是 `None` ⇒ 一个字都不加（fit 没这回事 ✓）。
+        crop_seg = ""
+        crop_tip = ""
+        crop_warn = False
+        if r.get("view_ok") is not None:
+            _vw = r.get("view") or []
+            if r.get("view_ok"):
+                crop_seg = "　显示区 %s（跟住 %.2f%s）" % (
+                    "(%s)" % ",".join("%.0f" % float(v) for v in _vw) if _vw else "?",
+                    float(r.get("view_score") or 0.0),
+                    "" if r.get("view_trust") else "·不太稳")
+                if not r.get("view_trust"):
+                    crop_warn = True
+                    crop_tip = (
+                        "局部小地图（crop）这一拍**跟住了**，但匹配分没到可信那一档"
+                        "（%.2f < %.2f）。\n"
+                        "常见原因：面板被游戏 UI 挡掉一块 / 画面糊了。⚠ 被挡掉的那一块"
+                        "**是平的**⇒ 匹配分会虚高、位置也可能差几个底图像素\n"
+                        "（1 个底图像素 = 好几到十几个世界像素）⇒ 这一拍的读数比干净那拍"
+                        "糙一点。" % (float(r.get("view_score") or 0.0), mm.TRUST_SCORE))
+            else:
+                crop_warn = True
+                crop_seg = "　⚠ 显示区没跟住"
+                crop_tip = (
+                    "局部小地图（crop）的面板**随玩家滚动** ⇒ 程序每拍都要重新问"
+                    "「现在显示的是底图哪一块」。\n"
+                    "这一拍**没跟上** ⇒ 世界坐标用的是**标定里那个位置**算的，可能整体偏"
+                    "（偏的多少 = 滚了多少 × 底图刻度）。\n\n"
+                    "跟不住常见原因：面板被游戏 UI 挡住 / 画面糊了 / 「显示方式」选错 /\n"
+                    "标定的缩放或显示区起点不对。%s"
+                    % ("\n\n具体：%s" % r.get("view_why") if r.get("view_why") else ""))
         # ⚠ 工具提示原来**写死**「来源：从实时画面」（`SRC_LABEL[SRC_LIVE]`）—— 就算
         #   来源选的是「收流」也这么说 ✗。来源说错，人会去错的标定里找问题，而这份几何
         #   只对当时那条来源成立（用户 2026-09-27 查"同一个黄点为什么读数差 9"时就踩在
         #   这句上）。顺带把**黄点的原始像素**摆出来：世界坐标对 1 个面板像素的敏感度 =
         #   `px_per_world / scale`（这张图 8.55 世界单位 ⇒ 差 9 恰好是**一格**）——
         #   有争议时先看这行 x/y 有没有变：变了是"解析/跟踪"，没变就是"标定/来源" ✓。
-        return _say("%s%s%s%s%s%s" % (head, where, lad_s, top_s, held, tail),
-                    color,
-                    "来源：%s　标定：%s\n"
-                    "黄点原始像素（面板）：x=%.2f　y=%.2f（重心，亚像素）"
-                    "　脚底锚点 y=%.2f　%s族·%s层%s%s"
-                    % (mm.SRC_LABEL.get(src, src), mm.SRC_LABEL.get(src, src),
-                       float(r.get("px") or 0.0), float(r.get("py") or 0.0),
-                       mm.dot_feet(r)[1],
-                       "黄" if r.get("family") == "yellow" else "青",
-                       r.get("layer") or "?",
-                       "（上一帧沿用）" if r.get("held") else "",
-                       ("\n\n" + r["note"]) if r.get("held") else ""),
+        return _say("%s%s%s%s%s%s%s" % (head, where, lad_s, top_s, held, tail, crop_seg),
+                    "#b06000" if (crop_warn or not r["confirmed"]) else color,
+                    ("来源：%s　标定：%s\n"
+                     "黄点原始像素（面板）：x=%.2f　y=%.2f（重心，亚像素）"
+                     "　脚底锚点 y=%.2f　%s族·%s层%s%s"
+                     % (mm.SRC_LABEL.get(src, src), mm.SRC_LABEL.get(src, src),
+                        float(r.get("px") or 0.0), float(r.get("py") or 0.0),
+                        mm.dot_feet(r)[1],
+                        "黄" if r.get("family") == "yellow" else "青",
+                        r.get("layer") or "?",
+                        "（上一帧沿用）" if r.get("held") else "",
+                        ("\n\n" + r["note"]) if r.get("held") else ""))
+                    + (("\n\n" + crop_tip) if crop_tip else ""),
                     osd="世界 (%d, %d)%s%s%s"
                         % (round(r["world_x"]), round(r["world_y"]),
                            ("　fh：%s" % zone_s) if zone_s else "",
@@ -2199,9 +2430,14 @@ class RoutePanel(QWidget):
             return "还没选地图"
         if not mm.has_geometry(mapdata.load_calib(mid, self._mmap_src()) or {}):
             return ("这张图在当前小地图来源下还没标定（点右边「标定…」量一次并保存）")
-        if not load_live().get("mmap_crop"):
-            return ("还没框选小地图在画面里的位置（设置 → 界面 → 实时画面 · 地形叠加 → "
-                    "「框选小地图」）")
+        # ⚠ 框选区域**一处口径**（`_mmap_crop` = `mm.crop_of`：本项目优先、没框过才回退
+        #   老的那份全局值 ✓）。这里原来读 `load_live()["mmap_crop"]` ✗ —— 框选区域
+        #   2026-09-27 起**按项目存**（project.yaml）⇒ 只框了本项目的图上，这一层会一直
+        #   说"还没框选小地图"、叠图压根画不出来 ✗（用户 2026-09-29 问"叠图跟不跟"时
+        #   顺手查出来的同族问题）。
+        if not self._mmap_crop():
+            return ("还没框选小地图在画面里的位置（路线识别 → 小地图定位 → "
+                    "「框选小地图」，按项目存）")
         if not (mapdata.map_dir() / ("%s_overlay.png" % mid)).exists():
             return "还没有 %s_overlay.png（先点下面的「生成地形图」）" % mid
         t = mapdata.load(mid, with_canvas=True)
@@ -2241,6 +2477,126 @@ class RoutePanel(QWidget):
             self._ov_pix = (p, QPixmap(p))
         return self._ov_pix[1]
 
+    def _on_live_map_toggle(self, on):
+        """勾/去勾「叠加实时小地图」：开/停那条 250ms 的节拍，并立刻来一拍 ✓。"""
+        # 透明度那条只对"看得见的那一层"有意义 ⇒ 跟着开关**灰掉**（不藏掉：布局不跳 ✓，
+        # 和设置窗里「浓淡」对「叠图」的做法一致 ✓）
+        self.sld_live_alpha.setEnabled(bool(on))
+        if on:
+            self.canvas.set_live_patch_alpha(self._live_alpha / 100.0)
+            self._live_map_timer.start()
+            self._live_map_tick()
+        else:
+            self._live_map_timer.stop()
+            self.canvas.set_live_patch(None)        # 收起来（不是留一张空的 ✗）
+            self.lbl_live_map.setText("")
+
+    def _on_live_alpha(self, v):
+        """拖动透明度：**立刻**生效（跟手 ✓）。
+
+        ⚠ **不在这里写盘**：拖一次会来几十个事件 ⇒ 写几十次 YAML（每次重写整个文件 ✗）；
+        落盘在**松手**（`sliderReleased`）和**离开这一页**（`hideEvent`）各一次 ✓。
+        """
+        self._live_alpha = int(v)
+        self.lbl_live_alpha.setText("%d%%" % self._live_alpha)
+        self.canvas.set_live_patch_alpha(self._live_alpha / 100.0)
+
+    def _save_live_alpha(self):
+        """把透明度存进 `config/live.yaml`（本机外观偏好，和 `mmap_draw` 同一处 ✓）。"""
+        try:
+            update_live(live_map_alpha=int(self._live_alpha))
+        except Exception:                       # noqa: BLE001 —— 存不下也不该把界面弄崩 ✗
+            pass
+
+    def _live_map_rect(self, cal, canvas_wh):
+        """面板图摆在**地形图坐标系**里的哪儿 → `(origin_x, origin_y, kx, ky)`。
+
+        地形图 / 叠加图那一层是底图的 `overlay_zoom` 倍（`<id>_zones.png` 同理 ✓），
+        所以要把"面板像素 → 底图像素"（`mm.panel_to_canvas`，**唯一口径** ✓）再乘回去。
+        两种模式同一个式子：fit 的 `offset`、crop 的 `view` 都由它自己处理 ✓。
+        """
+        bx, by = mm.panel_to_canvas(0.0, 0.0, cal)
+        z = float(mm.overlay_zoom(canvas_wh[0]))
+        sx, sy = mm.scales_of(cal)
+        return (bx * z, by * z,
+                z / max(1e-6, float(sx)), z / max(1e-6, float(sy)))
+
+    def _live_map_tick(self):
+        """把当前那块小地图面板按标定摆到地形图上（每 250ms 一拍 ✓）。
+
+        跟「实测精度」那一路共用一个取帧口（`_mmap_panel_for_check(blocking=False)` ✓，
+        **不阻塞** —— 定时器里不许等网络 ✗）。
+
+        ⭐ **局部小地图这一层自己跟显示区**（`self._live_view_track` ✓）：它手里本来就有
+        这一拍的面板 ⇒ 不依赖"画面那层叠图开着 / 世界坐标算得出来"那些条件 ✓。
+        跟住 ⇒ 用新位置摆；没跟住 ⇒ 退回画面那层跟出来的 / 标定里那份，并在状态行**说清**
+        （橙色 `⚠`，不是静默照标定 ✗ —— 那会让人以为"它在跟着走"）。
+        """
+        # ⚠ **不要**先判"有没有 live_panel"：来源=收流时那块面板是从 A 机那一口来的，
+        #   跟本机实时页在不在跑没关系 ✓（那条路要 `live_panel` 的是"从实时画面框选"，
+        #   由 `_mmap_panel_for_check` 自己按来源判 ✓）。
+        mid = self._map_id()
+        if not mid:
+            self.canvas.set_live_patch(None)
+            self.lbl_live_map.setText("先选地图 + 打开项目")
+            return
+        t = mapdata.load(mid, with_canvas=True)
+        if t is None or t.canvas is None:
+            self.canvas.set_live_patch(None)
+            self.lbl_live_map.setText("这张图还没有底图 —— 先点「生成地形图」")
+            return
+        panel, why = self._mmap_panel_for_check(blocking=False)
+        if panel is None:
+            self.canvas.set_live_patch(None)
+            self.lbl_live_map.setText("取不到面板：%s" % why)
+            return
+        cal = mapdata.load_calib(mid, self._mmap_src()) or {}
+        if not mm.has_geometry(cal):
+            self.canvas.set_live_patch(None)
+            self.lbl_live_map.setText("这张图还没有标定（面板摆不上去）")
+            return
+        # ⭐⭐ **局部小地图：这一层自己跟"现在显示的是底图哪一块"**（用户 2026-09-29：
+        #   "实时小地图的位置没有跟着我的移动变化"✗）。
+        #   ⚠ 以前这里借的是 `self._ov_view`（**画面那层叠图**跟出来的），而那条路只在
+        #     "叠图开着 **且** 世界坐标那行算得出来"时才更新 ⇒ **认不出黄点 / 没开叠图**
+        #     的时候它一直是 None ⇒ 面板钉在标定那一刻的位置上，人走了也不动 ✗✗。
+        #   现在：这一拍的面板就在手上 ⇒ 直接喂给自己那份 `CropViewTracker` ✓
+        #     （`_refresh_world` 换图/重标定时 `reset` ✓）—— 跟住就用它，没跟住再退回
+        #     `_ov_view`，都没有就照标定里那份摆（= 老行为 ✓，并在状态行说清 ✓）。
+        follow, how = None, "照标定"
+        if cal.get("mode") == mm.MODE_CROP:
+            seed = self._ov_view or (cal.get("view") or (0.0, 0.0))
+            vt = self._live_view_track.update(panel, t.canvas,
+                                              dict(cal, view=[float(seed[0]),
+                                                              float(seed[1])]))
+            if vt.get("ok") and vt.get("view"):
+                follow = [float(v) for v in vt["view"]]
+                how = ("跟住了显示区 %.2f%s" % (float(vt.get("score") or 0.0),
+                                              "" if vt.get("trust") else "·不太稳"))
+            elif self._ov_view:
+                follow = [float(v) for v in self._ov_view]
+                how = "用画面那层跟出来的显示区"
+            else:
+                follow = None
+                how = "⚠ 显示区没跟住 ⇒ 照标定里那个位置摆"
+            if follow is not None:
+                cal = dict(cal, view=follow)
+        from gui.minimap_calib import np_to_pixmap      # 一处实现（别各写一份 ✓）
+        ch, cw = t.canvas.shape[:2]
+        ox, oy, kx, ky = self._live_map_rect(cal, (cw, ch))
+        hp, wp = panel.shape[:2]
+        ok = self.canvas.set_live_patch(np_to_pixmap(panel), (ox, oy), kx, ky)
+        if not ok:
+            self.lbl_live_map.setText("地形图还没画出来（先点「生成地形图」）")
+            return
+        warn = how.startswith("⚠")
+        self.lbl_live_map.setText(
+            "面板 %d×%d 摆在地图 (%d, %d) 起、%.2f×（%s）%s"
+            % (wp, hp, round(ox), round(oy), kx, how,
+               "" if cal.get("mode") == mm.MODE_CROP
+               else "　（全局小地图：整张底图都在面板里、不滚动 ✓）"))
+        self.lbl_live_map.setStyleSheet("color: %s;" % ("#b06000" if warn else "#80868b"))
+
     def _calib_panel_wh(self, cal=None):
         """**标定当时那块面板的尺寸** `(w, h)` —— 画叠图时要把标定几何折算到当前画面。
 
@@ -2275,24 +2631,41 @@ class RoutePanel(QWidget):
                     return (int(f.shape[1]), int(f.shape[0]))
         return None
 
-    def _refresh_overlay(self):
+    def _refresh_overlay(self, view=None):
         """照标定算出「叠图的哪一块画到画面的哪里」，交给实时面板去画。
 
         算出来的矩形是**画面坐标**：面板在画面里的位置来自 `mmap_crop`，
         面板里怎么摆来自标定（`perception/minimap.frame_overlay_rects` 一份公式，
         和标定弹窗的叠加层同源）。
 
+        `view` = **这一拍跟出来的**「显示区起点」（底图像素；只有局部小地图才用得上 ✓，
+        见 `perception.minimap.CropViewTracker`）—— 传了就**压过标定里那份** ✓：
+        crop 的面板随玩家滚动，标定里那个只在标定那一刻成立，不压的话叠图会停在
+        标定那一刻的位置、和人看到的小地图对不上 ✗（用户 2026-09-29 问"现在已经能
+        实时地滚动底图了？" ✓）。不传 = 照标定里那份画（老行为 ✓）。
+
         画/没画、画的哪儿、没画卡在哪 —— 都写在勾选框旁边那行上。
         """
+        if not view:
+            # 没带"这一拍跟出来的" ⇒ 这一层回到"照标定画"的状态；把记住的那个清掉，
+            # 下一拍（`_tick_world`）好照新跟出来的重画一次 ✓（不清的话它会以为
+            # "已经画在当前那个显示区上了"、于是不再更新 ✗）。
+            self._ov_view = None
         lp = getattr(self, "live_panel", None)
         on = self._mmap_draw_on()
         why = self._overlay_blocker()
         if on and not why and lp is not None:
             mid = self._map_id()
             t = mapdata.load(mid, with_canvas=True)
-            crop = load_live().get("mmap_crop") or []
+            # ⚠ **框选区域取一处口径**（`_mmap_crop` = `mm.crop_of`：本项目优先、
+            #   没框过才回退老的那份全局值 ✓）。这里原来直接读 `load_live()["mmap_crop"]`
+            #   ✗ —— 而框选区域 2026-09-27 起**按项目存**（project.yaml）⇒ 只框了本项目
+            #   的图上，叠图会被摆到"老那份全局值"的位置（多半是上一张图的框）✗。
+            crop = self._mmap_crop() or []
             if len(crop) == 4 and t is not None and t.canvas is not None:
                 cal = mapdata.load_calib(mid, self._mmap_src()) or {}
+                if view:
+                    cal = dict(cal, view=[float(v) for v in view])
                 src, dst = mm.frame_overlay_rects(
                     cal, [int(v) for v in crop],
                     (t.canvas.shape[1], t.canvas.shape[0]),
@@ -2478,6 +2851,7 @@ class RoutePanel(QWidget):
         settings.climb_align_gap_ms = int(v)
         settings.save()
 
+
     def _on_align_near(self, v):
         """改了「开始对齐绳梯x的距离(px)」⇒ 写进配置（同样是决策参数、跟着项目存）。"""
         settings.climb_align_near_px = int(v)
@@ -2558,5 +2932,22 @@ class RoutePanel(QWidget):
         if getattr(self, "project", None) is not None:
             self._refresh_mmap()
             self._refresh_map_image()
+        # ⭐ 「叠加实时小地图」那条 **只在看得见的时候跑**（切到别的页签就停 ——
+        #   4 次/秒的取帧+重绘虽然便宜，但没人看的时候白花 ✓）。默认是勾上的 ⇒
+        #   进这一页就该看见它在滚（取不到面板时右边那行会说清为什么 ✓）。
+        if (getattr(self, "ck_live_map", None) is not None
+                and self.ck_live_map.isChecked()):
+            if not self._live_map_timer.isActive():
+                self._live_map_timer.start()
+            self._live_map_tick()
+
+    def hideEvent(self, e):
+        """切走这个页签 ⇒ 停掉「叠加实时小地图」那条节拍（没人看就不取帧 ✓）。"""
+        super().hideEvent(e)
+        if getattr(self, "_live_map_timer", None) is not None:
+            self._live_map_timer.stop()
+        # 透明度可能拖完没松手就切页了 ⇒ 这里补一次落盘（拖的时候不写盘，见 `_on_live_alpha`）
+        if getattr(self, "sld_live_alpha", None) is not None:
+            self._save_live_alpha()
 
 

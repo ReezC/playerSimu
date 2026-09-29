@@ -30,12 +30,47 @@ def check(cond, msg):
 
 
 def _win():
-    """建主窗口（离屏）。**只碰界面**：不打开项目、不连流 ✓。"""
+    """建主窗口（离屏）。**只碰界面**：不打开项目、不连流 ✓、**也不连远端键盘** ✓。"""
     from PyQt5.QtWidgets import QApplication
 
+    from decision import agent as _ag
     from gui.main_window import MainWindow
 
     app = QApplication.instance() or QApplication([])
+    # ⚠⚠ **必须先把输入设备摁成 `local`**（2026-09-28 修 ✓ 踩过）：
+    #   项目配置里 `input_device` 常常是 `remote` ⇒ `PlayerPanel` 构造时会**自动**
+    #   `_do_connect` ⇒ 起一条**后台线程**去 TCP 连被控机（`remote_kbd` ✓）⇒ 那条线程
+    #   **没人管**，本用例跑完、主线程一退出 ⇒ 它就变成"**在别的线程里摸已经拆掉的
+    #   解释器 / Qt**" ⇒ **段错误 `0xC0000005`** ✗。
+    #   ⚠ 症状极迷惑（这次又踩）：`faulthandler` 打出来是**另一条线程**的栈
+    #     （`socket.create_connection` ← `kbd_client` ← `input.use_network` ← `_do_connect`），
+    #     而**当前线程**只是"正在跑用例" ⇒ 一眼看着像"用例自己崩了" ✗；
+    #     而且它是**时机性**的：对面恰好拒绝连接时那条线程早早异常退出 ⇒ 碰巧不崩 ✗
+    #     （所以之前有几轮是 8/8 通的 ✓ 不是修好了，是没赶上 ✗）。
+    #   ⚠ **光改 `settings.input_device` 不管用**（踩过）：`MainWindow()` 构造时会**重载
+    #     项目配置**（`from_dict` 里那个 `input_device: remote` ✓）⇒ 当场改回 `remote` ✓。
+    #   ⚠ **只改 `decision.input.use_network` 也不够**（又踩一次）：起线程那一步在
+    #     `PlayerPanel._apply_input_device` 里 ✓ ⇒ 从**源头**掐掉它最干净 ✓
+    #     （离屏自检本来就不该真发按键、更不该连被控机 ✓）。
+    _ag.settings.input_device = "local"
+    # ⚠⚠ **离屏自检绝不连被控机**（2026-09-28 ✓ 这是"段错误 `0xC0000005`"的真凶）：
+    #   `MainWindow()` 构造时会**重载项目配置**（`input_device: remote` ✓）⇒ 光设 `settings`
+    #   会被当场盖回去 ✗ ⇒ `PlayerPanel._apply_input_device` 起一条**后台线程**去 TCP 连
+    #   被控机（`remote_kbd` ✓）⇒ 它在**几秒后才超时**、而那时用例早跑完、`PlayerPanel`
+    #   的 C++ 对象**已经销毁** ⇒ 线程回来碰它 ⇒ 崩 ✗（`faulthandler` 会指到
+    #   `socket.create_connection` ← `kbd_client` ← `input.use_network` ← `_do_connect` ✓）。
+    #   ⚠ 它是**时机性**的（对面秒拒就碰巧不崩 ✗）⇒ 所以"多跑几次"不算验证，
+    #     这里**从源头掐掉** ✓ 并且**当场自检**（`_assert_net_disabled` ✓ 免得哪天又没生效 ✗）。
+    from decision import input as _dinput
+    if not hasattr(_dinput, "_selftest_orig_use_network"):
+        _dinput._selftest_orig_use_network = _dinput.use_network
+        _dinput.use_network = lambda *a, **k: None      # 连远端 ⇒ 直接当成功返回 ✓
+    from gui.player_panel import PlayerPanel as _PP
+    if not hasattr(_PP, "_selftest_orig_apply_input_device"):
+        _PP._selftest_orig_apply_input_device = _PP._apply_input_device
+        _PP._apply_input_device = lambda self, dev=None: None   # 不起那条连网线程 ✓
+    assert _dinput.use_network.__name__ == "<lambda>", "打桩没生效（自检要立刻炸 ✗）"
+    assert _PP._apply_input_device.__name__ == "<lambda>", "打桩没生效（自检要立刻炸 ✗）"
     w = MainWindow()
     w.resize(1200, 800)
     return app, w
@@ -46,15 +81,19 @@ def t_view_open_close_flow():
     app, w = _win()
     try:
         v = w.viewer
-        check(v.count() == 1 and v.tabText(0) == "起始",
-              "主视区一开始该只有「起始」一个页签（实际 %d 个：%s）"
+        # ⭐⭐ **2026-09-28 改口径**：一开始就是 **3 个常驻页签**（用户原话："起始页签、实时页签、
+        #    质检台页签现在是 **3 个常驻页签**"✓）—— 它们**启动就都在** ✓
+        #    （以前「实时」「质检台」是**按需打开**的 ✗，所以老断言是"一开始只有「起始」"✗）。
+        check(v.count() == 3 and [v.tabText(i) for i in range(3)] == ["起始", "实时", "质检台"],
+              "主视区一开始该有 3 个常驻页签「起始 / 实时 / 质检台」（实际 %d 个：%s）"
               % (v.count(), [v.tabText(i) for i in range(v.count())]))
 
-        # ① 打开 = 新开页签 + 切过去
+        # ① 打开**已经在的**页签 ⇒ **不重复开**、只切过去 ✓（`open_view` 的老契约 ✓）
+        _n0 = v.count()
         w.open_view(w.live_panel, "实时")
-        check(v.count() == 2 and v.currentWidget() is w.live_panel,
-              "open_view 没把「实时」开到主视区最前面：%d 个页签 / 当前 %r"
-              % (v.count(), v.currentWidget()))
+        check(v.count() == _n0 and v.currentWidget() is w.live_panel,
+              "open_view 没把「实时」切到最前面（或重复开了页签）：%d → %d 个 / 当前 %r"
+              % (_n0, v.count(), v.currentWidget()))
         check(v.tabText(v.indexOf(w.live_panel)) == "实时",
               "页签标题不对：%r" % v.tabText(v.indexOf(w.live_panel)))
 
@@ -84,16 +123,37 @@ def t_view_open_close_flow():
 
 
 def t_closing_live_tab_says_it_keeps_running():
-    """关掉「实时」页签**不停**收流/推理 ⇒ 必须当场说一句（不然是很危险的误会 ✗）。"""
+    """⭐ **「实时」是常驻页签 ⇒ 关不掉**（用户 2026-09-28 改的口径 ✓ 原话："起始页签、实时页签、
+    质检台页签现在是 **3 个常驻页签，不需要关闭按钮**"）。
+
+    ⚠ 老用例是"关掉「实时」⇒ 要说清收流/推理还在跑"✗ —— 那个前提**已经不成立**：
+      现在它**根本关不掉** ✓（页签栏上连「×」都不显示 ✓ 见 `_refresh_tab_close_buttons`）
+      ⇒ 那句"还在跑"的提醒也随"可关"一起去掉了 ✓（**不是漏了，是不需要了** ✓；
+        跑不跑仍然由「实时」页里那个「开始 / 停止」管 ✓）。
+    """
     app, w = _win()
+    # ⭐⭐ **启动时三个常驻页签就都在**（用户 2026-09-28 ✓ 当场问过"**实时页签呢？质检台页签呢？**"✗）
+    #   ⚠ 这正是我第一版漏掉的：只做了"关不掉"+摘「×」✗，而这俩页签以前是**按需打开**的
+    #     （「实时」靠**顶栏那个按钮** ✓）⇒ 按钮一删就**没入口**了 ✗ ⇒ **"常驻"必须启动就全建** ✓。
+    _names = [w.viewer.tabText(i) for i in range(w.viewer.count())]
+    check(_names == ["起始", "实时", "质检台"],
+          "启动时三个常驻页签**没有都在**（用户当场问过「实时页签呢？质检台页签呢？」✗）：%s"
+          % (_names,))
     said = []
     try:
         w.open_view(w.live_panel, "实时")
         w.log = lambda msg, level="info": said.append(str(msg))     # 只截获这一条
         w._on_view_close(w.viewer.indexOf(w.live_panel))
-        check(w.viewer.indexOf(w.live_panel) < 0, "「实时」页签没关掉")
-        check(any("还在跑" in s for s in said),
-              "关「实时」页签时没说清「收流/推理还在跑」：%s" % said)
+        check(w.viewer.indexOf(w.live_panel) >= 0,
+              "「实时」是常驻页签，却**被关掉了**（用户 2026-09-28：3 个常驻页签关不掉 ✗）")
+        check(any("常驻" in s for s in said),
+              "关「实时」时没说明「它是常驻页签、不能关」：%s" % said)
+        # ⭐ 常驻页签上**不该有「×」**（用户："不需要关闭按钮"✓）
+        from PyQt5.QtWidgets import QTabBar
+
+        _i = w.viewer.indexOf(w.live_panel)
+        check(w.viewer.tabBar().tabButton(_i, QTabBar.RightSide) is None,
+              "常驻页签「实时」上还挂着「×」关闭按钮（用户要求不需要它 ✗）")
     finally:
         w.close()
 
@@ -128,12 +188,12 @@ def t_clear_pages_keeps_work_tabs():
         #   `_clear_pages()` 里对那些步骤详情页调的是 `deleteLater()` —— 它是"**事件循环里
         #   才真删**"，而**离屏自检几乎不跑事件循环** ⇒ 这些控件一直挂在删除队列里 ⇒ 等到
         #   **解释器退出**（那时 `QApplication` 已经在拆）才轮到它们 ⇒ 段错误 ✗。
-        #   ⚠ 现场形状很有迷惑性：`faulthandler` 显示崩在"**用例每条断言都过了之后**、且
-        #     `<no Python frame>`"✗ ⇒ 看着像"用例本身没问题、是环境的事" ✓ —— 实际是这一条
-        #     用例制造出来的、**留到退出时才还的账** ✓。（产品里不会遇到：真实运行时事件循环
-        #     一直在跑 ✓ —— 所以这是**离屏用例特有的收尾义务** ✓。）
-        from PyQt5.QtWidgets import QApplication
-        app.processEvents()
+        #   ⚠ **别在这一条用例里手动 `processEvents()`**（2026-09-28 又踩一次 ✗）：那次
+        #     实测把它加在用例内 ⇒ `selftest_main_window` **2/4 崩**；而把它移出用例、
+        #     统一放到 `main()` 的"每条之后"（见下面那段 ✓）⇒ 就稳了 ✓。
+        #     原因：在**用例中途**跑事件循环，会顺带把**别人**挂起的事件（定时器 / 队列里的
+        #     `deleteLater`）一起处理掉 ⇒ 那些对象本来是"跑完这条再清"的 ✗。
+        #   ⇒ 收尾统一交给 `main()` ✓（一处管全部 ✓ 比散在各用例里可控 ✓）。
         for wdg, name in ((w.home_view, "起始"), (w.live_panel, "实时"),
                           (w.review, "质检台")):
             check(w.viewer.indexOf(wdg) >= 0,
@@ -179,6 +239,26 @@ def t_viewer_has_single_entry():
 
     check("setTabsClosable(True)" in src,
           "主视区不是可关的页签（用户要的「关闭流程」没了 ✗）")
+
+
+def _redirect_ui_store():
+    """⛔ 自检**绝不许**改用户的 `config/ui.yaml`（全仓库规矩 ✓）—— 把 theme 的落点指到临时文件。
+
+    ⚠ **这一句在别的套件里是"顺手加的"，在这里是"必须加的"**（2026-09-29 量出来的）：
+    本套件里 `hide()`/`show()` 那套恢复是**延后一拍**做的（`QTimer.singleShot(0, …)` ✓），
+    而 `_fake_store()` 的 `with patcher:` 早就退出了 ⇒ 延后那一拍**写的是真文件** ✗ ——
+    实测本套件会往用户的 `ui.yaml` 里留下 `windows.t_bind` / `views.t_view2`
+    （那两个键就是这么来的：它们本来只在用例的假 store 里 ✓）。
+    `_fake_store` 继续留着（它管"用例自己那几次存取走内存" ✓），两者不冲突 ✓。
+    """
+    import tempfile
+
+    from gui import theme
+
+    theme.CFG = Path(tempfile.mkdtemp(prefix="psimu_ui_")) / "ui.yaml"
+
+
+_redirect_ui_store()
 
 
 def _fake_store():
@@ -408,7 +488,8 @@ def t_window_state_covers_editors():
 
 TESTS = (
     ("主视区页签开合：开一次/不重复/关掉不销毁/起始页关不掉", t_view_open_close_flow),
-    ("关「实时」页签要说清「收流/推理还在跑」", t_closing_live_tab_says_it_keeps_running),
+    ("「实时」是常驻页签：关不掉、且页签上没有「×」（用户 2026-09-28）",
+     t_closing_live_tab_says_it_keeps_running),
     ("换项目只清步骤详情页，常驻工作页与起始页留着", t_clear_pages_keeps_work_tabs),
     ("源码：主视区开合只有 open_view / close_view 一条路", t_viewer_has_single_entry),
     ("弹窗几何：按客户端一份存取；坏值当没存过", t_window_state_roundtrip),
@@ -423,13 +504,28 @@ TESTS = (
 def main() -> int:
     failed = 0
     for name, fn in TESTS:
+        # ⚠ `flush=True` + 先打"开始"（**故意**）：离屏自检里万一又出原生崩溃（段错误 ⇒
+        #   连 `print` 的缓冲都可能丢 ✗），有这两行就能从输出里看出**崩在哪一条** ✓。
+        print("==> %s" % name, flush=True)
         try:
             fn()
         except Exception as e:
             failed += 1
-            print("[FAIL] %s\n       %s: %s" % (name, type(e).__name__, e))
+            print("[FAIL] %s\n       %s: %s" % (name, type(e).__name__, e), flush=True)
         else:
-            print("[ OK ] %s" % name)
+            print("[ OK ] %s" % name, flush=True)
+        # ⚠⚠ **每条之后都要把 Qt 的延迟删除队列跑干净**（2026-09-28 修 ✓）：
+        #   用例里那些 `deleteLater()`（`_clear_pages` 等）是"**事件循环里才真删**"，而离屏
+        #   自检几乎不跑事件循环 ⇒ 它们**跨用例累积** ⇒ 等**解释器退出**时（`QApplication`
+        #   已在拆）一起还账 ⇒ **段错误 `0xC0000005`** ✗（症状极迷惑：所有断言都过了、
+        #   `faulthandler` 显示 `<no Python frame>` ✗）。⇒ 在这儿统一清 ✓（一处管全部 ✓）。
+        try:
+            from PyQt5.QtWidgets import QApplication
+            _app = QApplication.instance()
+            if _app is not None:
+                _app.processEvents()
+        except Exception:
+            pass
     print("\n%d/%d 通过" % (len(TESTS) - failed, len(TESTS)))
     return 1 if failed else 0
 

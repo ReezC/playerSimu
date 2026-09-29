@@ -193,7 +193,59 @@ def t_editor_card_entry_button_style():
                   "%s 里又硬写了一遍入口按钮的色值（%s）—— 该从 theme 取 ✗" % (f, hard))
 
 
+def t_dataset_empty_frame_is_negative():
+    """⭐⭐ **「标过但空」的帧能当负样本收进来**（用户 2026-09-28 ✓ 原话："frame_00381 画面里
+    没有东西，他对训练**有益无害**就加"）。
+
+    钉三件：
+      ① **没有标注文件** ⇒ `_merge_label_lines` 给 `None`（= 这帧**没标注过** ✗ 该跳过 ✓）；
+      ② ⭐ **文件在、但内容为空** ⇒ 给 `[]`（= **标过、确认没东西** ⇒ 负样本 ✓）；
+      ③ ⭐ `_collect_pairs` + `min_boxes=0` ⇒ **收下它** ✓ ——
+         ⚠ 原来这两种都返回 `None` ✗ ⇒ 空帧**永远进不来** ⇒ `prepare_dataset` 里那句
+         "`0 = 保留空帧（当负样本）`"**从来没生效过**（真 bug ✓ 用户当天就撞上了 ✓）。
+    ⚠ `_merge_label_lines` 全仓**只有一个调用点**（`_collect_pairs` ✓）⇒ 改这语义是安全的 ✓。
+    """
+    import tempfile
+    from pathlib import Path
+
+    from perception import prepare_dataset as P
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        fr = root / "frames"
+        lb = root / "labels"
+        fr.mkdir()
+        lb.mkdir()
+        for _stem in ("f_none", "f_empty", "f_box"):
+            (fr / (_stem + ".png")).write_bytes(b"")
+        # ① `f_none`：**不建**标注文件（= 没标注过 ✓）
+        # ② `f_empty`：**建**一个 0 字节的（= 标过、确认没东西 ✓）
+        (lb / "f_empty.txt").write_text("", encoding="utf-8")
+        # ③ `f_box`：有一个真框
+        (lb / "f_box.txt").write_text("1 0.5 0.5 0.1 0.1\n", encoding="utf-8")
+
+        check(P._merge_label_lines("f_none", [str(lb)], ()) is None,
+              "「**没有**标注文件」该给 `None`（= 没标注过 ⇒ 跳过 ✓）：%r"
+              % (P._merge_label_lines("f_none", [str(lb)], ()),))
+        _e = P._merge_label_lines("f_empty", [str(lb)], ())
+        check(_e == [],
+              "「**标过但空**」该给 `[]`（负样本 ✓）—— 给 `None` 就会把它当「没标注」丢掉，"
+              "于是 `min_boxes=0` 也永远收不到（真 bug，用户 2026-09-28 撞上的 ✗）：%r" % (_e,))
+
+        _p1, _nl1, _em1 = P._collect_pairs(str(fr), [str(lb)], 1, ())
+        check(len(_p1) == 1 and _nl1 == 1 and _em1 == 1,
+              "`min_boxes=1` 该只收那 1 帧有框的（没标注 1 / 框数不足 1）：%r / %r / %r"
+              % (len(_p1), _nl1, _em1))
+        _p0, _nl0, _em0 = P._collect_pairs(str(fr), [str(lb)], 0, ())
+        check(len(_p0) == 2 and _nl0 == 1 and _em0 == 0,
+              "`min_boxes=0` 该**多收那帧空帧**（当负样本 ✓）—— 这正是用户要的「就加」："
+              "%r 帧 / 没标注 %r" % (len(_p0), _nl0))
+
+
 TESTS = (
+    ("⭐⭐ 数据集：「标过但空」的帧能当负样本收（`min_boxes=0`）—— 空文件给 `[]`、"
+     "没文件给 `None`（用户 2026-09-28：frame_00381 画面没东西，有益无害就加）",
+     t_dataset_empty_frame_is_negative),
     ("⑤ 卡「打开质检台」= 入口按钮样式（与寻路编辑器同一份色值）",
      t_editor_card_entry_button_style),
     ("质检台 ←/→ 切帧：真的换帧、到头停住、空列表不崩", t_left_right_switch_frames),

@@ -85,20 +85,52 @@
     1000,
     2500
   ],
-  "input_device": "remote",
+  "input_device": "local",
   "attack_cd": 300,
   "attack_lock_debounce_ms": 1000,
   "min_turn_hold_ms": 1000,
   "turn_output_delay_ms": 500,
   "player_track_jump": 200,
-  "hp_bar": null,
+  "player_foot_offset_px": -25,
+  "player_box_min_area_pct": 0.0,
+  "player_box_area_base_s": 1.0,
+  "player_box_area_tol_pct": 0.0,
+  "hp_bar": [
+    0.341142,
+    0.973958,
+    0.120791,
+    0.019531
+  ],
   "mp_bar": null,
   "probe_calib": {},
-  "hp_color": null,
-  "mp_color": null,
-  "hp_threshold": 30,
+  "hp_color": [
+    [
+      0,
+      0,
+      135
+    ],
+    [
+      79,
+      82,
+      255
+    ]
+  ],
+  "mp_color": [
+    [
+      143,
+      78,
+      0
+    ],
+    [
+      255,
+      198,
+      77
+    ]
+  ],
+  "hp_threshold": 39,
   "mp_threshold": 7,
   "pot_cd": 1000,
+  "mob_sets_ttl_s": 3.0,
   "auto_hp_pot": true,
   "auto_mp_pot": false,
   "strategy": "patrol",
@@ -111,18 +143,37 @@
   "vision_off_y": 0,
   "sweep_turn_cd": 500,
   "back_range": 150,
-  "route_goto_set": "小平台",
-  "align_tol_px": 10,
+  "route_goto_set": "二楼",
+  "align_tol_px": 12,
   "align_hold_ms": 1000,
-  "climb_align_gap_ms": 180,
-  "climb_align_near_px": 20,
+  "climb_align_gap_ms": 200,
+  "climb_align_near_px": 30,
   "climb_retry_delay_s": 1.0,
   "climb_retry_delay_inc_s": 1.0,
   "goto_timeout_s": 10.0,
+  "chase_goto_max_s": 5.0,
   "goto_timeout_key": "表情_无语",
+  "disable_chase_pathfinding": false,
   "jump_start_px": 80,
-  "move_retry_ms": 1000,
-  "battle_zones": [],
+  "move_retry_ms": 350,
+  "battle_zones": [
+    {
+      "set": "底层",
+      "cd_s": 3.0,
+      "idle_foothold": "39",
+      "fight_max_s": 0.0,
+      "fight_dst": "",
+      "can_fight": false
+    },
+    {
+      "set": "顶层",
+      "cd_s": 3.0,
+      "idle_foothold": "",
+      "fight_max_s": 15.0,
+      "fight_dst": "一楼",
+      "can_fight": false
+    }
+  ],
   "battle_zone_sets": [],
   "debounce_conf": 0.5,
   "debounce_ms": 2000,
@@ -266,6 +317,11 @@
   "anti_afk_spot_set": "",
   "anti_afk_spot_seq": [],
   "anti_afk_spot_after": "",
+  "anti_afk_spot_loop": false,
+  "anti_afk_spot_loop_items": [],
+  "anti_afk_spot_loop_min": 30.0,
+  "anti_afk_spot_loop_max": 60.0,
+  "anti_afk_spot_loop_hold": false,
   "anti_afk_retry_on_interrupt": true,
   "anti_afk_retry_sec": 10.0,
   "reconnect_enabled": false,

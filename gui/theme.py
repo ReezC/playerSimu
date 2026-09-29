@@ -27,6 +27,54 @@ from perception import classes   # 类别表（唯一定义处）：框颜色按
 #: 蓝 `#1a73e8` = 运行/主按钮、绿 = 通过、橙 = 提醒、红 = 错误/停止、紫 = 编辑序列；
 #: "打开一个地方"原来只有寻路编辑器一个按钮，2026-09-27 起有两个了 ⇒ 颜色值和含义
 #: 都放**这一处**，别两份各写一遍 ✗（约定 10）。
+#: ⭐⭐ **「确定 / 取消」的统一配色**（用户 2026-09-28 要求 ✓ 原话："遍历项目所有的确定、
+#:   取消按钮，给他们设计按钮颜色并统一，然后把这个列入 UI 规范"）。
+#:   · **确定 = 主按钮**：蓝底白字（`#1a73e8` ✓ 就是本文件第 27 行那条约定里的"运行/主按钮"✓）
+#:     —— 一个对话框里**主操作只有这一种颜色** ✓（跟"绿=通过 / 橙=提醒 / 红=错误"不冲突 ✓）。
+#:   · **取消 = 次按钮**：浅灰底 + 深灰字（`#f0f2f5` / `#5f6368` ✓ 与下面 `TAB_QSS` 的
+#:     未选中页签同色 ✓）⇒ 一眼看出"它不是主操作" ✓。
+#:   · ⚠ **只认这两个名字**（`确定` / `取消` ✓）—— 别的按钮（"应用"/"重置"/"删除"）**不套** ✗：
+#:     那些各有语义色（红=破坏性 ✓），统一到这里会把语义抹掉 ✗。
+OK_BTN_QSS = (
+    "QPushButton { background:#1a73e8; color:#ffffff; font-weight:600;"
+    " border:1px solid #1a73e8; border-radius:4px; padding:5px 16px; }"
+    "QPushButton:hover { background:#1765cc; border-color:#1765cc; }"
+    "QPushButton:pressed { background:#14539f; border-color:#14539f; }"
+    "QPushButton:disabled { background:#c3c7cb; border-color:#c3c7cb; color:#ffffff; }")
+
+CANCEL_BTN_QSS = (
+    "QPushButton { background:#f0f2f5; color:#5f6368;"
+    " border:1px solid #dadce0; border-radius:4px; padding:5px 16px; }"
+    "QPushButton:hover { background:#e4e7eb; color:#202124; }"
+    "QPushButton:pressed { background:#d8dce0; }"
+    "QPushButton:disabled { color:#b0b4b8; border-color:#eceff1; }")
+
+
+def unify_ok_cancel(ok=None, cancel=None):
+    """把一对「**确定 / 取消**」按钮刷成项目统一配色（用户 2026-09-28 ✓）。
+
+    用法（**一行**，放在按钮建好之后 ✓）：
+        theme.unify_ok_cancel(bb.button(QDialogButtonBox.Ok),
+                              bb.button(QDialogButtonBox.Cancel))
+      或  theme.unify_ok_cancel(btn_ok, btn_cancel)
+
+    ⚠ 传 `None` 就跳过那一半 ✓（有的界面只有"关闭"一个按钮 ✓）；
+    ⚠ 只**加 QSS**、不动文字/尺寸/信号 ✓（各处的文案已经是"确定/取消"✓ 别在这儿改 ✗）；
+    ⚠ **规范**：新建任何带"确定/取消"的对话框，**都必须调它一次** ✓
+      （见 `docs/UI规范.md` 的按钮那一条 ✓）。
+    """
+    if ok is not None:
+        try:
+            ok.setStyleSheet(OK_BTN_QSS)
+        except Exception:                             # noqa: BLE001 —— 样式失败不该拖垮界面 ✓
+            pass
+    if cancel is not None:
+        try:
+            cancel.setStyleSheet(CANCEL_BTN_QSS)
+        except Exception:                             # noqa: BLE001
+            pass
+
+
 ENTRY_BTN_QSS = (
     "QPushButton { background:#e8eaf6; border:1px solid #9fa8da;"
     " color:#283593; font-weight:600; padding:4px 10px; }"
@@ -101,10 +149,37 @@ VIS_DEFAULTS = dict(
     chase_jump_color="#00c800",
     vision_color="#5f6368",       # 视野线 深灰
     vision_width=1,               # 视野线宽
+    # ⭐⭐ **各框的线宽**（用户 2026-09-28 要求 ✓ 原话："**给其他的粗细也加配置**，
+    #   并且用**网格对齐**，要求**参数名显示完整**"）。
+    #   ⚠ 默认值 = **现在的写死值**（一个字都不许改观感 ✗）：攻击/盲区/追击框在原代码里
+    #     是 `thickness=2` ✓、锁定框是 `3` ✓ ⇒ 所以默认分别给 2 / 2 / 2 / 2 / 3 ✓。
+    #   ⚠ 抄 `vision_width` 那套：**只在这一组里配、只影响实时预览的画法** ✓（不参与决策 ✓）。
+    lock_width=3,                 # 锁定框线宽（原写死 3）
+    attack_width=2,               # 攻击范围框线宽（原写死 2）
+    min_attack_width=2,           # 攻击盲区框线宽（原写死 2）
+    jump_attack_width=2,          # 跳跃攻击范围框线宽（原写死 2）
+    chase_jump_width=2,           # 追击起跳框线宽（原写死 2）
     # 「当前任务 / 定时任务」那几行的字色（贴在实时画面上，**不铺底色**，只有描边）——
     # 2026-09-26 用户要求"文字颜色在设置里配"。默认取亮黄：它要压在游戏画面上，
     # 暗色读不清（这里没有黑底可衬）。
     timer_color="#ffeb3b",
+    # ⭐⭐ **玩家坐标箭头**（用户 2026-09-28 ✓ 原话："放在**设置 → 界面页签 → 辅助线与标记
+    #   （实时预览）**"）：以**玩家脚底**为原点画两根 —— 一根朝画面右（世界 x 正方向）、
+    #   一根朝上（世界 y 正方向）✓。
+    #   ⚠ 它干的活是**照着调"脚底偏移"**（那个仍在「决策参数 → 玩家位置」✓）：箭头根部
+    #     该正好落在脚底 ✓，偏了就是偏移没调对 ✓。
+    #   ⚠ 颜色/粗细/长度**都归这一组**（规范 §4："画面上**每个可显示的东西**都该能在这一组里
+    #     单独关掉" ✅ ⇒ 因此有 `player_arrow_on` 开关 ✓；长度 0 = 不画 ✓）。
+    player_arrow_color="#00e5ff",
+    player_arrow_width=2,         # 线宽(px)
+    player_arrow_len=60,          # 线段长(px)，0 = 不画
+    # ⭐ **箭头尖大小**（用户 2026-09-28 追加 ✓ 原话："再加个箭头 size 配置"）：
+    #   就是两根箭头**尖端那个三角头**的大小 ✓ —— 单位是**占线段长的百分比**
+    #   （25 = 尖长正好是线长的 1/4 ✓）。⚠ 这不是我另立的名目：它就是
+    #   `cv2.arrowedLine` 的 `tipLength` 参数，而它**只吃比例、不吃像素** ✗
+    #   ⇒ 所以这里直接按百分比存，画的时候 `/100` ✓。
+    #   ⚠ 默认 25 = **原代码里写死的 `tipLength=0.25`** ✓（加参数**不许改观感** ✗）。
+    player_arrow_tip_pct=25,
     # ---- 每项的**显示开关**（用户 2026-09-27："辅助线与标记组里每项参数前加开关"）----
     lock_on=True,                 # 锁定框
     attack_on=True,               # 攻击范围框
@@ -113,17 +188,19 @@ VIS_DEFAULTS = dict(
     chase_jump_on=True,           # 追击起跳框
     vision_on=True,               # 视野线
     timer_on=True,                # 「当前任务 / 定时任务」那几行字
+    player_arrow_on=True,         # 玩家坐标箭头（⭐ 用户 2026-09-28 要求搬进这一组 ✓）
 )
 
 #: 参与「颜色合法性校验」的键：类别框色 + 辅助框/线色（vision_width 是数值，不在内）
 _VIS_COLOR_KEYS = CLASS_COLOR_KEYS + ("lock_color", "attack_color",
                                       "min_attack_color", "jump_attack_color",
                                       "chase_jump_color",
-                                      "vision_color", "timer_color")
+                                      "vision_color", "timer_color",
+                                      "player_arrow_color")
 
 #: 「显示开关」的键（布尔；缺省/写坏一律按 `True` = 画 ✓ —— 老配置里没有它们 ✓）
 _VIS_ON_KEYS = ("lock_on", "attack_on", "min_attack_on", "jump_attack_on",
-                "chase_jump_on", "vision_on", "timer_on")
+                "chase_jump_on", "vision_on", "timer_on", "player_arrow_on")
 
 
 def _load():
@@ -440,6 +517,45 @@ def load_vis():
         out["vision_width"] = max(1, min(10, int(vis.get("vision_width", 1))))
     except (TypeError, ValueError):
         out["vision_width"] = 1
+    # ⭐⭐ **玩家坐标箭头的两个数值**（用户 2026-09-28 报："**玩家坐标线段粗细无法调整至
+    #   1px**" ✗ —— 根因正是**这里漏了它们**：上面那两道白名单只管**颜色 / 开关**，线宽
+    #   只处理了 `vision_width` ⇒ 箭头的粗细 / 长度**永远读不回来**、一直停在默认的 2 / 60
+    #   ✗ ⇒ 表现就是"改了没用、也调不到 1"✓）。
+    #   ⚠ 教训：**往 `vis:` 加数值键时，必须同时在这儿加一道"读回 + 夹范围"** ——
+    #     只加 `VIS_DEFAULTS` 是不够的（那只是"没存过时用谁" ✗ 用户存的值根本进不来 ✗）；
+    #     颜色靠 `_VIS_COLOR_KEYS`、开关靠 `_VIS_ON_KEYS`、**数值就得靠这一段** ✓。
+    #   ⚠ 坏值（缺键 / 不是数 / 超范围）⇒ 回到默认（规范："坏值当没存过" ✓）。
+    # ⭐⭐ **各框线宽**（用户 2026-09-28 ✓"给其他的粗细也加配置"）—— 同一道口径：
+    #   **读回 + 夹 `1~20`**，坏值回默认（规范："坏值当没存过" ✓）。
+    #   ⚠ 教训（上一轮刚踩过）⇒ **往 `vis:` 加数值键，必须同时在这儿加一道** ✗：
+    #     只写 `VIS_DEFAULTS` 是**不够**的（那只是"没存过时用谁"✗ 用户存的值根本进不来 ✗
+    #     ⇒ 表现就是"改了没用 / 调不到 1px"✓）。
+    for _wk, _wd in (("lock_width", 3), ("attack_width", 2),
+                     ("min_attack_width", 2), ("jump_attack_width", 2),
+                     ("chase_jump_width", 2)):
+        try:
+            out[_wk] = max(1, min(20, int(vis.get(_wk, _wd))))
+        except (TypeError, ValueError):
+            out[_wk] = _wd
+    try:
+        out["player_arrow_width"] = max(
+            1, min(20, int(vis.get("player_arrow_width", 2))))
+    except (TypeError, ValueError):
+        out["player_arrow_width"] = 2
+    try:
+        out["player_arrow_len"] = max(
+            0, min(2000, int(vis.get("player_arrow_len", 60))))
+    except (TypeError, ValueError):
+        out["player_arrow_len"] = 60
+    # ⭐ **箭头尖大小**（用户 2026-09-28 ✓"再加个箭头 size 配置"）—— 同一道口径：
+    #   **读回 + 夹 `5~100`（%）**，坏值回默认（规范："坏值当没存过" ✓）。
+    #   ⚠ 又踩一遍那个坑的代价 = "改了没用"✗ ⇒ 加键**必须同时**改这里（只写
+    #     `VIS_DEFAULTS` 只是"没存过时用谁"✗）。
+    try:
+        out["player_arrow_tip_pct"] = max(
+            5, min(100, int(vis.get("player_arrow_tip_pct", 25))))
+    except (TypeError, ValueError):
+        out["player_arrow_tip_pct"] = 25
     return out
 
 

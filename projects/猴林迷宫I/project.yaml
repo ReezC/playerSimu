@@ -19,6 +19,8 @@ mmap_crop: null
 decision:
   attack_dist: 80.0
   min_attack_dist: 0
+  attack_up_dist: -1
+  attack_down_dist: -1
   chase_jump_enabled: true
   chase_jump_min: -10
   chase_jump_max: 5
@@ -71,40 +73,25 @@ decision:
   target_cd:
   - 1500
   - 2500
-  input_device: remote
+  input_device: local
   attack_cd: 300
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 1000
   turn_output_delay_ms: 200
   player_track_jump: 200
-  hp_bar:
-  - 0.341142
-  - 0.971354
-  - 0.120791
-  - 0.022135
-  mp_bar:
-  - 0.462665
-  - 0.970052
-  - 0.122987
-  - 0.02474
+  player_foot_offset_px: 0
+  player_box_min_area_pct: 0.0
+  player_box_area_base_s: 3.0
+  player_box_area_tol_pct: 0.0
+  hp_bar: null
+  mp_bar: null
   probe_calib: {}
-  hp_color:
-  - - 0
-    - 0
-    - 135
-  - - 89
-    - 91
-    - 255
-  mp_color:
-  - - 136
-    - 81
-    - 0
-  - - 255
-    - 201
-    - 102
+  hp_color: null
+  mp_color: null
   hp_threshold: 30
   mp_threshold: 7
   pot_cd: 1500
+  mob_sets_ttl_s: 3.0
   auto_hp_pot: true
   auto_mp_pot: false
   strategy: patrol
@@ -125,8 +112,12 @@ decision:
   climb_retry_delay_s: 1.0
   climb_retry_delay_inc_s: 1.0
   goto_timeout_s: 30.0
-  stall_s: 3.0
-  climb_reassert_s: 3.0
+  chase_goto_max_s: 0.0
+  goto_timeout_key: null
+  disable_chase_pathfinding: false
+  jump_start_px: 0
+  move_retry_ms: 3000
+  battle_zones: []
   battle_zone_sets: []
   debounce_conf: 0.6
   debounce_ms: 2000
@@ -207,6 +198,11 @@ decision:
   anti_afk_spot_set: ''
   anti_afk_spot_seq: []
   anti_afk_spot_after: ''
+  anti_afk_spot_loop: false
+  anti_afk_spot_loop_items: []
+  anti_afk_spot_loop_min: 30.0
+  anti_afk_spot_loop_max: 60.0
+  anti_afk_spot_loop_hold: false
   anti_afk_retry_on_interrupt: false
   anti_afk_retry_sec: 60.0
   reconnect_enabled: false

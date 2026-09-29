@@ -181,6 +181,8 @@ class CalibManualDialog(QDialog):
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.button(QDialogButtonBox.Ok).setText("确定")
         btns.button(QDialogButtonBox.Cancel).setText("取消")
+        theme.unify_ok_cancel(btns.button(QDialogButtonBox.Ok),
+                              btns.button(QDialogButtonBox.Cancel))
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         root.addWidget(btns)
