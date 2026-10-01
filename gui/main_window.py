@@ -227,6 +227,9 @@ class PlayerMatchPage(QWidget):
     """角色匹配验证结果页：画面 + 说明文字。
 
     匹配验证的结果直接显示在主视区，不在角色模板页里再开一个画面窗口。
+
+    ⚠ **有意不放滚动区**（§4「有意为之」标注）：内容就三样（标题 / 一段说明 / 画面），
+    画面必须常驻占满 ⇒ 整页滚动没有收益 ✗（真要放长文字时再给「说明」那截单独接滚动 ✓）。
     """
 
     def __init__(self):
@@ -472,7 +475,7 @@ class MainWindow(QMainWindow):
         return host
 
     def _build_right_tabs(self):
-        """右侧：模型训练流程 + 决策参数 + 路线识别，三个页签。"""
+        """右侧：模型训练流程 + 决策参数 + 路线识别 + 挂机保护，四个页签。"""
         tabs = QTabWidget()
         tabs.addTab(self._build_cards(), "模型训练")
         self.player_panel = PlayerPanel()
@@ -493,6 +496,12 @@ class MainWindow(QMainWindow):
         # 才会看到叠图 —— 而它明明是开着的（"勾了没反应"就长这样）。
         self.route_panel._refresh_overlay()
         tabs.addTab(self.route_panel, "路线识别")
+        # ⭐ 「挂机保护」页（2026-09-29，用户要求：在路线识别右边 ✓）：
+        #    「防挂机」新组（触发音效 + 试听 ✓）+ 从「决策参数」**整体搬来**的「防掉线」组 ✓。
+        #    ⚠ 防掉线的控件/槽函数仍归 PlayerPanel 所有（信号早连好 ✓）——
+        #      build_protection_page 只是把那个组 **re-parent** 到本页 ✓（搬视觉不搬逻辑 ✓）。
+        self.protection_panel = self.player_panel.build_protection_page()
+        tabs.addTab(self.protection_panel, "挂机保护")
         # 最小宽度兜底：主视区尺寸波动时不把配置区挤没
         tabs.setMinimumWidth(460)
         # 忽略 sizeHint：卡片状态文字更新会改变 sizeHint，传导到 QSplitter
@@ -654,11 +663,8 @@ class MainWindow(QMainWindow):
         # （玩家面板不持有地图 id）。以前写好了 `set_zone_sets()` 却**没人调** ⇒
         # 那两个下拉一直只有「（未选）」✗（2026-09-26 补）。
         self.player_panel.set_zone_sets(self.route_panel.zone_sets())
-        # 「编辑战斗区域」子弹窗里那块**只读集合视图**（用户 2026-09-28 要求 ✓）：地形同样按
-        # **地图 id** 存 ⇒ 和上面一样，把**工厂**从路线识别面板推过去 ✓（玩家面板不持有地图 id ✓；
-        # 拿不到就回 `None` ⇒ 弹窗**退回文本框** ✓，老用法不坏 ✓）。
-        self.player_panel.set_foothold_picker_factory(
-            getattr(self.route_panel, "make_foothold_picker", None))
+        # ⛔ 「编辑战斗区域」2026-10-01 整个搬到「路线识别 → 寻路配置 → 路线规划」✓ ——
+        #   只读 foothold 视图的工厂不再跨面板推（那边自己就有 `make_foothold_picker` ✓）。
         # 「前往平台」（选择平台 / 命令前往 / 结束当前寻路）**显示在决策参数页**：
         # 控件还是 RoutePanel 造的那一份（逻辑要在那边 ✓），这里只负责搬位置 ✓。
         self.player_panel.mount_goto(getattr(self.route_panel, "goto_box", None))
@@ -731,6 +737,8 @@ class MainWindow(QMainWindow):
         # 「设置 → 界面」里改了叠图开关 / 浓淡 ⇒ 立刻让路线识别面板重画那一层
         # （那一层是它画的，见 route_panel.apply_overlay_settings ✓）
         dlg.overlay_changed.connect(self.route_panel.apply_overlay_settings)
+        # 「质检台蒙版透明度」改了 ⇒ 立刻推给质检台画布（不重取帧 ✓）
+        dlg.mask_changed.connect(self.review.canvas.set_mask_alpha)
         self._settings_dlg = dlg
         dlg.show()
         dlg.raise_()
@@ -1098,6 +1106,9 @@ class MainWindow(QMainWindow):
         # 降级为窗口内快捷键，保证本窗口聚焦时仍能用同一键开关自动。
         if self._auto_shortcut is None:
             self._auto_shortcut = QShortcut(QKeySequence(key_name), self)
+            # ⚠ 显式写出来（§10）：这里**故意**用 WindowShortcut（默认值）—— 降级语义就是
+            #   "本窗口聚焦时"仍能用同一键开关自动；不写出来后人会以为是漏了 ✗
+            self._auto_shortcut.setContext(Qt.WindowShortcut)
             self._auto_shortcut.activated.connect(self.player_panel.toggle_auto)
         else:
             self._auto_shortcut.setKey(QKeySequence(key_name))

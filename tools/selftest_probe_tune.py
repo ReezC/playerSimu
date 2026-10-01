@@ -246,7 +246,7 @@ def t_initial_geo_matches_workbench():
     check(src in ("项目标定", "全局标定", "配置值"), "来源标注不认识：%r" % src)
     check(geo["cell"] > 0 and geo["gap"] >= 0, "几何不合法：%s" % geo)
     if src == "配置值":                      # 没标定过时应当等于 link.yaml 的值
-        from tools.config import get
+        from core.config import get
         check(abs(geo["x"] - float(get("probe", "x", 100))) < 1e-6,
               "回退到配置值时 x 没对上 link.yaml")
 

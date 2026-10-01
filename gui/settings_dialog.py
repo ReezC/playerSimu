@@ -35,7 +35,7 @@ from perception import minimap as mm
 # （详见 docs/UI规范.md：滚轮不许改参数）
 from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSlider,
                          NoWheelSpinBox, scroll_page)
-from tools.config import load_live, update_live
+from core.config import load_live, update_live
 
 #: 页签名（顺序 = 显示顺序）。测试和文档都按这份来。
 TAB_NAMES = ("界面", "保护与恢复", "判定参数", "诊断")
@@ -50,6 +50,9 @@ class SettingsDialog(QDialog):
     #: （那一层是它画的，见 `route_panel.apply_overlay_settings` ✓）。主窗口接线 ✓。
     #: （「框选小地图」2026-09-27 搬回那一页了 ⇒ 重框不再走这个信号 ✓。）
     overlay_changed = pyqtSignal()
+    #: 「质检台蒙版透明度」改了 ⇒ 通知**质检台画布**即时改蒙版浓淡
+    #: （不重取帧 ✓ —— 主窗口接线到 `review.canvas.set_mask_alpha` ✓）。
+    mask_changed = pyqtSignal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -312,6 +315,40 @@ class SettingsDialog(QDialog):
             if ws is not None:
                 form.addWidget(ws, r, 2)
 
+        # ---- ③⭐ 质检台 · 蒙版透明度（2026-09-29 用户要求 ✓）----
+        # 看帧时在画面上罩一层灰、**框画在蒙版上面**（框不受影响 ✓）—— 观察"框和
+        # 目标对不对"更省眼 ✓。存 `config/ui.yaml`（**这台机器的界面偏好** ✓）；
+        # 改了**即时生效**（信号 → 主窗口 → 质检台画布，不重取帧 ✓）。
+        grp = QGroupBox("质检台 · 蒙版透明度")
+        lay = QVBoxLayout(grp)
+        lay.setSpacing(6)
+        page_lay.addWidget(grp)
+        mrow = QHBoxLayout()
+        mrow.setSpacing(8)
+        mrow.addWidget(QLabel("蒙版"))
+        self.sld_mask = NoWheelSlider(Qt.Horizontal)
+        self.sld_mask.setRange(0, 100)
+        self.sld_mask.setValue(int(round(theme.review_mask_alpha() * 100)))
+        self.sld_mask.setToolTip(
+            "质检台看帧时，画面上罩一层灰蒙版的**浓淡**（% = 不透明度 ✓）。\n\n"
+            "· **0 = 不罩**（原始画面 ✓）；\n"
+            "· 越大画面越暗 —— **标注框不受影响**（框画在蒙版上面 ✓），\n"
+            "  观察\"框和目标对不对\"更省眼 ✓。\n\n"
+            "拖动**即时生效**（正在看的帧也跟着变 ✓），按确定后**跟着客户端存** ✓。")
+        self._mask_live = QLabel()
+        self._mask_live.setStyleSheet("color: #5f6368;")
+        self._mask_live.setMinimumWidth(40)
+        mrow.addWidget(self.sld_mask, 1)
+        mrow.addWidget(self._mask_live)
+        lay.addLayout(mrow)
+
+        def _on_mask(v):
+            self._mask_live.setText("%d%%" % v)
+            a = theme.set_review_mask_alpha(v / 100.0)
+            self.mask_changed.emit(a)
+        self.sld_mask.valueChanged.connect(_on_mask)
+        _on_mask(self.sld_mask.value())     # 打开时先对齐一次（label + 现帧 ✓）
+
         grp = QGroupBox("检测框颜色")
         lay = QVBoxLayout(grp)
         lay.setSpacing(6)
@@ -500,8 +537,12 @@ class SettingsDialog(QDialog):
             "确认是断线就停止自动并按步骤走回游戏，回到游戏后恢复自动。\n"
             "鼠标点服务器 / 点频道还没接（要先做鼠标标定），走到那一步会停下并提示。\n"
             "做判断用模板锚点，不读文字、不训模型。")
-        self.ck_reconnect = QCheckBox("检测到断线后自动重连")
+        self.ck_reconnect = QCheckBox("检测到断线后自动走回游戏")
         self.ck_reconnect.setChecked(bool(settings.reconnect_enabled))
+        self.ck_reconnect.setToolTip(
+            "⚠ **判到断线界面就停止自动** —— 这一半永远生效（2026-09-30 ✓），\n"
+            "不受本开关影响 ✓；本开关管的是要不要**自动按回车走回游戏** ✓。\n"
+            "回到游戏后按「恢复自动」的设置决定要不要接着打 ✓。")
         lay.addWidget(self.ck_reconnect)
 
         # 重连的**子参数**（2026-09-26 补：审计发现这 5 个"只能在配置文件里改" ✗ ——

@@ -64,7 +64,7 @@ class TwoPointCalibDialog(QDialog):
         #   两扇窗写/读的是同一份文件的同一条来源（`sources.<来源>`），兜底规则不一致就会
         #   出现"我在普通标定里存的，双点标定里看不见"（用户 2026-09-27 说的"应该引用的
         #   是一套数据"）。调用方（路线识别）本来就会显式传 src ✓，这里只是把兜底对齐 ✓。
-        from tools.config import load_live
+        from core.config import load_live
         self.src = src or (load_live().get("mmap_src") or mm.SRC_STREAM)
         #: 「保存标定」成功过 → 调用方拿它决定要不要立刻刷新状态行（同 `MinimapCalibDialog`）
         self.saved = False
@@ -82,7 +82,7 @@ class TwoPointCalibDialog(QDialog):
         #: 地形/底图：换"世界坐标 ↔ 底图像素"要用它（拿不到就老实说，别给个"填了没用"的入口）
         self._terrain = mapdata.load(self.map_id, with_canvas=True)
         self._dot = None                    # 最近一次认到的黄点结论（报脚底用）
-        from tools.config import get
+        from core.config import get
         self.host = host or get("a_host")
         self.port = int(port or get("minimap", "port", 5003))
         #: client 传进来就**不接管它的生命周期**（实时那路可能已经有一条在跑）；

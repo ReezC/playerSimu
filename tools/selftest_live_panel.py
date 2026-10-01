@@ -1031,6 +1031,61 @@ def t_capture_est_frames():
           "`stride`/`limit` 改了没重算 ⇒ 标签会停在旧数字上 ✗")
 
 
+def t_key_caps_overlay():
+    """左下「按键帽」：按住的**半透明绿填充**、没按的极淡灰；文案随键位映射自适应。
+
+    2026-09-30 用户要求 ✓（"以'半透明背景色填充'的形式在画面左下蓝框位置显示
+    Agent 当前正在按住的键，从左到右分别是：4个方向键、跳、输出"）。
+    """
+    from gui.live_thread import (_KEYCAP_SLOTS, draw_key_caps,
+                                 keycap_positions)
+
+    class _KS:
+        def __init__(self, keys):
+            self._k = set(keys)
+
+        def pressed(self):
+            return set(self._k)
+
+    class _S:
+        keymap = {"left": "left", "up": "up", "down": "down", "right": "right",
+                  "jump": "alt", "attack": "ctrl"}
+
+    class _A:
+        settings = _S()
+        keys = _KS({"left", "alt"})           # ← 按住 + 跳(Alt) 按住
+
+    vis = np.zeros((240, 320, 3), np.uint8)
+    draw_key_caps(vis, _A())                  # 不炸 ✓
+    # 布局用**实现同款算式**（`keycap_positions` ✓ 别各算各的 ✗ —— 倒 T 布局 ✓）
+    pos, side = keycap_positions(240, 320)
+    for slot in _KEYCAP_SLOTS:
+        px, py = pos[slot]
+        # 采样**帽内左上角**：居中那行是文字笔画（LINE_AA 的灰/绿都占 ✗ 采样会被骗）
+        b, g, r = vis[py + 4, px + 4]
+        on = slot in ("left", "jump")
+        if on:
+            check(g > b and g > r and g > 60,
+                  "按住的键帽（%s）该是半透明绿填充 ✗：BGR=(%d,%d,%d)"
+                  % (slot, b, g, r))
+        else:
+            check(abs(g - b) < 30 and abs(g - r) < 30 and g < 40,
+                  "没按的键帽（%s）该是极淡灰、不该带绿色 ✗：BGR=(%d,%d,%d)"
+                  % (slot, b, g, r))
+    # 替身/缺失 ⇒ 静默跳过（不炸、画面不动 ✓）
+    vis2 = np.zeros((240, 320, 3), np.uint8)
+    draw_key_caps(vis2, object())
+    check(not vis2.any(), "拿不到 settings/keys 时该什么都不画 ✗")
+    class _S2:
+        keymap = {"left": "a", "up": "w", "down": "s", "right": "d",
+                  "jump": "space", "attack": "j"}
+    class _A2:
+        settings = _S2()
+        keys = _KS(set())
+    vis3 = np.zeros((240, 320, 3), np.uint8)
+    draw_key_caps(vis3, _A2())                # 改键位 ⇒ 不炸（文案自适应走 ASCII/原名 ✓）
+
+
 TESTS = (
     ("⭐⭐ 采集：选中文件后显示预估张数（公式与 extract_frames 一份 + MKV 容器时长兜底）",
      t_capture_est_frames),
@@ -1057,6 +1112,8 @@ TESTS = (
     ("「卡在谁身上」：输入受限 / 本机受限 / 说不清（纯函数）", t_limit_reason_rules),
     ("显示链路：带 padding 的帧画得对，且不再白拷一整幅", t_pixmap_handles_padded_frame),
     ("静态检查：会当场炸的名字错误（pyflakes）", t_static_check_no_crash_classes),
+    ("左下按键帽：按住=半透明绿填充、文案随键位映射自适应（2026-09-30 用户要求）",
+     t_key_caps_overlay),
     ("怪框那行地点：「查过的怪框」写在框下方靠左；锁定框不再写地点（绘制层不许自己扫 foothold）",
      t_mob_box_labels),
 )

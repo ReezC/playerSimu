@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 
 from link import PyAVSource
-from tools.config import ROOT, get
+from core.config import ROOT, get
 from tools.probe_codec import resolve_delay_ms
 
 

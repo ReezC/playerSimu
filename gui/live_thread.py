@@ -25,7 +25,9 @@ import time
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from core import behavior                  # 「查怪结果」打点（`mob_fh` ✓ 见 `_make_mob_sets_resolver`）
-from tools.config import get, load_live
+from perception import screen_state        # 界面状态（测谎弹窗）检测 —— M1「测谎报警」✓
+from perception import ui_state            # 掉线/登录系界面判别（重连素材锚点 ✓）
+from core.config import get, load_live
 
 # 探针解码：**必须模块级**。原来它是在 `_run()` 里局部 import 的，那会让
 # `probe_codec` 变成 `_run` 的**局部名** —— 函数里任何在那一行之前读它的地方都会
@@ -232,6 +234,90 @@ def _blit_alpha(img, color, fn):
     cv2.addWeighted(ov, a / 255.0, img, 1.0 - a / 255.0, 0.0, img)
 
 
+#: 键帽指示的槽位顺序（2026-09-30 用户要求 ✓："从左到右分别是：4个方向键、跳、输出"）。
+_KEYCAP_SLOTS = ("left", "up", "down", "right", "jump", "attack")
+#: 箭头键的 **ASCII** 兜底（cv2.putText 的 HERSHEY 字体画不了 "←"/"空格" ✗ —— 键位
+#: 没改过时 `display_name` 给的正是箭头字符 ⇒ 用这个 ✓；改过键位（字母/F 键 ✓）
+#: 就显示配置键的友好名 ✓）。
+_KEYCAP_ARROW = {"left": "<", "up": "^", "down": "v", "right": ">"}
+
+
+def keycap_positions(h, w):
+    """键帽布局：左下角、方向键**键盘式倒 T**（↑ 在上、←↓→ 在下 ✓ 用户 2026-09-30
+    报"布局不对"✗ 一字排开不像键盘 ✓），跳/输出在整块**右侧**一行 ✓。
+    → `({slot: (x, y)} 左上角, side)`（测试用**同一套算式** ✓ 别各算各的 ✗）。"""
+    side = max(22, min(40, h // 14))            # 750p ≈ 36px；小窗不至于挤成一团 ✓
+    gap = max(4, side // 5)
+    margin = max(8, side // 3)
+    x0, yb = margin, h - margin - side          # **左下角**（用户截图蓝框位置 ✓）
+    yt = yb - (side + gap)                      # ↑ 那一行 ✓
+    pos = {
+        "left": (x0, yb),
+        "down": (x0 + side + gap, yb),
+        "right": (x0 + 2 * (side + gap), yb),
+        "up": (x0 + side + gap, yt),            # ↑ 居中在 ↓ 正上方 ✓
+        "jump": (x0 + 3 * (side + gap), yb),
+        "attack": (x0 + 4 * (side + gap), yb),
+    }
+    return pos, side
+
+
+def draw_key_caps(dst, agent):
+    """画面**左下角**画一排「按键帽」：Agent 当前按住的键**半透明填充**（2026-09-30
+    用户要求 ✓ 原话："以'半透明背景色填充'的形式在画面左下蓝框位置显示 Agent 当前
+    正在按住的键，从左到右分别是：4个方向键、跳、输出（根据按键映射配置自适应）"）。
+
+    · 布局**常驻**：方向键排**键盘式倒 T**（↑ 在上、←↓→ 在下 ✓ —— 2026-09-30
+      用户报"方向键布局不对，注意看图"✗ 一字排开不像键盘 ✓），跳/输出在整块
+      **右侧**一行 ✓；位置不跳、好盯 ✓；
+    · **按住**才亮：半透明绿填充 + 高亮描边 ✓（没按 = 极淡灰、几乎不干扰画面 ✓）；
+    · 文案 = `display_name(keymap[槽位])` ✓ **按键映射自适应** ✓ —— ⚠ HERSHEY 字体
+      画不了非 ASCII（"←"/"空格" ✗）⇒ 箭头键用 ASCII 兜底、其余退回原始键名 ✓；
+    · 画在**显示帧**上（收流线程 ✓ 不碰决策链 ✓，同 `_blit_alpha` 那条的口径 ✓）；
+      `agent.keys.pressed()` 是**按键名快照**（set 拷贝 ✓ 跨线程读安全 ✓）；
+    · 拿不到 settings / keys（自检替身 ✓）⇒ 什么都不画 ✓。
+    """
+    import cv2
+    from decision.input import display_name
+    km = getattr(getattr(agent, "settings", None), "keymap", None)
+    ks = getattr(agent, "keys", None)
+    if not km or ks is None or not hasattr(ks, "pressed"):
+        return                                  # 替身/老环境 ✓ 静默跳过 ✓
+    try:
+        pressed = ks.pressed()                  # 只读快照 ✓（一次拷贝 ✓）
+    except Exception:                           # noqa: BLE001
+        return
+    h, w = dst.shape[:2]
+    pos, side = keycap_positions(h, w)
+    # ⭐ **tap/瞬发只有 ~30ms**（`_attack_duration` ✗）显示帧 33ms+ 大概率错过 ⇒
+    #   "最近 0.25s 内发过键"也点亮（视觉上是一次可见的闪烁 ✓ 时钟同源 monotonic ✓）。
+    import time as _time
+    now = _time.monotonic()
+    last = getattr(agent, "_seq_key_at", None) or {}
+    for slot in _KEYCAP_SLOTS:
+        key = km.get(slot)
+        px, py = pos[slot]
+        on = bool(key) and (
+            key in pressed or now - float(last.get(key, 0) or 0) < 0.25)
+        # 帽底：**按住 = 半透明绿** ✓；没按 = 极淡灰（`_blit_alpha` 自己混 ✓）。
+        _blit_alpha(dst, (80, 220, 80, 110) if on else (70, 70, 70, 36),
+                    lambda im, c, _a=px, _b=py, _c=px + side, _d=py + side:
+                    cv2.rectangle(im, (_a, _b), (_c, _d), c, -1))
+        cv2.rectangle(dst, (px, py), (px + side, py + side),
+                      (120, 230, 120) if on else (150, 150, 150), 1)
+        if key:
+            _lbl = display_name(str(key))
+            if not all(ord(ch) < 128 for ch in _lbl):
+                _lbl = _KEYCAP_ARROW.get(slot, str(key))
+            (tw, th), _bl = cv2.getTextSize(_lbl, cv2.FONT_HERSHEY_SIMPLEX,
+                                            0.42, 1)
+            cv2.putText(dst, _lbl,
+                        (px + (side - tw) // 2, py + (side + th) // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                        (60, 255, 60) if on else (210, 210, 210), 1,
+                        cv2.LINE_AA)
+
+
 def _draw_dashed_line(img, y, color, dash_len=10, gap=6, thickness=1, x0=0, x1=None):
     """画一条水平虚线（y 固定）。x0~x1 指定范围，x1=None 表示到右边缘。"""
     h, w = img.shape[:2]
@@ -424,6 +510,10 @@ class LiveThread(QThread):
         #: ⚠ 写它的**唯一入口**是 `_mark_mob_query`（由 `mob_sets_of` 那个解析器调用 ✓ ——
         #: 它是所有"问怪在哪块平台"的**唯一漏斗** ✓）；读它的是画框那一段 ✓（顺手剪过期的 ✓）。
         self._mob_queries = {}
+        # ---- 界面状态（测谎弹窗，M1「测谎报警」✓）：检测限流 1s；状态**切换**时
+        #      打点（lie_state）/ 报警音 / 存原生帧（攒真实样本 ✓）三件事一起做 ✓。
+        self._screen_state = "combat"
+        self._screen_last = 0.0
 
     def set_mmap(self, map_id=None, src=None, crop=None, track=None):
         """更新小地图定位要的东西（**运行中也改得动**：切项目/换来源/重框/改容差）。
@@ -1045,15 +1135,19 @@ class LiveThread(QThread):
 
         return resolve
 
-    def _make_foothold_x_resolver(self):
-        """给 agent 装的「**这条 foothold 的世界中心 x**」解析器（用户 2026-09-28 要求）。
+    def _make_foothold_span_resolver(self):
+        """给 agent 装的「**这条 foothold 的世界 [x1, x2]**」解析器（用户 2026-09-28 要求）。
 
         用途：「**idle 回归**」—— 区域项里的 `idle_foothold`（一条 foothold 的 **id** ✓）
         要说清"往哪边走、走到哪算到" ✓，而 agent **不持有地形** ✓ ⇒ 和 `mob_sets_of` /
         `route_plan` 一样由这里给（同一份 `_route_ctx` 2 秒缓存 ✓）。
 
-        回值：`float`（世界 x 中心 ✓）/ `None`（没这个 id / 它是墙 / 读不到地形 ✓）。
-        ⚠ **只给横向**：调用方（`agent._idle_walk_beat`）拿它算 `dx` 再按 ←/→ ✓ ——
+        ⭐ 2026-09-29 晚口径（用户："到了idle回归foothold范围内就应该停下来，
+        而不是一直找中心"✓）：回值从**中心 x**（`_make_foothold_x_resolver` ✗）
+        改成 **(x1, x2) 范围** ✓ —— 调用方（`agent._idle_walk_beat`）**进了范围就停** ✓。
+
+        回值：`(x1, x2)` 元组（世界 x ✓）/ `None`（没这个 id / 它是墙 / 读不到地形 ✓）。
+        ⚠ **只给横向**：调用方拿它判"在不在范围内 / 朝哪边走"再按 ←/→ ✓ ——
           「**不跨层**」是那边的口径 ✓，这里不给 y ✗（要跨层是 `fight_dst` 那种"前往"的事 ✓）。
         """
         def resolve(fid):
@@ -1070,7 +1164,7 @@ class LiveThread(QThread):
                         continue
                     if getattr(f, "is_wall", False):
                         return None              # 墙站不上去 ⇒ 当作没有 ✓
-                    return (float(f.x1) + float(f.x2)) / 2.0
+                    return (float(f.x1), float(f.x2))
             except Exception:                    # noqa: BLE001
                 return None
             return None
@@ -1278,6 +1372,31 @@ class LiveThread(QThread):
 
     # ---------------- 主循环 ----------------
 
+    def _screen_beat(self, raw):
+        """界面状态检测拍（限流由调用方管 ✓）：模板匹配 → **状态切换**时三件事 ✓。
+
+        两级判定：① 测谎弹窗模板（screen_state ✓）；② 没命中再问 **ui_state**
+        （掉线/登录系：login_err 断线提示框 / login / channel_* / queue / char_select，
+        整段重连素材裁的锚点 ✓ —— 用户 2026-09-29："把断线的判断也做一下"✓）。
+        ① `behavior.event("screen_state")`（st / prev ✓ —— 事后核对"它看到的画面"
+           和"它判的状态"全靠这条 ✓）；② ③ 存一帧**原生帧**（攒真实样本 = 模板自愈的
+           原料 ✓）。⚠ **报警音不在这里响**（2026-09-29 起）：`QMediaPlayer` 必须在
+           **GUI 线程** ⇒ 搬到 live_panel（combat → 非 combat 的过渡播一次 ✓，
+           音效文件可在「挂机保护」页配 ✓）。
+        """
+        st, det = screen_state.check_frame(raw)
+        if st == "combat":
+            _ui = ui_state.detect(raw)
+            if _ui:
+                st = _ui
+                det = {"name": _ui}
+        if st == self._screen_state:
+            return
+        behavior.event("screen_state", st=st, prev=self._screen_state,
+                       score=round(float(det.get("score") or 0.0), 3))
+        screen_state.capture_frame(raw, st)
+        self._screen_state = st
+
     def run(self):
         # 这条线程就是关键回路（收流 → 推理 → 决策），单独把**线程**优先级提一档：
         # Windows 会给「前台进程的线程」额外的调度优待，失焦时被压下去的往往正是
@@ -1361,7 +1480,7 @@ class LiveThread(QThread):
         # ⭐ 再装一个「**这条 foothold 的世界中心 x**」的解析器（用户 2026-09-28：「idle 回归」
         #    要"位于本集合时**水平走**向 `idle_foothold` 的中心" ✓）—— agent 同样不持有地形 ✓
         #    （同一份 `_route_ctx` 缓存 ✓）。没装 ⇒ agent 那边什么都不做（照旧站住 ✓）。
-        agent.foothold_x = self._make_foothold_x_resolver()
+        agent.foothold_span = self._make_foothold_span_resolver()
         # ⭐ 再装一个「**朝『玩家 → 怪』方向、最近的那个集合**」的解析器（用户 2026-09-28 定稿 ✓）
         #    —— 给追击的**降级路径**用（怪那层判不出 / 走不到 / 判成"同一集合"但攻击框与怪框
         #    不相交时，改成"朝方向逐层逼近"✓，绕开"层判定"这个最不稳的环节 ✓）。
@@ -1605,6 +1724,8 @@ class LiveThread(QThread):
         infer_ms = []
         gaps = []
         last_mono = None
+        # ⭐ 首次拿到"可信相机"的时刻（冷启动指标，参考 Maple_xfeat 的 `first_valid_seconds`）
+        _first_cam_t = [None]
         # 上一次统计窗口的 [收帧数, 处理数, 丢弃数]，用来算**窗口内**的速率
         # （累计平均会把「刚刚开始恶化」抹平）
         _prev = [0, 0, 0]
@@ -1688,7 +1809,7 @@ class LiveThread(QThread):
             if now - _clock[0] >= 5.0:
                 _clock[0] = now
                 try:
-                    from tools.config import ROOT
+                    from core.config import ROOT
                     _clock[1] = float((ROOT / "config" / "clock_offset.txt")
                                       .read_text(encoding="utf-8").strip())
                 except Exception:
@@ -1777,6 +1898,13 @@ class LiveThread(QThread):
                 # _mmap_panel_from_frame 的说明。来源=收流时这里是 None（那一帧
                 # 来自 A 机单独那一路，和主画面无关）。
                 _mmap_panel = self._mmap_panel_from_frame(vis)
+
+                # ---- 界面状态检测（测谎弹窗，M1「测谎报警」✓）：**原生帧**（画框之前 ✓）、
+                #      限流 1s —— 弹窗报警不需要帧级延迟，1s 足够 ✓（匹配本身 ~0.1s，
+                #      见 screen_state 的性能账 ✓）。状态切换时打点/报警/存帧三件事 ✓。
+                if time.monotonic() - self._screen_last >= 1.0:
+                    self._screen_last = time.monotonic()
+                    self._screen_beat(raw)
 
                 # 定期重读可视化配置：标记颜色/线宽改了实时生效
                 if time.perf_counter() - _vis_refresh_last >= 1.0:
@@ -2015,7 +2143,10 @@ class LiveThread(QThread):
                                 perf.count("player_area_below_base")
                     #      ⚠ 拦住时 `_loc = None` ⇒ 下面 `apply_to_player` 不跑 ⇒ **世界坐标沿
                     #        用上一拍** = 这一拍"**不定位**"✓（而不是"定到错的地方"✗）。
+                    _t_loc = time.perf_counter()
                     _loc = None if _gate_closed else self._locate_mmap(_mmap_panel)
+                    # ⭐ **定位阶段耗时**（参考 Maple_xfeat 的 `stage_ms`：分阶段量才有意义）
+                    perf.ms("locate_ms", _t_loc)
                     if _loc is not None:
                         perf.count("mmap_ok" if _loc.get("ok") else "mmap_miss")
                     _world_now = None
@@ -2026,13 +2157,43 @@ class LiveThread(QThread):
 
                     player_tracker.max_jump = max(
                         1.0, float(decision_settings.player_track_jump))
+                    # ⭐ **把"此刻按着哪个方向"喂给追踪器**（用户 2026-10-01 ✓
+                    #   「输入感知的运动预测」）：角色是被按键驱动的 ⇒ 漏检那几帧照着
+                    #   **意图**推演（按着右就在加速、松手就在地面摩擦下减速），比"拿上一帧
+                    #   位移线性外推"准得多 —— 玩家中途变向 / 停住时，老口径会朝错的方向
+                    #   一路跑 ⇒ 挑候选挑错、补出来的框也错 ✗（两处共用同一个预测位置）。
+                    #   模型与它的边界（"意图 ≠ 事实"）都写在 `PlayerTracker.set_input` ✓。
+                    # ⚠ 取的是**按键名快照**：`keys.pressed()` 返回 set 拷贝、跨线程读安全 ✓
+                    #   （画按键帽那处也是这么取的 ✓）。拿不到（替身 / 老环境）⇒ 不喂
+                    #   ⇒ 追踪器 `_input_aware` 保持假 ⇒ **老口径一字不变** ✓。
+                    # ⚠ 键名是**映射后的名字**（`keymap` 里就是 left/right/up/down ✓）。
+                    try:
+                        _pk = agent.keys.pressed()
+                    except Exception:                       # noqa: BLE001
+                        _pk = ()
+                    player_tracker.set_input(
+                        1 if "right" in _pk else (-1 if "left" in _pk else 0),
+                        1 if "up" in _pk else (-1 if "down" in _pk else 0))
+                    _t_trk = time.perf_counter()
                     player_box = player_tracker.update(player_cands, world=_world_now)
+                    # ⭐ **追踪+相机对账阶段耗时**（同上：`pipe_ms` 减掉 `infer_ms`/`agent_ms`
+                    #   和这一段，剩下的才是"候选整理 + 状态机填充"那种零碎）
+                    perf.ms("track_ms", _t_trk)
                     # ⭐ **可信相机**（用户 2026-09-29 任务 2 ✓）：追踪器拿黄点的**权威世界
                     #   坐标**核对过玩家框，只把"对得上"那几拍采纳成相机 ✓ ⇒ 下游所有
                     #   "画面 → 世界"都用它（`screen_to_world` / 怪的集合解析器 ✓），
                     #   玩家框抖 Δ 时不再把 Δ 原样灌进每只怪的世界坐标 ✓。
                     #   ⚠ `None` = 还没建立 ⇒ 下游退回老口径现算，行为一字不变 ✓（不许当 0 ✗）。
                     _cam_now = player_tracker.camera()
+                    # ⭐ **质量指标**（参考 Maple_xfeat 的 `valid_camera_fraction`）：耗时低
+                    #   ≠ 质量好。每帧记 1.0/0.0 ⇒ `perf.log` 的分位数天然就是"有效比例" ✓。
+                    #   · `cam_valid`    = 这一拍有没有可信相机（p50 = 有效比例）
+                    #   · `cam_rejected` = 这一拍"框与黄点对不上"（p50 = 拒绝比例）
+                    perf.sample("cam_valid", 1.0 if _cam_now is not None else 0.0)
+                    perf.sample("cam_rejected", 1.0 if player_tracker.cam_rejected else 0.0)
+                    if _cam_now is not None and _first_cam_t[0] is None:
+                        _first_cam_t[0] = time.perf_counter()
+                        perf.note("first_cam_s", round(_first_cam_t[0] - t_start, 2))
                     if player_tracker.cam_rejected:
                         # 这一拍"框与黄点对不上" ⇒ 相机冻着用旧的（**打点**，排查要用：
                         # 一直涨说明玩家框锁错了 / 标定偏了 / 黄点在骗人 ✓）
@@ -2081,6 +2242,7 @@ class LiveThread(QThread):
                     ws = WorldState(frame_id=f.frame_id, ts=f.t_recv_mono,
                                     width=vis.shape[1], height=vis.shape[0])
                     ws.e2e_ms = float(_e2e_ref[0])   # 上绳对齐的保持窗口要用（见下）
+                    ws.screen = self._screen_state   # 界面状态（测谎弹窗，M1 ✓）⇒ tick 接管 ✓
                     if player_box is not None:
                         ws.player.x, ws.player.y = player_box[0], player_box[1]
                         ws.player.bottom = player_box[2]
@@ -2163,6 +2325,7 @@ class LiveThread(QThread):
                     # 纯画面：不推理、不画框、不做决策。ws 给个空壳供统计用。
                     ws = WorldState(frame_id=f.frame_id, ts=f.t_recv_mono,
                                     width=vis.shape[1], height=vis.shape[0])
+                    ws.screen = self._screen_state   # 界面状态（不开推理也要报警 ✓）
                     n_boxes = 0
                     action = None
 
@@ -2175,16 +2338,8 @@ class LiveThread(QThread):
 
                 _t_draw = time.perf_counter()
                 if should_show and draw and self._infer.is_set():
-                    st = action.get("state", "?")
-                    label = "决策:%s" % st
-                    t_id = action.get("target")
-                    if st == "chase" and t_id is not None:
-                        # 巡逻分支（无锁定目标）也是 chase 态，此时没有怪号可显示
-                        label += " -> 怪%d dist=%.0f" % (t_id,
-                                                        action.get("dist", 0.0))
-                    cv2.putText(vis, label, (10, 28),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                                (255, 255, 255), 2, cv2.LINE_AA)
+                    # ⭐ 「决策:attack」那行左上角白字**已删**（2026-09-29 用户要求 ✓）：
+                    #    搬进信息栏、放世界坐标下面、同款式（见 route_panel._osd_lines ✓）。
 
                     # **攻击范围 = 矩形**（用户 2026-09-27：以前只画一条水平线）：
                     #   攻击范围框 = 角色中心 → 最大攻击距离（含**上下攻击距离**）
@@ -2425,6 +2580,10 @@ class LiveThread(QThread):
                 # 显示限流：到点了才推一帧。emit 是队列信号，不阻塞推理，
                 # 所以推理始终按自己的速度跑。
                 if should_show:
+                    # ⭐ **按键帽**（左下，2026-09-30 用户要求 ✓）：显示层的事 ✓
+                    #    —— 只在真要显示的帧画（省一半开销 ✓）；`self.agent` 在
+                    #    本线程留有引用（见 1371 那段 ✓），替身/缺失时静默跳过 ✓。
+                    draw_key_caps(vis, getattr(self, "agent", None))
                     self.frame_ready.emit(vis)
 
                 if now - t_last_stat >= 0.5:
@@ -2529,6 +2688,7 @@ class LiveThread(QThread):
                         # 抢机器。非空时状态行会把它顶到最前面 —— 它是上面那些
                         # 数字「为什么变差」的解释，比数字本身更要紧。
                         "load_warn": self._load[0],
+                        "screen": self._screen_state,
                         "load_detail": self._load[1],
                     })
                     t_last_stat = now

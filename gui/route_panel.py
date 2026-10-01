@@ -30,7 +30,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QGroupBox, QHBoxLayout, QL
                              QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget)
 
 from core import mapdata
-from decision.agent import settings
+from decision.agent import ZONE_GOTO_RETRY_S, settings
 from gui import theme
 from gui.canvas import ImageCanvas
 from gui.minimap_calib import MinimapCalibDialog   # 量「面板 ↔ 底图」的弹窗
@@ -43,13 +43,29 @@ from perception import minimap as mm
 # ⚠ 小地图框选区域**不在这里存**：它**按项目**存（`project.yaml` 的 `mmap_crop`）——
 #   取它的口径只有 `perception.minimap.crop_of` 一处（本项目 → 没框过时回退老的那份 ✓）。
 #   `live.yaml` 这里只剩**来源**（`mmap_src`）和叠图那几项 ✓。
-from tools.config import load_live, update_live
+from core.config import load_live, update_live
 
 
 def _mmss(sec):
     """秒 → `M:SS`（倒计时统一这个写法，和 player_panel 那边一致）。"""
     sec = max(0, int(sec))
     return "%d:%02d" % (sec // 60, sec % 60)
+
+
+def _clear_layout(layout):
+    """清空一个布局（连里面的子控件一起销毁）—— 「编辑战斗区域」那条摘要要**重画**。
+
+    ⚠ 为什么要销毁而不是只摘出来：布局里的 `QLabel` 摘出来如果不删，会**堆在父
+    widget 上越积越多**（每次重画留一批不可见的孤儿 ✗）。
+    """
+    while layout.count():
+        item = layout.takeAt(0)
+        child = item.layout()
+        if child is not None:
+            _clear_layout(child)
+        w = item.widget()
+        if w is not None:
+            w.deleteLater()
 
 
 def _mmss2(sec):
@@ -494,6 +510,43 @@ class RoutePanel(QWidget):
         row_js.addStretch(1)
         pv.addLayout(row_js)
         root.addWidget(grp_phys)
+
+        # ---- 子组：**路线规划**（2026-10-01 用户要求："把「编辑战斗区域」移到路线识别页签
+        #      寻路配置的新子组『路线规划』"）----
+        #
+        # 为什么它该在这一页、而不是决策参数页（用户那句"为什么龙族打猎场不能编辑战斗
+        # 区域"的根因就在这 ✓）：
+        #   · 战斗区域**每一项都是地图里的东西** —— `set` 是**本图已注册的集合名**、
+        #     `idle_foothold` 是**本图的 foothold 编号**、`fight_dst` 又是集合名 ⇒
+        #     只有本页（持有地图 id）能**当场**问出"这张图有哪些集合"；
+        #   · 原来挂在决策参数页 ⇒ 候选集合名只能由本页在**开项目那一刻推一次**
+        #     （`main_window._bind_cards` → `player_panel.set_zone_sets`）⇒ 那张图的
+        #     地形/集合若是**会话中途才导出来**的，那份候选就是**一张空表、用到关掉工作台**
+        #     ⇒ 「添加」里一个集合都没有 = "不能编辑"（龙族打猎场正是这样 ✗）。
+        #   ⇒ 搬到本页后候选**每次点开现读**（`_bz_candidate_names` ✓），不再看推送时机。
+        grp_plan = QGroupBox("路线规划")
+        plv = QVBoxLayout(grp_plan)
+        plv.setSpacing(6)
+        # 这一行现在只有：标签 + 「编辑」按钮 + **只读的已配摘要**（添加 / 删除 / 改参数
+        # **全在弹窗里** ✓ —— 行内再来一套按钮就是重复 ✗ 用户 2026-09-28 第 1 条 ✓）。
+        self._bz_rows = QVBoxLayout()
+        self._bz_rows.setSpacing(4)
+        self._bz_names = []                 # 当前显示的名字（顺序 = 界面顺序 ✓）
+        self.btn_battle_zone_edit = QPushButton("编辑战斗区域")
+        self.btn_battle_zone_edit.setToolTip(
+            "打开「编辑战斗区域」：**添加 / 删除 / 双击一行改参数** ✓\n"
+            "每一项可以勾「可以战斗」—— 那就是旧的「限制战斗区域」✓\n\n"
+            "候选集合 = **当前这张图已注册的集合**（每次点开现读 ✓ 2026-10-01）。")
+        self.btn_battle_zone_edit.clicked.connect(
+            safe_slot(self._on_battle_zone_edit_clicked))
+        _bz_top = QHBoxLayout()
+        _bz_top.setSpacing(6)
+        _bz_top.addWidget(self.btn_battle_zone_edit)
+        _bz_top.addStretch(1)
+        plv.addLayout(_bz_top)
+        plv.addLayout(self._bz_rows)
+        plv.addWidget(self._bz_hint())
+        root.addWidget(grp_plan)
 
         # ---- ② 小地图定位（寻路用；方式由你选，程序不猜）----
         root = card("小地图定位")
@@ -1261,8 +1314,30 @@ class RoutePanel(QWidget):
         # 加开关）—— 关掉 ⇒ **这几行一个字都不画** ✓。
         # ⚠ 它只管自己那几行（当前任务 / 定时任务 / 任务说明）：上面那个 `first` 是
         #   **世界坐标等读数**，不归这个开关管（颜色本来也不是 `timer_color` ✓）。
+        # ⭐ **决策状态行**（2026-09-29 用户要求：把画面左上角的「决策:attack」
+        #   **搬进信息栏**、放在世界坐标**下面**、与世界坐标**统一格式** ——
+        #   就是普通 `str` ⇒ 黑底白字、基础字号，同一份样式 ✓；左上角那行 cv2 白字已删 ✓）。
+        #   追击带锁定目标时带上怪号 ✓；拿不到 agent / 状态（老环境、替身）⇒
+        #   **一个字都不画**（不画「决策：?」这种废行 ✗）。
+        #   ⚠ 它和世界坐标一样是**读数** ⇒ 不归「定时任务」开关管 ✓（关掉也常驻 ✓）。
+        _dec = ""
+        try:
+            _ag = self._live_agent()
+            _st = str(getattr(_ag, "state", "") or "") if _ag is not None else ""
+            if _st:
+                _dec = "决策：%s" % _st
+                _tid = getattr(_ag, "_target_id", None)
+                if _st == "chase" and _tid is not None:
+                    _dec += "（怪%d）" % _tid
+                # ⭐ 当前区域配了 idle 回归 foothold ⇒「决策：idle → foothold#N」
+                #   （用户 2026-09-29 ✓；目标 id 由 `_idle_walk_beat` 每拍写 ✓ 一处口径）
+                _ifid = getattr(_ag, "_idle_fid", None)
+                if _st == "idle" and _ifid:
+                    _dec += " → foothold#%s" % _ifid
+        except Exception:                     # noqa: BLE001 —— 老环境/替身 ⇒ 不画 ✓
+            _dec = ""
         if not bool(_vis.get("timer_on", True)):
-            return [first]
+            return [first] + ([_dec] if _dec else [])
         dst = self._current_goto_set()
         # 休息时「当前任务」写「**休息**」（用户 2026-09-26 要求）—— 休息**优先**于寻路：
         # 「定点休息」本来就会挂着一条"走过去"的任务，那行若还写「前往：X」，会让人以为
@@ -1278,11 +1353,9 @@ class RoutePanel(QWidget):
         #   · ⚠ **休息时不加**（`_rest` ✓）：休息的剩余**已经**在下面「定时任务」那几行里显示着
         #     （`休息　休息中　剩余 2:05` ✓ 那是 `_timer_lines` 管的 ✓）⇒ 再加一遍是重复 ✗。
         #   · ⚠ 行元组仍是 **4 项**、字号仍 `11` ✓ ⇒ `gui/live_panel._draw_note` **一个字都不用改** ✓。
-        #   · ⭐⭐ **只有「追击」签注才显示剩余**（用户 2026-09-29 第 1 条 ✓："只有追击签注的
-        #     任务是有时间限制的（到点结束任务），其他任务不应该有时间限制（无限）"）——
-        #     判据在 `goto_time_left()` 里（**一处** ✓）：非追击 ⇒ `None` ⇒ 这儿整段括号不出现 ✓
-        #     （命令前往 / 定点休息 / 回战斗区域那些"想跑多久跑多久"的任务，屏幕上不再出现
-        #     一个会让人以为"它马上要被切掉"的倒计时 ✗）。
+        #   · ⭐⭐ **所有任务都显示剩余**（2026-09-29 晚用户澄清 ✓："其他所有的任务都走
+        #     「寻路超时时间」，都有出口"）—— 判据在 `goto_time_left()` 里（**一处** ✓）：
+        #     追击额外吃「追怪寻路.duration」取更早者 ✓；「寻路超时时间」= 0（不限时）才不显示 ✓。
         _tail = ""
         if not _rest:
             try:
@@ -1297,10 +1370,12 @@ class RoutePanel(QWidget):
         #   缩进的说明字体稍微大点"）—— 行元组第 4 项 = 字号标记（非 0 ⇒ 用大字 ✓
         #   具体字号由 `gui/live_panel._draw_note` 的 `_TASK_PT` 定 ✓ **只此一处**✗别各写各的）。
         # ⚠ 上面那行 `first`（世界坐标等读数）**不标** ⇒ 保持原字号 ✓。
-        lines = [first,                       # str ⇒ 保持黑底白字（读数是排查用的）
-                 ("当前任务　%s%s" % ("休息" if _rest else
-                                     ("前往：%s" % dst if dst else "战斗"), _tail),
-                  col, False, 11)]
+        lines = [first]                       # str ⇒ 保持黑底白字（读数是排查用的）
+        if _dec:
+            lines.append(_dec)                # 决策状态：与世界坐标同款式 ✓（见上）
+        lines.append(("当前任务　%s%s" % ("休息" if _rest else
+                                          ("前往：%s" % dst if dst else "战斗"), _tail),
+                      col, False, 11))
         # 任务**现在这一步在干什么 / 为什么失败**（2026-09-26 补）：任务里一直写着原因
         #（对齐中差几像素 / 偏离绳 / 爬不动了 / 拿不到世界坐标），以前没人看得到 ⇒
         # 连着两次"角色爬到某个 y 就不动了"都只能靠猜。挂在任务名下面一行，任务结束就消失。
@@ -1429,9 +1504,10 @@ class RoutePanel(QWidget):
         用户原话："编辑战斗区域的**子弹窗**需要有『foothold 集合编辑器』的**同款视图（只读）**，
         可以通过**点选**来**查看 foothold 参数**、**配置「idle回归foothold」**"✓。
 
-        谁调：**玩家面板**（存进 `player_panel._bz_picker_factory` ✓）—— 那个弹窗不持有地图 id ✗，
-        所以走同一套"面板间推送"：主窗口把**工厂**交给它（`set_foothold_picker_factory` ✓），
-        它真要用时再回调本方法 ✓。
+        谁调：**本面板的「路线规划 → 编辑战斗区域」**（`_on_battle_zone_edit_clicked` ✓
+        把它当 `picker_factory` 传给列表弹窗 ✓）。⭐ 2026-10-01 起**不再跨面板推**：原来
+        "玩家面板 → 主窗口 `set_foothold_picker_factory` → 本方法"那条路已经删掉（编辑战斗
+        区域整块搬到本页 ✓）—— 弹窗不持有地图 id，而**本页有** ⇒ 直接自己调就行 ✓。
 
         为什么给**工厂**而不是"造好一个视图推过去"：
           · 视图要按**集合名**造（一个区域项一个集合 ✓ 造的那一刻才知道是哪个 ✓）；
@@ -1463,6 +1539,204 @@ class RoutePanel(QWidget):
             return FootholdPickerPanel(t, z, set_name, current=current_fid)
         except Exception:                       # noqa: BLE001 —— 造不出来就让弹窗退回文本框 ✓
             return None
+
+    # ---------------- 路线规划：编辑战斗区域（2026-10-01 从决策参数页搬来 ✓）----------------
+
+    def _bz_hint(self):
+        """「编辑战斗区域」下面那行短说明（2026-09-28 用户重构后重写 ✓；2026-10-01 搬来）。"""
+        lbl = QLabel("点上面的「编辑战斗区域」增删改 ✓；每一项**勾了「可以战斗」**才等于旧的"
+                     "「限制战斗区域」（人在它外面 ⇒ 这一拍不打架、先走回去 ✓）。")
+        lbl.setStyleSheet("color: #80868b;")
+        lbl.setWordWrap(True)
+        lbl.setToolTip(
+            "**每一项 = 一块集合（平台）的配置**（区域查询CD / idle 回归 foothold /\n"
+            "最大战斗时长 / 到点去哪 / **可以战斗** ✓）。\n\n"
+            "「可以战斗」= **旧的「限制战斗区域」**（用户 2026-09-28 搬进每一项 ✓）：\n"
+            "  勾上 ⇒ 人**不在这块集合上**时这一拍**不打架**、先下「前往」回去 ✓，\n"
+            "          而且只打**本集合里**的怪 ✓；\n"
+            "  不勾 ⇒ 这块区域**只管它自己那几项参数**，不影响在哪打架 ✓\n"
+            "          （**新加的项默认勾上** ✓ —— 不勾的话它进不了能打名单，\n"
+            "            别的区域能打时人会被请出去，idle 回归也起不来 ✗）。\n\n"
+            "一个都没勾 = **不限制**（任何地方都打 ✓ 老行为）。\n\n"
+            "怎么配：点「编辑战斗区域」⇒ 打开列表 ——\n"
+            "  点「添加」选一块集合 ⇒ 立刻弹出它的参数窗 ✓；\n"
+            "  **双击一行**同样是改它 ✓；选中后点「删除」移除 ✓。\n\n"
+            "⚠ 集合候选 = **当前这张图已注册的集合**（每次点开现读 ✓）：\n"
+            "   这张图还没圈集合时，先去「**寻路编辑器**」圈一块再来 ✓。\n\n"
+            "⚠ 拿不到定位（不知道自己在哪块平台）时按「不在禁战区里」处理 ⇒ 先回去 ✓：\n"
+            "   宁可先归位，也不要在不知道自己在哪的时候开打 ✗。")
+        return lbl
+
+    def _bz_items(self):
+        """**真源**：`settings.battle_zones` 的每一项 → `[(名字, 项), …]`（顺序 = 界面顺序 ✓）。
+
+        ⚠ **界面一律读它**（`battle_zone_sets` 只是**派生副本** ✗）：用户 2026-09-28 原话
+          "按钮和弹窗呢？你做的我没法测" —— 那时界面只读写副本 ⇒ `cd_s` /
+          `idle_foothold` / `fight_max_s` / `fight_dst` 四个字段**一个入口都没有** ✗。
+        """
+        out = []
+        for z in (getattr(settings, "battle_zones", None) or []):
+            if isinstance(z, dict) and str(z.get("set") or ""):
+                out.append((str(z["set"]), z))
+        return out
+
+    def _bz_commit(self, zones):
+        """写回 `battle_zones` + **同步派生副本** + 存盘 + 重画（唯一出口 ✓）。
+
+        ⭐ 存盘目标 2026-10-01 起是**这张图的 `datasets/map/<id>.battle.json`** ✓（不再是
+          project.yaml ✗）—— 战斗区域按地图 id 存（见 `core.battle` ✓）。
+        ⚠ `sync_battle_zone_sets()` **必须调**（见 `decision/agent.py` 的说明 ✓）：
+          `battle_zone_sets` **没有自动同步**（`__getattr__` 代理 + property 会栈溢出 ✗）
+          ⇒ 不调的话"筛怪 / 回区域"还会按**老名单**跑 ✗。
+        """
+        settings.battle_zones = [dict(z) for z in zones]
+        try:
+            settings.sync_battle_zone_sets()
+        except Exception:                       # noqa: BLE001 —— 老设置对象没这个方法也照存 ✓
+            pass
+        from core import battle
+        mid = self._map_id()
+        if mid:
+            battle.save(mid, settings.battle_zones)     # 写**清洗后**的列表 ✓
+        self._refresh_battle_zones()
+
+    def _load_battle_zones_for_map(self, project):
+        """按**地图 id** 把战斗区域读进 `settings.battle_zones`（换图 / 开项目时调 ✓）。
+
+        2026-10-01 起战斗区域改存 `datasets/map/<id>.battle.json`（`core.battle` ✓）——
+        所以这里是**新的"读"那一边**（`from_dict` 不再读 project.yaml 里的老键 ✓）。
+
+        ⭐ **老配置迁移（只发生一次，显式）**：这张图**还没有** per-map 文件、而旧 project.yaml
+          里还留着 `decision.battle_zones` / `battle_zone_sets`（升级前存的）⇒ 把旧值**迁进
+          文件一次**（照 `_load_battle_zones` 的老口径：`no_fight` 照抄 / 老名单 = 能打 / 老
+          `goto_retry_s` 当 CD ✓），旧行为一点不变 ✓。⚠ 迁移**只在文件不存在时**发生：
+          文件一旦写过（哪怕空列表）就**不再**拿旧 project.yaml 覆盖它 ✓（"清空了"是有意的 ✗）。
+        """
+        from core import battle
+        mid = self._map_id()
+        if not mid:
+            settings.battle_zones = []
+            settings.sync_battle_zone_sets()
+            self._refresh_battle_zones()
+            return
+        raw = battle.load(mid)
+        if raw is None:
+            legacy = (project or {}).get("decision") or {}
+            if (isinstance(legacy, dict)
+                    and (legacy.get("battle_zones") or legacy.get("battle_zone_sets"))):
+                try:
+                    _cd = max(0.5, float(legacy.get("goto_retry_s", ZONE_GOTO_RETRY_S)))
+                except (TypeError, ValueError):
+                    _cd = ZONE_GOTO_RETRY_S
+                raw = settings._load_battle_zones(legacy, _cd)
+                battle.save(mid, raw)
+            else:
+                raw = []
+        settings.battle_zones = settings._load_battle_zones({"battle_zones": raw})
+        settings.sync_battle_zone_sets()
+        self._refresh_battle_zones()
+
+    def _bz_candidate_names(self):
+        """候选集合名 = **这张图已注册的集合**（`zone_sets()`，**每次点开现读** ✓）。
+
+        ⭐ 这就是搬到本页的意义（用户 2026-10-01 的根因 ✓）：原来在决策参数页时，候选
+          只能由本页在**开项目那一刻推一次**（`main_window._bind_cards` →
+          `player_panel.set_zone_sets`）⇒ 地形/集合若是会话中途才导出来的，那份候选
+          **永远是空表** ⇒ 「添加」里一个集合都没有 ✗（龙族打猎场就是这样）。
+          本页持有地图 id ⇒ 现读一遍即可，而且**读不到就明说**（见
+          `_on_battle_zone_edit_clicked` ✓）。
+        """
+        return [str(n) for n in self.zone_sets() if str(n)]
+
+    def _refresh_battle_zones(self):
+        """把 `settings.battle_zones` 灌成**一条一行**：**勾选框（可以战斗）+ 摘要** ✓。
+
+        ⭐ 2026-10-01 用户要求：把「可以战斗」的勾选框**从「编辑战斗区域」弹窗挪到主窗口**、
+          放在每一个已配项目的前面 ✓ —— 勾 / 取消**立刻**写回（`_on_bz_can_fight` ✓）。
+
+        ⚠ 这里**只显示 + 勾选**：增删、双击改参数都在「编辑战斗区域」弹窗里 ✓（不重复 ✓）。
+        """
+        _clear_layout(self._bz_rows)
+        items = self._bz_items()
+        self._bz_names = [n for n, _z in items]
+        if not items:
+            empty = QLabel("（还没配 —— 点上面的「编辑战斗区域」添加）")
+            empty.setStyleSheet("color: #80868b;")
+            self._bz_rows.addWidget(empty)
+            return
+        for n, z in items:
+            bits = []
+            bits.append("CD %gs" % float(z.get("cd_s") or ZONE_GOTO_RETRY_S))
+            _ids = [str(x) for x in (z.get("idle_footholds") or []) if str(x).strip()]
+            if _ids:
+                bits.append("idle 回 fh %s（随机）" % "、".join(_ids[:3])
+                            + ("…等%d" % len(_ids) if len(_ids) > 3 else ""))
+            if float(z.get("fight_min_s") or 0.0) > 0:
+                bits.append("至少打 %gs" % z.get("fight_min_s"))
+            if float(z.get("fight_max_s") or 0.0) > 0:
+                bits.append("最多打 %gs → %s"
+                            % (z.get("fight_max_s"), z.get("fight_dst") or "（不前往）"))
+            _ids_t = "、".join(_ids) if _ids else "（无）"
+            # ⭐ 勾选框**就是**「可以战斗」（文本里不再重复写它 ✓ 免得两处表达同一件事 ✗）。
+            #   ⚠ 先 `setChecked` 再 `connect`（否则重画时 `toggled` 会误写一次盘 ✗）。
+            cb = QCheckBox("%s　·　%s" % (n, "，".join(bits)) if bits else n)
+            cb.setChecked(bool(z.get("can_fight")))
+            cb.setToolTip("这一项的完整设置（**改参数请点上面的「编辑战斗区域」** ✓）：\n"
+                          "  区域查询CD(s) = %s\n"
+                          "  idle 回归 foothold（随机池） = %s\n"
+                          "  最小战斗时长(s) = %s\n"
+                          "  最大战斗时长(s) = %s\n  到点去哪 = %s"
+                          % (z.get("cd_s"), _ids_t,
+                             z.get("fight_min_s") or 0.0,
+                             z.get("fight_max_s"), z.get("fight_dst") or "（不前往）"))
+            cb.toggled.connect(lambda on, _n=n: self._on_bz_can_fight(_n, on))
+            self._bz_rows.addWidget(cb)
+
+    def _on_bz_can_fight(self, name, on):
+        """主窗口列表项前面的**勾选框**变动 ⇒ 写回 `can_fight`（用户 2026-10-01 ✓ 从弹窗挪来）。
+
+        ⚠ **状态没变就直接返回**（重画 / 重复触发不该白写一次盘 ✓）。
+        """
+        zones = [dict(z) for _n, z in self._bz_items()]
+        for z in zones:
+            if str(z.get("set") or "") == name:
+                if bool(z.get("can_fight")) == bool(on):
+                    return
+                z["can_fight"] = bool(on)
+                break
+        else:
+            return                        # 那一项已经不在配置里了 ⇒ 不动 ✓
+        self._bz_commit(zones)
+
+    def _on_battle_zone_edit_clicked(self):
+        """点「**编辑战斗区域**」⇒ 打开列表弹窗（用户 2026-09-28 第 2 条 ✓）。
+
+        弹窗里：**添加 / 删除 / 双击一行改参数** ✓；每次增删改都**立刻**经 `_bz_commit`
+        写回（存盘 + 同步派生副本 ✓）⇒ 关掉弹窗不需要额外的"确定"语义 ✓。
+
+        ⭐ **候选集合名本页现读**（见 `_bz_candidate_names` ✓）；读不到（这张图还没圈
+        集合 / 没打开项目）⇒ **明说怎么补**，别开一个"什么都选不了"的空弹窗 ✗
+        （用户 2026-10-01 报的"不能编辑战斗区域"就是这么来的 ✓）。
+
+        ⚠ 只读 foothold 视图的工厂就是本页的 `make_foothold_picker`（**不再跨面板推** ✓）——
+          弹窗不持有地图 id，而本页有 ✓。
+        """
+        names = self._bz_candidate_names()
+        if not names:
+            QMessageBox.information(
+                self, "这张图还没有集合",
+                "战斗区域是按**集合（平台）**配的，而现在这张图（%s）里一条集合都没有。\n\n"
+                "先点本页上面的「**寻路编辑器**」圈几块集合（存 "
+                "datasets/map/<地图id>.zones.json），\n回来就能在这里添加区域了 ✓"
+                % (self._map_id() or "没打开项目 / 没选地图"))
+            return
+        from gui.player_panel import BattleZoneListDialog   # 懒加载（避免构造面板时的循环 ✓）
+        dlg = BattleZoneListDialog([z for _n, z in self._bz_items()],
+                                   names=names,
+                                   on_save=self._bz_commit, parent=self,
+                                   picker_factory=self.make_foothold_picker)
+        dlg.exec_()
+        self._refresh_battle_zones()
 
     def _on_edit_zones(self):
         """打开/聚焦 foothold 集合编辑器（按当前项目的地图）。
@@ -1844,7 +2118,7 @@ class RoutePanel(QWidget):
         """
         if getattr(self, "_mmap_cli", None) is None:
             try:
-                from tools.config import get
+                from core.config import get
                 self._mmap_cli = mm.MiniMapClient(
                     get("a_host"), port=get("minimap", "port", 5003)).start()
             except Exception:                       # noqa: BLE001
@@ -2920,6 +3194,9 @@ class RoutePanel(QWidget):
         self._refresh_mmap()
         self._refresh_map_image()
         self._refresh_goto()        # 换图/换项目：下拉要跟着换成这张图的集合
+        # 「路线规划」的战斗区域**按地图 id 存** ⇒ 换图时从这里读进 settings（必要时先从旧
+        #   project.yaml 迁移一次 ✓）—— 它内部会顺手重画摘要 ✓。
+        self._load_battle_zones_for_map(project)
 
     def showEvent(self, e):
         """切到「路线识别」页签时重读一次。

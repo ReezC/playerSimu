@@ -73,7 +73,9 @@ class MobTracker:
         self.ghost_decay = ghost_decay  # 幽灵框每帧速度衰减
         self.ghost_max_shift = ghost_max_shift  # 幽灵总位移上限（× 框长边）
 
-        self.debounce_conf = 0.0    # 防抖置信度：高于它的框消失后保留位置
+        #: 防抖置信度：这只怪**曾经达到过**它 ⇒ 消失后按「防抖时间」残留（幽灵框 ✓）。
+        #: ⭐ 2026-10-01 起判据是**历史最高置信度**（`peak_conf`），不是最后一次 ✓。
+        self.debounce_conf = 0.0
         self.debounce_ms = 0.0      # 防抖时间（毫秒）
         self._tracks = []       # 每条是 dict，字段见 _new_track
         self._next_id = 1
@@ -84,7 +86,12 @@ class MobTracker:
     def _new_track(tid, x1, y1, x2, y2, conf, now):
         return {
             "id": tid, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-            "conf": conf, "missed": 0, "age": 1, "vx": 0.0, "vy": 0.0,
+            "conf": conf,
+            #: ⭐ **历史最高置信度**（用户 2026-10-01 ✓）：防抖判据用「**曾经达到过**
+            #:   阈值」而不是「最后一次的置信度」—— 一只怪先被高置信度认出来、之后几帧
+            #:   框得不准掉到阈值以下，它消失时**仍该**残留防抖时间 ✓（见 `update` 输出）。
+            "peak_conf": conf,
+            "missed": 0, "age": 1, "vx": 0.0, "vy": 0.0,
             "shifted": 0.0,          # 幽灵外推累计走了多远（到上限就不走了）
             "last_seen": now,
         }
@@ -176,7 +183,11 @@ class MobTracker:
         for t in self._tracks:
             if t["missed"] == 0:
                 out.append(self._to_mob(t))
-            elif (t["conf"] >= self.debounce_conf
+            # ⭐ 防抖判据用「**历史最高置信度**」`peak_conf`（用户 2026-10-01 ✓）：
+            #   只要这只怪的框**曾经达到过**「防抖置信度」，它消失时就残留「防抖时间」——
+            #   哪怕最后几帧置信度已经掉到阈值以下（框得不准了）✓。原来用 `t["conf"]`
+            #   （最后一次的置信度）✗：那种"先高后低"的怪消失时会被立刻丢掉 ✗。
+            elif (t["peak_conf"] >= self.debounce_conf
                   and (now - t["last_seen"]) * 1000.0 <= self.debounce_ms):
                 out.append(self._to_mob(t))
         return out
@@ -219,6 +230,9 @@ class MobTracker:
         t["vy"] = v * t["vy"] + (1 - v) * (cy - ocy)
 
         t["conf"] = cf
+        # ⭐ 历史最高置信度只涨不落（防抖判据用"曾经达到过阈值" ✓）
+        if cf > t["peak_conf"]:
+            t["peak_conf"] = cf
         t["missed"] = 0
         t["age"] += 1
         t["shifted"] = 0.0
@@ -289,6 +303,7 @@ class MobTracker:
                   "last_seen"):
             host[k] = t[k]
         host["conf"] = max(host["conf"], t["conf"])
+        host["peak_conf"] = max(host["peak_conf"], t["peak_conf"])
 
     # ---------------- 输出 ----------------
 
@@ -340,10 +355,32 @@ class PlayerTracker:
     无框返回 None。
     """
 
-    def __init__(self, max_jump=150.0, max_missed=10, smooth=0.6):
+    def __init__(self, max_jump=150.0, max_missed=10, smooth=0.6,
+                 walk_v_max=128.0, walk_accel=1500.0, walk_brake=900.0):
         self.max_jump = float(max_jump)     # 位置突变阈值（像素）：超过就认为不是「我」
         self.max_missed = int(max_missed)   # 连续漏检多少帧放弃锁定
         self.smooth = float(smooth)         # 速度平滑系数（0~1，越大越平滑）
+        #: ⭐ **输入感知运动模型**（2026-10-01 ✓，借 `Maple_xfeat` 的
+        #:   `InputAwareHorizontalKalman` 那套思路）：方向键不是"观测"，而是
+        #:   **已知控制输入** —— 按住就在加速、松手就在地面摩擦下减速。
+        #:   ⚠ 单位是**画面像素**（本类所有量都是画面坐标 ✓），不是世界像素；
+        #:     默认值照搬那个项目的世界像素常数（冒险岛走路 ≈125 px/s @100% 速度）。
+        #:     **画面若做过缩放**（推流分辨率 ≠ 游戏分辨率）就要按倍率改 ✗。
+        self.walk_v_max = float(walk_v_max)     # 走路最高速（像素/秒）
+        self.walk_accel = float(walk_accel)     # 按住方向键的加速度（像素/秒²）
+        self.walk_brake = float(walk_brake)     # 松手后的减速度（像素/秒²）
+        #: 当前**输入意图**：-1 左 / 0 没按 / +1 右（`set_input` 喂进来）
+        self._in_x = 0
+        #: 同上，竖直（爬梯用 ↑/↓）—— 只在真喂了值时才参与 ✓
+        self._in_y = 0
+        #: 上一次 `update` 的时刻（monotonic）—— 只用来算 `dt`，`None` = 从头开始 ✓
+        self._t_prev = None
+        #: ⭐ **有没有人喂过输入**（`set_input` 调过一次就为真）。
+        #:   **没喂过 ⇒ 一切照旧**（速度保持上一帧那个，一字不变 ✓）—— 这条闸是必须的：
+        #:   没有它的话，`direction=0`（没喂 / 没按）会被当成"松手" ⇒ 速度按摩擦衰减到 0
+        #:   ⇒ 连**不用这个功能的人**的老行为也被改了 ✗（那就不是"可选增强"了）。
+        #:   喂过（哪怕喂的是 0）⇒ 说明上层**知道**玩家此刻按没按 ⇒ 按输入算才对 ✓。
+        self._input_aware = False
         self._box = None                    # 当前锁定框 (cx, cy, bottom, conf, bw, bh)
         self._vx = 0.0
         self._vy = 0.0
@@ -452,6 +489,79 @@ class PlayerTracker:
             return None
         return (dx * dx + dy * dy) ** 0.5
 
+    # ---------------- 输入感知的运动预测（2026-10-01 ✓） ----------------
+
+    def set_input(self, direction=0, vertical=0):
+        """喂「**此刻按着哪个方向**」（-1 / 0 / +1）⇒ 预测位置照它算 ✓。
+
+        **为什么这比"拿上一帧速度线性外推"准**：角色的移动是**被我们的按键驱动的**
+        —— 这是个**已知控制输入**。漏检那几帧里，我们**明知**自己按着右键 ⇒ 它该往右
+        加速；松了手 ⇒ 它在摩擦下滑行减速。而"上一帧位移"外推完全不知道这件事：玩家
+        中途变向 / 停住 / 起跳时，它照旧朝原方向跑 ⇒ 预测越漂越远 ⇒ ① 挑"哪个框是我"
+        挑错、② 漏检补出来的框也是错的 ✗（这两个坑共用同一个预测位置，见 `update`）。
+        这正是 `Maple_xfeat` 那个 `InputAwareHorizontalKalman` 的做法（方向键当控制
+        输入，按 push/drag 加速度推演 ✓）。
+
+        ⚠ **这里是"意图"，不是"事实"**：键发出去了角色可能还没动（卡墙、端到端延迟）。
+        拿它**预测**是对的（本来就该超前一点 ✓）；但**别拿它当"现在在干嘛"的判据** ——
+          那正是 2026-09-28 爬绳那件事踩过的坑（"本机按键状态会跟执行器意图飘开" ✗，
+          所以 `ladder_id` 改吃"执行器通知"了）。用途不同，别混 ✗。
+          兜底还在：`max_missed` 那道闸该解锁还得解锁 ⇒ 意图骗人时不会永远漂下去 ✓。
+
+        ⚠ **不喂**（默认 `0`）⇒ 完全退回老口径（上一帧速度外推）⇒ 现有行为一字不变 ✓。
+        """
+        try:
+            self._in_x = 1 if float(direction) > 0 else (-1 if float(direction) < 0 else 0)
+        except (TypeError, ValueError):
+            self._in_x = 0
+        try:
+            self._in_y = 1 if float(vertical) > 0 else (-1 if float(vertical) < 0 else 0)
+        except (TypeError, ValueError):
+            self._in_y = 0
+        self._input_aware = True    # 喂过就按输入算（见 `_input_aware` 那段说明 ✓）
+
+    def _advance_input(self, now):
+        """按"已知控制输入"把 `_vx` / `_vy` 推进一步（单位：**像素/帧**，与老口径一致 ✓）。
+
+        ⚠ 三件事必须说清，不然这里最容易改错：
+          · **`_vx` 的语义是"每帧位移"**（老代码是 `px = box[0] + _vx` 这么用的）⇒
+            速度上限要换算成"这一帧该走多少"：`v_max × dt` ✓；
+          · `walk_accel` / `walk_brake` 是"像素/秒²" ⇒ 每帧的速度增量是
+            `a × dt × dt`（先乘 dt 得"像素/秒"，再乘 dt 得"像素/帧" ✓）；
+          · **`dt` 必须夹住**：主循环卡一下（推理卡了半秒）时，不夹会一口气把预测推出去
+            几百像素 ⇒ 比"干脆不预测"还坏 ✗。夹到 1/4 秒 ✓。
+        """
+        if not self._input_aware:
+            return              # 没人喂输入 ⇒ **一个字都不动**（老口径：速度保持 ✓）
+        if self._t_prev is None:
+            self._t_prev = now
+            return
+        dt = float(now) - float(self._t_prev)
+        self._t_prev = now
+        if dt <= 0.0:
+            return
+        dt = min(0.25, dt)
+        self._vx = self._step_axis(self._vx, self._in_x, dt)
+        self._vy = self._step_axis(self._vy, self._in_y, dt)
+
+    def _step_axis(self, v, direction, dt):
+        """单个轴推进一步 → 新的"像素/帧"。按着 ⇒ 加速到上限；松手 ⇒ 摩擦减速到 0。"""
+        if direction:
+            goal = direction * self.walk_v_max * dt
+            if (goal - v) * direction > 0:        # 还没到目标速度 ⇒ 加速
+                v += direction * self.walk_accel * dt * dt
+                if (v - goal) * direction > 0:    # 这一下超了 ⇒ 夹住（别冲过上限 ✗）
+                    v = goal
+            else:                                 # 已经比目标快（被打飞 / 下坡）⇒ 按摩擦拉回
+                v -= direction * self.walk_brake * dt * dt
+                if (v - goal) * direction < 0:
+                    v = goal
+            return v
+        dv = self.walk_brake * dt * dt            # 松手：地面摩擦，减到 0 就停在 0 ✓
+        if abs(v) <= dv:
+            return 0.0
+        return v - (1.0 if v > 0 else -1.0) * dv
+
     def update(self, cands, world=None):
         """喂本帧的玩家候选框，返回跟住的 player_box（或 None）。
 
@@ -489,6 +599,7 @@ class PlayerTracker:
                 pick = max(cands, key=lambda c: c[4])
             self._box = self._cand_to_box(pick)
             self._vx = self._vy = 0.0
+            self._t_prev = None         # 重新锁定 ⇒ 计时重来（别拿断开那段时间算 dt ✗）
             self._missed = 0
             self._last_box = self._box
             if world is not None:
@@ -500,6 +611,10 @@ class PlayerTracker:
             self._cam_step(self._box[0], self._box[2], world)
             return self._box
 
+        # ⭐ **先按"此刻按着什么"把速度推进一拍，再算预测位置**（2026-10-01 ✓）：
+        #   这个预测位置是**两件事共用**的 —— ① 下面挑"哪个框是我"；② 没匹配到时外推
+        #   那个框（见函数末尾）。放在这里，两处一起受益 ✓（模型见 `set_input`）。
+        self._advance_input(time.monotonic())
         px = self._box[0] + self._vx   # 预测位置（位置 + 速度外推）
         py = self._box[1] + self._vy
 
@@ -541,6 +656,7 @@ class PlayerTracker:
         if self._missed > self.max_missed:
             self._box = None           # 跟丢：解锁，下一帧重新按置信度锁
             self._vx = self._vy = 0.0
+            self._t_prev = None         # 计时也重来（同上面那条：断开的时长不该算 dt ✗）
             return None
         cx, cy, bottom, conf, bw, bh = self._box
         self._box = (px, py, bottom + (py - cy), conf, bw, bh)

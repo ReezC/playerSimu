@@ -616,39 +616,83 @@ def load_calibs(map_id):
     return {}
 
 
-def load_calib(map_id, src=None):
-    """→ 某条来源的标定（形状同老格式）；没有 → None。
+def zoom_of(calib, default=1):
+    """这份标定是在 A 机 zoom 为多少的时候标出来的（**没记** ⇒ 当 `default`）。
+
+    ⭐ 为什么标定要记 zoom（2026-10-01 修的那个坑）：A 机推来的一帧是
+      「小地图面板 × zoom」（`tools/minimap_push`），标定里的 `scale` / `offset`
+      是**对着那个像素尺寸**量出来的。zoom 一变、帧的尺寸就整倍数变 ⇒ 旧标定照套
+      会让 `perception.minimap.panel_to_world` 出来的坐标**整倍数错**，
+      而**全程没有任何报错**（`gui/route_panel._calib_panel_wh` 里那个"读了没写"的
+      `panel` 字段正是当年没堵住的口子）。记下来，读的时候才可能**拒不发货** ✓。
+    """
+    try:
+        z = int((calib or {}).get("zoom"))
+    except (TypeError, ValueError):
+        return int(default)
+    return z if z >= 1 else int(default)
+
+
+def _zoom_ok(calib, zoom):
+    """`zoom` 给了 ⇒ 与标定里记的那个**相符**才肯用。没给 ⇒ 不管（保持老行为 ✓）。"""
+    if zoom is None:
+        return True
+    try:
+        return int(zoom) == zoom_of(calib)
+    except (TypeError, ValueError):
+        return False
+
+
+def load_calib(map_id, src=None, zoom=None):
+    """→ 某条来源的标定（形状同老格式）；没有 / **zoom 不相符** → None。
 
     src=None：老格式直接给；新格式**只有一份**时给那一份，多份则返回 None ——
     「哪一份」必须由调用方说清，猜错就是拿另一条来源的几何去算世界坐标。
+
+    ⭐ `zoom`（**可选**，不传 = 与从前完全一样）：标定是**按某个 zoom 标出来的**
+      （A 机推流时的放大倍数）。传了 zoom 而文件里那份记的不是这个 zoom ⇒
+      **返回 None**（而不是把错的几何发回去）—— zoom 变了就该重标，这是**事实**，
+      "凑合着用"才会让人拿着错了的坐标去查寻路 ✗。
+      ⚠ 只**新**写下来的标定才带 zoom 字段；老文件没有 ⇒ 一律当 zoom=1
+      （`zoom_of`），于是"现在是 zoom=3"的机器上它们会判成不适用 ⇒ 界面会说
+      「这份标定不是在当前 zoom 下标的」，人来决定重标还是改 zoom —— 这就是要它说的那句话。
     """
     srcs = load_calibs(map_id)
     if src:
         if src in srcs:
-            return srcs[src]
+            return srcs[src] if _zoom_ok(srcs[src], zoom) else None
         if "" in srcs:
+            if not _zoom_ok(srcs[""], zoom):
+                return None
             out = dict(srcs[""])
             out["legacy"] = True        # 老格式：先当它可用，但让界面提醒重量
             return out
         return None
     if "" in srcs:
-        return srcs[""]
+        return srcs[""] if _zoom_ok(srcs[""], zoom) else None
     if len(srcs) == 1:
-        return next(iter(srcs.values()))
+        only = next(iter(srcs.values()))
+        return only if _zoom_ok(only, zoom) else None
     return None
 
 
-def save_calib(map_id, calib, src=None):
+def save_calib(map_id, calib, src=None, zoom=None):
     """写标定。**src 给了就只覆盖那一条来源**，其它来源原样保留。
 
     src=None 走老格式（整份平铺）—— 只有诊断/迁移用；界面那条路一律传 src，
     不传的话写一次就把另一条来源的标定抹掉了（而人看不出来）。
+
+    ⭐ `zoom`（**可选**）：写进这一份，标明**这份几何是对着哪个 A 机 zoom 量的**
+      （对上 `zoom_of` / `load_calib` 的 zoom 参数）。**保存标定那几条路都要传** ——
+      不写的话，将来 zoom 一变就没人知道这份几何其实已经不成立了 ✗。
     """
     import json as _json
     p = calib_path(map_id)
     p.parent.mkdir(parents=True, exist_ok=True)
     body = dict(calib or {})
     body.pop("legacy", None)            # 读的时候临时加的标记，别写进文件
+    if zoom is not None:
+        body["zoom"] = max(1, int(zoom))
     if src is None:
         out = body
     else:

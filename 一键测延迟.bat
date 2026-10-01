@@ -27,7 +27,11 @@ rem  page, so non-ASCII comment text gets executed as a command (mojibake
 rem  "is not recognized" errors). Chinese output from python is fine because
 rem  of chcp 65001 + PYTHONIOENCODING below.
 rem ---------------------------------------------------------------------------
+rem Prefer the project venv (.venv, shared by every workbench in this repo).
 cd /d "%~dp0"
-python -m tools.stream_sweep --auto
+set "PY="
+if exist ".venv\Scripts\python.exe" set "PY=.venv\Scripts\python.exe"
+if not defined PY set "PY=python"
+"%PY%" -m tools.stream_sweep --auto
 echo.
 pause

@@ -28,6 +28,8 @@
     这样滚不滚、滚多少完全由我们决定，也不依赖任何冒泡细节。
 """
 
+from pathlib import Path
+
 from PyQt5.QtCore import QEvent, QObject, Qt
 from PyQt5.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
                              QAbstractSpinBox, QApplication, QComboBox,
@@ -265,3 +267,50 @@ def scroll_area(content, parent=None, h_scroll=False, min_width=None):
         scroll.setMinimumWidth(int(min_width))
     scroll.setWidget(content)
     return scroll
+
+
+_sound_player = None          # QMediaPlayer 常驻引用（局部变量会被 GC 掉 ⇒ 放不出声 ✗）
+
+
+def sound_player():
+    """常驻的 QMediaPlayer（「试听」的**停止**要读它的播放状态 ✓）。
+
+    只在 **GUI 线程**用 ✓（收流线程要响就发信号给面板 ✓）。
+    """
+    global _sound_player
+    if _sound_player is None:
+        from PyQt5.QtMultimedia import QMediaPlayer
+
+        _sound_player = QMediaPlayer()
+    return _sound_player
+
+
+def stop_sound():
+    """停止播放（「试听」点成「停止」✓）。没在播 = 空操作 ✓。"""
+    if _sound_player is not None:
+        _sound_player.stop()
+
+
+def play_sound(path):
+    """播放音效文件（测谎/掉线弹窗的「触发音效」+「试听」✓ **一处实现**）。
+
+    相对路径按仓库根解析 ✓；文件缺失 / QtMultimedia 不可用 ⇒ 退回系统提示音 ✓
+    —— **报警不能因为音效配置坏了就哑掉** ✓。返回 **True = 真的在播**（「试听」
+    按钮据它决定要不要变「停止」✓）；`QMediaPlayer` 必须在 **GUI 线程** ✓。
+    """
+    p = Path(path) if path else None
+    if p is not None and not p.is_absolute():
+        p = Path(__file__).resolve().parent.parent / p
+    if p is not None and p.exists():
+        try:
+            from PyQt5.QtCore import QUrl
+            from PyQt5.QtMultimedia import QMediaContent
+
+            player = sound_player()
+            player.setMedia(QMediaContent(QUrl.fromLocalFile(str(p))))
+            player.play()
+            return True
+        except Exception:                 # noqa: BLE001 —— 编解码器缺失等 ✓
+            pass
+    QApplication.beep()
+    return False

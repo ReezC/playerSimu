@@ -19,16 +19,26 @@
 的语义本来就在**接收端**做（B 机 `perception/minimap.py`），用 TCP 反而简单可靠。
 
 区域配置存在 `config/minimap_region.json`（`--pick` 会写进去），下次直接跑即可。
+
+**按地图 id 存放 / 运行中换图**（2026-10-01）：
+一条推流可以**不停进程就换抓取区域** —— B 机连一条新的连接、先报 `HELLO mmap-ctl`，
+再发一行 `MAP <地图id>` ⇒ A 机从 `config/minimap_regions/<地图id>.json` 里取出那张图
+自己的区域与 zoom，**下一帧**推的就是新区域的画面。不用新端口、不用重启、不用多起服务
+（协议见 `tools/mmap_regions.py`，A/B 两边共用那一份）。
+启动时也可以直接指定图：`--map-id <id>`（没给 ⇒ 用上面那份单值老配置，行为同以前 ✓）。
 """
 
 import argparse
 import json
+import select
 import socket
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from tools import mmap_regions                              # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 REGION_FILE = ROOT / "config" / "minimap_region.json"
@@ -97,6 +107,107 @@ def _already_listening(port, host="127.0.0.1", timeout=0.4):
         return False
 
 
+# ---------------- 控制连接（B 机 → 本进程：换图 / 问状态） ----------------
+
+def _close(sock):
+    try:
+        sock.close()
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def _send_line(sock, raw):
+    """往控制连接上回**一行**（结尾补 `\\n`）。写不出去就当那一路已经没了。"""
+    try:
+        sock.sendall(raw if raw.endswith(b"\n") else raw + b"\n")
+        return True
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
+def _answer_ctl(sock, raw, state, log=print):
+    """处理**一条**控制命令 ⇒ 改 `state`（区域/zoom）并回一行。
+
+    `state = {"map_id": str, "box": [x,y,w,h], "zoom": int}` —— 它**故意是可变的**：
+    帧循环每拍都读它 ⇒ 改完**下一帧**抓的就是新区域（"不重启也能换图"的全部机关 ✓）。
+
+    ⚠ `MAP` 只认**库里有**的那份（`mmap_regions.load`），查不到 ⇒ 回 `ERR` 且
+      **原来的区域一个字节都不动**：半切换的状态（框变了图没变 / 反过来）比"没切成"
+      难查得多 ✗。
+    """
+    parts = raw.decode("utf-8", "replace").split()
+    cmd = (parts[0] if parts else "").upper()
+    arg = parts[1] if len(parts) > 1 else ""
+
+    if cmd == mmap_regions.CMD_PING:
+        return _send_line(sock, b"PONG")
+    if cmd == mmap_regions.CMD_LIST:
+        return _send_line(sock, mmap_regions.list_reply(
+            mmap_regions.list_ids()).encode("utf-8"))
+    if cmd == mmap_regions.CMD_STATE:
+        return _send_line(sock, mmap_regions.state_reply(
+            state.get("map_id") or "-", state["box"], state.get("zoom") or 1
+        ).encode("utf-8"))
+    if cmd == mmap_regions.CMD_MAP:
+        got = mmap_regions.load(arg)
+        if not got:
+            # 光说"找不到"人会重框错地方 ⇒ 顺手告诉他**已经配了哪些**
+            _ids = mmap_regions.list_ids()
+            why = ("这张图还没框过（%s）；已配的有：%s"
+                   % (arg or "没给 id", "、".join(_ids) if _ids else "（一张都没有）"))
+            return _send_line(sock, mmap_regions.err_reply(
+                "no-such-map", why).encode("utf-8"))
+        state["map_id"] = got["map_id"]
+        state["box"] = [got["x"], got["y"], got["w"], got["h"]]
+        state["zoom"] = got["zoom"]
+        _send_line(sock, mmap_regions.ok_reply(
+            got["map_id"], state["box"], got["zoom"]).encode("utf-8"))
+        log("[%s] 按 B 机要求换图 → %s　区域 (%d,%d) %dx%d　zoom=%d（下一帧生效）"
+            % (time.strftime("%H:%M:%S"), got["map_id"], got["x"], got["y"],
+               got["w"], got["h"], got["zoom"]))
+        return True
+    return _send_line(sock, mmap_regions.err_reply(
+        "bad-command",
+        "不认识的命令 %r（可用：MAP / STATE / LIST / PING）" % (cmd,)).encode("utf-8"))
+
+
+def _poll_controls(controls, state, log=print):
+    """把每条控制连接上**已经到了**的命令处理掉 ⇒ 返回还活着的那几条。
+
+    ⚠ 用 `select(…, 0)` 问一句"有没有数据"，**不给 socket 设超时去 recv**：帧循环
+      30 拍/秒，任何阻塞 recv 都会直接拖低帧率 —— 而这里多数时候一根毛的数据都没有。
+
+    ⚠ 必须在 `if not clients: continue` **之前**调用：B 机常常是"先问一句再连"（切图
+      那一刻也可能压根没收流），少了这一步，命令会一直没人理 ✗ 且看起来像"A 机挂了"。
+    """
+    if not controls:
+        return controls
+    try:
+        rd, _, _ = select.select([rec[0] for rec in controls], [], [], 0.0)
+    except (OSError, ValueError):                # 有一路已经废掉了 ⇒ 退化成"都没数据"
+        rd = []
+    keep = []
+    for rec in controls:
+        c, name = rec
+        if c in rd:
+            try:
+                buf = c.recv(8192)
+            except Exception as e:                           # noqa: BLE001
+                log("[%s] 控制连接 %s 读不了（%s: %s），移除"
+                    % (time.strftime("%H:%M:%S"), name, type(e).__name__, e))
+                _close(c)
+                continue
+            if not buf:                                      # 对端关了
+                _close(c)
+                continue
+            for line in buf.replace(b"\r\n", b"\n").split(b"\n"):
+                line = line.strip()
+                if line:
+                    _answer_ctl(c, line, state, log=log)
+        keep.append(rec)
+    return keep
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="A 机：小地图截屏推流")
     ap.add_argument("--bind", default=None, help="监听地址，默认 0.0.0.0")
@@ -117,6 +228,12 @@ def main() -> int:
     ap.add_argument("--force", action="store_true",
                     help="端口上已经有东西在监听时也强行启动（默认拦住 —— 两个推流"
                          "同端口会让 B 机连到旧的那个，表现为「连上却收不到帧」）")
+    ap.add_argument("--map-id", dest="map_id", default=None,
+                    help="启动时就推**这张图**的区域 —— 从 "
+                         "config/minimap_regions/<id>.json 取（连同那张图自己的 zoom ✓）。"
+                         "不给 ⇒ 用 config/minimap_region.json 那份单值老配置，"
+                         "行为和以前一模一样 ✓。运行途中 B 机还能发 `MAP <id>` 换掉，"
+                         "**不用重启本进程**。")
     args = ap.parse_args()
 
     from PyQt5.QtCore import QBuffer, QByteArray, QIODevice
@@ -141,6 +258,17 @@ def main() -> int:
         save_cfg(cfg)
         print("已保存区域: x=%d y=%d w=%d h=%d → %s" % (r[0], r[1], r[2], r[3],
                                                       REGION_FILE))
+        # ⭐ 同时给了 `--map-id` ⇒ **这次框的这块就归这张图**（存进 per-map 库 ✓）。
+        #   带 box 和 zoom 一起存是有讲究的：标定是按某个 zoom 标出来的，两者必须是
+        #   同一份，换图时才知道该用它自己那个 zoom（见 `mmap_regions.save`）。
+        _pmid = str(args.map_id or "").strip()
+        if _pmid:
+            _p = mmap_regions.save(_pmid, r[0], r[1], r[2], r[3],
+                                   zoom=int(cfg["zoom"]),
+                                   note="命令行 --pick 存进来的")
+            print("并已存给「%s」这张图 → %s（zoom=%d）\n"
+                  "  以后推它就跑：python -m tools.minimap_push --map-id %s"
+                  % (_pmid, _p, int(cfg["zoom"]), _pmid))
 
     if args.x is not None:
         # 部署台走这条：区域在它的卡片里框、由命令行传进来。
@@ -148,14 +276,34 @@ def main() -> int:
         cfg["region"] = [args.x, args.y, args.w, args.h]
         save_cfg(cfg)
 
-    region = cfg.get("region")
-    if not region:
-        print("还没有小地图区域。A 机上：部署台「小地图推流」卡片里点「框选…」；"
-              "命令行：python -m tools.minimap_push --pick")
-        return 2
+    # ⭐ **区域按地图 id 取**（2026-10-01）：给了 `--map-id` ⇒ 从那张图自己那份里取，
+    #   **连同它的 zoom 一起** —— 标定是按某个 zoom 标出来的，两者必须是同一份 ✓
+    #   （zoom 变了还套旧标定，坐标会整倍数错且不报错，见 core.mapdata.load_calib）。
+    #   没给 ⇒ 走老的那份单值配置（和以前完全一样的行为 ✓）。
+    _mid = str(args.map_id or "").strip()
+    if _mid:
+        got = mmap_regions.resolve(_mid)
+        if not got:
+            _ids = mmap_regions.list_ids()
+            print("「%s」这张图还没有框选数据。\n"
+                  "  文件：%s\n"
+                  "  库里现在有：%s\n\n"
+                  "  先在这台机上框一次并存到这个 id 下（部署台「小地图推流」卡片），\n"
+                  "  或者不带 --map-id 启动（用老的那份单值配置 ✓）。"
+                  % (_mid, mmap_regions.path_of(_mid),
+                     "、".join(_ids) if _ids else "（一张都没有）"))
+            return 2
+        box0 = [got["x"], got["y"], got["w"], got["h"]]
+        zoom0, mid0 = int(got["zoom"]), str(got["map_id"] or _mid)
+    else:
+        region = cfg.get("region")
+        if not region:
+            print("还没有小地图区域。A 机上：部署台「小地图推流」卡片里点「框选…」；"
+                  "命令行：python -m tools.minimap_push --pick")
+            return 2
+        box0 = [int(v) for v in region]
+        zoom0, mid0 = max(1, int(cfg["zoom"])), ""
 
-    x, y, w, h = (int(v) for v in region)
-    zoom = max(1, int(cfg["zoom"]))
     quality = int(cfg["quality"])
     fps = max(1, int(cfg["fps"]))
     screen = QGuiApplication.primaryScreen()
@@ -181,10 +329,14 @@ def main() -> int:
     srv.listen(8)
     # **非阻塞 accept**：同一帧要广播给**每一路**客户端（见下面 clients 的说明）
     srv.setblocking(False)
-    print("监听 %s:%d   区域 (%d,%d) %dx%d   zoom=%d   %d fps   JPEG q=%d"
-          % (cfg.get("bind") or "0.0.0.0", int(cfg["port"]),
-             x, y, w, h, zoom, fps, quality))
-    print("等 B 机连进来…（B 机跑：python -m perception.minimap --map <地图id>）")
+    # ⭐ **当前在推哪一块**是**可变的**状态，不再是常量：B 机连一条控制连接发一句
+    #   `MAP <地图id>` 就能改它 ⇒ 帧循环每拍读它，下一帧生效（不用重启进程 ✓）。
+    state = {"map_id": mid0, "box": list(box0), "zoom": int(zoom0)}
+    print("监听 %s:%d   图=%s   区域 (%d,%d) %dx%d   zoom=%d   %d fps   JPEG q=%d"
+          % (cfg.get("bind") or "0.0.0.0", int(cfg["port"]), mid0 or "（老配置）",
+             box0[0], box0[1], box0[2], box0[3], zoom0, fps, quality))
+    print("等 B 机连进来…（B 机跑：python -m perception.minimap --map <地图id>；"
+          "**换图时发 `MAP <地图id>` 即可，不必重启本进程** ✓）")
 
     # **支持多个 B 机客户端**（2026-09-26 修）：原来一次只服务一个连接 —— B 机上
     # 只要多一条客户端（工作台面板的定位 + 「标定…」弹窗 + 忘了关的命令行探针都是
@@ -192,6 +344,7 @@ def main() -> int:
     # 一帧都不来"（B 机报「等帧超时」），而 A 机日志里一片正常 —— 极难查。
     # 现在每帧**广播**给所有连着的客户端，谁都不会被饿死。
     clients = []             # [[sock, 对端名, 本次已发帧数, 连上的时刻], ...]
+    controls = []            # [[sock, 对端名], ...] —— 只"说话"（换图/问状态）的那几路
     n = 0
     t0 = time.time()
     while True:
@@ -204,18 +357,42 @@ def main() -> int:
                     break
                 except OSError:
                     break
-                c.settimeout(10)
                 name = "%s:%d" % (peer[0], peer[1])
+                # ⭐ **先认一下是不是控制连接**：新连上来的第一行如果是 `HELLO mmap-ctl`
+                #   ⇒ 它只想说话（换图 / 问状态），**不收帧** ⇒ 千万别塞进 clients，
+                #   否则每帧往它那儿推 JPEG，它一句都看不懂。
+                #   ⚠ 等握手的时间必须很短（0.25s）：正常的收流客户端连上后**一声不吭**
+                #   等着收帧 ⇒ 它只会被这个等待拖慢"首帧"，拖久了就是"B 机等帧超时"。
+                c.settimeout(mmap_regions.CTL_HANDSHAKE_TIMEOUT)
+                try:
+                    hello = c.recv(64)
+                except Exception:                            # noqa: BLE001
+                    hello = b""
+                if hello[:len(mmap_regions.CTL_HELLO.rstrip(b"\n"))] == \
+                        mmap_regions.CTL_HELLO.rstrip(b"\n"):
+                    c.settimeout(10)
+                    controls.append([c, name])
+                    print("[%s] 控制连接 %s 已连上（发 `MAP <地图id>` 换图，不重启）"
+                          % (time.strftime("%H:%M:%S"), name))
+                    continue
+                c.settimeout(10)
                 clients.append([c, name, 0, time.perf_counter()])
                 print("[%s] B 机 %s 已连上（现在 %d 路）"
                       % (time.strftime("%H:%M:%S"), name, len(clients)))
+
+            # ② **先把控制命令处理掉，再看有没有人收帧** —— B 机常常是"先叫换图、再连
+            #   收流"，这一步放到 `if not clients` 后面的话，命令会一直没人理 ✗
+            #   （现象看着像 A 机挂了，其实只是还没人收帧而已）。
+            controls = _poll_controls(controls, state)
             if not clients:
                 time.sleep(0.5)          # 没人连着：不必白抓屏
                 continue
             t_frame = time.perf_counter()
-            shot = screen.grabWindow(0, x, y, w, h)
-            if zoom > 1:
-                shot = shot.scaled(shot.width() * zoom, shot.height() * zoom)
+            # ⭐ 每拍**重新读** state（上一拍可能刚被 `MAP` 换掉 ⇒ 这一帧就是新区域 ✓）
+            _bx, _bz = state["box"], int(state["zoom"] or 1)
+            shot = screen.grabWindow(0, _bx[0], _bx[1], _bx[2], _bx[3])
+            if _bz > 1:
+                shot = shot.scaled(shot.width() * _bz, shot.height() * _bz)
             ba = QByteArray()
             buf = QBuffer(ba)
             buf.open(QIODevice.WriteOnly)

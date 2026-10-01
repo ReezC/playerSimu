@@ -33,7 +33,8 @@ from gui.project import last_opened
 # NoWheel* 必须模块级导入：控件在 _build() 里建，懒导入到不了那儿。
 # （详见 docs/UI规范.md：滚轮不许改参数）
 from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,
-                         NoWheelSlider, NoWheelSpinBox, forward_wheel)
+                         NoWheelSlider, NoWheelSpinBox, forward_wheel,
+                         play_sound, scroll_page, sound_player, stop_sound)
 from gui.touchpad import TouchPad
 
 # 键盘映射的每一行：(key, 标签, 默认键名)
@@ -144,17 +145,11 @@ class BattleZoneListDialog(QDialog):
         self.lst.setSelectionMode(QAbstractItemView.SingleSelection)
         # 双击 = 编辑（同 `gui/zone_editor.py` 的列表范式 ✓）
         self.lst.itemDoubleClicked.connect(self._on_edit)
-        # ⭐⭐ **「可以战斗」就在列表项上勾**（用户 2026-09-28 ✓）：每一项带勾选框，
-        #   勾 / 取消**立刻**写回 ✓。
-        #   ⚠⚠ 它**原来叫「可以战斗」**（✗ 名字与实现相反：代码一直把这份名单当**白名单**用 ✓
-        #   ⇒ 勾上其实是"这块**能打**" ✓）。2026-09-28 用户要求改成「**可以战斗**」✓ ——
-        #   **只是纠正名字，值与行为一点没变** ✓（取反会把已配好的能打区全废掉 ✗）。
-        self.lst.itemChanged.connect(self._on_check)
+        # ⭐⭐ 2026-10-01：「可以战斗」的勾选框**挪到主窗口**了（用户要求 ✓）⇒ 这里列表
+        #   只显示**只读摘要**（含"可以战斗"字样）；勾选入口在主窗口每项前面 ✓。
         self.lst.setToolTip("**双击一行**改它的参数 ✓（区域查询CD / idle 回归 foothold / "
-                            "最大战斗时长 / 到点去哪）。\n"
-                            "**勾上前面的框** = 「**可以战斗**」：这块平台**允许打架** ✓；"
-                            "人在别的平台上时会先走去一块**能打**的（多块能打就挑**代价最低**的 ✓）。\n"
-                            "⚠ **一个都不勾 = 哪都能打**（不限制 ✓）。")
+                            "最小战斗时长 / 最大战斗时长 / 到点去哪）。\n"
+                            "「**可以战斗**」在主窗口「路线规划」组的每项前面勾 ✓。")
         root.addWidget(self.lst, 1)
 
         btns = QHBoxLayout()
@@ -173,10 +168,7 @@ class BattleZoneListDialog(QDialog):
         btns.addWidget(self.btn_close)
         root.addLayout(btns)
 
-        hint = QLabel("⚠ **勾上前面的框** = 「**可以战斗**」：这块平台**允许打架** ✓；"
-                      "人在别的平台上时这一拍不打架、先去一块**能打**的"
-                      "（多块能打 ⇒ 挑**代价最低**的 ✓）。\n"
-                      "⚠ **一个都不勾 = 哪都能打**（不限制 ✓）。"
+        hint = QLabel("「**可以战斗**」的勾选在**主窗口「路线规划」组的每项前面**勾 ✓（这里只显示）。\n"
                       "**双击一行**改它的其他参数 ✓。改完**立刻生效并跟着项目存** ✓。")
         hint.setStyleSheet("color: #80868b;")
         hint.setWordWrap(True)
@@ -235,22 +227,35 @@ class BattleZoneListDialog(QDialog):
             "「到点去哪」换地方" % (name, cap - left, left, cap))
 
     def _reload(self):
-        """把 `self._zones` 灌进列表 —— 一行 = 一个区域项：**勾选框（可以战斗）+ 摘要** ✓。"""
-        # ⚠⚠ **重画期间必须屏蔽 `itemChanged`**（经典坑 ✗）：`clear()` / `addItem()` 都会发这个
-        #   信号 ⇒ 不屏蔽的话，重画一遍就等于"把每一行的勾选状态再写一遍配置"
-        #   ⇒ 轻则白写盘、重则把 `can_fight` 写乱 ✗。
+        """把 `self._zones` 灌进列表 —— 一行 = 一个区域项的**只读摘要**（含"可以战斗"字样 ✓）。
+
+        ⭐ 2026-10-01：「可以战斗」的**勾选框**挪到主窗口了 ⇒ 这里不再有 `ItemIsUserCheckable`
+          和 `setCheckState`（勾选入口在主窗口每项前面 ✓），文本里把"可以战斗"读回来 ✓。
+        """
+        # ⚠⚠ **重画期间仍屏蔽信号**（经典坑 ✗）：`clear()` / `addItem()` 都会发 `itemChanged`
+        #   ⇒ 不屏蔽的话，重画一遍就等于"把每一行的状态再写一遍配置"（白写盘 / 写乱 ✗）。
         self.lst.blockSignals(True)
         try:
             self.lst.clear()
             for z in self._zones:
                 nm = str(z.get("set") or "")
                 bits = []
+                if z.get("can_fight"):
+                    bits.append("**可以战斗**")
                 try:
                     bits.append("CD %.1fs" % float(z.get("cd_s") or ZONE_GOTO_RETRY_S))
                 except (TypeError, ValueError):
                     pass
-                if str(z.get("idle_foothold") or ""):
-                    bits.append("idle #%s" % str(z["idle_foothold"]))
+                _ids = [str(x) for x in (z.get("idle_footholds") or []) if str(x).strip()]
+                if _ids:
+                    bits.append("idle #%s" % "、#".join(_ids[:3])
+                                + ("…等%d块" % len(_ids) if len(_ids) > 3 else ""))
+                try:
+                    _fn = float(z.get("fight_min_s") or 0.0)
+                except (TypeError, ValueError):
+                    _fn = 0.0
+                if _fn > 0:
+                    bits.append("至少打 %.0fs" % _fn)
                 try:
                     _fm = float(z.get("fight_max_s") or 0.0)
                 except (TypeError, ValueError):
@@ -260,9 +265,9 @@ class BattleZoneListDialog(QDialog):
                 item = QListWidgetItem("%s    ·    %s" % (nm, "，".join(bits))
                                        if bits else nm)
                 item.setData(Qt.UserRole, nm)
-                # ⭐ 勾选框**就是**「可以战斗」（文本里不再重复写它 ✓ 免得两处表达同一件事 ✗）
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Checked if z.get("can_fight") else Qt.Unchecked)
+                # ⭐ 去掉勾选框：`QListWidgetItem` **默认就带** `ItemIsUserCheckable` ✗
+                #   （勾选框挪到主窗口了）⇒ 显式把这一位摘掉 ✓。
+                item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
                 self.lst.addItem(item)
         finally:
             self.lst.blockSignals(False)
@@ -272,37 +277,11 @@ class BattleZoneListDialog(QDialog):
         return [dict(z) for z in self._zones]
 
     def _commit(self, reload=True):
-        """**唯一出口**：写回一笔 ✓（`reload=True` 时顺手重画列表 ✓）。
-
-        ⚠ 勾选那条路传 `reload=False`：勾选框**自己**已经表达了状态 ⇒ 重画是多余的，
-          而且会把**当前选中的行**弄丢 ✗。
-        """
+        """**唯一出口**：写回一笔 ✓（`reload=True` 时顺手重画列表 ✓）。"""
         if reload:
             self._reload()
         if callable(self._on_save):
             self._on_save([dict(z) for z in self._zones])
-
-    def _on_check(self, item):
-        """列表项上的勾选变动 ⇒ 写回 `can_fight`（用户 2026-09-28 追加要求 ✓）。
-
-        ⚠ **状态没变就直接返回**：`_reload` 里虽然已经屏蔽过信号 ✓，但别处若再触发一次，
-          这里也**不该白写一次盘** ✓。
-        """
-        if item is None:
-            return
-        nm = str(item.data(Qt.UserRole) or "")
-        if not nm:
-            return
-        want = (item.checkState() == Qt.Checked)
-        for z in self._zones:
-            if str(z.get("set") or "") == nm:
-                if bool(z.get("can_fight")) == want:
-                    return
-                z["can_fight"] = want
-                break
-        else:
-            return                        # 列表里那项已经不在配置里了 ⇒ 不动 ✓
-        self._commit(reload=False)
 
     def _picked(self):
         it = self.lst.currentItem()
@@ -391,10 +370,9 @@ class BattleZoneDialog(QDialog):
         self._picker_factory = picker_factory
         self._picker = None
         self._set = str(z0.get("set") or "")
-        #: ⚠ **「可以战斗」不在这里改**（2026-09-28 用户要求挪到**列表项上**勾 ✓，
-        #:   原话："把可以战斗参数**移出来**，在**已添加的项目上勾选**"✓）——
-        #:   这里只把它**记下来**，`zone()` 时**原样带回** ✓
-        #:   ⇒ 免得"进来编辑一次就把勾选弄丢" ✗✗（这一句是本次最要紧的一步 ✓）。
+        #: ⚠ **「可以战斗」不在这里改**（用户要求挪出去勾 ✓；2026-10-01 起在
+        #:   **主窗口「路线规划」组每项前面**勾 ✓）—— 这里只把它**记下来**，
+        #:   `zone()` 时**原样带回** ✓ ⇒ 免得"进来编辑一次就把勾选弄丢" ✗✗。
         # ⚠ 新增区域（列表"添加"传来的 z0 没有 can_fight 键）默认「可以战斗」；
         # 否则新加的战斗区域会被排除出 battle_zone_sets 白名单，导致玩家站在它上面、
         # 场景里又有怪时 tick 提前返回 leave_battle_zone，idle 回归（以及战斗）都不触发。
@@ -426,11 +404,9 @@ class BattleZoneDialog(QDialog):
                       "⚠ 这里不给改：它是这一项的**身份** —— 要换区域请**删了重加** ✓。")
         form.addRow("区域集合", lb)
 
-        # ⚠ **「可以战斗」曾经在这里**（2026-09-28 第 3 条那份 ✓）—— 用户当天又要求
-        #   "**把可以战斗参数移出来，在已添加的项目上勾选**"✓ ⇒ 它现在在
-        #   `BattleZoneListDialog` 的**列表项勾选框**上 ✓（那里勾一下立刻生效 ✓）。
-        #   这里删掉控件，但 `__init__` 把它记进 `self._can_fight`、`zone()` **原样带回** ✓
-        #   （否则"进来编辑一次就把勾选弄丢" ✗✗）。
+        # ⚠ **「可以战斗」不在这里**（用户要求挪出去勾 ✓；2026-10-01 起在**主窗口
+        #   「路线规划」组每项前面**勾 ✓）—— 这里删掉控件，但 `__init__` 把它记进
+        #   `self._can_fight`、`zone()` **原样带回** ✓（否则"进来编辑一次就把勾选弄丢" ✗✗）。
 
         # ② 区域查询CD(s)（旧「前往重下间隔(s)」的**逐项版** ✓）
         self.sp_cd = NoWheelDoubleSpinBox()
@@ -446,18 +422,21 @@ class BattleZoneDialog(QDialog):
         self.sp_cd.setToolTip(tip_cd)
         form.addRow("区域查询CD(s)", self.sp_cd)
 
-        # ③ idle 回归 foothold
+        # ③ idle 回归 foothold（**列表随机**，2026-09-29 用户要求 ✓）
+        #    交互流程（用户定的 ✓）：**走选中**（在上面的只读视图里点一条）→ **点添加** →
+        #    **显示在列表里**；列表里可**删除**。运行时每次触发回归**随机抽一个** ✓。
         #    ⭐ 2026-09-28 用户要求（原话）："编辑战斗区域的**子弹窗**需要有『foothold 集合
-        #    编辑器』的**同款视图（只读）**，可以通过**点选**来**查看 foothold 参数**、
-        #    **配置「idle回归foothold」**"✓ ⇒ 有工厂就摆**只读视图**（点一条 = 选中它 + 旁边
-        #    显示它的参数 ✓），没有就**退回文本框** ✓（视图本体：`gui/foothold_picker.py` ✓）。
-        self.ed_idle = QLineEdit(str(z0.get("idle_foothold") or ""))     # ← 兜底（没工厂时用 ✓）
-        self.ed_idle.setPlaceholderText("例如 41（空 = 不跨层走）")
+        #    编辑器』的**同款视图（只读）**，可以通过**点选**来**查看 foothold 参数**"✓ ⇒
+        #    有工厂就摆**只读视图**，没有就**退回文本框** ✓（视图本体：`gui/foothold_picker.py` ✓）。
+        _legacy_ids = [str(x) for x in (z0.get("idle_footholds") or []) if str(x).strip()]
+        if not _legacy_ids and str(z0.get("idle_foothold") or "").strip():
+            _legacy_ids = [str(z0["idle_foothold"]).strip()]     # 老单值配置 ✓
+        self.ed_idle = QLineEdit(" ".join(_legacy_ids))          # ← 兜底（没工厂时用 ✓）
+        self.ed_idle.setPlaceholderText("例如 41 或 41 5 27（空 = 不做 idle 回归）")
         self.ed_idle.setToolTip(
-            "**闲着没事的时候回哪块砖上站着** —— 填一个 **foothold 编号**（字符串 ✓，\n"
-            "在「寻路编辑器」里点那条线能看到它的 id ✓）。\n\n"
-            "· 空 = **不做这件事**（老行为：不跨层水平走 ✓）；\n"
-            "· 填了 ⇒ 没怪、也没别的任务要跑时，会走回这条线上站住 ✓。\n\n"
+            "**闲着没事的时候回哪些砖上站着**（**列表随机** ✓）—— 填 **foothold 编号**，\n"
+            "多个用空格隔开；每次触发回归随机抽一块 ✓。\n\n"
+            "· 空 = **不做这件事**（老行为：不跨层水平走 ✓）。\n\n"
             "⚠ 只填**编号**，不要填集合名（集合是上面那一格的事 ✓）。")
         try:
             self._picker = self._make_picker()
@@ -474,9 +453,35 @@ class BattleZoneDialog(QDialog):
             self.lbl_fh.setStyleSheet("color: #5f6368;")
             self.lbl_fh.setWordWrap(True)
             box.addWidget(self.lbl_fh)
+            # ---- 列表（回归点池）+ 增删行（§4：一件东西一行 ✓）----
+            # ⚠⚠ 2026-09-30 用户报「编辑战斗区域弹窗双击打不开编辑」的根因就在这行：
+            #   之前调试时把它换成 `= None` 忘了还原 ⇒ `__init__` 在下一行
+            #   `setMaximumHeight` 当场 AttributeError ⇒ 弹窗建一半炸掉、
+            #   信号槽里异常被 PyQt 吞掉 = 双击「没反应」✗。
+            self.lst_idle = QListWidget()
+            self.lst_idle.setMaximumHeight(76)      # ~3 行够用；长了弹窗被顶高 ✗
+            self.lst_idle.setToolTip(
+                "**回归点池**：每次触发 idle 回归，**随机抽一块**去站 ✓。\n"
+                "点一行 = 在上面的视图里看那块的参数 ✓；删除见下面按钮 ✓。")
+            self.lst_idle.itemClicked.connect(self._on_idle_row_clicked)
+            for fid in _legacy_ids:
+                self.lst_idle.addItem("#%s" % fid)
+            box.addWidget(self.lst_idle)
             row_i = QHBoxLayout()
+            self.btn_idle_add = QPushButton("添加选中")
+            self.btn_idle_add.setToolTip(
+                "把上面视图里**当前选中的 foothold** 加进回归点池 ✓\n"
+                "（池里的每一块都可能被随机抽中 ✓）")
+            self.btn_idle_add.clicked.connect(self._on_add_idle)
+            row_i.addWidget(self.btn_idle_add)
+            self.btn_idle_del = QPushButton("删除选中")
+            self.btn_idle_del.setEnabled(False)
+            self.btn_idle_del.setToolTip("把列表里**选中的那行**从回归点池里删掉 ✓")
+            self.btn_idle_del.clicked.connect(self._on_del_idle)
+            row_i.addWidget(self.btn_idle_del)
             self.btn_idle_clear = QPushButton("清空")
-            self.btn_idle_clear.setToolTip("不设 idle 回归点（= 老行为：不跨层水平走 ✓）")
+            self.btn_idle_clear.setToolTip(
+                "清空回归点池（= 不做 idle 回归 ✓ 老行为：不跨层水平走 ✓）")
             self.btn_idle_clear.clicked.connect(self._on_clear_idle)
             row_i.addWidget(self.btn_idle_clear)
             row_i.addStretch(1)
@@ -487,7 +492,21 @@ class BattleZoneDialog(QDialog):
             self._idle_box = box
             self._refresh_idle_label()
 
-        # ④ 最大战斗时长(s) + ⑤ 到点去哪
+        # ④ 最小战斗时长(s) + ⑤ 最大战斗时长(s) + ⑥ 到点去哪
+        self.sp_fight_min = NoWheelDoubleSpinBox()
+        self.sp_fight_min.setRange(0.0, 3600.0)
+        self.sp_fight_min.setDecimals(1)
+        self.sp_fight_min.setSingleStep(5.0)
+        self.sp_fight_min.setValue(max(0.0, float(z0.get("fight_min_s") or 0.0)))
+        self.sp_fight_min.setToolTip(
+            "在这块区域里**至少连着打多久**，才肯去追**别的 foothold 集合**的怪（秒 ✓）。\n\n"
+            "· **0 = 不限**（老行为 ✓ —— 一进这块平台，别的平台的怪也照追）；\n"
+            "· 填了 ⇒ 在本集合累计战斗**还没到**这个秒数时，**不追别的集合的怪** ✓\n"
+            "  （只在本集合里打；到点之后才恢复跨集合追击 ✓）。\n\n"
+            "⚠ 计时口径见 `decision/agent.py` 里 `fight_min_s` 字段的说明（和「最大战斗时长」\n"
+            "   共用同一把钟：只有寻路会暂停、换区域才归零 ✓）。")
+        form.addRow("最小战斗时长(s)", self.sp_fight_min)
+
         self.sp_fight = NoWheelDoubleSpinBox()
         self.sp_fight.setRange(0.0, 3600.0)
         self.sp_fight.setDecimals(1)
@@ -554,40 +573,83 @@ class BattleZoneDialog(QDialog):
         return w
 
     def _refresh_idle_label(self):
-        """刷新"当前 idle 回归点"那行（**顺带显示它的参数** —— 用户点选要看的就是它 ✓）。"""
+        """刷新"当前选中的 foothold"那行（**顺带显示它的参数** —— 用户点选要看的就是它 ✓）。"""
         if self._picker is None or not hasattr(self, "lbl_fh"):
             return
         fid = str(self._picker.current() or "")
         info = self._picker.info(fid) if fid else ""
         self.lbl_fh.setText(("已选：%s" % info) if info
-                            else "还没选 —— 点上面一条 foothold ⇒ 它就是 idle 回归点 ✓")
+                            else "还没选 —— 点上面一条 foothold ⇒ 再点「添加选中」入池 ✓")
+        if hasattr(self, "btn_idle_add"):
+            self.btn_idle_add.setEnabled(bool(fid))
+        if hasattr(self, "btn_idle_del"):
+            self.btn_idle_del.setEnabled(self.lst_idle.currentRow() >= 0)
         if hasattr(self, "btn_idle_clear"):
-            self.btn_idle_clear.setEnabled(bool(fid))
+            self.btn_idle_clear.setEnabled(self.lst_idle.count() > 0)
 
-    def _on_clear_idle(self):
-        """清空 idle 回归点（= 老行为：不跨层水平走 ✓）。"""
-        if self._picker is not None:
-            self._picker.set_current("")
+    def _on_idle_row_clicked(self, item):
+        """点列表一行 = 在视图里**看那块**的参数（只切选中，不加不加错 ✗）。"""
+        fid = str(item.text()).lstrip("#").strip()
+        if self._picker is not None and fid:
+            self._picker.set_current(fid)
             self._refresh_idle_label()
 
-    def idle_fid(self):
-        """当前配的 idle 回归 foothold（**有视图就读视图 ✓ 否则读文本框 ✓**）。
+    def _on_add_idle(self):
+        """把视图里当前选中的 foothold **加进回归点池**（重复添加 = 忽略 ✓）。"""
+        if self._picker is None:
+            return
+        fid = str(self._picker.current() or "").strip()
+        if not fid:
+            return
+        if fid in self.idle_fids():
+            return                      # 已在池里 ⇒ 不重复加（列表会越叠越长 ✗）
+        self.lst_idle.addItem("#%s" % fid)
+        self._refresh_idle_label()
 
-        ⚠ 一处取值（`zone()` 也走它 ✓）：别让"视图"和"文本框"两处各取一次 ✗
-          —— 那样迟早出现"界面看着选了、存下去是空的"✗。
+    def _on_del_idle(self):
+        """删掉列表里**选中的那行**（没选中 = 不动 ✓）。"""
+        row = self.lst_idle.currentRow()
+        if row >= 0:
+            self.lst_idle.takeItem(row)
+        self._refresh_idle_label()
+
+    def _on_clear_idle(self):
+        """清空回归点池（= 不做 idle 回归 ✓ 老行为）。"""
+        self.lst_idle.clear()
+        if self._picker is not None:
+            self._picker.set_current("")
+        self._refresh_idle_label()
+
+    def idle_fids(self):
+        """回归点池（**有视图就读列表 ✓ 否则解析文本框 ✓**；保序去重 ✓）。
+
+        ⚠ 一处取值（`zone()` 也走它 ✓）：别让"列表"和"文本框"两处各取一次 ✗
+          —— 那样迟早出现"界面看着加了、存下去是空的"✗。
         """
         if self._picker is not None:
-            return str(self._picker.current() or "")
-        return str(self.ed_idle.text() or "").strip()
+            fids = []
+            for row in range(self.lst_idle.count()):
+                fid = str(self.lst_idle.item(row).text()).lstrip("#").strip()
+                if fid and fid not in fids:
+                    fids.append(fid)
+            return fids
+        # 兜底文本框：空格/逗号分隔都能吃 ✓
+        out = []
+        for tok in str(self.ed_idle.text() or "").replace(",", " ").split():
+            fid = tok.strip()
+            if fid and fid not in out:
+                out.append(fid)
+        return out
 
     def zone(self):
         """确定之后取回这一项（`dict` ✓ 字段与 `settings.battle_zones` 的项一一对应 ✓）。"""
         return {"set": self._set,
                 "cd_s": float(self.sp_cd.value()),
-                "idle_foothold": self.idle_fid(),
+                "idle_footholds": self.idle_fids(),
+                "fight_min_s": float(self.sp_fight_min.value()),
                 "fight_max_s": float(self.sp_fight.value()),
                 "fight_dst": str(self.cmb_dst.currentData() or ""),
-                # ⭐ 「可以战斗」**不在这个弹窗里改**（用户 2026-09-28 要求挪到列表项上勾 ✓）——
+                # ⭐ 「可以战斗」**不在这个弹窗里改**（2026-10-01 起在**主窗口每项前面**勾 ✓）——
                 #   这里只是**原样带回**（见 `__init__` 里 `self._can_fight` ✓）
                 #   ⇒ 编辑别的参数不会顺手把勾选清掉 ✓✓（这一条最容易漏 ✗）。
                 "can_fight": bool(self._can_fight)}
@@ -765,6 +827,8 @@ class PlayerPanel(QWidget):
         self.btn_reset_link = QPushButton("重置指令通道")
         self.btn_reset_link.setToolTip(
             "按键卡住（角色自己一直走 / 一直攻击）或按键发不出去时点这里。\n"
+            "⓪ 先把 ←/→/↑/↓ 四个方向键**各点按一遍**（按下→松开）：补发这一下能把\n"
+            "   游戏侧「卡住的方向键」刷成松开（光靠 RELEASEALL 只清得了固件侧 ✗）；\n"
             "① 重连远程通道 —— 连接断开时 relay 会直接往固件写一条 RELEASEALL，\n"
             "   把卡住的键一次松开（这条路不依赖我们的网络还通不通）；\n"
             "② 再补发一轮 RELEASEALL + 所有映射键的 RELEASE；\n"
@@ -1144,40 +1208,52 @@ class PlayerPanel(QWidget):
         self.sp_chase_dash.valueChanged.connect(self._on_chase_jump)
         af.addRow("追击起跳需要的冲刺时间(ms)", self.sp_chase_dash)
 
+        # ③ **大怪优先**（用户 2026-10-01 ✓；当天又要求挪进「攻击」子组 ✓）：
+        #   锁定目标时优先「明显更高」的大怪 —— 这是"**打谁**"这一件事 ⇒ 收进「攻击」✓。
+        #   2026-10-01 再要求：加**总开关**「大怪优先」勾选框 —— 不勾 = 逻辑不启用、
+        #   下面「大怪判定倍数」「大怪优先半径」两个参数也**灰掉不可配** ✓。
+        self.ck_big_mob = QCheckBox("大怪优先")
+        self.ck_big_mob.setChecked(bool(getattr(settings, "big_mob_enabled", True)))
+        self.ck_big_mob.setToolTip(
+            "**总开关**：勾上才启用「大怪优先」（锁定目标时优先明显更高的大怪 ✓）。\n"
+            "不勾 = 逻辑不启用、下面「大怪判定倍数」「大怪优先半径」也**不可配** ✓。")
+        af.addRow("大怪优先", self.ck_big_mob)
+
+        self.sp_big_mob_ratio = self._spin(1.0, 5.0, 1.5, 1)
+        self.sp_big_mob_ratio.setSingleStep(0.1)
+        self.sp_big_mob_ratio.setToolTip(
+            "锁定目标时优先「明显更高」的大怪（**相对判定** ✓）。\n"
+            "判据：怪框高度 ≥ 候选怪框高度的**中位数 × 这个倍数**就算大怪\n"
+            "（中位数 = 这堆小怪的典型高度，大怪天然突出，不用每张图调高度 ✓）。\n"
+            "设为 1.0 = 关闭（人人都是大怪，等于不优先）。")
+        af.addRow("大怪判定倍数", self.sp_big_mob_ratio)
+
+        self.sp_big_mob_range_px = self._spin(0, 5000, 600, 0)
+        self.sp_big_mob_range_px.setToolTip(
+            "大怪优先的**半径**（画面像素 ✓）。\n"
+            "只有「画面距离 ≤ 这个值」的大怪才会插队优先，否则仍按距离排\n"
+            "（避免为了远处的大怪放弃眼前的小怪 ✓）。\n"
+            "设为 0 = 关闭大怪优先。")
+        af.addRow("大怪优先半径(px)", self.sp_big_mob_range_px)
+
+        # 三个控件接同一个回调（开关 + 两个参数），并按开关初值启用/禁用参数 ✓
+        self.ck_big_mob.stateChanged.connect(self._on_big_mob)
+        self.sp_big_mob_ratio.valueChanged.connect(self._on_big_mob)
+        self.sp_big_mob_range_px.valueChanged.connect(self._on_big_mob)
+        self._apply_big_mob_enabled()
+
         # 子组挂到「战斗参数」组上（版式同下面的 `evade_grp`：标签留空、整块占一行 ✓）。
         # ⚠ **必须挂**：只建 QGroupBox 不加进来，这个框永远不会显示（Qt 里没有父级的
         #   控件不参与布局 ✗）—— 自检 `t_attack_group` 会当场红 ✓。
         bf.addRow("", attack_grp)
 
-        # ---- 「限制战斗区域」（2026-09-26 用户要求：**一条一行**、别占那么大地方）----
-        # 只在**这些集合**里才进入战斗；不在里面 ⇒ 这一拍不打架，先下「前往」回去
-        #（默认去**第一条** ✓，更多策略用户后续补 ✓）。
-        # 候选 = 这张图**已注册的集合**，由路线识别面板推过来（和「定点休息」那两个
-        # 下拉同一份来源 ✓ —— 集合属于地图，只有那边知道地图 id ✓）。
-        # ⚠ **2026-09-28 用户重构（第 1 条，原话）**："『限制战斗区域』参数改名『**编辑战斗区域**』，
-        #   **移除其 foothold 下拉列表的配置和按钮**（**不在这里限制**），**新增『编辑』按钮**"✓。
-        #   ⇒ 这一行现在只有：标签 + 「编辑」按钮 + **只读的已配摘要** ✓
-        #     （添加 / 删除 / 改参数**全在弹窗里** ✓ —— 行内再来一套按钮就是重复 ✗）。
-        self._bz_rows = QVBoxLayout()          # 已配的那几条（**只读**摘要 ✓ 一条一行）
-        self._bz_rows.setSpacing(4)
-        self._bz_candidate = []                # 候选集合名（由路线识别面板推过来 ✓）
-        self._bz_picker_factory = None         # 「只读 foothold 视图」的工厂（同上，推过来 ✓）
-        self._bz_names = []                    # 当前显示的名字（顺序 = 界面顺序 ✓）
-        self.btn_battle_zone_edit = QPushButton("编辑")
-        self.btn_battle_zone_edit.setToolTip(
-            "打开「编辑战斗区域」：**添加 / 删除 / 双击一行改参数** ✓\n"
-            "每一项可以勾「可以战斗」—— 那就是旧的「限制战斗区域」✓")
-        self.btn_battle_zone_edit.clicked.connect(self._on_battle_zone_edit_clicked)
-        bz = QVBoxLayout()
-        bz.setSpacing(4)
-        bz_row = QHBoxLayout()
-        bz_row.setSpacing(6)
-        bz_row.addWidget(self.btn_battle_zone_edit)
-        bz_row.addStretch(1)
-        bz.addLayout(bz_row)
-        bz.addLayout(self._bz_rows)
-        bz.addWidget(self._bz_hint())
-        bf.addRow("编辑战斗区域", bz)
+        # ⛔ 「编辑战斗区域」这一行 2026-10-01 搬走了（用户要求：移到「路线识别 →
+        #   寻路配置 → 路线规划」✓）—— 战斗区域的每一项都是**地图里的东西**（集合名 /
+        #   idle 回归 foothold 编号），只有持有地图 id 的路线识别页能**每次现读**候选集合名。
+        #   它原来在这里靠"面板间推送"（开项目那一刻推一次），地形/集合会话中途才导出来时
+        #   就是**空候选、用到关工作台** ⇒ "不能编辑战斗区域" ✗。
+        #   （弹窗类 `BattleZoneListDialog` / `BattleZoneDialog` 还留在这个文件里，
+        #   由 `gui/route_panel.py` 懒加载调用 ✓ —— 它们读写的是 settings，不持有地图 id ✓。）
 
         # 规避策略（仅最小攻击距离 > 0 时显示）
         evade_grp = QGroupBox("规避策略")
@@ -1361,7 +1437,8 @@ class PlayerPanel(QWidget):
         self.cmb_strategy.setToolTip(
             "平地巡逻：锁定全部怪，就近优先。\n"
             "扫平台：优先朝向方向，背后一定距离内的怪按就近锁定；\n"
-            "当前朝向没怪持续一段时间就换向。")
+            "到集合边缘附近（「距离平台边缘回头」）或当前朝向没怪持续\n"
+            "一段时间就换向。")
         sf.addRow("策略类型", self.cmb_strategy)
 
         self.lbl_strategy_note = QLabel("")
@@ -1386,6 +1463,17 @@ class PlayerPanel(QWidget):
             "扫平台优先朝向方向，但背后很近的怪也会被就近锁定。")
         sf.addRow("背后锁定距离", self.sp_back_range)
         self._lbl_back_range = sf.labelForField(self.sp_back_range)
+
+        # 距离平台边缘多远回头（仅「扫平台」策略用，2026-09-29 新增 ✓）
+        self.sp_edge_turn = self._spin(0, 2000, 100, 0)
+        self.sp_edge_turn.valueChanged.connect(self._on_edge_turn)
+        self.sp_edge_turn.setToolTip(
+            "扫平台：距离当前 foothold 集合边缘 ≤ 此距离（像素）就回头，\n"
+            "即使该方向有怪也转（旧口径会被赖在另一头不走的怪一直拽向边缘）。\n"
+            "判不出当前集合（平台没圈集合 / 定位缺）时这条不生效，\n"
+            "退回「换朝向延迟」的老逻辑。")
+        sf.addRow("距离平台边缘回头(px)", self.sp_edge_turn)
+        self._lbl_edge_turn = sf.labelForField(self.sp_edge_turn)
 
         root.addWidget(strategy_grp)
 
@@ -1455,6 +1543,7 @@ class PlayerPanel(QWidget):
 
         # ---- 防掉线组 ----
         afk = QGroupBox("防掉线")
+        self.afk = afk      # ⭐ 存成员引用：「挂机保护」页要把它 **re-parent** 过去 ✓（2026-09-29）
         af = QFormLayout(afk)
 
         self.ck_afk = QCheckBox("自动防掉线")
@@ -1926,6 +2015,22 @@ class PlayerPanel(QWidget):
     def _reset_link(self):
         """手动重置指令通道：卡键 / 发不出指令时的逃生口（见按钮 tooltip）。"""
         from decision import input as dinput
+        # ⭐ **先把所有方向键点按一遍，再重置**（用户 2026-10-01 ✓）：
+        #   重连 / RELEASEALL 只能清掉**固件侧**按住的键；但若一条 RELEASE 在链路里
+        #   丢了，**游戏侧**会一直以为某个方向键还按着（角色往一个方向一直走、按啥
+        #   都不停）—— 那条"卡住的键"根本不经过固件了。逐个方向键 `tap` 一下 =
+        #   往游戏里补一个「按下 → 松开」，把游戏侧的键状态钉回"松开" ✓。
+        #   ⚠ 顺序**必须先按、后重置**（用户定的 ✓）：先补的这四下能把游戏侧的方向键
+        #   刷干净；随后 RELEASEALL / 重连再清固件侧，两边就都不留卡键 ✓。
+        #   ⚠ 通道死了这几下会静默失败（`_send_remote` 吞掉、不抛 ✗）⇒ 无副作用，
+        #   后面的重连照走 ✓。
+        for _name in ("left", "right", "up", "down"):
+            _k = (settings.keymap or {}).get(_name)
+            if _k:
+                try:
+                    dinput.tap(_k)
+                except Exception:                       # noqa: BLE001
+                    pass
         h = dinput.link_health()
         backend = h.get("backend")
         reconnected = False
@@ -2451,136 +2556,6 @@ class PlayerPanel(QWidget):
         #   这里再刷一次是为了"切回定点休息类型时状态是对的"（不刷也不会错，但便宜 ✓）。
         self._refresh_spot_loop_ui()
 
-    def _bz_hint(self):
-        """「编辑战斗区域」下面那行短说明（2026-09-28 用户重构后重写 ✓）。"""
-        lbl = QLabel("点「**编辑**」增删改 ✓；每一项**勾了「可以战斗」**才等于旧的"
-                     "「限制战斗区域」（人在它外面 ⇒ 这一拍不打架、先走回去 ✓）。")
-        lbl.setStyleSheet("color: #80868b;")
-        lbl.setWordWrap(True)
-        lbl.setToolTip(
-            "**每一项 = 一块集合（平台）的配置**（区域查询CD / idle 回归 foothold /\n"
-            "最大战斗时长 / 到点去哪 / **可以战斗** ✓）。\n\n"
-            "「可以战斗」= **旧的「限制战斗区域」**（用户 2026-09-28 搬进每一项 ✓）：\n"
-            "  勾上 ⇒ 人**不在这块集合上**时这一拍**不打架**、先下「前往」回去 ✓，\n"
-            "          而且只打**本集合里**的怪 ✓；\n"
-            "  不勾 ⇒ 这块区域**只管它自己那几项参数**，不影响在哪打架 ✓\n"
-            "          （**新加的项默认勾上** ✓ —— 不勾的话它进不了能打名单，\n"
-            "            别的区域能打时人会被请出去，idle 回归也起不来 ✗）。\n\n"
-            "一个都没勾 = **不限制**（任何地方都打 ✓ 老行为）。\n\n"
-            "怎么配：点「**编辑**」⇒ 打开「编辑战斗区域」列表 ——\n"
-            "  点「添加」选一块集合 ⇒ 立刻弹出它的参数窗 ✓；\n"
-            "  **双击一行**同样是改它 ✓；选中后点「删除」移除 ✓。\n"
-            "改完**立刻生效**，并且**跟着项目存** ✓。\n\n"
-            "⚠ 拿不到定位（不知道自己在哪块平台）时按「不在禁战区里」处理 ⇒ 先回去 ✓：\n"
-            "   宁可先归位，也不要在不知道自己在哪的时候开打 ✗。")
-        return lbl
-
-    def _bz_items(self):
-        """**真源**：`settings.battle_zones` 的每一项 → `[(名字, 项), …]`（顺序 = 界面顺序 ✓）。
-
-        ⚠ **界面一律读它**（`battle_zone_sets` 只是**派生副本** ✗）：用户 2026-09-28 原话
-          "**按钮和弹窗呢？你做的我没法测**" —— 那时界面只读写副本 ⇒ `cd_s` /
-          `idle_foothold` / `fight_max_s` / `fight_dst` 四个字段**一个入口都没有** ✗。
-        """
-        out = []
-        for z in (getattr(settings, "battle_zones", None) or []):
-            if isinstance(z, dict) and str(z.get("set") or ""):
-                out.append((str(z["set"]), z))
-        return out
-
-    def _bz_commit(self, zones):
-        """写回 `battle_zones` + **同步派生副本** + 存盘 + 重画（唯一出口 ✓）。
-
-        ⚠ `sync_battle_zone_sets()` **必须调**（见 `decision/agent.py:734` 的说明 ✓）：
-          `battle_zone_sets` **没有自动同步**（`__getattr__` 代理 + property 会栈溢出 ✗）
-          ⇒ 不调的话"筛怪 / 回区域"还会按**老名单**跑 ✗（`t_align_params` / `t_zone_cd_setting` 钉着 ✓）。
-        """
-        settings.battle_zones = [dict(z) for z in zones]
-        try:
-            settings.sync_battle_zone_sets()
-        except Exception:                     # noqa: BLE001 —— 老设置对象没这个方法也照存 ✓
-            pass
-        settings.save()
-        self._refresh_battle_zones()
-
-    def _bz_candidate_names(self):
-        """候选集合名 = `set_zone_sets` 推过来的**已注册集合** ✓
-        （⚠ 2026-09-28 起不再从下拉读 —— 那个下拉已经被用户要求去掉了 ✓；
-        再兜一层"当前已配的那些"，免得换图后候选空掉 ⇒ 连编辑都点不开 ✗）。"""
-        names = [str(n) for n in (getattr(self, "_bz_candidate", None) or []) if str(n)]
-        for n, _z in self._bz_items():
-            if n not in names:
-                names.append(n)
-        return names
-
-    def _refresh_battle_zones(self):
-        """把 `settings.battle_zones` 灌成**一条一行的只读摘要**（2026-09-28 用户重构 ✓）。
-
-        ⚠ 这里**只显示**：增删改都搬进「编辑战斗区域」弹窗了 ✓（用户第 1 条："不在这里限制"✓）
-          —— 行内再留「编辑 / 删除」按钮就是和弹窗那套重复、还容易两处不同步 ✗。
-        ⚠ 摘要里**必须看得见「可以战斗」**：它是旧「限制战斗区域」的去处 ✓，也是最要紧的一条 ✓
-          （看不见的话，用户根本不知道哪块在禁战 ✓）。
-        """
-        self._clear_layout(self._bz_rows)
-        items = self._bz_items()
-        self._bz_names = [n for n, _z in items]
-        if not items:
-            empty = QLabel("（还没配 —— 点上面的「编辑」添加）")
-            empty.setStyleSheet("color: #80868b;")
-            self._bz_rows.addWidget(empty)
-            return
-        for n, z in items:
-            bits = []
-            if z.get("can_fight"):
-                bits.append("**可以战斗**")
-            bits.append("CD %gs" % float(z.get("cd_s") or ZONE_GOTO_RETRY_S))
-            if str(z.get("idle_foothold") or ""):
-                bits.append("idle 回 fh %s" % z.get("idle_foothold"))
-            if float(z.get("fight_max_s") or 0.0) > 0:
-                bits.append("最多打 %gs → %s"
-                            % (z.get("fight_max_s"), z.get("fight_dst") or "（不前往）"))
-            lbl = QLabel("%s　·　%s" % (n, "，".join(bits)))
-            lbl.setToolTip("这一项的完整设置（**改它请点上面的「编辑」** ✓）：\n"
-                           "  可以战斗 = %s\n  区域查询CD(s) = %s\n"
-                           "  idle 回归 foothold = %s\n  最大战斗时长(s) = %s\n  到点去哪 = %s"
-                           % ("是" if z.get("can_fight") else "否",
-                              z.get("cd_s"), z.get("idle_foothold") or "（无）",
-                              z.get("fight_max_s"), z.get("fight_dst") or "（不前往）"))
-            self._bz_rows.addWidget(lbl)
-
-    def _on_battle_zone_edit_clicked(self):
-        """点「**编辑**」⇒ 打开「**编辑战斗区域**」列表弹窗（用户 2026-09-28 第 2 条 ✓）。
-
-        弹窗里：**添加 / 删除 / 双击一行改参数** ✓；每次增删改都**立刻**经 `_bz_commit`
-        写回（存盘 + 同步派生副本 ✓）⇒ 关掉弹窗不需要额外的"确定"语义 ✓（老界面就是
-        "改完即存"，这个习惯保持不变 ✓）。
-
-        ⚠ 候选集合名**从本面板转交**（弹窗不持有地图 id ✓ 同 `set_zone_sets` 那套推送 ✓）。
-        ⚠ 回来后再 `_refresh_battle_zones()` 一次：弹窗里改过 ⇒ 这行摘要要对齐 ✓
-          （其实每次改动弹窗都会回调 `_bz_commit` 顺带重画 ✓，这里只是收尾兜一层 ✓）。
-        """
-        dlg = BattleZoneListDialog([z for _n, z in self._bz_items()],
-                                   names=self._bz_candidate_names(),
-                                   on_save=self._bz_commit, parent=self,
-                                   picker_factory=self._bz_picker_factory)
-        dlg.exec_()
-        self._refresh_battle_zones()
-
-    def set_foothold_picker_factory(self, fn):
-        """接住「**只读 foothold 视图**」的工厂（由路线识别面板推过来 ✓ 同 `set_zone_sets`）。
-
-        用户 2026-09-28 的要求："编辑战斗区域的**子弹窗**需要有『foothold 集合编辑器』的
-        **同款视图（只读）**，可以通过**点选**来查看 foothold 参数、配置『idle回归foothold』"✓。
-
-        ⚠ 为什么走"推"：集合 / 地形都按 **地图 id** 存（`core/zones` / `core/mapdata`），
-          而本面板**不持有地图 id** ✗ —— 只有路线识别面板知道当前是哪张图 ✓
-          （`gui/main_window.py::_bind_cards` 里和 `set_zone_sets` 一起推 ✓）。
-
-        工厂签名：`fn(set_name, current_fid) -> QWidget | None` ✓
-        （拿不准 / 没地图 / 读不出地形 ⇒ 回 `None` ⇒ 弹窗**退回文本框** ✓ 老用法不坏 ✓）。
-        """
-        self._bz_picker_factory = fn if callable(fn) else None
-
     def set_zone_sets(self, names):
         """把**当前地图已注册的集合名**灌进「定点休息」那两个下拉（由路线识别面板推过来）。
 
@@ -2589,12 +2564,6 @@ class PlayerPanel(QWidget):
         所以走它已经用的那套"面板间推送"（同 live_panel.set_mmap ✓）。
         保留当前选择：refill 之后按名字重新选回去；选的名字没了就回到"未选"。
         """
-        # 顺带：① 记下「**编辑战斗区域**」的**候选集合名**（就是同一份集合名 ✓ ——
-        #         2026-09-28 起不再往某个下拉里灌：用户要求把那个下拉去掉 ✓
-        #         ⇒ 候选**只存在内存里**（`_bz_candidate` ✓），弹窗要用时由本面板转交 ✓）
-        #       ② 把**已经配好的**区域重画一遍（换项目/换图它也要跟着变 ✓）
-        self._bz_candidate = sorted(str(n) for n in (names or []) if str(n))
-        self._refresh_battle_zones()
         names = [str(n) for n in (names or [])]
         for cmb, empty_label, cur in (
                 (self.cmb_spot_set, "（未选）", settings.anti_afk_spot_set),
@@ -2709,10 +2678,109 @@ class PlayerPanel(QWidget):
         settings.back_range = int(val)
         settings.save()
 
+    def _on_edge_turn(self, val):
+        settings.sweep_edge_turn_px = int(val)
+        settings.save()
+
+    # ---- 「挂机保护」页（2026-09-29：右侧新页签，见 main_window ✓）----
+
+    def build_protection_page(self):
+        """构建「挂机保护」页（main_window 把返回值 `addTab` 成新页签 ✓）。
+
+        内容 = 「防挂机」新组（触发音效 + 试听 ✓）+ **整体搬来**的「防掉线」组 ✓。
+        ⚠⚠ 只是 **re-parent**：防掉线的控件与全部槽函数仍归**本面板**所有
+        （信号早就连在它身上 ✓）—— 搬的是视觉位置，不是重写 ✗；
+        `lay.addWidget(self.afk)` 会把它从决策参数页的布局里**自动摘走** ✓。
+        """
+        page = QWidget()
+        lay = scroll_page(page, margins=(12, 12, 12, 12), spacing=8)
+        lay.addWidget(self._build_antihang_group())
+        lay.addWidget(self.afk)               # ⭐ re-parent（见上 ✓）
+        lay.addStretch(1)
+        return page
+
+    def _build_antihang_group(self):
+        """「防挂机」组：测谎/掉线弹窗出现时的**触发音效**（用户 2026-09-29 ✓）。"""
+        grp = QGroupBox("防挂机")
+        f = QFormLayout(grp)
+
+        row = QHBoxLayout()
+        self.ed_alarm_sound = QLineEdit(
+            getattr(settings, "lie_alarm_sound",
+                    "datasets/sound/Neotokyo.Effect.alert.mp3"))
+        self.ed_alarm_sound.editingFinished.connect(self._on_alarm_sound)
+        self.ed_alarm_sound.setToolTip(
+            "测谎/掉线等弹窗出现时播放的音效文件（mp3/wav）。\n"
+            "相对路径按仓库根解析；留空 = 系统提示音。")
+        row.addWidget(self.ed_alarm_sound, 1)
+        _b = QPushButton("浏览…")
+        _b.clicked.connect(self._browse_alarm_sound)
+        row.addWidget(_b)
+        _p = QPushButton("试听")
+        _p.setToolTip("播一遍当前配置的音效 ✓")
+        _p.clicked.connect(self._preview_alarm_sound)
+        row.addWidget(_p)
+        f.addRow("触发音效", row)
+
+        note = QLabel("测谎 / 掉线等弹窗出现时播放的提示音（mp3 / wav）；"
+                      "留空或文件缺失时退回系统提示音。")
+        note.setStyleSheet("color: #80868b;")
+        note.setWordWrap(True)
+        f.addRow("", note)
+        return grp
+
+    def _on_alarm_sound(self):
+        settings.lie_alarm_sound = self.ed_alarm_sound.text().strip()
+        settings.save()
+
+    def _browse_alarm_sound(self):
+        from PyQt5.QtWidgets import QFileDialog
+        p, _ = QFileDialog.getOpenFileName(self, "选择触发音效", "",
+                                           "音频 (*.mp3 *.wav);;所有文件 (*)")
+        if p:
+            self.ed_alarm_sound.setText(p)
+            self._on_alarm_sound()
+
+    def _preview_alarm_sound(self):
+        play_sound(self.ed_alarm_sound.text().strip())
+
+    def _toggle_preview(self):
+        """试听 ⇄ 停止（2026-09-29 用户要求 ✓：点击后变「停止」，播放完或点停止再变回）。"""
+        if self._previewing:
+            stop_sound()
+            self._set_preview_text("试听")
+            return
+        if play_sound(self.ed_alarm_sound.text().strip()):
+            self._set_preview_text("停止")   # 真的在播才变 ✓（文件缺失只会 beep ✓）
+
+    def _set_preview_text(self, text):
+        self._previewing = (text == "停止")
+        self._btn_preview.setText(text)
+
+    def _on_player_state(self, state):
+        """共享播放器的状态信号：播完（EndOfMedia）/ 被停 ⇒ 按钮弹回「试听」✓。"""
+        from PyQt5.QtMultimedia import QMediaPlayer
+        if state == QMediaPlayer.StoppedState and self._previewing:
+            self._previewing = False
+            self._btn_preview.setText("试听")
+
     def _on_debounce(self, _val=None):
         settings.debounce_conf = float(self.sp_debounce_conf.value())
         settings.debounce_ms = int(self.sp_debounce_ms.value())
         settings.save()
+
+    def _on_big_mob(self, _val=None):
+        settings.big_mob_enabled = bool(self.ck_big_mob.isChecked())
+        settings.big_mob_ratio = float(self.sp_big_mob_ratio.value())
+        settings.big_mob_range_px = int(self.sp_big_mob_range_px.value())
+        self._apply_big_mob_enabled()
+        settings.save()
+
+    def _apply_big_mob_enabled(self):
+        """「大怪优先」勾选开关 ⇒ 下面两个参数**可用 / 禁用**（用户 2026-10-01 ✓）。"""
+        on = bool(self.ck_big_mob.isChecked())
+        self.sp_big_mob_ratio.setEnabled(on)
+        self.sp_big_mob_range_px.setEnabled(on)
 
     def _refresh_strategy_ui(self):
         """按策略切换说明文字，并控制扫平台专属参数是否可见。"""
@@ -2720,7 +2788,8 @@ class PlayerPanel(QWidget):
         if is_sweep:
             self.lbl_strategy_note.setText(
                 "扫平台：优先朝向方向，背后一定距离内的怪按就近锁定；"
-                "当前朝向没怪持续一段时间就换向。继承上/下阈值过滤。")
+                "到集合边缘（「距离平台边缘回头」）或当前朝向没怪持续一段时间"
+                "就换向。继承上/下阈值过滤。")
         else:
             self.lbl_strategy_note.setText(
                 "以角色脚底为基准：上阈值往上、下阈值往下，范围外的怪不追踪")
@@ -2730,6 +2799,9 @@ class PlayerPanel(QWidget):
         self.sp_back_range.setVisible(is_sweep)
         if getattr(self, "_lbl_back_range", None) is not None:
             self._lbl_back_range.setVisible(is_sweep)
+        self.sp_edge_turn.setVisible(is_sweep)
+        if getattr(self, "_lbl_edge_turn", None) is not None:
+            self._lbl_edge_turn.setVisible(is_sweep)
 
     def _on_vision(self, _val=None):
         settings.vision_top = int(self.sp_vision_top.value())
@@ -3102,7 +3174,7 @@ class PlayerPanel(QWidget):
         from decision import input as dinput
         import threading
         if dev == "remote":
-            from tools.config import get
+            from core.config import get
             host = get("kbd", "host")
             port = int(get("kbd", "port", 9000))
             cert = get("kbd", "cert", "remote_kbd/certs/cert.pem")
@@ -3134,7 +3206,7 @@ class PlayerPanel(QWidget):
                     pass
             threading.Thread(target=_do_connect, daemon=True).start()
         elif dev == "serial":
-            from tools.config import get
+            from core.config import get
             ser_port = get("kbd", "serial_local", "COM5")
             self.lbl_device_state.setText("正在连接 ProMicro(本地)…")
             def _do_connect():
@@ -3393,7 +3465,6 @@ class PlayerPanel(QWidget):
 
     def _sync_from_settings(self):
         """启动时把 settings 里的值灌到控件上。"""
-        self._refresh_battle_zones()
         self.sp_attack.blockSignals(True)
         self.sp_attack.setValue(settings.attack_dist)
         self.sp_attack.blockSignals(False)
@@ -3522,6 +3593,9 @@ class PlayerPanel(QWidget):
         self.sp_back_range.blockSignals(True)
         self.sp_back_range.setValue(settings.back_range)
         self.sp_back_range.blockSignals(False)
+        self.sp_edge_turn.blockSignals(True)
+        self.sp_edge_turn.setValue(getattr(settings, "sweep_edge_turn_px", 100))
+        self.sp_edge_turn.blockSignals(False)
 
         self.sp_debounce_conf.blockSignals(True)
         self.sp_debounce_conf.setValue(settings.debounce_conf)
@@ -3530,6 +3604,14 @@ class PlayerPanel(QWidget):
         self.sp_debounce_ms.blockSignals(True)
         self.sp_debounce_ms.setValue(settings.debounce_ms)
         self.sp_debounce_ms.blockSignals(False)
+
+        self.sp_big_mob_ratio.blockSignals(True)
+        self.sp_big_mob_ratio.setValue(getattr(settings, "big_mob_ratio", 1.5))
+        self.sp_big_mob_ratio.blockSignals(False)
+
+        self.sp_big_mob_range_px.blockSignals(True)
+        self.sp_big_mob_range_px.setValue(getattr(settings, "big_mob_range_px", 600))
+        self.sp_big_mob_range_px.blockSignals(False)
 
         self._refresh_strategy_ui()
 

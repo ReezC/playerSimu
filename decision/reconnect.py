@@ -23,6 +23,11 @@
 鼠标点击（选服务器 / 选频道）**故意还没接**：鼠标只有相对位移，要先做
 「撞角归零 + counts/px 标定」（见 docs/断线重连设计.md 6.1）。没标定就点，
 落到哪全凭运气 —— 宁可不做，也不乱点。
+
+**「停自动」与「自动重连」是两件事**（2026-09-30 解耦 ✓ 用户原话："刚刚判定到
+断线了，在断线的时候停止自动吧"）：判到断线界面 ⇒ **必停自动** ✓（安全行为，
+常开、不看开关）；`reconnect_enabled` 只管"要不要自动按回车/走回游戏" ✓。
+（原来开关把两件事连坐 ✗ 默认 False ⇒ 断线了自动还在瞎跑 ✗。）
 """
 
 import time
@@ -88,13 +93,11 @@ class Reconnector:
         """
         s = self.s
         self._now = now
-
-        # 关闭开关：清干净，不干预
-        if not s.reconnect_enabled:
-            if self.active:
-                self._reset()
-            self._say("", now)
-            return None
+        # ⭐ **「停自动」与「自动重连」解耦**（2026-09-30 用户要求 ✓ 原话："刚刚
+        #   判定到断线了，在断线的时候停止自动吧"）—— 原来这个早退把两件事连坐
+        #   ✗（`reconnect_enabled` 默认 False ⇒ 断线了自动还在瞎跑 ✗）：现在
+        #   **判到断线界面必停自动** ✓（安全行为、常开 ✓）；开关只管重连动作 ✓。
+        reconnect_on = bool(s.reconnect_enabled)
 
         # 玩家框回来了 → 已经回到游戏
         if player_found:
@@ -142,7 +145,15 @@ class Reconnector:
             self._scene_at = now
             self._auto_was_on = True      # 能走到这里说明 s.enabled 是开的
             s.enabled = False
-            self._say("检测到%s —— 已停止自动" % ui_state.UI_NAMES.get(ui, ui))
+            if reconnect_on:
+                self._say("检测到%s —— 已停止自动，开始重连"
+                          % ui_state.UI_NAMES.get(ui, ui))
+            else:
+                self._say("检测到%s —— 已停止自动（重连未开启：不会自动按键 ✓）"
+                          % ui_state.UI_NAMES.get(ui, ui))
+
+        if not reconnect_on:
+            return None                   # 只停自动 ✓：按 Enter 等重连动作不做 ✓
 
         act, desc = STEPS[ui]
 
@@ -192,7 +203,10 @@ class Reconnector:
 
     def _finish(self, now):
         """回到游戏：结束重连，按需恢复自动。"""
-        was = self._auto_was_on and bool(self.s.reconnect_resume_auto)
+        # ⭐ 只有**重连流程**走回来的才恢复自动 ✓ —— 开关没开时停自动是用户要的
+        #   唯一动作 ⇒ 回到游戏也**保持停止** ✓（人自己开 ✓）。
+        was = (self._auto_was_on and bool(self.s.reconnect_resume_auto)
+               and bool(self.s.reconnect_enabled))
         self.active = False
         self._scene = None
         self._tries = 0
@@ -200,7 +214,7 @@ class Reconnector:
             self.s.enabled = True
             self._say("已回到游戏 —— 恢复自动")
         else:
-            self._say("已回到游戏")
+            self._say("已回到游戏（自动保持停止 ✓）")
         return None
 
     def _give_up(self, why):

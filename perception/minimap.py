@@ -175,6 +175,99 @@ class MiniMapClient:
             return 0.0
         return (len(ts) - 1) / span
 
+    # ---------------- 换图：叫 A 机把推流换成这一张图 ----------------
+
+    def switch_map(self, map_id, timeout=3.0):
+        """叫 A 机把推流区域换成这张图 ⇒ `(ok, info)`（**不用重启它** ✓）。
+
+        ⭐ 这是「推流开着不停、内容自己变更」的那一句：另开一条到**同一个端口**的
+           连接，先报 `HELLO mmap-ctl`（协议常量都在 `tools/mmap_regions`，A/B 共用
+           那一份 ✓ —— 各写一份迟早讲成两种方言 ✗），再发 `MAP <id>`。
+           A 机查到就 **下一帧**生效，并把**实际在用的区域和 zoom 回过来**。
+
+        `info`：成功是个 dict（`map_id` / `box` / `zoom`）；失败是一句人话（str）。
+
+        ⚠ **必须另开一条连接，不碰收帧那条**：收帧线程正阻塞在 `recv(4)` 上等着读
+           帧头，拿它的 socket 说话等于往帧流里灌字，两边都不讨好 ✗。
+
+        ⚠ `zoom` 要搭回来是有讲究的：标定是**对着某个 zoom 标出来的**
+           （`mapdata.zoom_of`），换图后 zoom 可能不一样 ⇒ 上层拿这个 zoom 去问
+           `calib_for(..., zoom=...)`，才能让"几何对不上"当场暴露，而不是闷头
+           给出整倍数错的坐标 ✗。
+        """
+        mid = str(map_id or "").strip()
+        if not mid:
+            return False, "没给地图 id —— 不知道该叫 A 机推哪一张"
+        if not self.host:
+            return False, "不知道 A 机的地址（link.yaml 里没读到 a_host）"
+        end = time.time() + max(0.5, float(timeout))
+        try:
+            from tools import mmap_regions                 # 只在用到处局部 import ✓
+        except Exception as e:                             # noqa: BLE001
+            return False, "加载换图协议失败：%s: %s" % (type(e).__name__, e)
+        try:
+            with socket.create_connection((self.host, self.port),
+                                          timeout=max(0.5, float(timeout))) as s:
+                s.settimeout(max(0.2, end - time.time()))
+                s.sendall(mmap_regions.CTL_HELLO)
+                s.sendall(("%s %s\n" % (mmap_regions.CMD_MAP, mid)).encode("utf-8"))
+                buf = b""
+                while b"\n" not in buf and time.time() < end:
+                    try:
+                        chunk = s.recv(4096)
+                    except socket.timeout:
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+        except Exception as e:                             # noqa: BLE001
+            return False, ("叫 A 机换图失败：%s: %s\n"
+                           "（A 机的「小地图推流」在跑吗？它要是还没支持 MAP 命令，"
+                           "连上会受理但一帧也读不回来 —— 那种场合重启一次推流最省事）"
+                           % (type(e).__name__, e))
+        head = (buf.split(b"\n", 1)[0] or b"").decode("utf-8", "replace")
+        rep = mmap_regions.parse_reply(head)
+        if rep is None:
+            return False, ("A 机的回执看不懂：%r\n"
+                           "（多半是那边的推流还是旧版 —— 旧版不支持 MAP 命令，"
+                           "会把这条连接当成收流客户端，于是永远不回话）" % (head[:80],))
+        if not rep.get("ok"):
+            return False, "A 机拒绝了：%s %s" % (rep.get("code") or "",
+                                                 rep.get("why") or "")
+        return True, rep
+
+
+def is_blackout(frame, ratio=0.98, max_val=24):
+    """这一帧是不是**几乎全黑**（「进传送门 → 黑屏」那一瞬）→ bool。
+
+    ⭐ **切图的判据**（用户 2026-10-01 定）：「进传送门 → 黑屏 → 亮起」算进了新图，
+      由 **B 机**认这个瞬间，再把新图的 id 发给 A 机（`MiniMapClient.switch_map`）
+      ⇒ 推流内容自动换到新图那块区域。
+
+      ⚠ 这里**只判"黑不黑"**。什么时候算"亮起"、新图是哪张，得由**编排层**决定：
+      「黑 → 亮」是个**过程**，两次采样之间到底算不算换完了，只有知道目标图的
+      那一层说得清 —— 在这一层猜，就会把"半黑"判成"已经进图"✗。
+
+    `ratio`：多大比例的像素算黑，就算黑屏（默认 98% —— 面板边框残留几个亮点不算
+      "已经亮起"，别把"还剩 1% 有内容"当成已经进图 ✗）。
+    `max_val`：多暗算黑（0~255，默认 24 —— 给 JPEG 噪点和暗部 UI 留点余量）。
+
+    ⚠ **空帧 / 取不到帧 ⇒ False**：没有证据就说"进黑屏了"是猜 —— 那会把
+      "还没收到帧"（断流的症状 ✗）误判成"正在换图"，正好把人往错方向带。
+    """
+    try:
+        arr = np.asarray(frame)
+    except Exception:                                      # noqa: BLE001
+        return False
+    if getattr(arr, "ndim", 0) < 2 or getattr(arr, "size", 0) == 0:
+        return False
+    if arr.ndim == 3:
+        arr = arr.mean(axis=2)          # 三通道取平均 —— 比只看某一个通道稳 ✓
+    try:
+        return bool((arr <= float(max_val)).mean() >= float(ratio))
+    except Exception:                                      # noqa: BLE001
+        return False
+
 
 def offset_of(calib):
     """从**标定字典**里读「坐标系偏移」→ `(x, y)`（没有 / 坏了给 `(0, 0)`）。
@@ -1495,7 +1588,7 @@ def stream_panel(timeout=5.0):
     各写一遍"连哪口 / 最多等多久 / 清了没有"迟早分叉 ✗（和 `crop_of` 同一个理由 ✓）。
     取不到时 `原因` 是人话（没配 a_host / 超时没收到 ✓），调用方直接显示 ✓。
     """
-    from tools.config import get                    # 本模块只在用到处局部 import ✓
+    from core.config import get                    # 本模块只在用到处局部 import ✓
     host = get("a_host")                            # link.yaml 顶层
     port = get("minimap", "port", 5003)
     if not host:
@@ -2429,19 +2522,37 @@ class PlayerLocator:
         self._view_track.reset()
         return self
 
-    def calib_for(self, src, ttl=1.0):
+    def calib_for(self, src, ttl=1.0, zoom=None):
         """读某条来源的标定，**带 1 秒缓存**。
 
         为什么不每次读文件：实时回路 30 拍/秒，每拍读一次 JSON 纯属浪费；
         为什么不只在启动时读一次：标定在弹窗里随时会被改，读死了要重启才生效。
         1 秒的折中足够（弹窗保存后本来就会自己刷新一次）。
+
+        ⭐ `zoom`（**可选**，不传 = 与从前完全一样）：只肯要**在这个 zoom 下标出来的**
+           那份（见 `mapdata.zoom_of` / `mapdata.load_calib`）。zoom 变了 ⇒ 返回
+           **None**（不是"拿旧的凑合"）⇒ 上层会说"这份标定不适用"，而不是闷头给出
+           整倍数错的坐标 ✗。
+           ⇒ **换图之后一定要带上 `switch_map` 回回来的那个 zoom**：同一张图换个 zoom
+           推，面板像素尺寸就变了，而标定里的 `scale`/`offset` 是对着当时那个尺寸
+           量出来的（这正是 2026-10-01 修的那个坑）。
         """
         now = time.monotonic()
-        hit = self._calib_cache.get(src)
+        key = (src, int(zoom) if zoom is not None else None)
+        hit = self._calib_cache.get(key)
         if hit is not None and now - hit[0] < ttl:
             return hit[1]
-        cal = mapdata.load_calib(self.map_id, src) if self.map_id else None
-        self._calib_cache[src] = (now, cal)
+        # ⚠ **不传 zoom 时必须用"老调用形式"**（2026-10-01 修 ✗）：`tools/selftest_minimap`
+        #   的「实测精度」用例把 `load_calib` 换成了只认 `(_m, src=None)` 的替身 ⇒
+        #   一律多传一个 `zoom=None` 会当场 `TypeError`（那个用例就这么挂的 ✓）。
+        #   ⇒ **可选参数不该改变老调用形式** —— 这条对所有可能被替身/被 mock 的函数都成立 ✓。
+        if not self.map_id:
+            cal = None
+        elif zoom is not None:
+            cal = mapdata.load_calib(self.map_id, src, zoom=zoom)
+        else:
+            cal = mapdata.load_calib(self.map_id, src)
+        self._calib_cache[key] = (now, cal)
         return cal
 
     def forget_calib(self):
@@ -2988,7 +3099,6 @@ def _mode_zh(mode):
 
 
 def diagnose(map_id, host, port=5003, wait=8.0, out=None, mode="saved", save=True):
-    from tools.config import get
     t = mapdata.load(map_id, with_canvas=True)
     if t is None or t.canvas is None:
         print("没有 %s 的地形/底图，先导出："
@@ -3123,7 +3233,7 @@ def watch(map_id, host, port=5003, mode=None, seconds=0.0, fps=5.0,
       · 位移量级要和走的距离相符（`view` 的单位就是底图像素）。
     按 q（或 Ctrl+C）退出。
     """
-    from tools.config import get
+    from core.config import get
 
     t = mapdata.load(map_id, with_canvas=True)
     if t is None or t.canvas is None:
@@ -3216,7 +3326,7 @@ def watch(map_id, host, port=5003, mode=None, seconds=0.0, fps=5.0,
 
 def main() -> int:
     import argparse
-    from tools.config import get
+    from core.config import get
     ap = argparse.ArgumentParser(description="小地图定位诊断（B 机）")
     ap.add_argument("--map", dest="map_id", default="105090600")
     ap.add_argument("--host", default=None, help="A 机 IP，默认读 link.yaml 的 a_host")

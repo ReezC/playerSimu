@@ -22,7 +22,7 @@ import time
 import cv2
 
 from link import PyAVSource
-from tools.config import get
+from core.config import get
 from tools.probe_codec import decode_ms, resolve_delay_ms
 
 

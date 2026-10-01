@@ -302,6 +302,26 @@ def check_scroll_single_impl(errors):
                           % (rel(p), i, SCROLL_ALLOW, ln.strip()))
 
 
+def check_shortcut_context(errors):
+    """`QShortcut` 必须**显式** `setContext(...)`（UI规范 §10：context 是功能的一部分）。
+
+    为什么写进检查：默认 context 是 `WindowShortcut` —— 主窗口里**别的页签**按同一个键
+    也会响应（"抢键"比没有这个功能更糟 ✗）；而**故意**用 WindowShortcut 的地方
+    （主窗口「开关自动」热键降级那一处 ✓）也必须写出来，让人一眼看出是有意的 ✓。
+    2026-09-29 收口：3 处 QShortcut（review / frame_picker / main_window）全部显式 ✓。
+    """
+    for p in iter_scanned():
+        lines = read(p).splitlines()
+        for i, ln in enumerate(lines):
+            if "QShortcut(" not in ln:
+                continue
+            if not any("setContext(" in w for w in lines[i:i + 6]):
+                errors.append("%s:%d  QShortcut 必须显式 setContext(...) —— "
+                              "「只在那一页」用 WidgetWithChildrenShortcut；"
+                              "故意用默认值也要写出来（UI规范 §10）\n        %s"
+                              % (rel(p), i + 1, ln.strip()))
+
+
 def check_theme_colors(warnings):
     """（占位）样式里的硬编码颜色。
 
@@ -322,6 +342,7 @@ def main():
     check_ms_is_integer(errors)          # 毫秒一律整数（2026-09-26 新增）
     check_unit_in_label(errors)          # 单位写在框外（存量清零后已升级为错误）
     check_scroll_single_impl(errors)     # 滚动区只有一处实现（2026-09-27 收口）
+    check_shortcut_context(errors)       # QShortcut 必须显式 setContext（2026-09-29 收口）
     check_settings_sync(warnings)
     check_settings_have_ui(warnings)     # 每个参数都要有界面入口（2026-09-26 新增）
     check_theme_colors(warnings)

@@ -120,6 +120,10 @@ class WorldState:
     height: int = 0        # 画面高
     mobs: list = field(default_factory=list)
     player: Player = field(default_factory=Player)
+    #: **界面状态**（感知层在原生帧上做弹窗模板匹配的结论 ✓，M1「测谎报警」）：
+    #: "combat" / "lie_warn"（测谎预警弹窗）/ "lie_game"（测谎小游戏）/ "lie_success"。
+    #: 决策层 `tick` 见它带 `lie` 前缀 ⇒ **停发一切按键**（弹窗期间角色被锁操作 ✓）。
+    screen: str = "combat"
     #: 当前**端到端延迟**（毫秒，实时回路填；拿不到时 0）。
     #: 用途：上绳对齐的"保持窗口" = 设置里的保持时间 + 它（见 `agent._climb_tick`）——
     #: 定位读数本来就是"过去某一刻"的位置，延迟越大越不能拿单帧当真。

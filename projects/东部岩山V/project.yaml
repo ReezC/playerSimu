@@ -122,8 +122,12 @@ decision:
   vision_center: true
   vision_off_x: 0
   vision_off_y: 0
+  big_mob_enabled: true
+  big_mob_ratio: 1.5
+  big_mob_range_px: 600.0
   sweep_turn_cd: 1000
   back_range: 200
+  sweep_edge_turn_px: 100
   route_goto_set: ''
   align_tol_px: 6
   align_hold_ms: 250
@@ -137,8 +141,6 @@ decision:
   disable_chase_pathfinding: false
   jump_start_px: 0
   move_retry_ms: 3000
-  battle_zones: []
-  battle_zone_sets: []
   debounce_conf: 0.45
   debounce_ms: 2000
   custom_timers: []

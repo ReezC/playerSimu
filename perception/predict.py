@@ -28,7 +28,6 @@ import numpy as np
 
 from core.context import ConsoleContext, TaskContext
 from core.imgio import imread, imwrite
-from gui import theme
 from perception.classes import ZH_NAMES
 
 # 类别名来自 perception/classes.py；颜色来自可视化设置（与实时预览、质检台同一份）
@@ -36,7 +35,14 @@ CLASS_NAMES = ZH_NAMES
 
 
 def _cls_colors():
-    """类别 → BGR 颜色，和实时预览/质检台统一（每个类别的颜色都能在设置里改）。"""
+    """类别 → BGR 颜色，和实时预览/质检台统一（每个类别的颜色都能在设置里改）。
+
+    ⚠ **`gui.theme` 只能在这里懒加载**（2026-09-29 架构收口）：perception 是**库层**，
+    顶层 import gui 会把 PyQt5 + 整个 GUI 包拖进"离线推理 / A 机标注"那些根本
+    不开界面的路径 ✗（分层规则见 docs/交接.md §1）。颜色**口径仍是一处** ——
+    就是 `gui.theme.class_colors()` ✓，这里只是把"取"这一步推迟到真要画框时。
+    """
+    from gui import theme                 # noqa: PLC0415 —— 见上面的分层说明
     return theme.class_colors()
 
 

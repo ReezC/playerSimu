@@ -1,0 +1,30 @@
+{
+  "source": "perception/classes.py",
+  "classes": [
+    {
+      "id": 0,
+      "en": "player",
+      "zh": "玩家"
+    },
+    {
+      "id": 1,
+      "en": "mob",
+      "zh": "怪物"
+    },
+    {
+      "id": 2,
+      "en": "drop",
+      "zh": "掉落"
+    },
+    {
+      "id": 3,
+      "en": "npc",
+      "zh": "NPC"
+    },
+    {
+      "id": 4,
+      "en": "other_player",
+      "zh": "其他玩家"
+    }
+  ]
+}

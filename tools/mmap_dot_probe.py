@@ -43,7 +43,7 @@ import numpy as np                                          # noqa: E402
 from core import mapdata                                    # noqa: E402
 from core.imgio import imread, imwrite                      # noqa: E402
 from perception import minimap as mm                        # noqa: E402
-from tools import config                                    # noqa: E402
+from core import config                                    # noqa: E402
 
 OUT_DEFAULT = ROOT / "data" / "dot_probe"
 

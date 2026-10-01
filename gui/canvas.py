@@ -11,11 +11,12 @@
 """
 
 from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal
-from PyQt5.QtGui import (QBrush, QColor, QKeySequence, QPainter, QPen,
-                         QTransform)
-from PyQt5.QtWidgets import (QGraphicsItem, QGraphicsPixmapItem,
-                             QGraphicsRectItem, QGraphicsScene,
-                             QGraphicsSimpleTextItem, QGraphicsView)
+from PyQt5.QtGui import (QBrush, QColor, QKeySequence, QPainter, QPainterPath,
+                         QPen, QTransform)
+from PyQt5.QtWidgets import (QGraphicsItem, QGraphicsPathItem,
+                             QGraphicsPixmapItem, QGraphicsRectItem,
+                             QGraphicsScene, QGraphicsSimpleTextItem,
+                             QGraphicsView)
 
 from gui import theme
 from perception.classes import (CLASS_MOB, CLASS_PLAYER, ZH_NAMES, bgr_to_hex,
@@ -40,7 +41,8 @@ def _box_colors():
 class BBoxItem(QGraphicsRectItem):
     """一个可移动 / 可缩放的标注框。"""
 
-    def __init__(self, x, y, w, h, cls=1, manual=False, colors=None):
+    def __init__(self, x, y, w, h, cls=1, manual=False, colors=None,
+                 names=None):
         super().__init__(0, 0, w, h)
         self.setPos(x, y)
         self.cls = cls
@@ -50,12 +52,16 @@ class BBoxItem(QGraphicsRectItem):
         hex_, rgb = self._colors.get(cls, self._colors[1])
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setPen(QPen(QColor(hex_), 3 if manual else 2))
-        self.setBrush(QBrush(QColor(*rgb, 36)))
+        # ⭐ **只有描边、不填充**（2026-09-29 用户要求 ✓）：填充会让框中间蒙上一层色，
+        #    看"框和目标对不对"反而费眼 ✗ —— 描边已足够标出边界 ✓。
+        self.setBrush(QBrush(Qt.NoBrush))
         self.setZValue(10)
 
         # 类名标签：贴在框左上角上方
-        self.label = QGraphicsSimpleTextItem(
-            CLASS_NAMES.get(cls, str(cls)), self)
+        # ⭐ **工作台配的类别名优先**（2026-09-30 用户报 ✓ 原话："为什么 YOLO 提案后
+        #   框的名称是'玩家'？上面配的不是'shape'嘛"）—— 画布原来写死质检台那套
+        #   中文名（0=玩家/1=怪物 ✗），通用工作台配的"shape"根本显示不出来 ✗。
+        self.label = QGraphicsSimpleTextItem(self._label_text(names), self)
         self.label.setBrush(QBrush(QColor(hex_)))
         self.label.setZValue(1)
         self.label.setPos(-1, -18)
@@ -66,6 +72,14 @@ class BBoxItem(QGraphicsRectItem):
         self._orig_pos = None
         self.on_changed = None   # 拖动/缩放后由画布注入的回调
         self.on_press = None     # 拖动/缩放开始前由画布注入的回调（撤销记录用）
+
+    def _label_text(self, names=None):
+        """框上的类名文本：**注入的类别名表优先** ✓（`names` = 按 id 的名字列表 ✓）；
+        没注入 / id 越界（比如拿别的数据集训的权重预测出类别 7 ✓）⇒ 退回质检台
+        那套中文名（0=玩家/1=怪物 ✓），再不行就显示数字本身 ✓。"""
+        if names and 0 <= self.cls < len(names):
+            return str(names[self.cls])
+        return CLASS_NAMES.get(self.cls, str(self.cls))
 
     # ---------------- 光标形状 ----------------
 
@@ -280,7 +294,14 @@ class ImageCanvas(ZoomPanView):
         self.boxes = []
         self.editable = True
         self.current_cls = CLASS_MOB   # 新建框的默认类别（下拉框选的）
+        #: ⭐ **类别名表**（id → 名 ✓，通用工作台注入 ✓）—— `None` = 质检台那套
+        #:   中文名（0=玩家/1=怪物 ✓）。见 `set_class_names` ✓。
+        self.class_names = None
         self._colors = _box_colors()   # 框颜色缓存（load 时刷新）
+        #: ⭐ **质检台蒙版**层（2026-09-29 用户要求 ✓）：画面上罩一层灰、**框在蒙版上面**
+        #:   —— 观察"框和目标对不对"时把画面压暗、框更跳 ✓。0 = 不罩 ✓。
+        self._mask_alpha = 0.0
+        self._mask_item = None
 
         self._draw_start = None
         self._rubber = None
@@ -294,6 +315,38 @@ class ImageCanvas(ZoomPanView):
         #: ⚠ 存在这里、`load()` 重挂时**再贴一次** —— 否则换图/重画地形图之后
         #: 它悄悄回到不透明（看着像"参数没生效" ✗）。
         self._live_alpha = 0.8
+
+    @staticmethod
+    def _tag_helper(item):
+        """标成**辅助层**（蒙版 / 实时小地图贴图 ✓）：
+
+        · **不吃鼠标**（`setAcceptedMouseButtons(NoButton)` ✓）—— 它们只是"看"的 ✓；
+        · **不参与"空白"判定**（`setData(0, "helper")` ✓，`mousePressEvent` 里跳过 ✓）
+          —— ⚠ 否则蒙版盖满全图 ⇒ 永远判不出"空白" ⇒ **拉不出框** ✗（实测 ✓）。
+        """
+        item.setData(0, "helper")
+        item.setAcceptedMouseButtons(Qt.NoButton)
+
+    def _apply_mask(self):
+        """重铺**蒙版路径**：整幅画面、**挖掉所有框**（2026-09-30 用户报 ✓ 原话：
+        "框里的怪还是受了灰蒙版影响"）—— 蒙版只压暗**框外**的画面 ✓，**框里**保持
+        原亮度 ✓；框挪/缩/增/删都跟着重铺（见各调用点 ✓）。没画面 = 全空路径 ✓。"""
+        if self._mask_item is None:
+            return
+        w, h = self.img_size()
+        path = QPainterPath()
+        if w > 0 and h > 0:
+            path.addRect(0.0, 0.0, float(w), float(h))
+        for it in self.boxes:
+            hole = QPainterPath()
+            hole.addRect(it.sceneBoundingRect())
+            path = path.subtracted(hole)
+        self._mask_item.setPath(path)
+
+    def _on_item_changed(self):
+        """框几何变了（拖动/缩放）⇒ **蒙版洞跟着走** + 照常发 `boxes_changed` ✓。"""
+        self._apply_mask()
+        self.boxes_changed.emit()
 
     # ---------------- 载入 ----------------
 
@@ -311,12 +364,32 @@ class ImageCanvas(ZoomPanView):
         w, h = pixmap.width(), pixmap.height()
         self.scene_.setSceneRect(0, 0, w, h)
 
+        # ⭐ **蒙版层**：插在画面**之后**、框**之前**（同一 z 下按插入顺序堆叠 ⇒
+        #   天然"画面 < 蒙版 < 框" ✓）—— alpha=0 时也照建（透明不可见 ✓），
+        #   这样 `set_mask_alpha` 拖滑条时不用重新 load ✓。
+        # ⭐ **蒙版层**：插在画面**之后**、框**之前**，z=5 显式压序 ✓。
+        #   ⚠⚠ **是"挖了洞"的路径层**，不是一整块矩形（2026-09-30 用户报 ✓ 原话：
+        #   "框里的怪还是受了灰蒙版影响"）—— 蒙版只压暗**框外**的画面 ✓，**框里**
+        #   保持原亮度（看"框里的目标"才不费眼 ✓）；洞随框的增删/挪/缩实时重铺
+        #   （`_apply_mask` ✓）。alpha=0 时也照建（透明不可见 ✓），拖滑条不用重 load ✓。
+        #   ⚠⚠ **必须标成辅助层**（`_tag_helper` ✓）：它是盖满全图的一块，不标的话
+        #     `mousePressEvent` 的"空白"判定永远命中的是它 ⇒ **哪儿都拉不出框** ✗
+        #     （2026-09-30 用户报"质检台不能标框了"的根因 ✓）。
+        self._mask_item = QGraphicsPathItem()
+        self._mask_item.setPen(QPen(Qt.NoPen))
+        self._mask_item.setBrush(QBrush(QColor(96, 96, 96)))
+        self._mask_item.setZValue(5)          # 画面(0) < 蒙版(5) < 框(10) ✓
+        self._tag_helper(self._mask_item)
+        self.scene_.addItem(self._mask_item)
+        self._mask_item.setOpacity(self._mask_alpha)
+
         # ⭐ 实时小地图那层要**重新挂**（上面 `scene_.clear()` 连它一起删了 ✗）——
         #   落在最上面（ZValue 10）、默认不显示，等 `set_live_patch` 来放 ✓。
         self._live_item = QGraphicsPixmapItem()
         self._live_item.setZValue(10)
         self._live_item.setVisible(False)
         self._live_item.setOpacity(self._live_alpha)   # 重挂也带着浓淡 ✓（见那个属性）
+        self._tag_helper(self._live_item)     # 贴图层只是"看"的 ✓ 别挡交互/空白判定 ✓
         self.scene_.addItem(self._live_item)
 
         self.editable = editable
@@ -326,6 +399,8 @@ class ImageCanvas(ZoomPanView):
             manual = box[5] if len(box) > 5 else False
             self.add_box(x, y, bw, bh, cls, manual, self._colors)
 
+        self._apply_mask()            # 载入即铺（框里的画面不蒙灰 ✓）
+
         if fit:
             self.fit()      # 走 fit() 里的空场景守卫（0×0 上 fitInView 会崩）
 
@@ -334,6 +409,24 @@ class ImageCanvas(ZoomPanView):
             return 0, 0
         pm = self.pix_item.pixmap()
         return pm.width(), pm.height()
+
+    def set_class_names(self, names):
+        """换**类别名表**（id → 名 ✓，通用工作台用 ✓）—— 已有的框**当场刷新** ✓；
+        `None`/空 = 回质检台那套中文名 ✓（框标签的取值规则见 `BBoxItem._label_text` ✓）。"""
+        self.class_names = [str(n) for n in (names or []) if str(n)] or None
+        for it in self.boxes:
+            it.label.setText(it._label_text(self.class_names))
+
+    def set_mask_alpha(self, alpha):
+        """只改**蒙版层**的浓淡（不重取帧 ✓）—— 拖滑条要**跟手** ✓。返回生效值。
+
+        蒙版罩在画面上、**框画在蒙版上面**（插入顺序天然保证 ✓）——
+        看帧时压暗画面、框更跳 ✓；0 = 不罩（老观感 ✓）。
+        """
+        self._mask_alpha = max(0.0, min(1.0, float(alpha)))
+        if self._mask_item is not None:
+            self._mask_item.setOpacity(self._mask_alpha)
+        return self._mask_alpha
 
     def set_live_patch_alpha(self, alpha):
         """只改那一层的**浓淡**（不重取帧、不挪位）—— 拖动条要**跟手** ✓。
@@ -376,12 +469,14 @@ class ImageCanvas(ZoomPanView):
     # ---------------- 框操作 ----------------
 
     def add_box(self, x, y, w, h, cls=1, manual=False, colors=None):
-        it = BBoxItem(x, y, w, h, cls, manual, colors or self._colors)
+        it = BBoxItem(x, y, w, h, cls, manual, colors or self._colors,
+                      self.class_names)
         it.setEnabled(self.editable)
-        it.on_changed = self.boxes_changed.emit
+        it.on_changed = self._on_item_changed   # 框挪/缩 ⇒ 蒙版洞跟手 + 照常发信号 ✓
         it.on_press = self.before_change.emit   # 拖动前记录撤销快照
         self.scene_.addItem(it)
         self.boxes.append(it)
+        self._apply_mask()                      # 新框 = 新洞 ✓
         return it
 
     def get_boxes(self):
@@ -426,6 +521,7 @@ class ImageCanvas(ZoomPanView):
                     self.scene_.removeItem(it)
                     self.boxes.remove(it)
             self.boxes_changed.emit()
+            self._apply_mask()                  # 删框 = 补回那块蒙版 ✓
         return n
 
     def clear_boxes(self):
@@ -433,6 +529,7 @@ class ImageCanvas(ZoomPanView):
             self.scene_.removeItem(it)
         self.boxes = []
         self.boxes_changed.emit()
+        self._apply_mask()                      # 全删 = 整幅重新蒙上 ✓
 
     def set_editable(self, on):
         self.editable = bool(on)
@@ -453,8 +550,15 @@ class ImageCanvas(ZoomPanView):
         # **按住 Ctrl = 这一框按「玩家」画**：质检时玩家框少但要准，为了它来回切
         # 下拉框很烦；按 Ctrl 画完就回到下拉框里选的类别，不用切回去。
         if e.button() == Qt.LeftButton and self.editable and self.pix_item is not None:
+            # ⭐ **辅助层不参与"空白"判定**（蒙版/贴图只是"看"的 ✓）—— 蒙版盖满
+            #   全图，`itemAt`（只看最顶那个）永远命中的是它 ⇒ 拉不出框 ✗（实测 ✓）。
+            #   真空白 = 除辅助层外只剩底图 ✓；点在框上 ⇒ 这儿不进、事件交给框 ✓。
             item = self.itemAt(e.pos())
-            if item is None or item is self.pix_item:
+            if (item is None or item is self.pix_item
+                    or (item.data(0) == "helper"
+                        and all(it is self.pix_item
+                                for it in self.items(e.pos())
+                                if it.data(0) != "helper"))):
                 self._draw_cls = (CLASS_PLAYER
                                   if (e.modifiers() & Qt.ControlModifier)
                                   else self.current_cls)

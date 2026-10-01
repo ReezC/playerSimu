@@ -2303,15 +2303,26 @@ def t_foothold_picker_readonly():
             assert dlg._picker is not None and seen == [(best, "")], \
                 "「有工厂」却没摆视图（用户要的就是这块 ✗）：%r / %r" % (dlg._picker, seen)
             dlg._picker.pick_at_scene(mx, my, tol=8.0)
-            assert dlg.idle_fid() == pick, \
-                "视图里选中的那条没被当成 idle 回归点（`zone()` 会存空 ✗）：%r / %r" \
-                % (dlg.idle_fid(), pick)
-            assert dlg.zone().get("idle_foothold") == pick, \
-                "`zone()` 没把它写出来：%r" % (dlg.zone(),)
+            # ⭐ 2026-09-29 起 idle 回归是**列表随机**（用户 ✓）：走选中 → **点添加** → 显示在
+            #   列表里；`zone()` 写 `idle_footholds`（列表）✓
+            assert dlg.idle_fids() == [], \
+                "还没点「添加选中」池里就该是空的 ✗：%r" % (dlg.idle_fids(),)
+            dlg._on_add_idle()
+            assert dlg.idle_fids() == [pick], \
+                "「添加选中」没把视图里选中的那条放进回归点池 ✗：%r" % (dlg.idle_fids(),)
+            assert dlg.zone().get("idle_footholds") == [pick], \
+                "`zone()` 没把回归点池写出来：%r" % (dlg.zone(),)
             assert pick in dlg.lbl_fh.text(), \
                 "旁边那行没显示参数（用户点选就是要看它 ✗）：%r" % (dlg.lbl_fh.text(),)
+            # 再加一条 + 删除选中（列表交互 ✓）
+            dlg._picker.set_current("77" if pick != "77" else "78")
+            dlg._on_add_idle()
+            assert len(dlg.idle_fids()) == 2, "第二条没加进池 ✗：%r" % (dlg.idle_fids(),)
+            dlg.lst_idle.setCurrentRow(0)
+            dlg._on_del_idle()
+            assert len(dlg.idle_fids()) == 1, "「删除选中」没把那行删掉 ✗：%r" % (dlg.idle_fids(),)
             dlg._on_clear_idle()
-            assert dlg.idle_fid() == "", "「清空」没把 idle 回归点清掉：%r" % (dlg.idle_fid(),)
+            assert dlg.idle_fids() == [], "「清空」没把回归点池清掉 ✗：%r" % (dlg.idle_fids(),)
         finally:
             dlg.close()
             dlg.deleteLater()
@@ -2320,9 +2331,10 @@ def t_foothold_picker_readonly():
         try:
             assert dlg2._picker is None and not hasattr(dlg2, "lbl_fh"), \
                 "工厂回 `None` 时该**退回文本框**（老环境不许因此崩 ✗）"
-            dlg2.ed_idle.setText("41")
-            assert dlg2.idle_fid() == "41" and dlg2.zone().get("idle_foothold") == "41", \
-                "退回文本框之后读不到手填的编号：%r" % (dlg2.idle_fid(),)
+            dlg2.ed_idle.setText("41 5")
+            assert dlg2.idle_fids() == ["41", "5"] \
+                and dlg2.zone().get("idle_footholds") == ["41", "5"], \
+                "退回文本框之后读不到手填的编号（空格分隔多个 ✓）：%r" % (dlg2.idle_fids(),)
         finally:
             dlg2.close()
             dlg2.deleteLater()

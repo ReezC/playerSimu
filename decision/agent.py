@@ -74,6 +74,12 @@ DEFAULT_OUTPUT_SEQ = [
 # 防掉线行为类型：(id, 显示名)。加新类型时**必须**同时在决策层实现它的流程
 # （见 `_run_rest` 与 `docs/开发计划.md` P2），别只加个名字就完事 —— 那样用户选了
 # 却什么都不发生 ✗。
+#: ⚠⚠ **原来有个 `_IDLE_REROLL_MIN_S = 3.0`（"闲够 3 秒才算一轮"）——已按用户要求删除** ✗
+#:   用户 2026-09-30 原话："**每次都重新随机，没有任何判定机制，就是简单的『每次都随机抽取』**"
+#:   ✓。它的实际危害（`behavior.log` 实证 ✓）：森林迷宫III 里 idle 段被怪框打断成 0.05~1 秒
+#:   ⇒ **从来够不到 3 秒** ⇒ 抽签号长期不清 ⇒ 现场就是"**固定其中一个**" ✗✗。
+#:   ⇒ 现在：**每次离开 idle 就清号、每次闲下来必抽**，不设任何门槛 ✓。
+
 ANTI_AFK_TYPES = [("hidden_rest", "隐身休息"),
                   ("spot_rest", "定点休息")]
 
@@ -140,9 +146,11 @@ TURN_TAP_S = 0.15
 #: 「站桩输出」时，**每几轮攻击**补一个"朝目标"的方向键（用户 2026-09-28 要求 2，原话：
 #: "attack 增加一个逻辑：**每 3 次 attack 补一个朝向目标的方向键**，持续『最小切换朝向时间』，
 #: 并在这个参数里补上 tips" ✓）。
-#: 与 `TURN_TAP_S` 的分工：**不站桩**时换向一律按满「最小切换朝向时间」✓；**站桩时**默认只
-#: 点一下（`TURN_TAP_S` ✓ 那条的说明：按满就是从怪身上走过去 ✗），**每 `STATION_TURN_EVERY`
-#: 轮**才按满一次 ✓（"每 3 次 attack"就是它 ✓）。
+#: 与 `TURN_TAP_S` 的分工：**不站桩**时换向一律按满「最小切换朝向时间」✓；**站桩时**
+#: 一律点一下（`TURN_TAP_S` ✓ 那条的说明：按满就是从怪身上走过去 ✗）——
+#: ⭐ **"每 3 轮"那一下 2026-09-30 也改成点一下了**（用户实测纠偏："看起来每次 attack
+#:   都往前走了"✗ —— 「最小切换朝向时间」1000ms ≈ 3 轮周期 ⇒ 窗口首尾相接 = 一直在走 ✗；
+#:   补键的用途是转身对齐，点一下就够 ✓）。
 #: ⚠ 站桩期间的轮次计数**退出站桩即清零**（用户 2026-09-28 明确："只要退出站桩计数清零"✓）。
 #: ⚠ 「3」是**用户指定的数**（不是拍的 ✓）—— 要改就连这句注释一起改 ✓。
 STATION_TURN_EVERY = 3
@@ -284,8 +292,26 @@ class DecisionSettings:
         self.vision_center = False  # 基于画面中心：勾选则以画面屏幕中心为基准，否则以角色为中心
         self.vision_off_x = 0       # 视野框 x 偏移（像素）
         self.vision_off_y = 0       # 视野框 y 偏移（像素）
+        # ⭐ 「大怪优先」（用户 2026-10-01 ✓）：锁定目标时，候选里若有「明显更高、且在
+        #   优先半径内」的大怪，就只在这群大怪里挑（无视小怪 ✓）。
+        #   · `big_mob_enabled` —— **总开关**（2026-10-01 用户加 ✓）：False = 大怪优先
+        #     **整个不启用**（下面两个参数也不可配 ✓）；默认 True（老行为不变 ✓）。
+        #   · `big_mob_ratio` —— 大怪判定**倍数**（相对 ✓ 不用每图调高度）：框高 ≥
+        #     候选框高**中位数 × 倍数** 算大怪；≤1 = 关（人人都是大怪 = 没意义 ✓）。
+        #   · `big_mob_range_px` —— 大怪优先**半径**（画面像素）：画面距离 ≤ 它的大怪才
+        #     插队优先，否则仍按距离排（避免舍近求远 ✓）；≤0 = 关 ✓。
+        self.big_mob_enabled = True
+        self.big_mob_ratio = 1.5
+        self.big_mob_range_px = 600
         self.sweep_turn_cd = 1000   # 扫平台：当前朝向没怪持续此时间（毫秒）才换朝向
         self.back_range = 100       # 扫平台：允许锁定背后多远距离内的怪（像素）
+        # 扫平台：距当前 foothold 集合边缘 ≤ 此距离（px）⇒ 回头（**即使该方向有怪也转** ✓
+        # 2026-09-29 新增）。集合 x 范围 = 广播的 `here_span`（世界坐标）；判不出集合
+        # （没圈集合 / 没定位）⇒ 这条不生效，退回上面的「换朝向延迟」老逻辑 ✓。
+        self.sweep_edge_turn_px = 100
+        # 「挂机保护」页（2026-09-29）：测谎/掉线弹窗出现时的**触发音效**文件
+        # （mp3/wav；相对路径按仓库根解析 ✓）。播放在 GUI 线程（live_panel ✓）。
+        self.lie_alarm_sound = "datasets/sound/Neotokyo.Effect.alert.mp3"
 
         # 判定参数（设置 → 「判定参数」页签）：**对齐类**功能（寻路走到某个 x、上绳前对齐
         # 绳的 x、判定"在不在绳上"）靠这两个数说话 —— "多近才算对齐"、"对齐要保持多久算成功"。
@@ -395,9 +421,14 @@ class DecisionSettings:
         #:                       ② 追击下「前往」的节流 + ③ 区域筛缓存时效 ⇒ 都用「**怪那块
         #:                       foothold 命中的那个区域项**」✓（归属不到 ⇒ 兜底
         #:                       `ZONE_GOTO_RETRY_S` ✓ 用户 2026-09-28 定的 ✓）。
-        #:   · `idle_foothold` —— 「**idle 回归 foothold**」（**foothold id**；空 = 无 ✓）：
-        #:                       位于本集合时 idle（没怪）⇒ **水平走**向它的中心、到中心就停 ✓
-        #:                       （**不跨层** ✓ 用户 2026-09-28 明确）。
+        #:   · `idle_footholds` —— 「**idle 回归 foothold 列表**」（2026-09-29 用户要求
+        #:                       "列表随机" ✓；老单值键 `idle_foothold` 读时自动迁移 ✓）：
+        #:                       位于本集合时 idle（没怪）⇒ **水平走**向随机抽中的一块、
+        #:                       进范围就站住 ✓（**不跨层** ✓；每次触发回归重抽 ✓）。
+        #:   · `fight_min_s`   —— 「**最小战斗时长(s)**」（0 = 不限 ✓）：在本集合里**连续累计战斗**
+        #:                       （attack / chase）还没到它 ⇒ **不追击别的 foothold 集合的怪** ✓
+        #:                       （即 `_chase_goto_if_elsewhere` 那条"怪在别的平台 ⇒ 先下前往"
+        #:                       不下 ✓ —— 计时用 `_fight_acc`，与「最大战斗时长」同一把钟 ✓）。
         #:   · `fight_max_s`   —— 「**最大战斗时长(s)**」（0 = 不限 ✓）：在本集合里**有战斗**
         #:                       （attack / chase）连续累计超过它 ⇒ 前往 `fight_dst` ✓
         #:                       （没怪 / 离开 / 换区域 ⇒ **清零** ✓）。
@@ -417,17 +448,10 @@ class DecisionSettings:
         #:                       实现：派生副本 `battle_zone_sets` **只收 `can_fight=True` 的项** ✓
         #:                       ⇒ `_in_battle_zone` / `_zone_only` / `_leave_battle_zone_tick`
         #:                       这些老消费方**一个字都不用改** ✓（见 `sync_battle_zone_sets`）。
-        #: 判据仍用感知给的 `here_sets`（和寻路同一份 ✓）。
-        self.battle_zones = []
-        #: ⚠ **派生副本**：`battle_zones` 里**勾了「可以战斗」**那些项的**集合名**列表
-        #: （= "可战斗区白名单" ✓）。消费方（`_in_battle_zone` / `_zone_only` /
-        #: `_leave_battle_zone_tick` …）全都"拿集合名求交集" ✓ ⇒ 名字不用动 ✓。
-        #: **由 `from_dict` / 区域编辑弹窗写入**（真源是 `battle_zones` ✓，改配置请改那个 ✗）。
-        #: ⛔ 为什么不做成 `@property`（2026-09-28 踩过 ✗）：这个类有 `__getattr__` 代理
-        #:   （给"挂在全局 settings 上的参数"兜底 ✓），而 property 在 `__init__` 赋值**之前**
-        #:   被读到时会走 `__getattr__`、代理又回来读 ⇒ **无限递归 ⇒ 进程栈溢出直接崩**
-        #:   （`0xC0000409`，连异常都不是 ✗ 极难查）⇒ **普通属性最安全** ✓。
-        self.battle_zone_sets = []
+        #: ⛔ `battle_zones` / `battle_zone_sets` 现在**挪到「运行时状态」那一区**去了
+        #:   （2026-10-01 ✓）：它们不再持久化到 project.yaml，而是由 `route_panel` 按
+        #:   **地图 id** 从 `datasets/map/<id>.battle.json` 读进来、换图时灌到 settings 上
+        #:   （见文件靠后的"运行时状态"那一区 + `sync_battle_zone_sets` ✓）。
         # ⚠ 这里**曾经**有 `walk_mode`（走的方向：center / left / right，还摆进了设置里）。
         # 2026-09-26 用户明确删掉：**走只有一种走法 —— 朝目标集合的 x 中点**，
         # 设置里不许有这个参数（设置是全局参数，用户没提过的一律不加）。
@@ -456,6 +480,11 @@ class DecisionSettings:
         self.facing_timeout_min = 10     # 朝向无变化超时（分钟）：超过就停止自动，0=禁用
         self.player_lost_timeout_min = 3 # 找不到玩家超时（分钟）：超过就停止自动，0=禁用
         self.resetall_interval = 60      # 定时 RELEASEALL（秒）：清空固件侧按键防卡键，0=禁用
+        # ⚠ 「按键指令背压上限」这个参数**整个撤掉了**（2026-10-01 ✗）：它连着三次把
+        #   按键通道搞到不可用（"特别卡 / 输入全无效 / 方向键发不出去"），而且**全是
+        #   照代码推断的、没有真机时序数据**的产物 ⇒ 不许留在生产里 ✗。
+        #   要重做的话，**先量 `perf.log` 里的 `kbd_rtt_ms`**（B 发指令 → A 固件回执），
+        #   拿真实往返和抖动说话，别再一次拍脑袋 ✗。
         self.anti_afk_enabled = False   # 防掉线开关
         self.anti_afk_type = "hidden_rest"  # 防掉线行为类型，见 ANTI_AFK_TYPES
         self.anti_afk_min = 5           # 防掉线触发时间下限（分钟）
@@ -525,6 +554,13 @@ class DecisionSettings:
         self.next_afk_monotonic = 0.0   # 下次防掉线触发时刻（0 = 未排期 / 防掉线关着）
         self.rest_pending = False       # 已到触发时间，等攻击范围内的怪清空（「待休息」）
         self.custom_keys = {}           # 自定义按键：{键名: 物理键名}，键名自动命名（custom1...）
+        # ⭐ 「战斗区域」现在是**运行时状态**（2026-10-01 起不持久化到 project.yaml ✓）：
+        #   由 `route_panel` 按**地图 id** 从 `datasets/map/<id>.battle.json` 读进来、换图时
+        #   灌到 settings 上（`_load_battle_zones_for_map` ✓）+ 调 `sync_battle_zone_sets()` ✓。
+        #   契约（每项字段 / `can_fight` 语义）见 `_load_battle_zones` 与 `sync_battle_zone_sets` ✓。
+        #   ⚠ 别做成 `@property`（见原字段那处注释 ✓ —— `__getattr__` 代理会无限递归 ✗）。
+        self.battle_zones = []
+        self.battle_zone_sets = []      # 派生副本：`battle_zones` 里勾了「可以战斗」的集合名 ✓
         self.reconnect_note = ""        # 重连状态文字（reconnect.py 写，UI 只读）
         self.input_link_ok = True       # 指令通道是否健康（agent 的周期体检写，UI 只读）
         self.input_link_err = ""        # 通道不健康的原因（上面那个为 False 时才有值）
@@ -580,8 +616,12 @@ class DecisionSettings:
                 "vision_center": self.vision_center,
                 "vision_off_x": self.vision_off_x,
                 "vision_off_y": self.vision_off_y,
+                "big_mob_enabled": self.big_mob_enabled,
+                "big_mob_ratio": self.big_mob_ratio,
+                "big_mob_range_px": self.big_mob_range_px,
                 "sweep_turn_cd": self.sweep_turn_cd,
                 "back_range": self.back_range,
+                "sweep_edge_turn_px": self.sweep_edge_turn_px,
                 "route_goto_set": self.route_goto_set,
                 "align_tol_px": self.align_tol_px,
                 "align_hold_ms": self.align_hold_ms,
@@ -600,12 +640,12 @@ class DecisionSettings:
                 #   还留着它 ⇒ `from_dict` 读它**只用于迁移**，见那儿 ✓）。
                 "jump_start_px": self.jump_start_px,
                 "move_retry_ms": self.move_retry_ms,
-                # ⭐ 「路线脚本 → 战斗区域」：**整项**写出去（每项一份配置 ✓ 见 `__init__` ✓）
-                "battle_zones": [dict(z) for z in self.battle_zones],
-                # ⚠ `battle_zone_sets` 是**派生副本**（真源是上面那个 ✓）—— 还是写出去一份：
-                #   ① 老版本 / 老工具读得懂 ✓；② `check_ui` 有"设置字段必须能存下去"的检查 ✓
-                #   （派生字段也得写，否则它一直提示 ✗）。读的时候**以 `battle_zones` 为准** ✓。
-                "battle_zone_sets": list(self.battle_zone_sets),
+                # ⛔ 「战斗区域」（`battle_zones` / `battle_zone_sets`）2026-10-01 **不再写进
+                #   project.yaml** ✗（用户要求"路线识别页签所有配置按地图 id 存" ✓）：它每一项
+                #   都是地图里的东西（集合名 / idle 回归 foothold 编号 / 到点去哪）⇒ 改存
+                #   `datasets/map/<id>.battle.json`（`core.battle` ✓，由路线识别面板读写、
+                #   换图时灌进 `settings.battle_zones` ✓）。老项目文件里可能还留着这两个键 ⇒
+                #   `from_dict` 直接忽略；旧配置的**迁移**在 `route_panel` 那次"换图"里显式做 ✓。
                 "debounce_conf": self.debounce_conf,
                 "debounce_ms": self.debounce_ms,
                 # ⚠ 「自动喂宠」的三个键已移除（2026-09-26）—— 老项目文件里可能还留着，
@@ -737,8 +777,16 @@ class DecisionSettings:
         self.vision_center = bool(data.get("vision_center", False))
         self.vision_off_x = int(data.get("vision_off_x", 0))
         self.vision_off_y = int(data.get("vision_off_y", 0))
+        # ⭐ 大怪优先（用户 2026-10-01 ✓）：老配置没有 ⇒ 默认开 / 1.5 / 600（老行为一字不变 ✓）
+        self.big_mob_enabled = bool(data.get("big_mob_enabled", True))
+        self.big_mob_ratio = max(1.0, float(data.get("big_mob_ratio", 1.5) or 1.5))
+        self.big_mob_range_px = max(0.0, float(data.get("big_mob_range_px", 600) or 600))
         self.sweep_turn_cd = int(data.get("sweep_turn_cd", 1000))
         self.back_range = int(data.get("back_range", 100))
+        self.sweep_edge_turn_px = int(data.get("sweep_edge_turn_px", 100))
+        _snd = data.get("lie_alarm_sound")
+        self.lie_alarm_sound = str(_snd) if _snd else \
+            "datasets/sound/Neotokyo.Effect.alert.mp3"
         self.route_goto_set = str(data.get("route_goto_set") or "")
         # 老项目文件里没有这个键时用 **10**（= 上面那个默认值 ✓，别再退回 6 —— 那是在
         # 噪声里，见那儿的说明 ✓）
@@ -771,14 +819,9 @@ class DecisionSettings:
         # ⛔ 「**禁用杀怪寻路**」（用户 2026-09-28 加 ✓）：老项目文件里**没这个键** ⇒ `False`
         #   （= 老行为 ✓ 一点不变 ✓）。手改坏的 yaml 给个非布尔值也照 `bool()` 收 ✓。
         self.disable_chase_pathfinding = bool(data.get("disable_chase_pathfinding", False))
-        # ⚠ 「**前往重下间隔(s)**」**2026-09-28 已移除**（用户要求：搬进**每一个战斗区域项**、
-        #   改名「**区域查询CD(s)**」✓）⇒ 这里**只把老值读出来放在局部变量里**备用 ✓（不挂到
-        #   设置上 ✗）—— 老项目文件是"一串集合名 + 一个全局 CD"，下面 `battle_zones` 的迁移
-        #   会用它把每一项**原样**补齐 ✓。下限 0.5：再小就是"每拍重下前往"= 刷屏 ✗。
-        try:
-            _legacy_zone_cd = max(0.5, float(data.get("goto_retry_s", ZONE_GOTO_RETRY_S)))
-        except (TypeError, ValueError):
-            _legacy_zone_cd = ZONE_GOTO_RETRY_S
+        # ⛔ 「**前往重下间隔(s)**」（老键 `goto_retry_s`）与「**卡住判定时长(s)**」都已移除——
+        #   这里**直接忽略**（不再读、不再挂回设置 ✗）。老 `goto_retry_s` 只在「战斗区域」从
+        #   旧 project.yaml 迁到 per-map 文件时用一次（`route_panel._load_battle_zones_for_map` ✓）。
         # ⚠ 「**卡住判定时长(s)**」这一格 **2026-09-27 用户要求移除** ✓（"统一采用移动操作
         # 尝试间隔(ms)"）：老项目文件里可能还留着 `stall_s` 键 ⇒ **读进来直接忽略** ✓
         # （不再往设置上挂、也不报错 —— 手改过的配置不该因为这个打不开 ✗）。
@@ -806,14 +849,12 @@ class DecisionSettings:
                 self.move_retry_ms = 3000
         else:
             self.move_retry_ms = 3000
-        # ⭐ 「**路线脚本 → 战斗区域**」（2026-09-28 重构 ✓）：新键 `battle_zones`（每项一份
-        #   配置 ✓）优先；老项目文件里只有 `battle_zone_sets`（一串集合名 ✓）⇒ **迁移**：
-        #   CD 取老的「前往重下间隔(s)」全局值（`_legacy_zone_cd` ✓）、其余取默认
-        #   ⇒ **老配置的行为一点不变** ✓。
-        self.battle_zones = self._load_battle_zones(data, _legacy_zone_cd)
-        # ⚠ **必须同步派生副本**（`battle_zone_sets` ✓ 老消费方读的是它 ✓ —— `__init__` 里
-        #   已经同步过一次空表 ⇒ 这里读完真配置再同步一次 ✓；改配置的地方也要调 ✓）。
-        self.sync_battle_zone_sets()
+        # ⛔ 「**战斗区域**」2026-10-01 起**不再从 project.yaml 读** ✗（改存
+        #   `datasets/map/<id>.battle.json`，由 `route_panel` 换图时灌进 `settings.battle_zones`
+        #   并同步派生副本 ✓）。所以这里把两个字段**重置为空**：不重置的话，换项目时会残留
+        #   **上一个项目/上一张图**的战斗区域 ✗（那正是"跟着地图走"要消灭的口径 ✓）。
+        self.battle_zones = []
+        self.battle_zone_sets = []
         # ⚠ 老配置里可能还留着 `walk_mode` 键 —— **直接忽略**（用户 2026-09-26 删掉了它：
         # 走只有"朝集合中点"一种走法）⇒ 不读、也不再写回（见 `to_dict`）。
         self.debounce_conf = float(data.get("debounce_conf", 0.5))
@@ -825,6 +866,8 @@ class DecisionSettings:
         self.facing_timeout_min = float(data.get("facing_timeout_min", 10))
         self.player_lost_timeout_min = float(data.get("player_lost_timeout_min", 3))
         self.resetall_interval = int(data.get("resetall_interval", 60))
+        # ⚠ 老项目文件里可能留着 `kbd_max_inflight`（那个参数已撤掉，见字段那里）——
+        #   `from_dict` **直接忽略**它 ✓（不是参数了，别再写回去 ✗）。
         self.anti_afk_enabled = bool(data.get("anti_afk_enabled", False))
         atype = str(data.get("anti_afk_type") or "")
         self.anti_afk_type = (atype if any(atype == t for t, _ in ANTI_AFK_TYPES)
@@ -905,7 +948,7 @@ class DecisionSettings:
         tick 里那道门 …）**一个字都不用改**，语义自动变成"只对**禁战区**生效" ✓
         （这正是当初把它做成派生副本的价值 ✓）。
 
-        谁调：`from_dict`（读完配置 ✓）、以及编辑弹窗保存时 ✓ ——
+        谁调：`route_panel._load_battle_zones_for_map`（换图读完配置 ✓）、以及编辑弹窗保存时 ✓ ——
         **一处实现**（别各写一遍列表推导 ✗：漏一处就会出现"弹窗改完了、筛怪还按老名单"✗）。
 
         ⚠ **必须自己在所有"改 `battle_zones`"的地方调它** ✓（它做不成自动同步 —— 见
@@ -973,6 +1016,10 @@ class DecisionSettings:
                 fmax = max(0.0, float(it.get("fight_max_s", 0.0) or 0.0))
             except (TypeError, ValueError):
                 fmax = 0.0
+            try:
+                fmin = max(0.0, float(it.get("fight_min_s", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                fmin = 0.0
             if migrated:
                 # 老迁移：这些项本来就是从「限制战斗区域」那份名单造的 ⇒ **都能打** ✓
                 # （那份名单当年就是"允许打架的集合" ✓ 消费方是白名单 ✓）
@@ -983,9 +1030,18 @@ class DecisionSettings:
                 # 新格式：先认 `can_fight`（新名 ✓）；⚠ 老键 `no_fight` **照抄原值、不取反** ✗✗
                 #   —— 它当年也是"能打"的意思（白名单 ✓），取反会让你**丢掉所有能打区** ✗
                 cf = bool(it.get("can_fight", it.get("no_fight")))
+            _ids = [str(x).strip() for x in (it.get("idle_footholds") or [])
+                    if str(x).strip()]
+            _legacy_id = str(it.get("idle_foothold") or "").strip()
+            if not _ids and _legacy_id:
+                _ids = [_legacy_id]          # 老配置迁移：单值 ⇒ 单元素列表（行为不变 ✓）
             out.append({"set": name,
                         "cd_s": cd,
-                        "idle_foothold": str(it.get("idle_foothold") or "").strip(),
+                        # ⭐ **idle 回归 foothold 列表**（2026-09-29 用户要求"列表随机"✓）：
+                        #   触发回归时**随机选一个**（每次进区域重抽 ⇒ 站的位置不固定 ✓）。
+                        #   ⚠ 老键 `idle_foothold` **读后不再写出**（别两套口径并存 ✗）。
+                        "idle_footholds": _ids,
+                        "fight_min_s": fmin,
                         "fight_max_s": fmax,
                         "fight_dst": str(it.get("fight_dst") or "").strip(),
                         "can_fight": cf})
@@ -1274,10 +1330,21 @@ class CombatAgent:
         #: 见 `_note_chase_skip`（用户 2026-09-28："**依旧没有走『取向量 → … → 下达寻路任务』**"✓
         #: —— 这类"静默早退"已经让同一个 bug 查了三轮 ✓）。
         self._last_chase_skip = None
+        #: **界面接管中**（测谎弹窗 / 掉线登录系 ✓）：进/出沿只报一次事件、只在进的沿
+        #: 停手 + 给任务打"打断"点（见 tick 里那段 ✓）。
+        self._in_lie = False
+        #: **idle 回归目标 foothold id**（`_idle_walk_beat` 每拍写 ✓，信息栏的
+        #: 「决策：idle → foothold#N」从这里读 ✓；不在区域/没配 ⇒ None ✓）。
+        self._idle_fid = None
+        #: ⚠ 曾经有过 `self._idle_since`（"这轮闲从什么时候开始" ✗）—— 它只为那个被否掉的
+        #: "闲够 3 秒才算一轮"服务 ⇒ **随门槛一起删除** ✗（用户："没有任何判定机制" ✓）。
         #: **idle 回归**「静默 no-op」的原因去重（2026-09-29：`foothold_x` 解析失败原来
         #: 一声不吭 ⇒ 用户"站在区域上却不动"时无从查起 ✗）—— 只在原因变化时记一条
         #: `idle_walk_skip`（同 `_note_chase_skip` 的手法 ✓）。
         self._last_idle_walk_skip = None
+        #: 「补按 ↑/↓」打点的限流锚（2026-09-29：爬不动时该分支**每拍**都进 ⇒ 原来
+        #: 41 条/秒、一场 588 条把日志淹了 ✗）—— 同一卡顿只记 1 条/秒（键照补 ✓）。
+        self._reassert_log_at = 0.0
         #: ⭐⭐ **这条路线「因为什么」下的**（用户 2026-09-28 的「**来源签名**」✓）——
         #: `why` 是一句**人话**（给日志 / 界面看 ✓），这个是给**逻辑**看的结构化那份 ✓。
         #:   `{"kind": "chase", "mob_id": 123}`（见 `plan_and_start_route` 的 `origin` ✓）
@@ -1337,12 +1404,14 @@ class CombatAgent:
         self.spot_loop_idx = 0
         self.spot_loop_name = ""
         self.spot_loop_next_at = 0.0
-        #: ⭐ **注入位**：`foothold id -> 那条线的世界中心 x`（`fid` 传字符串 ✓，取不到回 `None` ✓）
-        #: —— 给「**idle 回归**」算"该往哪边走"用（`battle_zones` 的 `idle_foothold` ✓）。
+        #: ⭐ **注入位**：`foothold id -> 那条线的世界 [x1, x2]`（`fid` 传字符串 ✓，取不到回 `None` ✓）
+        #: —— 给「**idle 回归**」算"该往哪边走、到哪算到"用（`battle_zones` 的 `idle_foothold` ✓）。
+        #: ⭐ 2026-09-29 晚口径：**进了 foothold 范围就停**，不再走"找中心"（用户 ✓）——
+        #:   原来返回的是**中心 x**（`foothold_x` ✓）⇒ 人到了范围里还会继续挪向中心 ✗。
         #: ⚠ agent **不持有地形** ⇒ 和 `mob_sets_of` / `route_plan` / `set_span_of` 一样
-        #:   **由 `gui/live_thread.py` 装进来** ✓（见那边的 `_make_foothold_x_resolver` ✓）；
+        #:   **由 `gui/live_thread.py` 装进来** ✓（见那边的 `_make_foothold_span_resolver` ✓）；
         #:   没装（老环境 / 用例没给）⇒ 什么都不做（照旧站住 ✓）。
-        self.foothold_x = None
+        self.foothold_span = None
         #: **多步路径**：还没跑的任务队列 + 进度（见 `start_route`）。
         self._route = []
         self._route_why = ""
@@ -1424,6 +1493,10 @@ class CombatAgent:
         self._patrol_dir = 1        # 扫平台倾向朝向（巡逻主方向）：打背后怪不改变它
         self._last_facing_change = time.monotonic()  # 朝向最后一次变化的时刻（超时监控用）
         self._turn_at = 0.0         # 最近一次换向的时刻（最小按住时间 / 转向后输出延迟用）
+        #: ⭐ **序列最近发键时刻**（键名 → monotonic ✓）—— 流画面左下的「按键帽」
+        #:   据此点亮 tap/瞬发类的键（tap 只按 ~30ms ✗ 显示帧大概率错过 ⇒
+        #:   消费端给 0.25s 点亮窗 ✓）。
+        self._seq_key_at = {}
         self._player_lost_since = None  # 找不到玩家的起始时刻（monotonic），定位到就重置
         #: 「画面里连续看不到角色」的起始时刻（用户 2026-09-27 要求）。
         #: ⚠ **与"自动开着没"无关** —— 它只做**留痕**（perf 注记 + 计数），
@@ -1448,6 +1521,14 @@ class CombatAgent:
         #: `chase` 状态**连续**保持的起始时刻（None = 现在不在 chase）。
         #: 给「追击起跳需要的冲刺时间」用：每拍按**上一拍**的状态续/清（见 tick 里那段）。
         self._chase_since = None
+        #: ⭐「追击时按着走却**走不动** ⇒ 单点跳一下」的两个锚（用户 2026-10-01 要求 ✓，
+        #:   见 `_chase_hop_beat`）：
+        #:   `_chase_x` = 上一次"算它动过"时的**世界坐标 x**（`ws.player.world_x` ✓）；
+        #:   `_chase_x_at` = 那个锚点的时刻。两个都是 `None` = 还没起锚（下一拍重锚 ✓）。
+        #:   ⚠ 进/出 `chase` 都要清（见 tick 里 `_chase_since` 那一段）—— 不清的话
+        #:     "上一轮追击时那个锚" 会被这一轮接着用 ⇒ 刚进追击就可能**立刻**跳一下 ✗。
+        self._chase_x = None
+        self._chase_x_at = None
         self._band_had = False      # 上一拍起跳范围内有没有怪（用来判「从无到有」的沿）
         self._next_resetall = 0.0   # 下次定时 RELEASEALL 的时刻
         self._pending_attack = None # 待发的输出键时刻（跳规避：跳键后 interval 发输出）
@@ -1643,6 +1724,41 @@ class CombatAgent:
         s = self.settings
         return self._in_box(m, player, float(s.min_attack_dist), 0.0)
 
+    def _big_mob_pool(self, dists, player):
+        """⭐ **大怪优先的候选池**（用户 2026-10-01 ✓）：挑锁定目标时，若有「明显更高、且
+        在优先半径内」的大怪，就**只在这群大怪里挑**（无视小怪 ✓）。
+
+        · 「明显更高」= 框高 `m.h` ≥ 候选框高**中位数 × `big_mob_ratio`**（**相对判定** ✓，
+          自适应、不用每图调高度 —— 中位数就是"这堆小怪的典型高度"，大怪天然突出 ✓）；
+        · 「视野内」= 画面距离 ≤ `big_mob_range_px`（避免舍近求远 ✓）；
+        · 一条都不满足 / 关了（倍数 ≤1、半径 ≤0）⇒ 空，调用方退回原候选 ✓。
+
+        ⚠ 只影响"挑谁"，不动 `_center_dist` / 攻击判定（同 `_nearest` 那条纪律 ✓）。
+        ⚠ 数学上"所有候选都是大怪"不会发生（`h ≥ median×1.5` 不可能人人成立 ✓）⇒ 空 = 没大怪。
+        """
+        s = self.settings
+        # ⭐ 总开关（2026-10-01 用户加 ✓）：不勾「大怪优先」⇒ 整个不启用（退回原候选 ✓）。
+        #   ⚠ 老 settings 对象没有这个字段 ⇒ `getattr` 兜底 True（老行为不变 ✓）。
+        if not getattr(s, "big_mob_enabled", True):
+            return []
+        try:
+            ratio = float(getattr(s, "big_mob_ratio", 1.5) or 0.0)
+            rng = float(getattr(s, "big_mob_range_px", 600.0) or 0.0)
+        except (TypeError, ValueError):
+            return []
+        if ratio <= 1.0 or rng <= 0.0:
+            return []                              # 关（倍数 ≤1 = 人人都是大怪；半径 ≤0 = 不启用 ✓）
+        hs = sorted(float(getattr(m, "h", 0.0) or 0.0) for _, m in dists
+                    if float(getattr(m, "h", 0.0) or 0.0) > 0.0)
+        if len(hs) < 2:
+            return []                              # 只有 0/1 只，谈不上"相对更高" ✓
+        n = len(hs)
+        median = hs[n // 2] if n % 2 else (hs[n // 2 - 1] + hs[n // 2]) / 2.0
+        if median <= 0.0:
+            return []
+        return [(d, m) for d, m in dists
+                if float(getattr(m, "h", 0.0) or 0.0) >= median * ratio and d <= rng]
+
     def _nearest(self, mobs, player, ws=None):
         """挑要打的那只怪，返回 `(target, 画面距离)`；没怪返回 `(None, None)`。
 
@@ -1673,6 +1789,12 @@ class CombatAgent:
         if not dists:
             return None, None
         dists.sort(key=lambda t: t[0])                 # 老口径（也是副键 ✓）
+        # ⭐ 大怪优先（用户 2026-10-01 ✓）：候选里若有"明显更高、且在优先半径内"的大怪，
+        #   就把候选池**收窄成这群大怪**（无视小怪 ✓）—— 之后不管走"老口径"还是"寻路距离"
+        #   两条路，都只在这群大怪里挑 ✓。
+        _bigs = self._big_mob_pool(dists, player)
+        if _bigs:
+            dists = _bigs
         cost_fn = getattr(self, "mob_cost_of", None)
         here = getattr(player, "here_sets", None)
         # ⛔ 「**禁用杀怪寻路**」开着 ⇒ **连"挑目标"这一步也不查**（用户 2026-09-28 ✓ 原话：
@@ -1761,10 +1883,85 @@ class CombatAgent:
         if not jump_key:
             return
         tap(jump_key, self._attack_duration)
+        self._seq_key_at[jump_key] = time.monotonic()   # 键帽点亮窗 ✓（tap 30ms ✗）
         behavior.event("jump", why="追击跳")    # 战斗：追击时朝怪跳一下（行为打点 ✓）
         attack_cd_s = max(0.0, float(s.attack_cd)) / 1000.0
         # （原来这里还叠一个随机延迟；2026-09-27 删掉 ⇒ 追击跳的间隔就是 CD 本身 ✓）
         self._next_chase_jump = now + max(0.3, attack_cd_s)
+
+    def _chase_hop_beat(self, now, ws, keys):
+        """追击时「按着方向键、x 却一直不动」⇒ **单点跳一下**（用户 2026-10-01 要求）。
+
+        用户原话："战斗时的 chase 加个逻辑：如果在「移动操作尝试间隔(ms)」时间内没有
+        发生 x 水平位移，就发单点跳键"。
+
+        **为什么**：追击只会按 ←/→（`_steer`），被小台阶/小坎挡住时人就贴在那儿干蹭
+        —— 和 walk 执行器那次"走不动"是同一件事，那边（`route.WalkJob._hop_or_fail` ✓）
+        的解法就是"先单点跳一下"；这里把它搬到**战斗追击**这条路上。覆盖 `chase` 状态
+        的**两条**路（追怪 / 扫平台巡逻）—— 判据就写成 `self.state == "chase"` 一处 ✓。
+
+        三件都成立才跳（缺一条就会变成乱跳 ✗）：
+          · 这一拍的状态是 `chase`（站桩输出 / 攻击 / 上绳任务都不是 ✓）；
+          · 这一拍**真在按方向键**（`keys` 里有 ←/→ ✓）—— 没被指挥着走的时候"没位移"
+            本来就是正常的；
+          · x 的位移**没超过「坐标对齐误差范围」**（`align_tol_px` ✓，见下）。
+          然后 `now - 锚点时刻 ≥ 「移动操作尝试间隔」(ms)` ⇒ 跳。
+
+        `x` 用**世界坐标**（`ws.player.world_x`，小地图黄点给的 ✓）—— 项目里"我在哪 /
+        动没动"的唯一权威口径就是它（walk 执行器判「走不动」用的也是它 ✓）。
+        ⚠ **别换成画面 x**：镜头跟着人走，人明明在走时画面 x 也可能不动 ✗。
+        ⚠ **判"没动"的容差不能是小常数**：世界坐标来自黄点的**亚像素质心**，人站着一动
+        不动它也在 ± 半像素（≈ ±4 世界像素）里晃 —— `ALIGN_TOL_PX` 当初就是按这个读数
+        噪声定的（见 `decision/route.py` 的说明 ✓）⇒ 拿"1 像素"当门限会被噪声一直判成
+        "在动"、这条就成了摆设 ✗。所以直接复用**同一个**「坐标对齐误差范围」（设置里可调 ✓），
+        不新造数 ✓。
+        ⚠ 那个容差配成 `0` ⇒ 噪声也算"动了" ⇒ 等于把这条关掉（不替用户挑数，见上 ✓）。
+
+        跳的是**点按**（`tap` + `_attack_duration` = 30ms，和追击起跳 / 规避跳同一份节奏，
+        不新造时长 ✓）；跳完把锚点重置到当下 ⇒ 下一次机会要**再等一个**「移动操作尝试间隔」
+        ——这就是节流本身（**跳一次、等一个窗口**，绝不会每拍都跳 ✓）。
+        `move_retry_ms <= 0` ⇒ 整个不启用（和 `DropJob` 对这件参数的口径一致 ✓）。
+
+        打点：`behavior.event("jump", why=…)`（和追击起跳 / 规避跳**同一个事件名** ✓）。
+        """
+        if self.state != "chase":
+            return
+        s = self.settings
+        km = s.keymap
+        _dirs = {km.get("left"), km.get("right")}
+        _dirs.discard(None)
+        if not _dirs or not (set(keys) & _dirs):
+            return                  # 这一拍没在指挥它走 ⇒ "没位移"是正常的 ✓
+        retry_ms = float(getattr(s, "move_retry_ms", 0) or 0)
+        if retry_ms <= 0:
+            return                  # 关（同 `DropJob` 对「移动操作尝试间隔」的口径 ✓）
+        x = getattr(ws.player, "world_x", None)
+        if x is None:
+            # 拿不到世界坐标 ⇒ 判不了"动没动"（**不猜** ✓）；下一拍重新起锚。
+            # （正常路径到不了这儿：`_mmap_ok` 那道闸在没定位时已经早退了 ✓。）
+            self._chase_x = self._chase_x_at = None
+            return
+        x = float(x)
+        tol = max(0.0, float(getattr(s, "align_tol_px", 0) or 0))
+        if self._chase_x is None or self._chase_x_at is None:
+            self._chase_x, self._chase_x_at = x, now     # 起锚（这一拍不算"没动" ✓）
+            return
+        if abs(x - self._chase_x) >= tol:
+            self._chase_x, self._chase_x_at = x, now     # 真的动了 ⇒ 重锚、重新计时 ✓
+            return
+        if (now - self._chase_x_at) * 1000.0 < retry_ms:
+            return                  # 窗口还没到 ⇒ 再等等（别每拍都跳 ✗）
+        jump_key = km.get("jump")
+        if not jump_key:
+            return
+        _stuck_at, _stuck_x = self._chase_x_at, self._chase_x
+        tap(jump_key, self._attack_duration)
+        self._seq_key_at[jump_key] = time.monotonic()    # 键帽点亮窗 ✓（tap 30ms ✗）
+        self._chase_x, self._chase_x_at = x, now         # 下一次机会从这一跳之后重算 ✓
+        behavior.event("jump",
+                       why="追击走不动：按着方向键 %.1f 秒、x 一直在 %.0f 附近"
+                           "（现在 %.0f）⇒ 单点跳一下，试试跨过小台阶"
+                           % ((now - _stuck_at), _stuck_x, x))
 
     def _watch_output_held(self, now):
         """输出序列的键按着不放、而角色**早就不在输出状态** ⇒ 记一笔 + 松开 + 说明。
@@ -2494,26 +2691,21 @@ class CombatAgent:
           `self._climb_started`（同一步重下**不重置** ✓、挨打暂停会重打 ✓）
           ＋ `settings.goto_timeout_s`（「寻路超时时间」✓）
           ⇒ 显示的"剩余"和真到点那一刻**必然一致** ✓（自己另起一把钟就会对不上 ✗）。
-        ⭐⭐ **只有「追击」签注才有时间限制**（用户 2026-09-29 第 1 条 ✓）：其它任务
-          （命令前往 / 定点休息 / 回战斗区域 / 战斗时长到点换地方…）**一律不限时** ⇒ 这里
-          返回 `None` ✓（信息栏那行**不显示剩余** ✓ 也就不会让人以为"它马上要被切"✗）。
-          ⚠ 与 `_climb_tick` 里那道总闸**同一个判据**（`chase_tagged()` ✓）—— 显示与
-            真到点必须一致 ✓（一处口径 ✗ 别各判各的）。
+        ⭐⭐ **所有任务都显示**（2026-09-29 晚用户澄清 ✓："其他所有的任务都走「寻路超时时间」，
+          都有出口"）—— 显示与 `_climb_tick` 那道总闸**同一处口径** ✓（显示说"无限"、
+          闸却还在掐 = 最坏的那种不一致 ✗）。「追怪寻路.duration(s)」仍是追击独占的第二道闸 ✓。
         ⭐⭐ **取两道闸里"更早到期的那个"**（2026-09-28 用户报 ✓："我改了 5 秒，但是信息栏写的
           追击还是 **9 秒**开始（也可能是 10）"✗）：追怪任务（`_climb_origin` 的
           `kind == "chase"` ✓）且「追怪寻路.duration(s)」> 0 时，把它与「寻路超时时间」**取 min** ✓
           —— 两道闸**谁先到、任务就结束在谁那儿**，只显示大的那个会**骗人** ✗。
         ⚠ 返回 `None` 的情况（**都不显示** ✓ 别显示 `0:00` ✗）：
-          · **不是追击签注**（用户 2026-09-29 ✓ "其他任务不限时"）；
-          · **两道闸都没开**（`goto_timeout_s <= 0` **且**（不是追怪 或 追怪值也 <= 0）✓）；
+          · **「寻路超时时间」设 0**（不限时 ✓）且（不是追怪 或 追怪值也 <= 0）✓；
           · 还没起钟（`_climb_started` 为 0 ✓）；
           · 当前没有在跑的寻路任务（`_climb` 为空 ✓）。
         """
         t0 = float(getattr(self, "_climb_started", 0.0) or 0.0)
         if t0 <= 0.0 or getattr(self, "_climb", None) is None:
             return None
-        if not self.chase_tagged():
-            return None                      # 非追击 ⇒ 不限时 ⇒ 不显示剩余 ✓
         cap = max(0.0, float(getattr(self.settings, "goto_timeout_s", 0.0) or 0.0))
         # ⭐⭐ **取两道闸里"更早到期的那个"**（用户 2026-09-28 报 ✓ 原话："我改了 5 秒，但是
         #   信息栏写的追击还是 **9 秒**开始（也可能是 10）"✗）。
@@ -2969,16 +3161,18 @@ class CombatAgent:
                            secs=round(now - self._climb_started, 1),
                            cap=round(_chase_cap, 1))
             return self._task_finished(failed=True)
-        # ⭐⭐ **「寻路超时」只对「追击」签注生效**（用户 2026-09-29 第 1 条 ✓ 原话："只有追击
-        #   签注的任务是有时间限制的（到点结束任务），其他任务不应该有时间限制（无限）"）：
-        #   · 判据 = `chase_tagged()`（结构化 `kind == "chase"` ✓）—— 和 `goto_time_left`
-        #     显示的剩余**同一处口径** ✓（显示说"无限"、闸却还在掐 ⇒ 最坏的那种不一致 ✗）；
-        #   · 为什么其它任务该无限：一条长路线（走→爬→走）跑两分钟很正常，30 秒的闸
-        #     会把**正常**的路线当卡住切掉 ✗；而"追不上就别追了"是追击**独有**的语义 ✓。
-        #   ⚠ 各执行器自己的"卡住重试/放弃"（`stall_s` / `reassert_s` / `retry_ms` ✓）
-        #     **不受影响** ⇒ "真卡住"仍然各自处理 ✓（这一条只管**总时长**那把闸 ✓）。
-        cap_s = (max(0.0, float(getattr(self.settings, "goto_timeout_s", 0.0) or 0.0))
-                 if self.chase_tagged() else 0.0)
+        # ⭐⭐ **「寻路超时」对**所有**寻路任务生效**（2026-09-29 晚用户澄清 ✓ 原话：
+        #   "设置里的'追怪寻路.duration(s)'才只对追击签注生效的时间，其他所有的任务
+        #   都走「寻路超时时间」，都有出口"）：
+        #   · ⚠⚠ 当天早些钉反过一版（"只有追击吃这道闸、其他任务无限" ✗）—— 那版让
+        #     非追击任务**没有任何出口**：现场 21:22 在 L9 上爬不动（被怪围殴打断攀爬），
+        #     ↑ 按了 14.8 秒 y 纹丝不动，最后是**用户手动关自动**才收场 ✗（route.py
+        #     "真爬不上去由寻路超时兜底"说的就是这道闸 ✓）；
+        #   · **追击独占**的是上面那道「追怪寻路.duration(s)」（`chase_goto_max_s` ✓）；
+        #   · 这道闸**按每段一把钟**（`t_goto_timeout_per_hop` 钉着 ✓）—— "一条长路线
+        #     跑两分钟很正常"不受影响：每完成一段就重新计时 ✓；
+        #   ⚠ 各执行器自己的"卡住重试"（`stall_s` / 补按 `reassert` ✓）**不受影响** ✓。
+        cap_s = max(0.0, float(getattr(self.settings, "goto_timeout_s", 0.0) or 0.0))
         # ⭐ **节点②「寻路超时计时过半」**（用户 2026-09-28 要求 ✓）—— 放在超时判定**之前** ✓。
         #   意义：这一段已经花掉一半预算 ⇒ 主动复核一次"还值不值得往下走"（有更便宜的怪就掐 ✓）；
         #   过了这个节点就只剩"被超时硬切"了 ⇒ 这是最后一次自己拿主意的机会 ✓。
@@ -3181,8 +3375,12 @@ class CombatAgent:
             #    名字（`_reassert_ctx` ✓）；撞在一起就分不清是谁触发的 ✗（实测踩过 ✓）。
             # 把**当时那句 note**一起记下来（里面有卡在哪个 y、离目标面还差多少 ✓）：
             # 事后一眼就能分辨是"人没爬"还是"读数没动"（见 `climb_y` 那条 sample ✓）。
-            behavior.event("climb_reassert", y=py,
-                           note=str(getattr(self._climb, "note", ""))[:160])
+            # ⭐ **限流 1 条/秒**（2026-09-29：爬不动时这个分支**每拍**都进 ⇒ 现场
+            #    41 条/秒、一场 588 条把日志淹了 ✗）—— 键**照补**，只是别刷屏 ✓。
+            if now - self._reassert_log_at >= 1.0:
+                self._reassert_log_at = now
+                behavior.event("climb_reassert", y=py,
+                               note=str(getattr(self._climb, "note", ""))[:160])
         if out["failed"]:
             # ① **失败之后，先问广播"是不是其实已经到了"**（用户 2026-09-27 第 1 条：
             #    "位置状态变化即广播，且**绝对权威**" ✓）。
@@ -3240,6 +3438,8 @@ class CombatAgent:
                 # ⭐ **打点 `climb_retry_fast`**（用户 2026-09-28 ✓）："没挨打（或被设为不等）⇒
                 #   **立刻重来**"这一档 ✓ —— 日志里跟 `climb_retry_wait`（挨打后要等的 ✓）
                 #   一眼分清 ✓；带上 `hit` 字段便于分辨是"真没挨打"还是"delay 被设成 0"✓。
+                #   （2026-09-29：贴绳 x 偏出**已不再走到这里** —— 执行器把它改判为
+                #   「回对齐重走流程」，见 `route.py` 的 `_climb_step` 2a 那支 ✓。）
                 behavior.event("climb_retry_fast", ladder=getattr(job, "ladder_id", ""),
                                attempt=job.attempt, hit=bool(_hit_after_jump))
                 job.retry()
@@ -3336,6 +3536,11 @@ class CombatAgent:
                     if elem["type"] == "down":
                         key_down(key)
                         held.add(key)
+                        # ⭐ **登记进 KeyState（瞬发 ✓）**：`pressed()` 才含输出键 ⇒
+                        #   流画面的按键帽亮得起来 ✓（2026-09-30 用户报"输出的时候
+                        #   输出按键没亮"✗ 根因 = 序列走 `key_down` 直发 ✗）。
+                        self.keys.momentary_mark(key)   # 按键帽/状态指示 ✓（纯记账 ✓）
+                        self._seq_key_at[key] = now
                         if output:
                             # 性能口径：从「取到这一帧」到「输出键真的按下去」隔了多久
                             # —— 本机处理 + 排期等待的总和。推理尖刺、排期拖后都会
@@ -3348,6 +3553,7 @@ class CombatAgent:
                     else:
                         key_up(key)
                         held.discard(key)
+                        self.keys.momentary_discard(key)   # 摘账 ✓（松开上面刚发过 ✓）
                 # 键动作之间**不再插随机延迟**（2026-09-27 删掉），改成项目里**已有的**
                 # 「点按按住时长」（`_attack_duration` = 30ms，`tap()` 那几条路用的也是它
                 # ✓）—— 不新造数：间隔就是这个"一下按键"的长度，同一份配置每次都一样 ✓。
@@ -3394,10 +3600,14 @@ class CombatAgent:
         for sub in ctx[4]:
             self._reassert_ctx(sub)
 
-    @staticmethod
-    def _release_held_set(held):
-        """释放一个 held 集合里的键。"""
+    def _release_held_set(self, held):
+        """释放一个 held 集合里的键（**瞬发登记一起摘** ✓ —— 不然中途被掐断时
+        `pressed()` 会残留 ✗ 按键帽就一直亮着 ✗）。"""
         for k in held:
+            try:
+                self.keys.momentary_discard(k)   # 摘账 ✓（松开下面照发 ✓）
+            except Exception:
+                pass
             try:
                 key_up(k)
             except Exception:
@@ -3526,6 +3736,22 @@ class CombatAgent:
                     return z
         return None
 
+    def _zone_allows(self, name):
+        """**某个集合名能不能打**（`can_fight` 白名单 ✓）—— 追怪下前往前用它把关 ✓。
+
+        用户 2026-10-01 ✓（"把二楼关了还是会寻路去二楼"）：`can_fight` 原来只管"打架资格"
+        （人在能打区才打 / 只锁能打区的怪 / 回能打区），**漏了追怪的两条下前往路径** ✗ ⇒
+        现在追怪把目的地**也**用这份白名单拦一道 ✓。
+        ⚠ **名单空 = 不限制**（一个都没勾 = 哪都能打 ✓ 老行为一字不变 ✓）。
+        ⚠ 与 `_zone_only`（筛怪）/ `_in_battle_zone`（人在不在）**同一份** `battle_zone_sets`
+          名单 ✓ —— 只加一个"问单个集合"的读法，别另起一套口径 ✗。
+        """
+        zs = [str(z) for z in (getattr(self.settings, "battle_zone_sets", None) or [])
+              if str(z)]
+        if not zs:
+            return True                          # 没勾任何"能打" = 不限制（老行为 ✓）
+        return str(name or "").strip() in set(zs)
+
     def _fight_beat(self, now, ws):
         """**「最大战斗时长」到点就换地方**（`battle_zones` 的 `fight_max_s` / `fight_dst` ✓）。
 
@@ -3556,8 +3782,15 @@ class CombatAgent:
                 max_s = max(0.0, float(z.get("fight_max_s") or 0.0))
             except (TypeError, ValueError):
                 max_s = 0.0
-            if max_s <= 0.0:
-                self._fight_reset(now)        # 这一项 = 不限 ⇒ 收摊 ✓
+            try:
+                min_s = max(0.0, float(z.get("fight_min_s") or 0.0))
+            except (TypeError, ValueError):
+                min_s = 0.0
+            # ⭐ **两项都没配 ⇒ 收摊**（2026-10-01 加 `fight_min_s` ✓）：原来只看 `fight_max_s`，
+            #   现在只要「最大」或「最小」有一项配了，就得给 `_fight_acc` 计时（最小战斗时长
+            #   也要用这把钟 ✓）。
+            if max_s <= 0.0 and min_s <= 0.0:
+                self._fight_reset(now)        # 这一项 = 两项都不限 ⇒ 收摊 ✓
                 return
             # 真换到**另一个区域** ⇒ 归零（⚠ 只在**两边都读得到**时才敢这么判 ——
             # 读不到一瞬不是"离开"，用户口径 ✓）
@@ -3588,7 +3821,9 @@ class CombatAgent:
         cap = max(0.0, float(self._fight_zone.get("fight_max_s") or 0.0))
         self._publish_fight_clock(str(self._fight_zone.get("set") or ""),
                                   self._fight_acc, cap)
-        if self._fight_acc < cap:
+        # ⭐ `cap <= 0`（只配了「最小战斗时长」、没配「最大」✓）⇒ **永不换地方**，
+        #   但 `_fight_acc` 照常累计（喂给 `_chase_goto_if_elsewhere` 的最小战斗时长闸 ✓）。
+        if cap <= 0.0 or self._fight_acc < cap:
             return
         dst = str(self._fight_zone.get("fight_dst") or "")
         self._fight_reset(now)                # 到点 ⇒ 收摊（别每拍都来一遍 ✓）
@@ -3657,41 +3892,66 @@ class CombatAgent:
         return (str(z.get("set") or ""), max(0.0, max_s - self._fight_acc), max_s)
 
     def _idle_walk_beat(self, keys, ws):
-        """**idle 回归**：没怪、也没任务时，**水平走**回本区域那一格的中心 x ✓。
+        """**idle 回归**：没怪、也没任务时，**水平走**回本区域那一格的 foothold **范围内** ✓。
 
         用户 2026-09-28 定的口径（见 `__init__` 里 `battle_zones` 的 `idle_foothold`
-        注释原文 ✓）：
+        注释原文 ✓）；⭐ **"到哪算到"2026-09-29 晚改过**（用户原话："到了idle回归
+        foothold范围内就应该停下来，而不是一直找中心"✓）—— 原来走到**中心**
+        （`_deadzone` 内）才停 ✗ ⇒ 人已经站在范围里了还会被拽着继续挪向中心 ✗；
+        现在**进了 [x1, x2] 就站住** ✓。`_deadzone` 只当**边界容差**用（边线外
+        `±_deadzone` 之内也算到 ✓）—— 不然定位抖一下就会在边线上左右横跳 ✗：
           · 只有在"**位于本集合**"时才做（脚下 `here_sets` 命中某个区域项 ✓）；
-          · **水平走**（只按 ←/→ ✓），到中心就停（`_deadzone` 之内 ⇒ 一个键都不按 ✓）；
+          · **水平走**（只按 ←/→ ✓）：在范围左边 ⇒ 朝 x1 走；右边 ⇒ 朝 x2 走 ✓；
           · **不跨层** ✗ —— 不下寻路任务、不爬绳（"跨层换地方"是 `fight_dst` 那种事 ✓）。
-        ⚠ 中心 x 由**注入的** `self.foothold_x`（`fid -> 世界中心 x` ✓，`gui/live_thread.py`
-          装的 ✓）给 —— agent **不持有地形** ✓（同 `mob_sets_of` / `route_plan` 的纪律 ✓；
-          拿不到就什么都不做 ⇒ 照旧站住 ✓ 绝不自作聪明 ✗）。
+        ⚠ foothold 的 **[x1, x2]** 由**注入的** `self.foothold_span`（`fid -> (x1, x2)` ✓，
+          `gui/live_thread.py` 装的 ✓）给 —— agent **不持有地形** ✓（同 `mob_sets_of` /
+          `route_plan` 的纪律 ✓；拿不到就什么都不做 ⇒ 照旧站住 ✓ 绝不自作聪明 ✗）。
         """
         z = self._zone_of_sets(getattr(getattr(ws, "player", None), "here_sets", None))
-        fid = str((z or {}).get("idle_foothold") or "")
-        if not fid:
+        fids = [str(x) for x in ((z or {}).get("idle_footholds") or []) if str(x).strip()]
+        if not fids:
+            # ⭐ 决策行用：不在区域 / 该项没配 ⇒ 清掉（「决策：idle → foothold#N」不画 ✓）
+            self._idle_fid = None
             return                            # 没配 idle 回归 ⇒ 正常 no-op（不打点 ✓）
-        fx = getattr(self, "foothold_x", None)
+        # ⭐⭐⭐ **每次"闲下来"都重抽，不设任何判定**（用户 2026-09-30 定稿 ✓ 原话：
+        #   "每次都重新随机，**没有任何判定机制**，就是简单的『每次都随机抽取』" ✓）。
+        #   锚点 = `_set_state` 里"**离开 idle 就清号**" ⇒ 每次闲下来这里必然 `None` ⇒ 必抽 ✓。
+        #   ⚠⚠ 这一格我先后加过两个"门槛"，用户都明确否掉 ✗：
+        #     ① 抽签只在"当前目标不在名单里"时做 ⇒ 抽中一次**永久保留** ✗✗；
+        #     ② `_IDLE_REROLL_MIN_S = 3.0`（"这次闲够 3 秒才算一轮" ✗）⇒ 森林迷宫III 里
+        #        idle 段被怪框打断成 0.05~1 秒 ⇒ 从来不够格 ⇒ 抽签号长期不清 ⇒ 现场就是
+        #        用户报的"**固定其中一个**" ✗✗（2026-09-30 `behavior.log` 实证 ✓）。
+        #   ⇒ 现在只剩这一条最简单的规则 ✓（名单没变时才沿用：`not in fids` 是**配置变更**
+        #     的兜底，不是行为门槛 ✓）。
+        if self._idle_fid is None or str(self._idle_fid) not in fids:
+            self._idle_fid = str(random.choice(fids))
+            behavior.event("idle_draw", zone=str((z or {}).get("set") or ""),
+                           fid=self._idle_fid, n=len(fids))
+        fid = str(self._idle_fid)
+        fx = getattr(self, "foothold_span", None)
         why = ""
         if fx is None:
-            why = "没注入 foothold_x（实时线程没装解析器）"
+            why = "没注入 foothold_span（实时线程没装解析器）"
         else:
             try:
-                cx = fx(str(fid))
+                span = fx(str(fid))
             except Exception:                 # noqa: BLE001 —— 解析器坏了就照旧站住 ✓
-                cx = None
-            if cx is None:
-                why = "foothold_x(%s) 解析不出（地图没加载 / 没这条 foothold）" % fid
+                span = None
+            if not span:
+                why = "foothold_span(%s) 解析不出（地图没加载 / 没这条 foothold）" % fid
             else:
                 wx = getattr(getattr(ws, "player", None), "world_x", None)
                 if wx is None:
                     why = "没玩家世界坐标（小地图没定位到）"
                 else:
-                    dx = float(cx) - float(wx)
-                    if abs(dx) <= float(self._deadzone):
-                        return                # 到中心了 ⇒ 站住（一个键都不按 ✓）
-                    self._steer(dx, keys)
+                    x1, x2 = float(span[0]), float(span[1])
+                    if x1 > x2:               # 解析器给反了也能用（宁可用，别炸 ✗）
+                        x1, x2 = x2, x1
+                    wx = float(wx)
+                    if (x1 - float(self._deadzone)) <= wx <= (x2 + float(self._deadzone)):
+                        return                # 已在 foothold 范围（含边界容差）内 ⇒ 站住 ✓
+                    # 在范围左边 ⇒ 朝 x1 走；右边 ⇒ 朝 x2 走（`_steer` 只看 dx 的方向 ✓）
+                    self._steer((x1 - wx) if wx < x1 else (x2 - wx), keys)
                     return
         # 走到这儿 = **配了** idle 回归却静默 no-op ⇒ 打点（只在原因变化时记一条 ✓ ——
         # 这类早退每拍都命中，全记会淹 log ✗；手法同 `_note_chase_skip` ✓）
@@ -3962,6 +4222,24 @@ class CombatAgent:
         if not dst:
             self._note_chase_skip("朝方向解析器判不出集合（那条路上没有可去的层）")
             return False
+        # ⭐ **目的地也要是能打区**（用户 2026-10-01 ✓）：`nearest_set_towards` 是纯几何的
+        #   "朝怪方向最近的集合"，**不看 can_fight** ✗ —— 关掉「二楼」后它照样吐「二楼」⇒
+        #   这里拦一道：那个集合不能打就**不去**（留痕 ✓ 绝不走去被关掉的区域 ✗）。
+        if not self._zone_allows(dst):
+            self._note_chase_skip("朝方向最近的集合「%s」不能打（可以战斗被勾掉了），不去" % dst)
+            return False
+        # ⭐⭐ **落脚区就是我现在站的这块 ⇒ 这条降级没有意义**（2026-10-01 现场修 ✗ ——
+        #   「寺院通道2」卡死：人站在右下、**位置状态也显示右下**，却被反复下达"前往右下"）。
+        #   怎么来的：降级是想"**换个地方**够着怪"，可这张图**只有「右下」能打** ⇒ 朝那个
+        #   方向挑出来**还是玩家脚下这一块** ⇒ 目标 == 起点，等于哪儿也不用去。
+        #   ⚠ 后果不是"白走一趟"，而是**更坏的站着不动**（见下面那道 `_climb` 闸的说明 ✓）
+        #   ⇒ 这里直接拦掉：**照旧追**（不许站住 ✗），并留痕说明是哪种早退。
+        _here_now = set(str(s) for s in (getattr(ws.player, "here_sets", None) or []))
+        if _here_now and dst in _here_now:
+            self._note_chase_skip(
+                "朝方向挑出来的落脚区「%s」就是我现在站的这块 ⇒ 换不了地方，照旧追（不站住 ✗）"
+                % dst)
+            return False
         self._mob_goto_at = now
         # ⭐ 来源签名 = 「追击」（用户 2026-09-28 ✓）⇒ 这一步会参与那两个节点的复核 ✓
         # ⚠ `keep_clock=True`（用户 2026-09-29 第 2 条 ✓）：**攻击重下同一趟追击 ⇒ 不刷新
@@ -3970,6 +4248,17 @@ class CombatAgent:
                                            origin=self._chase_origin(target),
                                            keep_clock=True)
         self._last_goto_note = (str(msg), now)
+        # ⭐⭐ **"下成功了"要看有没有真的挂上动作，不能只看规划器说成功**（2026-10-01 现场修 ✗）。
+        #   `plan_and_start_route` 的 `ok=True` 有**两种**（见它自己的说明 ✓）：
+        #     · 真起跑了（`_climb` 非空）—— 这才是"下成功了" ✓；
+        #     · **"已经在 X 上了"**（`here=True`，`_climb` **是空的**）—— 那是"**不用走**" ✗。
+        #   把第二种当成功 ⇒ 调用方以为"已经安排他过去了" ⇒ 返回 True ⇒ **这一帧不朝怪走**
+        #   ⇒ 人站着不动、每过一次 CD 又重来一遍 ⇒ **卡死在角落** ✗（寺院通道2 的现象 ✓）。
+        #   ⇒ 判据与 `_chase_goto_if_elsewhere` 的出口**统一为看 `_climb`** ✓（一处口径 ✗
+        #     不然同一件事两套判据，迟早再漏 ✗）。
+        if ok and self._climb is None:
+            behavior.event("mob_goto_toward_noop", dst=str(dst))
+            return False
         behavior.event("mob_goto_toward" if ok else "mob_goto_toward_fail", dst=str(dst))
         return bool(ok)
 
@@ -4060,6 +4349,21 @@ class CombatAgent:
             _dst = str(getattr(self._climb, "dst_set", "") or "")
             if (not _dst) or (_dst in msets):
                 return False                   # 正走的就是它那块 ⇒ 不打断 ✓
+        # ⭐ 「最小战斗时长」（用户 2026-10-01 ✓）：在**本集合**连着打的秒数还没到这一项配的
+        #   `fight_min_s` 时，**不追别的 foothold 集合的怪**（= 这条跨集合的「前往」不下 ✓）。
+        #   判据用 `_fight_acc`（本集合"实际在打"的累计秒数，和「最大战斗时长」**同一把钟** ✓）；
+        #   0 = 不限（不拦 ✓ 老行为一字不变 ✓）。脚下 `here` 命中不到任何区域项 ⇒ 也不拦 ✓
+        #   （那项没配这个参数 ⇒ 没有"最短待多久"这回事 ✓）。
+        _here_z = self._zone_of_sets(here)
+        if _here_z is not None:
+            try:
+                _min_s = max(0.0, float(_here_z.get("fight_min_s") or 0.0))
+            except (TypeError, ValueError):
+                _min_s = 0.0
+            if _min_s > 0.0 and self._fight_acc < _min_s:
+                self._note_chase_skip("最小战斗时长还没到（本集合已打 %.0f / %.0f 秒）"
+                                      % (self._fight_acc, _min_s))
+                return False
         # 节流（同「限制战斗区域」✓）—— ⭐ CD 按「**怪那块 foothold 所属的那个区域项**」取 ✓
         # （用户 2026-09-28："②③ 也用目标区域项"✓；归属不到任何项 ⇒ 退回默认 ✓）。
         if now - getattr(self, "_mob_goto_at", 0.0) < self._zone_cd_of_sets(msets):
@@ -4067,6 +4371,10 @@ class CombatAgent:
         self._mob_goto_at = now
         ok, msg = False, ""
         for name in msets:
+            # ⭐ **目的地也要是能打区**（用户 2026-10-01 ✓）：怪若同时属于几个集合，别试到
+            #   那个被勾掉的「可以战斗」上 ✗ —— 只挑 `battle_zone_sets` 白名单里的试 ✓。
+            if not self._zone_allows(name):
+                continue
             # ⚠ `keep_clock=True`（用户 2026-09-29 第 2 条 ✓）：这条正是"怪换层了 ⇒ 目标
             #   集合变了"的最常见来源 ⇒ 不带上它，签名一变就重打钟 = 被 attack 刷新 ✗。
             ok, msg = self.plan_and_start_route(
@@ -4304,6 +4612,19 @@ class CombatAgent:
             self._back_ctx = None
         _prev_state = self.state
         self.state = new_state
+        # ⭐⭐⭐ **idle 回归的抽签号：每次闲下来都重抽**（用户 2026-09-30 **定稿** ✓ 原话：
+        #   "**每次都重新随机，没有任何判定机制**，就是简单的『**每次都随机抽取**』" ✓）。
+        #   ⇒ 只要**离开 idle 那一拍就清号** ⇒ 下一次闲下来 `_idle_walk_beat` 必抽一个新的 ✓
+        #   —— 不看闲了多久、不看有没有怪、**不设任何门槛** ✓。
+        #   ⚠⚠ 我先后加过两种"门槛"，用户都明确否掉 ✗：① 抽签只在"目标不在名单里"时做 ⇒
+        #     抽中一次**永久保留** ✗✗；② `_IDLE_REROLL_MIN_S = 3.0`（"这次闲够 3 秒才算
+        #     一轮" ✗）—— 用户原话："**没有提过这样的需求**" ✓。它的实际后果（2026-09-30
+        #     `behavior.log` 实证 ✓）：森林迷宫III 里 idle 段被怪框打断成 **0.05~1 秒**
+        #     （`chase_ghost` 36 次 ✓）⇒ **一次都不够格** ⇒ 抽签号从很久以前一直留到现在
+        #     ⇒ 现场表现就是用户报的"**固定其中一个**" ✗✗（21:26:31→21:31:23 连续 idle
+        #     292 秒里 0 次重抽 ✓）。⇒ **两个门槛都已删除** ✗，回到最简单的"每次都抽" ✓。
+        if new_state != "idle" and _prev_state == "idle":
+            self._idle_fid = None
         if new_state != _prev_state:            # 战斗状态切换（抖动/攻击↔追击一眼可见 ✓）
             behavior.event("battle_state", frm=_prev_state or "-", to=new_state)
 
@@ -4434,13 +4755,24 @@ class CombatAgent:
             #   2 秒里按了 1.67 秒 ✗）。⇒ 上一次补键没结束就不再起新的 ✓
             #   （实际频率 = max(每 3 轮, `min_turn_hold_ms`) ✓ —— 想让"每 3 轮"真的按得上，
             #    就把「最小切换朝向时间」配得比"3 轮"短一些 ✓）。
-            _hold_s = max(0.0, float(self.settings.min_turn_hold_ms)) / 1000.0
+            # ⭐ **补键时长 = `TURN_TAP_S`（点一下 ✓）**（2026-09-30 用户实测纠偏 ✓ 原话：
+            #   "现在好像看起来每次 attack 都往前走了，而不是每 3 次"）—— 原来按
+            #   「最小切换朝向时间」的**全长**按（用户配 1000ms ✗）：轮周期 ≈ attack_cd
+            #   300ms + 序列 ⇒ **3 轮 ≈ 1s ≈ 时长** ⇒ 窗口首尾相接、占空比 ~100%，
+            #   观感就是"每轮都在走"✗。而补键的用途是**转身对齐** —— 站桩转身点一下
+            #   就够（`TURN_TAP_S` 那条说明 ✓："按满就是从怪身上走过去"✗）。
+            #   （`_turn_until` 照旧记窗口终点 ⇒ tick 末尾据此补键 ✓ 防重叠逻辑不变 ✓。）
+            _hold_s = TURN_TAP_S
             if (self._atk_round % STATION_TURN_EVERY == 0
                     and (self._turn_until is None or now >= self._turn_until)):
-                # 该补的那一轮 ⇒ 记下起点（tick 末尾据此补"朝目标"的方向键、按满
-                # 「最小切换朝向时间」✓ 见 `_turn_due_at` 的说明 ✓）
+                # 该补的那一轮 ⇒ 记下起点（tick 末尾据此补"朝目标"的方向键 ✓
+                # 见 `_turn_due_at` 的说明 ✓）
                 self._turn_due_at = now
                 self._turn_until = now + _hold_s
+                # ⭐ 打点（用户 2026-10-01 ✓）：让"每 3 轮补朝向键"在日志里可数 ——
+                #   现场看"到底触发没有"不用再靠猜 ✓（`round` = 第几轮 ✓）。
+                behavior.event("station_turn", round=self._atk_round,
+                               hold_ms=int(round(_hold_s * 1000.0)))
         nxt = [seq, 0, due, set(), []]
         if due <= now:
             # 序列本身比 CD + 随机延迟还长 → 同一帧直接起步，不白等一个 tick
@@ -4561,6 +4893,7 @@ class CombatAgent:
             if now >= self._next_evade:
                 if jump_key:
                     tap(jump_key, self._attack_duration)
+                    self._seq_key_at[jump_key] = time.monotonic()   # 键帽点亮窗 ✓
                     behavior.event("jump", why="闪避")
                 self._pending_attack = now + interval
                 # （随机延迟已删，2026-09-27 ⇒ 规避间隔 = interval + CD ✓）
@@ -4571,6 +4904,7 @@ class CombatAgent:
                 # 不吃朝向），但攻击键要等转身做完，否则打向错误的方向。
                 # 没到点就继续挂着 _pending_attack，下一帧再补。
                 tap(attack_key, self._attack_duration)
+                self._seq_key_at[attack_key] = time.monotonic()   # 键帽点亮窗 ✓
                 behavior.event("out_evade")
                 self._last_output = now
                 self._pending_attack = None
@@ -4657,11 +4991,7 @@ class CombatAgent:
         #     空操作（见 decision/input.py：`if _remote is not None`）。这时若也只
         #     clear 记录，那个键就永远按着了：记录已清，后面 keys.set 再也不会补发 up
         #     （实测：本地后端下只看到 down left，永远看不到 up left）。
-        if dinput.link_health().get("backend") == "local":
-            self.keys.release_all()
-        else:
-            dinput.release_all_remote()
-            self.keys.clear()
+        self._release_keys_now()
         # **本机规划的行为序列一律保留进度**，并且把「该按着的键」**重按回去**：
         #     _output_ctx     输出行为序列（攻击连点 / 跳输出，自己按 CD 排下一轮）
         #     _back_ctx       回身输出序列（循环行为）
@@ -4680,6 +5010,29 @@ class CombatAgent:
             self._reassert_ctx(ctx)
         for st in self._timer_states.values():
             self._reassert_ctx(st)
+
+    def _release_keys_now(self):
+        """**真的**把键松开 —— 固件那条 RELEASEALL + 本机记录同步的**唯一写法** ✓。
+
+        ⭐ 抽出来是为了"停自动"也能调它（2026-10-01 ✓）。以前只有定期 RELEASEALL 一处
+        这么松 ⇒ 关自动那会儿只能"不再发新的"，**已经进管道的照走不误** ✗（见 tick 里
+        那条下降沿的说明）。
+
+        ⚠ 两种后端走法不同，**不许合并**（2026-09-26 现场踩过 ✗）：
+          · 远程 / 串口 —— 固件一次 `RELEASEALL` 全清，最可靠（逐条 RELEASE 丢一个就卡键）；
+            本机只同步**记录**（`clear` 故意**不发** up —— 固件那边已经全松了，再逐键松一遍
+            等于把"没按着的键"又松一次 ✗）；
+          · 本地(仅测试) —— **没有固件**，`release_all_remote()` 在那上面是空操作
+            （见 `decision/input.py`：`if _remote is not None`）⇒ 必须走 `keys.release_all()`
+            逐键发 up；只 clear 记录的话那个键在本机就**永远按着** ✗（实测本地后端
+            只看得见 `down left`、永远没有 `up left`）。
+        """
+        from decision import input as dinput
+        if dinput.link_health().get("backend") == "local":
+            self.keys.release_all()
+        else:
+            dinput.release_all_remote()
+            self.keys.clear()
 
     def tick(self, ws, timing_only=False):
         """跑一帧决策；`timing_only=True` 时只跑一次「时序拍」。
@@ -4705,6 +5058,22 @@ class CombatAgent:
         if s.enabled and not self._was_enabled:
             self._last_facing_change = time.monotonic()
             self._player_lost_since = None   # 重新开启自动：重置找不到玩家计时
+
+        # ⭐⭐ **关闭自动的下降沿 ⇒ 把键真的松干净**（用户 2026-10-01 ✓ ——
+        #   现场："停止自动后它还在自动按键，还会按输出键、左右走，直到把输入设备从
+        #   ProMicro(远程) 换成别的才停" ✗）。
+        #   为什么光"不再发新命令"不够：固件是**逐条执行**的（`TAP` / `FIX` / `RND`
+        #   内部还会 `delay`，期间它压根不读串口），而发送侧原来**从不等待回执**
+        #   （`kbd_client.send` 直接 `sendall`）⇒ 决策产生的命令早就排在 TCP / relay /
+        #   串口的缓冲里了。自动一关只是**不再往队尾加新的**，**队里已有的还会一条条被
+        #   固件执行** ⇒ 看着就是"停了还在自己按"，要等它慢慢消化完才停 ✗。
+        #   ⇒ 这里补一条 `RELEASEALL`：它排在队尾，等队里的执行完就立刻把固件的 held 表
+        #     清空 ⇒ 不会再出现"停了几十秒还在走"那种事（配合 `kbd_client` 那边的背压 ✓）。
+        #   ⚠ 这里**不许**像定期 RELEASEALL 那样把该按着的键 **`_reassert_ctx` 重按回去** ——
+        #     停自动就是要停手，补按等于又给它按回去了 ✗。
+        if not s.enabled and self._was_enabled:
+            self._release_keys_now()
+
         self._was_enabled = s.enabled
         now = time.monotonic()
 
@@ -4759,6 +5128,37 @@ class CombatAgent:
             s.next_afk_monotonic = 0.0
             return {"state": "idle", "reason": "未开启",
                     "kill_mobs": self._take_kill_mobs()}
+
+        # ---- ⭐ 界面状态接管（M1「测谎报警」+ 断线判断，2026-09-29）----
+        # 判据来源：感知层每秒在**原生帧**上做两级模板匹配，结论写进 `ws.screen`：
+        #   测谎弹窗（screen_state："lie_warn"/"lie_game"/"lie_success" ✓）+
+        #   掉线/登录系（ui_state："login_err" 断线提示框 / "login" / "channel_*" /
+        #   "queue" / "char_select" ✓ 整段重连素材的锚点）。
+        # 为什么排在休息/战斗分支**之前**：这些画面上**角色不能操作**（测谎锁操作、
+        # 掉线后根本不在游戏里），发任何战斗键都无效（「有怪先打」的总判据到此让位 ✓）；
+        # 停发按键还能防"画面恢复后按着的键突然生效" ✗。任务**保留不撤**：进沿给攀爬
+        # 任务调 `interrupted()` ⇒ 锚点整体后移（这段不算"卡住/超时" ✓）。
+        # ⚠ 报警音 / 存帧 / screen_state 打点在 **live_thread**（不开自动也要响 ✓）；
+        # ⚠ 掉线重连的**动作**（点连接/选频道…）是 `decision/reconnect.py` 的活 ✓，
+        #   这里只负责"别跟它抢着发战斗键" ✓。
+        _scr = str(getattr(ws, "screen", "") or "combat")
+        if _scr != "combat":
+            if timing_only:
+                return None          # 时序拍不做事（同 4885 的口径 ✓ 停手是决策拍的事 ✓）
+            if not self._in_lie:
+                self._in_lie = True
+                behavior.event("screen_takeover", st=_scr)
+                job = self._climb
+                if job is not None and hasattr(job, "interrupted"):
+                    job.interrupted(now)      # 这段不算"卡住/超时" ✓
+                self._release_held_keys()     # 停手：按着的键全松（恢复后重新按 ✓）
+            return {"state": self.state, "reason": "界面接管（%s）" % _scr,
+                    "target": None, "dx": 0, "dist": 0, "keys": [],
+                    "facing": self.facing,
+                    "kill_mobs": self._take_kill_mobs()}
+        if self._in_lie:
+            self._in_lie = False
+            behavior.event("screen_resume", st=_scr)
 
         # 防掉线-隐身休息：休息流程独占本帧 —— 不走 RELEASEALL / 喂宠 / 自定义定时
         # （计时器由 _run_rest → _pause_timers 冻住），也不做任何战斗动作。
@@ -4953,8 +5353,15 @@ class CombatAgent:
         if self.state == "chase":
             if self._chase_since is None:
                 self._chase_since = now
+                # ⭐ 「按着走却走不动 ⇒ 跳一下」的锚也跟着重起（用户 2026-10-01 ✓）：
+                #   只在**刚追起来**这一拍重锚 —— 否则站在攻击范围外发呆那段时间
+                #   攒下的"没动"会被算进追击里 ⇒ 一进追击就白跳一下 ✗。
+                self._chase_x = None
+                self._chase_x_at = now
         else:
             self._chase_since = None
+            self._chase_x = None
+            self._chase_x_at = None
 
         # ⭐ 「**最大战斗时长 ⇒ 换地方**」（用户 2026-09-28 接上行为 ✓，口径见 `_fight_beat` ✓）：
         #   放在这里和 `_chase_since` 同一个位置 —— **每拍、所有分支之前**算一次 ✓
@@ -5175,7 +5582,29 @@ class CombatAgent:
             # 方向键都不按，一直站到攻击范围内清空（下面 else 分支解除）。CD 期间也
             # 保持停下：范围内还有怪就不该往前走。**两个策略都要**（老写法只给扫平台，
             # 平地巡逻就成了"一边打一边朝怪挪"，见 _attack_state 的说明）。
+            _was_stand = self._stand_attack
             self._stand_attack = (self.state == "attack")
+            # ⭐⭐ **站桩进入首窗：朝怪方向键按满「最小切换朝向时间」**（2026-09-30 用户
+            #   要求 ✓ 原话："攻击范围内从无怪首次变成有怪而触发 attack 时，向着怪的
+            #   方向键需要按'最小切换朝向时间(ms)'"）—— 刚进站桩那一刻角色往往还
+            #   **没转过来**（内部朝向只是贴同步 ✓），只点 `TURN_TAP_S` 可能不够 ⇒
+            #   进站桩的**第一窗**按**满参数** ✓；窗过后照旧每 `STATION_TURN_EVERY`
+            #   轮点一下 ✓，防重叠闸照旧 ✓（`_turn_until` 没到期 ⇒ 3 轮那下不起 ✓）。
+            #   ⚠ 复用「每 3 轮补键」的**同一个窗**（`_turn_due_at`/`_turn_until` ✓，
+            #     tick 末尾**同一处**消费 ✓）—— 别开第二扇窗 ✗（两处各按各的会叠 ✗）。
+            #   ⚠ **挂任务（对齐绳 x）时不启窗**：站桩走位会推翻对齐（2026-09-26
+            #     "挂着寻路不许走位"✓，`_attack_state` 的爬绳早退分支同理 ✗）；
+            #     绳上更不启 ✓（消费端的 `_in_rope_now` 已挡 ✓）。
+            #   ⚠ 方向**跟着 `self.facing` 走**（消费端取的就是它 ✓）—— `_attack_state`
+            #     每拍把朝向贴向目标 ⇒ 窗内怪挪了、按键方向也跟着 ✓。
+            if self._stand_attack and not _was_stand and self._climb is None:
+                self._turn_due_at = now
+                self._turn_until = (now + max(0.0, float(s.min_turn_hold_ms))
+                                    / 1000.0)
+                # ⭐ 打点（用户 2026-10-01 ✓）：进站桩首窗那一下（按满「最小切换朝向时间」✓），
+                #   与「每 3 轮」的 `station_turn` 分开记 —— 首窗是"从无怪到有怪"的沿 ✓。
+                behavior.event("station_turn_first",
+                               hold_ms=int(s.min_turn_hold_ms))
         else:
             # 前方攻击范围内没框
             self._stand_attack = False    # 清空 → 恢复移动（巡逻/追怪）
@@ -5219,8 +5648,40 @@ class CombatAgent:
                 self._set_state("chase")
             elif s.strategy == "sweep":
                 # 扫平台巡逻：无背后怪，朝倾向朝向走（不锁定、无红框）。
-                # 物理朝向先拉回倾向朝向（可能刚转身打过背后怪），再朝它走。
                 best = 0.0
+                # ⭐ **换向 = 两条件任一**（2026-09-29 用户定稿 ✓）：
+                #   A（新）：**距当前 foothold 集合边缘 ≤「距离平台边缘回头(px)」⇒ 回头，
+                #     即使该方向有怪也转**（老口径"主方向有怪就不换向"会在怪赖在另一头时
+                #     把人一直拽向集合边缘 ✗）。集合 x 范围 = 广播的 `here_span`
+                #     （**世界坐标** ✓，位置状态机给）⇒ 距离用 `world_x` 比（同一坐标系 ✓，
+                #     别拿画面 px 混比 ✗）；判不出（没圈集合 / 没定位）⇒ 这条不生效 ✓。
+                #   B（旧，保留）：倾向方向没怪持续「换朝向延迟」⇒ 回头 ✓（一字不动 ✓）。
+                #   ⚠ 换向必须放在**算行走键之前**：到边当场折返，不然还要多走一步
+                #     才生效（贴着集合边缘走可能直接走出去 ✗）。
+                _wx = getattr(ws.player, "world_x", None)
+                _span = getattr(ws.player, "here_span", None)
+                _edge_turn = False
+                if _wx is not None and _span and len(_span) >= 2:
+                    try:
+                        _d = ((float(_span[1]) - float(_wx)) if self._patrol_dir > 0
+                              else (float(_wx) - float(_span[0])))
+                        _edge_turn = _d <= max(0.0, float(s.sweep_edge_turn_px))
+                    except (TypeError, ValueError):
+                        _edge_turn = False
+                _front_has_mob = any((m.x - px) * self._patrol_dir >= 0 for m in mobs)
+                if _edge_turn:
+                    self._patrol_dir = -self._patrol_dir
+                    self._no_target_since = None      # B 的计时重来 ✓
+                else:
+                    if _front_has_mob:
+                        self._no_target_since = None   # 倾向方向有怪：重置换向计时（B ✓）
+                    else:
+                        if self._no_target_since is None:
+                            self._no_target_since = now
+                        turn_cd = max(0.0, float(s.sweep_turn_cd)) / 1000.0
+                        if now - self._no_target_since >= turn_cd:
+                            self._patrol_dir = -self._patrol_dir
+                            self._no_target_since = None
                 self.set_facing(self._patrol_dir)
                 keys.add(s.keymap["right"] if self._patrol_dir > 0 else s.keymap["left"])
                 self._set_state("chase")
@@ -5233,19 +5694,6 @@ class CombatAgent:
                     if hit is not None:
                         self._maybe_chase_jump(self._center_dist(hit, ws.player),
                                                now, edge=jump_edge)
-                # 换向：倾向朝向方向没怪持续 sweep_turn_cd 才换向。
-                # 主方向有怪（哪怕是远处、还没进攻击范围）就不换向，保持朝它走。
-                front_has_mob = any((m.x - px) * self._patrol_dir >= 0 for m in mobs)
-                if front_has_mob:
-                    self._no_target_since = None   # 主方向有怪：重置换向计时
-                else:
-                    if self._no_target_since is None:
-                        self._no_target_since = now
-                    turn_cd = max(0.0, float(s.sweep_turn_cd)) / 1000.0
-                    if now - self._no_target_since >= turn_cd:
-                        self._patrol_dir = -self._patrol_dir
-                        self.set_facing(self._patrol_dir)
-                        self._no_target_since = None
             else:
                 # 平地巡逻：无怪，idle
                 self._set_state("idle")
@@ -5268,6 +5716,13 @@ class CombatAgent:
                 #     解析器 ⇒ `_idle_walk_beat` 一个键都不加 ⇒ 行为和以前**一模一样** ✓。
                 _ikeys = set()                # ⚠ `_steer` 往里 `add` ⇒ 必须是 **set** ✗ list 会炸
                 self._idle_walk_beat(_ikeys, ws)
+                # ⚠⚠ **必须紧跟一次 `self.keys.set(...)`**（2026-09-29 实测踩坑：
+                #   "森林迷宫III 二楼 idle→fh26 没生效"）—— 这里和休息分支一样是**早退**，
+                #   正常路径末尾那次下发（下面 `self.keys.set(keys)`）到不了这儿 ⇒ 转向键
+                #   只进了返回字典（那个只喂信息栏显示 ✗），**从来没人按下去** —— 现场
+                #   `act move=1`（想按）而 `keys` 字段是空（真按着的键一个没有）✗。
+                #   同款修复见休息分支那条（"早退必须紧跟 keys.set" ✓）。
+                self.keys.set(_ikeys)
                 return {"state": "idle", "reason": "无怪", "keys": list(_ikeys),
                         "kill_mobs": self._take_kill_mobs()}
 
@@ -5290,10 +5745,11 @@ class CombatAgent:
         #   但**站桩攻击**那一拍必须留口子（用户 2026-09-26 报的"寻路途中身后的怪不打"）：
         #   攻击只打得到**面前**，不给这一下就**不会真的转身** ⇒ 算进来了也是**空放** ✗。
         #   `TURN_TAP_S` 那一小下是**原地转**、不改变位置 ✓；走路时仍然 cap 0，绝不干预任务 ✗。
-        # ⭐ **站桩时每 `STATION_TURN_EVERY` 轮按满一次**（用户 2026-09-28 要求 2 ✓）：
-        #   · 平时站桩 ⇒ 仍只点一下（`TURN_TAP_S` ✓ 见上面那段说明：按满就是从怪身上走过 ✗）；
-        #   · **轮到"该补"的那一轮**（第 3、6、9… 轮 ✓）⇒ **按满「最小切换朝向时间」** ✓
-        #     —— 就是用户说的"持续『最小切换朝向时间』"✓。
+        # ⭐ **站桩时每 `STATION_TURN_EVERY` 轮补一次**（用户 2026-09-28 要求 2 ✓）：
+        #   · 平时站桩 ⇒ 只点一下（`TURN_TAP_S` ✓ 见上面那段说明：按满就是从怪身上走过 ✗）；
+        #   · **轮到"该补"的那一轮**（第 3、6、9… 轮 ✓）⇒ **也只点一下**（2026-09-30 用户
+        #     实测纠偏 ✓："看起来每次 attack 都往前走"✗ —— 按满「最小切换朝向时间」
+        #     会把 3 轮周期全占满 ✗ 见 `_run_output_ctx` 那段 ✓）。
         #   ⚠ **绳上绝不按左右**（`_in_rope_now` ✓）：在绳上按左右在游戏里就是**松手** ⇒ 会掉 ✗
         #     （用户 2026-09-28 明确："在绳上只用逻辑朝向（`set_facing`）+ 攻击键，绝不按左右"
         #      ✓）⇒ 传 `cap=0`（`_hold_turn` 见 0 就不补键 ✓，`set_facing` 照旧每拍设 ✓）。
@@ -5311,16 +5767,23 @@ class CombatAgent:
         # ⚠ **绳上绝不按**（`_in_rope_now` ✓，用户 2026-09-28 明确）：在绳上按左右 = 松手掉下来 ✗。
         # ⚠ 键已经按着方向键时不重复加（`_hold_turn` 同款判断 ✓）。
         if (self._stand_attack and not self._in_rope_now
-                and self._turn_due_at is not None):
-            _hold_s = max(0.0, float(s.min_turn_hold_ms)) / 1000.0
-            if (now - self._turn_due_at) < _hold_s:
-                _km = s.keymap
-                _dirs = {_km.get("left"), _km.get("right"), _km.get("up"), _km.get("down")}
-                _dirs.discard(None)
-                if not (keys & _dirs):
-                    _k = _km.get("right") if self.facing > 0 else _km.get("left")
-                    if _k:
-                        keys = set(keys) | {_k}
+                and self._turn_until is not None and now < self._turn_until):
+            # ⭐ 时长在**触发那一刻**已定（`_turn_until` ✓ = 起点 + `TURN_TAP_S`）——
+            #   别在这儿再拿 `min_turn_hold_ms` 现算 ✗（两处口径会各走各的 ✗）。
+            _km = s.keymap
+            _dirs = {_km.get("left"), _km.get("right"), _km.get("up"), _km.get("down")}
+            _dirs.discard(None)
+            if not (keys & _dirs):
+                _k = _km.get("right") if self.facing > 0 else _km.get("left")
+                if _k:
+                    keys = set(keys) | {_k}
+        # ⭐ 「追击时按着方向键却走不动 ⇒ 单点跳一下」（用户 2026-10-01 ✓）。
+        # ⚠ 放在**这里**（`keys` 已经定稿、状态也已经由上面各分支写好 ✓）：
+        #   · 状态这一拍就是 `chase` ⇒ 追怪 / 扫平台巡逻两条路**自动都覆盖** ✓；
+        #   · `keys` 里真按着 ←/→ 才谈得上"走不动"（它自己判 ✓）；
+        #   · 跳键走 `tap`（直接发键 ✓），**不进 `keys`** —— 它不是"这一拍要按住的键"，
+        #     和追击起跳 / 规避跳同一条路 ✓。
+        self._chase_hop_beat(now, ws, keys)
         self.keys.set(keys)
 
         # 输出行为：攻击 / 跳规避 / 回身输出（按 self.state）

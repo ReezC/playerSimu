@@ -13,7 +13,7 @@ import time
 import av
 
 from link import PyAVSource
-from tools.config import get, record_dir
+from core.config import get, record_dir
 
 
 def main() -> int:

@@ -54,7 +54,7 @@ import numpy as np
 
 from link import FileSource, PyAVSource
 from tools import probe_codec
-from tools.config import get
+from core.config import get
 # 判据与工作台**共用一份实现**（`probe_codec.Verdict`）：两边各写一份必然漂移，
 # 而漂移的那一份会让"工具说 OK、工作台说不对"这种最难查的分歧出现。
 from tools.probe_codec import Verdict                   # noqa: F401
@@ -395,7 +395,7 @@ def main():
         if now - _off_t[0] >= OFFSET_REFRESH:
             _off_t[0] = now
             try:
-                from tools.config import ROOT
+                from core.config import ROOT
                 p = ROOT / "config" / "clock_offset.txt"
                 _off_v = float(p.read_text(encoding="utf-8").strip()) / 1000.0
                 return _off_v

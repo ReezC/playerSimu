@@ -11,7 +11,7 @@ import argparse
 import sys
 import tkinter as tk
 
-from tools.config import get
+from core.config import get
 from tools.probe_codec import encode_bits, now_ms
 
 

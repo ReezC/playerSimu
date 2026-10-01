@@ -13,7 +13,7 @@ import time
 
 import av
 
-from tools.config import get
+from core.config import get
 
 
 class UDPWriter:

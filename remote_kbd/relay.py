@@ -242,7 +242,14 @@ def bridge(conn, link):
         trace("tcp->serial 写失败，结束本连接: %s" % e)
     finally:
         stop.set()
-        # 连接断开时清空所有按住的键，防止「释放包丢失」导致卡键
+        # ⭐⭐ 连接断开时**清空串口缓冲 + 重开句柄**（2026-10-02 ✓ —— 用户报
+        #   "必须断开 ProMicro 才拯救"）：光发 RELEASEALL 不够 —— 它只清固件侧
+        #   held 表，但**积压在 OS 串口驱动缓冲里的命令还在**（固件不读时 write
+        #   照样成功返回 ✗）⇒ B 机重连后 relay 又把积压的写出去 ⇒ 还是卡 ✗。
+        #   reopen 关掉旧句柄重开 ⇒ OS 缓冲清空 ⇒ 积压的命令全丢 ✓（客户端都
+        #   断开了，丢积压是对的 —— 本来就是异常退出 ✓）。然后在干净的新句柄
+        #   上发 RELEASEALL，让固件回到空状态。
+        link.reopen("client disconnect")
         try:
             link.write(b"RELEASEALL\n")
         except Exception:

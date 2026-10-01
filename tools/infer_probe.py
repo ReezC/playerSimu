@@ -309,7 +309,7 @@ def main():
     ap.add_argument("--skip-raw", action="store_true", help="跳过裸 torch op 对比")
     a = ap.parse_args()
 
-    from tools.config import load_live
+    from core.config import load_live
     live = load_live()
     imgsz = a.imgsz or int(live.get("imgsz", 800))
     device = a.device or str(live.get("device", "0"))

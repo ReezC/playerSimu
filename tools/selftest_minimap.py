@@ -2768,6 +2768,40 @@ def t_osd_task_and_timers():
                   for l in lines),
               "没有寻路任务时「当前任务」该显示「战斗」：%r" % (lines,))
 
+        # ⭐ **决策状态行**（2026-09-29 用户要求：从画面左上角**搬进信息栏**、放世界坐标
+        #   **下面**、与世界坐标**统一格式** ✓）：是**普通 str**（= 黑底白字、基础字号，
+        #   与世界坐标同一份样式 ✓）；拿不到状态（_Fake 没有 state）⇒ 不画 ✓。
+        class _FakeS:
+            state = "attack"
+
+        with mock.patch.object(agent_mod, "CURRENT", _FakeS()):
+            d_lines = p._osd_lines("世界 (1, 2)")
+        d_texts = [l if isinstance(l, str) else l[0] for l in d_lines]
+        check(d_texts[0] == "世界 (1, 2)" and d_texts[1] == "决策：attack",
+              "决策行该紧跟世界坐标、且同款式（普通 str = 黑底白字）✗：%r"
+              % (d_texts[:3],))
+
+        # ⭐ 当前区域配了 idle 回归 foothold ⇒「决策：idle → foothold#41」
+        #   （2026-09-29 用户要求 ✓；目标 id = agent._idle_walk_beat 每拍写的 ✓）
+        class _FakeI:
+            state = "idle"
+            _idle_fid = "41"
+
+        with mock.patch.object(agent_mod, "CURRENT", _FakeI()):
+            i_lines = p._osd_lines("世界 (1, 2)")
+        i_texts = [l if isinstance(l, str) else l[0] for l in i_lines]
+        check(i_texts[1] == "决策：idle → foothold#41",
+              "idle 回归目标没显示（该是「决策：idle → foothold#41」✗）：%r"
+              % (i_texts[:3],))
+        class _FakeNoSt:                  # 没有 state 属性 = 拿不到状态 ✓（_Fake 在后面才定义 ✗）
+            pass
+
+        with mock.patch.object(agent_mod, "CURRENT", _FakeNoSt()):
+            nd_texts = [l if isinstance(l, str) else l[0]
+                        for l in p._osd_lines("世界 (1, 2)")]
+        check(all(not t.startswith("决策：") for t in nd_texts),
+              "拿不到状态却画了「决策：?」废行 ✗：%r" % (nd_texts[:3],))
+
         class _Fake:
             def current_goto_set(self):
                 return "左上平台"
@@ -7222,6 +7256,123 @@ def t_player_tracker_trusted_camera():
           "重锁之后相机没重来：%r（期望 1100）" % (tr3.camera(),))
 
 
+def t_player_tracker_input_aware():
+    """⭐⭐ **输入感知的运动预测**（用户 2026-10-01 ✓，借 `Maple_xfeat` 的思路）。
+
+    病根：漏检那几帧原来是"**拿上一帧位移**线性外推"—— 它**不知道玩家按了什么**。
+    玩家中途变向 / 停住时，预测就朝错的方向一路跑 ⇒ ① 挑"哪个框是我"挑错、
+    ② 补出来的框也是错的 ✗（这两处**共用同一个预测位置**，见 `update`）。
+
+    做法：方向键是**已知控制输入** —— 按住就朝该方向加速到 `walk_v_max`，松手就在
+    地面摩擦下减速到 0（`InputAwareHorizontalKalman` 那套 ✓）。
+
+    钉五件：
+      ① **没喂过输入 ⇒ 老口径一字不变**（速度*保持*，绝不按"松手"去减速 ✗）——
+         这道闸必需：没有它，不用这个功能的人的老行为也被改了；
+      ② 按右 ⇒ 漏检期**一路往右**，且速度单调增（不是恒定不变）；
+      ③ 松手 ⇒ 速度**衰减到 0** 然后停住（不是永远滑下去）；
+      ④ 变向 ⇒ 从正速度**刹到负**（不会卡在 0 不动）；
+      ⑤ 主循环卡一下（`dt` 很大）⇒ 预测**不许被推出去几百像素**（夹住 ✓）。
+    """
+    from perception import tracker as _tk
+
+    class _Clock:
+        """只替**本模块**里那个 `time`（不动全局 ✓）—— 让它按固定步长往前走。"""
+        now = 1000.0
+
+        @staticmethod
+        def monotonic():
+            return _Clock.now
+
+    _real_time = _tk.time
+    _tk.time = _Clock
+
+    def _c(cx, bottom=300.0):
+        return [(cx - 20.0, bottom - 60.0, cx + 20.0, bottom, 0.9)]
+
+    def _tick(step=0.033):
+        _Clock.now += step
+
+    P = _tk.PlayerTracker
+    try:
+        # ① 没喂过输入 ⇒ 老口径：速度**保持**
+        a = P()
+        a.update(_c(400.0))
+        a.update(_c(440.0))              # 速度 = 0.6*0 + 0.4*40 = 16（像素/帧）
+        v0 = a._vx
+        check(v0 > 0, "用例前提不成立：没建立起速度 %r" % (v0,))
+        _tick()
+        b1 = a.update([])
+        _tick()
+        a.update([])
+        check(abs(a._vx - v0) < 1e-9,
+              "**没喂过输入却在改速度**（老口径是「速度保持」）✗：%r → %r" % (v0, a._vx))
+        check(abs(b1[0] - (440.0 + v0)) < 1e-6,
+              "没喂输入时外推口径变了：%r（期望 %r）" % (b1[0], 440.0 + v0))
+
+        # ② 按右 ⇒ 漏检期一路往右，速度单调增
+        b = P(max_missed=100)
+        b.set_input(1)
+        _tick()
+        b.update(_c(400.0))
+        xs, vs = [], []
+        for _ in range(10):
+            _tick()
+            bx = b.update([])
+            xs.append(bx[0])
+            vs.append(b._vx)
+        check(all(y > x for x, y in zip(xs, xs[1:])),
+              "按着右却没一路往右：%r" % (xs,))
+        check(all(y >= x - 1e-9 for x, y in zip(vs, vs[1:])),
+              "按着右时速度没有单调增（说明压根没用上输入）✗：%r" % (vs,))
+
+        # ③ 松手 ⇒ 减速到 0，然后停住
+        b.set_input(0)
+        for _ in range(10):
+            _tick()
+            b.update([])
+        check(abs(b._vx) < 1e-9, "松手之后速度没减到 0：%r" % (b._vx,))
+        _tick()
+        x_stop = b.update([])[0]
+        _tick()
+        x_stop2 = b.update([])[0]
+        check(abs(x_stop2 - x_stop) < 1e-9,
+              "速度已经是 0 了还在往前挪：%r → %r" % (x_stop, x_stop2))
+
+        # ④ 变向 ⇒ 从正速度刹到负
+        c = P(max_missed=100)
+        c.set_input(1)
+        _tick()
+        c.update(_c(400.0))
+        for i in range(8):
+            _tick()
+            c.update(_c(400.0 + (i + 1) * 6.0))
+        check(c._vx > 0, "先按右却没建立起正速度：%r" % (c._vx,))
+        c.set_input(-1)
+        for _ in range(12):
+            _tick()
+            c.update([])
+        check(c._vx < 0, "变向往左之后速度还是正的（没刹过来）✗：%r" % (c._vx,))
+
+        # ⑤ dt 夹住：主循环卡 5 秒 ⇒ 预测不许被推出去几百像素
+        d = P(max_missed=100)
+        d.set_input(1)
+        _tick()
+        d.update(_c(400.0))
+        for _ in range(30):
+            _tick()
+            d.update([])
+        x_before = d._box[0]
+        _tick(step=5.0)                  # 卡了 5 秒
+        x_after = d.update([])[0]
+        jump = abs(x_after - x_before)
+        check(jump <= d.walk_v_max * 0.25 + 1e-6,
+              "卡帧之后预测一口气跳了 %r 像素（该夹在 1/4 秒 = %r）✗"
+              % (jump, d.walk_v_max * 0.25))
+    finally:
+        _tk.time = _real_time
+
+
 def t_screen_to_world_trusted_camera():
     """`screen_to_world` 优先用**可信相机**（用户 2026-09-29 任务 2 ✓）。
 
@@ -7511,6 +7662,9 @@ TESTS = (
      t_crop_overlay_follows_view),
     ("可信相机：用黄点的权威世界坐标核对玩家框",
      t_player_tracker_trusted_camera),
+    ("⭐ 输入感知的运动预测：按着方向键就照它推演、松手就减速、卡帧要夹住；"
+     "**没喂过输入 ⇒ 老口径一字不变**（用户 2026-10-01）",
+     t_player_tracker_input_aware),
     ("画面→世界：优先用可信相机（没有就退回老口径）",
      t_screen_to_world_trusted_camera),
     ("可信相机 / 显示区跟踪的接线（源码级）",

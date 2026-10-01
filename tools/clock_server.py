@@ -14,7 +14,7 @@ import socket
 import sys
 import time
 
-from tools.config import get
+from core.config import get
 
 
 def main() -> int:

@@ -37,7 +37,7 @@ import numpy as np                                         # noqa: E402
 from core import mapdata                                   # noqa: E402
 from gui.project import last_opened                        # noqa: E402
 from perception import minimap as mm                       # noqa: E402
-from tools.config import load_live                         # noqa: E402
+from core.config import load_live                         # noqa: E402
 from tools.mmap_dot_probe import grab_live, grab_stream     # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent

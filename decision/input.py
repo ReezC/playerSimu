@@ -184,14 +184,21 @@ class KeyState:
 
     def __init__(self):
         self._pressed = set()
+        #: ⭐ **瞬发键**（输出序列 / 攻击 tap ✓ 2026-09-30）：它们不能走 `set()`
+        #:   —— 决策拍是**全量重算** ✗ 会把序列正按着的键当场顶掉 ⇒ 单独登记、
+        #:   `pressed()` 取**并集** ✓（流画面左下的「按键帽」据此点亮输出键 ✓）。
+        self._momentary = set()
 
     def pressed(self):
         """当前按着的键（**只读快照** ✓）—— 给"现在按着 ↑/↓ 吗"这类**许可条件**用 ✓。
+        ⭐ 2026-09-30 起含**瞬发键**（序列/攻击 ✓ 见 `_momentary` ✓）—— 流画面
+        的按键帽据此点亮 ✓；`holding_vertical` 等许可判定不受影响 ✓（瞬发的攻击键
+        本来就不是攀爬许可的输入 ✗ 语义不冲突 ✓）。
 
         用户 2026-09-27 要求："位置状态判定优化：除非按住了 ↑ 或 ↓，不能主动判定为在绳梯上"
         ⇒ `agent.holding_vertical()` 读它，再由感知层决定要不要写 `player.ladder_id` ✓。
         """
-        return set(self._pressed)
+        return set(self._pressed) | set(self._momentary)
 
     def set(self, keys):
         """keys：本次应该按下的键名集合。"""
@@ -201,6 +208,17 @@ class KeyState:
         for k in keys - self._pressed:
             key_down(k)
         self._pressed = keys
+
+    def momentary_mark(self, name):
+        """**瞬发键记账**（只记账、**不发键** ✓ —— 键已由调用方发出，再发就是双按
+        ✗ 实测输出 CD 用例当场炸 ✓）。⚠ 该键已被**决策**按着（∈ `_pressed`）⇒
+        不记账（决策侧本来就在 `pressed()` 里 ✓ 摘账时也不能发松开 ✓）。"""
+        if name and name not in self._momentary and name not in self._pressed:
+            self._momentary.add(name)
+
+    def momentary_discard(self, name):
+        """**瞬发键摘账**（只摘账、**不发松开** ✓ 同上 ✓）。"""
+        self._momentary.discard(name)
 
     def release_all(self):
         self.set(set())

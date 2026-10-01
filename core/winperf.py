@@ -217,8 +217,8 @@ def enabled_by_config():
     没人会想到是自己关的。想省电再自己去设置里关。
     """
     try:
-        # 用 load_live()（tools.config.get 读的是 link.yaml，单键会被当成 section）
-        from tools.config import load_live
+        # 用 load_live()（core.config.get 读的是 link.yaml，单键会被当成 section）
+        from core.config import load_live
         return bool(load_live().get("perf_keepalive", True))
     except Exception:
         return True

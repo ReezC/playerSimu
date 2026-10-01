@@ -22,7 +22,7 @@ import statistics
 import sys
 import time
 
-from tools.config import ROOT, get
+from core.config import ROOT, get
 
 
 def measure(host: str, port: int, samples: int, interval_ms: int, timeout: float = 0.5):

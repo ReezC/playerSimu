@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 
 from link import FileSource, PyAVSource
-from tools.config import ROOT, get
+from core.config import ROOT, get
 from tools.probe_codec import decode_ms, resolve_delay_ms
 from tools.probe_tune import initial_geo        # 探针几何：与工作台同一套来源
 

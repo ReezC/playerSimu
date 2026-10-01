@@ -18,8 +18,9 @@ import numpy as np
 
 from decision.agent import settings
 from gui.live_thread import LiveThread
-from gui.widgets import NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox
-from tools.config import ROOT, get, load_live, update_live
+from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox,
+                         play_sound)
+from core.config import ROOT, get, load_live, update_live
 
 
 def _bgr_to_pixmap(img):
@@ -199,7 +200,12 @@ class LivePanel(QWidget):
 
         root.addLayout(bar)
 
-        # ---- 参数行 ----
+        # ---- 参数区（2026-09-29 按 §4「一行只放一个参数组」拆行：原来 10 个控件挤一行，
+        #      窗口一窄所有标签一起被压没 ✗。按「你在干什么」分三行 ✓）----
+        # ⚠ 本页**有意不放滚动区**：实时画面必须常驻占满（预览页出滚动条是反交互 ✗）——
+        #   取舍同 player_panel 的「参数 + 常驻画布」；view 是 QLabel 虽然能进滚动区 ✗。
+        #
+        # 行 1（推理参数：权重 / 置信度阈值 / 分辨率 / 设备）—— 这一行到这儿结束
         row = QHBoxLayout()
         row.setSpacing(6)
 
@@ -235,10 +241,31 @@ class LivePanel(QWidget):
         self.sp_imgsz.setValue(int(_live.get("imgsz", 960)))
         row.addWidget(self.sp_imgsz)
 
+        row.addWidget(QLabel("显示"))
+        self.sp_show_fps = NoWheelSpinBox()
+        self.sp_show_fps.setRange(1, 120)
+        self.sp_show_fps.setValue(int(_live.get("show_fps", 30)))
+        self.sp_show_fps.setToolTip(
+            "界面画面每秒推多少帧。\n\n"
+            "  调高 = 画面更顺滑，但**内容帧率受推理速度限制** —— 推理 33fps 时\n"
+            "  显示设 60 也只有 33 个不同帧（其余是重复上一帧）。\n\n"
+            "  真想让画面快 ⇒ 先降「imgsz」（960→640 约省 56% ⇒ 推理 22ms→~10ms）。\n"
+            "  30 就够看；想顺滑点设 60。")
+        self.sp_show_fps.valueChanged.connect(self._save_live_params)
+        row.addWidget(self.sp_show_fps)
+
         row.addWidget(QLabel("设备"))
         self.ed_device = QLineEdit(str(_live.get("device", "0")))
-        self.ed_device.setFixedWidth(50)
+        # ⚠ 别用 setFixedWidth 钉死（§4）：钉死会把整行的最小宽度顶上去
+        self.ed_device.setMinimumWidth(40)
+        self.ed_device.setMaximumWidth(64)
         row.addWidget(self.ed_device)
+        row.addStretch(1)
+        root.addLayout(row)
+
+        # 行 2（抓帧与显示；「抓帧fps」只在窗口来源显示 ✓）—— 这一行到这儿结束
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
 
         # 本地窗口：抓帧频率
         self.lbl_capfps = QLabel("抓帧fps")
@@ -246,12 +273,19 @@ class LivePanel(QWidget):
         self.sp_capfps.setRange(1, 60)
         self.sp_capfps.setValue(int(_live.get("capture_fps", 60)))
         self.sp_capfps.setToolTip("本地窗口每秒抓几帧去推理。\n窗口画面本身可能只有 60fps，抓太高浪费，\n15~30 对角色/怪物识别通常足够。")
-        row.addWidget(self.lbl_capfps)
-        row.addWidget(self.sp_capfps)
+        row2.addWidget(self.lbl_capfps)
+        row2.addWidget(self.sp_capfps)
 
         self.ck_draw = QCheckBox("画框")
         self.ck_draw.setChecked(bool(_live.get("draw", True)))
-        row.addWidget(self.ck_draw)
+        row2.addWidget(self.ck_draw)
+
+        row2.addStretch(1)
+        root.addLayout(row2)
+
+        # 行 3（延迟探针：开关 / 采样几何显示 / 框选）—— 这一行到这儿结束
+        row3 = QHBoxLayout()
+        row3.setSpacing(6)
 
         self.ck_probe = QCheckBox("延迟探针")
         self.ck_probe.setChecked(bool(get("probe", "enabled", True)))
@@ -260,40 +294,40 @@ class LivePanel(QWidget):
             "需要：A 机跑 python -m tools.probe_gen\n"
             "      B 机跑过一次对时（A 机 IP 见 config/link.yaml 的 a_host）：\n"
             "        python -m tools.clock_sync --host <A机IP> --save\n"
-            "      ⚠ 对时偏置会**整段**加进延迟里（偏置旧了延迟数就整体偏高/偏低 ✗）——\n"
+            "      ⚠ 对时偏置会整段加进延迟里（偏置旧了延迟数就整体偏高/偏低 ✗）——\n"
             "        状态行上会把它一并显示出来，体感对不上时先重对一次时。\n\n"
             "不启用时延迟显示为 ——，因为 pts 推算只能反映网络抖动，测不出真实延迟。")
-        row.addWidget(self.ck_probe)
+        row3.addWidget(self.ck_probe)
 
         self.ck_probe_box = QCheckBox("探针框")
         self.ck_probe_box.setChecked(True)
         self.ck_probe_box.setToolTip(
-            "在实时画面上把**采样几何**画出来（框 + 每个采样点），不用去命令行看：\n\n"
+            "在实时画面上把采样几何画出来（框 + 每个采样点），不用去命令行看：\n\n"
             "  · 框的颜色就是判据的结论 ——\n"
             "      绿 = 几何可用（时间戳单调、值也合理）；\n"
             "      红 = 几何可疑（时间戳乱跳 / 整片挪位）；\n"
             "      黄 = 判据还在攒样本；灰 = 探针没启用。\n"
             "  · 每个十字是该块的采样点，颜色跟着判成 0/1 变（黄=白块、蓝=黑块）；\n"
-            "      变紫 = 这个点压在黑白之间，也就是**没对准**。\n"
+            "      变紫 = 这个点压在黑白之间，也就是没对准。\n"
             "  · 框角上有两个圆圈 = 头两个固定标记块（白、黑）。\n\n"
             "框没括住整条码带、或尾部十字开始发紫，就是几何不对 —— 点「框选探针」重框。")
-        row.addWidget(self.ck_probe_box)
+        row3.addWidget(self.ck_probe_box)
 
         # 探针几何：人工框选（秒级、当场验证）—— 「调完探针大小，收流位置全靠猜」的解药。
         # 与 HP/MP 条同一套框选交互（在实时画面上拖矩形），但换算不同：
         # 方块带是 n = 2+bits 个等大等距方块，头两个是固定标记（白、黑），
-        # 所以框完能**当场解码验证**；解不出就不保存（宁可不改，也别改坏）。
+        # 所以框完能当场解码验证；解不出就不保存（宁可不改，也别改坏）。
         self.btn_probe_box = QPushButton("框选探针")
         self.btn_probe_box.setToolTip(
             "在实时画面上框住整条时间码方块带（含最左边那个常亮的白块）。\n"
             "框完当场解码验证：解得出时间码才保存。\n"
-            "存进 config/probe_calib.json，存的是**画面比例** —— 换分辨率/窗口不用重标；\n"
+            "存进 config/probe_calib.json，存的是画面比例 —— 换分辨率/窗口不用重标；\n"
             "保存后每秒自动生效，不用重开预览。解不出会提示检查什么，且不修改任何配置。")
         self.btn_probe_box.clicked.connect(self._pick_probe)
-        row.addWidget(self.btn_probe_box)
+        row3.addWidget(self.btn_probe_box)
 
-        row.addStretch(1)
-        root.addLayout(row)
+        row3.addStretch(1)
+        root.addLayout(row3)
 
         # 探针几何一行：现在用的是哪套（人工标定 / 配置值）、具体数值是多少。
         # 有这一行就不用再靠猜 —— 改完立刻看得见。
@@ -699,6 +733,7 @@ class LivePanel(QWidget):
                 device=self.ed_device.text().strip() or "0",
                 capture_fps=self.sp_capfps.value(),
                 draw=self.ck_draw.isChecked(),
+                show_fps=self.sp_show_fps.value(),
             )
         except Exception:
             pass
@@ -733,6 +768,7 @@ class LivePanel(QWidget):
             device=self.ed_device.text().strip() or "0",
             capture_fps=self.sp_capfps.value(),
             draw=self.ck_draw.isChecked(),
+            show_fps=self.sp_show_fps.value(),
         )
 
         common = {
@@ -743,7 +779,7 @@ class LivePanel(QWidget):
             "device": self.ed_device.text().strip() or "0",
             "draw": self.ck_draw.isChecked(),
             "perf_log": bool(load_live().get("perf_log", True)),
-            "show_fps": 30.0,
+            "show_fps": float(self.sp_show_fps.value()),
             "player_id": pid,
             # 小地图定位（S3）：把玩家世界坐标写进 WorldState（见 live_thread）
             "mmap_map_id": self._mmap_mid,
@@ -1142,6 +1178,15 @@ class LivePanel(QWidget):
 
     def _on_stats(self, s):
         self._last_stats = s
+        # ⭐ 测谎/掉线弹窗的**报警音**（M1，2026-09-29 从 live_thread 迁来 ✓）：
+        #    「combat → 非combat」的过渡播一次「触发音效」（挂机保护页可配 ✓）。
+        #    QMediaPlayer 必须在 **GUI 线程** ⇒ 收流线程发不了，放这里正好 ✓；
+        #    流程内的界面切换（登录→选频道→排队…）不连响 ✓。
+        _scr = str(s.get("screen") or "combat")
+        _prev = getattr(self, "_alarm_prev_screen", "combat")
+        self._alarm_prev_screen = _scr
+        if _scr != "combat" and _prev == "combat":
+            play_sound(getattr(settings, "lie_alarm_sound", ""))
         self._verify_calib_if_due(s)
         w, h = s.get("size") or (0, 0)
         d = s.get("delay_ms")
@@ -1244,6 +1289,17 @@ class LivePanel(QWidget):
         lag = (s.get("lag_warn") or "").strip()
         if lag:
             head = "【%s】 " % lag + head
+        # ⭐ 测谎/防挂机弹窗接管中（M1「测谎报警」）：这是「**现在必须人来玩小游戏**」
+        #    的报警，比负载/积压都优先 —— 放最前面 ✓（往 head 前拼 = 显示在最左 ✓）。
+        #    配套的报警音在 live_thread（进入弹窗状态那一下响 ✓）。
+        _scr = str(s.get("screen") or "combat")
+        if _scr.startswith("lie"):
+            head = "【测谎弹窗 %s：请人工完成小游戏】 " % _scr + head
+        elif _scr != "combat":
+            # 掉线/登录系（ui_state 的界面 id ⇒ 中文名 ✓）：重连开着时 reconnect_note
+            # 会另报它在做哪一步，这里报的是"现在画面在哪个界面" ✓
+            from perception import ui_state as _uist
+            head = "【界面：%s】 " % _uist.UI_NAMES.get(_scr, _scr) + head
         # 明细放 tooltip：状态行那一行已经塞满了，硬挤进去反而看不清数字
         for key in ("lag_detail", "load_detail"):
             d = (s.get(key) or "").strip()

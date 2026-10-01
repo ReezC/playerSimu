@@ -9,7 +9,7 @@ import argparse
 import cv2
 
 from link import PyAVSource
-from tools.config import get
+from core.config import get
 
 
 def main() -> int:

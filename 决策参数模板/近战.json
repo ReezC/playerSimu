@@ -2,11 +2,11 @@
   "attack_dist": 80.0,
   "min_attack_dist": 0,
   "attack_up_dist": 30,
-  "attack_down_dist": 20,
-  "chase_jump_enabled": true,
+  "attack_down_dist": 22,
+  "chase_jump_enabled": false,
   "chase_jump_min": -10,
   "chase_jump_max": 5,
-  "chase_jump_dash_ms": 50,
+  "chase_jump_dash_ms": 100,
   "mouse_speed": 1.1999999999999995,
   "evade_type": "jump",
   "jump_interval": 0,
@@ -88,8 +88,8 @@
   "input_device": "local",
   "attack_cd": 300,
   "attack_lock_debounce_ms": 1000,
-  "min_turn_hold_ms": 1000,
-  "turn_output_delay_ms": 500,
+  "min_turn_hold_ms": 500,
+  "turn_output_delay_ms": 300,
   "player_track_jump": 200,
   "player_foot_offset_px": -25,
   "player_box_min_area_pct": 0.0,
@@ -101,7 +101,12 @@
     0.120791,
     0.019531
   ],
-  "mp_bar": null,
+  "mp_bar": [
+    0.464129,
+    0.973958,
+    0.120791,
+    0.019531
+  ],
   "probe_calib": {},
   "hp_color": [
     [
@@ -143,38 +148,51 @@
   "vision_off_y": 0,
   "sweep_turn_cd": 500,
   "back_range": 150,
-  "route_goto_set": "二楼",
+  "sweep_edge_turn_px": 100,
+  "route_goto_set": "底层",
   "align_tol_px": 12,
-  "align_hold_ms": 1000,
+  "align_hold_ms": 3000,
   "climb_align_gap_ms": 200,
-  "climb_align_near_px": 30,
+  "climb_align_near_px": 1,
   "climb_retry_delay_s": 1.0,
-  "climb_retry_delay_inc_s": 1.0,
-  "goto_timeout_s": 10.0,
+  "climb_retry_delay_inc_s": 3.0,
+  "goto_timeout_s": 20.0,
   "chase_goto_max_s": 5.0,
   "goto_timeout_key": "表情_无语",
-  "disable_chase_pathfinding": false,
+  "disable_chase_pathfinding": true,
   "jump_start_px": 80,
   "move_retry_ms": 350,
   "battle_zones": [
     {
       "set": "底层",
       "cd_s": 3.0,
-      "idle_foothold": "39",
-      "fight_max_s": 0.0,
-      "fight_dst": "",
-      "can_fight": false
+      "idle_footholds": [
+        "37",
+        "42",
+        "41"
+      ],
+      "fight_max_s": 30.0,
+      "fight_dst": "二楼",
+      "can_fight": true
     },
     {
-      "set": "顶层",
+      "set": "二楼",
       "cd_s": 3.0,
-      "idle_foothold": "",
-      "fight_max_s": 15.0,
-      "fight_dst": "一楼",
-      "can_fight": false
+      "idle_footholds": [
+        "29",
+        "19",
+        "30",
+        "29 19 30"
+      ],
+      "fight_max_s": 45.0,
+      "fight_dst": "底层",
+      "can_fight": true
     }
   ],
-  "battle_zone_sets": [],
+  "battle_zone_sets": [
+    "底层",
+    "二楼"
+  ],
   "debounce_conf": 0.5,
   "debounce_ms": 2000,
   "custom_timers": [
@@ -195,6 +213,40 @@
         12.0
       ],
       "pause_on_rest": false
+    },
+    {
+      "name": "自动回避药水",
+      "seq": [
+        {
+          "type": "down",
+          "key": "回避药水"
+        },
+        {
+          "type": "up",
+          "key": "回避药水"
+        }
+      ],
+      "interval": [
+        3.0,
+        3.0
+      ]
+    },
+    {
+      "name": "自动无语",
+      "seq": [
+        {
+          "type": "down",
+          "key": "表情_无语"
+        },
+        {
+          "type": "up",
+          "key": "表情_无语"
+        }
+      ],
+      "interval": [
+        5.0,
+        10.0
+      ]
     }
   ],
   "facing_timeout_min": 0.0,
@@ -279,18 +331,6 @@
     }
   ],
   "anti_afk_exit_seq": [
-    {
-      "type": "down",
-      "key": "普攻"
-    },
-    {
-      "type": "up",
-      "key": "普攻"
-    },
-    {
-      "type": "delay",
-      "ms": 1000
-    },
     {
       "type": "down",
       "key": "普攻"

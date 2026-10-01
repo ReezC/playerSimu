@@ -38,7 +38,7 @@ from gui.canvas import ZoomPanView    # 看图交互在几个窗口里是同一�
 from gui.widgets import NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSlider
 from gui.worker import safe_slot      # 槽里抛异常 = 整个工作台 abort（见 worker.py）
 from perception import minimap as mm
-from tools.config import load_live
+from core.config import load_live
 
 #: 版面：一行里"参数名"那格与"单位"那格的**统一宽度** ⇒ 各行的拖动条/数字框能对齐 ✓
 #: （对齐是"读起来像一张表"的关键 —— 参差的行让人没法竖着比对两轴 ✓）。
@@ -155,7 +155,7 @@ class MinimapCalibDialog(QDialog):
         self.terrain = mapdata.load(self.map_id, with_canvas=True)
         self.canvas = None if self.terrain is None else self.terrain.canvas
 
-        from tools.config import get
+        from core.config import get
         self.host = host or get("a_host")
         self.port = int(port or get("minimap", "port", 5003))
         #: client 传进来就**不接管它的生命周期**（将来实时那路已经在跑时共用一条）；

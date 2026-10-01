@@ -242,10 +242,59 @@ def t_dataset_empty_frame_is_negative():
               "%r 帧 / 没标注 %r" % (len(_p0), _nl0))
 
 
+def t_mask_and_outline_box():
+    """⭐ **蒙版与描边框**（2026-09-29 用户紧急反馈两件 ✓）：
+
+      ① **设置弹窗能建**（第一版把局部函数 `_on_mask` 误写成 `self._on_mask` ⇒
+         打开即 AttributeError ✗ —— "设置打不开"就是这么来的 ✓）；
+      ② **框只有描边、不填充**（填充 14% 蓝色蒙在框中间，看"框和目标对不对"费眼 ✗）；
+      ③ **框在蒙版上面**（box z=10 > mask z=0 ✓ —— 描边不被灰蒙版压暗 ✓）；
+      ④ `set_mask_alpha` 生效且**截到 [0,1]** ✓。
+    """
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QPixmap
+    from PyQt5.QtWidgets import QApplication
+
+    # ⚠ 本用例排在最前 ⇒ QApplication 可能还没建（QWidget 没有它就是 0xC0000409 ✗）
+    _ = QApplication.instance() or QApplication(sys.argv)
+
+    # ②③④ 画布：蒙版层 + 描边框
+    # （① "设置弹窗能建"的检查 → `tools/selftest_yolo_wb.py`：本套件离屏环境建
+    #   SettingsDialog 会 0xC0000409 ✗ —— 同 selftest_decision 的已知问题 ✓）
+    from gui.canvas import ImageCanvas
+    from gui.theme import review_mask_alpha, set_review_mask_alpha
+
+    _old = review_mask_alpha()
+    c = None
+    try:
+        set_review_mask_alpha(0.5)
+        c = ImageCanvas()
+        c.set_mask_alpha(0.5)
+        c.load(QPixmap(120, 90), [])
+        c.add_box(10, 10, 50, 40, 0, False)
+        box = c.boxes[0]
+        assert c._mask_item is not None and c._mask_item.opacity() == 0.5, \
+            "蒙版层没建 / 浓淡不对 ✗：%r" % (
+                c._mask_item.opacity() if c._mask_item else None,)
+        assert box.zValue() > c._mask_item.zValue(), \
+            "框不在蒙版上面（描边会被灰蒙版压暗 ✗）：%r / %r" % (
+                box.zValue(), c._mask_item.zValue())
+        assert box.brush().style() == Qt.NoBrush, \
+            "框内部还有填充（用户：**只有描边** ✗）：%r" % (box.brush().style(),)
+        c.set_mask_alpha(7.0)
+        assert c._mask_alpha == 1.0, "蒙版浓度没截到 [0,1] ✗：%r" % (c._mask_alpha,)
+    finally:
+        set_review_mask_alpha(_old)
+        if c is not None:
+            c.deleteLater()
+
+
 TESTS = (
     ("⭐⭐ 数据集：「标过但空」的帧能当负样本收（`min_boxes=0`）—— 空文件给 `[]`、"
      "没文件给 `None`（用户 2026-09-28：frame_00381 画面没东西，有益无害就加）",
      t_dataset_empty_frame_is_negative),
+    ("⭐ 蒙版与描边框：设置弹窗能建 / 框只有描边 / 框在蒙版上面（2026-09-29 紧急反馈）",
+     t_mask_and_outline_box),
     ("⑤ 卡「打开质检台」= 入口按钮样式（与寻路编辑器同一份色值）",
      t_editor_card_entry_button_style),
     ("质检台 ←/→ 切帧：真的换帧、到头停住、空列表不崩", t_left_right_switch_frames),

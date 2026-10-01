@@ -204,13 +204,31 @@ def t_debounce_window():
 
 
 def t_debounce_conf_gate():
-    """置信度低于防抖置信度的框：消失就消失，不留幽灵框。"""
+    """置信度**从没达到过**防抖置信度的框：消失就消失，不留幽灵框。"""
     with Feed() as f:
         f.t.debounce_conf = 0.8
         f.t.debounce_ms = 1000.0
         f.step(det(500, conf=0.4))          # 低置信度
         out = f.idle(1)[0]
         check(len(out) == 0, "低置信度的框不该被保留：%d 个" % len(out))
+
+
+def t_debounce_conf_peak():
+    """⭐ 防抖置信度看**历史最高**（用户 2026-10-01 ✓）：先高后低的怪，消失时仍残留。
+
+    原来用**最后一次**的 `conf` ✗：一只怪先被高置信度认出来、之后几帧框得不准掉到
+    阈值以下，它一消失就被立刻丢掉 ✗。改后用 `peak_conf`（历史最高）✓ ——
+    "只要达到过阈值，消失时就残留防抖时间" ✓。
+    """
+    with Feed() as f:
+        f.t.debounce_conf = 0.8
+        f.t.debounce_ms = 1000.0
+        f.step(det(500, conf=0.9))          # 高置信度：达到过阈值
+        f.step(det(500, conf=0.4))          # 掉到阈值以下（最后一次只有 0.4）
+        out = f.idle(1)[0]                  # 消失
+        check(len(out) == 1 and out[0].missed > 0,
+              "置信度**曾经达到过**阈值、只是最后几帧变低了，消失时却不残留防抖：%d 个"
+              % len(out))
 
 
 def t_ghost_drift():
@@ -274,6 +292,7 @@ TESTS = (
     ("静止 + 噪声：抖动被压下去", t_jitter_smoothed),
     ("防抖窗口：保留 / 到期 / 清理", t_debounce_window),
     ("置信度不够就不留幽灵框", t_debounce_conf_gate),
+    ("置信度看历史最高：先高后低也残留（用户 2026-10-01）", t_debounce_conf_peak),
     ("幽灵框继续走、速度衰减、位移有上限", t_ghost_drift),
     ("kill 立即消除", t_kill),
     ("同一帧 id 唯一", t_ids_unique),

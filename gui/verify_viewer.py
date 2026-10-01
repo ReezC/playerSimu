@@ -13,6 +13,13 @@ from gui.canvas import ImageCanvas
 
 
 class VerifyViewer(QWidget):
+    """（布局取舍见模块 docstring）
+
+    ⚠ **有意不放滚动区**（§4「有意为之」标注）：本页主体 = 画布（QGraphicsView，
+    它自己就是滚动视图、**不许再套外层滚动区** ✗ 见 §4），其余只有一行导航 +
+    一行提示，内容短 ⇒ 整页滚动没有收益，画布常驻 ✓。
+    """
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.files = []

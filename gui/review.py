@@ -23,7 +23,7 @@ from PyQt5.QtGui import QKeySequence, QPixmap
 from PyQt5.QtWidgets import (QHBoxLayout, QLabel, QMessageBox, QPushButton,
                              QShortcut, QSizePolicy, QVBoxLayout, QWidget)
 
-from gui import labelio
+from gui import labelio, theme
 from gui.canvas import ImageCanvas
 from gui.widgets import NoWheelComboBox, NoWheelSlider
 
@@ -65,6 +65,9 @@ class ReviewPanel(QWidget):
     # 界面
     # ══════════════════════════════════════════════════
     def _build(self):
+        # ⚠ **有意不放滚动区**（§4「有意为之」标注）：本页主体 = 画布（QGraphicsView，
+        #    **不许再套外层滚动区** ✗ 见 §4）；导航 / 本帧信息 / 编辑行已按「一件事一行」
+        #    分好（见下面各行注释），窗口变窄时信息行与反馈走 Ignored 策略缩 ✓。
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
@@ -268,6 +271,9 @@ class ReviewPanel(QWidget):
         w, h = pm.width(), pm.height()
         boxes = labelio.load_boxes(self.project, stem, w, h)
 
+        # ⭐ **蒙版透明度**（用户 2026-09-29 ✓）：每次载帧都从界面偏好读 ⇒
+        #   设置里改完、下一帧就生效（当前帧由设置弹窗的信号即时推 ✓）
+        self.canvas.set_mask_alpha(theme.review_mask_alpha())
         self.canvas.load(pm, boxes, editable=True, fit=True)
         self._dirty = False
 

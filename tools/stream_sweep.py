@@ -38,7 +38,7 @@ import numpy as np                                              # noqa: E402
 
 from link import PyAVSource                                     # noqa: E402
 from tools import probe_codec, push_presets as pp, sweep_link    # noqa: E402
-from tools.config import ROOT, get                              # noqa: E402
+from core.config import ROOT, get                              # noqa: E402
 
 #: 每段等流等多久（A 机换参数会重启 ffmpeg，UDP 流会断一下）
 WAIT_S = 15.0

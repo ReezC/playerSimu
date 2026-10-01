@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from decision import input as dinput      # noqa: E402
-from tools.config import get              # noqa: E402
+from core.config import get              # noqa: E402
 
 
 def main() -> int:

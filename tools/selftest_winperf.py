@@ -138,7 +138,7 @@ def t_probe_and_default_on():
               and 5.0 < d["probe_ms"] < 40.0,
               "probe 数字不合理：%r" % (d.get("probe_ms"),))
 
-    import tools.config as tcfg
+    import core.config as tcfg
     old = tcfg.load_live
     try:
         tcfg.load_live = lambda: {}              # 配置里没有这个键
@@ -185,7 +185,7 @@ def t_wired_into_app():
         src = (ROOT / "gui" / name).read_text(encoding="utf-8")
         check("save_live(" not in src,
               "%s 又用 save_live 整文件覆盖了 —— 会把 perf_log / perf_keepalive "
-              "一起抹掉（改用 tools.config.update_live）" % name)
+              "一起抹掉（改用 core.config.update_live）" % name)
 
 
 def t_update_live_keeps_keys():
@@ -198,7 +198,7 @@ def t_update_live_keeps_keys():
     import shutil
     import tempfile
 
-    import tools.config as tcfg
+    import core.config as tcfg
 
     tmp = Path(tempfile.mkdtemp(prefix="livecfg_"))
     old = tcfg.LIVE_CONFIG

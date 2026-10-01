@@ -52,7 +52,7 @@ decision:
   chase_jump_enabled: true
   chase_jump_min: -10
   chase_jump_max: 8
-  chase_jump_dash_ms: 550
+  chase_jump_dash_ms: 200
   mouse_speed: 1.1999999999999995
   evade_type: jump
   jump_interval: 0
@@ -105,7 +105,7 @@ decision:
   attack_cd: 300
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 1000
-  turn_output_delay_ms: 500
+  turn_output_delay_ms: 0
   player_track_jump: 200
   player_foot_offset_px: 0
   player_box_min_area_pct: 0.0
@@ -138,9 +138,13 @@ decision:
   vision_center: false
   vision_off_x: 0
   vision_off_y: 0
+  big_mob_enabled: true
+  big_mob_ratio: 1.5
+  big_mob_range_px: 600.0
   sweep_turn_cd: 500
   back_range: 150
-  route_goto_set: 右下
+  sweep_edge_turn_px: 100
+  route_goto_set: 左上
   align_tol_px: 10
   align_hold_ms: 1000
   climb_align_gap_ms: 180
@@ -153,23 +157,7 @@ decision:
   disable_chase_pathfinding: true
   jump_start_px: 100
   move_retry_ms: 1000
-  battle_zones:
-  - set: 左上
-    cd_s: 3.5
-    idle_foothold: ''
-    fight_max_s: 30.0
-    fight_dst: 右下
-    can_fight: true
-  - set: 右下
-    cd_s: 3.0
-    idle_foothold: '33'
-    fight_max_s: 0.0
-    fight_dst: 左上
-    can_fight: true
-  battle_zone_sets:
-  - 左上
-  - 右下
-  debounce_conf: 0.4
+  debounce_conf: 0.3
   debounce_ms: 2000
   custom_timers:
   - name: 自动喂宠
@@ -204,7 +192,7 @@ decision:
     paused_left: 179.95438051701058
   facing_timeout_min: 0.0
   player_lost_timeout_min: 3.0
-  resetall_interval: 30
+  resetall_interval: 10
   anti_afk_enabled: true
   anti_afk_type: spot_rest
   anti_afk_min: 25.0

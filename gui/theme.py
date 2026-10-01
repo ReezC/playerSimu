@@ -220,6 +220,119 @@ def _save(data):
         pass
 
 
+def load_section(name):
+    """读 `config/ui.yaml` 里的一个**自定义段**（→ dict 副本；没有/坏值 ⇒ `{}` ✓）。
+
+    用途 = 某个窗口自己的"**上次配置**"（用户 2026-10-01 要求："让窗口能够记住我上次的
+    配置" ✓ 例：测谎演示窗的 `lie_demo` 段 ✓）——与 `windows:` / `views:` 同一个文件
+    （**按客户端唯一一份** ✓ 不进项目 ✓ 换项目不该改界面偏好 ✓）。
+    """
+    try:
+        d = _load()
+    except Exception:
+        return {}
+    v = d.get(name) if isinstance(d, dict) else None
+    return dict(v) if isinstance(v, dict) else {}
+
+
+def save_section(name, data):
+    """整体替换 `config/ui.yaml` 里的一个自定义段（**其余键一个不动** ✓）。"""
+    try:
+        d = _load()
+    except Exception:
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    d[name] = dict(data or {})
+    _save(d)
+
+
+# ══════════════════════════════════════════════════════════
+# 质检台 · 蒙版透明度（2026-09-29 用户要求 ✓）
+# ══════════════════════════════════════════════════════════
+#: 看帧时在**画面上**罩一层灰蒙版（标注框画在蒙版上面、不受影响 ✓）——
+#: 观察"框和目标对不对"时把画面压暗，框更跳 ✓。存 `config/ui.yaml`
+#: 的 `review_mask_alpha`（0~1；**这台机器上的界面偏好**，跟项目无关 ✓）。
+REVIEW_MASK_DEFAULT = 0.45
+
+
+def review_mask_alpha():
+    """→ 蒙版透明度（0~1，越大战检台画面越暗；0 = 不罩 ✓）。"""
+    try:
+        v = float((_load() or {}).get("review_mask_alpha", REVIEW_MASK_DEFAULT))
+    except Exception:
+        v = REVIEW_MASK_DEFAULT
+    return max(0.0, min(1.0, v))
+
+
+def set_review_mask_alpha(v):
+    """写回蒙版透明度（截到 [0,1] ✓），返回生效值。"""
+    d = _load() or {}
+    d["review_mask_alpha"] = max(0.0, min(1.0, float(v)))
+    _save(d)
+    return d["review_mask_alpha"]
+
+
+# ══════════════════════════════════════════════════════════
+# yolo 工作台 · 蒙版透明度 / 界面字号（2026-09-30 用户要求 ✓）
+# ══════════════════════════════════════════════════════════
+#: 与质检台 `review_mask_alpha` 同一套画法（画布挖洞那套 ✓）、**各自的偏好键** ✓
+#:（两个窗口想暗得不一样是正常的 ✓）。存 config/ui.yaml ✓。
+YOLO_MASK_DEFAULT = 0.45
+
+
+def yolo_mask_alpha():
+    """→ yolo 工作台标注页的蒙版浓淡（0~1 ✓；0 = 不罩 ✓）。"""
+    try:
+        v = float((_load() or {}).get("yolo_mask_alpha", YOLO_MASK_DEFAULT))
+    except Exception:
+        v = YOLO_MASK_DEFAULT
+    return max(0.0, min(1.0, v))
+
+
+def set_yolo_mask_alpha(v):
+    """写回蒙版浓淡（截到 [0,1] ✓），返回生效值。"""
+    d = _load() or {}
+    d["yolo_mask_alpha"] = max(0.0, min(1.0, float(v)))
+    _save(d)
+    return d["yolo_mask_alpha"]
+
+
+def ui_font_pt(default=9):
+    """→ yolo 工作台的界面字号（pt ✓；默认 9 ✓）。"""
+    try:
+        return int((_load() or {}).get("ui_font_pt", default))
+    except Exception:
+        return int(default)
+
+
+def set_ui_font_pt(v):
+    """写回界面字号（int ✓）。"""
+    d = _load() or {}
+    d["ui_font_pt"] = int(v)
+    _save(d)
+    return d["ui_font_pt"]
+
+
+def yolo_session():
+    """→ yolo 工作台**上次关闭前的数据状态**（dict ✓；没存过 = {} ✓）。
+    路径/类别名/手选模型/页签/当前帧/筛选排序/训练参数 ✓ —— 同为本机偏好 ⇒
+    存 config/ui.yaml ✓（§11 同款 ✓）。"""
+    try:
+        d = (_load() or {}).get("yolo_session")
+        return dict(d) if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def set_yolo_session(sess):
+    """写回 yolo 工作台的数据状态（整包覆盖 ✓）。"""
+    d = _load() or {}
+    d["yolo_session"] = dict(sess or {})
+    _save(d)
+    return d["yolo_session"]
+
+
 # ══════════════════════════════════════════════════════════
 # 弹窗几何：**按客户端唯一一份**（存 config/ui.yaml 的 windows:）
 # ══════════════════════════════════════════════════════════
