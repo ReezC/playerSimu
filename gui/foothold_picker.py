@@ -154,6 +154,10 @@ class FootholdPicker(ZoomPanView):
         self.zones = zones
         self.set_name = str(set_name or "")
         self._cur = str(current or "")
+        #: ⭐ 要**呼吸高亮的另一个集合**名（用户 2026-10-02 ✓ —— "切换平台"模式下高亮
+        #:   idle 去哪选中的集合）：和 `_cur`（选中的**一条**）不同，这个高亮**整个集合**
+        #:   的所有 foothold（只进呼吸表、不改基准色 ✓）。`""` = 不高亮 ✓。
+        self._highlight_set = ""
         self._items = {}                    # fid(str) -> QGraphicsLineItem（高亮要用 ✓）
         #: ⭐ **每一条线的画法**：`[(item, 基准色, 线型, 归不归呼吸), …]` —— 由 `_rebuild` 填 ✓
         #:   ⚠ **笔宽不在建的时候定死**（那样缩放一变就粗细不对 ✗）⇒ 统一在 `_apply_pens`
@@ -228,6 +232,22 @@ class FootholdPicker(ZoomPanView):
         if focus:
             self.focus_on(fid)
 
+    def highlight_set(self, set_name):
+        """**呼吸高亮另一个集合**的所有 foothold（用户 2026-10-02 ✓ —— "切换平台"模式下
+        高亮 idle 去哪选中的集合）。
+
+        和 `set_current` 的区别：那个选**一条** foothold（改基准色为 `C_SEL` + 压顶 + 呼吸）；
+        这个高亮**整个集合**的所有 foothold —— **只进呼吸表、不改基准色** ✓（"能选的"
+        还是 `C_IN_SET` 绿，"要去的那块"只是呼吸一明一暗，颜色不换，两个语义不打架 ✓）。
+
+        ⚠ `set_name=None / ""` = 清掉集合高亮 ✓（切回"回归 foothold"模式时调一次清掉 ✓）。
+        """
+        sn = str(set_name or "")
+        if sn == self._highlight_set:
+            return
+        self._highlight_set = sn
+        self._rebuild()
+
     # ---------------- 画 ----------------
 
     def _rebuild(self):
@@ -279,6 +299,14 @@ class FootholdPicker(ZoomPanView):
             it.setZValue(9)                     # 压在最上面（一眼看出选的是哪条 ✓）
             self._lines = [(i, (C_SEL if i is it else b), s_, (i is it))
                            for i, b, s_, _ in self._lines]
+        # ⭐ **集合级呼吸高亮**（用户 2026-10-02 ✓）：把 `_highlight_set` 集合的所有 foothold
+        #   也进呼吸表（**不改基准色** ✓ —— 和"选中的那条"区别开：那个改色压顶，这个只呼吸）。
+        #   用途："切换平台"模式下让用户**一眼看到「idle 去哪」选的那块平台在地图哪里** ✓。
+        if self._highlight_set:
+            _hl_fids = set(set_fids(self.zones, self._highlight_set))
+            _hl_items = set(self._items[fid] for fid in _hl_fids if fid in self._items)
+            self._lines = [(i, b, s_, (hl or (i in _hl_items)))
+                           for i, b, s_, hl in self._lines]
         r = self._scene.itemsBoundingRect()
         if r.width() > 1 and r.height() > 1:
             self._scene.setSceneRect(r.adjusted(-40, -40, 40, 40))
@@ -665,3 +693,11 @@ class FootholdPickerPanel(QWidget):
             finally:
                 self.cmb.blockSignals(False)
         self._view.set_current(fid, focus=focus)
+
+    def highlight_set(self, set_name):
+        """**呼吸高亮另一个集合**（转发给内部视图 ✓ —— 与 `FootholdPicker` 同接口）。
+
+        ⭐ 用户 2026-10-02 ✓ —— "切换平台"模式下高亮 idle 去哪选中的集合：下拉是 foothold
+        列表（不是集合列表）⇒ 这里**不同步下拉**，只把视图的集合高亮转过去 ✓。
+        """
+        self._view.highlight_set(set_name)

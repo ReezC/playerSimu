@@ -142,14 +142,26 @@ class BattleZoneListDialog(QDialog):
         root.setContentsMargins(16, 16, 16, 16)
 
         self.lst = QListWidget()
-        self.lst.setSelectionMode(QAbstractItemView.SingleSelection)
+        # ⭐ 框选多选 + Ctrl 连续选中/反选（用户 2026-10-02 ✓）：
+        #   `ExtendedSelection` 一次到位支持三种手势 ——
+        #   · **Ctrl+点击** = 切换那一项的选中（反选 ✓）；
+        #   · **Shift+点击** = 从当前项到点击项的范围选中 ✓；
+        #   · **鼠标拖框**（空白处按下拖）= 框选范围内的所有项 ✓。
+        #   双击编辑不受影响（双击会让那项变成 current，然后开编辑 ✓）。
+        self.lst.setSelectionMode(QAbstractItemView.ExtendedSelection)
         # 双击 = 编辑（同 `gui/zone_editor.py` 的列表范式 ✓）
         self.lst.itemDoubleClicked.connect(self._on_edit)
         # ⭐⭐ 2026-10-01：「可以战斗」的勾选框**挪到主窗口**了（用户要求 ✓）⇒ 这里列表
         #   只显示**只读摘要**（含"可以战斗"字样）；勾选入口在主窗口每项前面 ✓。
-        self.lst.setToolTip("**双击一行**改它的参数 ✓（区域查询CD / idle 回归 foothold / "
-                            "最小战斗时长 / 最大战斗时长 / 到点去哪）。\n"
-                            "「**可以战斗**」在主窗口「路线规划」组的每项前面勾 ✓。")
+        self.lst.setToolTip(
+            "**双击一行**改它的参数 ✓（区域查询CD / idle 回归 foothold / "
+            "最小战斗时长 / 最大战斗时长 / 到点去哪）。\n\n"
+            "**多选**（用户 2026-10-02 ✓）：\n"
+            "· **Ctrl+点击** = 切换选中（反选 ✓）；\n"
+            "· **Shift+点击** = 范围选中；\n"
+            "· **空白处拖框** = 框选多项 ✓。\n"
+            "选了多项后**删除**会一次删干净 ✓。\n\n"
+            "「**可以战斗**」在主窗口「路线规划」组的每项前面勾 ✓。")
         root.addWidget(self.lst, 1)
 
         btns = QHBoxLayout()
@@ -330,15 +342,28 @@ class BattleZoneListDialog(QDialog):
         self._commit()
 
     def _on_del(self):
-        nm = self._picked()
-        if not nm:
-            QMessageBox.information(self, "先选一项", "在列表里点一下要删的那一项 ✓")
+        # ⭐ 批量删除（用户 2026-10-02 ✓）：多选了就一次删干净。
+        #   `selectedItems()` = 框选 / Ctrl 多选的所有项；**空 ⇒ 退化到 `currentItem()`**
+        #   （老行为 ✓ —— 单选时 selectedItems 也是空的，那一下还能用 currentItem 删）。
+        items = self.lst.selectedItems() or ([self.lst.currentItem()]
+                                             if self.lst.currentItem() else [])
+        names = [str(it.data(Qt.UserRole) or "") for it in items
+                 if it is not None]
+        names = [n for n in names if n]
+        if not names:
+            QMessageBox.information(self, "先选一项",
+                                    "在列表里点一下要删的那一项 ✓（**Ctrl+点击** 可多选）")
             return
-        if QMessageBox.question(
-                self, "删除战斗区域",
-                "确定把「%s」从战斗区域里删掉吗？" % nm) != QMessageBox.Yes:
+        if len(names) == 1:
+            msg = "确定把「%s」从战斗区域里删掉吗？" % names[0]
+        else:
+            msg = "确定把这 %d 项从战斗区域里删掉吗？\n\n%s" % (
+                len(names), "、".join(names))
+        if QMessageBox.question(self, "删除战斗区域", msg) != QMessageBox.Yes:
             return
-        self._zones = [z for z in self._zones if str(z.get("set") or "") != nm]
+        _kill = set(names)
+        self._zones = [z for z in self._zones
+                       if str(z.get("set") or "") not in _kill]
         self._commit()
 
 
@@ -394,15 +419,20 @@ class BattleZoneDialog(QDialog):
         root = QVBoxLayout(self)
         root.setSpacing(10)
         root.setContentsMargins(16, 16, 16, 16)
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignLeft)
+        form_top = QFormLayout()
+        form_top.setLabelAlignment(Qt.AlignLeft)
+        # ⭐ 拆成上下两段表单（用户 2026-10-02 ✓ 要求"idle 回归 foothold 块放在 idle 模式
+        #   下方"⇒ 视图块要夹在「idle 去哪」与「最小战斗时长」之间 ✓ —— 表单按 addRow 顺序
+        #   排，没法在中间插一段 ⇒ 拆成 `form_top` / `form_bottom`，中间塞 `_idle_box`）。
+        form_bottom = QFormLayout()
+        form_bottom.setLabelAlignment(Qt.AlignLeft)
 
         # ① 区域集合（只读，见类说明）
         lb = QLabel(self._set or "（未选）")
         lb.setStyleSheet("font-weight: 600;")
         lb.setToolTip("这一项管的是哪块平台（集合名 ✓）。\n"
                       "⚠ 这里不给改：它是这一项的**身份** —— 要换区域请**删了重加** ✓。")
-        form.addRow("区域集合", lb)
+        form_top.addRow("区域集合", lb)
 
         # ⚠ **「可以战斗」不在这里**（用户要求挪出去勾 ✓；2026-10-01 起在**主窗口
         #   「路线规划」组每项前面**勾 ✓）—— 这里删掉控件，但 `__init__` 把它记进
@@ -420,7 +450,12 @@ class BattleZoneDialog(QDialog):
                   "⚠ 下限 0.5 —— 再小就等于「每拍重下 / 每拍重算」✗。\n"
                   "默认 %.1f（归属不到任何区域项时也用它兜底 ✓）。" % ZONE_GOTO_RETRY_S)
         self.sp_cd.setToolTip(tip_cd)
-        form.addRow("区域查询CD(s)", self.sp_cd)
+        form_top.addRow("区域查询CD(s)", self.sp_cd)
+
+        # ⭐⭐ idle 模式下拉已移除（用户 2026-10-02 ✓ 取消互斥）：
+        #   idle 回归 foothold 和 切换平台**同时**生效，不再二选一 ✓。
+        #   切换平台的参数（idle持续n秒切换平台 / idle 去哪）移到了下面 form_bottom ✓。
+        _idle_dst_val = str(z0.get("idle_dst_set") or "").strip()
 
         # ③ idle 回归 foothold（**列表随机**，2026-09-29 用户要求 ✓）
         #    交互流程（用户定的 ✓）：**走选中**（在上面的只读视图里点一条）→ **点添加** →
@@ -443,7 +478,7 @@ class BattleZoneDialog(QDialog):
         except Exception:                   # noqa: BLE001 —— 视图建不出来就退回文本框 ✓（别炸弹窗 ✗）
             self._picker = None
         if self._picker is None:
-            form.addRow("idle 回归 foothold", self.ed_idle)
+            form_top.addRow("idle 回归 foothold", self.ed_idle)
         else:
             # ⭐ 有视图 ⇒ **把文本框收起来**（那套"手填编号"就不摆了 ✓ 免得两处表达同一件事 ✗）
             box = QVBoxLayout()
@@ -492,6 +527,45 @@ class BattleZoneDialog(QDialog):
             self._idle_box = box
             self._refresh_idle_label()
 
+        # ⭐ idle 切换平台参数（用户 2026-10-02 ✓ —— 移到这，最小战斗时长之前）：
+        #   取消互斥后，idle 回归 foothold（上面 _idle_box）和切换平台**同时**生效 ✓。
+        #   idle 持续 N 秒没怪才下切换平台任务；delay=0 ⇒ 不启用、idle 去哪置灰 ✓。
+        self.sp_idle_delay = NoWheelDoubleSpinBox()
+        self.sp_idle_delay.setRange(0.0, 60.0)
+        self.sp_idle_delay.setDecimals(1)
+        self.sp_idle_delay.setSingleStep(0.5)
+        _isd0 = z0.get("idle_switch_delay_s")
+        self.sp_idle_delay.setValue(max(0.0, float(_isd0) if _isd0 is not None else 3.0))
+        self.sp_idle_delay.setToolTip(
+            "**idle 持续多久没怪**才切换平台（秒 ✓）。\n\n"
+            "· **0 = 不启用**切换平台逻辑（下面的「idle 去哪」置灰 ✓）；\n"
+            "· >0 = idle 持续这么久**确实没怪了**才下前往任务 ✓"
+            "（中途有怪 ⇒ 计时清零重来 ✓）。\n\n"
+            "⭐ idle 期间**同时**走 idle 回归 foothold（上面的视图+列表）✓ —— 两者不再互斥 ✓。")
+        self.sp_idle_delay.valueChanged.connect(self._on_idle_delay_changed)
+        form_bottom.addRow("idle持续n秒切换平台", self.sp_idle_delay)
+
+        self.cmb_idle_dst = NoWheelComboBox()
+        self.cmb_idle_dst.setMinimumWidth(150)
+        self.cmb_idle_dst.addItem("（不前往）", "")
+        for n in sorted(str(x) for x in (names or [])):
+            if n and n != self._set:                   # 别把自己列成目的地 ✗（同 cmb_dst ✓）
+                self.cmb_idle_dst.addItem(n, n)
+        _i_dst = self.cmb_idle_dst.findData(_idle_dst_val)
+        self.cmb_idle_dst.setCurrentIndex(_i_dst if _i_dst >= 0 else 0)
+        self.cmb_idle_dst.setToolTip(
+            "idle 持续够「idle持续n秒切换平台」后**前往哪块平台**（集合名 ✓）。\n"
+            "· 候选 = 这张图已注册的集合（不含这一项自己 ✓）。\n"
+            "· 上面的「idle持续n秒切换平台」= 0 时这格**置灰**（不启用 ✓）。")
+        self.cmb_idle_dst.currentIndexChanged.connect(self._on_idle_dst_changed)
+        self._idle_dst_widget = QWidget()
+        _h_dst = QHBoxLayout(self._idle_dst_widget)
+        _h_dst.setContentsMargins(0, 0, 0, 0)
+        _h_dst.setSpacing(6)
+        _h_dst.addWidget(QLabel("idle 去哪"))
+        _h_dst.addWidget(self.cmb_idle_dst, 1)
+        form_bottom.addRow(self._idle_dst_widget)
+
         # ④ 最小战斗时长(s) + ⑤ 最大战斗时长(s) + ⑥ 到点去哪
         self.sp_fight_min = NoWheelDoubleSpinBox()
         self.sp_fight_min.setRange(0.0, 3600.0)
@@ -505,7 +579,7 @@ class BattleZoneDialog(QDialog):
             "  （只在本集合里打；到点之后才恢复跨集合追击 ✓）。\n\n"
             "⚠ 计时口径见 `decision/agent.py` 里 `fight_min_s` 字段的说明（和「最大战斗时长」\n"
             "   共用同一把钟：只有寻路会暂停、换区域才归零 ✓）。")
-        form.addRow("最小战斗时长(s)", self.sp_fight_min)
+        form_bottom.addRow("最小战斗时长(s)", self.sp_fight_min)
 
         self.sp_fight = NoWheelDoubleSpinBox()
         self.sp_fight.setRange(0.0, 3600.0)
@@ -517,7 +591,7 @@ class BattleZoneDialog(QDialog):
             "· **0 = 不限**（老行为 ✓ —— 打到没怪为止）；\n"
             "· 填了 ⇒ 到点就去下面的「到点去哪」（没填就不动 ✓）。\n\n"
             "⚠ 计时口径见 `decision/agent.py` 里那个字段的说明。")
-        form.addRow("最大战斗时长(s)", self.sp_fight)
+        form_bottom.addRow("最大战斗时长(s)", self.sp_fight)
 
         self.cmb_dst = NoWheelComboBox()
         self.cmb_dst.setMinimumWidth(150)
@@ -532,19 +606,19 @@ class BattleZoneDialog(QDialog):
             "「最大战斗时长」到点之后**去哪块平台**（集合名 ✓）。\n"
             "· **（不前往）** = 到点只停手、不换地方（默认 ✓）；\n"
             "· 候选 = 这张图已注册的集合（不含这一项自己 ✓）。")
-        form.addRow("到点去哪", self.cmb_dst)
+        form_bottom.addRow("到点去哪", self.cmb_dst)
 
-        root.addLayout(form)
-        # ⭐ 把那块（视图 + 下拉 + 说明 + 清空）**插到最前面** + 让它吃满剩余高度
-        #   （用户 2026-09-28："可视图放在最上面吧，而且需要窗口纵向缩放"✓）：
-        #   · 插到 index 0 ⇒ 在最上面 ✓（表单项的顺序保持原样不动 ✓）；
-        #   · `stretch=1` ⇒ 窗口**纵向拉大时高度全给它**（这就是"窗口纵向缩放"✓）——
-        #     ⚠ 原来这里 `addStretch(1)` 把剩余高度全给了**空白** ⇒ 视图永远长不大 ✗。
-        #   ⚠⚠ 那块是个 **`QVBoxLayout`**（不是 widget）⇒ 必须用 `insertLayout` ✗
-        #      （写成 `insertWidget` 会当场 `TypeError` ✓ 对照用例抓到的 ✓）。
+        root.addLayout(form_top)
+        # ⭐ **视图块夹在两段表单之间**（用户 2026-10-02 ✓ —— "idle 回归 foothold 块放在
+        #   idle 模式下方"）：`form_top`（区域集合/CD/idle 模式/idle 去哪）→ `_idle_box`
+        #   （视图+列表+按钮）→ `form_bottom`（最小/最大战斗时长/到点去哪）。
+        #   · 有视图 ⇒ `_idle_box` 吃满剩余高度（窗口纵向缩放 ✓ 用户 2026-09-28 那条仍成立）；
+        #   · 没视图 ⇒ `form_top` 的"idle 回归 foothold"文本框已经够了 ⇒ 直接接 `form_bottom`。
         if getattr(self, "_idle_box", None) is not None:
-            root.insertLayout(0, self._idle_box, 1)
+            root.addLayout(self._idle_box, 1)
+            root.addLayout(form_bottom)
         else:
+            root.addLayout(form_bottom)
             root.addStretch(1)
 
         row = QHBoxLayout()
@@ -559,6 +633,34 @@ class BattleZoneDialog(QDialog):
         root.addLayout(row)
         # 拉过的大小/位置按客户端记住（docs/UI规范.md §11 ✓）—— 第一次打开用上面那个 `resize`
         theme.bind_window_state(self, "battle_zone")
+        # ⭐ 初始化「idle 去哪」的置灰状态（delay=0 ⇒ 置灰 ✓ 建完所有控件后调一次 ✓）
+        self._on_idle_delay_changed(self.sp_idle_delay.value())
+
+    def _on_idle_delay_changed(self, val):
+        """「idle持续n秒切换平台」改值 ⇒ delay=0 时把「idle 去哪」置灰（用户 2026-10-02 ✓）。
+
+        · val=0 ⇒ 不启用切换平台逻辑 ⇒ idle 去哪 置灰（无法配置 ✓）；
+        · val>0 ⇒ 启用 ⇒ idle 去哪 可配置 ✓ + 更新视图高亮 ✓。
+        """
+        _on = float(val) > 0
+        self.cmb_idle_dst.setEnabled(_on)
+        self._apply_set_highlight()
+
+    def _on_idle_dst_changed(self):
+        """idle 去哪集合下拉切换 ⇒ 更新视图的集合高亮（用户 2026-10-02 ✓）。"""
+        self._apply_set_highlight()
+
+    def _apply_set_highlight(self):
+        """delay>0 时把"idle 去哪"选的集合喂给视图 `highlight_set` ✓；delay=0 清掉 ✓。"""
+        _picker = getattr(self, "_picker", None)
+        if _picker is None:
+            return
+        _delay = float(self.sp_idle_delay.value()) if hasattr(self, "sp_idle_delay") else 0.0
+        _hl = str(self.cmb_idle_dst.currentData() or "") if _delay > 0 else ""
+        try:
+            _picker.highlight_set(_hl)
+        except Exception:                               # noqa: BLE001
+            pass        # 视图没这个方法（旧版/测试替身）也不许炸弹窗 ✗
 
     def _make_picker(self):
         """按工厂建那块**只读视图**（建不出来 / 没工厂 ⇒ `None` ✓ 调用方退回文本框 ✓）。"""
@@ -645,7 +747,12 @@ class BattleZoneDialog(QDialog):
         """确定之后取回这一项（`dict` ✓ 字段与 `settings.battle_zones` 的项一一对应 ✓）。"""
         return {"set": self._set,
                 "cd_s": float(self.sp_cd.value()),
+                # ⭐ 两个字段**都存**（不管模式 ✓ —— 模式只控制 UI 显隐，不控制保存）：
+                #   决策层靠 `idle_dst_set` **优先**判断（有值 ⇒ 切换平台，不看 footholds ✓）；
+                #   这样从"回归 foothold"切到"切换平台"时，旧 footholds 不丢（下次切回来还在 ✓）。
                 "idle_footholds": self.idle_fids(),
+                "idle_dst_set": str(self.cmb_idle_dst.currentData() or ""),
+                "idle_switch_delay_s": float(self.sp_idle_delay.value()),
                 "fight_min_s": float(self.sp_fight_min.value()),
                 "fight_max_s": float(self.sp_fight.value()),
                 "fight_dst": str(self.cmb_dst.currentData() or ""),
@@ -1155,6 +1262,25 @@ class PlayerPanel(QWidget):
         self.sp_min_turn_hold.valueChanged.connect(self._on_turn_params)
         bf.addRow("最小切换朝向时间(ms)", self.sp_min_turn_hold)
 
+        # ⭐⭐ 「**站桩补朝向间隔(ms)**」（用户 2026-10-02 ✓ 原话："把『站桩 attack n 次后补朝向』
+        #   改成『站桩补朝向间隔(ms)』，**新增在『最小切换朝向时间(ms)』下面**。逻辑是**每站桩
+        #   这么久就补**"）—— 站桩那一段里，距上一次补键 ≥ 它就补一次（照旧点一下 `TURN_TAP_S` ✓；
+        #   进站桩的**首窗**照旧按满上面那个「最小切换朝向时间」✓ 并当作一次补键 ✓）。
+        #   ⚠ **0 = 不补**（只留首窗 ✓）；**按项目存** ✓（`to_dict`/`from_dict` ✓ ⇒ 项目保存 +
+        #     保存/加载模板三处一起生效 ✓）。
+        self.sp_station_turn_iv = self._spin(
+            0, 60000, int(getattr(settings, "station_turn_interval_ms", 1000) or 0), 0, 100)
+        self.sp_station_turn_iv.setToolTip(
+            "站桩输出时，**每隔这么久补一次「朝目标」的方向键**（毫秒）。\n"
+            "补的那一下**按满上面那个「最小切换朝向时间」**（用户 2026-10-02 定 ✓）；\n"
+            "⚠ 自动保护：**实际按多长 = min(最小切换朝向时间, 这个间隔)**\n"
+            "   —— 否则时长 ≥ 间隔时，方向键会一直按着（角色一边打一边朝怪走）。\n\n"
+            "0 = 不补（只留刚进站桩那一下）。\n"
+            "默认 1000（≈ 原来「每 3 次攻击补一次」的实际节奏）。\n"
+            "信息栏那行会按 0.1 秒精度显示「还有多久补」（例：1.2s后补朝向）。")
+        self.sp_station_turn_iv.valueChanged.connect(self._on_turn_params)
+        bf.addRow("站桩补朝向间隔(ms)", self.sp_station_turn_iv)
+
         # 转向后输出延迟（毫秒）：换向后推迟这么久才开始输出
         self.sp_turn_output_delay = self._spin(0, 3000, 0, 0)
         self.sp_turn_output_delay.setToolTip(
@@ -1208,6 +1334,34 @@ class PlayerPanel(QWidget):
         self.sp_chase_dash.valueChanged.connect(self._on_chase_jump)
         af.addRow("追击起跳需要的冲刺时间(ms)", self.sp_chase_dash)
 
+        # ⭐⭐ 「**距离平台边缘多远禁用(px)**」（用户 2026-10-02 ✓ 原话："追击起跳功能加个参数
+        #   「距离平台边缘多远禁用(px)」（**不启用时不能配置**），代表如果距离 foothold 集边缘
+        #   距离小于等于这个值即使满足条件也不按跳"）。
+        #   样式**照「大怪优先」**（用户点名 ✓）：勾选框 + 一个 px 框；**不勾 ⇒ px 框灰掉不可配** ✓
+        #   且这条闸**整个不启用** ✓（= 老行为 ✓）。
+        self.ck_chase_edge_guard = QCheckBox("距离平台边缘禁用")
+        self.ck_chase_edge_guard.setChecked(bool(
+            getattr(settings, "chase_jump_edge_guard_enabled", False)))
+        self.ck_chase_edge_guard.setToolTip(
+            "**起跳贴边防掉**：人到「**跳向那侧**」的平台边缘距离 ≤ 下面这个值时，\n"
+            "哪怕起跳条件全部满足也**不按跳**（再跳出去就掉下平台了）。\n"
+            "「跳向那侧」= 当前朝向那侧（起跳本来就是朝目标飞）。\n"
+            "⚠ 判不出边缘距离时（没定位 / 位置状态没给平台宽度）→ **不禁用**（宁缺勿错）。\n"
+            "不勾 = 这条闸不启用，下面那个值也不可配（老行为）。")
+        self.ck_chase_edge_guard.stateChanged.connect(self._on_chase_jump)
+        self.sp_chase_edge_px = self._spin(
+            0, 2000, int(getattr(settings, "chase_jump_edge_guard_px", 100) or 0), 0, 10)
+        self.sp_chase_edge_px.setToolTip(
+            "阈值（像素）：距「跳向那侧」的平台边缘 ≤ 它 ⇒ 不跳。\n"
+            "0 = 等于没开（只禁掉「已经贴在边缘上」那一瞬间）。")
+        self.sp_chase_edge_px.valueChanged.connect(self._on_chase_jump)
+        eg_row = QHBoxLayout()
+        eg_row.setSpacing(4)
+        eg_row.addWidget(self.ck_chase_edge_guard)
+        eg_row.addWidget(self.sp_chase_edge_px)
+        eg_row.addStretch(1)
+        af.addRow("距离平台边缘禁用(px)", eg_row)
+
         # ③ **大怪优先**（用户 2026-10-01 ✓；当天又要求挪进「攻击」子组 ✓）：
         #   锁定目标时优先「明显更高」的大怪 —— 这是"**打谁**"这一件事 ⇒ 收进「攻击」✓。
         #   2026-10-01 再要求：加**总开关**「大怪优先」勾选框 —— 不勾 = 逻辑不启用、
@@ -1223,8 +1377,10 @@ class PlayerPanel(QWidget):
         self.sp_big_mob_ratio.setSingleStep(0.1)
         self.sp_big_mob_ratio.setToolTip(
             "锁定目标时优先「明显更高」的大怪（**相对判定** ✓）。\n"
-            "判据：怪框高度 ≥ 候选怪框高度的**中位数 × 这个倍数**就算大怪\n"
-            "（中位数 = 这堆小怪的典型高度，大怪天然突出，不用每张图调高度 ✓）。\n"
+            "判据：怪框高度 ≥ **最小框均线 × 这个倍数**就算大怪\n"
+            "（最小框均线 = 最近 10 秒里「每拍最小的那个怪框高」的平均\n"
+            " —— 最小那一头永远站在小怪那边，**大怪多、小怪少**时也认得出 ✓；\n"
+            " 单个漏检的小框被均线摊平，不会把基准拖低 ✓）。\n"
             "设为 1.0 = 关闭（人人都是大怪，等于不优先）。")
         af.addRow("大怪判定倍数", self.sp_big_mob_ratio)
 
@@ -2313,6 +2469,11 @@ class PlayerPanel(QWidget):
         settings.chase_jump_min = int(self.sp_chase_jump_min.value())
         settings.chase_jump_max = int(self.sp_chase_jump_max.value())
         settings.chase_jump_dash_ms = int(self.sp_chase_dash.value())
+        # ⭐ 「距离平台边缘禁用(px)」（用户 2026-10-02 ✓）：开关 + 阈值（勾选框控制可配 ✓）
+        if hasattr(self, "ck_chase_edge_guard"):
+            settings.chase_jump_edge_guard_enabled = bool(
+                self.ck_chase_edge_guard.isChecked())
+            settings.chase_jump_edge_guard_px = int(self.sp_chase_edge_px.value())
         settings.save()
         self._refresh_chase_jump_ui()
 
@@ -2325,6 +2486,12 @@ class PlayerPanel(QWidget):
             self.sp_chase_dash.setEnabled(on)
         self.sp_chase_jump_min.setEnabled(on)
         self.sp_chase_jump_max.setEnabled(on)
+        # ⭐ 「距离平台边缘禁用」那个 px 框：**两个开关都要开**才可配
+        #   （追击起跳开 ✓ + 它自己的勾选框开 ✓）—— 就是用户那句"**不启用时不能配置**" ✓
+        #   （样式同「大怪优先」的两个参数框 ✓）。
+        if hasattr(self, "ck_chase_edge_guard") and hasattr(self, "sp_chase_edge_px"):
+            self.sp_chase_edge_px.setEnabled(
+                bool(on) and self.ck_chase_edge_guard.isChecked())
 
     def _on_evade_type(self, _idx=None):
         settings.evade_type = self.cmb_evade.currentData()
@@ -2648,6 +2815,10 @@ class PlayerPanel(QWidget):
     def _on_turn_params(self, _val=None):
         """换向相关的两个时间参数一起写（同一组，一个处理器够了）。"""
         settings.min_turn_hold_ms = int(self.sp_min_turn_hold.value())
+        # ⭐ 「站桩补朝向间隔(ms)」（2026-10-02 ✓）：与上面那条同一个处理器 ⇒ 改完即时落盘 ✓
+        #   （`settings.save()` 在下面统一调 ✓）—— 它随项目存 ✓，也会跟着"保存/加载模板"走 ✓。
+        if hasattr(self, "sp_station_turn_iv"):
+            settings.station_turn_interval_ms = int(self.sp_station_turn_iv.value())
         settings.turn_output_delay_ms = int(self.sp_turn_output_delay.value())
         settings.save()
 
@@ -3537,6 +3708,13 @@ class PlayerPanel(QWidget):
         self.sp_min_turn_hold.blockSignals(True)
         self.sp_min_turn_hold.setValue(settings.min_turn_hold_ms)
         self.sp_min_turn_hold.blockSignals(False)
+        # ⭐ 「站桩补朝向间隔(ms)」（2026-10-02 ✓）—— **切项目 / 加载模板之后必须回填** ✓
+        #   （不回填的话界面还显示上一个项目的值 ⇒ 一改就把新项目的值写错 ✗）。
+        if hasattr(self, "sp_station_turn_iv"):
+            self.sp_station_turn_iv.blockSignals(True)
+            self.sp_station_turn_iv.setValue(
+                int(getattr(settings, "station_turn_interval_ms", 1000) or 0))
+            self.sp_station_turn_iv.blockSignals(False)
 
         self.sp_turn_output_delay.blockSignals(True)
         self.sp_turn_output_delay.setValue(settings.turn_output_delay_ms)

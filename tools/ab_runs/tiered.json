@@ -1,0 +1,59 @@
+{
+ "override": {
+  "merge_iou": 0.5,
+  "ring_iou_sep": 0.35,
+  "brick_iou_sep": 0.5,
+  "ring_iou_fuse": 0.35,
+  "brick_iou_fuse": 0.7
+ },
+ "result": {
+  "10月1日.mp4": {
+   "frames": 70,
+   "merged": 8,
+   "split": 5,
+   "lost": 2,
+   "jump_max": 89.4,
+   "jump_top3": [
+    89.4,
+    38.7,
+    21.9
+   ]
+  },
+  "10月2日.mp4": {
+   "frames": 70,
+   "merged": 1,
+   "split": 1,
+   "lost": 2,
+   "jump_max": 34.9,
+   "jump_top3": [
+    34.9,
+    28.1,
+    25.8
+   ]
+  },
+  "9月30日(1).mp4": {
+   "frames": 70,
+   "merged": 1,
+   "split": 1,
+   "lost": 2,
+   "jump_max": 12.0,
+   "jump_top3": [
+    12.0,
+    8.0,
+    8.0
+   ]
+  },
+  "10月3日.mp4": {
+   "frames": 70,
+   "merged": 4,
+   "split": 4,
+   "lost": 2,
+   "jump_max": 22.9,
+   "jump_top3": [
+    22.9,
+    15.8,
+    14.4
+   ]
+  }
+ }
+}

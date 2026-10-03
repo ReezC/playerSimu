@@ -24,7 +24,7 @@
 
 import time
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QGroupBox, QHBoxLayout, QLabel,
                              QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget)
@@ -124,6 +124,13 @@ def _generate_task(params, ctx):
 
 
 class RoutePanel(QWidget):
+    #: ⭐ **本面板把「项目的地图 id」改掉了**（用户 2026-10-02 的「手动更换」✓）——
+    #: 参数是新地图 id ✓。
+    #: 谁接谁刷新（**不强推给谁** ✓）：主窗口接上重新推 `player_panel.set_zone_sets` ——
+    #: 那正是 `_bind_cards` 在"切项目"时做的同一件事（集合按**地图 id** 存 ✓）；
+    #: 本面板自己的刷新不靠信号（`_on_manual_map_change` 里当场做 ✓）。
+    map_changed = pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         # ⚠ **长面板必须能滚**（用户 2026-09-27 报："路线识别页签不支持滚动？现在攀爬参数组的
@@ -210,6 +217,91 @@ class RoutePanel(QWidget):
         # 下面这段所有 `root.add*` 都落进这张卡片（`root` 依次指向各卡片的内布局）。
         # 组名 2026-09-26 由「路线识别」改成「寻路配置」（用户要求；页签名不变 ✓）。
         root = card("寻路配置")
+        #: ⭐ **记住这张卡的布局**（用户 2026-10-03 ✓ 原话："「小地图定位」的来源、黄点跟踪
+        #:   参数挪到寻路配置最上方"）：那两组控件的**定义**还在「小地图定位」那一节里
+        #:   （紧挨着它们说明的上下文 ✓ 搬定义要连 tooltip 一起抄 40 行 ✗ 不值），
+        #:   但**它们的布局插到这张卡的顶部** ✓（`insertLayout` ✓ 见下面两处）。
+        #:   为什么这么做：这三样**按地图 id 存**（`core/route_cfg.py` ✓）⇒ 和"现在是哪张图"
+        #:   是同一件事的两半，放一起才看得出是一组 ✓。
+        #:   ⚠ 插入位置从 **1** 起（不是 0）：第 0 位是「当前地图」那行 —— 那一行是全卡的
+        #:     **前提**（用户 2026-10-02 定的"在寻路配置最顶部"✓ 下面每一件都以它为前提 ✓）。
+        root_pf = root
+
+        # ---- ⭐ 「当前地图」+「手动更换」（用户 2026-10-02 ✓ 原话："在路线识别→寻路配置
+        #      最顶部 增加只读参数『当前地图』，默认为 模型训练 页签→识别目标选项里的地图参数；
+        #      增加按钮『手动更换』，用以修改这个 id"）----
+        # 为什么必须在**这一组的最顶上**：下面每一件（寻路编辑器 / 框选小地图 / 标定 /
+        #   集合下拉 / 战斗区域 / 攀爬参数）**全都以"现在是哪张图"为前提** ✓ ——
+        #   不先把这件事说清，下面所有操作都在猜（而"猜错了图"这一类最难查 ✗）。
+        # · **只读**（`QLabel` ✓ 与本页「小地图定位」卡里那个同名标签同一写法、同一个文本 ✓
+        #   见 `_map_display_text`）：它默认就是「模型训练 → 识别目标」那个地图参数 ——
+        #   一份数据两个显示（`project.map_id` ✓），切页签/换项目靠 `_refresh_mmap()`
+        #   重读（`bind` / `showEvent` 都会调 ✓）。
+        # · 「手动更换」= 就地改它：候选与写口都复用同一份实现
+        #   （`gui/map_picker.MapPickDialog` + `core.wzexport.apply_map_choice` ✓）——
+        #   走的是和那个下拉**同一个写口**（地图 + 怪列表四件一起写 ✓ 各写一份迟早漏 ✗）。
+        # · 样式：**普通按钮**（同旁边「框选小地图」「实测精度」✓）—— 它不是"打开编辑器"
+        #   那种入口（那个才用 `theme.ENTRY_BTN_QSS` 拎出来 ✓ 见 UI规范 §6）。
+        mrow = QHBoxLayout()
+        mrow.setSpacing(8)
+        mrow.addWidget(QLabel("当前地图"))
+        self.lbl_cur_map = QLabel("—")
+        self.lbl_cur_map.setStyleSheet("color: #5f6368;")
+        self.lbl_cur_map.setWordWrap(True)
+        mrow.addWidget(self.lbl_cur_map, 1)
+        self.btn_map_change = QPushButton("手动更换")
+        self.btn_map_change.setObjectName("mapChange")
+        self.btn_map_change.setToolTip(
+            "就地换掉这个项目的**地图参数**（和「模型训练 → 识别目标」那个下拉"
+            "是同一个 ✓）。\n\n"
+            "换了之后：地形图 / 集合 / 标定 / 战斗区域都跟着这张图走；\n"
+            "「实时」如果在跑，会**立刻改用新图**（不用重启 ✓）。\n\n"
+            "为什么要有这个按钮：那个下拉在**另一个页签**里，本来要来回切页签 +\n"
+            "等本页重读一次才看得到变化。\n\n"
+            "⚠ 换图会连带把「要识别的怪」换成这张图的（和那个下拉的行为一致 ✓）——\n"
+            "上一张图手动增删过的怪列表**不会**跟过来。")
+        self.btn_map_change.clicked.connect(safe_slot(self._on_manual_map_change))
+        mrow.addWidget(self.btn_map_change)
+        root.addLayout(mrow)
+        self._refresh_current_map()
+
+        # ---- ⭐ 「小地图来源」**搬到这里**（用户 2026-10-03 ✓ 原话："「小地图定位」的
+        #      来源、黄点跟踪参数挪到寻路配置最上方"）----
+        # 为什么挪：三样（来源 / 跟踪参数 / 框选区域）**按地图 id 存**（`core/route_cfg.py`
+        #   ✓ 见 `docs/开发日志.md` 第 124 条）⇒ 和"现在是哪张图"是同一件事的两半，
+        #   放一起才看得出是一组 ✓。
+        # ⚠ 位置在「当前地图」那行**下面**（不是它上面 ✗）：那一行是**全卡的前提**
+        #   （用户 2026-10-02 定"在寻路配置最顶部"✓ 下面每一件都以它为前提 ✓）。
+        # ⚠ 为什么把**代码整段搬过来**、而不是"定义留在原地、只把布局插过来"（我先试了 ✗）：
+        #   实测那个 combo 会**丢父**（父链为空 ⇒ 变成顶级控件 ⇒ 之后 `mapTo` 直接
+        #   **访问违例崩进程** ✗ 见 `t_mmap_rows_split` 那次 0xC0000005 ✓）——
+        #   布局这样借来借去不可靠 ✗，控件建在**它真正要待的那张卡**里最稳 ✓。
+        # ⚠ 摆放：一行只放一个参数组（UI 规范 §4）—— 这一行**只有来源** ✓（「标定…」
+        #   仍在「小地图定位」卡里挨着它读的那份几何 ✓）。
+        srow = QHBoxLayout()
+        srow.setSpacing(6)
+        srow.addWidget(QLabel("小地图来源"))
+        self.cmb_mmap_src = NoWheelComboBox()
+        self.cmb_mmap_src.addItem("收流（A 机小地图推流）", mm.SRC_STREAM)
+        self.cmb_mmap_src.addItem("从实时画面框选（实验）", mm.SRC_LIVE)
+        self.cmb_mmap_src.setToolTip(
+            "小地图面板的画面从哪来。\n\n"
+            "收流（默认）：A 机「被控机部署台 → 小地图推流」单独推一路原始像素 ——\n"
+            "  黄点（玩家点）只有几个像素，这一路是唯一能保证它不糊的画质。\n\n"
+            "从实时画面框选（实验）：不另推一路，直接在「实时」页那一帧上裁一块。\n"
+            "  省掉 A 机一次截屏 + 一路 TCP，但画面是压过的 —— 面板和底图还能对上，\n"
+            "  黄点识别能不能稳还没实测。\n\n"
+            "（「框选小地图」和来源**无关**，是必做的一步：两种来源都要知道\n"
+            "  小地图面板在实时画面的哪儿 —— 收流时主画面里也有小地图，只是压过。）\n"
+            "（2026-09-27 起它在「设置 → 界面 → 实时画面 · 地形叠加」里。）\n\n"
+            "两者只在「画面从哪来」这一步不同：标定、换算、世界坐标都一样。\n\n"
+            "⭐ 2026-10-03 起它**按地图 id 存**（`datasets/map/<id>.route.json` ✓）——\n"
+            "   每张图各记一份（换图就跟着换 ✓）；`config/live.yaml` 那份只剩"
+            "「新图第一次打开时的播种值」。")
+        self.cmb_mmap_src.currentIndexChanged.connect(self._on_mmap_src)
+        srow.addWidget(self.cmb_mmap_src)
+        srow.addStretch(1)
+        root.addLayout(srow)
 
         # 这一组**只剩「寻路编辑器」**（2026-09-26 用户定：其余都没意义）。
         # 原来上面还有一段说明 + `启用路线识别` 开关 + 一行状态提示 —— 那个开关门控的是
@@ -589,27 +681,10 @@ class RoutePanel(QWidget):
         row2 = QHBoxLayout()
         row2.setSpacing(6)
 
-        # ---- 面板画面从哪来（**实验**开关；存 config/live.yaml，和地图无关）----
-        #   收流        —— A 机那条独立推流：原始像素，黄点最清楚（默认）
-        #   从实时画面  —— 不另推一路，直接在实时预览那一帧上裁一块
-        #                  （画面是 H.264 压过的；面板↔底图匹配没问题，黄点待实测）
-        row2.addWidget(QLabel("小地图来源"))
-        self.cmb_mmap_src = NoWheelComboBox()
-        self.cmb_mmap_src.addItem("收流（A 机小地图推流）", mm.SRC_STREAM)
-        self.cmb_mmap_src.addItem("从实时画面框选（实验）", mm.SRC_LIVE)
-        self.cmb_mmap_src.setToolTip(
-            "小地图面板的画面从哪来。\n\n"
-            "收流（默认）：A 机「被控机部署台 → 小地图推流」单独推一路原始像素 ——\n"
-            "  黄点（玩家点）只有几个像素，这一路是唯一能保证它不糊的画质。\n\n"
-            "从实时画面框选（实验）：不另推一路，直接在「实时」页那一帧上裁一块。\n"
-            "  省掉 A 机一次截屏 + 一路 TCP，但画面是压过的 —— 面板和底图还能对上，\n"
-            "  黄点识别能不能稳还没实测。\n\n"
-            "（「框选小地图」和来源**无关**，是必做的一步：两种来源都要知道\n"
-            "  小地图面板在实时画面的哪儿 —— 收流时主画面里也有小地图，只是压过。）\n"
-            "（2026-09-27 起它在「设置 → 界面 → 实时画面 · 地形叠加」里。）\n\n"
-            "两者只在「画面从哪来」这一步不同：标定、换算、世界坐标都一样。")
-        self.cmb_mmap_src.currentIndexChanged.connect(self._on_mmap_src)
-        row2.addWidget(self.cmb_mmap_src)
+        # ⚠ 「小地图来源」**2026-10-03 已搬去「寻路配置」卡**（「当前地图」那行下面 ✓
+        #   用户原话："「小地图定位」的来源、黄点跟踪参数挪到寻路配置最上方"✓）——
+        #   控件的**定义也跟着走了** ✓（别在这儿再建一个 ✗ 见那张卡里的长注释：
+        #   "布局借来借去会让 combo 丢父 ⇒ `mapTo` 访问违例崩进程"✓）。
 
         # ---- 「坐标系偏移」(x, y)：算出来的世界坐标**加上**它（2026-09-26 用户要求）----
         # 单独一行（docs/UI规范.md §4：一行只放一个参数组）；按**地图 id + 来源**存在
@@ -699,7 +774,11 @@ class RoutePanel(QWidget):
         #   行3「漏检怎么办」：沿用窗口 / 外推上限
         #   行4「怎么搜、怎么判噪声」：搜索半径 / 跳变上限
         # 四个都是"这一帧的黄点要不要信"：小 → 反应快、抗噪差；大 → 稳、但会跟丢。
-        # 存 config/live.yaml（和「来源」「框选」一样：取决于本机画面与帧率，与地图无关）。
+        # ⚠ 存哪儿（2026-10-03 改）：**按地图 id 存**（`core/route_cfg.py` ✓
+        #   `datasets/map/<id>.route.json` ✓）—— 以前一律写 `config/live.yaml` ✗；
+        #   那份现在只是"**新图第一次打开时的播种值**"（用户选的 ① ✓）。
+        #   为什么该按图：面板尺寸/压缩比逐图不同 ⇒ "多大的跳变算噪声"本来就该逐图调 ✓。
+        #   （布局上也已搬进「寻路配置」卡顶部 ✓ 用户 2026-10-03 ✓ 见 `root_pf.insertLayout` ✓。）
         self._sp_track = {}          # 配置键名 → 输入框（键名以 mm.TRACK_KEYS 为准）
 
         def _track_spin(key, name, lo, hi, tip):
@@ -731,7 +810,8 @@ class RoutePanel(QWidget):
             "mmap_ghost_shift", "外推上限", 0, 100,
             "沿用期间位置最多往外推这么多像素（面板像素，1 px ≈ 16 世界像素）。"))
         row4.addStretch(1)
-        root.addLayout(row4)
+        # ⭐ **插进「寻路配置」卡**（用户 2026-10-03 ✓）：第 2 位 = 「来源」那行下面 ✓
+        root_pf.insertLayout(2, row4)
 
         # 行4：怎么搜、怎么判噪声（搜索半径 + 跳变上限）。**别往上面那行续加**。
         row5 = QHBoxLayout()
@@ -749,7 +829,9 @@ class RoutePanel(QWidget):
             "两拍之间位置跳超过这么多像素就当噪声：丢掉位置、下一拍重捕。\n"
             "调小 = 更不信突变（适合跟丢少、噪声多的画面）；0 = 不判跳变。"))
         row5.addStretch(1)
-        root.addLayout(row5)
+        # ⭐ 同上（第 3 位 = 「沿用/外推」那行下面 ✓ 两行**不许挤一行** —— UI 规范 §4 ✓
+        #   `t_track_rows_layout` 按坐标量着 ✓）
+        root_pf.insertLayout(3, row5)
 
         # ---- 世界坐标那行 ----
         # 紧挨着「小地图面板」那一组（原来「框选小地图」按钮就在这行上面；按钮
@@ -761,6 +843,19 @@ class RoutePanel(QWidget):
         self.lbl_mmap_world.setWordWrap(True)
         self.lbl_mmap_world.setVisible(False)
         root.addWidget(self.lbl_mmap_world)
+        #: ⭐⭐ 「**小地图链路快不快**」那一行（用户 2026-10-03 ✓ 原话："我能在路线识别页签→
+        #:   地形图看到验证结果吗？"）—— 以前这些数只有 `perf.log` 里有 ✗：
+        #:     `收帧 58.2 fps ・ 丢帧 12（本次 +3）・ 定位 0.5 ms`
+        #:   收帧 = `MiniMapClient.fps`（**真实**收帧率 ⇒ "A 机到底推了多少" ✓）；
+        #:   丢帧 = `n_drop` 增量（没被取走就被覆盖 ✓ 持续 >0 ⇒ 消费侧比推流慢 ✓）；
+        #:   定位 = 这一拍 `locator.update` 的耗时（`locate_ms` 的界面版 ✓）。
+        #:   ⚠ 它和上面那行「玩家世界坐标」**分工不同**：那行回答"**对不对**"（几何/标定 ✓），
+        #:     这行回答"**快不快/新不新**"（链路 ✓）—— 地形图那层叠加看的是前者 ✓。
+        #:   ⚠ 只在**收流**来源有意义（live 来源没有这条推流链 ⇒ 明说一句，别留旧数骗人 ✗）。
+        self.lbl_mmap_rate = QLabel()
+        self.lbl_mmap_rate.setStyleSheet("color: #80868b;")
+        self.lbl_mmap_rate.setWordWrap(True)
+        root.addWidget(self.lbl_mmap_rate)
         #: 玩家定位器：面板画面 → 世界坐标 → 在哪条段（perception.minimap）。
         #: **和实时线程各持一份**：那一份写进 WorldState（决策用），这一份只做读数；
         #: 共用一份会让两边的跨帧跟踪互相打乱（同一套跳变判据被两边各推一次）。
@@ -774,6 +869,16 @@ class RoutePanel(QWidget):
         #: 叠图**当前是按哪个显示区画的**（局部小地图：这一拍跟出来的那个 ✓）。
         #: 用来"**变了才重画**" —— 250ms 一拍，显示区没动就别白重画一遍 ✓（见 _tick_world）。
         self._ov_view = None
+        #: ⭐ 「小地图链路」那一行的两个账（见 `_refresh_mmap_rate` ✓）：
+        #:   `_rate_drop_last` = 上次记的累计丢帧（算**增量** ✓）；`_loc_ms_last` = 这一拍定位耗时。
+        self._rate_drop_last = None
+        self._loc_ms_last = None
+        #: ⭐ 「当前这张图」的小地图框选区域（2026-10-03 ✓）：`_apply_route_cfg` 灌进来；
+        #:   `None` = 还没灌过（没选图 / 老会话）⇒ `_mmap_crop()` 走**原来的口径**（项目优先 ✓）。
+        self._crop_override = None
+        #: ⭐ 「当前这张图」的小地图来源（2026-10-03 ✓）：`_apply_route_cfg` 灌进来；
+        #:   `None` = 还没灌过 ⇒ `_mmap_src()` 走**原来的口径**（读全局 live.yaml ✓）。
+        self._src_override = None
         self._world_timer = QTimer(self)
         self._world_timer.setInterval(250)      # 4 次/秒：够看，又不占主线程
         self._world_timer.timeout.connect(self._tick_world)
@@ -1329,6 +1434,17 @@ class RoutePanel(QWidget):
                 _tid = getattr(_ag, "_target_id", None)
                 if _st == "chase" and _tid is not None:
                     _dec += "（怪%d）" % _tid
+                # ⭐ **站桩 attack 的轮次提示**（用户 2026-10-02 ✓ 原话："给站桩 attack 的计数也
+                #   加上显示，显示在信息栏，例如 决策：attack (2次后补朝向)"）—— 文案由
+                #   `agent.station_turn_hint()` **一处**给 ✓（界面层只贴字符串，**别自己算轮次** ✗
+                #   —— 那是第二份口径 ✗）；没在站桩 / 判不出 ⇒ 空串 ⇒ 这行**一个字不变** ✓。
+                _hint = ""
+                try:
+                    _hint = str(_ag.station_turn_hint() or "")
+                except Exception:                 # noqa: BLE001 —— 少一行提示别把界面带崩 ✗
+                    _hint = ""
+                if _hint:
+                    _dec += " (%s)" % _hint
                 # ⭐ 当前区域配了 idle 回归 foothold ⇒「决策：idle → foothold#N」
                 #   （用户 2026-09-29 ✓；目标 id 由 `_idle_walk_beat` 每拍写 ✓ 一处口径）
                 _ifid = getattr(_ag, "_idle_fid", None)
@@ -1478,6 +1594,87 @@ class RoutePanel(QWidget):
     def _map_id(self):
         p = getattr(self, "project", None)
         return (p.get("map_id") or "").strip() if p is not None else ""
+
+    def _map_display_text(self):
+        """「当前地图」那一行的文字：`名字_id`（用户 2026-10-02 给的样式 ✓ 例：`森林迷宫III_105040303`）。
+
+        ⚠ **一处口径、两个显示**（本组顶部那行 + 「小地图定位」卡里的「当前地图」✓）——
+          同一件事写两种格式，人就会以为它是两个东西 ✗（`_refresh_current_map` 一起刷 ✓）。
+        ⚠ 名字来自 `core.wzexport.map_entry`（和"选地图"那份清单**同一份** ✓）；
+          清单读不出来就退回**只给 id** ✓（不编 ✗ 本套资源里几百张图没有名字 ✓）。
+        ⚠ 「没打开项目」和「项目里还没选地图」是两回事（以前一律写"没打开项目"，
+          项目明明开着却看到这句，像项目丢了 ✗）。
+        """
+        p = getattr(self, "project", None)
+        if p is None:
+            return "（没打开项目）"
+        mid = self._map_id()
+        if not mid:
+            return "（这个项目还没选地图）"
+        try:
+            from core import wzexport
+            m = wzexport.map_entry(mid)
+            return wzexport.short_label(mid, (m or {}).get("name", ""))
+        except Exception:                       # noqa: BLE001 —— 清单读不了也别说不出话 ✓
+            return mid
+
+    def _refresh_current_map(self):
+        """把「当前地图」**两处**只读文字一起刷（口径见 `_map_display_text` ✓）。
+
+        谁调：`_refresh_mmap()`（`bind` / `showEvent` 都会走到 ✓）、构造函数 ✓、
+        以及「手动更换」改完之后 ✓ —— 所以它**不需要**自己盯配置变化 ✓。
+        """
+        t = self._map_display_text()
+        for lbl in (getattr(self, "lbl_cur_map", None),
+                    getattr(self, "lbl_mmap", None)):
+            if lbl is not None:
+                lbl.setText(t)
+
+    def _on_manual_map_change(self):
+        """「手动更换」：就地改项目的**地图参数**（用户 2026-10-02 ✓）。
+
+        候选与写口都复用现成那份（`gui/map_picker.MapPickDialog` +
+        `core.wzexport.apply_map_choice` ✓ 和「模型训练 → 识别目标」那个下拉**同一个写口**）。
+
+        改完照 `bind()` 末尾那张"换图该刷新什么"的清单做一遍 ✓（漏一处就是"改了没生效"，
+        而那类最难查 ✗），并**推给实时线程**（`_push_mmap` ✓）—— 不然"实时还在用上一张图"
+        要等到重启才发现 ✗。
+        ⚠ 别忘 `map_changed` 信号：玩家的「定点休息」集合下拉是按**地图 id** 存的，
+          主窗口靠它重新推（同 `_bind_cards` 在切项目时那一步 ✓）。
+        """
+        from core import wzexport
+        from gui.map_picker import MapPickDialog
+
+        p = getattr(self, "project", None)
+        if p is None:
+            self._set_hint("先打开一个项目，才能换地图", "#d93025")
+            return
+        before = self._map_id()
+        dlg = MapPickDialog(before, parent=self)
+        if dlg.exec_() != dlg.Accepted:
+            return
+        mid = str(dlg.chosen or "").strip()
+        if not mid or mid == before:
+            return                                  # 没选/选了同一张 ⇒ 什么都不做 ✓
+        m = wzexport.apply_map_choice(p, mid)
+        if m is None:
+            # 只可能是清单变了（少了这张图）—— 说清、**一个字节都没写** ✓
+            self._set_hint("地图清单里找不到 %s —— 换个候选再试一次" % mid, "#d93025")
+            return
+        # ① 本面板：只读那两行 + 小地图定位那一套（来源/标定/框选状态都在里面 ✓）
+        self._refresh_mmap()
+        # ② 依赖"是哪张图"的那些：地形图、集合相关下拉、战斗区域（照 `bind()` 的清单 ✓）
+        self._refresh_map_image()
+        self._refresh_goto()
+        self._load_battle_zones_for_map(p)
+        # ⭐ 同一件事的第二处：**这张图**的「路线识别」配置也在此刻灌进来（用户 2026-10-03 ✓）
+        self._apply_route_cfg(mid)
+        # ③ 实时线程（在跑就当场生效 ✓ 见 live_panel.set_mmap）
+        self._push_mmap()
+        # ④ 别的面板（玩家的集合下拉 ✓ 按地图 id 存的那一批）
+        self.map_changed.emit(mid)
+        self._set_hint("当前地图已换成 %s ✓"
+                       % wzexport.short_label(mid, m.get("name", "")), "#0b8043")
 
     def zone_sets(self):
         """当前地图里**已注册的集合名**（给「定点休息」那两个下拉用）。
@@ -1788,12 +1985,156 @@ class RoutePanel(QWidget):
     # ---------------- 小地图框选（**按项目存**，2026-09-27 从设置搬回本页）----------------
 
     def _mmap_crop(self):
-        """本项目的小地图框选区域 `[x, y, w, h]`；取不到给 None。
+        """**当前这张图**的小地图框选区域 `[x, y, w, h]`；取不到给 None。
 
-        口径只有一处：`perception.minimap.crop_of`（**项目优先**，本项目没框过时回退老的
-        那份全局值 ✓）—— 这里别再写一遍"项目优先还是全局优先" ✗。
+        ⭐ 2026-10-03 起**先看这张图那份**（`datasets/map/<id>.route.json` ✓ 用户要求
+        "路线识别页签所有配置按地图 id 存"✓）⇒ 换图后不会再拿上一张图的框 ✗
+        （那正是用户 2026-09-27 在 B 机侧踩过的坑 ✓）。
+        没灌过（`_crop_override` 为 None：还没选图 / 老会话）⇒ 走**原来的口径**
+        `perception.minimap.crop_of`（**项目优先，回退老的那份全局值** ✓）—— 行为一字不变 ✓。
         """
+        if getattr(self, "_crop_override", None):
+            return list(self._crop_override)
         return mm.crop_of(getattr(self, "project", None), load_live())
+
+    # ---------------- ⭐ 「路线识别」配置按地图 id 存（用户 2026-10-03 ✓）----------------
+    # 口径与键清单见 `core/route_cfg.py` ✓：这批键（攀爬参数 / 移动重试 / 起跳距离 /
+    # 小地图框选 / 来源 / 黄点跟踪）从"按项目、全局"改成**按地图 id**；而 `project.yaml`
+    # （6 个参数 + `mmap_crop`）与 `config/live.yaml`（`mmap_src` / `mmap_track`）
+    # **留着当"新图第一次打开时的播种值"** ✓（用户 2026-10-03 选的 ✓）。
+    # ⚠ 落盘时机**不在这里逐个 handler 挂** ✗：`main_window` 注册的保存钩子会在**任何**
+    #   `settings.save()` 之后顺手调 `_save_route_cfg()` ✓（一处 ✓ 以后加控件不会漏 ✓）。
+    def _route_cfg_values(self):
+        """面板上按图存的那 9 个键的当前值 → `(map_id, vals)`。"""
+        from core import route_cfg
+        vals = {}
+        for k in route_cfg.PARAM_KEYS:
+            v = getattr(settings, k, None)
+            if v is not None:
+                vals[k] = v
+        crop = self._mmap_crop()
+        if crop:
+            vals["mmap_crop"] = [int(v) for v in crop]
+        vals["mmap_src"] = self._mmap_src()
+        vals["mmap_track"] = dict(getattr(self, "_mmap_track", None) or {})
+        return self._map_id(), vals
+
+    def _save_route_cfg(self):
+        """把当前这 9 个键写回**当前这张图**那份（没选图 ⇒ 一个字都不写 ✓ 别瞎存 ✗）。"""
+        from core import route_cfg
+        mid, vals = self._route_cfg_values()
+        if not mid:
+            return None
+        try:
+            return route_cfg.save(mid, vals)
+        except Exception:                       # noqa: BLE001 —— 存不下不该炸界面 ✗
+            return None
+
+    def _seed_route_cfg(self):
+        """这张图**第一次打开**时的播种值（用户 2026-10-03 选的 ① ✓）—— 来源就是**老家**：
+          · 6 个参数 ⇒ `project.yaml` 的 `decision` 段（那份空 ⇒ 用 settings 当前值 = 默认 ✓）；
+          · `mmap_crop` ⇒ `project.yaml` 顶层（它的老家 ✓）；
+          · `mmap_src` / `mmap_track` ⇒ `config/live.yaml`（它们的另一个老家 ✓）。
+        ⚠ **别拿 settings 当前值当那 6 个的来源** ✗：手动换图那一刻，settings 里装的是
+          **上一张图**的值 ⇒ 那样就把 A 图的参数种给 B 图 ✗（正是本次要治的"换图串参数"✓）。
+        """
+        from core import route_cfg
+        p = getattr(self, "project", None)
+        dec = {}
+        if p is not None and isinstance(p.get("decision"), dict):
+            dec = p.get("decision")
+        out = {}
+        for k in route_cfg.PARAM_KEYS:
+            if k in dec:
+                out[k] = dec[k]
+            else:
+                v = getattr(settings, k, None)
+                if v is not None:
+                    out[k] = v
+        crop = p.get("mmap_crop") if p is not None else None
+        if isinstance(crop, (list, tuple)) and len(crop) == 4:
+            out["mmap_crop"] = [int(v) for v in crop]
+        live = load_live() or {}
+        if live.get("mmap_src"):
+            out["mmap_src"] = live.get("mmap_src")
+        if isinstance(live.get("mmap_track"), dict):
+            out["mmap_track"] = dict(live.get("mmap_track"))
+        return out
+
+    def _apply_route_cfg(self, mid=None):
+        """切图 / 换项目：把**这张图**那份灌进来；文件不存在 ⇒ **先播种再灌** ✓。
+
+        灌两拨：6 个参数交给 `settings.apply_route_cfg`（钳位/容错在**那一处** ✓）；
+        `mmap_crop` / `mmap_src` / `mmap_track` 是本页控件的事 ⇒ 在这里灌（**一处** ✓）。
+        ⚠ `mmap_src` 走 `setCurrentIndex` —— 会触发它自己的 handler（重连收流客户端、
+          刷状态 ✓ 那正是换图需要的 ✓）；`mmap_track` 那排用 **blockSignals** 免得逐格
+          触发一串下行（值最后一起 `_push_mmap` 推 ✓）。
+        """
+        from core import route_cfg
+        mid = mid or self._map_id()
+        if not mid:
+            return 0
+        vals = route_cfg.load(mid)
+        if vals is None:                        # 这张图还没配过 ⇒ 播种
+            # ⚠⚠ **只灌值，绝不落盘** ✗（2026-10-03 现场踩了 ✓）：切图 / 换项目是**只读**
+            #   动作 —— 一旦在这里写文件，任何"跑一遍自检 / 探针"都会把**当时的假值**
+            #   （用例 mock 的 live.yaml ✓）写成真实配置 ✗✗ ⇒ 之后所有用例都被它污染
+            #   （实测：3 个 `<id>.route.json` 被写出来，其中 `climb_retry_delay_s=1.0`
+            #   把"换项目刚绑好的 3.0"顶掉 ⇒ `selftest_minimap` 当场红 ✓ 见
+            #   "bind 里的 setValue 又写回配置了" 那条断言 ✓）。
+            #   为什么不写也**不影响**功能：播种源就是"老家"（`project.yaml` / `live.yaml` ✓），
+            #   而它们会被用户的每次改动同步更新 ✓ ⇒ 下次读不到文件时再播一次，结果**一样** ✓；
+            #   真正落盘的时刻只有一个 —— 用户**改了**任何一个参数（走 `_save_route_cfg` ✓
+            #   经保存钩子 / 三个写口 ✓），那时整份 9 键一起写 ✓。
+            vals = self._seed_route_cfg()
+        n = settings.apply_route_cfg(vals)
+        _crop = vals.get("mmap_crop")
+        self._crop_override = ([int(v) for v in _crop]
+                              if isinstance(_crop, (list, tuple)) and len(_crop) == 4
+                              else None)
+        # ② 来源：**只摆控件，绝不触发它的 handler** ✗（用户 2026-10-03 这条崩过 ✓ 见下）
+        #    ✗ 老写法 `self.cmb_mmap_src.setCurrentIndex(...)`（**没挡信号**）=
+        #      在 `bind()` 跑到一半时**伪装成"用户手动换了来源"** ⇒ 钻进
+        #      `_on_mmap_src → _refresh_mmap（会 load 标定 / 重建 locator / 推到实时）`
+        #      整条链 ⇒ 现场实测**进程硬崩**（`0xC0000409` fail-fast ✗ 连 traceback 都没有，
+        #      是靠"逐步打成空操作"二分才定到就是这一句 ✓✗）。
+        #    ⇒ 程序性恢复配置**不该走"用户交互"那条路**：这里只摆值 + 记覆盖值 ✓，
+        #      副作用（收掉本页收流客户端 ✓ / 刷状态 ✓）**由流程显式做**
+        #      （`bind()` 末尾本来就会 `_refresh_mmap()` ✓，而它现在读的是覆盖值 ✓）。
+        #    ⚠ 也**不写 `config/live.yaml`** —— 那份是"新图的播种值"（用户选的 ① ✓），
+        #      切图不该动它 ✗（只有用户自己动下拉时才更新 ✓ 见 `_on_mmap_src` ✓）。
+        src = vals.get("mmap_src")
+        self._src_override = src or None
+        _cmb = self.cmb_mmap_src
+        _want = _cmb.findData(src) if src else -1
+        if _want >= 0 and _want != _cmb.currentIndex():
+            _cmb.blockSignals(True)
+            try:
+                _cmb.setCurrentIndex(_want)
+            finally:
+                _cmb.blockSignals(False)
+            # 来源换了 ⇒ 本页那条收流客户端要收掉（形状同 `_on_mmap_src` ✓ 下次按需重连）
+            _cli = getattr(self, "_mmap_cli", None)
+            if _cli is not None:
+                try:
+                    _cli.stop()
+                except Exception:                   # noqa: BLE001
+                    pass
+                self._mmap_cli = None
+        trk = vals.get("mmap_track")
+        if isinstance(trk, dict):
+            for k, sp in getattr(self, "_sp_track", {}).items():
+                if k not in trk:
+                    continue
+                sp.blockSignals(True)
+                try:
+                    sp.setValue(float(trk[k]))
+                except (TypeError, ValueError):  # 坏值 ⇒ 保留控件现值（不猜 ✗）
+                    pass
+                sp.blockSignals(False)
+            self._mmap_track = dict(trk)
+        self._refresh_crop_status()
+        return n
 
     def _refresh_crop_status(self):
         """按钮右边那行「本项目：…」—— 把三个状态**分开说清楚**（别都说成"没框" ✗）：
@@ -1853,6 +2194,10 @@ class RoutePanel(QWidget):
         if rect is None:
             return                  # 取消（<4px 的框在框选里就按误点丢掉了）
         p.set("mmap_crop", [int(v) for v in rect], save=True)
+        # ⭐ 同时写进**这张图**那份（2026-10-03 ✓）：`project.yaml` 那份从此只是"新图的
+        #   播种值"✓ ⇒ 内存里那个覆盖值也要跟着更新（本页 `_mmap_crop()` 读的就是它 ✓）。
+        self._crop_override = [int(v) for v in rect]
+        self._save_route_cfg()
         self._refresh_crop_status()
         # 立刻生效：实时线程拿新框去裁面板（`_push_mmap`）+ 叠图那一层按新位置重画。
         # 以前这两步靠"通知设置窗"绕一圈（`overlay_changed`），现在按钮就在本页 ⇒ 直接叫 ✓。
@@ -2085,12 +2430,39 @@ class RoutePanel(QWidget):
     # ---------------- 小地图来源（面板画面从哪来）----------------
 
     def _mmap_src(self):
-        """当前来源（config/live.yaml 的 `mmap_src`，默认收流）。
+        """**当前这张图**的小地图来源（没灌过 ⇒ 回退全局 `config/live.yaml` ✓）。
 
-        存 B 机本地配置、而不是每张图的标定里：它取决于本机的推流/画面几何，
-        和"这是哪张地图"无关（切项目不该跟着变）。
+        ⭐ 2026-10-03 起**按地图 id 存**（用户要求："路线识别页签所有配置按地图 id 存" ✓）：
+        以前一律读 live.yaml ✗ ⇒ 换图后来源跟着上一条走的（而**标定是按来源分开存的** ⇒
+        来源错 = 读错那份几何、世界坐标整体错 ✗ 见 `core/mapdata.calib_path` ✓）。
+
+        ⚠ 为什么用"覆盖值"而不是**改写** live.yaml ✗：那份是**新图的播种值**
+          （用户 2026-10-03 选的 ① ✓）⇒ **切图不该动它** ✓ —— 只有用户自己动那个下拉时
+          才更新它（见 `_on_mmap_src` ✓）。
         """
+        if getattr(self, "_src_override", None):
+            return self._src_override
         return mm.live_src(load_live())     # 口径只有一处（`perception.minimap.live_src` ✓）
+
+    def _track_now(self):
+        """**当前这张图**的黄点跟踪参数（没灌过 ⇒ 回退全局 `config/live.yaml` ✓）。
+
+        ⭐ 2026-10-03 起按地图 id 存（见 `core/route_cfg.py`）：以前三处一律
+        `mm.track_params(load_live())` ✗ ⇒ 换图后还拿上一张图的跟踪参数（面板尺寸/压缩
+        都不一样 ⇒ 认黄点的阈值也该不一样 ✓）。
+
+        ⚠ "缺哪个键补默认"的口径**仍在 `mm.track_params` 一处** ✓：这里只决定**读哪一份**
+          + **按它的键清单过滤**（这张图那份多写的键忽略 ✗、少的键用默认 ✓）。
+        """
+        base = mm.track_params(load_live())
+        mine = getattr(self, "_mmap_track", None)
+        if not mine:
+            return base
+        out = dict(base)
+        for k, v in mine.items():
+            if k in out:
+                out[k] = v
+        return out
 
     def _on_world_offset(self, _v=None):
         """改了「坐标系偏移」⇒ 写进**这张图的标定文件**（按地图 id + 来源，2026-09-26 用户定）。
@@ -2135,7 +2507,10 @@ class RoutePanel(QWidget):
         不会再饿死别人，但没必要），下次切回来按时会重连。
         """
         src = self.cmb_mmap_src.currentData()
-        update_live(mmap_src=src)
+        update_live(mmap_src=src)      # 全局那份从此只是"新图的播种值"（2026-10-03 ✓）
+        # ⚠ 覆盖值要在**存之前**设（`_route_cfg_values` 读的就是 `_mmap_src()` ✓ 见 `_mmap_src`）
+        self._src_override = src
+        self._save_route_cfg()         # ⭐ 同时写进**这张图**那份 ✓（用户要求按图存 ✓）
         cli = getattr(self, "_mmap_cli", None)
         if cli is not None:
             try:
@@ -2278,15 +2653,11 @@ class RoutePanel(QWidget):
         # 裁面板 ✓）。**状态行这里也要跟着报**（框没框 / 是"本项目框的"还是"暂用老的" ✓）。
         self._refresh_crop_status()
 
-        # 「没打开项目」和「项目里还没选地图」是两回事 ——
-        # 以前一律写「（没打开项目）」，项目明明开着却看到这句，像项目丢了。
-        # （地图是在①里选的；选完这里靠 showEvent 重读，见下面。）
-        if p is None:
-            self.lbl_mmap.setText("（没打开项目）")
-        elif not mid:
-            self.lbl_mmap.setText("（这个项目还没选地图）")
-        else:
-            self.lbl_mmap.setText(mid)
+        # 「当前地图」那两行只读文字（本组顶部那行 + 本卡里那个「当前地图」）——
+        # **一处口径一处写**（`_map_display_text` ✓ 2026-10-02 起带地图名，例
+        # `森林迷宫III_105040303`）；「没打开项目」和「项目里还没选地图」是两回事
+        # （以前一律写"没打开项目"，项目明明开着却看到这句，像项目丢了 ✗）。
+        self._refresh_current_map()
 
         self.cmb_mmap_mode.setEnabled(bool(mid))
         self.btn_mmap_calib.setEnabled(bool(mid))
@@ -2378,7 +2749,8 @@ class RoutePanel(QWidget):
         # 「画什么、往哪画、没画的话卡在哪一步」。
         self._refresh_overlay()
         # 跟踪参数回填（blockSignals —— 回填别把配置又写一遍）
-        trk = mm.track_params(load_live())
+        # ⚠ 2026-10-03：读**这张图**那份（`_track_now` ✓ 按地图 id 存），不再是全局 live.yaml ✗
+        trk = self._track_now()
         for k, sp in self._sp_track.items():
             sp.blockSignals(True)
             sp.setValue(int(round(trk[k])))
@@ -2445,7 +2817,9 @@ class RoutePanel(QWidget):
         两边各持一份（见 _tick_world 的说明），参数必须一起同步。
         """
         vals = self._mmap_track_values()
-        update_live(**vals)
+        update_live(**vals)            # 全局那份从此只是"新图的播种值"（2026-10-03 ✓）
+        self._mmap_track = dict(vals)  # 本页那份（`_route_cfg_values` 读它 ✓）
+        self._save_route_cfg()         # ⭐ 同时写进**这张图**那份 ✓
         self._locator.use_track_config(vals)
         self._push_mmap()
 
@@ -2458,13 +2832,14 @@ class RoutePanel(QWidget):
         lp = getattr(self, "live_panel", None)
         if lp is None or not hasattr(lp, "set_mmap"):
             return
-        cfg = load_live()
-        # 框选区域**按项目**取（`crop_of`：本项目 → 没框过时回退老的那份 ✓）；
-        # 来源/容差仍是本机全局（`live.yaml` ✓）。
+        # ⭐ 2026-10-03：三样**全按地图 id**取（用户要求 ✓ 见 `core/route_cfg.py`）——
+        #   框选区域 `_mmap_crop()` ✓、来源 `_mmap_src()` ✓、跟踪参数 `_track_now()` ✓；
+        #   每一样都是"这张图那份 → 没灌过才回退全局（`project.yaml` / `live.yaml` ✓）"。
+        #   （不再需要 `load_live()` 了 ✗ —— 别把全局那份又读回来拼进来 ✓。）
         lp.set_mmap(map_id=self._map_id() or "",
                     src=self._mmap_src(),
                     crop=self._mmap_crop(),
-                    track=mm.track_params(cfg))
+                    track=self._track_now())
 
     def _refresh_world(self):
         """世界坐标那行的显隐与节拍：只在勾上「叠地形图」时才跑。"""
@@ -2490,6 +2865,42 @@ class RoutePanel(QWidget):
             if self._world_timer.isActive():
                 self._world_timer.stop()
             self._world_note = ""
+
+    def _refresh_mmap_rate(self, src):
+        """⭐ 「**小地图链路快不快**」那一行（用户 2026-10-03 ✓）—— 口径见 `lbl_mmap_rate` ✓。
+
+        为什么要有它：本轮把"小地图高帧率更新"改完之后（定位挪去高频回路 ✓ 推流默认
+        60fps ✓ 见 SKILL 170），验收数只在 `perf.log` 里 ✗ —— 而**这一页本来就是看链路
+        的地方**（它自己就有一条 `MiniMapClient` ✓ `_stream_client` ✓）⇒ 把数摆在这儿 ✓。
+        ⚠ 只报**事实**，不猜：没连上就说没连上；来源=live 就说明"没有这一路" ✓。
+        """
+        if str(src) != mm.SRC_STREAM:
+            self.lbl_mmap_rate.setText("链路：来源＝实时画面（没有小地图推流这一路，"
+                                       "帧率看「实时」页那行）")
+            return
+        cli = getattr(self, "_mmap_cli", None)
+        if cli is None or not bool(getattr(cli, "connected", False)):
+            self.lbl_mmap_rate.setText("链路：小地图推流还没连上（A 机那一路起了吗？）")
+            return
+        try:
+            fps = float(cli.fps)
+        except Exception:                       # noqa: BLE001 —— 读数而已，不许崩 ✗
+            fps = 0.0
+        n_drop = int(getattr(cli, "n_drop", 0) or 0)
+        n_recv = int(getattr(cli, "n_recv", 0) or 0)
+        _tot = n_recv + n_drop
+        pct = (100.0 * n_drop / _tot) if _tot else 0.0
+        ms = "—" if self._loc_ms_last is None else "%.2f ms" % self._loc_ms_last
+        self.lbl_mmap_rate.setText(
+            "链路：收帧 %5.1f fps ・ 丢帧 %d/%d（%.1f%%）・ 定位 %s"
+            % (fps, n_drop, _tot, pct, ms))
+        self.lbl_mmap_rate.setToolTip(
+            "收帧 = A 机**真正推出来**的帧率（`MiniMapClient.fps`，不是配置里那个数）；\n"
+            "丢帧 = 我们**没来得及取走**就被下一帧覆盖的次数（占收到总数的比例）——\n"
+            "  一直大于百分之几 ⇒ 消费侧比推流慢 ⇒ 该把定位/取用再提快一点；\n"
+            "定位 = 这一拍 `PlayerLocator.update` 的耗时（与 `perf.log` 的 `locate_ms` 同源）。\n\n"
+            "⚠ 这一行回答「**快不快/新不新**」；上面那行「玩家世界坐标」回答「**对不对**」\n"
+            "（几何/标定），地形图里那层叠加也是用来看「对不对」的 ✓。")
 
     def _tick_world(self):
         """算一次玩家世界坐标并显示（只在这行可见时跑）。
@@ -2528,6 +2939,10 @@ class RoutePanel(QWidget):
         # 黄点更糊 —— 跟"选收流"的初衷正好相反。实时线程那份（`live_thread`）一直是对的，
         # 这里照它分一次流。
         src = self._mmap_src()
+        # ⭐ 「链路快不快」那一行**先刷**（用户 2026-10-03 ✓）：它用**上一拍**的定位耗时 ✓，
+        #   而且下面有好几条早退（连不上 / 没框选 / 认不出黄点 ✓）—— 那些时候这一行**更该**
+        #   说清链路的状况 ✓（早退之后再刷就永远是上一句话了 ✗）。
+        self._refresh_mmap_rate(src)
         panel = None
         if src == mm.SRC_STREAM:
             cli = self._stream_client()
@@ -2560,8 +2975,12 @@ class RoutePanel(QWidget):
         loc = self._locator.load(mid)
         # 和实时线程**同一口径**：脚下 foothold 的 x 容差取设置里的「坐标对齐误差范围」
         # （站平台边上读数会偏出边界几像素 —— 见 `core.mapdata.foothold_below` 的 xtol 说明）
+        # ⭐ 这一拍定位花了多久（`_refresh_mmap_rate` 下一拍会把它显示出来 ✓）——
+        #   与 `perf.log` 的 `locate_ms` 同一件事，只是摆在界面上 ✓（用户 2026-10-03 ✓）。
+        _t_loc0 = time.perf_counter()
         r = loc.update(panel, src=src,
                        fh_xtol=int(getattr(settings, "align_tol_px", 0) or 0))
+        self._loc_ms_last = (time.perf_counter() - _t_loc0) * 1000.0
         # ⭐⭐ **「显示区跟住了没有」要先取出来**（用户 2026-09-29："实时小地图的位置没有跟着
         #   我的移动变化"✗ 的直接原因之一）：
         #   它和"认不认得出黄点"是**两件事** —— 面板随人滚动 ⇒ 这一拍显示的底图范围变了没，
@@ -3197,6 +3616,11 @@ class RoutePanel(QWidget):
         # 「路线规划」的战斗区域**按地图 id 存** ⇒ 换图时从这里读进 settings（必要时先从旧
         #   project.yaml 迁移一次 ✓）—— 它内部会顺手重画摘要 ✓。
         self._load_battle_zones_for_map(project)
+        # ⭐⭐ 「路线识别」那批配置**也按地图 id 存**（用户 2026-10-03 ✓ 见 `core/route_cfg.py`）：
+        #   换项目/换图时把**这张图**那份灌进来；文件不存在 ⇒ 从老家**播种**一份（口径 ① ✓）。
+        #   ⚠ 必须排在 `_load_battle_zones_for_map` **之后**（两者都是"按图"的 ✓ 顺序无依赖 ✓
+        #     但一起做、一起读文件更好排查 ✓）；它内部会顺带刷「小地图定位」那几行 ✓。
+        self._apply_route_cfg(self._map_id())
 
     def showEvent(self, e):
         """切到「路线识别」页签时重读一次。

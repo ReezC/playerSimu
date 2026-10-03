@@ -35,6 +35,24 @@ LEGACY_REGION_FILE = ROOT / "config" / "minimap_region.json"
 #: 「几个像素的区域推出去，B 机认不出是哪个地图」。
 MIN_WH = 20
 
+#: ⭐ **"现在该推哪张图"**（用户 2026-10-02 ✓）—— **A 机本地**的一份小状态：
+#: `config/minimap_current.json` = `{"map_id": ..., "by": "B机"/"手动", "updated": ...}`。
+#:
+#: 为什么要有它：用户 2026-10-02 定「**当前是哪张图**由 B 机推（A 机界面不许自己选）」，
+#: 而 A 机的框选（部署台「框选…」）**必须知道这次框的是哪张图** ⇒ 得有个地方**记着
+#: 最近一次 B 机告知的 id**：
+#:   · B 机发 `MAP <id>` ⇒ `tools/minimap_push` 处理成功时写它（`set_current` ✓）；
+#:   · 部署台卡片读它 ⇒ 显示「当前地图」、框选就存到这张图名下 ✓；
+#:   · 重启推流（没带 `--map-id` 时）也读它 ⇒ 起来就还是上一张图 ✓。
+#:
+#: ⚠ **A 机本地、绝不同步**（用户 2026-10-02 原话："地图与框选数据另存一份文件，仅 A 机本地
+#:   储存"✓）：它说的是"**这台机器的屏幕**"（分辨率/窗口位置各机不同）⇒ 进了 `LOCAL`
+#:   清单（`tools/config_sync.py`）并被 `.gitignore` 挡住 ✓。
+#: ⚠ 它**不是**区域库：区域还是每图一份（`DIR/<id>.json` ✓）；这份只回答"现在用哪张"。
+#: ⚠ 放在 `DIR` **之外**是故意的：`list_ids()` 是 `DIR.glob("*.json")` ⇒ 塞进那个目录会
+#:   被当成一张叫 `_current` 的图 ✗。
+CURRENT_FILE = ROOT / "config" / "minimap_current.json"
+
 
 # ══════════════════════════════════════════════════════════════
 # 【A/B 共用】控制协议
@@ -178,8 +196,9 @@ def _clean(d, map_id):
 def load(map_id):
     """读这张图的区域 → dict | None（**None = 这张图还没框过**，不是"一块都没配"）。
 
-    ⚠ 与 `resolve` 的分工：这里**不做兜底**。想知道"这张图没有时能不能先用老的那份"，
-    用 `resolve` —— 兜底规则只有一处 ✓（`crop_of` 就是这么被钉住的）。
+    ⚠ **这里不做任何兜底**：想知道"现在到底推哪一块"，用 `startup_region()` ——
+    兜底规则（老单值、以及"当前图没框过就别顶替"）**只有那一处** ✓
+    （口径同 B 机侧 `perception.minimap.crop_of` 的老兜底 ✓）。
     """
     mid = str(map_id or "").strip()
     if not mid:
@@ -216,17 +235,6 @@ def legacy():
     if isinstance(raw, dict):
         d["zoom"] = (raw.get("zoom") or 1)
     return _clean(d, "")
-
-
-def resolve(map_id):
-    """这张图**实际该用**的区域：`load(map_id)` → 没有才回退老的 `legacy()`。
-
-    和 `perception.minimap.crop_of` 同一套三条口径（那边有自检钉着 ✓）：
-      · 本图框过     ⇒ 用**本图**的（哪怕老的那份还在 ✓）；
-      · 本图没框过   ⇒ 用老的那份兜底（升级后不用把图全重框一遍 ✓）；
-      · 都没有       ⇒ **None**（界面就说"还没框"，不许编一个数 ✗）。
-    """
-    return load(map_id) or legacy()
 
 
 def save(map_id, x, y, w, h, zoom=1, note=""):
@@ -268,3 +276,90 @@ def ids_including_legacy():
     if legacy() is not None:
         out = out + [""]
     return out
+
+
+# ══════════════════════════════════════════════════════════════
+# 【A 机】"现在该推哪张图"（B 机推来的那个 id，记在本机）
+# ══════════════════════════════════════════════════════════════
+
+def current():
+    """本机记着的"当前图" → `{"map_id", "by", "updated"}` | `None`（还没人告诉过）。
+
+    ⚠ **只是一份记忆**，不是区域：真正的框在 `path_of(map_id)` 那份里 ✓
+      （这里回答的是"框选该存给谁 / 启动该推哪张"✓）。
+    """
+    if not CURRENT_FILE.exists():
+        return None
+    try:
+        raw = json.loads(CURRENT_FILE.read_text(encoding="utf-8"))
+    except Exception:                                        # noqa: BLE001
+        return None                       # 文件坏了 = 没记过（**不猜** ✓）
+    if not isinstance(raw, dict):
+        return None
+    mid = str(raw.get("map_id") or "").strip()
+    if not mid:
+        return None
+    return {"map_id": mid,
+            "by": str(raw.get("by") or ""),
+            "updated": str(raw.get("updated") or "")}
+
+
+def set_current(map_id, by=""):
+    """记下"现在该推这张图"（`by` = 谁说的：`"B机"` / `"手动"` ✓）。
+
+    `map_id` 空 ⇒ **删掉这份记忆**（= 回到"还不知道是哪张图"✓，别留一个半截 id ✗）。
+    """
+    mid = str(map_id or "").strip()
+    if not mid:
+        return clear_current()
+    body = {"map_id": mid, "by": str(by or ""),
+            "updated": time.strftime("%Y-%m-%d %H:%M:%S")}
+    CURRENT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CURRENT_FILE.write_text(json.dumps(body, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+    return CURRENT_FILE
+
+
+def clear_current():
+    """忘掉"当前图"。没记过返回 False。"""
+    if not CURRENT_FILE.exists():
+        return False
+    CURRENT_FILE.unlink()
+    return True
+
+
+def startup_region(map_id=None):
+    """**推流启动时到底推哪一块** → `(mid, box, zoom, src)` | `None`（一块都定不下来）。
+
+    优先级**只有这一处**（`tools/minimap_push` 与部署台自检**共用** ✓ 别各写一份 ✗）：
+      ① 命令行给了 `--map-id` ⇒ 用**那张图**的框（`load` ✓ 查不到 ⇒ 整条作废 ✗ 别退到别人的框 ✗）；
+      ② 没给 ⇒ 用**本机记着的当前图**（`current()` ✓ 那是 B 机最近一次推来的 ✓）；
+         ⚠ **当前图明确、可它还没框过 ⇒ 也不退老单值**（`None` ✓）：老那份是**另一张图**的
+           屏幕坐标 ⇒ 顶上就是"推错一块画面"✗（B 机那边看着像寻路坏了 ✓ 最难查的一类）。
+      ③ 前两条都没有（**本机还没任何 id 记忆**）⇒ 用**老的单值兜底**（`legacy()` ✓ 升级后
+         不用重框一遍 ✓ —— 口径同 B 机侧 `perception.minimap.crop_of` 的老兜底 ✓）；
+      ④ 都没有 ⇒ `None` ⇒ 调用方**照旧起监听**、等 B 机 `MAP` 给图（用户 2026-10-02 的
+         "只靠 B 机推"就是这么闭环的 ✓ —— 没框过也能先把服务开起来 ✓）。
+
+    `src` 说明这块框是从哪来的（打进日志/界面用 ✓，排查时一眼看得出"它为什么推这块"）：
+    `"map-id"` / `"当前图"` / `"老单值"`。
+    """
+    mid = str(map_id or "").strip()
+    if mid:
+        got = load(mid)
+        if got:
+            return (got["map_id"], [got["x"], got["y"], got["w"], got["h"]],
+                    int(got["zoom"]), "map-id")
+        return None                       # 点名了却没有 ⇒ 别拿别的图顶上 ✗
+    cur = current()
+    if cur:
+        got = load(cur["map_id"])
+        if got:
+            return (got["map_id"], [got["x"], got["y"], got["w"], got["h"]],
+                    int(got["zoom"]), "当前图")
+        return None                       # 当前图明确了却没框过 ⇒ 不回退老单值（见上面 ② ✓）
+    old = legacy()
+    if old:
+        return ("", [old["x"], old["y"], old["w"], old["h"]],
+                int(old["zoom"]), "老单值")
+    return None

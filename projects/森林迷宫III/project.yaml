@@ -50,11 +50,14 @@ decision:
   min_attack_dist: 0
   attack_up_dist: 30
   attack_down_dist: 22
-  chase_jump_enabled: false
+  chase_jump_enabled: true
   chase_jump_min: -10
   chase_jump_max: 5
   chase_jump_dash_ms: 100
-  mouse_speed: 1.1999999999999995
+  chase_jump_edge_guard_enabled: true
+  chase_jump_edge_guard_px: 150
+  station_turn_interval_ms: 1000
+  mouse_speed: 0.9999999999999999
   evade_type: jump
   jump_interval: 0
   jump_random_prob: 0.1
@@ -92,7 +95,7 @@ decision:
     right: right
     up: up
     down: down
-    attack: t
+    attack: s
     jump: D
     hp_pot: g
     mp_pot: null
@@ -102,11 +105,11 @@ decision:
   target_cd:
   - 1000
   - 2500
-  input_device: local
+  input_device: remote
   attack_cd: 300
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 500
-  turn_output_delay_ms: 300
+  turn_output_delay_ms: 200
   player_track_jump: 200
   player_foot_offset_px: -25
   player_box_min_area_pct: 0.0
@@ -122,7 +125,16 @@ decision:
   - 0.973958
   - 0.120791
   - 0.019531
-  probe_calib: {}
+  probe_calib:
+    x_ratio: 0.0739385065885798
+    y_ratio: 0.02734375
+    cell_ratio: 0.01171303074670571
+    gap_ratio: 0.0016471449487554905
+    bits: 40
+    frame:
+    - 1366
+    - 768
+    solved_at: '2026-10-03 00:30:33'
   hp_color: *id001
   mp_color: *id002
   hp_threshold: 39
@@ -139,6 +151,9 @@ decision:
   vision_center: false
   vision_off_x: 0
   vision_off_y: 0
+  big_mob_enabled: true
+  big_mob_ratio: 1.5
+  big_mob_range_px: 1000.0
   sweep_turn_cd: 500
   back_range: 150
   sweep_edge_turn_px: 100
@@ -149,36 +164,13 @@ decision:
   climb_align_near_px: 1
   climb_retry_delay_s: 1.0
   climb_retry_delay_inc_s: 3.0
-  goto_timeout_s: 20.0
+  goto_timeout_s: 15.0
   chase_goto_max_s: 5.0
   goto_timeout_key: 表情_无语
   disable_chase_pathfinding: true
   jump_start_px: 80
   move_retry_ms: 350
-  battle_zones:
-  - set: 底层
-    cd_s: 3.0
-    idle_footholds:
-    - '37'
-    - '42'
-    - '41'
-    fight_max_s: 30.0
-    fight_dst: 二楼
-    can_fight: true
-  - set: 二楼
-    cd_s: 3.0
-    idle_footholds:
-    - '29'
-    - '19'
-    - '30'
-    - 29 19 30
-    fight_max_s: 45.0
-    fight_dst: 底层
-    can_fight: true
-  battle_zone_sets:
-  - 底层
-  - 二楼
-  debounce_conf: 0.5
+  debounce_conf: 0.3
   debounce_ms: 2000
   custom_timers:
   - name: 自动喂宠
@@ -209,6 +201,8 @@ decision:
     interval:
     - 5.0
     - 10.0
+    paused: true
+    paused_left: 502.4470833913947
   facing_timeout_min: 0.0
   player_lost_timeout_min: 3.0
   resetall_interval: 30
@@ -264,7 +258,7 @@ decision:
     key: 普攻
   - type: up
     key: 普攻
-  anti_afk_rest_min: 4.5
+  anti_afk_rest_min: 3.5
   anti_afk_rest_max: 5.5
   anti_afk_spot_set: ''
   anti_afk_spot_seq: []

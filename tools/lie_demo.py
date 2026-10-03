@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""测谎**效果演示窗**（2026-09-30 用户要求 ✓ 原话："做一个窗口程序，可以选择视频文件
+"""测谎**效果演示窗**（2026-09-30 用户要求 ✓ 原话：「做一个窗口程序，可以选择视频文件
 播放，播放的时候实时显示效果"；前身是"红点代表鼠标"的定视频演示 ✓）。
 
 窗口能做什么：
-  · **选择视频文件**（工具栏「选择视频…」✓ 默认开在 `datasets/liedetectorVideo`）；
+  · **选择视频文件**（工具栏"选择视频…"✓ 默认开在 `datasets/liedetectorVideo`）；
   · **播放 / 暂停**（空格也行 ✓）、**速度** 0.25~2×、**循环**；
-  · **检测器开关**（关掉 = 纯残差路线 M2a，开着 = 加检测复活通道 M2b ✓ 好对比）；
+  · **检测器开关**（关掉 = 纯残差路线 M2a；开着 = 加检测通道 M2b：建档种子 / 校验 / 吸附 ✓
+    ⚠ **复活已于 2026-10-02 停用** ✓ 好对比）；
   · 打开后**先预热检测**（进度显示在状态栏 ✓ 别让人对着黑屏等），然后自动开播 ✓；
   · 画面上：🔴 **大红点（带白圈）= 鼠标**（控制器输出的光标估计 ✓）、🟢 **绿圈 = 我们认为的
     真目标位置**（圆心 = 后端报告位置 ✓）、🟢 **实心绿点 = 追踪器真实位置**（未平滑 ✓）、
@@ -14,6 +15,12 @@
     用户 2026-10-01 ✓ 见 `LieTracker._merge_far_corner` ✓））、
     **粗红框 = 我们认为真目标被包含在里面**（后端 `tbox` ✓，绿圈**整圈**在它
     里面 ✓）、细蓝框 = 检测器看到的东西、白线 = 还差多少 ✓；命中 ⇒ 鼠标点转绿 ✓；
+    ⭐ **左键点选检出框**（用户 2026-10-03 ✓）：黄框高亮 + **两行标签**（第 1 行 = `(cx,cy)
+    WxH=面积` 例如 `(360.4,323.0) 179x208=37232` ✓；第 2 行 = 三个**重叠量** `IoU最大砖 … |
+    圆矩IoU … | 圆矩∩框 …` ✓ 用户第二次点名"都放在第二行" ✓ 见 `pick_extra` ✓），状态栏同步
+    写一行；点空白取消 ✓；⭐ **右键**（用户 2026-10-03 ✓）= 选中 + 弹菜单 ⇒"**复制检出框
+    信息**"（剪贴板文本 ✓ 见 `pick_clip_text` ✓ 用来"复制之后与人交流" ✓），点空白不开菜单 ✓
+    （纯显示 ✓ 不动任何判定 ✓ 数字口径 = **加工域** ✓ 与红框/登记同一把尺 ✓）；
   · 状态栏：`帧 i/N ｜ 状态 ｜ 命中率 x%（h/n）` 实时刷新 ✓。
 
 管线（与实机同构 ✓）：帧 →（缩到 500 高、素材域 ✓）→ 检测**常驻子进程**给框 →
@@ -40,10 +47,57 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from perception.lie_controller import LieMouseController  # noqa: E402
+#: ⭐⭐⭐ **鼠标跟随效率倍率**默认值（用户 2026-10-03 ✓ 原话："能否开放一个系数配置，调追踪器
+#: 跟上圆心的效率倍率？" + "**我不想影响位置计算**，只调追踪器（较大的白描边圈绿圆）" ✓
+#: 与控制器**同一处口径** ✓）：控制器每拍把"光标 → 目标点"的误差消掉这么多倍 ✓（1.0 = 全量 ✓）。
+from perception.lie_controller import _FOLLOW_GAIN as _FOLLOW_GAIN_DEFAULT  # noqa: E402
+#: ⭐⭐⭐ **新模式"运动分离"**（用户 2026-10-03 ✓ 见 `perception/lie_motion.py` 的模块头 ✓）：
+#:   它和 `Runner` **同签名**（`step` 回同样的 6 元组 ✓）⇒ 演示窗只换构造 ✓ 别的零改动 ✓。
+from perception.lie_motion import MotionRunner                          # noqa: E402
+# ⭐⭐⭐ **运动分离那几个参数的默认值**（用户 2026-10-03 ✓ 原话："运动分离 **没有任何参数要配吗？**"
+#   ✓）—— 从 `perception/lie_motion.py` **同一处口径**取 ✓（界面别抄一份数 ✗ 会漂 ✓）。
+from perception.lie_motion import _MIN_HITS as _MOTION_MINHITS_DEFAULT   # noqa: E402
+from perception.lie_motion import _PAIR_GATE as _MOTION_PAIRED_DEFAULT   # noqa: E402
+from perception.lie_motion import _SCORE_DECAY as _MOTION_SDECAY_DEFAULT  # noqa: E402
+from perception.lie_motion import _SWITCH_MARGIN as _MOTION_MARGIN_DEFAULT  # noqa: E402
+from perception.lie_motion import _WHITE_W as _MOTION_WHITEW_DEFAULT     # noqa: E402
 from perception.lie_tracker import LieTracker  # noqa: E402
 # ⭐ 轨迹预测观察窗 / 融合框判定阈值的**默认值**（界面初值用它 ✓ 与追踪器同一处口径 ✓）
-from perception.lie_tracker import _MERGE_RATIO as _MERGE_RATIO_DEFAULT  # noqa: E402
+# ⭐⭐ 重叠尺统一在 `perception/geom.py` ✓（用户 2026-10-03 ✓）：点选检出框时要按
+#   "**与哪块砖 IoU 最大**"显示 ⇒ 用**同一把尺**算 ✓（口径一处 ✓ 不自己写一份 ✗）。
+from perception import geom                                     # noqa: E402
+from perception.lie_tracker import _MERGE_IOU as _MERGE_IOU_DEFAULT  # noqa: E402
+from perception.lie_tracker import _MERGE_IOU_OUT as _MERGE_IOU_OUT_DEFAULT  # noqa: E402
+# ⭐⭐⭐ **参数分档默认值**（用户 2026-10-03 ✓ 第 2/3 行 ✓ 与追踪器同一处口径 ✓）
+from perception.lie_tracker import _RING_COV_SEP as _RING_COV_SEP_DEFAULT  # noqa: E402
+from perception.lie_tracker import _BRICK_IOU_SEP as _BRICK_IOU_SEP_DEFAULT  # noqa: E402
+from perception.lie_tracker import _RING_COV_FUSE as _RING_COV_FUSE_DEFAULT  # noqa: E402
+from perception.lie_tracker import _BRICK_IOU_FUSE as _BRICK_IOU_FUSE_DEFAULT  # noqa: E402
+#: ⭐⭐⭐ **分离判定阈值**默认值（用户 2026-10-02 ✓ 与追踪器**同一处口径** ✓ 见 `lie_tracker`）：
+#: 分离信号第三条的 x —— 融合期框**最大面积 ≥ 最小面积 × 它** ✓。
+from perception.lie_tracker import _SEP_RATIO as _SEP_RATIO_DEFAULT  # noqa: E402
+#: ⭐⭐⭐ **融合框继承距离限制**默认值（用户 2026-10-02 ✓ 口径修订 ✓ 与追踪器**同一处口径** ✓）：
+#: 融合框候选第一条闸 —— `圆心到框最近边的有符号垂距 ÷ 绿圈半径 > 它` ✓（0 = 圆心须在框内 ✓）。
+from perception.lie_tracker import _INHERIT_DIST as _INHERIT_DIST_DEFAULT  # noqa: E402
+#: ⭐⭐⭐ **融合框挑选允许倒退距离(绿圆半径比例)** 默认值（用户 2026-10-02 ✓ 与追踪器同一处口径 ✓）：
+#: 第二条闸的容差 —— 落位位移在白箭头方向上的分量 ≥ `−它 × 绿圈半径` 才算"安全候选" ✓（0 = 一点不许 ✓）。
+from perception.lie_tracker import _ALLOW_BACK_RATIO as _ALLOW_BACK_RATIO_DEFAULT  # noqa: E402
+#: ⭐⭐⭐ **砖最多拥有融合框边数量**默认值（用户 2026-10-02 ✓ 与追踪器**同一处口径** ✓）：
+#: 融合框四边的"边归属"里归砖的边**只留距离最近的这么条**（4 = 不截断 ✓）。
+from perception.lie_tracker import _EDGE_MAX as _EDGE_MAX_DEFAULT  # noqa: E402
+#: ⭐⭐⭐ **真目标预测最大速度倍率**默认值（用户 2026-10-03 ✓ 与追踪器**同一处口径** ✓）：
+#: 分离期（红框丢失 = 淡粉接力框那段）白箭头模长上限 = `a × 当拍群体速度模长` ✓。
+from perception.lie_tracker import _SEP_VEL_MAX as _SEP_VEL_MAX_DEFAULT  # noqa: E402
+from perception.lie_tracker import _NOISE_TOL as _NOISE_TOL_DEFAULT      # noqa: E402
+#: ⭐⭐⭐ **"缩成砖判定 · 最小 IoU"默认值**（用户 2026-10-03 ✓ 原话："我才学到 IoU 这个算法，
+#: 我认为我们很多判定都可以换成这个算法（例如『噪声容差』改成『**噪声最小 IoU**』）" ✓
+#: 与追踪器**同一处口径** ✓）：给"框缩回砖大小/位置"补一把**尺度无关**的尺 ✓ ——
+#: 与"四条边都在噪声容差(px) 内"**并列 OR** ✓（0 = 关 ✓ 只用像素那条腿 ✓）。
+from perception.lie_tracker import _IOU_BRICK as _IOU_BRICK_DEFAULT      # noqa: E402
 from perception.lie_tracker import _PATH_MS as _PATH_MS_DEFAULT  # noqa: E402
+from perception.lie_registry import _BOARD_S_DEF as _BOARD_S_DEFAULT     # noqa: E402
+#: ⭐⭐ **上板防抖重叠率**默认值（用户 2026-10-02 ✓ 与登记表**同一处口径** ✓ 见 `lie_registry`）
+from perception.lie_registry import _BOARD_OVERLAP_DEF as _BOARD_OVERLAP_DEFAULT  # noqa: E402
 
 VIDEO_DIR = ROOT / "datasets" / "liedetectorVideo"
 GIF_DIR = ROOT / "datasets" / "liedetectorgifs"   # GIF 素材默认根（用户 2026-09-30 ✓）
@@ -222,7 +276,7 @@ def load_gif(path):
 
 
 def load_source(path):
-    """统一入口：**`.gif` ⇒ GIF 动图** ✓（用户 2026-09-30："改为『选取 gif』" ✓）；
+    """统一入口：**`.gif` ⇒ GIF 动图** ✓（用户 2026-09-30：「改为『选取 gif』" ✓）；
     其余 ⇒ **视频文件** ✓。同形返回 `(frames, ts, (proc_w, proc_h), (sx, sy), fps)` ✓。
 
     ⚠ 原"选图片集（帧目录）"那条**已按用户要求移除** ✗ —— 目录不再是合法输入 ✓
@@ -271,7 +325,7 @@ def _track_velocity(hist, n=3):
     return ((x1 - x0) / dt, (y1 - y0) / dt)
 
 
-_RED_MATCH_GATE = 25.0    # ⭐ 「追踪器认定的目标框」↔「本帧检测框」的配对门（px ✓ 它就是
+_RED_MATCH_GATE = 25.0    # ⭐ "追踪器认定的目标框"↔"本帧检测框"的配对门（px ✓ 它就是
                           #   从那批框里选的 ⇒ 基本重合 ✓ 25px 足够容下检测抖动 ✓）
 _RAD_LO, _RAD_HI = 0.85, 1.25   # ⭐ **学习"目标实际半径"时只信这个面积带**的框（× 标准
                                 #   面积 ✓）：≈1.0× = 单个目标 ✓；跑出去（融合/分离 ✗）
@@ -279,10 +333,14 @@ _RAD_LO, _RAD_HI = 0.85, 1.25   # ⭐ **学习"目标实际半径"时只信这�
 _DOT_GAP = 2.0            # ⭐⭐ **绿点（追踪器真实位置 = `raw_pos`）与绿圈圆心（报告位置 = `pos`）
                           #   差多少 px 才算"两者不一致"**（显示域 px ✓ 用户 2026-09-30
                           #   认知 #4 ✓：差超过它就**用红点标出圆心** ✓；重合 ⇒ 只画绿点 ✓）。
-                          #   ⚠ 不一致有**两个来源** ✗：① **拟人平滑**（`_ease_pos` ✓ 老来源 ✓）；
-                          #     ② **信念修正**（用户 2026-10-01 ✓："并集吞下在册假目标 ⇒ 圆修正到
-                          #     对角" ✓ 只改**报告位置**那一层、内部状态不动 ⇒ 绿点必然落后于圆心 ✓
-                          #     见 `LieTracker._merge_far_corner` ✓）。
+                          #   ⚠ 不一致的**来源**：① **拟人平滑**（`_ease_pos` ✓ 老来源 ✓）；
+                          #     ② **统一出口的信念夹取**那一支（`raw_pos` 是本拍**夹取前**的快照
+                          #     ⇒ 可能滞后一拍 ✓ 见 `LieTracker.process()` 出口 ✓）；
+                          #     ~~③ 落位修正~~ —— ⭐⭐ **甲方案之后它不在了** ✓（用户 2026-10-02
+                          #     ✓ 原话："**我期望绿圆就是我们认为的真目标所处的位置**" ✓ ——
+                          #     落位那一拍**内部一起认**（`LieTracker._adopt_merge_fix` ✓ 且
+                          #     `out["raw_pos"]` 同拍同步刷 ✓）⇒ **绿点与圆心重合** ✓、小红点不再
+                          #     出现 ✓；老口径"只改报告位置那一层"见 tracker 出口的留档注释 ✓）。
                           #   2px 是显示上的"看得出"下限（1px 会被整数取整的抖动误触发 ✗）。
 _RAD_STEP = 2.5           # ⭐ 半径估计的**每帧最大变化**（px ✓ 防单帧噪声跳变 ✗）
 _RAD_FREEZE_S = 0.6       # ⭐ 白块连续消失这么久 ⇒ 判定"已透明" ⇒ **永久冻结**实际半径 ✓
@@ -330,7 +388,7 @@ def _choose_target_box(boxes, motion, pos, last_center, typ):
 
 
 def _sus_line(motion):
-    """图例那行"怀疑链"（用户 2026-09-30 ①②③④ ✓）：目标轨迹 id / 怀疑类型 / 不合群秒数。
+    """图例那行「怀疑链"（用户 2026-09-30 ①②③④ ✓）：目标轨迹 id / 怀疑类型 / 不合群秒数。
 
     · `sus`：`merge` = 框突然变大（疑似与假目标**重叠** ⇒ 中心不可信、按预测走 ✓）；
       `split` = 框突然变小 + 旁边**新出框**（疑似**分离** ⇒ 新框已标"严查" ✓）；
@@ -427,13 +485,88 @@ class Runner:
     """帧流 → 追踪 → 控制 → 光标（窗口与 headless 共用 ✓ 好测 ✓）。"""
 
     def __init__(self, dets=None, gain=None, assume=(375.0, 250.0), path_ms=None,
-                 merge_ratio=None):
+                 merge_iou=None, merge_iou_out=None, sep_ratio=None,
+                 ring_cov_sep=None, brick_iou_sep=None, ring_cov_fuse=None,
+                 brick_iou_fuse=None,
+                 inherit_dist=None, allow_back_ratio=None,
+                 edge_max=None, sep_vel_max_ratio=None, noise_tol=None, board_s=None,
+                 board_overlap=None, follow_gain=None, iou_brick=None, show_kf=None,
+                 kf_pos=None):
         # ⭐ `path_ms` = **轨迹预测窗口时间**（毫秒 ✓ 演示窗那一行配 ✓）⇒ 透传给追踪器 ✓
         self.path_ms = path_ms
-        # ⭐ `merge_ratio` = **融合框判定阈值**（面积比 ✓ 应用按钮左边配 ✓）⇒ 透传 ✓
-        self.merge_ratio = merge_ratio
-        self.tr = LieTracker(path_ms=path_ms, merge_ratio=merge_ratio)
-        self.ctl = LieMouseController(gain=gain, assume=assume)
+        # ⭐⭐⭐ `merge_iou` = **融合框判定 IoU**（用户 2026-10-03 ✓ 原话："把『融合框判定阈值』
+        #   换成『**融合框判定 IoU**』：**小于这个 IoU 才行**，之前配的 1.2 改成 **0.5**" ✓）
+        #   ⇒ 透传 ✓（判据 = `IoU(检出框, 该砖的登记框) < 它` ⇒ 判红框融合 ✓ 见 `_MERGE_IOU` ✓）。
+        self.merge_iou = merge_iou
+        # ⭐⭐ `merge_iou_out` = **融合判定 IoU · 退出**（用户 2026-10-03 ✓ 第 1 步"迟滞双阈值" ✓）：
+        #   进用 `merge_iou`（严 ✓）、守用 `merge_iou_out`（松 ✓）⇒ 边界不再横跳 ✓ 见 `_merge_iou_thr` ✓。
+        self.merge_iou_out = merge_iou_out
+        # ⭐⭐⭐ **参数分档（用户 2026-10-03 ✓ 第 2/3 行）**：每档一对 —— "框↔圆外接矩形 IoU >"
+        #   与 "框↔内砖 IoU <" ✓ 两条**同时**满足才算融合 ✓（分离期=进入 ✓ 融合期=保持 ✓
+        #   融合期不满足 ⇒ **判分离** ✓）；两档之差 = **迟滞** ✓（进严守松 ✓）。
+        self.ring_cov_sep = ring_cov_sep
+        self.brick_iou_sep = brick_iou_sep
+        self.ring_cov_fuse = ring_cov_fuse
+        self.brick_iou_fuse = brick_iou_fuse
+        # ⭐⭐⭐ `sep_ratio` = **分离判定阈值**（用户 2026-10-02 ✓ 界面上就在"融合框判定阈值"
+        #   **右边** ✓）⇒ 透传给追踪器 ✓（分离信号第三条的 x ✓ 见 `_merge_area_span_ok` ✓）。
+        self.sep_ratio = sep_ratio
+        # ⭐⭐⭐ `inherit_dist` = **融合框继承距离限制**（用户 2026-10-02 ✓ 界面上在"分离判定
+        #   阈值"右边 ✓ 口径已从"面积比"改为"距离比" ✓）⇒ 透传给追踪器 ✓
+        #   （融合框候选第一条闸 ✓ 见 `LieTracker._inherit_dist_ok` ✓）。
+        self.inherit_dist = inherit_dist
+        # ⭐⭐⭐ `allow_back_ratio` = **融合框挑选允许倒退距离(绿圆半径比例)**（用户 2026-10-02 ✓
+        #   口径从 px 改为"半径比例" ✓）⇒ 透传 ✓（第二条闸的容差 ✓ 见 `_merge_fix_safe` ✓）。
+        self.allow_back_ratio = allow_back_ratio
+        # ⭐⭐⭐ `edge_max` = **砖最多拥有融合框边数量**（用户 2026-10-02 ✓ 原话："增加参数：
+        #   『**砖最多拥有融合框边数量**』(1~4)，注意在多条边选取最近的**前 x 条**" ✓）⇒ 透传 ✓
+        #   （融合框四边的"边归属"只留距离最近的这么条 ✓ 见 `LieTracker._edge_ownership` ✓）。
+        self.edge_max = edge_max
+        # ⭐⭐⭐ `sep_vel_max_ratio` = **真目标预测最大速度倍率**（用户 2026-10-03 ✓ 原话："将分离期
+        #   （淡粉色框时期）的**最大相对假目标群速度（白箭头）** = a × 假目标群体的标准速度" ✓）
+        #   ⇒ 透传 ✓（分离期白箭头模长上限 ✓ 见 `LieTracker._sep_vel_cap` ✓）。
+        self.sep_vel_max_ratio = sep_vel_max_ratio
+        # ⭐ `noise_tol` = **噪声容差(px)**（融合规则①：**"圆心 ± 它"的范围与框相交** ✓
+        #   用户 2026-10-02 ✓ ⇒ 见 `LieTracker._pos_range_hits` ✓）⇒ 透传 ✓
+        self.noise_tol = noise_tol
+        # ⭐ `board_s` = **上板时长(秒)**（登记条目要走满这么久才上板 ✓ 用户 2026-10-02 ✓）
+        self.board_s = board_s
+        # ⭐ `board_overlap` = **上板防抖重叠率**（新检出与旧砖重叠 ≥ 它 ⇒ 判同一块砖、不新建 ✓
+        #   用户 2026-10-02 ✓ 原话："如果新砖与旧砖重叠率 >= 0.5，判定为同一登记砖……这个 0.5
+        #   做成参数配置『上板防抖重叠率』" ✓）⇒ 透传 ✓
+        self.board_overlap = board_overlap
+        # ⭐⭐⭐ `iou_brick` = **"缩成砖判定 · 最小 IoU"**（用户 2026-10-03 ✓ 原话："我才学到 IoU
+        #   这个算法，我认为我们很多判定都可以换成这个算法（例如『噪声容差』改成『**噪声最小
+        #   IoU**』）" ✓）⇒ 透传 ✓（给"框缩回砖大小/位置"补一把**尺度无关**的尺 ✓ 与"四条边都在
+        #   噪声容差(px) 内"并列 OR ✓；0 = 关 ✓ 见 `LieTracker._IOU_BRICK` ✓）。
+        self.iou_brick = iou_brick
+        # ⭐⭐⭐ `show_kf` = **"显示 KF 预测"开关**（用户 2026-10-03 ✓ 原话："**1. 移除"位置估计"
+        #   参数**（非可视化的配置用户界面不需要），新增"**显示 KF 预测**"的开关" ✓）：
+        #   **它不是"位置估计算法分支"** ✗（那名字会让人以为会改位置 ✗）—— 它是**可视化开关** ✓：
+        #   `False`（默认 ✓）= 不跑 KF、画面不画 ⇒ 零开销零污染 ✓；`True` = 跑 KF（只记录 ✓）＋
+        #   画青线/青点/青箭头 ✓ **位置仍走经典** ✓ 见 `LieTracker.show_kf` ✓。
+        self.show_kf = show_kf
+        # ⭐⭐⭐ `kf_pos` = **"KF 位置驱动"**（用户 2026-10-03 ✓ 原话："因为**预测结果不同，实际
+        #   走向也会不同**，所以在**实时演算上叠加 KF 显示意义不大**。能不能：当『KF预测』开启时，
+        #   将**窗口分为两列视图**，左边跑经典右边跑 KF，这样对照才有意义" ✓）：`True` ⇒ 这一路
+        #   **真的用 KF 位置当地点** ✓（见 `LieTracker.kf_pos` ✓）⇒ 演示窗拿它当**右列** ✓。
+        #   ⚠ **两列各跑一份 `Runner`**（各自一份 `LieTracker` ⇒ 状态完全隔离 ✓ 互不污染 ✓）。
+        self.kf_pos = kf_pos
+        self.tr = LieTracker(path_ms=path_ms, merge_iou=merge_iou,
+                             merge_iou_out=merge_iou_out, sep_ratio=sep_ratio,
+                             ring_cov_sep=ring_cov_sep, brick_iou_sep=brick_iou_sep,
+                             ring_cov_fuse=ring_cov_fuse, brick_iou_fuse=brick_iou_fuse,
+                             inherit_dist=inherit_dist, allow_back_ratio=allow_back_ratio,
+                             edge_max=edge_max, sep_vel_max_ratio=sep_vel_max_ratio,
+                             noise_tol=noise_tol,
+                             board_s=board_s, board_overlap=board_overlap,
+                             iou_brick=iou_brick, show_kf=show_kf, kf_pos=kf_pos)
+        # ⭐⭐⭐ `follow_gain` = **鼠标跟随效率倍率**（用户 2026-10-03 ✓ 原话："能否开放一个系数
+        #   配置，调**追踪器**跟上圆心的效率倍率？" ✓ + "**我不想影响位置计算**，只调追踪器
+        #   （较大的白描边圈绿圆）" ✓）⇒ 透传给**控制器** ✓ —— 它只决定"**模拟鼠标朝圆心走多快**"
+        #   ✗ 一个字都不动 `LieTracker` 的位置计算 ✓（1.0 = 全量，一拍尽量贴上去 ✓）。
+        self.follow_gain = follow_gain
+        self.ctl = LieMouseController(gain=gain, assume=assume, follow_gain=follow_gain)
         self.dets = dets
         self.prev_boxes = None                 # 上一帧的检测框（算逐框位移用 ✓）
         self.tgt_rad = None                    # ⭐ 真实目标的**实际半径**（学一次、之后冻结 ✓）
@@ -591,30 +724,49 @@ class Runner:
         # ⭐⭐⭐ **假目标登记表快照**（用户 2026-09-30："将登记的框做个标记显示出来我看看你登记的
         #   对不对，例如 `shape 0.98 #001`" ✓）—— 演示窗直接画它 ✓（只读 ✓ 不影响任何判定 ✓）。
         motion["reg"] = out.get("reg")
-        # ⭐⭐ **本拍红框是不是「融合框」**（用户 2026-10-01 新流程 ✓）也转发给演示窗/自检 ✓：
+        # ⭐⭐ **本拍红框是不是"融合框"**（用户 2026-10-01 新流程 ✓）也转发给演示窗/自检 ✓：
         #   融合 ⇒ 不做信念夹取、绿圈按白箭头（预测）走 ✓（"边归属相切"整套已移除 ✓）。
         motion["merged"] = bool(out.get("merged"))
         return out, pos, r, hit, raw, motion      # `raw` = 检测原框（带 cls/conf ✓ 画图用 ✓）
 
     def reset(self, assume=(375.0, 250.0)):
+        # ⚠ 这里只回传了 `path_ms` / `merge_iou`（既有口径 ✓ 我按同一处加 `sep_ratio` ✓
+        #   —— `noise_tol` / `board_s` / `board_overlap` 三个**本来就没回传** ✗，不在本轮范围内 ✓）。
         self.__init__(dets=self.dets, gain=self.ctl.gain, assume=assume,
-                      path_ms=self.path_ms, merge_ratio=self.merge_ratio)
+                      path_ms=self.path_ms, merge_iou=self.merge_iou,
+                      merge_iou_out=self.merge_iou_out,
+                      ring_cov_sep=self.ring_cov_sep, brick_iou_sep=self.brick_iou_sep,
+                      ring_cov_fuse=self.ring_cov_fuse,
+                      brick_iou_fuse=self.brick_iou_fuse,
+                      sep_ratio=self.sep_ratio, inherit_dist=self.inherit_dist,
+                      allow_back_ratio=self.allow_back_ratio, edge_max=self.edge_max,
+                      sep_vel_max_ratio=self.sep_vel_max_ratio,
+                      follow_gain=self.follow_gain, iou_brick=self.iou_brick,
+                      show_kf=self.show_kf, kf_pos=self.kf_pos)
 
 
-def analyze(frames, dets, gain=None, assume=(375.0, 250.0), on_progress=None):
+def analyze(frames, dets, gain=None, assume=(375.0, 250.0), on_progress=None,
+            follow_gain=None, iou_brick=None, show_kf=None, kf_pos=None,
+            merge_iou=None, merge_iou_out=None):
     """**整段一次算完**（用户 2026-09-30 要求 ② ✓ 原话："加载视频的时候就演算完，
     这样我拖帧就不用重算了"）⇒ 返回每帧结果列表，播放/拖动只是**查表** ✓。
 
     每项：`{"pos","r","hit","state","cursor","boxes"}`（都是**处理域**坐标 ✓ 画时再放大）。
     `on_progress(k, n)` 每帧回调（界面报进度 ✓）。
+    `follow_gain` ⇒ 透传给控制器（**鼠标跟随效率倍率** ✓ 用户 2026-10-03 ✓ 见 `Runner` ✓）。
     """
-    r = Runner(dets=dets, gain=gain, assume=assume)
+    r = Runner(dets=dets, gain=gain, assume=assume, follow_gain=follow_gain,
+               iou_brick=iou_brick, show_kf=show_kf, kf_pos=kf_pos,
+               merge_iou=merge_iou, merge_iou_out=merge_iou_out)
     out = []
     for i, (_big, small) in enumerate(frames):
         o, pos, rad, hit, d, motion = r.step(small, i, i / 60.0)
         out.append({"pos": pos, "r": rad, "hit": hit, "state": o["state"],
                     "cursor": tuple(r.cursor), "boxes": d or [],
-                    "motion": motion})
+                    "motion": motion,
+                    # ⭐ **本拍砖表快照**（用户 2026-10-03 ✓ 与演示窗同口径 ✓ 点选时算
+                    #   "IoU 最大的砖"用它 ✓）
+                    "bricks": o.get("bricks")})
         if on_progress and (i % 20 == 0 or i == len(frames) - 1):
             on_progress(i + 1, len(frames))
     return out
@@ -624,7 +776,11 @@ def apply_mask(frame, boxes, alpha, target=None, scale=(1.0, 1.0)):
     """⭐ **灰蒙版 + 框挖洞**（用户 2026-09-30 要求 ① 原话："把 yolo 工作台的背景蒙版 +
     框挖洞那一套用到测谎演示里" ✓ 同款语义：**框外压暗、框里保持原亮度** ✓）。
 
-    `alpha` = 蒙版不透明度（0 = 关 ✓）；洞 = 每个检测框 + 目标圆（要看的东西保持亮 ✓）。
+    `alpha` = 蒙版不透明度（0 = 关 ✓）；洞 = **每个检测框** ✓（+ 可选 `target` 目标圆 ✓）。
+    ⚠ **当前调用方（`draw`）只传检测框** ✗（用户 2026-10-02 ✓ 原话："你可以让非检出框都受灰蒙版
+      影响吗？目前绿色圆圈不是检出框也不受灰蒙版影响" ✓）—— 目标圆**不再挖洞** ⇒ 那块区域跟
+      背景一起压暗 ✓；而圆线照旧**鲜亮** ✓（所有线条都是蒙版之后画的 ✓）。
+      `target` 参数与逻辑**保留不删** ✓（要回退就把 `draw` 里那两行加回来 ✓）。
     现场帧 1620×1080 的整幅 alpha 运算 ~10ms ✓ 可接受（不透明为 0 时直接跳过 ✓）。
     """
     if alpha <= 0.005:
@@ -651,9 +807,154 @@ def apply_mask(frame, boxes, alpha, target=None, scale=(1.0, 1.0)):
     return out
 
 
+def pick_box_at(boxes, pt, tol=40.0):
+    """**点（加工域坐标）命中哪一格检出框**（用户 2026-10-03 ✓ 原话："你能让我在**点选检出框**
+    的时候显示 `(360.4,323.0) 179×208=37232` 这种信息吗" ✓）—— 纯函数（好测 ✓ 窗口与自检共用 ✓）。
+
+    规则：
+      · 点**落在框里** ⇒ 命中 ✓；**多个框套着** ⇒ 取**面积最小**的那个（里层优先 ✓
+        一眼点在"最里面那格" ✓ —— 融合并集框套着砖框时不会选错 ✓）；
+      · 都不落在里面 ⇒ 退回**中心最近**且 ≤ `tol` px 的一格 ✓（手抖差一点也能选上 ✓）；
+      · 连近的也没有 ⇒ **`None`**（调用方据此**取消选中** ✓）。
+    """
+    best, bs = None, None
+    for b in (boxes or []):
+        try:
+            cx, cy = float(b[1]), float(b[2])
+            w, h = float(b[3]), float(b[4])
+        except Exception:                       # noqa: BLE001 —— 布局不合（少于 5 列）就跳过 ✓
+            continue
+        inside = (cx - w / 2.0 <= pt[0] <= cx + w / 2.0
+                  and cy - h / 2.0 <= pt[1] <= cy + h / 2.0)
+        d = ((cx - pt[0]) ** 2 + (cy - pt[1]) ** 2) ** 0.5
+        if inside:
+            sc = (w * h) ** 0.5                 # 套着的 ⇒ 里层（面积小）优先 ✓
+        elif d <= float(tol):
+            sc = 1e6 + d                        # 差一点 ⇒ 按中心近的选 ✓
+        else:
+            continue
+        if bs is None or sc < bs:
+            best, bs = tuple(b), sc
+    return best
+
+
+def pick_extra(box, pos=None, rad=0.0, bricks=None):
+    """点选框的**重叠量**（= 画布标签**第 2 行**的内容 ✓ **纯函数** ✓ 好测 ✓ 窗口与自检共用 ✓）。
+
+    用户 2026-10-03 ✓ **两次**（都在同一天 ✓）：
+      · 第一次："**点选检出框的时候，希望他能显示 IoU 最大的砖的 IoU**" ✓；
+      · 第二次（本次）："点选检出框时，**与圆外接矩形的 iou**、**圆外接矩形与其相交的比例**也
+        显示下；另外，以上参数**及旧的 iou 显示都放在第二行**" ✓。
+    ⇒ 回 `(砖段, 圆段)` 两串（**空串 = 不显示那一段** ✓ 不猜 ✗）：
+      · 砖段 = `IoU最大砖 %.2f @(x,y)` —— 与**哪块砖** IoU 最大 ✓（同一把尺 `geom.iou` ✓）；
+      · 圆段 = `圆矩IoU %.2f | 圆矩∩框 %.2f`：
+          - `圆矩IoU` = **`IoU(检出框, 圆外接矩形)`** ✓（= **旧口径**那个量 ✓ 留作对照 ✓）；
+          - `圆矩∩框` = **圆外接矩形与检出框相交的比例** ✓ = 交 ÷ **圆矩形面积**（**单向** ✓
+            ⇒ 与后端 `LieTracker._ring_cov` **同一把尺** ✓ 不自己写一份 ✗）。
+    ⚠ `box` = `(cx, cy, w, h)`（**加工域** ✓ 与红框/登记/状态栏同一把尺 ✓）；
+      `pos` / `rad` 拿不到（**预测态**没圆心 / 半径还没学到 ✓）⇒ **圆段留空** ✓；
+      `bricks` 空（未演算 / 表为空 ✓）⇒ **砖段留空** ✓。
+    ⚠ `bricks` 的元素布局 = **`(bid, x, y, w, h)`** ✓ —— 与后端的本拍快照**同一份**
+      （`LieTracker._bricks_snap` ✓ `bid` 是**元组** ✓ 见那里 ✓）；`bid` 用来标"是哪一块砖" ✓。
+    """
+    _btxt = ""
+    _best, _bv = None, -1.0
+    for _t in (bricks or []):
+        _v = geom.iou(box, (float(_t[1]), float(_t[2]), float(_t[3]), float(_t[4])))
+        if _v > _bv:
+            _best, _bv = _t, _v
+    if _best is not None:
+        _btxt = "IoU最大砖 %.2f @(%d,%d)" % (_bv, int(_best[0][0]), int(_best[0][1]))
+    _rtxt = ""
+    _rr = float(rad or 0.0)
+    if pos is not None and _rr > 0.0:
+        _ring = (float(pos[0]), float(pos[1]), 2.0 * _rr, 2.0 * _rr)
+        _rtxt = ("圆矩IoU %.2f | 圆矩∩框 %.2f"
+                 % (geom.iou(box, _ring), geom.cover_ratio(box, _ring)))
+    return _btxt, _rtxt
+
+
+def pick_label(pick, names=None):
+    """点选框的**画布标签**（用户 2026-10-03 ✓ **两行** ✓ 原话："点选检出框时，与圆外接矩形的
+    iou、圆外接矩形与其相交的比例**也显示下**；另外，以上参数**及旧的 iou 显示都放在第二行**" ✓）。
+
+    · **第 1 行** = `类别 置信度 | (cx,cy) WxH=面积`（用户点名的那串数字 ✓）；
+    · **第 2 行** = 几个**重叠量** ✓ —— 全部由 `_pick_box` 算好附在**第 7/8 位**（`pick[6:]` ✓）：
+        `IoU最大砖 …`（旧有 ✓）｜ `圆矩IoU …` ｜ `圆矩∩框 …`（本次新增 ✓）；
+      该项为空（未演算 / 砖表空 / 圆心或半径还没学到）⇒ **不显示那一段** ✓ 不猜 ✗。
+
+    ⚠ 只出 **ASCII** ✗（乘号写 `x`、间隔写 `|`）：`cv2.putText` 不认全角/中文 ⇒ 会画成 `?` ✗
+      —— 状态栏那行是 Qt 画的 ⇒ 那边仍用 `×` / `｜` ✓（见 `_status` ✓）。
+    """
+    if pick is None:
+        return ""
+    cx, cy = float(pick[1]), float(pick[2])
+    w, h = float(pick[3]), float(pick[4])
+    nm = ""
+    if names:
+        cl = int(pick[0])
+        nm = (names[cl] if 0 <= cl < len(names) else str(cl))
+    # ⚠ 置信度可能是 `None`（离线/自检链路的框只有 5 列或没带 conf ✓）⇒ 只在这时**别拼** ✓ 不崩 ✗
+    if nm and len(pick) > 5 and pick[5] is not None:
+        nm = "%s %.2f" % (nm, float(pick[5]))
+    txt = "(%.1f,%.1f) %dx%d=%d" % (cx, cy, int(round(w)), int(round(h)),
+                                   int(round(w * h)))
+    _l1 = ("%s | %s" % (nm, txt)) if nm else txt          # 第 1 行：几何 / 面积 ✓
+    # 第 2 行：**重叠量**（> 1 项才另起一行 ✓；一项都不显示时退回单行 ✓）
+    _l2 = " | ".join([str(_x) for _x in pick[6:] if _x])
+    return ("%s\n%s" % (_l1, _l2)) if _l2 else _l1
+
+
+def pick_clip_text(pick, names=None, frame_no=None, total=None, state=None):
+    """点选框的**剪贴板文本**（用户 2026-10-03 ✓ 原话："加一个**右键点击检出框选中并弹出菜单**，
+    目前只有一项『**复制检出框信息**』，用来我**复制之后与你交流**" ✓）。
+
+    与画布标签（`pick_label` ✓）**同一份数据** ✓，但按"**要粘出去给人看**"重排 ✗：
+      · **全角 / 中文照用** ✓ —— 走 Qt 剪贴板，不受 `cv2.putText` 的 ASCII 限制 ✗；
+      · 多一行**上下文**（帧号 / 状态 ✓）—— 交流时能说清"**是哪一拍**" ✓（不然只有一个框的
+        数字，对不上是哪一帧 ✗）；
+      · 三个**重叠量**另起一行 ✓（与画布第 2 行同源 ✓ `pick[6:]` ✓）。
+    形如：
+        帧 37/120 ｜ 状态 merged
+        检出框 shape 0.39 ｜ 中心 (360.4, 323.0) ｜ 尺寸 179×208 ｜ 面积 37232
+        IoU最大砖 0.62 @(120,80) ｜ 圆矩IoU 0.41 ｜ 圆矩∩框 0.88
+    ⚠ **拿不到的量一律不编** ✗：没 `names` ⇒ 不写类别 ✓；没有重叠量 ⇒ 少一行 ✓；
+      没给帧号 ⇒ 不出上下文那行 ✓（自检用例就靠这一条 ✓）。
+    """
+    if pick is None:
+        return ""
+    _cx, _cy = float(pick[1]), float(pick[2])
+    _w, _h = float(pick[3]), float(pick[4])
+    _nm = ""
+    if names:
+        _c = int(pick[0])
+        _nm = (names[_c] if 0 <= _c < len(names) else str(_c))
+    if _nm and len(pick) > 5 and pick[5] is not None:
+        _nm = "%s %.2f" % (_nm, float(pick[5]))
+    _out = []
+    if frame_no is not None:
+        _out.append("帧 %s%s ｜ 状态 %s"
+                    % (frame_no, ("/%d" % total) if total else "", state or "-"))
+    _out.append("检出框%s ｜ 中心 (%.1f, %.1f) ｜ 尺寸 %d×%d ｜ 面积 %d"
+                % ((" " + _nm) if _nm else "", _cx, _cy,
+                   int(round(_w)), int(round(_h)), int(round(_w * _h))))
+    # ⚠ 那几段是 `pick_extra` 生成的 ✓ 内部用的是**半角 `|`** ✗（画布给 `cv2.putText` 用 ✓
+    #   全角会画成 `?` ✗）⇒ 这里**换成全角 `｜`** ✓（剪贴板是给人看的 ✓ 混排会显脏 ✗）。
+    _extra = " ｜ ".join([str(_x).replace("|", "｜") for _x in pick[6:] if _x])
+    if _extra:
+        _out.append(_extra)
+    return "\n".join(_out)
+
+
 def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
-         names=None, mask=0.0):
-    """🔴 红点（鼠标）/ 🟢 绿圈（目标）/ 框（类别名+置信度）/ 运动向量 ✓。"""
+         names=None, mask=0.0, pick=None, kf=None, kf_trail=None):
+    """🔴 红点（鼠标）/ 🟢 绿圈（目标）/ 框（类别名+置信度）/ 运动向量 ✓。
+
+    `pick` = **鼠标点选的那一格检出框**（用户 2026-10-03 ✓ 原话："你能让我在**点选检出框**
+    的时候显示 `(360.4,323.0) 179×208=37232` 这种信息吗" ✓）⇒ 画**黄框高亮 + 数字标签**
+    ✓ —— 纯显示层：不动任何判定、不改帧数据 ✓（与红框/绿圈/登记同一把尺 = **加工域坐标** ✓）。
+    传 `(cls, cx, cy, w, h[, conf])`（与检出框同布局 ✓）；`None` ⇒ 不画 ✓。
+    """
     _out, pos, r, hit, d = res
     # ⭐⭐ **绿圈半径 = 目标框半宽**（用户 2026-09-30 口径 ✓ 原话："将绿圈半径恒=目标框半宽" ✓）：
     #   红框（`_choose_target_box` ✓）与绿圈**同一个目标** ⇒ 半径取那格框的**半宽 × 显示缩放** ✓。
@@ -681,20 +982,25 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
     if _tbr:
         _rad_disp = max(6.0, float(_tbr) * (scale_x + scale_y) / 2.0)
     # ---- ⭐ 先铺蒙版（挖洞），再画标记（标记不被压暗 ✓）----
-    frame = apply_mask(frame, d or [], mask,
-                       target=(pos[0] * scale_x, pos[1] * scale_y, _rad_disp)
-                       if pos is not None else None,
-                       scale=(scale_x, scale_y))
+    #   ⭐⭐ **2026-10-02 口径变更**（用户 ✓ 原话："你可以让非检出框都受灰蒙版影响吗？目前绿色
+    #     圆圈不是检出框也不受灰蒙版影响" + "**所有的线条都保持鲜亮，只有镂空区域灰**" ✓）：
+    #     · **镂空（挖洞）只留给"检出框"** ✓ —— **不再给目标圆挖洞** ✗（原来圆那块方形也保持
+    #       原亮度 ⇒ 圆看着像"飘在灰蒙版上面" ✗）⇒ 现在目标圆所在区域**跟背景一起被压暗** ✓；
+    #     · **线条一律照旧鲜亮** ✓（它们都是这一步**之后**画的 ✓ 不被压暗 ✓）：绿圈线 / 红框线 /
+    #       登记青框 / 各框运动箭头 / 白线 / 黄白箭头 / 光标 / 左上角 HUD 全部保持 ✓。
+    #   ♻ **要回退**成"圆也挖洞"：把下面 `target=...` 那两行加回来即可 ✓（`apply_mask` 的参数
+    #     与逻辑都**原样保留** ✓ 没删 ✗）。
+    frame = apply_mask(frame, d or [], mask, scale=(scale_x, scale_y))
     if pos is not None:
         c = (int(pos[0] * scale_x), int(pos[1] * scale_y))
         # ⭐⭐⭐ **圆圈恒色**（用户 2026-10-01 定稿 ✓ 原话："圆圈不要有任何的变色与相关逻辑" ✓）
         cv2.circle(frame, c, int(_rad_disp), (0, 255, 0), 2)
-        # 用户 2026-10-01 定稿：淡粉框 = 「红框丢失后的预测接力」——
+        # 用户 2026-10-01 定稿：淡粉框 = "红框丢失后的预测接力"——
         #   · 红框**在**（后端 `tbox` 有 ✓）⇒ **不画**（检出范围由红框自己表达 ✓，画了反而
         #     看不出"什么时候丢了" ✗）；
         #   · 红框**丢**（`tbox=None` ✓）且有宽高快照 ⇒ 画：尺寸 = 最后一次红框宽高的
         #     **原始值**（不缩到圆内 ✗ 它代表的是检出范围本身 ✓）、中心跟着**报告位置**走
-        #     （丢框期间位置本来就是预测外推 ✓）⇒ 一眼看出「检出丢了、这段是预测在接力」✓。
+        #     （丢框期间位置本来就是预测外推 ✓）⇒ 一眼看出"检出丢了、这段是预测在接力"✓。
         _tw = (motion or {}).get("tbox_wh")
         if _tb is None and _tw and float(_tw[0]) > 1.0 and float(_tw[1]) > 1.0:
             _pw = float(_tw[0]) / 2.0 * scale_x
@@ -774,20 +1080,34 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
         _eh = max(8.0, float(_e.get("h", 0.0)) * scale_y / 2.0)
         _q1 = (int(_ex - _ew), int(_ey - _eh))
         _q2 = (int(_ex + _ew), int(_ey + _eh))
-        # ⭐⭐⭐ **"有了就标"**（用户 2026-10-01 定稿 ✓ 原话："**不需要灰框这么复杂的逻辑**：
-        #   1.**有了就标**，跟踪他们" ✓）⇒ **一个样式**：**青色框 + `登记 #xxx`** ✓
-        #   （不再分"青=假目标 / 灰=还没钉住"两层 ✗ —— 那套太绕 ✓；身份判定交给运动/后续逻辑 ✓）。
-        cv2.rectangle(frame, _q1, _q2, (255, 255, 0), 2)
+        # ⭐⭐⭐ **两层颜色**（用户 2026-10-02 ✓ 定稿 ✓ 原话："它**首次标青色时为候选框**，以后
+        #   **换个颜色标**，等他满足『**达到标准假目标群面积及尺寸比例**』的条件后**转正**，
+        #   **再标青色框**" ✓）：
+        #   · **🟠 橙色细框 + `候选(x,y)`** = 还没转正（边缘刚进相机、还在"生长跟进" ✓ 或面积/
+        #     比例没达标 ✓）—— 跟踪它 ✓ 但它还**不是**"已登记的假目标" ✗；
+        #   · **🟦 青色粗框 + `砖(x,y)`** = **已转正**（面积进了标准带、比例达标 ✓ = 钉死的假砖 ✓）。
         _bid = _e.get("bid") or (0, 0)
-        _txt = "砖(%d,%d)" % (int(_bid[0]), int(_bid[1]))
+        if bool(_e.get("pending")):
+            # ⭐⭐ **形状待定**（用户 2026-10-02 ✓ 原话："把形状待定的用边缘进视野的候选框
+            #   一样的颜色" ✓）：与绿圈相交中、尺寸被真目标影响 ✗ ⇒ 画**橙色候选框**同款 ✓
+            #   （哪怕已上板 ✗ —— 待定期间它的青框尺寸不可信 ✗）。
+            cv2.rectangle(frame, _q1, _q2, (0, 165, 255), 1)
+            _txt = "待定(%d,%d)" % (int(_bid[0]), int(_bid[1]))
+            _lab_col = (0, 165, 255)
+        elif bool(_e.get("ok")):
+            cv2.rectangle(frame, _q1, _q2, (255, 255, 0), 2)
+            _txt = "砖(%d,%d)" % (int(_bid[0]), int(_bid[1]))
+            _lab_col = (255, 255, 0)
+        else:
+            cv2.rectangle(frame, _q1, _q2, (0, 165, 255), 1)
+            _txt = "候选(%d,%d)" % (int(_bid[0]), int(_bid[1]))
+            _lab_col = (0, 165, 255)
         (tw, th2), _ = cv2.getTextSize(_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
         _ty = max(_q1[1] - 3, th2 + 4)
         cv2.rectangle(frame, (_q1[0], _ty - th2 - 4), (_q1[0] + tw + 4, _ty + 2),
                       (90, 60, 10), -1)
         cv2.putText(frame, _txt, (_q1[0] + 2, _ty - 1), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.42, (255, 255, 0), 1, cv2.LINE_AA)
-        # ⚠ **未转正的候选不画** ✗（2026-09-30 实测：相机一走，候选能涨到上百条 ✗ ⇒ 全画出来
-        #   会糊屏 ✓ 而且它们此刻**还不算"登记过的"** ✗ 画了反而误导 ✓）。只看实线的青框 ✓。
+                    0.42, _lab_col, 1, cv2.LINE_AA)
     # ---- 🔴 **唯一红框 = 后端那个框**（画在检测框之上 ✓ 用户："必须与后端完全一致" ✓）----
     if _tb is not None:
         _p1 = (int((float(_tb[0]) - float(_tb[2]) / 2.0) * scale_x),
@@ -795,8 +1115,8 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
         _p2 = (int((float(_tb[0]) + float(_tb[2]) / 2.0) * scale_x),
                int((float(_tb[1]) + float(_tb[3]) / 2.0) * scale_y))
         cv2.rectangle(frame, _p1, _p2, (0, 0, 255), 3)
-        # ⭐⭐ **融合红框 ⇒ 右上角标「融合」**（用户 2026-10-01 ✓ 原话："如果红框处于融合状态，
-        #   就标在框右上角吧" ✓）：一眼看出这格红框 = 真假目标的并集 ✓（与左上角的青框「登记」
+        # ⭐⭐ **融合红框 ⇒ 右上角标"融合"**（用户 2026-10-01 ✓ 原话："如果红框处于融合状态，
+        #   就标在框右上角吧" ✓）：一眼看出这格红框 = 真假目标的并集 ✓（与左上角的青框"登记"
         #   分开 ✓ 不打架 ✓）。⚠ 只认后端给的 `merged`（`motion["merged"]` ✓ 同一口径 ✓）。
         if (motion or {}).get("merged"):
             _txt = "融合"
@@ -927,11 +1247,173 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
                         0.5, (0, 0, 0), 3)
             cv2.putText(frame, s, (10, y0 + 16 * i), cv2.FONT_HERSHEY_SIMPLEX,
                         0.5, (235, 235, 235), 1)
+    # ⭐⭐⭐ **点选的检出框**（用户 2026-10-03 ✓ 原话："你能让我在**点选检出框**的时候显示
+    #   `(360.4,323.0) 179×208=37232` 这种信息吗" ✓）：**黄框高亮 + "几何=面积"标签** ✓。
+    #   ⚠ 画在**最后**（压在所有标注之上 ✓ —— 点选框是"我现在最关心的那一格" ✓）；
+    #   ⚠ 纯显示 ✓ 一个判定都不动 ✓；数字口径 = **加工域**（与红框/登记/状态栏同一把尺 ✓）。
+    # ⭐⭐⭐ **KF 影子可视化**（用户 2026-10-03 ✓ 原话："**你能把 KF 也做可视化给我检验效果吗？**" ✓）
+    #   —— 只在"位置估计 = **KF 影子**"时才有东西 ✓ **纯显示层** ✗ 一个判定都不动 ✓：
+    #   · 🟦 **青色细折线** = KF 位置的历史（与那根**白线**（经典位置历史）**并排** ⇒
+    #     "**抖不抖**"一眼看出 ✓ —— 这正是用户要检验的那件事 ✓）；
+    #   · 🟦 **青色实心点 + 空心圈** = KF 这一刻估的位置（与**绿圈圆心**对照 ⇒
+    #     两者差多少 = "平滑换来的滞后" ✓ 差太大 ⇒ R 偏大（太信模型）⇒ 该调小 ✓）；
+    #   · 🟦 **青色小箭头** = KF 估的速度（长度 = 速度 × dt ✓ 与白/黄箭头**同一口径** ✓）。
+    #   ⚠ 颜色：青 = BGR `(255,255,0)` ✓（与"点选框黄 (0,255,255)"、"白线白 (255,255,255)"
+    #     都区分得开 ✓）；⚠ 坐标是**加工域** ⇒ 画时乘 `scale` ✓（与红框/绿圈同一把尺 ✓）。
+    if kf_trail and len(kf_trail) >= 2:
+        _kt = [(int(round(float(p[0]) * scale_x)), int(round(float(p[1]) * scale_y)))
+               for p in kf_trail]
+        cv2.polylines(frame, [np.array(_kt, np.int32)], False, (255, 255, 0), 1, cv2.LINE_AA)
+    if kf is not None and kf.get("pos") is not None:
+        _kx = int(round(float(kf["pos"][0]) * scale_x))
+        _ky = int(round(float(kf["pos"][1]) * scale_y))
+        cv2.circle(frame, (_kx, _ky), 3, (255, 255, 0), -1, cv2.LINE_AA)     # 实心点 ✓
+        cv2.circle(frame, (_kx, _ky), 8, (255, 255, 0), 1, cv2.LINE_AA)      # 空心圈 ✓
+        _kvx, _kvy = (kf.get("vel") or (0.0, 0.0))
+        _kdt = float((motion or {}).get("dt") or 0.0)
+        if (_kvx or _kvy) and _kdt > 0:
+            _arrow(float(kf["pos"][0]) * scale_x, float(kf["pos"][1]) * scale_y,
+                   float(_kvx) * _kdt * scale_x, float(_kvy) * _kdt * scale_y,
+                   (255, 255, 0), 1)                                          # KF 速度 ✓
+    if pick is not None:
+        _pcx, _pcy = float(pick[1]), float(pick[2])
+        _pw, _ph = float(pick[3]), float(pick[4])
+        _q1 = (int(round((_pcx - _pw / 2.0) * scale_x)), int(round((_pcy - _ph / 2.0) * scale_y)))
+        _q2 = (int(round((_pcx + _pw / 2.0) * scale_x)), int(round((_pcy + _ph / 2.0) * scale_y)))
+        cv2.rectangle(frame, _q1, _q2, (0, 255, 255), 3)          # 🟡 黄：点选高亮 ✓
+        # 标签（**两行** ✓ 用户 2026-10-03 ✓ 见 `pick_label` ✓）：
+        #   第 1 行 = `类别 置信度 | (cx,cy) WxH=面积`（用户要的 `(360.4,323.0) 179x208=37232` ✓）；
+        #   第 2 行 = `IoU最大砖 … | 圆矩IoU … | 圆矩∩框 …`（重叠量 ✓ 用户点名放这行 ✓）。
+        #   ⚠ 只用 ASCII ✗ —— `cv2.putText` 不认全角 `｜`/`×` ⇒ 会画成 `?` ✗。
+        #   ⚠ `cv2.putText` **不认 `\n`** ✗ ⇒ 自己按行拆开逐行画 ✓（黑底高度 = 行数 × 行高 ✓）。
+        _ptxt = pick_label(pick, names)
+        _pln = [t for t in _ptxt.split("\n") if t]
+        _psz = [cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0] for t in _pln]
+        _pth = max(s[1] for s in _psz)
+        _pwmax = max(s[0] for s in _psz)
+        _plh = _pth + 8                       # 行高（含行距 ✓）
+        _phbox = _plh * len(_pln)
+        _pbot = _q2[1] + _phbox + 10          # 默认贴框**下方** ✓
+        if _pbot > frame.shape[0] - 4:                            # 框贴底 ⇒ 标签挪到框内上方 ✓
+            _pbot = max(_phbox + 4, _q1[1] - 8)
+        _px0 = max(0, min(_q1[0], frame.shape[1] - _pwmax - 8))
+        _ptop = _pbot - _phbox
+        cv2.rectangle(frame, (_px0, _ptop), (_px0 + _pwmax + 8, _pbot), (0, 0, 0), -1)
+        for _pk_i, _pk_t in enumerate(_pln):
+            cv2.putText(frame, _pk_t, (_px0 + 4, _ptop + _plh * _pk_i + _pth + 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
     if hud:
         cv2.putText(frame, hud, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (0, 0, 0), 4)
         cv2.putText(frame, hud, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (255, 255, 255), 2)
+    # ⭐⭐⭐ **运动分离（新）的「判定依据」叠加**（用户 2026-10-03 ✓ 原话："**我希望：能看到你判定的
+    #   可视化依据，不然我无法汇报问题**" ✓ —— 这句就是这一段的全部理由 ✓）：
+    #   · 每条候选画一个圈：**圈越大 = 累积分 `score` 越高** ✓ 旁边标出**分数**（一眼看谁在涨 ✓）；
+    #   · **被选中的那条** ⇒ **红色双圈 + `★`** ✓（"算法认它是真目标" ✓）；
+    #   · 每条再画一支**黄箭头** = 它**相对"群体中位位移"的偏离**（`mv − median` ✓）
+    #     ⇒ **箭头越长 = 越"不合群"** ✓✓ —— 这就是**判据本身** ✓ 可以直接核对 ✓；
+    #   · 右上角一块**黑底文字面板**：群体中位位移 / 候选数 / 选中者的三项（score·dev·hits）／
+    #     **Top3 明细** ✓ ⇒ 用户截图就能把"依据"发过来 ✓✓。
+    #   ⚠ 只在运动分离模式下画（`motion["mode"] == "motion"` ✓）⇒ **经典模式一个像素都不变** ✓。
+    #   ⚠ `cv2.putText` **只认 ASCII** ✗ ⇒ 文案全用英文/数字 ✓（中文会画成 `?` ✗）。
+    if (motion or {}).get("mode") == "motion":
+        _trk = list(motion.get("tracks") or [])
+        _med = motion.get("median") or (0.0, 0.0)
+        # ⭐⭐⭐ **「相对群体」的轨迹线**（用户 2026-10-03 ✓ 原话："我希望：像经典模式一样，
+        #   也把**相对于群体的轨迹线**画出来，这样就能看出**历史结果**" ✓）——
+        #   以**每条候选当前所在**为原点，把它的 `rel_hist` 铺出去 ✓（`rel_hist` 里的点已经是
+        #   "相对它现在"的偏移 ✓ ⇒ 加上它当前的屏幕坐标即可 ✓ 不用管绝对坐标 ✓）。
+        #   ⭐ **怎么读这条线** ✓：**绕在原地打转** ⇒ 它跟大家一起动（**假目标** ✓）；
+        #     **朝一个方向延伸出去** ⇒ 它在**相对群体**移动（**真目标** ✓✓）。
+        #   ⚠ **只画"够资格"的 + 目标** ✗ —— 不然满屏 30 条线 ⇒ 反而看不清 ✓。
+        for _lp in _trk:
+            if not (_lp.get("ok") or _lp.get("sel")):
+                continue
+            _h = _lp.get("rel_hist") or []
+            if len(_h) < 2:
+                continue
+            _sel = bool(_lp.get("sel"))
+            _bx = float(_lp["p"][0]) * scale_x
+            _by = float(_lp["p"][1]) * scale_y
+            _col = (0, 200, 255) if _sel else (190, 140, 60)
+            _th = 3 if _sel else 1
+            for _k2 in range(1, len(_h)):
+                cv2.line(frame,
+                         (int(_bx + _h[_k2 - 1][0] * scale_x),
+                          int(_by + _h[_k2 - 1][1] * scale_y)),
+                         (int(_bx + _h[_k2][0] * scale_x),
+                          int(_by + _h[_k2][1] * scale_y)),
+                         _col, _th, cv2.LINE_AA)
+        _sc_max = max([float(t.get("score") or 0.0) for t in _trk] or [1.0])
+        for _t in _trk:
+            _sc = float(t.get("score") or 0.0)
+            _sel = bool(t.get("sel"))
+            _px, _py = int(t["p"][0] * scale_x), int(t["p"][1] * scale_y)
+            # 圈：半径随分数（8~26 px ✓）—— 越大分越高 ✓
+            _rr = int(8 + 18 * min(1.0, _sc / max(1e-6, _sc_max)))
+            _col = (0, 0, 255) if _sel else (0, 190, 60)
+            cv2.circle(frame, (_px, _py), _rr, _col, 3 if _sel else 1, cv2.LINE_AA)
+            if _sel:
+                cv2.circle(frame, (_px, _py), _rr + 4, _col, 1, cv2.LINE_AA)
+            # 分数：只标"够资格"的（否则满屏数字 ✓ 反而看不清 ✓）
+            if t.get("ok") or _sel:
+                cv2.putText(frame, ("%.0f" % _sc), (_px + _rr + 2, _py - _rr + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(frame, ("%.0f" % _sc), (_px + _rr + 2, _py - _rr + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 255, 255) if not _sel else (60, 60, 255), 1, cv2.LINE_AA)
+            # ⭐ **蓝箭头 = 它的绝对速度**（用户 2026-10-03 ✓ 原话："把**所有目标**的**绝对速度**
+            #   像经典模式一样用**小蓝箭头**标一下" ✓）—— `v_abs` = 它这一拍**实际走了多少** ✓
+            #   ⇒ **所有候选都画** ✓（一眼看出"谁在动、往哪动" ✓）。
+            _va = t.get("v_abs") or (0.0, 0.0)
+            _ax, _ay = float(_va[0]), float(_va[1])
+            if abs(_ax) + abs(_ay) >= 2.0:
+                cv2.arrowedLine(frame, (_px, _py),
+                                (int(_px + _ax * 2.2 * scale_x),
+                                 int(_py + _ay * 2.2 * scale_y)),
+                                (255, 120, 0), 2, tipLength=0.35, line_type=cv2.LINE_AA)
+            # ⭐⭐ **相对群体速度**（判据本体 ✓ 箭头越长越"不合群" ✓）：
+            #   · **目标那条 = 白色粗箭头**（用户点名："把**真目标**的**相对群体速度**用
+            #     **小白箭头**标一下" ✓）；
+            #   · 其他候选 = **黄色细箭头**（保留 ✓ 方便对比"谁更不合群" ✓）。
+            _vr = t.get("v_rel")
+            if _vr is None:
+                _vr = (float(t.get("mv", (0.0, 0.0))[0]) - float(_med[0]),
+                       float(t.get("mv", (0.0, 0.0))[1]) - float(_med[1]))
+            _dx, _dy = float(_vr[0]), float(_vr[1])
+            if abs(_dx) + abs(_dy) >= 2.0:
+                cv2.arrowedLine(frame, (_px, _py),
+                                (int(_px + _dx * 3 * scale_x),
+                                 int(_py + _dy * 3 * scale_y)),
+                                (255, 255, 255) if _sel else (0, 220, 255),
+                                3 if _sel else 1,
+                                tipLength=0.35, line_type=cv2.LINE_AA)
+        # ---- 右上角文字面板（黑底 ✓ 可读 ✓）----
+        _lines = ["motion mode  |  cands %d" % len(_trk),
+                  "median mv (%.1f, %.1f)  |  dev_med %.1f" % (_med[0], _med[1],
+                                                               float(motion.get("dev") or 0.0))]
+        if motion.get("sel_score") is not None:
+            _lines.append("SEL score %.1f  dev %.1f  hits %s"
+                          % (float(motion["sel_score"]), float(motion.get("sel_dev") or 0.0),
+                             next((str(t.get("hits")) for t in _trk if t.get("sel")), "?")))
+        else:
+            _lines.append("SEL (none yet)")
+        _top = sorted(_trk, key=lambda t: -float(t.get("score") or 0.0))[:3]
+        for _k, _t in enumerate(_top):
+            _lines.append("#%d sc=%.1f dev=%.1f h=%s @(%d,%d)%s"
+                          % (_k + 1, float(_t.get("score") or 0.0),
+                             float(_t.get("dev") or 0.0), _t.get("hits"),
+                             _t["p"][0], _t["p"][1], "  <SEL" if _t.get("sel") else ""))
+        _lx, _ly, _lh = 8, 60, 20
+        _wmax = max(cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0][0]
+                    for s in _lines)
+        cv2.rectangle(frame, (_lx - 4, _ly - 16),
+                      (_lx + _wmax + 8, _ly + _lh * len(_lines)), (0, 0, 0), -1)
+        for _k, _s in enumerate(_lines):
+            cv2.putText(frame, _s, (_lx, _ly + _lh * _k),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 255, 200), 1, cv2.LINE_AA)
     return frame
 
 
@@ -972,11 +1454,12 @@ def code_stamp():
 
 def run_window(args):
     from PyQt5.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
-    from PyQt5.QtGui import QColor, QImage, QKeySequence, QPainter, QPixmap
+    from PyQt5.QtGui import (QColor, QCursor, QImage, QKeySequence, QPainter,
+                             QPixmap)
     from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox,
                                  QFileDialog, QHBoxLayout, QLabel, QMainWindow,
-                                 QPushButton, QShortcut, QSlider, QToolBar,
-                                 QVBoxLayout, QWidget)
+                                 QMenu, QPlainTextEdit, QPushButton, QShortcut,
+                                 QSlider, QToolBar, QVBoxLayout, QWidget)
     # ⚠ **滚轮不许改参数**（项目规范 ✓）⇒ 数字框一律 `NoWheel*`（与工作台同一份 ✓）
     from gui.widgets import NoWheelDoubleSpinBox, NoWheelSpinBox
 
@@ -1006,6 +1489,20 @@ def run_window(args):
             self._off = QPointF(0.0, 0.0)        # 图像(0,0)在视图里的位置（_fit=False 时用 ✓）
             self._mouse = None                   # 鼠标在视图里的位置（QPointF ✓）
             self._mouse_img = None               # 鼠标在**图像坐标**里的位置 (x, y) 或 None ✓
+            # ⭐ **中键拖动平移**（用户 2026-10-02 ✓）：
+            self._pan_from = None                # 按下中键那一点（视图坐标 ✓）；None = 没在拖 ✓
+            self._pan_off = None                 # 按下那一刻的图像偏移（`_off` 快照 ✓）
+            # ⭐⭐ **左键"点选检出框"的回调**（用户 2026-10-03 ✓ 原话："你能让我在点选检出框的
+            #   时候显示 (360.4,323.0) 179×208=37232 这种信息吗" ✓）：主窗设它 =
+            #   `_on_pick_box` ✓，参数是**加工域坐标**（= 图像坐标 ÷ `_sx/_sy` ✓ 与后端同一把尺 ✓）。
+            #   ⚠ 视图层只负责"把点报上去" ✗ 命中哪一格由主窗判 ✓（这里拿不到检出框 ✓）。
+            self._on_pick = None
+            # ⭐⭐⭐ **右键 = "选中 + 弹菜单"**（用户 2026-10-03 ✓ 原话："加一个**右键点击检出框
+            #   选中并弹出菜单**，目前只有一项『**复制检出框信息**』，用来我**复制之后与你交流**"
+            #   ✓）：主窗设它 = `_on_pick_menu` ✓，参数同样是**加工域坐标** ✓。
+            #   ⚠ 与左键**同一份命中逻辑** ✗ —— 命中判在**主窗**（`pick_box_at` ✓），这一层只
+            #     负责"把点报上去" ✓（它拿不到检出框 ✓）。
+            self._on_context = None
 
         def setText(self, s):
             self._text = str(s)
@@ -1070,11 +1567,61 @@ def run_window(args):
                 p.drawLine(QPointF(mx, my - 7), QPointF(mx, my + 7))
             p.end()
 
+        def mousePressEvent(self, ev):
+            # ⭐ **按住中键拖动画面**（用户 2026-10-02 ✓）：以按下那一刻的几何为起点，
+            #   移动量直接加到图像偏移上 ✓（在"适应窗口"模式下按下 ⇒ 先切到手动模式 ✓，
+            #   以当前实际缩放/偏移为起点 ✓ 松手保持 ✓ 滚轮缩放/双击适应照常 ✓）。
+            if ev.button() == Qt.MiddleButton and self._pix is not None:
+                z, ox, oy = self._geo()
+                self._fit = False
+                self._zoom = z
+                self._off = QPointF(ox, oy)
+                self._pan_from = QPointF(ev.pos())
+                self._pan_off = QPointF(ox, oy)
+                self.setCursor(Qt.ClosedHandCursor)
+                ev.accept()
+                return
+            # ⭐⭐⭐ **左键 = 点选检出框**（用户 2026-10-03 ✓）：把**加工域坐标**报给主窗 ✓
+            #   （命中/高亮/状态栏全在主窗做 ✓ 这一层不碰数据 ✓）。
+            if ev.button() == Qt.LeftButton and self._mouse_img is not None:
+                self._mouse = QPointF(ev.pos())
+                _f = getattr(self, "_on_pick", None)
+                if callable(_f):
+                    _f((self._mouse_img[0] / self._sx, self._mouse_img[1] / self._sy))
+                    ev.accept()
+                    return
+            # ⭐⭐⭐ **右键 = 选中 + 弹菜单**（用户 2026-10-03 ✓ 见 `_on_context` 那段说明 ✓）：
+            #   同样只把**加工域坐标**报给主窗 ✓（命中 / 选中 / 菜单 / 剪贴板全在主窗 ✓）。
+            if ev.button() == Qt.RightButton and self._mouse_img is not None:
+                self._mouse = QPointF(ev.pos())
+                _f = getattr(self, "_on_context", None)
+                if callable(_f):
+                    _f((self._mouse_img[0] / self._sx, self._mouse_img[1] / self._sy))
+                    ev.accept()
+                    return
+            super().mousePressEvent(ev)
+
         def mouseMoveEvent(self, ev):
+            if self._pan_from is not None:
+                self._off = QPointF(self._pan_off.x() + (ev.pos().x() - self._pan_from.x()),
+                                    self._pan_off.y() + (ev.pos().y() - self._pan_from.y()))
+                self._mouse = QPointF(ev.pos())
+                self._mouse_img = self._img_at(self._mouse)
+                self.update()
+                ev.accept()
+                return
             self._mouse = QPointF(ev.pos())
             self._mouse_img = self._img_at(self._mouse)
             self.update()
             super().mouseMoveEvent(ev)
+
+        def mouseReleaseEvent(self, ev):
+            if ev.button() == Qt.MiddleButton and self._pan_from is not None:
+                self._pan_from = None             # 松手 ⇒ 停在当前位置 ✓
+                self.setCursor(Qt.ArrowCursor)
+                ev.accept()
+                return
+            super().mouseReleaseEvent(ev)
 
         def leaveEvent(self, ev):
             self._mouse = None
@@ -1124,6 +1671,12 @@ def run_window(args):
             self.worker = None
             self.dets = None
             self.results = None                # ⭐ 整段演算表（播放/拖动都查它 ✓）
+            # ⭐⭐⭐ **右列（KF 位置驱动）的演算表**（用户 2026-10-03 ✓ 原话："当『KF预测』开启时，
+            #   将**窗口分为两列视图**，左边跑经典右边跑 KF，这样对照才有意义" ✓）：勾了"显示
+            #   KF 预测"才有 ✓（那一路 `Runner(kf_pos=True)` ✓ 真用 KF 位置跑 ✓）——
+            #   两列**各有一份 `LieTracker`** ⇒ 状态完全隔离、互不污染 ✓。
+            self.results_kf = None
+            self.runner_kf = None
             self.names = None                  # 类别名（画框标签用 ✓ 第一次演算时取 ✓）
             self.i = 0
             self.t = 0.0
@@ -1131,7 +1684,7 @@ def run_window(args):
             self.playing = False
             self.warm_n = 0
             self.warm_total = 0
-            self._reuse_dets = False       # 「应用」重算时 = True（复用检测框 ✓）
+            self._reuse_dets = False       # "应用"重算时 = True（复用检测框 ✓）
 
             tb = QToolBar("main")
             self.addToolBar(tb)
@@ -1159,8 +1712,9 @@ def run_window(args):
             self.chk_dets = QCheckBox("用检测器")
             self.chk_dets.setChecked(not args.no_dets)
 
-            self.chk_dets.setToolTip("关掉 = 纯残差路线（M2a）；开着 = 加检测复活"
-                                     "通道（M2b）✓ 好对比 ✗ 切换会重跑预热 ✓")
+            self.chk_dets.setToolTip(
+                "关掉 = 纯残差路线（M2a）；开着 = 加检测通道（M2b：建档种子 / 校验 / 吸附 ✓；"
+                "⚠ 复活已于 2026-10-02 停用 ✓）好对比 ✗ 切换会重跑预热 ✓")
             self.chk_dets.stateChanged.connect(self.reload_current)
             tb.addWidget(self.chk_dets)
             self.chk_loop = QCheckBox("循环")
@@ -1172,14 +1726,16 @@ def run_window(args):
             self.sld_mask.setRange(0, 80)
             self.sld_mask.setValue(int(args.mask * 100))
             self.sld_mask.setFixedWidth(110)
-            self.sld_mask.setToolTip("灰蒙版不透明度（框外压暗、**框里挖洞保持原亮度** ✓）")
+            self.sld_mask.setToolTip(
+                "灰蒙版不透明度（框外压暗、**框里挖洞保持原亮度** ✓ —— ⚠ 挖洞**只给检出框** ✓\n"
+                "目标圆不再挖洞（2026-10-02 ✓）；**所有线条一律鲜亮** ✓）")
             self.sld_mask.valueChanged.connect(self.on_view_change)
             tb.addWidget(self.sld_mask)
             self.lbl_mask = QLabel("%d%%" % self.sld_mask.value())
             tb.addWidget(self.lbl_mask)
             # ---- ⭐ **记住上次的配置**（用户 2026-10-01 ✓ 原话："让窗口能够记住我上次的
             #   配置" ✓）：这些开关/拖动条**离开窗口时**写回 `config/ui.yaml` 的 `lie_demo`
-            #   段（按客户端唯一一份 ✓）；「应用」按钮那条在 `apply_path_ms` 里写 ✓。
+            #   段（按客户端唯一一份 ✓）；"应用"按钮那条在 `apply_path_ms` 里写 ✓。
             #   ⚠ 拖动条用 `sliderReleased`（不是 `valueChanged` ✗ —— 拖一下会写几十次文件 ✗）。
             self.cmb_speed.currentIndexChanged.connect(self._cfg_save)
             self.chk_dets.stateChanged.connect(self._cfg_save)
@@ -1190,14 +1746,41 @@ def run_window(args):
             #   位置**" ✓）—— 箭头长度就是**这一拍的位移**（所见即所测 ✓），没什么可调的 ✓。
 
             # ---- ⭐ **配置行：轨迹预测窗口时间**（用户 2026-10-01 ✓ 原话："增加参数
-            #   「轨迹预测窗口时间」（就是你刚说的这 500ms），在输入框右边加按钮「应用」，
+            #   "轨迹预测窗口时间"（就是你刚说的这 500ms），在输入框右边加按钮"应用"，
             #   点击后重新运算并生效" ✓）----
             #   它 = `LieTracker.path_ms`：**切向预测回看多久的轨迹**（默认 500ms ✓
             #   10fps ⇒ 5 个采样点 ✓ 少于 3 个拟不出曲率 ✗、多于 ~7 个会把转弯前的旧
             #   方向带进来 ✗）⇒ 调大 = 更平滑更滞后、调小 = 更灵敏更抖 ✓。
             #   ⚠ 位置：**交互区（工具栏）下面、画面上面** ✓（交互区下加一行 ✓）。
             cfgrow = QHBoxLayout()
+            self._row1 = cfgrow            # ⭐ 存起来：切运动分离时**逐项**收掉用不上的那几个
+            #   （⚠ 第 1 行是**混着**的 —— "模式"/"鼠标跟随效率倍率"两边都要 ✓ ⇒ **整行藏不得** ✗）
             cfgrow.setContentsMargins(6, 2, 6, 2)
+            # ⭐⭐⭐ **第二行**（用户 2026-10-02 ✓ 原话："与『融合判定阈值』一起的**共 3 个参数**
+            #   一起放到**第二行**" ✓）：`融合框判定阈值` / `分离判定阈值` /
+            #   `融合框继承面积限制` 三个"融合系"参数放这一行 ✓ —— 它们是一组（判定融合 →
+            #   挑融合候选 → 结束融合）✓ 与第一行那些"轨迹/容差/上板"参数分开读 ✓。
+            # ---- ⭐⭐⭐ **算法模式**（用户 2026-10-03 ✓ 原话："你可以在测谎演示里加个**模式下拉
+            #   列表**，新的算法模式选中时，**不必要的参数配置都隐藏**" ✓）--------
+            cfgrow.addWidget(QLabel("模式"))
+            self.cmb_mode = QComboBox()
+            self.cmb_mode.addItem("经典（白块 + 纹理）", "classic")
+            self.cmb_mode.addItem("运动分离（新）", "motion")
+            self.cmb_mode.setToolTip(
+                "**经典**：在纹理里认那个白色图形（原来那套）。\n"
+                "**运动分离（新）**：按你 2026-10-03 给的规律 —— **用「颜色」当观测、用「运动」\n"
+                "当预测**：真目标开局是白的 ⇒ 直接找**最白的那块**（⚠ **对「波浪式」几何扭曲免疫** ✓\n"
+                "因为扭曲改的是位置、不是亮度 ✓）；它逐渐透明 / 与假目标视觉融合时 ⇒ 用\n"
+                "「上一拍位置 ＋ 速度」**外推**接着走（外推不读图像 ⇒ 波浪也影响不到它 ✓）。\n"
+                "⚠ **不再做「对齐 / 帧间差分」** ✗（那条路被几何扭曲毁掉 ⇒ 实测残差补不掉一半 ✗）。\n\n"
+                "⚠ 选新模式会把「融合/内砖/边归属/允许倒退」那几行参数**整行隐藏** ✓\n"
+                "  （新模式不用它们 ✓）；切回去它们就回来 ✓。\n"
+                "⚠ 改完要**重新点「应用」**（或重开素材）才按新模式演算。")
+            self.cmb_mode.currentIndexChanged.connect(self._on_mode_changed)
+            cfgrow.addWidget(self.cmb_mode)
+            cfgrow2 = QHBoxLayout()
+            cfgrow2.setContentsMargins(6, 2, 6, 2)
+            self._row2 = cfgrow2                  # ⭐ 存起来（新模式要整行隐藏 ✓）
             self.lbl_pms = QLabel("轨迹预测窗口时间")
             self.lbl_pms.setToolTip(
                 "切向轨迹预测**回看多久**的轨迹（毫秒 ✓ 默认 %d ms）。\n"
@@ -1214,37 +1797,509 @@ def run_window(args):
             self.sp_path_ms.setValue(int(_PATH_MS_DEFAULT))
             self.sp_path_ms.setToolTip(self.lbl_pms.toolTip())
             cfgrow.addWidget(self.sp_path_ms)
-            # ---- ⭐⭐ **融合框判定阈值**（用户 2026-10-01 ✓ 原话："判定检出框面积 > 登记的
-            #   假目标面积一定比例（**应用按钮左边加配置「融合框判定阈值」**）则判定红框融合" ✓）
-            #   —— 面积比（检出框面积 ÷ 登记的假目标面积 ✓）：≥ 它 ⇒ 判红框**融合**
-            #   （= 目标 + 假目标的并集 ✓）⇒ **不做信念夹取**、绿圈按白箭头（预测）走 ✓。
-            #   调小 ⇒ 更容易判成融合（夹取少、更信预测 ✓）；调大 ⇒ 更少融合（框更常被当约束 ✓）。
-            cfgrow.addWidget(QLabel("融合框判定阈值"))
+            # ---- ⭐⭐⭐ **融合框判定 IoU**（用户 2026-10-03 ✓ 原话："把『融合框判定阈值』换成
+            #   『**融合框判定 IoU**』：**小于这个 IoU 才行**，之前配的 1.2 改成 **0.5**" ✓）----
+            #   判据 = `IoU(检出框, 该砖的登记框) < 它` ⇒ 判红框**融合**（= 目标 + 假目标的并集 ✓）
+            #   ⇒ **不做信念夹取**、绿圈按白箭头（预测）走 ✓。
+            #   ⚠ **越小越严** ✓（要求框与砖**越不重叠**才算并集 ✓ —— 因为"两者基本同一格"的
+            #     IoU 会很大 ✓ 那已不是并集、而是"砖自己那一格"✗ 就不该标融合 ✓）。
+            cfgrow2.addWidget(QLabel("融合框判定 IoU"))
             self.sp_merge = NoWheelDoubleSpinBox()
-            self.sp_merge.setRange(1.0, 5.0)
-            # ⭐⭐ **精度到小数点后 2 位**（用户 2026-10-01 ✓ 原话："融合框判定阈值需要往后再精确
-            #   1 位小数" ✓）：实测判决常常"卡线"（`9月30日(1).mp4` 帧 16 的面积比是 **1.22** ⇒
-            #   阈值 1.2 判融合 / 1.4 不判 ✓）⇒ 1 位小数根本调不到那个点上 ✗ ⇒ 改 2 位 ✓；
-            #   箭头步长取 0.05（一键一格好按 ✓ 要 1.22 这种值直接手输即可 ✓）。
+            self.sp_merge.setRange(0.0, 1.0)
+            # ⭐⭐ **精度到小数点后 2 位**（沿用用户 2026-10-01 的要求 ✓："需要往后再精确 1 位
+            #   小数" ✓）：实测判决常常"卡线" ⇒ 1 位小数调不到那个点上 ✗；箭头步长 0.05 ✓。
             self.sp_merge.setSingleStep(0.05)
             self.sp_merge.setDecimals(2)
-            self.sp_merge.setValue(float(_MERGE_RATIO_DEFAULT))
+            self.sp_merge.setValue(float(_MERGE_IOU_DEFAULT))
             self.sp_merge.setToolTip(
-                "检出框面积 ÷ 登记的假目标面积 ≥ 它 ⇒ 判「红框融合」（框 = 目标 + 假目标的并集）。\n"
+                "IoU（检出框 ∩ 那块砖的登记框 ÷ 两者并集）**小于它** ⇒ 判「红框融合」\n"
+                "（框 = 目标 + 假目标的并集）。\n\n"
+                "· 默认 0.50；**越小越严**（要求框与砖越不重叠才算并集）；\n"
+                "· 0 = 关（只剩「整圈绿圈在框内 + 面积与砖相等」那条规则）；\n\n"
                 "融合时**不做信念夹取**，绿圈继续按白箭头（预测）走 ✓；\n"
                 "**没标融合的检出框一律不给红框**（那一拍走预测态 ✓）。\n"
-                "精度 0.01（可直接手输，例如 1.22 ✓）；改完点「应用」⇒ 重新演算整段并生效。")
-            cfgrow.addWidget(self.sp_merge)
+                "精度 0.01；改完点「应用」⇒ 重新演算整段并生效。")
+            # ---- ⭐⭐⭐ **"融合框判定 IoU · 退出"= 迟滞下半段**（用户 2026-10-03 ✓ 第 1 步 ✓）----
+            #   进用上面那个（严 ✓）、**守**用这个（松 ✓）：已在融合保持期时，要 `IoU > 它`
+            #   （两框明显同一格 ✗ 不像并集了 ✓）才**掉出**融合 ✓ ⇒ 边界不再"进进出出"横跳 ✓。
+            cfgrow2.addWidget(QLabel("退出 IoU"))
+            self.sp_merge_out = NoWheelDoubleSpinBox()
+            self.sp_merge_out.setRange(0.0, 1.0)
+            self.sp_merge_out.setSingleStep(0.05)
+            self.sp_merge_out.setDecimals(2)
+            self.sp_merge_out.setValue(float(_MERGE_IOU_OUT_DEFAULT))
+            self.sp_merge_out.setToolTip(
+                "**已经在融合里**（保持期）时用的 IoU 阈值：`IoU 大于它` ⇒ 两框已明显是同一格\n"
+                "⇒ **掉出融合**（不再当并集）。\n\n"
+                "· 与左边那个配合 = **迟滞**：**进严（0.50）、守松（0.75）** ⇒ 边界不横跳；\n"
+                "· 想退回单阈值 ⇒ 把它设成与左边**相同**的值；\n"
+                "· 调大 ⇒ 更不容易掉出（融合段更长、更稳，但可能赖着不走）。\n\n"
+                "改完点「应用」⇒ 重新演算整段并生效。")
+            cfgrow2.addWidget(self.sp_merge_out)
+            cfgrow2.addWidget(self.sp_merge)
+            # ---- ⭐⭐⭐ **分离判定阈值**（用户 2026-10-02 ✓ 原话："融合期间融合框的最大面积 >=
+            #   融合期间融合框的最小面积 * x，**这个 x 做成配置参数『分离判定阈值』加在『融合框
+            #   判定阈值』右边**" ✓）：分离信号的**第三条** ✓ —— 融合期**最大框面积 ÷ 最小框
+            #   面积 ≥ 它** 才允许判分离 ✓（= 框确实"从并集缩回过砖大小" ✓）。
+            #   调大 ⇒ 更苛刻（要缩得更多才算分离 ⇒ 融合保持得更久 ✓）；调小到 1.0 ⇒ 该条
+            #   恒成立（等价于没有这一条 ✓ 回到上一版口径 ✓）。
+            cfgrow2.addWidget(QLabel("分离判定阈值"))
+            self.sp_sep = NoWheelDoubleSpinBox()
+            self.sp_sep.setRange(1.0, 5.0)
+            self.sp_sep.setSingleStep(0.05)     # 与"融合框判定阈值"同一手感 ✓
+            self.sp_sep.setDecimals(2)
+            self.sp_sep.setValue(float(_SEP_RATIO_DEFAULT))
+            self.sp_sep.setToolTip(
+                "分离信号的第三条：**融合期间融合框的最大面积 ÷ 最小面积 ≥ 它**，才判「分离」\n"
+                "（= 融合框确实从并集大小缩回过砖大小）。\n\n"
+                "· 调大 ⇒ 要求缩得更多才算分离 ⇒ 融合保持更久（分离更保守）；\n"
+                "· 调到 1.00 ⇒ 这一条恒成立（等于没有它，回到上一版口径）；\n"
+                "· ⚠ 若整段融合期框面积几乎没变（框本来就是砖大小 ⇒ 当初多半量错了），\n"
+                "  这条会挡住「缩成砖」那条假分离 ✓\n\n"
+                "改完点「应用」⇒ 重新演算整段并生效。")
+            cfgrow2.addWidget(self.sp_sep)
+            # ---- ⭐⭐⭐ **融合框继承距离限制**（用户 2026-10-02 ✓ 口径定稿 ✓ 原话："『S = 框∩
+            #   绿圈外接矩形 ÷ 绿圈外接矩形 >"融合框继承面积限制"』改为『**绿圈圆心到框最近
+            #   一条边的垂直距离(绿圆半径比例) > "融合框继承距离限制"**』" ✓ 随后两次收紧口径：
+            #   "这个距离**正数判定才有意义**" ✓ + "**圆心在框外 才判定，圆心在框内直接允许融合**"
+            #   ✓）：**融合框候选的第一条闸** ✓ —— **圆心在框内 ⇒ 直接允许** ✓；**圆心在框外**
+            #   ⇒ 才判"**出框量 ≤ 本项 × 半径**" ✓（本项 = **允许圆心出框的倍数半径** ✓）。
+            #   （取代老那条面积比 S ✗ —— 那把尺跟框的尺寸耦合 ✗；也**取代**同日早先那版
+            #    "圆心离最近边还得 ≥ 本项 × 半径" ✗ —— 那版框内也受限 ⇒ 实测 9月30日 帧 38
+            #    圆心明明在框里、只因离下边 0.563 半径就被挡 ✗ = 用户点名 ✓）。
+            # ⚠⚠⭐ **本项 2026-10-03 起已屏蔽**（用户原话："**有了这个逻辑，就不需要『融合框
+            #   继承距离限制』了，先屏蔽相关逻辑**" ✓ —— "这个逻辑" = "分离前不许换内砖"✓
+            #   `LieTracker._same_inner_brick` ✓）：判据在追踪器里由开关 `_INHERIT_DIST_ON`
+            #   （= `False` ✓）短路成**恒放行** ✓ ⇒ 界面上**置灰** + 文案标注 ✓（免得调了不生效 ✗）；
+            #   值照旧落盘/回填 ✓（开关拨回 `True` 即恢复 ✓）。
+            cfgrow2.addWidget(QLabel("融合框继承距离限制（已屏蔽）"))
+            self.sp_inherit = NoWheelDoubleSpinBox()
+            self.sp_inherit.setRange(0.0, 3.0)
+            self.sp_inherit.setSingleStep(0.05)
+            self.sp_inherit.setDecimals(2)
+            self.sp_inherit.setValue(float(_INHERIT_DIST_DEFAULT))
+            self.sp_inherit.setEnabled(False)       # ⭐ 置灰（已屏蔽 ✓ 见上）
+            self.sp_inherit.setToolTip(
+                "⚠ **已屏蔽（2026-10-03）**：本项**不生效** —— 融合候选改由「分离前不许换内砖」\n"
+                "（内砖同一性）+「允许倒退距离」两道把关。要恢复本项，把追踪器里的\n"
+                "`perception/lie_tracker.py::_INHERIT_DIST_ON` 拨回 `True`。\n\n"
+                "（以下为原口径说明，仅供回退参考）\n"
+                "融合框候选的第一条闸 = **允许圆心出框的倍数半径**。\n\n"
+                "· 圆心**在框内** ⇒ **直接允许**（不看本项）；\n"
+                "· 圆心**在框外** ⇒ 才判：「出框量 ≤ 本项 × 绿圈半径」才允许；\n"
+                "· 0.00（默认）⇒ 一点也不许出框（圆心必须落在框内，贴着边也算在内）；\n"
+                "· 调大（如 0.3）⇒ 允许圆心出框「0.3 × 半径」以内 ⇒ 融合候选更多、更松。\n"
+                "· 它不跟框的大小挂钩，只问「圆心离边多远」，用**绿圈半径**归一 ⇒\n"
+                "  半径自己变了（实测 56~61px），判别也不跟着变。\n\n"
+                "第二条闸不在这里配：它固定是「沿白箭头推进**第一个接触到的框**」\n"
+                "（把绿圈沿白箭头方向推，最先撞上哪一格）。\n\n"
+                "改完点「应用」⇒ 重新演算整段并生效。")
+            cfgrow2.addWidget(self.sp_inherit)
+            # ---- ⭐⭐⭐ **融合框挑选允许倒退距离(绿圆半径比例)**（用户 2026-10-02 ✓ 原话：
+            #   "『融合框挑选允许倒退距离(px)』改为『**融合框挑选允许倒退距离(绿圆半径比例)**』"
+            #   ✓）：第二条闸的**容差** ✓ —— 落位把圆心在白箭头方向上的位移分量 ≥
+            #   `−它 × 绿圈半径` 就算"安全" ✓（见 `LieTracker._merge_fix_safe` ✓）。
+            #   · **0（默认）= 一点也不能倒退**（= 上一版的布尔判据 ✓ 行为一字不变 ✓）；
+            #   · 调大 ⇒ 允许"倒退一点点"的框也当候选 ⇒ 候选变多、融合段更连续 ✓（代价：圆
+            #     偶尔被落位往反方向拽几像素 ✓）。
+            #   ⚠ 换算参考：旧配置 20px ÷ 实测半径中位 60.8 ≈ **0.33** ✓。
+            cfgrow2.addWidget(QLabel("融合框挑选允许倒退距离(步数比例)"))
+            self.sp_back = NoWheelDoubleSpinBox()
+            self.sp_back.setRange(0.0, 5.0)
+            self.sp_back.setSingleStep(0.05)
+            self.sp_back.setDecimals(2)
+            self.sp_back.setValue(float(_ALLOW_BACK_RATIO_DEFAULT))
+            self.sp_back.setToolTip(
+                "融合框候选第二条闸的容差：落位会把圆心挪出去多远 —— 若落点在**白箭头后方**\n"
+                "（180° 扇形内），则要求位移长度 ≤ **本项 × 「本拍通常该走多远」**。\n\n"
+                "⚠⚠ **那把尺是 `|白箭头| × dt`，不是绿圈半径** ——\n"
+                "  用户 2026-10-03 明确要求改成这种「B 型 / 步数比例」\n"
+                "  （原来的「半径比例」写法会随**播放倍速**漂，B 型不会）。\n"
+                "  ⇒ 本项 1.0 = 「允许倒退 一步的距离」，**远小于**一个半径（半径约 60px，一步约 20px）。\n\n"
+                "· 0（默认）⇒ 一点也不能往反方向挪（最保守，候选最少）；\n"
+                "· 调大 ⇒ 允许轻微倒退的框也算候选 ⇒ 融合段更连续、更少「假分手」，\n"
+                "  但那一拍圆心可能被落位往反方向拽几像素。\n\n"
+                "⚠ 换算示例（实测）：某拍落位倒退 **34.0px**、一步 **21.1px** ⇒ **要 ≥ 1.61 才过**。\n"
+                "配到多少合适，用「应用」重算后看底部融合日志里「门内没有能挑的格」少了多少。")
+            cfgrow2.addWidget(self.sp_back)
+            # ---- ⭐⭐⭐ **砖最多拥有融合框边数量**（用户 2026-10-02 ✓ 原话："增加参数：『**砖
+            #   最多拥有融合框边数量**』(1~4)，注意在**多条边选取最近的前 x 条**" ✓）：
+            #   融合框的"边归属"（`_edge_ownership` ✓）里，归砖的边**只保留距离最近的这么条**
+            #   ✓ —— 更远的那几条改判"真目标提供的边" ✓（⇒ 落位五档 `_merge_edge_own` 里的
+            #   `n` 就被它限制住 ✓）。
+            #   · **4（默认）= 不截断**（老行为一字不变 ✓）；
+            #   · 设 1~3 ⇒ "一块砖最多只能占住这么多条边" ⇒ "四假边 ⇒ 不落位"那档不再发生 ✓。
+            cfgrow2.addWidget(QLabel("砖最多拥有融合框边数量"))
+            self.sp_emax = NoWheelDoubleSpinBox()
+            self.sp_emax.setRange(1.0, 4.0)
+            self.sp_emax.setSingleStep(1.0)
+            self.sp_emax.setDecimals(0)
+            self.sp_emax.setValue(float(_EDGE_MAX_DEFAULT))
+            self.sp_emax.setToolTip(
+                "融合框四边的「边归属」里，**允许一块砖最多占住几条边**（1~4）。\n\n"
+                "· 每条边看「它离**最近的某块砖**的对应边有多远」（线段对线段）⇒ 在\n"
+                "  「噪声容差(px)」以内就算这条边归砖；\n"
+                "· 若归砖的边**多于**本项 ⇒ 按距离从小到大**只留最近的前 x 条**，\n"
+                "  其余改判「真目标提供的边」；\n"
+                "· 4（默认）= 不截断（保持原样）；设 1~3 会把「四条边全归砖 ⇒\n"
+                "  不落位、照预测走「那一档变成」还有真边可用 ⇒ 照样落位「。\n\n"
+                "改完点「应用」⇒ 重新演算整段并生效。")
+            cfgrow2.addWidget(self.sp_emax)
+            # ---- ⭐⭐⭐ **真目标预测最大速度倍率**（用户 2026-10-03 ✓ 原话："将**分离期（淡粉色框
+            #   时期）**的**最大相对假目标群速度（白箭头）** = a × **假目标群体的标准速度**，a 为
+            #   新配置『**真目标预测最大速度倍率**』默认 1.0" ✓）：分离期（**红框丢失**、演示窗画
+            #   "淡粉接力框"那段预测期 ✓）里白箭头（`vel_rel` = 相对假目标群的速度 ✓）的**模长上限**
+            #   = 本项 × **当拍实测群体速度模长** ✓（只压不抬 ✓ 方向不变 ✓）。
+            cfgrow2.addWidget(QLabel("真目标预测最大速度倍率"))
+            self.sp_svmax = NoWheelDoubleSpinBox()
+            self.sp_svmax.setRange(0.0, 5.0)
+            self.sp_svmax.setSingleStep(0.1)
+            self.sp_svmax.setDecimals(2)
+            self.sp_svmax.setValue(float(_SEP_VEL_MAX_DEFAULT))
+            self.sp_svmax.setToolTip(
+                "**分离期**（红框丢失、画淡粉接力框那段预测期）里，白箭头（相对假目标群的\n"
+                "速度）的**模长上限** = 本项 × **当拍实测的群体速度模长**。\n\n"
+                "· 1.00（默认）⇒ 真目标的预测速度最多与假目标群的移动速度一样快；\n"
+                "· 调小（如 0.5）⇒ 分离期预测更保守、圆走得更慢；\n"
+                "· 0 ⇒ 分离期白箭头模长压到 0（圆不再按预测前进，极端值）。\n"
+                "· **只压不抬**：没超上限就一个字不动；方向不变 ⇒ 「白箭头 = 圆真的会走多少」\n"
+                "  仍成立；群体速度判不出来（没观测）时**不夹**。\n\n"
+                "改完点「应用」⇒ 重新演算整段并生效。")
+            cfgrow2.addWidget(self.sp_svmax)
+            # ⭐⭐ **第二行统一"居左、不平铺"**（用户 2026-10-02 ✓ 原话："第二行的配置布局统一
+            #   一下**居左不要平铺**" ✓）：末尾加一根弹簧 ⇒ 控件按各自 sizeHint 靠左排、余量
+            #   留在右边 ✓（不加弹簧时，若某个控件带横向扩展策略就会被拉宽 ⇒ 看着像"平铺" ✗）。
+            # ---- ⭐⭐⭐ **分离期那一对（用户 2026-10-03 ✓ 参数分档第 2 行）** ----------------
+            #   一句话口径（用户 2026-10-03 ✓ **二次修订**）："**圆外接矩形与检出框相交的比例 > ___
+            #   时，检出框与内砖 IoU < ___ 判定为融合**" ✓ —— ⚠ 原来那一句是"检出框与圆外接矩形
+            #   **IoU** > ___"✗（分母 = **并集** ⇒ 框一大就摊薄 ⇒ 天生偏小 ✗ 实测同局面仅 0.35~0.5
+            #   ✗）⇒ 现在分母换成 **圆外接矩形面积** ✓（单向 ✓ 同局面直接 1.0 ✓）。
+            #   ⚠ **量级提醒**（务必知悉 ✗）：可用区从 0.3~0.4 抬到 **0.70~0.95** ✓。
+            cfgrow2.addWidget(QLabel("分离期：圆外接矩形 相交比例 >"))
+            self.sp_ring_sep = NoWheelDoubleSpinBox()
+            self.sp_ring_sep.setRange(0.0, 1.0)
+            self.sp_ring_sep.setSingleStep(0.05)
+            self.sp_ring_sep.setDecimals(2)
+            self.sp_ring_sep.setValue(float(_RING_COV_SEP_DEFAULT))
+            self.sp_ring_sep.setToolTip(
+                "**分离期**（红框丢失、画淡粉接力框那段预测期）判「这格算出并集了吗」的前半条：\n\n"
+                "**（圆外接矩形 ∩ 检出框）÷ 圆外接矩形面积 > 本值**\n"
+                "⇒ 才算「绿圈那一块地方大体落在框里」。\n\n"
+                "⚠ 这是**单向比例**（分母 = 圆的那个方块），**不是 IoU**：圆整个落在框里 = 1.00；\n"
+                "圆只落进去三成 = 0.30。\n"
+                "⚠ 量级 ⇒ **可用区约 0.70~0.95**（默认 0.80 = 「八成落在框里」）——\n"
+                "别再拿 IoU 时代的 0.35 来配（那等于「三成半落在框里就算」⇒ 形同虚设）。\n\n"
+                "· 调小 ⇒ 更容易认成融合；调大 ⇒ 更严。\n"
+                "· 半径还没学到那几拍 ⇒ 这条**自动放行**（不拦）。\n\n"
+                "⚠ 这条**取代**了原来的「圆心±噪声容差 与框相交」那条判据。\n"
+                "改完点「应用」⇒ 重新演算整段并生效。")
+            cfgrow2.addWidget(self.sp_ring_sep)
+            cfgrow2.addWidget(QLabel("↔内砖 IoU <"))
+            self.sp_brick_sep = NoWheelDoubleSpinBox()
+            self.sp_brick_sep.setRange(0.0, 1.0)
+            self.sp_brick_sep.setSingleStep(0.05)
+            self.sp_brick_sep.setDecimals(2)
+            self.sp_brick_sep.setValue(float(_BRICK_IOU_SEP_DEFAULT))
+            self.sp_brick_sep.setToolTip(
+                "**分离期**判融合的后半条：\n\n"
+                "**IoU(检出框, 它压着的那块砖) < 本值** ⇒ 两框**不是同一格** ⇒ 才是「并集」。\n\n"
+                "· 默认 0.50（**进入严** ⇒ 不容易误判成融合）；\n"
+                "· 与「融合期」那一项之差 = **迟滞**（进严守松）⇒ 边界不来回横跳。\n\n"
+                "改完点「应用」⇒ 重新演算整段并生效。")
+            cfgrow2.addWidget(self.sp_brick_sep)
+            cfgrow2.addStretch(1)
+            # ---- ⭐⭐⭐ **融合期那一对（用户 2026-10-03 ✓ 参数分档第 3 行）** ----------------
+            #   同一句话口径，但落点是"**保持**"：满足 ⇒ **继续融合** ✓；**否则就算分离** ✓
+            #   （= 迟滞的下半段"守松" ✓ 治"融合段太碎" ✓）。
+            cfgrow3 = QHBoxLayout()
+            cfgrow3.setContentsMargins(6, 2, 6, 2)
+            self._row3 = cfgrow3                  # ⭐ 同上（新模式整行隐藏 ✓）
+            cfgrow3.addWidget(QLabel("融合期：圆外接矩形 相交比例 >"))
+            self.sp_ring_fuse = NoWheelDoubleSpinBox()
+            self.sp_ring_fuse.setRange(0.0, 1.0)
+            self.sp_ring_fuse.setSingleStep(0.05)
+            self.sp_ring_fuse.setDecimals(2)
+            self.sp_ring_fuse.setValue(float(_RING_COV_FUSE_DEFAULT))
+            self.sp_ring_fuse.setToolTip(
+                "**融合期**（已在融合保持里）复核的**前半条**（与上面「分离期」那一项同一把尺）：\n\n"
+                "**（圆外接矩形 ∩ 检出框）÷ 圆外接矩形面积 > 本值** ⇒ 这条算过。\n\n"
+                "⚠ 同一把尺：**单向比例**不是 IoU ⇒ 量级 = 0.70~0.95（默认 0.80 ✓ 见上一项说明）。\n\n"
+                "⚠ 这一行与下一项**任一不满足** ⇒ **判分离**（红框消失、走淡粉预测态）。\n"
+                "改完点「应用」⇒ 重新演算整段并生效。")
+            cfgrow3.addWidget(self.sp_ring_fuse)
+            cfgrow3.addWidget(QLabel("↔内砖 IoU <"))
+            self.sp_brick_fuse = NoWheelDoubleSpinBox()
+            self.sp_brick_fuse.setRange(0.0, 1.0)
+            self.sp_brick_fuse.setSingleStep(0.05)
+            self.sp_brick_fuse.setDecimals(2)
+            self.sp_brick_fuse.setValue(float(_BRICK_IOU_FUSE_DEFAULT))
+            self.sp_brick_fuse.setToolTip(
+                "**融合期**复核的**后半条**：\n\n"
+                "**IoU(检出框, 它压着的那块砖) < 本值** ⇒ 还算「并集」。\n\n"
+                "· 默认 0.70（**守松** ⇒ 已经融合的不容易掉）；\n"
+                "· 与「分离期」那一项（0.50）之差 = **迟滞**；\n"
+                "· **想临时关掉「融合期退出」** ⇒ 把它设成 **1.00**（等价于「只要框还包着砖就继续」）。\n\n"
+                "改完点「应用」⇒ 重新演算整段并生效。")
+            cfgrow3.addWidget(self.sp_brick_fuse)
+            # ⚠ "允许倒退距离"两期共用（用户第 2/3 行都写了 ✓）⇒ 第 3 行这一份与第 2 行
+            #   **双向同步** ✓（改任一处、另一处跟着变 ✓ 见 `_sync_ab` ✓）。
+            cfgrow3.addWidget(QLabel("允许倒退距离(步数比例)"))
+            self.sp_ab_fuse = NoWheelDoubleSpinBox()
+            self.sp_ab_fuse.setRange(0.0, 5.0)
+            self.sp_ab_fuse.setSingleStep(0.05)
+            self.sp_ab_fuse.setDecimals(2)
+            self.sp_ab_fuse.setValue(float(_ALLOW_BACK_RATIO_DEFAULT))
+            self.sp_ab_fuse.setToolTip(
+                "与上面那一行**同一个参数**（两期共用 ✓ 改任一处另一处同步 ✓）：\n\n"
+                "落位点在白箭头**后方 180° 扇形**内时，允许挪多远 = 本值 × **本拍该走多远**\n"
+                "（B 型 ⇒ **帧率 / 播放倍速无关** ✓）。\n\n"
+                "· 0 ⇒ 一点不许倒退；调大 ⇒ 允许「退一点点」的框也算安全。\n\n"
+                "⚠ 只看「融合第 2 拍起」（进门那一拍按流程图不判 ✓）。\n"
+                "改完点「应用」⇒ 重新演算整段并生效。")
+            cfgrow3.addWidget(self.sp_ab_fuse)
+            # ⚠ 这一句会把"砖最多拥有融合框边数量"**从第 2 行迁到第 3 行** ✓（Qt 会把它
+            #   从旧布局摘走 ✓ = 用户要的"第 3 行放它" ✓ 不重复出现 ✓）。
+            cfgrow3.addWidget(self.sp_emax)
+            cfgrow3.addStretch(1)
+            # ⭐ 同步：`sp_back`（第 2 行）↔ `sp_ab_fuse`（第 3 行）——**同一个参数** ✓
+            self._sync_ab_guard = False
+            self.sp_back.valueChanged.connect(
+                lambda v: self._sync_ab(self.sp_back, self.sp_ab_fuse, v))
+            self.sp_ab_fuse.valueChanged.connect(
+                lambda v: self._sync_ab(self.sp_ab_fuse, self.sp_back, v))
+            # ---- ⭐⭐ **噪声容差(px)**（用户 2026-10-02 ✓ 原话："加容差，且将这个容差作为
+            #   配置参数『噪声容差(px)』加在『融合框判定阈值』的右边，依旧点应用重算后生效" ✓；
+            #   ⭐ 同日口径更新 ✓ 原话："**圆心在框内改成『圆心±噪声容差范围与框相交』**" ✓）：
+            #   规则① 判的就是"**圆心 ± 它** 的范围（以圆心为中心的方块）与检出框**相交**"✓
+            #   —— 吸收检出框边缘的亚像素噪声（实测帧 16 圆心只出框 0.7px ✗ 严格判会漏 ✓）；
+            #   0 = 范围退化成点 = 严格"圆心在框内" ✓（同一把尺 ✓ 见 `_pos_range_hits` ✓）。
+            # ---- ⭐⭐⭐ **第 4 行：运动分离（新）专用参数**（用户 2026-10-03 ✓ 原话："运动分离
+            #   **没有任何参数要配吗？**" ✓）----------------------------------------------------
+            #   ⚠ **分两档给** ✗ 不一股脑全给 ✓：
+            #     · **手感 / 权衡档**（跟得紧 ↔ 稳 ✓ 按素材调 ✓）⇒ **放这一行** ✓；
+            #     · **物理契约档**（"什么算一个块"：**面积带** / **填充度** ✓ 见
+            #       `perception/lie_motion.py` 顶上 ✓）⇒ **不放** ✗ —— 那几个是按"本素材那个白星的
+            #       形状"定的 ✓ 调了会**认错东西** ✗（要换素材，改那几个常量 ✓ 比放界面上安全 ✓）。
+            #   ⚠ 5 个**都是"点『应用』才生效"**（与其余参数同一个约定 ✓ 不自动重算 ✗ 免得卡界面 ✓）。
+            cfgrowM = QHBoxLayout()
+            cfgrowM.setContentsMargins(6, 2, 6, 2)
+            self._rowM = cfgrowM            # ⭐ 存起来（**经典模式下整行隐藏** ✓ 见 `_on_mode_changed` ✓）
+            cfgrowM.addWidget(QLabel("候选配对门限(px)"))
+            self.sp_pair = NoWheelDoubleSpinBox()
+            self.sp_pair.setRange(20.0, 200.0)
+            self.sp_pair.setSingleStep(5.0)
+            self.sp_pair.setDecimals(0)
+            self.sp_pair.setValue(float(_MOTION_PAIRED_DEFAULT))
+            self.sp_pair.setToolTip(
+                "**YOLO 的框**与**已有候选轨迹**相距超过本值 ⇒ 认为是「新出现的一个」 ⇒ 另起一条轨迹 ✓。\n\n"
+                "为什么需要它 ✗：**相机一帧能走几十 px**（实测群体中位位移到过 **(26, 1)** ✓），而\n"
+                "真目标**本身还在动** ✓ ⇒ 门限太小会把「同一个目标」断成两截 ✗（轨迹一直重建 ⇒ 分数\n"
+                "永远攒不起来 ✗）。\n\n"
+                "· **调大** ⇒ 更不容易断（但离得近的两个目标可能被并成一条 ✗）。\n"
+                "· **调小** ⇒ 候选更「干净」（但相机一快就断链 ✗）。\n"
+                "⚠ 实测（`10月1日` 全片）用 **70** 时，\「假目标的相对群体偏离\」只有 **3.3~6.5px** ✓\n"
+                "   ⇒ 说明 70 完全没有\「配错对\」的迹象 ✓。")
+            cfgrowM.addWidget(self.sp_pair)
+            cfgrowM.addWidget(QLabel("偏离累积衰减"))
+            self.sp_sdecay = NoWheelDoubleSpinBox()
+            self.sp_sdecay.setRange(0.50, 0.99)
+            self.sp_sdecay.setSingleStep(0.01)
+            self.sp_sdecay.setDecimals(2)
+            self.sp_sdecay.setValue(float(_MOTION_SDECAY_DEFAULT))
+            self.sp_sdecay.setToolTip(
+                "**候选分数 = 候选分数 × 本值 ＋ 本拍偏离**（本拍偏离 = |它的位移 − 群体中位位移| ✓）。\n\n"
+                "这一项是本模式的**核心** ✓：真目标\「**相对假目标群体一直在动**\」 ⇒ 每拍都攒分 ✓；\n"
+                "假目标只是**偶然**跳一下 ✓ ⇒ 衰减让\「偶然\」攒不起来 ✓。\n\n"
+                "· **调大**（→0.99）⇒ 几乎不衰减 ⇒ **老分数说话**（更认\「谁历史上最不合群\」 ✓\n"
+                "  但一旦跟错，**很难纠正** ✗）。\n"
+                "· **调小**（→0.5）⇒ 只看最近几拍 ⇒ 反应快（但会被一次抖动带跑 ✗）。\n"
+                "⚠ 实测：每帧 top1 偏离 **8~26px**、噪声底 **3~6px**（信噪比 **1.6~5.1** ✓）\n"
+                "   ⇒ 0.90 相当于\「**约 10 拍的有效记忆**\」 ✓ 够把真目标顶上去 ✓。")
+            cfgrowM.addWidget(self.sp_sdecay)
+            cfgrowM.addWidget(QLabel("切换迟滞余量"))
+            self.sp_margin = NoWheelDoubleSpinBox()
+            self.sp_margin.setRange(0.0, 40.0)
+            self.sp_margin.setSingleStep(1.0)
+            self.sp_margin.setDecimals(0)
+            self.sp_margin.setValue(float(_MOTION_MARGIN_DEFAULT))
+            self.sp_margin.setToolTip(
+                "**换目标要有余量**：新候选的分数要超过当前目标 **这么多分** 才换 ✓（防来回跳 ✗）。\n\n"
+                "· **调大** ⇒ 更稳（但真目标换了、它却死抱着旧的 ✗）。\n"
+                "· **调小**（0）⇒ 谁分高跟谁（反应快 ✓ 但两个候选分数接近时会**反复横跳** ✗）。\n"
+                "⚠ 一次典型偏离约 10 分 ⇒ 默认 **8** ≈ \「**领先不到一次偏离就不换**\」 ✓。")
+            cfgrowM.addWidget(self.sp_margin)
+            cfgrowM.addWidget(QLabel("最少命中拍数"))
+            self.sp_minhits = NoWheelDoubleSpinBox()
+            self.sp_minhits.setRange(1.0, 20.0)
+            self.sp_minhits.setSingleStep(1.0)
+            self.sp_minhits.setDecimals(0)
+            self.sp_minhits.setValue(float(_MOTION_MINHITS_DEFAULT))
+            self.sp_minhits.setToolTip(
+                "一条候选轨迹至少要被**关联上这么多拍**，才有资格被选成目标 ✓。\n\n"
+                "· 防的是\「**刚建的空轨迹**\」抢位 ✗（新框第一拍分数是 0 ✓ 但它可能恰好排在前面 ✗）。\n"
+                "· **调大** ⇒ 更保险（但开局会**晚几拍**才出白线 ✗）。\n"
+                "· **调小**（1）⇒ 第一拍就能选（万一那一拍刚好挑错 ⇒ 起点就歪 ✗）。")
+            cfgrowM.addWidget(self.sp_minhits)
+            cfgrowM.addWidget(QLabel("白度辅助权重"))
+            self.sp_whitew = NoWheelDoubleSpinBox()
+            self.sp_whitew.setRange(0.0, 5.0)
+            self.sp_whitew.setSingleStep(0.5)
+            self.sp_whitew.setDecimals(1)
+            self.sp_whitew.setValue(float(_MOTION_WHITEW_DEFAULT))
+            self.sp_whitew.setToolTip(
+                "**开局的辅助证据**（用户口径：\「一开始依旧用白色图形展示真目标\」 ✓）：\n"
+                "哪条候选正好落在\「**画面里最白的那块**\」上 ⇒ 给它加 `本值 × 6` 分 ✓。\n\n"
+                "⚠ **只在白块还在时有效** ✗ —— 目标**逐渐透明**之后白度就没了 ⇒ 该项自然归零 ✓\n"
+                "  （那时完全靠\「运动不合群\」 ✓ 两者互补 ✓ 不是二选一 ✓）。\n\n"
+                "· **0** ⇒ 完全不用白度（纯靠运动 ✓ 开局会**晚几拍**才定下来 ✗）。\n"
+                "· **调大** ⇒ 开局定得更快（但\「画面里别处也有白东西\」时会被带偏 ✗）。\n"
+                "⚠ 加分量 6 分 < 一次典型偏离 10 分 ⇒ 它是**辅助**，不会盖过运动证据 ✓。")
+            cfgrowM.addWidget(self.sp_whitew)
+            cfgrowM.addStretch(1)
+            cfgrow.addWidget(QLabel("噪声容差(px)"))
+            self.sp_ntol = NoWheelDoubleSpinBox()
+            self.sp_ntol.setRange(0.0, 100.0)
+            self.sp_ntol.setSingleStep(0.5)
+            self.sp_ntol.setDecimals(1)
+            self.sp_ntol.setValue(float(_NOISE_TOL_DEFAULT))
+            self.sp_ntol.setToolTip(
+                "规则① 判的是「**圆心 ± 它** 的范围」与检出框**相交**（以圆心为中心的方块，\n"
+                "碰到框就算相交 ⇒ 吸收检出框边缘的亚像素噪声 ✓）。\n"
+                "只作用于**融合判定**（规则①）；0 = 范围退化成点 = 严格「圆心在框内」。\n"
+                "改完点「应用」⇒ 重新演算整段并生效。")
+            cfgrow.addWidget(self.sp_ntol)
+            # ---- ⭐⭐ **上板时长(秒)**（用户 2026-10-02 ✓ 原话："『多久判定为上板』应该以
+            #   时长为单位做成配置，像『噪声容差』一样加到配置行" ✓）：登记条目**自出生起**
+            #   跟着群体走满这么多秒、且面积/宽高比/不贴边判据都过 ⇒ 才转正上板 ✓；
+            #   0 = 一帧就上板（老行为 ✓）。
+            cfgrow.addWidget(QLabel("上板时长(秒)"))
+            self.sp_board = NoWheelDoubleSpinBox()
+            self.sp_board.setRange(0.0, 10.0)
+            self.sp_board.setSingleStep(0.1)
+            self.sp_board.setDecimals(1)
+            self.sp_board.setValue(float(_BOARD_S_DEFAULT))
+            self.sp_board.setToolTip(
+                "登记条目自出生起要跟着群体走满这么多秒、且面积/宽高比/不贴边判据都满足，\n"
+                "才转正为上板的青色砖。0 = 一帧就上板。\n"
+                "改完点「应用」⇒ 重新演算整段并生效。")
+            cfgrow.addWidget(self.sp_board)
+            # ---- ⭐⭐ **上板防抖重叠率**（用户 2026-10-02 ✓ 原话："目前有**旧砖被重复往上
+            #   叠加砖**的问题。优化：如果**新砖与旧砖重叠率 >= 0.5**，判定为**同一登记砖**。
+            #   **标砖的框选更接近假目标群体标准尺寸的那个**。这个 0.5 做成参数配置『**上板防抖
+            #   重叠率**』" ✓）：紧门配不上、正要**新建条目**之前，先拿这个检出与**旧砖**比重叠率
+            #   ✓（重叠率 = 交集 ÷ 两者中较小的面积 ✓ —— 小框叠在大砖上也接近 1.0 ✓）：
+            #   ≥ 它 ⇒ 判**同一块砖**、**不新建** ✗，并把该砖的框改成**更接近群体标准尺寸**的
+            #   那个 ✓。0 = 关（老行为一字不变 ✓）。判据在登记表里（`ShapeRegistry` ✓）。
+            cfgrow.addWidget(QLabel("上板防抖重叠率"))
+            self.sp_ov = NoWheelDoubleSpinBox()
+            self.sp_ov.setRange(0.0, 1.0)
+            self.sp_ov.setSingleStep(0.05)
+            self.sp_ov.setDecimals(2)
+            self.sp_ov.setValue(float(_BOARD_OVERLAP_DEFAULT))
+            self.sp_ov.setToolTip(
+                "新建登记砖之前，先拿这个检出与**已有旧砖**比一次重叠率\n"
+                "（重叠率 = 交集 ÷ 两者中较小的面积 —— 小框叠在大砖上也接近 1.0）。\n"
+                "≥ 它 ⇒ 判**同一块登记砖**、**不再新建**，并把该砖的框改成**更接近群体标准尺寸**\n"
+                "（登记表定的标准面积 typ_area）的那个。0 = 关（老行为）。\n"
+                "改完点「应用」⇒ 重新演算整段并生效。")
+            cfgrow.addWidget(self.sp_ov)
+            # ---- ⭐⭐⭐ **鼠标跟随效率倍率**（用户 2026-10-03 ✓ 原话："能否开放一个系数配置，
+            #   调**追踪器**跟上圆心的效率倍率？" ✓ + "**我不想影响位置计算**，只调追踪器
+            #   （较大的白描边圈绿圆）" ✓）：画面上那个"**白圈 + 绿实心点**"的大点 = **控制器
+            #   输出的模拟鼠标** ✓（不是 `LieTracker` 的位置 ✓）⇒ 本项只决定"**鼠标每拍朝圆心
+            #   走多快**" ✗ 一点也不影响位置计算 ✓（融合落位 / 夹取 / 预测全都不看它 ✓）。
+            #   · **1.00（默认）= 全量**（每拍尽量贴上去 ✓ 老行为一字不变 ✓）；
+            #   · 调小 ⇒ 每拍只走剩余误差的一部分 ⇒ 光标**渐进**贴上圆心 ✓；
+            #   · 调大 ⇒ 过冲 ⇒ 在"一拍延迟 + 速度前馈"的闭环里**提前压住滞后** ✓。
+            cfgrow.addWidget(QLabel("鼠标跟随效率倍率"))
+            self.sp_follow = NoWheelDoubleSpinBox()
+            self.sp_follow.setRange(0.01, 5.0)      # ⚠ 0 = 光标几乎不动 ⇒ 无意义 ⇒ 下限 0.01 ✓
+            self.sp_follow.setSingleStep(0.05)
+            self.sp_follow.setDecimals(2)
+            self.sp_follow.setValue(float(_FOLLOW_GAIN_DEFAULT))
+            self.sp_follow.setToolTip(
+                "**鼠标（追踪器那个白圈绿点）每拍朝圆心走多快** —— 每拍消掉「光标 → 圆心」\n"
+                "误差的这么多倍（**只作用在控制器输出上**，不影响任何位置计算 ✓）。\n\n"
+                "· 1.00（默认）⇒ 每拍尽量全量贴上去（仍受单步限幅 200 与整数取整限制）；\n"
+                "· 调小（如 0.50）⇒ 每拍只走一半剩余 ⇒ 光标渐进贴上圆心；\n"
+                "· 调大（如 1.50）⇒ 会过冲，但在「一拍延迟 + 速度前馈」的闭环里能提前到位。\n\n"
+                "改完点「应用」⇒ 重新演算整段并生效。")
+            cfgrow.addWidget(self.sp_follow)
+            # ---- ⭐⭐⭐ **缩成砖判定 · 最小 IoU**（用户 2026-10-03 ✓ 原话："我才学到 IoU 这个
+            #   算法，我认为我们很多判定都可以换成这个算法（例如『噪声容差』改成『**噪声最小
+            #   IoU**』）" ✓）：融合期判"这格框已经缩回**砖的大小/位置**了"原来只看"**四条边都在
+            #   噪声容差(px) 内**"（绝对像素 ⇒ 大砖松、小砖紧 ✗）；本项补一把**尺度无关**的尺 =
+            #   `IoU(框, 砖) ≥ 本值` ✓（两条**并列** ⇒ 满足任一即算"缩成砖" ✓）。
+            #   ⚠ **只有这一处加 IoU** —— "覆盖率/是否包住砖"那些是**单向**"大框盖住小砖"（框多大
+            #   不进分母 ✓）⇒ 换 IoU 反而会误判 ✗；登记表"上板防抖"要的是"小框叠大砖≈1"✓（IoU
+            #   会偏小、拦不住 ✗）；"圆心±容差与框相交"是"离框边几像素"（点/边对区域 ✓）⇒ IoU
+            #   没有对应物 ✓（详见 `perception/geom.py` 模块头 ✓）。
+            #   · **0.70（默认）**≈ 上面那条"四条边差 20px 上下" ✓；越接近 1 越严 ✓；
+            #   · **0 = 关**（只剩像素那条腿 ✓ 老行为一字不变 ✓）。
+            cfgrow.addWidget(QLabel("缩成砖最小 IoU"))
+            self.sp_ioub = NoWheelDoubleSpinBox()
+            self.sp_ioub.setRange(0.0, 1.0)
+            self.sp_ioub.setSingleStep(0.05)
+            self.sp_ioub.setDecimals(2)
+            self.sp_ioub.setValue(float(_IOU_BRICK_DEFAULT))
+            self.sp_ioub.setToolTip(
+                "融合期判「这格框已经缩回**砖的大小/位置**」的另一把尺：\n"
+                "**IoU(框, 砖) ≥ 本值** 也算「缩成砖」（与「四条边都在噪声容差内」并列）。\n\n"
+                "· 0.70（默认）≈ 「四条边差 20px 上下」同一量级；越接近 1 越严；\n"
+                "· 0 = 关（只用「噪声容差(px)」那条腿，老行为一字不变）。\n\n"
+                "⚠ 只有这一处判据用 IoU —— 「覆盖率 / 是否包住砖」是单向的「大框盖住小砖多少」，\n"
+                "换 IoU 会误判（并集框本来就比砖大）；登记表「上板防抖重叠率」要的是「小框叠在\n"
+                "大砖上 ≈ 1「，IoU 会偏小、拦不住。\n\n"
+                "改完点「应用」⇒ 重新演算整段并生效。")
+            cfgrow.addWidget(self.sp_ioub)
+            # ---- ⭐⭐⭐ **"位置估计"算法分支**（用户 2026-10-03 ✓ 原话："做 KF影子模式 然后找个
+            #   地方加按钮或开关切换（**你决定在哪、叫什么**）—— 目的是可以**自由选择算法分支
+            #   以防污染当前的进展**" ✓）：
+            #   · **经典（现状）**（默认 ✓）= 现在这套链条（残差/白块观测 + 夹取 + 拟人平滑 ✓）
+            #     —— **一字不变** ✓；
+            #   · **KF 影子（只记录）** = 卡尔曼与经典**并行**跑 ✓ 把经典每拍的位置当观测喂给它 ✓
+            #     **只记录** KF 的位置/速度/**新息** ✗ **绝不改位置** ✓（这就是"不污染" ✓）。
+            #     数据在**状态栏尾**看：`KF 影子：差 p50/p90 ｜ 新息 p50/p90` ✓
+            #     —— 新息量级 **直接告诉你观测噪声 σ 该取多大** ✓（`kf.KF_R_DEF` 现在是 6px ✓）。
+            #   ⚠ 默认**经典** ⇒ 现有进展不动 ✓ 想对照就切到影子 ✓ 任何时候能切回来 ✓。
+            cfgrow.addWidget(QLabel("显示 KF 预测"))
+            self.chk_kf = QCheckBox()
+            self.chk_kf.setChecked(False)
+            self.chk_kf.setToolTip(
+                "**位置估计用哪条算法分支**（切换后点「应用」重算）：\n\n"
+                "· 经典（现状）⇒ 现在这套链条，行为一字不变（默认）；\n"
+                "· KF 影子（只记录）⇒ 卡尔曼与经典**并行跑**，只记录不开车：\n"
+                "   把经典每拍算出的位置当观测喂给卡尔曼，看它估到哪、以及「新息」多大。\n"
+                "   结果在**状态栏尾**：差 p50/p90（KF 与经典差多少）、新息 p50/p90\n"
+                "   （= 经典输出里的抖动/意外量级，直接告诉你观测噪声该设多大）。\n\n"
+                "⚠ 影子模式**不影响**任何位置计算 ⇒ 可以放心开着跑、对照完再切回来。")
+            cfgrow.addWidget(self.chk_kf)
+            # ⭐ 勾选变化 ⇒ 立刻显示/隐藏**右列**（KF 位置驱动 ✓ 用户 2026-10-03 ✓）——
+            #   ⚠ 数据要**点"应用"重算**才有（右列要重跑一整遍 ✓ 不自动重算免得卡界面 ✓）。
+            self.chk_kf.stateChanged.connect(self.on_toggle_kf)
             self.btn_apply = QPushButton("应用")
             self.btn_apply.setToolTip("按当前「轨迹预测窗口时间」**重新演算**整段并生效 ✓")
             self.btn_apply.clicked.connect(self.apply_path_ms)
             self.btn_apply.setEnabled(False)          # 载入素材前点了没意义 ✓
-            cfgrow.addWidget(self.btn_apply)
+            # ⭐⭐ **"应用"统一放整个配置区的右下角**（用户 2026-10-02 ✓ 原话："把应用按钮放到
+            #   **整个配置区的右下角**（**以后也如此**）" ✓ ⇒ 已同步写进 `docs/UI规范.md` ✓）：
+            #   所以这里**不**把它加进 `cfgrow` ✗（那一行只放参数 ✓ 组装见下面的配置区 ✓）。
             cfgrow.addStretch(1)
 
             self.lbl = _ImageView()
             self.lbl.setText("点左上角「选择视频…」放一段录像，或「选择 GIF…」"
                              "选一个动图（如 datasets/liedetectorgifs/test.gif）✓")
+            # ⭐⭐⭐ **左键点选检出框**（用户 2026-10-03 ✓ 原话："你能让我在**点选检出框**的时候
+            #   显示 `(360.4,323.0) 179×208=37232` 这种信息吗" ✓）：视图把**加工域坐标**报给
+            #   这里 ⇒ 命中那格检出框 ⇒ 黄框高亮 + `几何=面积` 标签 + 状态栏一行 ✓（纯显示 ✓）。
+            #   `_pick` = `{"frame": 第几帧, "box": 检出框元组}`（切帧后**不显示**但不清除 ✓
+            #   —— 拖回那一帧还能看到 ✓）；点空白 ⇒ 取消（`box=None`）。
+            self._pick = None
+            self.lbl._on_pick = self._on_pick_box
+            # ⭐⭐⭐ **右键**（用户 2026-10-03 ✓ 原话："加一个**右键点击检出框选中并弹出菜单**，
+            #   目前只有一项『**复制检出框信息**』，用来我**复制之后与你交流**" ✓）⇒
+            #   `_on_pick_menu` ✓（命中 ⇒ 选中 + 弹菜单 + 复制 ✓ 见它 ✓）。
+            self.lbl._on_context = self._on_pick_menu
             # ---- 播放进度条（可拖动定位 ✓ 用户 2026-09-30 要求 ①）----
             self.sld = QSlider(Qt.Horizontal)
             self.sld.setRange(0, 0)
@@ -1267,9 +2322,116 @@ def run_window(args):
             c = QWidget()
             lay = QVBoxLayout(c)
             lay.setContentsMargins(0, 0, 0, 0)
-            lay.addLayout(cfgrow)          # ⭐ 配置行在**画面上方**（交互区下面 ✓）
-            lay.addWidget(self.lbl, 1)
+            # ⭐⭐⭐ **配置区组装**（用户 2026-10-02 ✓ 原话："把应用按钮放到**整个配置区的右下角**
+            #   （**以后也如此**）" ✓）：两行参数**靠左排**（各自末尾都有弹簧 ✓ 不平铺 ✓），
+            #   `应用`按钮摆在**整个配置区**的**右下角** ✓。规范已写进 `docs/UI规范.md` ✓。
+            _cfgcol = QVBoxLayout()
+            _cfgcol.setContentsMargins(0, 0, 0, 0)
+            _cfgcol.setSpacing(2)
+            # ⭐⭐⭐ **三行分档布局**（用户 2026-10-03 ✓ 原话："整理参数分档布局（设计一下，直观、
+            #   美观、好理解点）"＋"按状态配置参数" ✓）：每行前面加一条**分组标题**（淡色小字 ✓
+            #   不占高度 ✓）⇒ 一眼能看出"这行管哪一期" ✓。
+
+            def _group(_title, _desc=""):
+                _w = QWidget()
+                _h = QHBoxLayout(_w)
+                _h.setContentsMargins(6, 2, 6, 0)
+                _h.setSpacing(6)
+                _t = QLabel(_title)
+                _t.setStyleSheet("color:#7fd; font-weight:bold; padding:0;")
+                _h.addWidget(_t)
+                if _desc:
+                    _d = QLabel(_desc)
+                    _d.setStyleSheet("color:#98a; padding:0;")
+                    _h.addWidget(_d)
+                _h.addStretch(1)
+                return _w
+
+            _cfgcol.addWidget(_group("通用", "轨迹预测 / 上板 / 跟随 / 同检出 IoU / 选框与夹取限速"))
+            _cfgcol.addLayout(cfgrow)
+            _cfgcol.addWidget(_group("分离期", "红框丢失、走淡粉预测那一段："
+                                                "这一对阈值管「算不算又融合了」（进严）"))
+            _cfgcol.addLayout(cfgrow2)
+            _cfgcol.addWidget(_group("融合期", "已在融合保持里：同一对阈值管「还该不该继续」"
+                                                "（守松）——不满足就判分离"))
+            _cfgcol.addLayout(cfgrow3)
+            # ⭐⭐⭐ **第 4 行：运动分离（新）专用**（用户 2026-10-03 ✓ 原话："运动分离 **没有任何
+            #   参数要配吗？**" ✓）—— ⚠ 只在**新模式**下显示 ✓（经典模式整行隐藏 ✓ 见
+            #   `_on_mode_changed` ✓）。
+            _wM = _group("运动分离（新）",
+                         "YOLO 给候选 + 「运动不合群」分辨：配对门限 · 偏离衰减 · 切换迟滞 · "
+                         "最少命中 · 白度辅助"
+                         "（⚠ 本模式**不用砖、不做融合/分离** ✓ 但**要看检出框** ✓）")
+            _wM.setVisible(False)               # 默认是经典 ⇒ 先藏起来 ✓（切模式时同步 ✓）
+            self._rowM_head = _wM               # ⭐ 标题也跟着收 ✓
+            _cfgcol.addWidget(_wM)
+            _cfgcol.addLayout(cfgrowM)
+            _cfgbox = QHBoxLayout()
+            _cfgbox.setContentsMargins(0, 0, 6, 2)
+            _cfgbox.addLayout(_cfgcol)
+            _cfgbox.addStretch(1)                                  # 参数列靠左、余量留右 ✓
+            _cfgbox.addWidget(self.btn_apply, 0, Qt.AlignRight | Qt.AlignBottom)   # 右下角 ✓
+            lay.addLayout(_cfgbox)
+            # ⭐⭐⭐ **并排两列视图**（用户 2026-10-03 ✓ 原话："因为**预测结果不同，实际走向也会
+            #   不同**，所以在**实时演算上叠加 KF 显示意义不大**。能不能：当『KF预测』开启时，
+            #   将**窗口分为两列视图**，左边跑经典右边跑 KF，这样对照才有意义" ✓）：
+            #   · **左列 = 经典**（= 现状 ✓ 一个字不变 ✓）；
+            #   · **右列 = KF 位置驱动**（`Runner(kf_pos=True)` ✓ 真用 KF 位置跑整条链 ✓）；
+            #   · **勾了"显示 KF 预测"才显示右列** ✓（不勾 ⇒ 右列整体 `hide()` ⇒ 与改动前
+            #     **逐像素一致** ✓ 老行为一字不变 ✓）；
+            #   · 两列**同帧号**对齐（各取各的演算表 ✓），缩放各自独立（滚轮/双击互不影响 ✓）。
+            _cols = QHBoxLayout()
+            _cols.setContentsMargins(0, 0, 0, 0)
+            _cols.setSpacing(2)
+            _col1 = QVBoxLayout()
+            _col1.setContentsMargins(0, 0, 0, 0)
+            _col1.setSpacing(1)
+            self.lbl_k1 = QLabel("经典")
+            self.lbl_k1.setStyleSheet("color:#9ad; padding:0 6px;")
+            _col1.addWidget(self.lbl_k1)
+            _col1.addWidget(self.lbl, 1)
+            self.col2 = QWidget()
+            _col2 = QVBoxLayout(self.col2)
+            _col2.setContentsMargins(0, 0, 0, 0)
+            _col2.setSpacing(1)
+            self.lbl_k2 = QLabel("KF 位置估计")
+            self.lbl_k2.setStyleSheet("color:#0ff; padding:0 6px;")
+            self.lbl2 = _ImageView()
+            self.lbl2.setText("（勾「显示 KF 预测」⇒ 这一列跑 KF ✓）")
+            _col2.addWidget(self.lbl_k2)
+            _col2.addWidget(self.lbl2, 1)
+            _cols.addLayout(_col1, 1)
+            _cols.addWidget(self.col2, 1)
+            lay.addLayout(_cols, 1)
+            self.col2.setVisible(False)        # ⭐ 默认不显示（= KF 关 ⇒ 老样子 ✓）
             lay.addLayout(prow)
+            # ---- ⭐⭐ **底部深色日志区**（用户 2026-10-02 ✓ 原话："给测谎演示窗口**下面**加上
+            #   **深色背景的日志区**。当**融合框生成时**添加日志，**显示相关的砖**以及**解释
+            #   判定为融合框的计算数据**" ✓）----
+            #   · 内容 = 追踪器 `out["merge_log"]`（**只在"融合框生成"那一拍**非空 ✓ ——
+            #     融合保持期不给 ✗ 见 `LieTracker._build_merge_log` ✓）⇒ 这里只管显示 ✓
+            #     **不重算判据** ✗（口径不许分家 ✓）；
+            #   · 固定高 176px（不抢画面太多 ✓）；`setMaximumBlockCount` 只留最近 400 条 ✓
+            #     （稳态内存有界 ✓）；
+            #   · 可**鼠标选中复制** ✓ —— 但它是"会吃 ←→/空格"的控件 ✗ ⇒ 加进 `_steal_on`
+            #     （与数字框同一套 ✓ 见下 ✓）⇒ 焦点在日志上照样能切帧 ✓；
+            #   · 回拖 / 换素材会**重建**（不重复刷 ✗ 见 `_log_sync` ✓）。
+            self.log = QPlainTextEdit()
+            self.log.setReadOnly(True)
+            self.log.setPlaceholderText(
+                "融合框日志：判定为「融合框（真并集）」的那一拍（融合框生成）"
+                "与「融合框消失」的那一拍（分离），都会在这里列出参照砖与判定数据")
+            self.log.setMaximumBlockCount(400)
+            self.log.setFixedHeight(176)
+            self.log.setStyleSheet(
+                "QPlainTextEdit{background:#15171a;color:#cfd8dc;border:1px solid #303030;"
+                "font-family:Consolas,'Cascadia Mono',monospace;font-size:11px;"
+                "padding:4px 6px;selection-background-color:#37474f;}"
+                "QScrollBar:vertical{background:#15171a;width:10px;margin:0;}"
+                "QScrollBar::handle:vertical{background:#455a64;border-radius:5px;"
+                "min-height:20px;}"
+                "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}")
+            lay.addWidget(self.log)
             self.setCentralWidget(c)
 
             self.timer = QTimer(self)
@@ -1308,15 +2470,19 @@ def run_window(args):
             #   ⇒ 在数字框上装 `eventFilter`（= 本类的 `eventFilter` ✓ 见那边）：这两个键的
             #     `ShortcutOverride` **吞掉且不 accept** ⇒ 快捷键系统照常匹配 ✓。
             #     代价：数字框里不能再用 ←→ 挪光标（本来也用不上 —— 改值 = 全选重打 ✓）。
+            #   ⚠ **底部日志区**（`QPlainTextEdit` ✓ 2026-10-02 加 ✓）也吃 ←→/空格 ⇒ 一并装上 ✓
+            #     （它只读、不靠键盘操作 ⇒ 代价为零 ✓；**鼠标选中复制**照旧可用 ✓）。
             self._steal_on = set()
-            for _w in (getattr(self, "sp_path_ms", None), getattr(self, "sp_merge", None)):
+            for _w in (getattr(self, "sp_path_ms", None), getattr(self, "sp_merge", None),
+                       getattr(self, "sp_ntol", None), getattr(self, "sp_board", None),
+                       getattr(self, "sp_ov", None), getattr(self, "log", None)):
                 if _w is not None:
                     _w.installEventFilter(self)
                     self._steal_on.add(_w)
 
             # ---- ⭐ **回填上次的配置**（用户 2026-10-01 ✓）----
-            #   ⚠ 必须在 `load()` **之前**（「用检测器」决定走哪条演算路 ✓、
-            #     「轨迹预测窗口时间」决定 Runner 的切向窗 ✓）。
+            #   ⚠ 必须在 `load()` **之前**（"用检测器"决定走哪条演算路 ✓、
+            #     "轨迹预测窗口时间"决定 Runner 的切向窗 ✓）。
             self._last_file = ""          # ⭐ "上次打开的文件"（`_cfg_apply` 回填 ✓）
             self._cfg_apply()
 
@@ -1341,7 +2507,7 @@ def run_window(args):
         def pick_gif(self):
             """选 **GIF 动图**（`datasets/liedetectorgifs/*.gif` ✓ 用户 2026-09-30 改 ✓）。
             起始目录 = 上次选过的目录（连着看好几个 gif 时少点几下 ✓）。"""
-            start = getattr(self, "_gif_root", "") or (
+            start = getattr(self, "_gif_root「, 」") or (
                 str(GIF_DIR) if GIF_DIR.is_dir() else str(ROOT))
             f, _ = QFileDialog.getOpenFileName(self, "选一个 GIF 动图", start, GIF_EXT)
             if f:
@@ -1353,7 +2519,7 @@ def run_window(args):
                 self.load(self._cur)
 
         def apply_path_ms(self):
-            """⭐ **「应用」**：把「轨迹预测窗口时间」写进追踪器并**重新演算整段**（用户
+            """⭐ **「应用」**：把「轨迹预测窗口时间"写进追踪器并**重新演算整段**（用户
             2026-10-01 ✓ 原话："点击后重新运算并生效" ✓）。
 
             ⚠ 为什么**不重跑检测**：检测框（`self.dets`）与这个参数**无关** ⇒ 复用它
@@ -1364,18 +2530,47 @@ def run_window(args):
             if not self.frames:
                 return
             self.stop()
+            # ⭐⭐⭐ **运动分离（新）必须有 YOLO 检出框**（用户 2026-10-03 第 ⑤ 条："**还是需要
+            #   依赖 yolo**，无论真假至少把目标定位出来" ✓）—— ⚠ 它的观测**就是检出框** ✗
+            #   （`MotionTracker.process` 吃 `dets` ✓）⇒ 不勾"用检测器"就**完全没有观测** ✗
+            #   ⇒ 一条候选轨迹都建不起来 ⇒ 白线根本不出 ✗（看着像"坏了" ✗）。
+            #   ⇒ 这里**自动勾上**并告知 ✓（⚠ 用 `blockSignals` 包住 —— `chk_dets` 的
+            #     `stateChanged` 会触发 `reload_current` ✗ 不挡会**递归重载** ✗✗）。
+            if self._mode() == "motion" and not self.chk_dets.isChecked():
+                self.chk_dets.blockSignals(True)
+                self.chk_dets.setChecked(True)
+                self.chk_dets.blockSignals(False)
+                self.statusBar().showMessage(
+                    "⚠ 「运动分离」的观测**就是 YOLO 检出框** ⇒ 已自动勾上「用检测器」✓", 10000)
             ms = int(self.sp_path_ms.value())
             mr = float(self.sp_merge.value())
+            nt = float(self.sp_ntol.value())
+            bs = float(self.sp_board.value())
+            ov = float(self.sp_ov.value())
             # ⚠ 复用前先确认**检测框是齐的**（上次演算被打断 ⇒ 缺帧 ✗）：没齐就老实重检测 ✓
-            #   （没勾「用检测器」⇒ 本来就不需要框 ⇒ 也走复用 ✓ 省一个检测子进程 ✓）。
+            #   （没勾"用检测器"⇒ 本来就不需要框 ⇒ 也走复用 ✓ 省一个检测子进程 ✓）。
             reuse = ((not self.chk_dets.isChecked())
                      or (bool(self.dets) and len(self.dets) >= len(self.frames)))
-            self.lbl.setText("应用「轨迹预测窗口时间 = %d ms ／ 融合框判定阈值 = %.1f」"
+            self.lbl.setText("应用「轨迹预测窗口时间 = %d ms ／ 融合框判定 IoU = %.2f ／ "
+                             "分离判定阈值 = %.2f ／ 融合框继承距离限制 = %.2f ／ "
+                             "允许倒退距离 = %.2f ×半径 ／ 砖最多拥有边框数 = %d ／ "
+                             "真目标预测最大速度倍率 = %.2f ／ "
+                             "噪声容差 = %.1f px ／ "
+                             "上板时长 = %.1f s ／ 上板防抖重叠率 = %.2f ／ "
+                             "鼠标跟随效率倍率 = %.2f ／ 缩成砖最小 IoU = %.2f ／ "
+                             "位置估计 = %s」"
                              "⇒ 重新演算 %d 帧…（%s）"
-                             % (ms, mr, len(self.frames),
+                             % (ms, mr, float(self.sp_sep.value()),
+                                float(self.sp_inherit.value()), float(self.sp_back.value()),
+                                int(self.sp_emax.value()),
+                                float(self.sp_svmax.value()),
+                                nt, bs, ov, float(self.sp_follow.value()),
+                                float(self.sp_ioub.value()),
+                                "开「 if self._show_kf() else 」关",
+                                len(self.frames),
                                 "检测框复用 ✓" if reuse else "重跑检测"))
             self.start_warmup(reuse=reuse)
-            self._cfg_save()          # ⭐ 点「应用」= 这个值就是"我要的配置" ⇒ 落盘 ✓
+            self._cfg_save()          # ⭐ 点"应用"= 这个值就是"我要的配置" ⇒ 落盘 ✓
 
         # ---- ⭐ 记住上次的配置（`config/ui.yaml` 的 `lie_demo` 段 ✓ 用户 2026-10-01）----
         def _cfg_apply(self):
@@ -1393,10 +2588,123 @@ def run_window(args):
                                                             _PATH_MS_DEFAULT)), 50), 5000))
             except Exception:
                 pass
-            # ①' 融合框判定阈值
+            # ①' 融合框判定 IoU
             try:
-                self.sp_merge.setValue(min(max(float(c.get("merge_ratio",
-                                                           _MERGE_RATIO_DEFAULT)), 1.0), 5.0))
+                # ⚠ 键名换成 `merge_iou`（用户 2026-10-03 ✓）；旧键 `merge_ratio`（面积比 ✓）**不再读** ✗
+                #   —— 若读到 1.2 会被当成 IoU 1.2 ⇒ 恒不成立 ✗✗（夹进 [0,1] 后是 1.0 ⇒ 也几乎不成立 ✓）。
+                self.sp_merge.setValue(min(max(float(c.get("merge_iou",
+                                                             _MERGE_IOU_DEFAULT)), 0.0), 1.0))
+                self.sp_merge_out.setValue(min(max(float(c.get("merge_iou_out",
+                                                               _MERGE_IOU_OUT_DEFAULT)), 0.0), 1.0))
+                # ⭐⭐⭐ **参数分档**（用户 2026-10-03 ✓ 第 2/3 行 ✓ 各自回填 ✓）
+                self.sp_ring_sep.setValue(min(max(float(c.get("ring_cov_sep",
+                                                              _RING_COV_SEP_DEFAULT)), 0.0), 1.0))
+                self.sp_brick_sep.setValue(min(max(float(c.get("brick_iou_sep",
+                                                               _BRICK_IOU_SEP_DEFAULT)), 0.0), 1.0))
+                self.sp_ring_fuse.setValue(min(max(float(c.get("ring_cov_fuse",
+                                                               _RING_COV_FUSE_DEFAULT)), 0.0), 1.0))
+                self.sp_brick_fuse.setValue(min(max(float(c.get("brick_iou_fuse",
+                                                                _BRICK_IOU_FUSE_DEFAULT)), 0.0), 1.0))
+                # ⚠ "允许倒退"两处控件同步到同一个值（**同一个参数** ✓ 只存一份 ✓）
+                _abv = min(max(float(c.get("allow_back_ratio", _ALLOW_BACK_RATIO_DEFAULT)),
+                               0.0), 5.0)
+                self.sp_back.setValue(_abv)
+                self.sp_ab_fuse.setValue(_abv)
+            except Exception:
+                pass
+            # ①'''' 融合框继承距离限制（用户 2026-10-02 ✓ 口径定稿：允许圆心出框的倍数半径 ✓）
+            try:
+                self.sp_inherit.setValue(min(max(float(c.get("inherit_dist",
+                                                             _INHERIT_DIST_DEFAULT)),
+                                                 0.0), 3.0))
+            except Exception:
+                pass
+            # ①''''' 融合框挑选允许倒退距离(绿圆半径比例)（用户 2026-10-02 ✓ 第二条闸的容差 ✓）
+            try:
+                self.sp_back.setValue(min(max(float(c.get("allow_back_ratio",
+                                                         _ALLOW_BACK_RATIO_DEFAULT)), 0.0), 5.0))
+            except Exception:
+                pass
+            # ①'''''' 砖最多拥有融合框边数量（用户 2026-10-02 ✓ 1~4 ✓）
+            try:
+                self.sp_emax.setValue(min(max(float(c.get("edge_max", _EDGE_MAX_DEFAULT)),
+                                              1.0), 4.0))
+            except Exception:
+                pass
+            # ①''''''' 真目标预测最大速度倍率（用户 2026-10-03 ✓ 分离期白箭头模长上限 ✓）
+            try:
+                self.sp_svmax.setValue(min(max(float(c.get("sep_vel_max_ratio",
+                                                           _SEP_VEL_MAX_DEFAULT)), 0.0), 5.0))
+            except Exception:
+                pass
+            # ①''' 分离判定阈值（用户 2026-10-02 ✓ 融合期框面积 max/min 的比值门槛 ✓）
+            try:
+                self.sp_sep.setValue(min(max(float(c.get("sep_ratio",
+                                                         _SEP_RATIO_DEFAULT)), 1.0), 5.0))
+            except Exception:
+                pass
+            # ①'' 噪声容差(px)（用户 2026-10-02 ✓）
+            try:
+                self.sp_ntol.setValue(min(max(float(c.get("noise_tol",
+                                                          _NOISE_TOL_DEFAULT)), 0.0), 100.0))
+            except Exception:
+                pass
+            # ①''' 上板时长(秒)（用户 2026-10-02 ✓）
+            try:
+                self.sp_board.setValue(min(max(float(c.get("board_s",
+                                                           _BOARD_S_DEFAULT)), 0.0), 10.0))
+            except Exception:
+                pass
+            # ①'''' 上板防抖重叠率（用户 2026-10-02 ✓）
+            try:
+                self.sp_ov.setValue(min(max(float(c.get("board_overlap",
+                                                       _BOARD_OVERLAP_DEFAULT)), 0.0), 1.0))
+            except Exception:
+                pass
+            # ①''''' ''' 鼠标跟随效率倍率（用户 2026-10-03 ✓ 控制器侧 ✓ 不影响位置计算 ✓）
+            try:
+                self.sp_follow.setValue(min(max(float(c.get("follow_gain",
+                                                            _FOLLOW_GAIN_DEFAULT)), 0.01), 5.0))
+            except Exception:
+                pass
+            # ①'''''' 缩成砖判定 · 最小 IoU（用户 2026-10-03 ✓ IoU 尺 ✓ 0 = 关 ✓）
+            try:
+                self.sp_ioub.setValue(min(max(float(c.get("iou_brick",
+                                                          _IOU_BRICK_DEFAULT)), 0.0), 1.0))
+            except Exception:
+                pass
+            # ①''''''' ''' 显示 KF 预测（用户 2026-10-03 ✓ 开关 ✓ 缺项 = 关 ✓）
+            try:
+                self.chk_kf.setChecked(bool(c.get("show_kf", False)))
+            except Exception:
+                pass
+            # ①'''''''''' **运动分离（新）那 5 个参数**（用户 2026-10-03 ✓ 见 `_cfg_save` 同名键 ✓）
+            #   ⚠ 键名随算法换过两轮 ✓：旧键（`motion_q`/`motion_gate_k`/`motion_smooth`/
+            #     `motion_vel_decay`/`motion_learn_pick` —— 那是"**颜色观测**"时代的 ✗）**不再读** ✗
+            #     ⇒ 直接落新默认 ✓（免得把旧量纲的值当新参数用 ✗：例如旧的 `gate_k=2.5` 若被当成
+            #     "配对门限" 用 ⇒ 2.5px ⇒ **一条都配不上** ✗✗）。
+            try:
+                self.sp_pair.setValue(min(max(float(c.get("motion_pair_gate",
+                                                          _MOTION_PAIRED_DEFAULT)), 20.0), 200.0))
+                self.sp_sdecay.setValue(min(max(float(c.get("motion_score_decay",
+                                                            _MOTION_SDECAY_DEFAULT)), 0.5), 0.99))
+                self.sp_margin.setValue(min(max(float(c.get("motion_switch_margin",
+                                                            _MOTION_MARGIN_DEFAULT)), 0.0), 40.0))
+                self.sp_minhits.setValue(min(max(float(c.get("motion_min_hits",
+                                                             _MOTION_MINHITS_DEFAULT)), 1.0), 20.0))
+                self.sp_whitew.setValue(min(max(float(c.get("motion_white_w",
+                                                            _MOTION_WHITEW_DEFAULT)), 0.0), 5.0))
+            except Exception:
+                pass
+            # ⭐ **算法模式**（用户 2026-10-03 ✓ 记住上次选的 ✓）—— ⚠ `setCurrentIndex` 会**自动
+            #   触发** `currentIndexChanged` ⇒ `_on_mode_changed` 顺手把四条行的显隐摆正 ✓
+            #   （那时控件全建好了 ✓ 安全 ✓）；键缺（老配置 ✓）⇒ 保持第 0 项 = 经典 ✓。
+            try:
+                _md = str(c.get("mode", "classic") or "classic")
+                for _i in range(self.cmb_mode.count()):
+                    if str(self.cmb_mode.itemData(_i)) == _md:
+                        self.cmb_mode.setCurrentIndex(_i)
+                        break
             except Exception:
                 pass
             # ② 速度（按 `itemData` 找那一档 ✓ 别按下标 ✗ —— 档位可能变过 ✓）
@@ -1430,7 +2738,7 @@ def run_window(args):
                 self._last_file = ""
 
         def _cfg_save(self, *_a):
-            """把当前配置写回 `config/ui.yaml` 的 `lie_demo` 段（开关/拖动条/「应用」都调 ✓）。
+            """把当前配置写回 `config/ui.yaml` 的 `lie_demo` 段（开关/拖动条/「应用"都调 ✓）。
 
             ⚠ 写不进去（没权限/文件被占）**不许影响演示** ✓ —— 存偏好是附带的 ✓。
             """
@@ -1438,7 +2746,46 @@ def run_window(args):
                 from gui import theme
                 theme.save_section("lie_demo", {
                     "path_ms": int(self.sp_path_ms.value()),
-                    "merge_ratio": round(float(self.sp_merge.value()), 3),
+                    # ⭐ **融合框判定 IoU**（用户 2026-10-03 ✓ 键名同步 ✓）
+                    "merge_iou": round(float(self.sp_merge.value()), 3),
+                    # ⭐ **融合框判定 IoU · 退出**（迟滞下半段 ✓ 用户 2026-10-03 ✓）
+                    "merge_iou_out": round(float(self.sp_merge_out.value()), 3),
+                    # ⭐⭐⭐ **参数分档**（用户 2026-10-03 ✓ 第 2/3 行 ✓ 与"融合系"一起落盘 ✓）
+                    "ring_cov_sep": round(float(self.sp_ring_sep.value()), 3),
+                    "brick_iou_sep": round(float(self.sp_brick_sep.value()), 3),
+                    "ring_cov_fuse": round(float(self.sp_ring_fuse.value()), 3),
+                    "brick_iou_fuse": round(float(self.sp_brick_fuse.value()), 3),
+                    # ⭐ **分离判定阈值**（用户 2026-10-02 ✓ 与"融合框判定阈值"一起落盘 ✓）
+                    "sep_ratio": round(float(self.sp_sep.value()), 3),
+                    # ⭐ **融合框继承距离限制**（用户 2026-10-02 ✓ "融合系"参数一起落盘 ✓）
+                    "inherit_dist": round(float(self.sp_inherit.value()), 3),
+                    # ⭐ **融合框挑选允许倒退距离(绿圆半径比例)**（用户 2026-10-02 ✓ 同上 ✓）
+                    "allow_back_ratio": round(float(self.sp_back.value()), 3),
+                    # ⭐ **砖最多拥有融合框边数量**（用户 2026-10-02 ✓ 1~4 ✓ "融合系"一起落盘 ✓）
+                    "edge_max": int(self.sp_emax.value()),
+                    # ⭐ **真目标预测最大速度倍率**（用户 2026-10-03 ✓ 分离期白箭头模长上限 ✓）
+                    "sep_vel_max_ratio": round(float(self.sp_svmax.value()), 3),
+                    "noise_tol": round(float(self.sp_ntol.value()), 2),
+                    "board_s": round(float(self.sp_board.value()), 2),
+                    "board_overlap": round(float(self.sp_ov.value()), 3),
+                    # ⭐ **鼠标跟随效率倍率**（用户 2026-10-03 ✓ 控制器侧 ✓ 与"融合系"一起落盘 ✓）
+                    "follow_gain": round(float(self.sp_follow.value()), 3),
+                    # ⭐ **缩成砖判定·最小 IoU**（用户 2026-10-03 ✓ IoU 尺 ✓ 与"融合系"一起落盘 ✓）
+                    "iou_brick": round(float(self.sp_ioub.value()), 3),
+                    # ⭐ **显示 KF 预测**（用户 2026-10-03 ✓ 开关 ✓ 与参数一起落盘 ✓）
+                    "show_kf": bool(self.chk_kf.isChecked()),
+                    # ⭐⭐⭐ **算法模式**（用户 2026-10-03 ✓ 原话："加个模式下拉列表" ✓ ——
+                    #   记住上次选的 ✓ 免得每次重选 ✓）
+                    "mode": str(self.cmb_mode.currentData() or "classic"),
+                    # ⭐⭐⭐ **运动分离（新）那 5 个参数**（用户 2026-10-03 ✓ 原话："运动分离
+                    #   **没有任何参数要配吗？**" ✓）—— 与其余参数一起落盘 ✓。
+                    #   ⚠ 键名随算法一起换过一轮 ✓（旧的是 `q/gate_k/smooth/vel_decay/learn_pick`
+                    #   —— 那是"颜色观测"时代的参数 ✗ 现在**不再读** ✗ 直接落新默认 ✓）。
+                    "motion_pair_gate": round(float(self.sp_pair.value()), 1),
+                    "motion_score_decay": round(float(self.sp_sdecay.value()), 3),
+                    "motion_switch_margin": round(float(self.sp_margin.value()), 2),
+                    "motion_min_hits": int(round(float(self.sp_minhits.value()))),
+                    "motion_white_w": round(float(self.sp_whitew.value()), 2),
                     "speed": float(self.cmb_speed.currentData() or 1.0),
                     "mask": int(self.sld_mask.value()),
                     "dets": bool(self.chk_dets.isChecked()),
@@ -1455,11 +2802,224 @@ def run_window(args):
                        if getattr(self, "sp_path_ms", None) is not None
                        else _PATH_MS_DEFAULT)
 
-        def _merge_ratio(self):
-            """当前界面上的「融合框判定阈值」（面积比 ✓ 没建控件时 = 默认值 ✓）。"""
+        def _merge_iou(self):
+            """当前界面上的「**融合框判定 IoU**"（用户 2026-10-03 ✓ 判据 = `IoU(框, 砖) < 它`
+            ✓ 没建控件时 = 默认值 ✓）。"""
             return float(getattr(self, "sp_merge", None).value()
                          if getattr(self, "sp_merge", None) is not None
-                         else _MERGE_RATIO_DEFAULT)
+                         else _MERGE_IOU_DEFAULT)
+
+        def _sync_ab(self, _src, _dst, _v):
+            """「**允许倒退距离**"两处控件**双向同步**（用户 2026-10-03 ✓ 第 2/3 行都写了它 ✓
+            但它是**同一个参数** ⇒ 改任一处另一处跟着变 ✓；用守卫位防互相触发死循环 ✗）。"""
+            if getattr(self, "_sync_ab_guard", False):
+                return
+            self._sync_ab_guard = True
+            try:
+                if abs(float(_dst.value()) - float(_v)) > 1e-9:
+                    _dst.setValue(float(_v))
+            finally:
+                self._sync_ab_guard = False
+
+        # ---- ⭐⭐⭐ **参数分档的取值**（用户 2026-10-03 ✓ 第 2/3 行）----
+        def _ring_cov_sep(self):
+            """分离期「框↔圆外接矩形 IoU >」（没建控件时 = 默认值 ✓）。"""
+            return float(getattr(self, "sp_ring_sep", None).value()
+                         if getattr(self, "sp_ring_sep", None) is not None
+                         else _RING_COV_SEP_DEFAULT)
+
+        def _brick_iou_sep(self):
+            """分离期「框↔内砖 IoU <」（**进严** ✓ 没建控件时 = 默认值 ✓）。"""
+            return float(getattr(self, "sp_brick_sep", None).value()
+                         if getattr(self, "sp_brick_sep", None) is not None
+                         else _BRICK_IOU_SEP_DEFAULT)
+
+        def _ring_cov_fuse(self):
+            """融合期「框↔圆外接矩形 IoU >」（没建控件时 = 默认值 ✓）。"""
+            return float(getattr(self, "sp_ring_fuse", None).value()
+                         if getattr(self, "sp_ring_fuse", None) is not None
+                         else _RING_COV_FUSE_DEFAULT)
+
+        def _brick_iou_fuse(self):
+            """融合期「框↔内砖 IoU <」（**守松** ✓ 设 1.00 ⇒ 关掉「融合期退出」 ✓）。"""
+            return float(getattr(self, "sp_brick_fuse", None).value()
+                         if getattr(self, "sp_brick_fuse", None) is not None
+                         else _BRICK_IOU_FUSE_DEFAULT)
+
+        def _merge_iou_out(self):
+            """当前界面上的「**融合框判定 IoU · 退出**"（用户 2026-10-03 ✓ 迟滞 ✓ 没建控件时
+            = 默认值 ✓）。"""
+            return float(getattr(self, "sp_merge_out", None).value()
+                         if getattr(self, "sp_merge_out", None) is not None
+                         else _MERGE_IOU_OUT_DEFAULT)
+
+        def _sep_ratio(self):
+            """当前界面上的「**分离判定阈值**"（用户 2026-10-02 ✓ 分离信号第三条的 x ✓
+            没建控件时 = 默认值 ✓）。"""
+            return float(getattr(self, "sp_sep", None).value()
+                         if getattr(self, "sp_sep", None) is not None
+                         else _SEP_RATIO_DEFAULT)
+
+        def _inherit_dist(self):
+            """当前界面上的「**融合框继承距离限制**」（用户 2026-10-02 ✓ 口径已改为"圆心到框最近
+            一条边的垂距 ÷ 绿圈半径" ✓ 融合框候选第一条闸 ✓ 没建控件时 = 默认值 ✓）。"""
+            return float(getattr(self, "sp_inherit", None).value()
+                         if getattr(self, "sp_inherit", None) is not None
+                         else _INHERIT_DIST_DEFAULT)
+
+        def _allow_back_ratio(self):
+            """当前界面上的「**融合框挑选允许倒退距离(绿圆半径比例)**"（用户 2026-10-02 ✓
+            第二条闸的容差 ✓ 没建控件时 = 默认值 ✓）。"""
+            return float(getattr(self, "sp_back", None).value()
+                         if getattr(self, "sp_back", None) is not None
+                         else _ALLOW_BACK_RATIO_DEFAULT)
+
+        def _edge_max(self):
+            """当前界面上的「**砖最多拥有融合框边数量**"（用户 2026-10-02 ✓ 1~4 ✓ 融合框四边的
+            「边归属」只留距离最近的前它条 ✓ 没建控件时 = 默认值 ✓）。"""
+            return int(getattr(self, "sp_emax", None).value()
+                       if getattr(self, "sp_emax", None) is not None
+                       else _EDGE_MAX_DEFAULT)
+
+        def _sep_vel_max(self):
+            """当前界面上的「**真目标预测最大速度倍率**」（用户 2026-10-03 ✓ 分离期白箭头模长
+            上限 = 本项 × 当拍群体速度模长 ✓ 没建控件时 = 默认值 ✓）。"""
+            return float(getattr(self, "sp_svmax", None).value()
+                         if getattr(self, "sp_svmax", None) is not None
+                         else _SEP_VEL_MAX_DEFAULT)
+
+        def _noise_tol(self):
+            """当前界面上的「噪声容差(px)」（规则①：「圆心 ± 它」的范围与框相交 ✓ 没建控件时 =
+            默认值 ✓）。"""
+            return float(getattr(self, "sp_ntol", None).value()
+                         if getattr(self, "sp_ntol", None) is not None
+                         else _NOISE_TOL_DEFAULT)
+
+        def _board_s(self):
+            """当前界面上的「上板时长(秒)」（登记条目转正的时长门 ✓ 没建控件时 = 默认值 ✓）。"""
+            return float(getattr(self, "sp_board", None).value()
+                         if getattr(self, "sp_board", None) is not None
+                         else _BOARD_S_DEFAULT)
+
+        def _board_overlap(self):
+            """当前界面上的「上板防抖重叠率」（用户 2026-10-02 ✓ 没建控件时 = 默认值 0.5 ✓）。"""
+            return float(getattr(self, "sp_ov", None).value()
+                         if getattr(self, "sp_ov", None) is not None
+                         else _BOARD_OVERLAP_DEFAULT)
+
+        def _follow_gain(self):
+            """当前界面上的「**鼠标跟随效率倍率**"（用户 2026-10-03 ✓ 只作用在**控制器**的
+            指令输出上 ✓ 不碰位置计算 ✓ 没建控件时 = 默认值 1.0 ✓）。"""
+            return float(getattr(self, "sp_follow", None).value()
+                         if getattr(self, "sp_follow", None) is not None
+                         else _FOLLOW_GAIN_DEFAULT)
+
+        def _motion_kw(self):
+            """**运动分离（新）**的界面参数 ⇒ 一个 dict（直接喂 `MotionRunner` ✓）。
+
+            用户 2026-10-03 ✓ 原话："运动分离 **没有任何参数要配吗？**" ✓ ⇒ 给它配第 4 行 ✓。
+            ⚠ **只给"手感/权衡档"** ✗ —— "物理契约档"（面积带 `_AREA_LO/HI` / 填充度
+              `_FILL_LO/HI` ✓ 见 `lie_motion` 顶上 ✓）**不给** ✓：那几个是"**什么算一个块**"的
+              定义 ✓（按本素材那个白星的形状定的 ✓）⇒ 调了会认错东西 ✗（想用在别的素材上，
+              改 `perception/lie_motion.py` 顶上那几个常量 ✓ 比放界面上安全 ✓）。
+            ⚠ 没建控件（离屏自检 / 老配置 ✓）⇒ 一律回默认值 ✓ 不崩 ✓。
+            """
+            def _v(_n, _d):
+                _w = getattr(self, _n, None)
+                return float(_w.value()) if _w is not None else float(_d)
+            return {"pair_gate": _v("sp_pair", _MOTION_PAIRED_DEFAULT),
+                    "score_decay": _v("sp_sdecay", _MOTION_SDECAY_DEFAULT),
+                    "switch_margin": _v("sp_margin", _MOTION_MARGIN_DEFAULT),
+                    "min_hits": max(1, int(round(_v("sp_minhits", _MOTION_MINHITS_DEFAULT)))),
+                    "white_w": _v("sp_whitew", _MOTION_WHITEW_DEFAULT)}
+
+        def _mode(self):
+            """当前算法模式（没建控件 ⇒ `classic` ✓ 老行为 ✓）。"""
+            _c = getattr(self, "cmb_mode", None)
+            return str(_c.currentData() or "classic") if _c is not None else "classic"
+
+        def _on_mode_changed(self, *_a):
+            """切模式 ⇒ **整行显示 / 隐藏**那批「新模式用不上"的参数（用户 2026-10-03 ✓ 原话见下）。
+
+            用户原话："你可以在测谎演示里加个**模式下拉列表**，**新的算法模式选中时，不必要的
+            参数配置都隐藏**" ✓。
+            ⚠ 隐藏的是**整行**（第 2/3 行 = 融合 / 内砖 / 边归属 / 允许倒退 / 继承距离那一整组 ✓）
+              —— 逐控件藏会留下一排空标签 ✗ 更难看 ✓。
+            ⚠ **不自动重算** ✗（与其它参数同一个约定 ✓ 改完点"应用"✓ 免得卡界面 ✓）。
+            """
+            _motion = (self._mode() == "motion")
+            # ① **第 2/3 行**（融合 / 内砖 / 边归属 / 允许倒退 / 继承距离 ✓）⇒ **整行**收 ✓
+            for _lay in (getattr(self, "_row2", None), getattr(self, "_row3", None)):
+                if _lay is None:
+                    continue
+                for _i in range(_lay.count()):
+                    _w = _lay.itemAt(_i).widget()
+                    if _w is not None:
+                        _w.setVisible(not _motion)
+            # ② **第 4 行 + 它的分组标题**（运动分离专用 ✓）⇒ 新模式才放出来 ✓
+            _h = getattr(self, "_rowM_head", None)
+            if _h is not None:
+                _h.setVisible(_motion)
+            _layM = getattr(self, "_rowM", None)
+            if _layM is not None:
+                for _i in range(_layM.count()):
+                    _w = _layM.itemAt(_i).widget()
+                    if _w is not None:
+                        _w.setVisible(_motion)
+            # ③ ⚠ **第 1 行是混着的**（"模式" / "鼠标跟随效率倍率" 两边都要 ✓）⇒ **整行藏不得** ✗
+            #    ⇒ 只把"新模式**用不上**"的那几项**逐项**收掉（连它**紧挨着的那个标签** ✓ ——
+            #    布局是"标签, 控件, 标签, 控件…"⇒ 前一个 item 就是它的标签 ✓）。
+            _hide_on_motion = ("sp_ntol", "sp_board", "sp_ov", "sp_ioub", "chk_kf")
+            _lay1 = getattr(self, "_row1", None)
+            if _lay1 is not None:
+                for _i in range(_lay1.count()):
+                    _w = _lay1.itemAt(_i).widget()
+                    if _w is None:
+                        continue
+                    if not any(_w is getattr(self, _n, None) for _n in _hide_on_motion):
+                        continue
+                    _w.setVisible(not _motion)
+                    _lb = _lay1.itemAt(_i - 1).widget() if _i > 0 else None
+                    if isinstance(_lb, QLabel):
+                        _lb.setVisible(not _motion)
+            self.statusBar().showMessage(
+                "已切到「**运动分离（新）**」⇒ 融合系两行已收、**第 4 行专用参数已放出** ✓ "
+                "（⚠ 本模式**不看检出框、不用砖、不做融合/分离** ✓）点「应用」重新演算 ✓"
+                if _motion else "已切回「经典「⇒ 参数行都在、运动分离那行已收 ✓ 点「应用「重新演算 ✓",
+                12000)
+
+        def on_toggle_kf(self):
+            """「**显示 KF 预测**」勾选变化（用户 2026-10-03 ✓ 原话："当『KF预测』开启时，将窗口
+            分为**两列视图**" ✓）：立刻显示/隐藏**右列**（`col2` ✓）并落盘配置 ✓。
+
+            ⚠ **不自动重算** ✗ —— 右列要**重跑一整遍**才有数据（与左列同耗时 ✓）⇒ 自动重算会把
+              界面卡住 ✓；⇒ 只切显示 + 提示用户点"**应用**"重算 ✓（与其余参数同一个约定 ✓）。
+            """
+            self._cfg_save()
+            if getattr(self, "col2", None) is not None:
+                self.col2.setVisible(bool(self._show_kf()))
+            try:
+                self._status(getattr(self, "i", 0))
+            except Exception:
+                pass
+
+        def _show_kf(self):
+            """「**显示 KF 预测**」开关（用户 2026-10-03 ✓ 原话：「1. 移除」位置估计"参数……
+            新增"显示 KF 预测"的开关" ✓）—— ⚠ 它**只决定"跑不跑 KF + 画不画"** ✓（跑也只是
+            **只记录** ✗ 不改位置 ✓）；没建控件时 = 关 ✓（零开销零污染 ✓）。"""
+            _c = getattr(self, "chk_kf", None)
+            # ⚠ **运动分离模式下恒为关**（那个勾选框在该模式下**已被收起** ✓ 见 `_on_mode_changed` ③）
+            #   —— 右列是"经典那一档"的东西 ✓ 新模式没有"KF 位置驱动"这回事 ✓ 免得白跑一遍 ✗。
+            if self._mode() == "motion":
+                return False
+            return bool(_c is not None and _c.isChecked())
+
+        def _iou_brick(self):
+            """当前界面上的「**缩成砖判定 · 最小 IoU**」（用户 2026-10-03 ✓ 给「框缩回砖大小/位置」
+            补的**尺度无关**尺 ✓ 与「四条边都在噪声容差内」并列 OR ✓；没建控件时 = 默认值 ✓）。"""
+            return float(getattr(self, "sp_ioub", None).value()
+                         if getattr(self, "sp_ioub", None) is not None
+                         else _IOU_BRICK_DEFAULT)
 
         def load(self, path):
             self.stop()
@@ -1487,7 +3047,7 @@ def run_window(args):
             self.sld.setValue(0)
             self.upd_time()
             self.btn_play.setEnabled(True)
-            self.btn_apply.setEnabled(True)      # ⭐ 有素材了 ⇒「应用」才可用 ✓
+            self.btn_apply.setEnabled(True)      # ⭐ 有素材了 ⇒"应用"才可用 ✓
             self.btn_play.setText("播放")
             if args.record:
                 rp = Path(args.record)
@@ -1507,16 +3067,104 @@ def run_window(args):
         def start_warmup(self, reuse=False):
             """`reuse=True` ⇒ **复用已算好的检测框**（只重跑追踪 ✓ 「应用」走这条 ✓）。
 
-            ⚠ 只有"检测框与本次参数无关"时才可复用 ✓ —— 「轨迹预测窗口时间」只影响
-            切向拟合 ⇒ 可复用 ✓；而「用检测器」开关会**改变有没有框** ⇒ 必须重检测 ✗。
+            ⚠ 只有"检测框与本次参数无关"时才可复用 ✓ —— "轨迹预测窗口时间"只影响
+            切向拟合 ⇒ 可复用 ✓；而"用检测器"开关会**改变有没有框** ⇒ 必须重检测 ✗。
             """
             self._reuse_dets = bool(reuse)
             if not self._reuse_dets:
                 self.worker = DetsWorker(args.weights or None, conf=args.conf)
                 self.dets = []
             self.results = []
+            # ⭐⭐⭐ **右列（KF 位置驱动）那一份也重来**（用户 2026-10-03 ✓ 双列对照 ✓）：
+            #   勾了"显示 KF 预测"⇒ 右列显示 + 这一路**真用 KF 位置**跑（`kf_pos=True` ✓）；
+            #   没勾 ⇒ 右列整体隐藏、这一路不跑（零开销 ✓ 与改动前逐像素一致 ✓）。
+            self.results_kf = [] if self._show_kf() else None
+            if getattr(self, "col2", None) is not None:
+                self.col2.setVisible(bool(self._show_kf()))
+            # ⭐ 日志区跟着新素材 / 新演算**重来**（用户 2026-10-02 ✓）—— `_log_i` 归零 ⇒
+            #   `_log_sync` 会从头重建 ✓（换素材/换参数后不会留着上一段的融合日志 ✗）。
+            self._log_i = 0
+            self._log_n = 0
+            if getattr(self, "log", None) is not None:
+                self.log.clear()
             self.runner = Runner(dets=None, path_ms=self._path_ms(),
-                                 merge_ratio=self._merge_ratio())
+                                 # ⭐ **融合框判定 IoU**（用户 2026-10-03 ✓ 进严 ✓）
+                                 merge_iou=self._merge_iou(),
+                                 # ⭐ **融合框判定 IoU · 退出**（迟滞下半段 ✓ 守松 ✓）
+                                 merge_iou_out=self._merge_iou_out(),
+                                 # ⭐⭐⭐ **分离判定阈值**（用户 2026-10-02 ✓ 与"融合框判定
+                                 #   阈值"同一个接线法 ✓）⇒ 点"应用"就按新值重算 ✓。
+                                 sep_ratio=self._sep_ratio(),
+                                 # ⭐ **融合框继承距离限制**（用户 2026-10-02 ✓ 融合框候选第一条 ✓）
+                                 inherit_dist=self._inherit_dist(),
+                                 # ⭐ **融合框挑选允许倒退距离(绿圆半径比例)**（用户 2026-10-02 ✓）
+                                 allow_back_ratio=self._allow_back_ratio(),
+                                 # ⭐ **砖最多拥有融合框边数量**（用户 2026-10-02 ✓ 1~4 ✓）
+                                 edge_max=self._edge_max(),
+                                 # ⭐ **真目标预测最大速度倍率**（用户 2026-10-03 ✓）
+                                 sep_vel_max_ratio=self._sep_vel_max(),
+                                 noise_tol=self._noise_tol(),
+                                 board_s=self._board_s(),
+                                 board_overlap=self._board_overlap(),
+                                 # ⭐ **鼠标跟随效率倍率**（用户 2026-10-03 ✓ 只进控制器 ✓
+                                 #   不影响位置计算 ✓）⇒ 点"应用"就按新值重算 ✓。
+                                 follow_gain=self._follow_gain(),
+                                 # ⭐ **缩成砖判定·最小 IoU**（用户 2026-10-03 ✓ 进追踪器 ✓）
+                                 iou_brick=self._iou_brick(),
+                                 # ⭐ **显示 KF 预测**（用户 2026-10-03 ✓ 勾上 ⇒ 卡尔曼并行跑、
+                                 #   只记录 ✓ 位置仍走经典 ⇒ **不污染** ✓）
+                                 show_kf=self._show_kf())
+            # ⭐⭐⭐ **右列的 Runner = 同一套参数 + `kf_pos=True`**（用户 2026-10-03 ✓ 原话："左边
+            #   跑经典右边跑 **KF**，这样对照才有意义" ✓）：**独立一份 `LieTracker`** ⇒ 状态与左列
+            #   完全隔离 ✓；`kf_pos=True` ⇒ 它**真的用 KF 位置**跑整条链（不是叠加影子 ✓）。
+            self.runner_kf = (Runner(dets=None, path_ms=self._path_ms(),
+                                     # ⭐ **融合框判定 IoU**（用户 2026-10-03 ✓ 进严 ✓）
+                                     merge_iou=self._merge_iou(),
+                                     # ⭐ **融合框判定 IoU · 退出**（迟滞下半段 ✓ 守松 ✓）
+                                     merge_iou_out=self._merge_iou_out(),
+                                     # ⭐⭐⭐ **参数分档**（用户 2026-10-03 ✓ 第 2/3 行）
+                                    ring_cov_sep=self._ring_cov_sep(),
+                                    brick_iou_sep=self._brick_iou_sep(),
+                                    ring_cov_fuse=self._ring_cov_fuse(),
+                                    brick_iou_fuse=self._brick_iou_fuse(),
+                                     sep_ratio=self._sep_ratio(),
+                                     inherit_dist=self._inherit_dist(),
+                                     allow_back_ratio=self._allow_back_ratio(),
+                                     edge_max=self._edge_max(),
+                                     sep_vel_max_ratio=self._sep_vel_max(),
+                                     noise_tol=self._noise_tol(),
+                                     board_s=self._board_s(),
+                                     board_overlap=self._board_overlap(),
+                                     follow_gain=self._follow_gain(),
+                                     iou_brick=self._iou_brick(),
+                                     kf_pos=True)
+                             if self._show_kf() else None)
+            # ⭐⭐⭐ **模式 = 运动分离（新）** ⇒ 换成 `MotionRunner`（用户 2026-10-03 ✓ 见模式下拉 ✓）
+            #   ⚠ 它与 `Runner` **同签名**（`step` 回同样的 6 元组 ✓）⇒ `warm_tick` / 显示 / 拖动
+            #     **一行都不用改** ✓（白线 = 报告位置历史、绿圈 = 目标、红点 = 光标 全是现成的 ✓）。
+            #   ⚠ 新模式**不做右列（KF）** ⇒ 关掉 ✓（那是老算法那一档的东西 ✓）。
+            if self._mode() == "motion":
+                _pc = self.frames[0][1].shape
+                self.runner = MotionRunner(
+                    # ⚠⚠ **`gain` 千万别填 `self._follow_gain()`** ✗✗（那是"跟随效率倍率"，
+                    #    是个**标量** ✓ 该给下面那个 `follow_gain` ✓）—— `gain` 要的是
+                    #    **每像素的二元组**（`LieMouseController.__init__` 里 `tuple(gain)` ✓）
+                    #    ⇒ 填标量会 `TypeError: 'float' object is not iterable` ✗ ⇒ **点"应用"
+                    #    当场闪退** ✓（PyQt5 未捕获异常直接 `abort()` ✓ 用户实测就是这个 ✓）。
+                    #    经典 `Runner` 那边**压根没传 `gain`** ✓（用 `load_gain()` 默认 ✓）⇒ 这里
+                    #    照抄"不传"才是对的 ✓。
+                    dets=None, gain=None,
+                    assume=(_pc[1] / 2.0, _pc[0] / 2.0),
+                    follow_gain=self._follow_gain(),
+                    # ⭐⭐⭐ **第 4 行那 5 个参数**（用户 2026-10-03 ✓ 原话："运动分离 **没有任何
+                    #   参数要配吗？**" ✓）—— `_motion_kw()` 回 `{q, gate_k, smooth, vel_decay,
+                    #   learn_pick}` ✓ 与 `MotionRunner.__init__` 的形参**正好对上** ✓
+                    #   （`q`/`gate_k` 是显式形参 ✓ 其余进 `**tracker_kw` ✓）。
+                    **self._motion_kw())
+                self.runner_kf = None
+                self.results_kf = None
+                if getattr(self, "col2", None) is not None:
+                    self.col2.setVisible(False)
             self.warm_n = 0
             self.warm_total = len(self.frames)
             self.warm.start(10)
@@ -1529,7 +3177,7 @@ def run_window(args):
                     break
                 i = self.warm_n
                 d = None
-                # ⭐ 复用模式（「应用」✓）：检测框**已经算好了** ⇒ 不再问检测器 ✓
+                # ⭐ 复用模式（"应用"✓）：检测框**已经算好了** ⇒ 不再问检测器 ✓
                 if not getattr(self, "_reuse_dets", False) and self.chk_dets.isChecked():
                     d = self.worker.detect(self.frames[i][1])
                     self.dets.append(d)
@@ -1538,12 +3186,59 @@ def run_window(args):
                 o, pos, rad, hit, boxes, motion = self.runner.step(
                     self.frames[i][1], i, self.ts[i])
                 self.results.append({"pos": pos, "r": rad, "hit": hit,
+                                     # ⭐⭐⭐ **目标实际半径**（= `out["rad"]` = `LieTracker._rad` ✓
+                                     #   与**后端 `_ring_cov`**、**画面上那个绿圈**用的是**同一把尺** ✓）。
+                                     #   ⚠⚠ 别拿上面那个 `r` 去当"圆外接矩形"的半径 ✗✗ —— 那是
+                                     #     `Runner` 按**面积等效**算的（`max(18, √area/1.7725)` ✗）：
+                                     #     实测 `10月1日.mp4` 帧 12 两者 **18.0 vs 60.8**（差 3 倍 ✗）
+                                     #     ⇒ 圆的方块缩成 36×36 ⇒ 塞进 169×206 的框里 ⇒ 点选标签
+                                     #     算出 `圆矩IoU 0.04 ／ 圆矩∩框 1.00` ✗✗（用户 2026-10-03
+                                     #     看出来的就是这个 ✓）。
+                                     "tgt_rad": o.get("rad"),
                                      "state": o["state"],
                                      "cursor": tuple(self.runner.cursor),
                                      "boxes": boxes or [], "motion": motion,
                                      # ⚠ 变量名是 `o`（追踪器输出 ✓）不是 `out` ✗
                                      #   （我上一版写成 `out` ⇒ 一开窗 NameError ⇒ 闪退 ✗）
-                                     "white": o.get("white")})
+                                     "white": o.get("white"),
+                                     # ⭐⭐ **融合框生成**那一拍的事件（其余帧为 `None` ✓ 用户
+                                     #   2026-10-02 ✓）⇒ 底部深色日志区显示它 ✓（`_log_sync` ✓）。
+                                     "merge_log": o.get("merge_log"),
+                                     # ⭐⭐ **融合框消失（分离）**那一拍的事件（用户 2026-10-02 ✓
+                                     #   原话："把融合框消失（分离）的日志**也依据融合的格式**打印
+                                     #   出来" ✓）⇒ 与融合日志同一个日志区、**同格式** ✓。
+                                     "split_log": o.get("split_log"),
+                                     # ⭐ **融合期"每拍"的边归属**（用户 2026-10-02 ✓ 原话：
+                                     #   "融合时期每拍打印一下边的归属（砖或真目标）" ✓）⇒ 同一
+                                     #   个日志区显示 ✓（与融合/分离日志并列 ✓ 三条互补 ✓）。
+                                     "edge_log": o.get("edge_log"),
+                                    # ⭐⭐⭐ **非融合红框选择**（用户 2026-10-03 ✓ 原话："在日志
+                                    #   加一下**非融合红框选择**的判定信息吧" ✓）：红框**不是**
+                                    #   融合框（= "目标自己那格" ✓）那一拍给 ✓ ⇒ 同日志区显示 ✓。
+                                    "pick_log": o.get("pick_log"),
+                                   # ⭐⭐ **本拍砖表快照**（用户 2026-10-03 ✓ 点选时算
+                                   #   "IoU 最大的砖"要用它 ✓ 见 `_bricks_snap` ✓）
+                                   "bricks": o.get("bricks"),
+                                    # ⭐ KF 影子（用户 2026-10-03 ✓）：勾了"显示 KF 预测"才非 None
+                                    #   （KF 位置/速度/新息/与经典的差/**群体系锚点** ✓ 只读不参与判定 ✓）
+                                    "kf": o.get("kf")})
+                # ⭐⭐⭐ **右列（KF 位置驱动）逐帧同步跑**（用户 2026-10-03 ✓ 双列对照 ✓）：
+                #   同一批检测框（`self.dets` ✓ 检测只跑一次 ✓）、**同一时间戳** ✓ ⇒ 两列只在
+                #   "位置估计"这一处不同 ✓ ⇒ 差异全部来自 KF ✓（这样对照才干净 ✓）。
+                if self.runner_kf is not None and self.results_kf is not None:
+                    self.runner_kf.dets = (self.dets if self.chk_dets.isChecked() else None)
+                    o2, pos2, rad2, hit2, boxes2, motion2 = self.runner_kf.step(
+                        self.frames[i][1], i, self.ts[i])
+                    self.results_kf.append({"pos": pos2, "r": rad2, "hit": hit2,
+                                            "state": o2["state"],
+                                            "cursor": tuple(self.runner_kf.cursor),
+                                            "boxes": boxes2 or [], "motion": motion2,
+                                            "white": o2.get("white"),
+                                            # ⚠ 右列是"KF 在跑"⇒ **不再叠加青色影子** ✗（用户
+                                            #   原话"叠加 KF 显示意义不大" ✓）⇒ 日志/KF 诊断都不带 ✓
+                                            "merge_log": None, "split_log": None,
+                                            "edge_log": None, "pick_log": None,
+                                            "kf": None})
                 self.warm_n += 1
             acc = 100.0 * self.runner.hits / self.runner.n if self.runner.n else 0.0
             self.lbl.setText("演算中 %d / %d 帧…（检测 + 追踪 + 控制**一次算完** ⇒ "
@@ -1637,6 +3332,137 @@ def run_window(args):
             self._was_playing = self.playing
             self.stop()
 
+        # ---- ⭐⭐⭐ 点选检出框（用户 2026-10-03 ✓）----
+        def _kf_trail(self, i):
+            """**KF 轨迹（青线）= 群体系锚定**（用户 2026-10-03 ✓ 原话："**2. KF 青色线没有像白线
+            一样利用群体速度『刻在背景板上』**" ✓）—— 与**白线完全同一套算法** ✓（见 `_path_viz` ✓）：
+
+            · 每个历史点 = 它**自己那拍**的 `kf.pos_grp`（**已扣掉**它那拍的累计群体平移 ✓ 后端算好 ✓）
+              ＋ **当拍**的累计群体平移 `kf.cum2` ✓ ⇒ 整条线**跟着假目标群一起动** ✓
+              （不再跟着相机走 ✗ —— 这正是用户点名的那条 ✓）；
+            · ⚠ `_path_cumT` 是**半域** ⇒ 后端已经 ×2 放进 `cum2` ✓ 这里不再换算 ✗（口径一处 ✓）；
+            · ⚠ 纯显示层 ✗：`results` 里本来就有每帧的 `kf` ⇒ 这里只**连点** ✓ 不重算、不判定 ✓；
+              勾选关掉 ⇒ 恒为空列表 ⇒ 画面什么都不多 ✓（零污染 ✓）。
+            """
+            _n = max(0, int(i))
+            _now = None
+            for _k in range(_n, -1, -1):          # 从当拍往回找**最近**的 `cum2`（那拍可能没 kf ✓）
+                _kk = self.results[_k].get("kf") or {}
+                if _kk.get("cum2") is not None:
+                    _now = (float(_kk["cum2"][0]), float(_kk["cum2"][1]))
+                    break
+            if _now is None:
+                return []
+            _out = []
+            for _k in range(0, _n + 1):
+                _g = (self.results[_k].get("kf") or {}).get("pos_grp")
+                if _g is not None:
+                    _out.append((float(_g[0]) + _now[0], float(_g[1]) + _now[1]))
+            return _out
+
+        def _pick_box(self):
+            """**当前帧**点选的那格检出框（没选 / 选的是别的帧 ⇒ `None` ✓ 纯显示用 ✓）。
+
+            ⭐⭐⭐ 2026-10-03 ✓ 第一次：用户："**点选检出框的时候，希望他能显示 IoU 最大的砖的
+            IoU**" ✓ ⇒ 这里算好"**与哪块砖 IoU 最大、值是多少**" ✓ 附在元组**第 7 位** ✓。
+            ⭐⭐⭐ 2026-10-03 ✓ 第二次（原话："点选检出框时，与圆外接矩形的 iou、圆外接矩形与其
+            相交的比例**也显示下**；另外，以上参数**及旧的 iou 显示都放在第二行**" ✓）：再补
+            **圆那一侧的两个量** ✓ 附在**第 8 位** ✓（`pick_label` 把 `pick[6:]` 一起摆到
+            **第二行** ✓）：
+              · `圆矩IoU` = `IoU(检出框, 圆外接矩形)` ✓（= **旧口径**那个量 ✓ 与 `_ring_cov` 对照 ✓）；
+              · `圆矩∩框` = `圆外接矩形与检出框相交的比例` ✓（分母 = **圆矩形面积** ✓ **单向** ✓）
+                ⇒ 与后端 `_ring_cov` / `geom.cover_ratio` **同一把尺** ✓ 不自己写一份 ✗。
+            ⚠ 圆心 / 半径取**这一帧演算出来的**（`results[i]["pos"] / ["r"]` ✓ 同一份数据 ✓）；
+              拿不到（预测态没圆心 / 半径还没学到 ✓）⇒ **那一段留空** ⇒ 界面自动不显示 ✓ 不猜 ✗。
+            ⚠ 基准 = **那一帧的砖表快照**（`results[i]["bricks"]` ✓ 见后端 `_bricks_snap` ✓）——
+              砖表每拍都随群体平移 ✗ ⇒ 用"演算结束时的表"会差一个累计平移 ✗。
+            ⚠ 三段量的**具体计算一律交给纯函数 `pick_extra`** ✓（口径一处 ✓ 好测 ✓ 自检直接钉
+              它 ✗ 不在这里再写一遍 ✓）—— 本函数只负责"取哪一帧的数据" ✓。
+            """
+            _p = getattr(self, "_pick", None)
+            if not _p or _p.get("frame") != getattr(self, "i", -1):
+                return None
+            _b = _p.get("box")
+            _br = []
+            if self.results and 0 <= self.i < len(self.results):
+                _br = self.results[self.i].get("bricks") or []
+            # ⚠ 三段量**一律交给纯函数 `pick_extra`** 算 ✓（口径一处 ✓ 好测 ✓ 自检直接钉它 ✓）：
+            #   第 7 位 = 砖那一段、第 8 位 = **圆那一侧那一段**（本次新增 ✓ 见 `pick_extra` ✓）。
+            _row = (self.results[self.i]
+                    if (self.results and 0 <= self.i < len(self.results)) else {})
+            _btxt, _rtxt = pick_extra((float(_b[1]), float(_b[2]),
+                                       float(_b[3]), float(_b[4])),
+                                      _row.get("pos"), _row.get("tgt_rad"), _br)
+            return tuple(_b) + (_btxt, _rtxt)
+
+        def _on_pick_box(self, pt):
+            """左键点了画面（`pt` = **加工域坐标** ✓）⇒ 命中那格检出框并显示其几何/面积。
+
+            用户口径（2026-10-03 ✓ 原话："你能让我在点选检出框的时候显示
+            `(360.4,323.0) 179×208=37232` 这种信息吗" ✓）：
+              · 命中 = 点落在框内（**多个套着 ⇒ 取面积最小的那个** ✓ 里层优先 ✓）；
+              · 没落在任何框里 ⇒ 退回**中心最近**且距离 ≤ 40px 的那格（手抖差一点也能选上 ✓）；
+              · 点空白（连近的都没有）⇒ **取消**选中 ✓（再点同一格/别处照常 ✓）。
+            ⚠ 纯显示层 ✗：不选中任何"判定"、不改红框/绿圈/参数 ✓（只是把数字摆出来 ✓）。
+            """
+            if not self.results or not self.frames:
+                return
+            _i = max(0, min(getattr(self, "i", 0), len(self.results) - 1))
+            _best = pick_box_at(self.results[_i].get("boxes"), pt)   # ⭐ 命中逻辑在模块函数里 ✓ 好测 ✓
+            self._pick = None if _best is None else {"frame": _i, "box": _best}
+            self._show_precomputed()                    # 立刻重画（带高亮 ✓）
+            self._status(_i)                            # 状态栏写上这一格的数字 ✓
+
+        def _on_pick_menu(self, pt):
+            """**右键点选检出框 ⇒ 选中 + 弹菜单**（用户 2026-10-03 ✓ 原话："加一个**右键点击检出框
+            选中并弹出菜单**，目前只有一项『**复制检出框信息**』，用来我**复制之后与你交流**" ✓）。
+
+            · 命中逻辑与左键**同一份**（`pick_box_at` ✓ 里层优先 / 差一点取最近 ✓ 不各写一份 ✗）；
+            · ⚠ **没点在检出框上 ⇒ 不开菜单** ✓（不猜 ✗ —— 那唯一一项对"空选中"没有意义 ✓）；
+            · 选中后**照左键那条路**刷新（高亮 + 状态栏 ✓），再弹菜单 ✓；
+            · 菜单目前**只有一项** ✓（用户明说"目前只有一项" ✓ 结构留好 ✓ 以后加项就在这加 ✓）。
+            ⚠ 纯显示层 ✗：不改任何判定 / 参数 ✓ —— 只是把这一格的数字**放进剪贴板** ✓。
+            """
+            if not self.results or not self.frames:
+                return
+            _i = max(0, min(getattr(self, "i", 0), len(self.results) - 1))
+            _best = pick_box_at(self.results[_i].get("boxes"), pt)
+            if _best is None:
+                return                              # 没命中 ⇒ 不开菜单 ✓
+            self._pick = {"frame": _i, "box": _best}
+            self._show_precomputed()
+            self._status(_i)
+            _txt = self._pick_clip_text()
+            _m = QMenu(self)
+            _m.addAction("复制检出框信息").triggered.connect(
+                lambda _=False: self._copy_pick_text(_txt))
+            _m.exec_(QCursor.pos())                 # 在**鼠标处**弹（右键就该在指的地方 ✓）
+
+        def _pick_clip_text(self):
+            """当前点选框的**剪贴板文本**（组装在纯函数 `pick_clip_text` 里 ✓ 好测 ✓）。"""
+            _pk = self._pick_box()
+            if _pk is None:
+                return ""
+            _i = getattr(self, "i", 0)
+            _st = None
+            if self.results and 0 <= _i < len(self.results):
+                _st = self.results[_i].get("state")
+            return pick_clip_text(_pk, self.names, frame_no=(_i + 1),
+                                  total=(len(self.frames) if self.frames else None),
+                                  state=_st)
+
+        def _copy_pick_text(self, txt):
+            """写剪贴板 + 状态栏给个回执（用户 2026-10-03 ✓ 「用来我**复制之后与你交流**" ✓）。
+
+            ⚠ 回执只有 6 秒、且播放中会被 `_status`（每帧刷 ✓）盖掉 ✗ —— 无所谓 ✓：用户复制完
+              就切去粘贴了 ✓，这里只求"点了有反应" ✓（不为了回执去改状态栏那套刷新机制 ✗）。
+            """
+            if not txt:
+                return
+            QApplication.clipboard().setText(txt)
+            self.statusBar().showMessage("已复制检出框信息（%d 字符）⇒ 直接粘贴即可 ✓" % len(txt),
+                                         6000)
+
         def _show_precomputed(self):
             """按演算表画**当前帧**（拖动定位时用 ✓ 零等待 —— 用户要求 ② ✓）。"""
             if not self.results:
@@ -1653,10 +3479,25 @@ def run_window(args):
             hud = "t=%5.2fs  %s  hit=%.0f%%" % (
                 self.t, r["state"], 100.0 * h / n if n else 0.0)
             mk = self.view()
+            # ⭐⭐ **右列（KF 位置驱动）**（用户 2026-10-03 ✓ 双列对照 ✓）：拖动/改视图参数时
+            #   也一起刷新 ✓（同一帧号 ✓ 各取各的演算表 ✓）；KF 关 ⇒ `None` ⇒ 单列老样子 ✓。
+            vis2 = None
+            if self.results_kf:
+                _i2 = min(self.i, len(self.results_kf) - 1)
+                if _i2 >= 0:
+                    r2 = self.results_kf[_i2]
+                    vis2 = draw(big.copy(),
+                                (None, r2["pos"], r2["r"], r2["hit"], r2["boxes"]),
+                                self.scale[0], self.scale[1], hud + "  [KF]",
+                                r2["cursor"], r2.get("motion"), self.names, mk)
             self.show_frame(draw(big.copy(),
                                  (None, r["pos"], r["r"], r["hit"], r["boxes"]),
                                  self.scale[0], self.scale[1], hud, r["cursor"],
-                                 r.get("motion"), self.names, mk))
+                                 r.get("motion"), self.names, mk,
+                                 pick=self._pick_box(),      # ⭐ 点选的检出框（黄框+数字 ✓）
+                                 # ⭐ KF 影子可视化（用户 2026-10-03 ✓ 青线/青点/青箭头 ✓）
+                                 kf=r.get("kf"), kf_trail=self._kf_trail(self.i)),
+                            vis2)
             self._status(self.i)      # ⭐ 帧号一起刷新（拖动/改视图参数都走这儿 ✓）
 
         def on_seek(self, value):
@@ -1685,11 +3526,11 @@ def run_window(args):
             acc = 100.0 * h / n if n else 0.0
             # ⭐⭐ **登记框与检出框的错位量**（中位 px ✓ 2026-10-01 加 ✓）：一眼就能判
             #   "登记表到底有没有贴合检出"（用户几次问"为什么错开" ⇒ 把它变成**数字** ✓
-            #   截图也能直接对 ✓）。算法 = 每个检出 → 最近「已上板」条目的距离，取中位 ✓；
+            #   截图也能直接对 ✓）。算法 = 每个检出 → 最近"已上板"条目的距离，取中位 ✓；
             #   0.0 = 全部严丝合缝 ✓。
             _mo = r.get("motion") or {}
             _reg = [e for e in (_mo.get("reg") or []) if e.get("ok")]
-            #   ⚠⚠ 口径必须是「**已上板条目 → 最近检出**」✗✗ —— 反过来（检出 → 最近条目）会
+            #   ⚠⚠ 口径必须是"**已上板条目 → 最近检出**"✗✗ —— 反过来（检出 → 最近条目）会
             #   **跨砖匹配**：刚滚进画面、还没有条目的新砖，会被配到**邻砖**的条目上 ⇒ 算出
             #   十几~几十 px 的"假错位"（我自己就被它误导了一轮 ✓ 实测帧 20：反过来量是中位
             #   17.8px，正着量是 0.0px ✓）。中位对"少数顶着不动的条目"不敏感 ✓。
@@ -1705,9 +3546,91 @@ def run_window(args):
                     _ds.append(_bd)
             _ds.sort()
             _mis = ("%.1f" % _ds[len(_ds) // 2]) if _ds else "-"
+            # ⭐⭐⭐ **点选的检出框**（用户 2026-10-03 ✓）：把那格的数字**也写进状态栏** ✓
+            #   —— 与画面上的黄框标签同一份（`(cx,cy) W×H=面积` ✓ 口径 = 加工域 ✓）。
+            _pk = self._pick_box()
+            _pks = ""
+            if _pk is not None:
+                _pks = " ｜ 点选 (%.1f,%.1f) %d×%d=%d" % (
+                    float(_pk[1]), float(_pk[2]), int(round(float(_pk[3]))),
+                    int(round(float(_pk[4]))),
+                    int(round(float(_pk[3]) * float(_pk[4]))))
+                # ⭐⭐ **第 2 行那几个量也写进来**（用户 2026-10-03 ✓ 原话："以上参数及旧的 iou
+                #   显示**都放在第二行**" ✓）—— 状态栏只有一行 ⇒ 接在同一行**末尾** ✓
+                #   （与画布标签**同一份数据** ✓ 一个算法两处显示 ✓ 不各算一份 ✗）。
+                _pkx = " ｜ ".join([str(_x) for _x in _pk[6:] if _x])
+                if _pkx:
+                    _pks = "%s ｜ %s" % (_pks, _pkx)
+            # ⭐⭐⭐ **KF 影子对照**（用户 2026-10-03 ✓）：只在"位置估计 = KF 影子"时显示 ✓
+            #   数据来自 `LieTracker.kf_summary()`（**全片累计** ✓ 纯读 ✓ 不影响任何判定 ✗）：
+            #   · `差 p50/p90` = KF 估的位置与经典位置的差（px ✓）；
+            #   · `新息 p50/p90` = 观测 − 先验预测（px ✓）—— **它就是"经典输出里那部分抖动"**
+            #     的量级 ✓ ⇒ 直接告诉我们观测噪声 σ 该设多大（现在默认 6px ✓ 见 `kf.KF_R_DEF` ✓）。
+            _kfs = ""
+            try:
+                _ks = self.runner.tr.kf_summary() if self.runner is not None else None
+                if _ks:
+                    _kfs = (" ｜ KF 影子(全片 n=%d) 差 p50 %.1f/p90 %.1f px ｜ 新息 p50 %.1f/p90 %.1f px"
+                            " ｜ 🟦青线=KF 轨迹 ｜ 青点/青圈=KF 位置 ｜ 青箭头=KF 速度"
+                            % (int(_ks["n"]), float(_ks["d_p50"]), float(_ks["d_p90"]),
+                               float(_ks["innov_p50"]), float(_ks["innov_p90"])))
+            except Exception:                       # noqa: BLE001 —— 状态栏不许因为诊断崩 ✗
+                _kfs = ""
             self.statusBar().showMessage(
-                "帧 %d/%d ｜ %s ｜ 命中率 %.1f%%（%d/%d）｜ 登记 %d 条 ｜ 错位中位 %s px"
-                % (i + 1, len(self.frames), r["state"], acc, h, n, len(_reg), _mis))
+                "帧 %d/%d ｜ %s ｜ 命中率 %.1f%%（%d/%d）｜ 登记 %d 条 ｜ 错位中位 %s px%s%s"
+                % (i + 1, len(self.frames), r["state"], acc, h, n, len(_reg), _mis, _pks, _kfs))
+            self._log_sync(i)                    # ⭐ 底部融合日志区跟着这一帧刷 ✓
+
+        def _log_sync(self, i):
+            """把底部**深色日志区**刷成「**截至第 i 帧**的融合框事件"（用户 2026-10-02 ✓）。
+
+            · 正常播放（`i` 递增）⇒ **只追加新帧**的事件 ✓ O(1)/帧 ✓（不会随帧数变卡 ✗）；
+            · 往回拖 / 换了素材（`results` 变短）⇒ **整段重建**（清空 + 从 0 扫到 i ✓）——
+              拖动来回看**不重复刷** ✗、也一条不漏 ✓。
+
+            ⚠ 只显示追踪器给的 `merge_log["text"]` ⇒ **判据不在这里重算** ✗（口径一处 ✓
+              见 `LieTracker._build_merge_log` ✓）。
+            """
+            _n = len(self.results)
+            if i < 0 or i >= _n:
+                return
+            if i < getattr(self, "_log_i", 0) or getattr(self, "_log_n", 0) > _n:
+                self.log.clear()
+                self._log_i = 0
+            for k in range(self._log_i, i + 1):
+                # ⭐⭐⭐ **运动分离模式的「通俗说明」**（用户 2026-10-03 ✓ 原话："我希望：你能把你
+                #   大概的**计算**、必要的我可以跟你**沟通**的信息在**日志**里写出来
+                #   （**最好通俗易懂**）" ✓）—— 每拍一行：相机走了多少／目标分数与位移／
+                #   它是不是"最不合群"的那个／**有没有换目标及为什么** ✓
+                #   ⇒ 用户**截一行日志就能跟我对话** ✓✓（比让他描述画面强得多 ✓）。
+                _mo = self.results[k].get("motion") or {}
+                if _mo.get("log_text"):
+                    self.log.appendPlainText("帧 %d ｜ %s" % (k + 1, _mo["log_text"]))
+                _m = self.results[k].get("merge_log")
+                if _m:
+                    self.log.appendPlainText("帧 %d ｜ %s" % (k + 1, _m.get("text", "")))
+                # ⭐⭐ **融合框消失（分离）**（用户 2026-10-02 ✓）：与融合日志**同格式** ✓ 一起进
+                #   这个日志区 ✓ —— 同一帧可能两条都有（"旧融合框作废 + 新融合框生成"同拍发生 ✓
+                #   正是 `9月30日(1).mp4` 第 45 帧那种情形 ✓）并排看最清楚 ✓。
+                # ⭐⭐ **融合期"每拍"的边归属**（用户 2026-10-02 ✓ 原话："日志里，融合时期每拍
+                #   打印一下**边的归属（砖或真目标）**" ✓）：夹在"生成"与"消失"之间 ✓ ——
+                #   于是日志区里一段融合看起来就是：生成 → 边归属×N → 消失 ✓ 一眼看到归属怎么变 ✓。
+                _e = self.results[k].get("edge_log")
+                if _e:
+                    self.log.appendPlainText("帧 %d ｜ %s" % (k + 1, _e.get("text", "")))
+                # ⭐⭐⭐ **非融合红框选择**（用户 2026-10-03 ✓ 原话："在日志加一下**非融合红框
+                #   选择**的判定信息吧" ✓）—— 与融合 / 边归属 / 分离**四条互补** ✓：
+                #   一条融合段在日志里看起来就是：生成 → 边归属×N → 分离；而**不融合的红框**
+                #   （"目标自己那格"）由本条给出"凭什么挑中它" ✓（判据仍在 `_build_pick_log`
+                #   那边组句子 ✓ 这里只显示 ✗ 口径一处 ✓）。
+                _p = self.results[k].get("pick_log")
+                if _p:
+                    self.log.appendPlainText("帧 %d ｜ %s" % (k + 1, _p.get("text", "")))
+                _s = self.results[k].get("split_log")
+                if _s:
+                    self.log.appendPlainText("帧 %d ｜ %s" % (k + 1, _s.get("text", "")))
+            self._log_i = i + 1
+            self._log_n = _n
 
         def on_seek_done(self):
             if getattr(self, "_was_playing", False) and self.results:
@@ -1740,10 +3663,26 @@ def run_window(args):
             mk = self.view()
             vis = draw(big.copy(), (None, r["pos"], r["r"], r["hit"], r["boxes"]),
                        self.scale[0], self.scale[1], hud, r["cursor"],
-                       r.get("motion"), self.names, mk)
+                       r.get("motion"), self.names, mk,
+                       pick=self._pick_box(),               # ⭐ 点选的检出框（黄框+数字 ✓）
+                       # ⭐ KF 影子可视化（用户 2026-10-03 ✓ 青线/青点/青箭头 ✓）
+                       kf=r.get("kf"), kf_trail=self._kf_trail(self.i))
+            # ⭐⭐⭐ **右列（KF 位置驱动）**（用户 2026-10-03 ✓ 原话："左边跑经典右边跑 **KF**，
+            #   这样对照才有意义" ✓）：**同一帧号**取它自己的演算表 ✓ —— 两列各画各的 ✓。
+            #   ⚠ 右列**不叠加青色影子**（它就是 KF 本身 ✓ 用户原话"叠加 KF 显示意义不大" ✓）；
+            #     也不画日志/点选高亮（那些是左列的事 ✓ 免得两列抢同一份 `_pick` ✓）。
+            vis2 = None
+            if self.results_kf:
+                _i2 = min(self.i, len(self.results_kf) - 1)
+                if _i2 >= 0:
+                    r2 = self.results_kf[_i2]
+                    vis2 = draw(big.copy(),
+                                (None, r2["pos"], r2["r"], r2["hit"], r2["boxes"]),
+                                self.scale[0], self.scale[1], hud + "  [KF]",
+                                r2["cursor"], r2.get("motion"), self.names, mk)
             if self.rec is not None:
                 self.rec.write(vis)
-            self.show_frame(vis)
+            self.show_frame(vis, vis2)
             self._status(self.i)                 # 状态栏（与拖动**共用**同一份 ✓）
             self.retime()                        # ⭐ 这一帧该停多久 = 它的**真实**帧间隔 ✓
             self.i += 1
@@ -1754,7 +3693,14 @@ def run_window(args):
                 self.sld.blockSignals(False)
             self.upd_time()
 
-        def show_frame(self, bgr):
+        def show_frame(self, bgr, bgr2=None):
+            # ⭐⭐ **右列（KF 位置驱动）**（用户 2026-10-03 ✓ 双列对照 ✓）：`bgr2` 给了就一起显示 ✓
+            #   （同一帧号、各画各的演算表 ✓）；⚠ 两列的缩放**各自独立**（各自滚轮/双击 ✓）。
+            if bgr2 is not None and getattr(self, "lbl2", None) is not None:
+                _rgb2 = cv2.cvtColor(bgr2, cv2.COLOR_BGR2RGB)
+                _h2, _w2, _ = _rgb2.shape
+                _qi2 = QImage(_rgb2.data, _w2, _h2, 3 * _w2, QImage.Format_RGB888).copy()
+                self.lbl2.set_image(_qi2, self.scale[0], self.scale[1])
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             h, w, _ = rgb.shape
             qi = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
@@ -1763,7 +3709,7 @@ def run_window(args):
             self.lbl.set_image(qi, self.scale[0], self.scale[1])
 
         def eventFilter(self, obj, ev):
-            """**把 ←→ / 空格 从数字框手里抢回来**（用户 2026-10-01 ✓ "不管聚焦在哪" ✓）。
+            """**把 ←→ / 空格 从数字框手里抢回来**（用户 2026-10-01 ✓ 「不管聚焦在哪" ✓）。
 
             ⚠ 只有**数字框**需要这一手（`__init__` 里只装在 `sp_path_ms` / `sp_merge` 上 ✓）：
               其余子控件（滑块/下拉/勾选框/按钮 ✓）本来就不 accept 这个键 ⇒ 窗口快捷键自然
@@ -1777,6 +3723,11 @@ def run_window(args):
             if (ev.type() == QEvent.ShortcutOverride and obj in getattr(self, "_steal_on", ())
                     and ev.key() in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Space)):
                 ev.ignore()          # 关键：**保持"没被 accept"**（accept 了就等于把键让回去 ✗）
+                return True
+            # ⭐⭐ **下拉也要挡滚轮**（项目规矩"滚轮不许改参数" ✓）：数字框已经有 `NoWheel*` ✓，
+            #   而 `QComboBox` **默认会被滚轮切档** ✗ ⇒ 鼠标从上面划过就偷偷换了算法分支 ✗✗。
+            #   ⚠ 只挡**下拉** ✗（底部日志区照旧能滚 ✓ —— 那是它唯一的用途 ✓）。
+            if ev.type() == QEvent.Wheel and isinstance(obj, QComboBox):
                 return True
             return super().eventFilter(obj, ev)
 
@@ -1805,7 +3756,7 @@ def run_window(args):
                 super().keyPressEvent(e)
 
         def closeEvent(self, e):
-            # ⭐ 关窗时把「上次的配置」落盘（用户 2026-10-01："让窗口能够记住我上次的配置" ✓）
+            # ⭐ 关窗时把"上次的配置"落盘（用户 2026-10-01："让窗口能够记住我上次的配置" ✓）
             self._cfg_save()
             self.timer.stop()
             self.warm.stop()

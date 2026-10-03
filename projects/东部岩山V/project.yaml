@@ -27,6 +27,9 @@ decision:
   chase_jump_min: -30
   chase_jump_max: 5
   chase_jump_dash_ms: 0
+  chase_jump_edge_guard_enabled: false
+  chase_jump_edge_guard_px: 100
+  station_turn_interval_ms: 1000
   mouse_speed: 1.8000000000000005
   evade_type: jump
   jump_interval: 0

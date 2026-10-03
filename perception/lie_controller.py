@@ -21,6 +21,20 @@ GAIN_PATH = Path(__file__).resolve().parent.parent / "config" / "mouse_gain.json
 # ---- 参数（集中在头部 ✓ 实跑调这里）----
 _DEADZONE = 3.0           # 死区（游戏像素）：|误差| 小于它不发指令（防抖/防过冲 ✓）
 _MAX_STEP = 200.0         # 单步限幅（指令单位）：防"一帧飞很远"（丢帧后误差巨大 ✓）
+_FOLLOW_GAIN = 1.0        # ⭐⭐⭐ **「鼠标跟随效率倍率」默认值**（用户 2026-10-03 ✓ 原话："能否
+                          #   开放一个系数配置，调追踪器跟上圆心的效率倍率？" ✓ + "**我不想影响
+                          #   位置计算**，只调追踪器（较大的白描边圈绿圆）" ✓）：P 控制每拍把
+                          #   误差（光标 → 目标点）**消掉这么多倍** ✓ —— 作用在**指令输出**上，
+                          #   ⇒ 只改"**模拟鼠标往圆心走多快**" ✗ **不碰 `LieTracker` 的任何位置
+                          #   计算** ✓（演示窗里那个"白圈 + 绿实心点"的大点 = 控制器输出 ✓）。
+                          #   · **1.0（默认）= 全量**（一拍尽量贴上去 = 老行为一字不变 ✓，
+                          #     实际仍受 `_MAX_STEP` 限幅与整数取整 ✓）；
+                          #   · **< 1** ⇒ 每拍只走剩余误差的一部分 ⇒ 光标**渐进**贴上圆心 ✓
+                          #     （拟人 ✓ ⚠ 太小会因整数取整停在几 px 的残差上 ✗）；
+                          #   · **> 1** ⇒ 过冲（在"一拍延迟 + 前馈"的闭环里能提前压住滞后 ✓
+                          #     代价是抖 ✓）。
+                          #   ⚠ 与 `gain`（**标定**：1 指令单位 ⇒ 多少游戏像素 ✓）不是一回事 ✗
+                          #     —— gain 是"换算尺"、本项是"走多快" ✓。
 _FF_LEAD_S = 0.10         # 前馈提前量：目标速度 × 它（≈ 传输+处理一拍延迟 ✓）
 _FF_VMAX = 300.0          # ⭐ 前馈速度限幅（px/s）：正常目标几十 px/s —— 超过它说明
                           #   速度估计被**跳变**污染，前馈会把指令甩飞 ✗（闭环实测：
@@ -55,12 +69,18 @@ class LieMouseController:
     """
 
     def __init__(self, gain=None, deadzone=_DEADZONE, max_step=_MAX_STEP,
-                 ff_lead_s=_FF_LEAD_S, lost_hold=_LOST_HOLD, assume=None):
+                 ff_lead_s=_FF_LEAD_S, lost_hold=_LOST_HOLD, assume=None,
+                 follow_gain=None):
         self.gain = tuple(gain) if gain else load_gain()
         self.deadzone = float(deadzone)
         self.max_step = float(max_step)
         self.ff_lead_s = float(ff_lead_s)
         self.lost_hold = int(lost_hold)
+        # ⭐⭐⭐ **鼠标跟随效率倍率**（用户 2026-10-03 ✓ 见 `_FOLLOW_GAIN` ✓）：每拍把"光标 →
+        #   目标点"的误差消掉这么多倍 ✓。⚠ **0 会被夹成一个极小值**（= 光标几乎不动 ⇒
+        #   永不收敛 ✗ 无实际意义 ✓）；上界 5 防手输离谱值 ✓；`None` ⇒ 模块默认 1.0 ✓。
+        self.follow_gain = (float(_FOLLOW_GAIN) if follow_gain is None
+                            else max(0.01, min(5.0, float(follow_gain))))
         # ⚠ **起点假设**（无光标反馈时的航位推算起点 ✓）：不给就 (0,0)——
         #   ⛔ 千万别默认成"光标就在目标上"（误差恒 0 ⇒ 永远不发指令 ✗ 踩过思路陷阱 ✓）。
         #   实机建议给**弹窗视口中心**（光标通常就近 ✓ 见 M3 的视口矩形）。
@@ -116,9 +136,12 @@ class LieMouseController:
             return (0, 0)
 
         # ⑥ P 控制 + 限幅（游戏像素误差 ⇒ 指令单位 ✓）
+        #   ⭐⭐⭐ **「鼠标跟随效率倍率」`follow_gain`**（用户 2026-10-03 ✓ 见 `_FOLLOW_GAIN` ✓）：
+        #     每拍消掉误差的**多少倍** ✓ —— 1.0 = 全量（老行为 ✓）；< 1 ⇒ 渐进贴上 ✓；
+        #     > 1 ⇒ 过冲（对抗一拍延迟 ✓）。⚠ 只作用在**指令输出**上 ⇒ 不碰 `LieTracker` ✓。
         gx, gy = self.gain
-        dx = ex / gx
-        dy = ey / gy
+        dx = ex / gx * self.follow_gain
+        dy = ey / gy * self.follow_gain
         dx, dy = self._clamp_step(dx, dy)
         self.last_cmd = (int(round(dx)), int(round(dy)))
         # 航位推算：**自己发过的指令**累回去（有反馈时会被 ① 覆盖 ✓ 不会漂 ✗）

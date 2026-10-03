@@ -495,6 +495,11 @@ class MainWindow(QMainWindow):
         # 不补的话：上次退出时开关是开着的用户，要先去「路线识别」页点一下
         # 才会看到叠图 —— 而它明明是开着的（"勾了没反应"就长这样）。
         self.route_panel._refresh_overlay()
+        # ⭐ 路线识别页**就地换地图**（用户 2026-10-02 的「手动更换」✓）之后，把玩家的
+        #   「定点休息」集合下拉重新推一遍 —— 集合按**地图 id** 存，不推就还列着上一张图的
+        #   集合（比不列更糟：选得到、但站在那儿永远不成立 ✗）。这一步和 `_bind_cards`
+        #   切项目时**同一个动作** ✓（那处见下面 `set_zone_sets`）。
+        self.route_panel.map_changed.connect(self._on_map_changed)
         tabs.addTab(self.route_panel, "路线识别")
         # ⭐ 「挂机保护」页（2026-09-29，用户要求：在路线识别右边 ✓）：
         #    「防挂机」新组（触发音效 + 试听 ✓）+ 从「决策参数」**整体搬来**的「防掉线」组 ✓。
@@ -646,7 +651,36 @@ class MainWindow(QMainWindow):
             project.set("decision", settings.to_dict(), save=True)
         else:
             settings.from_dict(data)
-        set_save_hook(lambda d, p=project: (p.set("decision", d), p.save()))
+        # ⭐⭐ **顺手写回「当前这张图」那份**（用户 2026-10-03 ✓）：「路线识别」页那批配置
+        #   改成**按地图 id** 存（`datasets/map/<id>.route.json` ✓ 见 `core/route_cfg.py`），
+        #   而 `project.yaml` 里那份**留着当"新图第一次打开时的播种值"**（用户选的 ✓）。
+        #   ⚠ 挂在这一处 ⇒ **以后任何人加一个"改完就 `settings.save()`"的控件，都会自动
+        #     带上"写回这张图"** ✓（逐个 handler 去加必然漏 ✗ 而漏了就是"改了没存"✗）。
+        #   ⚠ 面板可能还没建好（首次构造 / 换项目途中）⇒ `getattr` 兜底 + 吞异常：参数存不
+        #     下去是坏事，但不能连界面一起炸 ✗（同 `DecisionSettings.save` 的纪律 ✓）。
+        def _save_everywhere(d, p=project):
+            p.set("decision", d)
+            p.save()
+            rp = getattr(self, "route_panel", None)
+            if rp is not None:
+                try:
+                    rp._save_route_cfg()
+                except Exception:                   # noqa: BLE001
+                    pass
+        set_save_hook(_save_everywhere)
+
+    def _on_map_changed(self, map_id):
+        """路线识别页**就地换了地图**（「手动更换」✓）⇒ 把依赖"哪张图"的跨面板东西重推。
+
+        ⚠ 只有**跨面板**的那几件归这里（本面板自己的刷新在 `_on_manual_map_change` 里
+          当场做过 ✓ 别重复一套 ✗）：目前就是玩家面板那两个「定点休息」集合下拉 ——
+          集合按**地图 id** 存，不重推的话它们还列着上一张图的集合名
+          （比"空着"更糟：选得到、但站在那儿永远不成立 ✗）。
+        `map_id` 只用来打日志（谁需要它自己从 `route_panel._map_id()` 取 ✓）。
+        """
+        self.player_panel.set_zone_sets(self.route_panel.zone_sets())
+        # ⚠ 「前往平台」那一组也是按地图列集合的（控件归 RoutePanel ✓）——它自己会在
+        #   `_refresh_goto()` 里重读 ✓（`_on_manual_map_change` 已经调过 ✓），这里不用管 ✗。
 
     def _bind_cards(self):
         # 先换决策参数，再让各面板回填控件（它们从 settings 读数）

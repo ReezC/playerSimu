@@ -50,7 +50,8 @@ def run_cycle(cid, frames, viz_dir=None, dets=None):
     """跑一个 cycle ⇒ 摘要 dict（顺带按需导出标注帧 ✓）。
 
     `dets`（M2b ✓）：{帧 stem: [[cls, cx, cy, w, h], ...]} —— 按 stem 查到就传给
-    追踪器（复活/吸附通道 ✓）；没查到 = 纯残差路线 ✓。
+    追踪器（吸附 / 校验通道 ✓）；没查到 = 纯残差路线 ✓。
+    ⚠ **复活通道已于 2026-10-02 停用**（用户："停用这个逻辑" ✓ 见 `lie_tracker` 那处注释 ✓）。
     """
     tr = LieTracker()
     rows = []
@@ -116,7 +117,8 @@ def main():
     ap.add_argument("--cycles", type=str, default="")
     ap.add_argument("--viz-out", type=str, default="")
     ap.add_argument("--dets", type=str, default="",
-                    help="v2 检测 json（_tmp_lie_dets.py 产物）⇒ 启用 M2b 复活通道 ✓")
+                    help="v2 检测 json（_tmp_lie_dets.py 产物）⇒ 启用 M2b 检测通道（吸附/校验 ✓；"
+                         "复活已停用 ✗）")
     args = ap.parse_args()
     cyc = load_cycles()
     dets = None

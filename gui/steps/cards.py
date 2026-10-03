@@ -224,6 +224,8 @@ class MapCard(StepCard):
 
         怪列表必须跟着地图一起写：项目只改了 map_id、`mobs` 还是空的话，
         「确认要识别怪物」弹窗就会一个怪都没有（实测踩过）。
+        ⚠ 那四件**统一由 `wzexport.apply_map_choice` 写**（2026-10-02 收编 ✓）：
+          路线识别页的「手动更换」走的是**同一个写口** —— 各写一份迟早一边漏一件 ✗。
         """
         m = self._manifest_entry(mid)
         if m is None:
@@ -231,11 +233,7 @@ class MapCard(StepCard):
             self.set_result("⚠ 地图清单里找不到 %s —— 点「刷新列表」再选一次" % mid)
             return False
 
-        self.project.set("map_id", mid)
-        self.project.set("mobs", list(m["mobs"]))
-        self.project.set("mob_names", list(m["mob_names"]))
-        self.project.set("mobs_cleared", False)     # 换了图，上一张的清空记录作废
-        self.project.save()
+        wzexport.apply_map_choice(self.project, mid, pool=self._pool)
         self.set_result(self._describe(mid, m["mobs"], m["mob_names"]))
         return True
 

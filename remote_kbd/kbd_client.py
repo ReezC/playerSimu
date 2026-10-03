@@ -11,6 +11,18 @@ import socket
 import ssl
 import threading
 import time
+from pathlib import Path
+
+#: ⭐ **A 机日志在 B 机的落点**（用户 2026-10-03 ✓ 原话："你能让 A 机的log都往B机发吗？
+#: 这样我就不用老切换了"）。A 机的 `relay_trace.log` 里正是"鼠标节拍 / tcp->serial /
+#: 串口错误"这些**只能在被控机上看到**的东西 ✓ ⇒ 现在 relay 顺手回传、B 侧落在这 ✓。
+#: ⚠ 名字带 `A_` 前缀：两台机器上都有一个同名文件最容易看错 ✗（A 机那份还叫
+#:   `relay_trace.log` ✓ 这份是"从 A 转发来的" ✓）。
+A_LOG_PATH = Path(__file__).resolve().parent / "A_relay_trace.log"
+#: 单文件上限（超了砍半 ✓ 与 A 侧 `relay.py` 的 `_trim` 同口径 ✓）。
+A_LOG_MAX = 4 * 1024 * 1024
+#: A 侧回传行的前缀（`relay.py::_push_to_client` 一处实现 ✓ 两边必须一致 ✗）。
+A_LOG_PREFIX = b"#LOG "
 
 
 def _perf():
@@ -74,6 +86,11 @@ class KbdClient:
         #: 固件对**每条**指令回一条 `DONE`/`ERR`（见 `_drain` ✓）⇒ 一对一，账能对上 ✓。
         self._pending = 0
         self._rtt_t0 = None
+        #: ⭐ A 机日志回传（2026-10-03 ✓ 见 `A_LOG_PATH`）：半行缓冲 + 计数 + 每连接一条
+        #:   抬头行（不然日志里两个连接的行会接在一起分不清 ✓）。
+        self._log_carry = b""
+        self.a_log_lines = 0
+        self._a_log_banner = False
         # 后台读线程：relay 会把固件的 DONE 应答回传，这里持续读走丢弃，
         # 否则回传缓冲被 DONE 塞满后，relay/固件/控制机整条链路会连锁卡死
         # （表现为：按键发不出、推理丢帧暴增、RELEASE 丢失导致卡键）。
@@ -148,6 +165,65 @@ class KbdClient:
         self._pending = max(0, self._pending - n)
         self._rtt_t0 = time.perf_counter() if self._pending > 0 else None
 
+    def _take_a_logs(self, data):
+        """把 A 机**回传的日志行**（`#LOG …`）挑出来落盘，返回**剩下的**给回执计数用 ✓。
+
+        用户原话："你能让 A 机的log都往B机发吗？这样我就不用老切换了" ✓ —— A 机 relay 的
+        `trace()` 现在顺手回传（`relay.py::_push_to_client` ✓），这里落进 `A_LOG_PATH` ✓。
+
+        ⚠ 三件必须做对（少一件就会把**别的**功能弄坏 ✗）：
+          · **挑走的行不再参与 `DONE`/`ERR` 计数** ✗ —— 否则 `kbd_rtt_ms` 和"链路卡死"判据
+            （`silent_for`，看的就是回执）会被**日志里的字眼**骗到 ✓；
+          · **只留"可能是日志行开头"的半行**（TCP 切包是常态 ✓）—— 普通半行（比如 `DON`）
+            **绝不能扣住** ✗（扣住就拖慢回执计数 = 把 RTT 量歪 ✓）；
+          · 落盘失败**不许把读线程搞挂** ✗（它一退，回程缓冲堆满 ⇒ 整条链连锁卡死 ✓
+            见本模块 `_drain` 的文档 ✓）。
+        """
+        if not data:
+            return data
+        try:
+            body = self._log_carry + bytes(data)
+        except Exception:                           # noqa: BLE001
+            return data
+        if A_LOG_PREFIX not in body and not body.startswith(b"#"):
+            self._log_carry = b""
+            return data                             # 一条日志都没有 ⇒ 一个字不改 ✓
+        lines = body.split(b"\n")
+        keep = b""
+        if lines and lines[-1] and not body.endswith(b"\n"):
+            tail = lines[-1]
+            if tail.startswith(b"#") or A_LOG_PREFIX.startswith(tail):
+                keep = lines.pop()                  # 只可能是半条日志行 ✓
+        self._log_carry = keep
+        rest = []
+        for raw in lines:
+            if raw.startswith(A_LOG_PREFIX):
+                self._append_a_log(raw[len(A_LOG_PREFIX):])
+            elif raw:
+                rest.append(raw)
+        return b"\n".join(rest)                     # 回执计数在**剩下的**上做 ✓
+
+    def _append_a_log(self, raw):
+        """写一行到 `A_LOG_PATH`（超限砍半 ✓；失败静默 ✓ —— 只是方便，不是功能 ✗）。"""
+        try:
+            text = raw.decode("utf-8", "replace")
+        except Exception:                           # noqa: BLE001
+            return
+        try:
+            p = A_LOG_PATH
+            with open(p, "a", encoding="utf-8") as fh:
+                if not self._a_log_banner:
+                    self._a_log_banner = True
+                    fh.write("=== A 机 relay 日志（转发 · 本连接 %s）===\n"
+                             % time.strftime("%Y-%m-%d %H:%M:%S"))
+                fh.write(text + "\n")
+            self.a_log_lines += 1
+            if p.stat().st_size > A_LOG_MAX:
+                blob = p.read_bytes()
+                p.write_bytes(blob[len(blob) // 2:])    # 砍半（同 A 侧口径 ✓）
+        except Exception:                           # noqa: BLE001
+            pass
+
     def _drain(self):
         """读走 relay 回传的应答，避免回传缓冲堆积。
 
@@ -162,6 +238,9 @@ class KbdClient:
                     self.ok = False     # 连接被对端关闭
                     self.last_err = "连接被对端关闭"
                     break
+                # ⭐ **先把 A 机日志挑走**再数回执（2026-10-03 ✓ 见 `_take_a_logs`）——
+                #   挑走的行不许参与 `DONE`/`ERR` 计数 ✗（否则日志字眼会骗到 RTT / 死链判据 ✓）
+                data = self._take_a_logs(data)
                 n = data.count(b"DONE") + data.count(b"ERR")
                 if n:
                     self.replies += n

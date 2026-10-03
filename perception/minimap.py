@@ -57,7 +57,7 @@ class MiniMapClient:
         self._t = 0.0               # 收到它的时刻（perf_counter）
         # 最近若干帧的到达时刻：算"拍/秒"要用它。**不能用 1/(现在-最后一帧时刻)**
         # ——那算的是"距上一帧过了多久"，界面每 100ms 取一次值，会看到 52 这种
-        # 假数字（默认推 30 fps，见 tools.minimap_push.DEFAULTS）。
+        # 假数字（默认推 **60** fps，见 tools.minimap_push.DEFAULTS —— 2026-10-03 从 30 提上来 ✓）。
         self._times = deque(maxlen=40)
         self._stop = threading.Event()
         self._th = None

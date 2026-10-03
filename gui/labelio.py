@@ -26,7 +26,7 @@ from pathlib import Path
 # 这里只转发，保持既有的名字 —— 别处（质检台、实时预览、验证、数据集导出）都从
 # 这里或那里取，加类别时只用改那一个文件。
 from perception.classes import (CLASS_DROP, CLASS_MOB, CLASS_NPC,
-                                CLASS_OTHER_PLAYER, CLASS_PLAYER,
+                                CLASS_OTHER_PLAYER, CLASS_PET, CLASS_PLAYER,
                                 EN_NAMES as CLASS_NAMES, ORDER, ZH_NAMES, label)
 
 

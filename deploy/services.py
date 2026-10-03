@@ -148,9 +148,25 @@ PARAMS = {
                  "安装：winget install --id Gyan.FFmpeg -e"),
     ],
     "mmap": [
-        dict(key="region", keys=("x", "y", "w", "h"), label="小地图区域",
-             kind="region", width=250,
-             tip="小地图面板在 A 机屏幕上的矩形（屏幕坐标 x,y,w,h）。\n"
+        # ⭐⭐ **「当前地图」+「小地图区域」= 只读两行**（用户 2026-10-02 定 ✓ 原话："只靠
+        #   B 机推（A 机不能自己选）" + "地图与框选数据另存一份文件，仅 A 机本地储存"）：
+        #   · 「当前地图」= 本机记着的那个 id（B 机 `MAP <地图id>` 顺手写下的 ✓ 见
+        #     `tools/mmap_regions.set_current`）+ 右边一个「重读」；
+        #   · 「小地图区域」= **当前这张图**那份框（`config/minimap_regions/<id>.json` ✓
+        #     A 机本地）+ 右边**「框选…」**。
+        #   ⚠ **deploy.json 里不再存 x/y/w/h**（已从 DEFAULTS 删掉 ✗）：区域跟着**地图 id**
+        #     走，一台机上好几张图各一份 —— 存成一份"全局的"正是"换图还推上一张图的框"✗
+        #     （用户 2026-09-27 在 B 机侧踩过同一个坑 ✓ 见 `perception.minimap.crop_of`）。
+        #   ⚠ **没框过也能「启动」**：服务起来先监听、等 B 机 `MAP <id>`（见 `_mmap_cmd` ✓）——
+        #     这就是"只靠 B 机推"能闭环的原因（id 是 B 机给的，框是拿到 id 之后才框的 ✓）。
+        dict(key="current", keys=(), label="当前地图", kind="mmap_current", width=250,
+             tip="**B 机现在跑的是哪张图** —— 由 B 机告诉本机（A 机不能自己选）。\n"
+                 "B 机开始实时（以后还有换图）时会发一句 `MAP <地图id>`，这里跟着变；\n"
+                 "右下角「框选…」存的也是这张图名下。\n\n"
+                 "还空着 = 还没有机器告诉过本机 —— 先去 B 机开始实时。\n"
+                 "点右边的「重读」可以立刻再查一次（A 机自己不会变，只能等 B 机说）。"),
+        dict(key="region", keys=(), label="小地图区域", kind="mmap_region", width=250,
+             tip="**当前这张图**的小地图面板在 A 机屏幕上的矩形（屏幕坐标）。\n"
                  "点右边的「框选…」，把**小地图面板本身**框出来。\n"
                  "框选时跟着光标的放大镜是 8×（按 +/- 调，4~16 倍）—— 面板边框\n"
                  "差一两个像素，在放大镜里数像素格对齐。\n\n"
@@ -160,7 +176,10 @@ PARAMS = {
                  "部署台会在框选前把自己藏起来再抓屏，所以框到的是游戏画面；\n"
                  "但**运行期间**没有这种保护 —— 推的是屏幕这一块，谁压在上面就推谁，\n"
                  "所以启动后别让别的窗口盖在小地图上。\n"
-                 "游戏窗口移动过、换过分辨率/显示缩放、改过 UI 布局 → 要重新框一次。"),
+                 "游戏窗口移动过、换过分辨率/显示缩放、改过 UI 布局 → 要重新框一次。\n\n"
+                 "⚠ 区域**按地图 id 分别存**，而且只存在这台机器上：换图/换项目不用重框，"
+                 "各图各一份（另一台 A 机有自己的屏幕布局，不会互相覆盖 ✓）。\n"
+                 "框完如果推流正在跑，它会自动重启一次（下一帧就用新区域）。"),
         dict(key="port", keys=("port",), label="TCP 端口", kind="int",
              minimum=1, maximum=65535, width=110,
              tip="A 机监听这个端口，B 机连进来收小地图帧。\n"
@@ -176,15 +195,31 @@ PARAMS = {
              tip="抓到的这块区域先放大几倍再发。\n"
                  "小地图面板本身像素很少，黄点只有 2~5 像素：放大只是让它在\n"
                  "JPEG 编码里少掉点细节，**不增加信息量**，B 机会按比例缩回去。\n"
-                 "面板本身够大（≥150px）就不用放大。"),
+                 "面板本身够大（≥150px）就不用放大。\n\n"
+                 "⚠ **这个值跟着图存**（点「框选…」时写进那张图那份里 ✓）：标定是按\n"
+                 "某个 zoom 标出来的，换图时得用它自己那个 zoom（见 core.mapdata.load_calib）。"
+                 "所以它不写进 deploy.json 的区域里，改了它要重新框（或换图）才生效。"),
+        # ⭐⭐ 2026-10-03（用户 ✓ 原话："A机 fps 已经 60 了，quality 允许降；游戏（小地图）
+        #   应该有 200+ [刷新率]"）：小地图是**权威世界坐标** ⇒ 帧率越高坐标越新 ✓；
+        #   而"B 机每帧都要解一次、匹配一次"这条**已经不是瓶颈**了（定位 ~0.5ms ✓，
+        #   而且 B 机现在有**高频定位回路**按推流帧率取用 ✓ 见 `gui/live_thread.py`）⇒
+        #   默认从 30 提到 **60** ✓；`quality` 100 → **80**（面板本就一两百像素 ✓ 80 肉眼
+        #   看不出差别，JPEG 体积约减半 ⇒ A 机编码（它自述"编码是大头"✓）与带宽都省 ✓）。
         dict(key="fps", keys=("fps",), label="帧率", kind="combo_edit", cast=int,
-             choices=("10", "15", "30"), width=110,
-             tip="用户 2026-09-27 定：**实时小地图位置是权威**，帧率越高位置状态越新 ⇒\n"
-                 "默认 30。⚠ 帧率越高，B 机每帧都要解一次、匹配一次 ⇒ 真吃紧时降回 10~15。"),
+             choices=("30", "45", "60", "90"), width=110,
+             tip="用户 2026-09-27 定：**实时小地图位置是权威**，帧率越高位置状态越新 ✓。\n"
+                 "默认 60（2026-10-03 从 30 提上来 —— B 机侧已经改成按推流帧率取用 ✓，\n"
+                 "定位本身只要 ~0.5ms ⇒ 不再是瓶颈 ✓）。\n"
+                 "⚠ 这一路的开销在 **A 机**（抓屏 + JPEG 编码，它自述「编码是大头」✓）和\n"
+                 "带宽上 ⇒ 真吃紧再降回 30；**别低于游戏小地图自己的刷新率**（那会让坐标\n"
+                 "变旧 ✗，用户的游戏是 200+ ✓ 所以越低损失越明显）。"),
         dict(key="quality", keys=("quality",), label="JPEG 质量", kind="int",
              minimum=30, maximum=100, width=110,
-             tip="默认 100。这一路的**唯一价值**就是像素清晰（主画面那路压过一遍，\n"
-                 "黄点早糊了），所以默认不压。带宽真不够再往下调。"),
+             tip="默认 80（2026-10-03 从 100 降下来 ✓ 用户批的：「quality 允许降」）。\n"
+                 "这一路的**唯一价值**就是像素清晰（主画面那路压过一遍，黄点早糊了），\n"
+                 "但面板本身才一两百像素 ⇒ 80 与 100 的差别肉眼看不出来，而 JPEG 体积约\n"
+                 "减半 ⇒ **A 机编码时间和带宽都省一半** ✓（这正好是 60fps 的开销来源 ✓）。\n"
+                 "黄点认不出来（`mmap_miss` 一直涨）才需要往上调。"),
     ],
 }
 
@@ -246,34 +281,46 @@ def build_cmd(key, cfg):
 def _mmap_cmd(p, num):
     """小地图推流的命令行。
 
-    区域**从命令行传**（而不是让它去读 config/minimap_region.json）：
-    部署台里的框选结果存在 config/deploy.json，参数以界面上显示的那份为准 ——
-    「界面显示 A、命令跑的却是 B」那种不一致在这里不能出现。
+    ⭐ **区域按"当前是哪张图"传**（用户 2026-10-02 ✓）：本机记着当前图、而且那张图
+    **框过** ⇒ 传 `--map-id <id>` —— 区域与 zoom 都由 `config/minimap_regions/<id>.json`
+    说了算，而**那正是界面上「小地图区域」显示的那一份** ✓ ⇒ 「界面显示 A、命令跑的
+    却是 B」这条规矩照样成立 ✓（见那个文件顶部说明）。
+    没有当前图（或那张图还没框过）⇒ **一个区域参数都不带**：服务照起、先监听，等 B 机
+    那句 `MAP <id>`（用户 2026-10-02 的流程 ✓ 见 `tools/minimap_push` 顶部说明）——
+    ⚠ 别拿老的单值兜底硬凑一个区域 ✗：那会推一块**这张图无关**的画面出去，
+      B 机那边看着就像寻路坏了（区域是**屏幕坐标**，换图/换布局就全错 ✓）。
+    ⚠ 有 `--map-id` 时**不传 `--zoom`**：那张图那份里存着它自己的 zoom
+      （标定是按某个 zoom 标的 ⇒ 两者必须是同一份 ✓ 见 `core.mapdata.load_calib`）。
     """
     cmd = [python_exe(), "-m", "tools.minimap_push",
            "--bind", str(p.get("bind") or "0.0.0.0"),
            "--port", str(int(num(p.get("port"), 5003, int))),
-           "--zoom", str(int(num(p.get("zoom"), 3, int))),
-           "--fps", str(int(num(p.get("fps"), 30, int))),
-           "--quality", str(int(num(p.get("quality"), 100, int)))]
-    if region_set(p):
-        cmd += ["--x", str(int(num(p.get("x"), 0, int))),
-                "--y", str(int(num(p.get("y"), 0, int))),
-                "--w", str(int(num(p.get("w"), 0, int))),
-                "--h", str(int(num(p.get("h"), 0, int)))]
+           # ⭐ 默认与卡片/DEFAULTS 一致（2026-10-03：30→60、100→80 ✓ 见上面那个 spec ✓）
+           "--fps", str(int(num(p.get("fps"), 60, int))),
+           "--quality", str(int(num(p.get("quality"), 80, int)))]
+    from tools import mmap_regions                 # 懒导入（同 app.py 的框选那份 ✓）
+    cur = mmap_regions.current() or {}
+    mid = str(cur.get("map_id") or "")
+    if mid and mmap_regions.load(mid) is not None:
+        cmd += ["--map-id", mid]
     return cmd
 
 
-def region_set(p):
-    """小地图区域填全了没有（x/y/w/h 四个都是数）。填全靠它一处判断。"""
-    vals = [(p or {}).get(k) for k in ("x", "y", "w", "h")]
-    if any(v in (None, "") for v in vals):
-        return False
-    try:
-        [int(v) for v in vals]
-    except (TypeError, ValueError):
-        return False
-    return True
+def mmap_region_now():
+    """**当前这张图**的推流区域 → `(map_id, box, zoom)` | `(map_id|"", None, None)`。
+
+    部署台那两行显示（「当前地图」/「小地图区域」）、自检、框选落盘**共用这一处**
+    （别各自去读文件 ✗ 约定：一条口径一处实现 ✓）。`box` 是 `(x, y, w, h)`。
+    """
+    from tools import mmap_regions
+    cur = mmap_regions.current() or {}
+    mid = str(cur.get("map_id") or "")
+    if not mid:
+        return "", None, None
+    got = mmap_regions.load(mid)
+    if not got:
+        return mid, None, None
+    return mid, (got["x"], got["y"], got["w"], got["h"]), int(got["zoom"])
 
 
 def _push_cmd(p, num):
@@ -466,22 +513,13 @@ def missing_hint(key, cfg):
             return "分辨率太小了（%dx%d）。" % (w, h)
 
     if key == "mmap":
-        if not region_set(p):
-            return ("还没框选小地图区域。\n\n"
-                    "点这张卡片里「小地图区域」右边的**「框选…」**按钮，"
-                    "在屏幕上把游戏的小地图面板框出来（只框面板本身，"
-                    "别把血条/聊天一起框进去）。\n\n"
-                    "框完再点「启动」；区域是「什么时候框的」就对应"
-                    "「屏幕当时是什么样」，游戏窗口动过就要重框。")
-        w, h = int(p.get("w")), int(p.get("h"))
-        if w < 20 or h < 20:
-            return ("小地图区域太小了（%d x %d）。\n\n"
-                    "框的时候要把**整个小地图面板**框进去 —— 几个像素的"
-                    "区域推出去，B 机那边认不出是哪个地图，会报「没对上」。" % (w, h))
-        if int(p.get("x")) < 0 or int(p.get("y")) < 0:
-            return ("区域坐标是负数（x=%d y=%d）—— 重新框一次；"
-                    "手输的话 x/y 是屏幕左上角起算的像素。" % (int(p.get("x")),
-                                                             int(p.get("y"))))
+        # ⭐ **不再拦"还没框过"的启动**（用户 2026-10-02 ✓）：现在"当前是哪张图"只由 B 机推，
+        #   而 B 机那句 `MAP <id>` 必须走这条服务的连接 ⇒ **必须先让它起来**（先监听、
+        #   再被告诉是哪张图，拿到 id 之后才谈得上框 ✓ 见 `tools/minimap_push` 顶部说明）。
+        #   ⇒ 这一项现在交给**环境自检**提示（warn：还没图/这张图还没框过 ✓ 不红 ✗）。
+        #   ⚠ 区域本身的合法性（太小 / 负数 / 非数字）由 `mmap_regions._clean` 那一处判 ✓
+        #     （那份配置进不了库 ⇒ `load` 给 None ⇒ 与"还没框过"同一档 ✓ 一处判据 ✓）。
+        return ""
 
     if key == "probe":
         try:

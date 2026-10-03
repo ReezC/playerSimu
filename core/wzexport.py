@@ -191,6 +191,61 @@ def format_label(mid, name, region, mob_names, n_mob):
     return "   ".join(parts)
 
 
+def short_label(mid, name=""):
+    """「当前地图」那种**一行确认**用的文字：`森林迷宫III_105040303`（用户 2026-10-02 给的样式 ✓）。
+
+    ⚠ 与下拉用的 `format_label` **不是一回事**（别合并 ✗）：
+      · `format_label` 是"**挑**的时候一眼认出"⇒ id 在前、还带怪名（可长 ✓）；
+      · 本函数是"**确认我现在在哪张图**"⇒ **名字在前、id 在后、不吃怪名**（一行放得下 ✓）。
+    名字查不到就只给 id ✓ —— 本套资源里有几百张图在 String.wz 里没名字，
+    **别编一个**（"(未命名)_001000000" 比 "001000000" 更难认 ✗）。
+    """
+    n = str(name or "").strip()
+    m = str(mid or "").strip()
+    if n and m and n != m:
+        return "%s_%s" % (n, m)
+    return m or n
+
+
+def map_entry(map_id, pool=None):
+    """地图清单里那张图的条目（= `list_maps` 的一项）；空 id / 查不到 → `None` ✓。
+
+    `pool` 可传现成的一份（调用方已列过就别再列一遍 ✓ 一处匹配口径 ✓）。
+    """
+    mid = str(map_id or "").strip()
+    if not mid:
+        return None
+    rows = pool if pool is not None else list_maps(only_with_mob=False, keyword="")
+    return next((x for x in rows if x["id"] == mid), None)
+
+
+def apply_map_choice(project, map_id, pool=None):
+    """把「选了这张图」写进项目 —— **唯一一处写口**（2026-10-02 收编 ✓）。
+
+    谁在用：① 模型训练 →「识别目标」那张卡的下拉（`gui/steps/cards.MapCard` ✓）；
+            ② 路线识别 →「寻路配置」顶部那个「手动更换」（用户 2026-10-02 ✓）。
+    两处**必须走同一份**：这个动作不是"改一个字段"，而是四件一起写（少一件就是坑 ✓
+    见下面），各写一份迟早分叉 ✗。
+
+    写四件：`map_id` ✓ + 这张图的怪列表 `mobs` / `mob_names` ✓ + `mobs_cleared=False`
+    （换了图，上一张"用户清空过怪"的记录作废 ✓），最后 `save()` ✓。
+
+    返回那张图的清单条目（调用方可以拿它渲染一句人话 ✓）；
+    **清单里没有（或没给项目）⇒ `None` 且一个字节都不写** ✗ ——
+    半提交的后果很具体：项目里地图换了、怪列表还是上一张的 ⇒
+    「确认要识别怪物」弹窗一个怪都没有（实测踩过）。
+    """
+    m = map_entry(map_id, pool=pool)
+    if m is None or project is None:
+        return None
+    project.set("map_id", m["id"])
+    project.set("mobs", list(m["mobs"]))
+    project.set("mob_names", list(m["mob_names"]))
+    project.set("mobs_cleared", False)
+    project.save()
+    return m
+
+
 def build_mob_name_map():
     """从地图清单收集「怪 id → 名称」映射（同名取第一个非空值）。
 

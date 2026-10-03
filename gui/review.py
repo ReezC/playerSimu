@@ -157,7 +157,7 @@ class ReviewPanel(QWidget):
         # 拖出来的一律是玩家框**（不用来回切下拉框，见下面那行提示）。
         # 「其他玩家」只人工标（自动标注不产这个类，见 perception/classes.py）。
         for _cls in (labelio.CLASS_MOB, labelio.CLASS_PLAYER,
-                     labelio.CLASS_OTHER_PLAYER):
+                     labelio.CLASS_OTHER_PLAYER, labelio.CLASS_PET):
             self.cmb_cls.addItem(labelio.label(_cls), _cls)
         self.cmb_cls.currentIndexChanged.connect(self._on_cls_changed)
         ops.addWidget(self.cmb_cls)

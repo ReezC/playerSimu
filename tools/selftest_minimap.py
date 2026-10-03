@@ -1506,17 +1506,21 @@ def t_mmap_crop_is_per_project():
 
 
 def t_mmap_rows_split():
-    """「小地图定位」要分两行：来源及其右边的东西另起一行（UI规范 §4）。
+    """「小地图来源」**搬进「寻路配置」卡**（用户 2026-10-03 ✓ 原话："「小地图定位」的来源、
+    黄点跟踪参数挪到寻路配置最上方"）+ 原来那条"两行不许挤一行"的口径照旧管着。
 
     **为什么量坐标，而不是匹配源码**：源码里 `row.addWidget` 写在哪儿，和它到底
     落在哪一行是两回事 —— 一个带 stretch 的 HBox 里，往右加多少次都还是同一行。
-    只有把面板真建出来量 y，才说明视觉结果，也才拦得住「顺手往右续一个控件」。
+    只有把面板真建出来量 y，才说明视觉结果。
 
-    窄窗口那一半同样要量：一路往右堆的真实后果不是"太长"，而是**窗口一窄标签
-    先被压没**（只剩几个看不出是什么的下拉框），所以换行必须在窄窗口下也成立。
+    ⚠ **为什么这条钉子的口径变了**（2026-10-03 ✓）：它原来钉的是"来源在「小地图定位」
+      卡的第二行、和「标定…」同行" ✗ —— 用户要求把来源挪去「寻路配置」⇒ 那条前提**不存在了**
+      （照旧写会假红 ✗）。改成钉"**搬到位**"：来源的父组 = 「寻路配置」、整卡在「小地图定位」
+      之上；「标定…」**留在**「小地图定位」（它读的就是那张卡里的几何 ✓）且不再与来源同行 ✓；
+      窄窗口下来源那行的标签仍不许被压没 ✓。
     """
     from PyQt5.QtCore import QPoint
-    from PyQt5.QtWidgets import QApplication
+    from PyQt5.QtWidgets import QApplication, QGroupBox, QLabel
 
     from gui.route_panel import RoutePanel
 
@@ -1529,26 +1533,213 @@ def t_mmap_rows_split():
     def y(w):
         return w.mapTo(p, QPoint(0, 0)).y()
 
-    try:
-        y_up, y_dn = y(p.cmb_mmap_mode), y(p.cmb_mmap_src)
-        check(y_dn > y_up,
-              "「小地图来源」还跟「显示方式」挤在同一行（y %d vs %d）—— "
-              "UI规范 §4：一行只放一个参数组，放不下就另起一行" % (y_dn, y_up))
-        check(y(p.btn_mmap_calib) == y_dn,
-              "「标定…」应当跟着「小地图来源」在第二行（y %d），实际 y %d"
-              % (y_dn, y(p.btn_mmap_calib)))
-        check(p.cmb_mmap_src.x() < p.cmb_mmap_mode.x(),
-              "第二行没从左边起（来源 x=%d 在显示方式 x=%d 的右边）—— "
-              "那只是把一个更长的行折了个位置，没解决问题"
-              % (p.cmb_mmap_src.x(), p.cmb_mmap_mode.x()))
+    def group_of(w):
+        q = w.parent()
+        while q is not None and not isinstance(q, QGroupBox):
+            q = q.parent()
+        return q.title() if q is not None else None
 
-        # 窄窗口下两行不许合并（这才是「无脑往右加」真正的后果）
+    try:
+        check(group_of(p.cmb_mmap_src) == "寻路配置",
+              "「小地图来源」没搬进「寻路配置」卡（用户 2026-10-03 要求）：%r"
+              % (group_of(p.cmb_mmap_src),))
+        check(y(p.cmb_mmap_src) < y(p.cmb_mmap_mode),
+              "「来源」还在「小地图定位」卡那把（该在它**上面**那张卡里）：y %d vs %d"
+              % (y(p.cmb_mmap_src), y(p.cmb_mmap_mode)))
+        check(group_of(p.btn_mmap_calib) == "小地图定位",
+              "「标定…」被连坐搬走了 —— 它该留在读那张几何的卡里：%r"
+              % (group_of(p.btn_mmap_calib),))
+        check(y(p.btn_mmap_calib) != y(p.cmb_mmap_src),
+              "「标定…」和「来源」挤成同一行了（两张卡的东西混一行 ✗）：%d"
+              % (y(p.btn_mmap_calib),))
+        # 跟踪那四个容差也一起搬了（用户同一句话里要求的 ✓）；两行分组由
+        # `t_track_rows_layout` 量着 ✓ 这里只钉"在不在「寻路配置」里" ✓
+        check(all(group_of(sp) == "寻路配置" for sp in p._sp_track.values()),
+              "「黄点跟踪参数」没跟着搬进「寻路配置」：%s"
+              % ({k: group_of(sp) for k, sp in p._sp_track.items()},))
+
+        # 窄窗口下「来源」那行仍在（标签不许被压没）
         p.resize(520, 700)
         app.processEvents()
-        check(y(p.cmb_mmap_src) > y(p.cmb_mmap_mode),
-              "窗口变窄之后两行又挤回一行了")
+        _lbs = [lb for lb in p.findChildren(QLabel) if lb.text() == "小地图来源"]
+        check(_lbs and _lbs[0].width() > 0,
+              "窗口变窄之后「小地图来源」标签被压没了（§4 说的就是这个后果）")
     finally:
         p.close()
+
+
+def t_route_panel_current_map_row():
+    """⭐⭐ 路线识别 →「寻路配置」**最顶部**那行「当前地图」+「手动更换」。
+    （用户 2026-10-02 ✓ 原话："在路线识别→寻路配置最顶部 增加只读参数『当前地图』，
+    默认为 模型训练 页签→识别目标选项里的地图参数；增加按钮『手动更换』，用以修改这个 id"）
+
+    钉七件：
+      ① **真的在最顶部**：它比同组第一个控件（「寻路编辑器」）还靠上 —— 量**坐标**，
+         不看源码顺序（同 `t_mmap_rows_split` 的理由：源码顺序 ≠ 视觉位置 ✓）；
+      ② **只读**：显示是 `QLabel`（没有输入框），且**两处文本一字不差**
+         （本组顶部 +「小地图定位」卡里那个「当前地图」⇒ 一件事一个口径 ✓）；
+      ③ 默认跟着项目的**地图参数**走（`project.map_id` ✓ 与「模型训练 → 识别目标」同一份），
+         格式 = `名字_id`（用户给的样式 ✓ 例 `森林迷宫III_105040303`）；
+      ④ 「没打开项目」和「项目里还没选地图」**两种说法**（不许都写"没打开项目" ✗）；
+      ⑤ 「手动更换」走**同一个写口** `wzexport.apply_map_choice`（源码级钉 route_panel 真调它；
+         功能级钉那个写口本身：地图 + 怪列表 + `mobs_cleared` 四件一起写 ✓、清单里没有就
+         **一个字节都不写** ✗）；
+      ⑥ 换图要**通知出去**（`map_changed` 信号 —— 玩家的「定点休息」集合下拉按地图 id 存 ✓）；
+      ⑦ 弹窗：**没选中不许确定**、默认（没输关键词时）只列当前那张、筛选走 `list_maps`
+         （清单几百张图，全列出来没法看 ✓ 也**别自己写一套匹配** ✗）。
+
+    ⚠ 清单**喂一份假的**（`wzexport.list_maps` 打桩 ✓）：这条钉子不该依赖本机 `datasets`
+      里恰好有什么图（那种用例换台机器就红 ✗）。
+    """
+    import types
+
+    from PyQt5.QtCore import QPoint, Qt
+    from PyQt5.QtWidgets import QApplication, QLabel
+
+    from core import wzexport
+    from gui import map_picker as mp_mod
+    from gui.route_panel import RoutePanel
+
+    POOL = [{"id": "105040303", "name": "森林迷宫III", "region": "", "mobs": ["1", "2"],
+             "mob_names": ["蜗牛", "蓝蜗牛"], "has_mob": True, "score": 1,
+             "label": "105040303   森林迷宫III   · 蜗牛/蓝蜗牛"}]
+    real_lm = wzexport.list_maps
+
+    def _fake_lm(only_with_mob=True, keyword=""):
+        """假的清单：**照真实现的语义**按关键词过滤（真实现是打分的，这里子串就够 ✓）——
+        打桩**不能把筛选也顺手关掉** ✗，否则"筛不到要说清"那条永远测不出来（第一版就踩了 ✓）。
+        """
+        kw = (keyword or "").strip().lower()
+        return [dict(x) for x in POOL
+                if not kw or kw in str(x["label"]).lower()]
+
+    wzexport.list_maps = _fake_lm
+    app = QApplication.instance() or QApplication([])
+
+    class _Proj:
+        """只有 RoutePanel 会用到的那几件（`get` / `set` / `save` ✓）。"""
+
+        def __init__(self):
+            self.data = {}
+            self.saved = 0
+
+        def get(self, k, d=None):
+            return self.data.get(k, d)
+
+        def set(self, k, v, save=False):
+            self.data[k] = v
+
+        def save(self):
+            self.saved += 1
+
+    p = RoutePanel()
+    try:
+        p.resize(900, 700)
+        p.show()
+        app.processEvents()
+
+        # ④ 没打开项目
+        check("没打开项目" in p.lbl_cur_map.text(),
+              "没有项目时「当前地图」没说清：%r" % p.lbl_cur_map.text())
+        # ④' 有项目、但没选地图 ⇒ **另一种**说法
+        proj = _Proj()
+        p.project = proj
+        p._refresh_current_map()
+        check("还没选地图" in p.lbl_cur_map.text(),
+              "项目开着却没选地图时，该说「还没选地图」（不是「没打开项目」✗）：%r"
+              % p.lbl_cur_map.text())
+
+        # ③ 默认跟着项目的地图参数走 + ② 两处一致
+        proj.data["map_id"] = "105040303"
+        p._refresh_mmap()                        # 真走那条刷新链（bind / showEvent 走的也是它 ✓）
+        app.processEvents()
+        want = "森林迷宫III_105040303"
+        check(p.lbl_cur_map.text() == want,
+              "「当前地图」没按「名字_id」显示（用户给的样式 ✓）：%r" % p.lbl_cur_map.text())
+        check(p.lbl_mmap.text() == want,
+              "同一件事两处显示不一样（本组顶部 %r vs 小地图定位卡 %r）—— 会让以为它是两个东西 ✗"
+              % (p.lbl_cur_map.text(), p.lbl_mmap.text()))
+        check(isinstance(p.lbl_cur_map, QLabel),
+              "「当前地图」该是**只读**的 QLabel（用户要的是只读参数 ✓）")
+        check(hasattr(p, "btn_map_change") and p.btn_map_change.text() == "手动更换",
+              "这一行没有「手动更换」按钮（用户点名要的 ✓）")
+
+        # ① 真在最顶部（比同组第一个控件还靠上）
+        def y(w):
+            return w.mapTo(p, QPoint(0, 0)).y()
+
+        check(y(p.lbl_cur_map) < y(p.btn_zones),
+              "「当前地图」没在「寻路配置」最顶部（y %d vs 寻路编辑器 %d）—— "
+              "下面每一件都以「现在是哪张图」为前提，得先说清 ✓"
+              % (y(p.lbl_cur_map), y(p.btn_zones)))
+        check(y(p.lbl_cur_map) < y(p.btn_mmap_crop),
+              "「当前地图」跑到「框选小地图」下面去了（y %d vs %d）"
+              % (y(p.lbl_cur_map), y(p.btn_mmap_crop)))
+
+        # ⑤ 写口只有一个：route_panel / 卡片 都调 `apply_map_choice`
+        _rp = (ROOT / "gui" / "route_panel.py").read_text(encoding="utf-8")
+        _cd = (ROOT / "gui" / "steps" / "cards.py").read_text(encoding="utf-8")
+        check("wzexport.apply_map_choice(" in _rp and "MapPickDialog" in _rp,
+              "「手动更换」没走共用的选图弹窗 + 共用写口（自己 set map_id 会漏写怪列表 ✗）")
+        check("wzexport.apply_map_choice(" in _cd,
+              "「模型训练 → 识别目标」那个下拉没走共用写口 —— 两处各写一遍迟早分叉 ✗")
+        # ⑤' 功能级：那个写口自己对不对
+        proj.data.clear()
+        proj.saved = 0
+        m = wzexport.apply_map_choice(proj, "105040303")
+        check(m is not None and proj.data.get("map_id") == "105040303",
+              "写口没把地图写进项目：%r" % (proj.data,))
+        check(proj.data.get("mobs") == ["1", "2"]
+              and proj.data.get("mob_names") == ["蜗牛", "蓝蜗牛"],
+              "写口没把**怪列表**一起写（「确认要识别怪物」会空着 ✗ 实测踩过）：%r" % (proj.data,))
+        check(proj.data.get("mobs_cleared") is False and proj.saved == 1,
+              "写口没把「上一张的清空记录」作废 / 没落盘：%r saved=%d"
+              % (proj.data, proj.saved))
+        before = dict(proj.data)
+        check(wzexport.apply_map_choice(proj, "999999999") is None
+              and proj.data == before,
+              "清单里没有的图居然写进去了（半提交 = 地图换了、怪列表还是上一张的 ✗）：%r"
+              % (proj.data,))
+
+        # ⑥ 换图要通知外面（玩家的集合下拉按地图 id 存 ✓）。源码级 + 信号存在性
+        got = []
+        p.map_changed.connect(lambda mid: got.append(mid))
+        p.map_changed.emit("105040303")
+        check(got == ["105040303"], "`map_changed` 信号没接上/没收发：%r" % (got,))
+        check("self.map_changed.emit(" in _rp,
+              "改完地图没发 `map_changed` ⇒ 别的面板（玩家那两个集合下拉）还用着上一张图的集合 ✗")
+        _mw = (ROOT / "gui" / "main_window.py").read_text(encoding="utf-8")
+        check("route_panel.map_changed.connect(" in _mw
+              and "set_zone_sets(self.route_panel.zone_sets())" in _mw,
+              "主窗口没接 `map_changed` 重新推集合下拉（`_bind_cards` 里那一步的同一件事 ✓）")
+
+        # ⑦ 弹窗：没选中不许确定 / 默认只列当前那张 / 筛选走 list_maps
+        dlg = mp_mod.MapPickDialog("105040303")
+        try:
+            check(dlg.btn_ok.isEnabled() is False,
+                  "还没选中就允许确定（点了会「什么都没换」✗）：%r" % dlg.chosen)
+            check(dlg.lst.count() == 1,
+                  "没输关键词时该只列**当前那张**（几百张图全列出来没法看 ✗）：%d"
+                  % dlg.lst.count())
+            it = dlg.lst.item(0)
+            check(it is not None and it.data(Qt.UserRole) == "105040303"
+                  and "当前" in it.text(),
+                  "默认那张没标出「当前」/ 数据不是地图 id：%r" % (it.text() if it else None,))
+            dlg.lst.setCurrentItem(it)
+            check(dlg.btn_ok.isEnabled() is True, "选中之后「换成这张」还是灰的 ✗")
+            dlg._on_ok()
+            check(dlg.chosen == "105040303" and dlg.result() == dlg.Accepted,
+                  "点确定没把选中的 id 交出来：%r" % (dlg.chosen,))
+            dlg.ed_filter.setText("森林")
+            check(dlg.lst.count() == 1, "按地图名筛选没命中：%d" % dlg.lst.count())
+            dlg.ed_filter.setText("zzz不存在的图")
+            check(dlg.lst.count() == 0 and "没有匹配" in dlg.lbl_count.text(),
+                  "筛不到东西时没说清（人会以为界面卡了 ✗）：%r" % dlg.lbl_count.text())
+        finally:
+            dlg.close()
+    finally:
+        p.close()
+        wzexport.list_maps = real_lm
 
 
 def t_two_point_solve():
@@ -3374,6 +3565,7 @@ def t_route_panel_mmap_crop():
     try:
         with mock.patch.object(rpmod, "load_live", lambda: dict(cfg)), \
              mock.patch.object(mapdata, "load_calib", lambda _m, src=None: dict(cal)), \
+             mock.patch("core.route_cfg.save", lambda *a, **k: None), \
              mock.patch.object(rpmod.QMessageBox, "information",
                                # information(parent, title, text) ⇒ 正文在 a[2]
                                lambda *a, **k: tips.append(a[2] if len(a) > 2 else "")):
@@ -5572,9 +5764,14 @@ def t_queried_mob_boxes_marked():
         区域筛缓存 `_zone_cache` 的时效 ✓）—— 到点**自己消失**（读口顺手剪 ✓）；
       ③ 再查一次 ⇒ 时效**续上**（不是"查过一次就永远是旧时刻" ✗）；
       ④ ⭐ **"有 → 失败"时沿用上次有效集合 + 续期**（用户 2026-09-28："不要空"✓）；
-         但**第一次就失败**（没上次可沿用）⇒ 仍照记成"空 + why"✓（那一档不能丢 ✗）；
-         `why` 一律照记（给 `mob_fh` 那条 log 看 ✓ 画面与 log 两边都不丢 ✓）；
-      ⑤ 记的是**画面框**（怪每拍都在动 ⇒ 标记要跟着它走 ✓）。
+        但**第一次就失败**（没上次可沿用）⇒ 仍照记成"空 + why"✓（那一档不能丢 ✗）；
+        `why` 一律照记（给 `mob_fh` 那条 log 看 ✓ 画面与 log 两边都不丢 ✓）；
+      ⑤ ⭐⭐ **账里只存"怪号 + 集合名 + 时刻"，不存框**（用户 2026-10-02 ✓ 原话：
+        "能不能让他只是作为『怪物框的标记』，跟着怪物的检出框走"）—— 框由**绘制那一刻**
+        按怪号去**这一帧的检出框**（`ws.mobs`）现查 ✓。原来存的是"**查询那一刻**的框"✗
+        ⇒ 怪走开之后红框**留在原地**（用户现场："红框在原地残留，可读性极差"✗）。
+        ⚠ 所以这条断言从"记的是画面框"改成"**账里没有框**"（画框那一侧按**源码**钉，见
+        `selftest_live_panel.t_mob_query_label_placement` ✓ —— 那一段没有可驱动的最小夹具 ✓）。
     """
     import types
     from unittest import mock
@@ -5629,9 +5826,13 @@ def t_queried_mob_boxes_marked():
     got = lt.LiveThread.queried_mob_boxes(th, now=100.5)
     check(len(got) == 1 and got[0][0] == "7",
           "查过的怪没被记下来（画面上就不会标 ✗）：%r" % (got,))
-    box = got[0][1][0]
-    check(box == (100.0, 200.0, 40.0, 60.0),
-          "记的不是画面框（标记会跟不住怪 ✗）：%r" % (box,))
+    # ⑤ ⭐⭐ 账里**不许再有框**（用户 2026-10-02 ✓）：有框 = 画的时候就会用旧位置 ✗
+    _rec = got[0][1]
+    check(len(_rec) == 4 and _rec[0] == ["甲平台"],
+          "账的形状不是 `(集合名, why, 首查时刻, 失效时刻)`（多存了框 ⇒ 红框会留在原地 ✗）：%r"
+          % (_rec,))
+    check(not any(isinstance(_v, tuple) for _v in _rec),
+          "账里还是塞了「查询那一刻的框」（标记就跟不住怪了 ✗）：%r" % (_rec,))
 
     # ② 到点就移除（"缓存失效再移除" ✓）；③ 再查一次 ⇒ 续上
     check(len(lt.LiveThread.queried_mob_boxes(th, now=101.9)) == 1,
@@ -5648,7 +5849,7 @@ def t_queried_mob_boxes_marked():
     #    `why` 仍**照记**（给 `mob_fh` 那条 log 看 ✓ 两边都不丢 ✓）。
     lt.LiveThread._mark_mob_query(th, mob, [], "怪底下没找到 foothold", now=200.0)
     got = lt.LiveThread.queried_mob_boxes(th, now=200.1)
-    check(len(got) == 1 and got[0][1][1] == ["甲平台"] and "foothold" in got[0][1][2],
+    check(len(got) == 1 and got[0][1][0] == ["甲平台"] and "foothold" in got[0][1][1],
           "「有 → 失败」时没沿用上次有效集合（用户 2026-09-28：**不要空** ✗）：%r" % (got,))
     # ④' 沿用时**也要续期**（否则到点照样消失 ✗）—— 200.0 续的期 ⇒ 201.9 还在 ✓
     check(len(lt.LiveThread.queried_mob_boxes(th, now=201.9)) == 1,
@@ -5657,8 +5858,60 @@ def t_queried_mob_boxes_marked():
     th._mob_queries.clear()
     lt.LiveThread._mark_mob_query(th, mob, [], "第一次就判不出来", now=300.0)
     got = lt.LiveThread.queried_mob_boxes(th, now=300.1)
-    check(len(got) == 1 and got[0][1][1] == [] and "第一次" in got[0][1][2],
+    check(len(got) == 1 and got[0][1][0] == [] and "第一次" in got[0][1][1],
           "第一次查就失败时没照记（「查到了」那一档丢了 ✗）：%r" % (got,))
+
+
+def t_queried_mob_boxes_follow_detection():
+    """⭐⭐ 「查过的怪框」**跟着这一帧的检出框走**（用户 2026-10-02 ✓ 原话："能不能让他只是作为
+    『怪物框的标记』，跟着怪物的检出框走"）。
+
+    病（用户现场截图）：账里存的是**查询那一刻的框** ⇒ 怪走开之后红框**留在原地**
+    （"红框在原地残留，可读性极差"✗ —— 屏幕上积了一堆空框）。
+
+    钉四件（驱动纯函数 `queried_mob_draw_list` ✓ —— 画框那一段在 GUI 里驱动不起来，
+    所以把"账 → 这一帧的框"做成纯函数、绘制那边只照画 ✓ 见那个方法 ✓）：
+      ① **同一个怪号换了位置 ⇒ 用新的框**（旧写法画的是查询那一下的旧位置 ✗）；
+      ② **这一帧没检出它 ⇒ 不画**（不是"画在旧位置"✗ —— 那正是用户报的残留 ✓）；
+      ③ 没查过的怪**不画**（只有真查过的才标 ✓ 顺带钉住"按怪号对上"这件事 ✓）；
+      ④ 到点（TTL）⇒ 不画（沿用「缓存失效再移除」✓）。
+    """
+    import types
+
+    from gui import live_thread as lt
+
+    th = types.SimpleNamespace(
+        agent=types.SimpleNamespace(_zone_cd_s=lambda zone=None: 2.0), _mob_queries={})
+    th._mob_query_ttl = lambda: lt.LiveThread._mob_query_ttl(th)
+    # ⚠ 替身 self 也得有那两个入口（方法内部都是 `self.xxx(...)` ✓ —— 少一个就 AttributeError，
+    #   而它会被当成用例失败 ✗；这一坑在同文件的记账用例里已经踩过一次 ✓）
+    th.queried_mob_boxes = lambda now=None: lt.LiveThread.queried_mob_boxes(th, now=now)
+    th._mark_mob_query = lambda m, names, why="", now=None: lt.LiveThread._mark_mob_query(
+        th, m, names, why, now=now)
+
+    mob = types.SimpleNamespace(id=7, x=100.0, y=200.0, w=40.0, h=60.0)
+    lt.LiveThread._mark_mob_query(th, mob, ["甲平台"], "", now=100.0)
+
+    # ① 同一个怪号（7），但**这一帧挪到 (300, 260)**（同样 40×60）⇒ 画出来的必须是**新位置** ✓
+    moved = types.SimpleNamespace(id=7, x=300.0, y=260.0, w=40.0, h=60.0)
+    got = lt.LiveThread.queried_mob_draw_list(th, [moved], now=100.5)
+    check(got == [("7", ["甲平台"], 280, 230, 320, 290)],
+          "「查过的怪框」没跟着**这一帧的检出框**走（画的是查询那一刻的旧位置 ⇒ 怪一走开"
+          "红框就留在原地 ✗）：%r" % (got,))
+
+    # ② 这一帧没检出它（视野里只有别的怪）⇒ **不画** ✓
+    other = types.SimpleNamespace(id=99, x=500.0, y=200.0, w=40.0, h=60.0)
+    check(lt.LiveThread.queried_mob_draw_list(th, [other], now=100.6) == [],
+          "这一帧没检出那只怪却还画了框（留在旧位置上的空框 = 用户截图里那些残留 ✗）")
+
+    # ③ 两只怪都在 ⇒ **只标查过的那只**（按怪号对上 ✓，不是"见怪就标"✗）
+    got = lt.LiveThread.queried_mob_draw_list(th, [other, moved], now=100.7)
+    check(len(got) == 1 and got[0][0] == "7",
+          "没查过的怪也被标了（只有「真查过」的那只才画 ✓）：%r" % (got,))
+
+    # ④ 到点（TTL = `_zone_cd_s()` = 2 秒 ✓）⇒ 不画 ✓
+    check(lt.LiveThread.queried_mob_draw_list(th, [moved], now=103.0) == [],
+          "过了时效还在画（用户要求「缓存失效再移除」✗）")
 
 
 def t_pos_state_machine():
@@ -7719,6 +7972,8 @@ TESTS = (
      t_mmap_crop_is_per_project),
     ("「小地图定位」分两行（来源另起一行）",
      t_mmap_rows_split),
+    ("⭐ 寻路配置**最顶部**「当前地图」+「手动更换」（只读 / 一处分口径 / 同一个写口）",
+     t_route_panel_current_map_row),
     ("双点标定：两对点 → 两轴缩放 + 偏移 + 自查",
      t_two_point_solve),
     ("双点标定弹窗：两次采样 → 算 → 存",
@@ -7821,6 +8076,9 @@ TESTS = (
      t_foothold_below_prefers_nearer_within_xtol),
     ("查过的怪框标出来、缓存失效再移除",
      t_queried_mob_boxes_marked),
+    ("⭐ 「查过的怪框」跟着**这一帧的检出框**走（用户 2026-10-02：红框原地残留 ⇒ 现在按怪号"
+     "现查、查不到就不画）",
+     t_queried_mob_boxes_follow_detection),
     ("「怪判不出集合」时的可观测性：相机不许再平滑、why 分档说清卡在哪级、"
      "mob_fh 打点带上图名与玩家 x/框底（用户 2026-09-28：又开始全程找不到，排查全靠猜）",
      t_mob_fh_observability),

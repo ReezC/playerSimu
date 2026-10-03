@@ -71,13 +71,56 @@ def enable_forensics(log_dir=None):
     return LOG_DIR
 
 
+#: ⭐ **A 机日志的回传口**：当前连着的那个客户端（`bridge` 里设 / 清 ✓）。
+#: 用户 2026-10-03 ✓ 原话："你能让 A 机的log都往B机发吗？这样我就不用老切换了" ——
+#: A 机的 `relay_trace.log` 只在被控机上 ✓，每次要看都得切过去 ✗ ⇒ 顺手挂到**已有的
+#: 回程**（固件回执那条 TCP ✓）上，B 侧收到就落盘（`remote_kbd/kbd_client.py` ✓）。
+_LOG_SINK = None
+#: 所有对客户端的 `sendall` **共用这把锁**：回程现在有**两个写者** —— `ser_to_tcp`
+#: 写固件回执 ✓、`trace()` 写日志回传 ✓ —— 而 **TLS 记录不许交错** ✗（两个线程同时
+#: `sendall` 会写出坏记录 ⇒ 整条链烂掉 ✓）。
+_SEND_LOCK = threading.Lock()
+
+
+def _push_to_client(text):
+    """把一行日志**顺手回传给 B 机**（用户 2026-10-03 ✓ 见 `_LOG_SINK`）。
+
+    ⚠ 三条纪律：
+      · 只在**有客户端连着**时发 ✓（没连就只是本地文件 ✓，`relay_trace.log` 照旧写全 ✓）；
+      · 发失败**不算事**（回传只是为了方便，绝不许把中继搞挂 ✗）⇒ 静默 ✓；
+      · **不许在这里再调 `trace()`** ✗（会自激 ✓）。
+    """
+    conn = _LOG_SINK
+    if conn is None:
+        return
+    try:
+        with _SEND_LOCK:
+            conn.sendall(("#LOG %s %s\n" % (_ts(), text)).encode("utf-8", "replace"))
+    except Exception:                           # noqa: BLE001
+        pass
+
+
+def _ts():
+    """日志时间戳：**到毫秒**（2026-10-03 ✓）。
+
+    为什么必须毫秒：原来只写 `%H:%M:%S` ✗ ⇒ 「一段一段一顿一顿」那种现象发生在
+    **20~30 ms** 的尺度上 ✓ —— 秒级精度下那些缝**完全看不见** ✗（现场问的就是这件事 ✓）。
+    """
+    return time.strftime("%H:%M:%S") + ".%03d" % (int(time.time() * 1000) % 1000)
+
+
 def trace(text):
-    """记一条指令级日志（超限自动瘦身）。"""
+    """记一条指令级日志（超限自动瘦身）+ **顺手回传给 B 机**（2026-10-03 ✓）。"""
     global _trace_fh
+    # ⭐ **先回传**（用户 2026-10-03 ✓："这样我就不用老切换了"）——
+    #   ⚠ 必须**与本地文件无关** ✗：`_trace_fh` 为 None 时（目录建不出来 / 打开失败 ✓）
+    #   原来会直接 `return` ⇒ 回传也一起死 ✗ ⇒ 人还是得切到 A 机去看（甚至没得看 ✓）。
+    #   实测就是这么发现的（探针里把 `_trace_fh` 设成 None，"推出"是空的 ✓）。
+    _push_to_client(text)
     if _trace_fh is None:
         return
     try:
-        _trace_fh.write("%s %s\n" % (time.strftime("%H:%M:%S"), text))
+        _trace_fh.write("%s %s\n" % (_ts(), text))
         _trace_fh.flush()
         if _trace_fh.tell() > TRACE_MAX:
             _trace_fh.close()
@@ -86,6 +129,9 @@ def trace(text):
                              encoding="utf-8")
     except Exception:
         pass
+    # ⭐ 顺手回传给 B 机（2026-10-03 ✓ 用户："这样我就不用老切换了"）—— 本地文件照旧
+    #   写全 ✓（回传只是**多一条**路 ✓）；没客户端连着时这里什么也不做 ✓。
+    _push_to_client(text)
 
 
 class SerialLink:
@@ -178,6 +224,130 @@ class SerialLink:
                 pass
 
 
+class MoveStats:
+    """⭐ 「**MOVE 命令**以什么节拍到达 A 机」——只统计鼠标，不掺键盘（2026-10-03 ✓）。
+
+    用户现场原话："看起来现象是在 A 机上一段一段一顿一顿的指令汇报很离散，B 机卡不卡
+    其实没关系"。**判据得先有**：relay 原来只把 `tcp->serial <数据>` 按**秒**记进
+    `relay_trace.log` ✗ ⇒ 那个"离散"根本量不出来 ✓；`perf.log` 里也没有鼠标专用计数 ✗
+    （`MOVE` 和键盘混在 `send` 里 ✓）⇒ 只能靠猜 ✓。
+
+    每 `report_sec` 秒往 `relay_trace.log` 写**一行**（现场只需抓这一个文件 ✓）：
+
+      · `n`         这一段 MOVE **条数 + 条/秒** ⇒ 实际命令率（触控板正常 60~125/s ✓
+                    远低于它 ⇒ B 侧在**攒着发** ✗ 见 B 侧 `int()` 量化 + 主线程节流 ✓）
+      · `per_batch` **一次 recv 里带几条 MOVE** ⇒ 「**成批**」的直接证据 ✓（理想 ≈1；
+                    出现 3~5 ⇒ 那就是「一段一段」✗）
+      · `gap_ms`    相邻两条 MOVE 的**到达间隔** ⇒ 「**一顿一顿**」的直接证据 ✓
+                    （中位小而 p95/最大 大 = 一撮一撮 ✗ 理想是绕节拍的小抖动 ✓）
+      · `step_px`   每条 MOVE 的 `|dx|+|dy|` ⇒ **中位 1~2 = 量化台阶** ✓
+                    （B 侧 `int()` + 余数累积 ⇒ 慢速时几个事件才凑够 1 像素 ✓）
+
+    ⚠ **只看完整行**：一条 `MOVE …\n` 可能被 TCP 切成两半 ⇒ 半行留到下一批再算 ✗
+      （不然"批内条数 / 间隔"全歪 ✓ 见 `_carry`）。
+    ⚠ 统计**不许改变转发行为** ✗：它只读 `data`；`link.write(data)` 照旧原样 ✓。
+    ⚠ 只认 `MOVE` ✓：键指令混进来会把率算歪 ✗。
+    """
+
+    def __init__(self, report_sec=5.0):
+        self.report_sec = float(report_sec)
+        self._carry = b""
+        self._n = 0
+        self._batches = 0            # 这一段里"带 MOVE 的 recv"次数 ✓
+        self._per_batch = []
+        self._gaps = []
+        self._steps = []
+        self._last_t = None
+        self._t0 = None
+
+    # ---- 喂数据（在 relay 的 tcp->serial 那条路上调 ✓）----
+    def feed(self, data, now):
+        """把一次 `recv` 拿到的原始字节喂进来（**只统计 MOVE** ✓）。"""
+        if self._t0 is None:
+            self._t0 = now
+        try:
+            body = self._carry + bytes(data)
+        except Exception:                           # noqa: BLE001 —— 统计不许把桥搞挂 ✗
+            return
+        lines, _, rest = body.rpartition(b"\n")
+        self._carry = rest if rest and len(rest) < 4096 else b""
+        n_in_batch = 0
+        for raw in lines.split(b"\n"):
+            parts = raw.strip().split()
+            if not parts or parts[0] != b"MOVE":
+                continue
+            try:
+                step = abs(int(parts[1])) + abs(int(parts[2]))
+            except Exception:                       # noqa: BLE001
+                step = 0
+            if self._last_t is not None:
+                self._gaps.append((now - self._last_t) * 1000.0)
+            self._last_t = now
+            self._n += 1
+            n_in_batch += 1
+            self._steps.append(step)
+        if n_in_batch:
+            self._batches += 1
+            self._per_batch.append(n_in_batch)
+
+    # ---- 取报告（到点了返回一行文本，否则 None ✓）----
+    def maybe_report(self, now=None, force=False):
+        now = time.perf_counter() if now is None else now
+        if self._t0 is None:
+            return None
+        if not force and (now - self._t0) < self.report_sec:
+            return None
+        span = max(1e-6, now - self._t0)
+        line = ("MOVE 节拍 %.0fs n=%d（%.1f 条/秒）批=%d 批内中位%d最大%d "
+                "间隔中位%.1f p95 %.1f 最大%.1fms 步长中位%d最大%d"
+                % (span, self._n, self._n / span, self._batches,
+                   int(self._med(self._per_batch)), int(self._max(self._per_batch)),
+                   self._med(self._gaps), self._p95(self._gaps), self._max(self._gaps),
+                   int(self._med(self._steps)), int(self._max(self._steps))))
+        self._n = 0
+        self._batches = 0
+        self._per_batch = []
+        self._gaps = []
+        self._steps = []
+        self._t0 = now
+        return line
+
+    def reset(self):
+        """别把"上一段"的样本带进下一段 ✓（换客户端 / 重连时调 ✓）。"""
+        self.report_sec = float(self.report_sec)
+        self._carry = b""
+        self._n = 0
+        self._batches = 0
+        self._per_batch = []
+        self._gaps = []
+        self._steps = []
+        self._last_t = None
+        self._t0 = None
+
+    # ---- 小工具（空样本安全 ✓）----
+    @staticmethod
+    def _med(xs):
+        if not xs:
+            return 0.0
+        s = sorted(xs)
+        return float(s[len(s) // 2])
+
+    @staticmethod
+    def _max(xs):
+        return float(max(xs)) if xs else 0.0
+
+    @staticmethod
+    def _p95(xs):
+        if not xs:
+            return 0.0
+        s = sorted(xs)
+        return float(s[min(len(s) - 1, int(0.95 * (len(s) - 1)))])
+
+
+#: 全进程一份（relay 只管一个客户端 ✓）
+MOVE_STATS = MoveStats()
+
+
 def bridge(conn, link):
     """双向桥：TCP -> 串口，串口 -> TCP。
 
@@ -196,6 +366,12 @@ def bridge(conn, link):
     #   而控制机正是拿"发指令→收到回执"在算 `kbd_rtt_ms`（用户 2026-09-29 链路提效 ✓）
     #   —— 让回执被 Nagle 拖住，量出来的往返就不干净了 ✗（`set_nodelay` 一处实现 ✓）。
     _set_nodelay(conn)
+    # 换客户端 ⇒ 统计从头开始（别把上一条连接的样本并进来 ✓ 见 `MoveStats.reset`）
+    MOVE_STATS.reset()
+    # ⭐ 日志回传口：本条连接期间，`trace()` 写的每一行也发给这个客户端
+    #   （用户 2026-10-03 ✓ 见 `_LOG_SINK` / `_push_to_client`）。
+    global _LOG_SINK
+    _LOG_SINK = conn
 
     def ser_to_tcp():
         while not stop.is_set():
@@ -206,7 +382,10 @@ def bridge(conn, link):
                 break
             if data:
                 try:
-                    conn.sendall(data)
+                    # ⚠ 回程**两个写者**（这里的固件回执 + `trace` 的日志回传）⇒ 必须
+                    #   同一把锁 ✗（TLS 记录交错 = 整条链烂掉 ✓ 见 `_SEND_LOCK`）
+                    with _SEND_LOCK:
+                        conn.sendall(data)
                 except Exception:
                     break
             else:
@@ -238,10 +417,23 @@ def bridge(conn, link):
             trace("tcp->serial %s"
                   % data.decode("ascii", "replace").replace("\n", "|")[:60])
             link.write(data)
+            # ⭐ **鼠标节拍统计**（2026-10-03 ✓ 用户现场："A 机上一段一段一顿一顿的指令
+            #   汇报很离散"）：只**读** `data` ✓、不动转发（`link.write` 上一行照旧原样 ✓）；
+            #   到点就往 trace 里补一行 `MOVE 节拍 …` ✓ ⇒ 现场**只需抓 relay_trace.log** ✓。
+            #   ⚠ 包在 try 里：统计是"观测"，绝不许把桥搞挂 ✗。
+            try:
+                MOVE_STATS.feed(data, time.perf_counter())
+                _stat_line = MOVE_STATS.maybe_report()
+                if _stat_line:
+                    trace(_stat_line)
+            except Exception:
+                pass
     except Exception as e:
         trace("tcp->serial 写失败，结束本连接: %s" % e)
     finally:
         stop.set()
+        # 客户端走了 ⇒ 日志回传口一起清掉 ✓（下一个连上来时再设 ✓）
+        _LOG_SINK = None
         # ⭐⭐ 连接断开时**清空串口缓冲 + 重开句柄**（2026-10-02 ✓ —— 用户报
         #   "必须断开 ProMicro 才拯救"）：光发 RELEASEALL 不够 —— 它只清固件侧
         #   held 表，但**积压在 OS 串口驱动缓冲里的命令还在**（固件不读时 write

@@ -26,6 +26,16 @@
 自己的区域与 zoom，**下一帧**推的就是新区域的画面。不用新端口、不用重启、不用多起服务
 （协议见 `tools/mmap_regions.py`，A/B 两边共用那一份）。
 启动时也可以直接指定图：`--map-id <id>`（没给 ⇒ 用上面那份单值老配置，行为同以前 ✓）。
+
+**"当前是哪张图"由 B 机推**（2026-10-02 用户定 ✓，原话："只靠 B 机推（A 机不能自己选）"）：
+  · 启动解析优先级的**唯一一处**是 `mmap_regions.startup_region`：
+    `--map-id` → **本机记着的当前图**（`config/minimap_current.json` ✓ 上次 B 机推来的）
+    → 老单值兜底 → **一块都没有**；
+  · ⭐ **一块都没有也照常起来等**（不再直接退出 ✗）：A 机没框过也能先把服务开着，
+    B 机一句 `MAP <id>` 之后——库里**有**那张图 ⇒ 立刻开始推；**没有** ⇒ 回 `ERR no-such-map`，
+    人再去部署台卡片里框一次（那时 id 已经知道了 ✓）；
+  · 每次 `MAP` 处理成功都**顺手把 id 记在本机**（`mmap_regions.set_current` ✓）——
+    部署台的「当前地图」那一行读它，框选也就是存到这张图名下 ✓。
 """
 
 import argparse
@@ -43,8 +53,17 @@ from tools import mmap_regions                              # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 REGION_FILE = ROOT / "config" / "minimap_region.json"
 
-DEFAULTS = {"bind": "0.0.0.0", "port": 5003, "zoom": 3, "fps": 30,
-            "quality": 100, "region": None}
+# ⭐⭐ **fps 60 / quality 80**（用户 2026-10-03 ✓ 原话："A机 fps 已经 60 了，quality 允许降；
+#    游戏（小地图）应该有 200+ [刷新率]"）：
+#   · 小地图是**权威世界坐标**（`deploy/services.py` 那条口径 ✓）⇒ 帧率越高坐标越新 ✓；
+#     以前默认 30 是"怕 B 机吃力"（那时定位是**每个推理帧**才做一次 ✗ 见
+#     `gui/live_thread.py` 的高频定位线程 ✓ 现在已经不是瓶颈了 ✓）；
+#   · `quality` 100 → 80：面板只有一两百像素宽 ✓ 100 是浪费 —— 降到 80 **肉眼看不出来**，
+#     而 JPEG 体积约减半 ⇒ A 机编码时间（它自述"编码是大头"✓）和带宽都省一半 ✓。
+#   ⚠ 老 `config/deploy.json` 里存着 30/100 的机器**照旧用自己那份**（这里只是默认值 ✓）——
+#     真要提速，得把那台 A 机的 fps/quality 也改过来（部署台卡片上改 ✓ 或删掉那两个键 ✓）。
+DEFAULTS = {"bind": "0.0.0.0", "port": 5003, "zoom": 3, "fps": 60,
+            "quality": 80, "region": None}
 
 
 def load_cfg():
@@ -145,9 +164,12 @@ def _answer_ctl(sock, raw, state, log=print):
         return _send_line(sock, mmap_regions.list_reply(
             mmap_regions.list_ids()).encode("utf-8"))
     if cmd == mmap_regions.CMD_STATE:
+        # ⚠ 还没有区域（启动时一块都没框 ⇒ 等 B 机 `MAP`）⇒ 回**四个 0**：
+        #   协议里 `STATE - x y w h zoom` 的 `-` 就是"没指定图"那一档 ✓
+        #   （`state_reply`/`ok_reply` 只会摊 int ⇒ 别把 None 丢进去 ✗）。
         return _send_line(sock, mmap_regions.state_reply(
-            state.get("map_id") or "-", state["box"], state.get("zoom") or 1
-        ).encode("utf-8"))
+            state.get("map_id") or "-", state.get("box") or (0, 0, 0, 0),
+            state.get("zoom") or 1).encode("utf-8"))
     if cmd == mmap_regions.CMD_MAP:
         got = mmap_regions.load(arg)
         if not got:
@@ -160,6 +182,14 @@ def _answer_ctl(sock, raw, state, log=print):
         state["map_id"] = got["map_id"]
         state["box"] = [got["x"], got["y"], got["w"], got["h"]]
         state["zoom"] = got["zoom"]
+        # ⭐ **顺手记在 A 机本地**（用户 2026-10-02："当前是哪张图由 B 机推"✓）：部署台的
+        #   「当前地图」那一行读它、框选也是存到这张图名下 ⇒ "B 机说在跑哪张图"和"A 机
+        #   往哪张名下框"从此是**同一件事** ✓（不记的话，框选时人根本不知道该填哪个 id ✗）。
+        try:
+            mmap_regions.set_current(got["map_id"], by="B机")
+        except Exception as e:                              # noqa: BLE001
+            log("[%s] ⚠ 记不下「当前图」（%s: %s）—— 图切了，但部署台那边可能还显示旧的"
+                % (time.strftime("%H:%M:%S"), type(e).__name__, e))
         _send_line(sock, mmap_regions.ok_reply(
             got["map_id"], state["box"], got["zoom"]).encode("utf-8"))
         log("[%s] 按 B 机要求换图 → %s　区域 (%d,%d) %dx%d　zoom=%d（下一帧生效）"
@@ -276,33 +306,30 @@ def main() -> int:
         cfg["region"] = [args.x, args.y, args.w, args.h]
         save_cfg(cfg)
 
-    # ⭐ **区域按地图 id 取**（2026-10-01）：给了 `--map-id` ⇒ 从那张图自己那份里取，
-    #   **连同它的 zoom 一起** —— 标定是按某个 zoom 标出来的，两者必须是同一份 ✓
-    #   （zoom 变了还套旧标定，坐标会整倍数错且不报错，见 core.mapdata.load_calib）。
-    #   没给 ⇒ 走老的那份单值配置（和以前完全一样的行为 ✓）。
+    # ⭐ **区域按地图 id 取**（2026-10-01；2026-10-02 起**没框过也允许先起来**）：
+    #   优先级只有一处（`mmap_regions.startup_region` ✓ 部署台自检共用那一份）：
+    #     `--map-id` → 本机记着的"当前图"（B 机推来的 ✓）→ 老单值兜底 → **一块都没有**。
+    #   ⚠ 点名了 `--map-id` 却没有那张图 ⇒ **报错退出**（2）：这时人是在明确要那张图，
+    #     拿别的图顶上会推一片无关画面、B 机那边表现为"底图对不上"✗（难查）。
+    #   ⚠ **一块都没有也照常起监听**（不再 return 2 ✗）：用户 2026-10-02 定"当前是哪张图
+    #     **只由 B 机推**" ⇒ A 机必须能先开服务、等 B 机那句 `MAP <id>`（协议里 `STATE`
+    #     的"还没指定图"那一档就是给这个状态留的 ✓）。开着不动比"起不来"省事得多 ✓。
     _mid = str(args.map_id or "").strip()
-    if _mid:
-        got = mmap_regions.resolve(_mid)
-        if not got:
-            _ids = mmap_regions.list_ids()
-            print("「%s」这张图还没有框选数据。\n"
-                  "  文件：%s\n"
-                  "  库里现在有：%s\n\n"
-                  "  先在这台机上框一次并存到这个 id 下（部署台「小地图推流」卡片），\n"
-                  "  或者不带 --map-id 启动（用老的那份单值配置 ✓）。"
-                  % (_mid, mmap_regions.path_of(_mid),
-                     "、".join(_ids) if _ids else "（一张都没有）"))
-            return 2
-        box0 = [got["x"], got["y"], got["w"], got["h"]]
-        zoom0, mid0 = int(got["zoom"]), str(got["map_id"] or _mid)
+    _start = mmap_regions.startup_region(_mid)
+    if _mid and not _start:
+        _ids = mmap_regions.list_ids()
+        print("「%s」这张图还没有框选数据。\n"
+              "  文件：%s\n"
+              "  库里现在有：%s\n\n"
+              "  先在这台机上框一次：部署台「小地图推流」卡片（B 机开始实时时会告诉\n"
+              "  本机现在跑的是哪张图，卡片的「当前地图」会跟着变 ✓）。"
+              % (_mid, mmap_regions.path_of(_mid),
+                 "、".join(_ids) if _ids else "（一张都没有）"))
+        return 2
+    if _start:
+        mid0, box0, zoom0, _src = _start
     else:
-        region = cfg.get("region")
-        if not region:
-            print("还没有小地图区域。A 机上：部署台「小地图推流」卡片里点「框选…」；"
-                  "命令行：python -m tools.minimap_push --pick")
-            return 2
-        box0 = [int(v) for v in region]
-        zoom0, mid0 = max(1, int(cfg["zoom"])), ""
+        mid0, box0, zoom0, _src = "", None, max(1, int(cfg["zoom"])), "无"
 
     quality = int(cfg["quality"])
     fps = max(1, int(cfg["fps"]))
@@ -331,22 +358,34 @@ def main() -> int:
     srv.setblocking(False)
     # ⭐ **当前在推哪一块**是**可变的**状态，不再是常量：B 机连一条控制连接发一句
     #   `MAP <地图id>` 就能改它 ⇒ 帧循环每拍读它，下一帧生效（不用重启进程 ✓）。
-    state = {"map_id": mid0, "box": list(box0), "zoom": int(zoom0)}
-    print("监听 %s:%d   图=%s   区域 (%d,%d) %dx%d   zoom=%d   %d fps   JPEG q=%d"
-          % (cfg.get("bind") or "0.0.0.0", int(cfg["port"]), mid0 or "（老配置）",
-             box0[0], box0[1], box0[2], box0[3], zoom0, fps, quality))
-    print("等 B 机连进来…（B 机跑：python -m perception.minimap --map <地图id>；"
-          "**换图时发 `MAP <地图id>` 即可，不必重启本进程** ✓）")
+    # ⭐ `box` 允许是 `None`（**还没框过** ✓）：那时只接受控制命令、一帧都不抓
+    #   （B 机发 `MAP <id>` 且库里**有**这张图 ⇒ 当场补上区域，见 `_answer_ctl` ✓）。
+    state = {"map_id": mid0, "box": (list(box0) if box0 else None),
+             "zoom": int(zoom0)}
+    if box0:
+        print("监听 %s:%d   图=%s（%s）   区域 (%d,%d) %dx%d   zoom=%d   %d fps   JPEG q=%d"
+              % (cfg.get("bind") or "0.0.0.0", int(cfg["port"]), mid0 or "（老单值）",
+                 _src, box0[0], box0[1], box0[2], box0[3], zoom0, fps, quality))
+    else:
+        print("监听 %s:%d   ⚠ **还没有小地图区域** —— 先开着，等 B 机告诉本机"
+              "「现在跑的是哪张图」（`MAP <地图id>`）\n"
+              "  　收到之后：库里**有**这张图 ⇒ 立刻开始推；没有 ⇒ 回一句 ERR，"
+              "在部署台「小地图推流」卡片里点「框选…」框一次即可（id 已经知道了 ✓）"
+              % (cfg.get("bind") or "0.0.0.0", int(cfg["port"])))
+    print("等 B 机连进来…（**换图时发 `MAP <地图id>` 即可，不必重启本进程** ✓）")
 
     # **支持多个 B 机客户端**（2026-09-26 修）：原来一次只服务一个连接 —— B 机上
     # 只要多一条客户端（工作台面板的定位 + 「标定…」弹窗 + 忘了关的命令行探针都是
     # 各连一条），**后连的那条就只能排队、永远收不到帧**：现象是"TCP 连得上、
     # 一帧都不来"（B 机报「等帧超时」），而 A 机日志里一片正常 —— 极难查。
     # 现在每帧**广播**给所有连着的客户端，谁都不会被饿死。
-    clients = []             # [[sock, 对端名, 本次已发帧数, 连上的时刻], ...]
+    clients = []             # [[sock, 对端名, 本次已发帧数, 连上的时刻, 上一帧耗时ms], ...]
+    _skip = {}               # 对端名 → 累计**跳帧**数（跟不上就跳 ✓ 见帧循环那段 ✓）
     controls = []            # [[sock, 对端名], ...] —— 只"说话"（换图/问状态）的那几路
     n = 0
     t0 = time.time()
+    #: 「还没收到图」那条提醒上次说了什么时候（**只提醒、不刷屏** ✓ 见帧循环那一段 ✓）
+    _no_box_note = 0.0
     while True:
         try:
             # ① 收新连接（非阻塞：有多少收多少，别让谁排队等）
@@ -376,7 +415,8 @@ def main() -> int:
                           % (time.strftime("%H:%M:%S"), name))
                     continue
                 c.settimeout(10)
-                clients.append([c, name, 0, time.perf_counter()])
+                # ⚠ 第 5 项 = **上一帧发这一路用了多少毫秒**（跳帧背压的判据 ✓ 见帧循环那段 ✓）
+                clients.append([c, name, 0, time.perf_counter(), 0.0])
                 print("[%s] B 机 %s 已连上（现在 %d 路）"
                       % (time.strftime("%H:%M:%S"), name, len(clients)))
 
@@ -386,6 +426,18 @@ def main() -> int:
             controls = _poll_controls(controls, state)
             if not clients:
                 time.sleep(0.5)          # 没人连着：不必白抓屏
+                continue
+            # ⭐ **还没有区域**（启动时一块都没框 ⇒ 在等 B 机 `MAP` ✓）：不抓屏 —— 抓了也
+            #   不知道抓哪儿。每 10 秒提醒一句（不刷屏 ✓）：B 机那边收到的会是**一帧都没有**，
+            #   日志里这句就是"为什么没有"的答案 ✓（否则看着像推流坏了 ✗）。
+            if not state["box"]:
+                _now = time.time()
+                if _now - _no_box_note >= 10.0:
+                    _no_box_note = _now
+                    print("[%s] ⚠ 还没收到图（%d 路连着但一帧都推不了）：等 B 机发 "
+                          "`MAP <地图id>`，或者在部署台「小地图推流」卡片里框一次"
+                          % (time.strftime("%H:%M:%S"), len(clients)))
+                time.sleep(0.5)
                 continue
             t_frame = time.perf_counter()
             # ⭐ 每拍**重新读** state（上一拍可能刚被 `MAP` 换掉 ⇒ 这一帧就是新区域 ✓）
@@ -402,8 +454,22 @@ def main() -> int:
             pkt = len(data).to_bytes(4, "big") + data
             n += 1
             keep = []
+            #: 一帧预算的一半（毫秒）—— 某一路**上一帧**超过它就算"跟不上"⇒ 这一帧跳过它 ✓
+            _budget_ms = 500.0 / max(1, fps)
             for rec in clients:
-                c, name, sent, c_t0 = rec
+                c, name, sent, c_t0, _last_ms = rec
+                # ⭐⭐ **跳帧背压**（用户 2026-10-03 ✓ fps 提到 60 之后必须有它）：
+                #   老做法是**阻塞** `sendall` （"一帧编一次、发多路"✓）⇒ 只要有一路
+                #   网络/对端慢，`sendall` 就把**整个帧循环**拖住 ⇒ 所有客户端一起变慢 ✗。
+                #   ⇒ 现在：这一路**上一帧**发送耗时超过半帧预算 ⇒ 判定它跟不上 ⇒
+                #     **这一帧干脆不发它**（跳帧 ✓）。跳帧在这里**无损**：B 机本来就
+                #     "只留最新帧"（`MiniMapClient` ✓）⇒ 跳过反而让它**马上追到最新** ✓✓。
+                if _last_ms > _budget_ms:
+                    rec[4] = _last_ms * 0.5              # 慢慢衰减 ⇒ 后面还有机会 ✓
+                    _skip[name] = _skip.get(name, 0) + 1
+                    keep.append(rec)
+                    continue
+                t_send = time.perf_counter()
                 try:
                     c.sendall(pkt)       # 一帧编一次、发多路（编码是大头）
                 except Exception as e:                  # noqa: BLE001
@@ -415,6 +481,7 @@ def main() -> int:
                     except Exception:                   # noqa: BLE001
                         pass
                     continue
+                rec[4] = (time.perf_counter() - t_send) * 1000.0
                 rec[2] = sent + 1
                 if rec[2] == 1:
                     # **第一帧**单独报：B 机"等帧"最需要知道的就是"推出去了没有"
@@ -424,9 +491,10 @@ def main() -> int:
                              len(data) / 1024.0))
                 elif rec[2] % max(1, fps * 10) == 0:    # 之后每 10 秒报一次
                     print("[%s] → %s 已发 %d 帧（本次）　累计 %d 帧　约 %.1f fps  "
-                          "单帧 %.1f KB"
+                          "单帧 %.1f KB　跳帧 %d"
                           % (time.strftime("%H:%M:%S"), name, rec[2], n,
-                             n / max(1e-6, time.time() - t0), len(data) / 1024.0))
+                             n / max(1e-6, time.time() - t0), len(data) / 1024.0,
+                             _skip.get(name, 0)))
                 elif rec[2] == 2 and time.perf_counter() - c_t0 > 3.0:
                     # **发出去了没有**：连上 3 秒才发出第二帧，八成卡在抓屏上
                     #（A 机在远程桌面/锁屏/最小化时 `grabWindow` 会卡住）

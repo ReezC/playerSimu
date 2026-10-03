@@ -909,6 +909,10 @@ def t_mob_box_labels():
     做法：
       · ① 那行文字来自 `queried_mob_boxes()`（`mob_sets_of` 那个**唯一漏斗**记的账 ✓）——
         绘制层**只读** ✓；位置 = x 贴**框左边**、y 在**框下沿 + 14**，贴画面下沿放不下才翻上去 ✓；
+      · ①' ⭐⭐ **框跟着「这一帧的检出框」走**（用户 2026-10-02 ✓ 原话："能不能让他只是作为
+        『怪物框的标记』，跟着怪物的检出框走"）：账里**只存怪号**（不存框 ✓）⇒ 这里按怪号在
+        `_mob_by_id`（= 这一帧的 `ws.mobs` ✓ 和绿框/锁定框同一份）里现查；**查不到就跳过**
+        （画旧框 = 用户报的"红框在原地残留，可读性极差"✗）。
       · ② 锁定框那块**不许**再出现 `current_target_sets(...)` 的**调用** ✓（那份缓存本身也
         随之删掉了 ✗ —— "死数据不留"）。
 
@@ -919,7 +923,10 @@ def t_mob_box_labels():
     src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
 
     # ① 查过的怪框：**框下方靠左**
-    i = src.index("queried_mob_boxes()")
+    # ⚠ 定位锚用**绘制那处的入口**（`queried_mob_draw_list(ws.mobs)` ✓）—— **别**再用
+    #   `queried_mob_boxes()`：它现在第一个出现的地方是 `queried_mob_draw_list` 的 docstring
+    #   （账→框的换算那一段 ✓）⇒ 拿它当锚会切到**别的方法**里去 ⇒ 这几条断言全跑偏 ✗。
+    i = src.index("queried_mob_draw_list(ws.mobs)")
     # ⚠ 窗口**别卡太死**（2026-09-28 踩过 ✗）：原来 1800，而那段里后来陆续加了注释
     #   （"判不出只写失败"那段 ✓）⇒ 把 `_qy2 + 14` **挤出窗口** ⇒ 用例**假红** ✗。
     #   这条钉的是"那几样在不在"，不是"隔多远" ⇒ 给宽一点 ✓。
@@ -934,6 +941,16 @@ def t_mob_box_labels():
     # ⚠ 只看**真调用**（带括号 ✓）：注释里本来就会提到这两个名字，别把注释算成调用 ✗
     check("mob_sets_of(" not in seg and "foothold_below(" not in seg,
           "绘制那一支里自己重算了集合（每帧扫 foothold ✗ 纪律不允许）")
+
+    # ①' ⭐⭐ **框是"这只怪身上的标记"、跟着这一帧的检出框走**（用户 2026-10-02 ✓ 原话：
+    #     "能不能让他只是作为『怪物框的标记』，跟着怪物的检出框走"）
+    #     算法在 `queried_mob_draw_list()` 里（**纯函数** ⇒ `selftest_minimap.
+    #     t_queried_mob_boxes_follow_detection` 真跑它 ✓）；绘制这段**只许照它给的坐标画** ✓。
+    check("queried_mob_draw_list(" in seg,
+          "绘制那段没走「按怪号在**这一帧的检出框**里现查」那个 helper（用账里的旧框 ⇒ 怪一走开"
+          "红框就留在原地 ✗ 用户 2026-10-02 报的那件事）")
+    check("_qbox" not in seg and "queried_mob_boxes()" not in seg,
+          "绘制那段又直接从账里取框算了（绕过 helper ⇒ 「原地残留」会回来 ✗）：账里已经没有框了 ✗")
 
     # ② 锁定框**不再写地点**（钉**真调用** ✓：先把 `#` 注释行丢掉再找 ——
     #    那一段的注释里本来就会提到 `agent.current_target_sets()`（"以前在这里读过 ✗" ✓），
@@ -1086,7 +1103,206 @@ def t_key_caps_overlay():
     draw_key_caps(vis3, _A2())                # 改键位 ⇒ 不炸（文案自适应走 ASCII/原名 ✓）
 
 
+def t_lie_recording():
+    """⭐⭐ **测谎现场录屏**（用户 2026-10-02 ✓ 原话："实时触发测谎时录屏，最后确认弹窗关闭后
+    结束录屏（录制带所有我们后期线条的）好保留现场" ✓）。
+
+    口径（逐条钉）：
+      · 起 = 状态进 `lie_*`、止 = 状态离开 `lie_*`（`lie_success` 关掉 / 回战斗 ✓）；
+      · 录**原生帧**（不含战斗框线 ✓）⇒ **绝不能污染 `raw`** ✗（它还要走 `raw_frame_ready`
+        的测量链路 ✓ 见 `current_frame()` 那段口径 ✓）；
+      · 叠加 = **时间戳 + 帧号 + 屏幕状态**（用户选 ✓）；落盘到 `record_dir()` ✓、文件名
+        `lie_<时间戳>.mp4` ✓。
+    ⚠ 这里直接调 `LiveThread` 的那几个方法（`object.__new__` 绕过 `__init__` ⇒ 不起线程、
+      不要流 ✓），并把 `record_dir` 指到**临时目录**（绝不碰用户数据 ✓）。
+    """
+    import tempfile
+    import time as _time
+
+    from core import config as cfg
+    from gui.live_thread import LiveThread
+
+    # ⚠ `LiveThread` 是 PyQt 的 `QThread` 子类 ⇒ 只能用 `LiveThread.__new__`（`object.__new__`
+    #   会抛 "is not safe" ✗）；绕过 `__init__` ⇒ 不起线程、不要流、不建 UI ✓。
+    t = LiveThread.__new__(LiveThread)
+    t._screen_state = "combat"
+    t._lie_rec = None
+    t._lie_rec_pending = 0.0
+    t._lie_rec_path = ""
+    t._lie_rec_n = 0
+    t._lie_rec_t0 = 0.0
+    t._lie_rec_err = ""
+
+    check(t._lie_rec_pending == 0.0, "初始状态不该在录")
+    t._lie_rec_stop(why="空停")               # 没在录时停 ⇒ 必须无害 ✓
+    check(t._lie_rec is None and t._lie_rec_pending == 0.0, "空停把状态搞脏了")
+
+    t._lie_rec_start()
+    check(t._lie_rec_pending > 0.0, "触发（进 lie_*）没起录")
+    t._lie_rec_stop(why="单元")
+    check(t._lie_rec_pending == 0.0 and t._lie_rec is None, "停录没清状态")
+
+    _d = tempfile.TemporaryDirectory()
+    _old = cfg.record_dir
+    cfg.record_dir = lambda: Path(_d.name)
+    try:
+        t._lie_rec_start()
+        _raw = _frame(7)
+        t._lie_rec_write(_raw, _time.monotonic())
+        t._lie_rec_write(_raw, _time.monotonic())
+        check(t._lie_rec is not None and t._lie_rec_n == 2,
+              "没按帧写进容器（实际写 %d 帧）" % t._lie_rec_n)
+        check(int(_raw[0, 0, 0]) == 7,
+              "**污染了原生帧**（raw 左上像素被改：%d ≠ 7）—— 测量链路还指望它干净 ✗"
+              % int(_raw[0, 0, 0]))
+        _p = Path(t._lie_rec_path)
+        t._lie_rec_stop(why="单元")
+        check(_p.exists() and _p.stat().st_size > 0,
+              "停录后文件不存在或为空：%s" % _p)
+        check(_p.name.startswith("lie_") and _p.suffix == ".mp4",
+              "文件名不符合约定（要 lie_<时间戳>.mp4）：%s" % _p.name)
+
+        # ⭐⭐ **两类现场 + 设置页那两个开关**（用户 2026-10-02 ✓ 原话："在设置（数据工作台
+        #   上面的按钮弹窗）→ 保护与恢复页签 最顶部加开关『保留测谎录屏』『保留断线录屏』" ✓）：
+        #   · 开关落 `config/live.yaml`（`rec_lie` / `rec_disc` ✓ 默认开 ✓）；
+        #   · **关掉 ⇒ 该类不起录**（一个字节都不写 ✓）；开机时 `_rec_kind` 记种类（文件名前缀 ✓）。
+        check(t._rec_allowed("lie") is True and t._rec_allowed("disc") is True,
+              "两个录屏开关**默认都开着**（`config/live.yaml` 没写这两个键 ⇒ 默认 True ✓ "
+              "宁可不小心留下现场，也别静默丢掉 ✓）")
+        t._rec_kind = ""
+        _old_live = cfg.load_live
+        try:
+            cfg.load_live = lambda: {"rec_lie": False, "rec_disc": False}
+            check(t._rec_allowed("lie") is False and t._rec_allowed("disc") is False,
+                  "开关关掉 ⇒ `_rec_allowed` 如实回 False ✓")
+            check(t._lie_rec_start("lie") is False and t._lie_rec_pending == 0.0,
+                  "**关掉的类别不起录**（返回 False、`pending` 不动 ✓ ⇒ 一个字节都不写 ✓）")
+        finally:
+            cfg.load_live = _old_live
+        _rd = Path(_d.name)
+        _before = set(_rd.glob("*.mp4"))
+        t._lie_rec_start("disc")
+        check(t._rec_kind == "disc" and t._lie_rec_pending > 0.0,
+              "断线类起录 ⇒ `_rec_kind='disc'`（文件名会带 `disc_` 前缀 ✓）")
+        _raw2 = _frame(9)
+        t._lie_rec_write(_raw2, _time.monotonic())
+        t._lie_rec_stop(why="回到游戏")
+        _new = sorted(p.name for p in (set(_rd.glob("*.mp4")) - _before))
+        check(len(_new) == 1 and _new[0].startswith("disc_"),
+              "断线那段落盘的文件名要用 `disc_` 前缀（实际 %s ✓）" % (_new,))
+        check(t._rec_kind == "",
+              "停录后 `_rec_kind` 必须清空 ✓（否则下一拍 `combat` 会拿它误触发一次停录 ✗）")
+    finally:
+        cfg.record_dir = _old
+        _d.cleanup()
+
+    # ⭐⭐ **设置页那两个开关**（用户 2026-10-02 ✓ 原话："在设置（数据工作台上面的按钮弹窗）→
+    #   保护与恢复页签 **最顶部**加开关『保留测谎录屏』『保留断线录屏』" ✓）—— 源码级钉住
+    #   三件事（`SettingsDialog` 太重，不适合在这套自检里真建一个来测 ✓）：
+    #     · 两个 `QCheckBox` 存在 ✓；· 点确定后落 `config/live.yaml` 的 `rec_lie` / `rec_disc`
+    #     （= 刚才那些 `_rec_allowed` 读的同一对键 ✓ 两边不许分家 ✗）；· 位置在**保护与恢复
+    #     页签的最顶部**（该页签第一个 `_head`「朝向无变化」之前 ✓）。
+    import pathlib as _p10
+
+    _sd = (_p10.Path(__file__).resolve().parent.parent / "gui"
+           / "settings_dialog.py").read_text(encoding="utf-8")
+    check('self.ck_rec_lie = QCheckBox("保留测谎录屏")' in _sd
+          and 'self.ck_rec_disc = QCheckBox("保留断线录屏")' in _sd,
+          "设置页有「保留测谎录屏 / 保留断线录屏」两个开关 ✓")
+    check("update_live(rec_lie=rl)" in _sd and "update_live(rec_disc=rd)" in _sd,
+          "两个开关点确定后落 `config/live.yaml`（`rec_lie` / `rec_disc` ✓ —— 与实时线程 "
+          "`_rec_allowed` 读的必须是同一对键 ✓ 不许两边各写一套 ✗）")
+    _ip = _sd.index("def _page_protect")
+    _ij = _sd.index("def _page_judge")
+    _ic = _sd.index("ck_rec_lie")
+    check(_ip < _ic < _ij and _ic < _sd.index("朝向无变化停止自动"),
+          "两个开关落在**保护与恢复**页签内、且在**最顶部**（该页签第一个控件之前 ✓ "
+          "用户点名的位置 ✓）")
+
+
+def t_engine_imgsz_alignment():
+    """⭐⭐ TensorRT 引擎下「imgsz 随便填」不许把实时开不起来（用户 2026-10-03 ✓ 现场：
+    「现在开始实时，如果imgsz不是640会报错，能不能让其兼容可以随便填写？」）。
+
+    本机实测（`寺院通道2/models/detect_v5.engine` ✓）：
+      · **`.engine`**：填 960 / 512 直接
+        `AssertionError: input size … not equal to max model size (1, 3, 640, 640)`
+        ⇒ 从 `_run` 抛出去被 `failed` 收掉 ⇒ **实时根本起不来** ✗（用户踩的就是它 ✓）；
+      · **`.pt`**：640 / 960 / 512 / 641 **都能跑** ✓（641 还被 ultralytics 对齐到 672 ✓）
+        ⇒ 那条路**一个字都不许改** ✗。
+    引擎的输入尺寸**导出时焊死** ⇒ 想让 960 "真生效"是不可能的 ✗；能做的只有
+    **按引擎尺寸跑 + 如实说清** ✓（假装 960 生效 ⇒ 画面尺度与框尺度悄悄不一致 ✗）。
+
+    钉五件：
+      ① 从报错里抠得出尺寸（`(1, 3, 640, 640)` ⇒ 640 ✓）；
+      ② **认不出来返回 None**（无关报错 / 非方形 profile ✓）⇒ 调用方 `raise` 照旧报上去 ✗
+         （**不许假装兼容** ✓ —— 那会把别的问题吞掉 ✓）；
+      ③ 预演**只对 `.engine`** 做（`.pt` 那条路不许被碰 ✗）；
+      ④ 预演 + 对齐必须在**主循环那次 `predict` 之前**（否则报错发生在循环里 ⇒ 线程被收掉 ✓）；
+      ⑤ 失败上报要**把栈打全**（不然只有一句「类型: 消息」，定不了案 ✓）。
+    """
+    from gui.live_thread import LiveThread
+
+    _err = AssertionError("input size torch.Size([1, 3, 960, 960]) not equal to "
+                          "max model size (1, 3, 640, 640)")
+    check(LiveThread._engine_imgsz_from_error(_err) == 640,
+          "抠不出引擎尺寸（用户报的就是这条 ✗）：%r"
+          % (LiveThread._engine_imgsz_from_error(_err),))
+    check(LiveThread._engine_imgsz_from_error(RuntimeError("别的问题")) is None,
+          "无关报错也该返回 None（否则会把别的问题当尺寸问题吃掉 ✗）")
+    check(LiveThread._engine_imgsz_from_error(
+        AssertionError("input size torch.Size([1, 3, 960, 640]) not equal to "
+                       "max model size (1, 3, 960, 640)")) is None,
+          "非方形 profile 不许瞎猜 ✗")
+
+    src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    check("_engine_imgsz_from_error(_e)" in src,
+          "找不到「引擎预演 + 抠尺寸」那段（被删了？）⇒ 实时又要起不来 ✗")
+    # ⚠ **要看"这段被 `.engine` 守卫着"** ✗ —— 光断言 `endswith(".engine")` 在**文件里**
+    #   出现抓不住"守卫被删"：**别处**（FP16 那段 ✓）本来就有同一个写法 ⇒ 反向验证实测
+    #   会假绿 ✓；⇒ 改成"取预演那段**前面**的窗口，里面必须有那个条件" ✓。
+    _win = src[max(0, src.index("_probe_img") - 500):src.index("_probe_img")]
+    check('endswith(".engine")' in _win,
+          "预演没被 `endswith(\".engine\")` 守卫住 ⇒ `.pt` 那条路也白多跑一次推理 ✗")
+    check(src.index("_engine_imgsz_from_error(_e)") < src.index("res = model.predict(vis"),
+          "对齐写在**主循环那次推理之后** ✗ ⇒ 报错照样把线程收掉 ✓")
+    check("if _eng is None:" in src
+          and "raise" in src.split("if _eng is None:")[1][:220],
+          "认不出尺寸时没 `raise` ⇒ 别的问题会被悄悄吞掉 ✗")
+    check("traceback.print_exc()" in src,
+          "失败上报没打完整栈 ⇒ 下次还是只有一句「类型: 消息」，定不了案 ✗")
+
+
+def t_mmap_fail_reason_is_logged():
+    """⭐ 小地图定位**失败的原因**要进日志，不许只在界面上说（用户 2026-10-03 ✓ 现场：
+    "寺院通道2 现在开启自动怎么没用了"）。
+
+    现场是这么查出来的：`perf.log` 里 `mmap_miss` **恒为 1** ✓（定位一直失败 ✓），
+    可"**为什么**失败"当时只在界面状态行 ✗ ⇒ 看日志只能猜 ✓；而 agent 正是靠它判
+    「未定位玩家」⇒ 回 idle ⇒ 超时还**自己把自动关掉** ⇒ 现象就是"开启自动没用" ✓。
+
+    钉两件（源码约定 ✓ —— 行为级要靠真定位器，成本不值 ✓）：
+      ① `mmap_miss` 那条计数**旁边**就有 `perf.note("mmap_note", …)`（失败原因进段头 ✓）；
+      ② 只在**原因变化**时才写（`_mmap_note_last` 去重 ✗ 否则每拍一行把段头刷爆 ✓）。
+    """
+    src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    _i = src.index('perf.count("mmap_ok" if loc.get("ok") else "mmap_miss")')
+    _seg = src[_i:_i + 900]
+    check('perf.note("mmap_note"' in _seg,
+          "定位失败的原因没进日志 ⇒ 下次还只能看界面那行、日志里只有一个计数 ✗")
+    check("_mmap_note_last" in _seg,
+          "失败原因没去重 ⇒ 段头会被同一句刷爆 ✗")
+    # ③ 决策给出的理由（`agent.tick` 的 `reason`）也必须进日志 —— 这次"开启自动没用"
+    #    最直接的答案就是它那句「未定位玩家」✓（以前谁都不记 ✗）。
+    check('_perf2.note("agent_why"' in src or 'note("agent_why"' in src,
+          "决策理由没进日志 ⇒ 只能看到 st=idle / move=0，看不到「为什么」✗")
+    check("_agent_why_last" in src,
+          "决策理由没去重 ⇒ 每拍一样的那句会把段头刷爆 ✗")
+
+
 TESTS = (
+    ("⭐⭐ 测谎现场录屏：进 lie_* 起录 / 离开即停、录原生帧副本（不污染 raw）",
+     t_lie_recording),
     ("⭐⭐ 采集：选中文件后显示预估张数（公式与 extract_frames 一份 + MKV 容器时长兜底）",
      t_capture_est_frames),
     ("⭐⭐ 开自动前体检：标定/地形没凑齐要先弹窗说清（用户 2026-09-29；⚠ 光有函数没接上=没有）",
@@ -1111,6 +1327,10 @@ TESTS = (
     ("实时画面上的采样框：颜色跟判据、只画在副本上", t_probe_box_overlay),
     ("「卡在谁身上」：输入受限 / 本机受限 / 说不清（纯函数）", t_limit_reason_rules),
     ("显示链路：带 padding 的帧画得对，且不再白拷一整幅", t_pixmap_handles_padded_frame),
+    ("⭐⭐ 引擎 imgsz：随便填不再把实时开不起来（按引擎尺寸跑 + 如实说清）",
+     t_engine_imgsz_alignment),
+    ("⭐ 小地图定位失败的原因要进日志（只在界面说 ⇒ 事后查不出来）",
+     t_mmap_fail_reason_is_logged),
     ("静态检查：会当场炸的名字错误（pyflakes）", t_static_check_no_crash_classes),
     ("左下按键帽：按住=半透明绿填充、文案随键位映射自适应（2026-09-30 用户要求）",
      t_key_caps_overlay),

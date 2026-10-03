@@ -32,6 +32,9 @@ CLASS_MOB = 1
 CLASS_DROP = 2
 CLASS_NPC = 3
 CLASS_OTHER_PLAYER = 4      # 其他玩家：目前只画框、不进决策（见 gui/live_thread.py）
+CLASS_PET = 5               # ⭐ 宠物（干扰类，用户 2026-10-02 ✓）：不进决策，标它只为让模型
+                            #   学会区分"宠物 vs 怪"——被宠物挡住的怪也能检测、宠物不被误检为怪。
+                            #   推理时过滤掉（见 live_thread 的检测过滤）✓
 
 #: (id, 英文名, 中文名, 默认色 BGR)
 #: 顺序即权威 id —— **不要在中间插队或删除**，那会让已经训好的权重整体错位。
@@ -43,6 +46,7 @@ CLASSES = (
     (CLASS_DROP,         "drop",         "掉落",     (0, 255, 255)),
     (CLASS_NPC,          "npc",          "NPC",      (0, 0, 255)),
     (CLASS_OTHER_PLAYER, "other_player", "其他玩家", (255, 0, 255)),
+    (CLASS_PET,          "pet",          "宠物",     (180, 180, 180)),   # 灰色：不显眼（干扰类 ✓）
 )
 
 ORDER = [c[0] for c in CLASSES]

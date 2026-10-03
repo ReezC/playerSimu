@@ -1,0 +1,56 @@
+{
+ "override": {
+  "merge_iou": 0.5,
+  "merge_iou_out": 0.5
+ },
+ "result": {
+  "10月1日.mp4": {
+   "frames": 70,
+   "merged": 9,
+   "split": 6,
+   "lost": 2,
+   "jump_max": 89.4,
+   "jump_top3": [
+    89.4,
+    58.3,
+    25.1
+   ]
+  },
+  "10月2日.mp4": {
+   "frames": 70,
+   "merged": 1,
+   "split": 1,
+   "lost": 2,
+   "jump_max": 34.9,
+   "jump_top3": [
+    34.9,
+    28.1,
+    25.8
+   ]
+  },
+  "9月30日(1).mp4": {
+   "frames": 70,
+   "merged": 2,
+   "split": 2,
+   "lost": 2,
+   "jump_max": 124.5,
+   "jump_top3": [
+    124.5,
+    12.0,
+    8.0
+   ]
+  },
+  "10月3日.mp4": {
+   "frames": 70,
+   "merged": 6,
+   "split": 6,
+   "lost": 2,
+   "jump_max": 114.5,
+   "jump_top3": [
+    114.5,
+    44.2,
+    44.2
+   ]
+  }
+ }
+}

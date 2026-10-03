@@ -245,7 +245,10 @@ def t_train_resume():
          一律不生效 ⇒ 日志 / `run.json` / 摘要必须说**真话** ✓）；
       ③ `_vram_note`：**够就不吵、不够就 warn**（本次训练就是显存不够崩的 ⇒ 先报一句 ✓）；
       ④ 源码级：`model.train(resume=True)` 真的传下去了、CLI 有 `--resume`、
-         GUI 训练卡片上有这一项且会传给 `run_train` ✓。
+         GUI 训练卡片上有这一项且会传给 `run_train` ✓；
+      ⑤ ⭐⭐ **2026-10-03 扩**：续训前**先判能不能真续**（`ckpt_resumable` ✓）、
+         而且续训**也带 `data`**（退化时的第二道闸 ✓）—— 不能续时 ultralytics 会**静默改用
+         自带的 coco8** 从零训 ✗（现场就训出个 80 类 COCO 模型 ⇒ 发布 ⇒ 实时 0 框 ✓）。
     """
     import os
     import tempfile
@@ -350,8 +353,19 @@ def t_train_resume():
         check('"（早停）" if early_stopped else ""' in _src,
               "摘要没标出早停 ⇒ 卡片上只看得到「200 轮」✗")
 
-        check("model.train(resume=True)" in _src,
-              "续训分支没把 `resume=True` 真传给 ultralytics（勾了也没用 ✗）")
+        # ⭐⭐ 2026-10-03 扩（用户现场："是不是训练链路坏了？"）：除了"`resume=True` 真传下去"，
+        #   还必须有两样 —— ① **先判这份检查点能不能真续**（不能续时 ultralytics 会用**自带的
+        #   coco8** 从零训 ✗ 训出个 80 类模型 ⇒ 发布 ⇒ 实时 0 框 ✓）；② 续训**也带上 `data`**
+        #   （万一它又退化，用的还是咱自己的数据 ✓ —— 这是第二道闸 ✓）。
+        check("resume=True" in _src and "ckpt_resumable" in _src,
+              "续训分支没传 `resume=True` / 没有「先判能不能真续」那道闸 ✗（2026-10-03 现场："
+              "不能续 ⇒ ultralytics 静默改用 coco8 从零训 ✗）")
+        import re as _re
+        _m = _re.search(r"model\.train\(\s*resume=True,(.*?)\)\n", _src, _re.S)
+        check(_m is not None and "data=str(data)" in _m.group(1),
+              "续训**没带 `data`**：一旦 ultralytics 退化成普通训练，它就会用自带的 "
+              "`coco8.yaml`（联网下 COCO ✗）⇒ 训出个 80 类模型 ⇒ 发布 ⇒ 实时 0 框 ✗：%r"
+              % ((_m.group(1) if _m else None),))
         check('ap.add_argument("--resume"' in _src,
               "CLI 没有 `--resume`（命令行续不了 ✗）")
         check("find_last_ckpt" in _src and "_vram_note" in _src,

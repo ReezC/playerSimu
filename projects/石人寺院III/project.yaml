@@ -21,7 +21,7 @@ bars:
   - 0.973958
   - 0.120791
   - 0.019531
-  hp_color:
+  hp_color: &id001
   - - 0
     - 0
     - 135
@@ -42,6 +42,9 @@ decision:
   chase_jump_min: -10
   chase_jump_max: 5
   chase_jump_dash_ms: 50
+  chase_jump_edge_guard_enabled: true
+  chase_jump_edge_guard_px: 150
+  station_turn_interval_ms: 1000
   mouse_speed: 1.1999999999999995
   evade_type: jump
   jump_interval: 0
@@ -80,7 +83,7 @@ decision:
     right: right
     up: up
     down: down
-    attack: t
+    attack: s
     jump: D
     hp_pot: g
     mp_pot: null
@@ -90,11 +93,11 @@ decision:
   target_cd:
   - 1000
   - 2500
-  input_device: local
+  input_device: remote
   attack_cd: 300
   attack_lock_debounce_ms: 1000
-  min_turn_hold_ms: 1000
-  turn_output_delay_ms: 500
+  min_turn_hold_ms: 600
+  turn_output_delay_ms: 300
   player_track_jump: 200
   player_foot_offset_px: -25
   player_box_min_area_pct: 0.0
@@ -107,14 +110,14 @@ decision:
   - 0.019531
   mp_bar: null
   probe_calib: {}
-  hp_color:
-  - - 0
+  hp_color: *id001
+  mp_color:
+  - - 143
+    - 78
     - 0
-    - 135
-  - - 79
-    - 82
-    - 255
-  mp_color: null
+  - - 255
+    - 198
+    - 77
   hp_threshold: 39
   mp_threshold: 7
   pot_cd: 1000
@@ -129,35 +132,25 @@ decision:
   vision_center: false
   vision_off_x: 0
   vision_off_y: 0
+  big_mob_enabled: true
+  big_mob_ratio: 1.5
+  big_mob_range_px: 600.0
   sweep_turn_cd: 500
   back_range: 150
+  sweep_edge_turn_px: 100
   route_goto_set: 二楼
   align_tol_px: 12
   align_hold_ms: 1000
   climb_align_gap_ms: 200
-  climb_align_near_px: 30
+  climb_align_near_px: 1
   climb_retry_delay_s: 1.0
   climb_retry_delay_inc_s: 1.0
-  goto_timeout_s: 10.0
+  goto_timeout_s: 15
   chase_goto_max_s: 5.0
   goto_timeout_key: 表情_无语
   disable_chase_pathfinding: false
   jump_start_px: 80
   move_retry_ms: 350
-  battle_zones:
-  - set: 底层
-    cd_s: 3.0
-    idle_foothold: '39'
-    fight_max_s: 0.0
-    fight_dst: ''
-    can_fight: false
-  - set: 顶层
-    cd_s: 3.0
-    idle_foothold: ''
-    fight_max_s: 15.0
-    fight_dst: 一楼
-    can_fight: false
-  battle_zone_sets: []
   debounce_conf: 0.5
   debounce_ms: 2000
   custom_timers:
@@ -280,13 +273,13 @@ dataset:
   min_boxes: 0
   quality: 92
 train:
-  model: E:\MyPrograms\playerSimu\projects\石人寺院III\models\detect_v2.pt
+  model: E:\MyPrograms\playerSimu\projects\寺院通道2\models\detect_v5.pt
   epochs: 200
   imgsz: 1280
   batch: 8
   device: '0'
   patience: 40
-  resume: true
+  resume: false
 player_id: 数值策划
 verify: {}
 iterate: {}

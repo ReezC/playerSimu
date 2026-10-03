@@ -239,6 +239,14 @@ class LivePanel(QWidget):
         self.sp_imgsz = NoWheelSpinBox()
         self.sp_imgsz.setRange(320, 2048)
         self.sp_imgsz.setValue(int(_live.get("imgsz", 960)))
+        self.sp_imgsz.setToolTip(
+            "推理时把画面缩到多大再喂网络：越大越准、越慢（960→640 约省 56% 推理时间）。\n\n"
+            "⚠ 如果这个项目的权重是 **TensorRT 引擎**（`models/*.engine` —— 实时会优先选它 ✓），\n"
+            "   那它的输入尺寸是**导出时焊死**的（比如 640）⇒ 这里填别的**不会生效**：\n"
+            "   实时会**按引擎的尺寸跑**（所以不会再报错起不来 ✓），并在控制台和\n"
+            "   `perf.log` 的段头里写明实际用的是多少（`imgsz=640(引擎·已对齐)`）。\n"
+            "   想真换成别的尺寸：重新导出那个尺寸的引擎，或改用 `.pt` 权重\n"
+            "   （`.pt` 没有这个限制 —— 320~2048 随便填都能跑 ✓）。")
         row.addWidget(self.sp_imgsz)
 
         row.addWidget(QLabel("显示"))
@@ -279,6 +287,15 @@ class LivePanel(QWidget):
         self.ck_draw = QCheckBox("画框")
         self.ck_draw.setChecked(bool(_live.get("draw", True)))
         row2.addWidget(self.ck_draw)
+
+        self.ck_half = QCheckBox("FP16")
+        self.ck_half.setChecked(bool(_live.get("half", True)))
+        self.ck_half.setToolTip(
+            "半精度推理（FP16）：GPU 上比 FP32 快 30~50%，精度几乎无损。\n"
+            "  老显卡 / 某些模型不支持时取消勾选（退回 FP32）。\n"
+            "  和「imgsz」降低**叠加生效**：640 + FP16 ⇒ 推理可能从 22ms 降到 ~6ms。")
+        self.ck_half.stateChanged.connect(self._save_live_params)
+        row2.addWidget(self.ck_half)
 
         row2.addStretch(1)
         root.addLayout(row2)
@@ -700,10 +717,15 @@ class LivePanel(QWidget):
             self.ed_weights.setText("")
             return
 
-        # 按修改时间取最新的模型（detect_v1 比旧的 mob_v1 新）。
-        # 不能按文件名排序：detect_v1 < mob_v1，got[-1] 会选中旧的单类模型。
-        got = sorted(project.dir_of("models").glob("*.pt"),
+        # ⭐ **.engine 优先于 .pt**（2026-10-02 ✓）：导出过 TensorRT 引擎的项目
+        #   自动选它（推理快 3-5 倍）；没导出过的退回 .pt（老行为 ✓）。
+        #   按修改时间取最新的模型（detect_v1 比旧的 mob_v1 新）。
+        #   不能按文件名排序：detect_v1 < mob_v1，got[-1] 会选中旧的单类模型。
+        got = sorted(project.dir_of("models").glob("*.engine"),
                      key=lambda p: p.stat().st_mtime, reverse=True)
+        if not got:
+            got = sorted(project.dir_of("models").glob("*.pt"),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
         if not got:
             got = sorted(project.dir_of("runs").glob("**/weights/best.pt"),
                          key=lambda p: p.stat().st_mtime, reverse=True)
@@ -734,6 +756,7 @@ class LivePanel(QWidget):
                 capture_fps=self.sp_capfps.value(),
                 draw=self.ck_draw.isChecked(),
                 show_fps=self.sp_show_fps.value(),
+                half=self.ck_half.isChecked(),
             )
         except Exception:
             pass
@@ -769,6 +792,7 @@ class LivePanel(QWidget):
             capture_fps=self.sp_capfps.value(),
             draw=self.ck_draw.isChecked(),
             show_fps=self.sp_show_fps.value(),
+            half=self.ck_half.isChecked(),
         )
 
         common = {
@@ -778,6 +802,7 @@ class LivePanel(QWidget):
             "imgsz": self.sp_imgsz.value(),
             "device": self.ed_device.text().strip() or "0",
             "draw": self.ck_draw.isChecked(),
+            "half": self.ck_half.isChecked(),
             "perf_log": bool(load_live().get("perf_log", True)),
             "show_fps": float(self.sp_show_fps.value()),
             "player_id": pid,
@@ -827,6 +852,8 @@ class LivePanel(QWidget):
         self.thread.stats_ready.connect(self._on_stats)
         self.thread.potions_ready.connect(self.potions_ready)
         self.thread.failed.connect(self._on_failed)
+        # ⭐ 「这份权重不是本项目训的」⇒ 状态行 + 弹一次（2026-10-03 ✓ 见那个槽的说明 ✓）
+        self.thread.weights_warn.connect(self._on_weights_warn)
         self.thread.stream_status.connect(self._on_stream_status)
         self.thread.finished.connect(
             lambda _t=self.thread: self._on_finished(_t))
@@ -1300,12 +1327,35 @@ class LivePanel(QWidget):
             # 会另报它在做哪一步，这里报的是"现在画面在哪个界面" ✓
             from perception import ui_state as _uist
             head = "【界面：%s】 " % _uist.UI_NAMES.get(_scr, _scr) + head
+        # ⭐⭐ **小地图权威坐标的"新鲜度"先算好**（用户 2026-10-03 ✓ 他问"我能在…看到验证
+        #   结果吗"）：`mmap_age_ms` = 这份世界坐标背后的那一帧是**多久以前收到的** ⇒
+        #   提高小地图帧率到底有没有用，看这一个数最直接 ✓（口径见 SKILL **约定 170** ✓）。
+        #   `None`（还没定位过 / 来源是实时画面 ⇒ 没有这条推流链）⇒ 显 `—`，别编个 0 ✗。
+        #   ⚠ 必须**定义在使用之前**：下面 tooltip 那一段也要用它 ✓（第一版写在状态行那儿 ⇒
+        #     pyflakes 当场抓出 `undefined name '_age'` ✗ `selftest_live_panel` 也红了 ✓）。
+        _age = s.get("mmap_age_ms")
+        _age_txt = ("%5.1f ms" % float(_age)) if isinstance(_age, (int, float)) else "    —  "
         # 明细放 tooltip：状态行那一行已经塞满了，硬挤进去反而看不清数字
         for key in ("lag_detail", "load_detail"):
             d = (s.get(key) or "").strip()
             if d:
                 cur = self.lbl_stats.toolTip()
                 self.lbl_stats.setToolTip((cur + "\n\n" if cur else "") + d)
+        # ⭐ 小地图那一路的明细也挂 tooltip（用户 2026-10-03 ✓）：状态行里只放最要紧的
+        #   「坐标 xx ms」✓，其余（收帧率 / 累计丢帧）放这儿 —— 状态行已经塞满了 ✗。
+        if _age is not None or s.get("mmap_rate") is not None:
+            _mr = s.get("mmap_rate")
+            cur = self.lbl_stats.toolTip()
+            _mline = ("小地图（世界坐标的来源）：\n"
+                      "  · 坐标延迟 %s —— 这份坐标背后的那一帧**多久以前**收到的\n"
+                      "    （越小越新；提到 60fps 之后应该稳定在半帧~一帧，约 8~17 ms ✓）\n"
+                      "  · 收帧 %s fps —— **A 机真正推出来**的帧率（不是配置里那个数）\n"
+                      "  · 累计丢帧 %s —— 我们没来得及取走就被下一帧覆盖的次数\n"
+                      "    （一直涨 ⇒ 消费侧比推流慢，见 SKILL 170）"
+                      % (_age_txt.strip() + " ms" if _age is not None else "—",
+                         ("%.1f" % float(_mr)) if isinstance(_mr, (int, float)) else "—",
+                         int(s.get("mmap_drop", 0) or 0)))
+            self.lbl_stats.setToolTip((cur + "\n\n" if cur else "") + _mline)
         # 绘制那一段单独报：「显示 fps」只说明**推**了多少，看不出主线程画得
         # 动不动 —— 而"失焦就卡"恰恰卡在这里（合并丢弃的帧数一涨，就说明主线程
         # 跟不上推送、开始在丢中间帧；不丢帧时界面才不会滞后）。
@@ -1316,11 +1366,11 @@ class LivePanel(QWidget):
                       "self": "　⚠ 本机算不过来"}.get(s.get("limit") or "", "")
         self.lbl_stats.setText(
             "%s%s ｜ 输入 %5.1f fps ｜ 处理 %5.1f fps ｜ 丢帧 %d ｜ 推理 %5.1f ms ｜ "
-            "显示 %4.1f fps ｜ 绘制 %4.1f ms 合并丢弃 %d ｜ 检出 %d ｜ %d×%d%s"
+            "显示 %4.1f fps ｜ 绘制 %4.1f ms 合并丢弃 %d ｜ 检出 %d ｜ 坐标 %s ｜ %d×%d%s"
             % (head, d_txt, s.get("recv_fps", 0), s.get("proc_fps", 0),
                s.get("dropped", 0), s.get("infer_ms", 0), s.get("show_fps", 0),
                self._draw_ms, self._disp_merged,
-               s.get("boxes", 0), w, h, _limit_txt))
+               s.get("boxes", 0), _age_txt, w, h, _limit_txt))
 
     def _on_stream_status(self, status):
         if status == "waiting":
@@ -1335,6 +1385,19 @@ class LivePanel(QWidget):
 
     def _on_failed(self, msg):
         self.lbl_stats.setText("失败：%s" % msg)
+
+    def _on_weights_warn(self, msg):
+        """⭐ 权重**不是本项目训的** ⇒ 状态行写清 + 弹一次（2026-10-03 ✓ 用户现场
+        "怎么没有检出框了"）。
+
+        为什么要弹：那个现象（**一个框都没有**）以前**没有任何提示** ✗ —— 人只能猜是
+        抓屏坏了 / 实时没开 / 阈值太高 ✓（现场那次真因是"续训退化成了 coco8 ⇒ 发布成
+        项目权重 ⇒ 类名全对不上" ✗）。这条只在**开始推理那一下**发一次 ✓，不刷屏 ✓，
+        而且**不阻止**实时继续跑 ✓（有的权重只是类名顺序不同，照旧能用 ✓）。
+        """
+        self.lbl_stats.setText("⚠ 权重与项目对不上（不会检出框）")
+        self.lbl_stats.setToolTip(msg)
+        QMessageBox.warning(self, "这份权重不是本项目的", msg)
 
     def _on_finished(self, t=None):
         # 只清理「当前线程」；若用户已重开新线程，旧线程退出不该动新线程的引用

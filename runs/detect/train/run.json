@@ -1,0 +1,23 @@
+{
+  "name": "detect_v3",
+  "base": "yolo26n.pt",
+  "epochs": 120,
+  "epochs_planned": 120,
+  "early_stopped": false,
+  "imgsz": 1280,
+  "batch": 8,
+  "device": "0",
+  "seconds": 0.0009148000099230558,
+  "finished_at": "2026-10-03 18:46:16",
+  "metrics": {
+    "precision": null,
+    "recall": null,
+    "map50": 0.9,
+    "map": null
+  },
+  "frames": {
+    "train": 0,
+    "val": 0,
+    "total": 0
+  }
+}

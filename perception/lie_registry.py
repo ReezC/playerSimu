@@ -37,6 +37,8 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from perception import geom          # ⭐ 重叠尺统一在 `perception/geom.py`（用户 2026-10-03 ✓）
+
 #: 归算后「两个检出算同一块砖」的门（px ✓）。
 #: ⚠⚠⚠ **必须小于"真目标相对群体的一帧位移"** ✗✗（自检 `③` 与合成台判决性验证都钉着 ✓）：
 #:   门比它大 ⇒ 目标**每拍都落进自己上一拍那格条目** ⇒ 自己给自己投票 ⇒ **洗白进表** ✗✗
@@ -83,11 +85,31 @@ _SEED_AREA_RATIO = 0.8    # ⚠ 遗留（已被下面的尺寸带取代 ✓ 保�
 #:   · **之后**：检出面积落在 `[LO, HI] × 完整尺寸` 里 ⇒ 才算"一块完整的砖" ✓ ⇒ 才登记 ✓；
 #:   · **太小的**（边缘被切 / 碎片 ✗）**不登记** ✓；**太大的**（融合并集 ✗）**也不登记** ✓
 #:     —— 这正是用户说的"登记的是**稳定尺寸**的假目标" ✓（融合把框撑大 ✗ 就不是一块独立的砖 ✓）。
-_SIZE_LO, _SIZE_HI = 0.70, 1.30
+#: ⭐⭐ **2026-10-03 上带放宽 1.30 → 1.35**（用户 ✓ 原话："**按③做**，但是要保证 IoU 限制门
+#:   能拦住" ✓）。起因 = 实测 `10月3日 (1).mp4` 帧 3：一块**开局就在画面里**的砖
+#: `189.9×189.4 = 35980.7`，而建表上限 = `1.30 × typ(27630) = 35919.0` ⇒ **只超 61.7**
+#: （0.17% ✗）⇒ 被判"太大（融合并集 / 被切框）"⇒ 不登记 ✗。⚠ 而"大"这件事在
+#: **并集框**上是 1.4 倍起（`merge_ratio` 默认 1.4 ✓）⇒ 放到 1.35 仍拦得住并集 ✓。
+_SIZE_LO, _SIZE_HI = 0.70, 1.35
 #: ⭐⭐ **宽高比上限**（用户 2026-10-01 ✓ 原话："符合标准面积**还要一定程度符合尺寸比例**" ✓）：
 #:   一块砖面积对、但宽高比太离谱（被切的长条 ✗ 或 YOLO 抖出来的窄条 ✗）仍不是砖 ✗。
 #:   实测砖的宽高比 ≈ 0.8~1.24 ✓，碎片/被切框 ≈ 3.5~10 ✗ ⇒ 取 1.6 既放得下砖、又拦得住碎片 ✓。
 _ASPECT_MAX = 1.6
+#: ⭐⭐⭐ **「真目标框 IoU 门」= 0.4**（用户 2026-10-03 ✓ 原话一字不改："关于初始登记砖『**与真目标
+#:   相交暂不不登记**』改成 → **检出框与真目标框 IoU > 0.4 的暂不登记**" ✓）。
+#:   · **真目标框** = **绿圈外接矩形**（`origin ± rad` ✓ 与"锁尺寸 / 形状待定"同一套口径 ✓）；
+#:   · 旧口径 = 矩形**相交**（擦到一个角就算 ✗）⇒ 门槛太低 ⇒ 真目标**路过**时把它边上那些
+#:     本来独立的砖也挡掉 ✗（那几拍不登记 ✓ 等目标走开才登记 ✓）；新口径 = **IoU > 0.4**
+#:     ⇒ 只有"**基本叠在目标身上**"的那格才不登记 ✓；
+#:   · `0.0` ⇒ 等价旧口径（`iou > 0` ⇔ **相交** ✓ —— 回退 & A/B 就用它 ✓）。
+_TGT_IOU_MAX = 0.4
+#: ⭐⭐⭐ **「边缘门」开局豁免拍数**（用户 2026-10-03 ✓ 选项③ ✓ 原话："**按③做**，但是要保证
+#:   IoU 限制门能拦住" ✓）：进入 `track` 之后的头 `本值` 拍**不判边缘门** ✓。
+#:   为什么必须有它 ✗✗："贴边才许登记"那条铁律管的是"**中途凭空出现**"✓；而**开局就在画面里**
+#:   的砖**根本没有"入境那一拍"** ⇒ 永远拿不到入境标记 ✗ ⇒ **永远登记不上** ✗✗
+#:   （实测 `10月3日 (1).mp4` 帧 3 的 `(510.2,349.1)` ✓ —— 用户："**它不是新检出的，它在视频的
+#:   第一帧就存在了**" ✓）。⚠ 那几拍多半还没上板（要 ≥2 拍 ✓）⇒ 混进干扰的代价很小 ✓。
+_EDGE_GRACE_N = 2
 _CONSENSUS_R = 9.0        # ⭐⭐ RANSAC 共识半径（px ✓ 见 `step` ✓）：两票之差 ≤ 它就算"同声" ✓。
                           #   ⚠⚠ 不能小 ✗（2026-09-30 实测 ✓）：**检出自己的逐帧位移就散着
                           #   ~10px** ✗（用户："通过检出框去算速度会略有差别，但这是**噪声和
@@ -145,6 +167,9 @@ _GROW_COV = 0.6          # ⭐ **「生长跟进」的覆盖率门**（`step` �
                          #   （交集 ≥ 0.6×条目面积 ✓）才算"同一块砖在展开" ✓ —— 砖滑进相机时可见
                          #   部分**单调变大** ✓ 新检出 ⊇ 旧可见区 ✓；**真新砖**盖不住旧条目大半 ✗
                          #   ⇒ 不会被误并 ✓（用户 2026-10-02 ✓ "登记框也需要跟着扩展" ✓）。
+                         #   ⭐ 2026-10-02 二改 ✓（用户选 A）：门③"检出贴画面边缘"放宽为
+                         #   "贴边 **或** 大半盖住未上板条目" ⇒ "刚长完整、还没进紧门"的砖
+                         #   （10月1日 帧12 的 (90,303) ✓）走生长不新建 ✗ 不再重复登记 ✓。
 
 #: ⭐⭐⭐ **第一段匹配用的"松门"（px ✓）** —— 只为**估出 `T` 的残差**，不投票 ✓。
 #: ⚠⚠ 为什么必须有它（2026-09-30 实测 ✓）：`T`（A 层）本身有误差，实测本视频里
@@ -186,6 +211,27 @@ _CONFIRM_SPAN_S = 0.15     # ⚠⚠ **跨度从 0.6s 松到 0.15s**（10fps 下 
 _CONFIRM_SPREAD = 4.0
 _DS_MAX = 24              # 每个条目最多记多少票的距离（中位用它 ✓ 有界 ✓）
 
+#: ⭐⭐ **上板时长（秒 ✓ 用户 2026-10-02 ✓ 原话："『多久判定为上板』应该以时长为单位做成
+#:   配置，像『噪声容差』一样加到配置行" ✓）**：登记条目**自出生起**要跟着群体走满这么多秒、
+#:   且面积/宽高比/不贴边三条判据**同时**满足 ⇒ 才转正上板 ✓。
+#:   `0` = **一帧就上板**（= 2026-10-01"只要符合标准面积一帧就上板"的老行为 ✓ 默认 ✓）。
+_BOARD_S_DEF = 0.0
+
+#: ⭐⭐ **上板防抖重叠率**（用户 2026-10-02 ✓ 原话一字不改："目前有**旧砖被重复往上叠加砖**
+#:   的问题。优化：如果**新砖与旧砖重叠率 >= 0.5**，判定为**同一登记砖**。**标砖的框选更接近
+#:   假目标群体标准尺寸的那个**。这个 0.5 做成参数配置『**上板防抖重叠率**』" ✓）。
+#:   落点 = `step` 里"紧门配不上、正准备 `_new_cand` **新建**"之前的那道闸 ✓（见
+#:   `_dedup_board_overlap` ✓）：
+#:   · 候选旧砖 = **不与绿圆外接矩形相交**的全部砖（用户 2026-10-02 口径 ✓ —— 被绿圈压着
+#:     的砖位置/尺寸都不可信 ✗，拿它判"同一块"会把真目标并进表里 ✗）；
+#:   · 重叠率 = **交集 ÷ 两者中较小的面积**（用户 2026-10-02 选 ✓）：小框叠在大砖上也接近
+#:     1.0 ✓ —— 这正是"旧砖被重复往上叠"的形态 ✓（IoU 会偏小、拦不住 ✗）；
+#:   · ≥ 它 ⇒ 判**同一块登记砖** ⇒ **不新建** ✗，并把这块砖的框改成**更接近群体标准尺寸**
+#:     （`typ_area` ✓）的那个（`|面积 − typ_area|` 更小者胜 ✓ 用户口径 ✓）；**位置不动** ✗
+#:     （条目位置只由群体平移驱动 ✓ 见模块头 ✓）。
+#:   `0` = 关（老行为一字不变 ✓）；`1` = 只认"完全被包住" ✓。
+_BOARD_OVERLAP_DEF = 0.5
+
 #: 条目休眠多久没票就丢掉（秒 ✓）—— 给"漏检补框"留足时间，但别把噪声永久留在表里 ✓。
 _GHOST_TTL_S = 1.5       # ⭐ **幽灵条目**（没上过板又没配到）活多久（秒 ✓ 用户 2026-10-01：
                           #   "#017 是哪来的" ✓）—— 参见 `step` ③ 的说明 ✓。
@@ -205,7 +251,7 @@ class Entry:
     __slots__ = ("x", "y", "w", "h", "hits", "t0", "t1", "seen", "ds",
                  "bid", "cls", "conf", "tent", "re_n", "re_off", "size_free",
                  "on_board", "hit_ts", "_boarded", "born",
-                 "_prev_det_wh", "_was_lock")
+                 "_prev_det_wh", "_shape_pending", "_size_locked")
 
     def __init__(self, box: Sequence[float], ts: float,
                  cls: Optional[int] = None, conf: float = 0.0):
@@ -237,11 +283,19 @@ class Entry:
         #: ⭐ **尺寸自由？**（用户 2026-09-30 ✓）：离追踪器 > `_LOCK_R` ⇒ `True` ⇒ 尺寸跟着检出
         #:   走 ✓；落在 `_LOCK_R` 内 ⇒ `False` ⇒ **锁死**（防真目标的融合把它撑大 ✗）。
         self.size_free = True
-        #: ⭐ 上一拍配到的**检出尺寸**（px ✓）—— 用来实现用户的口径："锁定**相交之前**的
-        #:   检出框尺寸" ✓（锁死那一拍弹回它 ✓ 而不是冻住 EMA 的滞后值 ✗）。
+        #: ⭐ 上一拍配到的**检出尺寸**（px ✓）—— 诊断留档 ✓（旧"冻在相交之前"机制已废 ✓）。
         self._prev_det_wh = None
-        #: ⭐ 上一拍是不是已经锁死了（判"刚被锁"的跃迁 ✓ 只在跃迁那一拍弹一次 ✓）。
-        self._was_lock = False
+        #: ⭐⭐ **形状待定**（用户 2026-10-02 ✓ 原话："砖在登记时如果与绿圆外接矩形相交，那么
+        #:   要被标记为『形状待定』，当不再相交时，需要根据与它重叠最多的检出框修正登记的
+        #:   尺寸" ✓）：相交期间尺寸**不写** ✗（绿圈压着 ⇒ 检出被真目标影响 ✓ 不可信 ✓）；
+        #:   **不再相交** ⇒ 用"与它重叠最多的检出框"修正尺寸 ✓（见 `step` 的 `size_free` 段 ✓）。
+        #:   ⚠ **只有"初次登记（未上板）"才会待定** ✓；**钉死（上板）之后**再与绿圆相交 ⇒
+        #:   走 `_size_locked`（锁尺寸 ✓ 用户 2026-10-02 ✓："钉死后就算再与绿圆相交也不用待定，
+        #:   而是走锁尺寸等逻辑" ✓）。
+        self._shape_pending = False
+        #: ⭐ 已钉死的砖被绿圈相交 ⇒ **锁尺寸**（尺寸不写 ✗、位置照旧严丝合缝 ✓；
+        #:   解除后恢复跟随检出 ✓ —— 不修正位置 ✗ 它钉在背景板上、位置没飘 ✓）。
+        self._size_locked = False
         #: ⭐⭐ **这块砖"上板"了没**（用户 2026-09-30 定稿 ✓ 原话："假目标是不会凭空出现的，
         #:   他们**钉死在背景板上**的" ✓）⇒ 判据 = **它相对背景板钉住不动** ✓：
         #:   在**至少 2 拍**里都被"紧门"配到（且票距够紧 ✓ 见 `spread` ✓）⇒ `on_board = True` ✓。
@@ -288,8 +342,16 @@ class Entry:
 class ShapeRegistry:
     """**假目标登记表**（见模块头 ✓）。每帧 `step()` 一次 ⇒ 表跟着群体走 + 收票 + 定身份 ✓。"""
 
-    def __init__(self, gate: float = _MATCH_GATE):
+    def __init__(self, gate: float = _MATCH_GATE, board_s: float = _BOARD_S_DEF,
+                 board_overlap: float = _BOARD_OVERLAP_DEF):
         self.gate = float(gate)
+        # ⭐ **上板时长（秒 ✓）**：条目自出生起要走满这么久才许上板（`0` = 一帧 ✓ 老行为 ✓）。
+        self.board_s = max(0.0, float(board_s))
+        # ⭐⭐ **上板防抖重叠率**（用户 2026-10-02 ✓ 见 `_BOARD_OVERLAP_DEF` ✓）：新检出与
+        #   旧砖重叠 ≥ 它 ⇒ 判**同一登记砖**、**不新建** ✗（专治"旧砖被重复往上叠加砖"）。
+        self.board_overlap = max(0.0, min(1.0, float(board_overlap)))
+        #: 本拍"被上板防抖拦下"的次数（诊断/自检用 ✓ 每拍在 `step` 开头清零 ✓）。
+        self._dedup_n = 0
         self.entries: List[Entry] = []
         #: 这一拍**不在册**的检出下标（= 真目标候选 ✓ 先验 B ✓）
         self.unknown_idx: List[int] = []
@@ -316,6 +378,9 @@ class ShapeRegistry:
         #   才允许登记 ✓（屏幕中间凭空冒出的检出**没有标记** ⇒ 永远不登记 ✓✓）。
         self._entry_marks: List[Tuple[float, float, float]] = []
         self.last_wh: Optional[Tuple[float, float]] = None   # ⭐ 画面尺寸（宽, 高 ✓ 判"贴边"用 ✓）
+        #: ⭐⭐ **本局"进 track 之后被喂了几拍"**（用户 2026-10-03 ✓）：给「边缘门」的**开局豁免**
+        #:   用 ✓（见 `_EDGE_GRACE_N` ✓）——"开局就在画面里"的砖没有入境标记 ⇒ 头几拍不判边缘门 ✓。
+        self.n_step = 0
 
     # ---- 外部可接"世界坐标"（实时链路有地图 ⇒ 表精确、不漂 ✓；视频链路没有 ⇒ 走 T ✓）----
     world_of = None                   # fn(box) -> (x, y) | None
@@ -328,6 +393,7 @@ class ShapeRegistry:
         self.known_idx = []
         self.n_confirmed = 0
         self.n_entries = 0
+        self._dedup_n = 0
         self._miss_run = 0
         self._last_t = None               # 新一局 ⇒ 旧 T 作废 ✓
         # ⭐⭐ **「边缘入境标记」**（用户 2026-10-01 ✓ "假目标只能从屏幕边缘挪进相机" ✓）：
@@ -336,6 +402,7 @@ class ShapeRegistry:
         #   才允许登记 ✓（屏幕中间凭空冒出的检出**没有标记** ⇒ 永远不登记 ✓✓）。
         self._entry_marks = []            # [(x, y, ts)（板系坐标 ✓ 与条目同一坐标系 ✓）]
         self.last_wh = None               # ⭐ 画面尺寸（宽, 高）✓ 上层每拍传入 ✓（判"贴边"用 ✓）
+        self.n_step = 0                   # ⭐ 新一局 ⇒ 重新数"喂了几拍"（边缘门开局豁免用 ✓）
 
     def _new_cand(self, i, cx, cy, b, ts, cls, conf):
         """**登记一条候选**（移动相机时新进画面的砖 ✓ 用户 2026-09-30："相机在运动会有新的
@@ -360,6 +427,108 @@ class ShapeRegistry:
             _e.born = (ts, (cx, cy, float(b[2]), float(b[3])))   # ⭐ 出生溯源 ✓
             self.entries.append(_e)
 
+    # ---- ⭐⭐ **上板防抖**（用户 2026-10-02 ✓ 见 `_BOARD_OVERLAP_DEF` ✓）----
+    @staticmethod
+    def _circle_inter(e, origin, rad) -> bool:
+        """条目框与**「绿圈外接矩形」**相交？（没给 `origin`/半径 ⇒ `False` = 判不出、保守放行 ✓）
+        —— 与 `step` 里"锁尺寸 / 形状待定"用的是**同一套矩形相交**判据 ✓（口径一处 ✓ 用户
+        2026-10-01："我说过**只有与绿圈外接矩形相交**才会锁定**相交之前**的检出框尺寸" ✓）。
+
+        ⚠⚠ **上板防抖闸已不用它** ✗（用户 2026-10-02 ✓ B 方案 ⇒ 换成 `_circle_center_in` ✓）：
+          因为它把"只**擦到绿圈一个角**"的老砖也排除掉 ⇒ 实测显示帧 57 放行了一条与老砖
+          **重叠 100%** 的新建 ✗。**保留它**是为了留回退路径 + 供对照 ✓（当前**无调用者** ✓）。
+        """
+        if origin is None or float(rad or 0.0) <= 0.0:
+            return False
+        _ox, _oy = float(origin[0]), float(origin[1])
+        _r = float(rad)
+        return not (e.x + e.w / 2.0 < _ox - _r
+                    or e.x - e.w / 2.0 > _ox + _r
+                    or e.y + e.h / 2.0 < _oy - _r
+                    or e.y - e.h / 2.0 > _oy + _r)
+
+    @staticmethod
+    def _circle_center_in(e, origin) -> bool:
+        """**绿圈圆心**是否落在**条目框内**？（没给 `origin` ⇒ `False` = 判不出、保守放行 ✓）
+
+        ⭐⭐ **用户 2026-10-02 定稿（B 方案）**：上板防抖的"候选旧砖"判据从"条目框与**绿圈外接
+        矩形相交**"改成它 ✓（原话："**B 绿圈圆心是否落在条目框内**" ✓）。
+
+        为什么非换不可 ✓（实测 `9月30日(1).mp4` **显示帧 57** ✓）：老砖 `(645,217)`
+        `(380.5,131.9) 161.6×162.3` 与绿圈外接矩形**只擦到一个角**（交集 ≈ 295px² = 它自己面积的
+        **1.1%** ✓）⇒ 旧判据把它当"被绿圈压着"**排除出候选** ✗ ⇒ 防抖闸根本看不见它 ⇒ 一条与它
+        **重叠率 1.000** 的新检出被**放行新建** ✗（新生 `(385,117)` 落进它框里 ⇒ 你看到的"旧砖被
+        重复往上叠" ✓、且新条目框被它整个包住 ✓）。
+        换成"圆心是否落在条目框内"后：那一拍圆心 `(253.7,240.4)` 在它框外（框 x ≥ 299.7 ✓）⇒
+        **照常参与防抖** ⇒ 重叠 1.000 ≥ 0.5 ⇒ **拦下、不新建** ✓✓ —— 与"生长跟进"的同砖护栏
+        **同一把尺** ✓（用户 2026-10-02："盖住路径必须带同砖护栏（**检出中心落在条目框内**）" ✓）。
+
+        ⚠⚠ **`step` 里"锁尺寸 / 形状待定"那处仍用「与绿圈外接矩形相交」** ✗（用户 2026-10-01 口径
+        ✓ 没动 ✓）—— 两处判据**故意不同** ✓：那处管"尺寸可不可信"（宁可多锁 ⇒ 保守 ✓）；这处管
+        "要不要把它当成同一块砖"（口径要准 ⇒ **擦边不算** ✓）。
+        """
+        if origin is None:
+            return False
+        _ox, _oy = float(origin[0]), float(origin[1])
+        return (e.x - e.w / 2.0 <= _ox <= e.x + e.w / 2.0
+                and e.y - e.h / 2.0 <= _oy <= e.y + e.h / 2.0)
+
+    @staticmethod
+    def _ov_ratio(cx, cy, w, h, e) -> float:
+        """框 `(cx, cy, w, h)` 与条目 `e` 的**重叠率** = **交集 ÷ 两者中较小的面积**
+        （用户 2026-10-02 选 ✓ 较小者作分母 ⇒ **"小框叠在大砖上"也接近 1.0** ✓ —— 这正是
+        "旧砖被重复往上叠"的形态 ✓；用 IoU 会偏小、拦不住 ✗）。
+
+        口径**只有这一处** ✓：上板防抖闸（`_dedup_board_overlap` ✓）与"尺寸写回准入"
+        （`step` 的 `_claimed` 段 ✓ 用户 2026-10-02 ✓ 原话："严丝合缝的意思是就取检出框当砖，
+        **不存在无限养大**的说法（前提是**该检出框判定为砖**：判定条件是与**旧砖重叠率**的
+        参数符合条件 **&& 不与绿圆相交**）" ✓）共用它 ✓。
+        """
+        # ⭐ 算法统一在 `perception/geom.py`（用户 2026-10-03 ✓ 原话："我认为我们很多判定都可以
+        #   换成这个算法" ✓）⇒ 这里只**委托** ✓；⚠ 本处**必须**是"交集 ÷ 较小面积"（`overlap_min` ✓
+        #   —— 用户 2026-10-02 选定 ✓ "小框叠在大砖上"要接近 1.0 ✓）；**不许**换成 `iou` ✗
+        #   （IoU ≈ 小/大 ⇒ 拦不住"旧砖被重复往上叠" ✗ 见 `geom` 模块头 ✓）。
+        return geom.overlap_min((cx, cy, w, h), (e.x, e.y, e.w, e.h))
+
+    def _dedup_board_overlap(self, cx, cy, w, h, origin=None, rad=0.0):
+        """**上板防抖**：这个检出是不是"我表里某块旧砖"？
+
+        命中 ⇒ 返回**那块旧砖**（顺手把它的框改成**更接近群体标准尺寸**的那个 ✓）｜没命中 ⇒
+        `None` ✓（调用方照旧走 `_new_cand` 新建 ✓）。
+
+        判据（用户 2026-10-02 ✓ 原话一字不改："目前有**旧砖被重复往上叠加砖**的问题。优化：
+        如果**新砖与旧砖重叠率 >= 0.5**，判定为**同一登记砖**。**标砖的框选更接近假目标群体
+        标准尺寸的那个**" ✓）：
+          · 候选旧砖 = **绿圈圆心不在它框内**的全部砖 ✓（⭐⭐ **B 方案** 用户 2026-10-02 ✓ 原话：
+            "**B 绿圈圆心是否落在条目框内**" ✓ —— 原来用"与绿圈外接矩形相交"会把只**擦到绿圈一个
+            角**的老砖也排除掉 ✗ ⇒ 实测显示帧 57 因此放行了一条与老砖**重叠率 1.000** 的新建 ✗；
+            现判据见 `_circle_center_in` ✓ 与"生长跟进"的同砖护栏同一把尺 ✓）；
+          · 重叠率 = **交集 ÷ `min(新检出面积, 旧砖面积)`** ✓（用户 2026-10-02 选 ✓ —— 较小者
+            作分母 ⇒ **小框叠在大砖上**也接近 1.0 ✓ 这正是"旧砖被重复往上叠"的形态 ✓）；
+          · 命中后**框选取舍** = `|面积 − typ_area|` 更小者胜 ✓（用户 2026-10-02 选 ✓）；
+            `typ_area <= 0`（还没定标准）⇒ **保持原框** ✗ 不猜 ✓。
+        **位置一律不动** ✗（条目位置只由群体平移驱动 ✓ 见模块头 ✓）。
+        """
+        if self.board_overlap <= 0.0 or not self.entries:
+            return None
+        _a_new = float(w) * float(h)
+        if _a_new <= 0.0:
+            return None
+        _best, _br = None, 0.0
+        for e in self.entries:
+            if self._circle_center_in(e, origin):
+                continue                     # ⭐ B（2026-10-02 ✓）：绿圈**圆心**落在它框内 ⇒
+                #   被绿圈压着 ⇒ 不参与 ✓（⚠ 只**擦到角**不算了 ✗ 见 `_circle_center_in` ✓）
+            _r = self._ov_ratio(cx, cy, w, h, e)     # ⭐ 口径一处 ✓（见 `_ov_ratio` ✓）
+            if _r > _br:
+                _best, _br = e, _r
+        if _best is None or _br < self.board_overlap:
+            return None
+        if self.typ_area > 0.0:
+            if abs(_a_new - self.typ_area) < abs(_best.w * _best.h - self.typ_area):
+                _best.w, _best.h = float(w), float(h)
+        return _best
+
     def step(self, boxes: Optional[Sequence[Sequence[float]]],
              t: Optional[Sequence[float]] = None, ts: float = 0.0,
              origin: Optional[Sequence[float]] = None,
@@ -373,7 +542,12 @@ class ShapeRegistry:
         边缘门 ✗（保守放行 ✓ 自检/合成链路没画面尺寸时照常工作 ✓））。
         """
         boxes = list(boxes or [])
+        # ⭐⭐ **记"这是进入 track 之后第几拍"**（用户 2026-10-03 ✓ 选项③ ✓）：给「边缘门」的
+        #   **开局豁免**用 ✓（"开局就在画面里"的砖没有入境标记 ⇒ 头 `_EDGE_GRACE_N` 拍不判边缘门 ✓
+        #   见它 ✓）。
+        self.n_step = int(getattr(self, "n_step", 0)) + 1
         self.known_idx, self.unknown_idx = [], []
+        self._dedup_n = 0                     # ⭐ 本拍"上板防抖"命中次数（诊断/自检 ✓）
         self.last_wh = (float(wh[0]), float(wh[1])) if wh else self.last_wh
         # ⭐ **入境标记到期作废** ✓（平移在下面与条目同一处做 ✓ 保证同一套 `T` ✓）
         # ⭐ 记下**每一条**这一帧开始时的位置 ⇒ 帧尾算"群体平均速度" ✓（用户 2026-10-01 ✓）
@@ -578,6 +752,24 @@ class ShapeRegistry:
                 if _typ > 0 and not (_SIZE_LO * _typ <= _a0 <= _SIZE_HI * _typ):
                     continue                  # ⭐ 只收"完整尺寸" ✓（用户 ✓）
                 _cx, _cy, _cls, _cnf = _pts[_i]
+                # ⭐⭐⭐ **「真目标框 IoU 门」也要管住"首帧建表"** ✗✗（用户 2026-10-03 ✓ 原话：
+                #   "**按③做，但是要保证 IoU 限制门能拦住**" ✓）：原来这道门**只在"新建候选"那条
+                #   路上判** ✗ ⇒ 首帧建表**完全不走它** ✗✗ —— 一旦按③放宽尺寸门 / 边缘门，
+                #   **与真目标叠在一起的框就会直接从建表这条路混进表里** ✗（那正是用户要防的 ✓）。
+                #   ⚠ 半径还没学到（开局那几拍 ✓ `rad=0` ✓）⇒ IoU 算不出 ⇒ **退化成"圆心落在
+                #     这格框里"** ✓（**比 IoU 更保守** ✓ 用户要的就是"拦住" ✓）；⚠ 与上面那条
+                #     `_tgt_i` 不重复：`_tgt_i` 只挡"**离圆心最近**的那一格"✓ 这里挡的是"**所有**
+                #     含圆心的格"✓（重叠检出时可能不止一格 ✓）。
+                if origin is not None:
+                    _r0 = float(rad or 0.0)
+                    if _r0 > 0.0:
+                        if geom.iou((_cx, _cy, float(_b[2]), float(_b[3])),
+                                    (float(origin[0]), float(origin[1]),
+                                     2.0 * _r0, 2.0 * _r0)) > _TGT_IOU_MAX:
+                            continue
+                    elif (abs(_cx - float(origin[0])) <= float(_b[2]) / 2.0
+                          and abs(_cy - float(origin[1])) <= float(_b[3]) / 2.0):
+                        continue
                 # ⚠⚠ **开局那批也不"直接上板"** ✗（2026-10-01 改 ✓）：它们只拿到 id ✓，
                 #   上板仍要过"**钉死判据**"（≥2 拍 ✓）✓ —— 这样**真目标那格**（开局恰好在它
                 #   身上 ✓）**也不会被算成假目标** ✓✓（用户第 1 条就是要这个：与真目标重合的
@@ -595,6 +787,8 @@ class ShapeRegistry:
         _claimed = {}          # ⭐ 本拍"条目 → (离它最近的检出距离, 该检出 w, h)"（循环后统一定尺寸 ✓）
         _snapped = []          # ⭐ 本拍"被拉回来复用"的条目（诊断：防重复登记的实绩 ✓）
         _grown = set()         # ⭐ 本拍已被"生长跟进"长过的条目（一拍一个检出 ✓ 防两检出抢同一条 ✓）
+        _used_dets = set()     # ⭐ 本拍**已被认领**的检出下标（配对/生长/新建都算 ✓）——
+                               #   "形状待定"修位置时只许用**没被认领**的检出 ✓（用户 2026-10-02 ✓）
         for i, b in enumerate(boxes):
             # ⭐⭐⭐ **碎片 / 被切框**：既不配对（不改条目 ✗）、也不新建（它不是砖 ✗）、
             #   也不算"不在册的真目标候选"（目标有完整尺寸的形状 ✓）⇒ 整个跳过 ✓。
@@ -618,40 +812,57 @@ class ShapeRegistry:
                 #     ① 表里有**没上板**的候选条目（上板砖的尺寸已钉死 ✗ **绝不许长** ✓）；
                 #     ② 该检出**大半盖住**那条目（交集 ≥ `_GROW_COV`×条目面积 ✓ —— 砖滑进来时
                 #        可见部分**单调变大** ✓ 新检出 ⊇ 旧可见区 ✓；**真新砖**盖不住旧条目大半 ✗）；
-                #     ③ 检出**贴画面边缘**（= 还在进相机 ✓；完整在画面里的砖不存在"长个" ✓）；
+                #     ③ 检出**贴画面边缘**（= 还在进相机 ✓）**或** ② 成立即可（用户 2026-10-02 ✓
+                #        选 A 放宽：**"刚长完整、还没进紧门"的砖** —— 群体平移把条目推过头、
+                #        检出已离边缘 ✗ 10月1日 帧12 的 (90,303) ✓ —— 也走生长不新建 ✗✗）；
                 #     ④ **绿圈门**（与绿圈相交的是真目标框 ✗ 绝不许吞进砖里 ✓ 同新建门 ✓）。
                 #   命中 ⇒ 条目**连位置带尺寸**长成这个检出 ✓（= 同一块砖在展开 ✓）、记一票 ✓、
                 #   **跳过新建** ✓ —— 长到"标准面积 + 比例达标"时由下面的上板判据**自然转正** ✓
                 #   （用户："等他满足『达到标准假目标群面积及尺寸比例』的条件后转正" ✓）。
                 _grow = None
                 if self.last_wh:
-                    _W, _H = self.last_wh
                     _gx0 = float(b[0]) - float(b[2]) / 2.0
                     _gx1 = float(b[0]) + float(b[2]) / 2.0
                     _gy0 = float(b[1]) - float(b[3]) / 2.0
                     _gy1 = float(b[1]) + float(b[3]) / 2.0
-                    if (_gx0 <= _EDGE_TOL or _gy0 <= _EDGE_TOL
-                            or _gx1 >= _W - _EDGE_TOL or _gy1 >= _H - _EDGE_TOL):
-                        for _ge in self.entries:
-                            if _ge._boarded or id(_ge) in _grown:
-                                continue                # 上板砖不许长 ✓ / 本拍已被别的检出长过 ✓
-                            _gex0, _gex1 = _ge.x - _ge.w / 2.0, _ge.x + _ge.w / 2.0
-                            _gey0, _gey1 = _ge.y - _ge.h / 2.0, _ge.y + _ge.h / 2.0
-                            _gix = max(0.0, min(_gx1, _gex1) - max(_gx0, _gex0))
-                            _giy = max(0.0, min(_gy1, _gey1) - max(_gy0, _gey0))
-                            _gea = _ge.w * _ge.h
-                            if _gea > 0.0 and _gix * _giy >= _GROW_COV * _gea:
-                                _grow = _ge
-                                break
+                    # ⭐ 门③放宽后：覆盖率扫描**不再以"检出贴边"为前置** ✓ —— 贴边检出（旧路 ✓）
+                    #   与"盖住未上板条目"的检出（新路 ✓）都进扫描 ✓。
+                    #   ⚠⚠ **同砖护栏**（2026-10-02 实测 demo 自检帧52~54/70 抓到 ✗）：只看
+                    #   "盖住 ≥60%×条目"会被**画面远处的大框**钻空子 ✗ —— 小候选条目（贴边
+                    #   碎片 ✓）随便被哪个大检出盖住 60% ⇒ 条目被**瞬移**过去 ✗✗（实测一块砖
+                    #   被叠出三条目 ✗）。⇒ "盖住"路径还要求**检出中心落在条目框内** ✓（同一块
+                    #   正在展开的砖，检出中心不可能跑出条目范围 ✓；帧12 (90,303)：中心在条目
+                    #   框内 7.3px ✓；远处劫持：中心在框外 ✗ 拦住 ✓）。
+                    for _ge in self.entries:
+                        if _ge._boarded or id(_ge) in _grown:
+                            continue                # 上板砖不许长 ✓ / 本拍已被别的检出长过 ✓
+                        _gex0, _gex1 = _ge.x - _ge.w / 2.0, _ge.x + _ge.w / 2.0
+                        _gey0, _gey1 = _ge.y - _ge.h / 2.0, _ge.y + _ge.h / 2.0
+                        _near = (_gex0 <= cx <= _gex1 and _gey0 <= cy <= _gey1)
+                        if not (_near
+                                or (_gx0 <= _EDGE_TOL or _gy0 <= _EDGE_TOL
+                                    or _gx1 >= self.last_wh[0] - _EDGE_TOL
+                                    or _gy1 >= self.last_wh[1] - _EDGE_TOL)):
+                            continue                # 盖住路径要"中心在条目内" ✓ 贴边路径照旧 ✓
+                        _gix = max(0.0, min(_gx1, _gex1) - max(_gx0, _gex0))
+                        _giy = max(0.0, min(_gy1, _gey1) - max(_gy0, _gey0))
+                        _gea = _ge.w * _ge.h
+                        if _gea > 0.0 and _gix * _giy >= _GROW_COV * _gea:
+                            _grow = _ge
+                            break
                     if _grow is not None and origin is not None and float(rad or 0.0) > 0.0:
+                        # ⭐⭐⭐ **同新建门**（用户 2026-10-03 ✓ 同一句口径 ✓ 见 `_TGT_IOU_MAX` ✓）：
+                        #   原来也是"与绿圈外接矩形**相交**"✗ ⇒ 一并换成 **IoU > 0.4** ✓ —— 两处
+                        #   必须同一把尺 ✗（注释早就写着"同新建门"✓ 换一处不换另一处 ⇒ 口径就分叉了 ✗）。
+                        _r5 = float(rad)
                         _ox5, _oy5 = float(origin[0]), float(origin[1])
-                        if not (cx + float(b[2]) / 2.0 < _ox5 - float(rad)
-                                or cx - float(b[2]) / 2.0 > _ox5 + float(rad)
-                                or cy + float(b[3]) / 2.0 < _oy5 - float(rad)
-                                or cy - float(b[3]) / 2.0 > _oy5 + float(rad)):
-                            _grow = None                # 与绿圈相交 = 真目标框 ✗ 不吞 ✓
+                        _iou_g = geom.iou((cx, cy, float(b[2]), float(b[3])),
+                                          (_ox5, _oy5, 2.0 * _r5, 2.0 * _r5))
+                        if _iou_g > _TGT_IOU_MAX:
+                            _grow = None                # 与真目标框叠太多 ✗ 不吞 ✓
                 if _grow is not None:
                     _grown.add(id(_grow))
+                    _used_dets.add(i)                   # 这个检出被生长认领了 ✓
                     _grow.x, _grow.y = cx, cy           # 位置、尺寸一起长 ✓（"跟着扩展" ✓）
                     _grow.w, _grow.h = float(b[2]), float(b[3])
                     _grow.hits += 1
@@ -678,38 +889,92 @@ class ShapeRegistry:
                 #   ⚠ 候选**立刻不算"在册"** ✗（`confirmed` 要票数 + 跨度 + 票挤得紧 ✓ 三条
                 #     一起满足 ✓）⇒ 新砖几帧后自然转正 ✓；而**真目标**每帧相对群体走 ~10px
                 #     ✗ ⇒ 攒不到 4 票、票距也散 ✗ ⇒ **永远转不了正** ✓✓（先验 B 的关键 ✓）。
-                    # ⭐⭐⭐ **新建前再过两道门**（用户 2026-10-01 ✓ 定稿 ✓）：
-                    #   ① **边缘门**："假目标不会凭空出现，**只有由从屏幕边缘挪进相机的方式出现**，
-                    #      在**屏幕中间的新检出框不能登记**" ✓ —— 贴边 ✓ 或 **有"入境标记"** ✓
-                    #      （标记 = 当初贴边出现、还没走到"完整尺寸"的那块砖 ✓ 每帧随群体平移 ✓）
-                    #      才许登记 ✓；没有画面尺寸（自检/合成链路 ✓）⇒ 保守放行 ✓。
-                    #   ② **绿圈门**："一旦出现且**与绿圈相交**就说明它是**真目标框**" ✓ ⇒
-                    #      **不许登记** ✓（已在表里的条目相交时照旧"锁尺寸、不动位置" ✓ 那套在下面 ✓）。
-                    _ok_edge = True
-                    if self.last_wh:
-                        _W, _H = self.last_wh
-                        _x0 = float(b[0]) - float(b[2]) / 2.0
-                        _x1 = float(b[0]) + float(b[2]) / 2.0
-                        _y0 = float(b[1]) - float(b[3]) / 2.0
-                        _y1 = float(b[1]) + float(b[3]) / 2.0
-                        _ok_edge = (_x0 <= _EDGE_TOL or _y0 <= _EDGE_TOL
-                                    or _x1 >= _W - _EDGE_TOL or _y1 >= _H - _EDGE_TOL
-                                    or any(math.hypot(cx - _mx, cy - _my) <= _ENTRY_GATE
-                                           for (_mx, _my, _s0) in self._entry_marks))
-                    _r4 = float(rad or 0.0)
-                    _hit_circle = False
-                    if origin is not None and _r4 > 0.0:
-                        _ox4, _oy4 = float(origin[0]), float(origin[1])
-                        _hit_circle = not (cx + float(b[2]) / 2.0 < _ox4 - _r4
-                                           or cx - float(b[2]) / 2.0 > _ox4 + _r4
-                                           or cy + float(b[3]) / 2.0 < _oy4 - _r4
-                                           or cy - float(b[3]) / 2.0 > _oy4 + _r4)
-                    if not _ok_edge or _hit_circle:
-                        continue                          # 中间凭空冒出 / 与绿圈相交 ⇒ 不登记 ✓
-                    self._new_cand(i, cx, cy, b, ts, _cls, _cnf)
-                    self.unknown_idx.append(i)
+                # ⭐⭐⭐ **新建前再过两道门**（用户 2026-10-01 ✓ 定稿 ✓）：
+                #   ① **边缘门**："假目标不会凭空出现，**只有由从屏幕边缘挪进相机的方式出现**，
+                #      在**屏幕中间的新检出框不能登记**" ✓ —— 贴边 ✓ 或 **有"入境标记"** ✓
+                #      （标记 = 当初贴边出现、还没走到"完整尺寸"的那块砖 ✓ 每帧随群体平移 ✓）
+                #      才许登记 ✓；没有画面尺寸（自检/合成链路 ✓）⇒ 保守放行 ✓。
+                #   ② **绿圈门**："一旦出现且**与绿圈相交**就说明它是**真目标框**" ✓ ⇒
+                #      **不许登记** ✓（已在表里的条目相交时照旧"锁尺寸、不动位置" ✓ 那套在下面 ✓）。
+                _ok_edge = True
+                if self.last_wh:
+                    _W, _H = self.last_wh
+                    _x0 = float(b[0]) - float(b[2]) / 2.0
+                    _x1 = float(b[0]) + float(b[2]) / 2.0
+                    _y0 = float(b[1]) - float(b[3]) / 2.0
+                    _y1 = float(b[1]) + float(b[3]) / 2.0
+                    _ok_edge = (_x0 <= _EDGE_TOL or _y0 <= _EDGE_TOL
+                                or _x1 >= _W - _EDGE_TOL or _y1 >= _H - _EDGE_TOL
+                                or any(math.hypot(cx - _mx, cy - _my) <= _ENTRY_GATE
+                                       for (_mx, _my, _s0) in self._entry_marks))
+                _r4 = float(rad or 0.0)
+                # ⭐⭐⭐ **绿圈门改成 IoU 门**（用户 2026-10-03 ✓ 原话一字不改："关于初始登记砖
+                #   『**与真目标相交暂不不登记**』改成 → **检出框与真目标框 IoU > 0.4 的暂不登记**"
+                #   ✓ 见 `_TGT_IOU_MAX` ✓）：旧口径 = 矩形**相交** ✗（擦到一个角就算 ⇒ 门槛太低
+                #   ⇒ 真目标**路过**时把它边上本来独立的砖也挡掉 ✗）；新口径 = **IoU(检出框,
+                #   真目标框) > 0.4** ✓（真目标框 = **绿圈外接矩形** `origin ± rad` ✓ 与"锁尺寸 /
+                #   形状待定"同一套口径 ✓）⇒ 只有"**基本叠在目标身上**"的那格才暂不登记 ✓。
+                _iou_circle = 0.0
+                if origin is not None and _r4 > 0.0:
+                    _iou_circle = geom.iou((cx, cy, float(b[2]), float(b[3])),
+                                           (float(origin[0]), float(origin[1]),
+                                            2.0 * _r4, 2.0 * _r4))
+                # ⚠⚠ **两条门现在分开了** ✗✗（用户 2026-10-03 ✓ "按③做，**但要保证 IoU 门能拦住**" ✓）：
+                #   · **IoU 门 ⇒ 任何时刻都拦** ✓（**不受开局豁免** ✓ —— 用户点名要的那条 ✓）；
+                #   · **边缘门 ⇒ 头 `_EDGE_GRACE_N` 拍豁免** ✓（"开局就在画面里"的砖没有入境
+                #     标记 ✗ ⇒ 不豁免就**永远登记不上** ✗✗ 见 `_EDGE_GRACE_N` ✓）。
+                if _iou_circle > _TGT_IOU_MAX:
+                    continue                          # 与真目标框叠太多 ⇒ **暂不登记**（不受豁免 ✓）
+                if not _ok_edge and self.n_step > _EDGE_GRACE_N:
+                    continue                          # 中途凭空冒出 ⇒ 不登记（开局头几拍豁免 ✓）
+                # ⭐⭐⭐ **上板防抖：先问"这是不是我表里某块旧砖"**（用户 2026-10-02 ✓ 原话
+                #   一字不改："目前有**旧砖被重复往上叠加砖**的问题。优化：如果**新砖与旧砖
+                #   重叠率 >= 0.5**，判定为**同一登记砖**。**标砖的框选更接近假目标群体标准
+                #   尺寸的那个**" ✓）—— 紧门（`gate`）配不上（群体平移 / 检出抖动 / 被绿圈
+                #   压着 …… 都很常见 ✓）、正要**新建**之前，先跟旧砖比一次重叠率 ✓：
+                #     · 旧砖 = **绿圈圆心不在它框内**的那些 ✓（用户 2026-10-02 ✓ **B 方案**：
+                #       原来用"不与绿圆外接矩形相交"，会把只**擦到绿圈一个角**的老砖也排除掉 ✗
+                #       ⇒ 实测第 57 帧放行了一条与老砖**重叠 1.000** 的新建 ✗ 见 `_circle_center_in` ✓）；
+                #     · 重叠率 = 交集 ÷ 较小面积 ✓（用户 2026-10-02 选 ✓）；
+                #     · ≥ `board_overlap` ⇒ **同一块砖** ⇒ **不新建** ✗，框取**更接近
+                #       `typ_area`** 的那个 ✓（位置不动 ✗ —— 条目位置只由群体平移驱动 ✓）。
+                _ded = self._dedup_board_overlap(cx, cy, float(b[2]), float(b[3]), origin, rad)
+                if _ded is not None:
+                    self._dedup_n += 1
+                    _ded.hits += 1
+                    _ded.t1 = ts
+                    _ded.seen = ts
+                    _ded.hit_ts = ts        # ⭐ 这拍真的看到它了 ⇒ 别被"幽灵清理"删掉 ✓
+                    _ded.ds.append(math.hypot(_ded.x - cx, _ded.y - cy))
+                    if len(_ded.ds) > _DS_MAX:
+                        _ded.ds.pop(0)
+                    if _cls is not None:
+                        _ded.cls, _ded.conf = _cls, _cnf
+                    _used_dets.add(i)       # 这个检出被"防抖"认领了 ✓
+                    # ⭐⭐⭐ **还要记进 `_claimed`（"这条目这拍被认领了"）** ✗✗（2026-10-02 实测
+                    #   踩到 ✓ 用户报的"第 57 帧砖 `(645,217)` 在第 58 帧飘移" ✓）：原来只写
+                    #   `_used_dets` ✗ ⇒ 后面「解除相交 ⇒ 收尾修正」查 `id(_e2) in _claimed` 查
+                    #   不到它 ⇒ 以为"它没被认领（位置飘了）"⇒ 走"就近抓**未被认领**检出" ✗ ——
+                    #   而它自己的检出刚被本闸占进 `_used_dets` ✗ ⇒ 只能抓 120px 外另一格的框
+                    #   ⇒ 位置被搬 **142px** ✗✗（实测第 58 帧：(391.1,116.1) → (306.2,199.8)，
+                    #   而它自己的检出 (396.7,98.7) 就在 18px 外、还在同一拍被本闸命中了 ✓）。
+                    #   ⚠⚠ **元组里的位置写"条目自己当前的"** ✗（不是检出位置 ✗）：本闸口径是
+                    #     "**位置一律不动**"✓（用户 2026-10-02 ✓ 自检 `⑫` 钉着 ✓）—— 写
+                    #     `_claimed` 只是让它"参与这一拍的尺寸统一（尺寸保持 ✓）"+ 让收尾修正
+                    #     认出"它被认领了"⇒ 走"**只修尺寸**"那一支 ✓ 位置自然不动 ✓。
+                    _claimed[id(_ded)] = (0.0, float(_ded.w), float(_ded.h),
+                                          float(_ded.x), float(_ded.y), False, 1.0)
+                    if _ded.confirmed:
+                        self.known_idx.append(i)
+                    else:
+                        self.unknown_idx.append(i)
                     continue
+                self._new_cand(i, cx, cy, b, ts, _cls, _cnf)
+                _used_dets.add(i)                       # 这个检出被新建条目认领了 ✓
+                self.unknown_idx.append(i)
+                continue
             best.hits += 1
+            _used_dets.add(i)                           # 这个检出被配对认领了 ✓
             best.t1 = ts
             best.seen = ts
             best.hit_ts = ts              # ⭐ 这一拍配到了 ⇒ 刷新"还钉得住"的时刻 ✓
@@ -741,10 +1006,15 @@ class ShapeRegistry:
                              or float(b[0]) - float(b[2]) / 2.0 > _ox3 + _r3
                              or float(b[1]) + float(b[3]) / 2.0 < _oy3 - _r3
                              or float(b[1]) - float(b[3]) / 2.0 > _oy3 + _r3)
+            # ⭐⭐⭐ **"这个检出框算不算一块砖"**（用户 2026-10-02 ✓ 原话："严丝合缝的意思是
+            #   就取检出框当砖，**不存在无限养大**的说法（前提是**该检出框判定为砖**：判定
+            #   条件是**与旧砖重叠率**的参数符合条件 **&& 不与绿圆相交**）" ✓）⇒ 尺寸写回
+            #   用它当**准入** ✓（见下面统一写尺寸那段 ✓）。
+            _ov = self._ov_ratio(float(b[0]), float(b[1]), float(b[2]), float(b[3]), best)
             _c0 = _claimed.get(id(best))
             if _c0 is None or float(bd) < _c0[0]:
                 _claimed[id(best)] = (float(bd), float(b[2]), float(b[3]),
-                                      float(b[0]), float(b[1]), _cont)
+                                      float(b[0]), float(b[1]), _cont, _ov)
             # 在册（做实了）⇒ 判它是**假目标** ✓
             if best.confirmed:
                 self.known_idx.append(i)
@@ -762,7 +1032,7 @@ class ShapeRegistry:
             _c3 = _claimed.get(id(_e3))
             if _c3 is None:
                 continue                              # 这拍没配上 ⇒ 尺寸一动不动 ✓
-            _d3, _pw3, _ph3, _px3, _py3, _cont3 = _c3
+            _d3, _pw3, _ph3, _px3, _py3, _cont3, _ov3 = _c3
             # ⭐⭐⭐ **位置：一律"严丝合缝"写成检出本身**（用户 2026-10-01 ✓ 原话："登记框只是
             #   『标记』，**必须与检出框严丝合缝**" ✓）。
             #   ⚠⚠ **位置不再有"被真目标影响"的例外** ✗✗（2026-10-01 实测修正 ✓）：用户当时
@@ -772,18 +1042,31 @@ class ShapeRegistry:
             #   ⚠ 位置可靠的前提是**检出的框心可信** ⇒ 由上一段保证：**碎片（<0.7×）与并集
             #     （>1.3×）都已被 `_ok_sz` 挡掉** ✓ ⇒ 能配上的都是"一块完整砖" ✓。
             _e3.x, _e3.y = _px3, _py3
-            if not _cont3:
-                # 没被真目标影响 ⇒ 尺寸也照写检出 ✓
-                _e3.w, _e3.h = _pw3, _ph3
-                _e3._was_lock = False
-            elif not _e3._was_lock:
-                # 与绿圈外接矩形相交（= "被真目标影响" ✓）⇒ **只锁尺寸**：弹回"相交之前"
-                # 那一拍的检出尺寸 ✓（用户原话："只有与绿圈外接矩形相交才会锁定**相交之前**
-                # 的检出框尺寸" ✓）。
-                if _e3._prev_det_wh is not None:
-                    _e3.w, _e3.h = _e3._prev_det_wh
-                _e3._was_lock = True
-            _e3._prev_det_wh = (_pw3, _ph3)           # 记下这拍（供下一拍锁定用 ✓）
+            if _cont3:
+                # ⭐⭐ **相交 ⇒ 尺寸不许信**（用户 2026-10-02 ✓ 定稿 ✓ 原话："初次登记才会是
+                #   待定，**钉死后就算再与绿圆相交也不用待定了，而是走锁尺寸等逻辑**" ✓）：
+                #   · **还没钉死**（未上板 ✓）⇒ 「**形状待定**」✓ —— 解除时按"重叠最多的
+                #     没被认领检出"修**位置+尺寸** ✓（初次登记的位置也可能飘 ✓）；
+                #   · **已钉死**（上板 ✓）⇒ 走「**锁尺寸**」✓ —— 尺寸不写 ✗、位置照旧严丝
+                #     合缝 ✓（它钉在背景板上、位置没飘 ✓），解除后恢复跟随检出 ✓。
+                if _e3._boarded:
+                    _e3._size_locked = True
+                else:
+                    _e3._shape_pending = True
+            elif not (getattr(_e3, "_shape_pending", False)
+                      or getattr(_e3, "_size_locked", False)):
+                # ⭐⭐⭐ **"这个检出框判定为砖"才许写尺寸**（用户 2026-10-02 ✓ 原话："严丝合缝
+                #   的意思是就取检出框当砖，**不存在无限养大**的说法（前提是**该检出框判定为
+                #   砖**：判定条件是**与旧砖重叠率**的参数符合条件 **&& 不与绿圆相交**）" ✓）：
+                #     · **不与绿圆相交** = `_cont3` 为假 ✓（相交那一支已在上面分流成
+                #       「锁尺寸 / 形状待定」⇒ 尺寸本来就不写 ✓）；
+                #     · **与旧砖重叠率达标** = `_ov3 >= board_overlap` ✓（同一处口径 `_ov_ratio` ✓）。
+                #   ⇒ 两条都过 ⇒ 尺寸照写检出 ✓（严丝合缝 ✓）；任一条不过 ⇒ **保持原框** ✗
+                #     （把一个"不是这块砖"的框写进登记尺寸 ⇒ 那才会"越养越大" ✗✗）。
+                if _ov3 >= self.board_overlap:
+                    _e3.w, _e3.h = _pw3, _ph3
+            # 待定/锁尺寸中且本拍检出不相交 ⇒ 尺寸先不写 ✓ 等下面 `size_free` 段统一收尾 ✓。
+            _e3._prev_det_wh = (_pw3, _ph3)           # 诊断留档 ✓
         # ③ ⭐⭐ **清"幽灵条目"**（用户 2026-10-01："**#017 是哪来的**" ✓）：表里有一类条目
         #   —— **从来没上过板、而且再也没被配到过** ✗（`#017` 实测：帧 7 出生 ✓ 票卡在 3 ✗
         #   上板=False ✓ 位置一路跟着群体漂 ✓）。它们多半是**真目标走过留下的** ✓（真目标自己
@@ -839,6 +1122,37 @@ class ShapeRegistry:
                               or _e2.y + _e2.h / 2.0 < _oy - _r2
                               or _e2.y - _e2.h / 2.0 > _oy + _r2)
                 _e2.size_free = (not _inter)
+                # ⭐⭐⭐ **「形状待定」→ 修正**（用户 2026-10-02 ✓ 原话："砖在登记时如果与
+                #   绿圆外接矩形相交，那么要被标记为『形状待定』，当不再相交时，需要根据与
+                #   它重叠最多的检出框修正登记的尺寸" ✓）：
+                #   · **相交** ⇒ 标"形状待定" ✓（尺寸停在本拍之前的值 ✗ 不写被影响的检出 ✓）；
+                #   · **不再相交**（待定中 ✓）⇒ 按"与它重叠最多的检出框"修正登记尺寸 ✓
+                #     并清除待定 ✓（修正发生在上板判据**之前** ✓ 当拍就能按新尺寸上板 ✓）。
+                if _inter:
+                    if _e2._boarded:
+                        _e2._size_locked = True      # 钉死的砖 ⇒ 锁尺寸（不待定 ✓ 用户 ✓）
+                    else:
+                        _e2._shape_pending = True    # 初次登记 ⇒ 形状待定 ✓
+                else:
+                    # ⭐ 解除相交 ⇒ 收尾修正 ✓。**待定**（初次登记）与**锁尺寸**（钉死的砖）
+                    #   **都做**（用户 2026-10-02 ✓ 点名的帧 10 砖(392,354)、帧 15 砖(270,233)
+                    #   本身就是已上板的砖 ✓ —— 它们被绿圈压着那几拍没配上 ⇒ 位置只被群体推着
+                    #   走 ⇒ 同样会飘 ✓）。**没被认领**的条目 ⇒ **就近找重叠度最高的没被认领的
+                    #   检出框**，**位置+尺寸**一起修 ✓；被认领的（位置已严丝合缝 ✓）⇒ 只修尺寸 ✓。
+                    if (getattr(_e2, "_shape_pending", False)
+                            or getattr(_e2, "_size_locked", False)):
+                        if id(_e2) in _claimed:
+                            _mw0 = self._max_overlap_det_wh(_e2, boxes, _ok_sz)
+                            if _mw0 is not None:
+                                _e2.w, _e2.h = _mw0
+                        else:
+                            _md0 = self._max_overlap_unclaimed_det(_e2, boxes, _ok_sz,
+                                                                   _used_dets)
+                            if _md0 is not None:
+                                _e2.x, _e2.y = _md0[0], _md0[1]
+                                _e2.w, _e2.h = _md0[2], _md0[3]
+                    _e2._shape_pending = False
+                    _e2._size_locked = False         # 收尾清标记 ⇒ 尺寸恢复跟随检出 ✓
         # ⭐⭐⭐ **铁律补刀：真目标那一格里"没上过板"的条目一律删掉** ✗✗（用户 2026-10-01 ✓
         #   原话："第7帧的 **#017 就不该存在**，记住铁律：『**只登记假目标！**』" ✓）。
         #   为什么只删"没上过板"的 ✗：**上过板的就是真砖** ✓（用户："只要是登记过的，都不能丢" ✓）
@@ -872,14 +1186,29 @@ class ShapeRegistry:
             #   ⚠ 安全：真目标那格已被「铁律」排除（不登记 ✗），而**并集大框面积 > 1.30× 标准
             #   ✗ 也进不了带** ⇒ 不会被误上板 ✓。
             if not _e2._boarded:
-                # ⭐ 两条**同时**成立才上板 ✓：① 面积在标准带内 ✓；② 宽高比别太离谱（`_ASPECT_MAX`
-                #   ✓ 用户："符合标准面积还要一定程度符合尺寸比例" ✓）。
+                # ⭐ 三条**同时**成立才上板 ✓：① 面积在标准带内 ✓；② 宽高比别太离谱（`_ASPECT_MAX`
+                #   ✓ 用户："符合标准面积还要一定程度符合尺寸比例" ✓）；③ **没贴着画面边缘**
+                #   （用户 2026-10-02 ✓：**"还没有在相机内完全展示"的砖不许转正** ✗ —— 贴边时
+                #   检出只是"露出的一角"，面积碰巧落进标准带（宽没长够、高先够了 ✗）也会过 ①②
+                #   ✗ ⇒ 一旦转正就**再也不许长** ✗✗ ⇒ 同一块砖后面又开新条目 ✗✗。⇒ 贴边 =
+                #   还在"生长跟进"期 ✓ 等它**完全进来 + 面积/比例都达标**再转正 ✓✓）。
                 _ok_area = (self.typ_area <= 0
                             or _SIZE_LO * self.typ_area <= _e2.w * _e2.h <= _SIZE_HI * self.typ_area)
                 _ok_ratio = max(_e2.w, _e2.h) <= _ASPECT_MAX * min(_e2.w, _e2.h)
-                if _ok_area and _ok_ratio:
-                    _e2._boarded = True
-                    _e2.tent = False
+                _at_edge = False
+                if self.last_wh:
+                    _W3, _H3 = self.last_wh
+                    _at_edge = (_e2.x - _e2.w / 2.0 <= _EDGE_TOL
+                                or _e2.y - _e2.h / 2.0 <= _EDGE_TOL
+                                or _e2.x + _e2.w / 2.0 >= _W3 - _EDGE_TOL
+                                or _e2.y + _e2.h / 2.0 >= _H3 - _EDGE_TOL)
+                if _ok_area and _ok_ratio and not _at_edge:
+                    # ⭐ **上板时长门**（用户 2026-10-02 ✓）：`board_s > 0` 时条目要**自出生**
+                    #   走满这么多秒才许转正 ✓（判据别条全过、时长不够 ⇒ 继续当候选 ✓）；
+                    #   `0` = 一帧就上板 ✓（老行为 ✓）。
+                    if self.board_s <= 0 or float(ts) - float(_e2.t0) >= self.board_s:
+                        _e2._boarded = True
+                        _e2.tent = False
             _e2.on_board = _e2._boarded
         # ⭐⭐ **实时算"登记假目标群的平均速度向量"**（用户 2026-10-01 定稿 ✓）：每条登记条目
         #   这一拍相对上一拍的位移 ✓ ⇒ 取**分量中位** ⇒ 这就是"群体一起怎么动" ✓。
@@ -893,6 +1222,8 @@ class ShapeRegistry:
         self.n_entries = len(self.entries)
         self.n_confirmed = sum(1 for e in self.entries if e.confirmed)
         return {"n_entries": self.n_entries, "n_confirmed": self.n_confirmed,
+                # ⭐⭐ 本拍"上板防抖"拦下的次数（诊断/自检 ✓ 用户 2026-10-02 ✓）
+                "dedup": self._dedup_n,
                 # ⭐ 假目标群的**平均速度向量**（px/帧 ✓ 供追踪器预测轨迹 ✓ 用户 2026-10-01 ✓）
                 "avg_vel": self.avg_vel, "avg_vel_n": self.avg_vel_n,
                 "known": list(self.known_idx), "unknown": list(self.unknown_idx),
@@ -903,6 +1234,58 @@ class ShapeRegistry:
                 "snapped": _snapped}
 
     # ---- 查询（给追踪器用 ✓）----
+    def _max_overlap_det_wh(self, e, boxes, ok_sz):
+        """与条目**重叠最多**的检出框的 `(w, h)`（"形状待定"解除时修登记尺寸用 ✓）。
+
+        · 只在**尺寸带内**（`ok_sz` ✓）的检出里挑 —— 碎片/并集不配当"这块砖的形状" ✓；
+        · 重叠 = 交集面积（绝对值 ✓ 不除砖面积 —— "重叠最多"就是盖住它最多的那格 ✓）；
+        · 没有任何带内检出与它重叠 ⇒ `None`（保持原尺寸、待定标记照清 ✓ 下次再修 ✓）。
+        """
+        if e is None:
+            return None
+        _ex0 = float(e.x) - float(e.w) / 2.0
+        _ex1 = float(e.x) + float(e.w) / 2.0
+        _ey0 = float(e.y) - float(e.h) / 2.0
+        _ey1 = float(e.y) + float(e.h) / 2.0
+        _best, _ba = None, 0.0
+        for _i, _b in enumerate(boxes or []):
+            if _i < len(ok_sz) and not ok_sz[_i]:
+                continue                      # 碎片/并集不参与 ✓
+            _cx, _cy = float(_b[0]), float(_b[1])
+            _cw, _ch = float(_b[2]), float(_b[3])
+            _ix = max(0.0, min(_ex1, _cx + _cw / 2.0) - max(_ex0, _cx - _cw / 2.0))
+            _iy = max(0.0, min(_ey1, _cy + _ch / 2.0) - max(_ey0, _cy - _ch / 2.0))
+            if _ix * _iy > _ba:
+                _ba = _ix * _iy
+                _best = (float(_b[2]), float(_b[3]))
+        return _best
+
+    def _max_overlap_unclaimed_det(self, e, boxes, ok_sz, used):
+        """与条目**重叠最多**的【没被认领】检出 ⇒ `(cx, cy, w, h)`（用户 2026-10-02 ✓ 原话：
+        "应该**就近找重叠度最高的没有被认领的检出框**修正砖的位置" ✓ —— 待定中的条目位置
+        一路只被群体推着走 ⇒ 已经飘离砖了 ✗ ⇒ 解除时连**位置**一起修 ✓）。
+        只在尺寸带内、**没被本拍认领**（配对/生长/新建 ✓）的检出里挑 ✓；没有 ⇒ `None` ✓。"""
+        if e is None:
+            return None
+        _ex0 = float(e.x) - float(e.w) / 2.0
+        _ex1 = float(e.x) + float(e.w) / 2.0
+        _ey0 = float(e.y) - float(e.h) / 2.0
+        _ey1 = float(e.y) + float(e.h) / 2.0
+        _best, _ba = None, 0.0
+        for _i, _b in enumerate(boxes or []):
+            if _i in used:
+                continue                          # 别抢别的条目认领过的检出 ✓
+            if _i < len(ok_sz) and not ok_sz[_i]:
+                continue                          # 碎片/并集不参与 ✓
+            _cx, _cy = float(_b[0]), float(_b[1])
+            _cw, _ch = float(_b[2]), float(_b[3])
+            _ix = max(0.0, min(_ex1, _cx + _cw / 2.0) - max(_ex0, _cx - _cw / 2.0))
+            _iy = max(0.0, min(_ey1, _cy + _ch / 2.0) - max(_ey0, _cy - _ch / 2.0))
+            if _ix * _iy > _ba:
+                _ba = _ix * _iy
+                _best = (_cx, _cy, float(_b[2]), float(_b[3]))
+        return _best
+
     def is_known(self, box: Sequence[float]) -> bool:
         """这个框**在册**吗（= 已做实的假目标 ✓ 先验 B 的反面 ✓）。"""
         cx, cy = float(box[0]), float(box[1])
@@ -933,7 +1316,8 @@ class ShapeRegistry:
         """
         return [{"bid": e.bid, "x": e.x, "y": e.y, "w": e.w, "h": e.h,
                  "hits": e.hits, "conf": e.conf, "cls": e.cls,
-                 "ok": bool(e.on_board), "born": e.born}
+                 "ok": bool(e.on_board), "born": e.born,
+                 "pending": bool(getattr(e, "_shape_pending", False))}
                 for e in self.entries]
 
     def confirmed_boxes(self) -> List[Tuple[float, float, float, float]]:

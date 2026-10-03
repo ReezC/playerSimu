@@ -47,6 +47,11 @@ projects/*/测试集/
 # 覆盖掉；两边的证书也一直对不上（cert.pem 不一致 = 键盘连不上）。
 # 名单口径见 tools/config_sync.py 的 LOCAL —— selftest_config_sync 会验有没有漏。
 config/deploy.json
+# A 机本地的"小地图推流区域"三件（屏幕坐标 ⇒ 各机不同，2026-10-02 补登记）：
+# 老的单值那份、按地图 id 的那一堆、以及"现在该推哪张图"的记忆。
+config/minimap_region.json
+config/minimap_regions/
+config/minimap_current.json
 remote_kbd/certs/key.pem
 config/probe_calib.json
 config/ui.yaml

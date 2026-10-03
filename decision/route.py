@@ -216,16 +216,36 @@ class _PausableJob:
 
     # ⭐ 执行器回值的**统一形状**（2026-09-27 结构整理 ✓）：四个 `_out` 原来各拼一份一模一样的
     #   dict ✗ —— 现在**一处拼** ✓，形状与以前逐字一致 ✓。
-    def _result(self, move, jump=False, dir=0, reassert=None):
+    def _result(self, move, jump=False, dir=0, reassert=None, replan=False):
         """`reassert=None` = **不带**这个键（走 / 跳从不重发按键 ✗，带上反而误导 ✓）；
-        `False/True` = 带上（爬 / 下跳会重发 ✓）。"""
+        `False/True` = 带上（爬 / 下跳会重发 ✓）。
+        `replan=True` = **位置状态返回非目标**（上了别的绳 / 站在别的集合）⇒ 通知上层重启寻路
+        （用户 2026-10-02 ✓ 治本：align 阶段按住 ↑ 是设计，但被非目标绳吸住时该立刻重启，不卡住）。"""
         out = {"phase": self.phase, "move": int(move), "jump": bool(jump),
                "dir": dir, "note": self.note,
                "done": self.phase == self.DONE,
                "failed": self.phase == self.FAILED}
         if reassert is not None:
             out["reassert"] = bool(reassert)
+        if replan:
+            out["replan"] = True
         return out
+
+    def _cancel_common(self, why):
+        """外部叫停的**统一收尾**（用户 2026-10-02 #8 ✓）—— 四个 `cancel()` 共用这一处。
+
+        ⚠ 为什么必须这么做（原风险）：`cancel()` 原来**只置 `FAILED` + note**，**一个运行时
+          字段都不清** ✗；而 `retry()` 要清的字段一大把（ClimbJob ~28 个）⇒ 将来谁复用同一个
+          job 实例、或者新加字段忘了同步，就会带着**上一个任务的脏锚**（历史踩过：
+          `_diag_at` / `_climb_sig` / `_rope_seen` ✓）。⇒ 让 `cancel` **复用 `retry` 的清单**
+          （一处口径 ✓：以后加字段只改 `retry`✓），再盖成 `FAILED` + 原因 ✓。
+        ⚠ `attempt` 会被 `retry()` +1：取消后这个对象就作废了，无副作用 ✓（用例只看相位/note ✓）。
+        ⚠ **这里不碰 `_out`**：四个子类的 `_out` 形状不同（走是 `_out(move)`、跳是 `_out(move, jump)`
+          ⇒ 没有共同的调用形状 ✗）—— 回值由各自的 `cancel()` 自己拼 ✓（见那四处 ✓）。
+        """
+        self.retry()
+        self.phase = self.FAILED
+        self.note = str(why)
 
     # ⭐ 共享的「进步跟踪」骨架（2026-09-27 结构整理 ✓）：ClimbJob 的"爬不动"与 WalkJob 的
     #   "走不动"原来**各写一遍** `best + best_at + 卡住时长` 的比较 ✗ —— 现在一处 ✓。
@@ -503,9 +523,40 @@ class ClimbJob(_PausableJob):
         #: 上一拍 `_out` 请他按的**竖直键**（+1 上 / -1 下 / 0 没按 ✓）—— 用来判"这一拍感知
         #: 说不在绳上"是不是**我们自己松的键**（见 `update` 里那段 ✓）。
         self._last_vert = 0
+        #: ⭐ **这一拍位置状态广播说"人在本任务那根绳的绳段里"**（纯几何、**与按键许可无关**
+        #:   ✓ = `update` 里那个 `_in_rope_span`）—— 全项目只有一处用途：给 `_out` 那条
+        #:   "自动按住 ↑"**开例外**（用户 2026-10-02 方案 B ✓：跳之前**不按 ↑**，但人
+        #:   **已经挂在绳上**时照旧按住 ⇒ 接着爬；没有 ↑ 就没有"按键许可" ⇒ 广播给不出
+        #:   `ladder_id` ⇒ 认不出"已上绳" ⇒ 会去横向对齐 = **在绳上按左右等于松手掉下来** ✗）。
+        #: ⚠ 它是**布尔**、不是时刻 ⇒ **别**加进 `_ANCHORS`（那张表 `_resume` 会给它加 dt ✗）。
+        self._in_rope_span_now = False
+        #: ⭐ **这一拍离绳多远**（世界像素；`None` = 还没有 x 读数 ✓）—— 由 `_align_step` 在**唯一
+        #:   一处**记账 ✓（`update` 里那两处 `self.x - px` 都改成读它 ✓）。
+        #:   ⚠ 全项目只有两个读者：`walking_to_ladder()`（✅ 就是它要回答的）与"斜跳飞行中"那支 ✓
+        #:     —— **别在别处再算一遍距离** ✗（约定 10：一条口径一处实现 ✓）。
+        self._last_dx = None
         #: 「**按过跳了**」（`_out` 里 `jump=True` 的拍都会置上 ✓，**一次就够、永不清** ✓）——
         #: "从按下跳到攀爬成功期间不许进 attack"（用户 2026-09-27 ✓）要用它，见 `holds_player` ✓。
         self._jumped_once = False
+        #: ⭐ **"按跳之后 y 升过没有"**（用户 2026-10-03 ✓ 口径「A + 发呆重试」）——
+        #:   用来把两种情况分开：**压根没挂上**（跳那一下没贴上绳 ⇒ 该退回重试 ✓）
+        #:   与 **挂上了但爬不动**（y 先往上走过才停住 ⇒ 照 2026-09-29 那条"继续按住 ↑"✓）。
+        #:   `_jump_y` = 按跳那一拍的 y（基准）；`_rose_since_jump` = 之后有没有走过
+        #:   `STALL_GAIN_PX`（现成那把"y 动没动"的尺 ✓ 不新造数 ✓）。
+        self._jump_y = None
+        self._rose_since_jump = False
+        #: ⭐ **这一轮强制重走对齐**（只在"没挂上 ⇒ 退回重试"那一轮为 True ✓）：
+        #:   因为那时广播可能**还**说"在绳上"（正是误判本身 ✗）⇒ 会当场被 ①' 那条
+        #:   "已在绳上 ⇒ 跳过横向对齐"顶回去 ⇒ 重试变成空转 ✗。按跳那一下起就清掉 ✓
+        #:   （那时该不该"跳过对齐"已经由 `/` 新的一轮自己决定 ✓）。
+        self._force_align = False
+        #: ⭐ **"锁定目标在哪边"的注入位**（`() -> +1/-1/0` ✓）—— 由 agent **每拍重挂**
+        #:   （`agent._climb_tick` 里那一行 ✓；⚠ 锁定目标会换 ⇒ 必须现读，不许建任务时定死 ✗）。
+        #:   ⚠ **与 `DropJob` 同一个属性名**（那边是"跳下绳子朝哪边按"✓）：**注入一处、两处读**
+        #:   （约定 10 ✓）；没有目标 / 没注入 / 回调抛异常 ⇒ 读的地方一律当 `0` ✓（不许报错 ✗）。
+        #:   本任务的用途只有一处：**到顶后"再按住一会儿"那几拍朝目标按方向键**（用户 2026-10-02 ✓
+        #:   见 `_arrive_step` 与 `_arrive_dir` ✓）。
+        self._target_dir_fn = None
         #: 「跳下绳梯」第一步（先单独按住方向键一拍）做过了没 —— 只做一次。
         self._press_dir_done = False
         #: 「按跳」的那一拍（点按 TAP_ON_S；None = 还没按）。
@@ -574,10 +625,42 @@ class ClimbJob(_PausableJob):
         #     · 感知说不在 ⇒ **只要位置还在绳段里就不清** ✓（那多半是**我们自己刚把键松开**
         #       —— 比如下爬"点按重试"那几拍 ✓，位置当然没变）⇒ 仍算在绳上 ✓；
         #     · 位置也出了绳段（或这一拍读数判不出来 ✓）⇒ 清掉 ✓（那是真离开了 ✓）。
+        # ⭐⭐ **斜跳那几拍不许采信"按键许可"**（用户 2026-10-03 ✓ 口径 A）：
+        #   斜跳是"**先朝绳走 + 按住 ↑**（第 1 拍）、**第 2 拍才按跳**"（见下面 `_diag_arming`
+        #   那一段 ✓）—— 那几拍的 ↑ 是**"为了抓绳"发的** ✗，**不是"已经在绳上"的证据** ✗。
+        #   而位置状态那把尺**很宽**（`LADDER_DX=24` / `LADDER_PAD=12`）⇒ 飞行中怪/人的框
+        #   扫过绳段就会给出 `ladder_id` ⇒ **许可 + 几何同时成立** ⇒ 下面 `_rope_seen` 一锁上
+        #   就"跳过横向对齐、也不按跳"⇒ **在绳下按住 ↑ 发呆** ✗（用户现场：森林迷宫III
+        #   底层"一直想往右走、角色往左"，事后就是这种卡住 ✓）。
+        #   ⇒ 这几拍把 `_lid_ok` **一律压成 False** ✓（于是下面 `dir>0` 那支会把记忆清掉 ✓
+        #     上爬本来就不靠记忆 ✓）；落到绳上之后再采信 ✓。
+        #   ⚠ 只压**本执行器**的判据 ✗ —— 感知层那条"没按 ↑/↓ 不算在绳上"**一个字没动** ✓
+        #     （别顺手去掉：那是治"碰到绳子就卡住"的规矩 ✓）。
+        _diag_now = bool(self._diag_flying) or (self._diag_arming is not None)
         _lid_ok = (ladder_id is not None and str(ladder_id) == self.ladder_id)
         _in_rope_span = bool(on_rope_pos is not None
                             and str(on_rope_pos) == self.ladder_id)
-        if _lid_ok:
+        # ⭐ 存一份给 `_out`（它只有这一个用途：**跳之前也按住 ↑ 的那个例外** ✓，见 `_out` ✓）
+        self._in_rope_span_now = _in_rope_span
+        # ⭐⭐ **上了非目标绳 ⇒ 通知重启寻路**（用户 2026-10-02 ✓ 治本）：
+        #   align 阶段按住 ↑ 是设计（用户 2026-09-27 定的"上爬一路按住 ↑"✓），但角色被
+        #   **别的绳**吸住时，位置状态返回 ladder_id=别的绳（非目标）⇒ 立刻重启寻路，不卡在
+        #   align（"龙族打猎场"bug：角色被 L1 吸住、往左走、卡左角 ✗）。
+        #   ⚠ 只认**带按键许可的 `ladder_id`**（广播说真在绳上 ✓）—— `on_rope_pos`（位置在
+        #   绳段里）不认：角色只是经过绳段、还没真吸上，不该重启 ✗。
+        #   ⚠ `vert=0`：replan 这一拍不该按 ↑（要重启了，别再按 ↑ 把人按在别的绳上 ✗）。
+        if (ladder_id is not None and str(ladder_id) != self.ladder_id
+                and self.phase not in (self.DONE, self.FAILED)):
+            self.note = ("上了 %s（非目标 %s）⇒ 通知重启寻路"
+                         % (ladder_id, self.ladder_id))
+            return self._out(0, False, vert=0, replan=True)
+        if _lid_ok and not _diag_now:
+            # ⭐⭐ **斜跳那几拍不许把"许可"锁成记忆**（用户 2026-10-03 ✓ 口径 A）：那几拍的
+            #   ↑ 是"为了抓绳"发的、而位置状态那把尺很宽（`LADDER_DX=24`/`PAD=12`）⇒ 飞行中
+            #   扫过绳段就会给 `ladder_id` ⇒ 记忆一锁上就"跳过横向对齐、也不按跳"⇒
+            #   **绳下按住 ↑ 发呆** ✗（用户现场 ✓）。
+            #   ⚠ `_lid_ok` 本身**不压**（见上面 `_diag_now` 的说明）：斜跳"吸上了"那条判据
+            #     读的正是广播 ✓ 压了它就永远吸不上 ⇒ 用例当场红 ✓（真踩过 ✓）。
             self._rope_seen = True
         elif self.dir > 0:
             # ⭐ **上爬一律以广播的 `ladder_id` 为准**（用户 2026-09-27 定的第 1 条：
@@ -609,31 +692,29 @@ class ClimbJob(_PausableJob):
                 and self.phase not in (self.DONE, self.FAILED)
                 and self._arrived_at is None):
             self.phase = self.ALIGN
-            # 下面这些锚点**全清**：它们都是"这一轮尝试"的进度，重走流程就得从零算
-            #（同 `retry()` ✓）—— 留着就会出现"刚回来第一拍就判爬不动/掉下来了" ✗。
-            self._in_tol_since = None
-            self._on_ladder_since = None     # 下爬"稳住 hold_ms"那一段也重算 ✓
-            self._rope_seen = False          # 「确认过在绳上」那条记忆也清（重走一遍流程 ✓）
-            self._off_since = None
-            # 对齐阶段的"按过方向键"也重算（同 `retry()` ✓）：不然会被上一轮的
-            # 「对齐绳梯移动延迟」挡住第一拍 ✗。
-            self._press_dir = 0
-            self._press_at = None
-            self._jump_tried = False        # 重新走一遍 ⇒ "按过跳了没"也从零算 ✓
-            self._armed_at = None           # 同理：「对齐完成」这个哨兵也清掉（对齐要重来 ✓）
-            self._retrying = False
-            self._dir_tap_at = None         # "点按到一半"也一样，别带着半个状态回来 ✗
-            self._retry_stage = ""          # 重来那一小段（等 y 稳定 / 点按）同理从零 ✓
-            self._diag_done = False         # 斜跳也重新武装（重走一遍流程 ⇒ 允许再斜跳一次 ✓）
-            self._diag_flying = False       # "飞行中"同理清掉（不许带着上一轮的飞行状态回来 ✗）
-            self._diag_y0 = None
-            self._diag_left = False
-            self._diag_at = None            # 起跳时刻也清（脏状态不留 ✓）
-            self._diag_arming = None        # 斜跳"起手了"那步同理清（残留会误触发按跳 ✗）
-            self._align_pressed = False     # 重走一遍 ⇒ 方向键也算没发过（要先点按一次 ✓）
+            # 这一轮尝试的锚点**全清**（口径与实现都只有 `_reset_round` 一处 ✓）。
+            # ⚠ `clear_jump=False`：这一支**不动** `_jumped_once`（老行为一字不变 ✓）。
+            self._reset_round()
             self.note = "被战斗打断 %.1fs ⇒ 重新走一遍上绳流程%s" % (
                 _paused,
                 "（已经在绳上：跳过横向对齐，接着爬）" if _on_ladder else "")
+        # ---- ①'' **这一轮压根没挂上 ⇒ 退回重试**（用户 2026-10-03 ✓ 口径「A + 发呆重试」）----
+        # 判据（**与 2026-09-29 那条定稿不冲突** ✓）：`climb_stalled`（广播说 y 在「移动操作
+        # 尝试间隔」内没变 ✓）**且** "**按跳之后 y 一次都没往上走过**"（`_rose_since_jump` ✓）
+        # ⇒ 那不可能是"挂在绳上爬不动"（真挂上会立刻往上走 ✓）⇒ 是**跳那一下没贴上绳**
+        # ⇒ 退回 `ALIGN` 重新对齐 + 重新按跳 ✓；而"升过之后才停住" ⇒ **不退**（继续按住 ↑ ✓
+        # 那是 2026-09-29 定稿那条 ✓）。
+        # ⚠ **不新造次数上限**：反复重试的兜底就是「寻路超时时间」（用户 ✓ 同约定 157 #2）。
+        # ⚠ `_force_align`：广播这会儿**可能还**说"在绳上"（那正是误判本身 ✗）⇒ 不挡住 ①'
+        #   那条"已在绳上 ⇒ 跳过横向对齐"的话，重试会被当场顶回去 ⇒ 空转 ✗。
+        self._track_rose(py)
+        if (self.phase == self.CLIMB and climb_stalled and not climb_failed
+                and self._jumped_once and not self._rose_since_jump):
+            self._reset_round(clear_jump=True)
+            self.phase = self.ALIGN
+            self._force_align = True
+            self.note = ("这一轮没挂上（按跳之后 y 一次都没往上走）⇒ 退回重来："
+                         "重新对齐 + 重新按跳")
         if now - self._t0 > self.timeout_s:
             return self._fail("超时 %.0fs：没能在 %s 上完成上绳" % (
                 self.timeout_s, self.ladder_id))
@@ -642,22 +723,17 @@ class ClimbJob(_PausableJob):
         # 在绳上按左右键在游戏里就是"松手" ⇒ 人会掉下来 ✗（这是这个分支唯一存在的理由）。
         # 跳过之后**仍然算重走了一遍流程**：交给 ② 那段按当前状态重新决定
         #（下爬重新起算"稳住 hold_ms"、上爬接着按住 ↑ / 重新判爬不动 ✓）。
-        if self.phase == self.ALIGN and _on_ladder:
-            self._in_tol_since = None
-            self.note = "已在 %s 上（战斗后回来）⇒ 跳过横向对齐，接着 %s" % (
-                self.ladder_id, "爬" if self.dir > 0 else "下爬")
-            self.phase = self.CLIMB
-            self._retrying = False          # 已经在绳上了 ⇒ 不再是"回来重来"那一轮 ✓
-            self._jump_tried = False
-            # ⚠ 「人已经在绳上」不是"对齐完成"那件事 ⇒ 哨兵也清掉：不然 agent 会把**上一次**
-            #   对齐的时刻当成新的一次去复核（那一步早就跳过了 ✓）
-            self._armed_at = None
-            self._retry_stage = ""          # 点按/等 y 那一小段也收干净（人已经在绳上）✓
-            self._dir_tap_at = None         # 那一轮的点按也收干净（点按本身把它抓上来了 ✓）
-            self._diag_flying = False       # "斜跳飞行中"也收干净（已经吸上了 ✓）
-            self._diag_y0 = None            # 起跳高度 / 起跳时刻也收干净（吸上了用不着 ✓）
-            self._diag_left = False
-            self._diag_at = None
+        # ⚠ `and not self._force_align`：**"没挂上 ⇒ 退回重试"那一轮**里，广播可能**还**说
+        #   "在绳上"（那正是误判本身 ✗）⇒ 不挡住这一支的话，刚退回来就被顶成 CLIMB ⇒ 空转 ✗
+        #   （用户 2026-10-03 ✓；按跳那一下起 `_force_align` 就清掉 ✓ 见 `_out` ✓）。
+        if (self.phase == self.ALIGN and _on_ladder and not self._force_align
+                and not _diag_now):
+            # ⚠ `and not _diag_now`（用户 2026-10-03 ✓ 口径 A）：斜跳飞行中广播可能**误报**
+            #   "在绳上" ⇒ 不挡住的话会当场被顶成 CLIMB ⇒ 不再按跳、在绳下按住 ↑ 发呆 ✗。
+            #   （斜跳自己的"吸上了 ⇒ 收飞行相"那条判据不在这儿、也不受它影响 ✓ —— 那一条
+            #     读的是广播原件 ✓ 见 `_align_step` 的斜跳段 ✓。）
+            self._handoff_to_climb("已在 %s 上（战斗后回来）⇒ 跳过横向对齐，接着 %s" % (
+                self.ladder_id, "爬" if self.dir > 0 else "下爬"))
 
         if self.phase == self.ALIGN:
             _o = self._align_step(now, px, py, _on_ladder)
@@ -862,7 +938,18 @@ class ClimbJob(_PausableJob):
             # （`base_hold_ms`，不含端到端延迟 ✓）—— 理由是**游戏机制**（"迈上平台"那一步
             # 要按着 ↑），跟读数延迟无关；端到端延迟只补偿在「对齐稳住」那边（对齐依赖读数 ✓）。
             if (now - self._arrived_at) * 1000.0 < self._arrived_hold:
-                return self._out(0, False, hold_dir=True)
+                # ⭐ **到顶之后朝「锁定目标」那边按住方向键**（用户 2026-10-02 ✓ 原话："攀爬
+                #   (追击)优化：到顶时如果存在锁定目标，就按住向着该目标的方向键（注意后续
+                #   chase 的方向键处理）"）—— 这一段 ↑ 还要按住（游戏里"迈上平台"那一步 ✓），
+                #   顺手把**水平方向**也给上 ⇒ 一落地就朝目标走 ✓（不然要等这一小段过完、
+                #   由 chase 接手才动 ✓）。
+                #   ⚠ **方向与后续 chase 用同一处口径**（就是用户提醒的那件事 ✓）：两边都是
+                #     "**画面 x 的左右**"（chase 那边是 `_steer(target.x - px)`、`px = ws.player.x` ✓
+                #     见 `agent.tick` ✓）⇒ 交接那一拍**不会翻向** ✓（`KeyState` 只在键集变化时
+                #     才发键 ⇒ 方向一样时对面看到的是"一直按着" ✓）。
+                #   ⚠ **没有锁定目标 / 目标正好同列 ⇒ `_arrive_dir()` 给 0** ⇒ 与加这个功能之前
+                #     **一字不差**（只按住 ↑ ✓ 兼容底线 ✓）。
+                return self._out(self._arrive_dir(), False, hold_dir=True)
             self.phase = self.DONE
             self.note = self._arrived_why
             return self._out(0, False)
@@ -917,13 +1004,56 @@ class ClimbJob(_PausableJob):
                 self.phase = self.DONE
                 self.note = why
                 return self._out(0, False)
-            self.note = ("%s（再按住 ↑ %d ms 再松）" % (why, self._arrived_hold))
-            return self._out(0, False, hold_dir=True)
+            # ⭐ 到顶那一刻就把**朝目标的方向**给上（用户 2026-10-02 ✓ 见上面 `_arrived_at`
+            #   那一支的说明 ✓）—— 同一处口径（`_arrive_dir()` ✓），别在这儿另写一份 ✗。
+            _ad = self._arrive_dir()
+            self.note = ("%s（再按住 ↑ %d ms 再松%s）"
+                         % (why, self._arrived_hold,
+                            "" if not _ad
+                            else "，并朝目标按住 %s" % ("→" if _ad > 0 else "←")))
+            return self._out(_ad, False, hold_dir=True)
 
         return None
 
+    def _handoff_to_climb(self, note):
+        """⛓ ALIGN → CLIMB 的交接：**唯一一处**（约定 10 ✓）。
+
+        谁调（两个）：
+          · `update` 里"**已在绳上**（战斗后回来）"那支 ✓（口径没变 ✓）；
+          · `_align_step` 里"**斜跳吸上绳**"那一支 ✓（用户 2026-10-03 现场：
+            "现在一跳上绳立马就跳下来了" ✗ —— 见那边的长注释 ✓）。
+
+        为什么要抽出来：这一串是"**这一轮尝试的全部锚点**"，抄一遍必漏一个 ✗ ——
+        漏掉哪个都是"脏状态带到下一轮"（`_armed_at` 漏 ⇒ agent 拿旧对齐时刻复核；
+        `_diag_arming` 漏 ⇒ 下一拍又按一次跳 ✗ ⇒ 正好就是用户报的那个"跳下来" ✗）。
+
+        ⚠ 「人已经在绳上」不是"对齐完成"那件事 ⇒ `_armed_at` 哨兵也清掉：不然 agent 会把
+          **上一次**对齐的时刻当成新的一次去复核（那一步早就跳过了 ✓）。
+        """
+        self._in_tol_since = None
+        self.note = str(note)
+        self.phase = self.CLIMB
+        self._retrying = False          # 已经在绳上了 ⇒ 不再是"回来重来"那一轮 ✓
+        self._jump_tried = False
+        self._armed_at = None
+        self._retry_stage = ""          # 点按/等 y 那一小段也收干净（人已经在绳上）✓
+        self._dir_tap_at = None         # 那一轮的点按也收干净（点按本身把它抓上来了 ✓）
+        self._diag_flying = False       # "斜跳飞行中"也收干净（已经吸上了 ✓）
+        self._diag_y0 = None            # 起跳高度 / 起跳时刻也收干净（吸上了用不着 ✓）
+        self._diag_left = False
+        self._diag_at = None
+        # ⚠ 这里**不需要**清 `_diag_arming`（也刻意不留那一行 ✗ —— 它是个**测不到**的防御）：
+        #   两个入口都保证进门时它就是空的 —— `update` 那支靠 `not _diag_now` ✓（那个判据
+        #   里就含 `_diag_arming is None` ✓）；`_align_step` 的吸上支只在 `_diag_flying`
+        #   为真时进 ⇒ 而"按跳"那一拍已经把 `_diag_arming` 清掉了 ✓。
+        #   （反向验证实测：把那一行删掉，用例照样绿 ⇒ 说明它永远不生效 ✓。）
+
     def _align_step(self, now, px, py, _on_ladder):
         """① 对齐相：斜跳 / 横向对齐 / 按跳（`None` = 对齐好了，落到下一段 ✓）。"""
+        # ⭐ **这一拍离绳多远 —— 唯一记账**（`_last_dx` ✓，用户 2026-10-02）：
+        #   读者两处：`walking_to_ladder()`（"还在起跳距离外朝绳走么" ✓ 给 agent 每拍复核用 ✓）
+        #   与下面"斜跳飞行中"那一支 ✓ ⇒ **一处算、两处读** ✓（约定 10；别在别处再算一遍 ✗）。
+        self._last_dx = None if px is None else (self.x - float(px))
         # ---- ①'' **斜跳飞行中：朝绳走 + 按住 ↑**（用户 2026-09-27 现场）----
         # 原话："现在斜跳上绳梯会有「**经过绳梯却没有上去**」的现象，**空中吸附绳梯的
         #   条件是「正在按住 ↑」**"。
@@ -937,7 +1067,23 @@ class ClimbJob(_PausableJob):
         #   误差范围」，否则刚起跳那几拍就自己结束了 ✗）⇒ 之后交回下面的老逻辑 ✓。
         if self._diag_flying:
             if _on_ladder:
-                self._diag_flying = False        # 吸上了 ⇒ 下面"已在绳上"那支接管 ✓
+                # ⭐⭐ **吸上绳 ⇒ 本拍就交接到上爬，而且这一拍只按住 ↑**
+                #   （用户 2026-10-03 现场原话："**现在一跳上绳立马就跳下来了**"✓）：
+                #   以前这里只清掉"飞行中"就**继续往下走** ✗ ⇒ 落到下面"斜跳第 1 拍起手 /
+                #   对齐按跳"那两支 ⇒ ① **按住左右**（在绳上按左右 = **松手** ⇒ 掉下来 ✗）
+                #   ② 下一拍**又按一次跳**（在绳上按跳 = **跳下来** ✗）—— 现场 `behavior.log`
+                #   实证（17:03:54）：`climb_on_ladder v=1` 之后紧接着两条
+                #   "斜跳上绳：离绳 -12 px ⇒ **先按住 ← 朝绳走**" + "⇒ **按跳**"，
+                #   然后 `climb_on_ladder v=0`（掉了）⇒ 一秒多一轮**死循环** ✓。
+                #   ⇒ 现在：交接走 `_handoff_to_climb`（**唯一一处** ✓ 它会把这一轮的锚点全清，
+                #     包括 `_diag_arming` —— 那正是"下一拍又按一次跳"的来源 ✗），
+                #     本拍返回"只按住 ↑"（不按跳、不按左右 ✓）。
+                #   ⚠ 交接**必须在本拍**（不能拖到下一拍）：`agent` 的 `route_diag` 判"吸上 /
+                #     没吸上"看的就是**这一拍相有没有变成 CLIMB**（`agent.py` 那段 ✓）——
+                #     拖一拍会被记成"结束·没吸上"✗（用例当场红 ✓ 真踩了 ✓）。
+                self._handoff_to_climb("斜跳吸上 %s ⇒ 交给上爬"
+                                       "（本拍只按住 ↑：不按跳、不按左右 ✓）" % self.ladder_id)
+                return self._out(0, False, vert=1)
             elif py is not None:
                 if self._diag_y0 is None:
                     self._diag_y0 = float(py)
@@ -957,14 +1103,14 @@ class ClimbJob(_PausableJob):
                     and (float(now) - self._diag_at) >= self.stall_s):
                 self._diag_flying = False
             if self._diag_flying:
-                _dxf = self.x - float(px)
+                _dxf = self._last_dx          # 本拍离绳多远（本函数开头那**唯一一处**算的 ✓）
                 _sgf = 1 if _dxf > 0 else (-1 if _dxf < 0 else 0)
                 self.note = ("斜跳飞行中：朝绳%s + **按住 ↑**"
                              "（空中吸绳要 ↑ 一直按着，跳不再按 ✓）"
                              % ("→" if _sgf > 0 else ("←" if _sgf < 0 else "（已对上）")))
                 return self._out(_sgf, False, vert=1)
 
-        dx = self.x - float(px)
+        dx = self._last_dx          # 本拍离绳多远（本函数开头那**唯一一处**算的 ✓）
         # ⭐ **斜跳第 2 拍**（上一拍已经发过"朝绳走" ⇒ 这一拍**才按跳** ✓，见下面第 1 拍那段）——
         #   ⚠ 放在 `|dx| > tol` 判断**之前**：朝绳走了一步可能就进容差了，那一拍**照样要跳** ✓
         #   （这一轮的目的就是跳上去 ✓）。`_out` 里按了跳会清 `_align_pressed` ⇒ 下一轮又要点 ✓。
@@ -1026,8 +1172,11 @@ class ClimbJob(_PausableJob):
                              "⇒ **先按住 %s 朝绳走**（下一拍再按跳 ✓）"
                              % (dx, self.near_px, self.jump_start_px,
                                 "→" if sign > 0 else "←"))
-                # ⚠ 竖直方向**一律 ↑**（`vert=1`）—— 空中吸附绳梯的条件就是"正在按住 ↑" ✓
-                return self._out(sign, False, vert=1)   # 只朝绳走 + 按住 ↑（**不按跳** ✓）
+                # ⚠ 竖直方向**交给 `_out` 那条"自动按住 ↑"**（`vert=None` ✓，用户 2026-10-02）：
+                #   这一拍**还没按跳** ⇒ 第一次爬的这一轮**不按 ↑**（旧写法写死 `vert=1` ⇒
+                #   一进这个区间 ↑ 就按住 ✗，"从任务下达一直被按住"里有它一份 ✓）；
+                #   已经按过跳 / 人已在绳段里 ⇒ 由那条规则照旧按住 ✓（例外见 `_out` ✓）。
+                return self._out(sign, False)   # 只朝绳走（**不按跳**；↑ 由规则决定 ✓）
             # 「**对齐绳梯移动延迟(ms)**」（用户 2026-09-27 加的参数）：对齐 x 时
             # **两次按下方向键之间至少要隔这么久**。怎么算"一次按下"：**同方向的连续
             # 按住算一次**（`_press_dir` 记着现在按着哪边）—— 所以远距离那种"一口气
@@ -1222,6 +1371,113 @@ class ClimbJob(_PausableJob):
         return bool(self._arrived_at is not None
                     and self.phase not in (self.DONE, self.FAILED))
 
+    def _arrive_dir(self):
+        """**到顶"再按住一会儿"那几拍，水平方向按哪边**（`+1` 右 / `-1` 左 / `0` 什么都不按 ✓）。
+
+        口径（用户 2026-10-02 ✓ 原话："到顶时**如果存在锁定目标**，就按住**向着该目标**的方向键
+        （注意后续 chase 的方向键处理）"）：
+          · **有锁定目标** ⇒ **朝它**（读注入的 `_target_dir_fn()` ✓ —— 和"跳下绳子"那次
+            **同一处注入** ✓ 一处实现 ✓）；没有注入 / 回调抛异常 ⇒ 当"没有目标" ✓（**绝不
+            因为拿不到目标就报错或停住** ✗，同 `DropJob._detach_dir` 那条纪律 ✓）；
+          · **没有目标 / 目标正好同列** ⇒ `0` = **老行为**（只按住 ↑ ✓ 兼容底线 ✓）。
+        ⚠ `0` 里包含"同列"：**别瞎挑一边**（挑错了就是朝反方向迈出平台边 ✗ —— 同
+          `agent._target_dir` 的口径 ✓）。
+        ⚠ 与**后续 chase** 的方向口径**同一条**（都是"画面 x 的左右" ✓ 见 `_arrive_step` 那段 ✓）
+          ⇒ 交接那一拍**不翻向** ✓（这正是用户提醒的"注意后续 chase 的方向键处理" ✓）。
+        """
+        fn = getattr(self, "_target_dir_fn", None)
+        if not callable(fn):
+            return 0
+        try:
+            d = int(fn() or 0)
+        except Exception:                     # noqa: BLE001 —— 注入坏了 ⇒ 当"没目标" ✓
+            return 0
+        return 0 if d == 0 else (1 if d > 0 else -1)
+
+    def walking_to_ladder(self):
+        """⭐ 「**离绳还远、正朝绳走**」= **起跳距离外**、还没起跳那一段（用户 2026-10-02 ✓）。
+
+        给 `agent._climb_recheck_walk` **每拍**复核用（用户原话："处于**起跳距离外**向绳梯移动时，
+        每拍查询：如果在当前 foothold 集合有**代价更低的目标**就结束任务"）——
+        这一段时间人还在地上走、"只是朝那边挪"，**换个主意几乎不花代价** ✓。
+
+        成立四条（**任一不成立就 False** ✓）：
+          · ① 还在 `ALIGN` 相（`_climb_step` 之后就不算了 ✓）；
+          · ② **没按过跳**（`_jumped_once` 为假 ✓）—— 按过跳就说明这一轮已经进了攀爬流程，
+               后面那一段该交给 `agent._climb_recheck` 的节点①/② ✓（**别在这儿拦** ✗）；
+          · ③ **人不在绳上**（`_in_rope_span_now` 为假 ✓）—— 在绳上按左右 = 松手掉下来 ✗；
+          · ④ 斜跳**没在进行**（`_diag_arming` / `_diag_flying` 都空 ✓ —— 已经起手跳了就别拦 ✓）。
+        再加上"`|dx| > 起跳距离`"：`dx` 取**本拍算出来的那个**（`_last_dx` ✓，见 `_align_step` ✓）。
+
+        ⚠ `起跳距离 = 0`（默认 ⇒ 斜跳整条关着 ✓）⇒ 只要没对上绳就算 ✓（这正是用户要的那段 ✓）。
+        ⚠ **不自己算距离** ✗：`|dx| > 起跳距离` 这个分档本来就是 `_align_step` 里那段
+          （"一口气按住走过去" vs "斜跳/点按" ✓）—— 这里只读它记账的结果 ✓（约定 10 ✓）。
+        """
+        if self.phase != self.ALIGN or self._jumped_once:
+            return False
+        if self._in_rope_span_now or self._diag_arming is not None or self._diag_flying:
+            return False
+        if self._last_dx is None:
+            return False                       # 没有 x 读数 ⇒ 判不了（不猜 ✓）
+        return bool(abs(float(self._last_dx)) > self.jump_start_px)
+
+    def _reset_round(self, clear_jump=False):
+        """把"**这一轮尝试**"的进度锚点**全清**（重走一遍上绳流程 ⇒ 从零算 ✓ 一处实现 ✓）。
+
+        谁调（**只有这两处** ✓ —— 各写一份迟早漏掉一两个锚点 ✗，而漏掉的表现就是
+        "刚回来第一拍就判爬不动 / 带着半截斜跳状态回来"）：
+          · **被战斗打断太久**（`_paused` ≥ `PAUSE_MIN_S`，见 `update` ✓）⇒ `clear_jump=False`
+            （**老行为一字不变** ✓：那一支原来就不动 `_jumped_once`）；
+          · **这一轮压根没挂上** ⇒ 退回重试（用户 2026-10-03 ✓）⇒ `clear_jump=True`
+            （必须把"按过跳"也归零，否则重来那一轮会一进来就被当成"已经跳过了" ✗）。
+        """
+        self._in_tol_since = None
+        self._on_ladder_since = None     # 下爬"稳住 hold_ms"那一段也重算 ✓
+        self._rope_seen = False          # 「确认过在绳上」那条记忆也清（重走一遍流程 ✓）
+        self._off_since = None
+        # 对齐阶段的"按过方向键"也重算（同 `retry()` ✓）：不然会被上一轮的
+        # 「对齐绳梯移动延迟」挡住第一拍 ✗。
+        self._press_dir = 0
+        self._press_at = None
+        self._jump_tried = False        # 重新走一遍 ⇒ "按过跳了没"也从零算 ✓
+        self._armed_at = None           # 同理：「对齐完成」这个哨兵也清掉（对齐要重来 ✓）
+        self._retrying = False
+        self._dir_tap_at = None         # "点按到一半"也一样，别带着半个状态回来 ✗
+        self._retry_stage = ""          # 重来那一小段（等 y 稳定 / 点按）同理从零 ✓
+        self._diag_done = False         # 斜跳也重新武装（重走一遍流程 ⇒ 允许再斜跳一次 ✓）
+        self._diag_flying = False       # "飞行中"同理清掉（不许带着上一轮的飞行状态回来 ✗）
+        self._diag_y0 = None
+        self._diag_left = False
+        self._diag_at = None            # 起跳时刻也清（脏状态不留 ✓）
+        self._diag_arming = None        # 斜跳"起手了"那步同理清（残留会误触发按跳 ✗）
+        self._align_pressed = False     # 重走一遍 ⇒ 方向键也算没发过（要先点按一次 ✓）
+        if clear_jump:
+            self._jumped_once = False   # ⭐ 新一轮 ⇒ 得**重新按跳**（见上面两条分工 ✓）
+            self._jump_y = None
+            self._rose_since_jump = False
+
+    def _track_rose(self, py):
+        """记账：**按跳之后 y 有没有真的往上走过** → `_rose_since_jump`（用户 2026-10-03 ✓）。
+
+        这是"没挂上"与"挂上了但爬不动"之间**唯一**的判据（见 `update` ①'' 那段 ✓）：
+        真贴上绳会立刻往上走 ✓；没贴上（跳空了 / 斜跳没落上去）则 y 一直不动 ⇒ 后者
+        才该退回重试 ✓。
+        尺子用现成的 `STALL_GAIN_PX`（= 8px，"y 动没动"那一把 ✓ 不新造数 ✓）；
+        方向按 `dir` 分（上爬 y **变小**、下爬 y **变大** ✓）。只记账、**不发键** ✓。
+        """
+        if py is None or not self._jumped_once:
+            return
+        try:
+            y = float(py)
+        except (TypeError, ValueError):
+            return
+        if self._jump_y is None:
+            self._jump_y = y            # 按跳那一拍的 y 当基准 ✓
+            return
+        d = (self._jump_y - y) if self.dir > 0 else (y - self._jump_y)
+        if d >= STALL_GAIN_PX:
+            self._rose_since_jump = True
+
     def retry(self):
         """**失败后重新激活**（用户 2026-09-26：「失败触发后重新激活就行」）。
 
@@ -1280,9 +1536,9 @@ class ClimbJob(_PausableJob):
 
     def cancel(self, why="取消"):
         """外部叫停（比如切了目标/手动关自动）—— 状态收干净，别再按键。"""
-        if self.phase not in (self.DONE, self.FAILED):
-            self.phase = self.FAILED
-            self.note = str(why)
+        # ⚠ **运行时字段一起收干净**（用户 2026-10-02 #8 ✓ 见 `_cancel_common` ✓）——
+        #   原来这里只置相位，带着脏锚被复用就是隐患 ✗。
+        self._cancel_common(why)
         return self._out(0, False)
 
     # ---- 内部 ----
@@ -1531,7 +1787,7 @@ class ClimbJob(_PausableJob):
         self.note = why
         return self._out(0, False)
 
-    def _out(self, move, jump, hold_dir=False, reassert=False, vert=None):
+    def _out(self, move, jump, hold_dir=False, reassert=False, vert=None, replan=False):
         """`hold_dir`：**不按跳也要按住方向键** —— 下跳要求"先按住 ↓，再按跳"。
 
         （爬绳用不到它：那边只有"按住跳 + ↑/↓"一步。）
@@ -1544,17 +1800,31 @@ class ClimbJob(_PausableJob):
         但绝不能再按 ↓**（↓ 是"还挂在绳上"的动作，用户 2026-09-26："松开 ↓"）。
         """
         d = (self.dir if (jump or hold_dir) else 0) if vert is None else int(vert)
-        # ⭐ **向上攀爬只有"按住 ↑"和"补按住 ↑"**（用户 2026-09-27 明确，原话："向上攀爬只有
-        #   「按住 ↑」和「补按住 ↑」，**不能存在「松开 ↑」和「点按 ↑」**"）⇒ 任何走"老规则"
-        #   （`vert=None`）却算出 `dir=0` 的那几拍，**一律改成按住 `self.dir`** ✓ ——
-        #   "补按住"由 `reassert=True` 负责（**只再发一次 PRESS** ✓，绝不先松开 ✓）。
-        # ⚠ 两个例外（**只有**它们能松 ↑）：
+        # ⭐⭐ **上爬的 ↑ 从「按跳那一刻」才开始按**（用户 2026-10-02 ✓ 原话："应该是**按跳之后
+        #   再按住 ↑**，我观察到 ↑ **从任务下达就一直被按住了**"）：`_jumped_once` 是"按过跳
+        #   就一直记着、`retry()` / 被打断重走都**不清**"（见下 ✓）⇒ 这一条同时满足两件事：
+        #     · **跳之前**（对齐走位 / 点按 / 站住等保持窗口）⇒ 走"老规则"算出的 `dir=0`
+        #       **保持 0** ✓ —— 原来一律改成按住 `self.dir` ⇒ 任务一挂上 ↑ 就按住 ✗
+        #       （角色走到绳旁边会**提前把绳抓住 / 被路过的绳粘住**，正是要修的那件事 ✓）；
+        #     · **按跳那一拍起** ⇒ 一路按住（斜跳飞行相 / CLIMB 爬升 / 到顶后再按住 /
+        #       失败重跳与"回对齐"那几拍 ✓）—— 用户 2026-09-27 那条"向上攀爬**只有**「按住 ↑」
+        #       和「补按住 ↑」，不能存在「松开 ↑」和「点按 ↑」"**原样成立** ✓（它管的就是
+        #       跳之后那一段 ✓）；"补按住"由 `reassert=True` 负责（**只再发一次 PRESS** ✓、
+        #       绝不先松 ✓）。
+        # ⭐ **唯一的例外 = 人已经挂在绳上**（用户 2026-10-02 方案 B ✓）：位置状态广播说
+        #   "**这一拍位置就在本任务那根绳的绳段里**"（`_in_rope_span_now` ✓，**纯几何、与
+        #   按键许可无关** ✓）⇒ 照旧按住 ↑ ⇒ 接着爬。为什么必须留着它：没有 ↑ 就没有
+        #   "按键许可" ⇒ 广播给不出 `ladder_id` ⇒ 执行器**认不出"已上绳"** ⇒ 会走 ALIGN 去做
+        #   横向对齐 ⇒ **在绳上按左右在游戏里就是松手掉下来** ✗（任务刚下达时人已经挂在
+        #   绳上那一类 —— 上一段留下的 / 手工站上去的）。
+        # ⚠ 另外两个"能把 ↑ 压成 0"的口子（与上面那条例外正交，只有它们）：
         #   ① **明确传 `vert=0`** 的（下爬的「跳下绳梯」那几拍 ✓ —— 那是"主动松手离开绳"✓，
         #      语义与上爬无关 ✓）；
         #   ② **收工那几处**（`DONE` / `FAILED` / `cancel` ⇒ 该松手了 ✓）。
-        #   ⚠ 所以这段**不改 `move`**：横向对齐的"点按节奏"（「对齐绳梯移动延迟」✓）照旧 ✓，
-        #     只是**竖直方向一路上都按着 ↑** ✓。
-        if d == 0 and vert is None and self.dir > 0 and self.phase not in (self.DONE, self.FAILED):
+        #   ⚠ 所以这段**不改 `move`**：横向对齐的"点按节奏"（「对齐绳梯移动延迟」✓）照旧 ✓。
+        if (d == 0 and vert is None and self.dir > 0
+                and (self._jumped_once or self._in_rope_span_now)
+                and self.phase not in (self.DONE, self.FAILED)):
             d = self.dir
         # ⚠ 记下**这一拍我们请他按的竖直键**（`dir` ✓）—— 下一拍判"感知说不在绳上"是不是
         #   **我们自己松的键**造成的（`_rope_seen` 那条记忆要用 ✓，见 `update` 里那段 ✓）。
@@ -1564,6 +1834,8 @@ class ClimbJob(_PausableJob):
         #   见 `holds_player` ✓。
         if jump:
             self._jumped_once = True
+        # ⭐ 按跳这一下起，"强制重走对齐"那一轮就结束了 ✓（见 `_force_align` ✓）
+        self._force_align = False
         # ⭐ 「**这一轮发过水平方向键没有**」—— 记账**只有这一处** ✓（用户 2026-09-28 要求：
         #   "朝目标绳梯的 x 方向对齐 x（**至少发 1 次点按方向键**）→ 跳 → 按住 ↑，这三步要
         #   循环"）：· **按了跳** ⇒ 这一轮结束（下一轮必须重新发方向键 ✓）；
@@ -1573,7 +1845,7 @@ class ClimbJob(_PausableJob):
             self._align_pressed = False
         elif move:
             self._align_pressed = True
-        return self._result(move, jump, d, reassert=reassert)
+        return self._result(move, jump, d, reassert=reassert, replan=replan)
 
 
 #: 「人**站在那块面上**吗」的判据：`|玩家 y − 脚下那块面的 y|` 超过它就说明**人悬着**
@@ -1640,9 +1912,27 @@ class DropJob(_PausableJob):
         #: ⚠ **目标集合里每条非墙 foothold 的面 y 都收进来**：运行时落点取决于从哪个下跳点
         #:   跳，这里**不预先绑定**那一条 ✓（命中任意一条即算 ✓）。
         self.dst_ys = [float(v) for v in (dst_ys or [])]
-        #: [(中心 x, 左, 右, foothold id)] —— 可下跳的那几条（就近挑）
-        self.spots = [(float(c), float(a), float(b), str(i))
-                      for c, a, b, i in (spots or [])]
+        #: [(中心 x, 左, 右, **面 y**, foothold id)] —— 可下跳的那几条（就近挑）。
+        #: 形状**统一成 5 元组**（与 `WalkJob` 的"落点五元组"同款 ✓）：面 y 是
+        #: `f.y_at(中心 x)`（与 `_set_spans` 同一口径 ✓），给 ALIGN 的"**人是不是站在
+        #: 这一块上**"用 —— 用户 2026-10-02 现场（下跳 ALIGN **只看 x** ⇒ 人掉到别的层
+        #: 也被判成"已经在下跳点上" ⇒ 从错误的层按 ↓+跳 ⇒ 一路穿到最底层 ✗）。
+        #: ⚠ 传**老的 4 元组**（手写用例 / 老调用方）⇒ 面 y 记 `None` ⇒ 那一条**不参与
+        #:   y 校验**（"判不出来不拦"，与 `ground_y is None` 那条**同一个口径** ✓
+        #:   老行为一字不变 ✓）；形状既不是 4 也不是 5 ⇒ 报错（别猜 ✓）。
+        self.spots = []
+        for _s in (spots or []):
+            _s = tuple(_s)
+            if len(_s) == 4:
+                _c, _a, _b, _i = _s
+                self.spots.append((float(_c), float(_a), float(_b), None, str(_i)))
+            elif len(_s) == 5:
+                _c, _a, _b, _y, _i = _s
+                self.spots.append((float(_c), float(_a), float(_b),
+                                   None if _y is None else float(_y), str(_i)))
+            else:
+                raise ValueError(
+                    "可下跳点的形状该是 (中心x, 左, 右, 面y, id)（或老的 4 元组）：%r" % (_s,))
         if not self.spots:
             raise ValueError("下跳任务没有可下跳的 foothold")
         #: 站在 foothold 范围两侧允许的**读数余量**（世界像素，见 `update` 的 ALIGN ✓）
@@ -1814,23 +2104,66 @@ class DropJob(_PausableJob):
             # ⚠ **不再做"下方是不是目标集合"的二审**：那几块 foothold 是**你在编辑器里圈给
             #   这条下跳边**的（`zones.drop_footholds` ✓）⇒ "从这儿跳能到目标"是**你配的意图**
             #   ✓，执行器**不必也不该**再验一遍（同"编辑器编的是意图、连不连通归执行器自洽"✓）。
+            # ---- ⓪ **别在错的层上做下跳**（用户 2026-10-02 现场 ✓，判据**只问广播** ✓）----
+            #   2026-10-02「龙族打猎场卡 40 秒」的根因：这一段原来**只看 x** ⇒ 人从「上层」
+            #   滑落平台、掉到「二楼」时，那个 x 正好落进**上层**某块可下跳 foothold 的
+            #   ±`tol_px` 里 ⇒ 被判成"已经在下跳点上" ⇒ 从**错误的层**按 ↓+跳（在二楼穿平台）
+            #   ⇒ 一路掉到最底层，而任务还在"等落到中层"⇒ 卡死 ✗✗。
+            #   日志铁证：`align→armed` 那一拍 `pos sets=二楼 x=456.7 y=855.5`，而 spots 全是
+            #   上层的面（y≈305）✓。
+            #   ⇒ 两条闸（都只用广播，**执行器不自己算几何** ✓ 同 SKILL 77）：
+            #     · **已经到目标层**（`here_sets` 命中 `dst_set`）⇒ **收工** ✓ —— 他可能是
+            #       掉下来正好落到目标，那是"到"、不是"失败"（用现成的 `_arrived` ✓ 一处口径）；
+            #     · **既不在起跳平台、也不在目标层**（`here_sets` 非空却两边都不沾）⇒
+            #       **这一段做不了 ⇒ 如实失败**，让上层**按现在的位置重算**路线 ✓
+            #       （现场就是掉到二楼 ⇒ 失败 ⇒ 追击重规划 ⇒ 从二楼出发 ✓）。
+            #   ⚠ 脚下**没圈进任何集合**（`here_sets` 空 = 判不出来 / 半空中）⇒ **不拦** ✓
+            #     （继续走流程，"站在对的面上/超时"那两条会兜住 ✓）。
+            #   ⚠ `src_set` 空（手工建的任务 / 老调用方）⇒ 换层那条**不判** ✓。
+            _why = self._arrived(py, here_sets, ground_y=ground_y)
+            if _why:
+                self.phase = self.DONE
+                self.note = _why
+                return self._out(0, False)
+            _here = set(str(v) for v in (here_sets or ()) if str(v))
+            if (_here and self.src_set and self.dst_set
+                    and self.src_set not in _here and self.dst_set not in _here):
+                return self._fail(
+                    "人已经不在起跳的「%s」上了（脚下是「%s」）⇒ 这段下跳做不了，"
+                    "交给上层按现在的位置重算"
+                    % (self.src_set, "／".join(sorted(_here))))
+            # ---- ① "就在下跳点上" = x 命中 **且** 脚下那块面就是它的面（y 判据 ✓）----
+            #   ⚠ y 那把尺**只问广播的 `ground_y`**（= 位置状态给的"脚下那块面的 y"✓，
+            #     与"是不是悬着"那条（`_hanging`）**同一把尺** `FOOT_GAP_PX` ✓ 不新造 ✓）。
+            #   `ground_y` / 该点的面 y 任一拍拿不到（None）⇒ **退回只看 x** ✓
+            #   —— "判不出来不拦"，老用例 / 老调用方行为一字不变 ✓。
+            _gy = None if ground_y is None else float(ground_y)
             _hit = None
-            for _c, _a, _b, _fid in self.spots:
+            for _c, _a, _b, _fy, _fid in self.spots:
                 if _a - self.tol_px <= float(px) <= _b + self.tol_px:
-                    _hit = (_c, _a, _b, _fid)
-                    break
+                    if _gy is None or _fy is None or abs(_gy - float(_fy)) <= FOOT_GAP_PX:
+                        _hit = (_c, _a, _b, _fy, _fid)
+                        break
             if _hit is not None:
                 self._pick = _hit
                 self._in_tol_since = None    # 这套"站住计时"已经不用了（字段留给 DETACH 清 ✓）
-                self.note = ("已经在可下跳的 fh %s 上（x 落在 %.0f~%.0f）⇒ 直接按住 ↓"
-                             % (_hit[3], _hit[1], _hit[2]))
+                self.note = ("已经在可下跳的 fh %s 上（x 落在 %.0f~%.0f%s）⇒ 直接按住 ↓"
+                             % (_hit[-1], _hit[1], _hit[2],
+                                "" if (_gy is None or _hit[3] is None)
+                                else "、脚下那块面差 %.0f px" % abs(_gy - float(_hit[3]))))
                 self.phase = self.ARMED
             else:
+                # ⚠ 这里**不做"重挑点"**（用户 2026-10-02 ② 的另一半，实测是空操作 ✓ 说明如下）：
+                #   `spots` **全部来自起跳集合**（`zones.drop_footholds` 给的就是 `from` 集合
+                #   那几块面 ✓）⇒ 人已经不在这一层时，重挑出来的还是同层的点 ⇒ 朝它走也走不到
+                #   ✗。而"人到底在哪一层"这件事**只有广播说得清** ⇒ 交给上面 ⓪ 的两条闸：
+                #   到了目标层 ⇒ 收工 ✓ / 在别的已知集合 ⇒ 失败让上层重算 ✓；**判不出来**
+                #   （集合空）⇒ 就是下面这条：不许 ARMED，照旧走流程等它落定 ✓。
                 if self._pick is None:
                     self._pick = min(self.spots, key=lambda s: abs(s[0] - float(px)))
                     self.note = ("就近平齐到 fh %s 的中心（x=%.0f，该 fh 范围 %.0f~%.0f）"
-                                 % (self._pick[3], self._pick[0], self._pick[1], self._pick[2]))
-                _pc, _pl, _pr, _pfid = self._pick
+                                 % (self._pick[-1], self._pick[0], self._pick[1], self._pick[2]))
+                _pc, _pl, _pr = self._pick[0], self._pick[1], self._pick[2]
                 self.note = "对齐中：朝中心 x=%.0f 走（差 %.0f px）" % (_pc, _pc - float(px))
                 return self._out(1 if _pc > float(px) else -1, False)
             self._armed_at = now
@@ -2107,9 +2440,9 @@ class DropJob(_PausableJob):
         return self._out(0, False)
 
     def cancel(self, why="取消"):
-        if self.phase not in (self.DONE, self.FAILED):
-            self.phase = self.FAILED
-            self.note = str(why)
+        # ⚠ **运行时字段一起收干净**（用户 2026-10-02 #8 ✓ 见 `_cancel_common` ✓）——
+        #   原来这里只置相位，带着脏锚被复用就是隐患 ✗。
+        self._cancel_common(why)
         return self._out(0, False)
 
     def _arrived(self, py, here_sets, ground_y=None, on_rope_pos=None):
@@ -2249,7 +2582,7 @@ class DropJob(_PausableJob):
         """
         return int(self._reassert_n)
 
-    def _out(self, move, jump, hold_dir=False, reassert=False, vert=None):
+    def _out(self, move, jump, hold_dir=False, reassert=False, vert=None, replan=False):
         """`vert`：这一拍要不要发 ↓（`None` = 老规则：按跳或 `hold_dir` 时发 `self.dir`=↓ ✓）。
 
         ⚠ 「**被绳吸住要脱离**」那几拍必须传 `vert=0`：在绳上按 ↓ 是"还挂在绳上"（口径同
@@ -2269,7 +2602,7 @@ class DropJob(_PausableJob):
         self._jump_on = bool(jump)
         # ⭐ 记下这一拍请他按的竖直键（给 ladder_id 许可的「执行器通知」用，同 ClimbJob ✓）
         self._last_vert = int(d)
-        return self._result(move, jump, d, reassert=reassert)
+        return self._result(move, jump, d, reassert=reassert, replan=replan)
 
 
 def drop_job_for_edge(terrain, z, edge, **kw):
@@ -2294,7 +2627,12 @@ def drop_job_for_edge(terrain, z, edge, **kw):
         f = known.get(str(fid))
         if f is None or f.is_wall:
             continue
-        spots.append(((f.left + f.right) / 2.0, f.left, f.right, str(fid)))
+        # ⭐ **五元组**（中心 x, 左, 右, **面 y**, id ✓ 同 `WalkJob` 的落点形状 ✓）：
+        #   面 y = 该 foothold **中点 x** 处的面 y（与 `_set_spans` 同一口径 ✓）——
+        #   ALIGN 用它判"**人是不是站在这一块面上**"（用户 2026-10-02 ✓ 见 `DropJob.update`
+        #   的 ALIGN ✓，就是这次"掉到别的层还按 ↓+跳"那个 bug 的闸 ✓）。
+        _mid = (f.left + f.right) / 2.0
+        spots.append((_mid, f.left, f.right, float(f.y_at(_mid)), str(fid)))
     if not spots:
         raise ValueError("可下跳 foothold 在本图里都找不到（或都是墙）：%s" % (ids,))
     # ⭐ **目标平台的"面 y"**（用户 2026-09-28：下跳的到达判据换成"脚下这块面 == 目标面"✓）——
@@ -2528,10 +2866,9 @@ class WalkJob(_PausableJob):
         return self._out(0)
 
     def cancel(self, why="取消"):
-        if self.phase not in (self.DONE, self.FAILED):
-            self.phase = self.FAILED
-            self.note = str(why)
-        return self._out(0)
+        # ⚠ **运行时字段一起收干净**（用户 2026-10-02 #8 ✓ 见 `_cancel_common` ✓）
+        self._cancel_common(why)
+        return self._out(0)          # ★ 走只有 move 一个位置参数 ✓
 
     # ---- 内部 ----
 
@@ -2791,9 +3128,9 @@ class JumpJob(_PausableJob):
         return self._out(0, False)
 
     def cancel(self, why="取消"):
-        if self.phase not in (self.DONE, self.FAILED):
-            self.phase = self.FAILED
-            self.note = str(why)
+        # ⚠ **运行时字段一起收干净**（用户 2026-10-02 #8 ✓ 见 `_cancel_common` ✓）——
+        #   原来这里只置相位，带着脏锚被复用就是隐患 ✗。
+        self._cancel_common(why)
         return self._out(0, False)
 
     # ---- 内部 ----

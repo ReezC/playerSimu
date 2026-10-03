@@ -12,8 +12,17 @@
 对策是每次手动按键都请求一次「按键状态重同步」（见 `_request_resync`）：
 决策层清掉本地按键状态，下一帧重新声明它需要的键。清状态**不发** RELEASE，
 所以不会让自动的按键闪断。
+
+⚠⚠ **2026-10-02 修卡死**（用户报"启用手动输入按键会卡死"）：
+    Windows 低级键盘钩子（`WH_KEYBOARD_LL`）要求回调**快速返回**（默认 300ms 超时）。
+    原来 `_on_press` / `_on_release` **同步**调 `dinput.key_down` → `_send_remote` →
+    背压等待 + 网络发送，一旦超过 300ms ⇒ Windows 冻结整个键盘输入 ⇒ "卡死"（后续按键
+    进不来、`_on_release` 也进不来 ⇒ 键卡住一直按着 ⇒ 游戏里角色乱跑 ✗）。
+    ⇒ 改成**异步**：Listener 回调只把按键事件放进队列，由后台消费线程慢慢发 ✓。
+    回调立刻返回，Windows 钩子永远不会被判"无响应" ✓。
 """
 
+import queue
 import threading
 
 from decision import input as dinput
@@ -68,8 +77,13 @@ def _key_name(key):
 
 
 _listener = None
+_consumer = None                # 消费线程（异步发指令 ✓ 见模块文档）
 _pressed = set()
 _lock = threading.Lock()
+# ⭐ **异步队列**（2026-10-02 ✓ 修卡死）：Listener 回调只 put 队列、立刻返回；
+#   消费线程从队列取、慢慢发（背压 / 网络都不卡 Windows 钩子 ✓）。
+#   放 `(name, is_down)`；`None` 是哨兵 ⇒ 消费线程退出。
+_queue = queue.Queue()
 
 
 def _request_resync():
@@ -86,6 +100,27 @@ def _request_resync():
         pass
 
 
+def _consumer_loop():
+    """⭐ 消费线程：从队列取按键事件，慢慢发指令（不阻塞 Listener 回调 ✓）。
+
+    ⚠ 这里的发送可能慢（背压 / 网络），但**不卡 Windows 钩子**——钩子早就返回了 ✓。
+    ⚠ 发失败不该把消费线程带崩 ✗（`except` 兜住，继续取下一个 ✓）。
+    """
+    while True:
+        item = _queue.get()
+        if item is None:            # 哨兵 ⇒ 退出
+            break
+        name, is_down = item
+        try:
+            _request_resync()
+            if is_down:
+                dinput.key_down(name)
+            else:
+                dinput.key_up(name)
+        except Exception:          # noqa: BLE001 —— 一个键发失败不该把整条消费线程带崩 ✗
+            pass
+
+
 def _on_press(key):
     name = _key_name(key)
     if not name:
@@ -94,8 +129,8 @@ def _on_press(key):
         if name in _pressed:
             return   # 按住自动重复，去重
         _pressed.add(name)
-    _request_resync()
-    dinput.key_down(name)
+    # ⭐ **异步**：只 put 队列、立刻返回（不阻塞 Windows 钩子 ✓ 见模块文档）。
+    _queue.put((name, True))
 
 
 def _on_release(key):
@@ -104,27 +139,33 @@ def _on_release(key):
         return
     with _lock:
         _pressed.discard(name)
-    _request_resync()
-    dinput.key_up(name)
+    _queue.put((name, False))       # ⭐ 同上：立刻返回 ✓
 
 
 def start():
-    """开启手动输入：启动全局键盘监听。"""
-    global _listener
+    """开启手动输入：启动全局键盘监听 + 消费线程。"""
+    global _listener, _consumer
     stop()
+    _consumer = threading.Thread(target=_consumer_loop, daemon=True, name="manual-input-consumer")
+    _consumer.start()
     _listener = keyboard.Listener(on_press=_on_press, on_release=_on_release)
     _listener.start()
 
 
 def stop():
-    """关闭手动输入：停止监听并释放所有已转发的键（防卡键）。"""
-    global _listener
+    """关闭手动输入：停止监听 + 停消费线程 + 释放所有已转发的键（防卡键）。"""
+    global _listener, _consumer
     if _listener is not None:
         _listener.stop()
         _listener = None
     with _lock:
         held = list(_pressed)
         _pressed.clear()
+    # 停消费线程：先 drain 队列里剩余的（哨兵之前的会发完 ✓），再发 held 的 RELEASE。
+    if _consumer is not None:
+        _queue.put(None)            # 哨兵 ⇒ 消费线程发完前面的就退出 ✓
+        _consumer.join(timeout=2.0)
+        _consumer = None
     if held:
         # 这里发的 RELEASE 可能把自动也正按着的键一并松开（固件侧是个集合），
         # 所以同样要请决策层重同步一次，让它下一帧把需要的键补回来。

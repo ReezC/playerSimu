@@ -103,6 +103,88 @@ def _run_args(ck):
         return {}
 
 
+def ckpt_resumable(ck):
+    """这份 `last.pt` 能不能**真的续训**？→ `(能不能, 为什么不能)`。
+
+    ⭐⭐ 2026-10-03（用户现场 ✓ 原话："这个是我新训练的，基础权重是森林迷宫III/detect_v6，
+    是不是训练链路坏了？"）：
+
+      · **病**：ultralytics 的 `resume=True` **只认检查点里的"训到第几轮 + 优化器状态"** ✓；
+        而**上一次训练正常跑完**的 `last.pt` 里，收工那一步会把优化器 **strip** 掉、`epoch`
+        置 `-1` ✗ ⇒ 它**续不了**。这时 ultralytics **只打一句 warning 就当成"普通训练"跑**
+        ✗✗ —— 而 resume 那一路**没传 `data`** ⇒ 它用**自己带的默认数据集** `coco8.yaml`
+        （还会**联网下载 COCO** ✗）、`project=null` ⇒ 产物落到 `runs/detect/train/` ✗、
+        `epochs=100`（默认 ✓）⇒ 100 轮训出个 **80 类 COCO 模型**（mAP 全 0 ✓），
+        训完还被**发布成项目正式权重** ↓ ⇒ 实时那边"按 mtime 选最新"选中它 ⇒
+        **一个框都不认**（用户报的"怎么没有检出框了"✓ 全链就这么来的 ✓）。
+      · **改**：续训之前**自己先判**，不能续就**报错停下** ✗（别再让它悄悄退化 ✓）——
+        提示也一并给全（"想在这版上继续学 ⇒ 用普通模式、基础权重填那份 `best.pt`"✓）。
+
+    ⚠ 判据只认**这两个字段**（`epoch >= 0` + 优化器状态在位 ✓）：它们就是 ultralytics
+      自己 `resume` 时要读的东西 ✓（多判别的反而容易误伤 ✓）。
+    ⚠ 这里 `torch.load` 一次是可接受的（几十 MB、只在点"续训"时一次 ✓）—— 反正紧接着
+      ultralytics 自己也要整份读进来 ✓。
+    """
+    try:
+        import torch
+    except ImportError:
+        # 没装 torch ⇒ 说不清能不能续 ⇒ **当"能"放过去**（让 ultralytics 自己去试 ✓）：
+        # 这一路本来就会把"没装 ultralytics"报出来 ✓，别在这里多造一个失败 ✓。
+        return True, ""
+    try:
+        meta = torch.load(str(ck), map_location="cpu", weights_only=False)
+    except Exception as e:
+        return False, "读不出来（%s: %s）" % (type(e).__name__, e)
+    if not isinstance(meta, dict) or "model" not in meta:
+        return False, "它不像 ultralytics 的训练检查点"
+    ep = meta.get("epoch")
+    try:
+        epn = int(ep)
+    except (TypeError, ValueError):
+        epn = -1
+    if epn < 0:
+        return False, ("里面没有\"训到第几轮\"（epoch=%r）—— 上一次训练是**正常跑完**的"
+                       "（收工时优化器被 strip 掉了 ✓）" % (ep,))
+    if meta.get("optimizer") is None:
+        return False, "里面没有优化器状态（optimizer 是空的 ✗）"
+    return True, ""
+
+
+def ckpt_names(ck):
+    """权重**自己声明**的类别名（按 id 排好序 ✓）→ `[名字, …]`；读不出来给 `None`。
+
+    谁用：① 发布前校验（本次 best.pt 的类名 vs `data.yaml` 的类名 ✓ 见 `run_train`）；
+    ② 实时侧加载权重后的校验（`gui/live_thread.py` ✓）。
+    ⚠ 必须 `weights_only=False`（ultralytics 的检查点是个整对象 ✓ torch 2.6+ 默认 `True` 会拒 ✓）。
+    """
+    try:
+        import torch
+        meta = torch.load(str(ck), map_location="cpu", weights_only=False)
+        names = getattr(meta.get("model") if isinstance(meta, dict) else None,
+                        "names", None)
+        return [str(names[k]) for k in sorted(names)] if names else None
+    except Exception:
+        return None
+
+
+def data_names(data_yaml):
+    """`data.yaml` 里写的类别名（**有序** ✓）；读不出来给 `None`。
+
+    ⚠ 顺序很重要（类 id 就是顺序 ✓）：所以比较时**按列表比**，不按集合比 ✗。
+    """
+    try:
+        import yaml
+        d = yaml.safe_load(Path(data_yaml).read_text(encoding="utf-8")) or {}
+        names = d.get("names")
+        if isinstance(names, dict):
+            return [str(names[k]) for k in sorted(names)]
+        if isinstance(names, (list, tuple)):
+            return [str(x) for x in names]
+    except Exception:
+        pass
+    return None
+
+
 #: 显存余量低于这个数（GB）就提一句"偏紧" —— 留给碎片 + 训练中途的缓存增长 ✓
 VRAM_TIGHT_GB = 1.0
 
@@ -296,6 +378,26 @@ def run_train(params, ctx=None):
                 "没有可续训的检查点：%s 下找不到 */weights/last.pt\n"
                 "（还没跑过训练，或者那个 run 目录被删了）"
                 % Path(project_dir).as_posix())
+        # ⭐⭐ **先自己判"能不能续"**（2026-10-03 ✓ 用户现场踩的坑 ✓ 见 `ckpt_resumable`）：
+        #   不能续时 ultralytics **只打一句 warning 就当成普通训练跑** ✗，而这一路没传
+        #   `data` ⇒ 它会用自带的 `coco8.yaml`（还联网下载 COCO ✗）训出个 80 类模型，
+        #   再被发布成项目正式权重 ⇒ 实时那边 0 框 ✗（"怎么没有检出框了"）。
+        #   ⇒ **停下来报错**，并把"那该怎么办"一起说清 ✓。
+        _ok, _why = ckpt_resumable(ck)
+        if not _ok:
+            _best = ck.parent / "best.pt"
+            raise RuntimeError(
+                "这份检查点**续不了**：\n  %s\n  %s\n\n"
+                "原因：ultralytics 的「接着上次跑」要从检查点里读回\"训到第几轮 + 优化器状态\"，"
+                "而这份里没有 —— 上一次训练是**正常跑完**的（收工时优化器会被 strip 掉 ✓）。\n\n"
+                "怎么办（两条）：\n"
+                "  · **想在这版基础上继续学**（推荐）：把「接着上次跑」去掉、用**普通模式**，"
+                "「基础权重」填这一份：\n      %s\n"
+                "  · 想从上一次中断的地方接着跑：那得是**崩掉/被取消**留下的 last.pt（那种才"
+                "带优化器状态 ✓）。\n\n"
+                "⚠ 特意**不**让你继续：不能续时 ultralytics 会悄悄改成\"用默认数据集"
+                "（coco8）从零训\"✗ —— 训出来的东西跟本项目无关，还会覆盖正式权重。"
+                % (ck.as_posix(), "检测到：%s" % _why, _best.as_posix()))
         _ra = _run_args(ck)
         # 从 `args.yaml` 读回真实参数 ⇒ 后面的日志、`run.json`、界面摘要说的都是**实话**
         # （否则会显示"界面上填的 120 轮"，而实际续的是原来那个 200 轮 ✗）。
@@ -365,9 +467,21 @@ def run_train(params, ctx=None):
 
     try:
         if resume:
-            # ⚠ **只传 `resume=True`**：多传别的 ultralytics 会警告"resume 时被忽略" ✗
-            #   （它自己从检查点里读回数据 / 轮数 / 尺寸 / 批 ✓）
-            model.train(resume=True)
+            # ⚠ 正常续训时 ultralytics **只认 `resume`**、其它参数一律忽略（它会警告一句 ✓
+            #   —— 它自己从检查点里读回数据 / 轮数 / 尺寸 / 批 ✓）。
+            # ⭐⭐ **但还是要把它该有的都传进去**（2026-10-03 ✓ 用户现场踩的坑 ✓）：
+            #   万一它又因为"续不了"退化成普通训练 ✗，有 `data=` 在手它就只会用**咱自己的
+            #   数据集** ✓ —— 而不是它自带的 `coco8.yaml`（那个会联网下载 COCO ✗ 训出个
+            #   80 类模型 ⇒ 发布 ⇒ 实时 0 框 ✗）。这是**保险**：正常 resume 时它被忽略 ✓、
+            #   退化时它是唯一能救回来的一句 ✓。
+            #   （`ckpt_resumable` 已经先把"明摆着续不了"的挡在门外了 ✓ 这一句是第二道 ✓。）
+            model.train(
+                resume=True,
+                data=str(data),
+                project=str(project_dir),
+                name=name,
+                exist_ok=True,
+            )
         else:
             model.train(
                 data=str(data),
@@ -416,14 +530,31 @@ def run_train(params, ctx=None):
         ctx.log("best.pt  %.1f MB" % (best.stat().st_size / 1024 / 1024))
 
         if copy_to:
-            dst = Path(copy_to)
-            dst.mkdir(parents=True, exist_ok=True)
-            target = dst / (name + ".pt")
-            try:
-                shutil.copy2(str(best), str(target))
-                ctx.log("已复制到 %s" % target.as_posix())
-            except Exception as e:
-                ctx.log("复制失败：%s" % e, "warn")
+            # ⭐⭐ **发布前先把类名对一遍**（2026-10-03 ✓ 用户现场那件事的最后一道闸 ✓）：
+            #   本次 `best.pt` 自己声明的类名，必须与 `data.yaml` 的**完全一致（含顺序）**——
+            #   类 id 就是顺序 ✓，错位就等于把 mob 当 player 用 ✗。对不上 ⇒ **不发布** ✗
+            #   （宁可这一版没发布，也不能把一份和本项目无关的权重写成"正式权重" ✗：
+            #    现场那次就是把 80 类 COCO 模型写成了 `models/detect_v3.pt` ⇒ 实时 0 框 ✗）。
+            #   ⚠ 读不出来（没装 torch / 文件坏了）⇒ **放行**（别把"读不出来"当成"错了" ✗）。
+            _want = data_names(data)
+            _got = ckpt_names(best)
+            if _want and _got and _want != _got:
+                ctx.log("⚠⚠ **不发布这份权重**：它的类名与数据集对不上 ✗", "warn")
+                ctx.log("   数据集（%s）：%s" % (data.as_posix(), "、".join(_want)), "warn")
+                ctx.log("   本次权重：%s" % "、".join(_got), "warn")
+                ctx.log("   ⇒ 这一版先留在 %s，**没**写进 models/（正式权重没被动 ✓）"
+                        % save_dir.as_posix(), "warn")
+                ctx.log("   常见原因：训练时数据指错了（比如退化成 ultralytics 自带的 "
+                        "coco8 ✗）—— 查一下这次 run 的 args.yaml ✓", "warn")
+            else:
+                dst = Path(copy_to)
+                dst.mkdir(parents=True, exist_ok=True)
+                target = dst / (name + ".pt")
+                try:
+                    shutil.copy2(str(best), str(target))
+                    ctx.log("已复制到 %s" % target.as_posix())
+                except Exception as e:
+                    ctx.log("复制失败：%s" % e, "warn")
 
     # 最终指标从 trainer 读一次，作为摘要
     final = {}

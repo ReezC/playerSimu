@@ -12,6 +12,19 @@ import time
 import traceback
 from pathlib import Path
 
+# ⭐ **输出（含被重定向的日志）统一按 utf-8**（2026-10-03 ✓ 现场排查吃过这个亏）：
+#   Windows 下把 stdout 重定向到文件时，默认用**本地编码（GBK）** ⇒ 路径里的**中文会被吃掉**
+#   （实测：`projects\石人寺院III\runs\...` 在日志里变成 `projects\III\runs\...` ✗）⇒
+#   事后排查很容易**认错项目** ✗（"那条警告说的到底是哪个项目？"）。
+#   `reconfigure` 只改编码、不动缓冲（Python 3.7+ ✓）。
+#   ⚠ 失败就算了（例如 stdout 被替换成不支持 `reconfigure` 的对象 ✓）—— 绝不能因为
+#     日志编码把程序起不来 ✗。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # ⚠ 这段必须在导入 PyQt5 **之前**执行，位置不能挪。
 #
 # PyQt5/Qt5/bin/ 里自带一整套 MSVC 运行时（msvcp140.dll、vcruntime140.dll 等）。

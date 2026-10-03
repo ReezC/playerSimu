@@ -19,6 +19,7 @@
     python -m tools.selftest_mmap_regions
 """
 
+import json
 import shutil
 import subprocess
 import sys
@@ -50,7 +51,13 @@ _TMP = None
 
 
 def _fresh():
-    """每个用例开头调一次：把库换到一个**干净的空目录**（不许碰真实数据 ✓）。"""
+    """每个用例开头调一次：把库换到一个**干净的空目录**（不许碰真实数据 ✓）。
+
+    ⚠ **三份都要换**（2026-10-02 补 `CURRENT_FILE` ✗）：区域的每图一份、老单值兜底、
+      以及「现在该推哪张图」那份记忆。少换一份的后果很具体：`_answer_ctl` 处理 `MAP`
+      时会**写进真实的那份**（`config/minimap_current.json` ✗）⇒ 自检把人本机的
+      状态改了，还可能让别的用例看机器状态吃饭（假绿/假红都来过 ✓）。
+    """
     global _TMP
     if _TMP is None:
         _TMP = Path(tempfile.mkdtemp(prefix="selftest-mmap-regions-"))
@@ -62,6 +69,9 @@ def _fresh():
     mmap_regions.LEGACY_REGION_FILE = _TMP / "minimap_region.json"
     if mmap_regions.LEGACY_REGION_FILE.exists():
         mmap_regions.LEGACY_REGION_FILE.unlink()
+    mmap_regions.CURRENT_FILE = _TMP / "minimap_current.json"
+    if mmap_regions.CURRENT_FILE.exists():
+        mmap_regions.CURRENT_FILE.unlink()
     return _dir
 
 
@@ -82,10 +92,16 @@ class _Sock:
 
 # ══════════════════════ 用例 ══════════════════════
 
-def t_resolve_three_cases():
-    """按 id 取的三条口径：**本图优先 → 回退老的那份 → 都没有 None**（同 crop_of ✓）。
+def t_load_and_legacy():
+    """`load`（每图一份）与 `legacy`（老单值兜底）各自的边界。
 
-    ⚠ 第 4 件也要注意：**坏值当"没填"** —— 拿半截数去抓屏，推的是一片无关画面。
+    ⭐ 2026-10-02：原来这里测的是 `resolve()`（"本图没有就用老那份"）—— 那个口径**搬到**
+    `startup_region()` 里了（用户新口径：**点名的图没框过就别拿别的图顶上** ✗），
+    `resolve` 随之删掉（死代码不留 ✓）。这里只钉这两个基础读取：
+      ① `load` 给的是**本图**那份（哪怕老的那份还在 ✓ 不串台 ✓）；
+      ② `legacy()` 读得回老那份（升级后不用重框 ✓ 口径同 `perception.minimap.crop_of`）；
+      ③ **`load` 不兜底**：本图没框过就是 `None`（兜底只发生在 `startup_region` 那一处 ✓）；
+    第 4 件照旧：**坏值当"没填"** —— 拿半截数去抓屏，推的是一片无关画面。
     """
     _fresh()
     mmap_regions.save("111111111", 1, 2, 200, 150, zoom=3)
@@ -94,20 +110,19 @@ def t_resolve_three_cases():
     mmap_regions.LEGACY_REGION_FILE.parent.mkdir(parents=True, exist_ok=True)
     mmap_regions.LEGACY_REGION_FILE.write_text(
         '{"region": [7, 7, 70, 70], "zoom": 2}', encoding="utf-8")
-    got = mmap_regions.resolve("111111111")
+    got = mmap_regions.load("111111111")
     check(got is not None and got["x"] == 1 and got["zoom"] == 3,
           "本图框过了却没用本图的：%s" % (got,))
 
-    # ② 本图没框过 ⇒ 用老的那份兜底（升级后不用把图全重框一遍 ✓）
-    got = mmap_regions.resolve("222222222")
-    check(got is not None and got["x"] == 7 and got["zoom"] == 2,
-          "本图没框过时没回退老的那份：%s" % (got,))
+    # ② 老单值读得回来（它现在是**只读兜底**：只有"这台机还没有任何 id"时才用 ✓）
+    old = mmap_regions.legacy()
+    check(old is not None and old["x"] == 7 and old["zoom"] == 2,
+          "老单值那份读不出来了（升级后要人把每张图重框一遍 ✗）：%s" % (old,))
 
-    # ③ 都没有 ⇒ None（界面就会说"还没框"，不许编一个数 ✗）
-    mmap_regions.LEGACY_REGION_FILE.unlink()
-    check(mmap_regions.resolve("222222222") is None, "两边都没有却说「有一个框」✗")
-    check(mmap_regions.resolve("") is None, "空 id 居然配出了一个框 ✗")
-    check(mmap_regions.resolve(None) is None, "None id 居然配出了一个框 ✗")
+    # ③ `load` **不兜底**（兜底只在 `startup_region` 那一处 ✓）
+    check(mmap_regions.load("222222222") is None, "本图没框过，load 却拿出了别的框 ✗")
+    check(mmap_regions.load("") is None, "空 id 居然配出了一个框 ✗")
+    check(mmap_regions.load(None) is None, "None id 居然配出了一个框 ✗")
 
     # ④ 坏值 ⇒ 当"没填"（不是拿去抓屏 ✗）
     _p = mmap_regions.path_of("444444444")
@@ -207,6 +222,14 @@ def t_map_command_switches_region():
     check(state["box"] == [10, 20, 200, 150] and state["zoom"] == 3,
           "第二次换图没生效：%s" % (state,))
 
+    # ⭐ **"当前是哪张图"顺手记在本机**（用户 2026-10-02 ✓："只靠 B 机推"）——
+    #   部署台的「当前地图」读的就是它、框选也存到这张图名下 ✓ ⇒ 不记的话人根本
+    #   不知道该往哪个 id 下框 ✗。
+    cur = mmap_regions.current()
+    check(cur and cur["map_id"] == "111",
+          "换图成功却没把「当前是哪张图」记在本机（部署台/框选就没法对上 ✗）：%r" % (cur,))
+    check(cur.get("by") == "B机", "记下来的来源不对（该写清是 B 机说的 ✓）：%r" % (cur,))
+
     # 没配过的图 ⇒ **一个字节都不动**（半切换的状态比没切成还难查 ✗）
     before = list(state["box"])
     minimap_push._answer_ctl(s, "MAP 不在库里的图".encode("utf-8"), state, log=_q)
@@ -224,6 +247,127 @@ def t_map_command_switches_region():
     minimap_push._answer_ctl(s, "乱写 一通".encode("utf-8"), state, log=_q)
     check(mmap_regions.parse_reply(s.sent[-1].decode("utf-8"))["code"] == "bad-command",
           "未知命令没回 bad-command ✗")
+
+
+def t_current_map_memory():
+    """⭐ 「现在该推哪张图」那份记忆（用户 2026-10-02 ✓ 原话："只靠 B 机推（A 机不能
+    自己选）" + "地图与框选数据另存一份文件，仅 A 机本地储存"）。
+
+    钉五件：
+      ① 没记过 ⇒ `current()` 是 `None`（**不是**编一个空 id ✗）；
+      ② 记了 ⇒ 读回来带着 `map_id` / `by`（谁说的）/ `updated` ✓；
+      ③ **空 id ⇒ 删掉那份记忆**（回到"还不知道是哪张图"✓ 别留半截 ✗）；
+      ④ 文件坏了 / 不是 dict / 没有 map_id ⇒ 一律 `None`（**不猜** ✓）；
+      ⑤ `clear_current()` 能忘掉它（没记过返回 False ✓）。
+    """
+    _fresh()
+    check(mmap_regions.current() is None, "从没记过却说有当前图 ✗")
+
+    mmap_regions.set_current("105040303", by="B机")
+    got = mmap_regions.current()
+    check(got and got["map_id"] == "105040303" and got["by"] == "B机" and got["updated"],
+          "记下来的当前图不完整：%r" % (got,))
+    check(mmap_regions.CURRENT_FILE.exists(),
+          "「当前图」没落到本机文件里（重启一次就丢 ⇒ 部署台又说「不知道哪张图」✗）")
+
+    # ③ 空 id ⇒ 删掉记忆（不是"记一个空 id"）
+    mmap_regions.set_current("", by="手动")
+    check(mmap_regions.current() is None, "空 id 没把记忆清掉 ✗")
+    check(not mmap_regions.CURRENT_FILE.exists(), "空 id 之后文件还在 ✗")
+
+    # ④ 坏文件一律当"没记过"
+    for bad in ("不是 json", "[]", '{"by": "B机"}', '{"map_id": "  "}'):
+        mmap_regions.CURRENT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        mmap_regions.CURRENT_FILE.write_text(bad, encoding="utf-8")
+        check(mmap_regions.current() is None,
+              "坏掉的「当前图」文件被当成有效配置了（%r ⇒ 会去推一张不存在的图 ✗）"
+              % bad)
+
+    # ⑤ 忘掉它
+    mmap_regions.set_current("222", by="B机")
+    check(mmap_regions.clear_current() is True, "清当前图失败")
+    check(mmap_regions.current() is None and mmap_regions.clear_current() is False,
+          "清完之后状态不对 ✗")
+
+
+def t_startup_region_priority():
+    """⭐ 推流启动时"到底推哪一块"的**唯一一处**口径（用户 2026-10-02 ✓）。
+
+    优先级：`--map-id` → **本机记着的当前图** → 老单值兜底 → **一块都没有**（⇒ 照旧
+    起监听、等 B 机 `MAP` ✓）。两条"别顶替"的规矩是这套东西的重点：
+      · **点名了却没有** ⇒ `None`（拿别的图顶上 = 推错一块画面 ✗ B 机那边像寻路坏了 ✗）；
+      · **当前图明确、可它还没框过** ⇒ `None`（**不许**退到老单值 —— 那是**另一张图**的
+        屏幕坐标 ✗ 同一条理由 ✓）。
+    返回里的 `src` 要说清这块框是从哪来的（`map-id` / `当前图` / `老单值` ✓ 排查用 ✓）。
+    """
+    _fresh()
+    # 老单值放一份（升级前的那份）
+    mmap_regions.LEGACY_REGION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    mmap_regions.LEGACY_REGION_FILE.write_text(
+        json.dumps({"region": [1, 2, 300, 200], "zoom": 2}), encoding="utf-8")
+
+    # ④ 一个 id 都没有 ⇒ **老单值兜底**（升级后不用重框 ✓）
+    got = mmap_regions.startup_region("")
+    check(got is not None and got[3] == "老单值" and got[1] == [1, 2, 300, 200],
+          "还没有任何 id 时该回退老单值（升级后不用重框 ✓）：%r" % (got,))
+
+    mmap_regions.save("111", 10, 20, 200, 150, zoom=3)
+    mmap_regions.set_current("111", by="B机")
+    got = mmap_regions.startup_region("")
+    check(got is not None and got[0] == "111" and got[3] == "当前图"
+          and got[1] == [10, 20, 200, 150] and got[2] == 3,
+          "有当前图时该用**当前图**那份（含它自己的 zoom ✓）：%r" % (got,))
+
+    # ① 命令行点名 ⇒ 用点名那张（哪怕当前图是另一张 ✓）
+    mmap_regions.save("222", 30, 40, 260, 190, zoom=1)
+    got = mmap_regions.startup_region("222")
+    check(got is not None and got[0] == "222" and got[3] == "map-id",
+          "点名了哪张图就该推哪张：%r" % (got,))
+
+    # ② 点名了却没有 ⇒ None（**不拿别的图顶上** ✗）
+    check(mmap_regions.startup_region("999") is None,
+          "点名了一张没框过的图，却拿了别的图的框顶上（推错画面 ✗）")
+
+    # ③ 当前图明确、可它还没框过 ⇒ None（**不退老单值** ✗）
+    mmap_regions.set_current("888", by="B机")
+    check(mmap_regions.startup_region("") is None,
+          "当前图还没框过时退回了老单值 —— 那是**另一张图**的屏幕坐标（换图就全错 ✗）"
+          "B 机那边会表现为「底图对不上」，看着像寻路坏了 ✗")
+
+    # ⑤ 当前图的记忆是坏的 ⇒ 当"没有 id" ⇒ 老单值兜底（别把坏记忆当结论 ✗）
+    mmap_regions.CURRENT_FILE.write_text("坏", encoding="utf-8")
+    got = mmap_regions.startup_region("")
+    check(got is not None and got[3] == "老单值",
+          "「当前图」文件坏了就该当成「没记过」⇒ 走老单值兜底：%r" % (got,))
+
+    # ⑥ 连老单值都没有 ⇒ None（调用方照旧起监听等 B 机 ✓）
+    mmap_regions.LEGACY_REGION_FILE.unlink()
+    check(mmap_regions.startup_region("") is None,
+          "一块都没有时该给 None（让服务「先起来等 B 机」✓）")
+
+
+def t_push_waits_without_region():
+    """⭐ **"还没框过也先起来等 B 机"**（用户 2026-10-02 ✓ 的必然要求）——**源码级**钉。
+
+    为什么只能源码级：这一段要真起 Qt 抓屏 + 一个 TCP 服务（自检里建不起来 ✗）。
+    但这条**必须钉**，因为它是整条链的闭环处：B 机那句 `MAP <id>` 走的就是这条服务的
+    连接 ⇒ 服务起不来 ⇒ A 机**永远**知道不了是哪张图（框选都无从谈起 ✗）。
+    钉三件：
+      ① 启动解析走**共用那一处** `startup_region`（别在推流里再写一套优先级 ✗）；
+      ② 没有区域时**不再直接退出**、而是照常绑定端口进主循环 ✓；
+      ③ 帧循环在没有区域时**一帧都不抓**（抓了也不知道抓哪儿 ✗）且会提醒一句 ✓。
+    """
+    src = (Path(__file__).resolve().parent / "minimap_push.py").read_text(encoding="utf-8")
+    check("mmap_regions.startup_region(" in src,
+          "推流启动没走 `mmap_regions.startup_region`（优先级口径该只有一处 ✗）")
+    check('"box": (list(box0) if box0 else None)' in src,
+          "state 没允许「还没有区域」（box=None）⇒ 起不来就等不到 B 机的 MAP ✗")
+    body = src.split("controls = _poll_controls(controls, state)", 1)
+    check(len(body) == 2, "帧循环里找不到处理控制命令那段（改动太大，脚本要跟上 ✗）")
+    check('if not state["box"]:' in body[1][:400],
+          "帧循环没有「还没有区域就跳过抓屏」这一档 ⇒ 会拿一个空/旧区域乱抓 ✗")
+    check("还没收到图" in body[1][:900],
+          "没有区域时不提醒一句 ⇒ B 机那边「连上却一帧不来」，日志里也看不出为什么 ✗")
 
 
 def t_calib_zoom():
@@ -345,7 +489,8 @@ def t_import_without_numpy():
         "    sys.modules[name] = None\n"          # None ⇒ 再 import 直接 ImportError
         "import tools.mmap_regions as r\n"
         "assert r.MIN_WH >= 1\n"
-        "assert callable(r.resolve) and callable(r.parse_reply)\n"
+        "assert callable(r.startup_region) and callable(r.set_current)\n"
+        "assert callable(r.parse_reply)\n"
         "assert callable(r.ok_reply) and callable(r.err_reply)\n"
         "print('ok')\n"
     )
@@ -357,8 +502,8 @@ def t_import_without_numpy():
 
 
 TESTS = (
-    ("按 id 取：本图优先 / 回退老的那份 / 都没有 None / 坏值当没填",
-     t_resolve_three_cases),
+    ("load 与老单值兜底：本图不串台 / legacy 读得回 / load 自己不兜底 / 坏值当没填",
+     t_load_and_legacy),
     ("库列表与删除（LIST 命令要用）", t_list_and_remove),
     ("没给地图 id 不许存（会推到错的图上）", t_save_rejects_empty_id),
     ("协议回执：拼得出来就解得回去（含 `-` 那种空 id）", t_protocol_roundtrip),
@@ -369,6 +514,12 @@ TESTS = (
     ("黑屏判据（含「取不到帧不许当黑屏」）", t_blackout_detection),
     ("协议只有一份：A/B 共用常量，不许各写一份魔数", t_protocol_is_single_sourced),
     ("A 机环境：没有 numpy/cv2 也要能 import", t_import_without_numpy),
+    ("⭐ 「现在该推哪张图」那份记忆（B 机推来 / 本机本地 / 坏了当没记过）",
+     t_current_map_memory),
+    ("⭐ 启动推哪一块：点名 → 当前图 → 老单值兜底 → 一块都没有等 B 机"
+     "（两条「不许顶替」的规矩）", t_startup_region_priority),
+    ("⭐ 「还没框过也先起来等 B 机」（源码级：共用解析 + 跳过抓屏 + 提醒一句）",
+     t_push_waits_without_region),
 )
 
 

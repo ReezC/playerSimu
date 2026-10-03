@@ -20,7 +20,9 @@
 
 import copy
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # 界面部分不开真窗口
@@ -30,14 +32,35 @@ from deploy import config as dcfg                        # noqa: E402
 from deploy import selfcheck, services                   # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-MMAP = {"bind": "0.0.0.0", "port": 5003, "zoom": 3, "fps": 30, "quality": 100,
-        "x": 100, "y": 40, "w": 200, "h": 150}
-MMAP_NO_REGION = dict(MMAP, x=None, y=None, w=None, h=None)
+#: mmap 那张卡片的参数 fixture —— ⚠ **里面没有 x/y/w/h**（2026-10-02 起区域不再存
+#: deploy.json ✗ 改按地图 id 存 `config/minimap_regions/<id>.json` ✓ 见 `_with_mmap_regions` ✓）。
+# ⚠ 2026-10-03：fps/quality 默认值改成 **60 / 80**（用户批的 ✓ 小地图要尽量高帧率更新 ✓）
+MMAP = {"bind": "0.0.0.0", "port": 5003, "zoom": 3, "fps": 60, "quality": 80}
 
 
 def check(cond, msg):
     if not cond:
         raise AssertionError(msg)
+
+
+def _with_mmap_regions(fn):
+    """把 `tools.mmap_regions` 的**三个文件位置**指到临时目录里跑 `fn(mr)`。
+
+    **绝不碰真实配置**（同本文件开头那条：所有构造都用副本、不写文件 ✓）：
+    区域库（`DIR`）、老单值兜底、以及"当前图"那份记忆（`CURRENT_FILE`）全是模块级
+    路径常量 ⇒ 换掉它们就够了 ✓（`selftest_mmap_regions` 也是这么干的 ✓）。
+    """
+    from tools import mmap_regions as mr
+    tmp = Path(tempfile.mkdtemp(prefix="selftest-deploy-mmap-"))
+    old = (mr.DIR, mr.LEGACY_REGION_FILE, mr.CURRENT_FILE)
+    mr.DIR = tmp / "regions"
+    mr.LEGACY_REGION_FILE = tmp / "legacy.json"
+    mr.CURRENT_FILE = tmp / "current.json"
+    try:
+        return fn(mr)
+    finally:
+        mr.DIR, mr.LEGACY_REGION_FILE, mr.CURRENT_FILE = old
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- 参数表
@@ -62,64 +85,89 @@ def t_service_table():
 
 
 def t_mmap_cmd():
-    """小地图推流的命令：参数要真的带上，区域没框就别瞎传。"""
-    cmd = services.build_cmd("mmap", MMAP)
-    txt = " ".join(cmd)
-    check("tools.minimap_push" in txt, "没拼上 tools.minimap_push")
-    for want in ("--port 5003", "--zoom 3", "--fps 30", "--quality 100",
-                 "--x 100", "--y 40", "--w 200", "--h 150"):
-        check(want in txt, "命令行里缺 %r：%s" % (want, txt))
-    check("--bind 0.0.0.0" in txt, "命令行里没带监听地址")
+    """小地图推流的命令：**区域按"当前是哪张图"传**（用户 2026-10-02 ✓）。
 
-    # 没框区域：命令里就不该有 --x（宁可启动被拦住，也不传个猜的区域）
-    txt2 = " ".join(services.build_cmd("mmap", MMAP_NO_REGION))
-    check("--x" not in txt2, "没框区域却传了 --x：%s" % txt2)
-    check("--port 5003" in txt2, "没框区域时其它参数也该照传")
+    钉四件：
+      ① 有当前图、且**那张图框过** ⇒ 带 `--map-id <id>`（区域与 zoom 都由
+         `config/minimap_regions/<id>.json` 说了算 ⇒ 与界面显示的那份是同一份 ✓）；
+      ② 那张图**还没框过** ⇒ 一个区域参数都不带（`--map-id` 也不带：带了 A 机会直接
+         报错退出 ✗，而我们要的是"先起来等 B 机"✓）；
+      ③ **不许**再有 `--x/--y/--w/--h`（老口径 ✗）—— 那会推一块"这张图无关"的画面 ✗；
+      ④ 有 `--map-id` 时**不传 `--zoom`**（那张图那份里存着它自己的 zoom ✓）。
+    """
+    def run(mr):
+        cmd0 = services.build_cmd("mmap", copy.deepcopy(MMAP))
+        txt0 = " ".join(cmd0)
+        check("tools.minimap_push" in txt0, "没拼上 tools.minimap_push")
+        for want in ("--port 5003", "--fps 60", "--quality 80", "--bind 0.0.0.0"):
+            check(want in txt0, "命令行里缺 %r：%s" % (want, txt0))
+        # 还没有"当前图" ⇒ 不带任何区域参数（服务照起、等 B 机 MAP ✓）
+        check("--map-id" not in txt0, "还不知道是哪张图就传了 --map-id：%s" % txt0)
 
-    # 端口是字符串化过的数字（subprocess 只吃 str）
-    check(all(isinstance(a, str) for a in cmd), "命令行里有非字符串参数")
+        # ② 知道图了，但那图还没框过 ⇒ 照样不带区域参数（别让 A 机一起就退 ✗）
+        mr.set_current("105040303", by="B机")
+        txt1 = " ".join(services.build_cmd("mmap", copy.deepcopy(MMAP)))
+        check("--map-id" not in txt1,
+              "这张图还没框过却传了 --map-id —— A 机会直接报错退出，"
+              "而我们要的是「先起来等 B 机」：%s" % txt1)
 
+        # ①③④ 框过了 ⇒ 只带 --map-id（区域/zoom 都在那份文件里 ✓）
+        mr.save("105040303", 100, 40, 200, 150, zoom=4)
+        cmd = services.build_cmd("mmap", copy.deepcopy(MMAP))
+        txt = " ".join(cmd)
+        check("--map-id 105040303" in txt, "框过了却没按地图 id 传区域：%s" % txt)
+        for bad in ("--x", "--y", "--w", "--h", "--zoom"):
+            check(bad not in txt,
+                  "区域/zoom 又跑到命令行里了（%s）—— 该由那张图那份文件说了算 ✗：%s"
+                  % (bad, txt))
 
-def t_region_set():
-    """region_set 的边界：缺一个、空串、非数字都不算填好。"""
-    check(services.region_set(MMAP), "填全了的区域被判成没填")
-    for bad in (dict(MMAP, x=None), dict(MMAP, h=""), dict(MMAP, w="abc"),
-                dict(MMAP, y="1.5"), {}):
-        check(not services.region_set(bad), "这些该判成没填好：%r" % (bad,))
+        # 端口是字符串化过的数字（subprocess 只吃 str）
+        check(all(isinstance(a, str) for a in cmd), "命令行里有非字符串参数")
+
+    _with_mmap_regions(run)
 
 
 def t_missing_hint():
-    """启动前的拦截：没框区域要说「框选」，框小了/负数也要说清楚。"""
-    hint = services.missing_hint("mmap", MMAP_NO_REGION)
-    check(hint and "框选" in hint, "没框区域时没提示去框选：%r" % hint)
-    check(services.missing_hint("mmap", MMAP) == "", "正常的区域不该被拦")
-    check("太小" in services.missing_hint("mmap", dict(MMAP, w=5, h=5)),
-          "区域太小没被拦")
-    check("负" in services.missing_hint("mmap", dict(MMAP, x=-3)),
-          "负数坐标没被拦")
+    """启动前的拦截：**mmap 不再拦"还没框过"**（用户 2026-10-02 ✓），别的照旧。"""
+    check(services.missing_hint("mmap", copy.deepcopy(MMAP)) == "",
+          "小地图还没框过就被拦住了 —— 但用户定的流程是「先起来等 B 机告诉是哪张图」"
+          "（B 机那句 MAP 必须走这条服务的连接 ⇒ 拦了它就没法闭环 ✗）")
+    # 别的服务照旧拦（别把这条豁免顺手带过去 ✗）
+    check(services.missing_hint("kbd", {}) != "", "键盘缺串口号该被拦住")
+    check(services.missing_hint("push", {}) != "", "推流缺 ffmpeg 该被拦住")
 
 
 # ---------------------------------------------------------------- 配置
 
 def t_config_defaults():
-    """DEFAULTS 必须含 mmap 的每个键 —— 否则界面填了也会被 _deep_merge 丢掉。"""
-    # 「区域」这一个参数摊平成四个键（x/y/w/h），其余参数一对一
-    one_to_one, expanded = set(), set()
+    """DEFAULTS 必须含 mmap 的每个键 —— 否则界面填了也会被 _deep_merge 丢掉。
+
+    ⭐ 2026-10-02：**区域那几个键不在 DEFAULTS 里了**（用户定"按地图 id 各存一份、
+    且只存 A 机本地"✓）⇒ 这里反过来钉"它**不许**回来"✗（回来了就说明又有人把
+    屏幕坐标塞进 deploy.json，那正是"换图还推上一张图"的老坑 ✓）。
+    """
+    keys = set()
     for spec in services.PARAMS["mmap"]:
-        (expanded if spec["kind"] == "region" else one_to_one).update(spec["keys"])
-    check(one_to_one | expanded == set(dcfg.DEFAULTS["mmap"]),
+        keys |= set(spec["keys"])
+    check(keys == set(dcfg.DEFAULTS["mmap"]),
           "参数表和 DEFAULTS 的键对不上：参数表 %s vs DEFAULTS %s"
-          % (sorted(one_to_one | expanded), sorted(dcfg.DEFAULTS["mmap"])))
-    check(expanded, "小地图区域参数没摊平成坐标键")
+          % (sorted(keys), sorted(dcfg.DEFAULTS["mmap"])))
+    for k in ("x", "y", "w", "h"):
+        check(k not in dcfg.DEFAULTS["mmap"],
+              "「%s」又回到 deploy.json 的 mmap 段里了 ✗ —— 区域现在按地图 id 存在 "
+              "config/minimap_regions/<id>.json（A 机本地 ✓ 见 tools/mmap_regions.py）" % k)
 
 
 def t_config_merge():
     """_deep_merge 只认 DEFAULTS 里的键：新加的键必须在，垃圾键必须被丢。"""
     merged = dcfg._deep_merge(copy.deepcopy(dcfg.DEFAULTS),
-                              {"mmap": {"w": 321, "垃圾键": 1, "port": 5003}})
-    check(merged["mmap"]["w"] == 321, "配置里的 w 没被读进来")
+                              {"mmap": {"port": 5099, "垃圾键": 1, "x": 5, "w": 321}})
+    check(merged["mmap"]["port"] == 5099, "配置里的 port 没被读进来")
     check("垃圾键" not in merged["mmap"], "多余的键没被丢掉")
-    check(merged["mmap"]["x"] is None, "缺的键没落回默认值")
+    check("x" not in merged["mmap"] and "w" not in merged["mmap"],
+          "老 deploy.json 里的 x/y/w/h 又被读进来了 ✗（区域已改按地图 id 存 ✓）")
+    check(merged["mmap"]["zoom"] == dcfg.DEFAULTS["mmap"]["zoom"],
+          "没填的键没落回默认值")
 
 
 def t_link_expect():
@@ -145,12 +193,31 @@ def t_link_expect():
 
 
 def t_check_region():
-    """自检里的小地图区域项：没框=warn（不是 bad），填错=bad，框好=ok。"""
-    lv = lambda c: selfcheck.check_region(c)[0]["level"]        # noqa: E731
-    check(lv({}) == "warn", "没框区域应该是 warn（不用寻路的人不该看到红）")
-    check(lv(dict(MMAP)) == "ok", "框好的区域应该是 ok")
-    check(lv(dict(MMAP, w="abc")) == "bad", "填错应该是 bad")
-    check(lv(dict(MMAP, w=5, h=5)) == "warn", "太小应该是 warn")
+    """自检里的小地图区域项：**按"当前是哪张图"判**（用户 2026-10-02 ✓）三档都只 warn ✓。
+
+    ① 还不知道是哪张图（B 机还没说）⇒ warn，且文案要说"去 B 机开始实时"；
+    ② 知道图、但**这张图还没框过** ⇒ warn，文案要带上已配过哪些图（免得框错地方 ✗）；
+    ③ 框过 ⇒ ok，带 id / 屏幕坐标 / 该图的 zoom ✓。
+    ⚠ 都用临时目录（`_with_mmap_regions` ✓ 不碰真实配置 ✓）。
+    """
+    def run(mr):
+        r = selfcheck.check_region({})[0]
+        check(r["level"] == "warn" and "哪张图" in r["title"] and "B 机" in r["detail"],
+              "还没有当前图时该 warn 并说清「去 B 机开始实时」：%r" % (r,))
+
+        mr.set_current("105040303", by="B机")
+        r = selfcheck.check_region({})[0]
+        check(r["level"] == "warn" and "还没框过" in r["title"],
+              "知道图但没框过该 warn：%r" % (r,))
+        check("105040303" in r["detail"], "警告里没写是哪张图：%r" % (r,))
+
+        mr.save("105040303", 10, 20, 200, 150, zoom=3)
+        r = selfcheck.check_region({})[0]
+        check(r["level"] == "ok" and "105040303" in r["title"],
+              "框过了该给 ok（并且带上图 id）：%r" % (r,))
+        check("zoom=3" in r["detail"], "ok 那行没带上该图的 zoom：%r" % (r,))
+
+    _with_mmap_regions(run)
 
 
 def t_read_real_config():
@@ -160,8 +227,11 @@ def t_read_real_config():
         return
     cfg = dcfg.read()
     check("mmap" in cfg, "读出来的配置里没有 mmap 段")
-    for k in ("port", "zoom", "fps", "quality", "x", "y", "w", "h"):
+    for k in ("port", "zoom", "fps", "quality", "bind"):
         check(k in cfg["mmap"], "mmap 段里缺 %s" % k)
+    # ⚠ 老 deploy.json 里可能还留着 x/y/w/h ⇒ **读进来必须没有它们**（区域改按地图 id 存 ✓）
+    for k in ("x", "y", "w", "h"):
+        check(k not in cfg["mmap"], "mmap 段里又有 %s 了（区域不该存 deploy.json ✗）" % k)
 
 
 # ---------------------------------------------------------------- 界面（离屏）
@@ -197,9 +267,9 @@ def t_app_source():
 
 
 def t_cards():
-    """五张卡片都能建起来；小地图卡片有「框选…」且框完能落到配置里。"""
+    """五张卡片都能建起来；小地图卡片有「框选…」+ 两行只读（当前地图 / 小地图区域）。"""
     from PyQt5.QtWidgets import QApplication, QPushButton
-    from deploy.app import ServiceCard, _parse_region, _region_text
+    from deploy.app import ServiceCard
 
     app = QApplication.instance() or QApplication([])
     check(app is not None, "建不起 QApplication")
@@ -208,9 +278,10 @@ def t_cards():
         card = ServiceCard(key, copy.deepcopy(dcfg.DEFAULTS[key]))
         check(card.cmd_text().strip(), "%s 卡片没算出「将执行」命令行" % key)
 
-    card = ServiceCard("mmap", copy.deepcopy(dcfg.DEFAULTS))
+    card = ServiceCard("mmap", copy.deepcopy(dcfg.DEFAULTS["mmap"]))
     btns = [b.text() for b in card.findChildren(QPushButton)]
     check("框选…" in btns, "小地图卡片上没有「框选…」按钮：%s" % btns)
+    check("重读" in btns, "小地图卡片上没有「重读」（B 机说了新图之后立刻重读用 ✓）：%s" % btns)
 
     # 键盘卡片的「生成证书…」：A 机的原则是**不敲命令**（deploy/app.py 开头那条），
     # 而生成证书有个只做一半就很坑的分支（私钥留 A、cert.pem 必须拷到 B）——
@@ -220,35 +291,37 @@ def t_cards():
     check("生成证书…" in btns_kbd,
           "键盘卡片上没有「生成证书…」按钮：%s" % btns_kbd)
 
-    # 空配置 → 输入框空、values() 是 None（会被 missing_hint 拦住）
-    role, line, _getter = card._getters["region"]
-    check(line.text() == "", "没框过区域时输入框应该是空的")
-    check([card.values()[k] for k in role["keys"]] == [None] * 4,
-          "没框过区域时不该给出坐标：%s" % card.values())
+    # ⭐ 那两行**只读**（用户 2026-10-02）：还没有当前图时文案要说清"去 B 机"✓，
+    #   而且**一个配置键都不产出**（区域不进 deploy.json ✓）
+    def run(mr):
+        card.refresh_displays()
+        cur_w = card._getters["current"][1]
+        reg_w = card._getters["region"][1]
+        check("B 机" in cur_w.text(), "没有当前图时该说「先去 B 机」：%r" % cur_w.text())
+        check("还没" in reg_w.text() and "图" in reg_w.text(),
+              "还不知道哪张图时，区域那行该说清楚：%r" % reg_w.text())
+        check(not (set(card.values()) & {"x", "y", "w", "h"}),
+              "只读两行居然产出了区域键（区域不该进 deploy.json ✗）：%s" % card.values())
+        check("--x" not in card.cmd_text() and "--map-id" not in card.cmd_text(),
+              "还没有当前图时命令里就有区域了：%s" % card.cmd_text())
 
-    # 框完（＝按钮写回文本）→ 四个键都落进配置，命令行也跟着变
-    line.setText("100,40,200,150")
-    got = card.values()
-    check([got[k] for k in role["keys"]] == [100, 40, 200, 150],
-          "框选结果没变成 x/y/w/h：%s" % got)
-    card.refresh_cmd()
-    check("--w 200" in card.lbl_cmd.text(),
-          "框完之后「将执行」里没有区域：%s" % card.lbl_cmd.text())
+        # B 机告诉本机是哪张图了 ⇒ 两行当场变（refresh_displays 是"现读" ✓）
+        mr.set_current("105040303", by="B机")
+        card.refresh_displays()
+        check("105040303" in cur_w.text() and "B机" in cur_w.text(),
+              "「当前地图」没跟着当前图变：%r" % cur_w.text())
+        check("还没框过" in reg_w.text(), "知道图但没框过时说错了：%r" % reg_w.text())
 
-    # 手输的容错：中文逗号/空格/小数都能认，垃圾则一律 None
-    for text, want in (("100,40,200,150", (100, 40, 200, 150)),
-                       ("100，40，200，150", (100, 40, 200, 150)),
-                       ("100, 40, 200, 150", (100, 40, 200, 150)),
-                       ("100,40,200", (None, None, None, None)),
-                       ("", (None, None, None, None)),
-                       ("a,b,c,d", (None, None, None, None))):
-        check(_parse_region(text) == want,
-              "%r 解析成 %s，应该是 %s" % (text, _parse_region(text), want))
+        # 框过了 ⇒ 区域那行给屏幕坐标 + zoom，而且命令行变成 --map-id ✓
+        mr.save("105040303", 100, 40, 200, 150, zoom=4)
+        card.refresh_displays()
+        card.refresh_cmd()
+        check("200x150" in reg_w.text() and "zoom=4" in reg_w.text(),
+              "框过之后那行没给出坐标/zoom：%r" % reg_w.text())
+        check("--map-id 105040303" in card.lbl_cmd.text(),
+              "框过之后「将执行」里没按地图 id 传区域：%s" % card.lbl_cmd.text())
 
-    check(_region_text({"x": 1, "y": 2, "w": 3, "h": 4}) == "1,2,3,4",
-          "_region_text 拼得不对")
-    check(_region_text({"x": None, "y": 2, "w": 3, "h": 4}) == "",
-          "缺键时 _region_text 该给空串")
+    _with_mmap_regions(run)
 
 
 def t_ask_region_modal():
@@ -699,10 +772,9 @@ def t_gen_cert_pair_loads():
 
 TESTS = (
     ("服务表（标题/参数/命令行）完整", t_service_table),
-    ("小地图推流的命令行", t_mmap_cmd),
-    ("区域填好没有的判据", t_region_set),
-    ("启动前的拦截提示", t_missing_hint),
-    ("DEFAULTS 与参数表同步", t_config_defaults),
+    ("小地图推流的命令行（按「当前是哪张图」传 --map-id）", t_mmap_cmd),
+    ("启动前的拦截提示（mmap 不再拦「还没框过」）", t_missing_hint),
+    ("DEFAULTS 与参数表同步（区域键不许回 deploy.json）", t_config_defaults),
     ("_deep_merge 只认已声明的键", t_config_merge),
     ("小地图端口进一致性自检", t_link_expect),
     ("自检里的小地图区域项", t_check_region),

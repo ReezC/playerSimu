@@ -493,6 +493,43 @@ class SettingsDialog(QDialog):
         """出问题怎么办：什么时候停下、怎么清干净、断了怎么回来。"""
         page, lay = self._page()
 
+        # ⭐⭐ **现场录屏保留开关**（用户 2026-10-02 ✓ 原话："在设置（数据工作台上面的按钮
+        #   弹窗）→ **保护与恢复页签 最顶部**加开关『保留测谎录屏』『保留断线录屏』" ✓）。
+        #   ⚠ 放在这一页**表单之外的最上面**（= "最顶部" ✓，与"判定参数"页那个顶层开关同款
+        #     版式 ✓ 见 `_page_judge` 的 `ck_no_chase_path`）：它管的是"**出问题（测谎 / 断线）时
+        #     要不要把现场留下**"✓ —— 与下面那些"什么时候停 / 怎么重连"是同一类事（出事怎么办 ✓），
+        #     不属于"某个参数的数值" ✗。
+        #   ⚠ 落 `config/live.yaml`（**与「性能日志」同款** ✓）：它不是决策参数 ⇒ 不进项目文件 ✓
+        #     （见本文件头那段"保护与恢复里的都是决策参数" —— 这两项是**本机录制偏好** ✓ 例外 ✓）；
+        #     实时线程 `gui/live_thread.py` 每段起录前读它 ✓（关掉 ⇒ 一个字节都不落盘 ✓）。
+        self._head(lay, "测谎 / 断线现场录屏",
+                   "把**出问题那一刻的画面**录成 mp4 留档（落在 `data/recordings/`）：\n"
+                   "  · **测谎录屏** —— 测谎弹窗出现 ⇒ 起录；成功弹窗关掉（回战斗）⇒ 停录，\n"
+                   "    文件名 `lie_<时间戳>.mp4`；\n"
+                   "  · **断线录屏** —— 断线提示框（`login_err`）出现 ⇒ 起录；**一路录到回到\n"
+                   "    游戏画面** ⇒ 停录（提示框本身只显示两三秒，只录它不够看现场 ✓），\n"
+                   "    文件名 `disc_<时间戳>.mp4`。\n\n"
+                   "录的是**原生帧**（不带玩家/怪物框、攻击线 —— 战斗标记一律不进文件 ✓）＋\n"
+                   "左上角叠「**时间戳 / 帧号 / 屏幕状态**」（便于逐帧对照 ✓）。\n"
+                   "单段最长 5 分钟（保险）；**实时画面的显示不受影响** ✓。")
+        self.ck_rec_lie = QCheckBox("保留测谎录屏")
+        self.ck_rec_lie.setChecked(bool(load_live().get("rec_lie", True)))
+        self.ck_rec_lie.setToolTip(
+            "测谎弹窗出现 ⇒ 起录；`lie_success` 关掉（回战斗）⇒ 停录 ✓\n"
+            "（`lie_warn → lie_game → lie_success` 之间的切换不会重开 ✓ 一路录到底 ✓）。\n\n"
+            "关掉 ⇒ **不写任何文件**（实时画面、报警音一切照旧 ✓）。")
+        lay.addWidget(self.ck_rec_lie)
+
+        self.ck_rec_disc = QCheckBox("保留断线录屏")
+        self.ck_rec_disc.setChecked(bool(load_live().get("rec_disc", True)))
+        self.ck_rec_disc.setToolTip(
+            "断线提示框（`login_err`）出现 ⇒ 起录；**回到游戏画面（`combat`）才算完** ⇒ 停录 ✓\n"
+            "（中间经过登录 / 选频道 / 排队那些界面**不停** ✗ —— 整个断线-回归过程都要留下 ✓）。\n\n"
+            "关掉 ⇒ **不写任何文件**。\n"
+            "⚠ 与测谎录屏共用一套录制器：万一两者撞在同一段（测谎中断线），先起的那个录 ✓。")
+        lay.addWidget(self.ck_rec_disc)
+
+        lay.addSpacing(8)
         self._head(lay, "朝向无变化停止自动（min）",
                    "角色朝向超过该时长没变化，自动停止（0 = 禁用）。")
         self.sp_timeout = NoWheelDoubleSpinBox()
@@ -1174,6 +1211,15 @@ class SettingsDialog(QDialog):
         if pl != bool(load_live().get("perf_log", True)):
             update_live(perf_log=pl)
             perf.set_enabled(pl)
+        # ⭐⭐ 现场录屏两开关（用户 2026-10-02 ✓"保护与恢复页签最顶部" ✓）：落
+        #   `config/live.yaml` ✓ —— 实时线程**每段起录前**才读它 ✓ ⇒ 这里不需要任何
+        #   "立即生效"的接线（下一段测谎 / 断线就按新值走 ✓；正在录的那一段不打断 ✓）。
+        rl = self.ck_rec_lie.isChecked()
+        rd = self.ck_rec_disc.isChecked()
+        if rl != bool(load_live().get("rec_lie", True)):
+            update_live(rec_lie=rl)
+        if rd != bool(load_live().get("rec_disc", True)):
+            update_live(rec_disc=rd)
         if ka != bool(load_live().get("perf_keepalive", True)):
             update_live(perf_keepalive=ka)
         # 保活立即生效：开 → 马上声明（幂等，重复调无害）；

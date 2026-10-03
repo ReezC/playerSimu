@@ -53,6 +53,9 @@ decision:
   chase_jump_min: -10
   chase_jump_max: 8
   chase_jump_dash_ms: 200
+  chase_jump_edge_guard_enabled: false
+  chase_jump_edge_guard_px: 100
+  station_turn_interval_ms: 1000
   mouse_speed: 1.1999999999999995
   evade_type: jump
   jump_interval: 0
@@ -91,7 +94,7 @@ decision:
     right: right
     up: up
     down: down
-    attack: t
+    attack: s
     jump: D
     hp_pot: g
     mp_pot: null
@@ -107,7 +110,7 @@ decision:
   min_turn_hold_ms: 1000
   turn_output_delay_ms: 0
   player_track_jump: 200
-  player_foot_offset_px: 0
+  player_foot_offset_px: -25
   player_box_min_area_pct: 0.0
   player_box_area_base_s: 3.0
   player_box_area_tol_pct: 0.0
@@ -148,7 +151,7 @@ decision:
   align_tol_px: 10
   align_hold_ms: 1000
   climb_align_gap_ms: 180
-  climb_align_near_px: 20
+  climb_align_near_px: 1
   climb_retry_delay_s: 1.0
   climb_retry_delay_inc_s: 1.0
   goto_timeout_s: 10.0

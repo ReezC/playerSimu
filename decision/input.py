@@ -220,6 +220,20 @@ class KeyState:
         """**瞬发键摘账**（只摘账、**不发松开** ✓ 同上 ✓）。"""
         self._momentary.discard(name)
 
+    def held_by_decision(self, name):
+        """这个键**这一拍正被决策侧按着**吗（∈ `_pressed`，**不含**瞬发账 ✓）。
+
+        谁问：输出序列里那个 `up` 步（用户 2026-10-03 ✓ —— "按键挤压"的另一半）。
+        为什么需要它：序列 `down` 时若这个键**已经被决策按着**，`momentary_mark` **故意
+        不登记**（决策侧本来就在 `pressed()` 里 ✓）；到 `up` 那一步要是照发 `key_up`，
+        松掉的其实是**决策侧**按着的那个键 ✗ —— 而决策侧 `keys.set` 因为"键集没变"
+        **不会补发** PRESS ⇒ 这个键**静默丢掉**（按住的动作莫名断一下 = 现场说的挤压 ✓）。
+        ⚠ 与 `_tap` 用的 `pressed()`（**并集** ✓）**不是一回事，别合并** ✗：
+          点按不能碰任何"别人按着的"键（并集 ✓）；而"松开"只该让开**决策侧**的键 ——
+          序列**自己**按下去的那个必须照松（不然序列自己就卡住了 ✗）。
+        """
+        return str(name) in self._pressed
+
     def release_all(self):
         self.set(set())
 
@@ -362,9 +376,35 @@ def release_all_remote():
 
 
 # ---- 鼠标（远程模式：由 Pro Micro 固件作为硬件 HID 鼠标输出，同键盘一样走固件）----
+#: 上一条 `mouse_move` 的时刻（算「命令间隔」用 ✓ 见 `mouse_move`）。
+_last_move_t = None
+
+
 def mouse_move(dx, dy):
-    """相对移动鼠标：dx/dy 像素（正数向右/向下）。"""
+    """相对移动鼠标：dx/dy 像素（正数向右/向下）。
+
+    ⭐ **打点**（2026-10-03 ✓ 用户现场："看起来现象是在 A 机上一段一段一顿一顿的指令
+    汇报很离散，B 机卡不卡其实没关系"）：
+    鼠标这条链以前**没有任何专用计数** ✗（`MOVE` 和键盘混在 `send` 里 ✓）⇒ 「实际命令率
+    多少 / 间隔匀不匀 / 每步几像素」全都量不出来、只能猜 ✓。现在补三个：
+
+      · `mouse_send`   条数 ⇒ 命令率（触控板正常 60~125/s；远低于它 = 在攒着发 ✗）
+      · `move_gap_ms`  相邻两条 MOVE 的间隔 ⇒ 中位小而 p95 大 = **一撮一撮** ✗
+      · `move_px`      `|dx|+|dy|` ⇒ **中位 1~2 = 量化台阶**（`_on_pad_moved` 的 `int()`
+                        + 余数累积：慢速时几个事件才凑够 1 像素 ✓）
+
+    ⚠ 另一半在 **A 侧**（`remote_kbd/relay.py` 的 `MOVE 节拍` 那行 ✓）⇒ 两边一对比就能
+      定案「是 B **发**得就不匀」还是「A **转**得不匀」✓（这正是本轮只加打点、不先改代码
+      的原因 ✓）。
+    """
+    global _last_move_t
     if _remote is not None:
+        _now = time.perf_counter()
+        if _last_move_t is not None:
+            perf.sample("move_gap_ms", (_now - _last_move_t) * 1000.0)
+        _last_move_t = _now
+        perf.count("mouse_send")
+        perf.sample("move_px", abs(int(dx)) + abs(int(dy)))
         _send_remote("MOVE %d %d" % (int(dx), int(dy)))
 
 

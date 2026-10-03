@@ -277,15 +277,32 @@ class ServiceCard(QFrame):
             row_box.addWidget(btn)
             holder = QWidget()
             holder.setLayout(row_box)
-        elif spec["kind"] == "region":
+        elif spec["kind"] == "mmap_current":
+            # 「当前地图」：只读一行 + 「重读」（B 机说了就变 ⇒ 想立刻看新的就点它 ✓）
+            row_box = QHBoxLayout()
+            row_box.setSpacing(4)
+            row_box.addWidget(widget, 1)
+            btn = QPushButton("重读")
+            btn.setFixedWidth(48)
+            btn.setToolTip("再读一次「当前是哪张图」。\n"
+                           "A 机自己不会变 —— 它只在 B 机发 `MAP <地图id>` 时变\n"
+                           "（这个按钮是给「我不想等它下一次说」用的）。")
+            btn.clicked.connect(lambda _c: self._reload_current_map())
+            row_box.addWidget(btn)
+            holder = QWidget()
+            holder.setLayout(row_box)
+        elif spec["kind"] == "mmap_region":
+            # 「小地图区域」：只读一行（当前那张图那份）+ 「框选…」（写进**这张图**名下 ✓）
             row_box = QHBoxLayout()
             row_box.setSpacing(4)
             row_box.addWidget(widget, 1)
             btn = QPushButton("框选…")
             btn.setFixedWidth(58)
             btn.setToolTip("抓一张全屏图，把游戏的小地图面板框出来\n"
-                           "（框之前这个窗口会自动藏起来）")
-            btn.clicked.connect(lambda _c, w=widget: self._pick_region(w))
+                           "（框之前这个窗口会自动藏起来）\n\n"
+                           "结果存进**当前这张图**那份里（config/minimap_regions/<id>.json，\n"
+                           "只在这台机器上）；推流正在跑的话会自动重启一次。")
+            btn.clicked.connect(lambda _c: self._pick_region())
             row_box.addWidget(btn)
             holder = QWidget()
             holder.setLayout(row_box)
@@ -374,11 +391,13 @@ class ServiceCard(QFrame):
             w.currentTextChanged.connect(self.changed)
             return w, w.currentText
 
-        if kind == "region":
-            w = QLineEdit(_region_text(cfg))
-            w.setPlaceholderText("x,y,w,h —— 点右边「框选…」")
-            w.textChanged.connect(self.changed)
-            return w, (lambda: w.text().strip())
+        if kind in ("mmap_current", "mmap_region"):
+            # ⭐ **只读两行**（用户 2026-10-02 ✓）：内容是**现读**的（B 机随时可能告诉本机
+            #   换图 ⇒ 不能只在建卡片时算一次 ✗）⇒ getter 每次重算，`refresh_displays`
+            #   拿它 `setText` 即可 ✓（一处实现：文案都在 `_mmap_display_text` ✓）。
+            w = QLabel(_mmap_display_text(kind))
+            w.setToolTip(spec.get("tip", ""))
+            return w, (lambda k=kind: _mmap_display_text(k))
 
         if kind == "serial":
             w = NoWheelComboBox()
@@ -470,16 +489,33 @@ class ServiceCard(QFrame):
             "（「键盘中继」若正在跑，需要重启它才会用上新证书。）"
             % (cert_p, key_p))
 
-    def _pick_region(self, line):
-        """「框选…」：抓屏拖一个框 → 把 x,y,w,h 写回输入框。
+    def _pick_region(self):
+        """「框选…」：抓屏拖一个框 ⇒ **存进"当前这张图"那份**（用户 2026-10-02 ✓）。
 
-        走 `tools.minimap_push.ask_region`（**和命令行 --pick 同一份实现**）：
+        与以前（写 `deploy.json` 的 x/y/w/h）的区别，正是这次改的东西：
+          · **落点** = `config/minimap_regions/<当前图 id>.json`（A 机本地 ✓ 每图一份 ✓）；
+          · **不知道是哪张图 ⇒ 不框**（用户定"当前是哪张图只由 B 机推"✓）—— 提示先去
+            B 机开始实时，别让人对着一个**猜出来的**图名框（框错了下一步谁都不知道 ✗）；
+          · **zoom 一起存**（拿卡片上那个「放大倍数」✓）：标定是按某个 zoom 标的，
+            区域与 zoom 必须同一份（见 `core.mapdata.load_calib`）；
+          · 框完**推流正在跑就自动重启一次** —— 不然"框了没生效"要人去猜 ✗
+            （重启是部署台本来就有的动作 ✓ 与"停一下再启"完全等价 ✓）。
+
+        抓屏走 `tools.minimap_push.ask_region`（**和命令行 --pick 同一份实现**）：
         owner 传自己，它会先把部署台窗口藏起来再抓屏 —— 不藏的话截到的图里
         盖着部署台自己，人对着自己的界面框小地图（这一步不做就白框）。
-
-        写回输入框靠 `setText` 触发 textChanged → 部署台照常「立即落盘 + 刷新
-        命令行预览」，不另走一条路 —— 否则「框完没保存」这种坑迟早会出现。
         """
+        from tools import mmap_regions
+        mid, _box, _zoom = services.mmap_region_now()
+        if not mid:
+            QMessageBox.information(
+                self, "先知道是哪张图",
+                "还不知道现在跑的是哪张图 —— 这个由 **B 机**告诉 A 机：\n\n"
+                "在 B 机开始实时（以后换图也一样），它会发一句 `MAP <地图id>`，\n"
+                "这张卡片的「当前地图」就会变成那张图；那时候再点「框选…」，\n"
+                "框出来的结果就存到那张图名下。\n\n"
+                "（A 机不能自己选图，免得和 B 机正在跑的图对不上。）")
+            return
         try:
             from tools.minimap_push import ask_region
         except Exception as e:
@@ -494,7 +530,48 @@ class ServiceCard(QFrame):
             return
         if not rect:
             return
-        line.setText(",".join(str(int(v)) for v in rect))
+        zoom = int(self.cfg.get("mmap", {}).get("zoom") or 3)
+        try:
+            path = mmap_regions.save(mid, rect[0], rect[1], rect[2], rect[3],
+                                     zoom=zoom, note="部署台「框选…」")
+        except Exception as e:                    # noqa: BLE001
+            QMessageBox.warning(self, "保存失败",
+                                "框到了，但存不进「%s」那份：%s: %s\n文件：%s"
+                                % (mid, type(e).__name__, e,
+                                   mmap_regions.path_of(mid)))
+            return
+        self.refresh_mmap_rows()
+        _restarted = False
+        proc = self.procs.get("mmap")
+        if proc is not None and proc.running():
+            self.stop_service("mmap")
+            QTimer.singleShot(600, lambda: self.start_service("mmap"))
+            _restarted = True
+        QMessageBox.information(
+            self, "已保存",
+            "「%s」的区域已存（zoom=%d）：\n%s\n\n屏幕 (%d,%d) %dx%d\n\n%s"
+            % (mid, zoom, path, rect[0], rect[1], rect[2], rect[3],
+               "推流正在跑 ⇒ 已自动重启一次，下一帧就是新区域。"
+               if _restarted else "推流没在跑 ⇒ 下次「启动」就用这块。"))
+
+    def _reload_current_map(self):
+        """「重读」：再问一次"当前是哪张图"（B 机说了才变 ✓ 这里只是立刻重读一次）。
+
+        ⚠ 顺手**同步 zoom**：卡片上的「放大倍数」是"这张图要放大几倍"的现行值 ⇒
+          点重读时把它写回那张图那份（不然人改了 zoom、点了重读却还是旧的 ✗）。
+          只在**那张图已经框过**时写（没框过就等框选那一下一起落 ✓）。
+        """
+        from tools import mmap_regions
+        mid, box, zoom = services.mmap_region_now()
+        if mid and box is not None:
+            want = int(self.cfg.get("mmap", {}).get("zoom") or 3)
+            if want != int(zoom or 3):
+                try:
+                    mmap_regions.save(mid, box[0], box[1], box[2], box[3], zoom=want,
+                                      note="部署台改「放大倍数」同步")
+                except Exception:                 # noqa: BLE001 —— 存不下也别把界面弄崩 ✓
+                    pass
+        self.refresh_mmap_rows()
 
     # ---------------- 命令行预览 ----------------
 
@@ -534,23 +611,33 @@ class ServiceCard(QFrame):
     # ---------------- 取值 / 状态 ----------------
 
     def values(self):
-        """参数控件的当前值 → 配置片段（按 spec 的 keys 摊平）。"""
+        """参数控件的当前值 → 配置片段（按 spec 的 keys 摊平）。
+
+        ⚠ **只读那几行（「当前地图」/「小地图区域」）一个配置键都没有**（`keys=()` ✓
+          它们的内容在 `config/minimap_regions/` 里 ⇒ 不进 deploy.json ✗）⇒ 直接跳过 ✓
+          （不跳的话 `spec["keys"][0]` 会 IndexError ✗）。
+        """
         out = {}
         for spec, _w, getter in self._getters.values():
+            if not spec.get("keys"):
+                continue
             val = getter()
             if spec["kind"] == "size":
                 w, h = _parse_size(val)
                 out[spec["keys"][0]] = w
                 out[spec["keys"][1]] = h
-            elif spec["kind"] == "region":
-                # 一个框 → 四个键。解析不出来时写 None（**不猜一个默认区域**）：
-                # 猜出来的区域会推一片无关画面出去，B 机那边「底图对不上」，
-                # 看着完全像寻路坏了；写 None 则会被 missing_hint 当场拦住。
-                for k, v in zip(spec["keys"], _parse_region(val)):
-                    out[k] = v
             else:
                 out[spec["keys"][0]] = val
         return out
+
+    def refresh_displays(self):
+        """把**只读那几行**按现在的实际情况重读一遍（B 机随时可能告诉本机换图 ✓）。
+
+        ⚠ 只动只读行（`setText` ✓），**不重建卡片**：重建会把人的输入/焦点清掉 ✗。
+        """
+        for spec, w, getter in self._getters.values():
+            if spec.get("kind") in ("mmap_current", "mmap_region"):
+                w.setText(getter())
 
     def set_running(self, running, uptime=0.0):
         self.btn_start.setEnabled(not running)
@@ -592,32 +679,31 @@ def _parse_size(text):
         return 1366, 768
 
 
-def _region_text(cfg):
-    """配置里的 x/y/w/h → 输入框显示文本 'x,y,w,h'；没框选过就是空串。"""
-    vals = [(cfg or {}).get(k) for k in ("x", "y", "w", "h")]
-    if any(v in (None, "") for v in vals):
-        return ""
-    try:
-        return ",".join(str(int(v)) for v in vals)
-    except (TypeError, ValueError):
-        return ""
+def _mmap_display_text(kind):
+    """小地图卡片那两行**只读文字**（用户 2026-10-02 ✓）—— 文案**只有这一处** ✓。
 
-
-def _parse_region(text):
-    """'x,y,w,h' → (x, y, w, h)；解析不出来返回 (None, None, None, None)。
-
-    逗号/中文逗号/空格都认（手输时全角逗号很常见）。**不退回默认值** ——
-    理由见 ServiceCard.values()。
+    内容全部**现读** `tools/mmap_regions`（B 机随时可能告诉本机换图 ⇒ 不能缓 ✗）：
+      · `"mmap_current"` = 当前图 id（+ 是谁/什么时候说的）；
+      · `"mmap_region"` = **当前这张图**那份框（屏幕坐标 + zoom），没框过就说没框过。
+    ⚠ 不猜、不编默认值：没有就说"还没有/还没框过"（编一个数出来会让人以为框好了 ✗）。
     """
-    parts = [v for v in
-             str(text or "").replace("，", ",").replace(" ", ",").split(",")
-             if v != ""]
-    if len(parts) != 4:
-        return (None, None, None, None)
-    try:
-        return tuple(int(float(v)) for v in parts)
-    except (TypeError, ValueError):
-        return (None, None, None, None)
+    from tools import mmap_regions
+    cur = mmap_regions.current() or {}
+    mid = str(cur.get("map_id") or "")
+    if kind == "mmap_current":
+        if not mid:
+            return "（还没有 —— 先在 B 机开始实时）"
+        _by = str(cur.get("by") or "")
+        _t = str(cur.get("updated") or "")
+        return "%s（%s%s）" % (mid, ("%s 说的" % _by) if _by else "别人说的",
+                              ("　%s" % _t[11:]) if len(_t) >= 16 else "")
+    if not mid:
+        return "（还没有图 —— 等 B 机告诉本机是哪张图）"
+    got = mmap_regions.load(mid)
+    if not got:
+        return "「%s」还没框过 —— 点右边「框选…」" % mid
+    return "屏幕 (%d,%d) %dx%d　zoom=%d" % (got["x"], got["y"], got["w"], got["h"],
+                                          int(got["zoom"]))
 
 
 def _hms(sec):
@@ -1336,6 +1422,8 @@ class DeployWindow(QMainWindow):
 
     def _refresh_cmd_all(self):
         for card in self.cards.values():
+            # ⚠ `_refresh_cmd_all` 被重建卡片时调用 ⇒ **别在这儿顺带刷只读行** ✗
+            #   （重建之后 `refresh_mmap_rows` 自己会刷 ✓ 见 `_refresh_states` ✓）
             card.refresh_cmd()
 
     # ---------------- 状态显示 ----------------
@@ -1346,6 +1434,21 @@ class DeployWindow(QMainWindow):
             "推流目标 udp://%s:%s   ·   分辨率 %sx%s @ %s fps   ·   %s"
             % (push.get("host"), push.get("port"), push.get("width"),
                push.get("height"), push.get("fps"), push.get("encoder")))
+
+    def refresh_mmap_rows(self):
+        """刷「当前地图」/「小地图区域」两行 + 小地图那张卡的「将执行」（用户 2026-10-02 ✓）。
+
+        为什么得**定时**刷：这两行说的是"B 机在跑哪张图 / 那张图框在哪" —— 而 id 是
+        **B 机**推来的（`MAP <地图id>` ⇒ 推流收到就写本机 ✓）。不刷的话，界面上永远
+        是"刚打开那一刻"的图 ⇒ B 机换图后**框选会框到错的图名下** ✗（那正是用户要
+        避免的"填错地方"）。
+        ⚠ 只 `setText` 两行 + 重拼一条命令字符串（微秒级 ✓ 跟着 1 秒的状态刷新一起跑 ✓）。
+        """
+        card = self.cards.get("mmap")
+        if card is None:
+            return
+        card.refresh_displays()
+        card.refresh_cmd()
 
     def _refresh_states(self):
         for key, card in self.cards.items():
@@ -1358,6 +1461,9 @@ class DeployWindow(QMainWindow):
         running = sum(1 for p in self.procs.values() if p.running())
         self.btn_all_stop.setEnabled(running > 0)
         self.btn_all_start.setEnabled(running < len(services.ORDER))
+        # ⭐ 顺带刷小地图那两行只读文字（B 机随时可能告诉本机换图 ✓ 见那个方法 ✓）——
+        #   放在**每秒**的状态刷新里就跑成了定时刷新，而不用另起一个 QTimer ✓。
+        self.refresh_mmap_rows()
 
     # ---------------- 启停 ----------------
 

@@ -171,26 +171,37 @@ def check_certs(cfg):
 
 
 def check_region(cfg):
-    """小地图区域框了没有 / 框得对不对（只有用寻路定位时才需要）。
+    """小地图区域框了没有 —— **按"当前是哪张图"判**（用户 2026-10-02 ✓）。
 
-    **没框选只算 warn 不算 bad**：不用寻路的人根本不需要这张卡片，
-    把它标成红的会让人以为部署台坏了。
+    三档（都只算 warn 不算 bad：不用寻路的人根本不需要这张卡片，
+    标成红的会让人以为部署台坏了 ✓）：
+      · **还不知道是哪张图**（B 机还没告诉过本机）⇒ 说清"先去 B 机开始实时"；
+      · 知道图，但**这张图还没框过** ⇒ 说清"在卡片里点框选"，并列出**已经配了哪些图**
+        （不然人很容易在错的图名下框 ✗）；
+      · 框过 ⇒ ok，带上这台的屏幕坐标与该图的 zoom ✓。
+    ⚠ 参数 `cfg` 现在**不参与**了（区域不再存 deploy.json ✓）—— 留着是为了调用处统一
+      （签名与其它 check_xxx 一致 ✓）。
     """
-    vals = [cfg.get(k) for k in ("x", "y", "w", "h")]
-    if any(v in (None, "") for v in vals):
-        return [warn("小地图区域还没框选",
-                     "只在用寻路定位时才需要：在「小地图推流」卡片里点「框选…」，\n"
-                     "把游戏的小地图面板框出来（只框面板本身）。")]
-    try:
-        x, y, w, h = (int(v) for v in vals)
-    except (TypeError, ValueError):
-        return [bad("小地图区域填得不对",
-                    "应该是四个整数 x,y,w,h，现在是：%s\n"
-                    "点「框选…」重框一次最省事。" % (vals,))]
-    if w < 20 or h < 20:
-        return [warn("小地图区域偏小（%dx%d）" % (w, h),
-                     "确认框的是**整个**小地图面板 —— 太小 B 机认不出是哪个地图。")]
-    return [ok("小地图区域已框选", "屏幕 (%d,%d) %dx%d" % (x, y, w, h))]
+    from tools import mmap_regions
+    cur = mmap_regions.current() or {}
+    mid = str(cur.get("map_id") or "")
+    if not mid:
+        return [warn("还不知道现在跑的是哪张图",
+                     "（只在用寻路定位时才需要。）\n"
+                     "「当前是哪张图」由 **B 机**告诉 A 机（B 机开始实时时会发一句\n"
+                     "`MAP <地图id>`）—— 先在 B 机开始实时；B 机换图之后这里也会跟着变。\n"
+                     "知道了 id 之后再在「小地图推流」卡片里点「框选…」。")]
+    got = mmap_regions.load(mid)
+    if not got:
+        ids = mmap_regions.list_ids()
+        return [warn("「%s」这张图还没框过" % mid,
+                     "已在「小地图推流」卡片里点「框选…」，把游戏的小地图面板框出来\n"
+                     "（只框面板本身）—— 框的结果会存到「%s」名下（只在这台机上）。\n\n"
+                     "这台机器上已经配过的图：%s"
+                     % (mid, "、".join(ids) if ids else "（一张都还没有）"))]
+    x, y, w, h, zoom = (got["x"], got["y"], got["w"], got["h"], int(got["zoom"]))
+    return [ok("小地图区域已框选（%s）" % mid,
+               "屏幕 (%d,%d) %dx%d　zoom=%d" % (x, y, w, h, zoom))]
 
 
 def check_link(cfg, expect):

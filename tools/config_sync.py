@@ -76,6 +76,16 @@ SOFT = ()
 LOCAL = (
     ("config/deploy.json",
      "A 机本地：本机串口/屏幕区域/推流参数。它**派生**自 link.yaml，由环境自检比对"),
+    ("config/minimap_region.json",
+     "A 机本地：老的那份**单值**推流区域 —— 它说的是**这台机器的屏幕**上小地图板在哪"
+     "（分辨率/窗口位置/UI 缩放各机不同）⇒ 同步过去就是「推错一块画面」，"
+     "B 机那边看着像寻路坏了（见 tools/mmap_regions.py 顶部说明）"),
+    ("config/minimap_regions/",
+     "A 机本地：按地图 id 分开的推流区域（同一件事，只是每图一份）—— "
+     "同上，都是**屏幕坐标**，各机不同"),
+    ("config/minimap_current.json",
+     "A 机本地：「现在该推哪张图」的那份记忆（最近一次 B 机 `MAP <id>` 告诉本机的 ✓）—— "
+     "它跟着本机的屏幕区域走，同步过去会让另一台机去推一张不属于它的图"),
     ("remote_kbd/certs/key.pem",
      "私钥**只在 A 机**用（relay 服务端 load_cert_chain，见 remote_kbd/relay.py）；"
      "B 机从不加载它 —— 所以两边不必一致（要求同步一份私钥是没必要的）"),

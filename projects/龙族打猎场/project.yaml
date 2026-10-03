@@ -36,9 +36,9 @@ mmap_crop:
 decision:
   attack_dist: 80.0
   min_attack_dist: 0
-  attack_up_dist: 30
+  attack_up_dist: 40
   attack_down_dist: 22
-  chase_jump_enabled: false
+  chase_jump_enabled: true
   chase_jump_min: -10
   chase_jump_max: 5
   chase_jump_dash_ms: 100
@@ -80,7 +80,7 @@ decision:
     right: right
     up: up
     down: down
-    attack: f
+    attack: s
     jump: D
     hp_pot: g
     mp_pot: null
@@ -90,7 +90,7 @@ decision:
   target_cd:
   - 1000
   - 2500
-  input_device: local
+  input_device: remote
   attack_cd: 300
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 500
@@ -123,14 +123,17 @@ decision:
   vision_center: false
   vision_off_x: 0
   vision_off_y: 0
+  big_mob_enabled: true
+  big_mob_ratio: 1.5
+  big_mob_range_px: 600.0
   sweep_turn_cd: 500
   back_range: 150
-  sweep_edge_turn_px: 100
+  sweep_edge_turn_px: 60
   route_goto_set: 上层
   align_tol_px: 12
   align_hold_ms: 1000
   climb_align_gap_ms: 200
-  climb_align_near_px: 1
+  climb_align_near_px: 20
   climb_retry_delay_s: 0.1
   climb_retry_delay_inc_s: 3.0
   goto_timeout_s: 20.0
@@ -139,7 +142,7 @@ decision:
   disable_chase_pathfinding: false
   jump_start_px: 80
   move_retry_ms: 350
-  debounce_conf: 0.3
+  debounce_conf: 0.2
   debounce_ms: 2000
   custom_timers:
   - name: 自动喂宠
@@ -243,10 +246,10 @@ decision:
 notes: ''
 capture:
   source: file
-  file: D:/Media/record/mxd/龙族大猎场_中.mp4
+  file: D:/Media/record/mxd/龙族打猎场_补充.mp4
   url: udp://0.0.0.0:5000
   fps: 5.0
-  stride: 50
+  stride: 40
   seconds: 120.0
   dedup: 0.01
   limit: 0
@@ -264,7 +267,7 @@ dataset:
   min_boxes: 1
   quality: 92
 train:
-  model: E:\MyPrograms\playerSimu\projects\森林迷宫III\models\detect_v6.pt
+  model: E:\MyPrograms\playerSimu\projects\寺院通道2\models\detect_v5.pt
   epochs: 120
   imgsz: 1280
   batch: 8

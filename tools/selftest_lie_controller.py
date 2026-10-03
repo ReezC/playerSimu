@@ -13,7 +13,10 @@
   ④ **丢失保护**：目标丢 ⇒ 一步不发（光标**原地不动** ✓）、持续丢 ⇒ `lost_event` ✓；
   ⑤ **增益标定错也能收敛**（真增益 1.6× 配置 ⇒ 靠反馈自校正 ✓；反向验证：**掐掉
      反馈**（纯航位推算）⇒ 同一场景系统性偏掉 ⇒ 证明"标定要同状态做"和小偏差
-     都由反馈兜住 ✓）。
+     都由反馈兜住 ✓）；
+  ⑥ **鼠标跟随效率倍率**（用户 2026-10-03 ✓ 新配置 ✓）：每拍消掉误差的这么多倍 ✓
+     —— 1.0 = 全量（老行为 ✓）、0.5 = 渐进、2.0 = 过冲；只改**指令输出** ⇒
+     **不影响任何位置计算** ✓。
 """
 import sys
 from pathlib import Path
@@ -173,6 +176,67 @@ def t_gain_error():
           "无反馈（纯航位推算）居然也不偏（用例没造出错增益的后果 ✗）：%.0f px" % e_open)
 
 
+def t_follow_gain():
+    """⑥ **鼠标跟随效率倍率**（用户 2026-10-03 ✓ 原话："能否开放一个系数配置，调**追踪器**跟上
+    圆心的效率倍率？" ✓ + "**我不想影响位置计算**，只调追踪器（较大的白描边圈绿圆）" ✓）：
+    控制器每拍把「光标 → 目标点」的误差消掉**这么多倍** ✓ —— 只作用在**指令输出**上 ✓
+    （`LieTracker` 的位置计算一个字都不看它 ✓）。钉三件：
+      · 1.0 = **全量**（一拍尽量贴上去 = 老行为 ✓）；
+      · 0.5 = **渐进**（每拍只走一半剩余 ⇒ 步数明显变多 ✓）；
+      · 2.0 = **过冲**（发出去的比误差还多 ✓ 用来对抗一拍延迟）；
+      · 夹取：0 ⇒ 夹到 0.01（光标几乎不动 ⇒ 无意义 ✓）、上界 5 ✓、`None` ⇒ 默认 1.0 ✓。
+    ⚠ **反向验证**：把倍率那一项掐掉（恒等于全量）⇒ 下面第 ②③ 条会红 ✓。
+    """
+    # ① 单拍指令量**按倍率成比例**（同一局面、只改倍率 ✓）
+    def _one_cmd(k):
+        c = LieMouseController(gain=(1.0, 1.0), deadzone=3.0, max_step=1000.0,
+                               ff_lead_s=0.0, follow_gain=k)
+        return c.step((300.0, 100.0), ts=0.0, vel=(0.0, 0.0), cursor=(100.0, 100.0))
+
+    _c1, _c2, _c5 = _one_cmd(1.0), _one_cmd(0.5), _one_cmd(2.0)
+    check(_c1 == (200, 0),
+          "⑥ 倍率 1.00 ⇒ 误差 200px **全量**发出（实际 %s ✓ 老行为 ✓）" % (_c1,))
+    check(_c2 == (100, 0),
+          "⑥ 倍率 0.50 ⇒ 只发一半（实际 %s ✓ 每拍走剩余的一半 ⇒ 渐进 ✓）" % (_c2,))
+    check(_c5 == (400, 0),
+          "⑥ 倍率 2.00 ⇒ **过冲**（实际 %s ✓ 发得比误差还多 ⇒ 抗一拍延迟 ✓）" % (_c5,))
+
+    # ② 渐进收敛：倍率小**也能贴上**（只是要更多拍 ✓）—— 这是"跟上圆心的效率"的本体 ✓
+    def _steps_to_hit(k, n=60):
+        sim = Sim(vel=(0.0, 0.0), tgt0=(600.0, 300.0), start=(100.0, 300.0))
+        c = LieMouseController(gain=(1.0, 1.0), deadzone=3.0, max_step=1000.0,
+                               follow_gain=k)
+        for i in range(n):
+            tgt = sim.target()
+            sim.apply(c.step(tgt, ts=i * 0.14, cursor=sim.cursor_delay))
+            sim.advance()
+            if abs(sim.cursor[0] - tgt[0]) < 3.0:
+                return i
+        return None
+
+    _h1, _h5 = _steps_to_hit(1.0), _steps_to_hit(0.5)
+    check(_h1 == 0,
+          "⑥ 倍率 1.00 ⇒ **第一拍就贴住**（实际第 %s 拍 ✓ 全量 = 一步到位 ✓）"
+          % ((_h1 if _h1 is not None else -1) + 1,))
+    check(_h5 is not None and _h1 is not None and _h5 > _h1,
+          "⑥ 倍率 0.50 ⇒ 步数**明显变多**（1.0 用 %s 拍 ／ 0.5 用 %s 拍 ✓ 效率确实被这个系数"
+          "控制 ✓）" % (None if _h1 is None else _h1 + 1, None if _h5 is None else _h5 + 1))
+
+    # ③ 夹取与默认值
+    check(LieMouseController(follow_gain=0.0).follow_gain == 0.01,
+          "⑥ 0 ⇒ 夹到 0.01（= 光标几乎不动 ⇒ 无意义但要可复现 ✓ 不崩 ✗）")
+    check(LieMouseController(follow_gain=99.0).follow_gain == 5.0,
+          "⑥ 上界 5（防手输离谱值 ✓）")
+    import perception.lie_controller as _LC
+    check(LieMouseController().follow_gain == float(_LC._FOLLOW_GAIN) == 1.0,
+          "⑥ `None` ⇒ 模块默认 %.2f（= 全量 ⇒ 老行为一字不变 ✓）" % float(_LC._FOLLOW_GAIN))
+    # ④ ⭐ **不影响位置计算**：本项只改指令，不碰任何"游戏像素"的目标点 ✓（同一局面下
+    #    目标点一致 ⇒ 只是发多少不同 ✓）—— 这条由①的三档比例关系间接钉住 ✓。
+    check(_c1[0] * 0.5 == _c2[0] and _c1[0] * 2.0 == _c5[0],
+          "⑥ 三档严格成比例（1.0 的 0.5 倍 = 0.5 档 ／ 2 倍 = 2.0 档 ✓ ⇒ 只缩放「走多少」、"
+          "不移动目标点 ✓ = 不影响位置计算 ✓）")
+
+
 def main():
     print("测谎鼠标闭环控制律自检：")
     t_converge()
@@ -180,6 +244,7 @@ def main():
     t_clamp()
     t_lost_hold()
     t_gain_error()
+    t_follow_gain()
     if _FAILED:
         print("自检：%d 条失败" % len(_FAILED))
         return 1
