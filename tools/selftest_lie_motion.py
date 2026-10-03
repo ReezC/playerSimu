@@ -239,6 +239,117 @@ def test_runner_same_shape():
           "⑥ 第 0 拍只有一帧框 ⇒ 还没有位移 ⇒ 不出位置（pos=None ✓ 不乱猜 ✓）")
 
 
+def test_stuck_deprioritize():
+    """⭐⭐⭐ **粘连（重叠）期：观测不可信 ⇒ 降权、偏预测、减速** ✓✓
+    （用户 2026-10-03 ✓ 原话："这一帧其实**已经跟假目标重叠了** ⇒ 应该稍微**沿着轨迹预测减点速**，
+    而不是急于**寻找跟踪信号**（**现在看起来就很急**）" ✓）
+
+    ⚠ 为什么"急"是错的 ✗（实测链 ✓）：真目标与假目标**部分重叠**时，YOLO 把**两个目标检成一个
+      框** ✓ ⇒ 框**面积暴增**（实测帧 13/14 = 自己基准的 **1.67x / 1.90x** ✓）而**框中心 =
+      两个目标的中点** ✗ ⇒ 于是这拍的 `mv` / `dev` 是"观测被拉偏"的产物 ✗（实测 `v_rel` 从
+      27.8 飙到 **40.5** ✗）—— 旧代码把它当"最不合群"**照样加分** ✗ ⇒ `score` 涨到 198.6 ✓
+      **越粘越像目标** ✗✗。
+    ⇒ 现在：`stuck`（+ 分开后 `cool` 几拍）⇒ ①`dev` 只按 `_STUCK_DEV_W` 记分 ✓；②位置偏预测 ✓；
+      ③速度额外衰减 ✓。本用例钉住①（`score` 不许被那个假 `dev` 顶起来 ✓）。
+    """
+    _tr = MotionTracker()
+    _red = 60.0          # 目标"相对群体"每拍多走这么多 ⇒ `dev ≈ 60` ✓（好算 ✓）
+
+    def _d(i, tsz=(150.0, 150.0)):
+        _dets = [(0, 200.0 + 30.0 * i, 100.0, 150.0, 150.0, 0.9),
+                 (0, 500.0 + 30.0 * i, 100.0, 150.0, 150.0, 0.9),
+                 (0, 800.0 + 30.0 * i, 100.0, 150.0, 150.0, 0.9),
+                 (0, 1000.0 + (30.0 + _red) * i, 300.0, tsz[0], tsz[1], 0.9)]
+        return _dets
+
+    for _i in range(0, 7):                       # 帧 0~6：正常（框 150×150 ✓）
+        _tr.process(None, ts=0.1 * _i, dets=_d(_i))
+    _t4 = next((t for t in _tr.tracks if t.id == 4), None)
+    _s6 = None if _t4 is None else float(_t4.score)
+    # 帧 7：**框突然放大到 2.7 倍面积**（= 与邻居粘成一个框 ✓ 而且中心被拉向群体 ✓）
+    _tr.process(None, ts=0.7, dets=_d(7, tsz=(150.0 * 1.65, 150.0 * 1.65)))
+    _t4 = next((t for t in _tr.tracks if t.id == 4), None)
+    check(_t4 is not None and _t4.stuck >= 1,
+          "框面积突然变成 **%.2fx** ⇒ 认出「**粘住了**」（`stuck = %s` ✓ —— ⚠ 面积基准只由"
+          "**正常拍**更新 ✗ 不然它自己会把基准顶上去 ⇒ 永远认不出来 ✓）"
+          % ((_t4.w * _t4.h / max(1.0, _t4.area_ema)) if _t4 else -1.0,
+             None if _t4 is None else _t4.stuck))
+    _inc = None if (_t4 is None or _s6 is None) else float(_t4.score) - _s6 * _tr.score_decay
+    check(_inc is not None and _inc < 0.35 * _red,
+          "粘连那一拍，`score` 只涨了 **%.1f**（`dev` 本可以是 **%.0f** 那一档 ✓）⇒ 那个假"
+          "「偏离」**几乎没进分数** ✓（= 用户要的「**别急于寻找跟踪信号**」✓；⚠ 不降权的话"
+          "这一拍会把分数顶上去 ✓ 实测帧 13 就是这么涨到 198.6 的 ✗）" % (_inc, _red))
+
+
+def test_span_and_vel_normalized():
+    """⭐⭐ **两个实测抓到的真 bug**（用户 2026-10-03 ✓ 他贴的**帧 13** 日志 ✓）。
+
+    ① **跨拍位移没归一化 ⇒ `dev` 虚高 5~6 倍** ✗✗：
+       轨迹「没配上」时 `obs` 会被「按群体中位**推一把**」✓，而 `prev` 仍停在**上一次真实观测**
+       ✓ ⇒ 它下次配上时 `mv = 本拍 − prev` 其实是**跨了好几拍的位移** ✗。
+       实测（帧 13 的 `#10`）：`mv = (+255.9, −43.3)`、**`dev = 218.7 px`** ✗ —— 而相机这一拍
+       只走了 45.7px、配对门限才 70px ⇒ 一拍**绝无可能**位移 255px ⇒ 它**根本不合群个屁** ✗
+       ⇒ 这个虚高的 `dev` 还**顶进 `score`** ⇒ 把幽灵轨迹捧成「最不合群」⇒ **帧 14 换错目标** ✗✗。
+       ⇒ 修：`mv` 一律换算成**每拍**（`÷ mv_span` ✓）。本用例钉住「它回来那一拍 `mv ≈ 每拍`」
+       ✓ 而**不是**「跨拍总量」✗。
+
+    ② **`prev` 存的是「两拍前」的观测 ⇒ `mv` 系统性翻倍** ✗✗（**同一个循环里的另一处** ✓
+       自检 ①② 是一起把它逼出来的 ✓）：`_t.prev = _t.obs` 写在 `_t.obs = 本拍` **之前** ✗
+       ⇒ `prev` 拿到的是**进入本拍时的那个 `obs`**（= 「**上上拍**」的观测 ✗）⇒ 下一拍算 `mv`
+       时等于跨了两拍 ⇒ **正好翻倍** ✓（实测：每拍真走 30 ⇒ `mv` 报 **60** ✗；每拍走 40 ⇒
+       报 **80** ✗）⇒ **判据的量纲整个是错的** ✓（⚠ 排序不变 ⇒ 所以光看「谁分高」不会露馅 ✗，
+       但 `dev` / 噪声底 / 信噪比**全不可信** ✗）。
+       ⇒ 修：**两行顺序对调**（先 `obs = 本拍`、再 `prev = obs` ✓）⇒ `prev` 就 = "上一拍观测" ✓。
+       ⇒ 顺带把**轨迹速度**也改用 `_moves` ✓（原来写的是 `obs − prev` ✗，在旧顺序下**恒为 0** ✗
+       ⇒ 目标「没配上要外推」时**位置一步不动** ✗）。本用例钉住「`vel` ≈ 真实每拍速度」✓
+       ＋「`mv` 不翻倍」✓。
+    """
+    def _d(xs):
+        return [(0, float(_x), 100.0, 60.0, 60.0, 0.9) for _x in xs]
+
+    # ---- ① 跨拍位移必须归一化 ----
+    # ⚠⚠ **夹具本身有两个坑**（我第一版就写错了 ✓ 记下来免得再踩 ✗）：
+    #   ① 轨迹之间要**拉开 400px** ✓ —— 间距 100 时会被**邻居的框"抢走"** ✗（配对门限 70px ✓
+    #      实测：间距 100 ⇒ 第三条当场就配到了邻居那儿 ⇒ `mv_span` 压根不涨 ✗）；
+    #   ② 要留**≥3 条"配得上"的轨迹** ✗ —— `_MIN_PAIRS = 3` 才算得出群体中位 ✓ 不然
+    #      "推一把"推的是 **(0,0)**（= **没推** ✗）⇒ 缺席那条的位置**永远不动** ✗ 也配不回来 ✓
+    #      （这个"不足 3 条就不推"是**合理的** ✓ —— 画面里没有"群体"就谈不上"相对群体" ✓）。
+    _x4 = (100.0, 500.0, 900.0, 1300.0)
+    _tr = MotionTracker()
+    _tr.process(None, ts=0.0, dets=_d(_x4))                             # 建 4 条（id 1~4 ✓）
+    for _i in range(1, 5):                                              # 只喂前三条 ⇒ 第 4 条缺席
+        _tr.process(None, ts=0.1 * _i, dets=_d([_x + 40 * _i for _x in _x4[:3]]))
+    _th = next((t for t in _tr.tracks if t.id == 4), None)
+    _span = None if _th is None else int(_th.mv_span)
+    check(_th is not None and _span >= 4,
+          "① 第 4 条轨迹连续 4 拍没配上 ⇒ 跨拍计数 `mv_span` 涨到 **%s** ✓（它就是「要除以几」✓）"
+          % _span)
+    _tr.process(None, ts=0.5,                                           # 它回来了（位置正好在推到的点 ✓）
+                dets=_d([_x + 40 * 5 for _x in _x4]))
+    _th = next((t for t in _tr.tracks if t.id == 4), None)
+    _mv = None if _th is None else _th.mv
+    _dv = None if _th is None else _th.dev
+    check(_mv is not None and abs(_mv[0] - 40.0) < 12.0,
+          "① 它回来的那一拍，`mv` = **每拍约 40px**（实测 %s ✓）—— ⚠ **不是**跨 5 拍攒出来的 "
+          "**200px** ✗✗（不修的话实测爆出 `dev = 218.7 px` ✗ ⇒ 幽灵被捧成「最不合群」✗）"
+          % (None if _mv is None else "(%.1f, %.1f)" % _mv))
+    check(_dv is not None and _dv < 15.0,
+          "① ⇒ 它的 `dev` 也只有 **%.1f px** ✓（它本来就**跟大家一起动** ⇒ 不该「不合群」✓；"
+          "⚠ 不修的话这里是 **200+** ✗✗）" % (-1.0 if _dv is None else _dv))
+
+    # ---- ② 轨迹速度不许恒为 0 ----
+    _t2 = MotionTracker()
+    for _i in range(6):
+        _t2.process(None, ts=0.1 * _i, dets=[(0, 100.0 + 30 * _i, 100.0, 60.0, 60.0, 0.9)])
+    _tf = _t2.tracks[0] if _t2.tracks else None
+    _vx = None if _tf is None else _tf.vel[0]
+    check(_vx is not None and abs(_vx - 30.0) < 9.0,
+          "② 匀速（每拍 +30px）跑 6 拍 ⇒ 轨迹速度学到 **%.1f px/拍** ✓（一阶滞后 0.7/0.3 收敛到"
+          "这个量级就对了 ✓）—— ⚠ 这条同时钉住「**`mv` 的量纲**」：`prev` 顺序写反时 `mv` 会"
+          "**翻倍成 60** ✗ ⇒ 速度会被拉到 **47.8** ✗（实测踩到 ✓ 而 25 才是对的 ✓）"
+          % (-999.0 if _vx is None else _vx))
+
+
 def test_real_clip_smoke():
     """真素材短冒烟：**用真 YOLO 跑前几拍** ⇒ 报的位置与**白星真值**几乎重合 ✓（唯一有真值的时刻 ✓）。"""
     _src = (Path(__file__).resolve().parent.parent
@@ -278,6 +389,8 @@ def main():
     test_white_helper()
     test_params_really_work()
     test_runner_same_shape()
+    test_stuck_deprioritize()
+    test_span_and_vel_normalized()
     test_real_clip_smoke()
     if _FAILED:
         print("自检：%d 条失败" % _FAILED)

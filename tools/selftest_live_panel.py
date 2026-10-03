@@ -1292,6 +1292,26 @@ def t_mmap_fail_reason_is_logged():
           "定位失败的原因没进日志 ⇒ 下次还只能看界面那行、日志里只有一个计数 ✗")
     check("_mmap_note_last" in _seg,
           "失败原因没去重 ⇒ 段头会被同一句刷爆 ✗")
+
+    # ⭐⭐ **"现在是哪张图"这条线要真接上**（用户 2026-10-03 ✓ 现场："A 显示 当前地图还没有"
+    #   + "没有收到小地图流"）—— 根因是 `MiniMapClient.switch_map` **写好了却一直没人调** ✗
+    #   ⇒ A 永不收到 `MAP` ⇒ A 那行「还没有」✓、且 A **没区域就不抓屏** ✗ ⇒ B 收 0 帧 ✓。
+    #   ⚠ 所以这里必须钉**调用点**（`self._push_map_to_a()` ✓），不是"函数存在" ✗
+    #     —— 上一轮的盲区就是这个形状（断言"槽存在"抓不住 connect 被删 ✓）。
+    check("self._push_map_to_a()" in src,
+          "`_push_map_to_a` 没被调用 ⇒ A 还是收不到 `MAP` ⇒ 那行永远「还没有」+ 不推帧 ✗")
+    check("def _push_map_to_a(self):" in src and "switch_map(" in src,
+          "没走已有那条实现（`MiniMapClient.switch_map` ✓ 不许另写一套 ✗）")
+    _h = src[src.index("def _push_map_to_a(self):"):]
+    check('self._mmap_src == "live"' in _h[:1200],
+          "没排除「来源＝从实时画面」⇒ 那条路不经过 A 的推流，白发一条控制连接 ✗")
+    # ⚠⚠ 这两条**必须断言那一行本身**，不能只看名字 ✗（反向验证实测踩了两个盲区：
+    #    ① 断言 `"_mmap_map_sent" in src` —— 去掉去重那句后**赋值那句**还在 ⇒ 假绿 ✓；
+    #    ② 断言 `'perf.note("mmap_map"'` —— 我自己的**注释里**也写了这串 ⇒ 假绿 ✓✓）。
+    check('if mid == getattr(self, "_mmap_map_sent", None):' in src,
+          "同一张图没去重 ⇒ 每拍都开一条 TCP 连接 ✗")
+    check('_perf.note("mmap_map", ("ok " if ok else "失败 ")' in src,
+          "A 的回答没进日志 ⇒ 失败时人不知道「A 还缺什么」✗")
     # ③ 决策给出的理由（`agent.tick` 的 `reason`）也必须进日志 —— 这次"开启自动没用"
     #    最直接的答案就是它那句「未定位玩家」✓（以前谁都不记 ✗）。
     check('_perf2.note("agent_why"' in src or 'note("agent_why"' in src,

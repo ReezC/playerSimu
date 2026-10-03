@@ -1374,26 +1374,45 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
         for _t in (_trk if _sh_ok.get("cands", True) else []):
             _sc = float(t.get("score") or 0.0)
             _sel = bool(t.get("sel"))
+            # ⭐⭐⭐ **本拍这条到底"有没有观测"**（用户 2026-10-03 ✓ 帧 13 的教训 ✓ 见
+            #   `_Track.mv_span` / `process` ⑤ ✓）：`live=False` = **没配上** ⇒ 位置是
+            #   "按相机怎么走**推**出来的" ✗ `dev` 被置 0 ✗ ⇒ ⚠⚠ **它会在日志/画面上伪装成
+            #   "最正常的那个"** ✗（用户就是被那条"偏了 0.0 px"骗的 ✓）⇒ 这里**必须一眼可分** ✓：
+            #   **灰色细圈 + 分数前加 `*`** ✓（`*` = "数字是推出来的，不是看出来的" ✓）。
+            _live = bool(t.get("live", True))
             _px, _py = int(t["p"][0] * scale_x), int(t["p"][1] * scale_y)
             # 圈：半径随分数（8~26 px ✓）—— 越大分越高 ✓
             _rr = int(8 + 18 * min(1.0, _sc / max(1e-6, _sc_max)))
-            _col = (0, 0, 255) if _sel else (0, 190, 60)
+            _col = (0, 0, 255) if _sel else ((0, 190, 60) if _live else (110, 110, 110))
             cv2.circle(frame, (_px, _py), _rr, _col, 3 if _sel else 1, cv2.LINE_AA)
             if _sel:
                 cv2.circle(frame, (_px, _py), _rr + 4, _col, 1, cv2.LINE_AA)
             # 分数：只标"够资格"的（否则满屏数字 ✓ 反而看不清 ✓）
             if t.get("ok") or _sel:
-                cv2.putText(frame, ("%.0f" % _sc), (_px + _rr + 2, _py - _rr + 4),
+                # ⚠ `*` = **本拍没有观测**（这个数字是"推"出来的 ✓ 见上面 `_live` ✓）；
+                #   `S` = **本拍跟别的目标粘住了** ✗（框面积暴增 ✓ 框中心是**两个目标的中点** ✗
+                #   ⇒ 这一拍的 `dev` **不可信** ✗ 见 `_STUCK_RATIO` ✓）—— 用户 2026-10-03 ✓
+                #   "这一帧其实已经跟假目标重叠了" ✓ 画出来他一眼就能对上 ✓。
+                _txt = (("%.0f" % _sc) + ("" if _live else "*")
+                        + ("S" if (t.get("stuck") or t.get("cool")) else ""))
+                cv2.putText(frame, _txt, (_px + _rr + 2, _py - _rr + 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                             (0, 0, 0), 3, cv2.LINE_AA)
-                cv2.putText(frame, ("%.0f" % _sc), (_px + _rr + 2, _py - _rr + 4),
+                cv2.putText(frame, _txt, (_px + _rr + 2, _py - _rr + 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                            (0, 255, 255) if not _sel else (60, 60, 255), 1, cv2.LINE_AA)
+                            ((60, 60, 255) if _sel else
+                             ((0, 255, 255) if _live else (170, 170, 170))), 1, cv2.LINE_AA)
             # ⚠⚠ **箭头长度必须封顶 + 缩放要小** ✗✗（用户 2026-10-03 截图反馈："**只有意义不明的
             #   大蓝箭头、黄箭头**（尺寸跟经典里的也不对）" ✓）—— 根因：真目标偶尔**一拍走 200+px**
-            #   （实测帧 13 的 `#10`：`v_rel = (211.7,-54.9)` ✗）⇒ 原来 ×3 ⇒ **656px** ⇒ 横跨画面 ✗✗
-            #   ⇒ 现在：**幅度缩放降到 1.6/1.2** ✓ + **硬封顶 `_ARR_MAX` px** ✓ ⇒ 既能看出方向 ✓
-            #     又不会糊满屏 ✓（⚠ 封顶只是**显示**处理 ✗ 判定用的原始值一个字不改 ✓）。
+            #   ⇒ 原来 ×3 ⇒ **656px** ⇒ 横跨画面 ✗✗ ⇒ 现在：**幅度缩放降到 1.6/1.2** ✓ +
+            #   **硬封顶 `_ARR_MAX` px** ✓ ⇒ 既能看出方向 ✓ 又不会糊满屏 ✓（⚠ 封顶只是**显示**
+            #   处理 ✗ 判定用的原始值一个字不改 ✓）。
+            #   ⚠⚠ **更正（2026-10-03 帧 13 查实 ✓）**：原来这里写着"实测帧 13 的 `#10`：
+            #   `v_rel = (211.7,-54.9)`" ✗ 并据此以为"真目标偶尔**一拍走 200+px**" ✗✗ ——
+            #   **那是错的** ✓：那条轨迹**跨了好几拍没配上**（`prev` 停在老位置 ✓）⇒ 算出来的是
+            #   个**跨拍位移** ✗（见 `_Track.mv_span` ✓）⇒ **不是它跑得快，是数据坏了** ✓。
+            #   ⇒ 已修（`mv` 一律归一化成"每拍" ✓）⇒ 这种 200+ 的假箭头**不该再出现** ✓；
+            #   `_ARR_MAX` 就纯当"真遇到大机动时的兜底"留着 ✓。
             _ARR_MAX = 110.0
             # ⚠⚠ **蓝箭头改到"检出框"那一层去画了** ✗✗（见上面 `box_v` 的循环 ✓）——
             #   用户 2026-10-03："**每个假目标检出框**加蓝色箭头显示**瞬时绝对速度**，
@@ -1402,8 +1421,10 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
             # ⭐⭐ **相对群体速度**（判据本体 ✓ 越长越"不合群" ✓）：
             #   · ⚠⚠ **目标那条只画白色** ✗✗（原来黄+白都画 ⇒ **同起点同方向 ⇒ 白被黄盖住**
             #     ⇒ 用户"**没有看到小白箭头**" ✓ 就是这个 ✓）；
-            #   · 其他候选 = **黄色细箭头**（保留 ✓ 对比用 ✓）。
-            if not _sel:
+            #   · 其他候选 = **黄色细箭头**（保留 ✓ 对比用 ✓）；
+            #   · ⚠⚠ **只有 `live`（本拍真配上）的才画黄箭头** ✗✗ —— 没配上的那份 `v_rel`
+            #     是"推"出来的（恒 0 或跨拍平均 ✗）⇒ 画出来就是**假信息** ✓。
+            if not _sel and _live:
                 _vr = t.get("v_rel") or (0.0, 0.0)
                 _dx, _dy = float(_vr[0]), float(_vr[1])
                 _rm = (abs(_dx) ** 2 + abs(_dy) ** 2) ** 0.5
@@ -1431,12 +1452,14 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
             _vr = _sel_t.get("v_rel") or (0.0, 0.0)
             _dx, _dy = float(_vr[0]), float(_vr[1])
             _rm = (abs(_dx) ** 2 + abs(_dy) ** 2) ** 0.5
-            if _rm < 1.0:
-                # ⚠ `v_rel` 为零 = 目标**本拍没配上**（判据上"没有个性运动" ✓ 该怀疑的信号 ✓）
-                cv2.putText(frame, "?", (_px + 16, _py + 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
-                cv2.putText(frame, "?", (_px + 16, _py + 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+            # ⚠⚠ **目标本拍没观测**（`live=False` ⇒ 位置是"按相机怎么走推的" ✗）——
+            #   ⇒ **不许画白箭头** ✗✗（画出来像"它相对大家没动" ✓ 其实**是没有数据** ✗）
+            #   ⇒ 明写 **`? no obs`** ✓（"这拍它没数据" ✓ —— 这本身就是要怀疑的信号 ✓）。
+            if not _sel_t.get("live", True) or _rm < 1.0:
+                cv2.putText(frame, "? no obs", (_px + 16, _py + 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(frame, "? no obs", (_px + 16, _py + 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
             else:
                 _FIX = 56.0                       # 固定视觉长度（px ✓ 显示域 ✓）
                 _ex = int(_px + _dx / _rm * _FIX * scale_x)
@@ -1453,22 +1476,27 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
         # ---- 右上角文字面板（黑底 ✓ 可读 ✓）----
         # ⚠ 颜色图例（用户 2026-10-03 反馈："只有**意义不明**的大蓝箭头、黄箭头" ✗ ⇒ 必须自解释 ✓）
         _lines = ["BLUE=abs vel(each det)  WHITE=target rel-vel(FIXED 56px,see the number)",
-                  "YELLOW=other rel-vel  ORANGE line=target rel-path  BLUE box=YOLO det",
-                  "motion mode  |  cands %d" % len(_trk),
-                  "median mv (%.1f, %.1f)  |  dev_med %.1f" % (_med[0], _med[1],
-                                                               float(motion.get("dev") or 0.0))]
+                  "YELLOW=other rel-vel(**live only**)  GREY+DIM=**lost**(no obs,pos=GUESSED)",
+                  "ORANGE line=target rel-path  |  BLUE box=YOLO det  |  cands %d (live %s)"
+                  % (len(_trk), motion.get("n_live", "?")),
+                  "cam moved (%.1f, %.1f) = %.1f px  |  **NOISE FLOOR** dev %.1f px"
+                  % (_med[0], _med[1], float(motion.get("cam_len") or 0.0),
+                     float(motion.get("dev") or 0.0))]
         if motion.get("sel_score") is not None:
-            _lines.append("SEL score %.1f  dev %.1f  hits %s"
+            _lines.append("SEL score %.1f  dev %.1f  hits %s  %s"
                           % (float(motion["sel_score"]), float(motion.get("sel_dev") or 0.0),
-                             next((str(t.get("hits")) for t in _trk if t.get("sel")), "?")))
+                             next((str(t.get("hits")) for t in _trk if t.get("sel")), "?"),
+                             next((("LIVE" if t.get("live") else "NO-OBS(pos guessed)")
+                                   for t in _trk if t.get("sel")), "?")))
         else:
             _lines.append("SEL (none yet)")
         _top = sorted(_trk, key=lambda t: -float(t.get("score") or 0.0))[:3]
         for _k, _t in enumerate(_top):
-            _lines.append("#%d sc=%.1f dev=%.1f h=%s @(%d,%d)%s"
+            _lines.append("#%d sc=%.1f dev=%.1f h=%s @(%d,%d)%s%s"
                           % (_k + 1, float(_t.get("score") or 0.0),
                              float(_t.get("dev") or 0.0), _t.get("hits"),
-                             _t["p"][0], _t["p"][1], "  <SEL" if _t.get("sel") else ""))
+                             _t["p"][0], _t["p"][1], "  <SEL" if _t.get("sel") else "",
+                             "" if _t.get("live") else "  [NO-OBS 推的]"))
         _lx, _ly, _lh = 8, 60, 20
         _wmax = max(cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0][0]
                     for s in _lines)

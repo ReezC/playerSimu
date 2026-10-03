@@ -1392,6 +1392,46 @@ class LiveThread(QThread):
         # 所以和 `_player_here` 一样存在线程上（都是"最近一次的定位结果" ✓）。
         self._player_at = (float(x), float(y))
 
+    def _push_map_to_a(self):
+        """把「**现在是哪张图**」告诉 A 机（`MiniMapClient.switch_map` ✓）。
+
+        ⭐⭐ 用户 2026-10-03 ✓ 现场："A 显示 **当前地图还没有**" + "**没有收到小地图流**"
+        —— 查下来是**一条从来没接上的线** ✗：
+          · `MiniMapClient.switch_map()`（B → 另开一条控制连接 → `HELLO mmap-ctl` →
+            `MAP <id>` ✓）**全仓库只有定义、没人调用** ✗（`perception/minimap.py:180` ✓）；
+          · 命令行那条诊断路（`python -m perception.minimap` ✓）**也不发 `MAP`** ✗；
+          ⇒ A 机**永远收不到 `MAP`** ⇒ ① 部署台那行永远「（还没有 —— 先在 B 机开始实时）」
+            ✗；② 更要命：A **没有区域就压根不抓屏** ✗（`tools/minimap_push.py` 那句
+            "⚠ 还没收到图（N 路连着但一帧都推不了）"✓）⇒ **B 收到 0 帧** ✓
+            ⇒ B 报「还没收到小地图推流（A 机那一路起了吗？）」✓ —— 两边日志**看着都正常** ✗
+            正是 `switch_map` 的文档里写的那种"连得上、叫不应"✓。
+
+        ⚠ 只在**来源＝收流**时发 ✓（`live` 那条路根本不走 A 的推流 ✓ 见 `_locate_mmap`）；
+        ⚠ 同一张图**只发一次**（每次开一条 TCP 连接 ✗）—— 换图（`_mmap_mid` 变了）会自动再发 ✓；
+        ⚠ A 的回答**如实记进日志**（`perf.note("mmap_map", …)` ✓）：失败时那句话正是
+          "A 还缺什么" ✓（例如"这张图还没框过（105090600）；已配的有：…"✓）⇒ 人知道下一步
+          该去 A 的部署台框一次 ✓，不用再来回猜 ✓。
+        """
+        cli = getattr(self, "_mmap_cli", None)
+        mid = str(getattr(self, "_mmap_mid", "") or "")
+        if cli is None or not mid or self._mmap_src == "live":
+            return
+        if mid == getattr(self, "_mmap_map_sent", None):
+            return
+        self._mmap_map_sent = mid
+        try:
+            ok, info = cli.switch_map(mid)
+        except Exception as e:                          # noqa: BLE001
+            ok, info = False, "%s: %s" % (type(e).__name__, e)
+        try:
+            from core import perf as _perf
+            _perf.note("mmap_map", ("ok " if ok else "失败 ") + str(info)[:60])
+        except Exception:                               # noqa: BLE001
+            pass
+        print(("✓ 已叫 A 机切到这张图的推流区域：%s" % info) if ok
+              else ("⚠⚠ A 机那边还不能推这张图：%s\n"
+                    "   ⇒ 在 A 机「被控机部署台 → 小地图推流」卡片里「框选…」框一次。" % info))
+
     def _locate_mmap(self, panel):
         """这一拍定位一次玩家 → 结论 dict；没在用/没地图 → None。
 
@@ -1424,6 +1464,9 @@ class LiveThread(QThread):
                 except Exception as e:                      # noqa: BLE001
                     return {"ok": False, "note": "小地图推流起不来：%s: %s"
                             % (type(e).__name__, e)}
+            # ⭐⭐ **告诉 A 机"现在是哪张图"**（用户 2026-10-03 ✓ 现场："A 显示 当前地图还没有"）
+            #   ⇒ 见 `_push_map_to_a` 的说明：`switch_map` 写好了**却一直没人调** ✗。
+            self._push_map_to_a()
             panel, _t = self._mmap_cli.latest()
             if panel is None:
                 return {"ok": False, "note": "还没收到小地图推流（%s）"
