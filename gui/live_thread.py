@@ -477,6 +477,12 @@ class LiveThread(QThread):
     #: 只在**开始推理那一刻**发一次 ✓，不改任何行为（照旧按类别名对齐 ✓）—— 但要让
     #: "一个框都没有"这件事**当场有话说** ✗，而不是让人对着空画面猜 ✓。
     weights_warn = pyqtSignal(str)
+    #: ⭐ 「`imgsz` 填的值与引擎输入不符 ⇒ 已按引擎的跑」—— 给界面**弹指引**用
+    #:   （用户 2026-10-03 ✓ 原话："不合适的话弹提示指引然后搞个按钮一键导出也行" ✓）。
+    #:   参数 `(填的值, 引擎实际用的值)` ✓。
+    #:   ⚠ 为什么非要弹：只 `print` 进控制台**人看不到** ✗ ⇒ 人会以为 960 生效了 ✓
+    #:     （那会让"画面尺度 vs 框尺度"的认知悄悄错掉 ✓）。
+    imgsz_mismatch = pyqtSignal(int, int)
     stream_status = pyqtSignal(str)      # waiting / connected / no_stream
 
     def __init__(self, params, parent=None):
@@ -2499,9 +2505,16 @@ class LiveThread(QThread):
                                 if _eng != imgsz:
                                     print("⚠ TensorRT 引擎的输入尺寸是 %d（导出时焊死）⇒ "
                                           "「imgsz」里填的 %d **不会生效**，已按 %d 跑；"
-                                          "想真用 %d：重新导出该尺寸的引擎，"
-                                          "或改用 .pt 权重（.pt 没有这个限制）。"
+                                          "想真用 %d：点「实时」页那个「导出该尺寸引擎」"
+                                          "（或改用 .pt 权重 —— .pt 没有这个限制）。"
                                           % (_eng, imgsz, _eng, imgsz))
+                                    # ⭐ 还要**弹一条**（用户 2026-10-03 ✓ 见信号声明）：
+                                    #   只 print 进控制台人看不到 ✗ —— 面板那边会弹非致命
+                                    #   提示 + 指向「导出该尺寸引擎」按钮 ✓（一键导出 ✓）。
+                                    try:
+                                        self.imgsz_mismatch.emit(int(imgsz), int(_eng))
+                                    except Exception:           # noqa: BLE001
+                                        pass
                                 imgsz = _eng
                                 perf.note("imgsz", "%d(引擎·已对齐)" % _eng)
 

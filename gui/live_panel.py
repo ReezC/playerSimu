@@ -6,7 +6,7 @@
     · 显示三个分开的速度指标
 """
 
-from PyQt5.QtCore import QRect, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QRect, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPainter, QPixmap
 from PyQt5.QtWidgets import (QCheckBox, QFormLayout, QHBoxLayout, QLabel,
                              QLineEdit, QMessageBox, QPushButton, QSizePolicy,
@@ -113,6 +113,34 @@ class LiveFrameRegionClient:
                 self._t0, self._n0 = self._t, self.n_recv
             self.err = ""
         return self._crop, self._t
+
+
+class EngineExportThread(QThread):
+    """后台导 TensorRT 引擎（用户 2026-10-03 ✓："不合适的话弹提示指引然后搞个按钮一键导出也行"）。
+
+    ⚠ **必须后台** ✗：一次导出要**几分钟**（TensorRT 在自动调优 kernel ✓）⇒ 放主线程就是整个
+      界面假死 ✓（这个项目里"界面假死"已经被报过好几次 ✓）。
+    ⚠ **只复用已有那条实现**（`tools/export_engine.export_for` ✓ 约定"一处实现"✓）：它自己
+      处理了"**权重路径含中文**"那个坑 ✓（TensorRT / onnx 的 C 扩展读不了中文路径 ✗ ——
+      而本项目的地图名/项目名**全是中文** ⇒ 那条路必然踩 ✓）。
+    """
+
+    done = pyqtSignal(str)      # 成功：最终引擎路径 ✓
+    failed = pyqtSignal(str)    # 失败：原因（直接给对话框显示 ✓）
+
+    def __init__(self, weights, imgsz, device="0", parent=None):
+        super().__init__(parent)
+        self._weights = str(weights)
+        self._imgsz = int(imgsz)
+        self._device = str(device)
+
+    def run(self):
+        try:
+            from tools.export_engine import export_for
+            self.done.emit(str(export_for(self._weights, self._imgsz,
+                                          device=self._device)))
+        except Exception as e:                       # noqa: BLE001
+            self.failed.emit("%s: %s" % (type(e).__name__, e))
 
 
 class LivePanel(QWidget):
@@ -245,9 +273,28 @@ class LivePanel(QWidget):
             "   那它的输入尺寸是**导出时焊死**的（比如 640）⇒ 这里填别的**不会生效**：\n"
             "   实时会**按引擎的尺寸跑**（所以不会再报错起不来 ✓），并在控制台和\n"
             "   `perf.log` 的段头里写明实际用的是多少（`imgsz=640(引擎·已对齐)`）。\n"
-            "   想真换成别的尺寸：重新导出那个尺寸的引擎，或改用 `.pt` 权重\n"
-            "   （`.pt` 没有这个限制 —— 320~2048 随便填都能跑 ✓）。")
+            "   想真换成别的尺寸：点右边「导出该尺寸引擎」（一键 ✓ 要等几分钟），\n"
+            "   或改用 `.pt` 权重（`.pt` 没有这个限制 —— 320~2048 随便填都能跑 ✓）。")
         row.addWidget(self.sp_imgsz)
+
+        # ⭐ **一键导出「上面那个 imgsz」的引擎**（用户 2026-10-03 ✓ 原话："想真用别的尺寸：
+        #   重新导出那个尺寸的引擎 —— 就不能填写后自动导出吗？不合适的话弹提示指引然后搞个
+        #   按钮一键导出也行" ✓）。
+        #   ⚠ **不做"填完自动导出"** ✗（这也是用户的备选方案 ✓）：一次导出 = 几分钟的重编译
+        #     （TensorRT 调优 kernel ✓），而 `imgsz` 是**逐位敲**进去的 ⇒ `1`/`12`/`128`
+        #     每一击都触发一次全量导出 ✓ 而且会把正在跑的实时卡死 ✗ ⇒ 走"确认 + 按钮" ✓。
+        self.btn_export_engine = QPushButton("导出该尺寸引擎")
+        self.btn_export_engine.setToolTip(
+            "按左边「imgsz」里的尺寸**导出一份 TensorRT 引擎**（要等几分钟，界面不卡 ✓）。\n\n"
+            "为什么需要它：TensorRT 引擎的输入尺寸是**导出时焊死**的 ⇒ 换尺寸只能重导 ✓。\n\n"
+            "导出从哪来：\n"
+            "  · 训练从 `models/<名字>.pt` 来 ⇒ 引擎就是它导出的 ⇒ 同目录同名那份 .pt 必须在；\n"
+            "  · 只有 `.engine`（没有同名 .pt）时会**指路**、不会瞎猜导哪份 ✗。\n\n"
+            "导出的文件名**带尺寸**（`<名字>_<尺寸>.engine` ✓）⇒ 几个尺寸可以共存 ✓；\n"
+            "而实时挑权重是**按修改时间取最新的 .engine** ✓ ⇒ 刚导出的那个下次启动自动被选中 ✓。\n\n"
+            "⚠ 导出期间**请先停掉实时**：它会重写 `<名字>.engine`，被占用会失败 ✓。")
+        self.btn_export_engine.clicked.connect(self._on_export_engine)
+        row.addWidget(self.btn_export_engine)
 
         row.addWidget(QLabel("显示"))
         self.sp_show_fps = NoWheelSpinBox()
@@ -854,6 +901,9 @@ class LivePanel(QWidget):
         self.thread.failed.connect(self._on_failed)
         # ⭐ 「这份权重不是本项目训的」⇒ 状态行 + 弹一次（2026-10-03 ✓ 见那个槽的说明 ✓）
         self.thread.weights_warn.connect(self._on_weights_warn)
+        # ⭐ 「imgsz 填的值与引擎输入不符 ⇒ 已按引擎的跑」⇒ 弹**指引**（用户 2026-10-03 ✓
+        #   见 `LiveThread.imgsz_mismatch`：光 print 进控制台人看不到 ✗）。
+        self.thread.imgsz_mismatch.connect(self._on_imgsz_mismatch)
         self.thread.stream_status.connect(self._on_stream_status)
         self.thread.finished.connect(
             lambda _t=self.thread: self._on_finished(_t))
@@ -1385,6 +1435,99 @@ class LivePanel(QWidget):
 
     def _on_failed(self, msg):
         self.lbl_stats.setText("失败：%s" % msg)
+
+    def _on_imgsz_mismatch(self, want, used):
+        """引擎输入尺寸 ≠ 你填的 ⇒ **弹指引**（用户 2026-10-03 ✓ 见 `LiveThread.imgsz_mismatch`）。
+
+        ⚠ **非致命**：实时**照常在跑**（按引擎的尺寸 ✓，框的坐标仍然正确 ✓）⇒ 只指引、不停 ✓。
+        ⚠ 为什么不"自动帮你导出" ✗：那样会在**没确认**的情况下花几分钟重编译、还可能把正在
+          跑的实时卡住 ✓ ⇒ 只**指到按钮**，由人点 ✓（用户给的方案就是这个 ✓）。
+        """
+        self.lbl_stats.setText("⚠ imgsz 填的 %d 不生效（这个引擎是 %d）" % (want, used))
+        self.lbl_stats.setToolTip(
+            "这个项目用的是 TensorRT 引擎（`models/*.engine` ✓ 实时优先选它 ✓），\n"
+            "它的输入尺寸在**导出时**就焊死了：%d ✓。" % used)
+        QMessageBox.information(
+            self, "imgsz 不生效：这个项目用的是 TensorRT 引擎",
+            "引擎的输入尺寸在**导出时**就固定了：**%d**。\n\n"
+            "⇒ 你在「imgsz」里填的 **%d 不会生效**；实时已按 **%d** 跑"
+            "（框的坐标仍然正确 ✓，只是「缩到多大再喂网络」这个选择没生效）。\n\n"
+            "想真用 %d，二选一：\n"
+            "  1. 点本页那个「**导出该尺寸引擎**」→ 一键导出 %d 的引擎\n"
+            "     （要几分钟 ✓ 导出完**下次启动实时会自动选它** ✓）；\n"
+            "  2. 把「权重」改选成 `.pt`（`.pt` 没有这个限制 —— 320~2048 随便填 ✓）。\n\n"
+            "（提示只弹这一次；`perf.log` 段头里也会写 `imgsz=%d(引擎·已对齐)` ✓）"
+            % (used, want, used, want, want, used))
+
+    def _on_export_engine(self):
+        """⭐ 一键导出「当前 imgsz」对应尺寸的引擎（用户 2026-10-03 ✓ 见那个按钮的说明）。
+
+        四步都**如实**做（不许假装 ✗）：
+          ① 从**当前权重**推出该导哪份 `.pt`（`pt_for` ✓ 推不出来就**指路**，不猜 ✗）；
+          ② 弹确认框：尺寸 / 输出文件名 / 要等几分钟 / **请先停实时**（引擎会被重写 ✓）；
+          ③ 后台线程跑（复用 `tools/export_engine.export_for` ✓）；
+          ④ 成功 / 失败**都**弹框 ✓（成功还要说清"什么时候生效" ✓）。
+        """
+        weights = self.ed_weights.text().strip()
+        imgsz = int(self.sp_imgsz.value())
+        try:
+            from tools.export_engine import pt_for
+            _pt, _why = pt_for(weights)
+        except Exception as e:                       # noqa: BLE001
+            _pt, _why = None, "%s: %s" % (type(e).__name__, e)
+        if _pt is None:
+            QMessageBox.information(self, "先说明这份引擎是从哪份 .pt 导出来的", _why)
+            return
+        _t_old = getattr(self, "_engine_thread", None)
+        if _t_old is not None and _t_old.isRunning():
+            QMessageBox.information(self, "正在导出", "上一次导出还没跑完，等它结束再点。")
+            return
+        _out = _pt.with_name("%s_%d.engine" % (_pt.stem, imgsz))
+        _ok = QMessageBox.question(
+            self, "导出 TensorRT 引擎",
+            "按「imgsz」里的 **%d** 导一份引擎：\n\n"
+            "  从：%s\n  出：%s\n\n"
+            "⚠ 要等**几分钟**（TensorRT 在自动调优 kernel）；期间界面仍能用 ✓。\n"
+            "⚠ **请先停掉实时** —— 导出会先重写 `%s.engine`，被占用就会失败。\n\n"
+            "开始导出？" % (imgsz, _pt.name, _out.name, _pt.stem),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if _ok != QMessageBox.Yes:
+            return
+        self.btn_export_engine.setEnabled(False)
+        self.btn_export_engine.setText("导出中…")
+        self.lbl_stats.setText("正在导出 %d 的引擎…（几分钟，别关窗口）" % imgsz)
+        _t = EngineExportThread(_pt, imgsz,
+                                device=str(load_live().get("device", "0")))
+        _t.done.connect(self._on_export_done)
+        _t.failed.connect(self._on_export_failed)
+        _t.finished.connect(self._on_export_finished)
+        self._engine_thread = _t
+        _t.start()
+
+    def _on_export_done(self, path):
+        """导出成功：**说清什么时候生效**（别让人以为"现在就换了" ✗）。"""
+        from pathlib import Path
+        self.lbl_stats.setText("已导出引擎：%s（下次启动实时生效）" % Path(path).name)
+        QMessageBox.information(
+            self, "导出完成",
+            "已生成：\n  %s\n\n"
+            "**下次「开始实时」时会自动用它** —— 实时挑权重是**按修改时间取最新的\n"
+            "`.engine`** ✓，所以不用改任何设置；段头那时会写 `imgsz=<尺寸>(引擎·接受)` ✓。\n\n"
+            "⚠ 想同时留着别的尺寸：不用管，文件名带尺寸、互不覆盖 ✓。" % path)
+
+    def _on_export_failed(self, msg):
+        self.lbl_stats.setText("导出失败：%s" % msg[:60])
+        QMessageBox.warning(
+            self, "导出失败",
+            "没导出来：\n\n%s\n\n"
+            "常见原因：\n"
+            "  · **实时还开着**、`<权重名>.engine` 被占用 ⇒ 先停实时再导 ✓；\n"
+            "  · 没装 TensorRT / 显存不够 ⇒ 看控制台那几行（`stdout.log` ✓）。" % msg)
+
+    def _on_export_finished(self):
+        self.btn_export_engine.setEnabled(True)
+        self.btn_export_engine.setText("导出该尺寸引擎")
+        self._engine_thread = None
 
     def _on_weights_warn(self, msg):
         """⭐ 权重**不是本项目训的** ⇒ 状态行写清 + 弹一次（2026-10-03 ✓ 用户现场

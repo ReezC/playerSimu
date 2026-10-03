@@ -238,6 +238,22 @@ def t_map_command_switches_region():
     check(rep is not None and rep["ok"] is False, "失败该回 ERR：%r" % (s.sent[-1],))
     check((rep.get("why") or ""), "失败原因一句话都不说，人只能靠猜 ✗")
 
+    # ⭐⭐ **未命中也要把 id 记下来**（用户 2026-10-03 ✓ 现场："改成收流了 A 那行还是
+    #   「还没有」"✗）—— 本模块开头那段设计**本来就是这个意思** ✓（"没有 ⇒ 回 ERR，
+    #   人再去部署台卡片里框一次（**那时 id 已经知道了** ✓）"），可代码只写了回 ERR ✗
+    #   ⇒ 部署台那行永远读不到 id ⇒ 人**没法**按这张图的名字去框（框选是存到"当前这张图"
+    #   名下的 ✓）⇒ **死结** ✓。
+    #   ⚠ 记的只是**"当前地图"这个标签** ✓，抓取区域（`state`）**一个字节不动** ✗
+    #     —— 上面那条"半切换"的纪律照样守着 ✓（唯一变化：人现在知道该往哪张图名下框 ✓）。
+    cur2 = mmap_regions.current()
+    check(cur2 and cur2["map_id"] == "不在库里的图",
+          "未命中时没把 id 记下来 ⇒ 部署台永远「还没有」、人也框不到这张图名下 ✗：%r"
+          % (cur2,))
+    check(cur2.get("by") == "B机(未命中)",
+          "记下来时没标注「未命中」（人会以为区域已经就位 ✗）：%r" % (cur2,))
+    check(state["box"] == before,
+          "未命中时不该动抓取区域（还是上面那条纪律 ✗）：%s" % (state,))
+
     # PING / LIST / 未知命令
     minimap_push._answer_ctl(s, b"PING", state, log=_q)
     check(s.sent[-1].strip() == b"PONG", "PING 不回 PONG：%r" % (s.sent[-1],))

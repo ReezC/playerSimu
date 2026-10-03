@@ -259,6 +259,12 @@ class MotionTracker:
         self.lost_after = max(1, int(lost_after))
         self.tracks = []                     # [`_Track`]（真假不分 ✓）
         self.tid = None                      # 当前认定的目标轨迹 id ✓
+        #: ⭐ **本拍"每个配对上的检出框"的瞬时速度**（`[(x, y, dx, dy), …]` ✓）——
+        #:   用户 2026-10-03 原话："**每个假目标检出框**加**蓝色箭头**显示**瞬时绝对速度**，
+        #:   这个没看到" ✓ ⇒ 他要的是**每个框**都有一根 ✓（⚠ 而不是只给"够资格"的那几条 ✗
+        #:   —— 我上一版加了 `ok` 过滤 ✗ ⇒ 大部分框上没有箭头 ✗ 他直接看出来了 ✓）。
+        #:   ⚠ 用"配对上的观测"（不是 `tracks` 全表 ✗）⇒ 与"检出框"一一对应 ✓ 不重不漏 ✓。
+        self._box_v = []
         self.pos = None
         self.vel = None
         self.state = "init"
@@ -330,6 +336,7 @@ class MotionTracker:
             self._median_mv = (_mx, _my)
         # ---- ③④ 更新轨迹：偏离 ⇒ 累积（带衰减 ✓）----
         _updated = set()
+        self._box_v = []                    # ⭐ 本拍重新收集（每个配对框一根蓝箭头 ✓ 见 `__init__`）
         for _tid, _j in _pairs:
             _t = self._by_id(_tid)
             if _t is None:
@@ -347,6 +354,9 @@ class MotionTracker:
             if len(_t.rel_hist) > _REL_HIST:       # 只留最近 `_REL_HIST` 点（省内存 + 画面清爽 ✓）
                 _t.rel_hist.pop(0)
             _t.score = _t.score * self.score_decay + _dev
+            # ⭐ **收一根"本框的瞬时速度"**（用户要的蓝箭头 ✓ 见 `_box_v` 说明 ✓）
+            self._box_v.append((float(_t.obs[0]), float(_t.obs[1]),
+                                float(_moves[_tid][0]), float(_moves[_tid][1])))
             _t.prev = _t.obs                       # ⚠ 位移要用"观测对观测" ✓
             _t.obs = (float(_b[1]), float(_b[2]))
             _t.w, _t.h = float(_b[3]), float(_b[4])
@@ -554,6 +564,11 @@ class MotionTracker:
             "n_cands": len(_viz),
             "sel_score": (None if _tgt is None else float(_tgt.score)),
             "sel_dev": (None if _tgt is None else float(_tgt.dev)),
+            # ⭐⭐⭐ **每个检出框的瞬时速度**（用户 2026-10-03 ✓ 原话："**每个假目标检出框**加
+            #   **蓝色箭头**显示**瞬时绝对速度**" ✓）—— `[(x, y, dx, dy), …]` ✓
+            #   ⚠ 与"检出框"**一一对应**（只含本拍**配对成功**的那些 ✓ 配不上就是"没数据" ✗
+            #     不画零长箭头 ✓）。
+            "box_v": list(self._box_v),
             # ⭐ **日志区那一行**（演示窗把它追加到底部日志 ✓ 通俗说明 ✓ 见上面那段的拼装 ✓）
             "log_text": _log,
             # ⭐ 标记"这是运动分离模式" ⇒ 演示窗据此决定**要不要画那套依据** ✓（经典模式不画 ✓）

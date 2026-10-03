@@ -1300,6 +1300,67 @@ def t_mmap_fail_reason_is_logged():
           "决策理由没去重 ⇒ 每拍一样的那句会把段头刷爆 ✗")
 
 
+def t_engine_export_one_click():
+    """⭐⭐ 「一键导出该尺寸引擎」（用户 2026-10-03 ✓ 原话："想真用别的尺寸：重新导出那个尺寸
+    的引擎 —— 就不能填写后自动导出吗？不合适的话弹提示指引然后搞个按钮一键导出也行"）。
+
+    钉五件：
+      ① **从当前权重推出该导哪份 `.pt`**：`.engine` ⇒ 同目录**同名** `.pt` ✓；
+         没有 ⇒ 返回 `None` + 指路（**不许**去 `runs/**/best.pt` 瞎翻 ✗ ——
+         那会导出一份"名字对、内容错"的引擎 ✓）；
+      ② **输出名带尺寸**（`<stem>_<imgsz>.engine` ✓）⇒ 几个尺寸共存、互不覆盖 ✓；
+         而实时挑权重是**按 mtime 取最新的 `.engine`** ✓ ⇒ 刚导出的下次启动自动生效 ✓；
+      ③ **后台线程**（`EngineExportThread` 是 `QThread` ✓）—— 导出几分钟，放主线程 = 界面假死 ✗；
+      ④ **复用已有那条实现**（`tools/export_engine.export_for` ✓ 不许另写 ✗ —— 它还处理了
+         "权重路径含中文"那个坑 ✓ 而本项目项目名全中文 ✓）；
+      ⑤ 面板有按钮，且**成功 / 失败都要有反馈** ✗（不许点了没动静 ✓）。
+    """
+    import tempfile
+    from pathlib import Path as _P
+
+    from PyQt5.QtCore import QThread
+    from PyQt5.QtWidgets import QApplication
+    from tools.export_engine import pt_for
+    import gui.live_panel as lp
+
+    app = QApplication.instance() or QApplication([])
+    check(app is not None, "建不起 QApplication")
+
+    d = _P(tempfile.mkdtemp(prefix="eng_export_"))
+    (d / "m1.pt").write_text("x", encoding="utf-8")
+    (d / "m1.engine").write_text("x", encoding="utf-8")
+    got, why = pt_for(str(d / "m1.engine"))
+    check(got is not None and got.name == "m1.pt",
+          "从 .engine 没推出同目录同名的 .pt（这是「一键导出」的前置 ✗）：%r / %r"
+          % (got, why))
+    got2, why2 = pt_for(str(d / "没有这个.engine"))
+    check(got2 is None and why2,
+          "没有同名 .pt 时该**返回 None + 指路**（不猜 ✗）：%r" % (got2,))
+    got3, _ = pt_for(str(d / "m1.pt"))
+    check(got3 is not None and got3.name == "m1.pt", "给 .pt 时该原样用它：%r" % (got3,))
+
+    src = (ROOT / "tools" / "export_engine.py").read_text(encoding="utf-8")
+    check('"%s_%d.engine"' in src,
+          "输出的引擎名没带尺寸 ⇒ 换个尺寸导出会把原来那个覆盖掉 ✗（640/960 没法共存 ✓）")
+    check("os.replace(" in src, "改名那步没做 ⇒ 还是覆盖同名引擎 ✗")
+
+    check(issubclass(lp.EngineExportThread, QThread),
+          "导出没放在 QThread 里 ⇒ 几分钟的重编译会把界面冻住 ✗")
+    _w = (ROOT / "gui" / "live_panel.py").read_text(encoding="utf-8")
+    check("from tools.export_engine import export_for" in _w,
+          "没复用已有的导出实现（另有实现 = 迟早两套不一致 ✗）")
+    # ⚠ 必须断言**接上了**，不是"函数定义了" ✗ —— 反向验证实测：只看函数名在文件里出现，
+    #   把 `connect(...)` 那一行删掉**照样绿** ✓（定义还在 ✓）⇒ 得直接看 connect ✓。
+    for _name, _sig in (("_on_export_done", "_t.done.connect(self._on_export_done)"),
+                        ("_on_export_failed", "_t.failed.connect(self._on_export_failed)"),
+                        ("_on_export_finished",
+                         "_t.finished.connect(self._on_export_finished)")):
+        check(_sig in _w,
+              "`%s` 没接到导出线程上 ⇒ 那一步**没有反馈** ✗（点了没动静 ✓）" % _name)
+    check("btn_export_engine" in _w and "imgsz_mismatch" in _w,
+          "「导出该尺寸引擎」按钮 / 「imgsz 不生效」提示没有接上 ✗")
+
+
 TESTS = (
     ("⭐⭐ 测谎现场录屏：进 lie_* 起录 / 离开即停、录原生帧副本（不污染 raw）",
      t_lie_recording),
@@ -1331,6 +1392,8 @@ TESTS = (
      t_engine_imgsz_alignment),
     ("⭐ 小地图定位失败的原因要进日志（只在界面说 ⇒ 事后查不出来）",
      t_mmap_fail_reason_is_logged),
+    ("⭐⭐ 一键导出该尺寸引擎（从 .engine 推同名 .pt / 名字带尺寸 / 后台线程 / 有反馈）",
+     t_engine_export_one_click),
     ("静态检查：会当场炸的名字错误（pyflakes）", t_static_check_no_crash_classes),
     ("左下按键帽：按住=半透明绿填充、文案随键位映射自适应（2026-09-30 用户要求）",
      t_key_caps_overlay),

@@ -173,6 +173,19 @@ def _answer_ctl(sock, raw, state, log=print):
     if cmd == mmap_regions.CMD_MAP:
         got = mmap_regions.load(arg)
         if not got:
+            # ⭐⭐ **未命中也要把 id 记下来**（用户 2026-10-03 ✓ 现场："改成收流了 A 那行还是
+            #   「还没有」"✗）。本模块开头那段设计**本来就是这么说的** ✓：
+            #     "没有 ⇒ 回 `ERR no-such-map`，人再去部署台卡片里框一次（**那时 id 已经
+            #      知道了** ✓）"
+            #   ⚠ 可代码只写了回 `ERR` ✗ ⇒ 部署台那行永远读不到 id ⇒ 人**没法**按这张图的
+            #     名字去框（框选是存到"当前这张图"名下的 ✓）⇒ **死结** ✓✓。
+            #   ⚠ 记的是**"当前地图"这个标签**（`set_current` ✓），**不是**要把抓取区域换掉 ✗ ——
+            #     `state` 一个字节都不动（还是"原来的区域"✓），所以上面那条"半切换"的纪律
+            #     照样守着 ✓：唯一变化是"人现在知道该往哪张图名下框" ✓。
+            try:
+                mmap_regions.set_current(arg, by="B机(未命中)")
+            except Exception:                       # noqa: BLE001 —— 记标签失败也不许打断回执 ✗
+                pass
             # 光说"找不到"人会重框错地方 ⇒ 顺手告诉他**已经配了哪些**
             _ids = mmap_regions.list_ids()
             why = ("这张图还没框过（%s）；已配的有：%s"

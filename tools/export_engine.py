@@ -84,6 +84,70 @@ def export(weights, imgsz=640, half=True, device=0, batch=1):
     return str(path)
 
 
+def pt_for(weights):
+    """从「**当前在用的权重**」推出**该拿哪份 `.pt` 去导出**（GUI 一键导出用 ✓ 2026-10-03 ✓）。
+
+    用户原话："想真用别的尺寸：重新导出那个尺寸的引擎 —— 就不能填写后自动导出吗？
+    不合适的话弹提示指引然后搞个按钮一键导出也行" ✓。
+    （**"填完自动导出"不做** ✗：导出要几分钟的重编译，而 `imgsz` 是逐位敲进去的
+      ⇒ `1`/`12`/`128` 每一击都触发一次全量导出 ✓ 而且会把正在跑的实时卡死 ✓。
+      ⇒ 走"按钮一键导出" ✓。）
+
+    · 给 `.pt`      ⇒ 就是它 ✓；
+    · 给 `.engine`  ⇒ **同目录同名的 `.pt`**（引擎就是从它导出来的 ✓ 实测
+      `寺院通道2/models/detect_v5.engine` 旁边正有 `detect_v5.pt` ✓）；
+    · 找不到 ⇒ 返回 `(None, 原因)` ✓ —— **不许猜** ✗（别自己去 `runs/**/best.pt` 里翻一个 ✗：
+      那多半不是这份引擎的来源，按它导出来的东西会**名字对、内容错** ✓）。
+    返回 `(Path | None, 说明文本)` ✓。
+    """
+    raw = str(weights or "").strip()
+    if not raw:
+        return None, "还没选权重（先在「权重」那一栏选一个 .pt 或 .engine）"
+    p = Path(raw)
+    if p.suffix.lower() == ".pt":
+        return (p, "") if p.exists() else (None, "权重文件不存在：%s" % p)
+    if p.suffix.lower() == ".engine":
+        cand = p.with_suffix(".pt")
+        if cand.exists():
+            return cand, ""
+        return None, ("找不到 %s —— 引擎是从一份 .pt 导出来的，同目录同名的那个不在。\n"
+                      "请把该 .pt 放回 %s，或者把「权重」改选成 .pt 再导。"
+                      % (cand.name, p.parent))
+    return None, "认不出这个权重类型：%s（要 .pt 或 .engine）" % p.name
+
+
+def export_for(weights, imgsz, half=True, device=0, batch=1):
+    """按「当前在用的权重」导出**带尺寸**的引擎 ✓（GUI 那个按钮用 ✓）。
+
+    ⚠ 为什么输出名要**带上尺寸**（`<stem>_<imgsz>.engine`）：ultralytics 默认写成
+      `<stem>.engine` ⇒ **换个尺寸导出就把原来那个覆盖了** ✗（640 / 960 没法共存 ✓）。
+      带上尺寸之后：几个尺寸**互不覆盖** ✓；而实时挑权重是**按 mtime 取最新的 `.engine`**
+      ✓（`gui/live_panel.py` 那段 ✓）⇒ 刚导出的那个**自动被选中** ✓。
+    ⚠ 导出过程 ultralytics 会先写 `<stem>.engine`（覆盖旧的 ✓）⇒ 若实时正开着、那个文件
+      被占用，Windows 会直接报 `PermissionError` ✓ ⇒ **调用方该先提示"停实时"** ✓
+      （GUI 的确认框里写了 ✓）。
+    返回最终引擎路径（`str`）✓。
+    """
+    import os
+
+    pt, note = pt_for(weights)
+    if pt is None:
+        raise FileNotFoundError(note)
+
+    out = Path(export(str(pt), imgsz=int(imgsz), half=bool(half),
+                      device=device, batch=int(batch)))
+    dst = out.with_name("%s_%d.engine" % (Path(pt).stem, int(imgsz)))
+    if out != dst and out.exists():
+        try:
+            os.replace(str(out), str(dst))       # 同名尺寸重复导出 ⇒ 覆盖它自己 ✓（对 ✓）
+        except Exception as e:                   # noqa: BLE001
+            raise RuntimeError("导出的引擎改名失败（%s → %s）：%s"
+                               % (out.name, dst.name, e))
+        print("（已改名为带尺寸的名字：%s）" % dst.name)
+    print("✓ 完成：%s" % dst)
+    return str(dst)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="把 YOLO 权重导出成 TensorRT 引擎（推理最快的形态）")

@@ -1318,6 +1318,11 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
     #   ⚠ 只在运动分离模式下画（`motion["mode"] == "motion"` ✓）⇒ **经典模式一个像素都不变** ✓。
     #   ⚠ `cv2.putText` **只认 ASCII** ✗ ⇒ 文案全用英文/数字 ✓（中文会画成 `?` ✗）。
     if (motion or {}).get("mode") == "motion":
+        # ⭐ **本模式的图层开关**（由 `_show_precomputed` 塞进 `motion["show"]` ✓）
+        #   `cands` = 候选圈+分数+箭头 ｜ `rel` = 橙色相对轨迹 ｜ `boxes` 在更上层就过滤掉了 ✓
+        #   ⚠⚠ **必须在最前面取** ✗✗（我第一版放在 `_trk` 那边 ⇒ 橙色轨迹段比它更靠前 ⇒
+        #     `NameError: _sh_ok is not defined` ✗）
+        _sh_ok = (motion or {}).get("show") or {}
         _trk = list(motion.get("tracks") or [])
         _med = motion.get("median") or (0.0, 0.0)
         # ⭐⭐⭐ **「相对群体」的轨迹线**（用户 2026-10-03 ✓ 原话："我希望：像经典模式一样，
@@ -1327,8 +1332,13 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
         #   ⭐ **怎么读这条线** ✓：**绕在原地打转** ⇒ 它跟大家一起动（**假目标** ✓）；
         #     **朝一个方向延伸出去** ⇒ 它在**相对群体**移动（**真目标** ✓✓）。
         #   ⚠ **只画"够资格"的 + 目标** ✗ —— 不然满屏 30 条线 ⇒ 反而看不清 ✓。
-        for _lp in _trk:
-            if not (_lp.get("ok") or _lp.get("sel")):
+        # ⚠⚠ **只画"目标那一条"** ✗✗（用户 2026-10-03 反馈："**这些细细的蓝色轨迹线是什么？
+        #   我从未要求加过**" ✓）—— 我上一版**把所有"够资格"的候选**（实测 28 条 ✗）全画了，
+        #   颜色又偏蓝 ✓ ⇒ 满屏斜线 ⇒ 看着像乱画 ✗。用户真正要的是："**像经典模式一样，也把
+        #   相对于群体的轨迹线画出来，这样就能看出历史结果**" ✓ ⇒ **要的是目标那条** ✓。
+        # ⚠ 只画**目标那一条** ✓ 且**听"相对轨迹"开关**（不是"候选圈" ✓ 两者独立 ✓）
+        for _lp in (_trk if _sh_ok.get("rel", True) else []):
+            if not _lp.get("sel"):
                 continue
             _h = _lp.get("rel_hist") or []
             if len(_h) < 2:
@@ -1345,8 +1355,23 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
                          (int(_bx + _h[_k2][0] * scale_x),
                           int(_by + _h[_k2][1] * scale_y)),
                          _col, _th, cv2.LINE_AA)
+        # ⭐⭐⭐ **蓝箭头 = 每个检出框的「瞬时绝对速度」**（用户 2026-10-03 ✓ 原话："**每个假目标
+        #   检出框**加**蓝色箭头**显示**瞬时绝对速度**，这个没看到" ✓）——
+        #   `box_v` = 本拍**每个配对成功的检出框** `(x, y, dx, dy)` ✓ ⇒ **每个框一根** ✓✓
+        #   （⚠ 与"够资格的候选"无关 ✗ —— 上一版挂在那层上 ⇒ 大部分框没有 ✗ 他就没看到 ✓）。
+        #   长度**硬封顶**（`_ARR_MAX` ✓）：真目标偶尔一拍走 200+px ✗ 不封顶会横跨画面 ✓。
+        _ARR_MAX = 110.0
+        for (_bx0, _by0, _bdx, _bdy) in (motion.get("box_v") or []):
+            _bm = (float(_bdx) ** 2 + float(_bdy) ** 2) ** 0.5
+            if _bm < 2.0:
+                continue
+            _k = min(1.2, _ARR_MAX / max(1e-6, _bm))
+            cv2.arrowedLine(frame, (int(_bx0 * scale_x), int(_by0 * scale_y)),
+                            (int((_bx0 + _bdx * _k) * scale_x),
+                             int((_by0 + _bdy * _k) * scale_y)),
+                            (255, 120, 0), 2, tipLength=0.35, line_type=cv2.LINE_AA)
         _sc_max = max([float(t.get("score") or 0.0) for t in _trk] or [1.0])
-        for _t in _trk:
+        for _t in (_trk if _sh_ok.get("cands", True) else []):
             _sc = float(t.get("score") or 0.0)
             _sel = bool(t.get("sel"))
             _px, _py = int(t["p"][0] * scale_x), int(t["p"][1] * scale_y)
@@ -1364,34 +1389,72 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
                 cv2.putText(frame, ("%.0f" % _sc), (_px + _rr + 2, _py - _rr + 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                             (0, 255, 255) if not _sel else (60, 60, 255), 1, cv2.LINE_AA)
-            # ⭐ **蓝箭头 = 它的绝对速度**（用户 2026-10-03 ✓ 原话："把**所有目标**的**绝对速度**
-            #   像经典模式一样用**小蓝箭头**标一下" ✓）—— `v_abs` = 它这一拍**实际走了多少** ✓
-            #   ⇒ **所有候选都画** ✓（一眼看出"谁在动、往哪动" ✓）。
-            _va = t.get("v_abs") or (0.0, 0.0)
-            _ax, _ay = float(_va[0]), float(_va[1])
-            if abs(_ax) + abs(_ay) >= 2.0:
-                cv2.arrowedLine(frame, (_px, _py),
-                                (int(_px + _ax * 2.2 * scale_x),
-                                 int(_py + _ay * 2.2 * scale_y)),
-                                (255, 120, 0), 2, tipLength=0.35, line_type=cv2.LINE_AA)
-            # ⭐⭐ **相对群体速度**（判据本体 ✓ 箭头越长越"不合群" ✓）：
-            #   · **目标那条 = 白色粗箭头**（用户点名："把**真目标**的**相对群体速度**用
-            #     **小白箭头**标一下" ✓）；
-            #   · 其他候选 = **黄色细箭头**（保留 ✓ 方便对比"谁更不合群" ✓）。
-            _vr = t.get("v_rel")
-            if _vr is None:
-                _vr = (float(t.get("mv", (0.0, 0.0))[0]) - float(_med[0]),
-                       float(t.get("mv", (0.0, 0.0))[1]) - float(_med[1]))
+            # ⚠⚠ **箭头长度必须封顶 + 缩放要小** ✗✗（用户 2026-10-03 截图反馈："**只有意义不明的
+            #   大蓝箭头、黄箭头**（尺寸跟经典里的也不对）" ✓）—— 根因：真目标偶尔**一拍走 200+px**
+            #   （实测帧 13 的 `#10`：`v_rel = (211.7,-54.9)` ✗）⇒ 原来 ×3 ⇒ **656px** ⇒ 横跨画面 ✗✗
+            #   ⇒ 现在：**幅度缩放降到 1.6/1.2** ✓ + **硬封顶 `_ARR_MAX` px** ✓ ⇒ 既能看出方向 ✓
+            #     又不会糊满屏 ✓（⚠ 封顶只是**显示**处理 ✗ 判定用的原始值一个字不改 ✓）。
+            _ARR_MAX = 110.0
+            # ⚠⚠ **蓝箭头改到"检出框"那一层去画了** ✗✗（见上面 `box_v` 的循环 ✓）——
+            #   用户 2026-10-03："**每个假目标检出框**加蓝色箭头显示**瞬时绝对速度**，
+            #   这个没看到" ✓ ⇒ 蓝箭头应当**每个框都有** ✓，而原来画在"够资格的候选"上
+            #   ⇒ 大部分框没有 ✗（他直接看出来了 ✓）。这里不再重复画 ✗。
+            # ⭐⭐ **相对群体速度**（判据本体 ✓ 越长越"不合群" ✓）：
+            #   · ⚠⚠ **目标那条只画白色** ✗✗（原来黄+白都画 ⇒ **同起点同方向 ⇒ 白被黄盖住**
+            #     ⇒ 用户"**没有看到小白箭头**" ✓ 就是这个 ✓）；
+            #   · 其他候选 = **黄色细箭头**（保留 ✓ 对比用 ✓）。
+            if not _sel:
+                _vr = t.get("v_rel") or (0.0, 0.0)
+                _dx, _dy = float(_vr[0]), float(_vr[1])
+                _rm = (abs(_dx) ** 2 + abs(_dy) ** 2) ** 0.5
+                if _rm >= 2.0:
+                    _k = min(1.6, _ARR_MAX / max(1e-6, _rm))
+                    cv2.arrowedLine(frame, (_px, _py),
+                                    (int(_px + _dx * _k * scale_x),
+                                     int(_py + _dy * _k * scale_y)),
+                                    (0, 220, 255), 1, tipLength=0.32, line_type=cv2.LINE_AA)
+        # ⭐⭐⭐ **目标那条「相对瞬时速度」白箭头**（用户 2026-10-03 ✓ 原话："**没有看到真目标
+        #   相对瞬时速度白色箭头**" ✓ —— 他说没看到 ✗，两个原因我都修了 ✓）：
+        #   ① ⚠⚠ **原来按真实比例画**（`×1.6` ✓）⇒ 而目标的相对速度常常只有 **2~8 px/拍** ✗
+        #      ⇒ 箭头只有 **3~13 px** ✗ **比它自己的圈（8~26 px）还短** ⇒ **看不出来** ✗✗
+        #      （实测帧 17~24 的 `v_rel` 模长就是 2.4 / 3.5 / 5.2 / 6.1 / 7.9 ✓）；
+        #   ② ⚠⚠ 它原来画在 `for _t in (_trk if _sh_ok.get("cands") …)` **里面** ✗
+        #      ⇒ 一旦关掉「候选圈」，`tracks` 被清空 ⇒ **白箭头跟着消失** ✗（很可能就是"没看到"✓）。
+        #   ⇒ 现在 **两个都改** ✓：
+        #     · **固定 56 px 长**（方向仍是真实的 ✓ 长度只为"看得见" ✗ **不表示大小** ✓）
+        #       ＋ **旁边标真实数值** `rel %.1f px`（精确信息在数字里 ✓✓）；
+        #     · **独立成段**（搬到候选圈循环**外面** ✓）⇒ 关掉候选圈它照样在 ✓；
+        #     · **黑描边 + 白粗箭头**（画面是金褐色纹理 ✓ 纯白细箭头会糊掉 ✗）。
+        _sel_t = next((t for t in _trk if t.get("sel")), None)
+        if _sel_t is not None:
+            _px, _py = int(_sel_t["p"][0] * scale_x), int(_sel_t["p"][1] * scale_y)
+            _vr = _sel_t.get("v_rel") or (0.0, 0.0)
             _dx, _dy = float(_vr[0]), float(_vr[1])
-            if abs(_dx) + abs(_dy) >= 2.0:
-                cv2.arrowedLine(frame, (_px, _py),
-                                (int(_px + _dx * 3 * scale_x),
-                                 int(_py + _dy * 3 * scale_y)),
-                                (255, 255, 255) if _sel else (0, 220, 255),
-                                3 if _sel else 1,
-                                tipLength=0.35, line_type=cv2.LINE_AA)
+            _rm = (abs(_dx) ** 2 + abs(_dy) ** 2) ** 0.5
+            if _rm < 1.0:
+                # ⚠ `v_rel` 为零 = 目标**本拍没配上**（判据上"没有个性运动" ✓ 该怀疑的信号 ✓）
+                cv2.putText(frame, "?", (_px + 16, _py + 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(frame, "?", (_px + 16, _py + 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+            else:
+                _FIX = 56.0                       # 固定视觉长度（px ✓ 显示域 ✓）
+                _ex = int(_px + _dx / _rm * _FIX * scale_x)
+                _ey = int(_py + _dy / _rm * _FIX * scale_y)
+                cv2.arrowedLine(frame, (_px, _py), (_ex, _ey), (0, 0, 0), 7,
+                                tipLength=0.28, line_type=cv2.LINE_AA)
+                cv2.arrowedLine(frame, (_px, _py), (_ex, _ey), (255, 255, 255), 3,
+                                tipLength=0.28, line_type=cv2.LINE_AA)
+                _txt = "rel %.1f px" % _rm
+                cv2.putText(frame, _txt, (_ex + 6, _ey + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(frame, _txt, (_ex + 6, _ey + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
         # ---- 右上角文字面板（黑底 ✓ 可读 ✓）----
-        _lines = ["motion mode  |  cands %d" % len(_trk),
+        # ⚠ 颜色图例（用户 2026-10-03 反馈："只有**意义不明**的大蓝箭头、黄箭头" ✗ ⇒ 必须自解释 ✓）
+        _lines = ["BLUE=abs vel(each det)  WHITE=target rel-vel(FIXED 56px,see the number)",
+                  "YELLOW=other rel-vel  ORANGE line=target rel-path  BLUE box=YOLO det",
+                  "motion mode  |  cands %d" % len(_trk),
                   "median mv (%.1f, %.1f)  |  dev_med %.1f" % (_med[0], _med[1],
                                                                float(motion.get("dev") or 0.0))]
         if motion.get("sel_score") is not None:
@@ -1720,6 +1783,42 @@ def run_window(args):
             self.chk_loop = QCheckBox("循环")
             self.chk_loop.setChecked(True)
             tb.addWidget(self.chk_loop)
+            # ⭐⭐⭐ **图层开关：自己取舍**（用户 2026-10-03 ✓ 原话："**这些细细的蓝色轨迹线是什么？
+            #   我从未要求加过**" ✓）—— 画面上一旦东西多了就分不清谁是谁 ✗ ⇒ 与其我猜 ✗，
+            #   不如把这几个图层**交给你自己开/关** ✓。
+            #   ⚠ 默认值是按你的反馈定的 ✓：
+            #     · **检出框** = 关 ✗（YOLO 的蓝框一大堆 ✓ 你没要求过 ✓ 需要时再开 ✓）；
+            #     · **候选圈/分数** = 开 ✓（运动分离的**核心依据** ✓ 不开就没法核对判据 ✓）；
+            #     · **相对群体轨迹线** = 开 ✓（就是你点名要的那条 ✓ 只画目标那一条 ✓）。
+            self.chk_boxes = QCheckBox("检出框")
+            # ⚠ **默认改成"开"** ✗（用户 2026-10-03："**每个假目标检出框**加蓝色箭头显示**瞬时绝对
+            #   速度**，这个没看到" ✓ ⇒ 他要的正是"**看得见检出框 + 框上的蓝箭头**" ✓ ⇒
+            #   上一版我默认关掉是猜错了 ✗）。
+            self.chk_boxes.setChecked(True)
+            self.chk_boxes.setToolTip(
+                "画不画 **YOLO 检出框**（蓝色细矩形 ✓ 带 `shape 0.98` 标签 ✓）。\n\n"
+                "· ⚠ 它**不影响任何判定** ✓ 纯显示 ✓；\n"
+                "· 默认**关** —— 之前它满屏都是（十几~二十个框 ✗）⇒ 把它关掉，画面清爽得多 ✓；\n"
+                "· 想核对「算法拿到的输入对不对」时再打开 ✓。")
+            self.chk_boxes.stateChanged.connect(self._on_layer_toggle)
+            tb.addWidget(self.chk_boxes)
+            self.chk_cands = QCheckBox("候选圈")
+            self.chk_cands.setChecked(True)
+            self.chk_cands.setToolTip(
+                "画不画 **运动分离的候选圈 + 分数**（绿圈，越大分越高 ✓）＋**蓝/白/黄箭头** ✓\n\n"
+                "· ⭐ 这是**判据的可视化**（`score` = 累积「不合群」程度 ✓）⇒ 核对算法时必须开 ✓；\n"
+                "· 关掉就只剩绝对位置（要「干净画面」时用 ✓）。")
+            self.chk_cands.stateChanged.connect(self._cfg_save)
+            tb.addWidget(self.chk_cands)
+            self.chk_rel = QCheckBox("相对轨迹")
+            self.chk_rel.setChecked(True)
+            self.chk_rel.setToolTip(
+                "画不画**目标「相对群体」的历史轨迹线**（橙色 ✓ 就是你点名要的那条 ✓）。\n\n"
+                "· 读法：**绕着原地打转** ⇒ 跟大家一起动（假目标 ✓）；**朝一个方向延伸** ⇒\n"
+                "  真在相对群体移动（真目标 ✓）；\n"
+                "· ⚠ 只画**目标那一条** ✗（我第一版把 28 条候选全画了 ⇒ 满屏斜线 ✗ 踩过 ✓）。")
+            self.chk_rel.stateChanged.connect(self._on_layer_toggle)
+            tb.addWidget(self.chk_rel)
             # ---- ⭐ 两个拖动条（用户 2026-09-30 要求 ①③）：蒙版透明度 / 箭头拖尾 ----
             tb.addWidget(QLabel("  蒙版 "))
             self.sld_mask = QSlider(Qt.Horizontal)
@@ -2933,6 +3032,34 @@ def run_window(args):
                     "min_hits": max(1, int(round(_v("sp_minhits", _MOTION_MINHITS_DEFAULT)))),
                     "white_w": _v("sp_whitew", _MOTION_WHITEW_DEFAULT)}
 
+        def _show_layers(self):
+            """三个**图层开关**的当前状态（用户 2026-10-03 ✓ "这些细细的蓝色轨迹线是什么？
+            **我从未要求加过**" ⇒ 与其我猜 ✗，交给你自己开关 ✓）。
+
+            回 `{"boxes": 检出框, "cands": 候选圈+箭头, "rel": 相对群体轨迹线}` ✓；
+            ⚠ 没建控件（离屏自检 ✓）⇒ 全 `True`（老行为 ✓ 自检不受影响 ✓）。
+            """
+            def _v(_n, _d):
+                _w = getattr(self, _n, None)
+                return bool(_w.isChecked()) if _w is not None else bool(_d)
+            return {"boxes": _v("chk_boxes", False),
+                    "cands": _v("chk_cands", True),
+                    "rel": _v("chk_rel", True)}
+
+        def _on_layer_toggle(self, *_a):
+            """图层开关变了 ⇒ **落盘 + 立刻重画当前帧** ✓。
+
+            ⚠⚠ 用户 2026-10-03 报："**关掉候选圈什么变化也没有**" ✗ —— 因为原来只接
+              `self._cfg_save`（**只落盘 ✗ 不刷新画面** ☠）⇒ 得**拖一下/播放**才生效
+              ⇒ 看着就像"开关坏了" ✓。现在**勾/取消的瞬间就重画** ✓（走 `_show_precomputed`
+              ✓ 只重画**当前这一帧** ⇒ 零等待、不重算 ✓）。
+            """
+            self._cfg_save()
+            try:
+                self._show_precomputed()
+            except Exception:                 # noqa: BLE001 —— 画不出来也不许把开关搞崩 ✗
+                pass
+
         def _mode(self):
             """当前算法模式（没建控件 ⇒ `classic` ✓ 老行为 ✓）。"""
             _c = getattr(self, "cmb_mode", None)
@@ -3490,11 +3617,21 @@ def run_window(args):
                                 (None, r2["pos"], r2["r"], r2["hit"], r2["boxes"]),
                                 self.scale[0], self.scale[1], hud + "  [KF]",
                                 r2["cursor"], r2.get("motion"), self.names, mk)
+            # ⭐⭐⭐ **图层过滤**（用户 2026-10-03 ✓ 他要按自己的需要开关图层 ✓）：在**显示入口**
+            #   这里过滤，**不动 `draw()` 一个字** ✗ ⇒ 风险最小 ✓ 且经典模式完全不受影响 ✓。
+            _sh = self._show_layers()
+            _mo_d = dict(r.get("motion") or {})
+            _mo_d["show"] = _sh
+            if not _sh["cands"]:                # 关掉"候选圈"⇒ 候选 + 箭头 + 面板都不画 ✓
+                _mo_d["tracks"] = []
+            elif not _sh["rel"]:                # 只关"相对轨迹"⇒ 保留候选圈 ✓
+                _mo_d["tracks"] = [dict(_t, rel_hist=[]) for _t in (_mo_d.get("tracks") or [])]
+            _boxes_d = (r["boxes"] if _sh["boxes"] else [])
             self.show_frame(draw(big.copy(),
-                                 (None, r["pos"], r["r"], r["hit"], r["boxes"]),
+                                 (None, r["pos"], r["r"], r["hit"], _boxes_d),
                                  self.scale[0], self.scale[1], hud, r["cursor"],
-                                 r.get("motion"), self.names, mk,
-                                 pick=self._pick_box(),      # ⭐ 点选的检出框（黄框+数字 ✓）
+                                 _mo_d, self.names, mk,
+                                 pick=(self._pick_box() if _sh["boxes"] else None),
                                  # ⭐ KF 影子可视化（用户 2026-10-03 ✓ 青线/青点/青箭头 ✓）
                                  kf=r.get("kf"), kf_trail=self._kf_trail(self.i)),
                             vis2)
@@ -3576,9 +3713,23 @@ def run_window(args):
                                float(_ks["innov_p50"]), float(_ks["innov_p90"])))
             except Exception:                       # noqa: BLE001 —— 状态栏不许因为诊断崩 ✗
                 _kfs = ""
+            # ⚠⚠ **运动分离模式下，"登记条数 / 错位中位"这两项没有意义** ✗✗ —— 它们是**经典模式**
+            #   的"假目标登记表 vs 检出框"两个量 ✓ 而本模式**根本没有登记表** ✗ ⇒ 恒显示
+            #   `登记 0 条 ｜ 错位中位 -px` ✗（用户 2026-10-03 直接问："**信息栏位置状态有坐标显示，
+            #   但是下面坐标是 —**" ✓ 问的就是这个 ✗）⇒ 换成**本模式真正有意义的量** ✓：
+            #   **候选条数 + 目标的（分数 / 本拍相对偏离）** ✓。
+            _mo_s = r.get("motion") or {}
+            if _mo_s.get("mode") == "motion":
+                _mid = "候选 %d 条 ｜ 目标 %s" % (
+                    len(_mo_s.get("tracks") or []),
+                    "（还没定）" if _mo_s.get("sel_score") is None else
+                    "分数 %.0f ／ 本拍相对偏离 %.1f px"
+                    % (float(_mo_s["sel_score"]), float(_mo_s.get("sel_dev") or 0.0)))
+            else:
+                _mid = "登记 %d 条 ｜ 错位中位 %s px" % (len(_reg), _mis)
             self.statusBar().showMessage(
-                "帧 %d/%d ｜ %s ｜ 命中率 %.1f%%（%d/%d）｜ 登记 %d 条 ｜ 错位中位 %s px%s%s"
-                % (i + 1, len(self.frames), r["state"], acc, h, n, len(_reg), _mis, _pks, _kfs))
+                "帧 %d/%d ｜ %s ｜ 命中率 %.1f%%（%d/%d）｜ %s%s%s"
+                % (i + 1, len(self.frames), r["state"], acc, h, n, _mid, _pks, _kfs))
             self._log_sync(i)                    # ⭐ 底部融合日志区跟着这一帧刷 ✓
 
         def _log_sync(self, i):
