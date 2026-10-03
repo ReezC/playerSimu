@@ -239,6 +239,52 @@ def test_runner_same_shape():
           "⑥ 第 0 拍只有一帧框 ⇒ 还没有位移 ⇒ 不出位置（pos=None ✓ 不乱猜 ✓）")
 
 
+def test_persist_beats_burst():
+    """⭐⭐⭐⭐⭐ **"不合群的持续性"要真的赢过"偶尔猛抖一下"** ✓✓
+    （用户 2026-10-04 ✓ 原话："**把「不合群的持续性」做进选目标**" ✓ —— 当前最大瓶颈 ✓）。
+
+    ⚠ 病根（实测 `10月1日` 全片 ✓）：**目标换了 14 次** ✗（平均每 5 拍一次 ✓）——
+      因为打分只看**强度** ✗ ⇒ 而"假目标偶尔猛抖一下"（单拍 `dev` 60+）在强度上
+      **比真目标平稳地走（每拍 20）还高** ✗✗ ⇒ "偶然"和"持续"在强度这一维**长得一样** ✓
+      （`_DEV_WIN=3` 的 3 拍中位只压得住**单拍**尖峰 ✗ 压不住"连着抖 2~3 拍"✗）。
+    ⇒ 现在加第二维 `persist`（最近 `p_win` 拍里"真有在动"的**比例** ✓）并按它给分数加权 ✓。
+    本用例钉住这个**核心性质**：
+      · 两条候选的**平均强度一样**（每 2 拍都多走 60px ⇒ 平均都是 30 ✓）；
+      · 但一条 **一直在动**（`persist ≈ 1.0` ✓）、另一条 **隔拍才动**（`persist ≈ 0.5` ✓）；
+      · ⇒ **"一直在动"的那条分数必须明显更高** ✓✓（改回"纯强度"⇒ 两者持平 ⇒ 立刻红 ✗）。
+    """
+    def _d(i):
+        _g = 30.0 * i
+        _dets = [(0, 200.0 + _g, 100.0, 150.0, 150.0, 0.9),
+                 (0, 500.0 + _g, 100.0, 150.0, 150.0, 0.9),
+                 (0, 800.0 + _g, 100.0, 150.0, 150.0, 0.9)]
+        # A：**每拍**都多走 30 ⇒ dev ≈ 30、persist ≈ 1.0 ✓
+        _dets.append((0, 1100.0 + _g + 30.0 * i, 300.0, 150.0, 150.0, 0.9))
+        # B：**隔拍**多走 60 ⇒ **平均也是 30** ✓ 但 persist ≈ 0.5 ✓
+        _dets.append((0, 1500.0 + _g + 60.0 * (i // 2), 300.0, 150.0, 150.0, 0.9))
+        return _dets
+
+    _tr = MotionTracker(min_hits=1)
+    for _i in range(24):
+        _tr.process(None, ts=0.1 * _i, dets=_d(_i))
+    _ta = _tr.tracks[3] if len(_tr.tracks) > 3 else None
+    _tb = _tr.tracks[4] if len(_tr.tracks) > 4 else None
+    check(_ta is not None and _tb is not None,
+          "① 两条候选都建起来了（A=每拍动 ✓ / B=隔拍动 ✓）")
+    _pa = None if _ta is None else float(_ta.persist)
+    _pb = None if _tb is None else float(_tb.persist)
+    check(_pa is not None and _pb is not None and _pa > 0.85 and _pb < 0.65,
+          "② **持续性把两者分开了**：每拍都在动的 `persist = %.2f` ✓ ／ 隔拍才动的 "
+          "`persist = %.2f` ✓（⚠ 这一维就是治「偶然」的 ✓ —— 强度上它俩**一模一样** ✗）"
+          % (-1.0 if _pa is None else _pa, -1.0 if _pb is None else _pb))
+    _sa = None if _ta is None else float(_ta.score)
+    _sb = None if _tb is None else float(_tb.score)
+    check(_sa is not None and _sb is not None and _sa > _sb * 1.6,
+          "③ ⭐ **分数拉开了**：一直在动 **%.0f** ／ 隔拍动 **%.0f**（差 %.1f 倍 ✓）—— "
+          "⚠ 改回「纯强度」（`+ _dev_eff` ✗）两者会**持平**（都 ≈ 300）⇒ 立刻红 ✗✗"
+          % (_sa, _sb, _sa / max(1e-6, _sb)))
+
+
 def test_merge_break_and_glide():
     """⭐⭐⭐⭐⭐ **融合期"断掉"的三条铁律**（用户 2026-10-04 ✓ 他给的机制 ✓ 实测逼出来的 ✓）。
 
@@ -514,6 +560,7 @@ def main():
     test_white_helper()
     test_params_really_work()
     test_runner_same_shape()
+    test_persist_beats_burst()
     test_merge_break_and_glide()
     test_stuck_deprioritize()
     test_ui_params_really_work()

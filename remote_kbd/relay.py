@@ -14,6 +14,7 @@ import socket
 import ssl
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import serial
@@ -82,22 +83,71 @@ _LOG_SINK = None
 _SEND_LOCK = threading.Lock()
 
 
-def _push_to_client(text):
-    """把一行日志**顺手回传给 B 机**（用户 2026-10-03 ✓ 见 `_LOG_SINK`）。
+#: 回传**队列**（见 `_push_to_client`）：**绝不许让回传挡住命令转发** ✗
+#:   —— 用户 2026-10-04 ✓："现在老有指令堆积的问题"。
+#:   原来 `_push_to_client` 是**同步 `sendall`** ✗，而 `trace()` 就在转发那条路上
+#:   （`bridge()` 里 `link.write(data)` **之前** ✓）⇒ 客户端（B）读得慢时 `sendall`
+#:   最长要阻塞 5 秒（那 socket 的写超时 ✓）⇒ **这一拍的命令根本发不到固件** ✗
+#:   ⇒ 表现就是"指令堆积 / 按键延迟突然很大"✓。
+#:   ⇒ 改成：**排队 + 独立线程发**，队列满了**丢最旧**（回传只是方便，宁可少几行 ✗
+#:     也绝不拖住命令 ✓）。
+LOG_BACKLOG_MAX = 200
+_QUEUE = deque()
+_QLOCK = threading.Lock()
+_QWAKE = threading.Event()
+_QDROP = 0                # 因队列满被丢掉的日志行数（给用例/排查看 ✓）
+_QSENT = 0                # 真发出去的日志行数
+_Q_THREAD = None
 
-    ⚠ 三条纪律：
-      · 只在**有客户端连着**时发 ✓（没连就只是本地文件 ✓，`relay_trace.log` 照旧写全 ✓）；
-      · 发失败**不算事**（回传只是为了方便，绝不许把中继搞挂 ✗）⇒ 静默 ✓；
+
+def _sender_loop():
+    """把队列里的日志行一条条发给客户端（**独立线程** ✓，慢也只慢它自己 ✓）。"""
+    global _QSENT
+    while True:
+        try:
+            _QWAKE.wait(0.5)
+            _QWAKE.clear()
+            while True:
+                with _QLOCK:
+                    if not _QUEUE:
+                        break
+                    line = _QUEUE.popleft()
+                conn = _LOG_SINK
+                if conn is None:
+                    continue                       # 客户端走了 ⇒ 丢掉这几行 ✓
+                try:
+                    with _SEND_LOCK:
+                        conn.sendall(line)
+                    _QSENT += 1
+                except Exception:                  # noqa: BLE001 —— 回传失败不算事 ✓
+                    pass
+        except Exception:                          # noqa: BLE001 —— 发送线程绝不许死 ✓
+            time.sleep(0.05)
+
+
+def _push_to_client(text):
+    """把一行日志**排队**回传给 B 机（用户 2026-10-03 ✓ 见 `_LOG_SINK`）。
+
+    ⚠ 四条纪律：
+      · 只在**有客户端连着**时排队 ✓（没连就只是本地文件 ✓，`relay_trace.log` 照旧写全 ✓）；
+      · **排队 + 独立线程发 ⇒ 绝不阻塞调用方** ✓（调用方是转发那条路 ✗ 见 `LOG_BACKLOG_MAX`）；
+      · 队列满了**丢最旧**（`_QDROP` 计数 ✓）—— 回传丢几行无害，拖住命令有害 ✓；
       · **不许在这里再调 `trace()`** ✗（会自激 ✓）。
     """
-    conn = _LOG_SINK
-    if conn is None:
+    global _QDROP, _Q_THREAD
+    if _LOG_SINK is None:
         return
-    try:
-        with _SEND_LOCK:
-            conn.sendall(("#LOG %s %s\n" % (_ts(), text)).encode("utf-8", "replace"))
-    except Exception:                           # noqa: BLE001
-        pass
+    if _Q_THREAD is None or not _Q_THREAD.is_alive():
+        _Q_THREAD = threading.Thread(target=_sender_loop, daemon=True,
+                                     name="relay-log-return")
+        _Q_THREAD.start()
+    line = ("#LOG %s %s\n" % (_ts(), text)).encode("utf-8", "replace")
+    with _QLOCK:
+        if len(_QUEUE) >= LOG_BACKLOG_MAX:
+            _QUEUE.popleft()
+            _QDROP += 1
+        _QUEUE.append(line)
+    _QWAKE.set()
 
 
 def _ts():
@@ -116,6 +166,9 @@ def trace(text):
     #   ⚠ 必须**与本地文件无关** ✗：`_trace_fh` 为 None 时（目录建不出来 / 打开失败 ✓）
     #   原来会直接 `return` ⇒ 回传也一起死 ✗ ⇒ 人还是得切到 A 机去看（甚至没得看 ✓）。
     #   实测就是这么发现的（探针里把 `_trace_fh` 设成 None，"推出"是空的 ✓）。
+    #   ⚠⚠ **只推这一次**（2026-10-04 ✓ 现场实测：B 收到的 `A_relay_trace.log` 里
+    #      **每行都是双份** ✗）—— 原来下面收尾处**又推了一次** ✗ ⇒ 回程（和固件回执
+    #      同一条 TLS ✓）白占一半带宽，而回程一堵就会拖住命令转发（见 `LOG_BACKLOG_MAX` ✓）。
     _push_to_client(text)
     if _trace_fh is None:
         return
@@ -129,9 +182,6 @@ def trace(text):
                              encoding="utf-8")
     except Exception:
         pass
-    # ⭐ 顺手回传给 B 机（2026-10-03 ✓ 用户："这样我就不用老切换了"）—— 本地文件照旧
-    #   写全 ✓（回传只是**多一条**路 ✓）；没客户端连着时这里什么也不做 ✓。
-    _push_to_client(text)
 
 
 class SerialLink:
@@ -224,6 +274,25 @@ class SerialLink:
                 pass
 
 
+def _med(xs):
+    """中位数（空样本 ⇒ 0 ✓）—— `MoveStats` / `KbdStats` **共用这三件** ✓。"""
+    if not xs:
+        return 0.0
+    s = sorted(xs)
+    return float(s[len(s) // 2])
+
+
+def _maxv(xs):
+    return float(max(xs)) if xs else 0.0
+
+
+def _p95(xs):
+    if not xs:
+        return 0.0
+    s = sorted(xs)
+    return float(s[min(len(s) - 1, int(0.95 * (len(s) - 1)))])
+
+
 class MoveStats:
     """⭐ 「**MOVE 命令**以什么节拍到达 A 机」——只统计鼠标，不掺键盘（2026-10-03 ✓）。
 
@@ -301,9 +370,9 @@ class MoveStats:
         line = ("MOVE 节拍 %.0fs n=%d（%.1f 条/秒）批=%d 批内中位%d最大%d "
                 "间隔中位%.1f p95 %.1f 最大%.1fms 步长中位%d最大%d"
                 % (span, self._n, self._n / span, self._batches,
-                   int(self._med(self._per_batch)), int(self._max(self._per_batch)),
-                   self._med(self._gaps), self._p95(self._gaps), self._max(self._gaps),
-                   int(self._med(self._steps)), int(self._max(self._steps))))
+                   int(_med(self._per_batch)), int(_maxv(self._per_batch)),
+                   _med(self._gaps), _p95(self._gaps), _maxv(self._gaps),
+                   int(_med(self._steps)), int(_maxv(self._steps))))
         self._n = 0
         self._batches = 0
         self._per_batch = []
@@ -325,27 +394,133 @@ class MoveStats:
         self._t0 = None
 
     # ---- 小工具（空样本安全 ✓）----
-    @staticmethod
-    def _med(xs):
-        if not xs:
-            return 0.0
-        s = sorted(xs)
-        return float(s[len(s) // 2])
 
-    @staticmethod
-    def _max(xs):
-        return float(max(xs)) if xs else 0.0
 
-    @staticmethod
-    def _p95(xs):
-        if not xs:
-            return 0.0
-        s = sorted(xs)
-        return float(s[min(len(s) - 1, int(0.95 * (len(s) - 1)))])
+class KbdStats:
+    """⭐⭐ 「**键盘指令**这条通道忙不忙、积压在哪一段」——`MoveStats` 的键盘版（2026-10-04 ✓）。
+
+    用户原话："**现在老有指令堆积的问题，能否做一些 A 向 B 汇报的东西？**" ✓。
+
+    为什么单开一条（原来一个字都不统计 ✗）：`MoveStats` **只认 `MOVE`** ✓（键盘混进去会把
+    鼠标率算歪 ✗），于是**键盘这条**在 A 侧完全看不见 —— 而"堆积"正是在这条上：
+    B 发的 `PRESS/TAP/…` 走 relay 原样写进 115200 串口，固件**逐条执行**（`TAP` 里还有
+    `delay` ✓）⇒ 发得比执行快时，命令就积压在**OS 串口缓冲 / 固件 RX** 里 ✓。
+
+    每 `report_sec` 秒往 trace 写一行（⇒ **自动回传 B** ✓，落 `remote_kbd/A_relay_trace.log`）：
+
+      · `n`        这一段键盘**条数 + 条/秒**（B 的发包率 ✓）
+      · `批内`     一次 `recv` 里带几条 ⇒ 「**成批发**」的证据 ✓（理想 ≈1~2 ✓）
+      · `间隔`     相邻两条**到达间隔** ⇒ 是否"一撮一撮" ✗
+      · `写` ⭐     `link.write()`（写串口）的**耗时** 中位/最大 —— **这就是"下游堵没堵"的
+                   直接证据** ✓：串口/固件忙 ⇒ 写变慢（`write_timeout=1.0`，最坏整秒 ✗）
+      · `完成` ⭐   回程收到的 `DONE/ERR` 条数 + 条/秒 —— **固件真实完成率** ✓
+                   ⇒ 与 `n`（发送率）一对比就能定案：**发 N 条/秒、完成 M 条/秒，N>M 就是在积压** ✓
+
+    ⚠ 只看完整行（TCP 切包是常态 ✓ 半行留到下一批 ✓）；⚠ 统计**不许改变转发行为** ✗；
+    ⚠ 只认**键盘**（`MOVE` 归 `MoveStats` ✓，两边都不许互相污染 ✓）。
+    """
+
+    #: 键盘指令的第一个词（与固件 `pro_micro.ino` 的那几个 `head == "…"` 对齐 ✓）。
+    #: ⚠ **`MOVE` 归 `MoveStats`** ✓；`PRESSM`/`RELEASEM`（**鼠标左右键**）两边都**不**算 ✓
+    #:   —— 它们是鼠标那条、量极小；混进"键盘节拍"会把"键盘积压"的故事搅浑 ✗
+    #:   （真要量它们，加一条 MouseBtnStats 比塞进这里清楚 ✓）。
+    KEYS = (b"PRESS", b"RELEASE", b"RELEASEALL", b"TAP", b"FIX", b"RND", b"HOLD")
+
+    def __init__(self, report_sec=5.0):
+        self.report_sec = float(report_sec)
+        self._carry = b""
+        self._n = 0
+        self._batches = 0
+        self._per_batch = []
+        self._gaps = []
+        self._wrs = []
+        self._done = 0
+        self._last_t = None
+        self._t0 = None
+
+    def feed(self, data, now, wr_ms=None, done=0):
+        """喂一次 `recv` 的原始字节（**只统计键盘** ✓）+ 这次写串口花了多少毫秒 + 收到的回执数。"""
+        if self._t0 is None:
+            self._t0 = now
+        if wr_ms is not None:
+            try:
+                self._wrs.append(float(wr_ms))
+            except (TypeError, ValueError):
+                pass
+        if done:
+            self._done += int(done)
+        try:
+            body = self._carry + bytes(data)
+        except Exception:                           # noqa: BLE001 —— 统计不许把桥搞挂 ✗
+            return
+        lines, _, rest = body.rpartition(b"\n")
+        self._carry = rest if rest and len(rest) < 4096 else b""
+        n_in_batch = 0
+        for raw in lines.split(b"\n"):
+            parts = raw.strip().split()
+            if not parts or parts[0] not in self.KEYS:
+                continue
+            if self._last_t is not None:
+                self._gaps.append((now - self._last_t) * 1000.0)
+            self._last_t = now
+            self._n += 1
+            n_in_batch += 1
+        if n_in_batch:
+            self._batches += 1
+            self._per_batch.append(n_in_batch)
+
+    def maybe_report(self, now=None, force=False):
+        now = time.perf_counter() if now is None else now
+        if self._t0 is None:
+            return None
+        if not force and (now - self._t0) < self.report_sec:
+            return None
+        span = max(1e-6, now - self._t0)
+        line = ("KBD 节拍 %.0fs n=%d（%.1f 条/秒）批=%d 批内中位%d最大%d "
+                "间隔中位%.1f p95 %.1f 最大%.1fms 写中位%.1f 最大%.1fms "
+                "完成 %d（%.1f 条/秒）"
+                % (span, self._n, self._n / span, self._batches,
+                   int(_med(self._per_batch)), int(_maxv(self._per_batch)),
+                   _med(self._gaps), _p95(self._gaps), _maxv(self._gaps),
+                   _med(self._wrs), _maxv(self._wrs), self._done, self._done / span))
+        self._n = 0
+        self._batches = 0
+        self._per_batch = []
+        self._gaps = []
+        self._wrs = []
+        self._done = 0
+        self._t0 = now
+        return line
+
+    def reset(self):
+        """别把"上一段"的样本带进下一段 ✓（换客户端 / 重连时调 ✓）。"""
+        self._carry = b""
+        self._n = 0
+        self._batches = 0
+        self._per_batch = []
+        self._gaps = []
+        self._wrs = []
+        self._done = 0
+        self._last_t = None
+        self._t0 = None
 
 
 #: 全进程一份（relay 只管一个客户端 ✓）
 MOVE_STATS = MoveStats()
+#: 键盘那条（见 `KbdStats` ✓）
+KBD_STATS = KbdStats()
+#: 回程收到的 `DONE/ERR` 条数**暂存**：由 `ser_to_tcp` 累加、主循环**取走清零** ✓。
+#:   为什么不直接喂给 `KBD_STATS`：那会变成**两个线程同时改它** ✗（`feed` 在动列表、
+#:   `maybe_report` 在排序 ⇒ 采样本会互相踩 ✓）⇒ 这里只用"整数的 `+=` / 取走"
+#:   （CPython 下够原子 ✓），统计对象**永远只由主循环一个线程碰** ✓。
+_DONE_PENDING = 0
+
+
+def _take_done():
+    """取走暂存的固件回执条数并清零（见 `_DONE_PENDING` ✓）。"""
+    global _DONE_PENDING
+    n, _DONE_PENDING = _DONE_PENDING, 0
+    return n
 
 
 def bridge(conn, link):
@@ -368,12 +543,15 @@ def bridge(conn, link):
     _set_nodelay(conn)
     # 换客户端 ⇒ 统计从头开始（别把上一条连接的样本并进来 ✓ 见 `MoveStats.reset`）
     MOVE_STATS.reset()
+    KBD_STATS.reset()             # 键盘那条同理（见 `KbdStats` ✓）
     # ⭐ 日志回传口：本条连接期间，`trace()` 写的每一行也发给这个客户端
     #   （用户 2026-10-03 ✓ 见 `_LOG_SINK` / `_push_to_client`）。
-    global _LOG_SINK
+    global _LOG_SINK, _DONE_PENDING
     _LOG_SINK = conn
+    _DONE_PENDING = 0
 
     def ser_to_tcp():
+        global _DONE_PENDING
         while not stop.is_set():
             try:
                 data = link.read(256)
@@ -381,6 +559,12 @@ def bridge(conn, link):
                 trace("serial->tcp 读失败，结束本连接: %s" % e)
                 break
             if data:
+                # ⭐ **固件的完成率**（`KbdStats` 要它）：回程这批里数 `DONE/ERR` ⇒ 暂存整数，
+                #   主循环取走（统计对象只由主循环一个线程碰 ✓ 见 `_DONE_PENDING` ✓）。
+                try:
+                    _DONE_PENDING += data.count(b"DONE") + data.count(b"ERR")
+                except Exception:                    # noqa: BLE001
+                    pass
                 try:
                     # ⚠ 回程**两个写者**（这里的固件回执 + `trace` 的日志回传）⇒ 必须
                     #   同一把锁 ✗（TLS 记录交错 = 整条链烂掉 ✓ 见 `_SEND_LOCK`）
@@ -416,16 +600,27 @@ def bridge(conn, link):
                 break
             trace("tcp->serial %s"
                   % data.decode("ascii", "replace").replace("\n", "|")[:60])
+            # ⭐ **写串口耗时**（`KbdStats` 要它）：这就是"下游堵没堵"的直接证据 ✓
+            #   （固件忙 ⇒ OS 串口缓冲满 ⇒ `write` 变慢，最坏撞上 `write_timeout=1.0` ✓）。
+            _t_wr = time.perf_counter()
             link.write(data)
+            _wr_ms = (time.perf_counter() - _t_wr) * 1000.0
             # ⭐ **鼠标节拍统计**（2026-10-03 ✓ 用户现场："A 机上一段一段一顿一顿的指令
-            #   汇报很离散"）：只**读** `data` ✓、不动转发（`link.write` 上一行照旧原样 ✓）；
-            #   到点就往 trace 里补一行 `MOVE 节拍 …` ✓ ⇒ 现场**只需抓 relay_trace.log** ✓。
+            #   汇报很离散"）+ ⭐⭐ **键盘节拍/积压统计**（2026-10-04 ✓ 用户现场："现在老有
+            #   指令堆积的问题，能否做一些 A 向 B 汇报的东西？"）：都只**读** `data` ✓、
+            #   不动转发（`link.write` 上一行照旧原样 ✓）；到点就往 trace 里补一行
+            #   ⇒ **自动回传 B** ✓ ⇒ 现场只需抓 `remote_kbd/A_relay_trace.log` ✓。
             #   ⚠ 包在 try 里：统计是"观测"，绝不许把桥搞挂 ✗。
             try:
-                MOVE_STATS.feed(data, time.perf_counter())
-                _stat_line = MOVE_STATS.maybe_report()
+                _now_stat = time.perf_counter()
+                MOVE_STATS.feed(data, _now_stat)
+                _stat_line = MOVE_STATS.maybe_report(now=_now_stat)
                 if _stat_line:
                     trace(_stat_line)
+                KBD_STATS.feed(data, _now_stat, wr_ms=_wr_ms, done=_take_done())
+                _kbd_line = KBD_STATS.maybe_report(now=_now_stat)
+                if _kbd_line:
+                    trace(_kbd_line)
             except Exception:
                 pass
     except Exception as e:

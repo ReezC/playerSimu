@@ -1304,7 +1304,10 @@ def t_mmap_fail_reason_is_logged():
     """
     src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
     _i = src.index('perf.count("mmap_ok" if loc.get("ok") else "mmap_miss")')
-    _seg = src[_i:_i + 900]
+    # ⚠ 这个窗口是"从计数那句往下这一整块"的**启发式** ⇒ 块里加注释/加分支时要跟着放宽 ✓
+    #   （2026-10-04 加了"恢复写 ok"那条 + 它的长注释 ⇒ 900 装不下 `perf.note("mmap_note"`
+    #    了 ⇒ 本用例当场红 ✓ 正好说明窗口别卡太紧 ✓）。
+    _seg = src[_i:_i + 2400]
     check('perf.note("mmap_note"' in _seg,
           "定位失败的原因没进日志 ⇒ 下次还只能看界面那行、日志里只有一个计数 ✗")
     check("_mmap_note_last" in _seg,
@@ -1340,6 +1343,67 @@ def t_mmap_fail_reason_is_logged():
           "决策理由没进日志 ⇒ 只能看到 st=idle / move=0，看不到「为什么」✗")
     check("_agent_why_last" in src,
           "决策理由没去重 ⇒ 每拍一样的那句会把段头刷爆 ✗")
+
+
+def t_mmap_note_says_ok_on_recovery():
+    """⭐⭐ `mmap_note` **恢复之后必须说一句 `ok`**（2026-10-04 ✓ 现场我差点看错 ✗）。
+
+    背景：`perf.note` 的值**整个会话都不清**（`core/perf.py` 的 `_notes` 只在 `configure()`
+    清一次 ✓）⇒ 失败那句话写一次，就会**一直挂在后面每一段的段头** ✗ —— 我看 01:5x 的
+    log 时正是把它当成"现在还在失败"，而**同一段**里 `mmap_ok` 明明在涨 ✓
+    （那种"注记和计数互相打脸"的日志，下次谁看都会踩 ✗）。
+    ⇒ 现在"上一次是失败"这一刻**写一次 `ok`** ✓ ⇒ 注记的含义变成"**最后一次变化是什么**" ✓。
+
+    钉四件（**真跑 `_locate_latest`** ✓ —— `LiveThread.__new__` 绕过 `__init__`，不起线程、
+    不要流 ✓ 同 `t_lie_recording` 的写法 ✓；`_locate_mmap` 换成替身、`core.perf` 三个口
+    记下来 ✓）：
+      ① 失败 ⇒ 注记 = 原因（截断到 70 字 ✓）；
+      ② **同一句再来** ⇒ **不写**（去重：段头不许被刷爆 ✗）；
+      ③ 恢复 ⇒ 注记 = `ok`（**这一条就是本次要修的**）；
+      ④ 一直 ok ⇒ **不重复写**（不刷屏 ✓）；之后**同一句失败再来** ⇒ 还要写 ✓（去重标记
+         在恢复时清掉了 ✓，别把"恢复过"记成"这句说过了" ✗）。
+    """
+    from unittest.mock import patch
+
+    from core import perf as _perf
+    from gui.live_thread import LiveThread
+
+    t = LiveThread.__new__(LiveThread)          # 绕过 __init__ ⇒ 不起线程/不要流 ✓
+    notes = []
+
+    def _fail(note="认不出玩家标记（黄族/color层：像点的块 0 个）"):
+        return {"ok": False, "note": note}
+
+    _ok = {"ok": True, "note": ""}
+    _cur = {"loc": _fail()}
+    t._locate_mmap = lambda _panel: _cur["loc"]           # 定位结果由用例摆 ✓
+
+    with patch.object(_perf, "note", lambda k, v: notes.append((k, v))), \
+            patch.object(_perf, "count", lambda *a, **k: None), \
+            patch.object(_perf, "ms", lambda *a, **k: None):
+        # ① 失败 ⇒ 原因进注记
+        t._locate_latest()
+        check(notes == [("mmap_note", "认不出玩家标记（黄族/color层：像点的块 0 个）")],
+              "定位失败的原因没进注记：%r" % (notes,))
+
+        # ② 同一句再来 ⇒ 不写（去重）
+        t._locate_latest()
+        check(len(notes) == 1, "同一句失败原因写了两遍（段头会被刷爆 ✗）：%r" % (notes,))
+
+        # ③ 恢复 ⇒ **必须说一句 `ok`**
+        _cur["loc"] = _ok
+        t._locate_latest()
+        check(notes[-1] == ("mmap_note", "ok"),
+              "定位恢复了，注记却还停在失败那句上 ⇒ 看日志的人会以为**现在还在失败** ✗："
+              "%r" % (notes,))
+
+        # ④ 一直 ok ⇒ 不重复写；同一句失败再来 ⇒ 照旧要写 ✓
+        t._locate_latest()
+        check(len(notes) == 2, "一直 ok 却每拍写一次 ⇒ 段头刷屏 ✗：%r" % (notes,))
+        _cur["loc"] = _fail()
+        t._locate_latest()
+        check(notes[-1][0] == "mmap_note" and notes[-1][1].startswith("认不出玩家标记"),
+              "恢复之后**同一句失败**没再写（去重标记没在恢复时清掉 ✗）：%r" % (notes,))
 
 
 def t_engine_export_one_click():
@@ -1434,6 +1498,8 @@ TESTS = (
      t_engine_imgsz_alignment),
     ("⭐ 小地图定位失败的原因要进日志（只在界面说 ⇒ 事后查不出来）",
      t_mmap_fail_reason_is_logged),
+    ("⭐ `mmap_note` 恢复时要写一句 ok（注记整个会话不清 ⇒ 不然一直挂着失败那句骗人）",
+     t_mmap_note_says_ok_on_recovery),
     ("⭐⭐ 一键导出该尺寸引擎（从 .engine 推同名 .pt / 名字带尺寸 / 后台线程 / 有反馈）",
      t_engine_export_one_click),
     ("静态检查：会当场炸的名字错误（pyflakes）", t_static_check_no_crash_classes),

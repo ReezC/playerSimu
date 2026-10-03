@@ -123,6 +123,7 @@ class KbdClient:
                 self._pending += 1
                 if self._rtt_t0 is None:
                     self._rtt_t0 = time.perf_counter()
+                self._sample_pending()
                 return True
             except Exception as e:
                 self._dirty = True
@@ -164,6 +165,26 @@ class KbdClient:
                 _p.ms("kbd_rtt_ms", self._rtt_t0)
         self._pending = max(0, self._pending - n)
         self._rtt_t0 = time.perf_counter() if self._pending > 0 else None
+        self._sample_pending()
+
+    def _sample_pending(self):
+        """把「**还没等到回执的指令条数**」打点进 `perf.log`（用户 2026-10-04 ✓ 见 `_pending`）。
+
+        ⭐ 这是"**指令堆积**"在 B 侧最直接的量化：固件/串口忙时，B 发得出去、回执回不来
+        ⇒ 这个数一路涨 ✓；而 `kbd_rtt_ms` 只说"**最老的**那条等了多久"、看不出**攒了几条** ✗
+        ⇒ 两个一起看才能定案（配 A 侧 `KBD 节拍` 那行的"发送率 vs 完成率"✓）。
+
+        ⚠ `min_gap=1.0`：它是**连续量**（每发一条就变，~10 条/秒 ✗）⇒ 不定频就是每拍一条、
+        把 `perf.log` 刷爆 ✓（口径同 `chase_dist` / `mmap_age_ms` ✓）。
+        ⚠ 吞异常：打点不许把发指令这条路搞挂 ✗（拿不到 `core.perf` 的老环境也是静默 ✓）。
+        """
+        _p = _perf()
+        if _p is None:
+            return
+        try:
+            _p.sample("kbd_pending", int(self._pending), min_gap=1.0)
+        except Exception:                       # noqa: BLE001
+            pass
 
     def _take_a_logs(self, data):
         """把 A 机**回传的日志行**（`#LOG …`）挑出来落盘，返回**剩下的**给回执计数用 ✓。

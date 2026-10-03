@@ -190,7 +190,7 @@ def t_follow_gain():
     # ① 单拍指令量**按倍率成比例**（同一局面、只改倍率 ✓）
     def _one_cmd(k):
         c = LieMouseController(gain=(1.0, 1.0), deadzone=3.0, max_step=1000.0,
-                               ff_lead_s=0.0, follow_gain=k)
+                               ff_lead=0.0, follow_gain=k)
         return c.step((300.0, 100.0), ts=0.0, vel=(0.0, 0.0), cursor=(100.0, 100.0))
 
     _c1, _c2, _c5 = _one_cmd(1.0), _one_cmd(0.5), _one_cmd(2.0)
@@ -237,6 +237,40 @@ def t_follow_gain():
           "不移动目标点 ✓ = 不影响位置计算 ✓）")
 
 
+def t_ff_lead():
+    """⭐⭐⭐⭐⭐ **前馈的单位：`vel` 是「px/拍」、`ff_lead` 的单位也是「拍」** ✓✓
+    （用户 2026-10-04 ✓ 他选了"**A**" ✓ 见 `lie_controller._FF_LEAD` ✓）。
+
+    ⚠⚠ 修掉的 bug：原来参数叫 `ff_lead_s`、注释写"**秒**" ✗，而喂进来的 `vel` 其实是
+      **px/拍**（= `MotionTracker.vel` = "每拍位移"的 EMA ✓）⇒ 那个 `× 0.10` 只补了
+      **0.10 拍** ✗ ⇒ **前馈等于没有** ✓
+      （实测 `10月1日`：`|vel|` 中位 **6.7** ／「报告位置每拍真走」**6.5** ⇒ 比值 **1.03**
+       ⇒ 单位确实是 px/拍 ✓✓；6.7px/拍 下那 0.10 拍只多挪 **0.67px** ✗）。
+    ⇒ 现在 `ff_lead = 1.0` ⇒ **补整整一拍** ✓（= 对"指令晚一拍落地"那个延迟 ✓）。
+    本用例把它钉死：**改回 0.10、或单位再混一次 ⇒ 立刻红** ✓。
+    """
+    def _cmd(vel, lead):
+        c = LieMouseController(gain=(1.0, 1.0), deadzone=0.0, max_step=1000.0,
+                               ff_lead=lead, follow_gain=1.0)
+        return c.step((300.0, 100.0), ts=0.0, vel=vel, cursor=(100.0, 100.0))
+
+    _c = _cmd((30.0, 0.0), 1.0)
+    check(_c == (230, 0),
+          "⑦ `vel=(30,0)`（**px/拍** ✓）、`ff_lead=1.0`（**拍** ✓）⇒ 目标点 = 300+30 ⇒ "
+          "指令 **%s**（应为 (230,0) ✓ = **补整整一拍** ✓）—— ⚠ 若退回 0.10 拍（老 bug）"
+          "这里会是 **(203,0)** ✗✗" % (_c,))
+    check(_cmd((30.0, 0.0), 0.0) == (200, 0),
+          "⑦ `ff_lead=0` ⇒ 不前馈 ✓（老行为可复现 ✓）")
+    check(_cmd(None, 1.0) == (200, 0),
+          "⑦ ⚠ **没给 `vel` ⇒ 一律不前馈** ✓：原来会退回 `_velocity` ✗ 而那个算的是 "
+          "**px/s** ✗ ⇒ 两个单位混进同一个乘法 ✓ ⇒ 现在宁可少补一拍 ✓ 也不甩鼠标 ✗")
+    _cf = _cmd((9999.0, 0.0), 1.0)
+    check(_cf == (260, 0),
+          "⑦ 限幅：`vel=9999` ⇒ 削到 **60 px/拍**（`_FF_VMAX` ✓）⇒ 指令 **%s**（应为 (260,0) ✓）"
+          "—— ⚠ 老值 **300** 是按 px/s 写的 ✗ 在 px/拍 世界**永远不触发** ✓ = 限幅形同虚设 ✗"
+          % (_cf,))
+
+
 def main():
     print("测谎鼠标闭环控制律自检：")
     t_converge()
@@ -245,6 +279,7 @@ def main():
     t_lost_hold()
     t_gain_error()
     t_follow_gain()
+    t_ff_lead()
     if _FAILED:
         print("自检：%d 条失败" % len(_FAILED))
         return 1

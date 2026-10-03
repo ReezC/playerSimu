@@ -231,6 +231,7 @@ def t_a_logs_are_forwarded_to_b():
       ⑤ 落盘内容里有抬头行 + 原文（超限砍半 ✓）。
     """
     import tempfile
+    import time as _t
     from remote_kbd import relay as relay_mod
     from remote_kbd import kbd_client as kc
 
@@ -248,6 +249,11 @@ def t_a_logs_are_forwarded_to_b():
         relay_mod._trace_fh = None
         relay_mod._LOG_SINK = sink
         relay_mod.trace("MOVE 节拍 5s n=42")
+        # ⚠ 回传现在**排队 + 独立线程发**（2026-10-04 ✓ 见 `_push_to_client`：不许阻塞
+        #   转发那条路 ✗）⇒ 这里要**等一下真发出去**，不然会误判成"没推"✗。
+        _dl = _t.time() + 2.0
+        while not sink.buf and _t.time() < _dl:
+            _t.sleep(0.01)
     finally:
         relay_mod._trace_fh = old_fh
         relay_mod._LOG_SINK = old_sink
@@ -347,6 +353,171 @@ def t_pad_move_is_coalesced():
         dinput.mouse_move = _old
 
 
+def t_kbd_stats_reports_backlog():
+    """⭐⭐⭐ **A 侧把「键盘这条通道忙不忙」汇报给 B**（用户 2026-10-04 ✓ 原话："现在老有
+    指令堆积的问题，能否做一些 A 向 B 汇报的东西？"）。
+
+    为什么单开一条：`MoveStats` **只认 `MOVE`** ✓（键盘混进去会把鼠标率算歪 ✗）⇒ 键盘这条
+    在 A 侧**一个字都不统计** ✗ —— 而"堆积"正是在它上面（B 发的 `PRESS/TAP/…` 走 relay
+    原样写进 115200 串口，固件**逐条执行**且 `TAP` 里还有 `delay` ✓ ⇒ 发得比执行快就积压 ✓）。
+
+    一行里两个数就能定案：`n`（**发送率**）与 `完成`（**固件完成率**）——发 N 条/秒、完成
+    M 条/秒、N>M **就是在积压** ✓；`写`（写串口耗时）告诉你"下游堵到什么程度" ✓。
+
+    钉五件：
+      ① 只认键盘（`MOVE` 不许混进来 ✗）；
+      ② 一批几条 / 到达间隔都量出来（成批、一顿一顿的证据 ✓）；
+      ③ `写` / `完成` 两个数都在（**本次要的就是它们** ✓）；
+      ④ **半行**（TCP 切包）留到下一批 ⇒ 不许把残行当命令 ✗；
+      ⑤ 没到 `report_sec` 不报（别把日志刷爆 ✓）。
+    """
+    from remote_kbd.relay import KbdStats
+
+    st = KbdStats(report_sec=0.0)
+    t = 100.0
+    st.feed(b"PRESS LEFT\nTAP d 30\n", t, wr_ms=0.4, done=1)      # 一批 2 条
+    t += 0.025
+    st.feed(b"MOVE 3 0\nRELEASE LEFT\n", t, wr_ms=0.6, done=2)    # 鼠标混进来：只算 1 条
+    line = st.maybe_report(now=t + 0.001)
+    check(line and line.startswith("KBD 节拍 "), "没报出 `KBD 节拍` 那行：%r" % (line,))
+    check("n=3" in line, "键盘条数算错了（`MOVE` 混进来了 / 漏算了？）：%s" % line)
+    check("批内中位2最大2" in line, "批内条数没量出来（「成批」就靠它 ✗）：%s" % line)
+    check("间隔中位" in line and "最大25.0ms" in line,
+          "到达间隔没量出来（「一顿一顿」就靠它 ✗）：%s" % line)
+    check("写中位0.6 最大0.6ms" in line,
+          "写串口耗时没报（**下游堵没堵就看它** ✗）：%s" % line)
+    check("完成 3（" in line and "条/秒" in line,
+          "固件完成率没报（发送率 vs 完成率才是积压判据 ✗）：%s" % line)
+
+    # ④ 半行：`TAP d` 与 ` 30\n` 分两批到 ⇒ 只算 1 条（不许把残行当命令 ✗）
+    st2 = KbdStats(report_sec=0.0)
+    st2.feed(b"TAP d", 1.0)
+    st2.feed(b" 30\n", 1.01, wr_ms=0.2)
+    line2 = st2.maybe_report(now=1.02)
+    check("n=1" in line2 and "批=1" in line2, "半行被算成两条命令了：%s" % line2)
+    check("写中位0.2" in line2, "写耗时丢了：%s" % line2)
+
+    # ⑤ 没到点不报（不然 5 秒的窗口会被刷成一堆行 ✗）
+    st3 = KbdStats(report_sec=5.0)
+    st3.feed(b"PRESS A\n", 10.0)
+    check(st3.maybe_report(now=10.5) is None, "没到 `report_sec` 就报了一行 ✗")
+    check(st3.maybe_report(now=15.5) is not None, "到点了却没报 ✗")
+
+
+def t_trace_push_is_async_and_once():
+    """⭐⭐ A 侧 `trace()`：**只推一次** + **绝不阻塞命令转发**（用户 2026-10-04 ✓）。
+
+    现场两件事（都在 `remote_kbd/A_relay_trace.log` 与代码里看出来的 ✓）：
+      · B 收到的那份日志里**每行都是双份** ✗ —— `trace()` 头上推一次、收尾**又推一次** ✗
+        （回程和固件回执**同一条 TLS** ⇒ 白占一半回程带宽 ✓）；
+      · 更要紧：回传原来是**同步 `sendall`**，而 `trace()` 就在转发那条路上（`link.write`
+        **之前** ✓）⇒ 客户端读得慢时 `sendall` 最长阻塞 **5 秒**（那 socket 的写超时 ✓）
+        ⇒ **这一拍的命令根本发不到固件** ✗ = "指令堆积 / 按键突然很迟"的一种真成因 ✓。
+      ⇒ 现在：**只推一次** + **排队交给独立线程**（满了丢最旧 ✓）。
+
+    钉四件：
+      ① `trace()` 只推**一次**（数 sink 里带标记的行 ✓）；
+      ② 回传**不阻塞**：sink 每次 `sendall` 故意慢 20 ms ⇒ `trace()` 必须**立刻返回** ✓；
+      ③ 队列满了**丢最旧**且**不抛**（`_QDROP` 涨 ✓、长度不超上限 ✓）；
+      ④ 没客户端连着 ⇒ 一个字都不排队（老行为 ✓）。
+    """
+    import time as _t
+    from remote_kbd import relay as relay_mod
+
+    class _SlowSink:
+        # ⚠ 故意慢到 **80 ms**：它必须**大于**下面那个 50 ms 的判据 ✗ —— 不然"同步发送"
+        #   那种写法（20 ms）也会通过 ⇒ 用例白写 ✓（反向验证实测就是这么发现的 ✓）。
+        def __init__(self, block=0.08):
+            self.block = float(block)
+            self.buf = b""
+
+        def sendall(self, raw):
+            _t.sleep(self.block)
+            self.buf += raw
+
+    old = relay_mod._LOG_SINK
+    sink = _SlowSink()
+    _drop0 = relay_mod._QDROP
+    try:
+        relay_mod._LOG_SINK = sink
+        with relay_mod._QLOCK:
+            relay_mod._QUEUE.clear()            # 别把上一轮的残留算进来 ✓
+        # ② **先**验"不阻塞"（⚠ 顺序有讲究：它排在"只推一次"**前面**，两条性质才各自
+        #   能被独立验到 ✓ —— 反过来时"同步发送"那种写法会先被 ① 挂住、② 根本没跑到 ✗）
+        _t0 = _t.perf_counter()
+        relay_mod.trace("排队不阻塞")
+        _dt = _t.perf_counter() - _t0
+        check(_dt < 0.05,
+              "回传把调用方阻塞住了（它就在转发那条路上 ⇒ 命令会发不出去 ✗）：%.3fs" % _dt)
+        # ① 只推一次
+        relay_mod.trace("tcp->serial PRESS LEFT|")
+        _dl = _t.time() + 2.0
+        while sink.buf.count(b"PRESS LEFT|") < 1 and _t.time() < _dl:
+            _t.sleep(0.01)
+        _t.sleep(0.15)                          # 再等一会儿，看有没有第二份 ✗
+        check(sink.buf.count(b"PRESS LEFT|") == 1,
+              "`trace()` 推了不止一次（现场实测 `A_relay_trace.log` 里每行双份 ✗）：%r"
+              % (sink.buf,))
+        # ③ 队列满 ⇒ 丢最旧、不抛
+        for _i in range(relay_mod.LOG_BACKLOG_MAX + 50):
+            relay_mod.trace("y%d" % _i)
+        check(len(relay_mod._QUEUE) <= relay_mod.LOG_BACKLOG_MAX,
+              "队列长度超过上限（回传会把内存吃光 ✗）：%d" % (len(relay_mod._QUEUE),))
+        check(relay_mod._QDROP > _drop0,
+              "队列满了**没丢**（该丢最旧 ✓）：%d → %d"
+              % (_drop0, relay_mod._QDROP))
+    finally:
+        relay_mod._LOG_SINK = old               # 让发送线程把剩下的丢掉 ✓
+        relay_mod._QUEUE.clear()
+
+    # ④ 没客户端 ⇒ 不排队
+    relay_mod._LOG_SINK = None
+    _n0 = len(relay_mod._QUEUE)
+    relay_mod.trace("没有客户端")
+    check(len(relay_mod._QUEUE) <= _n0, "没有客户端时还在排队（白占内存 ✗）")
+
+    # 源码级：`trace()` 里只许出现**一处**回传调用（双份那个坑别再回来 ✗）
+    src = (ROOT / "remote_kbd" / "relay.py").read_text(encoding="utf-8")
+    _tr = src[src.index("def trace(text):"):]
+    _tr = _tr[: _tr.index("\nclass ") if "\nclass " in _tr else len(_tr)]
+    check(_tr.count("_push_to_client(text)") == 1,
+          "`trace()` 里回传调用了 %d 处（要 1 处 ✗ —— 两处就是每行双份 ✓）"
+          % _tr.count("_push_to_client(text)"))
+
+
+def t_kbd_pending_is_sampled():
+    """⭐ B 侧把「**还没等到回执的指令条数**」打点进 `perf.log`（用户 2026-10-04 ✓）。
+
+    为什么：`kbd_rtt_ms` 只说"**最老的**那条等了多久"，看不出**攒了几条** ✗ —— 而"指令堆积"
+    最直接的量化就是**在飞条数** ✓（配 A 侧 `KBD 节拍` 那行的"发送率 vs 完成率"一起看 ✓）。
+
+    钉三件：
+      ① 打点的是在飞条数（`kbd_pending` ✓）；
+      ② **带 `min_gap`** —— 它是连续量（每发一条就变、~10 条/秒 ✗）⇒ 不定频会把日志刷爆 ✓；
+      ③ `send()`（+1）与 `_take_rtt()`（回落）**两处都记** ✓（只记一处 ⇒ 涨上去就下不来 ✗）。
+    """
+    from unittest.mock import patch
+
+    from core import perf as _pf
+    from remote_kbd import kbd_client as kc
+
+    rec = []
+    c = kc.KbdClient.__new__(kc.KbdClient)          # 不连网 ✓
+    c._pending = 3
+    with patch.object(_pf, "sample", lambda k, v, **kw: rec.append((k, v, kw))):
+        c._sample_pending()
+    check(rec and rec[-1][0] == "kbd_pending" and rec[-1][1] == 3,
+          "在飞条数没进 `perf`：%r" % (rec,))
+    check(rec[-1][2].get("min_gap") == 1.0,
+          "没定频（连续量 ⇒ 每拍一条会把 `perf.log` 刷爆 ✗）：%r" % (rec[-1],))
+
+    src = (ROOT / "remote_kbd" / "kbd_client.py").read_text(encoding="utf-8")
+    check("def _sample_pending(self):" in src, "`_sample_pending` 没定义 ✗")
+    check(src.count("self._sample_pending()") == 2,
+          "调用点不是 2 处（`send()` 记涨 / `_take_rtt()` 记落 ⇒ 缺一处就只涨不落 ✗）：%d"
+          % src.count("self._sample_pending()"))
+
+
 TESTS = (
     ("停自动要真的松干净（下降沿 + 不许把键按回去）", t_stop_automation_releases_keys),
     ("松键那条唯一写法同时认两种后端", t_release_keys_covers_both_backends),
@@ -361,6 +532,12 @@ TESTS = (
      t_a_logs_are_forwarded_to_b),
     ("⭐⭐ 触控板位移累积 + 8 ms 合并成一条（位移守恒、静下来停表）",
      t_pad_move_is_coalesced),
+    ("⭐⭐⭐ A 侧把「键盘这条」也汇报给 B（发送率 / 写串口耗时 / 固件完成率 ⇒ 积压判据）",
+     t_kbd_stats_reports_backlog),
+    ("⭐⭐ A 侧 `trace()` 只推一次 + 回传绝不阻塞命令转发（队列满丢最旧）",
+     t_trace_push_is_async_and_once),
+    ("⭐ B 侧打点「还没等到回执的条数」（kbd_pending：积压最直接的量化）",
+     t_kbd_pending_is_sampled),
 )
 
 

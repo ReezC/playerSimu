@@ -508,6 +508,10 @@ class LiveThread(QThread):
         #: 那份缓存最多活多久（秒）—— 编辑器里新圈了集合，最多这么久就生效（见 _route_ctx）
         self.ROUTE_CTX_TTL_S = 2.0
         self._mmap_cli = None           # 来源=收流 时那一路 TCP（懒起）
+        #: ⭐ 「小地图定位注记」上一次写进日志的那句（`mmap_note` ✓）——**恢复时会写回 `ok`**
+        #:   并把它清成 `None`（见 `_locate_latest` ✓；`perf.note` 的值整个会话都不清 ⇒
+        #:   不这么做的话，失败那句会一直挂在后面每一段的段头、看着像"现在还在失败" ✗）。
+        self._mmap_note_last = None
         #: ⭐⭐ **小地图高频定位回路**（用户 2026-10-03 ✓ 原话："**小地图作为权威世界坐标，
         #:   应该尽可能用较高的帧率去更新**"）—— 原来定位是**每个推理帧**才做一次
         #:   （≈30 次/秒 ⇒ 被推理节拍绑住 ✗），而实测定位只要 **~0.5ms**（`locate_ms` ✓）
@@ -1521,10 +1525,24 @@ class LiveThread(QThread):
             #   不知道卡在哪一步** ✗ —— 而 agent 正是靠它判"未定位玩家" ⇒ 回 idle ⇒
             #   超时还会**自己把自动关掉** ⇒ 现象就是"开启自动没用" ✓（本轮就是这么查的 ✓）。
             #   ⇒ 原因**一变**就 `note` 进段头 ✓（同一句不重复刷，免得段头被刷屏 ✗）。
+            # ⚠⚠ **恢复也要说一句**（2026-10-04 ✓ 现场差点看错 ✗）：`perf.note` 的值
+            #   **整个会话都不清**（`core/perf.py` 的 `_notes` 只在 `configure()` 那会儿清 ✓）
+            #   ⇒ 失败那句话说一次，就会**一直挂在后面每一段的段头** ✗ —— 我这次看 log 时
+            #   正是把它当成"现在还在失败"✗，而同一段里 `mmap_ok` 明明在涨 ✓。
+            #   ⇒ "上一次是失败"这一刻**写一次 `ok`** ✓ ⇒ 段头从此显示 `mmap_note=ok`
+            #     （含义变成"**最后一次变化是什么**"✓，不再骗人 ✓）。
+            # ⚠ 读它一律走 `self.__dict__.get(...)`（**别用 `getattr`** ✗）：`LiveThread` 是
+            #   `QThread` 子类，属性不存在时 `getattr` 会落到 PyQt 的 C++ 侧 ⇒ 自检里那种
+            #   "`__new__` 造壳、没跑 `__init__`" 的替身会当场 `RuntimeError: super-class
+            #   __init__() of type LiveThread was never called` ✗（写这条用例时正好踩了 ✓）；
+            #   而真机上 `__init__` 已经把它设成 `None`（见那儿 ✓）⇒ 两种情形都稳 ✓。
             _note = loc.get("note")
+            _nl = self.__dict__.get("_mmap_note_last")
             if loc.get("ok"):
-                self._mmap_note_last = None
-            elif _note and _note != getattr(self, "_mmap_note_last", None):
+                if _nl is not None:
+                    self._mmap_note_last = None
+                    perf.note("mmap_note", "ok")
+            elif _note and _note != _nl:
                 self._mmap_note_last = _note
                 perf.note("mmap_note", str(_note)[:70])
         return loc

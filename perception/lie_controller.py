@@ -35,10 +35,23 @@ _FOLLOW_GAIN = 1.0        # ⭐⭐⭐ **「鼠标跟随效率倍率」默认值*
                           #     代价是抖 ✓）。
                           #   ⚠ 与 `gain`（**标定**：1 指令单位 ⇒ 多少游戏像素 ✓）不是一回事 ✗
                           #     —— gain 是"换算尺"、本项是"走多快" ✓。
-_FF_LEAD_S = 0.10         # 前馈提前量：目标速度 × 它（≈ 传输+处理一拍延迟 ✓）
-_FF_VMAX = 300.0          # ⭐ 前馈速度限幅（px/s）：正常目标几十 px/s —— 超过它说明
-                          #   速度估计被**跳变**污染，前馈会把指令甩飞 ✗（闭环实测：
-                          #   跳变 → 裸差分 560px/s → 前馈甩出 85px ⇒ 命中率掉 13% ✗）
+#: ⭐⭐⭐⭐⭐ **前馈提前量** —— ⚠⚠⚠ **单位是「拍」，不是「秒」** ✗✗（用户 2026-10-04 ✓
+#:   他点了"A" ✓ 见下面那段单位订正 ✓）。
+#:   · 取 **1.0** = **补整整一拍**（= `目标点 = 报告位置 + 目标每拍位移` ✓）
+#:     —— 这才对应"**指令晚一拍落地**"那个延迟 ✓（闭环里就是这个延迟 ✓）。
+#:   ⚠⚠ **原来写的是 `_FF_LEAD_S = 0.10` 并声称单位是「秒」** ✗✗ —— 而喂进来的 `vel`
+#:     其实是 **px/拍**（= `MotionTracker.vel` = "每拍位移"的 EMA ✓ 由 `_moves` 算 ✓）
+#:     ⇒ 实际只补了 **0.10 拍** ✗ ⇒ **前馈几乎等于没有** ✓
+#:     （实测 `10月1日`：`|vel|` 中位 **6.7** vs「报告位置每拍真走」**6.5** ⇒ 比值 **1.03**
+#:      ⇒ 单位确实是 px/拍 ✓✓；6.7px/拍 下那 0.10 拍只多挪 **0.67px** ✗ 等于摆设 ✓）
+#:   ⚠ 调法：**> 1 会过冲**（目标急停/拐弯时鼠标越过绿圈 ✗）；**< 1 压不住滞后** ✓
+#:     （先按 1.0 ✓ 看"急停那几拍鼠标会不会冲出去"再定 ✓）。
+_FF_LEAD = 1.0
+#: ⭐ **前馈速度限幅**（单位 **px/拍** ✗ 不是 px/s ✗）—— 防"速度估计被跳变污染"✓。
+#:   ⚠⚠ **原值 300 是按「px/s」写的** ✗ ⇒ 换算到 px/拍 相当于 **5 拍/s × 300** 的天量
+#:     ⇒ **永远不会触发** ✗（限幅形同虚设 ✓）。实测：典型 **6.7 px/拍** ✓、混战时也就
+#:     20~40 px/拍 ✓ ⇒ 取 **60**（留 ~1.5 倍余量 ✓）：**真跳变**（一拍窜上百 px ✓）会被削掉 ✓。
+_FF_VMAX = 60.0
 _LOST_HOLD = 8            # 连续丢这么多帧 ⇒ 判"持续丢失"（记事件 ✓ 同 tracker 口径 ✓）
 
 
@@ -69,12 +82,14 @@ class LieMouseController:
     """
 
     def __init__(self, gain=None, deadzone=_DEADZONE, max_step=_MAX_STEP,
-                 ff_lead_s=_FF_LEAD_S, lost_hold=_LOST_HOLD, assume=None,
+                 ff_lead=_FF_LEAD, lost_hold=_LOST_HOLD, assume=None,
                  follow_gain=None):
         self.gain = tuple(gain) if gain else load_gain()
         self.deadzone = float(deadzone)
         self.max_step = float(max_step)
-        self.ff_lead_s = float(ff_lead_s)
+        # ⚠ 参数名**从 `ff_lead_s` 改成 `ff_lead`** ✗（`_s` 那个后缀一直在暗示"秒" ✗
+        #   而它**从来就不是秒** ✓ 名字本身在骗人 ⇒ 一起改掉 ✓ 见模块头 `_FF_LEAD` ✓）。
+        self.ff_lead = float(ff_lead)
         self.lost_hold = int(lost_hold)
         # ⭐⭐⭐ **鼠标跟随效率倍率**（用户 2026-10-03 ✓ 见 `_FOLLOW_GAIN` ✓）：每拍把"光标 →
         #   目标点"的误差消掉这么多倍 ✓。⚠ **0 会被夹成一个极小值**（= 光标几乎不动 ⇒
@@ -115,14 +130,25 @@ class LieMouseController:
         self.lost_n = 0
         self.held = False
 
-        # ③ 目标点 = 质心 + 速度前馈（补一拍延迟 ✓）；速度**限幅**（防跳变污染 ✓）
-        v = vel if vel is not None else self._velocity(pos, ts)
-        m = max(abs(v[0]), abs(v[1]))
-        if m > _FF_VMAX:
-            k = _FF_VMAX / m
-            v = (v[0] * k, v[1] * k)
-        tx = float(pos[0]) + v[0] * self.ff_lead_s
-        ty = float(pos[1]) + v[1] * self.ff_lead_s
+        # ③ ⭐⭐⭐⭐ **目标点 = 质心 + 速度前馈 × 一拍**（补"指令晚一拍落地"那个延迟 ✓）——
+        #   ⚠⚠ **`vel` 的契约 = 「px/拍」** ✗✗（**不是 px/s** ✗ 见模块头 `_FF_LEAD` 那段 ✓）：
+        #     喂进来的是 `MotionTracker.vel`（= "每拍位移"的 EMA ✓ 见 `lie_motion._moves` ✓）
+        #     —— 实测比值 1.03 ⇒ 确认是 px/拍 ✓✓。
+        #   ⚠⚠ **没给 `vel` ⇒ 一律"不前瞻"** ✗✗（原来退回 `self._velocity` ✓ 而那个是 **px/s** ✗
+        #     ⇒ **两个不同单位混进同一个乘法** ✗✗ ⇒ 宁可**不前馈** ✓ 也不能甩鼠标 ✓。
+        #     这条路径只在"轨迹刚出生、还没配上过一次"时走到 ✓ —— 那几拍**本来就没有可信速度** ✓
+        #     ⇒ 不前馈反而是对的 ✓。（⚠ `_velocity` **保留不删** ✓ 要回退随时能接 ✓。）
+        if vel is not None:
+            _vx, _vy = float(vel[0]), float(vel[1])
+            _m = max(abs(_vx), abs(_vy))
+            if _m > _FF_VMAX:                      # 限幅（px/拍 ✓ 见 `_FF_VMAX` ✓）
+                _k = _FF_VMAX / _m
+                _vx, _vy = _vx * _k, _vy * _k
+            tx = float(pos[0]) + _vx * self.ff_lead
+            ty = float(pos[1]) + _vy * self.ff_lead
+        else:
+            tx = float(pos[0])
+            ty = float(pos[1])
 
         # ④ 没有光标反馈 ⇒ 航位推算（起点按 `assume` ✓ 缺省 (0,0)；**不许**默认在目标上 ✗）
         if self.cursor is None:
@@ -158,7 +184,13 @@ class LieMouseController:
         return dx, dy
 
     def _velocity(self, pos, ts):
-        """位置差分估速度（px/s ✓）；没有历史/时间为 0 ⇒ 0。"""
+        """位置差分估速度（**px/s** ✗）；没有历史/时间为 0 ⇒ 0。
+
+        ⚠⚠ **`step` 现在不用它了** ✗（用户 2026-10-04 ✓ 原话"**A**" ✓ 见模块头 `_FF_LEAD` ✓）——
+          它回的是 **px/s** ✗，而 `step` 吃的 `vel` 是 **px/拍** ✗ ⇒ 两个单位混在一个乘法里
+          就是灾难 ✓ ⇒ 现在"**没给 `vel` 就不前瞻**" ✓（宁可少补一拍 ✓ 也不甩鼠标 ✗）。
+        ⚠ **保留不删** ✓：要回退、或将来有"真按 px/s 喂"的调用方，随时能接上 ✓。
+        """
         if self._last is None or ts is None or self._last[1] is None:
             self._last = (pos, ts)
             return (0.0, 0.0)

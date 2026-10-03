@@ -906,8 +906,20 @@ def pick_label(pick, names=None):
     txt = "(%.1f,%.1f) %dx%d=%d" % (cx, cy, int(round(w)), int(round(h)),
                                    int(round(w * h)))
     _l1 = ("%s | %s" % (nm, txt)) if nm else txt          # 第 1 行：几何 / 面积 ✓
-    # 第 2 行：**重叠量**（> 1 项才另起一行 ✓；一项都不显示时退回单行 ✓）
-    _l2 = " | ".join([str(_x) for _x in pick[6:] if _x])
+    # ⚠⚠ **第 2 行照旧 join** ✗ —— ⚠ 我一度在这里加了"只留纯 ASCII"的过滤 ✗✗ **结果自检当场
+    #   抓住**（`test_pick_box` 断言经典模式那行是 `IoU最大砖 … | 圆矩IoU … | 圆矩∩框 …` ✓
+    #   全被滤没了 ⇒ `IndexError` ✗）⇒ **回退** ✓。
+    #   ⚠ 教训：`cv2.putText` 画不出中文（会变 `?` ✓）是**既有的老问题** ✗，而"第 2 行包含中文"
+    #     是**既有契约** ✓ ⇒ **不能在改文案这轮顺手改它** ✗（会同时改掉接口 ✓ 得单独一轮 ✓）。
+    #   ✅ 本轮只做**用户要的那件事**：把 `_pick_box` 给的**多行**原样铺开（一行一主题 ✓）。
+    _segs = []
+    for _x in pick[6:]:
+        if not _x:
+            continue
+        for _ln in str(_x).split("\n"):
+            if _ln:
+                _segs.append(_ln)
+    _l2 = " | ".join(_segs)
     return ("%s\n%s" % (_l1, _l2)) if _l2 else _l1
 
 
@@ -946,7 +958,22 @@ def pick_clip_text(pick, names=None, frame_no=None, total=None, state=None):
                    int(round(_w)), int(round(_h)), int(round(_w * _h))))
     # ⚠ 那几段是 `pick_extra` 生成的 ✓ 内部用的是**半角 `|`** ✗（画布给 `cv2.putText` 用 ✓
     #   全角会画成 `?` ✗）⇒ 这里**换成全角 `｜`** ✓（剪贴板是给人看的 ✓ 混排会显脏 ✗）。
-    _extra = " ｜ ".join([str(_x).replace("|", "｜") for _x in pick[6:] if _x])
+    # ⚠⚠ **逐行拆开、别 join 成一长行** ✗✗（用户 2026-10-04 ✓ 原话："**这也太长了，你能归纳
+    #   信息分行显示吗？**" ✓）—— `_pick_box` 运动模式给的本来就是**多行** ✓
+    #   ⇒ 这里**按行摆出去** ✓（`\n` 拆开 ✓ 保持"一行一个主题" ✓）。
+    # ⚠⚠ **运动模式那一版有「多行 + 一个 ASCII 短码」两段** ⇒ 短码**别重复贴** ✗
+    #   （它是**画布专用的浓缩版** ✓ 内容全在详细版里 ✓ 两个一起贴看着像重复 ✓）。
+    #   ⚠⚠ **判据只能用「有没有换行」** ✗✗ —— 我第一版拿"含不含中文"当判据 ✓ **错** ✗：
+    #     经典模式那两段（`IoU最大砖 …` / `圆矩IoU …`）**也是中文** ✓ ⇒ 判据会把它俩
+    #     也砍成一段 ⇒ **自检当场抓住**（断言恰好 3 行 ✓ 实测只剩 2 行 ✗）✓
+    #     ⇒ 而"运动模式给的是**多行**"才是**它独有的特征** ✓✓。
+    #   ⚠ 另外**必须防元组长度**（自检里有 5 位的 `pick` ✗ ⇒ `pick[6]` 会 `IndexError` ✓）。
+    _p6 = str(pick[6]) if len(pick) > 6 else ""
+    _src = (pick[6:7] if "\n" in _p6 else pick[6:])
+    # ⚠⚠ **经典模式那两段仍要 `join` 成一行** ✗✗（我一度把它们也拆成两行 ⇒ 行数 3→4 ⇒
+    #   **自检当场抓住** ✓）；而**运动模式那一版自带 `\n`** ✓ ⇒ join 之后**自然还是多行** ✓✓
+    #   （一个 `join` 同时满足两边 ✓ 不用分支 ✓）。
+    _extra = " ｜ ".join([str(_x).replace("|", "｜") for _x in _src if _x])
     if _extra:
         _out.append(_extra)
     return "\n".join(_out)
@@ -1130,7 +1157,7 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
             cv2.rectangle(frame, _q1, _q2, (0, 165, 255), 1)
             _txt = "候选(%d,%d)" % (int(_bid[0]), int(_bid[1]))
             _lab_col = (0, 165, 255)
-        (tw, th2), _ = cv2.getTextSize(_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+        (tw, th2), _ = cv2.getTextSize(_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.63, 1)
         _ty = max(_q1[1] - 3, th2 + 4)
         cv2.rectangle(frame, (_q1[0], _ty - th2 - 4), (_q1[0] + tw + 4, _ty + 2),
                       (90, 60, 10), -1)
@@ -1148,13 +1175,13 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
         #   分开 ✓ 不打架 ✓）。⚠ 只认后端给的 `merged`（`motion["merged"]` ✓ 同一口径 ✓）。
         if (motion or {}).get("merged"):
             _txt = "融合"
-            (tw, th2), _ = cv2.getTextSize(_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            (tw, th2), _ = cv2.getTextSize(_txt, cv2.FONT_HERSHEY_SIMPLEX, 1.05, 1)
             _bx0 = _p2[0] - tw - 4
             _by0 = _p1[1]
             _by1 = _by0 + th2 + 4
             cv2.rectangle(frame, (_bx0, _by0), (_p2[0], _by1), (0, 0, 190), -1)
             cv2.putText(frame, _txt, (_bx0 + 2, _by0 + th2 + 1),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.05, (255, 255, 255), 1, cv2.LINE_AA)
     # ---- ⭐⭐ 每个框的**运动向量**（用户 2026-09-30 定口径 ✓）：**从本框上一帧的位置
     #   指向本帧的位置**（= 逐框位移 ✓ 方向就是真实运动方向 ✓）。
     #   🔵 蓝 = 一般框 ｜ 🟢 绿 = 追踪器认定"运动最异常"的那个 ｜ 🟡 黄 = 实际在跟的那个。
@@ -1316,7 +1343,7 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
         #   ⚠ `cv2.putText` **不认 `\n`** ✗ ⇒ 自己按行拆开逐行画 ✓（黑底高度 = 行数 × 行高 ✓）。
         _ptxt = pick_label(pick, names)
         _pln = [t for t in _ptxt.split("\n") if t]
-        _psz = [cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0] for t in _pln]
+        _psz = [cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, 1.055, 1)[0] for t in _pln]
         _pth = max(s[1] for s in _psz)
         _pwmax = max(s[0] for s in _psz)
         _plh = _pth + 8                       # 行高（含行距 ✓）
@@ -1329,11 +1356,13 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
         cv2.rectangle(frame, (_px0, _ptop), (_px0 + _pwmax + 8, _pbot), (0, 0, 0), -1)
         for _pk_i, _pk_t in enumerate(_pln):
             cv2.putText(frame, _pk_t, (_px0 + 4, _ptop + _plh * _pk_i + _pth + 3),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.055, (0, 255, 255), 1, cv2.LINE_AA)
     if hud:
-        cv2.putText(frame, hud, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (0, 0, 0), 4)
-        cv2.putText(frame, hud, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+        # ⚠ **字号调大后基线也得往下挪** ✗（用户 2026-10-04 ✓ "窗口字体能大点" ✓）——
+        #   原来 `y=26` 是配 `0.7` 的 ✓；现在字高 ~30px ✗ ⇒ 会**顶到画面上边缘**。
+        cv2.putText(frame, hud, (10, 38), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                    (0, 0, 0), 5)
+        cv2.putText(frame, hud, (10, 38), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                     (255, 255, 255), 2)
     # ⭐⭐⭐ **运动分离（新）的「判定依据」叠加**（用户 2026-10-03 ✓ 原话："**我希望：能看到你判定的
     #   可视化依据，不然我无法汇报问题**" ✓ —— 这句就是这一段的全部理由 ✓）：
@@ -1462,12 +1491,12 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
                 _bmk = float(_it[6]) if len(_it) > 6 else -1.0
                 _bt = _bs + (("  m%.2f" % _bmk) if _bmk >= 0.0 else "")
                 _tx, _ty = int(float(_it[0]) * scale_x), int(float(_it[1]) * scale_y)
-                _sz = cv2.getTextSize(_bt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+                _sz = cv2.getTextSize(_bt, cv2.FONT_HERSHEY_SIMPLEX, 1.05, 1)[0]
                 _x0, _y0 = _tx - _sz[0] // 2, _ty - 2
                 cv2.rectangle(frame, (_x0 - 3, _y0 - _sz[1] - 3),
                               (_x0 + _sz[0] + 3, _y0 + 4), (0, 0, 0), -1)
                 cv2.putText(frame, _bt, (_x0, _y0),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.05, (0, 255, 255), 1, cv2.LINE_AA)
             # ⭐⭐⭐ **"睡着的"轨迹也留标签**（用户 2026-10-04 ✓ 原话："**即使检出框消失了，能让
             #   它的编号标签也一直显示吗**？" ✓✓）—— ⚠⚠ 上面那一轮**只覆盖"有检出框的"** ✗
             #   （`box_v` 里全是"这拍配上框"的 ✓）⇒ 而它们这一拍**没有框** ✗ ⇒ 位置是**推的** ✓
@@ -1488,12 +1517,12 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
                     cv2.rectangle(frame, (_tx - _hw, _ty - _hh), (_tx + _hw, _ty + _hh),
                                   (150, 150, 150), 1, cv2.LINE_AA)
                 _bt2 = "#%d 推的" % int(_t.get("tid") or 0)
-                _sz2 = cv2.getTextSize(_bt2, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+                _sz2 = cv2.getTextSize(_bt2, cv2.FONT_HERSHEY_SIMPLEX, 1.05, 1)[0]
                 _x2, _y2 = _tx - _sz2[0] // 2, _ty - 2
                 cv2.rectangle(frame, (_x2 - 3, _y2 - _sz2[1] - 3),
                               (_x2 + _sz2[0] + 3, _y2 + 4), (0, 0, 0), -1)
                 cv2.putText(frame, _bt2, (_x2, _y2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.05,
                             (190, 190, 190), 1, cv2.LINE_AA)
         for _it in (motion.get("box_v") or []):
             _bx0, _by0, _bdx, _bdy = (float(_it[0]), float(_it[1]),
@@ -1545,10 +1574,10 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
                 _txt = (("%.0f" % _sc) + ("" if _live else "*")
                         + ("S" if (t.get("stuck") or t.get("cool")) else ""))
                 cv2.putText(frame, _txt, (_px + _rr + 2, _py - _rr + 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.05,
                             (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.putText(frame, _txt, (_px + _rr + 2, _py - _rr + 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.05,
                             ((60, 60, 255) if _sel else
                              ((0, 255, 255) if _live else (170, 170, 170))), 1, cv2.LINE_AA)
             # ⚠⚠ **箭头长度必须封顶 + 缩放要小** ✗✗（用户 2026-10-03 截图反馈："**只有意义不明的
@@ -1612,9 +1641,9 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
             _live_t = bool(_sel_t.get("live", True))
             if _rm < 1.0:
                 cv2.putText(frame, "? no obs", (_px + 16, _py + 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.055, (0, 0, 0), 4, cv2.LINE_AA)
                 cv2.putText(frame, "? no obs", (_px + 16, _py + 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.055, (255, 255, 255), 2, cv2.LINE_AA)
             else:
                 _FIX = 56.0                       # 固定视觉长度（px ✓ 显示域 ✓）
                 _ex = int(_px + _dx / _rm * _FIX * scale_x)
@@ -1632,16 +1661,21 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, _acol, 1, cv2.LINE_AA)
         # ---- 右上角文字面板（黑底 ✓ 可读 ✓）----
         # ⚠ 颜色图例（用户 2026-10-03 反馈："只有**意义不明**的大蓝箭头、黄箭头" ✗ ⇒ 必须自解释 ✓）
-        _lines = ["BLUE=abs vel(each det)  WHITE=target rel-vel  GREY=tgt rel-vel(GUESSED 推)",
-                  "YELLOW=other rel-vel(live only)  GREY box=lost(no obs,pos=GUESSED)",
-                  "ORANGE line=**MOUSE rel-path**  PURPLE=target rel-path  |  cands %d (live %s)"
+        # ⚠⚠⚠ **这一块是 `cv2.putText` 画的** ✗✗ ⇒ 两个硬限制，违反就会很脏 ✓：
+        #   ① **只认 ASCII** ✗ ⇒ 中文/全角一律变成 **`?`** ✗（原来这里有个"推"字 ✓）；
+        #   ② **没有 Markdown** ✗ ⇒ `**加粗**` 会**原样显示星号** ✓ 看着像坏了 ✓
+        #      （用户 2026-10-04 截图里就有这个 ✓ 是我把"写注释的习惯"带进界面了 ✗）。
+        #   ⇒ 图例**全 ASCII、零星号** ✓ 用 `|` 分段 ✓。
+        _lines = ["BLUE=abs vel(each det) | WHITE=target rel-vel | GREY=tgt rel-vel(GUESSED)",
+                  "YELLOW=other rel-vel(live only) | GREY box=lost(no obs, pos=guessed)",
+                  "ORANGE line=MOUSE rel-path | PURPLE=target rel-path | cands %d (live %s)"
                   % (len(_trk), motion.get("n_live", "?")),
                   # ⭐ **框的颜色 = 这一格的「可信度」**（用户 2026-10-04 ✓ 见 `lie_motion._M_OK` ✓）：
                   #   ⚠ 它与"**归属**"那条线**正交** ✓ —— 归属由框上的编号 `#22` 表达 ✓
                   #     颜色专管"**这一格能不能信**" ✓ 两者互不重复 ✓。
-                  "BOX: BLUE=ok  MAGENTA=**MERGED**(2 targets,mid-point!)  "
-                  "ORANGE=suspect(low match)  GREY=broken",
-                  "cam moved (%.1f, %.1f) = %.1f px  |  **NOISE FLOOR** dev %.1f px"
+                  "BOX: BLUE=ok | MAGENTA=MERGED(2 targets, mid-point) | "
+                  "ORANGE=suspect(low match) | GREY=broken",
+                  "cam moved (%.1f, %.1f) = %.1f px | NOISE FLOOR dev %.1f px"
                   % (_med[0], _med[1], float(motion.get("cam_len") or 0.0),
                      float(motion.get("dev") or 0.0))]
         if motion.get("sel_score") is not None:
@@ -1660,13 +1694,13 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
                              _t["p"][0], _t["p"][1], "  <SEL" if _t.get("sel") else "",
                              "" if _t.get("live") else "  [NO-OBS 推的]"))
         _lx, _ly, _lh = 8, 60, 20
-        _wmax = max(cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0][0]
+        _wmax = max(cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, 1.05, 1)[0][0]
                     for s in _lines)
         cv2.rectangle(frame, (_lx - 4, _ly - 16),
                       (_lx + _wmax + 8, _ly + _lh * len(_lines)), (0, 0, 0), -1)
         for _k, _s in enumerate(_lines):
             cv2.putText(frame, _s, (_lx, _ly + _lh * _k),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 255, 200), 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.05, (200, 255, 200), 1, cv2.LINE_AA)
     return frame
 
 
@@ -1707,7 +1741,7 @@ def code_stamp():
 
 def run_window(args):
     from PyQt5.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
-    from PyQt5.QtGui import (QColor, QCursor, QImage, QKeySequence, QPainter,
+    from PyQt5.QtGui import (QColor, QCursor, QFont, QImage, QKeySequence, QPainter,
                              QPixmap)
     from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox,
                                  QFileDialog, QHBoxLayout, QLabel, QMainWindow,
@@ -2775,10 +2809,12 @@ def run_window(args):
                 "融合框日志：判定为「融合框（真并集）」的那一拍（融合框生成）"
                 "与「融合框消失」的那一拍（分离），都会在这里列出参照砖与判定数据")
             self.log.setMaximumBlockCount(400)
-            self.log.setFixedHeight(176)
+            # ⚠⚠ **字数与高度一起调** ✗（用户 2026-10-04 ✓ 原话："**窗口字体能大点嘛要瞎了**" ✓）——
+            #   字号 11 → **15px** ✓、高度 176 → **260** ✓（不然行变高、可见行数骤减 ✗）。
+            self.log.setFixedHeight(260)
             self.log.setStyleSheet(
                 "QPlainTextEdit{background:#15171a;color:#cfd8dc;border:1px solid #303030;"
-                "font-family:Consolas,'Cascadia Mono',monospace;font-size:11px;"
+                "font-family:Consolas,'Cascadia Mono',monospace;font-size:15px;"
                 "padding:4px 6px;selection-background-color:#37474f;}"
                 "QScrollBar:vertical{background:#15171a;width:10px;margin:0;}"
                 "QScrollBar::handle:vertical{background:#455a64;border-radius:5px;"
@@ -2786,6 +2822,10 @@ def run_window(args):
                 "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}")
             lay.addWidget(self.log)
             self.setCentralWidget(c)
+            # ⭐ **状态栏也放大**（用户 2026-10-04 ✓ "窗口字体能大点" ✓）—— 它那句"点选 (x,y) W×H"
+            #   是**要盯着看的** ✓ 默认字号偏小 ✗；`QStatusBar` 的样式**不随 `app.setFont` 走** ✗
+            #   （Qt 给它自己一套默认样式 ✓）⇒ 单独设 ✓。
+            self.statusBar().setStyleSheet("QStatusBar{font-size:15px;}")
 
             self.timer = QTimer(self)
             self.timer.timeout.connect(self.tick)
@@ -3860,33 +3900,32 @@ def run_window(args):
                     # ⚠⚠ **文案必须"人话"** ✗✗（用户 2026-10-04 ✓ 他直接问："**什么是配对？
                     #   要归属谁？**" ✓ —— 我上一版写的是"未配对（这格还没有归属 ✓ 新出现 /
                     #   刚睡醒还没接上）"✗ 全是行话 ✓ 他看不懂 ✓ 这是我的问题 ✓）。
-                    return tuple(_b) + (
-                        "这格还没认出是「之前哪个目标」"
-                        "（可能是新出现的，也可能刚被挡住几拍、又出来了）", "")
+                    return tuple(_b) + ("无编号：新出现，或刚被挡住又出来", "NO OWNER")
                 _bid = int(_bv[4])
                 _mk = float(_bv[6]) if len(_bv) > 6 else -1.0
                 _tk = next((_t for _t in (_mo.get("tracks") or [])
                             if int(_t.get("tid") or 0) == _bid), None)
-                # ⭐ **说人话**：直接点明"就是画面上那个 `#22`" ✓（不说"配对/归属"这种行话 ✗）。
-                _seg = ("认出是 **#%d** 号（就是框上写的那个号）｜ 匹配分 %.2f"
-                        % (_bid, _mk))
+                # ⭐⭐⭐⭐ **分行、去掉 Markdown 标记**（用户 2026-10-04 ✓ 原话："**这也太长了，
+                #   你能归纳信息分行显示吗？**" ✓✓）—— ⚠ 上一版有两个毛病，都是我的 ✗：
+                #     ① **一行塞了七八项** ⇒ 长出画面 ✗；
+                #     ② 我把**写注释的习惯**（`**加粗**` ✓/✗）**带进了界面文案** ✗✗
+                #        ⇒ 界面上**原样显示星号** ✓ 看着很脏 ✓（用户截图里就是 ✓）。
+                #   ⇒ 现在：**一行一个主题、最多三行、全用大白话** ✓：
+                #     第 1 行 = **它是谁**（编号 + 这一格的匹配分）；
+                #     第 2 行 = **它的数**（偏离 / 分数 / 有没有观测）；
+                #     第 3 行 = **只在异常时出现**（融合 / 可疑 / 残缺 + 算法怎么办 ✓）。
+                _ls = ["编号 #%d ｜ 匹配分 %.2f" % (_bid, _mk)]
                 if _tk is not None:
-                    _seg += (" ｜ 偏离 %s ｜ 分 %s ｜ %s%s"
-                             % ("%.1f" % float(_tk.get("dev") or 0.0),
-                                "%.0f" % float(_tk.get("score") or 0.0),
-                                "有观测" if _tk.get("live") else "推的",
-                                " ｜ 粘住" if _tk.get("stuck")
-                                else (" ｜ 冷却" if _tk.get("cool") else "")))
-                # ⭐⭐⭐⭐ **框的「状态」用一句人话讲清楚**（用户 2026-10-04 ✓ 他问的就是这个 ✓）——
-                #   ⚠ 光靠颜色不够（他得知道**为什么**变色 ✓ 以及**算法拿它怎么办** ✓）。
+                    _ls.append("偏离 %.1f ｜ 分数 %.0f ｜ %s"
+                               % (float(_tk.get("dev") or 0.0),
+                                  float(_tk.get("score") or 0.0),
+                                  "有观测" if _tk.get("live") else "没观测（位置是推的）"))
                 _stv = int(_bv[7]) if len(_bv) > 7 else 0
-                _seg += {0: "",
-                         1: " ｜ ⚠⚠ **跟别的目标融在一起**：框心是**两个目标的中点** ✗ "
-                            "⇒ 位置**已经不采信它**了（只沿预测滑 ✓）",
-                         2: " ｜ ⚠ **这一格的位置偏离预测较多**（可能目标真在急动 ✓ 也可能被"
-                            "拉偏 ✗）⇒ 已经**按面积降权** ✓",
-                         3: " ｜ ⚠ **框只剩一小块**（被挡住 / 误检）⇒ 框心是**碎片重心** ✗"}.get(_stv, "")
-                return tuple(_b) + (_seg, "")
+                if _stv:
+                    _ls.append({1: "融合：框里裹着两个目标，框心是中点 ⇒ 位置不采信",
+                                2: "位置可疑（偏离预测较多）⇒ 已降权",
+                                3: "残缺：框只剩一小块 ⇒ 位置不采信"}.get(_stv, ""))
+                return tuple(_b) + ("\n".join([_x for _x in _ls if _x]), "")
             _btxt, _rtxt = pick_extra((float(_b[1]), float(_b[2]),
                                        float(_b[3]), float(_b[4])),
                                       _row.get("pos"), _row.get("tgt_rad"), _br)
@@ -4289,6 +4328,14 @@ def run_window(args):
             super().closeEvent(e)
 
     app = QApplication(sys.argv)
+    # ⭐⭐⭐ **全局字号调大**（用户 2026-10-04 ✓ 原话："**窗口字体能大点嘛要瞎了**" ✓✓）——
+    #   ⚠ **一处生效**：所有按钮 / 标签 / 下拉 / 状态栏 / 数字框 / 日志（未自带 `font-size`
+    #     的都吃这个 ✓）；⚠ 自己 `setStyleSheet` 写过字号的控件**不受影响** ✗
+    #     ⇒ 日志区**单独调**（见 `self.log` ✓）。
+    #   ⚠ 取 **12pt**（Qt 默认一般 9pt ✓）⇒ 明显大一圈 ✓；再大布局会挤 ✗（工具条两行很满 ✓）。
+    _f = QFont()
+    _f.setPointSize(12)
+    app.setFont(_f)
     win = DemoWindow()
     win.show()
     return app.exec_()

@@ -147,17 +147,17 @@ decision:
   sweep_turn_cd: 500
   back_range: 150
   sweep_edge_turn_px: 100
-  route_goto_set: 左上
+  route_goto_set: 右下
   align_tol_px: 10
   align_hold_ms: 1000
   climb_align_gap_ms: 180
   climb_align_near_px: 1
   climb_retry_delay_s: 1.0
   climb_retry_delay_inc_s: 1.0
-  goto_timeout_s: 10.0
+  goto_timeout_s: 15
   chase_goto_max_s: 0.0
   goto_timeout_key: 表情_无语
-  disable_chase_pathfinding: true
+  disable_chase_pathfinding: false
   jump_start_px: 100
   move_retry_ms: 1000
   debounce_conf: 0.3
