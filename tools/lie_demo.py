@@ -56,9 +56,15 @@ from perception.lie_controller import _FOLLOW_GAIN as _FOLLOW_GAIN_DEFAULT  # no
 from perception.lie_motion import MotionRunner                          # noqa: E402
 # ⭐⭐⭐ **运动分离那几个参数的默认值**（用户 2026-10-03 ✓ 原话："运动分离 **没有任何参数要配吗？**"
 #   ✓）—— 从 `perception/lie_motion.py` **同一处口径**取 ✓（界面别抄一份数 ✗ 会漂 ✓）。
+from perception.lie_motion import _DIR_N as _MOTION_DIRN_DEFAULT          # noqa: E402
+from perception.lie_motion import _KF_PRED_MAX as _MOTION_PREDMAX_DEFAULT  # noqa: E402
 from perception.lie_motion import _MIN_HITS as _MOTION_MINHITS_DEFAULT   # noqa: E402
 from perception.lie_motion import _PAIR_GATE as _MOTION_PAIRED_DEFAULT   # noqa: E402
+from perception.lie_motion import _Q_MIN as _MOTION_QMIN_DEFAULT         # noqa: E402
+from perception.lie_motion import _Q_NEED as _MOTION_QNEED_DEFAULT       # noqa: E402
 from perception.lie_motion import _SCORE_DECAY as _MOTION_SDECAY_DEFAULT  # noqa: E402
+from perception.lie_motion import _SMOOTH as _MOTION_SMOOTH_DEFAULT      # noqa: E402
+from perception.lie_motion import _STUCK_RATIO as _MOTION_STUCK_DEFAULT  # noqa: E402
 from perception.lie_motion import _SWITCH_MARGIN as _MOTION_MARGIN_DEFAULT  # noqa: E402
 from perception.lie_motion import _WHITE_W as _MOTION_WHITEW_DEFAULT     # noqa: E402
 from perception.lie_tracker import LieTracker  # noqa: E402
@@ -1048,6 +1054,28 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
         _col, _th = (255, 140, 0), 1
         if _role == "suspect":
             _col, _th = (0, 0, 255), 1             # 严查框（细红 ✓ 不当"唯一红框"抢戏 ✗）
+        # ⭐⭐⭐⭐ **运动分离模式：按「框状态」上色**（用户 2026-10-04 ✓ 原话："**检出框是否应该
+        #   有状态？现在只有无归属、归属某目标 —— 真假目标重叠的框呢？**" ✓✓）——
+        #   ⚠ 他的洞察：**「归属」和「可信」是两个正交维度** ✗；而"归属"已经由**框上的编号**
+        #     表达了（`shape 0.98 #22` ✓）⇒ 颜色这一路**专门表达"可信"** ✓ 两者不重复 ✓。
+        #   状态码来自后端 `motion["box_v"][7]`（`0` 正常 ｜ `1` **融合** ｜ `2` **可疑**
+        #   ｜ `3` **残缺** ✓ 见 `lie_motion._M_OK` 那段 ✓）—— **按位置反查**（与点选同一把尺 ✓）。
+        #   ⚠ **只在运动分离模式下改色** ✗ ⇒ **经典模式一个像素都不变** ✓（零污染 ✓）。
+        if (motion or {}).get("mode") == "motion":
+            for _it in (motion.get("box_v") or []):
+                if (len(_it) > 7 and abs(float(_it[0]) - float(cx)) < 1.5
+                        and abs(float(_it[1]) - float(cy)) < 1.5):
+                    # 🟣 洋红 = **融合**（框心 = 两个目标的**中点** ✗ ⇒ 位置**已经不采信**了 ✓）
+                    # 🟠 橙黄 = **可疑**（匹配分低 ⇒ 已经**降权 / 断掉** ✓）
+                    # ⚫ 灰   = **残缺**（框只剩一小块 ⇒ 框心是**碎片重心** ✗）
+                    _b7 = int(_it[7])
+                    if _b7 == 1:
+                        _col, _th = (255, 0, 255), 2
+                    elif _b7 == 2:
+                        _col, _th = (0, 165, 255), 2
+                    elif _b7 == 3:
+                        _col, _th = (120, 120, 120), 1
+                    break
         cv2.rectangle(frame, p1, p2, _col, _th)
         nm = names[cls] if (names and 0 <= cls < len(names)) else str(cls)
         txt = "%s %.2f" % (nm, conf)
@@ -1337,32 +1365,140 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
         #   颜色又偏蓝 ✓ ⇒ 满屏斜线 ⇒ 看着像乱画 ✗。用户真正要的是："**像经典模式一样，也把
         #   相对于群体的轨迹线画出来，这样就能看出历史结果**" ✓ ⇒ **要的是目标那条** ✓。
         # ⚠ 只画**目标那一条** ✓ 且**听"相对轨迹"开关**（不是"候选圈" ✓ 两者独立 ✓）
+        # ⭐⭐⭐ **橙色线 = 「鼠标在群体坐标系里的运动轨迹」**（用户 2026-10-04 ✓ 原话："我希望橙色线
+        #   代表**鼠标实际在群体坐标系中的运动轨迹**" ✓✓）——
+        #   ⚠⚠ **口径换了** ✗：以前这条橙线画的是"**目标候选**的相对轨迹"✓（那只是**过程量** ✗）；
+        #     现在画的是**鼠标**（= 这个项目**真正要控制的东西** ✓）⇒ "**鼠标相对群体怎么走**"
+        #     才是**结果指标** ✓✓（跟着真目标 ⇒ 会走出一条线 ✓；被假目标带着 ⇒ 绕在原地 ✓）。
+        #   ⚠ 数据由后端给（`motion["cursor_rel"]` ✓ 见 `MotionRunner.step` ✓）：点已经是
+        #     "**相对鼠标当前所在**的偏移" ✓ ⇒ 以**光标**为锚点铺出去即可 ✓（不用管绝对坐标 ✓）。
+        #   ⚠ 听"相对轨迹"这个开关 ✓（与"候选圈"独立 ✓）。
+        if _sh_ok.get("rel", True) and cursor is not None:
+            _ch = list(motion.get("cursor_rel") or [])
+            _cx0 = float(cursor[0]) * scale_x
+            _cy0 = float(cursor[1]) * scale_y
+            for _k2 in range(1, len(_ch)):
+                cv2.line(frame,
+                         (int(_cx0 + _ch[_k2 - 1][0] * scale_x),
+                          int(_cy0 + _ch[_k2 - 1][1] * scale_y)),
+                         (int(_cx0 + _ch[_k2][0] * scale_x),
+                          int(_cy0 + _ch[_k2][1] * scale_y)),
+                         (0, 150, 255), 2, cv2.LINE_AA)
+        # ⭐⭐⭐⭐ **方向置信度：在鼠标位置铺一圈灰箭头**（用户 2026-10-04 ✓ 原话："在**当前鼠标
+        #   的位置**以**不同角度离散出很多灰色箭头**，**所有在群体坐标系中的几何运动**都会影响
+        #   **这些方向的置信度**" ✓✓）—— 箭头**长度 = 该方向的置信度** ✓（越亮越长 ✓）
+        #   ⇒ "**往哪边走最有道理**"一眼可见 ✓。
+        #   ⚠ 它**只依赖"框的几何运动"** ✓ ⇒ **不需要轨迹配对** ✓ —— 正好补上"检出框还没归属"
+        #     那段空档（帧 19~24 那个大框就一直**未配对** ✓ 可它的边一直在向上动 ✓）。
+        _dc = list(motion.get("dir_conf") or [])
+        if _dc and cursor is not None:
+            _dn = len(_dc)
+            _cx1 = float(cursor[0]) * scale_x
+            _cy1 = float(cursor[1]) * scale_y
+            for _i, _v in enumerate(_dc):
+                if _v <= 0.02:
+                    continue
+                _ang = 2.0 * np.pi * (_i + 0.5) / _dn
+                _L = 10.0 + 50.0 * float(_v)          # 长度 = 置信度 ✓（最亮的约 60px 显示域 ✓）
+                _g = int(80 + 130 * float(_v))
+                cv2.arrowedLine(frame, (int(_cx1), int(_cy1)),
+                                (int(_cx1 + np.cos(_ang) * _L), int(_cy1 + np.sin(_ang) * _L)),
+                                (_g, _g, _g), 1, tipLength=0.32, line_type=cv2.LINE_AA)
+            _dtp = motion.get("dir_top")
+            if _dtp:
+                _dtx = "dir %.0fdeg  x%.1f" % (float(_dtp[0]),
+                                               float(motion.get("dir_strength") or 0.0))
+                cv2.putText(frame, _dtx, (int(_cx1) + 12, int(_cy1) - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(frame, _dtx, (int(_cx1) + 12, int(_cy1) - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        # ⚠ **目标候选那条相对轨迹保留、但换色** ✗（从橙改成**细紫** ✓）—— 橙色**专门留给鼠标** ✓
+        #   （两条都橙会分不清 ✓）；它仍有参考价值 ✓（"目标相对群体在往哪走" ✓）。
         for _lp in (_trk if _sh_ok.get("rel", True) else []):
             if not _lp.get("sel"):
                 continue
             _h = _lp.get("rel_hist") or []
             if len(_h) < 2:
                 continue
-            _sel = bool(_lp.get("sel"))
             _bx = float(_lp["p"][0]) * scale_x
             _by = float(_lp["p"][1]) * scale_y
-            _col = (0, 200, 255) if _sel else (190, 140, 60)
-            _th = 3 if _sel else 1
             for _k2 in range(1, len(_h)):
                 cv2.line(frame,
                          (int(_bx + _h[_k2 - 1][0] * scale_x),
                           int(_by + _h[_k2 - 1][1] * scale_y)),
                          (int(_bx + _h[_k2][0] * scale_x),
                           int(_by + _h[_k2][1] * scale_y)),
-                         _col, _th, cv2.LINE_AA)
+                         (230, 130, 255), 1, cv2.LINE_AA)
         # ⭐⭐⭐ **蓝箭头 = 每个检出框的「瞬时绝对速度」**（用户 2026-10-03 ✓ 原话："**每个假目标
         #   检出框**加**蓝色箭头**显示**瞬时绝对速度**，这个没看到" ✓）——
         #   `box_v` = 本拍**每个配对成功的检出框** `(x, y, dx, dy)` ✓ ⇒ **每个框一根** ✓✓
         #   （⚠ 与"够资格的候选"无关 ✗ —— 上一版挂在那层上 ⇒ 大部分框没有 ✗ 他就没看到 ✓）。
         #   长度**硬封顶**（`_ARR_MAX` ✓）：真目标偶尔一拍走 200+px ✗ 不封顶会横跨画面 ✓。
         _ARR_MAX = 110.0
-        for (_bx0, _by0, _bdx, _bdy) in (motion.get("box_v") or []):
-            _bm = (float(_bdx) ** 2 + float(_bdy) ** 2) ** 0.5
+        # ⭐⭐⭐ **在「检出框」上写轨迹号**（用户 2026-10-04 ✓ 原话："**没有看到标出 id**，
+        #   希望能在**检出框上**写出来" ✓）—— ⚠ 他为什么没看到 ✗：上一版 `#N` 画在**候选圈
+        #   那一层** ✗ ⇒ 一关「候选圈」图层（`cands`）就**整层消失** ✓；而"框"这一层是**常显**的
+        #   ⇒ 号跟着框走 ⇒ **一定看得见** ✓✓。
+        #   ⚠⚠ **每个框都写**（不只是配上的 ✗）：配上过的写 `#id` ✓、**没配上的写 `?`** ✓
+        #     —— 后者本身就说明"**这一格还没有归属**"（新出现的 / 刚睡醒还没接上的 ✓）。
+        # ⭐⭐⭐ **在检出框上写完整标签：`shape 0.90 #22`**（用户 2026-10-04 ✓ 原话："**没有看到
+        #   编号**，你能**写明显点**吗？例如 `Shape 0.90 #22`" ✓✓）—— ⚠ 格式**照用户给的** ✓：
+        #   类别名 ＋ 置信度 ＋ `#轨迹号` ✓（与经典模式的 `shape 0.98 #001` 同一套说法 ✓）。
+        #   ⚠⚠ **黑底 + 亮黄字** ✓：背景是**褐色花岗岩**、还压了灰蒙版 ⇒ 光描边**看不清** ✗
+        #     （"没看到"很可能就是这个原因之一 ✓）⇒ 给它一块**实心黑底** ✓ 一定跳出来 ✓。
+        #   ⚠ 只在"运动分离"模式下写 ✗ —— 经典 `Runner` 的 `box_v` 是**另一个东西**（4 元组、
+        #     没有 id ✗）⇒ 不加这道门会在经典模式里**乱写号** ✓（实测过 ✓）。
+        if (motion or {}).get("mode") == "motion":
+            for _it in (motion.get("box_v") or []):
+                if len(_it) < 5:
+                    continue
+                _bcf = _it[5] if len(_it) > 5 else None
+                _bs = (("shape %.2f #%d" % (float(_bcf), int(_it[4])))
+                       if _bcf is not None else ("shape #%d" % int(_it[4])))
+                # ⭐ **匹配分一起写**（用户 2026-10-04 ✓ 原话："**你可以把匹配分写出来**" ✓）——
+                #   `m` = match（这一格的观测**有多可信** ✓ 见 `lie_motion` 里那段定义 ✓）：
+                #   接近 1 ⇒ 可信 ✓；**骤降** ⇒ **这一拍该跟着 KF 走** ✓（= 他 ④ 那条 ✓）；
+                #   ⚠ 粘连时它会掉到很低 ✓（因为面积因子被压低 ✓）—— 正是"别信这一格"的提示 ✓。
+                _bmk = float(_it[6]) if len(_it) > 6 else -1.0
+                _bt = _bs + (("  m%.2f" % _bmk) if _bmk >= 0.0 else "")
+                _tx, _ty = int(float(_it[0]) * scale_x), int(float(_it[1]) * scale_y)
+                _sz = cv2.getTextSize(_bt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+                _x0, _y0 = _tx - _sz[0] // 2, _ty - 2
+                cv2.rectangle(frame, (_x0 - 3, _y0 - _sz[1] - 3),
+                              (_x0 + _sz[0] + 3, _y0 + 4), (0, 0, 0), -1)
+                cv2.putText(frame, _bt, (_x0, _y0),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+            # ⭐⭐⭐ **"睡着的"轨迹也留标签**（用户 2026-10-04 ✓ 原话："**即使检出框消失了，能让
+            #   它的编号标签也一直显示吗**？" ✓✓）—— ⚠⚠ 上面那一轮**只覆盖"有检出框的"** ✗
+            #   （`box_v` 里全是"这拍配上框"的 ✓）⇒ 而它们这一拍**没有框** ✗ ⇒ 位置是**推的** ✓
+            #   ⇒ **号会跟着框一起消失** ✗✗（而用户要的恰恰是"框没了号还在" ✓）。
+            #   ⇒ 所以**再遍历一遍 `tracks`** ✓：给"这拍没配上框"的那些，在**它推断出来的那个位置**
+            #     上补一个标签 ✓ ＋ 一个**标准尺寸的灰框** ✓（"框没有了，但目标就在这儿" ✓
+            #     ⚠ 尺寸用**标准尺寸** ✓ 正合用户那条"**所有目标尺寸一样**" ✓）。
+            _bids = {int(_it[4]) for _it in (motion.get("box_v") or []) if len(_it) >= 5}
+            _sw = ((float((motion or {}).get("std_area") or 0.0)) ** 0.5)
+            for _t in (motion.get("tracks") or []):
+                if int(_t.get("tid") or 0) in _bids:
+                    continue                     # 有框 ⇒ 上面已经写过 ✓ 不重复 ✗
+                _tx = int(float(_t["p"][0]) * scale_x)
+                _ty = int(float(_t["p"][1]) * scale_y)
+                if _sw > 0.0:                    # 灰框 = "它应该有多大"（标准尺寸 ✓）
+                    _hw = int(_sw * scale_x / 2.0)
+                    _hh = int(_sw * scale_y / 2.0)
+                    cv2.rectangle(frame, (_tx - _hw, _ty - _hh), (_tx + _hw, _ty + _hh),
+                                  (150, 150, 150), 1, cv2.LINE_AA)
+                _bt2 = "#%d 推的" % int(_t.get("tid") or 0)
+                _sz2 = cv2.getTextSize(_bt2, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+                _x2, _y2 = _tx - _sz2[0] // 2, _ty - 2
+                cv2.rectangle(frame, (_x2 - 3, _y2 - _sz2[1] - 3),
+                              (_x2 + _sz2[0] + 3, _y2 + 4), (0, 0, 0), -1)
+                cv2.putText(frame, _bt2, (_x2, _y2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (190, 190, 190), 1, cv2.LINE_AA)
+        for _it in (motion.get("box_v") or []):
+            _bx0, _by0, _bdx, _bdy = (float(_it[0]), float(_it[1]),
+                                      float(_it[2]), float(_it[3]))
+            _bm = (_bdx ** 2 + _bdy ** 2) ** 0.5
             if _bm < 2.0:
                 continue
             _k = min(1.2, _ARR_MAX / max(1e-6, _bm))
@@ -1387,6 +1523,19 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
             cv2.circle(frame, (_px, _py), _rr, _col, 3 if _sel else 1, cv2.LINE_AA)
             if _sel:
                 cv2.circle(frame, (_px, _py), _rr + 4, _col, 1, cv2.LINE_AA)
+            # ⭐⭐⭐ **id：每一条候选都标**（用户 2026-10-03 ✓ 原话："你能给**认定的假目标标个 id**
+            #   吗？" ✓）—— ⚠⚠ **不设"够资格"门槛** ✗（原来只在 `ok`/选中时标 ✗ 那是"分数"的规矩 ✓
+            #   id 的规矩是"**只要它是一条轨迹就标**" ✓ ⇒ 刚建的、睡着的**都要看得见** ✓）。
+            #   他要的是"**同一个目标始终是同一个号**" ✓（他补充："假目标……**不会凭空消失**的，
+            #   它的**检出框消失后很短时间内再被检出**" ✓ ⇒ 号必须**能续上** ✓ 见后端
+            #   `_REVIVE_GATE` 那条 ✓）。⚠ **它只是"这条轨迹"的编号** ✗ 不是"认定它是假目标" ✗：
+            #   真假的结论看**分数**和**有没有被选中**（红圈 ✓）✓。
+            _idc = ((0, 0, 255) if _sel else ((0, 255, 255) if _live else (170, 170, 170)))
+            _idt = "#%d" % int(t.get("tid") or 0)
+            cv2.putText(frame, _idt, (_px - _rr, _py + _rr + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(frame, _idt, (_px - _rr, _py + _rr + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, _idc, 1, cv2.LINE_AA)
             # 分数：只标"够资格"的（否则满屏数字 ✓ 反而看不清 ✓）
             if t.get("ok") or _sel:
                 # ⚠ `*` = **本拍没有观测**（这个数字是"推"出来的 ✓ 见上面 `_live` ✓）；
@@ -1452,10 +1601,16 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
             _vr = _sel_t.get("v_rel") or (0.0, 0.0)
             _dx, _dy = float(_vr[0]), float(_vr[1])
             _rm = (abs(_dx) ** 2 + abs(_dy) ** 2) ** 0.5
-            # ⚠⚠ **目标本拍没观测**（`live=False` ⇒ 位置是"按相机怎么走推的" ✗）——
-            #   ⇒ **不许画白箭头** ✗✗（画出来像"它相对大家没动" ✓ 其实**是没有数据** ✗）
-            #   ⇒ 明写 **`? no obs`** ✓（"这拍它没数据" ✓ —— 这本身就是要怀疑的信号 ✓）。
-            if not _sel_t.get("live", True) or _rm < 1.0:
+            # ⚠⚠⚠ **"没观测"那几拍照样画箭头** ✗✗（用户 2026-10-04 ✓ 原话："为什么第 15 帧
+            #   橙色轨迹线不跟了，**白色箭头也没了**？" ✓）—— 原来这里写的是"**不许画**" ✗
+            #   ⇒ 他看到的就成了"**箭头凭空消失**" ✗ ⇒ 而**位置明明还在沿预测滑** ✓
+            #   ⇒ 那就该画一个"**它打算往哪走**"的箭头 ✓✓（不然画面突然空一块，很像 bug ✗）。
+            #   ⇒ 规则改成（**更实在** ✓）：
+            #     · **有观测**（`live` ✓）⇒ **白箭头**（真·相对速度 ✓ 亮 ✓ 粗 ✓）；
+            #     · **没观测**（推的 ✓）⇒ **灰箭头 + 小字 `推`**（"方向是猜的，但方向就是这个"✓）；
+            #     · **连方向都没有**（`|v_rel| ≈ 0` ✓）⇒ 才写 `? no obs` ✓（真没数据 ✓）。
+            _live_t = bool(_sel_t.get("live", True))
+            if _rm < 1.0:
                 cv2.putText(frame, "? no obs", (_px + 16, _py + 6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4, cv2.LINE_AA)
                 cv2.putText(frame, "? no obs", (_px + 16, _py + 6),
@@ -1464,21 +1619,28 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
                 _FIX = 56.0                       # 固定视觉长度（px ✓ 显示域 ✓）
                 _ex = int(_px + _dx / _rm * _FIX * scale_x)
                 _ey = int(_py + _dy / _rm * _FIX * scale_y)
-                cv2.arrowedLine(frame, (_px, _py), (_ex, _ey), (0, 0, 0), 7,
+                _acol = (255, 255, 255) if _live_t else (185, 185, 185)
+                _aw = 3 if _live_t else 2
+                cv2.arrowedLine(frame, (_px, _py), (_ex, _ey), (0, 0, 0), _aw + 4,
                                 tipLength=0.28, line_type=cv2.LINE_AA)
-                cv2.arrowedLine(frame, (_px, _py), (_ex, _ey), (255, 255, 255), 3,
+                cv2.arrowedLine(frame, (_px, _py), (_ex, _ey), _acol, _aw,
                                 tipLength=0.28, line_type=cv2.LINE_AA)
-                _txt = "rel %.1f px" % _rm
+                _txt = ("rel %.1f px" % _rm) if _live_t else ("推 %.1f px" % _rm)
                 cv2.putText(frame, _txt, (_ex + 6, _ey + 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.putText(frame, _txt, (_ex + 6, _ey + 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, _acol, 1, cv2.LINE_AA)
         # ---- 右上角文字面板（黑底 ✓ 可读 ✓）----
         # ⚠ 颜色图例（用户 2026-10-03 反馈："只有**意义不明**的大蓝箭头、黄箭头" ✗ ⇒ 必须自解释 ✓）
-        _lines = ["BLUE=abs vel(each det)  WHITE=target rel-vel(FIXED 56px,see the number)",
-                  "YELLOW=other rel-vel(**live only**)  GREY+DIM=**lost**(no obs,pos=GUESSED)",
-                  "ORANGE line=target rel-path  |  BLUE box=YOLO det  |  cands %d (live %s)"
+        _lines = ["BLUE=abs vel(each det)  WHITE=target rel-vel  GREY=tgt rel-vel(GUESSED 推)",
+                  "YELLOW=other rel-vel(live only)  GREY box=lost(no obs,pos=GUESSED)",
+                  "ORANGE line=**MOUSE rel-path**  PURPLE=target rel-path  |  cands %d (live %s)"
                   % (len(_trk), motion.get("n_live", "?")),
+                  # ⭐ **框的颜色 = 这一格的「可信度」**（用户 2026-10-04 ✓ 见 `lie_motion._M_OK` ✓）：
+                  #   ⚠ 它与"**归属**"那条线**正交** ✓ —— 归属由框上的编号 `#22` 表达 ✓
+                  #     颜色专管"**这一格能不能信**" ✓ 两者互不重复 ✓。
+                  "BOX: BLUE=ok  MAGENTA=**MERGED**(2 targets,mid-point!)  "
+                  "ORANGE=suspect(low match)  GREY=broken",
                   "cam moved (%.1f, %.1f) = %.1f px  |  **NOISE FLOOR** dev %.1f px"
                   % (_med[0], _med[1], float(motion.get("cam_len") or 0.0),
                      float(motion.get("dev") or 0.0))]
@@ -1549,6 +1711,7 @@ def run_window(args):
                              QPixmap)
     from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox,
                                  QFileDialog, QHBoxLayout, QLabel, QMainWindow,
+                                 QMessageBox,
                                  QMenu, QPlainTextEdit, QPushButton, QShortcut,
                                  QSlider, QToolBar, QVBoxLayout, QWidget)
     # ⚠ **滚轮不许改参数**（项目规范 ✓）⇒ 数字框一律 `NoWheel*`（与工作台同一份 ✓）
@@ -2211,77 +2374,139 @@ def run_window(args):
             cfgrowM = QHBoxLayout()
             cfgrowM.setContentsMargins(6, 2, 6, 2)
             self._rowM = cfgrowM            # ⭐ 存起来（**经典模式下整行隐藏** ✓ 见 `_on_mode_changed` ✓）
-            cfgrowM.addWidget(QLabel("候选配对门限(px)"))
+            cfgrowM.addWidget(QLabel("配对门限"))
             self.sp_pair = NoWheelDoubleSpinBox()
             self.sp_pair.setRange(20.0, 200.0)
             self.sp_pair.setSingleStep(5.0)
             self.sp_pair.setDecimals(0)
             self.sp_pair.setValue(float(_MOTION_PAIRED_DEFAULT))
             self.sp_pair.setToolTip(
-                "**YOLO 的框**与**已有候选轨迹**相距超过本值 ⇒ 认为是「新出现的一个」 ⇒ 另起一条轨迹 ✓。\n\n"
-                "为什么需要它 ✗：**相机一帧能走几十 px**（实测群体中位位移到过 **(26, 1)** ✓），而\n"
-                "真目标**本身还在动** ✓ ⇒ 门限太小会把「同一个目标」断成两截 ✗（轨迹一直重建 ⇒ 分数\n"
-                "永远攒不起来 ✗）。\n\n"
-                "· **调大** ⇒ 更不容易断（但离得近的两个目标可能被并成一条 ✗）。\n"
-                "· **调小** ⇒ 候选更「干净」（但相机一快就断链 ✗）。\n"
-                "⚠ 实测（`10月1日` 全片）用 **70** 时，\「假目标的相对群体偏离\」只有 **3.3~6.5px** ✓\n"
-                "   ⇒ 说明 70 完全没有\「配错对\」的迹象 ✓。")
+                "两拍之间，同一个框最多挪这么远（px），超过就当成「新目标」另起一条。\n"
+                "相机一帧能走几十 px ⇒ 调太小会把同一个目标断成两截。\n"
+                "调大＝更不容易断（但离得近的两个目标容易并成一条）；调小＝更干净。")
             cfgrowM.addWidget(self.sp_pair)
-            cfgrowM.addWidget(QLabel("偏离累积衰减"))
+            cfgrowM.addWidget(QLabel("分数衰减"))
             self.sp_sdecay = NoWheelDoubleSpinBox()
             self.sp_sdecay.setRange(0.50, 0.99)
             self.sp_sdecay.setSingleStep(0.01)
             self.sp_sdecay.setDecimals(2)
             self.sp_sdecay.setValue(float(_MOTION_SDECAY_DEFAULT))
             self.sp_sdecay.setToolTip(
-                "**候选分数 = 候选分数 × 本值 ＋ 本拍偏离**（本拍偏离 = |它的位移 − 群体中位位移| ✓）。\n\n"
-                "这一项是本模式的**核心** ✓：真目标\「**相对假目标群体一直在动**\」 ⇒ 每拍都攒分 ✓；\n"
-                "假目标只是**偶然**跳一下 ✓ ⇒ 衰减让\「偶然\」攒不起来 ✓。\n\n"
-                "· **调大**（→0.99）⇒ 几乎不衰减 ⇒ **老分数说话**（更认\「谁历史上最不合群\」 ✓\n"
-                "  但一旦跟错，**很难纠正** ✗）。\n"
-                "· **调小**（→0.5）⇒ 只看最近几拍 ⇒ 反应快（但会被一次抖动带跑 ✗）。\n"
-                "⚠ 实测：每帧 top1 偏离 **8~26px**、噪声底 **3~6px**（信噪比 **1.6~5.1** ✓）\n"
-                "   ⇒ 0.90 相当于\「**约 10 拍的有效记忆**\」 ✓ 够把真目标顶上去 ✓。")
+                "分数每拍乘它：真目标「一直在动」⇒ 分数一直涨；假目标偶然跳一下 ⇒ 攒不住。\n"
+                "调大＝记性长、更稳（但一旦跟错很难纠正）；调小＝只看最近几拍（反应快、易被带跑）。\n"
+                "0.90 大约相当于「记住最近 10 拍」。")
             cfgrowM.addWidget(self.sp_sdecay)
-            cfgrowM.addWidget(QLabel("切换迟滞余量"))
+            cfgrowM.addWidget(QLabel("换人余量"))
             self.sp_margin = NoWheelDoubleSpinBox()
             self.sp_margin.setRange(0.0, 40.0)
             self.sp_margin.setSingleStep(1.0)
             self.sp_margin.setDecimals(0)
             self.sp_margin.setValue(float(_MOTION_MARGIN_DEFAULT))
             self.sp_margin.setToolTip(
-                "**换目标要有余量**：新候选的分数要超过当前目标 **这么多分** 才换 ✓（防来回跳 ✗）。\n\n"
-                "· **调大** ⇒ 更稳（但真目标换了、它却死抱着旧的 ✗）。\n"
-                "· **调小**（0）⇒ 谁分高跟谁（反应快 ✓ 但两个候选分数接近时会**反复横跳** ✗）。\n"
-                "⚠ 一次典型偏离约 10 分 ⇒ 默认 **8** ≈ \「**领先不到一次偏离就不换**\」 ✓。")
+                "新目标要比现任高出这么多分才换人（防来回跳）。\n"
+                "调大＝更稳（但真目标来了它还抱着旧的）；调小＝反应快（分数接近时会横跳）。")
             cfgrowM.addWidget(self.sp_margin)
-            cfgrowM.addWidget(QLabel("最少命中拍数"))
+            cfgrowM.addWidget(QLabel("建档拍数"))
             self.sp_minhits = NoWheelDoubleSpinBox()
             self.sp_minhits.setRange(1.0, 20.0)
             self.sp_minhits.setSingleStep(1.0)
             self.sp_minhits.setDecimals(0)
             self.sp_minhits.setValue(float(_MOTION_MINHITS_DEFAULT))
             self.sp_minhits.setToolTip(
-                "一条候选轨迹至少要被**关联上这么多拍**，才有资格被选成目标 ✓。\n\n"
-                "· 防的是\「**刚建的空轨迹**\」抢位 ✗（新框第一拍分数是 0 ✓ 但它可能恰好排在前面 ✗）。\n"
-                "· **调大** ⇒ 更保险（但开局会**晚几拍**才出白线 ✗）。\n"
-                "· **调小**（1）⇒ 第一拍就能选（万一那一拍刚好挑错 ⇒ 起点就歪 ✗）。")
+                "一条轨迹被关联上这么多拍，才有资格当目标（防「刚建的空轨迹」抢位）。\n"
+                "调大＝更保险（但开局晚几拍才出白线）；调小＝起跟快（第一拍挑错起点就歪）。")
             cfgrowM.addWidget(self.sp_minhits)
-            cfgrowM.addWidget(QLabel("白度辅助权重"))
+            cfgrowM.addWidget(QLabel("白度权重"))
             self.sp_whitew = NoWheelDoubleSpinBox()
             self.sp_whitew.setRange(0.0, 5.0)
             self.sp_whitew.setSingleStep(0.5)
             self.sp_whitew.setDecimals(1)
             self.sp_whitew.setValue(float(_MOTION_WHITEW_DEFAULT))
             self.sp_whitew.setToolTip(
-                "**开局的辅助证据**（用户口径：\「一开始依旧用白色图形展示真目标\」 ✓）：\n"
-                "哪条候选正好落在\「**画面里最白的那块**\」上 ⇒ 给它加 `本值 × 6` 分 ✓。\n\n"
-                "⚠ **只在白块还在时有效** ✗ —— 目标**逐渐透明**之后白度就没了 ⇒ 该项自然归零 ✓\n"
-                "  （那时完全靠\「运动不合群\」 ✓ 两者互补 ✓ 不是二选一 ✓）。\n\n"
-                "· **0** ⇒ 完全不用白度（纯靠运动 ✓ 开局会**晚几拍**才定下来 ✗）。\n"
-                "· **调大** ⇒ 开局定得更快（但\「画面里别处也有白东西\」时会被带偏 ✗）。\n"
-                "⚠ 加分量 6 分 < 一次典型偏离 10 分 ⇒ 它是**辅助**，不会盖过运动证据 ✓。")
+                "目标落在「画面最白那块」上就加分（只在开局白星还在时有效，透明后自动归零）。\n"
+                "0＝纯靠运动（开局晚几拍才定）；调大＝开局定得快（画面别处有白东西时会被带偏）。")
             cfgrowM.addWidget(self.sp_whitew)
+            # ---- ⭐⭐ **第 5 行：跟踪手感 / 自检那一档**（用户 2026-10-03 ✓ 原话："把一些需要
+            #   频繁调整的参数做成配置，然后告诉我应该怎么调、看什么" ✓）--------------------------------
+            #   ⚠ 只放**真会调**的 ✓；名字短 ✓ tip 只讲"调大调小会怎样" ✓（原理写在
+            #     `perception/lie_motion.py` 里 ✓ 这里不堆血泪史 ✗）。
+            cfgrowQ = QHBoxLayout()
+            cfgrowQ.setContentsMargins(6, 2, 6, 2)
+            self._rowQ = cfgrowQ            # ⭐ 与第 4 行一样：**只在运动分离模式下显示** ✓
+            cfgrowQ.addWidget(QLabel("位置平滑"))
+            self.sp_smooth = NoWheelDoubleSpinBox()
+            self.sp_smooth.setRange(0.0, 0.95)
+            self.sp_smooth.setSingleStep(0.05)
+            self.sp_smooth.setDecimals(2)
+            self.sp_smooth.setValue(float(_MOTION_SMOOTH_DEFAULT))
+            self.sp_smooth.setToolTip(
+                "白线的跟手程度：新位置 = 本值×旧位置 + (1−本值)×观测位置。\n"
+                "调大＝更稳但更滞后（实测 0.70 时滞后 87px）；调小＝跟手但抖。")
+            cfgrowQ.addWidget(self.sp_smooth)
+            cfgrowQ.addWidget(QLabel("合群门槛"))
+            self.sp_qmin = NoWheelDoubleSpinBox()
+            self.sp_qmin.setRange(0.5, 6.0)
+            self.sp_qmin.setSingleStep(0.1)
+            self.sp_qmin.setDecimals(1)
+            self.sp_qmin.setValue(float(_MOTION_QMIN_DEFAULT))
+            self.sp_qmin.setToolTip(
+                "它的「相对速度」要大于噪声底这么多倍，才算「还在不合群」。\n"
+                "调大＝更严（更容易判它跟丢）；调小＝更宽容（跟丢了也不说）。\n"
+                "⚠ 看日志里的 `q`：`q` 小于本值就有一次算「没在合群」。")
+            cfgrowQ.addWidget(self.sp_qmin)
+            cfgrowQ.addWidget(QLabel("跟丢拍数"))
+            self.sp_qneed = NoWheelDoubleSpinBox()
+            self.sp_qneed.setRange(1.0, 10.0)
+            self.sp_qneed.setSingleStep(1.0)
+            self.sp_qneed.setDecimals(0)
+            self.sp_qneed.setValue(float(_MOTION_QNEED_DEFAULT))
+            self.sp_qneed.setToolTip(
+                "最近 10 拍里有这么多拍「没在合群」⇒ 判它跟丢（降权、并允许换人）。\n"
+                "调大＝更耐心（跟错了也拖着）；调小＝更快换人（可能误伤、来回跳）。")
+            cfgrowQ.addWidget(self.sp_qneed)
+            cfgrowQ.addWidget(QLabel("粘连阈值"))
+            self.sp_stuck = NoWheelDoubleSpinBox()
+            self.sp_stuck.setRange(1.05, 3.0)
+            self.sp_stuck.setSingleStep(0.05)
+            self.sp_stuck.setDecimals(2)
+            self.sp_stuck.setValue(float(_MOTION_STUCK_DEFAULT))
+            self.sp_stuck.setToolTip(
+                "框面积超过自己基准这么多倍 ⇒ 认定「和别的目标粘住了」（两个目标被检成一个框）。\n"
+                "粘住时框中心是两目标的中点 ⇒ 那一拍的位置和偏离都不采信（先滑过去）。\n"
+                "调大＝更不敏感；调小＝更容易判粘住。⚠ 正常拍在 0.9~1.2，粘连拍在 1.7~1.9。")
+            cfgrowQ.addWidget(self.sp_stuck)
+            cfgrowQ.addWidget(QLabel("预测上限"))
+            self.sp_predmax = NoWheelDoubleSpinBox()
+            self.sp_predmax.setRange(0.0, 120.0)
+            self.sp_predmax.setSingleStep(5.0)
+            self.sp_predmax.setDecimals(0)
+            self.sp_predmax.setValue(float(_MOTION_PREDMAX_DEFAULT))
+            self.sp_predmax.setToolTip(
+                "找框时最多按预测往前挪这么远（px），防止预测错了更糟。\n"
+                "调大＝更敢预测（目标动得快时更跟得住）；调小＝更保守（贴着上一拍位置找）。\n"
+                "设 0 ＝ 完全不用预测。")
+            cfgrowQ.addWidget(self.sp_predmax)
+            # ⭐⭐⭐⭐ **方向数 N**（用户 2026-10-04 ✓ 原话："**方向数 N 做成配置**" ✓）——
+            #   就是"鼠标周围那一圈灰箭头"的个数 ✓（见 `_DIR_N` ✓）。
+            cfgrowQ.addWidget(QLabel("方向数"))
+            self.sp_dirn = NoWheelDoubleSpinBox()
+            self.sp_dirn.setRange(4.0, 36.0)
+            self.sp_dirn.setSingleStep(2.0)
+            self.sp_dirn.setDecimals(0)
+            self.sp_dirn.setValue(float(_MOTION_DIRN_DEFAULT))
+            self.sp_dirn.setToolTip(
+                "「方向置信度」把 360° 等分成几格 = 鼠标周围那圈灰箭头的个数。\n"
+                "每格的值 = 有多少「框边界在群体坐标系里的运动」指向这个方向。\n"
+                "调大＝分得更细（但每格票少、更抖）；调小＝更粗更稳。")
+            cfgrowQ.addWidget(self.sp_dirn)
+            # ⭐⭐⭐ **`?` = conf 的「统一说明处」**（用户 2026-10-04 ✓ 原话："我们需要有**统一的
+            #   地方管理 conf 都与什么有关、每一项都是如何作用的**，建议**加个 `？` 写在里面**" ✓✓）
+            #   ⇒ 点开就是**完整的构成表** ✓（通俗版 ✓ 与代码里的实现**一一对应** ✓）。
+            self.btn_what = QPushButton("匹配分?")
+            self.btn_what.setToolTip("点开看「匹配分」是怎么算出来的（每一项怎么作用）")
+            self.btn_what.clicked.connect(self._explain_conf)
+            cfgrowQ.addWidget(self.btn_what)
+            cfgrowQ.addStretch(1)
             cfgrowM.addStretch(1)
             cfgrow.addWidget(QLabel("噪声容差(px)"))
             self.sp_ntol = NoWheelDoubleSpinBox()
@@ -2486,13 +2711,14 @@ def run_window(args):
             #   参数要配吗？**" ✓）—— ⚠ 只在**新模式**下显示 ✓（经典模式整行隐藏 ✓ 见
             #   `_on_mode_changed` ✓）。
             _wM = _group("运动分离（新）",
-                         "YOLO 给候选 + 「运动不合群」分辨：配对门限 · 偏离衰减 · 切换迟滞 · "
-                         "最少命中 · 白度辅助"
+                         "YOLO 给候选 + 「运动不合群」分辨 —— 第 4 行：配对 / 打分 / 换人；"
+                         "第 5 行：平滑 / 自检 / 粘连"
                          "（⚠ 本模式**不用砖、不做融合/分离** ✓ 但**要看检出框** ✓）")
             _wM.setVisible(False)               # 默认是经典 ⇒ 先藏起来 ✓（切模式时同步 ✓）
             self._rowM_head = _wM               # ⭐ 标题也跟着收 ✓
             _cfgcol.addWidget(_wM)
             _cfgcol.addLayout(cfgrowM)
+            _cfgcol.addLayout(cfgrowQ)          # ⭐ **第 5 行**（跟踪手感 / 自检 ✓ 见上面那段 ✓）
             _cfgbox = QHBoxLayout()
             _cfgbox.setContentsMargins(0, 0, 6, 2)
             _cfgbox.addLayout(_cfgcol)
@@ -2821,6 +3047,19 @@ def run_window(args):
                                                              _MOTION_MINHITS_DEFAULT)), 1.0), 20.0))
                 self.sp_whitew.setValue(min(max(float(c.get("motion_white_w",
                                                             _MOTION_WHITEW_DEFAULT)), 0.0), 5.0))
+                # ---- ⭐ 第 5 行（跟踪手感 / 自检 / 粘连 ✓ 与 `_cfg_save` 同名键 ✓）----
+                self.sp_smooth.setValue(min(max(float(c.get("motion_smooth",
+                                                            _MOTION_SMOOTH_DEFAULT)), 0.0), 0.95))
+                self.sp_qmin.setValue(min(max(float(c.get("motion_q_min",
+                                                          _MOTION_QMIN_DEFAULT)), 0.5), 6.0))
+                self.sp_qneed.setValue(min(max(float(c.get("motion_q_need",
+                                                           _MOTION_QNEED_DEFAULT)), 1.0), 10.0))
+                self.sp_stuck.setValue(min(max(float(c.get("motion_stuck_ratio",
+                                                           _MOTION_STUCK_DEFAULT)), 1.05), 3.0))
+                self.sp_predmax.setValue(min(max(float(c.get("motion_pred_max",
+                                                             _MOTION_PREDMAX_DEFAULT)), 0.0), 120.0))
+                self.sp_dirn.setValue(min(max(float(c.get("motion_dir_n",
+                                                           _MOTION_DIRN_DEFAULT)), 4.0), 36.0))
             except Exception:
                 pass
             # ⭐ **算法模式**（用户 2026-10-03 ✓ 记住上次选的 ✓）—— ⚠ `setCurrentIndex` 会**自动
@@ -2913,6 +3152,14 @@ def run_window(args):
                     "motion_switch_margin": round(float(self.sp_margin.value()), 2),
                     "motion_min_hits": int(round(float(self.sp_minhits.value()))),
                     "motion_white_w": round(float(self.sp_whitew.value()), 2),
+                    # ---- ⭐⭐ **第 5 行**（跟踪手感 / 自检 / 粘连 ✓ 见 `_cfg_load` 同名键 ✓）----
+                    "motion_smooth": round(float(self.sp_smooth.value()), 3),
+                    "motion_q_min": round(float(self.sp_qmin.value()), 2),
+                    "motion_q_need": int(round(float(self.sp_qneed.value()))),
+                    "motion_stuck_ratio": round(float(self.sp_stuck.value()), 3),
+                    "motion_pred_max": round(float(self.sp_predmax.value()), 1),
+                    # ---- ⭐ **方向数 N**（用户 2026-10-04 ✓ 见 `_cfg_load` 同名键 ✓）----
+                    "motion_dir_n": int(round(float(self.sp_dirn.value()))),
                     "speed": float(self.cmb_speed.currentData() or 1.0),
                     "mask": int(self.sld_mask.value()),
                     "dets": bool(self.chk_dets.isChecked()),
@@ -3041,6 +3288,39 @@ def run_window(args):
                          if getattr(self, "sp_follow", None) is not None
                          else _FOLLOW_GAIN_DEFAULT)
 
+        def _explain_conf(self):
+            """⭐ **「匹配分」的统一说明处**（用户 2026-10-04 ✓ 原话："我们需要有**统一的地方管理
+            conf 都与什么有关、每一项都是如何作用的**，建议**加个 `？` 写在里面**" ✓✓）。
+
+            ⚠⚠ **这里只是"给人看的说明"** ✗ —— **真正算它的地方只有一处** ✓：
+            `perception/lie_motion.py` 的 `process` 打分段（搜 `匹配分` 就能跳过去 ✓）。
+            改公式时**两边一起改** ✓。
+            """
+            QMessageBox.information(self, "匹配分（观测可信度）是怎么算出来的",
+                "<b>一句话</b>：它是「<b>这一格框配到这条轨迹上，这次配对有多可信</b>」"
+                "（0 = 完全不信，1 = 完全可信）。<br><br>"
+                "<b>公式</b>：<code>匹配分 = 距离因子 × 面积因子</code>"
+                "（都取 0~1 ⇒ 任何一项差，整体就被拉低）<br><br>"
+                "<b>① 距离因子</b> = 1 − 距预测位置 ÷ 配对门限<br>"
+                "&nbsp;&nbsp;&nbsp;· 离「我以为它该在的位置」越近 ⇒ 越可信（会被「配对门限」影响）<br><br>"
+                "<b>② 面积因子</b>（真正关键的那项）：<br>"
+                "&nbsp;&nbsp;&nbsp;· 框面积 ÷ <b>标准面积</b> 落在 0.75~1.0 ⇒ 满分 1.0<br>"
+                "&nbsp;&nbsp;&nbsp;· <b>超出</b>（框变大 = 两个目标粘成一个合体）⇒ 按超出比例"
+                "<b>线性压到 0</b><br>"
+                "&nbsp;&nbsp;&nbsp;· 为什么这么狠：粘连时 <b>框中心 = 两个目标的中间点</b>，"
+                "这个观测量<b>根本不能信</b><br>"
+                "&nbsp;&nbsp;&nbsp;· 「标准面积」= 最近 240 个框面积的中位（实测 ≈19000，"
+                "白星时期也是这个数）<br><br>"
+                "<b>③ 什么时候它压根不参与</b>：<br>"
+                "&nbsp;&nbsp;&nbsp;· <b>粘连 / 冷却期</b>：整条观测链都不采信"
+                "（位置改成沿预测滑、速度不更新）<br>"
+                "&nbsp;&nbsp;&nbsp;· <b>没配上</b>：位置按「相机 + 它自己的相对速度」推<br><br>"
+                "<b>怎么用</b>（你 ④⑤ 那两条）：<br>"
+                "&nbsp;&nbsp;&nbsp;· <b>骤降</b> ⇒ 这一拍该<b>跟着 KF 走</b>（别信观测）<br>"
+                "&nbsp;&nbsp;&nbsp;· <b>回升</b> ⇒ 可以修正轨迹<br><br>"
+                "<b>画面上看</b>：每个检出框标签是 <code>shape 0.98 #20 m0.55</code>"
+                "（末尾的 <code>m</code> 就是匹配分）；低于 0.3 基本不可信。")
+
         def _motion_kw(self):
             """**运动分离（新）**的界面参数 ⇒ 一个 dict（直接喂 `MotionRunner` ✓）。
 
@@ -3058,7 +3338,15 @@ def run_window(args):
                     "score_decay": _v("sp_sdecay", _MOTION_SDECAY_DEFAULT),
                     "switch_margin": _v("sp_margin", _MOTION_MARGIN_DEFAULT),
                     "min_hits": max(1, int(round(_v("sp_minhits", _MOTION_MINHITS_DEFAULT)))),
-                    "white_w": _v("sp_whitew", _MOTION_WHITEW_DEFAULT)}
+                    "white_w": _v("sp_whitew", _MOTION_WHITEW_DEFAULT),
+                    # ---- ⭐⭐ **第 5 行**（跟踪手感 / 自检 / 粘连 ✓ 用户 2026-10-03 ✓）----
+                    "smooth": _v("sp_smooth", _MOTION_SMOOTH_DEFAULT),
+                    "q_min": _v("sp_qmin", _MOTION_QMIN_DEFAULT),
+                    "q_need": max(1, int(round(_v("sp_qneed", _MOTION_QNEED_DEFAULT)))),
+                    "stuck_ratio": _v("sp_stuck", _MOTION_STUCK_DEFAULT),
+                    "kf_pred_max": _v("sp_predmax", _MOTION_PREDMAX_DEFAULT),
+                    # ---- ⭐ **方向数 N**（用户 2026-10-04 ✓ 见 `_DIR_N` ✓）----
+                    "dir_n": max(4, int(round(_v("sp_dirn", _MOTION_DIRN_DEFAULT))))}
 
         def _show_layers(self):
             """三个**图层开关**的当前状态（用户 2026-10-03 ✓ "这些细细的蓝色轨迹线是什么？
@@ -3119,6 +3407,13 @@ def run_window(args):
             if _layM is not None:
                 for _i in range(_layM.count()):
                     _w = _layM.itemAt(_i).widget()
+                    if _w is not None:
+                        _w.setVisible(_motion)
+            # ②' ⭐ **第 5 行**（平滑 / 自检 / 粘连 ✓ 同一个约定 ✓）
+            _layQ = getattr(self, "_rowQ", None)
+            if _layQ is not None:
+                for _i in range(_layQ.count()):
+                    _w = _layQ.itemAt(_i).widget()
                     if _w is not None:
                         _w.setVisible(_motion)
             # ③ ⚠ **第 1 行是混着的**（"模式" / "鼠标跟随效率倍率" 两边都要 ✓）⇒ **整行藏不得** ✗
@@ -3545,6 +3840,53 @@ def run_window(args):
             #   第 7 位 = 砖那一段、第 8 位 = **圆那一侧那一段**（本次新增 ✓ 见 `pick_extra` ✓）。
             _row = (self.results[self.i]
                     if (self.results and 0 <= self.i < len(self.results)) else {})
+            # ⭐⭐⭐ **运动分离模式：点选信息整段换掉**（用户 2026-10-04 ✓ 原话："在运动分离模式下，
+            #   点选检出框的信息显示需要优化下，**旧逻辑的信息就不要了**；**你可以把匹配分写出来**" ✓✓）
+            #   —— ⚠ 旧那三段（`IoU最大砖` / `圆矩IoU` / `圆矩∩框`）全是**砖 / 圆矩**那套说法 ✓
+            #     而运动分离模式**压根没有砖、也不做融合** ✗ ⇒ 留着全是噪音 ⇒ **一个字不显示** ✓
+            #     ⇒ 换成这套**这模式真有的量** ✓：
+            #       · **匹配分**（用户点名要的 ✓ = "这一格的观测有多可信" ✓ 见 `lie_motion` ✓）；
+            #       · `#id`（它配到哪条轨迹上 ✓）；
+            #       · 该轨迹的**偏离 `dev`** / **分数** / 有观测还是推的 / 粘住 · 冷却 ✓。
+            _mo = _row.get("motion") or {}
+            if self._mode() == "motion":
+                _bv = None
+                for _it in (_mo.get("box_v") or []):
+                    if (abs(float(_it[0]) - float(_b[1])) < 1.5
+                            and abs(float(_it[1]) - float(_b[2])) < 1.5):
+                        _bv = _it
+                        break
+                if _bv is None:
+                    # ⚠⚠ **文案必须"人话"** ✗✗（用户 2026-10-04 ✓ 他直接问："**什么是配对？
+                    #   要归属谁？**" ✓ —— 我上一版写的是"未配对（这格还没有归属 ✓ 新出现 /
+                    #   刚睡醒还没接上）"✗ 全是行话 ✓ 他看不懂 ✓ 这是我的问题 ✓）。
+                    return tuple(_b) + (
+                        "这格还没认出是「之前哪个目标」"
+                        "（可能是新出现的，也可能刚被挡住几拍、又出来了）", "")
+                _bid = int(_bv[4])
+                _mk = float(_bv[6]) if len(_bv) > 6 else -1.0
+                _tk = next((_t for _t in (_mo.get("tracks") or [])
+                            if int(_t.get("tid") or 0) == _bid), None)
+                # ⭐ **说人话**：直接点明"就是画面上那个 `#22`" ✓（不说"配对/归属"这种行话 ✗）。
+                _seg = ("认出是 **#%d** 号（就是框上写的那个号）｜ 匹配分 %.2f"
+                        % (_bid, _mk))
+                if _tk is not None:
+                    _seg += (" ｜ 偏离 %s ｜ 分 %s ｜ %s%s"
+                             % ("%.1f" % float(_tk.get("dev") or 0.0),
+                                "%.0f" % float(_tk.get("score") or 0.0),
+                                "有观测" if _tk.get("live") else "推的",
+                                " ｜ 粘住" if _tk.get("stuck")
+                                else (" ｜ 冷却" if _tk.get("cool") else "")))
+                # ⭐⭐⭐⭐ **框的「状态」用一句人话讲清楚**（用户 2026-10-04 ✓ 他问的就是这个 ✓）——
+                #   ⚠ 光靠颜色不够（他得知道**为什么**变色 ✓ 以及**算法拿它怎么办** ✓）。
+                _stv = int(_bv[7]) if len(_bv) > 7 else 0
+                _seg += {0: "",
+                         1: " ｜ ⚠⚠ **跟别的目标融在一起**：框心是**两个目标的中点** ✗ "
+                            "⇒ 位置**已经不采信它**了（只沿预测滑 ✓）",
+                         2: " ｜ ⚠ **这一格的位置偏离预测较多**（可能目标真在急动 ✓ 也可能被"
+                            "拉偏 ✗）⇒ 已经**按面积降权** ✓",
+                         3: " ｜ ⚠ **框只剩一小块**（被挡住 / 误检）⇒ 框心是**碎片重心** ✗"}.get(_stv, "")
+                return tuple(_b) + (_seg, "")
             _btxt, _rtxt = pick_extra((float(_b[1]), float(_b[2]),
                                        float(_b[3]), float(_b[4])),
                                       _row.get("pos"), _row.get("tgt_rad"), _br)

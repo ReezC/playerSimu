@@ -10382,6 +10382,109 @@ def t_disable_chase_pathfinding():
           "会拿到 `None`、那个功能当场坏掉 ✗")
 
 
+def t_disable_chase_pathfinding_auto():
+    """⛔⭐ 「**禁用杀怪寻路开着时，开自动也要能正常运转**」（用户 2026-10-04 ✓ 原话）。
+
+    现场（触发这条的）：项目「东部岩山V」→ 图 `101030404` —— 它**没有标定几何、也没有
+    地形图**（`datasets/map/101030404.mapcalib.json` 里连 `scale`/`offset` 都没有 ✓，
+    也没有 `101030404.png`）⇒ 玩家世界坐标恒为 `None` ⇒ `tick` 里那条「**未定位玩家**」
+    早退**每拍都命中** ⇒ 角色**站着不动**（behavior.log 里只剩 `act move=0`），再等
+    「找不到玩家停止自动」到点就**自己把自动停掉** ✗。
+    可这个开关的语义恰恰是「**不寻路、只朝怪走**」（= 无寻路时的老逻辑 ✓）—— 那一层
+    **根本不读世界坐标**（锁定 / 追击 / 走位全用画面坐标 ✓）。
+
+    钉六件（①④ 是"老行为一点不变"的对照 ✓）：
+      ① **开关关着** + 没有世界坐标 ⇒ 照旧「未定位玩家」早退 ✓；
+      ② **开关开着** + 没有世界坐标 ⇒ **照常打怪**（进 attack + 真按攻击键）✓；
+      ③ **开关开着** + 没世界坐标 + **配了战斗区域** ⇒ 不许走「不在战斗区域，先回去」
+         （那一步**要寻路**，而这个模式不寻路 ⇒ 又是一只怪都不打 ✗）；
+      ④ **开关关着** + 世界坐标有、但**脚下集合空** + 同样配了区域 ⇒ **照旧**「先回去」
+         （老规矩不许动 ✗）；
+      ⑤ **开关开着**、脚下集合**读得到**且**不在区域里** ⇒ 区域规则**照旧生效** ✗
+         （不许因为开了这个开关就把整条区域规则放行）；
+      ⑥ **开关开着** + 连角色框都没有（`found=False`）⇒ 照旧「未定位玩家」✓。
+    """
+    s = fresh_settings(attack_dist=100.0)
+    s.enabled = True
+    h = Harness(s)
+    a = h.agent
+    atk = s.keymap["attack"]
+
+    def _state(here=None, found=True, world=True):
+        """摆这一拍的世界状态（`h.ws()` 每帧自建 ⇒ 只能这么摆 ✓ 同 `t_disable_chase_pathfinding`）。"""
+        def f(w):
+            w.player.world_x = 500.0 if world else None
+            w.player.world_y = 500.0 if world else None
+            w.player.here_sets = list(here or [])
+            w.player.found = found
+        return f
+
+    with h._patched():
+        h.clock0 = h.clock.t
+        # ① 关着 + 没有世界坐标 ⇒ 照旧「未定位玩家」（2026-09-28 的老口径，别弄丢 ✗）
+        h.log.clear()
+        ws = h.ws()
+        _state(world=False)(ws)
+        res = a.tick(ws)
+        check(res.get("reason") == "未定位玩家",
+              "开关**关着**、又没有世界坐标时，居然不判「未定位玩家」了"
+              "（那是 2026-09-28 定的老口径 ✗）：%r" % (res,))
+
+        s.disable_chase_pathfinding = True
+        try:
+            # ② 开着 + 没有世界坐标 ⇒ 照常打怪（这就是用户要的"正常运转" ✓）
+            h.log.clear()
+            ws = h.ws()
+            _state(world=False)(ws)
+            for _ in range(4):            # 输出序列真按下键要两拍（既有用例同款 ✓）
+                h.clock.t += 0.1
+                res = a.tick(ws)
+            check(a.state == "attack",
+                  "「禁用杀怪寻路」开着、只是没有世界坐标，就没进 attack（角色会站着不动"
+                  "⇒ 用户报的正是这个 ✗）：%s / %r" % (a.state, res))
+            check(any(k == atk for _t, kind, k in h.log if kind in ("down", "up")),
+                  "进了 attack 却没按攻击键：%r" % (h.log,))
+
+            # ③ 开着 + 配了战斗区域 + 脚下集合空 ⇒ **不许**「先回去」
+            s.battle_zone_sets = ["甲平台"]
+            a.stop_route("用例：复位")
+            ws = h.ws()
+            _state(world=False)(ws)
+            res = a.tick(ws)
+            check(str(res.get("reason") or "") != "不在战斗区域，先回去",
+                  "「禁用杀怪寻路」开着、脚下集合又读不到，还照老规矩判「不在战斗区域」⇒ "
+                  "而「回去」要寻路（这个模式不寻路）⇒ 一只怪都不打 ✗：%r" % (res,))
+            check(a.state == "attack" or res.get("keys"),
+                  "同上：这一拍什么都没做（站着不动 ✗）：%r" % (res,))
+
+            # ⑤ 开着 + 脚下集合**读得到**且不在区域里 ⇒ 区域规则照旧生效
+            ws = h.ws()
+            _state(here=["乙平台"])(ws)
+            res = a.tick(ws)
+            check(res.get("reason") == "不在战斗区域，先回去",
+                  "脚下集合读得到、又不在能打区，却没走「先回去」（区域规则被这个开关"
+                  "整个放行了 ✗）：%r" % (res,))
+
+            # ⑥ 开着 + 连角色框都没认出来 ⇒ 照旧「未定位玩家」（那条保护还在 ✓）
+            ws = h.ws()
+            _state(world=False, found=False)(ws)
+            res = a.tick(ws)
+            check(res.get("reason") == "未定位玩家",
+                  "连角色框都没认出来，却还往下走（「找不到玩家」那条保护没了 ✗）：%r" % (res,))
+        finally:
+            s.disable_chase_pathfinding = False
+
+        # ④ 关着 + 世界坐标有、脚下集合空 + 配了区域 ⇒ 照旧「先回去」（老规矩不许动 ✗）
+        #   ⚠ 这一档**必须**有世界坐标：没有的话先被上面①那条判走，根本到不了区域规则 ✗
+        a.stop_route("用例：复位")
+        ws = h.ws()
+        _state(world=True)(ws)
+        res = a.tick(ws)
+        check(res.get("reason") == "不在战斗区域，先回去",
+              "开关**关着**时，脚下集合读不到就该照旧「先回去」（2026-09-27 的老规矩 —— "
+              "别被这个开关的改动顺手放行 ✗）：%r" % (res,))
+
+
 def t_mob_goto_towards():
     """**降级路径**：朝「玩家 → 怪」方向的最近集合逐层逼近（用户 2026-09-28 定的三档 ②③ ✓）。
 
@@ -13938,6 +14041,9 @@ CHECKS = [
     ("⛔ 「**禁用杀怪寻路**」：开了不再查怪在哪块平台（也不显示）、不再因追怪下寻路任务，"
      "只单纯走向锁定怪物（默认关 = 老行为；用户 2026-09-28）",
      t_disable_chase_pathfinding),
+    ("⛔⭐ 「禁用杀怪寻路」**开着时开自动也要能正常运转**：没有小地图世界坐标（没标定/没地形）"
+     "照样打怪，且区域规则只在**判不了**时才不拦（用户 2026-10-04）",
+     t_disable_chase_pathfinding_auto),
     ("追击**降级路径**：怪那层判不出/走不到、或「判成同一集合但攻击框框不住怪」⇒ 朝"
      "「玩家→怪」方向的最近集合逐层逼近（用户 2026-09-28）；真同层同线照旧追、没注入不动",
      t_mob_goto_towards),

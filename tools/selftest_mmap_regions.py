@@ -89,6 +89,10 @@ class _Sock:
         self.sent.append(raw)
         return len(raw)
 
+    def settimeout(self, _t):
+        """`_accept_ctl` 会设超时（假 socket 记都不记，收下就行 ✓）。"""
+        return None
+
 
 # ══════════════════════ 用例 ══════════════════════
 
@@ -517,7 +521,213 @@ def t_import_without_numpy():
           % ((p.stderr or "").strip()[-300:]))
 
 
+def t_sniff_hello_survives_split():
+    """⭐ 第一行被 TCP **切半**时也要认得出"这是控制连接"（用户 2026-10-03 ✓ 现场）。
+
+    现场铁证（A 的控制台 ✓）：**一行「控制连接 … 已连上」都没有** ✗、全是「B 机 … 已连上」✓；
+    而 B 那边报「`mmap_map=失败 A 机的回执看不懂：''`」✓ ⇒ B 明明发了 `HELLO mmap-ctl`，
+    A 却把它判成了**收帧连接** ⇒ ① A 一句话不回 ✓ ② id 永远记不上 ⇒ 部署台永远「还没有」✓。
+
+    病根：原来**只 `recv(64)` 一次** ✗ —— TCP 不保证一次 `recv` 给整行，拿到
+      `b"HELLO mmap-"` 这种半截时，`hello[:20] == b"HELLO mmap-ctl"` **必然不成立** ✓。
+
+    钉三件：① 半截 hello 要**拼回来** ✓；② **一声不吭的收帧客户端**最多还是等原来那个
+      超时（不许被这个循环卡住 ⇒ 那会拖慢"首帧" ✗）；
+      ③ ⚠ 这里用的是**阻塞的 `socketpair()`**（`settimeout(None)` ✓）⇒ 顺带钉住"**这个函数
+      自己会设超时**" ✓ —— 少了它，② 那次 `recv` 会**永远不返回**、**整套自检一条都跑不完**
+      （用户 2026-10-04："每次跑都要等几个小时"✓ 根因就是它 ✓；`main()` 那条路因为先设了
+      超时 ⇒ 一直没暴露 ✗）。
+    """
+    import socket
+    import threading
+    import time as _t
+
+    a, b = socket.socketpair()
+    try:
+        # ① 半截 hello：先 `HELLO `，隔一会儿再 `mmap-ctl\n`
+        b.sendall(b"HELLO ")
+        th = threading.Thread(target=lambda: (_t.sleep(0.05),
+                                              b.sendall(b"mmap-ctl\n")))
+        th.start()
+        got = minimap_push._sniff_hello(a, 1.0)
+        th.join()
+        check(got.startswith(mmap_regions.CTL_HELLO.rstrip(b"\n")),
+              "半截 hello 没拼回来 ⇒ 会被判成收帧连接（现场就是这个 ✗）：%r" % (got,))
+
+        # ② 一声不吭（收帧客户端）：等满超时回空，且**不许等过头** ✓
+        b.sendall(b"")                       # 什么都不发 ✓
+        t0 = _t.time()
+        check(minimap_push._sniff_hello(a, 0.1) == b"",
+              "没数据时该回空（不然会去比一个不存在的 hello ✗）")
+        check(_t.time() - t0 < 1.0,
+              "嗅探把一声不吭的收帧客户端卡住了 ⇒ 会拖慢它的首帧 ✗")
+    finally:
+        a.close()
+        b.close()
+
+
+def t_hello_and_map_in_one_chunk():
+    """⭐⭐ 握手和命令**挤在同一段字节里**到达时，命令必须被就地处理（用户 2026-10-04 ✓ 现场）。
+
+    现场：B 一直报 `mmap_map=失败 A 机的回执看不懂：''`（**每次都这样**，不是偶发 ✓）。
+    病根：B 是"连上就一口气把 `HELLO` 和 `MAP <id>` 都发出来"的（两下 `sendall` 只隔几微秒
+      ⇒ A **还没轮到 `accept()`**，两个包就都已经躺进内核接收缓冲 ⇒ 握手那次 `recv` **一次
+      就拿回整行 hello + 整行 MAP** ✗），而 accept 那段原来**只认 hello、把余下的字节丢掉** ✗
+      ⇒ `MAP` 永远没人处理 ⇒ B 等 3 秒收到空气 ✓ —— 看着像"A 机压根不支持换图"✗。
+    ⇒ 现在这段收在 `_accept_ctl` 一处：余下字节**留着** + **就地喂给** `_answer_ctl` ✓；
+      没成行的（半条命令）**留到下一段** ✓（TCP 不保证按行到 ✓）。
+
+    钉四件（**不碰真 socket、不起 Qt** ✓ —— accept 那段逻辑抽成 `_accept_ctl` 就是为了这个 ✓）：
+      ① `HELLO + MAP` 同一段 ⇒ 认成控制连接 + **MAP 当场生效**（`state` 换了框 + 回了 OK ✓）；
+      ② 半截 hello（`b"HELLO mmap-c"`）⇒ **不算**控制连接（拼不全的不认 ✓）；
+      ③ `HELLO + 半条 MAP`（`b"HELLO mmap-ctl\\nMAP 111"`，没有换行）⇒ 认成控制连接、
+         **此刻不生效**、**尾巴留着**；补上下一段 `b"1\\n"` 才生效 ✓（半行不许当命令 ✗）；
+      ④ 一声不吭（收帧客户端 `b""`）⇒ 不算控制连接、`controls` 不变 ✓（老行为不许弄丢 ✗）。
+    """
+    _fresh()
+    mmap_regions.save("111", 10, 20, 200, 150, zoom=3)
+    HL = mmap_regions.CTL_HELLO
+    state = {"map_id": "", "box": [0, 0, 0, 0], "zoom": 1}
+
+    # ① 握手与命令**同一段**
+    s1, ctl1 = _Sock(), []
+    check(minimap_push._accept_ctl(ctl1, s1, "1.2.3.4:1", HL + b"MAP 111\n", state,
+                                  log=_q) is True,
+          "握手 + 命令挤在一段里，却没被认成控制连接 ✗")
+    check(len(ctl1) == 1 and ctl1[0][2] == b"", "控制连接没登记干净：%r" % (ctl1,))
+    check(state["map_id"] == "111" and state["box"] == [10, 20, 200, 150],
+          "**同一段里跟来的 `MAP` 被丢掉了**（B 那边就是「回执看不懂：''」✗）：%s" % (state,))
+    check(s1.sent and mmap_regions.parse_reply(s1.sent[-1].decode("utf-8"))["ok"] is True,
+          "同一段里的 `MAP` 没回 OK（B 那 3 秒就在等它 ✗）：%r" % (s1.sent,))
+
+    # ② 半截 hello ⇒ 不算控制连接（拼不全的不认 ✓）
+    ctl2 = []
+    check(minimap_push._accept_ctl(ctl2, _Sock(), "1.2.3.4:2", b"HELLO mmap-c", state,
+                                  log=_q) is False,
+          "半截 hello 被当成控制连接了（`_sniff_hello` 负责拼回来；没拼全的不算 ✓）")
+    check(ctl2 == [], "半截 hello 也登记进 controls 了 ✗")
+
+    # ④ 一声不吭 ⇒ 收帧客户端（老行为，别弄丢 ✗）
+    ctl4 = []
+    check(minimap_push._accept_ctl(ctl4, _Sock(), "1.2.3.4:4", b"", state, log=_q) is False,
+          "一声不吭的收帧客户端被当成控制连接了（那样它一帧都收不到 ✗）")
+    check(ctl4 == [], "收帧客户端被登记进 controls 了 ✗")
+
+    # ③ 同一段里只有**半条**命令 ⇒ 留着，等下一段补齐（`MAP 11` + `1\n` ⇒ `MAP 111` ✓）
+    state3 = {"map_id": "", "box": [0, 0, 0, 0], "zoom": 1}
+    s3, ctl3 = _Sock(), []
+    check(minimap_push._accept_ctl(ctl3, s3, "1.2.3.4:3", HL + b"MAP 11", state3,
+                                  log=_q) is True,
+          "握手认出来了却（因为命令没换行）没认成控制连接 ✗")
+    check(state3["map_id"] == "",
+          "半条命令（没有换行）被当成一条命令执行了 ✗：%s" % (state3,))
+    check(not s3.sent, "半条命令就回了东西 ✗：%r" % (s3.sent,))
+    check(len(ctl3) == 1 and ctl3[0][2] == b"MAP 11",
+          "半条命令没被留下来（下一段到了也接不上 ✗）：%r" % (ctl3,))
+    minimap_push._ctl_feed(ctl3[0], b"1\n", state3, log=_q)
+    check(state3["map_id"] == "111",
+          "补上换行之后这条命令还是没生效（半行 + 下一段拼不回来 ✗）：%s" % (state3,))
+    check(ctl3[0][2] == b"", "尾巴处理完该清空：%r" % (ctl3,))
+
+
+def t_ctl_roundtrip_end_to_end():
+    """⭐⭐ **端到端**：B 的 `MiniMapClient.switch_map` ↔ A 的 accept / `_sniff_hello` / `_ctl_feed`。
+
+    为什么非要端到端（而不是各测一半）：这次的 bug **长在两边之间的缝隙上** ✗ ——
+      · 只喂**一行**给 `_answer_ctl` ⇒ 永远绿 ✓；
+      · 只配个"收到就回 OK"的假服务器 ⇒ 也永远绿 ✓；
+      · **把 B 真实的发法接上 A 真实的收法** ⇒ 才红 ✓（2026-10-04 那条"`MAP` 石沉大海"✓）。
+    这正是用户验收的那条链：B 的 `perf.log` 里出现 `mmap_map=ok …` ⇔ A 真的换了推流区域 ✓。
+
+    假 A **不另写一套**：就用真代码那条路（`_sniff_hello` + `_accept_ctl` + `_poll_controls` ✓），
+    只是把 socket 换成 127.0.0.1 的临时端口、把日志吞掉 ✓。
+
+    钉四件：
+      ① `switch_map("111")` ⇒ **成功**，回执里的 `box`/`zoom` 就是那张图的 ✓；
+      ② A 侧 `state` 真的换了（不是只回了个 OK 的空壳 ✓）；
+      ③ 库里没有的图 ⇒ **失败**且说清是哪个 id（人好去框 ✓）；
+      ④ **源码级**：B 把 `HELLO` 与 `MAP` **合成一次 `sendall`**（分段是内核说了算的，
+         行为钉不住它 ✗ ⇒ 只能钉那一行本身 ✓）。
+    """
+    import socket
+    import threading
+
+    import perception.minimap as mm
+
+    _fresh()
+    mmap_regions.save("111", 10, 20, 200, 150, zoom=3)
+
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    srv.settimeout(0.2)
+    port = srv.getsockname()[1]
+    state = {"map_id": "", "box": None, "zoom": 1}
+    stop = threading.Event()
+
+    def _fake_a():
+        controls = []
+        while not stop.is_set():
+            try:
+                c, _peer = srv.accept()
+            except (socket.timeout, BlockingIOError, OSError):
+                pass
+            else:
+                try:
+                    c.settimeout(mmap_regions.CTL_HANDSHAKE_TIMEOUT)
+                    hello = minimap_push._sniff_hello(
+                        c, mmap_regions.CTL_HANDSHAKE_TIMEOUT)
+                    if not minimap_push._accept_ctl(controls, c, "fake", hello,
+                                                    state, log=_q):
+                        c.close()            # 本用例里没有收帧客户端
+                except Exception:            # noqa: BLE001
+                    try:
+                        c.close()
+                    except Exception:        # noqa: BLE001
+                        pass
+            controls = minimap_push._poll_controls(controls, state, log=_q)
+
+    th = threading.Thread(target=_fake_a, daemon=True)
+    th.start()
+    try:
+        cli = mm.MiniMapClient("127.0.0.1", port=port)
+        ok, info = cli.switch_map("111", timeout=2.0)
+        check(ok is True,
+              "端到端换图失败（B 一口气发 `HELLO`+`MAP`，A 必须**当场**处理 ✓）：%r" % (info,))
+        check(isinstance(info, dict) and info.get("map_id") == "111"
+              and info.get("box") == [10, 20, 200, 150] and info.get("zoom") == 3,
+              "回执里的框 / zoom 不对（上层要靠 zoom 挑标定 ✓）：%r" % (info,))
+        check(state["map_id"] == "111" and state["box"] == [10, 20, 200, 150],
+              "A 只是回了个 OK、抓取区域其实没换（半切换 ✗）—— B 那边看着就是「底图对不上」："
+              "%s" % (state,))
+
+        ok2, info2 = cli.switch_map("999", timeout=2.0)
+        check(ok2 is False and "999" in str(info2),
+              "库里没有的图该失败、并说清是哪个 id（人好照它去框一次 ✓）：%r" % (info2,))
+    finally:
+        stop.set()
+        th.join(timeout=2.0)
+        try:
+            srv.close()
+        except Exception:                    # noqa: BLE001
+            pass
+
+    # ④ B 侧：一次 `sendall` 发出去（合成只为让"一段 = 一条完整命令"更确定 ✓）
+    _mm = (ROOT / "perception" / "minimap.py").read_text(encoding="utf-8")
+    check("s.sendall(mmap_regions.CTL_HELLO\n" in _mm,
+          "`switch_map` 没把 `HELLO` 与 `MAP` 合成一次 `sendall`（见那儿注释 ✓）")
+    check('s.sendall(("%s %s\\n"' not in _mm,
+          "`switch_map` 又把 `MAP` 单独 `sendall` 了一次（老的两段式 ✗）：合成一条 ✓")
+
+
 TESTS = (
+    ("⭐ 第一行被 TCP 切半也要认得出控制连接（只 recv 一次认不出 ⇒ 现场那个 bug）",
+     t_sniff_hello_survives_split),
+    ("⭐⭐ 握手和命令挤在同一段里 ⇒ 命令必须就地处掉（现场：B 的 `MAP` 石沉大海、回执是 ''）",
+     t_hello_and_map_in_one_chunk),
+    ("⭐⭐ 端到端：B 的 `switch_map` ↔ A 的 accept/喂入口（含「一段 = 一条完整命令」）",
+     t_ctl_roundtrip_end_to_end),
     ("load 与老单值兜底：本图不串台 / legacy 读得回 / load 自己不兜底 / 坏值当没填",
      t_load_and_legacy),
     ("库列表与删除（LIST 命令要用）", t_list_and_remove),

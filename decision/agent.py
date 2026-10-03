@@ -4550,18 +4550,58 @@ class CombatAgent:
                        if self._in_attack_box(m, ws.player, 0)],
                       key=lambda m: self._center_dist(m, ws.player))
 
+    def _player_located(self, ws):
+        """这一拍**算不算"定位到玩家"**（决定 `tick` 里「未定位玩家」那条早退要不要走 ✓）。
+
+        两条判据（用户 2026-09-28 定的 + 2026-10-04 补的）：
+
+          · **默认（要寻路）**：**小地图找不到黄点**就算没定位 ✓ —— 用户 2026-09-28 原话
+            "找不到玩家停止自动的判断依据修改为**小地图找不到黄点**" ✓（要寻路就得有世界
+            坐标 ✓）；`world_held`（这一拍没认出黄点、坐标沿用上一帧）也算没找到 ✓。
+          · ⛔ **「禁用杀怪寻路」开着**：这一层**根本不读世界坐标**（锁定 / 追击 / 走位全用
+            **画面坐标** ✓，见那个开关的说明 ✓）⇒ 还拿黄点当判据，就等于"小地图那一路没
+            跑起来 ⇒ 整条自动**站着不动**、再等「找不到玩家停止自动」到点**自己把自动停
+            掉**" ✗ —— 用户 2026-10-04 报的"开了这个开关，开自动不能正常运转"就是这个 ✓
+            （现场：项目「东部岩山V」→ 图 `101030404`，**没有标定几何、也没有地形图**，
+            用户本来就不打算配它们 —— 那个模式下它们也确实用不上 ✓）。
+            ⇒ 退回**主画面里那个角色框**（= **无寻路时的老逻辑** ✓，也正是这个开关名字里
+              那半句 ✓）。⚠ 代价如实说：`ws.player.found` 有"跟丢时拿上一帧兜底"
+              （`gui/live_thread.py`）⇒ 它一旦为真基本不再变假 ⇒ **这一模式下"找不到玩家
+              自己停自动"几乎不会触发**（老逻辑本来就是这样 ✓）；别的保护（朝向超时 /
+              断线重连 / `player_gone` 留痕）不受影响 ✓。
+        """
+        p = getattr(ws, "player", None)
+        if p is None:
+            return False
+        if bool(getattr(self.settings, "disable_chase_pathfinding", False)):
+            return bool(getattr(p, "found", False))
+        return (getattr(p, "world_x", None) is not None
+                and not bool(getattr(p, "world_held", False)))
+
     def _in_battle_zone(self, ws):
         """这一拍**允许打架**吗 —— 「限制战斗区域」那条规则（空列表 = 不限制 ✓）。
 
         判据用感知给的 `here_sets`（脚下属于哪些命名集合 ✓）—— 和寻路那边**同一份**
         数据（不另发明一套"我在哪块平台"✗）。**拿不到 `here_sets` 也算"不在区域里"** ✓：
         宁可先回去，也别在不知道自己在哪的时候开打 ✗。
+
+        ⛔ **例外：`disable_chase_pathfinding` 开着**（用户 2026-10-04 ✓）—— 这个模式下
+        `here_sets` 很可能**一直是空**（世界坐标那一路没人要求它跑 ✓，见 `_player_located`
+        的说明 ✓）⇒ 照上面那条老规矩就是"**每一拍都不在区域里 ⇒ 先回去**"，而"回去"又
+        **要寻路**（用户把这个开关的效果正定义成"不寻路、只朝怪走"✗）⇒ 结果是**一只怪都
+        不打、站着不动** ✗ —— 和"未定位玩家"那条早退是同一类毛病 ✓。
+        ⇒ 这个模式下**判不了就不拦**（同 `_zone_only` 的"算不出来就不筛" ✓）：
+          · 脚下集合**读得到**时 ⇒ **照旧**按区域判 ✓（区域规则一点没减 ✓）；
+          · 读不到 ⇒ 放行（总比"永远不动"强 ✓）。
         """
         zones = [str(z) for z in
                  (getattr(self.settings, "battle_zone_sets", None) or []) if str(z)]
         if not zones:
             return True                     # 没配 = 不限制（老行为 ✓）
         here = set(getattr(getattr(ws, "player", None), "here_sets", None) or ())
+        if not here and bool(getattr(self.settings,
+                                     "disable_chase_pathfinding", False)):
+            return True                     # ⛔ 这个模式下判不了就不拦（见上 ✓）
         return bool(here & set(zones))
 
     def _mob_sig(self, target, ws):
@@ -6041,8 +6081,11 @@ class CombatAgent:
         #     `world_held` 就是小地图那边给的标记："**这一拍没认出黄点**、位置沿用上一帧"
         #     （见 `perception/minimap.apply_to_player` ✓）⇒ 它置上也算"没找到" ✓。
         #   · ⚠ 判据**只看黄点**（用户点名要的依据 ✓），不再看人物框认没认出来 ✓。
-        _mmap_ok = (ws.player.world_x is not None
-                    and not bool(getattr(ws.player, "world_held", False)))
+        #   · ⛔ **例外**（用户 2026-10-04 ✓）：「**禁用杀怪寻路**」开着时这一层**不读**
+        #     世界坐标 ⇒ 还拿黄点当判据就等于"小地图没跑起来 ⇒ 自动站着不动 + 自己停掉"
+        #     ✗ ⇒ 那时退回"主画面里认没认出角色框"（= 无寻路时的老逻辑 ✓）。
+        #     判据原文与代价都写在 `_player_located` 里（只那一处 ✓）。
+        _mmap_ok = self._player_located(ws)
         if not _mmap_ok:
             # 小地图找不到黄点：连续超时就停止自动
             lost_timeout = max(0.0, float(s.player_lost_timeout_min)) * 60.0

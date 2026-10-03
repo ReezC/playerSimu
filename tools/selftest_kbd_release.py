@@ -291,6 +291,62 @@ def t_a_logs_are_forwarded_to_b():
         kc.A_LOG_PATH = old_path
 
 
+def t_pad_move_is_coalesced():
+    """⭐⭐ 触控板位移**累积 + 8 ms 合并成一条**（用户 2026-10-03 ✓ 现场："卡卡的" +
+    "A 机上一段一段一顿一顿"）。
+
+    病：原来**每个事件直接发一条** ✗（触控板 60~125 Hz、快速滑还有突发）⇒ 每条都要走
+    ≈11 ms 往返（`perf.log` 的 `kbd_rtt_ms` ✓）⇒ 事件比往返快 ⇒ 必积压 ✓；且发送在
+    **GUI 主线程**、排在 `draw_ms`（中位 5 / p99 15~22 ms）后面 ⇒ 一帧攒的位移**同一拍
+    连发几条** ✗ = "一段一段"的形状来源 ✓（链路无缓冲：relay 原样转发 + 固件一批做完 ✓）。
+
+    钉四件：
+      ① `_on_pad_moved` **不再直接发** ✗（只累积 + 起节拍 ✓）；
+      ② `_flush_pad` 把累积量**合并成一条**发出去 ✓；
+      ③ **位移守恒**：整数发走、**小数留着**（慢速滑不会丢位移 ✓）；
+      ④ 没整像素时**停表**（不许空转 ✓）。
+    """
+    from types import SimpleNamespace
+
+    from gui.player_panel import PlayerPanel
+    from decision import input as dinput
+
+    sent = []
+    _old = dinput.mouse_move
+    dinput.mouse_move = lambda dx, dy: sent.append((dx, dy))
+    try:
+        class _T:
+            def __init__(self):
+                self.stopped = 0
+
+            def stop(self):
+                self.stopped += 1
+
+        # ③ 整数发走、小数留着（3.4px ⇒ 发 3、留 0.4 ✓）
+        fake = SimpleNamespace(_pad_acc=[3.4, -1.7], _pad_idle=0, _pad_timer=_T())
+        PlayerPanel._flush_pad(fake)
+        check(sent == [(3, -1)], "累积位移没有合并成一条发出去：%r" % (sent,))
+        check(abs(fake._pad_acc[0] - 0.4) < 1e-9 and abs(fake._pad_acc[1] + 0.7) < 1e-9,
+              "小数部分被丢了（慢速滑动会丢位移 ✗）：%r" % (fake._pad_acc,))
+
+        # ④ 没整像素 ⇒ 表停掉，不许空转
+        fake2 = SimpleNamespace(_pad_acc=[0.3, 0.4], _pad_idle=7, _pad_timer=_T())
+        before = len(sent)
+        PlayerPanel._flush_pad(fake2)
+        check(len(sent) == before, "不足 1px 也发了命令（空放 ✗）：%r" % (sent[before:],))
+        check(fake2._pad_timer.stopped == 1, "静下来没停表（会一直空转 ✗）")
+
+        # ① 每事件直发那条路必须**没了**（源码级，防止改回去 ✗）
+        src = (ROOT / "gui" / "player_panel.py").read_text(encoding="utf-8")
+        _body = src.split("def _on_pad_moved", 1)[1].split("def _flush_pad", 1)[0]
+        check("dinput.mouse_move(" not in _body,
+              "`_on_pad_moved` 又直接发命令了（每个事件一条 ⇒ 积压/一顿一顿回来 ✗）")
+        check("_flush_pad" in _body and "QTimer" in _body,
+              "没有起 8 ms 合并节拍（那就等于没改 ✗）")
+    finally:
+        dinput.mouse_move = _old
+
+
 TESTS = (
     ("停自动要真的松干净（下降沿 + 不许把键按回去）", t_stop_automation_releases_keys),
     ("松键那条唯一写法同时认两种后端", t_release_keys_covers_both_backends),
@@ -303,6 +359,8 @@ TESTS = (
      t_relay_trace_has_ms_timestamp),
     ("⭐⭐ A 机日志回传到 B 机（`#LOG` ⇒ `A_relay_trace.log`；不许污染回执计数）",
      t_a_logs_are_forwarded_to_b),
+    ("⭐⭐ 触控板位移累积 + 8 ms 合并成一条（位移守恒、静下来停表）",
+     t_pad_move_is_coalesced),
 )
 
 

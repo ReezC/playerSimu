@@ -973,11 +973,13 @@ def t_auto_precheck():
     （`player_lost_stop`）⇒ 表现成"开自动却只站着不打"✗ —— 查了半天 ✓。
     ⇒ 这几件事**开之前就查得出来** ⇒ 所以做在 `_toggle_auto` 里 ✓。
 
-    钉三件：
+    钉四件：
       ① 没选地图 ⇒ 只报「没选地图」并**立刻返回**（不再往下判 ✓）；
       ② 地图不存在 ⇒ 报「没标定」+「没地形」，**两条都要带"→ 去哪修"** ✓；
       ③ ⭐ **源码级**：`_toggle_auto` 里真的在"开"之前调了体检、且不通过会**把按钮拨回去** ✓
-         —— ⚠ 这条最要紧：**光有体检函数、没接上就等于没有** ✗。
+         —— ⚠ 这条最要紧：**光有体检函数、没接上就等于没有** ✗；
+      ④ ⛔⭐ **「禁用杀怪寻路」开着 ⇒ 一条都不报**（用户 2026-10-04 ✓），且 `_precheck_auto`
+         **真的把那个开关传进 `need_mmap`** ✓（光有形参不传 = 没接上 ✗）。
     """
     from gui.player_panel import PlayerPanel
 
@@ -1002,6 +1004,17 @@ def t_auto_precheck():
         check(isinstance(_r, list) and all(isinstance(x, str) and x for x in _r),
               "体检对 %r 的结论不是「非空字符串列表」⇒ 会崩或弹出空窗 ✗：%r" % (_mid, _r))
 
+    # ⛔⭐ 「**禁用杀怪寻路**」开着 ⇒ **一条都不报**（用户 2026-10-04 ✓ 原话："在设置里禁用
+    #   杀怪寻路时，让开启自动也能正常运转"）：这一页查的三件（地图 id / 标定几何 / 地形图）
+    #   全都只服务"世界坐标那一套"，而那个模式**根本不读世界坐标**（锁定/追击/走位全用画面
+    #   坐标 ✓，见 `decision/agent.py::_player_located` ✓）⇒ 它们不再是"开了自动会不动 /
+    #   自己停掉"的原因 ⇒ 再报就是**假警报**：弹窗默认按钮是「否」⇒ 点下去**自动压根没开
+    #   起来** ⇒ 现场看着就是"这个开关一开就不干活" ✗。
+    for _mid in ("", "999999999", "105040303", None):
+        check(PlayerPanel._precheck_problems(_mid, need_mmap=False) == [],
+              "「禁用杀怪寻路」开着还报体检问题（%r）⇒ 弹窗默认「否」会把自动挡在门外 ✗"
+              % (_mid,))
+
     _src = (Path(__file__).resolve().parent.parent
             / "gui" / "player_panel.py").read_text(encoding="utf-8")
     check("if on and not self._precheck_auto():" in _src,
@@ -1011,6 +1024,10 @@ def t_auto_precheck():
           "判据没抽成 `@staticmethod` ⇒ 没法像这条用例这样单测 ✗")
     check("QMessageBox.warning(" in _src and "开自动前的检查没通过" in _src,
           "没弹窗 / 弹窗标题丢了 ⇒ 用户不知道发生了什么 ✗")
+    # ⚠ 光有 `need_mmap` 形参、`_precheck_auto` 不传 ⇒ 等于没接上（那条开关还是会被弹窗挡 ✗）
+    check("need_mmap=not bool(getattr(settings, \"disable_chase_pathfinding\", False))" in _src,
+          "`_precheck_auto` 没把「禁用杀怪寻路」传进 `need_mmap` ⇒ 那个开关开着照样弹"
+          "「条件没凑齐」（默认「否」⇒ 自动开不起来）✗")
 
 
 def t_capture_est_frames():
@@ -1308,8 +1325,13 @@ def t_mmap_fail_reason_is_logged():
     # ⚠⚠ 这两条**必须断言那一行本身**，不能只看名字 ✗（反向验证实测踩了两个盲区：
     #    ① 断言 `"_mmap_map_sent" in src` —— 去掉去重那句后**赋值那句**还在 ⇒ 假绿 ✓；
     #    ② 断言 `'perf.note("mmap_map"'` —— 我自己的**注释里**也写了这串 ⇒ 假绿 ✓✓）。
-    check('if mid == getattr(self, "_mmap_map_sent", None):' in src,
-          "同一张图没去重 ⇒ 每拍都开一条 TCP 连接 ✗")
+    # ⚠⚠ 判重必须**只认成功**（`_mmap_map_ok` ✓）—— 用户 2026-10-03 ✓ 现场铁证：
+    #   原来记在**尝试之前** ✗ ⇒ 23:12 那次失败后**再也不发** ✓ ⇒ 用户把 A 换成新代码
+    #   并重启后 B 一个字没发 ⇒ A 那行永远「还没有」+ 一直"等 MAP"✓。
+    check('if mid == getattr(self, "_mmap_map_ok", None):' in src,
+          "判重还是「发过了就算」✗ ⇒ 失败不会重试、A 修好了也不会自愈 ✓")
+    check("self._mmap_map_ok = mid" in src and "_mmap_map_try" in src,
+          "失败没有重试（或没有节流）⇒ 要么永不自愈、要么每拍开一条连接 ✗")
     check('_perf.note("mmap_map", ("ok " if ok else "失败 ")' in src,
           "A 的回答没进日志 ⇒ 失败时人不知道「A 还缺什么」✗")
     # ③ 决策给出的理由（`agent.tick` 的 `reason`）也必须进日志 —— 这次"开启自动没用"

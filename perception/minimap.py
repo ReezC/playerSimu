@@ -209,8 +209,15 @@ class MiniMapClient:
             with socket.create_connection((self.host, self.port),
                                           timeout=max(0.5, float(timeout))) as s:
                 s.settimeout(max(0.2, end - time.time()))
-                s.sendall(mmap_regions.CTL_HELLO)
-                s.sendall(("%s %s\n" % (mmap_regions.CMD_MAP, mid)).encode("utf-8"))
+                # ⭐ **握手与命令合成一次 `sendall`**（2026-10-04 ✓）：分开写时这两个小包
+                #   几乎总是**被 A 那边一口气收成一段**（我们连上就发，A 还没轮到 `accept()`
+                #   ⇒ 都在它的内核接收缓冲里 ✓）—— A 侧现在能就地处理同一段里的命令
+                #   （`tools/minimap_push._ctl_feed` ✓），合成一条只是让"**一段 = 一条完整
+                #   命令**"更确定、也少一次系统调用 ✓。
+                #   ⚠ **不会让旧版 A 更糟**：旧 A 不认控制连接（不问卷手还是分段都当收帧
+                #     客户端 ✓）⇒ 两种写法它一样不理我们 ✓。
+                s.sendall(mmap_regions.CTL_HELLO
+                          + ("%s %s\n" % (mmap_regions.CMD_MAP, mid)).encode("utf-8"))
                 buf = b""
                 while b"\n" not in buf and time.time() < end:
                     try:

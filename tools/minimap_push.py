@@ -144,6 +144,61 @@ def _send_line(sock, raw):
         return False
 
 
+def _sniff_hello(c, timeout):
+    """新连接**第一行**是什么（等不到就回 `b""` ✓）—— 判断它是不是"控制连接" ✓。
+
+    ⚠⚠ 用户 2026-10-03 ✓ 现场铁证：A 的控制台里**一行「控制连接 … 已连上」都没有** ✗、
+      全是「B 机 … 已连上」✓；B 那边报「`mmap_map=失败 A 机的回执看不懂：''`」✓
+      ⇒ B 明明发了 `HELLO mmap-ctl`，A 却把它**判成了收帧连接** ⇒ ① A 一句话不回 ✓
+      ② id 永远记不上 ⇒ 部署台永远「还没有」✓。
+
+    病根：**原来只 `recv(64)` 一次** ✗ —— TCP **不保证**一次 `recv` 就给整行，拿到
+      `b"HELLO "` 这种半截时，`hello[:20] == b"HELLO mmap-ctl"` **必然不成立** ✗
+      （20 字节都没凑齐 ✓）⇒ 于是一个字都没错、但**永远认不出来** ✓。
+
+    改：**循环收，直到见到换行（或整段超时）** ✓ —— 总等待时长就是调用方给的
+      `timeout`（= 原来那个握手窗口 ✓）：**收帧客户端本来一声不吭，最坏还是等这么久** ✓
+      不会拖慢它的首帧 ✓；而控制客户端说完第一行就立刻被认出来 ✓。
+
+    ⚠⚠ 回值**不只是第一行**：可能还带着**同一口气里跟来的字节**（多半就是紧跟的那条
+      `MAP <id>` ✓ —— B 是"连上就把 `HELLO` 和 `MAP` 一起发出来"的 ✓，两下 `sendall`
+      只隔几微秒，而我们**还没轮到 `accept()`**，所以两个包早都躺在内核缓冲里了 ✓）。
+      ⇒ 调用方**必须把余下的字节交给 `_ctl_feed`**（`_accept_ctl` 就是干这个的 ✓），
+        **别丢掉** ✗ —— 丢掉就是 2026-10-04 那个"B 发的 `MAP` 石沉大海"✓。
+    """
+    end = time.time() + max(0.05, float(timeout))
+    # ⚠⚠ **超时得由这里自己设**（2026-10-04 ✓ 现场：整套自检**永远跑不完** ✗）：
+    #   上面那个"整段超时"（`while … time.time() < end`）**只在 socket 本身带超时时才成立** ——
+    #   调用方给的是一个**阻塞 socket**（`settimeout(None)`，比如 `socket.socketpair()` 的默认值）
+    #   时，`recv` 会**一直不返回** ⇒ 循环条件根本没机会判 ⇒ 函数挂死 ✗。
+    #   `main()` 那条路恰好先 `settimeout(CTL_HANDSHAKE_TIMEOUT)` 才调它 ⇒ 一直没暴露；
+    #   而 `selftest_mmap_regions.t_sniff_hello_survives_split`（用 socketpair ✓）第 ② 段
+    #   "一声不吭的收帧客户端"就卡在这儿 ⇒ **整套自检一条都跑不完**（用户："每次跑都要等
+    #   几个小时"✓ 根因就是它）。
+    _prev_to = None
+    try:
+        _prev_to = c.gettimeout()
+        c.settimeout(max(0.05, float(timeout)))
+    except Exception:                                # noqa: BLE001 —— 假 socket（用例替身）没这两个方法也算过 ✓
+        _prev_to = None
+    try:
+        buf = b""
+        while b"\n" not in buf and len(buf) < 64 and time.time() < end:
+            try:
+                chunk = c.recv(64 - len(buf))
+            except Exception:                        # noqa: BLE001 —— 超时/对端关了都算"没有" ✓
+                break
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        try:
+            c.settimeout(_prev_to)                   # 原样还回去（调用方自己会按需再设 ✓）
+        except Exception:                            # noqa: BLE001
+            pass
+    return buf
+
+
 def _answer_ctl(sock, raw, state, log=print):
     """处理**一条**控制命令 ⇒ 改 `state`（区域/zoom）并回一行。
 
@@ -214,6 +269,56 @@ def _answer_ctl(sock, raw, state, log=print):
         "不认识的命令 %r（可用：MAP / STATE / LIST / PING）" % (cmd,)).encode("utf-8"))
 
 
+def _ctl_feed(rec, buf, state, log=print):
+    """把一段字节喂给一条控制连接：**完整行**交给 `_answer_ctl`，**没成行的尾巴留着** ✓。
+
+    `rec = [sock, 对端名, 尾巴]` —— `rec[2]` 就是"上一口气里只到了半条命令"的那半个，
+    必须留着等下一段（TCP 只保证字节序、**不保证按行到** ✓）。
+
+    ⭐⭐ 为什么这个函数非有不可（2026-10-04 ✓ 现场：B 的 `MAP` 石沉大海）：
+      B 是**连上就一口气把 `HELLO` 和 `MAP <id>` 都发出来**的
+      （`perception/minimap.py::MiniMapClient.switch_map` ✓），而那两下 `sendall` 之间只隔
+      几微秒 —— A 那边多半**还没轮到 `accept()`**，两个包就都已经躺进内核接收缓冲 ⇒ 握手
+      那次 `recv` **一次就把整行 hello + 整行 MAP 拿回来了** ✓。
+      原来认完 hello 就把这坨字节**丢掉** ⇒ `MAP` 永远没人处理 ⇒ B 等 3 秒收到空气 ⇒
+      `mmap_map=失败 A 机的回执看不懂：''` ✓ —— 而且**每次都这样**（不是偶发 ✓），
+      所以现场看着像"A 机压根不支持换图" ✗。
+    """
+    c, name = rec[0], rec[1]
+    pend = (rec[2] if len(rec) > 2 else b"") + buf.replace(b"\r\n", b"\n")
+    lines = pend.split(b"\n")
+    rec[2:] = [lines.pop()]        # 尾巴 = 最后一段**没有换行**的（可能是半行 ✓）
+    for line in lines:
+        line = line.strip()
+        if line:
+            _answer_ctl(c, line, state, log=log)
+
+
+def _accept_ctl(controls, c, name, hello, state, log=print):
+    """新连接第一口气 `hello` 认出来是**控制连接** ⇒ 登记 + **就地把它喂掉** ⇒ True；否则 False。
+
+    `hello` 就是 `_sniff_hello` 的原样回值：**第一行 + 同一口气里跟来的字节** ✓ ——
+    跟来的那部分（多半是 `MAP <id>` ✓）**一个字都不许丢** ✗（见 `_ctl_feed` 的说明 ✓）。
+
+    ⚠ 抽成独立函数是为了**能单测**：这段原来嵌在 `main()` 的 accept 循环里（要 Qt + 抓屏 +
+      真 socket 才跑得到 ✗）⇒ "余下字节被丢掉"这个 bug 才藏了这么久 ✓
+      （`selftest_mmap_regions` 的 `t_hello_and_map_in_one_chunk` 与端到端那条都在钉它 ✓）。
+    """
+    _hl = mmap_regions.CTL_HELLO.rstrip(b"\n")
+    if hello[:len(_hl)] != _hl:
+        return False                   # 不是控制连接 ⇒ 交给收帧那条路（老客户端一声不吭 ✓）
+    rest = hello[len(_hl):]
+    while rest[:1] in (b"\r", b"\n"):
+        rest = rest[1:]                # 剥掉握手行自己的换行
+    c.settimeout(10)
+    rec = [c, name, rest]              # ⭐ 尾巴**必须留着**：它就是紧跟的那条 `MAP` ✓
+    controls.append(rec)
+    log("[%s] 控制连接 %s 已连上（发 `MAP <地图id>` 换图，不重启）"
+        % (time.strftime("%H:%M:%S"), name))
+    _ctl_feed(rec, b"", state, log=log)      # ⭐ 同一口气里已经到的命令**当场**处理 ✓
+    return True
+
+
 def _poll_controls(controls, state, log=print):
     """把每条控制连接上**已经到了**的命令处理掉 ⇒ 返回还活着的那几条。
 
@@ -222,6 +327,10 @@ def _poll_controls(controls, state, log=print):
 
     ⚠ 必须在 `if not clients: continue` **之前**调用：B 机常常是"先问一句再连"（切图
       那一刻也可能压根没收流），少了这一步，命令会一直没人理 ✗ 且看起来像"A 机挂了"。
+
+    ⚠ 字节一律走 `_ctl_feed`（**接到的可能是半条命令** ⇒ 尾巴要留 ✓；也可能是**两条**
+      命令连着来（`PING` + `LIST` ✓）⇒ 逐行处理 ✓）—— 别再在这里自己 `split` ✗，
+      那会把"半行"当成一条命令发出去 ✓。
     """
     if not controls:
         return controls
@@ -231,7 +340,7 @@ def _poll_controls(controls, state, log=print):
         rd = []
     keep = []
     for rec in controls:
-        c, name = rec
+        c, name = rec[0], rec[1]
         if c in rd:
             try:
                 buf = c.recv(8192)
@@ -243,10 +352,7 @@ def _poll_controls(controls, state, log=print):
             if not buf:                                      # 对端关了
                 _close(c)
                 continue
-            for line in buf.replace(b"\r\n", b"\n").split(b"\n"):
-                line = line.strip()
-                if line:
-                    _answer_ctl(c, line, state, log=log)
+            _ctl_feed(rec, buf, state, log=log)               # ⭐ 半行/多行都由它收口 ✓
         keep.append(rec)
     return keep
 
@@ -416,16 +522,13 @@ def main() -> int:
                 #   ⚠ 等握手的时间必须很短（0.25s）：正常的收流客户端连上后**一声不吭**
                 #   等着收帧 ⇒ 它只会被这个等待拖慢"首帧"，拖久了就是"B 机等帧超时"。
                 c.settimeout(mmap_regions.CTL_HANDSHAKE_TIMEOUT)
-                try:
-                    hello = c.recv(64)
-                except Exception:                            # noqa: BLE001
-                    hello = b""
-                if hello[:len(mmap_regions.CTL_HELLO.rstrip(b"\n"))] == \
-                        mmap_regions.CTL_HELLO.rstrip(b"\n"):
-                    c.settimeout(10)
-                    controls.append([c, name])
-                    print("[%s] 控制连接 %s 已连上（发 `MAP <地图id>` 换图，不重启）"
-                          % (time.strftime("%H:%M:%S"), name))
+                # ⚠⚠ 见 `_sniff_hello`：**一次 `recv` 认不出来**（"半截 hello"那条病根 ✓）；
+                #   而它回值里**还带着同一口气跟来的字节**（B 是"连上就把 `HELLO` 和 `MAP`
+                #   一起发"的 ⇒ 多半紧跟一条 `MAP` ✓）⇒ **一个字都不许丢** ✗
+                #   （丢掉的后果就是现场那个"B 的 `MAP` 石沉大海、回执看不懂：''" ✓）
+                #   ⇒ 认连接 + 登记 + **就地把余下字节喂掉**，全部收在 `_accept_ctl` 一处 ✓。
+                hello = _sniff_hello(c, mmap_regions.CTL_HANDSHAKE_TIMEOUT)
+                if _accept_ctl(controls, c, name, hello, state):
                     continue
                 c.settimeout(10)
                 # ⚠ 第 5 项 = **上一帧发这一路用了多少毫秒**（跳帧背压的判据 ✓ 见帧循环那段 ✓）

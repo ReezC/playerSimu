@@ -29,6 +29,12 @@ int heldCount = 0;
 
 void setup() {
   Serial.begin(115200);
+  // ⭐ **串口读超时收到 50 ms**（2026-10-03 ✓ 现场："一段一段一顿一顿"里那个偶发的
+  //   1 秒级冻结就是它 ✗）：默认 **1000 ms** ⇒ `readStringUntil('\n')`（见 loop ✓）
+  //   遇到 TCP 把一行切半时就**干等整整 1 秒** ✗ —— 鼠标是相对移动、这一秒里指针完全
+  //   不动（而且按键也跟着卡 ✓）。50 ms 足够收完整行（115200 下一行十几字节 ✓），
+  //   等不到就丢掉残行、继续下一拍 ✓。
+  Serial.setTimeout(50);
   Keyboard.begin();
   Mouse.begin();
   randomSeed(analogRead(A0));

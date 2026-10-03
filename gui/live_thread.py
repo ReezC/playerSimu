@@ -1416,13 +1416,24 @@ class LiveThread(QThread):
         mid = str(getattr(self, "_mmap_mid", "") or "")
         if cli is None or not mid or self._mmap_src == "live":
             return
-        if mid == getattr(self, "_mmap_map_sent", None):
+        if mid == getattr(self, "_mmap_map_ok", None):
+            return                                  # 这张图**已经成功**说过了 ✓（不再发 ✓）
+        # ⚠⚠ **失败必须重试**（用户 2026-10-03 ✓ 现场铁证）：原来把"发过了"记在**尝试之前**
+        #   ✗ ⇒ 23:12 那次失败之后**再也不发** ✓ ⇒ 用户把 A 换成新代码并重启（23:35 ✓）后
+        #   B **一个字都没再发** ⇒ A 那边自然一行「控制连接 … 已连上」都没有 ✓。
+        #   ⇒ 改成"**只在成功时才算说过**" + 失败后**每 5 秒重试一次** ✓：
+        #     A 那边一旦修好/重启，**下一次重试就自愈** ✓（不用人去重启 B 的实时 ✓）。
+        #   ⚠ 重试要有节流：每拍开一条 TCP 连接是灾难 ✗（A 那边已经被"连接只涨不落"缠住了 ✓）。
+        _now = time.monotonic()
+        if _now - float(getattr(self, "_mmap_map_try", 0.0)) < 5.0:
             return
-        self._mmap_map_sent = mid
+        self._mmap_map_try = _now
         try:
             ok, info = cli.switch_map(mid)
         except Exception as e:                          # noqa: BLE001
             ok, info = False, "%s: %s" % (type(e).__name__, e)
+        if ok:
+            self._mmap_map_ok = mid                     # ⭐ **只认成功** ⇒ 失败会重试 ✓
         try:
             from core import perf as _perf
             _perf.note("mmap_map", ("ok " if ok else "失败 ") + str(info)[:60])

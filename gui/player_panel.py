@@ -1944,9 +1944,16 @@ class PlayerPanel(QWidget):
     _precheck_ok = None
 
     @staticmethod
-    def _precheck_problems(map_id, src=None):
+    def _precheck_problems(map_id, src=None, need_mmap=True):
         """⭐ 开自动前的**条件体检**（用户 2026-09-29 ✓ 原话："开启自动前，检查一下条件吧，
         然后出弹窗提示"）。返回**问题清单**（空列表 = 通过 ✓）。
+
+        ⛔ `need_mmap=False`（= 设置里「**禁用杀怪寻路**」开着 ✓）⇒ **一条都不报** ✓：
+          这一页查的三件（地图 id / 标定几何 / 地形图）**全都只服务"世界坐标那一套"**，
+          而那个模式**根本不读世界坐标**（锁定 / 追击 / 走位全用画面坐标 ✓，见
+          `decision/agent.py::_player_located` 的说明 ✓）⇒ 它们**不再**构成"开自动不动、
+          或者过一会儿自己停掉" ✓。⚠ 不这么做的后果正是用户 2026-10-04 报的：弹窗默认
+          按钮是「否」⇒ 点下去**自动压根没开起来** ⇒ 看着就是"这个开关一开就不干活"✗。
 
         **为什么要有它**：2026-09-29 那次「开自动却不打怪、只站着」查了半天，根因是
         `森林迷宫III` 的小地图标定**只做了一半** —— `datasets/map/105040303.mapcalib.json`
@@ -1964,6 +1971,8 @@ class PlayerPanel(QWidget):
         弹窗那步交给调用方 `_precheck_auto` ✓。
         """
         probs = []
+        if not need_mmap:
+            return probs                    # ⛔ 「禁用杀怪寻路」开着 ⇒ 这些都不是拦路虎 ✓
         mid = str(map_id or "").strip()
         if not mid:
             probs.append("· **没选地图** —— 本项目还没在 ①「识别目标选项」里选地图。")
@@ -2007,7 +2016,10 @@ class PlayerPanel(QWidget):
         if self._auto_confirming:
             return True                         # 已经在问别的了，别叠对话框 ✗
         probs = self._precheck_problems(
-            getattr(self, "_map_id_for_check", lambda: "")())
+            getattr(self, "_map_id_for_check", lambda: "")(),
+            # ⛔ 「禁用杀怪寻路」开着 ⇒ 体检里那三件（地图/标定/地形）**都不构成拦路虎**
+            #   （那个模式不读世界坐标 ✓，见 `_precheck_problems` 的说明 ✓）
+            need_mmap=not bool(getattr(settings, "disable_chase_pathfinding", False)))
         if not probs:
             return True
         self._auto_confirming = True
@@ -2123,16 +2135,49 @@ class PlayerPanel(QWidget):
     # ---------------- 鼠标控制（摇杆 + 左右键） ----------------
 
     def _on_pad_moved(self, dx, dy):
-        """触控板原始位移 → 乘灵敏度 + 余数累积 → 发远程鼠标移动。"""
+        """触控板位移 → 只**累积**；真正发送交给 8 ms 的合并节拍（`_flush_pad` ✓）。
+
+        用户 2026-10-03 现场："通过触控板的远程鼠标操控卡卡的" + "在 A 机上一段一段一顿一顿
+        的指令汇报很离散" ✓。原来这里是**每个事件直接发一条** ✗（触控板 60~125 Hz、快速滑
+        还会突发）⇒ 每条都要走一趟 **≈11 ms 的往返**（`perf.log` 里 `kbd_rtt_ms` 中位 11.3 ms
+        ✓）⇒ 事件来得比往返快 ⇒ 必积压 ⇒ 「跟不上手指 + 一顿一顿」✓；而且发送跑在 **GUI 主
+        线程**上、排在 `draw_ms`（中位 5 / p99 15~22 ms）后面 ⇒ 一帧里攒下的位移**同一拍连发
+        几条** ✗ —— 这正是"A 机看到一段一段"的形状来源 ✓（链路一点缓冲都没有：relay 原样
+        转发、固件一批一口气做完 ✓）。
+        ⇒ 改成"**累积 + 8 ms 合并成一条**"：命令数从"事件率"压到 ≤125/s、且每条都是**真正的
+        位移**（位移守恒、小数留着不丢 ✓）⇒ 突发被抹平、往返不再被事件率顶爆 ✓。
+        """
         spd = max(0.01, float(settings.mouse_speed))
-        self._pad_rem[0] += dx * spd
-        self._pad_rem[1] += dy * spd
-        mx = int(self._pad_rem[0])
-        my = int(self._pad_rem[1])
-        self._pad_rem[0] -= mx
-        self._pad_rem[1] -= my
+        acc = getattr(self, "_pad_acc", None)
+        if acc is None:
+            acc = self._pad_acc = [0.0, 0.0]
+        acc[0] += dx * spd
+        acc[1] += dy * spd
+        t = getattr(self, "_pad_timer", None)
+        if t is None:
+            from PyQt5.QtCore import QTimer
+            t = self._pad_timer = QTimer(self)
+            t.setInterval(8)                 # ≈125 Hz 上限：比触控板事件率还高，不丢节拍 ✓
+            t.timeout.connect(self._flush_pad)
+        if not t.isActive():
+            t.start()
+
+    def _flush_pad(self):
+        """把这一刻累积的位移**合并成一条**发出去（位移守恒 ✓、静下来自己停表 ✓）。"""
+        acc = self._pad_acc
+        mx = int(acc[0])
+        my = int(acc[1])
         if mx or my:
+            acc[0] -= mx                     # 小数部分**留着** ⇒ 慢速滑动不会丢位移 ✓
+            acc[1] -= my
+            self._pad_idle = 0
             dinput.mouse_move(mx, my)
+            return
+        # 连续几拍都没有整像素（手指停了 / 慢到不足 1 px）⇒ 停表省空转 ✓
+        self._pad_idle = getattr(self, "_pad_idle", 0) + 1
+        if self._pad_idle >= 8:
+            self._pad_timer.stop()
+            self._pad_idle = 0
 
     def _on_mouse_speed(self, _val=None):
         settings.mouse_speed = float(self.sp_mouse_speed.value())
