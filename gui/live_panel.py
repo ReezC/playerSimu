@@ -8,19 +8,28 @@
 
 from PyQt5.QtCore import QRect, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPainter, QPixmap
-from PyQt5.QtWidgets import (QCheckBox, QFormLayout, QHBoxLayout, QLabel,
-                             QLineEdit, QMessageBox, QPushButton, QSizePolicy,
-                             QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QCheckBox, QDialog, QFileDialog, QFormLayout,
+                             QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+                             QPlainTextEdit, QProgressBar, QPushButton,
+                             QSizePolicy, QVBoxLayout, QWidget)
 
 import time
+from pathlib import Path
 
 import numpy as np
 
 from decision.agent import settings
+from gui import theme
 from gui.live_thread import LiveThread
 from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox,
                          play_sound)
 from core.config import ROOT, get, load_live, update_live
+
+#: ⭐⭐ **预览重绘的最低间隔**（毫秒 ✓ 用户 2026-10-06 ✓ 见 `_render` 的说明 ✓）：
+#: 取 **20**（= 50 fps 上限 ✓）—— 比管线实测的 `proc_fps`(**39** ✓) 略快一点 ✓
+#: ⇒ **正常时它不是限速者** ✓，只在"一小段时间里被请求多次"（换帧 + 叠图 + 那行读数 ✓）
+#: 时把重复的那些**合并掉** ✓ ⇒ 主线程开销封顶 ✓、画面永远是最新那一帧 ✓。
+RENDER_MIN_MS = 20.0
 
 
 def _bgr_to_pixmap(img):
@@ -115,6 +124,52 @@ class LiveFrameRegionClient:
         return self._crop, self._t
 
 
+class _TeeLog:
+    """导出的打印 —— **原 stdout 和界面日志各写一份**（一件都不许少 ✓）。
+
+    用户 2026-10-04 ✓ 原话："新的imgsz导出时，数据工作台**没有日志**和进度条" ⇒ 导出过程的
+    那堆输出（ultralytics / 我们自己的 print ✓）必须**实时**进到界面日志框里 ✓。
+
+    ⚠⚠ 为什么必须 **tee**（不能只往界面塞）：`redirect_stdout` 改的是**进程级**的
+      `sys.stdout`（全局只有一个 ✓），而实时线程 / 别的页也可能在打印 ⇒ 只塞界面、
+      不写回原 stdout 的话，**那些行就永远进不了 `stdout.log`** ✗
+      —— 这个项目排查问题几乎全靠日志 ⇒ 那是拿功能换功能 ✗。
+    ⚠ `sys.stdout` 在 `pythonw` 下可能是 `None` ⇒ 原样吞掉（只发界面 ✓ 不许抛 ✗）。
+    ⚠ `write` 会被 `print` **分几次**调（`print(a, b)` ⇒ 多次 write ✓）⇒ 自己攒到换行才
+      发一条（不然界面日志会被拆成半行 ✗）。
+    """
+
+    def __init__(self, orig, emit):
+        self._orig = orig
+        self._emit = emit
+        self._buf = ""
+
+    def write(self, s):
+        try:
+            if self._orig is not None:
+                self._orig.write(s)
+        except Exception:                            # noqa: BLE001
+            pass
+        try:
+            self._buf += str(s)
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                self._emit(line)
+        except Exception:                            # noqa: BLE001
+            pass
+        return len(str(s))
+
+    def flush(self):
+        try:
+            if self._orig is not None:
+                self._orig.flush()
+        except Exception:                            # noqa: BLE001
+            pass
+
+    def isatty(self):
+        return False
+
+
 class EngineExportThread(QThread):
     """后台导 TensorRT 引擎（用户 2026-10-03 ✓："不合适的话弹提示指引然后搞个按钮一键导出也行"）。
 
@@ -123,10 +178,13 @@ class EngineExportThread(QThread):
     ⚠ **只复用已有那条实现**（`tools/export_engine.export_for` ✓ 约定"一处实现"✓）：它自己
       处理了"**权重路径含中文**"那个坑 ✓（TensorRT / onnx 的 C 扩展读不了中文路径 ✗ ——
       而本项目的地图名/项目名**全是中文** ⇒ 那条路必然踩 ✓）。
+    ⭐ **`line` 信号 = 导出过程的每一行**（用户 2026-10-04 ✓ 见 `_TeeLog`）⇒ 界面上那个
+      「导出」进度窗拿它刷日志 ✓（原来这几分钟**一个字都看不到** ✗）。
     """
 
     done = pyqtSignal(str)      # 成功：最终引擎路径 ✓
     failed = pyqtSignal(str)    # 失败：原因（直接给对话框显示 ✓）
+    line = pyqtSignal(str)      # ⭐ 导出过程的一行输出（界面日志用 ✓）
 
     def __init__(self, weights, imgsz, device="0", parent=None):
         super().__init__(parent)
@@ -135,12 +193,128 @@ class EngineExportThread(QThread):
         self._device = str(device)
 
     def run(self):
+        import sys
+        from contextlib import redirect_stderr, redirect_stdout
+        from pathlib import Path
+
+        def say(text):
+            try:
+                self.line.emit(str(text))
+            except Exception:                        # noqa: BLE001 —— 日志发不出去不许影响导出 ✗
+                pass
+
+        say("=== 开始导出：%s → %s_%d.engine（imgsz=%d，device=%s）"
+            % (Path(self._weights).name, Path(self._weights).stem, self._imgsz,
+               self._imgsz, self._device))
+        say("（TensorRT 会自己调优 kernel ⇒ 这几分钟**没有百分比**，看日志在动就说明没死 ✓）")
         try:
-            from tools.export_engine import export_for
-            self.done.emit(str(export_for(self._weights, self._imgsz,
-                                          device=self._device)))
+            with redirect_stdout(_TeeLog(sys.stdout, say)), \
+                    redirect_stderr(_TeeLog(sys.stderr, say)):
+                from tools.export_engine import export_for
+                out = str(export_for(self._weights, self._imgsz,
+                                     device=self._device))
         except Exception as e:                       # noqa: BLE001
+            say("✗ 导出失败：%s: %s" % (type(e).__name__, e))
             self.failed.emit("%s: %s" % (type(e).__name__, e))
+            return
+        say("✓ 导出完成：%s" % out)
+        self.done.emit(out)
+
+
+class EngineExportDialog(QDialog):
+    """导出引擎的**进度窗**（用户 2026-10-04 ✓ 原话："新的imgsz导出时，数据工作台没有日志
+    和进度条"）。
+
+    为什么要有它：导出一次要**几分钟**（TensorRT 调优 kernel ✓），而原来界面上只有"按钮变成
+    导出中… + 状态行一句话" ⇒ 这**几分钟里没有日志、也没有任何进度** ✗ —— 人根本不知道
+    它是在跑还是已经死了 ✓（对照 `gui/yolo_workbench.py` 的训练/验证页：那两处早就是
+    「日志区 + 忙式进度条」✓，此处只是把同一套搬过来 ✓）。
+
+    三件：
+      · **忙式进度条**（`setRange(0, 0)`）：TensorRT **不给真实百分比** ⇒ **不编** ✗
+        （编个"40%"比不给更坏 ✓），配「已用 mm:ss」的计时器 ⇒ "在动"看得见 ✓；干完
+        自己收起来 ✓（同 `yolo_workbench` 的口径 ✓）；
+      · **日志框**（`QPlainTextEdit`，只读、`objectName="Log"` 走全局样式 ✓）：导出过程
+        **实时**追加（吃 `EngineExportThread.line` ✓），只追加、自动滚到最新 ✓；
+      · **关闭按钮**：跑着时写「隐藏（后台继续导出）」✓ —— 关窗**不中止**导出
+        （中止没有干净做法：TensorRT 中途被杀会留半份引擎 ✗）；结果照旧由
+        `_on_export_done/failed` 弹框报 ✓。
+    """
+
+    def __init__(self, imgsz, parent=None):
+        super().__init__(parent)
+        self._t0 = time.monotonic()
+        self._imgsz = int(imgsz)
+        self._done = False
+        self.setWindowTitle("导出 TensorRT 引擎（imgsz=%d）" % self._imgsz)
+        root = QVBoxLayout(self)
+        self.lbl_tip = QLabel("正在导出 imgsz=%d 的引擎…（几分钟；期间**界面仍能用** ✓）"
+                              % self._imgsz)
+        root.addWidget(self.lbl_tip)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 0)          # 忙式：拿不到真百分比 ⇒ 不编 ✓
+        self.bar.setToolTip(
+            "导出过程**拿不到真实百分比**（TensorRT 自己在调优 kernel）⇒ 这里只表示"
+            "「**还在跑**」✓；旁边的「已用」才是进度参考 ✓。")
+        root.addWidget(self.bar)
+        self.lbl_time = QLabel("已用 0:00")
+        self.lbl_time.setStyleSheet("color: #80868b;")
+        root.addWidget(self.lbl_time)
+        self.log = QPlainTextEdit()
+        self.log.setObjectName("Log")            # 同标注/训练页那套样式 ✓
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(2000)      # 超长截头（别无限吃内存 ✓）
+        self.log.setTextInteractionFlags(Qt.TextSelectableByMouse
+                                         | Qt.TextSelectableByKeyboard)
+        self.log.setMinimumHeight(180)
+        self.log.setToolTip("导出过程的输出（ultralytics / TensorRT / 本程序 ✓）——"
+                            "实时追加、只追加 ✓。")
+        root.addWidget(self.log, 1)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.btn_hide = QPushButton("隐藏（后台继续导出）")
+        self.btn_hide.setToolTip("关掉这个窗**不会中止导出** —— 跑完照旧弹框报结果 ✓。")
+        self.btn_hide.clicked.connect(self.hide)
+        row.addWidget(self.btn_hide)
+        root.addLayout(row)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(1000)
+        self.resize(760, 460)
+        theme.bind_window_state(self, "engine_export")
+
+    # ---- 给 `EngineExportThread.line` 用的入口 ----
+
+    def append(self, text):
+        """追一行日志（带时刻、只追加、自动滚到最新 ✓ —— 同 `yolo_workbench` 的日志区 ✓）。"""
+        s = str(text).rstrip()
+        if not s:
+            return
+        self.log.appendPlainText(time.strftime("%H:%M:%S  ") + s)
+        sb = self.log.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _tick(self):
+        m, s = divmod(int(time.monotonic() - self._t0), 60)
+        self.lbl_time.setText("已用 %d:%02d" % (m, s))
+
+    def mark_finished(self, ok=True, why=""):
+        """导出结束：进度条收起来 + 计时停 + 按钮改成「关闭」✓（如实标成功/失败 ✓）。"""
+        self._done = True
+        self._timer.stop()
+        self.bar.setVisible(False)
+        m, s = divmod(int(time.monotonic() - self._t0), 60)
+        self.lbl_time.setText("%s（用时 %d:%02d）%s"
+                              % ("✓ 完成" if ok else "✗ 失败", m, s,
+                                 ("　" + str(why)[:80]) if why else ""))
+        self.lbl_tip.setText("导出已结束 —— 可以关掉这个窗了 ✓"
+                             if ok else "导出失败了 —— 看上面的日志 ✓")
+        self.btn_hide.setText("关闭")
+        try:
+            self.btn_hide.clicked.disconnect()
+        except Exception:                            # noqa: BLE001
+            pass
+        self.btn_hide.clicked.connect(self.close)
 
 
 class LivePanel(QWidget):
@@ -151,6 +325,11 @@ class LivePanel(QWidget):
         self.project = None
         self.thread = None
         self._last_pix = None
+        #: ⭐⭐ 预览重绘**限频**用的两个小状态（用户 2026-10-06 ✓ 见 `_render` 的说明 ✓）：
+        #: `_last_render_at` = 上一次真画上去的时刻；`_render_pending` = 已经排了一次
+        #: 延迟重绘（同一拍里再来请求就只更新 `_last_pix` ✓ 合并掉 ✓）。
+        self._last_render_at = 0.0
+        self._render_pending = False
         self._last_bgr = None   # 最近一帧画面（BGR），供 HP/MP 条在画面上框选
         self._rect = None       # 本地窗口模式下框选的区域 (x, y, w, h)
         # 绘制合并（见 _on_frame）：只保留最新一帧，渲染慢时丢中间帧而不是排队
@@ -237,11 +416,32 @@ class LivePanel(QWidget):
         row = QHBoxLayout()
         row.setSpacing(6)
 
+        # ⭐⭐ **「权重」改成能自己选的下拉**（用户 2026-10-04 ✓ 原话："开始推理按钮下面的权重
+        #   为什么不能自己选（就像在 训练模型页签→训练卡片→基础权重 一样）"）。
+        #   原来是个**只读** `QLineEdit`：内容只能由 `bind(project)` 自动挑（`.engine` 优先 ✓）
+        #   —— 于是"**别的项目训好的模型想直接拿来试**""手头这份实验权重想跑一下""导出了
+        #   新引擎想立刻切过去"统统做不到 ✗（只能去改目录、或等它按 mtime 自己挑 ✓）。
+        #   候选口径**与训练卡片/④ 那张卡的「YOLO 权重」一致**（同一份 `list_weights()` ✓，
+        #   不另发明一套扫描 ✗）；默认仍是**自动挑最新**（老行为没变 ✓），
+        #   一旦你自己选了 ⇒ **按项目记住**（`project.yaml` 的 `live.weights` ✓，
+        #   同「基础权重」记在 `train.model` 的口径 ✓），下拉里的「（自动…）」随时切回来 ✓。
         row.addWidget(QLabel("权重"))
-        self.ed_weights = QLineEdit()
-        self.ed_weights.setReadOnly(True)
-        self.ed_weights.setMinimumWidth(200)
-        row.addWidget(self.ed_weights, 1)
+        self.cmb_weights = NoWheelComboBox()
+        self.cmb_weights.setMinimumWidth(200)
+        self.cmb_weights.setMaxVisibleItems(24)
+        self.cmb_weights.setToolTip(
+            "这次推理**用哪份模型**。\n\n"
+            "· （自动：本项目最新）—— 老行为 ✓：优先用最新导出的 **TensorRT 引擎**\n"
+            "  （`models/*.engine`，推理快 3-5 倍），没有才用 `models/*.pt`，再退回\n"
+            "  `runs/**/weights/best.pt`（按修改时间取最新的 ✓）；\n"
+            "· 本项目训好的：`.engine`（引擎 · 尺寸焊死）/ `.pt`（尺寸随便填 ✓）；\n"
+            "· 别的项目训好的：换张图先拿旧模型试很有用 ✓（会提示「这份权重不是本项目训的」）；\n"
+            "· （自定义 / 浏览…）：随便挑一个 `.pt` / `.engine`。\n\n"
+            "⚠ **改完要重新点「开始」才生效**（正在跑的实时不会中途换模型 —— 同其它参数 ✓）。\n"
+            "⚠ 一旦你手动选过，就会**按项目记住**、不再自动跟最新 ⇒ 想回到自动挑，\n"
+            "   选上面那项「（自动：本项目最新）」即可。")
+        self.cmb_weights.activated[int].connect(self._on_weight_pick)
+        row.addWidget(self.cmb_weights, 1)
 
         _live = load_live()
 
@@ -415,6 +615,15 @@ class LivePanel(QWidget):
         self.lbl_stats = QLabel("未开始")
         self.lbl_stats.setStyleSheet("color:#5f6368;")
         root.addWidget(self.lbl_stats)
+        # ⭐⭐ **推图那一行常显**（用户 2026-10-04 ✓ 原话："实时面板常显『推出的是哪张图 /
+        #   A 收没收下』"✓）。为什么要单独一行（现场教训 ✓）：以前只在**被拒**时才吭声 ✗，
+        #   而且只 `print` 到 stdout（重定向后还会被**缓冲**住 ✗）⇒ 人以为"我改了项目地图、
+        #   A 应该收到了"✓ 实际 A 一直收的是**旧图**、回回被拒 ✓ ⇒ 全程"没反应" ✓。
+        #   ⚠ 只读、不参与逻辑 ✓（数据来自线程的 `mmap_push_state()` ✓ 见那边说明 ✓）。
+        self.lbl_mmap = QLabel("小地图：—")
+        self.lbl_mmap.setStyleSheet("color:#5f6368;")
+        self.lbl_mmap.setWordWrap(True)
+        root.addWidget(self.lbl_mmap)
 
         self.lbl_hint = QLabel(
             "输入 fps = 来源给到的速度（收流=链路，窗口=抓帧频率）｜ 处理 fps = 我们实际跑完的帧率（低于输入就会丢帧）｜ "
@@ -761,22 +970,176 @@ class LivePanel(QWidget):
             self.stop()
 
         if project is None:
-            self.ed_weights.setText("")
+            self.cmb_weights.clear()
+            self.cmb_weights.addItem("（先打开一个项目）", "")
             return
 
-        # ⭐ **.engine 优先于 .pt**（2026-10-02 ✓）：导出过 TensorRT 引擎的项目
-        #   自动选它（推理快 3-5 倍）；没导出过的退回 .pt（老行为 ✓）。
-        #   按修改时间取最新的模型（detect_v1 比旧的 mob_v1 新）。
-        #   不能按文件名排序：detect_v1 < mob_v1，got[-1] 会选中旧的单类模型。
-        got = sorted(project.dir_of("models").glob("*.engine"),
-                     key=lambda p: p.stat().st_mtime, reverse=True)
-        if not got:
-            got = sorted(project.dir_of("models").glob("*.pt"),
-                         key=lambda p: p.stat().st_mtime, reverse=True)
-        if not got:
-            got = sorted(project.dir_of("runs").glob("**/weights/best.pt"),
-                         key=lambda p: p.stat().st_mtime, reverse=True)
-        self.ed_weights.setText(str(got[0]) if got else "")
+        # ⭐ **手选的优先、没选过才自动挑**（用户 2026-10-04 ✓ 见那个下拉的说明）：
+        #   存的地方是项目自己的 `live.weights` ✓（同「基础权重」记在 `train.model` 的口径 ✓）
+        #   —— 不存成"全局一份"：换个项目就该换模型 ✓。
+        self._fill_weight_options(str(project.sec("live").get("weights") or ""))
+
+    #: 「权重」下拉里**自动那项**的 userData（选它 = 清掉手选、回到"自动挑最新" ✓）
+    WEIGHTS_AUTO = "\x00auto"
+    #: ……「自定义 / 浏览…」那项（选中它会弹文件选择器 —— 它不是个真的权重路径 ✓）
+    WEIGHTS_CUSTOM = "\x00custom"
+
+    def _auto_weights(self, project=None):
+        """**自动挑**用哪份权重（老行为，口径只此一处 ✓）。
+
+        ⭐ `.engine` 优先于 `.pt`（2026-10-02 ✓）：导出过 TensorRT 引擎的项目自动选它
+        （推理快 3-5 倍）；没导出过的退回 `.pt`；再退回 `runs/**/weights/best.pt` ✓。
+        一律按**修改时间**取最新（不能按文件名排：`detect_v1` < `mob_v1`，
+        取 `[-1]` 会选中旧的单类模型 ✗）。
+        """
+        p = self.project if project is None else project
+        if p is None:
+            return ""
+        for pat in ("models/*.engine", "models/*.pt", "runs/**/weights/best.pt"):
+            got = sorted(p.root.glob(pat), key=lambda q: q.stat().st_mtime,
+                         reverse=True)
+            if got:
+                return str(got[0])
+        return ""
+
+    def _weight_candidates(self, project=None):
+        """「权重」下拉的候选，按"你会想用哪一份"排；**同一路径只出现一次** ✓。
+
+        ⚠ 口径与训练卡片「基础权重」/ ④ 那张卡的「YOLO 权重」**同一处**（都用
+          `tools.yolo_augment.list_weights()` ✓）—— 不另写一份扫描 ✗。
+        ⚠ `.engine` **单列一组**：`list_weights()` 只列 `.pt` ✗，而实时这边引擎才是首选 ✓
+          （几个尺寸的引擎是**共存**的：`<名字>_<尺寸>.engine` ✓，都得能选到 ✓）。
+        回 `[(label, path), …]`（不含「自动 / 自定义」那两项 ✓）。
+        """
+        p = self.project if project is None else project
+        out, seen = [], set()
+
+        def _add(label, path):
+            key = str(path)
+            if key and key not in seen:
+                seen.add(key)
+                out.append((label, key))
+
+        if p is not None:
+            for q in sorted(p.root.glob("models/*.engine"),
+                            key=lambda x: x.stat().st_mtime, reverse=True):
+                _add("%s　（引擎 · 本项目）" % q.name, q)
+            _mine = sorted(p.root.glob("models/*.pt"),
+                           key=lambda x: x.stat().st_mtime, reverse=True)
+            _mine += sorted(p.root.glob("runs/**/weights/best.pt"),
+                            key=lambda x: x.stat().st_mtime, reverse=True)
+            for q in _mine:
+                _add("%s　（本项目）" % q.name, q)
+        try:
+            from tools.yolo_augment import list_weights
+            trained = list_weights()
+        except Exception:                            # noqa: BLE001
+            trained = []
+        for label, path, pid in trained:
+            _add(label + (("　· 玩家:%s" % pid) if pid else ""), path)
+        for q in sorted(ROOT.glob("*.pt")):
+            _add("%s　（官方预训练）" % q.name, q)
+        return out
+
+    def _fill_weight_options(self, cur=None):
+        """填「权重」下拉 —— ⚠ **先填候选、再回填取值**：`findData` 找不到会**静默不选中** ✗
+        ⇒ 界面显示的是别的权重、实际用的却是存的那个（这类不一致最难查 ✓；
+        同训练卡片 `_fill_model_options` 那条说明 ✓）。
+        """
+        if cur is None:
+            cur = self._weights_chosen()
+        self.cmb_weights.blockSignals(True)
+        try:
+            self.cmb_weights.clear()
+            _auto = self._auto_weights()
+            self.cmb_weights.addItem(
+                "（自动：本项目最新）" + ("　" + Path(_auto).name if _auto
+                                        else "　· 还没有可用的"),
+                self.WEIGHTS_AUTO)
+            _cands = self._weight_candidates()
+            if _cands:
+                self.cmb_weights.insertSeparator(self.cmb_weights.count())
+            for label, path in _cands:
+                self.cmb_weights.addItem(label, path)
+            self.cmb_weights.insertSeparator(self.cmb_weights.count())
+            self.cmb_weights.addItem("（自定义 / 浏览…）", self.WEIGHTS_CUSTOM)
+            if cur and self.cmb_weights.findData(cur) < 0:
+                # 存着的那份**不在候选里**（被删了 / 从别的机器拷来的）⇒ 补一项、**别吞掉** ✗
+                # （⚠ 补的这项要标明"文件可能不在了"，不然人以为它还在用 ✓）
+                _miss = "" if Path(cur).is_file() else "　（文件不在了）"
+                self.cmb_weights.insertItem(
+                    0, "（当前填写）%s%s" % (Path(cur).name, _miss), cur)
+            i = self.cmb_weights.findData(cur) if cur else 0
+            self.cmb_weights.setCurrentIndex(i if i >= 0 else 0)
+        finally:
+            self.cmb_weights.blockSignals(False)
+        self._weights_prev = cur
+
+    def _weights_chosen(self):
+        """项目里**手选**的那份（没选过 = `""` ⇒ 走自动挑 ✓）。"""
+        if self.project is None:
+            return ""
+        try:
+            return str(self.project.sec("live").get("weights") or "")
+        except Exception:                            # noqa: BLE001
+            return ""
+
+    def cur_weights(self):
+        """**这次推理实际会用哪份权重** —— 唯一出口 ✓（`start()` 与导出引擎都读它 ✓）。
+
+        ⚠ 只许这一处：两处各读一个控件（或各写一遍自动挑的逻辑）迟早会不一致 ✗ ——
+          那正是"界面显示 A、实际用 B"这类最难查的毛病的来源 ✓。
+        """
+        w = str(self.cmb_weights.currentData() or "")
+        if w == self.WEIGHTS_AUTO or w in (self.WEIGHTS_CUSTOM, ""):
+            # 停在「自动」/「自定义」（没选完）/ 还没填过候选 ⇒ 都算自动 ✓
+            return self._auto_weights()
+        return w
+
+    def _on_weight_pick(self, _idx=None):
+        """下拉选择变化：**自定义** ⇒ 弹文件选择；**自动** ⇒ 清掉项目里手选的那份；
+        其它 ⇒ 按项目记住它 ✓（`project.yaml` 的 `live.weights` ✓）。
+        """
+        w = self.cmb_weights.currentData()
+        if w == self.WEIGHTS_CUSTOM:
+            start = str(self._weights_prev or self._auto_weights() or "")
+            path, _f = QFileDialog.getOpenFileName(
+                self, "选一份模型权重",
+                (str(Path(start).parent) if start else str(ROOT)),
+                "模型权重 (*.pt *.engine);;PyTorch 权重 (*.pt);;"
+                "TensorRT 引擎 (*.engine);;所有文件 (*)")
+            if not path:
+                i = self.cmb_weights.findData(self._weights_prev)   # 取消 ⇒ 还原
+                self.cmb_weights.setCurrentIndex(i if i >= 0 else 0)
+                return
+            if self.cmb_weights.findData(path) < 0:
+                self.cmb_weights.insertItem(self.cmb_weights.count() - 1,
+                                            "（自定义）%s" % Path(path).name, path)
+            self.cmb_weights.setCurrentIndex(self.cmb_weights.findData(path))
+            self._weights_prev = path
+            self._remember_weights(path)
+            return
+        if w == self.WEIGHTS_AUTO:
+            self._weights_prev = ""
+            self._remember_weights("")
+            return
+        self._weights_prev = str(w or "")
+        self._remember_weights(str(w or ""))
+
+    def _remember_weights(self, path):
+        """把手选结果**按项目**记住（`""` = 清掉、回到自动 ✓）。
+
+        ⚠ 存不上**不许拦人**（只读的项目目录 / yaml 坏了 ✓）：本次选择照旧生效
+          （`cur_weights` 读的是控件 ✓），只是下次打开会退回自动挑 ✓。
+        """
+        p = self.project
+        if p is None:
+            return
+        try:
+            p.sec("live")["weights"] = str(path or "")
+            p.save()
+        except Exception as e:                       # noqa: BLE001
+            print("⚠ 权重选择没存进项目（%s: %s）" % (type(e).__name__, e))
 
     @staticmethod
     def _load_offset_ms():
@@ -809,14 +1172,29 @@ class LivePanel(QWidget):
             pass
 
     def start(self):
+        # ⭐⭐ **先把地图 id 从项目重读一次**（用户 2026-10-04 ✓ 现场：项目里改了 map_id、
+        #   面板却还拿旧图去推 ⇒ A 一直回 `no-such-map` ⇒ 全程没反应 ✓ 见 `_sync_mmap_map_id`）
+        self._sync_mmap_map_id()
+        # 那一行**开局先填上**（不等第一份统计 ✓）：人一点「开始」就能看见"要推的是哪张图" ✓
+        self._show_mmap_push({"want": self._mmap_mid, "ok": "", "reply": "",
+                              "src": self._mmap_src})
         # 旧线程可能还在后台退出（已 stop），直接丢弃引用重开
         if self.thread is not None:
             self.thread.stop()
             self.thread = None
 
-        w = self.ed_weights.text().strip()
+        w = self.cur_weights()                       # ⭐ 唯一出口（见那边的说明 ✓）
         if not w:
             self.lbl_stats.setText("没有可用的模型权重 —— 请先完成 ⑦ 训练")
+            return
+        # ⚠ 手选的那份可能已经**被删 / 被移走**（下拉里会给它标「文件不在了」✓）⇒ 在这儿
+        #   就把话说清，别等 ultralytics 抛一长串栈 ✗。⚠ 只查"**带目录**的路径"：裸名字是
+        #   **官方权重名**（`yolo26n.pt` 这种），ultralytics 自己会去联网下载 ✓，
+        #   拿 `is_file()` 拦它会误伤 ✓。
+        _wp = Path(w)
+        if not _wp.is_file() and str(_wp.parent) not in ("", "."):
+            self.lbl_stats.setText("这份权重不在了：%s —— 请重新选一份（或先完成 ⑦ 训练）"
+                                   % _wp.name)
             return
 
         source = self.cmb_source.currentData()
@@ -920,6 +1298,9 @@ class LivePanel(QWidget):
         """在已收画面的基础上开启推理（YOLO + 决策 + 画框）。"""
         if self.thread is None:
             return
+        # ⭐ 顺手再重读一次地图 id（用户 2026-10-04 ✓ 同 `start` ✓）：万一"开始"之后
+        #   才改了项目地图，第二次重读能把新的推过去 ✓（成本只是一次 dict 读 ✓）。
+        self._sync_mmap_map_id()
         self.thread.set_infer(True)
         self.btn_infer.setEnabled(False)
         self.lbl_stats.setText("推理已开启（首次会加载模型，几秒）…")
@@ -1006,7 +1387,20 @@ class LivePanel(QWidget):
             # 画采样框（`_draw_probe_overlay` 内部自己拷副本，见那里的说明）
             vis = self._draw_probe_overlay(img)
         self._last_pix = _bgr_to_pixmap(vis)
-        self._render()
+        # ⭐⭐ **帧驱动这条才限频**（用户 2026-10-06 ✓ 见 `RENDER_MIN_MS` 与 `_render` 的说明 ✓）：
+        #   工作线程按 `proc_fps`(**39** ✓ 实测 ✓) 往主线程推帧 ✓，主线程还要管面板/日志/菜单 ✓
+        #   ⇒ 追不上就**排队** ✗（现场正是"预览 23.5fps + 整个窗口发木"✓，而 `draw_ms`
+        #   只有 0.02 ms ✓ ⇒ **不是画得慢** ✗）。
+        #   ⇒ 这里把"画的次数"压到 `RENDER_MIN_MS` 一次 ✓：中间来的帧**照旧更新 `_last_pix`** ✓
+        #     （下面几行统计也照旧走 ✓），只是**攒到点再画一次** ✓ ⇒ 主线程开销封顶 ✓、
+        #     画面永远是最新那一帧 ✓（同收流那条"只取最新"口径 ✓）。
+        #   ⚠ 被跳过的那次由 `QTimer.singleShot` 兜底 ✓（保证最后一帧一定画得出去 ✓）。
+        if (time.monotonic() - self._last_render_at) * 1000.0 < RENDER_MIN_MS:
+            if not self._render_pending:
+                self._render_pending = True
+                QTimer.singleShot(int(RENDER_MIN_MS) + 1, self._render_flush)
+        else:
+            self._render()
         self._draw_ms = (time.perf_counter() - t0) * 1000.0
         self._disp_drawn += 1
 
@@ -1043,7 +1437,11 @@ class LivePanel(QWidget):
         """
         if pix is None or pix.isNull() or frame_rect is None:
             self._ov_minimap = None
-            self._render()          # 立刻擦掉上一层，别等下一帧
+            # ⚠ **这里必须"立刻画"**（`_render_now` ✗ 不能用限频那个 `_render` ✓）：
+            #   限频是给**帧驱动**那条路（`_on_frame` ✓ 39 次/秒 ✓）准备的 ✓；
+            #   而"挂/卸叠图、换那行读数"是**人的动作**（几十次/秒都不到 ✓）⇒
+            #   推迟它只会让"点了没反应"或"测试看到的还是上一张"✗。
+            self._render_now()      # 立刻擦掉上一层，别等下一帧
             return
         # `note`：叠在**框选那块的下方**的一行字（玩家世界坐标，见 路线识别面板）。
         # 一起存进来，因为每次重画时都要重新贴上 —— 帧是新的，文字也得跟着重贴。
@@ -1051,7 +1449,7 @@ class LivePanel(QWidget):
         # 见 _draw_note）—— 套了 str 就会把整个列表画成一行字面量。
         self._ov_minimap = (pix, src_rect, tuple(int(v) for v in frame_rect),
                             float(alpha), note or "")
-        self._render()
+        self._render_now()          # ⚠ 人的动作 ⇒ 立刻画（同上，不限频 ✓）
 
     def set_overlay_note(self, note):
         """只换叠图那行读数 → 换成 True；现在没挂叠图 → False。
@@ -1065,12 +1463,50 @@ class LivePanel(QWidget):
         if ov is None:
             return False
         self._ov_minimap = tuple(ov[:4]) + (note or "",)   # 同上：原样存，可能是列表
-        self._render()
+        self._render_now()          # ⚠ 同上：这是"换一行字"，立刻画 ✓（不限频 ✓）
         return True
 
     def _render(self):
+        """把**最新那一帧**画上去 —— 带**限频**（同一小段时间里的多次请求合并成一次 ✓）。
+
+        ⭐⭐ 为什么要限频（用户 2026-10-06 ✓ 现场原话："**视频预览只有 10~13fps，
+          整个窗口都发木**"✓；重启调优后被拾到 **23.5fps** ✓，还是不够流畅 ✓）：
+            实测（`perf.log` ✓）`proc_fps` 中位 **39** ✓ ⇒ **管线产出没问题** ✓；
+            而 `draw_ms` 中位 **0.02 ms** ✓ ⇒ **也不是画得慢** ✗ ——
+            是工作线程按 39 帧/秒往主线程**推信号** ✓，而主线程还要处理面板/日志/菜单 ✓
+            ⇒ 追不上就**排队** ✗ ⇒ 两个现象一起来：预览只剩二十来帧 ✓、窗口发木 ✓
+            （下面那段注释里 2026-09 就记过同一件事："信号队列越堆越长，画面延迟几百毫秒"✓）。
+          ⇒ 这里把重绘**限到 `RENDER_MIN_MS` 一次** ✓：期间来的请求**只更新 `_last_pix`**
+            （`_on_frame` 照旧写 ✓）、到点**合并成一次**重绘 ✓ ⇒ 主线程每帧开销**有上限** ✓，
+            而且每次画的都是**当时最新**那一帧 ✓（陈旧帧直接丢 ✓ —— 与收流那条"只取最新"同一口径 ✓）。
+          ⚠ 保证"最后一帧一定画得出去" ✓：被推迟的那次由 `QTimer.singleShot` 兜底 ✓
+            （没有新帧也会补画 ✓）。
+        """
         if self._last_pix is None:
             return
+        # ⚠⚠ **限频不放在这儿**（如实记 ✓）：我第一版就放这儿 ⇒ 当场把 `selftest_main_window`
+        #   从 **12/12** 打到 **6/12** ✗ —— 因为这个函数**很多调用方**都用（挂/卸叠图、
+        #   换那行读数、可见性切换 ✓），放这儿等于**连"人动了立刻要看见"的那些也一起推迟** ✗。
+        #   ⇒ 限频只放**帧驱动那一條**（`_on_frame` ✓ 39 次/秒那条 ✓ 见它那几行 ✓）；
+        #     本函数**保持"立刻画"** ✓ —— 老行为一个字不变 ✓。
+        self._render_now()
+
+    def _render_flush(self):
+        """被推迟的那次到点了 ⇒ 照常画（`_render` 里会重新判一次限频 ✓）。"""
+        self._render_pending = False
+        self._render_now()
+
+    def _render_now(self):
+        """真正画一次（**只有这里**碰 Qt ✓）。
+
+        ⚠⚠ **必须自己守一道"还没有帧"**（如实记 ✓）：推迟重绘那条（`_render_flush` ✓）
+        是**直接**调本函数的 ✓ ⇒ 它绕过了 `_render` 顶上那道 `_last_pix is None` 的判断 ✗
+        ⇒ 实测当场炸 `'NoneType' object has no attribute 'scaled'` ✓（`selftest_main_window`
+        6/12 ✗）。守在这儿，两条入口就都安全了 ✓。
+        """
+        if self._last_pix is None:
+            return
+        self._last_render_at = time.monotonic()
         # 必须用 FastTransformation。
         # SmoothTransformation 缩放一张 1920x1080 要几十毫秒，而这个槽跑在
         # GUI 主线程上 —— 线程按 30fps 推信号，主线程却每帧花 40~60ms 处理，
@@ -1386,7 +1822,7 @@ class LivePanel(QWidget):
         _age = s.get("mmap_age_ms")
         _age_txt = ("%5.1f ms" % float(_age)) if isinstance(_age, (int, float)) else "    —  "
         # 明细放 tooltip：状态行那一行已经塞满了，硬挤进去反而看不清数字
-        for key in ("lag_detail", "load_detail"):
+        for key in ("lag_detail", "load_detail", "src_lag_detail"):
             d = (s.get(key) or "").strip()
             if d:
                 cur = self.lbl_stats.toolTip()
@@ -1414,6 +1850,13 @@ class LivePanel(QWidget):
         # `live_thread.limit_reason`（纯函数、有自检）：说不清时**不贴标签**。
         _limit_txt = {"input": "　⚠ 受 A 机推流限制",
                       "self": "　⚠ 本机算不过来"}.get(s.get("limit") or "", "")
+        # ⭐ 「跟不上源 ⇒ 已自动降显示刷新」（用户 2026-10-05 ✓ 见 `live_thread.
+        #   src_lag_watchdog`）：**说清它做了什么** —— 否则人看到帧率从 50 掉到 15
+        #   只会以为是程序坏了 ✗（明细在 tooltip ✓ 短句只写"降了预览" ✓）。
+        if s.get("preview_capped") and _limit_txt:
+            _limit_txt += "（预览已自动降到 %g fps）" % float(s.get("preview_fps") or 0.0)
+        # ⭐ 推图那一行每来一份状态就刷新一次（用户 2026-10-04 ✓ 常显 ✓ 见 `_show_mmap_push`）
+        self._show_mmap_push(s.get("mmap_push"))
         self.lbl_stats.setText(
             "%s%s ｜ 输入 %5.1f fps ｜ 处理 %5.1f fps ｜ 丢帧 %d ｜ 推理 %5.1f ms ｜ "
             "显示 %4.1f fps ｜ 绘制 %4.1f ms 合并丢弃 %d ｜ 检出 %d ｜ 坐标 %s ｜ %d×%d%s"
@@ -1421,6 +1864,61 @@ class LivePanel(QWidget):
                s.get("dropped", 0), s.get("infer_ms", 0), s.get("show_fps", 0),
                self._draw_ms, self._disp_merged,
                s.get("boxes", 0), _age_txt, w, h, _limit_txt))
+
+    def _sync_mmap_map_id(self):
+        """把「要给 A 机发的地图 id」从**项目**重读一次 ⇒ 变了就推给实时线程（返回是否变了 ✓）。
+
+        ⚠⚠ 为什么必须有它（用户 2026-10-04 ✓ 现场：手改了项目里的 `map_id`，A 那边"没有任何
+          变化"✓）——**权威源只有一个：`project.map_id`** ✓，而面板缓存的 `_mmap_mid` 只在
+          `bind(project)` 和"路线页手动推"时才更新 ✗ ⇒ **项目里改了它不知道** ✓ ⇒ 实时线程
+          一直拿**旧图**给 A 发 `MAP <旧 id>` ⇒ A 回 `no-such-map` ⇒ 收不到小地图 ⇒
+          定位不了玩家 ⇒ 自动不动作 ✓。
+          （查现场时的铁证：项目里明明写着 `105040306` ✓，而 `perf.log` 里 B 一直推的是
+            **105040303** ✓ 每 5 秒重试一次 ✓。）
+        ⚠ 路线页那个 `_map_id()` 读的也是 `project.map_id` ⇒ 重读是**收敛**的 ✓ 不会跟它打架 ✓；
+          项目没打开 ⇒ 什么都不做 ✓（也**不写项目** ✗）。
+        """
+        p = getattr(self, "project", None)
+        if p is None:
+            return False
+        mid = str(p.get("map_id") or "").strip()
+        if mid == str(getattr(self, "_mmap_mid", "") or ""):
+            return False
+        self._mmap_mid = mid
+        th = getattr(self, "thread", None)
+        if th is not None and hasattr(th, "set_mmap"):
+            try:
+                th.set_mmap(map_id=mid)   # 实时在跑 ⇒ 当场生效 ✓（见 set_mmap 的说明 ✓）
+            except Exception:             # noqa: BLE001 —— 推不动也别崩 ✗
+                pass
+        return True
+
+    def _show_mmap_push(self, st):
+        """把「推给 A 的是哪张图 / A 收没收下」写到常显那一行 ✓（纯展示，不参与判断 ✓）。"""
+        st = st if isinstance(st, dict) else {}
+        want = str(st.get("want") or "")
+        ok = str(st.get("ok") or "")
+        reply = str(st.get("reply") or "")
+        src = str(st.get("src") or "")
+        # ⚠ 这一段是**纯文本**（QLabel 不认 markdown ✗）⇒ 不许写 `**加粗**` ✗（写了就原样显示）
+        if src == "live":
+            self.lbl_mmap.setText("小地图：来源＝从实时画面取（不走 A 机的推流）")
+            self.lbl_mmap.setStyleSheet("color:#5f6368;")
+        elif ok and ok == want:
+            self.lbl_mmap.setText("✓ 已推给 A 机：%s（A 收下了 ✓）" % ok)
+            self.lbl_mmap.setStyleSheet("color:#137333;")
+        elif want:
+            self.lbl_mmap.setText("⚠ 要给 A 机推的是 %s —— A 说：%s"
+                                  % (want, reply or "（还没回话）"))
+            self.lbl_mmap.setStyleSheet("color:#b06000; font-weight:600;")
+        else:
+            self.lbl_mmap.setText("小地图：还没定要推哪张图（打开项目后自动带过来 ✓）")
+            self.lbl_mmap.setStyleSheet("color:#5f6368;")
+        self.lbl_mmap.setToolTip(
+            "这一行说的是「B→A 推图」那条路（小地图）现在的样子：\n"
+            "  · 要推的图 = 项目里的 map_id（打开项目/开始实时都会重读 ✓）；\n"
+            "  · 收下没 = A 机**明确回过 ok** 才算 ✓（失败每 5 秒重试一次，修好就自愈 ✓）；\n"
+            "  · 被拒时那句话就是『缺什么』—— 照着去 A 机「小地图推流 → 框选…」框一次 ✓。")
 
     def _on_stream_status(self, status):
         if status == "waiting":
@@ -1434,55 +1932,123 @@ class LivePanel(QWidget):
             self.lbl_stream.setStyleSheet("color:#c5221f; font-weight:600;")
 
     def _on_failed(self, msg):
+        # ⚠ 这行是**单行标签**（长了会被截 ✗）⇒ 全文另挂 tooltip ✓：像"权重文件不在了…"
+        #   那类消息已经把"怎么办"排在**前面**（见 `gui/live_thread.missing_weights_msg` ✓）
+        #   ⇒ 被截掉的只是尾巴上的路径，hover 一下照样看全 ✓。
         self.lbl_stats.setText("失败：%s" % msg)
+        self.lbl_stats.setToolTip(msg)
 
     def _on_imgsz_mismatch(self, want, used):
-        """引擎输入尺寸 ≠ 你填的 ⇒ **弹指引**（用户 2026-10-03 ✓ 见 `LiveThread.imgsz_mismatch`）。
+        """引擎输入尺寸 ≠ 你填的 ⇒ **弹窗，点「确定」就把导出跑起来**（用户 2026-10-05 ✓ 原话：
+        "现在调成 640imgsz 会弹窗，期望这个弹窗不管写什么，点确定就自动后台完成导出步骤"）。
 
-        ⚠ **非致命**：实时**照常在跑**（按引擎的尺寸 ✓，框的坐标仍然正确 ✓）⇒ 只指引、不停 ✓。
-        ⚠ 为什么不"自动帮你导出" ✗：那样会在**没确认**的情况下花几分钟重编译、还可能把正在
-          跑的实时卡住 ✓ ⇒ 只**指到按钮**，由人点 ✓（用户给的方案就是这个 ✓）。
+        ⚠ **非致命**：实时**照常在跑**（按引擎的尺寸 ✓，框的坐标仍然正确 ✓）⇒ 不停 ✓。
+        ⭐ **口径已改**（2026-10-03 → 2026-10-05 ✓）：原来这里只"指到按钮、由人再点一次" ✗
+          ⇒ 现在**点确定 = 直接后台开导** ✓（用户要的就是"一次点击"✓）。"要不要花几分钟重编译"
+          这件事**在这个弹窗里就已经问过了** ✓（所以不再叠一层确认 ✗ —— 那是"点两下"✗）。
+        ⚠ 推不出该导哪份 `.pt` / 已有导出在跑 ⇒ 由 `_start_engine_export` **如实说清**、**不瞎猜** ✗。
         """
         self.lbl_stats.setText("⚠ imgsz 填的 %d 不生效（这个引擎是 %d）" % (want, used))
         self.lbl_stats.setToolTip(
             "这个项目用的是 TensorRT 引擎（`models/*.engine` ✓ 实时优先选它 ✓），\n"
             "它的输入尺寸在**导出时**就焊死了：%d ✓。" % used)
-        QMessageBox.information(
+        _r = QMessageBox.question(
             self, "imgsz 不生效：这个项目用的是 TensorRT 引擎",
             "引擎的输入尺寸在**导出时**就固定了：**%d**。\n\n"
             "⇒ 你在「imgsz」里填的 **%d 不会生效**；实时已按 **%d** 跑"
             "（框的坐标仍然正确 ✓，只是「缩到多大再喂网络」这个选择没生效）。\n\n"
-            "想真用 %d，二选一：\n"
-            "  1. 点本页那个「**导出该尺寸引擎**」→ 一键导出 %d 的引擎\n"
-            "     （要几分钟 ✓ 导出完**下次启动实时会自动选它** ✓）；\n"
-            "  2. 把「权重」改选成 `.pt`（`.pt` 没有这个限制 —— 320~2048 随便填 ✓）。\n\n"
-            "（提示只弹这一次；`perf.log` 段头里也会写 `imgsz=%d(引擎·已对齐)` ✓）"
-            % (used, want, used, want, want, used))
+            "**点「确定」现在就开始导出 %d 的引擎**（后台跑，要几分钟；期间界面仍能用 ✓\n"
+            "导出完**下次启动实时会自动选它** ✓）。\n\n"
+            "⚠ 导出会重写 `models` 里那份引擎文件；**实时正在用它的话建议先停实时**"
+            "（被占用会失败 ✓）。\n"
+            "不想现在导 ⇒ 点「取消」，之后随时可点本页「导出该尺寸引擎」✓，\n"
+            "或把「权重」改选成 `.pt`（`.pt` 没有尺寸限制 —— 320~2048 随便填 ✓）。\n\n"
+            "（本提示只弹这一次；`perf.log` 段头里也会写 `imgsz=%d(引擎·已对齐)` ✓）"
+            % (used, want, used, want, used),
+            QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Ok)
+        if _r == QMessageBox.Ok:
+            self._start_engine_export(want)
+
+    def _engine_export_plan(self, imgsz):
+        """「该导哪份 `.pt` / 出什么文件名」⇒ `(pt, out, why)`。
+
+        ⚠⭐ 这是**导出这条路上唯一读权重的地方**（读权重的出口总共两处：`start()` 和这里 ✓
+          用例钉着这个数 ✓ 别再加 ✗ —— 说明见 `cur_weights` 那一处 ✓）。
+        `pt is None` 时 `why` 是**人话的原因**（由调用方弹框 ✓）—— **推不出来就指路、不猜** ✗
+        （口径同 `tools.export_engine.pt_for` ✓）。
+        """
+        try:
+            from tools.export_engine import pt_for
+            _pt, _why = pt_for(self.cur_weights())
+        except Exception as e:                       # noqa: BLE001
+            _pt, _why = None, "%s: %s" % (type(e).__name__, e)
+        if _pt is None:
+            return None, None, _why
+        return (_pt, _pt.with_name("%s_%d.engine" % (_pt.stem, int(imgsz))), "")
+
+    def _start_engine_export(self, imgsz):
+        """⭐ **把导出真的跑起来**（后台线程 + 进度窗）→ `True` = 起了 ✓。
+
+        两个调用方**共用这一段**（"一处实现" ✓）：
+          · `_on_export_engine`（按钮 ✓ —— 它自己先弹一次确认 ✓）；
+          · `_on_imgsz_mismatch`（**点确定 = 直接开导** ✓ 用户 2026-10-05 要求 ✓ ——
+            那次确认已经在那个弹窗里问过了 ⇒ **不再叠一层** ✗ 叠了就是"点两下"✗）。
+        ⚠ 推不出 `.pt` / 已有导出在跑 ⇒ **如实弹框说清** + 返回 `False` ✓（不静默 ✗）。
+        """
+        imgsz = int(imgsz)
+        _pt, _out, _why = self._engine_export_plan(imgsz)   # ⭐ 读权重只在这一处（见它 ✓）
+        if _pt is None:
+            QMessageBox.information(self, "先说明这份引擎是从哪份 .pt 导出来的", _why)
+            return False
+        _t_old = getattr(self, "_engine_thread", None)
+        if _t_old is not None and _t_old.isRunning():
+            QMessageBox.information(self, "正在导出", "上一次导出还没跑完，等它结束再点。")
+            return False
+        self.btn_export_engine.setEnabled(False)
+        self.btn_export_engine.setText("导出中…")
+        self.lbl_stats.setText("正在导出 %d 的引擎…（几分钟，别关窗口）" % imgsz)
+        _t = EngineExportThread(_pt, imgsz,
+                                device=str(load_live().get("device", "0")))
+        _t.done.connect(self._on_export_done)
+        _t.failed.connect(self._on_export_failed)
+        _t.finished.connect(self._on_export_finished)
+        # ⭐⭐ **进度窗**（用户 2026-10-04 ✓ 原话："新的imgsz导出时，数据工作台没有日志和
+        #   进度条"）：这几分钟里必须有**日志 + 进度**，不然人不知道它是在跑还是死了 ✗
+        #   （见 `EngineExportDialog` ✓）。非模态 ⇒ 界面照旧能用 ✓；
+        #   ⚠ 窗开不出来也**不许拦导出** ✗（导出才是正事 ✓）。
+        try:
+            _old = getattr(self, "_engine_dlg", None)
+            if _old is not None:
+                _old.close()
+            _dlg = EngineExportDialog(imgsz, self)
+            _t.line.connect(_dlg.append)
+            self._engine_dlg = _dlg
+            _dlg.show()
+        except Exception as e:                       # noqa: BLE001
+            self._engine_dlg = None
+            print("⚠ 导出进度窗建不起来（%s: %s）—— 导出照跑，日志看 stdout.log ✓"
+                  % (type(e).__name__, e))
+        self._export_ok = None
+        self._engine_thread = _t
+        _t.start()
+        return True
 
     def _on_export_engine(self):
         """⭐ 一键导出「当前 imgsz」对应尺寸的引擎（用户 2026-10-03 ✓ 见那个按钮的说明）。
 
-        四步都**如实**做（不许假装 ✗）：
+        三步都**如实**做（不许假装 ✗）：
           ① 从**当前权重**推出该导哪份 `.pt`（`pt_for` ✓ 推不出来就**指路**，不猜 ✗）；
           ② 弹确认框：尺寸 / 输出文件名 / 要等几分钟 / **请先停实时**（引擎会被重写 ✓）；
-          ③ 后台线程跑（复用 `tools/export_engine.export_for` ✓）；
-          ④ 成功 / 失败**都**弹框 ✓（成功还要说清"什么时候生效" ✓）。
+          ③ 交给 `_start_engine_export`（后台线程 + 进度窗 ✓ 与"imgsz 不生效"那个弹窗**共用** ✓）；
+          成功 / 失败**都**弹框 ✓（成功还要说清"什么时候生效" ✓）。
+        ⚠ 2026-10-05：**确认只在这里做**（按钮这条 ✓）；`_on_imgsz_mismatch` 那次点击本身就是
+          确认 ⇒ 那种情况**不再**走到这里（见那两个方法的说明 ✓）。
         """
-        weights = self.ed_weights.text().strip()
         imgsz = int(self.sp_imgsz.value())
-        try:
-            from tools.export_engine import pt_for
-            _pt, _why = pt_for(weights)
-        except Exception as e:                       # noqa: BLE001
-            _pt, _why = None, "%s: %s" % (type(e).__name__, e)
+        _pt, _out, _why = self._engine_export_plan(imgsz)
         if _pt is None:
             QMessageBox.information(self, "先说明这份引擎是从哪份 .pt 导出来的", _why)
             return
-        _t_old = getattr(self, "_engine_thread", None)
-        if _t_old is not None and _t_old.isRunning():
-            QMessageBox.information(self, "正在导出", "上一次导出还没跑完，等它结束再点。")
-            return
-        _out = _pt.with_name("%s_%d.engine" % (_pt.stem, imgsz))
         _ok = QMessageBox.question(
             self, "导出 TensorRT 引擎",
             "按「imgsz」里的 **%d** 导一份引擎：\n\n"
@@ -1493,29 +2059,64 @@ class LivePanel(QWidget):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if _ok != QMessageBox.Yes:
             return
-        self.btn_export_engine.setEnabled(False)
-        self.btn_export_engine.setText("导出中…")
-        self.lbl_stats.setText("正在导出 %d 的引擎…（几分钟，别关窗口）" % imgsz)
-        _t = EngineExportThread(_pt, imgsz,
-                                device=str(load_live().get("device", "0")))
-        _t.done.connect(self._on_export_done)
-        _t.failed.connect(self._on_export_failed)
-        _t.finished.connect(self._on_export_finished)
-        self._engine_thread = _t
-        _t.start()
+        self._start_engine_export(imgsz)
+
+    def _finish_export_dlg(self, ok, why=""):
+        """把进度窗收尾（**窗没建起来 / 已被关掉**都算正常 ⇒ 一律吞异常 ✓）。"""
+        dlg = getattr(self, "_engine_dlg", None)
+        if dlg is None:
+            return
+        try:
+            dlg.mark_finished(ok=bool(ok), why=why)
+        except Exception:                            # noqa: BLE001
+            pass
 
     def _on_export_done(self, path):
-        """导出成功：**说清什么时候生效**（别让人以为"现在就换了" ✗）。"""
-        from pathlib import Path
-        self.lbl_stats.setText("已导出引擎：%s（下次启动实时生效）" % Path(path).name)
+        """导出成功：① **当场把下拉切到刚导出的那份**；② 说清**怎么才算生效**。
+
+        **为什么这两件事都得做**（用户 2026-10-04 ✓ 现场：重导 960 之后点「开始推理」⇒
+        `FileNotFoundError: '…\\detect_v5.engine' does not exist` ✗）：引擎文件名带尺寸，
+        是靠 `tools/export_engine.export_for` 把 ultralytics 写出来的 `<权重名>.engine`
+        **`os.replace` 改名**成 `<权重名>_<尺寸>.engine` 得来的 ✓（不这么做几个尺寸没法共存 ✓）
+        ⇒ **旧的那个名字当场就没了** ✗。而权重路径是**点「开始」那一刻**定下、带进线程的 ✓
+        ⇒ 已经在跑的实时还捏着旧路径 ⇒ 首次加载（点「开始推理」）必然找不到文件 ✗。
+        ⇒ 三件一次收口：
+          · 「自动」时**刷新下拉**（自动那项此时就指向刚导出的引擎 ✓）；
+          · 手选的那份**正是被改名的那个**（`detect_v5.engine` ⇒ `detect_v5_960.engine` ✓）
+            ⇒ 把它改成新引擎并存进项目（否则那份选择会**永远指向一个不存在的文件** ✗）；
+          · 提示语从含糊的"下次启动生效"改成"**重新点「开始」**"（这正是这次踩空的来源 ✗）。
+        """
+        self._export_ok = True
+        _new = Path(path)
+        _cur = str(self.cmb_weights.currentData() or "")
+        if _cur in ("", self.WEIGHTS_AUTO):
+            self._fill_weight_options()              # 自动 ⇒ 刷新后自动项就指向新的 ✓
+        else:
+            _old = Path(_cur)
+            if not _old.is_file() and _new.name.startswith(_old.stem + "_"):
+                # 你选的那份**被改名成了这一份**（`detect_v5.engine` ⇒
+                # `detect_v5_960.engine` ✓）⇒ 跟着它（否则那份选择会**永远指向一个
+                # 不存在的文件** ✗），并落盘 ✓
+                self._remember_weights(path)
+                self._fill_weight_options(path)
+            else:
+                # ⚠ 别的**一律不许动**：你手选的是另一份引擎（它还在）、或者你选的就是
+                #   这份 ✓ —— 抢走选择是另一类毛病 ✗（只刷新列表 + 选回原选择 ✓）
+                self._fill_weight_options(_cur)
+        self.lbl_stats.setText("已导出引擎：%s —— 重新点「开始」即用它" % _new.name)
         QMessageBox.information(
             self, "导出完成",
             "已生成：\n  %s\n\n"
-            "**下次「开始实时」时会自动用它** —— 实时挑权重是**按修改时间取最新的\n"
-            "`.engine`** ✓，所以不用改任何设置；段头那时会写 `imgsz=<尺寸>(引擎·接受)` ✓。\n\n"
+            "**「权重」那一栏已经切到它了** ✓（名字带尺寸 `<名字>_<尺寸>.engine` ✓）。\n"
+            "⚠ **要重新点一次「开始」才用它**：权重是在点「开始」那一刻带进推理线程的，\n"
+            "   正在跑的实时**不会中途换模型** ✗（还开着就先「■ 停止」再「▶ 开始」）。\n\n"
+            "   ⭐ 刚才那个 `FileNotFoundError: … does not exist` 就是这么来的：\n"
+            "      重新导出会把**旧的** `<权重名>.engine` **改名**成带尺寸的新名字 ⇒\n"
+            "      还在跑的那份实时捏着的旧路径就没了 ✗（现在它会直接说清该怎么办 ✓）。\n\n"
             "⚠ 想同时留着别的尺寸：不用管，文件名带尺寸、互不覆盖 ✓。" % path)
 
     def _on_export_failed(self, msg):
+        self._export_ok = False
         self.lbl_stats.setText("导出失败：%s" % msg[:60])
         QMessageBox.warning(
             self, "导出失败",
@@ -1528,6 +2129,10 @@ class LivePanel(QWidget):
         self.btn_export_engine.setEnabled(True)
         self.btn_export_engine.setText("导出该尺寸引擎")
         self._engine_thread = None
+        # ⭐ 进度窗收尾（**成功/失败都收** ✓）：`_export_ok` 由 `_on_export_done/failed`
+        #   设好（信号是队列投递、顺序保持 ✓）⇒ 这里只负责"停下来 + 换成关闭按钮" ✓。
+        self._finish_export_dlg(getattr(self, "_export_ok", None) is not False)
+        self._export_ok = None
 
     def _on_weights_warn(self, msg):
         """⭐ 权重**不是本项目训的** ⇒ 状态行写清 + 弹一次（2026-10-03 ✓ 用户现场

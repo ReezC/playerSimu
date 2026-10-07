@@ -255,12 +255,47 @@ def _write(line):
         pass
 
 
+#: ⭐ 上一次截断之后**记下的文件大小**（迟滞用；见 `_trim` ✓）。
+_trim_seen = 0
+
+
 def _trim():
-    """文件太大就截掉前半（只在超限时发生，代价可忽略）。"""
+    """文件太大就**只留尾巴**（用户 2026-10-06 ✓ 现场铁证 ✓）。
+
+    ⛔⛔ **老写法每次打点都可能烧掉几十到几百毫秒** ✗（实测 ✓，`py-spy` 栈里逮到它 ✓）：
+      它 `read_text()` **整个文件**、再 `write_text()` 整个后半截 ✗ ⇒ 现场
+      `behavior.log` **14.67 MB**（`MAX_BYTES` 才 **8 MB** ✗）⇒ **每一条事件**都读 14 MB
+      （读一遍 **41.5 ms** ✗）⇒ 实测 `event()` 平均 **23.3 ms**、最坏 **~460 ms** ✗
+      ⇒ 每帧 3 条打点就是 **70 ms** ✗ ⇒ **帧率被它一个人按在 ~14 fps** ✓
+      （用户现场："预览只有 10~13fps、整个窗口都发木"✓）。
+    ⛔ 更糟的是它**静默失败** ✗（`except: pass` ✓ —— 文件被别处持有时 `write_text` 就会失败 ✓）
+      ⇒ 文件**永远停在超限状态** ✓ ⇒ **每一条事件都重来一遍** ✓（现场那个死循环 ✓）。
+    ⇒ 现在三件（都只影响"超限那一下" ✓ 平时的开销还是一行 append ✓）：
+      ① **只读尾巴**（`seek` 到"要留多少"再读 ✓）⇒ 读的量与**保留量**成正比 ✓，与文件多大无关 ✓；
+      ② **原子替换**（写临时文件 + `os.replace` ✓）⇒ 不会静默失败、也不会被并发 append 搅乱 ✓；
+      ③ **迟滞**（`_trim_seen` ✓）：只在"上次截过之后又长了一截"时才再截 ✓
+        ⇒ 不会一边截一边被自己的写入顶回去 ✓。
+    """
+    global _trim_seen
     try:
-        if LOG.stat().st_size <= MAX_BYTES:
+        size = LOG.stat().st_size
+        if size <= MAX_BYTES:
+            _trim_seen = size
             return
-        lines = LOG.read_text(encoding="utf-8").splitlines(True)
-        LOG.write_text("".join(lines[len(lines) // 2:]), encoding="utf-8")
-    except Exception:                            # noqa: BLE001
-        pass
+        if size < _trim_seen + MAX_BYTES // 8:
+            return                      # 迟滞：还没明显长出来 ⇒ 这一条不截 ✓
+        keep = MAX_BYTES // 2           # 留一半（同老口径 ✓）
+        with open(LOG, "rb") as f:
+            f.seek(max(0, size - keep))
+            f.readline()                # 丢掉可能被腰斩的半行 ✓
+            tail = f.read()
+        tmp = LOG.with_name(LOG.name + ".trim")
+        with open(tmp, "wb") as f:
+            f.write(tail)
+        tmp.replace(LOG)                # 原子换 ✓（`pathlib` 自带，省一个 import ✓）
+        _trim_seen = len(tail)
+    except Exception:                            # noqa: BLE001 —— 打点不许把主流程搞挂 ✓
+        try:
+            LOG.with_name(LOG.name + ".trim").unlink()
+        except Exception:                        # noqa: BLE001
+            pass

@@ -24,7 +24,7 @@ from PyQt5.QtWidgets import (QHBoxLayout, QLabel, QMessageBox, QPushButton,
                              QShortcut, QSizePolicy, QVBoxLayout, QWidget)
 
 from gui import labelio, theme
-from gui.canvas import ImageCanvas
+from gui.canvas import MODE_LABEL, MODE_SELECT, ImageCanvas
 from gui.widgets import NoWheelComboBox, NoWheelSlider
 
 
@@ -39,6 +39,15 @@ class ReviewPanel(QWidget):
                ("只看空帧（疑似漏检）", "zero"),
                ("只看多框（疑似误检）", "many"),
                ("只看玩家框丢失或重复", "player_count_bad"),
+               # ⭐ 「只看有掉落物」（用户 2026-10-04 ✓ 第 2 条）：掉落物是**人工标的**
+               #   （自动标注只产 玩家/怪物 ✓ 见 `tools/label_drops`），所以这条实际上是
+               #   "**挑出标过掉落物的帧**" —— 复核/补漏掉落物标注时用得上 ✓。
+               ("只看有掉落物", "has_drop"),
+               # ⭐ 「只看有宠物」（用户 2026-10-05 ✓）：宠物是**干扰类**（class 5 ✓ 见
+               #   `perception/classes.py` ✓）—— 自动标注**会**产它（`tools/label_pets` ✓ 模板匹配
+               #   或 YOLO 补框 ✓），所以这条既是"挑出标过宠物的帧"、也是**复核宠物框**的入口 ✓
+               #   （宠物最烦的错误是"把宠物误检成怪"⇒ 逐帧看一遍那几帧就够了 ✓）。
+               ("只看有宠物", "has_pet"),
                ("只看未经人工修改", "auto_only"),
                ("只看人工改过", "manual"))
 
@@ -106,9 +115,25 @@ class ReviewPanel(QWidget):
         b.clicked.connect(self.reload)
         bar.addWidget(b)
 
-        b = QPushButton("适应窗口")
-        b.clicked.connect(lambda: self.canvas.fit())
-        bar.addWidget(b)
+        # ⭐⭐ **操作模式**（用户 2026-10-04 ✓ 第 3 条：原来这儿是「适应窗口」按钮 ⇒ 换成它 ✓）。
+        #   · **标注模式**（默认 ✓ 快捷键 Q）：空白处拖 = 拉新框（老手感 ✓）；
+        #   · **选择模式**（快捷键 W）：空白处拖 = **黑色虚线**框选 ⇒ 松手**选中被框住的框**，
+        #     **不建框** ✓ ⇒ 点「删选中框」或按 Del 一次删掉一批（清理误检 ✓）。
+        #   ⚠ 「适应窗口」没消失：**双击画面**就是它 ✓（画布老规矩 ✓ 见 `ZoomPanView`），
+        #     提示行里也写着 ✓ —— 位置让给了更常用的模式开关 ✓。
+        bar.addWidget(QLabel("操作"))
+        self.cmb_mode = NoWheelComboBox()
+        self.cmb_mode.addItem("标注模式", MODE_LABEL)
+        self.cmb_mode.addItem("选择模式", MODE_SELECT)
+        self.cmb_mode.setToolTip(
+            "**标注模式**（默认 / 按 Q）：空白处拖 = **拉一个新框** ✓\n"
+            "**选择模式**（按 W）：空白处拖 = **黑色虚线**框选 ⇒ 松手**选中被框住的框** ✓\n"
+            "　　**不会建框** ✓ ⇒ 按 Del 或点「删选中框」一次删掉一批（清误检用 ✓）；\n"
+            "　　不按 Ctrl = 只选这一批，按住 Ctrl = **加选** ✓。\n\n"
+            "两种模式下都一样：框上拖 = 移动 / 框边拖 = 缩放 / 滚轮 = 缩放 /\n"
+            "中键拖 = 平移 / **双击 = 适应窗口** / ←→ = 上一帧下一帧 ✓")
+        self.cmb_mode.currentIndexChanged.connect(self._on_mode_changed)
+        bar.addWidget(self.cmb_mode)
 
         root.addLayout(bar)
 
@@ -135,7 +160,17 @@ class ReviewPanel(QWidget):
         self.canvas.copy_requested.connect(self._copy)
         self.canvas.paste_requested.connect(self._paste)
         self.canvas.undo_requested.connect(self._undo_edit)
+        # ⭐ 框选/点框选中了几个，写一句给用户看（「选中 3 个框 ⇒ 按 Del 一起删」✓）
+        self.canvas.selection_changed.connect(self._on_selection_changed)
         root.addWidget(self.canvas, 1)
+
+        # ⭐ 操作模式快捷键（用户 2026-10-04 ✓ 第 3 条）：**Q = 标注模式、W = 选择模式** ✓
+        #   ⚠ 与 ←/→ 用**同一套** context（`WidgetWithChildrenShortcut` ✓ 见上面那段说明）：
+        #     只在质检台里生效，不去别的页签抢 Q/W 那两个字母键 ✗。
+        for key, mode in ((Qt.Key_Q, MODE_LABEL), (Qt.Key_W, MODE_SELECT)):
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.WidgetWithChildrenShortcut)
+            sc.activated.connect(lambda m=mode: self.set_mode(m))
 
         # ---- 本帧信息行（独占一行）----
         # 「这一帧有什么」是质检时一直在看的东西：帧名 / 各类框数 / 是否人工改过 /
@@ -156,7 +191,10 @@ class ReviewPanel(QWidget):
         # 顺序按常用度：怪物最常用（自动标注也产它），玩家次之 —— 而**按住 Ctrl
         # 拖出来的一律是玩家框**（不用来回切下拉框，见下面那行提示）。
         # 「其他玩家」只人工标（自动标注不产这个类，见 perception/classes.py）。
-        for _cls in (labelio.CLASS_MOB, labelio.CLASS_PLAYER,
+        # ⭐ **掉落物**（用户 2026-10-04 ✓ 第 1 条："质检台现在需要能手动标注掉落物类"）——
+        #   排第二：自动标注产的是 玩家/怪物（见 `tools/label_drops` ✓），而**掉落物全靠人工补**
+        #   ⇒ 它和怪物一样常用 ✓（`CLASS_DROP = 2` 见 `perception/classes.py` ✓ 颜色/名字都在那儿 ✓）。
+        for _cls in (labelio.CLASS_MOB, labelio.CLASS_DROP, labelio.CLASS_PLAYER,
                      labelio.CLASS_OTHER_PLAYER, labelio.CLASS_PET):
             self.cmb_cls.addItem(labelio.label(_cls), _cls)
         self.cmb_cls.currentIndexChanged.connect(self._on_cls_changed)
@@ -186,14 +224,21 @@ class ReviewPanel(QWidget):
         root.addLayout(ops)
 
         # ---- 操作提示：只留「手上要用的」，快捷键细节放按钮 tooltip，别挤成一长条 ----
-        hint = QLabel("空白拖=建框（按住 Ctrl 拖 = 玩家框）　框边拖=缩放　"
+        hint = QLabel("空白拖=建框（按住 Ctrl 拖 = 玩家框）　Q/W=标注/选择模式　框边拖=缩放　"
                       "Del=删框　滚轮=缩放　中键拖=平移　双击=适应窗口　"
                       "←/→=上一帧/下一帧")
         hint.setStyleSheet("color: #80868b;")
         hint.setToolTip("复制 / 粘贴 / 撤销：Ctrl+C / Ctrl+V / Ctrl+Z（也可用上面的按钮）\n"
                         "按住 Ctrl 拖空白处 = 按「玩家」类建框，松开 Ctrl 后回到下拉框选的类\n"
+                        "Q = 标注模式（空白拖 = 拉新框）；W = 选择模式（空白拖 = 黑虚线框选，"
+                        "选中被框住的框 ⇒ Del 批量删 ✓）\n"
                         "← / →：上一帧 / 下一帧（焦点在这个面板里就行，按着不放会连切 ✓）")
         root.addWidget(hint)
+
+        # ⚠ 这一句要放在**最后**：`_on_mode_changed` 会写 `lbl_status`（上面那行才建出来 ✗）
+        #   —— 放早了就是 `AttributeError: 'ReviewPanel' object has no attribute 'lbl_status'`
+        #   （本轮踩过 ✓ 离屏探针当场抓到 ✓）。
+        self._on_mode_changed()      # 按下拉框的默认值同步一次（默认 = 标注模式 ✓ 光标也对上 ✓）
 
     # ══════════════════════════════════════════════════
     # 数据
@@ -240,6 +285,21 @@ class ReviewPanel(QWidget):
                 by_cls = labelio.count_by_class(self.project, stem)
                 if by_cls.get(labelio.CLASS_PLAYER, 0) == 1:
                     continue
+            if mode == "has_drop":
+                # ⭐ 「只看有掉落物」（用户 2026-10-04 ✓ 第 2 条）—— 一个掉落框都没有就跳过 ✓。
+                #   ⚠ 取的是**合并后**的框（labels_auto + labels ✓ 见 `labelio.count_by_class`）：
+                #     将来自动标注也产掉落物时，这条筛选不用改 ✓。
+                if not labelio.count_by_class(self.project, stem).get(labelio.CLASS_DROP, 0):
+                    continue
+            if mode == "has_pet":
+                # ⭐ 「只看有宠物」（用户 2026-10-05 ✓）—— 与上一条**同款** ✓：
+                #   一个宠物框都没有就跳过 ✓；同样取**合并后**的框（`labels_auto` + `labels` ✓
+                #   见 `labelio.count_by_class` ✓）⇒ 人工补的宠物框也算 ✓。
+                #   ⚠ 为什么值得有这么一条：宠物是**干扰类**（class 5 ✓）—— 它最烦的错误是
+                #     "宠物被误检成怪 / 怪被误检成宠物" ✓ ⇒ 有这一条就能把"标过宠物的那几帧"
+                #     一次挑出来逐帧核对 ✓（不用在几百帧里翻 ✓）。
+                if not labelio.count_by_class(self.project, stem).get(labelio.CLASS_PET, 0):
+                    continue
 
             self.items.append((stem, n, manual))
 
@@ -285,10 +345,35 @@ class ReviewPanel(QWidget):
         by_cls = " · ".join("%s %d" % (labelio.label(c), counts.get(c, 0))
                             for c in shown)
 
-        self.lbl_frame.setText("%s　%s%s"
-                               % (path.name, by_cls,
+        # ⭐⭐ **分辨率写在帧名后面**（用户 2026-10-05 ✓ 原话："在质检台帧名后面显示分辨率"）。
+        #   为什么值得放在这一行：**同一批里面混进别的分辨率**是真会发生的 ✓，而且后果很隐蔽 ✗ ——
+        #   实测现场（阳光沙滩那个项目）：前 158 帧 1920×1080、后 28 帧 1280×720（重采时窗口变小 ✓）
+        #   ⇒ 标定是按 1080p 做的（`scale_at` ✓）⇒ 720p 那批里目标小 1.5 倍 ⇒ 模板大 1.5 倍
+        #   ⇒ **那批帧一个都检不出** ✗（日志只会泛泛说"scale 不对" ✓ 上一轮就是被它带偏的 ✓）。
+        #   ⚠ 顺序要紧：**警告紧跟帧名 + 分辨率** ✗ —— 这一行是 `QSizePolicy.Ignored` ⇒ 太长会被
+        #     裁掉 ✗，把"最该看见的"塞在末尾等于没有 ✓。
+        res_txt = "%d×%d" % (w, h)
+        at = self.project.get("scale_at") or {}
+        warn = ""
+        try:
+            aw, ah = int(at.get("width") or 0), int(at.get("height") or 0)
+        except (TypeError, ValueError):
+            aw = ah = 0
+        if aw and ah and (aw, ah) != (w, h):
+            warn = "　⚠ 与标定不符（标定是 %d×%d）" % (aw, ah)
+
+        self.lbl_frame.setText("%s　%s%s　%s%s"
+                               % (path.name, res_txt, warn, by_cls,
                                   "　（人工改过）" if manual else ""))
-        self.lbl_frame.setToolTip("画面 %d×%d，本帧共 %d 个框" % (w, h, len(boxes)))
+        tip = "画面 %d×%d，本帧共 %d 个框" % (w, h, len(boxes))
+        if warn:
+            tip += ("\n\n⚠ 这一帧的分辨率与**标定时的画面**不一样（标定是 %d×%d ✓）。"
+                    "模板是按标定那套尺寸缩放出来的 ⇒ 分辨率对不上的帧，"
+                    "模板匹配**一个都检不出** ✓。\n"
+                    "处理办法：把这批帧单独放一个项目，先在 ③ 重标一遍再标 ✓" % (aw, ah))
+        elif aw and ah:
+            tip += "\n（分辨率与标定一致 %d×%d ✓）" % (aw, ah)
+        self.lbl_frame.setToolTip(tip)
         self.lbl_status.setText("")      # 翻帧后清掉上一帧的操作反馈
 
     def _save_current(self):
@@ -372,6 +457,36 @@ class ReviewPanel(QWidget):
     def _on_cls_changed(self):
         self.canvas.current_cls = self.cmb_cls.currentData()
         self._set_status("新建框类别：%s" % self.cmb_cls.currentText())
+
+    # ══════════════════════════════════════════════════
+    # 操作模式（用户 2026-10-04 ✓ 第 3 条）
+    # ══════════════════════════════════════════════════
+    def set_mode(self, mode):
+        """切**操作模式** —— 下拉 / **Q** / **W** 三条路都走这里 ✓（口径只此一处 ✓）。
+
+        ⚠ 快捷键也要**同步下拉框**：按了 W 而下拉还写着"标注模式"，人会以为快捷键没生效 ✗
+          （`setCurrentIndex` 自己会触发 `_on_mode_changed` ⇒ 剩下的活由它干，不重复 ✓）。
+        ⚠ 传未知值 ⇒ 回到标注模式（同 `ImageCanvas.set_mode` 的取舍：宁可回到最熟的那个 ✓）。
+        """
+        i = self.cmb_mode.findData(mode)
+        if i >= 0 and i != self.cmb_mode.currentIndex():
+            self.cmb_mode.setCurrentIndex(i)
+            return self.canvas.mode
+        return self._on_mode_changed()
+
+    def _on_mode_changed(self, *_):
+        """下拉变了（或按了 Q/W）⇒ 同步画布 + 写一句反馈 ✓。返回生效的模式 ✓。"""
+        mode = str(self.cmb_mode.currentData() or MODE_LABEL)
+        self.canvas.set_mode(mode)
+        self._set_status("操作模式：%s" % self.cmb_mode.currentText())
+        return self.canvas.mode
+
+    def _on_selection_changed(self, n):
+        """选中数变了 ⇒ 写一句 —— **批量删**这条路就靠这句告诉人下一步按什么 ✓。"""
+        if n > 0:
+            self._set_status("已选 %d 个框 —— 按 Del 或点「删选中框」一起删" % n, ok=True)
+        elif self.canvas.mode == MODE_SELECT:
+            self._set_status("没有选中的框 —— 在空白处拖一个黑框，被它框住的框会被选中 ✓")
 
     def _delete_selected(self):
         n = self.canvas.remove_selected()

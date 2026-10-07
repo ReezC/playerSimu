@@ -31,10 +31,15 @@ CLASS_PLAYER = 0
 CLASS_MOB = 1
 CLASS_DROP = 2
 CLASS_NPC = 3
-CLASS_OTHER_PLAYER = 4      # 其他玩家：目前只画框、不进决策（见 gui/live_thread.py）
-CLASS_PET = 5               # ⭐ 宠物（干扰类，用户 2026-10-02 ✓）：不进决策，标它只为让模型
+CLASS_OTHER_PLAYER = 4      # 其他玩家：**只画框、不进决策**（画框见 gui/live_thread 的
+                            #   `class_box_draw_list` ✓ 要不要画在"设置→界面→检测框颜色"
+                            #   那一行前面的勾里 ✓；决策那条链见 `live_thread.split_dets` ✓）
+CLASS_PET = 5               # ⭐ 宠物（干扰类，用户 2026-10-02 ✓）：**不进决策**，标它只为让模型
                             #   学会区分"宠物 vs 怪"——被宠物挡住的怪也能检测、宠物不被误检为怪。
-                            #   推理时过滤掉（见 live_thread 的检测过滤）✓
+                            #   ⚠ 2026-10-06 用户追问"**为何没看到掉落物、宠物的检出框？**"之后：
+                            #   **画是画了**（实时预览按类别画 ✓ 同 `CLASS_OTHER_PLAYER` ✓），
+                            #   但**照样不进决策** ✗（`split_dets` 那个唯一出口照旧丢掉它们 ✓）——
+                            #   "看得见"和"理它"是两件事，别混 ✗。
 
 #: (id, 英文名, 中文名, 默认色 BGR)
 #: 顺序即权威 id —— **不要在中间插队或删除**，那会让已经训好的权重整体错位。
@@ -58,6 +63,30 @@ EN_LIST = [c[1] for c in CLASSES]              # 按 id 索引的列表（数据
 def label(cls, fallback=None):
     """类别 id → 中文名；未知 id 回退成 fallback（默认就是 id 的字符串）。"""
     return ZH_NAMES.get(cls, fallback if fallback is not None else str(cls))
+
+
+#: 英文名 → 类别 id。⭐ 「标注 target」用的**就是**这个英文名（`"mob"` / `"player"` /
+#: `"drop"` / `"pet"` ✓ 见 `gui/labelio` 的台账与 `gui/frame_picker` 的 target ✓）。
+ID_BY_EN = {c[1]: c[0] for c in CLASSES}
+
+
+def id_of_name(name, fallback=None):
+    """英文名（= 标注 target 名 ✓）→ 类别 id ✓；不认识 ⇒ `fallback` ✓。"""
+    return ID_BY_EN.get(str(name or "").strip(), fallback)
+
+
+def zh_of_name(name, fallback=None):
+    """英文名（= 标注 target 名 ✓）→ 中文名 ✓。
+
+    ⚠⚠ **这是\"target 显示成什么中文\"的唯一定义处** ✓（2026-10-04 收的 ✓）——
+      原来 `gui/frame_picker.py` 和 `gui/steps/cards.py` 各写了一份
+      `"怪物" if target == "mob" else "玩家"` ✗ ⇒ 掉落物/宠物一进来**全被显示成「玩家」** ✗
+      （用户 2026-10-04 ✓：\"标注掉落物、宠物的提交按钮需要先开选帧弹窗\"⇒ 那些窗一开就露馅 ✓）。
+    """
+    cid = ID_BY_EN.get(str(name or "").strip())
+    if cid is None:
+        return fallback if fallback is not None else str(name or "")
+    return ZH_NAMES.get(cid, fallback if fallback is not None else str(name or ""))
 
 
 def bgr_to_rgb(bgr):

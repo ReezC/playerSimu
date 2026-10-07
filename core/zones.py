@@ -13,9 +13,10 @@
 
 3. **边是有向的** ✅
    "B 沿绳 L3 上去到 C" 与 "C 掉到 B" 是**两条**边（下落单向）。
-   类型（界面上叫「**通行方式**」）**只有四种**：`walk` / `climb` / `drop` / `jump`
-   —— 四种**都有执行器** ✓（2026-09-27 用户要求**移除** `portal` 传送门与
-   `unconfirmed` 待确认，理由见 `EDGE_KINDS` 上面那段 ✓）。
+   类型（界面上叫「**通行方式**」）**五种**：`walk` / `climb` / `drop` / `jump` / `portal`
+   —— 五种**都有执行器** ✓（2026-09-27 用户要求**移除** `portal` 传送门与 `unconfirmed`
+   待确认；⭐ **2026-10-06 又加回 `portal`（传送点）** ✓ —— 起因、口径与"两处按跳"那类坑
+   见 `EDGE_KINDS` 上面那段 ✓）。
    边仍然**只能靠人加**：`walk_suggestions()` / `climb_suggestions()` 只**建议**，
    采纳之后才写进 edges —— 与 README「标定前不把视觉预测变成按键」一致 ✓。
 
@@ -50,7 +51,18 @@ ATTACH_PAD = 24
 #:   从此不存在 ✓（老文件里若残留这两种 kind，`validate` 会报出来、规划时**不参选** ✓）。
 #: ⚠ `jump` / `drop` 都是**跳跃键**的动作，实机前要先做**跳跃标定**（§6），
 #: 但**记录/规划**不受影响 —— 先标好"这里要跳/要下跳"，标定完就能跑 ✓。
-EDGE_KINDS = ("walk", "climb", "drop", "jump")
+#: ⭐⭐ 2026-10-06 **加回 `portal`（传送点）**（用户原话："现在增加一种新的通行方式
+#:   '传送点(portal)'供寻路编辑器→增加可达 弹窗里配置；选中后，可以选择传送点（例如黄金沙滩项目，
+#:   地形叠加图里的"h009"），操作方式是走到该点位按↑" ✓）。
+#:   ⚠ 2026-09-27 移除它的两条理由，这次都被堵上了 ✓：
+#:     · "**没有执行器**" ⇒ 现在有 `route.PortalJob` ✓（走到该点 ⇒ **点按一下 ↑** ✓ 用户定 ✓）；
+#:     · "**落点数据也没有**" ⇒ **同图**门的落点查得到 ✓：`Portal.tn` 就是**目标门名** ✓
+#:       在本图 `terrain.portals` 里一解析就拿到出口坐标 ✓（`portal_exit` ✓）。
+#:   ⚠ **跨图不支持**（用户 2026-10-06 明确 ✓）：`tm != 999999999` 的门在编辑器里**列出来但标灰**
+#:     并说清原因 ✓（别静默 ✗）；真要用得先有"目标图 + 目标点"两件事 ✓ 那是另一个功能 ✓。
+#:   ⚠ 纪律不变：**每种通行方式都必须有执行器** ✓ ⇒ 加这个 kind 的那一轮**必须同时**
+#:     把 `job_for_edge` 的 `portal` 分支加上 ✗（只加 kind ⇒ 规划出一条 portal 边会当场炸 ✓）。
+EDGE_KINDS = ("walk", "climb", "drop", "jump", "portal")
 
 #: 边类型 → 界面上的说法 + 画布箭头颜色（绿实线/蓝虚线/橙虚线…，见 §12.3 B5）
 #:
@@ -64,12 +76,18 @@ EDGE_KINDS = ("walk", "climb", "drop", "jump")
 #:
 #: ⚠ 跳 vs 下跳是**两个不同类型**，别混（2026-09-26 用户专门澄清过）。它们的
 #: 按键不一样、落点也不一样：跳是"往前蹦"，下跳是"往下穿"。
-#: ⚠ **传送门 / 待确认 2026-09-27 已移除**（用户要求）：不是通行方式 ✗。
+#: ⭐ **传送门 → 传送点**：2026-09-27 移除过 ✓、**2026-10-06 加回** ✓（用户点了名要它 ✓
+#:   执行器 `route.PortalJob` ✓ 落点靠同图门的 `tn` 解析 ✓ 见 `portal_exit` ✓）。
+#:   ⚠ 「待确认（`unconfirmed`）」**仍然不是通行方式**（它是编辑器**建议边**的中转标记 ✗）——
+#:     老文件里若残留，`validate` 会如实报出来 ✓ 规划也不拿它当候选 ✓。
 EDGE_LABELS = {
     "walk": ("走(walk)", "#188038"),
     "climb": ("爬（绳梯）", "#1a73e8"),
     "jump": ("跳(jump)", "#00897b"),
     "drop": ("下跳(drop)", "#e8710a"),
+    # ⭐ 传送点（2026-10-06 ✓ 用户点名要的一种通行方式）：走到门 ⇒ 点按 ↑ ✓
+    #   紫色（和上面四种都不撞 ✓）；画布上按这个色画这条边 ✓（与「地点」那套的传送门标记区分 ✓）。
+    "portal": ("传送点(portal)", "#9334e6"),
 }
 
 #: 集合默认配色（编辑器按注册顺序取，可在界面上改）
@@ -207,16 +225,23 @@ def ladders_of(terrain, ids):
 
 
 def ladders_touching(terrain, ids):
-    """「和这个集合有关」的绳 → [Ladder…] = **本集合范围内的绳** ∪ **绳端落在本集合的绳**。
+    """「和这个集合有关」的绳 → [Ladder…]（给"加爬升边时选哪根绳"用 ✓ §12.3 B5）。
 
-    给"加爬升边时选哪根绳"用（§12.3 B5：只列与 from 集合有关的绳）。比 `ladders_of`
-    多一类：绳段在下面、**顶端却通到这块平台**（绳端离平台面几十像素是常态）——
-    那正是"能爬上来"的那种绳，选边时当然要能选到。
-    **高亮不用这个**：那会把"下面平台的绳"也画到本集合身上（见 ladders_of 的说明）。
+    三类，比 `ladders_of` 多两类：
+      · 绳段在下面、**顶端却通到这块平台**（绳端离平台面几十像素是常态）✓
+        —— 那正是"能爬上来"的那种绳，选边时当然要能选到 ✓；
+      · ⭐ **绳从这一层穿过去**（`_over_span` ✓ 2026-10-06 加 ✓）—— 哪怕绳的**正下方
+        不在**这一层里 ✓（人横着**斜跳**一下就够得着它 ✓ 见 `climb_via_jump` ✓）。
+        ⚠ 用户 2026-10-06 的现场（图 `110040000`：集合 7 想爬 L6 上 6 ✓ 绳在 x=423、
+          而 7 层从 467 起 ⇒ 差 44px ✗）就是这一类 ⇒ 老判据**两样都不占** ⇒ 编辑器
+          **根本列不出 L6** ✗（他当时只能勾「全部」硬选 ✓），选完又建不出任务 ⇒ **发呆** ✓。
+          ⇒ 这一格既是"够得着"的真相 ✓，也是**别在界面上说反话**（标着"走不到它"、其实能走 ✗）✓。
+    **高亮不用这个**：那会把"下面平台的绳"也画到本集合身上（见 `ladders_of` 的说明）。
     """
     out = list(ladders_of(terrain, ids))
     seen = {id(L) for L in out}
     want = {str(i) for i in ids}
+    sp = set_span(terrain, ids)
     for L in terrain.ladders:
         if id(L) in seen:
             continue
@@ -224,6 +249,9 @@ def ladders_touching(terrain, ids):
             if f is not None and str(f.fid) in want:
                 out.append(L)
                 break
+        else:
+            if _over_span(sp, L):        # ⭐ 只是"路过"这一层（2026-10-06 ✓）
+                out.append(L)
     return out
 
 
@@ -255,6 +283,46 @@ def ladder_ends(terrain, ladder, span=260):
     return (pairs[0][1], pairs[1][1])
 
 
+def portal_by_pn(terrain, pn):
+    """按门名（`pn` ✓ 例如 `h009`）找这个传送点 → `Portal` 或 None ✓（口径只此一处 ✓）。"""
+    want = str(pn or "").strip()
+    if not want or terrain is None:
+        return None
+    for p in getattr(terrain, "portals", []) or []:
+        if str(p.pn) == want:
+            return p
+    return None
+
+
+def portal_exit(terrain, pn):
+    """这个传送点**通向哪里** → 出口 `Portal` 或 None ✓（用户 2026-10-06 ✓）。
+
+    用户原话："我们应该能知道这个传送点通向哪里，寻路代价就等于角色当前到传送起点的距离
+      ＋ 传送终点距离到目标点的距离" ✓ ⇒ 所以要能把出口**解析出来** ✓。
+
+    ⭐⭐ 2026-10-06 **判据修正**（用户当面纠正 ✓ 原话："**阳光沙滩的 h00x 这些传送点的地图 id
+      不就是阳光沙滩本身吗？为什么写着跨图？**"✓）：
+      老实现只认 `tm == 999999999`（当成"本图内"的唯一标志 ✗）—— 那是**错的口径** ✗：
+      实数据里**同图门的 `tm` 就是本图的地图 id**（图 `110040000` 的 `h001`/`h002`/`h008`/
+      `h009`… 实测全是 `110040000` ✓；`999999999` 是**没配目标**那种，如 `h006`/`sp` ✓）
+      ⇒ 老判据把**整张图的同图门全判成"跨图"** ✗（`h009 → h010` 就在本图，也照样被挡 ✓）。
+      ⇒ 现在**只看一件事**：`tn` 指的那扇门**在不在本图的 `portals` 里** ✓ ——
+        在 ⇒ **同图出口** ✓（`tm` 是 999999999 还是本图 id **都不影响** ✓）；
+        不在 ⇒ `None` ✓（那才是真跨图 ✓ 如 `west00: tm=110030000, tn=east00` ✓）。
+      ⚠ `tm` 现在**只用于话术**（说清"跨图"还是"落点没导进来" ✓ 见 `validate` ✓）——
+        判据不再依赖它 ✓（依赖它就会重蹈这次 ✗）。
+      ⚠ 自环门（`tn == pn`）⇒ 当"没有出口" ✓（返回自己等于原地打转 ✗）。
+    """
+    p = portal_by_pn(terrain, pn)
+    if p is None:
+        return None
+    want = str(getattr(p, "tn", "") or "").strip()
+    if not want:
+        return None
+    hit = portal_by_pn(terrain, want)
+    return hit if (hit is not None and hit is not p) else None
+
+
 def portals_of(terrain, ids):
     """集合里**包含**的传送门 → [Portal…]（判据：落在集合包围盒 ±ATTACH_PAD 内）。"""
     sp = set_span(terrain, ids)
@@ -264,6 +332,173 @@ def portals_of(terrain, ids):
     return [p for p in terrain.portals
             if x0 - ATTACH_PAD <= p.x <= x1 + ATTACH_PAD
             and y0 - ATTACH_PAD <= p.y <= y1 + ATTACH_PAD]
+
+
+# ══════════════════════════════════════════
+# 「地点」（用户 2026-10-05 ✓）：一个地图元素的**稳定描述**
+# ══════════════════════════════════════════
+# 用途：「平台站桩」的**站桩地点** + 「定时拾取掉落」的**掉落地区**（各是一个 dict ✓），
+#   由「地区选择」通用弹窗（`gui/element_picker.py`）产出 ⇒ 按项目存进 `project.yaml` 的
+#   `decision` 段 ✓。四类（与 `DecisionSettings.SPOT_KINDS` **同一份口径** ✓）：
+#     {"kind":"set",     "name":"二楼"}                     foothold 集合
+#     {"kind":"foothold","fid":"41","ratio":100.0}          单条 foothold（`ratio` 只给"走到百分之几"用）
+#     {"kind":"ladder",  "lid":"L2","x":1234}               绳梯（`lid` 供显示、`x` 供定位 ✓）
+#     {"kind":"portal",  "pn":"sp","x":100,"y":200}         传送门
+# ⚠ 这四件**只在"怎么找回来"这一层**（本模块）；"x 范围""该走哪个集合"那些**决策语义**
+#   分别在 `decision.route.set_span`（集合）与 `decision.agent` / `gui/live_thread` 里 ✓
+#   —— 别把决策口径搬进 core（core 不许 import decision ✗ 见文件顶部的分层说明 ✓）。
+
+def find_foothold(terrain, fid):
+    """按 id 找那条 foothold（**墙也算** —— 判"能不能站"是调用方的事 ✓）；没有 ⇒ None。"""
+    want = str(fid or "").strip()
+    if not want or terrain is None:
+        return None
+    for f in (getattr(terrain, "footholds", None) or ()):
+        if str(getattr(f, "fid", "")) == want:
+            return f
+    return None
+
+
+def _nearest_by(objs, spot, keys, tol):
+    """`objs` 里**按存的坐标最近**的那个（> `tol` 就当"不是它" ⇒ None ✓）。"""
+    vals = []
+    for k in keys:
+        try:
+            vals.append(float((spot or {}).get(k)))
+        except (TypeError, ValueError):
+            return None
+    best = None
+    for o in objs:
+        try:
+            d = sum((v - float(getattr(o, k))) ** 2 for k, v in zip(keys, vals))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if best is None or d < best[0]:
+            best = (d, o)
+    if best is None or best[0] > float(tol) ** 2:
+        return None
+    return best[1]
+
+
+def find_ladder(terrain, spot):
+    """按「绳梯地点」找那根绳梯 → Ladder / None。
+
+    先按 `lid`（= `ladder_ids` 现算的编号 ✓），再按存的 `x` **就近**兜底 ✓。
+    ⚠ 为什么要有"就近"这一半：绳梯在数据里**没有稳定 id**（`lid` 是按 (x,page) 现排的 ✓）
+      ⇒ 重新导出地形 / 数据一变，`lid` 就可能指到别的绳上 ⇒ 存的坐标是最后一道保险 ✓。
+    """
+    lads = list(getattr(terrain, "ladders", None) or ()) if terrain is not None else []
+    if not lads:
+        return None
+    want = str((spot or {}).get("lid") or "").strip()
+    if want:
+        try:
+            ids = ladder_ids(terrain)
+        except Exception:                       # noqa: BLE001
+            ids = {}
+        hit = next((L for L in lads if str(ids.get(id(L)) or "") == want), None)
+        if hit is not None:
+            return hit
+    return _nearest_by(lads, spot, ("x",), ATTACH_PAD)
+
+
+def find_portal(terrain, spot):
+    """按「传送门地点」找那个传送门 → Portal / None（先按 `pn` ✓，再按坐标就近 ✓）。"""
+    ps = list(getattr(terrain, "portals", None) or ()) if terrain is not None else []
+    if not ps:
+        return None
+    want = str((spot or {}).get("pn") or "").strip()
+    if want:
+        hit = next((p for p in ps if str(getattr(p, "pn", "") or "") == want), None)
+        if hit is not None:
+            return hit
+    return _nearest_by(ps, spot, ("x", "y"), ATTACH_PAD)
+
+
+def element_span(terrain, spot):
+    """一个**非集合**地点在世界上占的 **x 范围** `(左, 右)`（绳梯/传送门 ⇒ 那个点 ✓）。
+
+    判不出（地图里没这个元素 / 是墙 / 类型不对）⇒ `None` ✓（**不猜** ✓）。
+    ⚠ **集合**那一类不在这里 —— 它的 x 范围要把集合的 foothold 并起来，口径在
+      `decision.route.set_span`（决策层）✓，调用方自己分派 ✓。
+    """
+    kind = str((spot or {}).get("kind") or "")
+    try:
+        if kind == "foothold":
+            f = find_foothold(terrain, (spot or {}).get("fid"))
+            if f is None or getattr(f, "is_wall", False):
+                return None
+            return (float(f.left), float(f.right))
+        if kind == "ladder":
+            L = find_ladder(terrain, spot)
+            return None if L is None else (float(L.x), float(L.x))
+        if kind == "portal":
+            p = find_portal(terrain, spot)
+            return None if p is None else (float(p.x), float(p.x))
+    except Exception:                           # noqa: BLE001 —— 数据坏了别把调用方弄崩 ✗
+        return None
+    return None
+
+
+#: 「地点」四类的**人话名**（弹窗 / 摘要 / 日志共用这一处 ✓ —— 别各写一份 ✗）。
+ELEMENT_LABELS = {"set": "集合", "foothold": "foothold",
+                  "ladder": "绳梯", "portal": "传送门"}
+
+
+def element_label(spot, terrain=None, zones=None):
+    """一个「地点」→ 一句人话（摘要行 / 列表 / 明细共用 ✓ 判不出也给一句 ✓，**绝不返回空**）。"""
+    spot = spot or {}
+    kind = str(spot.get("kind") or "")
+    where = ELEMENT_LABELS.get(kind, kind or "？")
+    try:
+        if kind == "set":
+            name = str(spot.get("name") or "")
+            n = len(((zones.sets or {}).get(name) or {}).get("footholds") or []) \
+                if zones is not None else 0
+            return "集合「%s」%s" % (name, ("（%d 条）" % n) if n else "")
+        if kind == "foothold":
+            fid = str(spot.get("fid") or "")
+            r = spot.get("ratio", 100.0)
+            try:
+                r = float(r)
+            except (TypeError, ValueError):
+                r = 100.0
+            # ⚠ 没给地形（**界面上的摘要**就常常没有 ✓）⇒ 只说「存着什么」，
+            #   **不许**说「本图里找不到」（那是在冤枉它 ✓）；给了地形才敢下这个判断 ✓。
+            f = find_foothold(terrain, fid) if terrain is not None else None
+            if terrain is not None and f is None:
+                return "foothold #%s（本图里找不到）" % fid
+            if f is None:
+                return "foothold #%s（走到 %.0f%%）" % (fid, r)
+            who = ""
+            if zones is not None:
+                names = zones.set_of(str(f.fid))
+                if names:
+                    who = " · " + "／".join(str(x) for x in names)
+            return "foothold #%s（x %.0f..%.0f，走到 %.0f%%）%s" % (
+                f.fid, float(f.left), float(f.right), r, who)
+        if kind == "ladder":
+            lid = str(spot.get("lid") or "") or "？"
+            L = find_ladder(terrain, spot) if terrain is not None else None
+            if terrain is not None and L is None:
+                return "绳梯 %s（x=%s，本图里找不到）" % (lid, spot.get("x"))
+            if L is None:
+                return "绳梯 %s（x=%s）" % (lid, spot.get("x"))
+            return "绳梯 %s（x=%.0f，y %.0f..%.0f）" % (
+                lid, float(L.x), min(float(L.y1), float(L.y2)),
+                max(float(L.y1), float(L.y2)))
+        if kind == "portal":
+            who = str(spot.get("pn") or "") or "？"
+            p = find_portal(terrain, spot) if terrain is not None else None
+            if terrain is not None and p is None:
+                return "传送门 %s（本图里找不到）" % who
+            if p is None:
+                return "传送门 %s（%s, %s）" % (who, spot.get("x"), spot.get("y"))
+            return "传送门 %s（%.0f, %.0f）" % (
+                str(getattr(p, "pn", "") or "？"), float(p.x), float(p.y))
+    except Exception:                           # noqa: BLE001
+        pass
+    return where
 
 
 # ══════════════════════════════════════════
@@ -346,17 +581,22 @@ class Zones:
     # ---------------- 边 ----------------
 
     def add_edge(self, src, dst, kind, ladder=None, footholds=None,
-                 walk_dir=None, mid_dir=None, mid_y=None, why=""):
+                 walk_dir=None, mid_dir=None, mid_y=None, why="", portal=None):
         """加一条**有向**边。自动去重：**同一条边**只留一条（判据见下面那条 ⚠）。
 
         `ladder`：climb 边必须给（爬哪根绳，id 形如 "L2"，见 `ladder_ids`）。
+        `portal`：portal 边必须给（**走哪扇门**，门名 `pn` 形如 "h009"，见 `portal_by_pn`）。
 
-        ⚠ **"同一条边"= `(from, to, kind, ladder)` 全都一样**：
+        ⚠ **"同一条边"= `(from, to, kind, ladder, portal)` 全都一样**：
           「爬」按**哪根绳**分开算 —— 同一对集合、同一类型、**不同绳**是**两条不同的边**
           （"怎么过去"不一样）。用户 2026-09-27 报的"点了增加没有添加项目"就是这个 bug：
           地图里已经有 `二楼 →(爬 L3)→ 三楼`，再加一条 `二楼 →(爬 L7)→ 三楼` 被当成重复
           ⇒ **静默返回老那条**，界面上一点动静都没有，看着就像程序坏了 ✗。
-          （原判据里还有 `portal` 那一格，2026-09-27 随「传送门」一起移除 ✓。）
+          ⭐ **`portal` 与 `ladder` 同理**（2026-10-06 加回 ✓）：同一对集合、同是传送点、
+          **不同门**（`h009` vs `h010`）也是**两条不同的边** ✓ —— 它们落点不同、
+          寻路代价也不同 ✓（用户 2026-10-06 定的代价口径见 `decision.route.PortalJob` ✓）。
+          ⚠ 2026-09-27 那一格随「传送门」一起移除过 ✓；加回来时**去重身份也必须一起加** ✗
+            （只写进字典、不进去重判据 ⇒ 第二条门会被当成重复**静默丢掉** ✓ 又是那个老 bug ✓）。
         ⚠ 真·完全重复时**不报错**（幂等：调用方可能是"采纳建议"那种重放）⇒ 有没有真的
           加进去，由**界面**说清楚（`gui/zone_editor._apply_reach` 比对条数，没加就弹一句 ✓）。
         ⚠ 同一对集合有多条时，规划取哪条见 `edge_between`（按类型优先级：走 > 爬 > …；
@@ -381,11 +621,16 @@ class Zones:
         for e in self.edges:
             if (e.get("from") == src and e.get("to") == dst
                     and e.get("kind") == kind
-                    and str(e.get("ladder") or "") == str(ladder or "")):
+                    and str(e.get("ladder") or "") == str(ladder or "")
+                    and str(e.get("portal") or "") == str(portal or "")):
                 return e
         e = {"from": src, "to": dst, "kind": kind}
         if ladder:
             e["ladder"] = str(ladder)
+        if portal:
+            # ⭐ 走哪扇门（用户 2026-10-06 ✓）：`portal` 边**必须**有这一格 ✓
+            #   （跟 `ladder` 对 climb 一样 ✓ —— "怎么过去"少了它就说不清 ✓ 校验会拦 ✓）。
+            e["portal"] = str(portal)
         if footholds:
             # 「可下跳 foothold」（2026-09-26 用户要求）：**下跳**从哪些 foothold 起跳。
             # 不填 = 起点集合的全部 foothold（见 `drop_footholds`）—— 所以**只在
@@ -436,6 +681,22 @@ class Zones:
                     break
             if e.get("kind") == "climb" and not e.get("ladder"):
                 out.append("攀爬边没指定绳：%s → %s" % (e.get("from"), e.get("to")))
+            if e.get("kind") == "portal":
+                # ⭐ 传送点边（用户 2026-10-06 ✓）：**必须指名哪个门** ✓（同"爬必须指名绳"✓），
+                #   而且那个门得**在本图**、**同图**（跨图不支持 ✓ 用户明确 ✓）——
+                #   说清三件事：没指名 / 本图没这个门 / 跨图或解析不出落点 ✓（别静默 ✗）。
+                _pn = str(e.get("portal") or "").strip()
+                if not _pn:
+                    out.append("传送点边没指定是哪扇门：%s → %s"
+                               "（编辑器里选一个 ✓）" % (e.get("from"), e.get("to")))
+                elif terrain is not None:
+                    if portal_by_pn(terrain, _pn) is None:
+                        out.append("传送点边引用了本图不存在的门：%s → %s：%r"
+                                   % (e.get("from"), e.get("to"), _pn))
+                    elif portal_exit(terrain, _pn) is None:
+                        out.append("传送点边用的是**跨图**（或落点查不到）的门：%s → %s：%r"
+                                   "（跨图不支持 ✓ 换一扇本图内的门，或改成别的通行方式）"
+                                   % (e.get("from"), e.get("to"), _pn))
             if e.get("kind") == "walk" and e.get("dir") \
                     and e.get("dir") not in WALK_DIRS:
                 out.append("走边的方向类型不认识：%s → %s：%r（可用：%s）"
@@ -516,12 +777,16 @@ def load(map_id):
 
 #: 同一对集合有**多条边**时"取哪条"的优先级（`edges_between` / `edge_between` /
 #: `decision.route.pick_edge` **共用这一处**）：
-#: **走 > 爬 > 下跳 > 跳**（`portal` 传送门 / `unconfirmed` 待确认 2026-09-27 已移除 ✓）。
+#: **走 > 爬 > 下跳 > 跳 > 传送点**（`unconfirmed` 待确认 2026-09-27 移除 ✓）。
 #: 为什么"走"最优先：同层无缝走过去最廉价、也最不容易失败；爬 / 下跳要让执行器接管动作；
 #: 「跳」的落点还要靠**跳跃标定**（最不确定）⇒ 放最后 ✓。
+#: ⭐ **传送点放最后**（2026-10-06 ✓）：它**不是**"更好的走路" —— 只有"另一头在别处"
+#:   才该用它 ✓ ⇒ 并列（代价一样 / 没位置可算）时**不该盖过**任何正常走法 ✓。
 #: ⚠ 它现在只是**并列时的兜底**：正式口径见 `docs/寻路设计.md` 的「择路」一节
 #:   （逐步贪心按**纯距离**比，代价相同时才看这个优先级 ✓）。
-KIND_PRIORITY = {"walk": 0, "climb": 1, "drop": 2, "jump": 9}
+#: ⚠ 传送点的**正式代价**照用户 2026-10-06 定的口径算（当前 → 起点门 ＋ 出口门 → 目标 ✓
+#:   见 `decision.route.hop_cost` 的 `portal` 那一支 ✓）—— 所以正常情况**轮不到**这个优先级 ✓。
+KIND_PRIORITY = {"walk": 0, "climb": 1, "drop": 2, "jump": 9, "portal": 10}
 
 
 def edges_between(zones, a, b):
@@ -564,6 +829,11 @@ def edge_text(zones, a, b, edge=None):
     zh = EDGE_LABELS.get(e.get("kind"), (str(e.get("kind")), ""))[0]
     if e.get("ladder"):
         s = "%s %s" % (zh, e["ladder"])
+    elif e.get("kind") == "portal" and e.get("portal"):
+        # ⭐ 传送点：**走哪扇门必须写出来**（2026-10-06 ✓）—— 同一对集合可能有两扇门
+        #   （落点不同 ✓ 是两条边 ✓）⇒ 光写「传送点(portal)」分不清是哪一条 ✗
+        #   （与上面绳号那条同一个理由 ✓ 用户 2026-09-27 就为这个"分不清哪条"卡过 ✓）。
+        s = "%s %s" % (zh, e["portal"])
     elif e.get("kind") == "walk" and walk_dir(e):
         s = "%s·%s" % (zh, WALK_DIR_LABELS.get(walk_dir(e), walk_dir(e)))
     else:
@@ -596,6 +866,10 @@ def edge_cond(edge):
     s = ""
     if edge.get("ladder"):
         s = "绳 %s" % edge["ladder"]
+    elif edge.get("kind") == "portal" and edge.get("portal"):
+        # ⭐ 走哪扇门（2026-10-06 ✓）—— 与「绳 L3」同一层：列表行里**必须有**这一截，
+        #   不然同一对集合的两扇门在编辑器里长得一模一样 ✗（那就是 2026-09-27 那条教训 ✓）。
+        s = "门 %s" % edge["portal"]
     elif edge.get("kind") == "drop" and edge.get("footholds"):
         s = "起跳 %d 处" % len(edge["footholds"])
     # 「中途跳下」**与绳号并存**（⚠ 不并存的话，同一对集合的两根爬边在列表里就没法分辨 ✗）
@@ -762,6 +1036,93 @@ def drop_footholds(z, edge):
     return [str(x) for x in (s.get("footholds") or [])]
 
 
+# ══════════════════════════════════════════
+# ⭐⭐ 「绳只是**路过**这一层」的爬升（用户 2026-10-06 ✓）
+# ══════════════════════════════════════════
+# 用户原话："这个比较特殊，在 x 范围不包含绳梯 x 的情况下默认走斜跳上绳梯，攀爬执行器需要
+#   默认判定出来并支持" ✓
+#
+# 现场（图 `110040000`，集合 `7` →(爬 L6)→ `6` —— 用户报的"发呆"✓）：
+#   · 集合 7 那一层：x[467..883]、**y=-113**；集合 6 在 **y=-293**（在它**上面** 180px ✓）；
+#   · L6：x=**423**、两端 y=**-291**（≈集合 6 那层）和 **+32**（更下面那层）✓
+#   ⇒ 起点（7）**不在绳的任何一端** ✗ —— 老判据在这儿给 `None` ⇒ `job_for_edge` 抛 ⇒
+#     `pick_edge` 剔掉 ⇒ `plan_jobs` 报"没有一条能走的边" ⇒ Agent **发呆** ✓（用户看到的 ✓）。
+#   可实际上：**L6 是从 7 这一层穿过去的**（-113 落在 [-291, +32] 里 ✓）⇒ 人站在 7 层
+#     **够得着**这根绳 ✓ —— 只是够不到它的**正下方**（绳在 x=423，7 层从 467 起 ⇒ 差 44px ✗）
+#     ⇒ 得**斜着跳过去**抓绳 ✓（用户说的"斜跳上绳梯" ✓）。
+#
+# ⇒ 口径（用户 2026-10-06 定 ✓）：
+#   · **方向照判** ✓：绳路过起点这一层 ⇒ 按"**目标集合比起点层高还是低**"定上下 ✓
+#     （不再一律 `None` ✗ —— 那正是"发呆"的根 ✓）；
+#   · **x 范围不含绳 x ⇒ 默认斜跳上绳** ✓（`climb_via_jump` ✓）：执行器那边早有一条
+#     「斜跳上绳」（`ClimbJob` ①'，2026-09-27 用户的设计 ✓），但它**默认是关的**
+#     （要人在设置里配「起跳距离」✗）⇒ 这里**替它从数据算出"要不要斜跳 + 最多跳多远"** ✓
+#     （见 `climb_jump_reach` ✓ **不拍数字** ✓）。
+#
+# ⚠ 与"贴着某一端"（`ladder_ends` 那套 ✓）是**两件事**：那个问"绳头压在哪块面上"✓；
+#   这一组只问"绳的竖直区间有没有**覆盖**这一层的面" ✓ —— 别混用容差（同 `ladders_of` 的 ⚠）✓。
+
+
+def _over_span(sp, ladder):
+    """`set_span` 的结果与绳的**竖直**区间有重叠吗（±`ATTACH_PAD` ✓）—— 一处判据 ✓。
+
+    ⚠ 只问 **y**：绳的正下方**在不在**这一层里是**另一件事**（那是 `climb_via_jump` ✓）——
+      "够得着"（这里）与"要不要斜跳"（那个）别混 ✓。
+    """
+    if sp is None or ladder is None:
+        return False
+    lo = min(float(ladder.y1), float(ladder.y2))
+    hi = max(float(ladder.y1), float(ladder.y2))
+    # ±ATTACH_PAD：与"归属"同一套容差（绳端离面几十像素也算挨着 ✓ 见 `ladders_of` 的 ⚠）
+    return not (sp[3] < lo - ATTACH_PAD or sp[2] > hi + ATTACH_PAD)
+
+
+def ladder_over_set(terrain, z, ladder, name):
+    """这根绳**路过**这个集合那一层吗 → bool（判据：**这一层的 y 与绳的竖直区间有重叠** ✓）。
+
+    人站在这一层 ⇒ 横着跳一下就够得到绳 ✓（哪怕绳的正下方不在这一层里 ✓ —— 那是
+    `climb_via_jump` 的事 ✓）。
+    """
+    if ladder is None or z is None or terrain is None:
+        return False
+    s = (z.sets.get(str(name)) or {}).get("footholds") or []
+    return _over_span(set_span(terrain, s), ladder)
+
+
+def climb_via_jump(terrain, z, ladder, name):
+    """这根绳要**斜跳**过去才够得着吗 → bool ✓（用户 2026-10-06 的**唯一**判据 ✓）。
+
+    用户原话（就这一条）："**在 x 范围不包含绳梯 x 的情况下**默认走斜跳上绳梯" ✓
+      · 这一层的 x 范围**不含**绳的 x ⇒ 人不在绳的正下方 ⇒ **斜着跳**过去 ✓；
+      · 含（罩住）⇒ 人正站在绳底下 ⇒ **原地跳**就够 ✓ 不用斜跳 ✓。
+    """
+    if ladder is None or z is None or terrain is None:
+        return False
+    s = (z.sets.get(str(name)) or {}).get("footholds") or []
+    sp = set_span(terrain, s)
+    if sp is None:
+        return False
+    return not (sp[0] <= float(ladder.x) <= sp[1])
+
+
+def climb_jump_reach(terrain, z, ladder, name):
+    """要斜跳的话，人**最多离绳多远还能跳上去** → 世界像素 / `None`（算不出来）。
+
+    ⚠ **不拍数字**（README 的纪律 ✓）：这个上界**从数据来** —— 人只能走到**这一层的边上**
+      朝绳跳 ✓ ⇒ 就是"**这一层离绳最近的那条边**到绳 x 的距离" ✓
+      （`min(|x−左|, |x−右|)` ✓ 人往近的那边跳 ✓）。
+      现场（7 / L6）：467−423 = **44px** ✓ ⇒ 人走到 7 层左边缘时正好能斜跳过去 ✓。
+    """
+    if ladder is None or z is None or terrain is None:
+        return None
+    s = (z.sets.get(str(name)) or {}).get("footholds") or []
+    sp = set_span(terrain, s)
+    if sp is None:
+        return None
+    x = float(ladder.x)
+    return max(0.0, min(abs(x - float(sp[0])), abs(x - float(sp[1]))))
+
+
 def climb_direction(terrain, z, ladder, src, dst, mid_jump=False):
     """「src →(爬这根绳)→ dst」是**向上**还是**向下** → +1 / -1 / None（说不清）。
 
@@ -793,9 +1154,16 @@ def climb_direction(terrain, z, ladder, src, dst, mid_jump=False):
     是"绳的两头各自压在**哪条 foothold** 上"，再查那条 foothold 属于哪个集合 ——
     用的是同一份数据，不引入第二套判据（§12 的老教训：两套判据必然漂）。
 
-    返回 None 的情况（**宁可不做也别猜**）：找不到绳；起点不在任何一端；
+    ⭐⭐ **2026-10-06 加一支：起点不在绳两头、但绳"路过"这一层**（用户原话："这个比较特殊，
+      在 x 范围不包含绳梯 x 的情况下默认走斜跳上绳梯，攀爬执行器需要默认判定出来并支持" ✓）：
+      这时方向看"**目标层贴着绳的哪一端**" ✓（起点不在任何一端 ⇒ 当不了基准 ✓），
+      而且**只有目标层真的贴着某一端**才放行 ✓（目标悬在绳中间 ⇒ 爬到头会冲过头 ⇒ 仍然 None ✓）。
+      ⚠ 这一支**不需要** `mid_jump` ✓（它是"爬到绳头"那种走法，不是"半路跳出去"✓）；
+      ⚠ "要不要**斜跳**过去够绳"**不在这儿判** ✗ —— 那是 `climb_via_jump` 的事 ✓（同时看 x ✓）。
+
+    返回 None 的情况（**宁可不做也别猜**）：找不到绳；起点不在任何一端**且绳不路过这一层**；
     起点两头都算得上（集合把整根绳圈进去了 ⇒ 那是圈错了）；终点在绳端、但**跟起点同一端**
-    （自环 / 圈错）；终点不在绳端、且**没配**中途跳下。
+    （自环 / 圈错）；终点不在绳端、且**没配**中途跳下；起点不在绳端时**目标层不贴绳的任何一端**。
     """
     if ladder is None:
         return None
@@ -808,7 +1176,25 @@ def climb_direction(terrain, z, ladder, src, dst, mid_jump=False):
     if not src or not dst:
         return None
     if src not in (su | sd):
-        return None                    # 起点不在这根绳的两头 ⇒ 不知道从哪上绳 ✗
+        # ⭐⭐ **起点不在绳的两头**（用户 2026-10-06 ✓ 见上面那段"绳只是路过这一层"）——
+        #   **不再一律 None** ✗（那正是用户报的"从 7 去 6 发呆"的根 ✓）：
+        #   只要绳**路过**起点这一层（`ladder_over_set` ✓），人**跳上去就够得着** ✓
+        #   ⇒ 方向改看"**目标层贴着绳的哪一端**" ✓（起点压根不在任何一端 ✗ 没法当基准 ✓）。
+        if not ladder_over_set(terrain, z, ladder, src):
+            return None                # 绳压根不路过这一层 ⇒ 那是真够不着，不猜 ✗
+        b = set_span(terrain, (z.sets.get(str(dst)) or {}).get("footholds") or [])
+        if b is None:
+            return None
+        top = min(float(ladder.y1), float(ladder.y2))
+        bot = max(float(ladder.y1), float(ladder.y2))
+        # ⚠ **只有目标层贴着绳的某一端才放行**（±`ATTACH_PAD` ✓；现场 7→6：目标层 y=-293、
+        #   绳上端 -291 ⇒ 差 2px ✓）。目标层悬在绳**中间**的话，爬到绳头会**冲过头** ✗
+        #   （执行器的到达判据就是"到绳的某一端"✓）⇒ 那种做法宁可不做也别猜 ✓。
+        if abs(b[2] - top) <= ATTACH_PAD or abs(b[3] - top) <= ATTACH_PAD:
+            return 1                   # 目标层在上端 ⇒ 往上爬 ✓
+        if abs(b[2] - bot) <= ATTACH_PAD or abs(b[3] - bot) <= ATTACH_PAD:
+            return -1                  # 目标层在下端 ⇒ 往下爬 ✓
+        return None
     # ⭐ 方向**只看起点在哪端**（用户 2026-09-28 ✓）
     if src in sd and src not in su:
         d = 1                          # 起点在下端 ⇒ 往上爬

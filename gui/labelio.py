@@ -27,7 +27,28 @@ from pathlib import Path
 # 这里或那里取，加类别时只用改那一个文件。
 from perception.classes import (CLASS_DROP, CLASS_MOB, CLASS_NPC,
                                 CLASS_OTHER_PLAYER, CLASS_PET, CLASS_PLAYER,
-                                EN_NAMES as CLASS_NAMES, ORDER, ZH_NAMES, label)
+                                EN_NAMES as CLASS_NAMES, ORDER, ZH_NAMES,
+                                id_of_name, label, zh_of_name)
+
+
+#: 标注目标（= 类别英文名 ✓）在**弹窗标题 / 确认框**里的说法。
+#: ⚠ 只列"读起来和类别短名不一样"的那几个 ✓：类别表里 `drop` 的短名是「掉落」✓（那是给
+#:   框上/图例用的 ✓），可弹窗里得说「标注**掉落物**」✓（用户 2026-10-04 就是这么叫的 ✓）。
+#:   ⇒ 这里**只补例外**，其余一律回落到 `zh_of_name`（= 类别表）✓ —— 别再抄一份全表 ✗。
+TARGET_ZH = {"drop": "掉落物"}
+
+
+def target_zh(target, fallback=None):
+    """标注目标 → **文案里的说法**（弹窗标题、确认框用 ✓）。
+
+    ⚠⚠ 这是"target 显示成什么"的**唯一出口** ✓ —— 原来 `frame_picker` 和 `cards` 各写一份
+      `"怪物" if target == "mob" else "玩家"` ✗ ⇒ drop/pet 一进来全被叫成「玩家」✗
+      （用户 2026-10-04 ✓ 就是接选帧弹窗时露出来的 ✓）。改口径只改这一处 ✓。
+    """
+    key = str(target or "").strip()
+    if key in TARGET_ZH:
+        return TARGET_ZH[key]
+    return zh_of_name(key, fallback if fallback is not None else key)
 
 
 def _files(project, stem):
@@ -276,12 +297,16 @@ def _write_state(labels_dir, d):
 
 
 def label_progress(project):
-    """统计各类标注进度，返回 {mob, player, total}。
+    """统计各类标注进度，返回 `{mob, player, drop, pet, total}`。
 
-    total = frames 目录里的 png 数；mob / player = 有对应类框的帧数
-    （labels/ 人工优先，labels_auto/ 回退）。给④自动标注卡片的进度摘要用。
+    total = frames 目录里的 png 数；其余几项 = 有**对应类别框**的帧数
+    （labels/ 人工优先，labels_auto/ 回退）。给④自动标注卡片的进度摘要用，
+    也给「确认重新标注」判断"这一类标过没有"用 ✓（`cards._confirm_relabel` 按 target 查 ✓）。
+    ⭐ 2026-10-04 补上 `drop` / `pet` ✓ —— 少了它们，掉落物/宠物**第二次**点按钮时
+      `prog["drop"]` 取不到 ⇒ 一律当成"还没标过"⇒ 不问"已标过，继续吗" ✗
+      （同一轮里那两个按钮接上选帧弹窗之后，这条路径就一定会被走到 ✓）。
     """
-    total = mob = player = 0
+    total = mob = player = drop = pet = 0
     for f in sorted(project.frames.glob("*.png")):
         total += 1
         by_cls = count_by_class(project, f.stem)
@@ -289,4 +314,8 @@ def label_progress(project):
             mob += 1
         if by_cls.get(CLASS_PLAYER, 0) > 0:
             player += 1
-    return {"mob": mob, "player": player, "total": total}
+        if by_cls.get(CLASS_DROP, 0) > 0:
+            drop += 1
+        if by_cls.get(CLASS_PET, 0) > 0:
+            pet += 1
+    return {"mob": mob, "player": player, "drop": drop, "pet": pet, "total": total}

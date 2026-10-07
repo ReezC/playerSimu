@@ -286,6 +286,8 @@ class MainWindow(QMainWindow):
         self._update_title()        # 还没有项目 → 只有基础标题
         self.task = None
         self.current_card = None
+        #: 卡片之外的**小任务**跑完时的收尾回调（`run_export` ✓ 见那段的说明 ✓）。
+        self._mini_done = None
         self.cards = []
 
         self._build()
@@ -298,16 +300,36 @@ class MainWindow(QMainWindow):
         self.log("工作台已就绪。先「新建」或「打开」一个项目。", "ok")
         self.log("项目根目录: %s" % PROJECTS_DIR)
 
-        # 启动也要绑一次决策参数：没有项目时用的是「最近打开的那个项目」那份，
-        # 不绑的话参数面板显示默认值，连下面注册的全局热键都会用默认 F11，
-        # 而不是那个项目里映射的键。
-        self._bind_cards()
+        # ⭐⭐ **启动就把「上次那个项目」打开**（用户 2026-10-04 ✓ 现场原话："决策参数页签→战斗参数→
+        #   追击起跳需要的冲刺时间，没有保存数据，每次重开 gui 都要重新填"）。
+        #   根因**不是**"没存" ✗ —— `chase_jump_dash_ms` 在 `DecisionSettings` 的 `to_dict` /
+        #   `from_dict` 里都有 ✓（实测往返 137 也对 ✓、项目文件里也真存着 ✓）；
+        #   而是**启动时没有项目** ✗：决策参数**只按项目存**（保存钩子见 `_bind_decision_params` ✓）
+        #   ⇒ 没项目时 `settings.save()` **一个字节都不写** ✗ ⇒ 人在"还没开项目"时改的参数，
+        #   一重开就回默认 ✓；而界面显示的偏偏是「最近打开那个项目」那份 ✗
+        #   ⇒ 看着特别像"保存没生效" ✓（用户那句话就是这么来的 ✓）。
+        #   ⇒ 启动直接开上次那个：改动从此有归属 ✓、标题里也看得见改的是谁 ✓。
+        #   ⚠ 没有项目时下面那句"绑一次决策参数"照样要跑 ✓ —— 就是它按"最近项目那份"回填控件 ✓
+        #     （连全局热键都吃它，不然会用默认 F11 ✗）。
+        if not self._open_last_project_at_startup():
+            self._bind_cards()
 
         # 全局热键：任何窗口聚焦时都能开关自动打怪。键 = 决策参数里
         # 「开关自动」的映射（默认 F11），改了映射会动态重新注册。
         self._hotkey_id = 1
         self._auto_shortcut = None   # 全局热键注册失败时的窗口内快捷键降级
         self._register_auto_hotkey()
+
+        # ⭐⭐ **窗口收尾：提示搬到字段标题 + 标签可复制**（用户 2026-10-04 ✓ 第 3、4 条）。
+        #   ⚠⚠ 页签面板**不走** `theme.bind_window_state`（那是弹窗专用的收尾 ✗）—— 用户反馈
+        #   "实测没有实现提示挂字段标题……决策参数页签→输出行为CD"就是这么来的：
+        #   面板这条路上**根本没人调** ✗ ⇒ 现在主窗口建完补一次 ✓（把整棵树都扫到 ✓：
+        #   决策参数 / 路线识别 / 模型训练 / 挂机保护 / 起始页 ✓），后开的页签走 `open_view` ✓。
+        try:
+            _tips, _lbls = theme.finish_window(self)
+            self.log("窗口收尾：提示搬到字段标题 %d 处 · 标签可复制 %d 个" % (_tips, _lbls))
+        except Exception as e:                        # noqa: BLE001 —— 收尾失败不该拖垮启动 ✓
+            self.log("窗口收尾（提示挂标题 / 可复制）没跑成：%s" % e, "warn")
 
     # ══════════════════════════════════════════════════
     # 构建界面
@@ -468,6 +490,12 @@ class MainWindow(QMainWindow):
             card = cls()
             card.run_clicked.connect(self._on_run)
             card.view_clicked.connect(self._on_view)
+            # ⭐⭐ 卡片**把"项目现在是哪张图"改掉了** ⇒ 交给 `_on_map_changed` 重推跨面板那几件
+            #   （用户 2026-10-04 ✓ 现场：从「识别目标」卡的下拉换图后，A 机「当前地图」不变、
+            #    小地图还按上一张图取区域 ✗）。`MapCard` 与 `RoutePanel` **信号名故意一致** ✓，
+            #   所以这里一条 `hasattr` 就把两个写口都接上 ✓（谁再加一个写口也自动接 ✓）。
+            if hasattr(card, "map_changed"):
+                card.map_changed.connect(self._on_map_changed)
             self.cards.append(card)
             inner_lay.addWidget(card)
 
@@ -577,6 +605,31 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "打开失败", str(e))
 
+    def _open_last_project_at_startup(self):
+        """启动时打开**上次那个项目**（成不成都不抛 ✓）。返回是否真的打开了。
+
+        ⚠ 为什么要有它（用户 2026-10-04 ✓ 现场："追击起跳需要的冲刺时间，没有保存数据，
+          每次重开 gui 都要重新填"）：决策参数**只按项目存** ✓ ⇒ **没有项目时
+          `settings.save()` 什么都不写** ✗（见 `decision/agent.py` 的 `set_save_hook` ✓）
+          ⇒ 人在"还没开项目"时改的参数，一重开就没了 ✓；而界面显示的又是
+          「最近打开那个项目」那份 ✗ ⇒ 看着就像"没保存" ✓（其实那个参数在 JSON 里
+          存/读两处都写着 ✓ 见 `DecisionSettings.to_dict` / `from_dict` ✓）。
+          ⇒ 启动把上次那个项目打开，改动就有归属了 ✓。
+        ⚠ 项目打不开（被删 / 改名 / 文件坏了）⇒ **保持"没有项目"** ✓ 只记一条日志 ✗
+          别让一个陈旧路径把工作台挡在门外 ✗。
+        """
+        proj = last_opened()
+        if proj is None:
+            return False
+        try:
+            self.open_project(Path(proj.root))     # 它自己会 `_bind_cards()` ✓
+            return True
+        except Exception as e:                     # noqa: BLE001
+            self.project = None
+            self.log("⚠ 上次的项目打不开（%s：%s）⇒ 按「没有项目」启动。"
+                     % (type(e).__name__, e), "warn")
+            return False
+
     def open_project(self, path):
         self.project = Project.open(path)
         self._clear_pages()
@@ -679,6 +732,19 @@ class MainWindow(QMainWindow):
         `map_id` 只用来打日志（谁需要它自己从 `route_panel._map_id()` 取 ✓）。
         """
         self.player_panel.set_zone_sets(self.route_panel.zone_sets())
+        # ⭐⭐ **把新地图 id 推给实时面板/线程**（用户 2026-10-04 ✓ 现场：换图/换项目后 A 的
+        #   「当前地图」不跟着变，而且小地图框选**还按上一张图**取 ⇒ `perf.log` 的 `mmap_note`
+        #   一直报「框选区超出当前画面，重框一次」✗ —— 同一个根因 ✓）。
+        #   ⚠ 两个写口（「识别目标」卡的下拉 ✓ / 路线识别页的「手动更换」✓）现在都会走到这里 ✓
+        #     （卡片那条是 2026-10-04 补的 ✓ 它原来**一个信号都不发** ✗）。
+        #   ⚠ 实时线程在跑 ⇒ `set_mmap` 只写几个字段、主回路每拍现读 ⇒ **当场生效** ✓
+        #     （不用停/开实时 ✓）；没跑 ⇒ 下一次 `start()` 由参数带进去 ✓ 两条路都对 ✓。
+        lp = getattr(self, "live_panel", None)
+        if lp is not None and hasattr(lp, "set_mmap"):
+            try:
+                lp.set_mmap(map_id=(self.route_panel._map_id() or ""))
+            except Exception as e:                        # noqa: BLE001 —— 推不动也别崩 ✓
+                self.log("新地图 id 没推进实时（%s: %s）" % (type(e).__name__, e), "warn")
         # ⚠ 「前往平台」那一组也是按地图列集合的（控件归 RoutePanel ✓）——它自己会在
         #   `_refresh_goto()` 里重读 ✓（`_on_manual_map_change` 已经调过 ✓），这里不用管 ✗。
 
@@ -697,6 +763,10 @@ class MainWindow(QMainWindow):
         # （玩家面板不持有地图 id）。以前写好了 `set_zone_sets()` 却**没人调** ⇒
         # 那两个下拉一直只有「（未选）」✗（2026-09-26 补）。
         self.player_panel.set_zone_sets(self.route_panel.zone_sets())
+        # ⭐ 「**地区选择**」通用弹窗的工厂（用户 2026-10-05 ✓）：玩家面板要选**地图元素**
+        #   （「站桩地点」/「拾取掉落地区」），而弹窗要地形与集合、只有**路线识别页**有
+        #   （`make_element_picker` ✓）⇒ 这里推一次（同上面 `set_zone_sets` 那条 ✓）。
+        self.player_panel.set_element_picker_factory(self.route_panel.make_element_picker)
         # ⛔ 「编辑战斗区域」2026-10-01 整个搬到「路线识别 → 寻路配置 → 路线规划」✓ ——
         #   只读 foothold 视图的工厂不再跨面板推（那边自己就有 `make_foothold_picker` ✓）。
         # 「前往平台」（选择平台 / 命令前往 / 结束当前寻路）**显示在决策参数页**：
@@ -841,11 +911,37 @@ class MainWindow(QMainWindow):
         fn, params = made
         self._start(card, fn, params)
 
-    def _start(self, card, fn, params):
+    # ⭐⭐ 卡片之外的**小任务**（用户 2026-10-05 ✓）
+    def run_export(self, fn, params, title, on_done=None):
+        """在**工作台**上跑一个小任务（读条 + 日志 + 取消 ✓）—— 卡片之外发起的那些 ✓。
+
+        为什么要它（用户 2026-10-05 ✓ 原话："如果没有导出，在添加的带装备的宠物、关闭弹窗后，
+        在数据集工作台显式读条导出"）：补导宠物图库这件事**不属于任何一张卡片**（它是在「自动
+        标注」卡里加宠物时触发的 ✓），但它必须**看得见** ✓ —— 同一条读条、同一份日志、同样能
+        取消 ✓（别做成"点了没反应"或"偷偷在后台跑"✗）。
+
+        ⚠ 与 `_on_run` 的区别：那条是"**跑某张卡片**"，要先做参数回写 / 上游依赖检查 /
+          选帧确认 ✗ —— 小任务这三件都不该有 ✓（它是补数据，不是跑步骤 ✓）。
+        ⚠ `on_done(ok, summary)` 在任务结算时（`_on_done` 里 ✓）被调 ⇒ 调用方在那儿刷新自己
+          （比如把宠物列表重新铺一遍 ⇒ 图标按新图重画 ✓）。
+
+        返回 False = **没起成**（已有任务在跑 ✓）⇒ 调用方自己决定怎么如实提示 ✓ 别静默 ✗。
+        """
+        if self.task is not None:
+            return False
+        self._mini_done = on_done
+        self._start(None, fn, params, title=title)
+        return True
+
+    def _start(self, card, fn, params, title=None):
+        """起一个后台任务。`card` 允许传 None ⇒ 卡片之外的**小任务**（见 `run_export` ✓）。"""
         self.current_card = card
-        card.set_state("running")
-        card.set_result("运行中…")
-        card.set_busy(True)
+        head = title or (("%s %s" % (CIRCLED[card.num - 1], card.title))
+                         if card is not None else "任务")
+        if card is not None:
+            card.set_state("running")
+            card.set_result("运行中…")
+            card.set_busy(True)
 
         for c in self.cards:
             c.set_busy(True)
@@ -853,7 +949,7 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setEnabled(True)
         self.progress.setRange(0, 0)
         self.progress.setFormat("运行中…")
-        self.log("── 开始 %s %s ──" % (CIRCLED[card.num - 1], card.title), "info")
+        self.log("── 开始 %s ──" % head, "info")
 
         self.task = TaskThread(fn, params, self)
         # 全部过 safe_slot —— 槽函数抛异常会让 PyQt5 调 qFatal() 直接 abort()
@@ -934,6 +1030,15 @@ class MainWindow(QMainWindow):
             else:
                 self._rebuild_page(card)
 
+        # ⭐ 小任务（`run_export` ✓）的收尾：**先摘下来再调**（回调里可能又发起别的任务 ✓
+        #   连清两遍也不会重复调 ✓）。卡片任务没有这个回调 ⇒ `_mini_done` 是 None ✓ 什么都不做 ✓。
+        cb, self._mini_done = self._mini_done, None
+        if cb is not None:
+            try:
+                cb(ok, summary)
+            except Exception as e:          # noqa: BLE001 —— 收尾坏了别把结算弄挂 ✗
+                self.log("小任务收尾失败: %s: %s" % (type(e).__name__, e), "warn")
+
         # 注意：这里**不要** self.task = None —— 线程可能还没跑完，
         # 交给 _on_task_finished（由 finished 信号触发）来释放。
         self.current_card = None
@@ -947,11 +1052,18 @@ class MainWindow(QMainWindow):
         if self.task is not None:
             self.task.cancel()
             # 点了要**当场有反应**，否则用户会以为没点上而反复点。任务本身不一定
-            # 立刻停 —— 模型/模板加载这类步骤拦不住，得等它返回（各阶段的检查点
-            # 见 tools/ 里的 ctx.canceled()）。
+            # 立刻停 —— 它在各阶段的检查点上看 `canceled()` 收工（`tools/` 里那些 ✓）。
+            # ⭐⭐ 用户 2026-10-05 ✓ 原话："能不等他返回吗？" —— **能的那几处已经能了** ✓：
+            #   模板加载以前是**整块**动作 ✗（逐张 `imread` 几百张精灵 ✓）⇒ 现在改成
+            #   "每读一张看一眼" ✓（`detect_mobs.load_templates` / `PlayerLocator` 的
+            #   `should_stop` ✓ 见 SKILL 258 ✓）⇒ 收工从"几十秒"降到"几百毫秒" ✓。
+            #   ⚠ 真正拦不住的只剩**第三方库内部**那一下（`import torch` / `YOLO(weights)`
+            #     读权重 ✓ —— 我们进不去 ✓）。所以话要说准：**常见情况是马上停**，
+            #     只有"载入 YOLO 权重"那一步要等它返回（通常几秒 ✓），别把话说成大喘气 ✓。
             self.btn_cancel.setEnabled(False)
             self.progress.setFormat("取消中…")
-            self.log("已请求取消：正在收尾（模型/模板加载这类步骤要等它返回）", "warn")
+            self.log("已请求取消：正在收尾（各步检查点上收工；"
+                     "只有「载入 YOLO 权重」那一下要等它返回，通常几秒）", "warn")
 
     # ══════════════════════════════════════════════════
     # 主视区
@@ -995,6 +1107,12 @@ class MainWindow(QMainWindow):
         idx = self.viewer.indexOf(widget)
         if idx < 0:
             idx = self.viewer.addTab(widget, title)
+            # ⭐ **新开的页签也收尾一次**（提示搬标题 + 可复制 ✓）：这些控件大多是**懒建**的
+            #   （点「查看」才造出来 ✗）⇒ 主窗口 `__init__` 那一次扫不到它们 ✓（用户第 3、4 条 ✓）
+            try:
+                theme.finish_window(widget)
+            except Exception as e:                    # noqa: BLE001
+                self.log("页签收尾没跑成（%s）：%s" % (title, e), "warn")
         self.viewer.setCurrentIndex(idx)
         self._refresh_tab_close_buttons()   # ⭐ 页签增减 ⇒ 重刷「×」的显隐 ✓（页号会变 ✗）
         return idx

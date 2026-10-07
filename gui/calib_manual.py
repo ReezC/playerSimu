@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                              QHBoxLayout, QLabel, QPushButton, QSlider,
                              QVBoxLayout)
 
+from core import petlib
 from core import wzexport
 from core.imgio import imread   # 支持中文路径，cv2.imread 遇中文会静默失败
 from gui import theme           # 弹窗几何按客户端存（config/ui.yaml）✓
@@ -60,7 +61,15 @@ def _load_trimmed_pixmap(path):
 
 class CalibManualDialog(QDialog):
     def __init__(self, mobs, player_id, frames_dir, mob_scales=None,
-                 mob_default=1.41, player_default=1.41, parent=None):
+                 mob_default=1.41, player_default=1.41, parent=None,
+                 *, drops=None, pets=None, drop_default=1.41, pet_default=1.41):
+        """⭐ 后四个走**关键字**（用户 2026-10-05 ✓ 原话："卡片3标定尺度 也要支持标定掉落物、
+        宠物类"）—— 老调用方是那 7 个位置参数 ✓ 加在末尾当 kw ⇒ 一处老写法都不用动 ✓。
+
+        `drops` / `pets`：④ 里那一类的清单（`label.drops` / `label.pets` ✓ 元素是
+        `{"id"/"pet", "name", "equips"}` 那种 ✓）；**只用来列模板** ✓ —— 结果按"类"存
+        （`drop_scale` / `pet_scale` ✓ 见 `CalibCard._save_manual_scale` ✓）。
+        """
         super().__init__(parent)
         self.setWindowTitle("手动目测标定尺度")
         self.setMinimumSize(720, 620)
@@ -71,6 +80,11 @@ class CalibManualDialog(QDialog):
         self._mob_scales = dict(mob_scales or {})   # {id:帧stem -> scale}
         self._mob_default = float(mob_default or 1.41)
         self._player_default = float(player_default or 1.41)
+        #: 掉落物 / 宠物的清单与"起点尺度"（没标过 ⇒ ③ 把总尺度递进来 ✓ 见 `_manual_calib` ✓）
+        self._drops = list(drops or [])
+        self._pets = list(pets or [])
+        self._drop_default = float(drop_default or 1.41)
+        self._pet_default = float(pet_default or 1.41)
         self._scale = max(0.2, min(4.0, self._mob_default))
 
         self.name_map = wzexport.build_mob_name_map()
@@ -86,6 +100,10 @@ class CalibManualDialog(QDialog):
         self.cmb_target = NoWheelComboBox()
         self.cmb_target.addItem("怪物", "mob")
         self.cmb_target.addItem("玩家", "player")
+        # ⭐ 多两类（用户 2026-10-05 ✓）：它们的模板来自**另外两套图库** ✓（掉落物图标 /
+        #   宠物组合外观 ✓ 见 `_on_target` ✓），结果按"类"记一个自己的尺度 ✓。
+        self.cmb_target.addItem("掉落物", "drop")
+        self.cmb_target.addItem("宠物", "pet")
         self.cmb_target.currentIndexChanged.connect(self._on_target)
         top.addWidget(self.cmb_target)
 
@@ -254,8 +272,20 @@ class CalibManualDialog(QDialog):
     def _on_target(self):
         self.cmb_tpl.blockSignals(True)
         self.cmb_tpl.clear()
-        self._tpl_meta = {}     # 模板路径 -> (怪/玩家 id, 帧 stem)
-        if self.cmb_target.currentData() == "player":
+        self._tpl_meta = {}     # 模板路径 -> (怪/玩家/掉落物/宠物 id, 帧 stem)
+        _tgt = self.cmb_target.currentData()
+        if _tgt in ("drop", "pet"):
+            # ⭐⭐ 掉落物 / 宠物（用户 2026-10-05 ✓）—— 模板来自**另外两套图库**：
+            #   · 掉落物：`datasets/sprites/drop/<id>/*.png`（`wzexport.drop_frame_files` ✓）；
+            #   · 宠物：**现算的组合外观**（宠物 + 它戴的装备 ✓ `petlib.compose_pet` ✓ ——
+            #     ④ 标的时候用的就是这一份 ✓，标定当然也得拿同一份 ✓ 不然量的是别的图 ✗）。
+            #   ⚠ 这两类都是**按类记一个尺度** ✓（没有"逐帧标定"那套 ✓ 见
+            #     `CalibCard._save_manual_scale` ✓）⇒ 这里列帧只是让你挑一张**最清楚的**来对齐 ✓。
+            self._fill_class_templates(_tgt)
+            self.cmb_tpl.blockSignals(False)
+            self._reload_template()
+            return
+        if _tgt == "player":
             root = Path("datasets/sprites/player") / self._player_id
             for f in sorted(root.glob("*.png")):
                 frame = f.stem
@@ -283,6 +313,53 @@ class CalibManualDialog(QDialog):
         self.cmb_tpl.blockSignals(False)
         self._reload_template()
 
+    def _fill_class_templates(self, kind):
+        """把「掉落物 / 宠物」这一类**能拿来对齐的模板**填进模板下拉 ⇒ 顺便记好 meta ✓。
+
+        ⚠ 一个都没有时**说清为什么**（不静默留个空下拉 ✗ —— "选不到东西"和"弹窗坏了"
+        得分得清 ✓）：占位项写在模板下拉里 ✓（它的 data 为空 ⇒ 画布上什么都不叠 ✓）。
+        ⚠ 这两类是**按类记一个尺度** ✓ ⇒ 列帧只是让你挑一张**最清楚的**来对齐 ✓
+          （`_tpl_meta` 里的 id 只用于显示 ✓ 写回时不看它 ✓ 见 `CalibCard._save_manual_scale` ✓）。
+        """
+        if kind == "drop":
+            for d in self._drops:
+                did = str(d.get("id") or "").strip()
+                if not did:
+                    continue
+                nm = str(d.get("name") or did)
+                files = wzexport.drop_frame_files(did)
+                if not files:
+                    continue
+                for f in files:
+                    self.cmb_tpl.addItem("%s (%s) · %s · %.2f×"
+                                         % (nm, did, f.stem, self._drop_default), str(f))
+                    self._tpl_meta[str(f)] = (did, f.stem)
+            if self.cmb_tpl.count() == 0:
+                self.cmb_tpl.addItem("（掉落物图库还是空的：先用 WzProbe dump-drops 导出，"
+                                     "并在 ④ 里勾上「标注掉落物」）", "")
+            return
+        for e in self._pets:
+            pid = str(e.get("pet") or "").strip()
+            if not pid:
+                continue
+            nm = str(e.get("name") or pid)
+            try:
+                # 宠物模板**现算组合外观**（宠物 + 它戴的装备 ✓）—— ④ 标的时候用的就是这一份 ✓
+                root = petlib.compose_pet(pid, e.get("equips") or ())
+            except Exception:                    # noqa: BLE001 —— 组合做不出来 ⇒ 如实跳过 ✓
+                root = None
+            if root is None:
+                continue
+            for f in sorted(Path(root).glob("*.png")):
+                if f.stem == "icon":
+                    continue
+                self.cmb_tpl.addItem("%s (%s) · %s · %.2f×"
+                                     % (nm, pid, f.stem, self._pet_default), str(f))
+                self._tpl_meta[str(f)] = (pid, f.stem)
+        if self.cmb_tpl.count() == 0:
+            self.cmb_tpl.addItem("（这一只宠物的组合外观还没做出来：先在 ④ 里勾上「标注宠物」，"
+                                 "并确认宠物图库已用 dump-pets / dump-petequips 导出）", "")
+
     def _reload_template(self):
         path = self.cmb_tpl.currentData()
         self._tpl_orig = _load_trimmed_pixmap(path) if path else None
@@ -290,10 +367,21 @@ class CalibManualDialog(QDialog):
         meta = self._tpl_meta.get(path) if path else None
         if meta:
             mid, frame = meta
-            default = (self._player_default
-                       if self.cmb_target.currentData() == "player"
-                       else self._mob_default)
-            sc = self._mob_scales.get("%s:%s" % (mid, frame), default)
+            _t = self.cmb_target.currentData()
+            if _t == "player":
+                default = self._player_default
+            elif _t == "drop":
+                default = self._drop_default
+            elif _t == "pet":
+                default = self._pet_default
+            else:
+                default = self._mob_default
+            # ⚠ 帧级覆盖（`mob_scales`）**只对 怪 / 玩家** 有意义 ✓ —— 掉落物 / 宠物按类存 ✓
+            #   （硬查那张表只会查到别人的账 ✓ 见 `CalibCard._save_manual_scale` ✓）
+            if _t in ("drop", "pet"):
+                sc = default
+            else:
+                sc = self._mob_scales.get("%s:%s" % (mid, frame), default)
             self._scale = max(0.2, min(4.0, sc))
             self.sld.blockSignals(True)
             self.sld.setValue(int(round(self._scale * 1000)))

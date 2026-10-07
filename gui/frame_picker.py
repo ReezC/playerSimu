@@ -1,7 +1,8 @@
 """选帧弹窗：挑「这一次自动标注要处理哪些帧」。
 
 **从哪来**
-    「标注怪物 / 标注玩家」点下去先弹它 —— 脑子里要清楚「哪些已经标过、哪些没有」。
+    「标注怪物 / 标注玩家 / 标注掉落物 / 标注宠物」点下去都先弹它 ——
+    脑子里要清楚「哪些已经标过、哪些没有」（用户 2026-10-04 ✓ 四个按钮统一走这一套 ✓）。
     数据集导出、迭代也能复用（各自的默认筛选不同）。
 
 **为什么需要「处理台账」**
@@ -35,7 +36,13 @@ _BASE_CLS = 2
 
 
 class FramePickDialog(QDialog):
-    """选帧。`project` 给目录，`target` 是 "mob"/"player"（决定台账与文案）。"""
+    """选帧。`project` 给目录，`target` 是标注目标名（= 类别英文名 ✓）。
+
+    现在有四个调用方（用户 2026-10-04 ✓：\"标注掉落物、宠物的提交按钮需要先开选帧弹窗\"✓）：
+    `"mob"`（标注怪物）/ `"player"`（标注玩家）/ `"drop"`（标注掉落物）/ `"pet"`（标注宠物）——
+    台账（`labelio.processed_set(dir, target)` ✓）本来就是**按 target 字符串**分的 ✓，
+    唯一写死的是标题那句中文 ✗ ⇒ 已改成从类别表反查（`labelio.zh_of_name` ✓）。
+    """
 
     FILTERS = (("全部", "all"), ("未勾选", "unchecked"), ("已勾选", "checked"),
                ("未处理", "todo"), ("已处理", "done"))
@@ -50,7 +57,10 @@ class FramePickDialog(QDialog):
         self.processed = labelio.processed_set(labels_dir, target)
         self.stems = [p.stem for p in sorted(project.frames.glob("*.png"))]
 
-        what = "怪物" if target == "mob" else "玩家"
+        # ⚠⚠ **不许再写 `"怪物" if target == "mob" else "玩家"`** ✗（那样 drop/pet 一进来
+        #   标题就成了「标注玩家」✓）。走 `labelio.target_zh`（唯一出口 ✓）：类别表兜底 +
+        #   少数"文案说法"的例外（如 `掉落` ⇒ `掉落物` ✓）⇒ 标题是「选帧 —— 标注掉落物」✓。
+        what = labelio.target_zh(target, target)
         self.setWindowTitle("选帧 —— 标注%s" % what)
         root = QVBoxLayout(self)
 

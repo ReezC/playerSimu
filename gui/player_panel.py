@@ -23,8 +23,11 @@ from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboB
                              QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout,
                              QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
                              QListWidget, QListWidgetItem, QMessageBox, QProgressBar,
-                             QPushButton, QScrollArea, QSlider, QVBoxLayout, QWidget)
+                             QPushButton, QScrollArea, QSizePolicy, QSlider,
+                             QVBoxLayout, QWidget)
 
+from core import behavior           # 重连回来"没恢复自动"要落一条日志（`reconnect_resume` ✓）
+from core import zones as zones_mod
 from decision import input as dinput
 from decision.agent import (ANTI_AFK_TYPES, ZONE_GOTO_RETRY_S, load_rect,
                             settings)
@@ -47,6 +50,10 @@ KEY_ROWS = [
     ("down", "移动↓", "down"),
     ("attack", "输出", "ctrl"),
     ("jump", "跳跃", "alt"),
+    # ⭐ 「拾取」（用户 2026-10-06 ✓ 原话："在键盘映射组里加一项默认键盘映射『拾取』"）——
+    #   默认 `z`（这类游戏的常见拾取键 ✓，不对就点一下按钮再按实际那个键 ✓）；
+    #   ⚠ 它**只在「战斗参数 → 自动拾取」开着时**才被点按 ✓（见 `_pickup_beat` ✓）。
+    ("pickup", "拾取", "z"),
     ("hp_pot", "补血", None),
     ("mp_pot", "补蓝", None),
     ("feed_pet", "喂宠", None),
@@ -253,7 +260,10 @@ class BattleZoneListDialog(QDialog):
                 nm = str(z.get("set") or "")
                 bits = []
                 if z.get("can_fight"):
-                    bits.append("**可以战斗**")
+                    # ⚠ 纯文本控件（`QListWidgetItem`）**不认 markdown** ✗ —— 原来写着
+                    #   `"**可以战斗**"` ⇒ 界面上原样显示四个星号 ✓（2026-10-04 顺手修 ✓；
+                    #   同一行的另一个说法是没勾时的 `⚠ 未启用，不会生效` ✓）。
+                    bits.append("可以战斗")
                 try:
                     bits.append("CD %.1fs" % float(z.get("cd_s") or ZONE_GOTO_RETRY_S))
                 except (TypeError, ValueError):
@@ -274,8 +284,11 @@ class BattleZoneListDialog(QDialog):
                     _fm = 0.0
                 if _fm > 0:
                     bits.append("最多打 %.0fs" % _fm)
-                item = QListWidgetItem("%s    ·    %s" % (nm, "，".join(bits))
-                                       if bits else nm)
+                # ⭐ 没勾「可以战斗」⇒ 当场标一句"不生效"（用户 2026-10-04 ✓ 原话："如果不生效
+                #   动态显示当前的配置有没有用并简短例如『该区域未启用，不会生效』"✓）。
+                _off = "" if z.get("can_fight") else "    ⚠ 未启用，不会生效"
+                item = QListWidgetItem(("%s    ·    %s" % (nm, "，".join(bits))
+                                        if bits else nm) + _off)
                 item.setData(Qt.UserRole, nm)
                 # ⭐ 去掉勾选框：`QListWidgetItem` **默认就带** `ItemIsUserCheckable` ✗
                 #   （勾选框挪到主窗口了）⇒ 显式把这一位摘掉 ✓。
@@ -287,6 +300,16 @@ class BattleZoneListDialog(QDialog):
     def zones(self):
         """当前这一份（`list of dict` ✓ —— 用例 / 外面都能直接读 ✓）。"""
         return [dict(z) for z in self._zones]
+
+    def _enabled_map(self):
+        """`{集合名: 勾没勾「可以战斗」}` —— **推给子弹窗**判断"目的地会不会去" ✓。
+
+        ⚠ 为什么从这儿推：子弹窗不认识 `settings`（见类说明 ✓），而"哪一项没启用"是
+          **同一份 `battle_zones` 里别项的状态** ⇒ 只有持有整份的调用方知道 ✓
+          （同 `names` / `picker_factory` 那套"面板间推送" ✓）。
+        """
+        return {str(z.get("set") or ""): bool(z.get("can_fight"))
+                for z in self._zones if str(z.get("set") or "")}
 
     def _commit(self, reload=True):
         """**唯一出口**：写回一笔 ✓（`reload=True` 时顺手重画列表 ✓）。"""
@@ -321,7 +344,8 @@ class BattleZoneListDialog(QDialog):
             return
         dlg = BattleZoneDialog({"set": nm, "cd_s": ZONE_GOTO_RETRY_S},
                                names=self._names, parent=self,
-                               picker_factory=self._picker_factory)
+                               picker_factory=self._picker_factory,
+                               enabled_map=self._enabled_map())
         if dlg.exec_() != QDialog.Accepted:
             return
         self._zones.append(dlg.zone())
@@ -333,7 +357,8 @@ class BattleZoneListDialog(QDialog):
         if not cur:
             return
         dlg = BattleZoneDialog(cur[0], names=self._names, parent=self,
-                               picker_factory=self._picker_factory)
+                               picker_factory=self._picker_factory,
+                               enabled_map=self._enabled_map())
         if dlg.exec_() != QDialog.Accepted:
             return
         new = dlg.zone()
@@ -382,7 +407,8 @@ class BattleZoneDialog(QDialog):
       本面板不持有地图 id（集合是按 map id 存在 `core/zones` 里的 ✓）。
     """
 
-    def __init__(self, zone, names=None, parent=None, picker_factory=None):
+    def __init__(self, zone, names=None, parent=None, picker_factory=None,
+                 enabled_map=None):
         super().__init__(parent)
         z0 = dict(zone or {})
         #: ⭐ **只读视图工厂**（用户 2026-09-28 要求 ✓ 原话："编辑战斗区域的**子弹窗**需要有
@@ -403,6 +429,12 @@ class BattleZoneDialog(QDialog):
         # 场景里又有怪时 tick 提前返回 leave_battle_zone，idle 回归（以及战斗）都不触发。
         # 编辑已有区域时，显式的值会被原样保留（get 的第二参数只兜底"没有该键"的情况）。
         self._can_fight = bool(z0.get("can_fight", True))
+        #: ⭐⭐ **每个区域项的「可以战斗」现状**（`{集合名: bool}` ✓）—— 由外面推进来 ✓。
+        #:   用途：本项的目的地（idle 切换平台 / 到点去哪）若指向**没启用的项** ⇒ 弹窗要
+        #:   **当场**说一句"配了也不会去" ✓（用户 2026-10-04 ✓ 原话："修功能，然后如果不生效
+        #:   动态显示当前的配置有没有用并简短例如『该区域未启用，不会生效』"✓）。
+        #:   ⚠ 没推 / 推来 None ⇒ 只报"本项自己启不启用" ✓（老环境与直接 new 的用例不受影响 ✓）。
+        self._enabled_map = dict(enabled_map or {})
         self.setWindowTitle(("编辑战斗区域「%s」" % self._set) if self._set
                             else "添加战斗区域")
         # ⚠ 只钉**宽度**、不钉高度，并给一个**打开的尺寸**（2026-09-28 现场修 ✗ ——
@@ -419,6 +451,15 @@ class BattleZoneDialog(QDialog):
         root = QVBoxLayout(self)
         root.setSpacing(10)
         root.setContentsMargins(16, 16, 16, 16)
+
+        # ⭐⭐ **这行配置到底会不会生效** —— 一行短话，随内容实时变（用户 2026-10-04 ✓ 原话：
+        #   "修功能，然后如果不生效动态显示当前的配置有没有用并简短例如『该区域未启用，
+        #   不会生效』"✓）。判据与措辞全在 `_update_effect_hint` ✓（唯一出口 ✓）。
+        #   ⚠ 纯文本，别写 markdown ✗（QLabel 不认 ✓ 同 `live_panel._show_mmap_push` 那条纪律 ✓）。
+        self.lbl_effect = QLabel("")
+        self.lbl_effect.setWordWrap(True)
+        root.addWidget(self.lbl_effect)
+
         form_top = QFormLayout()
         form_top.setLabelAlignment(Qt.AlignLeft)
         # ⭐ 拆成上下两段表单（用户 2026-10-02 ✓ 要求"idle 回归 foothold 块放在 idle 模式
@@ -632,6 +673,11 @@ class BattleZoneDialog(QDialog):
         row.addWidget(btn_ok)
         root.addLayout(row)
         # 拉过的大小/位置按客户端记住（docs/UI规范.md §11 ✓）—— 第一次打开用上面那个 `resize`
+        # ⭐ 目的地一变就重算那句"到底会不会生效"（用户 2026-10-04 ✓ 见 `_update_effect_hint`）
+        self.cmb_idle_dst.currentIndexChanged.connect(
+            lambda _i: self._update_effect_hint())
+        self.cmb_dst.currentIndexChanged.connect(lambda _i: self._update_effect_hint())
+        self._update_effect_hint()
         theme.bind_window_state(self, "battle_zone")
         # ⭐ 初始化「idle 去哪」的置灰状态（delay=0 ⇒ 置灰 ✓ 建完所有控件后调一次 ✓）
         self._on_idle_delay_changed(self.sp_idle_delay.value())
@@ -673,6 +719,40 @@ class BattleZoneDialog(QDialog):
         # 点选之后刷新下面那行参数（视图自己已经改好选中态了 ✓）
         w.picked.connect(lambda *_a: self._refresh_idle_label())
         return w
+
+    def _update_effect_hint(self):
+        """那一行短话：**这份配置现在到底会不会生效**（唯一出口 ✓ 纯展示 ✓ 不参与判断 ✓）。
+
+        用户 2026-10-04 ✓ 原话："修功能，然后如果不生效动态显示当前的配置有没有用并简短
+        例如『该区域未启用，不会生效』"。
+        三条（按优先级 ✓，短 ✓）：
+          ① 本项没勾「可以战斗」⇒ **整个不生效**（`decision/agent._zone_enabled` 的口径 ✓）；
+          ② 本项勾了、但**目的地**（idle 切换平台 / 到点去哪）指向**没启用的项** ⇒ 到时候
+             **不会去**（`_zone_dst_blocked` ✓ 2026-10-04 修的那条 ✓）；
+          ③ 都没问题 ⇒ 说一句"会生效"（**看得见才算数** ✗ 别让人猜 ✓）。
+        ⚠ 目的地是不是"没启用"靠外面推的 `_enabled_map` ✓；**没推 ⇒ 不猜**（② 整条不报 ✓）——
+          "图上压根没这一项"（中性平台 ✓）不是"未启用" ✗，别混 ✓。
+        """
+        lbl = getattr(self, "lbl_effect", None)
+        if lbl is None:
+            return
+        if not self._can_fight:
+            lbl.setText("⚠ 该区域未启用（主窗口「路线规划」里「可以战斗」没勾）"
+                        "—— 这里的配置不会生效")
+            lbl.setStyleSheet("color:#b06000; font-weight:600;")
+            return
+        _bad = []
+        for _cmb, _what in ((getattr(self, "cmb_idle_dst", None), "idle 切换平台"),
+                            (getattr(self, "cmb_dst", None), "到点去哪")):
+            _dst = str(_cmb.currentData() or "") if _cmb is not None else ""
+            if _dst and self._enabled_map.get(_dst) is False:
+                _bad.append("「%s」的目的地「%s」未启用" % (_what, _dst))
+        if _bad:
+            lbl.setText("⚠ " + "；".join(_bad) + " ⇒ 到时候不会去")
+            lbl.setStyleSheet("color:#b06000; font-weight:600;")
+            return
+        lbl.setText("✓ 该区域已启用：这里的配置会生效")
+        lbl.setStyleSheet("color:#5f6368;")
 
     def _refresh_idle_label(self):
         """刷新"当前选中的 foothold"那行（**顺带显示它的参数** —— 用户点选要看的就是它 ✓）。"""
@@ -762,6 +842,79 @@ class BattleZoneDialog(QDialog):
                 "can_fight": bool(self._can_fight)}
 
 
+class _PadSender:
+    """触控板位移的**发送器**：单槽累积 + **独立线程**发（用户 2026-10-05 ✓ 原话：
+    "B机F10控制A机鼠标，A机的鼠标移动不连续"）。
+
+    它在整条链里的位置（三段各自解耦 ✓，缺一段就会"一顿一顿" ✗）：
+      ① **产生**位移：`decision/input.py::PointerTracker` 独立线程按固定节拍轮询指针 ✓
+         （挂在 Qt move 事件上的老写法会让节拍跟着 GUI 卡 ✗）；
+      ② **入队**（本类的 `push()`）：跟踪线程直接调 ⇒ 只加法 + 置事件 ✓（不碰网络 ✓）；
+      ③ **发送**（本类的线程）：真去 `dinput.mouse_move` ⇒ **要阻塞就阻塞在这里** ✓。
+
+    **为什么第 ③ 步必须独立线程**（和 `decision/manual_input` 2026-10-02 那次同一个病 ✓）：
+      `dinput.mouse_move` → `_send_remote` **会阻塞**（socket + 背压 ✓；实测
+      `kbd_rtt_ms` 中位 **11 ms**、p95 更大 ✓）。若在**跟踪线程里直接发** ✗ ⇒ 那条约 250 Hz
+      的轮询节拍会被往返拖成"什么时候回来什么时候再轮询" ✗ ⇒ 一次攒一大坨 ⇒ A 机照样
+      "一段一段一顿一顿" ✓（2026-10-03 只做了"累积 + 合并"、发送仍在主线程 ⇒ 病根只治了一半 ✗）。
+      挪到独立线程后：**发送节奏只受链路限制**，而且永远拿最新累积量 ✓。
+
+    ⚠⚠ **单槽累积、不是覆盖** ✗：位移必须守恒 —— 覆盖（丢帧那套）在这里会**丢像素** ✓
+      ⇒ `push()` 是 `+=`，`take()` 发完再扣掉 ✓（小数留着 ✓ 慢速滑不丢 ✓）。
+    ⚠ `push()` **绝不碰网络**（只加法 + 置事件 ✓）—— 这是"调用方（跟踪线程 / GUI）不被拖住"
+      的全部保证 ✓。
+    ⚠ 谁调 `push()`：**只有** `_on_pad_tracked`（跟踪线程 ✓）；收尾只有 `shutdown` ✓
+      ⇒ 惰性创建才不用加锁 ✓（见 `_on_pad_tracked` 的说明 ✓）。
+    """
+
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self._acc = [0.0, 0.0]
+        self._evt = threading.Event()
+        self._stop = False
+        self.n_push = 0          # 入队次数（打点/自检用 ✓）
+        self.n_sent = 0          # 真发出去几条 ✓（< n_push 说明合并生效 ✓）
+        self._th = threading.Thread(target=self._run, daemon=True, name="pad-send")
+        self._th.start()
+
+    def push(self, dx, dy):
+        """入队（**立刻返回** ✓）—— GUI 侧只做加法 + 置事件 ✓。"""
+        with self._lock:
+            self._acc[0] += float(dx)
+            self._acc[1] += float(dy)
+            self.n_push += 1
+        self._evt.set()
+
+    def take(self):
+        """取走当前**整像素**累积（小数留着 ✓）—— 给发送线程用，也便于自检 ✓。"""
+        with self._lock:
+            mx, my = int(self._acc[0]), int(self._acc[1])
+            self._acc[0] -= mx
+            self._acc[1] -= my
+            return mx, my
+
+    def _run(self):
+        while not self._stop:
+            self._evt.wait(0.5)
+            if self._stop:
+                return
+            mx, my = self.take()
+            if not (mx or my):
+                self._evt.clear()        # 不足 1px ⇒ 等下一次 push（不空转 ✓）
+                continue
+            try:
+                dinput.mouse_move(mx, my)   # ⚠ 要阻塞就阻塞在**这条线程**里 ✓
+                self.n_sent += 1
+            except Exception:            # noqa: BLE001 —— 链路坏了别把发送线程弄死 ✗
+                pass
+
+    def stop(self):
+        """收尾（面板关闭时调 ✓）：置停止 + 唤醒线程，别留一条守护线程空等 ✓。"""
+        self._stop = True
+        self._evt.set()
+
+
 class PlayerPanel(QWidget):
     verify_started = pyqtSignal()            # 保留：主窗口既有连接
     verify_result = pyqtSignal(object, str)  # 保留：主窗口既有连接
@@ -775,8 +928,30 @@ class PlayerPanel(QWidget):
         self._build()
         self.device_connected.connect(self._on_device_connected)
         self._sync_from_settings()
+        self._update_save_hint()
 
     # ---------------- 界面 ----------------
+
+    def _update_save_hint(self):
+        """把"这份参数存到哪儿 / 现在改了会不会存"写进顶部那一行 ✓（纯展示 ✓ 不参与判断 ✓）。
+
+        ⚠⚠ 为什么要有一行（用户 2026-10-04 ✓ 原话："追击起跳需要的冲刺时间，没有保存数据，
+          每次重开 gui 都要重新填"）：**决策参数只按项目存** ✓ ⇒ 没打开项目时
+          `settings.save()` **什么都不写** ✗ ⇒ 那时候改的参数一重开就回默认 ✓。
+          以前界面上**一句都不说** ✗ ⇒ 人自然以为"存了" ⇒ 报的就是"没保存"✓。
+        ⚠ 有项目时也写一句（说清**写回哪个项目** ✓）—— "写进谁"这件事本来就该看得见 ✓。
+        """
+        lbl = getattr(self, "lbl_save_hint", None)
+        if lbl is None:
+            return
+        if self.project is None:
+            lbl.setText("⚠ 还没打开项目：这里改的参数不会保存（重开就回默认值）"
+                        "—— 先用上面的「打开…」选一个项目，之后改动会立即写回它。")
+            lbl.setStyleSheet("color:#b06000; font-weight:600;")
+        else:
+            lbl.setText("参数按项目保存：%s（改完立即写回它的 project.yaml）"
+                        % self.project.root.name)
+            lbl.setStyleSheet("color:#5f6368;")
 
     def mount_goto(self, widget):
         """把「前往平台」那一块（`RoutePanel` 造的）放进本页操控区 ⇒ **幂等** ✓。
@@ -797,6 +972,16 @@ class PlayerPanel(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 8, 10, 0)
         outer.setSpacing(6)
+
+        # ⭐⭐ **这份参数存到哪儿** 的一行常显提示（用户 2026-10-04 ✓ 现场："追击起跳需要的
+        #   冲刺时间，没有保存数据，每次重开 gui 都要重新填"）。决策参数**只按项目存** ✓
+        #   ⇒ **没打开项目时 `settings.save()` 一个字节都不写** ✗（见 `decision/agent.py`
+        #   的 `set_save_hook` ✓）⇒ 必须**明说**，别让人以为"改了就存上了" ✗
+        #   （同理：显示的是"最近打开那个项目"那份 ⇒ 尤其容易误会成"没保存"✗）。
+        #   ⚠ 纯文本，别写 markdown ✗（QLabel 不认 ✓ 同 `live_panel._show_mmap_push` 那条纪律 ✓）。
+        self.lbl_save_hint = QLabel("")
+        self.lbl_save_hint.setWordWrap(True)
+        outer.addWidget(self.lbl_save_hint)
 
         # ⚠ 这是**唯一一处**"自己 new 滚动区"（`# ui-allow-scroll：<理由>` 是给
         #   `tools/check_ui.py` 认的标记 ✓）：本页要在滚动区**外面**压一条**常驻**的
@@ -869,9 +1054,11 @@ class PlayerPanel(QWidget):
         self.touchpad = TouchPad()
         cg.addWidget(self.touchpad)
 
-        # 触控板位移的余数累积（小位移不丢：0.3px 攒到 1px 才发）
-        self._pad_rem = [0.0, 0.0]
-        self.touchpad.moved.connect(self._on_pad_moved)
+        # ⭐⭐ 触控板位移的**实时出口**（用户 2026-10-05 ✓ 原话："直接2"）：跟踪线程每拍**直接
+        #   调它** ⇒ **不经 Qt 事件循环** ✓✓ —— 这正是"GUI 卡不卡都均匀"的全部保证 ✓
+        #   （`moved` 信号是排队的 ⇒ 回到 GUI 线程 ⇒ 又会排在重绘/主回路后面 ✗ 那正是老毛病 ✓）。
+        #   ⚠ 它会在**跟踪线程**里被调 ⇒ 只许做线程安全的事（见 `_on_pad_tracked` ✓）。
+        self.touchpad.set_delta_sink(self._on_pad_tracked)
         # 触控模式（本地按 F10 开 / 关，见 eventFilter）下的点击 / 拖拽 / 滚轮都转发给远程鼠标：
         #   点一下就松 → clicked → 固件原子 CLICK；
         #   按住并滑动 → pressed/released → 固件 PRESSM/RELEASEM（拖窗口、框选）。
@@ -1232,6 +1419,29 @@ class PlayerPanel(QWidget):
         self.sp_attack_down.valueChanged.connect(self._on_attack_vertical)
         af.addRow("向下攻击距离", self.sp_attack_down)
 
+        # ⭐⭐ **「扇形角度」**（用户 2026-10-04 ✓ 原话："在「向下攻击距离」参数下面加个参数
+        #   「扇形角度」，代表攻击距离矩形的扇形化角度，默认 0。当不是 0 时，攻击距离框的
+        #   上下两条边要向上及向下倾斜这个角度"✓）。
+        #   **几何**：把矩形上下两条边、以**近端那条竖边**（=「最小攻击距离」处 ✓）为支点
+        #   向外倾斜 α ⇒ **远端更宽、近端高度不变** ✓（就是他那张示意图：左边那个窄矩形、
+        #   往右张开 ✓）。⚠ **0 = 老行为一字不差** ✓（`tan0 = 0` ✓）。
+        #   判据与绘制**同一处**：`decision/agent.py::DecisionAgent._in_box` / `attack_box_poly` ✓。
+        self.sp_attack_fan = self._spin(0, 60, 0, 1, 0.5)
+        self.sp_attack_fan.setToolTip(
+            "**扇形角度**（度）：把攻击范围框的**上下两条边**向外倾斜这么多。\n\n"
+            "· **0（默认）= 矩形**（老行为，一字不变 ✓）；\n"
+            "· **> 0 = 扇形（梯形）**：以「**最小攻击距离**」那条竖边为支点、远端向外张开 ——\n"
+            "  近端高度还是「向上/向下攻击距离」，离角色越远允许的竖直距离越大\n"
+            "  （水平距离 d 处 = 该方向距离 + max(0, d − 最小攻击距离) × tanα ✓）。\n\n"
+            "为什么要它：有些技能的判定是**扇形**（近处窄、远处宽）—— 用矩形框会在远处\n"
+            "把够不着的怪也算进来（或者反过来，把远处能打的漏掉 ✗）。\n\n"
+            "⚠ 上限 60°（再大就接近「上下不限」了 ✗）；负数一律按 0 算 ✓。\n"
+            "⚠ 「上下都配 0」的老规矩：**α = 0** 时整个框面积为 0 ⇒ 不判也不画；\n"
+            "   而 **α > 0 时远端有高度** ⇒ 框是有效的（判定与画面都照做 ✓）。\n"
+            "实机效果：设置 → 外观 → 辅助线与标记里的「攻击范围框」会从矩形变成梯形 ✓。")
+        self.sp_attack_fan.valueChanged.connect(self._on_attack_fan)
+        af.addRow("扇形角度(°)", self.sp_attack_fan)
+
         # 「**跳跃攻击范围**」（用户 2026-09-27 记的一笔，**本次不实现**）：等跳跃物理做好后，
         # 它表示"怪框落在这个范围内 ⇒ 按跳就能把它带进攻击范围框 ⇒ 触发 attack" ✓。
         # 所以这里**故意不放参数框**（没有物理逻辑可依据 ✗），但设置里已经有它的
@@ -1241,6 +1451,26 @@ class PlayerPanel(QWidget):
         lbl_jump_box.setWordWrap(True)
         lbl_jump_box.setStyleSheet("color: #5f6368;")
         af.addRow("", lbl_jump_box)
+
+        # ⭐⭐ **「走不动按跳」**（用户 2026-10-06 ✓ 原话："现在走路走不动会跳一下，能做成开关
+        #   放到战斗参数里吗「走不动按跳」，放在「追击起跳」上面"）—— 就摆在**追击起跳上面** ✓。
+        #   它管的是**走执行器**（`route.WalkJob` ✓）：判定"走不动了"之后先**单点跳一下**
+        #   （跳过小台阶 ✓ 2026-09-28 加 ✓；跳过还走不动才判失败 ✓）。
+        #   ⚠ **默认勾上** = **现在正在跑的行为** ✓（要的是"能关掉" ✓ 不是"默认关" ✗）。
+        self.ck_walk_hop = QCheckBox("走不动时跳一下")
+        self.ck_walk_hop.setChecked(bool(getattr(settings, "walk_stall_jump", True)))
+        self.ck_walk_hop.setToolTip(
+            "走（`走路`执行器）判定「走不动了」之后，**先单点跳一下**试试能不能跳过小台阶/\n"
+            "小障碍；跳完还走不动才判失败（并说清卡在哪）。\n\n"
+            "· **勾上（默认）= 现在正在跑的行为** ✓：被小台阶挡住时，跳一下就过去了 ✓；\n"
+            "· **取消** ⇒ 走不动**直接判失败**（= 加这个单点跳之前的老行为 ✓）——\n"
+            "  适合「一被挡住就让它早点放弃、别在那儿跳」的场合 ✓。\n\n"
+            "⚠ 一轮只跳一次（跳完重新计时，再走不动就失败 ⇒ 被真墙挡住时不会无限跳 ✓）。\n"
+            "⚠ 跳的那一下**只跳、不横挪**（跳起来挪会挪歪 ✓）；按 60ms 就松 ✓。\n"
+            "⚠ 和「追击起跳」（下面那个）**不是一回事** ✗：那个是**战斗中追怪**用的跳，\n"
+            "  这个只管**走路被挡住**时的那一下 ✓。")
+        self.ck_walk_hop.stateChanged.connect(self._on_walk_hop)
+        bf.addRow("走不动按跳", self.ck_walk_hop)
 
         # ② **追击起跳**（原来散在「战斗参数」里，2026-09-27 一起收进「攻击」子组 ✓）
         self.ck_chase_jump = QCheckBox("启用")
@@ -1287,9 +1517,31 @@ class PlayerPanel(QWidget):
             "换朝向后，输出行为要额外推迟这么久（毫秒）才开始。0 = 不延迟。\n"
             "和上面那条配合用：那条保证方向键按住够久，这条保证输出等转身做完。\n"
             "已经在跑的输出序列不会被掐断（半截掐断会留下按着的键），\n"
-            "只把「新开一轮输出」往后推。")
+            "只把「新开一轮输出」往后推。\n"
+            "站桩时补朝向键（上一项）也吃它 —— 顺序固定是"
+            "「输出 → 转向 → 本项延迟 → 输出」（用户 2026-10-06 定）。\n"
+            "改完立刻生效（不用重启、不用重开自动）。")
         self.sp_turn_output_delay.valueChanged.connect(self._on_turn_params)
         bf.addRow("转向后输出延迟(ms)", self.sp_turn_output_delay)
+
+        # ⭐⭐ 「**自动拾取**」（用户 2026-10-06 ✓ 原话："在战斗参数的『转向后输出延迟』**下面**
+        #   加一个参数『自动拾取』→ bool 开关，逻辑是**当玩家与掉落物接触时连续点按拾取**"）——
+        #   ⚠ 位置就是**这一行**（紧跟那个 spin ✓ 用例量坐标钉着"在它下面" ✓ 别挪 ✗）。
+        #   ⚠ 它跟「键盘映射 → 拾取」是一对：那个决定**点哪个键**，这个决定**点不点** ✓。
+        self.ck_auto_pickup = QCheckBox("自动拾取")
+        self.ck_auto_pickup.setChecked(bool(getattr(settings, "auto_pickup", False)))
+        self.ck_auto_pickup.setToolTip(
+            "**玩家与掉落物接触时，连续点按「拾取」键**（默认每 0.15 秒一下）。\n\n"
+            "· 判据 = 「玩家框」和「掉落物框」**相交**（感知层每帧算好 ⇒ 决策只读那个结论 ✓）；\n"
+            "· 点的是「键盘映射」组里那个「**拾取**」键（默认 Z）—— 不对就去那儿改一下；\n"
+            "· 没接触 / 没配拾取键 ⇒ **一下都不点** ✓。\n\n"
+            "⚠ **默认关**：老项目升上来行为一个字都不变 ✓；\n"
+            "⚠ 它**不占**输出CD、也不参与「转向」那套（拾取键不是方向键）⇒ 打架走路时照捡 ✓。\n"
+            "⚠ 模型里**要有掉落类**（class 2）：权重没这一类 ⇒ 永远判不出「接触」（框都没有 ✗）；\n"
+            "   「界面 → 检测框颜色 → 掉落框颜色」那个勾只影响**看不看得见**、不影响这里 ✓。\n"
+            "⚠ 要跟「平台站桩 → 定时拾取掉落」配合用：那套负责**走过去**，这个负责**碰到了就点** ✓。")
+        self.ck_auto_pickup.stateChanged.connect(self._on_auto_pickup)
+        bf.addRow("自动拾取", self.ck_auto_pickup)
 
         self.ck_chase_jump.setToolTip(
             "追击起跳：起跳范围内「从无怪变成有怪」的那一拍才跳一次。\n"
@@ -1444,7 +1696,28 @@ class PlayerPanel(QWidget):
         bf.addRow("", evade_grp)
         self._evade_grp = evade_grp
 
-        # 目标切换 CD [min, max]（毫秒）
+        # 定义输出行为：呼出行为编辑器，配置 attack 状态执行的输出序列（默认一个输出键）
+        self.btn_edit_output = QPushButton("定义输出行为")
+        self.btn_edit_output.setToolTip("打开行为编辑器，配置输出动作序列（默认一个输出键）")
+        self.btn_edit_output.setStyleSheet(self._BTN_EDIT_SEQ)
+        self.btn_edit_output.clicked.connect(self._edit_output_seq)
+        bf.addRow("", self.btn_edit_output)
+
+        root.addWidget(battle)
+
+        # ---- ⭐⭐ 「目标参数」组（用户 2026-10-06 ✓）----
+        #   用户原话："决策参数页签→战斗参数 的「目标切换CD」、「防抖置信度」、「防抖时间」
+        #   挪出到**下面**新的分组「目标参数」" ✓ ⇒ 它们仨从「战斗参数」**搬出来**、
+        #   在这一组里单开（`root.addWidget(battle)` 之后 = 主区里 battle 的**下面** ✓），
+        #   再补上「**目标被攻击CD(ms)**」（新参数 ✓ 同一条链上的东西 ⇒ 摆一起 ✓）。
+        #   ⚠ 这三个控件的**名字 / 键 / 默认值 / tooltip / 信号一个字都没改** ✓
+        #     （纯版式搬移 ⇒ `_sync_from_settings` 那几处回填、`_on_target_cd` /
+        #      `_on_debounce` 两个写回**都不用动** ✓）；存盘仍按**项目**走（同旁边那些 ✓）。
+        tgt = QGroupBox("目标参数")
+        tf = QFormLayout(tgt)
+        tf.setLabelAlignment(Qt.AlignLeft)
+
+        # ① 目标切换 CD [min, max]（毫秒）—— 从「战斗参数」搬来（键/默认值/提示全原样 ✓）
         self.sp_cd_min = self._spin(0, 10000, 500, 0)
         self.sp_cd_max = self._spin(0, 10000, 1000, 0)
         self.sp_cd_min.setToolTip("锁定目标后，至少/至多隔多久才允许换目标（随机取中间值）。")
@@ -1456,9 +1729,54 @@ class PlayerPanel(QWidget):
         cd_row.addWidget(QLabel("~"))
         cd_row.addWidget(self.sp_cd_max)
         cd_row.addWidget(QLabel("ms"))
-        bf.addRow("目标切换CD", cd_row)
+        tf.addRow("目标切换CD", cd_row)
 
-        # 防抖：高置信度怪框消失后保留位置（独立于策略）
+        # ②a ⭐⭐ 「攻击目标数量」（用户 2026-10-06 ✓ 原话："在「目标被攻击CD」**上方**增加
+        #    配置「攻击目标数量」→ int。代表一次攻击最多只能使几个怪物框进被攻击CD。
+        #    **填 0 代表不启用「目标被攻击CD」（配置置灰）**，**填 -1 代表不限制**"✓）。
+        #    ⇒ 它是下面那格的**闸 + 名额**：`0` = 不启用（下面那格**置灰** ✓）、
+        #      `-1` = 不限制（默认 ✓ 与上一版一字不差 ✓）、`N>0` = **同时最多 N 只怪**在 CD 里 ✓。
+        #    ⚠ **默认 -1**（不是 0 ✗）：0 会把"已经调过「目标被攻击CD」的老项目"**默默关掉** ✗。
+        self.sp_atk_target_count = self._spin(-1, 50, -1, 0)
+        self.sp_atk_target_count.setToolTip(
+            "**一次攻击最多让几只怪进「被攻击CD」**（`0` / `-1` / 正数是三种意思）：\n\n"
+            "· **0 = 不启用「目标被攻击CD」** —— 下面那一格会**置灰**，整个冷却机制关掉\n"
+            "  （不记 CD、不摘怪、预览里也不画灰框 ✓ 跟没有这个功能一样）。\n"
+            "· **-1 = 不限制**（默认 ✓ = 下面那格自己的行为，跟以前一样）。\n"
+            "· **正数 N = 名额**：同一时间**最多 N 只怪**能待在「目标被攻击CD」里。\n"
+            "  名额满了 ⇒ 新怪**不再被框进 CD**（它照旧能被选、照旧挨打 ✓）——\n"
+            "  也就是「别一次攻击就把一堆怪全框进去、结果没怪可打」。\n"
+            "  有怪冷却到点出表之后，新怪自然就能顶上来 ✓。\n\n"
+            "· 只在**攻击范围内触发了 attack** 那一刻才占名额（转身 / 追击本身不算 ✓）。\n"
+            "· 按项目存（跟旁边这些参数一样 ✓）。")
+        self.sp_atk_target_count.valueChanged.connect(self._on_atk_target_count)
+        tf.addRow("攻击目标数量", self.sp_atk_target_count)
+
+        # ②b ⭐⭐ 「目标被攻击CD」（毫秒；用户 2026-10-06 ✓ 原话："代表每只怪使玩家触发进 attack、
+        #    触发转朝向后，需要冷却该时间才可再次触发" + 追问定稿："**只有当其在攻击范围内触发了
+        #    attack 后才进CD**（我打过这只怪 1 次了）① 选为目标（不会拉你进 attack、不会让你为它
+        #    转身、chase），也 ② 不参与『背后怪抢锁 / 回身』"✓）。
+        #    `0`（默认）= **不限制** ✓ ⇒ 老项目一字不变 ✓。
+        #    ⚠ 上面那格填 0 ⇒ 这一格**置灰**且不生效 ✓（用户原话："配置置灰"✓）——
+        #      置灰那把开关在 `_sync_mob_cd_enabled` **一处** ✓（别在别处再 setEnabled ✗）。
+        self.sp_mob_atk_cd = self._spin(0, 60000, 0, 0)
+        self.sp_mob_atk_cd.setToolTip(
+            "**按怪**记的冷却（毫秒）：某只怪在**攻击范围内触发了 attack**（= 我打过它一次）\n"
+            "之后，这段时间里它：\n"
+            "· **不能被选为目标** —— 不会把我拉进 attack、不会让我为它转身、也不会去 chase 它；\n"
+            "· **不参与「背后怪抢锁 / 回身」**。\n"
+            "⇒ 效果就是「打过一次 ⇒ 先歇一会儿再打它」（有几只怪时会先打别的）。\n\n"
+            "· **0 = 不限制**（默认，= 以前的行为 ✓）；填得越大，同一只怪被再次触发得越慢。\n"
+            "· 只在**攻击范围内触发了 attack** 那一刻才进冷却（转身 / 追击本身不算）。\n"
+            "· 冷却中的怪在**实时预览里画成灰框**，右下角写着还剩几秒（一位小数）✓\n"
+            "  —— 它只是**不被选中**，不是看不见了 ✓。\n"
+            "· ⚠ 上面「**攻击目标数量**」填 **0** ⇒ 这一格**置灰、不生效** ✓（那是总开关）；\n"
+            "  填正数 ⇒ 只放那么多只怪同时进 CD ✓。\n"
+            "· 按项目存（跟旁边这些参数一样 ✓）。")
+        self.sp_mob_atk_cd.valueChanged.connect(self._on_mob_atk_cd)
+        tf.addRow("目标被攻击CD(ms)", self.sp_mob_atk_cd)
+
+        # ③④ 防抖（怪框消失后保留位置）—— 同样从「战斗参数」搬来（键/默认值/提示全原样 ✓）
         self.sp_debounce_conf = self._spin(0.0, 1.0, 0.5, 2)
         self.sp_debounce_conf.setSingleStep(0.05)
         self.sp_debounce_conf.setToolTip(
@@ -1466,7 +1784,7 @@ class PlayerPanel(QWidget):
             "保留期间框会按消失前的速度继续走一小段（逐渐收住），\n"
             "不会粘在原地 —— 移动中的怪也跟得上。")
         self.sp_debounce_conf.valueChanged.connect(self._on_debounce)
-        bf.addRow("防抖置信度", self.sp_debounce_conf)
+        tf.addRow("防抖置信度", self.sp_debounce_conf)
 
         self.sp_debounce_ms = self._spin(0, 10000, 300, 0)
         self.sp_debounce_ms.setToolTip(
@@ -1476,16 +1794,14 @@ class PlayerPanel(QWidget):
             "调大的代价：角色可能朝一个已经消失的框走过去（性能面板的\n"
             "chase_ghost 就是这个占比）。")
         self.sp_debounce_ms.valueChanged.connect(self._on_debounce)
-        bf.addRow("防抖时间(ms)", self.sp_debounce_ms)
+        tf.addRow("防抖时间(ms)", self.sp_debounce_ms)
 
-        # 定义输出行为：呼出行为编辑器，配置 attack 状态执行的输出序列（默认一个输出键）
-        self.btn_edit_output = QPushButton("定义输出行为")
-        self.btn_edit_output.setToolTip("打开行为编辑器，配置输出动作序列（默认一个输出键）")
-        self.btn_edit_output.setStyleSheet(self._BTN_EDIT_SEQ)
-        self.btn_edit_output.clicked.connect(self._edit_output_seq)
-        bf.addRow("", self.btn_edit_output)
-
-        root.addWidget(battle)
+        # ⚠ 这一组的控件**不进 `self.widgets`**（那是 `steps.base` 那套卡片的登记表 ✗
+        #   本面板的控件一律按成员名访问、回填走 `_sync_from_settings` ✓ 同上面 battle 里那批 ✓）。
+        root.addWidget(tgt)
+        # ⚠ 起手就按"攻击目标数量"把「目标被攻击CD」那格的灰/亮摆对一次 ✓（值本身由
+        #   `_sync_from_settings` 填 ✓）—— 只加 setEnabled 而没人调 = 没接上 ✗（约定 121 的教训 ✓）。
+        self._sync_mob_cd_enabled()
 
         # ---- 自动喝药组 ----
         pot = QGroupBox("自动喝药")
@@ -1564,6 +1880,35 @@ class PlayerPanel(QWidget):
         pg.addRow("HP当前", self.pb_hp)
         self._lbl_hp_cur = pg.labelForField(self.pb_hp)
 
+        # ⭐⭐ **「血条读空」的红字直接盖在 HP 条上、不占任何行**（用户 2026-10-05 ✓ 第二轮原话：
+        #   "不要把红字用额外行写出来，直接覆盖 Hp 红条"）。
+        #   ⛔ 它原来是「自动喝药」组里 `pg.addRow("", lbl)` 的**独立一行** ✗ ⇒ 一亮一灭就
+        #      **多一行 / 少一行** ✗；而血条**受击会闪**（那几拍采样出来就是空 ⇒ 判据翻来翻去 ✓）
+        #      ⇒ 版面**频繁抽动** ✓（用户现场："频繁的让 gui 多一行少一行" ✓）。
+        #   ⇒ 现在做成 `pb_hp` 的**子控件**、用 grid 贴在条上居中 ✓（红字压在红条上 = 他要的样子 ✓）；
+        #      亮的时候把条自带的 `HP xx%` 让开 ✓（`_on_potions` 里 `setTextVisible` ✓ 不然两段字叠）。
+        #   ⚠ 判据与 Agent **同源**：都是"血条读空 = 0" ✓（数据就是 `_on_potions` 收到的那两个数 ✓
+        #     —— 实时层识别出来的比例 ✓），界面层不另立规则 ✗。
+        self.lbl_hp_off = QLabel("读空：喝药/定时已停", self.pb_hp)
+        self.lbl_hp_off.setAlignment(Qt.AlignCenter)
+        self.lbl_hp_off.setStyleSheet("color: #d93025; background: transparent;")
+        # ⚠ 文案要**短**（实测 sizeHint：这句 170px；"血条读空 ⇒ 喝药 / 定时已停" 要 272px ✗
+        #   ⇒ 条一窄就被裁 ✓）。
+        # ⚠⚠ `Ignored` 策略不能省 ✗：QLabel 的 minimumSizeHint 就是文字宽 ⇒ 不压它的话
+        #   **条的最小宽会被这段红字顶大** ⇒ 面板那一列跟着变宽 ✗（= 版面还是在动 ✓，只不过从
+        #   "多一行"变成了"变宽" ✗）。`Ignored` = "最小 0、给我多少用多少" ✓ ⇒ 条多宽它多宽 ✓。
+        self.lbl_hp_off.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.lbl_hp_off.setMinimumSize(0, 0)
+        self.lbl_hp_off.setToolTip(
+            "已停用：血条读空（角色死亡 / 复活界面）。\n"
+            "自动喝药与自定义定时行为都会停；血条一读出数就自动恢复。")
+        _ovl = QGridLayout(self.pb_hp)
+        _ovl.setContentsMargins(0, 0, 0, 0)
+        _ovl.addWidget(self.lbl_hp_off, 0, 0)
+        _ovl.setColumnStretch(0, 1)      # 撑满整条（不然只拿 sizeHint，字会被挤在左边 ✓）
+        _ovl.setRowStretch(0, 1)
+        self.lbl_hp_off.setVisible(False)
+
         self.pb_mp = QProgressBar()
         self.pb_mp.setRange(0, 100)
         self.pb_mp.setValue(0)
@@ -1586,15 +1931,44 @@ class PlayerPanel(QWidget):
         sf.setLabelAlignment(Qt.AlignLeft)
 
         # 策略类型
+        #: 三种策略的**中文名**（只此一处 ✓ 标签 / 摘要 / "还没启用"那句都读它 ✗ 别各写一份）
+        #: ⚠ 与 `decision/agent.py` 的 `strategy` 取值**必须字字对应**（用例钉着 ✓）。
+        self.STRATEGY_NAMES = {"patrol": "平地巡逻",
+                               "sweep": "扫平台",
+                               "platform": "平台站桩",
+                               # ⭐ 「多点巡逻」（用户 2026-10-06 ✓）：**依次循环**走点位 ✓
+                               "multi": "多点巡逻"}
+
+        # ⭐ 「**当前策略类型**」放在策略参数组**最上方**（用户 2026-10-05 ✓ 原话："在策略参数组
+        #   最上方加「当前策略类型」，右下角加「启用」"✓）—— 它说的是**正在生效**那一个，
+        #   与下面下拉选中的那个**可能不同**（选了还没点「启用」✓）。
+        self.lbl_strategy_cur = QLabel("")
+        self.lbl_strategy_cur.setWordWrap(True)
+        sf.addRow("当前策略类型", self.lbl_strategy_cur)
+
+        # 策略类型（**选择**）—— ⚠ 换它**不生效**（只切下面的参数预览 ✓）；要生效点右下角「启用」✓。
         self.cmb_strategy = NoWheelComboBox()
         self.cmb_strategy.addItem("平地巡逻", "patrol")
         self.cmb_strategy.addItem("扫平台", "sweep")
+        # ⛔⛔ **这一行上一轮漏了**（用户 2026-10-05 报"真机策略类型选不了站桩"✗）——
+        #   当时只把下面那四行控件加上了、忘了把第三项塞进下拉 ⇒ 下拉里**根本没有**它 ✗。
+        #   教训：**用例要"真调一次"控件**（我那条是直接改 `settings.strategy` ⇒ 抓不到 ✗
+        #   见 `t_platform_panel_widgets` ✓ 现在改成走下拉 ✓）。
+        self.cmb_strategy.addItem("平台站桩", "platform")
+        # ⭐ 「多点巡逻」（用户 2026-10-06 ✓）—— ⚠ 上一轮**漏过一行**（"平台站桩"那次 ✓ 见下面那段
+        #   教训注释 ✓）：**加了策略就必须同时塞进这个下拉** ✗，否则"面板选不了"✗
+        #   （用例 `t_platform_panel_widgets` 现在是**走下拉**钉的 ✓ 抓得到 ✓）。
+        self.cmb_strategy.addItem("多点巡逻", "multi")
         self.cmb_strategy.currentIndexChanged.connect(self._on_strategy)
         self.cmb_strategy.setToolTip(
             "平地巡逻：锁定全部怪，就近优先。\n"
             "扫平台：优先朝向方向，背后一定距离内的怪按就近锁定；\n"
             "到集合边缘附近（「距离平台边缘回头」）或当前朝向没怪持续\n"
-            "一段时间就换向。")
+            "一段时间就换向。\n"
+            "平台站桩：站在「站桩地点」打（够不着的怪只在站点范围内水平逼近）。\n"
+            "多点巡逻：在多个「点位」之间**依次循环**走，**到了直接去下一个**；\n"
+            "          路上/到点遇怪照打（攻击范围内有怪优先 attack ✓）。\n"
+            "⚠ 这里只是**选择**：换它只切下面的参数预览，要生效请点本组右下角的「启用」✓。")
         sf.addRow("策略类型", self.cmb_strategy)
 
         self.lbl_strategy_note = QLabel("")
@@ -1630,6 +2004,124 @@ class PlayerPanel(QWidget):
             "退回「换朝向延迟」的老逻辑。")
         sf.addRow("距离平台边缘回头(px)", self.sp_edge_turn)
         self._lbl_edge_turn = sf.labelForField(self.sp_edge_turn)
+
+        # ---- 「平台站桩」专属（用户 2026-10-05 ✓）----
+        # ⚠ 这几行**只在策略 = 「平台站桩」时显示**（见 `_refresh_strategy_ui` 的**三态** ✓）
+        # ① 「站桩地点」= 一个**地图元素**（集合 / 单 foothold / 绳梯 / 传送门 ✓），
+        #    由「地区选择」通用弹窗（`gui/element_picker.py`）选 —— **单选** ✓。
+        #    ⚠ 本面板**不持有地图 id** ⇒ 弹窗由**工厂**推过来（同 `set_zone_sets` 那套 ✓）。
+        self.btn_station_spot = QPushButton("选择站桩地点…")
+        self.btn_station_spot.setStyleSheet(theme.ENTRY_BTN_QSS)
+        self.btn_station_spot.clicked.connect(self._on_station_spot_pick)
+        self.btn_station_spot.setToolTip(
+            "选一个**地图元素**当地点（集合 / 单个 foothold / 绳梯 / 传送门）✓。\n\n"
+            "· 人不在那儿 ⇒ 先下「前往」走过去（**可跨层** ✓）；\n"
+            "· 到位之后**就在那儿打**：够不着的怪只在站点 x 范围内水平逼近、到边缘就停\n"
+            "  （不出平台、不跨层 ✓）；\n"
+            "· 完全没怪 ⇒ 原地站住（不回归、不换平台 ✓）；\n"
+            "· **不选** = 这个策略什么都不做（站着不动 ✓，**不是**退回平地巡逻 ✗）。")
+        sf.addRow("站桩地点", self.btn_station_spot)
+        _r_spot = sf.labelForField(self.btn_station_spot)
+        self.lbl_station_spot = QLabel("")
+        self.lbl_station_spot.setWordWrap(True)
+        sf.addRow("", self.lbl_station_spot)
+        _r_spot2 = sf.labelForField(self.lbl_station_spot)
+
+        # ② 「定时拾取掉落」（用户 2026-10-05 ✓）：开关 ⇒ 时间区间 ⇒ 掉落地区；
+        #    **不勾 ⇒ 后面三个参数置灰不可配置** ✓（用户原话 ✓）。
+        self.ck_pickup = QCheckBox("定时拾取掉落")
+        self.ck_pickup.setToolTip(
+            "勾上之后：**到站桩地点**那一刻起随机一个倒计时（下面那段时间区间 ✓），\n"
+            "到点后按「拾取掉落地区」的顺序用寻路**依次全部走到**，走完**回站桩地点**、\n"
+            "再重新抽一个（循环 ✓）。\n\n"
+            "· 到点时攻击范围内还有怪 ⇒ **先打**（推迟到没怪、没任务那一刻才出发 ✓）；\n"
+            "· **不勾** = 老行为（不拾取 ✓），下面三个参数置灰。")
+        self.ck_pickup.stateChanged.connect(self._on_pickup_enabled)
+        sf.addRow("", self.ck_pickup)
+        _r_ck = sf.labelForField(self.ck_pickup)
+
+        self.sp_pickup_min = self._spin(0.0, 3600, 0, 1, 0.5)
+        self.sp_pickup_max = self._spin(0.0, 3600, 0, 1, 0.5)
+        self.sp_pickup_min.valueChanged.connect(self._on_pickup_time)
+        self.sp_pickup_max.valueChanged.connect(self._on_pickup_time)
+        self.sp_pickup_min.setToolTip("随机倒计时的**下限（秒）**；0~0 = 关。")
+        self.sp_pickup_max.setToolTip(
+            "随机倒计时的**上限（秒）**。\n"
+            "⚠ **上限 <= 0 ⇒ 整组不生效**（用户 2026-10-05：「配<=0不生效」✓）。")
+        _pk = QWidget()
+        _pk_row = QHBoxLayout(_pk)
+        _pk_row.setContentsMargins(0, 0, 0, 0)
+        _pk_row.addWidget(self.sp_pickup_min)
+        _pk_row.addWidget(QLabel("~"))
+        _pk_row.addWidget(self.sp_pickup_max)
+        sf.addRow("拾取掉落时间(s)", _pk)
+        _r_time = sf.labelForField(_pk)
+
+        self.btn_pickup_spots = QPushButton("选择掉落地区…")
+        self.btn_pickup_spots.setStyleSheet(theme.ENTRY_BTN_QSS)
+        self.btn_pickup_spots.clicked.connect(self._on_pickup_spots_pick)
+        self.btn_pickup_spots.setToolTip(
+            "选**多个地点**（可以选好几条 foothold / 集合 ✓）：到点后**按弹窗里列出的顺序**\n"
+            "（同类型按 x 从左到右 ✓）用寻路**依次全部走到**，走完算一轮 ✓。\n"
+            "⚠ 一个地点都解析不出可走的集合 ⇒ 这一轮**不出发**（log 里留一条 `pickup_abort` ✓）。")
+        sf.addRow("拾取掉落地区", self.btn_pickup_spots)
+        _r_ps = sf.labelForField(self.btn_pickup_spots)
+        self.lbl_pickup_spots = QLabel("")
+        self.lbl_pickup_spots.setWordWrap(True)
+        sf.addRow("", self.lbl_pickup_spots)
+        _r_ps2 = sf.labelForField(self.lbl_pickup_spots)
+
+        # ---- ⭐ 「多点巡逻」专属（用户 2026-10-06 ✓）----
+        # 「点位」= **多个地点**（同一个「地区选择」通用弹窗 ✓ **多选** ✓ 与「拾取掉落地区」
+        #   完全同款 ✓）；**顺序 = 依次走的顺序**（弹窗里列出的顺序 ✓）。
+        # ⚠ 少于 2 个 ⇒ **不许启用**（用户第 4 条：**爆红字** ✓ 见 `_apply_strategy` 的拦截 ✓）。
+        self.btn_multi_spots = QPushButton("选择点位…")
+        self.btn_multi_spots.setStyleSheet(theme.ENTRY_BTN_QSS)
+        self.btn_multi_spots.clicked.connect(self._on_multi_spots_pick)
+        self.btn_multi_spots.setToolTip(
+            "选**多个地点**当巡逻点位（集合 / 单条 foothold / 绳梯 / 传送门 ✓）。\n\n"
+            "· **顺序 = 依次走的顺序**（同弹窗里列出的顺序 ✓）；\n"
+            "· 启用后角色**依次循环**走过去（走完最后一个 ⇒ 回到第一个 ✓）；\n"
+            "· ⭐ **到了就直接去下一个**（不在那儿停留等条件 ✓）；\n"
+            "· 路上 / 到点时攻击范围内有怪 ⇒ **照打**（那是既有机制 ✓），打完接着走 ✓；\n"
+            "· ⚠ **至少选 2 个**才能启用这个策略（只选 1 个 = 站着不动 ✓）。")
+        sf.addRow("点位", self.btn_multi_spots)
+        _r_ms = sf.labelForField(self.btn_multi_spots)
+        self.lbl_multi_spots = QLabel("")
+        self.lbl_multi_spots.setWordWrap(True)
+        sf.addRow("", self.lbl_multi_spots)
+        _r_ms2 = sf.labelForField(self.lbl_multi_spots)
+
+        #: 「平台站桩」那几行的 `(控件, 左边那格标签)` —— 显隐**一处收口** ✓
+        #: （`QFormLayout` 里"标题"和"控件"是**两样东西** ⇒ 必须成对显隐 ✗ 只藏一个会留半行 ✓）
+        self._station_rows = [(self.btn_station_spot, _r_spot),
+                              (self.lbl_station_spot, _r_spot2),
+                              (self.ck_pickup, _r_ck),
+                              (_pk, _r_time),
+                              (self.btn_pickup_spots, _r_ps),
+                              (self.lbl_pickup_spots, _r_ps2)]
+        #: 「多点巡逻」那两行 —— 同上，成对显隐 ✓（只在**选中**「多点巡逻」时出现 ✓）
+        self._multi_rows = [(self.btn_multi_spots, _r_ms),
+                            (self.lbl_multi_spots, _r_ms2)]
+        #: 「地区选择」弹窗的工厂（`fn(parent, multi, init) -> [地点] | None` ✓
+        #:   —— 由主窗口从路线识别面板推过来 ✓ 见 `set_element_picker_factory` ✓）
+        self._element_factory = None
+
+        # ⭐ 右上那一行是「当前策略类型」、右下角这一个「**启用**」（用户 2026-10-05 ✓
+        #   原话："在策略参数组最上方加「当前策略类型」，右下角加「启用」"✓）。
+        #   为什么要有它：换策略**不是**改一个数字那么轻（它会换掉整套行为 ✓）⇒ 让"选"
+        #   和"生效"分开，用户可以先看参数、配好站桩地点再按下去 ✓。
+        _ap = QHBoxLayout()
+        _ap.addStretch(1)
+        self.btn_strategy_apply = QPushButton("启用")
+        self.btn_strategy_apply.clicked.connect(self._apply_strategy)
+        self.btn_strategy_apply.setToolTip(
+            "把上面「策略类型」里**选中的**那个真正启用（写进项目参数 ✓）。\n\n"
+            "· 换策略只改「这一拍之后怎么打」，**不会**丢别的配置 ✓；\n"
+            "· 「当前策略类型」那行显示的是**正在生效**的那一个 —— 与上面选的不一样时，\n"
+            "  下面那些参数只是**预览**（还没生效 ✓），这个按钮这时才是可点的 ✓。")
+        _ap.addWidget(self.btn_strategy_apply)
+        sf.addRow("", _ap)
 
         root.addWidget(strategy_grp)
 
@@ -1691,6 +2183,13 @@ class PlayerPanel(QWidget):
         self._timer_list = QVBoxLayout()
         self._timer_list.setSpacing(4)
         tv.addLayout(self._timer_list)
+        # ⚠⚠ **这里原来有一行红字**（"已暂停：血条读空…" ✓ `tv.addWidget(lbl)` ✗）——
+        #   用户 2026-10-05 第二轮要求**不再用额外行** ✓（原话："不要把红字用额外行写出来，直接
+        #   覆盖 Hp 红条"）：血条受击会闪 ⇒ 那行一亮一灭 ⇒ 版面**频繁多一行少一行** ✗。
+        #   ⇒ 显示统一挪到 **HP 条上**那一个（`self.lbl_hp_off` ✓ 不占行 ✓ 文案里就写着"定时已停" ✓），
+        #     这里**别再往回加** ✗。⛔ 注意：暂停本身**照旧有效** ✓（闸在 `agent._custom_timers` ✓
+        #     与 `agent.timers_suspended()` ✓）—— 本条只是"怎么给人看"改了位置 ✓。
+        timer_grp.setToolTip("血条读空（角色死亡 / 复活界面）期间整组暂停；血条一读出数就恢复。")
         btn_add_timer = QPushButton("＋ 添加行为")
         btn_add_timer.setToolTip("新增一个定时执行的按键行为（名字 + 序列 + 间隔）。")
         btn_add_timer.clicked.connect(self._add_timer)
@@ -2006,20 +2505,31 @@ class PlayerPanel(QWidget):
             probs.append("· 检查标定 / 地形时出错：%s" % e)
         return probs
 
+    def _auto_precheck_problems(self):
+        """开自动要查的那份问题清单 —— **唯一一处**（前台开自动的弹窗 ✓ + 后台重连恢复 ✓）。
+
+        ⚠ 两处**不许各写一遍**参数（`map_id` + `need_mmap`）✗：那个「禁用杀怪寻路」的口径
+          2026-10-04 刚错过一次（见 `selftest_live_panel.t_auto_precheck` ④ ✓）——
+          再分岔就是两份口径，早晚一处对一处错 ✓。
+        """
+        return self._precheck_problems(
+            self._map_id_for_check(),
+            # ⛔ 「禁用杀怪寻路」开着 ⇒ 体检里那三件（地图/标定/地形）**都不构成拦路虎**
+            #   （那个模式不读世界坐标 ✓，见 `_precheck_problems` 的说明 ✓）
+            need_mmap=not bool(getattr(settings, "disable_chase_pathfinding", False)))
+
     def _precheck_auto(self):
         """开自动前的体检 + 弹窗。返回 `True` = 放行 ✓。
 
         ⚠ **只"提示"不"禁止"**（用户说的是"**出弹窗提示**"✓）：提示完让人自己决定 ——
         但**默认按钮给「否」** ✓（这次要拦的是"条件没凑齐就开"✓，安全的一侧才是默认 ✓，
         和 `_confirm_local_auto` 同一个道理 ✓）。
+        ⚠ 判据本身在 `_auto_precheck_problems`（**两处共用的唯一一份** ✓）—— 后台那条
+          （重连回到游戏 ✓）**不弹窗**，走 `_poll_reconnect_resume` ✓。
         """
         if self._auto_confirming:
             return True                         # 已经在问别的了，别叠对话框 ✗
-        probs = self._precheck_problems(
-            getattr(self, "_map_id_for_check", lambda: "")(),
-            # ⛔ 「禁用杀怪寻路」开着 ⇒ 体检里那三件（地图/标定/地形）**都不构成拦路虎**
-            #   （那个模式不读世界坐标 ✓，见 `_precheck_problems` 的说明 ✓）
-            need_mmap=not bool(getattr(settings, "disable_chase_pathfinding", False)))
+        probs = self._auto_precheck_problems()
         if not probs:
             return True
         self._auto_confirming = True
@@ -2044,6 +2554,58 @@ class PlayerPanel(QWidget):
             return str((get("map_id") if callable(get) else "") or "").strip()
         except Exception:
             return ""
+
+    @staticmethod
+    def _resume_auto_verdict(probs):
+        """断线重连回来「能不能恢复自动」的判据（**纯函数** ✓ 能单测 ✓ 不吃 self / 不碰 Qt）。
+
+        回 `(要不要开自动, 人话原因)`：有问题 ⇒ `(False, 拼起来的问题清单)`；没问题 ⇒ `(True, "")`。
+
+        ⚠ 与前台那条（`_precheck_auto`）**同一份判据**、**不同处置**：
+          · 前台：**弹窗提醒**，由人决定（默认按钮「否」✓ 人就在旁边 ✓）；
+          · 后台（这里）：**不弹窗** ✗，直接**不恢复 + 写清原因** —— 人可能不在屏幕前，
+            弹一个模态框只会卡住界面，还把"没人点"变成"永久阻塞" ✗。
+        """
+        if probs:
+            return False, "；".join(str(p).strip() for p in probs)
+        return True, ""
+
+    def _poll_reconnect_resume(self):
+        """⭐⭐ 断线重连回到游戏 ⇒ **体检通过才恢复自动**（用户 2026-10-07 ✓ 三选一里选了"体检"）。
+
+        **为什么要多这一拍**：`reconnect.py::_finish` 原来直接 `settings.enabled = True` ✗
+        ⇒ **绕过了「开自动前体检」**（2026-09-29 ✓ `_precheck_problems`）⇒ 标定只做了一半 /
+        没有地形图时，重连回来照样把自动打开 ⇒ 表现成"开了却只站着不打、过几分钟自己停" ✗
+        —— 那正是 2026-09-29 查了半天的病根。所以状态机只**置旗子** ✓，由这里（**界面线程** ✓
+        `_state_timer` 500ms ✓）消费 ✓：`decision/` 里读不了项目 / 标定 / 地形（那是界面的事 ✓），
+        实时线程里也不许弹模态框 ✗。
+
+        ⚠ 三条口径：
+          · **用户已经自己开着** ⇒ 什么都不做（尊重人 ✓ 别因为体检不过又给他关掉 ✗）；
+          · **体检不过** ⇒ **不恢复** ✓ + 状态栏写清"为什么不恢复" ✓ + 落一条日志 ✓；
+          · 旗子**没人消费**（headless / 别的宿主 ✓）⇒ 自动就一直不开 ✓（安全的一侧 ✓）。
+        """
+        if not bool(getattr(settings, "reconnect_resume_pending", False)):
+            return
+        # ⚠ **先清旗子、再体检**：体检自己抛了也不至于每 500ms 重来一遍 ✓（幂等 ✓）
+        settings.reconnect_resume_pending = False
+        if bool(settings.enabled):
+            return                      # 人自己已经开了 ⇒ 不动他 ✓（也不必白跑一趟体检 ✓）
+        probs = self._auto_precheck_problems()
+        ok, why = self._resume_auto_verdict(probs)
+        if not ok:
+            # 状态栏那句要**短**（它挤在统计行最前面 ✓）：只取前两条的**第一行**，
+            # 完整原因落进日志（`behavior.event` ✓ 复盘时能查全 ✓）。
+            _short = "；".join(x.strip().splitlines()[0] for x in probs[:2])
+            settings.reconnect_note = (
+                "已回到游戏 —— **没恢复自动**：%s（共 %d 条）→ 修好后自己点「开启自动」"
+                % (_short, len(probs)))
+            behavior.event("reconnect_resume", ok=False, why=why[:120])
+            return
+        settings.enabled = True
+        settings.reconnect_note = "已回到游戏 —— 检查通过，已恢复自动"
+        behavior.event("reconnect_resume", ok=True, why="")
+        self._refresh_auto_ui()
 
     def _toggle_auto(self, checked=None):
         on = self.btn_auto.isChecked()
@@ -2134,50 +2696,29 @@ class PlayerPanel(QWidget):
 
     # ---------------- 鼠标控制（摇杆 + 左右键） ----------------
 
-    def _on_pad_moved(self, dx, dy):
-        """触控板位移 → 只**累积**；真正发送交给 8 ms 的合并节拍（`_flush_pad` ✓）。
+    def _on_pad_tracked(self, dx, dy):
+        """触控板位移 → 乘灵敏度 → 交给发送器（**在指针跟踪线程里被调** ✗⏰ 用户 2026-10-05 ✓）。
 
-        用户 2026-10-03 现场："通过触控板的远程鼠标操控卡卡的" + "在 A 机上一段一段一顿一顿
-        的指令汇报很离散" ✓。原来这里是**每个事件直接发一条** ✗（触控板 60~125 Hz、快速滑
-        还会突发）⇒ 每条都要走一趟 **≈11 ms 的往返**（`perf.log` 里 `kbd_rtt_ms` 中位 11.3 ms
-        ✓）⇒ 事件来得比往返快 ⇒ 必积压 ⇒ 「跟不上手指 + 一顿一顿」✓；而且发送跑在 **GUI 主
-        线程**上、排在 `draw_ms`（中位 5 / p99 15~22 ms）后面 ⇒ 一帧里攒下的位移**同一拍连发
-        几条** ✗ —— 这正是"A 机看到一段一段"的形状来源 ✓（链路一点缓冲都没有：relay 原样
-        转发、固件一批一口气做完 ✓）。
-        ⇒ 改成"**累积 + 8 ms 合并成一条**"：命令数从"事件率"压到 ≤125/s、且每条都是**真正的
-        位移**（位移守恒、小数留着不丢 ✓）⇒ 突发被抹平、往返不再被事件率顶爆 ✓。
+        为什么是它、而不是 Qt 信号（用户选的"直接2" ✓）：位移的**产生**已经挪进
+        `decision/input.py::PointerTracker` 那条独立线程（固定节拍轮询系统指针 ✓），
+        它的 `on_delta` 回调就直接落到这里 ⇒ 从"手指动"到"进发送队列"这条路上
+        **没有任何 Qt 事件循环** ✓✓（原来两段都挂在 GUI 线程上 ⇒ 一卡就成撮 ✓）。
+        位移的**发送**也早就在独立线程里（`_PadSender` ✓）⇒ 现在整条链只剩"链路本身"的
+        节奏限制 ✓（这才是该有的样子 ✓）。
+
+        ⚠ **不加锁也安全**（说明白，免得后人加一把没用的锁 ✓）：
+          · 这个方法只被**一条**线程（`pad-track` ✓）调 ⇒ 惰性创建 `_pad_sender`
+            也只有一个写者 ✓；
+          · 另一处会碰它的是 `shutdown`，而它**先停跟踪线程、再停发送器** ✓（见 `shutdown` ✓）
+            ⇒ 两者不会同时进行 ✓。
+        ⚠ 这里**不许碰界面、不许碰网络** ✗：`_PadSender.push()` 只做加法 + 置事件 ✓
+          （真发送在它自己的线程里 ✓）。
         """
         spd = max(0.01, float(settings.mouse_speed))
-        acc = getattr(self, "_pad_acc", None)
-        if acc is None:
-            acc = self._pad_acc = [0.0, 0.0]
-        acc[0] += dx * spd
-        acc[1] += dy * spd
-        t = getattr(self, "_pad_timer", None)
-        if t is None:
-            from PyQt5.QtCore import QTimer
-            t = self._pad_timer = QTimer(self)
-            t.setInterval(8)                 # ≈125 Hz 上限：比触控板事件率还高，不丢节拍 ✓
-            t.timeout.connect(self._flush_pad)
-        if not t.isActive():
-            t.start()
-
-    def _flush_pad(self):
-        """把这一刻累积的位移**合并成一条**发出去（位移守恒 ✓、静下来自己停表 ✓）。"""
-        acc = self._pad_acc
-        mx = int(acc[0])
-        my = int(acc[1])
-        if mx or my:
-            acc[0] -= mx                     # 小数部分**留着** ⇒ 慢速滑动不会丢位移 ✓
-            acc[1] -= my
-            self._pad_idle = 0
-            dinput.mouse_move(mx, my)
-            return
-        # 连续几拍都没有整像素（手指停了 / 慢到不足 1 px）⇒ 停表省空转 ✓
-        self._pad_idle = getattr(self, "_pad_idle", 0) + 1
-        if self._pad_idle >= 8:
-            self._pad_timer.stop()
-            self._pad_idle = 0
+        s = getattr(self, "_pad_sender", None)
+        if s is None:
+            s = self._pad_sender = _PadSender()
+        s.push(dx * spd, dy * spd)
 
     def _on_mouse_speed(self, _val=None):
         settings.mouse_speed = float(self.sp_mouse_speed.value())
@@ -2309,6 +2850,10 @@ class PlayerPanel(QWidget):
 
         顺带刷新休息状态：rest_state 由实时线程里的 agent 写，只能轮询。
         """
+        # ⭐⭐ **断线重连请求恢复自动**（用户 2026-10-07 ✓）：**必须排在最前** ——
+        #   它可能刚把 `settings.enabled` 打开 ⇒ 下面那句"同步到开关"才会跟着把按钮点亮 ✓
+        #   （放在后面就要等下一拍才亮 ✓ 白闪 500ms ✗）。
+        self._poll_reconnect_resume()
         # 兜底：面板被藏起来时不该还占着鼠标。hideEvent 管切页签那条路，
         # 这里再兜一层（父级被整体隐藏之类不会走我们的 hideEvent）。
         if self.touchpad.active and not self.isVisible():
@@ -2507,6 +3052,37 @@ class PlayerPanel(QWidget):
         """
         settings.attack_up_dist = int(self.sp_attack_up.value())
         settings.attack_down_dist = int(self.sp_attack_down.value())
+        settings.save()
+
+    def _on_attack_fan(self, _val=None):
+        """改了「扇形角度」⇒ 写进配置（决策参数、**跟着项目存** ✓）。
+
+        ⭐ 用户 2026-10-04 ✓：把攻击范围矩形的**上下两条边**以**近端竖边**（最小攻击距离处）
+        为支点向外倾斜这个角度 ⇒ 远端更宽（判据与绘制**同一处**：`agent._in_box` /
+        `attack_box_poly` ✓）。⚠ **0 = 老行为一字不差** ✓（老项目文件里没有这个键 ⇒ 兜底 0 ✓）。
+        """
+        settings.attack_fan_deg = float(self.sp_attack_fan.value())
+        settings.save()
+
+    def _on_walk_hop(self, _val=None):
+        """「走不动按跳」开关写回设置（用户 2026-10-06 ✓）。
+
+        ⚠ 和别的决策参数一样**按项目存** ✓（`walk_stall_jump` 在 `DecisionSettings.to_dict` /
+          `from_dict` 里 ✓ ⇒ 跟着 `project.yaml` 的 `decision:` 段走 ✓）；没打开项目时
+          `settings.save()` 一个字节都不写 ✓（顶部那行提示已经说清了 ✓）。
+        ⚠ 只管**走路被挡住**时那一下跳 ✗ —— 战斗里的「追击起跳」是另一个开关（下面那个 ✓）。
+        """
+        settings.walk_stall_jump = bool(self.ck_walk_hop.isChecked())
+        settings.save()
+
+    def _on_auto_pickup(self, _val=None):
+        """「自动拾取」开关写回设置（用户 2026-10-06 ✓）。
+
+        ⚠ 和别的决策参数一样**按项目存** ✓（`auto_pickup` 在 `DecisionSettings.to_dict` /
+          `from_dict` 里 ✓ ⇒ 跟着 `project.yaml` 的 `decision:` 段走 ✓）。
+        ⚠ 它只管**点不点** ✗ —— 点哪个键在「键盘映射 → 拾取」（`settings.keymap["pickup"]` ✓）。
+        """
+        settings.auto_pickup = bool(self.ck_auto_pickup.isChecked())
         settings.save()
 
     def _on_chase_jump(self, _val=None):
@@ -2836,6 +3412,41 @@ class PlayerPanel(QWidget):
         settings.target_cd = [int(self.sp_cd_min.value()), int(self.sp_cd_max.value())]
         settings.save()
 
+    def _on_mob_atk_cd(self, _val=None):
+        """「**目标被攻击CD**」写回设置（用户 2026-10-06 ✓）。
+
+        ⚠ 它是**按怪**记的冷却（`DecisionSettings.mob_atk_cd_ms` ✓）：`0` = 不限制 ✓；
+          agent 那边一张账、盖戳只在一处（见 `CombatAgent._mark_mob_atk_cd` ✓）。
+        ⚠ 跟旁边参数一样**按项目存** ✓（在 `to_dict` / `from_dict` 里 ✓）；没打开项目时
+          `settings.save()` 一个字节都不写 ✓（顶部那行提示已经说清 ✓）。
+        """
+        settings.mob_atk_cd_ms = int(self.sp_mob_atk_cd.value())
+        settings.save()
+
+    def _on_atk_target_count(self, _val=None):
+        """「**攻击目标数量**」写回设置（用户 2026-10-06 ✓）。
+
+        ⚠ 三种意思（`DecisionSettings.atk_target_count` ✓）：`0` = **不启用**「目标被攻击CD」
+          （⇒ 顺手把那一格置灰 ✓）、`-1` = **不限制**、`N>0` = **同时最多 N 只怪**在 CD 里 ✓。
+          内核判"开没开"只在 `CombatAgent._mob_atk_cd_on` **一处** ✓（这儿只管界面 ✓）。
+        ⚠ 跟旁边参数一样**按项目存** ✓（在 `to_dict` / `from_dict` 里 ✓）。
+        """
+        settings.atk_target_count = int(self.sp_atk_target_count.value())
+        # 0 ⇒ 下面那格置灰（用户原话："配置置灰"✓）；回 -1 / 正数 ⇒ 亮回来 ✓（值一直留着 ✓）
+        self._sync_mob_cd_enabled()
+        settings.save()
+
+    def _sync_mob_cd_enabled(self):
+        """按「攻击目标数量」把「目标被攻击CD」那格**置灰 / 亮回来** —— **只此一处** ✓。
+
+        ⚠ 两处都要调它：① 新建/回填（`_sync_from_settings` ✓）② 用户改上面那格
+          （`_on_atk_target_count` ✓）—— 只在一处调 = 另一个入口的灰/亮是错的 ✗。
+        ⚠ **不动那格的值** ✓：用户填的 300 一直留着（把「攻击目标数量」调回正数就照旧生效 ✓）
+          —— 千万别在置灰时顺手清零 ✗。
+        """
+        self.sp_mob_atk_cd.setEnabled(
+            int(self.sp_atk_target_count.value()) != 0)
+
     def _on_attack_cd(self, val):
         settings.attack_cd = int(val)
         settings.save()
@@ -2882,7 +3493,35 @@ class PlayerPanel(QWidget):
         settings.save()
 
     def _on_strategy(self, _idx=None):
-        settings.strategy = self.cmb_strategy.currentData()
+        """策略类型下拉**变了** ⇒ 只切下面的参数**预览**（**不生效** ✓ 用户 2026-10-05）。
+
+        ⚠ 生效要按右下角的「启用」（`_apply_strategy` ✓）—— 用户要求"手动启用"（原话：
+          "需要新加一个手动启用策略类型：在策略参数组最上方加「当前策略类型」，右下角加
+          「启用」"✓）：换策略换的是**整套行为**，让"选"与"生效"分开，才看得清现在跑的是哪一套 ✓。
+        """
+        self._refresh_strategy_ui()
+
+    def _apply_strategy(self):
+        """「启用」：把下拉里选中的那个策略**真正生效**（写进项目参数 ✓）。
+
+        已经是它 ⇒ 一个字节都不动 ✓（按钮那时本来就是灰的 ✓ 见 `_refresh_strategy_ui`）。
+        """
+        sel = str(self.cmb_strategy.currentData() or "patrol")
+        if sel == str(getattr(settings, "strategy", "patrol") or "patrol"):
+            return
+        # ⛔ 「**多点巡逻**」的点位少于 2 个 ⇒ **不许启用**（用户 2026-10-06 ✓ 第 4 条原话：
+        #   "**当未选择点位时，无法启用（爆红字）**"✓）⇒ 就地下红字、**什么都不改** ✓
+        #   （连"选中的那个"也保持原样 ✓ —— 让人先补齐点位再按一次 ✓）。
+        if sel == "multi":
+            n = len([x for x in (getattr(settings, "multi_spots", None) or [])
+                     if isinstance(x, dict) and x])
+            if n < 2:
+                self.lbl_strategy_note.setText(
+                    "⚠「多点巡逻」**至少要选 2 个点位**才能启用（现在 %d 个）—— "
+                    "先点上面的「选择点位…」再回来按「启用」。" % n)
+                self.lbl_strategy_note.setStyleSheet("color: #c5221f;")
+                return
+        settings.strategy = sel
         settings.save()
         self._refresh_strategy_ui()
 
@@ -2903,7 +3542,8 @@ class PlayerPanel(QWidget):
     def build_protection_page(self):
         """构建「挂机保护」页（main_window 把返回值 `addTab` 成新页签 ✓）。
 
-        内容 = 「防挂机」新组（触发音效 + 试听 ✓）+ **整体搬来**的「防掉线」组 ✓。
+        内容 = 「防挂机」新组（触发音效 + 试听 ✓）+ ⭐「断线重连」组（点名要的那个参数 ✓）
+        + **整体搬来**的「防掉线」组 ✓。
         ⚠⚠ 只是 **re-parent**：防掉线的控件与全部槽函数仍归**本面板**所有
         （信号早就连在它身上 ✓）—— 搬的是视觉位置，不是重写 ✗；
         `lay.addWidget(self.afk)` 会把它从决策参数页的布局里**自动摘走** ✓。
@@ -2911,6 +3551,9 @@ class PlayerPanel(QWidget):
         page = QWidget()
         lay = scroll_page(page, margins=(12, 12, 12, 12), spacing=8)
         lay.addWidget(self._build_antihang_group())
+        # ⭐⭐ 「断线重连」组（用户 2026-10-07 ✓ 原话："是数据工作台主窗口「挂机保护页签」"
+        #   —— 一开始做进了**设置弹窗**，位置不对 ✗ 在这儿才对 ✓）。
+        lay.addWidget(self._build_reconnect_group())
         lay.addWidget(self.afk)               # ⭐ re-parent（见上 ✓）
         lay.addStretch(1)
         return page
@@ -2944,6 +3587,47 @@ class PlayerPanel(QWidget):
         note.setWordWrap(True)
         f.addRow("", note)
         return grp
+
+    def _build_reconnect_group(self):
+        """⭐ 「断线重连」组（2026-10-07 ✓ 用户要求：**主窗口 → 挂机保护页签 → 新组「断线重连」
+        → 参数「频道」（整数）**）。
+
+        ⚠ 这里**只有"想进第几格"这一个参数** ✓ —— 断线重连的其余参数（探测延时 / 步骤超时 /
+        排队超时 / 重试上限 / 恢复自动 / 四个点击比例 / 鼠标标定那一行）仍在**设置弹窗**的
+        「保护与恢复 → 断线自动重连」里 ✓（2026-10-06 落的地方 ✓ 见设计文档 §7 ✓）；
+        用户点名要「频道」放这儿 ✓ 就放这儿 ✓（要其它也搬过来随时说 ✓）。
+
+        ⚠ 落点怎么算**不在这儿** ✗：`decision/reconnect.py::CHANNEL_GRID_*` 一处实现 ✓
+          （界面只收一个整数 ✓ 省得两处口径分叉 ✗）。
+        """
+        grp = QGroupBox("断线重连")
+        f = QFormLayout(grp)
+
+        self.sp_rc_channel = NoWheelSpinBox()
+        self.sp_rc_channel.setRange(1, 20)         # 4 列 × 5 行 ✓ 见 reconnect.CHANNEL_GRID_MAX ✓
+        self.sp_rc_channel.setValue(int(getattr(settings, "reconnect_channel", 1) or 1))
+        self.sp_rc_channel.setToolTip(
+            "断线重连时想进**第几个频道**（频道面板 4 列 × 5 行 ⇒ 1~20）。\n\n"
+            "**1 = 面板左上角那一格** ✓，从左到右、从上到下数 ✓。\n"
+            "落点 = 那对「频道 X/Y 比例」（= 第 1 格的位置）＋ 格距 × (格号−1) ✓\n"
+            "—— 格距是量出来的常数、存的是**比例** ⇒ 换分辨率不用重配 ✓。\n\n"
+            "⚠ 服务器那一格不受这里影响（永远是第 1 个服务器 + 单击 ✓）。\n"
+            "⚠ 填成超出 1~20 的数 ⇒ **一个字节都不点**、只在状态栏说清 ✓"
+            "（宁可不做，也不乱点 ✓）。")
+        self.sp_rc_channel.valueChanged.connect(self._on_reconnect_channel)
+        f.addRow("频道", self.sp_rc_channel)
+
+        note = QLabel("断线重连时进第几个频道；1 = 面板左上角（从左到右、从上到下数）。"
+                      "越界不会乱点，只会在状态栏提示。")
+        note.setStyleSheet("color: #80868b;")
+        note.setWordWrap(True)
+        f.addRow("", note)
+        return grp
+
+    def _on_reconnect_channel(self, _val=None):
+        """「频道」改了 ⇒ 写回设置并落盘 ✓（与会话里的其它参数同一个做法 ✓）。"""
+        settings.reconnect_channel = int(self.sp_rc_channel.value())
+        settings.save()
 
     def _on_alarm_sound(self):
         settings.lie_alarm_sound = self.ed_alarm_sound.text().strip()
@@ -2998,26 +3682,214 @@ class PlayerPanel(QWidget):
         self.sp_big_mob_ratio.setEnabled(on)
         self.sp_big_mob_range_px.setEnabled(on)
 
+    def _set_rows_visible(self, rows, on):
+        """成对显隐「控件 + 它左边那格标签」。
+
+        ⚠ `QFormLayout` 里"标题"和"控件"是**两样东西** ✗ ⇒ 只藏控件会留半个空标题
+          （用户一眼就看出来 ✓ 同 `_refresh_strategy_ui` 里那几处 `_lbl_*` 的写法 ✓）。
+        """
+        on = bool(on)
+        for w, lbl in (rows or ()):
+            w.setVisible(on)
+            if lbl is not None:
+                lbl.setVisible(on)
+
     def _refresh_strategy_ui(self):
-        """按策略切换说明文字，并控制扫平台专属参数是否可见。"""
-        is_sweep = settings.strategy == "sweep"
+        """切说明 / 参数预览，并报告「**当前生效**的是哪一个」（用户 2026-10-05 ✓）。
+
+        ⚠⚠ **参数显隐看的是"下拉选中的那个"**（= 预览 ✓ 让用户先配好站桩地点再启用 ✓）；
+          而"正在跑的是哪一套"由最上面那行 `当前策略类型` 说清楚 —— 两者不一致时那行会
+          **明写「还没启用」**（红字 ✓）⇒ 所以这**不是**在骗人 ✓（若参数跟着"生效的那个"走，
+          用户在启用前根本配不了站桩地点 ✗）。
+        ⛔ 参数显隐本身仍是**三态** ✗：原来"扫平台 / 其他"两态会让平台站桩下看到扫平台那三个
+          **不生效**的参数 ✓。
+        """
+        sel = str(self.cmb_strategy.currentData() or "patrol")
+        cur = str(getattr(settings, "strategy", "patrol") or "patrol")
+        names = getattr(self, "STRATEGY_NAMES", {}) or {}
+        same = (sel == cur)
+        if same:
+            self.lbl_strategy_cur.setText(
+                "%s（已启用）" % names.get(cur, cur))
+            self.lbl_strategy_cur.setStyleSheet("color: #0b8043;")
+        else:
+            self.lbl_strategy_cur.setText(
+                "%s（正在生效）；下面选的是「%s」—— 还没启用，"
+                "按右下角「启用」才生效"
+                % (names.get(cur, cur), names.get(sel, sel)))
+            self.lbl_strategy_cur.setStyleSheet("color: #c5221f;")
+        if getattr(self, "btn_strategy_apply", None) is not None:
+            self.btn_strategy_apply.setEnabled(not same)
+        is_sweep = sel == "sweep"
+        is_plat = sel == "platform"
+        is_multi = sel == "multi"
+        # ⚠ 说明行每次重设成**正常灰**（`_apply_strategy` 拦截时会把它染红 ✓ 见那儿 ✓）——
+        #   不在这儿复原的话，红字会一直挂着（哪怕后来补好了点位 ✓）。
+        self.lbl_strategy_note.setStyleSheet("color: #80868b;")
         if is_sweep:
             self.lbl_strategy_note.setText(
                 "扫平台：优先朝向方向，背后一定距离内的怪按就近锁定；"
                 "到集合边缘（「距离平台边缘回头」）或当前朝向没怪持续一段时间"
                 "就换向。继承上/下阈值过滤。")
+        elif is_plat:
+            self.lbl_strategy_note.setText(
+                "平台站桩：站在「站桩地点」打 —— 够不着的怪只在站点 x 范围内水平逼近、"
+                "到边缘就停（不出平台、不跨层）；完全没怪就原地站住；"
+                "「最大战斗时长」在这种策略下不生效。")
+        elif is_multi:
+            _n = len([x for x in (getattr(settings, "multi_spots", None) or [])
+                      if isinstance(x, dict) and x])
+            self.lbl_strategy_note.setText(
+                "多点巡逻：在 %d 个点位之间**依次循环**走 —— **到了就直接去下一个**；"
+                "路上/到点遇怪照打（攻击范围内有怪优先 attack ✓）。%s"
+                % (_n, "" if _n >= 2 else "　⚠ 少于 2 个点位 ⇒ **不能启用**（先「选择点位…」）"))
         else:
             self.lbl_strategy_note.setText(
                 "以角色脚底为基准：上阈值往上、下阈值往下，范围外的怪不追踪")
-        self.sp_turn_cd.setVisible(is_sweep)
-        if getattr(self, "_lbl_turn_cd", None) is not None:
-            self._lbl_turn_cd.setVisible(is_sweep)
-        self.sp_back_range.setVisible(is_sweep)
-        if getattr(self, "_lbl_back_range", None) is not None:
-            self._lbl_back_range.setVisible(is_sweep)
-        self.sp_edge_turn.setVisible(is_sweep)
-        if getattr(self, "_lbl_edge_turn", None) is not None:
-            self._lbl_edge_turn.setVisible(is_sweep)
+        # 扫平台那三个（只在 sweep 显示 ✓）
+        for w in (self.sp_turn_cd, self.sp_back_range, self.sp_edge_turn):
+            w.setVisible(is_sweep)
+        for a in ("_lbl_turn_cd", "_lbl_back_range", "_lbl_edge_turn"):
+            lb = getattr(self, a, None)
+            if lb is not None:
+                lb.setVisible(is_sweep)
+        # 「平台站桩」那几行（只在 platform 显示 ✓）
+        self._set_rows_visible(getattr(self, "_station_rows", ()), is_plat)
+        # ⭐ 「多点巡逻」那两行（只在 multi 显示 ✓ 用户 2026-10-06 ✓）
+        self._set_rows_visible(getattr(self, "_multi_rows", ()), is_multi)
+        self._refresh_station_texts()
+
+    def set_element_picker_factory(self, fn):
+        """把「地区选择」弹窗的**工厂**装进来（由主窗口从路线识别面板推 ✓ 同 `set_zone_sets`）。
+
+        `fn(parent, multi, init) -> [地点…] | None`（`None` = 用户取消 ⇒ **不改设置** ✓）。
+        ⚠ 为什么是"推一个工厂"：弹窗要**地图与集合**（`terrain` / `zones`），而本面板
+          **不持有地图 id** ✗（集合按 map id 存 ✓）—— 这正是仓库里"面板间推送"那条老规矩
+          （同 `set_zone_sets` / 当年的 `set_foothold_picker_factory` ✓；后者的"编辑战斗区域"
+          已整块搬到路线识别页，**本功能是它之后新的一条跨面板推送** ✓）。
+        """
+        self._element_factory = fn
+
+    def _refresh_station_texts(self):
+        """「站桩地点」/「拾取掉落地区」两行摘要 + 拾取参数的**灰不灰** ✓（一处收口）。"""
+        spot = settings.station_spot if isinstance(settings.station_spot, dict) else {}
+        if spot:
+            self.lbl_station_spot.setText(zones_mod.element_label(spot))
+            self.lbl_station_spot.setStyleSheet("color: #80868b;")
+        else:
+            self.lbl_station_spot.setText("（未选）不选 = 这个策略什么都不做（站着不动）")
+            self.lbl_station_spot.setStyleSheet("color: #c5221f;")
+        on = bool(getattr(settings, "station_pickup_enabled", False))
+        for w in (self.sp_pickup_min, self.sp_pickup_max, self.btn_pickup_spots):
+            w.setEnabled(on)
+        spots = [x for x in (getattr(settings, "station_pickup_spots", None) or [])
+                 if isinstance(x, dict)]
+        if not spots:
+            txt = "（未选地区）"
+        else:
+            txt = " → ".join(zones_mod.element_label(x) for x in spots)
+        try:
+            cap = float(getattr(settings, "station_pickup_max_s", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            cap = 0.0
+        if on and cap <= 0.0:
+            txt += "　⚠ 时间上限 <= 0 ⇒ 整组不生效"
+        elif on and not spots:
+            txt += "　⚠ 没选掉落地区 ⇒ 整组不生效"
+        self.lbl_pickup_spots.setText(txt)
+        # ⭐ 「多点巡逻」的点位摘要也在这儿刷（用户 2026-10-06 ✓）——**一处收口** ✓：
+        #   本方法已经被 `_refresh_strategy_ui` / 各写口 / `bind` 调着 ✓ 挂这儿不会漏 ✓。
+        self._refresh_multi_texts()
+
+    def _on_station_spot_pick(self):
+        """「选择站桩地点」⇒ 开「地区选择」弹窗（**单选** ✓）⇒ 写回 + 刷摘要 ✓。"""
+        got = self._open_element_picker(multi=False,
+                                        init=[settings.station_spot]
+                                        if isinstance(settings.station_spot, dict)
+                                        and settings.station_spot else [])
+        if got is None:
+            return                               # 取消 ⇒ 一个字都不改 ✓
+        settings.station_spot = dict(got[0]) if got else {}
+        settings.save()
+        self._refresh_station_texts()
+
+    def _on_multi_spots_pick(self):
+        """「选择点位」⇒ 开「地区选择」弹窗（**多选** ✓）⇒ 写回 + 刷摘要 ✓。
+
+        与「选择掉落地区」**完全同款**（同一工厂 / 同一弹窗 / 同一套写回 ✓）—— 用户 2026-10-06 ✓
+        第 1 条原话："选中后出现「选择点位」→ **平台站桩类型里已经实现了的通用地点选择弹窗**（多选）"✓。
+        """
+        got = self._open_element_picker(
+            multi=True,
+            init=[x for x in (getattr(settings, "multi_spots", None) or [])
+                  if isinstance(x, dict)])
+        if got is None:
+            return
+        settings.multi_spots = [dict(x) for x in got]
+        settings.save()
+        self._refresh_station_texts()       # 一处收口：它末尾会转调 `_refresh_multi_texts` ✓
+        self._refresh_strategy_ui()         # 点位数量变了 ⇒ 那句"能不能启用"的说明跟着变 ✓
+
+    def _refresh_multi_texts(self):
+        """「点位」那行摘要（`顺序 → 顺序` ✓；**< 2 个** ⇒ 红字说明"不能启用" ✓）。"""
+        spots = [x for x in (getattr(settings, "multi_spots", None) or [])
+                 if isinstance(x, dict) and x]
+        lbl = getattr(self, "lbl_multi_spots", None)
+        if lbl is None:
+            return
+        if not spots:
+            lbl.setText("（未选）至少要选 2 个点位，否则这个策略不能启用")
+            lbl.setStyleSheet("color: #c5221f;")
+            return
+        txt = " → ".join(zones_mod.element_label(x) for x in spots)
+        if len(spots) < 2:
+            lbl.setText("%s　⚠ 只有 1 个 ⇒ **不能启用**（再选一个 ✓）" % txt)
+            lbl.setStyleSheet("color: #c5221f;")
+        else:
+            lbl.setText("%s　（共 %d 个，走完回到第一个 ⇒ 循环 ✓）" % (txt, len(spots)))
+            lbl.setStyleSheet("color: #80868b;")
+
+    def _on_pickup_spots_pick(self):
+        """「选择掉落地区」⇒ 开「地区选择」弹窗（**多选** ✓）⇒ 写回 + 刷摘要 ✓。"""
+        got = self._open_element_picker(
+            multi=True,
+            init=[x for x in (getattr(settings, "station_pickup_spots", None) or [])
+                  if isinstance(x, dict)])
+        if got is None:
+            return
+        settings.station_pickup_spots = [dict(x) for x in got]
+        settings.save()
+        self._refresh_station_texts()
+
+    def _open_element_picker(self, multi, init):
+        """调那个**工厂**开弹窗；没装工厂（老环境 / 没打开项目）⇒ 说清怎么办 + `None` ✓。"""
+        fn = getattr(self, "_element_factory", None)
+        if not callable(fn):
+            QMessageBox.information(
+                self, "还没法选地点",
+                "选地点要用**地图里的元素**，而现在没有地图可用。\n\n"
+                "先在「路线识别」页**打开一个项目**（并在那页把地图/集合准备好）✓")
+            return None
+        try:
+            return fn(self, bool(multi), init)
+        except Exception as ex:                  # noqa: BLE001 —— 弹窗坏了别把面板弄崩 ✗
+            QMessageBox.warning(self, "选地点失败", "打开「地区选择」时出错：%s" % ex)
+            return None
+
+    def _on_pickup_enabled(self, _state=None):
+        """「定时拾取掉落」开关 ⇒ 写回 + 刷参数灰不灰 ✓。"""
+        settings.station_pickup_enabled = bool(self.ck_pickup.isChecked())
+        settings.save()
+        self._refresh_station_texts()
+
+    def _on_pickup_time(self, _val=None):
+        """「拾取掉落时间(s)」A~B 任一变化 ⇒ 写回 + 夹下限（A 不许大于 B ✓）。"""
+        settings.station_pickup_min_s = float(self.sp_pickup_min.value())
+        settings.station_pickup_max_s = float(self.sp_pickup_max.value())
+        if settings.station_pickup_max_s < settings.station_pickup_min_s:
+            settings.station_pickup_max_s = settings.station_pickup_min_s
+        settings.save()
+        self._refresh_station_texts()
 
     def _on_vision(self, _val=None):
         settings.vision_top = int(self.sp_vision_top.value())
@@ -3336,6 +4208,8 @@ class PlayerPanel(QWidget):
         self._sync_bar_ui()
         # 决策参数已经换成当前项目那份了，把控件重新回填一遍（切项目必走）
         self._sync_from_settings()
+        # ⭐ 顶部那行"存到哪儿"也跟着换（切项目 / 关掉项目都要重说一遍 ✓ 别留着上一句 ✗）
+        self._update_save_hint()
 
     def _sync_bar_ui(self):
         """按 settings 里的 HP/MP 条刷新标签文案、可见性和填充色。"""
@@ -3375,9 +4249,21 @@ class PlayerPanel(QWidget):
                     % (r, g, b))
 
     def _on_potions(self, hp, mp):
-        """实时更新识别出的血/蓝比例。"""
+        """实时更新识别出的血/蓝比例。
+
+        ⭐ 血条读出来是 **0** ⇒ 顺手把「自动喝药已停用」那行亮出来（用户 2026-10-05 ✓）——
+        判据**与 Agent 那道闸同源**：都是"血条读空"（`agent._pot_off_empty` ✓
+        `ws.player.dead` ✓ 见 `_drink_potions` ✓），界面层不另立规则 ✗。
+        """
         self.pb_hp.setValue(int(hp * 100))
         self.pb_mp.setValue(int(mp * 100))
+        # ⚠ **一处判据、一处显示**（"血条读出来是 0" ✓ 与 Agent 那道闸同源 ✓）：
+        #   红字**盖在 HP 条上**（`lbl_hp_off` ✓ **不占任何行** ✓ 用户 2026-10-05 第二轮要求 ✓）——
+        #   原来两处各一行（`lbl_pot_off` / `lbl_timers_off` ✗）⇒ 血条一闪就**多一行少一行** ✗。
+        #   ⚠ 亮的时候把条自带的 `HP xx%` **让开** ✓：不然两段字会叠在一起（红字压着自己的百分比 ✓）。
+        _off = float(hp) <= 0.0
+        self.pb_hp.setTextVisible(not _off)
+        self.lbl_hp_off.setVisible(_off)
 
     def _on_input_device(self, _idx=None):
         dev = self.cmb_device.currentData()
@@ -3386,66 +4272,67 @@ class PlayerPanel(QWidget):
         self._apply_input_device(dev)
 
     def _apply_input_device(self, dev):
-        """切换输入设备：本地 SendInput / 远程 Pro Micro / 本地 Pro Micro（后台异步连接）。"""
+        """切换输入设备：本地 SendInput / 远程 Pro Micro / 本地 Pro Micro（后台异步连接）。
+
+        ⭐⭐ 2026-10-05（用户"**从源头彻底封死**"✓）：**"起线程去连被控机"这件事挪进了
+          `decision.input.connect_async`** —— 那儿是**唯一**去连被控机的地方，也是**闸**
+          （`input.net_allowed` ✓）所在 ⇒ 谁调都绕不过去 ✓。
+          原来两个 `threading.Thread(...)` 就写在本方法里 ✗ ⇒ 只有**记得打桩的那个套件**
+          （`selftest_main_window` ✓）才不连，`gui_smoke` / `minimap` / `screen_state` /
+          `decision` 里那几个 `PlayerPanel()` 都照样连 ✗ ⇒ 那条线程回来碰已销毁的对象 ⇒
+          **偶发原生崩 `0xC0000005`** ✗（病根与判据见 `decision/input.py::net_allowed` ✓）。
+        """
         from decision import input as dinput
-        import threading
+        if dev in ("remote", "serial") and not dinput.net_allowed():
+            # ⭐ 离屏自检 / 显式关闸：**连线程都不起**、也不发（`use_blocked` ✓ 什么都不发）。
+            # ⚠ 这里**绝不 emit("fail")**：`_on_device_connected` 收到非 ok 会把
+            #   `settings.input_device` 写回 `local` 并 `save()` ✗（自检写脏用户配置 ✗），
+            #   而且那会把"离屏跳过"说成"连接失败"—— 两件事不一样 ✓。
+            dinput.use_blocked(dev)
+            self.lbl_device_state.setText("已跳过：离屏运行，不连被控机")
+            self._refresh_mouse_ui()
+            return
         if dev == "remote":
             from core.config import get
             host = get("kbd", "host")
             port = int(get("kbd", "port", 9000))
             cert = get("kbd", "cert", "remote_kbd/certs/cert.pem")
             self.lbl_device_state.setText("正在连接 ProMicro(远程)…")
-            def _do_connect():
-                """后台连远端（结果回主线程靠信号 ✓）。
-
-                ⚠⚠ **`emit` 必须兜住 `RuntimeError`**（2026-09-28 查明 ✓ 这是**真实隐患**，
-                  不只在自检里）：这条线程在**连不上时要等好几秒超时**（TCP ✓），而那时
-                  `PlayerPanel` 的 C++ 对象**可能已经销毁**了 —— 用户**把工作台关了** /
-                  离屏自检**跑完了** ✓ ⇒ `self.device_connected.emit(...)` 抛
-                  `RuntimeError: wrapped C/C++ object of type PlayerPanel has been deleted` ✗
-                  ⇒ 而它**在后台线程里、没人接** ⇒ **进程直接段错误 `0xC0000005`** ✗
-                  （症状极迷惑：自检"所有断言都过了"却崩、`faulthandler` 只给别的线程栈 ✓，
-                  而且它是**时机性**的 —— 对面秒拒就连不上、碰巧不崩 ✗）。
-                """
-                try:
-                    dinput.use_network(host, port, cert)
-                except Exception:
-                    dinput.use_local()
-                    try:
-                        self.device_connected.emit("fail")
-                    except RuntimeError:
-                        pass                # 窗口已销毁 ⇒ 没人听，别崩 ✓
-                    return
-                try:
-                    self.device_connected.emit("ok")
-                except RuntimeError:
-                    pass
-            threading.Thread(target=_do_connect, daemon=True).start()
+            dinput.connect_async("remote", self._on_device_link_result,
+                                 host=host, port=port, cert=cert)
         elif dev == "serial":
             from core.config import get
             ser_port = get("kbd", "serial_local", "COM5")
             self.lbl_device_state.setText("正在连接 ProMicro(本地)…")
-            def _do_connect():
-                """后台连本地串口 —— ⚠ 同 `remote` 那条：`emit` 要兜 `RuntimeError`
-                （串口打不开也耗时，窗口可能已经没了 ✗ 见上面那段说明 ✓）。"""
-                try:
-                    dinput.use_serial(ser_port)
-                except Exception:
-                    dinput.use_local()
-                    try:
-                        self.device_connected.emit("fail")
-                    except RuntimeError:
-                        pass
-                    return
-                try:
-                    self.device_connected.emit("ok")
-                except RuntimeError:
-                    pass
-            threading.Thread(target=_do_connect, daemon=True).start()
+            dinput.connect_async("serial", self._on_device_link_result, port=ser_port)
         else:
             dinput.use_local()
             self.lbl_device_state.setText("本地键盘")
         self._refresh_mouse_ui()
+
+    def _on_device_link_result(self, status):
+        """后台连接的回调（**在别的线程里**跑 ✓）：连不上就回退本地，再把结果发回主线程。
+
+        ⚠⚠ **`emit` 必须兜住 `RuntimeError`**（2026-09-28 查明 ✓ 这是**真实隐患**，
+          不只在自检里）：这条线程在**连不上时要等好几秒超时**（TCP ✓），而那时
+          `PlayerPanel` 的 C++ 对象**可能已经销毁**了 —— 用户**把工作台关了** /
+          离屏自检**跑完了** ✓ ⇒ `self.device_connected.emit(...)` 抛
+          `RuntimeError: wrapped C/C++ object of type PlayerPanel has been deleted` ✗
+          ⇒ 而它**在后台线程里、没人接** ⇒ **进程直接段错误 `0xC0000005`** ✗
+          （症状极迷惑：自检"所有断言都过了"却崩、`faulthandler` 只给别的线程栈 ✓，
+          而且它是**时机性**的 —— 对面秒拒就连不上、碰巧不崩 ✗）。
+
+        ⚠ 2026-10-05：这段原来在 `remote` / `serial` 两条路里**各抄一份** ✗ ⇒ 现在**一处** ✓
+          （`status` 只有 `"ok"` / `"fail"`：`"skip"`（离屏不连）在 `_apply_input_device`
+          里就返回了、**不走这条** ✓）。
+        """
+        from decision import input as dinput
+        if status != "ok":
+            dinput.use_local()          # 连不上 ⇒ 回退本地（老口径一字不变 ✓）
+        try:
+            self.device_connected.emit(status)
+        except RuntimeError:
+            pass                        # 窗口已销毁 ⇒ 没人听，别崩 ✓
 
     def _on_device_connected(self, result):
         """Pro Micro 连接结果回调（后台线程 → 主线程）。"""
@@ -3696,6 +4583,21 @@ class PlayerPanel(QWidget):
             sp.setValue(int(v))
             sp.blockSignals(False)
 
+        # ⭐ 「**扇形角度**」（度；用户 2026-10-04 ✓ 见它的 tooltip ✓）：
+        #   ⚠ `getattr` 兜底 0.0 —— 老配置 / 半初始化的 settings 里可能还没这个字段 ✓
+        #   （= 矩形 = 老行为 ✓，界面与判定都不变 ✓）。
+        self.sp_attack_fan.blockSignals(True)
+        self.sp_attack_fan.setValue(
+            float(getattr(settings, "attack_fan_deg", 0.0) or 0.0))
+        self.sp_attack_fan.blockSignals(False)
+
+        # ⭐ 「走不动按跳」（用户 2026-10-06 ✓）：老项目没这个键 ⇒ 显示 **True**（= 现在行为 ✓）
+        self.ck_walk_hop.setChecked(bool(getattr(settings, "walk_stall_jump", True)))
+        # ⭐ 「自动拾取」（用户 2026-10-06 ✓）：老项目没这个键 ⇒ 显示 **False**（= 关着 ✓
+        #   和 `DecisionSettings.from_dict` 的兜底同一个方向 ✓ 别一个显示开、一个读成关 ✗）
+        self.ck_auto_pickup.blockSignals(True)
+        self.ck_auto_pickup.setChecked(bool(getattr(settings, "auto_pickup", False)))
+        self.ck_auto_pickup.blockSignals(False)
         self.ck_chase_jump.blockSignals(True)
         self.ck_chase_jump.setChecked(bool(settings.chase_jump_enabled))
         self.ck_chase_jump.blockSignals(False)
@@ -3730,6 +4632,23 @@ class PlayerPanel(QWidget):
         self.sp_cd_max.blockSignals(True)
         self.sp_cd_max.setValue(hi)
         self.sp_cd_max.blockSignals(False)
+
+        # ⭐ 「攻击目标数量」（用户 2026-10-06 ✓）—— `getattr` 兜底 **-1** ✓（**老配置没有这个键**
+        #   ⇒ 显示 -1 = 不限制 ✓ 与 agent 那边的兜底一致 ✓，**不是 0** ✗：0 = 不启用 = 会把
+        #   老项目已经调好的「目标被攻击CD」关掉 ✓）。
+        self.sp_atk_target_count.blockSignals(True)
+        self.sp_atk_target_count.setValue(
+            int(getattr(settings, "atk_target_count", -1)))
+        self.sp_atk_target_count.blockSignals(False)
+
+        # ⭐ 「目标被攻击CD」（用户 2026-10-06 ✓）—— `getattr` 兜底 0 ✓（**老配置没有这个键**
+        #   ⇒ 显示 0 = 不限制 ✓ 与 agent 那边的兜底一致 ✓）。
+        self.sp_mob_atk_cd.blockSignals(True)
+        self.sp_mob_atk_cd.setValue(int(getattr(settings, "mob_atk_cd_ms", 0) or 0))
+        self.sp_mob_atk_cd.blockSignals(False)
+        # ⚠ 回填完**必须**跟着刷一次灰/亮（上面那格是 0 的话，这一格得是灰的 ✓ —— 只回填值、
+        #   不刷灰亮，就会出现"界面上是亮的、其实不生效"✗ 约定 121 的教训 ✓）。
+        self._sync_mob_cd_enabled()
 
         self._refresh_key_buttons()
 
@@ -3832,9 +4751,35 @@ class PlayerPanel(QWidget):
         self.sp_big_mob_ratio.setValue(getattr(settings, "big_mob_ratio", 1.5))
         self.sp_big_mob_ratio.blockSignals(False)
 
+        # ⭐ 「频道」（挂机保护页 → 断线重连组 ✓）：打开项目时得**跟着项目值走** ✓
+        #   （⚠ 不接这一步的后果很具体：界面上显示的还是上一个项目的数 / 默认 1 ✗
+        #     —— 而真正花的是 `settings.reconnect_channel` ✓ ⇒ "看到的不是用的" ✗）
+        # ⚠⚠ **必须判 hasattr** ✗：`_sync_from_settings()` 是在 `__init__` 里调的 ✓，
+        #   而「挂机保护页」是**按需**才建（`build_protection_page` ✓ 主窗口 addTab 时才调 ✓）
+        #   ⇒ 这一步跑的时候 `sp_rc_channel` 可能**还不存在** ✗
+        #   —— 2026-10-07 真栽过：不判就直接 `AttributeError` ⇒ **整个面板建不起来** ✗✗
+        #   （而控件建好之后它照旧会被同步 ✓ 见 `_build_reconnect_group` 里的初值 ✓）。
+        if hasattr(self, "sp_rc_channel"):
+            self.sp_rc_channel.blockSignals(True)
+            self.sp_rc_channel.setValue(int(getattr(settings, "reconnect_channel", 1) or 1))
+            self.sp_rc_channel.blockSignals(False)
+
         self.sp_big_mob_range_px.blockSignals(True)
         self.sp_big_mob_range_px.setValue(getattr(settings, "big_mob_range_px", 600))
         self.sp_big_mob_range_px.blockSignals(False)
+
+        # ⭐ 「平台站桩」三组（用户 2026-10-05 ✓）：拾取开关 / 时间区间 回填；
+        #   **站桩地点与掉落地区是"结构体"**（不是控件自己存得下的）⇒ 由
+        #   `_refresh_strategy_ui() → _refresh_station_texts()` 现读现画 ✓（一处口径 ✓）。
+        self.ck_pickup.blockSignals(True)
+        self.ck_pickup.setChecked(bool(getattr(settings, "station_pickup_enabled", False)))
+        self.ck_pickup.blockSignals(False)
+        self.sp_pickup_min.blockSignals(True)
+        self.sp_pickup_min.setValue(float(getattr(settings, "station_pickup_min_s", 0.0) or 0.0))
+        self.sp_pickup_min.blockSignals(False)
+        self.sp_pickup_max.blockSignals(True)
+        self.sp_pickup_max.setValue(float(getattr(settings, "station_pickup_max_s", 0.0) or 0.0))
+        self.sp_pickup_max.blockSignals(False)
 
         self._refresh_strategy_ui()
 
@@ -3933,6 +4878,19 @@ class PlayerPanel(QWidget):
 
     def shutdown(self):
         settings.enabled = False
+        # ⭐⭐ 触控板这两条线程都要收掉，**顺序不能反**（用户 2026-10-05 ✓）：
+        #   ① 先停**跟踪线程**（`pad-track` ✓ 它每拍都在往发送器里 push ✓）；
+        #   ② 再停**发送线程**（`pad-send` ✓）。
+        #   ⚠ 反了的话：发送器已经没了、跟踪线程还在 push ⇒ 又会惰性造一个出来 ✗
+        #     （那就是"关了还留着一条守护线程" ✓ 正是这两条注释要防的事 ✓）。
+        try:
+            self.touchpad.set_active(False)      # ⇒ `_deactivate` ⇒ `_stop_track` ✓
+        except Exception:                        # noqa: BLE001 —— 收尾别因小失大 ✗
+            pass
+        _ps = getattr(self, "_pad_sender", None)
+        if _ps is not None:
+            _ps.stop()
+            self._pad_sender = None
         # 释放所有按键 + 关闭远程键盘连接，停止指令传输
         self._force_release_all()
         from decision import input as dinput

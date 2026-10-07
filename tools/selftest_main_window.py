@@ -30,47 +30,41 @@ def check(cond, msg):
 
 
 def _win():
-    """建主窗口（离屏）。**只碰界面**：不打开项目、不连流 ✓、**也不连远端键盘** ✓。"""
+    """建主窗口（离屏）。**只碰界面**：不打开项目、不连流 ✓、**也不连远端键盘** ✓。
+
+    ⭐⭐ 2026-10-05（用户："**从源头彻底封死**"✓）—— **本函数不再打桩** ✗：
+      原来那两条 monkeypatch（`decision.input.use_network` / `PlayerPanel._apply_input_device`）
+      只护住了**本套件** ✗，而 `gui_smoke` / `selftest_minimap` / `selftest_screen_state` /
+      `selftest_decision` 里那几个 `PlayerPanel()` **都没打** ✗ ⇒ 只要项目配置是
+      `input_device: remote`（`config/decision.json` 与好几个项目就是 ✓）就照样起那条
+      **后台连被控机**的线程 ✗ ⇒ 它几秒后才超时返回，而那时用例早跑完、Qt 对象已销毁 ⇒
+      **偶发原生段错误 `0xC0000005`** ✗（时机性 ⇒ "多跑几次"不算验证 ✗）。
+      ⇒ 现在闸在**真源**：`decision/input.py::net_allowed` ＋ 线程的**唯一出生地**
+      `input.connect_async` ✓ ⇒ 离屏（`QT_QPA_PLATFORM=offscreen`）**连线程都不起** ✓。
+      本套件**不再打桩**（打桩反而会掩盖"闸到底有没有生效" ✗），改成**当场断言闸关着** ✓。
+    """
     from PyQt5.QtWidgets import QApplication
 
-    from decision import agent as _ag
+    from decision import input as _dinput
+    from gui import main_window as _mw
     from gui.main_window import MainWindow
+    from gui.player_panel import PlayerPanel as _PP
 
     app = QApplication.instance() or QApplication([])
-    # ⚠⚠ **必须先把输入设备摁成 `local`**（2026-09-28 修 ✓ 踩过）：
-    #   项目配置里 `input_device` 常常是 `remote` ⇒ `PlayerPanel` 构造时会**自动**
-    #   `_do_connect` ⇒ 起一条**后台线程**去 TCP 连被控机（`remote_kbd` ✓）⇒ 那条线程
-    #   **没人管**，本用例跑完、主线程一退出 ⇒ 它就变成"**在别的线程里摸已经拆掉的
-    #   解释器 / Qt**" ⇒ **段错误 `0xC0000005`** ✗。
-    #   ⚠ 症状极迷惑（这次又踩）：`faulthandler` 打出来是**另一条线程**的栈
-    #     （`socket.create_connection` ← `kbd_client` ← `input.use_network` ← `_do_connect`），
-    #     而**当前线程**只是"正在跑用例" ⇒ 一眼看着像"用例自己崩了" ✗；
-    #     而且它是**时机性**的：对面恰好拒绝连接时那条线程早早异常退出 ⇒ 碰巧不崩 ✗
-    #     （所以之前有几轮是 8/8 通的 ✓ 不是修好了，是没赶上 ✗）。
-    #   ⚠ **光改 `settings.input_device` 不管用**（踩过）：`MainWindow()` 构造时会**重载
-    #     项目配置**（`from_dict` 里那个 `input_device: remote` ✓）⇒ 当场改回 `remote` ✓。
-    #   ⚠ **只改 `decision.input.use_network` 也不够**（又踩一次）：起线程那一步在
-    #     `PlayerPanel._apply_input_device` 里 ✓ ⇒ 从**源头**掐掉它最干净 ✓
-    #     （离屏自检本来就不该真发按键、更不该连被控机 ✓）。
-    _ag.settings.input_device = "local"
-    # ⚠⚠ **离屏自检绝不连被控机**（2026-09-28 ✓ 这是"段错误 `0xC0000005`"的真凶）：
-    #   `MainWindow()` 构造时会**重载项目配置**（`input_device: remote` ✓）⇒ 光设 `settings`
-    #   会被当场盖回去 ✗ ⇒ `PlayerPanel._apply_input_device` 起一条**后台线程**去 TCP 连
-    #   被控机（`remote_kbd` ✓）⇒ 它在**几秒后才超时**、而那时用例早跑完、`PlayerPanel`
-    #   的 C++ 对象**已经销毁** ⇒ 线程回来碰它 ⇒ 崩 ✗（`faulthandler` 会指到
-    #   `socket.create_connection` ← `kbd_client` ← `input.use_network` ← `_do_connect` ✓）。
-    #   ⚠ 它是**时机性**的（对面秒拒就碰巧不崩 ✗）⇒ 所以"多跑几次"不算验证，
-    #     这里**从源头掐掉** ✓ 并且**当场自检**（`_assert_net_disabled` ✓ 免得哪天又没生效 ✗）。
-    from decision import input as _dinput
-    if not hasattr(_dinput, "_selftest_orig_use_network"):
-        _dinput._selftest_orig_use_network = _dinput.use_network
-        _dinput.use_network = lambda *a, **k: None      # 连远端 ⇒ 直接当成功返回 ✓
-    from gui.player_panel import PlayerPanel as _PP
-    if not hasattr(_PP, "_selftest_orig_apply_input_device"):
-        _PP._selftest_orig_apply_input_device = _PP._apply_input_device
-        _PP._apply_input_device = lambda self, dev=None: None   # 不起那条连网线程 ✓
-    assert _dinput.use_network.__name__ == "<lambda>", "打桩没生效（自检要立刻炸 ✗）"
-    assert _PP._apply_input_device.__name__ == "<lambda>", "打桩没生效（自检要立刻炸 ✗）"
+    # ⚠⚠ **当场自检闸**（不打桩了就得靠它 ✓ 免得哪天判据被改坏、又偷偷去连被控机 ✗）
+    assert not _dinput.net_allowed(), \
+        "离屏（offscreen）下闸没关 ⇒ 会起那条连被控机的线程（= 段错误 0xC0000005 的真凶 ✗）"
+    assert _PP._apply_input_device.__name__ == "_apply_input_device", \
+        "面板那条起线程的路又被打了桩（本套件不再打桩 ✓ 打桩会掩盖闸有没有生效 ✗）"
+    # ⚠⚠ 2026-10-04：`MainWindow()` 现在会**自动打开"上次那个项目"**（见
+    #   `_open_last_project_at_startup` ✓ 用户现场："参数每次重开都要重新填" ⇒ 启动就把
+    #   上次那个开上 ✓）。那会让**每条用例**都去开**用户真项目** ✗（慢 + 随
+    #   `config/session.json` 变 ⇒ 结果不确定 ✗）⇒ 这里把「最近打开的项目」钉成 None ✓
+    #   （= 老行为 ✓ 各条用例照旧"没有项目"）。**专门验"会打开"的那条**自己再打桩 ✓。
+    if not hasattr(_mw, "_selftest_orig_last_opened"):
+        _mw._selftest_orig_last_opened = _mw.last_opened
+        _mw.last_opened = lambda: None
+    assert _mw.last_opened() is None, "「最近打开的项目」的打桩没生效（自检要立刻炸 ✗）"
     w = MainWindow()
     w.resize(1200, 800)
     return app, w
@@ -455,7 +449,14 @@ def t_window_state_covers_editors():
             "frame_picker": (("frame_picker", "FramePickDialog"),),
             "mob_picker": (("mob_picker", "MobPickDialog"),),
             "player_panel": (("battle_zone", "BattleZoneDialog"),
-                             ("battle_zone_list", "BattleZoneListDialog"))}
+                             ("battle_zone_list", "BattleZoneListDialog")),
+            # ⚠ 2026-10-04 补：`live_panel` 一直**没列**（同 player_panel 那次的教训 ——
+            #   规范条本身就是检查清单，漏列 = 没这根钉子 ✗）。它里面那个「导出引擎」进度窗
+            #   是能拉大拉小的（见 `EngineExportDialog` ✓）⇒ 必须接几何 ✓。
+            "live_panel": (("engine_export", "EngineExportDialog"),),
+            # ⚠ 2026-10-05 补：新增的「地区选择」通用弹窗（`gui/element_picker.py` ✓
+            #   —— 「站桩地点」/「拾取掉落地区」都用它 ✓）也必须接上几何 ✓。
+            "element_picker": (("element_picker", "ElementPickerDialog"),)}
     seen = []
     for f, pairs in plan.items():
         src = (ROOT / "gui" / ("%s.py" % f)).read_text(encoding="utf-8")
@@ -486,7 +487,375 @@ def t_window_state_covers_editors():
     check(len(seen) == len(set(seen)), "窗口几何的键名重了：%s" % seen)
 
 
+def t_startup_opens_last_project_and_says_where_params_go():
+    """启动**自动打开"上次那个项目"** + 参数页顶部那行"参数存到哪儿"（用户 2026-10-04 ✓ 现场：
+    "决策参数页签→战斗参数→追击起跳需要的冲刺时间，没有保存数据，每次重开 gui 都要重新填"）。
+
+    为什么要盯**这两头**（它们是一条链 ✓）：
+      · 决策参数**只按项目存** ✓ ⇒ **没打开项目时 `settings.save()` 一个字节都不写** ✗
+        （见 `decision/agent.py` 的 `set_save_hook` ✓）⇒ 人在"还没开项目"时改的参数，
+        一重开就回默认 ✓ —— 这就是用户那句的原形 ✓。光看"参数自己存/读对不对"是看不出来的 ✗
+        （`chase_jump_dash_ms` 在 `to_dict`/`from_dict` 里都有 ✓ 实测往返也对 ✓）⇒
+        必须**启动就把上次那个项目开上** ✓ 改动才有归属 ✓；
+      · 而"现在这份存到哪儿"必须**看得见** ✗ 否则人只会得出"没保存"这个结论 ✓。
+    """
+    import atexit
+    import shutil
+    import tempfile
+    from pathlib import Path as _P
+
+    from PyQt5.QtWidgets import QApplication
+
+    from gui import main_window as _mw
+    from gui.main_window import MainWindow
+    from gui.project import Project
+
+    app = QApplication.instance() or QApplication([])
+    tmp = _P(tempfile.mkdtemp(prefix="startup_proj_"))
+    # ⚠⚠ **别在用例里当场删临时项目** ✗（2026-10-04 踩过 ✓）：这条用例会把窗口连同
+    #   「当前项目」一起留着（其它用例也这样 ✓ 它们不 `close()` ✓），而目录一删，
+    #   后面的用例里只要有人再碰那个项目 ⇒ **`0xC0000005`** ✗（症状极迷惑：报的是**下一条**
+    #   用例崩 ✓）。⇒ 交给 `atexit` 在**进程退出**时删 ✓。
+    atexit.register(shutil.rmtree, tmp, True)
+    orig = _mw.last_opened
+    try:
+        # ⚠ 目录名跟项目名**一致** ✓：那行提示显示的是 `project.root.name`（目录名 ✓）
+        proj = Project.create(tmp / "用例项目", name="用例项目", map_id="105090600")
+        # ⭐ 这条参数的**非默认值**（默认 0 ✓）—— 用例就靠它认出"到底有没有回填" ✓
+        # ⚠⚠ 必须 `save=True` ✗：下面 `last_opened` 是 `Project.open(...)` ⇒ **从磁盘重读** ✓
+        #   （只写内存的话，主窗口读到的是一份**没有 decision 段**的项目 ⇒ 参数落到默认 0 ✗
+        #     —— 本轮就这么红过一次 ✓）
+        proj.set("decision", {"chase_jump_enabled": True, "chase_jump_min": -10,
+                              "chase_jump_max": 5, "chase_jump_dash_ms": 137}, save=True)
+        _mw.last_opened = lambda: Project.open(proj.root)
+
+        # ① 启动就该把它打开 ✓（不打桩的话这里会是 None ✗ = 用户看到的"没保存"那套 ✓）
+        w = MainWindow()
+        try:
+            check(w.project is not None and w.project.root == proj.root,
+                  "启动没自动打开「上次那个项目」⇒ 改参数没有归属 ⇒ 重开就丢 ✗")
+
+            # ② 打开之后，那条参数**真的回填进控件**（用户看的是控件 ✓）
+            sp = w.player_panel.sp_chase_dash
+            check(int(sp.value()) == 137,
+                  "启动打开项目后，冲刺时间控件没回填（该 137）：%r" % sp.value())
+
+            # ③ 顶部那行：有项目 ⇒ 说清"按项目保存 + 是哪个项目"✓
+            lbl = w.player_panel.lbl_save_hint
+            txt = lbl.text()
+            check("用例项目" in txt and "保存" in txt,
+                  "有项目时没在参数页说明「参数按项目保存」：%r" % txt)
+
+            # ④ 没有项目时 ⇒ 必须**明说"不会保存"** ✗（不然用户就是会以为存了 ✓）
+            w.project = None
+            w.player_panel.bind(None)
+            txt2 = w.player_panel.lbl_save_hint.text()
+            check("不会保存" in txt2,
+                  "没打开项目时没提示「改了不会保存」⇒ 人以为存了 ✗：%r" % txt2)
+        finally:
+            # ⚠⚠ 收尾要**一次做干净**（2026-10-04 踩过两轮 ✓）：
+            #   ① 窗口**不 `close()`** ✗（那会顺手拆一堆东西 ⇒ 报的是**下一条**用例崩 ✓）；
+            #   ② 「当前项目」放回 None ✓（别留下指向"待删目录"的引用 ✗）；
+            #   ③ 然后**显式 `deleteLater()` + 跑一次事件循环** ✓ —— 照本套件 `main()` 里
+            #      那条纪律（`deleteLater` 是"事件循环里才真删" ⇒ 攒到解释器退出一起还账
+            #      就是 `0xC0000005` ✗）。
+            w.project = None
+            w.player_panel.bind(None)
+            w.deleteLater()
+            app.processEvents()
+    finally:
+        _mw.last_opened = orig
+
+
+def t_offscreen_never_connects_device():
+    """⭐⭐ 离屏 ⇒ **绝不连被控机**：闸在真源、连线程都不起（用户 2026-10-05 ✓ 治根）。
+
+    治的就是那条老病（`0xC0000005`）：`PlayerPanel._apply_input_device("remote")` 会起一条
+    **后台线程**去 TCP 连被控机，而它**几秒后**才超时返回 —— 那时用例早跑完、Qt 对象已销毁
+    ⇒ 线程回来碰它 ⇒ **偶发原生段错误** ✗（时机性 ⇒ "多跑几次"不算验证 ✗）。
+    原来只在**本套件**用例里打桩 ✗ ⇒ `gui_smoke` / `minimap` / `screen_state` / `decision`
+    里那几个 `PlayerPanel()` 照样连 ✗ ⇒ 现在闸放在 `decision/input.py::net_allowed`
+    （唯一真源 ✓）＋ 线程的唯一出生地 `connect_async` ✓。
+
+    钉四件：
+      ① 判据三条：offscreen ⇒ 不许连；显式 `PSIMU_ALLOW_NET=1` ⇒ 允许（`selftest_link`
+         那种"就是要连"的 ✓）；真平台 ⇒ 允许 ✓；
+      ② 运行时：闸关着时 `use_network` / `use_serial` **一个 socket 都不建**、
+         `reconnect_remote()` 如实回 `False`，且转「什么都不发」（`_blocked` ✓ ——
+         不许退化成把按键打到控制机上 ✗）；
+      ③ **面板真调一次**：`_apply_input_device("remote")` ⇒ 线程数不变 + 那行说清「已跳过」
+         + **不写** `settings.input_device`（别把"跳过"说成"连接失败"、也别写脏配置 ✗）；
+      ④ 源码钉：`gui/` 里**没有人**直接调 `use_network` / `use_serial`（出生地只有
+         `input.connect_async` ✓）、闸判在 `start()` **之前** ✓、三个入口都有闸 ✓。
+    """
+    import os
+    import re
+    import shutil
+    import socket
+    import subprocess
+    import tempfile
+    import unittest.mock as mock
+
+    from decision import input as dinput
+
+    _saved_allow = os.environ.pop("PSIMU_ALLOW_NET", None)
+    try:
+        # ① 判据三条（**每次都读环境** ⇒ 当场摆得动 ✓）
+        with mock.patch.dict(os.environ, {"QT_QPA_PLATFORM": "offscreen"}):
+            check(dinput.net_allowed() is False,
+                  "offscreen 下闸没关（会去连被控机 ⇒ 段错误 0xC0000005 ✗）")
+            os.environ["PSIMU_ALLOW_NET"] = "1"
+            check(dinput.net_allowed() is True,
+                  "显式 `PSIMU_ALLOW_NET=1` 没放开（`tools/selftest_link.py` 那种要连的会连不上 ✗）")
+            del os.environ["PSIMU_ALLOW_NET"]
+            os.environ["QT_QPA_PLATFORM"] = "windows"
+            check(dinput.net_allowed() is True, "真平台（windows）下也不许连设备了 ✗")
+            os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+            # ② 运行时：闸关着 ⇒ 一个 socket 都不建（真建了这条 canary 会炸 ⇒ 用例红 ✓）
+            with mock.patch.object(socket, "create_connection",
+                                   side_effect=AssertionError("闸关着还去建连接 ✗")):
+                dinput.use_network("127.0.0.1", 9, "不存在的证书.pem")
+                dinput.use_serial("COM_不存在")
+                check(dinput.reconnect_remote() is False,
+                      "闸关着重连却回了 True（对上层说谎：通道其实不可用 ✗）")
+            _h = dinput.link_health()
+            check(_h.get("backend") == "blocked",
+                  "闸关着却没进「什么都不发」（会退化成把按键打到控制机上 ✗）：%r" % _h)
+
+            # ③ 面板**真调一次** —— 放**子进程**里做（本仓库既有手法 ✓ 见
+            #   `selftest_live_panel` 那条"接线改由子进程验" ✓）：
+            #   ⚠⚠ 本进程里**一个窗口都不建**（2026-10-05 实测：本套件里多建一个窗口，
+            #     后面的 `t_clear_pages_keeps_work_tabs` 就**必崩 `0xC0000005`** ✗）；
+            #     而且离屏**裸建 `PlayerPanel()`** 本身就会原生崩（`0xC0000409` ✗）
+            #     ⇒ 子进程里用 `MainWindow().player_panel`（实测稳 ✓），收尾用 `os._exit`
+            #     跳过 Qt 析构 ✓。
+            _body = (
+                "import os, sys, threading, tempfile\n"
+                "sys.stdout.reconfigure(encoding='utf-8')\n"
+                "os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')\n"
+                "sys.path.insert(0, %r)\n"
+                "from pathlib import Path\n"
+                "from gui import theme, main_window as _mw\n"
+                "theme.CFG = Path(tempfile.mkdtemp(prefix='probe_ui_')) / 'ui.yaml'\n"
+                "_mw.last_opened = lambda: None\n"          # 别去开用户的真项目 ✓
+                "from decision import input as dinput\n"
+                "from PyQt5.QtWidgets import QApplication\n"
+                "app = QApplication.instance() or QApplication([])\n"
+                "print('ALLOWED=%%d' %% int(dinput.net_allowed()))\n"
+                "from gui.main_window import MainWindow\n"
+                "from gui.player_panel import settings as _ps\n"
+                "w = MainWindow()\n"
+                "dev0 = _ps.input_device\n"
+                "n0 = threading.active_count()\n"
+                "w.player_panel._apply_input_device('remote')\n"
+                "print('THREADS=%%d,%%d' %% (n0, threading.active_count()))\n"
+                "print('LABEL=%%s' %% w.player_panel.lbl_device_state.text())\n"
+                "print('DEV=%%s,%%s' %% (dev0, _ps.input_device))\n"
+                "os._exit(0)\n"
+            ) % str(ROOT)
+            _dir = Path(tempfile.mkdtemp(prefix="offscreen_net_"))
+            _pf = _dir / "probe.py"
+            _pf.write_text(_body, encoding="utf-8")
+            try:
+                _env = dict(os.environ)
+                _env["QT_QPA_PLATFORM"] = "offscreen"
+                _env.pop("PSIMU_ALLOW_NET", None)
+                _r = subprocess.run([sys.executable, "-X", "utf8", str(_pf)],
+                                    cwd=str(ROOT), capture_output=True, text=True,
+                                    timeout=300, env=_env)
+                _out = (_r.stdout or "") + (_r.stderr or "")
+                check(_r.returncode == 0 and "THREADS=" in _out,
+                      "子进程里「离屏切设备」没跑成（rc=%s）：\n%s"
+                      % (_r.returncode, _out.strip()[-600:]))
+                _m = re.search(r"ALLOWED=(\d)", _out)
+                check(_m is not None and _m.group(1) == "0",
+                      "子进程里闸没关：%s" % _out.strip()[-300:])
+                _m = re.search(r"THREADS=(\d+),(\d+)", _out)
+                check(_m is not None and _m.group(1) == _m.group(2),
+                      "离屏下 `_apply_input_device('remote')` 起了后台线程"
+                      "（正是段错误 0xC0000005 的真凶 ✗）：%s" % _out.strip()[-300:])
+                check("LABEL=" in _out and "跳过" in _out,
+                      "离屏跳过没在界面上说清（人只会以为「连不上」✗）：%s"
+                      % _out.strip()[-300:])
+                _m = re.search(r"DEV=(\S+),(\S+)", _out)
+                check(_m is not None and _m.group(1) == _m.group(2),
+                      "离屏跳过却改了 `settings.input_device`"
+                      "（该当「跳过」而不是「失败」✗）：%s" % _out.strip()[-300:])
+            finally:
+                shutil.rmtree(_dir, ignore_errors=True)
+
+        # ④ 源码钉：**出生地唯一** + 闸在起线程之前 + 三个入口都有闸
+        _bad = [f.name for f in sorted((ROOT / "gui").glob("*.py"))
+                if re.search(r"\b(use_network|use_serial)\s*\(", f.read_text(encoding="utf-8"))]
+        check(not _bad,
+              "gui/ 里还有文件直接调 use_network / use_serial"
+              "（该走 `input.connect_async` = 唯一出生地 ✗）：%s" % _bad)
+
+        _src = (ROOT / "decision" / "input.py").read_text(encoding="utf-8")
+
+        def _body(fn):
+            i = _src.index("def %s(" % fn)
+            j = _src.find("\ndef ", i + 1)
+            return _src[i:j if j > 0 else len(_src)]
+
+        _ca = _body("connect_async")
+        check("net_allowed()" in _ca, "`connect_async` 里没有闸（离屏会照样起那条线程 ✗）")
+        check(_ca.index("net_allowed()") < _ca.index(".start()"),
+              "`connect_async` 里闸判在起线程**之后**了（线程照样会活着 ⇒ 病还在 ✗）")
+        for _fn in ("use_network", "use_serial", "reconnect_remote"):
+            check("net_allowed()" in _body(_fn),
+                  "`%s` 里没有闸（直接调它的人绕过去了 ✗）" % _fn)
+    finally:
+        if _saved_allow is not None:
+            os.environ["PSIMU_ALLOW_NET"] = _saved_allow
+
+
+def t_watchdog_guarantees_exit():
+    """⭐⭐ 「关了必须走 / 卡住不许烧核」：`gui/app.py` 的两道看门狗（用户 2026-10-05 ✓
+    原话："保证以后不要关了该占进程就行"）。
+
+    **为什么要它**（现场实测 ✓）：有 **4 个工作台进程卡在启动里、各烧满一个核 25.7 小时** ✗
+    （`py-spy` 抓栈 = `theme._row_title_of` 那个已修的死循环 ✓：窗口从没出来、进程活着、
+    没有任何异常 ⇒ 用户看到的是"打不开 + 机器变卡"✓）。这类 bug **不报错、只是卡** ✗
+    ⇒ 只能靠"到点自己留栈 + 走人"兜底 ✓。
+
+    钉四件（都在**子进程**里验 ✓ —— 它会 `os._exit`，不能在本进程里跑 ✗）：
+      ① 卡住 ⇒ 退出码 **3**（启动那段）+ `crash.log` 里有「看门狗触发」+ **一份栈** ✓
+         （栈就是下次定位用的证据 ✓ 这次那 4 个僵尸就是靠它认出来的 ✓）；
+      ② **正常路径绝不被误杀**：立刻 `done.set()` ⇒ 退出码 0 ✓ 且没有「看门狗触发」✓；
+      ③ 源码钉：`main()` 里启动那道是**在 `MainWindow()` 之前** arm ✓（那段才死过 ✓）、
+         收尾那道是**在 `app.exec_()` 之后** arm ✓、两处 `done.set()` 都在 ✓；
+      ④ 常量齐（`WATCHDOG_STARTUP_S` / `WATCHDOG_EXIT_S`）且退出码 3/4 分开 ✓。
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    _src = (ROOT / "gui" / "app.py").read_text(encoding="utf-8")
+    check("WATCHDOG_STARTUP_S" in _src and "WATCHDOG_EXIT_S" in _src,
+          "看门狗的时长常量没了 ✗")
+    _main = _src[_src.index("def main():"):]
+    _i_boot = _main.find('_arm_watchdog(WATCHDOG_STARTUP_S, "启动", _boot_done, 3)')
+    _i_win = _main.find("win = MainWindow()")
+    _i_exec = _main.find("rc = app.exec_()")
+    _i_exit = _main.find('_arm_watchdog(WATCHDOG_EXIT_S, "收尾", _exit_done, 4)')
+    check(0 <= _i_boot < _i_win, "启动看门狗没 arm 在 `MainWindow()` **之前**"
+          "（那段正是卡死过的那一段 ✗）")
+    check(_i_exec < _i_exit, "收尾看门狗没 arm 在 `app.exec_()` **之后** ✗")
+    check("_boot_done.set()" in _main and "_exit_done.set()" in _main,
+          "正常路径没有收工信号 ⇒ 会把好进程也杀掉 ✗")
+    check("os._exit(int(code))" in _src and "dump_traceback" in _src,
+          "看门狗该「先留栈、再强退」（没栈 ⇒ 下次还是查不出来 ✗）")
+
+    _dir = Path(tempfile.mkdtemp(prefix="watchdog_"))
+    _child = _dir / "child.py"
+    _log = _dir / "crash.log"
+    _child.write_text(
+        "import sys, time, threading\n"
+        "sys.path.insert(0, %r)\n"
+        "from pathlib import Path\n"
+        "import gui.app as app\n"
+        "app.CRASH_LOG = Path(%r)          # ⚠ 别写用户的 crash.log ✗\n"
+        "done = threading.Event()\n"
+        "app._arm_watchdog(0.5, '启动', done, 3)\n"
+        "if sys.argv[1] == 'ok':\n"
+        "    done.set()\n"
+        "    print('NORMAL', flush=True)\n"
+        "else:\n"
+        "    time.sleep(8)                 # 模拟「卡住」（真实那次是死循环 ✓）\n"
+        % (str(ROOT), str(_log)), encoding="utf-8")
+    try:
+        for mode, want_rc, want_log in (("ok", 0, False), ("hang", 3, True)):
+            r = subprocess.run([sys.executable, "-X", "utf8", str(_child), mode],
+                               cwd=str(ROOT), capture_output=True, text=True,
+                               timeout=90)
+            txt = _log.read_text(encoding="utf-8") if _log.exists() else ""
+            check(r.returncode == want_rc,
+                  "%s 的退出码该是 %d，实得 %s（stderr=%s）"
+                  % (mode, want_rc, r.returncode, (r.stderr or "")[-200:]))
+            check(("看门狗触发" in txt) == want_log,
+                  "%s：crash.log 里「看门狗触发」对不对（卡住必须留痕 ✗）：\n%s"
+                  % (mode, txt[-300:]))
+            if want_log:
+                # ⚠ 判据是**子进程脚本名**出现在栈里（faulthandler 打的是"文件 + 行号 + 函数名"，
+                #   没有 `sleep` 这种字面 ✓）：有它才叫"留下了卡在哪一行的证据" ✓
+                check("强制退出" in txt and "child.py" in txt,
+                      "没留下「卡在哪」的栈（下次照样查不出来 ✗）：\n%s" % txt[-300:])
+            _log.unlink(missing_ok=True)
+    finally:
+        shutil.rmtree(_dir, ignore_errors=True)
+
+
+def t_run_export_uses_workbench_bar():
+    """⭐⭐ **卡片之外的小任务也走工作台那条读条**（用户 2026-10-05 ✓ 原话："如果没有导出，
+    在添加的带装备的宠物、关闭弹窗后，在数据集工作台显式读条导出"）。
+
+    为什么非要有这一条（只钉源码不够 ✓）：`run_export` 是给**卡片之外**用的入口 ✓ ——
+      `_start` 原来句句都当"有卡片"（`card.set_state` / `CIRCLED[card.num - 1]` ✗）
+      ⇒ 传 None 当场炸 ✓；还要验"读条真变忙式"、"日志真写进工作台"、"结算真回调发起方"
+      （卡片靠它重刷宠物列表 ✓）—— 这几件只有**真起一次任务**才看得到 ✓。
+
+    钉五件：① 起得来、且读条**立刻**变忙式（不许还显示"空闲"✗）；② 标题进了工作台日志；
+      ③ 任务里的日志真回到工作台；④ 结算时 `on_done(ok, summary)` 调**一次**、summary 是任务
+      回的那份 ✓；⑤ **正忙时不许再起**（回 False ✓ 调用方据此如实提示 ✓ 不许静默 ✗）。
+    """
+    import time
+
+    app, w = _win()
+    seen = []
+
+    def _fn(params, ctx):
+        ctx.log("小任务：%s" % params.get("tag"))
+        ctx.progress(3, 10, "补导中")
+        return {"summary": "补导 2 项"}
+
+    def _pump(sec):
+        t0 = time.time()
+        while time.time() - t0 < sec:
+            app.processEvents()
+            time.sleep(0.01)
+
+    check(w.run_export(_fn, {"tag": "pet"}, "补导宠物图库（2 项）",
+                       on_done=lambda ok, sm: seen.append((ok, sm))) is True,
+          "`run_export` 没起得来（卡片之外的小任务这条路 ✗）")
+    check(w.progress.maximum() == 0,
+          "起任务之后读条没变**忙式**（range 还是 0..%d ⇒ 人看着像「空闲」✗）"
+          % w.progress.maximum())
+
+    _pump(3.0)
+    check(len(seen) == 1 and seen[0] == (True, "补导 2 项"),
+          "结算没回调发起方（卡片靠它重刷宠物列表 ✓）/ 回调得不对：%r" % (seen,))
+    txt = w.txt_log.toPlainText()
+    check("补导宠物图库（2 项）" in txt and "小任务：pet" in txt,
+          "小任务的标题/日志没进工作台（那就成了「偷偷跑」✗）：\n%s" % txt[-300:])
+    _pump(0.5)
+    check(w.task is None, "任务结束了但 `self.task` 还挂着（下一条任务会被挡 ✗）")
+
+    # ⑤ 正忙时不许再起（调用方据此如实说"有别的任务在跑"✓ 别静默 ✗）
+    seen2 = []
+
+    def _slow(params, ctx):
+        time.sleep(0.6)
+        return {"summary": "慢"}
+
+    check(w.run_export(_slow, {}, "慢任务", on_done=lambda ok, sm: seen2.append(ok)) is True,
+          "第二条起不来（第一条收尾没把状态清干净 ✗）")
+    check(w.run_export(_fn, {}, "不该起来", on_done=None) is False,
+          "正忙时又答应起了一条 ⇒ 两条一起跑（读条/取消都会乱 ✗）")
+    _pump(2.5)
+    check(seen2 == [True], "慢任务没正常结算：%r" % (seen2,))
+
+
 TESTS = (
+    ("⭐⭐ 卡片之外的小任务**也走工作台那条读条**（补导宠物图库用；用户 2026-10-05）",
+     t_run_export_uses_workbench_bar),
+    ("⭐⭐ 「关了必须走 / 卡住不许烧核」：两道看门狗（留栈 + 退出码 3/4；用户 2026-10-05）",
+     t_watchdog_guarantees_exit),
+    ("⭐⭐ 离屏 ⇒ **绝不连被控机**：闸在真源（`net_allowed`）+ 连线程都不起（用户 2026-10-05）",
+     t_offscreen_never_connects_device),
+    ("启动自动打开上次项目 + 参数页说明「参数存到哪儿」（用户 2026-10-04）",
+     t_startup_opens_last_project_and_says_where_params_go),
     ("主视区页签开合：开一次/不重复/关掉不销毁/起始页关不掉", t_view_open_close_flow),
     ("「实时」是常驻页签：关不掉、且页签上没有「×」（用户 2026-09-28）",
      t_closing_live_tab_says_it_keeps_running),

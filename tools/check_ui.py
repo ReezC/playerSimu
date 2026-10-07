@@ -322,6 +322,39 @@ def check_shortcut_context(errors):
                               % (rel(p), i + 1, ln.strip()))
 
 
+def check_window_labels_copyable(errors):
+    """**字段标题 / 灰字说明要能复制 + 提示要挂在标题上**（UI规范 §6；用户 2026-10-04 ✓ 第 3、4 条）。
+
+    判据（**一处保证 + 三条路都通** ✓）：
+      · `theme.finish_window` 存在，且它**把两件事都做了**（`move_tips_to_titles` ✓ +
+        `enable_label_copy` ✓）；
+      · ⚠⚠ **三条路都要调它**：弹窗（`bind_window_state` ✓）、**主窗口建完** ✓、
+        **新开页签**（`open_view` ✓）—— 用户反馈"实测没有实现"正是**漏了页签那条路** ✗
+        （`bind_window_state` 只有弹窗在调 ✗ ⇒ 决策参数页签的提示/可复制全都没生效 ✓）。
+    """
+    src = read(ROOT / "gui" / "theme.py")
+    if "def finish_window(" not in src:
+        errors.append("gui/theme.py 里没有 `finish_window`（窗口收尾：提示搬标题 + 标签可复制 ✗）"
+                      "（UI规范 §6，用户 2026-10-04 第 3、4 条）")
+        return
+    fw = re.search(r"def finish_window\(.*?(?=\ndef |\Z)", src, re.S)
+    body = fw.group(0) if fw else ""
+    for need, why in (("move_tips_to_titles(", "提示没搬到字段标题上"),
+                      ("enable_label_copy(", "标签没设成可复制")):
+        if need not in body:
+            errors.append("`theme.finish_window` 没做这件事：%s（缺 `%s` ✗）" % (why, need))
+    bw = re.search(r"def bind_window_state\(.*?(?=\ndef |\Z)", src, re.S)
+    if not bw or "finish_window(" not in bw.group(0):
+        errors.append("`theme.bind_window_state`（弹窗收尾）里没调 `finish_window` ✗（UI规范 §6）")
+    mw = read(ROOT / "gui" / "main_window.py")
+    if "theme.finish_window(self)" not in mw:
+        errors.append("`MainWindow` 建完没调 `theme.finish_window(self)` —— **页签面板**那条路是空的"
+                      "✗（提示搬不动、标题复制不了 ✓ 用户 2026-10-04 实测反馈的就是这条 ✗）")
+    if "theme.finish_window(widget)" not in mw:
+        errors.append("`open_view` 里新开的页签没调 `theme.finish_window(widget)` ✗"
+                      "（懒建那些页签收不到收尾 ✓）")
+
+
 def check_theme_colors(warnings):
     """（占位）样式里的硬编码颜色。
 
@@ -343,6 +376,7 @@ def main():
     check_unit_in_label(errors)          # 单位写在框外（存量清零后已升级为错误）
     check_scroll_single_impl(errors)     # 滚动区只有一处实现（2026-09-27 收口）
     check_shortcut_context(errors)       # QShortcut 必须显式 setContext（2026-09-29 收口）
+    check_window_labels_copyable(errors)  # 标题/说明要能复制（2026-10-04 收口 ✓ 一处保证）
     check_settings_sync(warnings)
     check_settings_have_ui(warnings)     # 每个参数都要有界面入口（2026-09-26 新增）
     check_theme_colors(warnings)

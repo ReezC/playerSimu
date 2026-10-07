@@ -321,45 +321,73 @@ def t_rope_ends_and_climb_suggestions():
 
 
 def t_removed_kinds():
-    """**「传送门」与「待确认」已经不是通行方式了**（用户 2026-09-27 要求移除）。
+    """**「待确认」不是通行方式；「传送点」2026-10-06 又加回来了**（口径变过两次，这条把终点钉住）。
 
-    它们都不是"能走的路"：传送门**没有执行器**、门的落点导出数据里也没有（WZ 只给跨图的
-    `tm` + 目标门名 `tn`，本图内的落点得人指认）；"待确认"更不是通行方式 —— 它是编辑器
-    **建议边**的中转标记 ✗。⇒ 现在**只有四种**，而且**四种都有执行器**（走/爬/下跳/跳 ✓），
-    于是"路径里出现没做执行器的边"这种情形**从此不存在** ✓。
+    2026-09-27 用户要求移除「传送门」与「待确认」—— 理由：传送门**没有执行器**、门的落点
+    导出数据里也没有（WZ 只给跨图的 `tm` + 目标门名 `tn`，本图内的落点得人指认）；
+    "待确认"更不是通行方式（它是编辑器**建议边**的中转标记 ✗）。
+    ⭐ **2026-10-06 用户把「传送点」加回来了**（原话："操作方式是走到该点位按↑"✓）—— 那两条
+      理由**都堵上了** ✓：
+        · **执行器** = `route.PortalJob` ✓（走到位 ⇒ **点按一下 ↑** ✓ 用户定 ✓）；
+        · **落点** = **同图**门的 `tn` 就是**目标门名** ✓ ⇒ `zones.portal_exit` 一解析就拿到
+          出口坐标 ✓（跨图**明确不支持** ✓ 用户定 ✓）。
+    ⚠ 纪律不变：**每种通行方式都必须有执行器** ✓ ⇒ 加 kind 与加执行器**必须同一轮落** ✗
+      （只加 kind ⇒ 规划出一条传送点边会当场炸 ✓）。
 
-    钉五件：
-      ① 通行方式清单**正好是**走/爬/下跳/跳；
-      ② 界面名字表 / 优先级表里都不许再留着它们（留着就是个永不到达的优先级 ✗）；
-      ③ 连"把传送门连成边"那个工具函数都删了（`portal_suggestions` ✗ 别再回来）；
-      ④ 老文件里若残留这两种 kind，`validate` **必须报出来**（别静默当没看见 ✗）；
-      ⑤ 新加边时 `add_edge` **当场拦住**（也不该再接受 `portal=` 这个参数 ✓）。
+    钉六件：
+      ① 通行方式**正好是** 走/爬/下跳/跳/**传送点**；
+      ② 界面名字表 / 优先级表都要有传送点 ✓，而 `unconfirmed` **一个都不许留** ✗；
+      ③ "把传送门连成边"那个建议函数仍然**不许有**（`portal_suggestions` ✗ —— 建议只产
+         "走 / 爬"两种可信候选 ✓ 自动产不出可信的门 ✓）；
+      ④ 老文件残留 `unconfirmed` ⇒ `validate` **必须报** ✓；残留 `portal` **但不指名门** ⇒
+         也要报（"没指定是哪扇门" ✓ 同"爬不指名绳" ✓）；
+      ⑤ `add_edge` 收哪种 kind：`unconfirmed` **拦住** ✓、`portal` **收下** ✓（身份要含门 ✓）；
+      ⑥ 去重身份含门 ⇒ **两扇门是两条边** ✓、同一扇门重复加**幂等** ✓。
     """
-    check(set(zones.EDGE_KINDS) == {"walk", "climb", "drop", "jump"},
-          "通行方式该只剩走/爬/下跳/跳 四种：%s" % (zones.EDGE_KINDS,))
+    check(set(zones.EDGE_KINDS) == {"walk", "climb", "drop", "jump", "portal"},
+          "通行方式该是走/爬/下跳/跳/传送点 五种：%s" % (zones.EDGE_KINDS,))
     for k in zones.EDGE_KINDS:
         check(k in zones.EDGE_LABELS, "「%s」没有界面名字" % k)
-    left = [k for k in ("portal", "unconfirmed")
-            if k in zones.EDGE_LABELS or k in zones.KIND_PRIORITY]
-    check(not left, "已移除的通行方式还留在标签/优先级表里：%s" % left)
+    check("portal" in zones.KIND_PRIORITY,
+          "传送点没进优先级表 ⇒ 并列时的兜底变成「看运气」✗")
+    check("unconfirmed" not in zones.EDGE_LABELS
+          and "unconfirmed" not in zones.KIND_PRIORITY,
+          "「待确认」不是通行方式，不该留在标签 / 优先级表里 ✗")
     check(not hasattr(zones, "portal_suggestions"),
-          "`portal_suggestions` 还留着 —— 它产出的边根本跑不了 ✗")
-    # 老文件残留 ⇒ validate 要报；新加 ⇒ 当场拦住
+          "`portal_suggestions` 不该回来 —— 建议只产「走 / 爬」两种可信候选 ✓")
+    # 老文件残留「待确认」⇒ validate 要报（portal 现在是正经 kind，见下一条 ✓）
     bad = zones.Zones.from_dict({
         "map_id": MAP_ID,
         "sets": {"A": {"footholds": ["1"]}, "B": {"footholds": ["2"]}},
-        "edges": [{"from": "A", "to": "B", "kind": "portal"}]})
+        "edges": [{"from": "A", "to": "B", "kind": "unconfirmed"}]})
     check(any("已经移除的通行方式" in x for x in bad.validate()),
-          "老文件里残留的「传送门」边没报警：%s" % bad.validate())
+          "老文件里残留的「待确认」边没报警：%s" % bad.validate())
+    # ⭐ 传送点**不指名门** ⇒ 必须报（同"爬不指名绳"✓ 一句话说清怎么办 ✓）
+    nop = zones.Zones.from_dict({
+        "map_id": MAP_ID,
+        "sets": {"A": {"footholds": ["1"]}, "B": {"footholds": ["2"]}},
+        "edges": [{"from": "A", "to": "B", "kind": "portal"}]})
+    _v = nop.validate()
+    check(any("没指定是哪扇门" in x for x in _v),
+          "传送点边不指名门居然没报警（§校验该拦它 ✓）：%s" % _v)
+    # add_edge：unconfirmed 拦、portal 收（且身份含门 ✓）
     z = zones.Zones(MAP_ID)
     z.add_set("A", ["1"])
     z.add_set("B", ["2"])
-    for k in ("portal", "unconfirmed"):
-        try:
-            z.add_edge("A", "B", k)
-        except ValueError:
-            continue
-        check(False, "`add_edge` 居然收下了 %r（那种走法已经不存在了）" % k)
+    try:
+        z.add_edge("A", "B", "unconfirmed")
+    except ValueError:
+        pass
+    else:
+        check(False, "`add_edge` 居然收下了 'unconfirmed'（那种走法不存在 ✗）")
+    e1 = z.add_edge("A", "B", "portal", portal="h009")
+    e2 = z.add_edge("A", "B", "portal", portal="h010")
+    check(len(z.edges) == 2 and e1 is not e2,
+          "两扇门该是**两条边**（去重身份必须含门 ✗ 否则第二条被静默吞掉 ✓）：%r" % (z.edges,))
+    check(z.add_edge("A", "B", "portal", portal="h009") is e1,
+          "同一扇门重复加该**幂等**（返回老那条 ✓）")
+    check(zones.edge_cond(e1) == "门 h009",
+          "列表行里没写出哪扇门（同一对集合两扇门就分不清了 ✗）：%r" % zones.edge_cond(e1))
 
 
 def t_find_path_over_edges():
@@ -499,6 +527,140 @@ def t_climb_direction():
           % _rt.count("mid_jump=bool(edge.get(\"mid_dir\"))"))
 
 
+def t_climb_over_layer():
+    """⭐⭐⭐ **「绳只是路过这一层」也能爬**（用户 2026-10-06 ✓ 原话："这个比较特殊，在 **x 范围不
+    包含绳梯 x** 的情况下默认走**斜跳上绳梯**，攀爬执行器需要**默认判定出来并支持**"）。
+
+    现场（图 `110040000`，集合 `7` →(爬 L6)→ `6` —— 用户报的"从7去6 发呆"✓）：
+      · 集合 7 那一层 x[467..883] y=**-113**；集合 6 在 y=**-293**（在它上面 180px ✓）；
+      · L6 x=**423**、两端 y=-291（≈集合 6 那层）和 +32（更下面那层）✓
+      ⇒ 起点（7）**不在绳的任何一端** ✗ ⇒ 老判据 `climb_direction` 给 `None` ⇒ 建不出任务 ⇒
+        规划报"没有一条能走的边" ⇒ **发呆** ✓。而真相是：**绳从 7 这层穿过去了**（-113 落在
+        [-291, +32] 里 ✓）⇒ 人**够得着** ✔ 只是够不到它**正下方**（绳在 423、7 层从 467 起 ⇒
+        差 **44px** ✗）⇒ 得**斜跳** ✓。
+    ⇒ 两条口径一起落（都从**数据**算 ✓ 不拍数字 ✓）：
+      ① 方向：绳路过这一层 ⇒ 看"**目标层贴着绳的哪一端**"✓（`climb_direction` 新分支 ✓）；
+      ② 斜跳：**x 范围不含绳 x** ⇒ 默认斜跳 ✓（`climb_via_jump` ✓）、跳得够不够得着
+         = **这一层最近的边到绳的距离** ✓（`climb_jump_reach` ✓ 现场 = 44 ✓）。
+
+    合成地形（手算 ✓ 绳下端故意离起点层 300px > `ladder_ends` 的 span 260 ⇒ 起点**查不到**
+    任何一端 ⇒ 保证走**新分支** ✗ 不然测的还是老路 ✓）：
+      集合「下」fh1 x[100..200] y=**300**；集合「上」fh2 x[100..200] y=**100**；
+      集合「底」fh4 x[300..400] y=**600**；集合「中」fh3 x[300..400] y=**250**；
+      **L1** x=**60** y[**110**..600]（x 在「下」的 x 范围**外** ⇒ 要斜跳 ✓；y 跨过 300 ⇒ 路过 ✓；
+      ⚠ 上端特意取 **110**（不是目标层的 100）⇒ 让"代价用绳端"与"用目标层"差出 10px 分辨得出 ✓）。
+    钉七件：① 路过/不含绳 x/跳多远（手算 40 ✓）；② 方向 +1（目标贴上端 ✓）、-1（目标贴下端 ✓）、
+    None（目标悬在绳中间 ✗）；③ 绳**不路过**时不放行（仍然 None ✓ 不许乱猜 ✗）；
+    ④ `job_for_edge` **默认**把斜跳区间灌进去（不用人配「起跳距离」✓）；
+    ⑤ `hop_cost` 算得出且**手算对** —— ⚠ 爬升那一段取的是「**起点层 → 绳的那一端**」✓
+       （**与执行器的停止点同一套** ✓ 用户 2026-10-06 特地提醒"代价算法与斜跳上升算法一样" ✓：
+        上爬停在绳上端 ✓ ⇒ 用 |绳上端−起点层面| = 190 ✓，**不是**目标层的 y = 200 ✗）；
+    ⑥ `plan_jobs` 出任务（对照：改之前这里 **jobs=0** ⇒ 发呆 ✓）；
+    ⑦ **执行器真跑**：离绳 40px（≤ 上界 ✓、> 对齐距离 20 ✓）⇒ 那一拍 `jump=True` + `dir` 朝上 ✓。
+    """
+    from decision import route as route_mod
+
+    t = _terrain([_fh(1, 100, 300, 200, 300),        # 「下」（起点那一层，y=300）
+                  _fh(2, 100, 100, 200, 100),        # 「上」（目标层，y=100 —— 贴着绳上端 ✓）
+                  _fh(3, 300, 250, 400, 250),        # 「中」（悬在绳中间 ⇒ 该判不出 ✓）
+                  _fh(4, 300, 600, 400, 600)],       # 「底」（y=600 —— 贴着绳下端 ✓）
+                 ladders=[{"x": "60", "y1": "110", "y2": "600", "l": "1", "page": "0"}])
+    z = zones.Zones(MAP_ID)
+    for n, fid in (("下", "1"), ("上", "2"), ("中", "3"), ("底", "4")):
+        z.add_set(n, [fid])
+    L1 = t.ladders[0]
+
+    # ---- ① 三个几何判据（手算）----
+    check(zones.ladder_over_set(t, z, L1, "下"),
+          "绳 y[100..600] 罩住了「下」那一层（y=300）⇒ 该算「路过」✓")
+    check(zones.climb_via_jump(t, z, L1, "下"),
+          "绳 x=60 不在「下」的 x[100..200] 里 ⇒ **该斜跳** ✓（用户 2026-10-06 的唯一判据 ✓）")
+    check(abs(zones.climb_jump_reach(t, z, L1, "下") - 40.0) < 1e-6,
+          "跳多远该是「这一层最近的边到绳」= 100-60 = 40 ✓：%r"
+          % zones.climb_jump_reach(t, z, L1, "下"))
+
+    # ---- ② 方向（新分支）----
+    check(zones.climb_direction(t, z, L1, "下", "上") == 1,
+          "起点不在绳端、但绳路过这一层、目标层贴着**上端** ⇒ 该判**往上爬 +1** ✓：%r"
+          % zones.climb_direction(t, z, L1, "下", "上"))
+    check(zones.climb_direction(t, z, L1, "下", "底") == -1,
+          "目标层贴着**下端** ⇒ 该判**往下爬 -1** ✓：%r"
+          % zones.climb_direction(t, z, L1, "下", "底"))
+    check(zones.climb_direction(t, z, L1, "下", "中") is None,
+          "目标层**悬在绳中间** ⇒ 爬到绳头会冲过头 ⇒ 必须仍然 None（不许猜 ✗）：%r"
+          % zones.climb_direction(t, z, L1, "下", "中"))
+
+    # ---- ③ 绳不路过 ⇒ 仍然 None ----
+    t2 = _terrain([_fh(1, 100, 300, 200, 300), _fh(2, 100, 100, 200, 100)],
+                  ladders=[{"x": "60", "y1": "500", "y2": "700", "l": "1", "page": "0"}])
+    z2 = zones.Zones(MAP_ID)
+    z2.add_set("下", ["1"])
+    z2.add_set("上", ["2"])
+    check(zones.climb_direction(t2, z2, t2.ladders[0], "下", "上") is None,
+          "绳在这层的**下面**（压根够不着）⇒ 必须 None ✗（放宽口径 ≠ 乱放行 ✗）")
+    check(not zones.ladder_over_set(t2, z2, t2.ladders[0], "下"),
+          "「路过」判据把够不着的绳也算进来了 ✗")
+
+    # ---- ④⑤⑥ 任务 / 代价 / 规划（合成地形上跑真函数）----
+    e = z.add_edge("下", "上", "climb", ladder="L1")
+    at = (150.0, 300.0)                     # 人站在「下」的中间
+    j = route_mod.job_for_edge(t, z, e, tol_px=6, hold_ms=250, stall_s=1.0)
+    check(type(j).__name__ == "ClimbJob" and j.dir == 1,
+          "任务没建对：%r dir=%r" % (type(j).__name__, getattr(j, "dir", None)))
+    check(abs(float(j.jump_start_px) - 40.0) < 1e-6,
+          "⭐ **默认**没把「斜跳上绳」的区间灌进去（用户要的正是「默认判定出来」✗）：%r"
+          % j.jump_start_px)
+    # 代价 = 走到绳那一段（90px）+ 爬到**绳上端**那一段（|110-300| = 190）⇒ 280 ✓
+    # ⚠⚠ **爬升那一段必须跟执行器的停止点同一套**（用户 2026-10-06："注意这种寻路代价算法与
+    #   斜跳上升算法一样，检查一下" ✓）：执行器上爬停在**绳上端**（`ClimbJob._arrived` ✓
+    #   `dst_y` 不参与上爬判定 ✗）⇒ 该用 |绳上端 − 起点层面| = |110−300| = **190** ✓，
+    #   **不是** |目标层 − 起点层面| = |100−300| = 200 ✗（差 10px 正是专门留出来分辨这两者的 ✓）。
+    c = route_mod.hop_cost(t, z, e, at)
+    check(c is not None and abs(c - 280.0) < 1e-6,
+          "代价该 = 90（走到绳）+ 190（爬到**绳上端** ✓ 与执行器同一停止点）= 280 ✓"
+          "（用目标层的 y 会得 290 ✗ 照整根绳算更离谱 ✗）：%r" % c)
+    p = route_mod.plan_jobs(t, z, "下", "上", at=at)
+    check(len(p["jobs"]) == 1 and not p["why"],
+          "⭐ 规划该给出 **1 个任务**（改之前这里 jobs=0 ⇒ 界面报「没有一条能走的边」⇒ 发呆 ✗）："
+          "%d / %r" % (len(p["jobs"]), p["why"]))
+
+    # ---- ⑦ 执行器真跑：离绳 40px ⇒ **先按住朝绳走，下一拍按跳**（斜跳 ✓）----
+    o1 = j.update(0.0, px=100.0, py=300.0, ladder_id=None, here_sets=("下",))
+    check(o1["move"] == -1 and not o1["jump"],
+          "斜跳前一拍该**先按住朝绳的方向**（不是当场按跳 ✓ 那是它自己的两步节奏 ✓）：%r" % (o1,))
+    o2 = j.update(0.05, px=100.0, py=300.0, ladder_id=None, here_sets=("下",))
+    check(o2["jump"] and o2["dir"] == 1,
+          "离绳 40px（≤ 上界 40 ✓、> 对齐距离 20 ✓）该**斜跳 + 按 ↑**：%r" % (o2,))
+
+    # ---- ⑧ 候选不再说反话：这类绳该被算进「相关」（界面别标「走不到它」✗）----
+    check(L1 in zones.ladders_touching(t, z.sets["下"]["footholds"]),
+          "「路过这一层」的绳没进候选 ⇒ 界面上还是那句「⚠ 从「下」走不到它」✗（说反话 ✓）")
+
+    # ---- ⑨ ⭐ **人正站在绳底下**（起点不在绳端 + x **罩住**绳 x）—— 不斜跳，但代价同样要对 ----
+    #   ⚠ 这是"检查代价与执行器一不一样"逼出来的**第二处**（用户 2026-10-06 ✓）：老条件把
+    #     这一类打回老分支 ⇒ 拿**绳端**当入绳点 ⇒ 距离虚大 ⇒ 能建出来却几乎不被选 ✗。
+    t3 = _terrain([_fh(1, 100, 300, 200, 300), _fh(2, 100, 100, 200, 100),
+                   _fh(3, 300, 250, 400, 250), _fh(4, 300, 600, 400, 600)],
+                  ladders=[{"x": "150", "y1": "110", "y2": "600", "l": "1", "page": "0"}])
+    z3 = zones.Zones(MAP_ID)
+    for n, fid in (("下", "1"), ("上", "2"), ("中", "3"), ("底", "4")):
+        z3.add_set(n, [fid])
+    L2 = t3.ladders[0]
+    check(zones.climb_direction(t3, z3, L2, "下", "上") == 1,
+          "起点不在绳端、目标贴上端 ⇒ 照样该判 +1 ✓：%r"
+          % zones.climb_direction(t3, z3, L2, "下", "上"))
+    check(not zones.climb_via_jump(t3, z3, L2, "下"),
+          "绳 x=150 落在「下」的 x[100..200] 里 ⇒ 人正站在绳**底下** ⇒ **不该斜跳** ✓")
+    e3 = z3.add_edge("下", "上", "climb", ladder="L1")
+    j3 = route_mod.job_for_edge(t3, z3, e3, tol_px=6, hold_ms=250, stall_s=1.0)
+    check(float(j3.jump_start_px or 0) == 0.0,
+          "x 罩住绳 x 时**不该**启用斜跳（用户口径只看「x 不含绳 x」✓）：%r" % j3.jump_start_px)
+    c3 = route_mod.hop_cost(t3, z3, e3, (150.0, 300.0))
+    check(c3 is not None and abs(c3 - 190.0) < 1e-6,
+          "人站在绳底下 ⇒ 代价该 = 0（横向）+ 190（从这一层爬到绳上端）= 190 ✓"
+          "（拿绳端当入绳点会虚大 ✗ 那就是「能建却几乎不被选」✗）：%r" % c3)
+
+
 def t_walk_dir():
     """「走」的方向类型（2026-09-26 用户要求；**2026-09-27 起真的生效**）：能填、能存、能校验。
 
@@ -565,20 +727,318 @@ def t_edge_identity_includes_ladder():
     check(len(z.edges) == 2,
           "换一根绳被当成重复了（用户报的「点增加没反应」）：%s" % z.edges)
     check(e2.get("ladder") == "L7" and e2 is not e1, "第二条没建对：%r" % e2)
-    # ⚠ 身份里原来还有 `portal`（走哪个门）那一格 —— 2026-09-27 随「传送门」一起移除 ✓
-    #   ⇒ 这里改成钉"**它真的没了**"：`add_edge` 不再接受 `portal=`（谁加回来当场红 ✓）。
-    try:
-        z.add_edge("二楼", "三楼", "walk", portal="west01")
-    except TypeError:
-        pass
-    else:
-        check(False, "`add_edge` 还在收 `portal=` —— 那个通行方式已经移除了 ✗")
-    check(len(z.edges) == 2, "加了不该加的东西：%s" % z.edges)
+    # ⭐ 身份里**还有 `portal`**（走哪个门）那一格 —— 2026-09-27 随「传送门」移除过 ✓、
+    #   **2026-10-06 加回** ✓。它与绳号**同理**：同一对集合、同是传送点、**不同门**是
+    #   两条不同的边 ✓（落点不同、代价也不同 ✓ 用户 2026-10-06 定的口径 ✓）。
+    p1 = z.add_edge("二楼", "三楼", "portal", portal="h009", why="第一扇门")
+    p2 = z.add_edge("二楼", "三楼", "portal", portal="h010", why="另一扇门")
+    check(len(z.edges) == 4 and p1 is not p2,
+          "换一扇门被当成重复了（身份里少一格 ⇒ 第二条被**静默吞掉** ✗）：%s" % (z.edges,))
+    check(p2.get("portal") == "h010", "第二条门没存对：%r" % p2)
+    check(len(z.edges) == 4, "加了不该加的东西：%s" % z.edges)
     # 同一对、同一类型、多条时的**取法**：按类型优先级，同类型不同绳取**先出现**的那条。
     # 把这条钉住，免得以后有人"顺手"换成别的口径（寻路用哪根绳靠它 ✓）
     got = zones.edge_between(z, "二楼", "三楼")
     check(got.get("ladder") == "L3",
           "同类型多条时的取法变了（该取文件里先出现的）：%r" % got)
+
+
+def t_portal_align_like_climb():
+    """⭐⭐ 传送点的**对齐 / 补按**与爬绳执行器**同一套**（用户 2026-10-06 ✓ 两句话：
+    "去传送门的对齐需要调用攀爬执行器对齐那个方法：在「坐标误差范围」内就可以按 ↑
+      ＋ 位置状态没回执补按 ↑"✓；看完日志又补："看 log 会在从5到4的 h010 传送门
+     **左右来回晃但是没有按 ↑** —— 我们应该**整套照搬对齐式爬绳梯的逻辑**，**还要补按方向**"✓）。
+
+    钉七件（①~⑥ 都在 `PortalJob` 上真跑 ✓）：
+      ① **对齐判据 = 「坐标对齐误差范围」**（`tol_px` ✓ 与 `ClimbJob.tol_px` 同一把尺 ✓）
+         ＋ **进容差先站住稳 `hold_ms`**（「坐标对齐误差时间」✓ 照搬爬绳"站住等 ⇒ 再动作"✓
+         —— 不做这道就是"路过一下也按 ↑"✗）；`hold_ms=0` ⇒ **同一拍就按**（不白拖 ✓）；
+      ② **还没对齐 ⇒ 按住朝门走**（远超 `near_px` 一口气按住 ✓ 近了才点按 ✓ 同爬绳分档 ✓）；
+      ③ ⭐ **不会在门口来回晃**（用户报的病 ✗）：**过冲之后往回按（换了方向）也要等
+         「对齐绳梯移动延迟」** ✓ —— 没过间隔那一拍必须**一个键都不按** ✓；
+      ④ **近处点按**：按够 `TAP_ON_S`(30ms) 就**松开**（别一路蹭过去 = 冲过头 ✗）；
+      ⑤ ⭐ **补按方向**（用户："**还要补按方向**"✓）：按着某个方向却**一直没进步**、
+         过了「移动操作尝试间隔」⇒ `reassert=True` ＋ 还是那个方向 ✓（对面把键丢了也能救 ✓）；
+         没到间隔 ⇒ **不补**（否则就是键盘风暴 ✗）；`retry_ms=0` ⇒ 一个都不补 ✓（老行为 ✓）；
+      ⑥ ⭐ **按 ↑ 只看 x 对齐**（照搬爬绳那条："对齐了就按跳开始爬啊，**不需要判定别的**"✓
+         见 `ClimbJob._align_step` ✓）：y 差 50px（`> PORTAL_TOL_Y`）**照样按 ↑** ✓，
+         但**差多少必须写进 note** ✓（人就靠日志判断"为什么按了没反应"✓）；
+      ⑦ 真规划那条路：`plan_jobs` 一起灌的 `tol_px` / `hold_ms` **真落进** `PortalJob` ✓
+         （`tol_px` 原来在 `portal_job_for_edge` 里被摘掉 ✗ ⇒ 用的是它自己那个"门的框"✓）。
+    """
+    from decision import route as route_mod
+
+    t = _terrain([_fh(1, 0, 300, 100, 300),          # 「下」：x[0..100] y=300
+                  _fh(2, 600, 300, 700, 300)],       # 「上」：x[600..700] y=300
+                 portals=[{"pn": "h009", "pt": "1", "x": "50", "y": "280",
+                           "tm": "999999999", "tn": "h010"},
+                          {"pn": "h010", "pt": "1", "x": "650", "y": "280",
+                           "tm": "999999999", "tn": ""}])
+    z = zones.Zones(MAP_ID)
+    z.add_set("下", ["1"])
+    z.add_set("上", ["2"])
+    pe = z.add_edge("下", "上", "portal", portal="h009", why="用例：本图内的门")
+    p = zones.portal_by_pn(t, "h009")
+    ex = zones.portal_exit(t, "h009")
+    check(p is not None and ex is not None, "用例地形没造好（门 / 出口解析不出来）")
+
+    # ---- ① 对齐判据（＋ 先稳住 ＋ ⭐**对齐一开始就点按 ↑**）----
+    j = route_mod.PortalJob("上", p, ex, tol_px=50, hold_ms=200, retry_ms=0)
+    o = j.update(0.0, px=10.0, py=280.0)            # 差 40px ≤ 容许 50 ⇒ 对齐好了 ✓
+    check(o["move"] == 0 and "对齐好了" in j.note,
+          "差 40px、容许 ±50 ⇒ 判「对齐好了」、站住（照搬爬绳：稳 hold_ms ✓）：%s / %r"
+          % (o, j.note))
+    check(o["dir"] == 1 and j._up_taps == 1,
+          "⭐「**对齐过程开始时就可以按 ↑**」（用户 2026-10-06 新口径 ✗）—— 第一拍就该点按 ↑："
+          "%s" % (o,))
+    o = j.update(0.07, px=10.0, py=280.0)           # 按够 `TAP_ON_S`(30ms) ⇒ 松手 ✓
+    check(o["dir"] == 0,
+          "点按要**按够 `TAP_ON_S` 就松**（一路按着对面只算一次长按 ✗）：%s" % (o,))
+    o = j.update(0.25, px=10.0, py=280.0)           # 稳够 200ms ⇒ 那一下「正式的 ↑」
+    check(o["dir"] == 1 and o["move"] == 0,
+          "稳够「坐标对齐误差时间」⇒ 该**只按 ↑**（`dir=+1` 才是 ↑ ✓ 按消费点口径 ✓）：%s" % (o,))
+    j0 = route_mod.PortalJob("上", p, ex, tol_px=50, hold_ms=0, retry_ms=0)
+    o0 = j0.update(0.0, px=10.0, py=280.0)
+    check(o0["dir"] == 1,
+          "`hold_ms=0`（不等）⇒ **同一拍就该按 ↑**（别白拖一拍 ✓ 同爬绳 ✓）：%s" % (o0,))
+
+    # ---- ② 还没对齐 ⇒ 横向朝门走，⭐**同一拍照样点按 ↑** ----
+    j2 = route_mod.PortalJob("上", p, ex, tol_px=10, hold_ms=200, retry_ms=0)
+    o2 = j2.update(0.0, px=10.0, py=280.0)          # 差 40px > near_px(20)
+    check(o2["move"] == 1 and o2["dir"] == 1,
+          "差 40px、容许 ±10 ⇒ 该**朝门走 ＋ 同时点按 ↑**（用户 2026-10-06：「对齐过程"
+          "开始时就可以按 ↑」✓ 两路同一拍一起发 ✓）：%s" % (o2,))
+
+    # ---- ③④ 近处点按 + **过冲往回按也得等「移动延迟」**（用户报的"左右晃"就是这个 ✗）----
+    j3 = route_mod.PortalJob("上", p, ex, tol_px=2, hold_ms=200, retry_ms=0,
+                             align_gap_ms=180, near_px=20)
+    o3 = j3.update(0.0, px=45.0, py=280.0)          # dx=+5（超容许、在 near_px 内）⇒ 点按"→"
+    check(o3["move"] == 1, "差 +5px ⇒ 该朝右点一下：%s" % (o3,))
+    o3 = j3.update(0.05, px=55.0, py=280.0)         # 冲过头 ⇒ dx=-5 ⇒ **这一拍不许反按**
+    check(o3["move"] == 0 and "等移动延迟" in j3.note,
+          "过冲之后**立刻反按** ⇒ 人就在门口左右晃 ✗（用户 2026-10-06 现场报的正是这个 ✗）："
+          "%s / %r" % (o3, j3.note))
+    o3 = j3.update(0.20, px=55.0, py=280.0)         # 过了 180ms ⇒ 才允许反按
+    check(o3["move"] == -1, "过了「对齐绳梯移动延迟」该反按回来了：%s" % (o3,))
+    o3 = j3.update(0.20 + route_mod.TAP_ON_S + 0.01, px=55.0, py=280.0)
+    check(o3["move"] == 0 and "松开" in j3.note,
+          "近处点按：按够 `TAP_ON_S`(30ms) 就该**松开**（一路蹭过去 = 冲过头 ✗）：%s / %r"
+          % (o3, j3.note))
+
+    # ---- ⑤ 补按方向（用户："还要补按方向"✓）----
+    j5 = route_mod.PortalJob("上", p, ex, tol_px=10, hold_ms=200, retry_ms=500,
+                             align_gap_ms=180, near_px=20)
+    j5.update(0.0, px=10.0, py=280.0)               # 远 ⇒ 一口气按住"→"
+    o5 = j5.update(0.3, px=10.0, py=280.0)          # 位置**没动**、但还没到间隔
+    check(o5["move"] == 1 and not o5.get("reassert"),
+          "还没到「移动操作尝试间隔」就补按了（那是键盘风暴 ✗）：%s" % (o5,))
+    o5 = j5.update(0.6, px=10.0, py=280.0)          # 过了 500ms 还是没动 ⇒ 补按一次
+    check(o5.get("reassert") is True and o5["move"] == 1,
+          "按着某个方向却**一直没进步**、过了「移动操作尝试间隔」⇒ 该**补按一次方向键**"
+          "（`reassert=True` ✓ 用户 2026-10-06：「还要补按方向」✗）：%s" % (o5,))
+    j5b = route_mod.PortalJob("上", p, ex, tol_px=10, hold_ms=200, retry_ms=0,
+                              align_gap_ms=180, near_px=20)
+    j5b.update(0.0, px=10.0, py=280.0)
+    o5b = j5b.update(9.0, px=10.0, py=280.0)
+    check(not o5b.get("reassert"),
+          "`retry_ms=0`（= 不重试，老行为 ✓）却补按了 ✗：%s" % (o5b,))
+
+    # ---- ⑥ 按 ↑ 只看 x 对齐（照搬爬绳那条 ✓）＋ y 差写进 note ✓ ----
+    j6 = route_mod.PortalJob("上", p, ex, tol_px=50, hold_ms=0, retry_ms=0)
+    o6 = j6.update(0.0, px=10.0, py=330.0)          # y 差 50px（> PORTAL_TOL_Y=12）
+    check(o6["dir"] == 1,
+          "按 ↑ 只看 x 对齐（照搬爬绳「对齐了就按，不需要判定别的」✓）——"
+          " y 差 50px 就不按了 ✗：%s" % (o6,))
+    check("y" in j6.note and "50" in j6.note,
+          "y 差多少该**写进 note** ✓（人正靠日志判断「为什么按了没反应」✓）：%r" % (j6.note,))
+
+    # ---- ⑥′ ⭐⭐ 本轮新口径本体：**对齐过程开始时就可以按 ↑** ＋ **以「移动操作尝试间隔」
+    #      连续点按 ↑**（用户 2026-10-06 原话："增加传送点的特殊对齐逻辑：对齐过程开始时
+    #      就可以按 ↑，并以「移动操作尝试间隔」连续点按 ↑"✓）----
+    j8 = route_mod.PortalJob("上", p, ex, tol_px=2, hold_ms=0, retry_ms=500)
+    o = j8.update(0.0, px=10.0, py=280.0)           # 差 40px（远、还没进容差）
+    check(o["move"] == 1 and o["dir"] == 1 and j8._up_taps == 1,
+          "对齐**刚开始**（还没进容差）就该：朝门走 **＋ 同时**点按 ↑（新口径 ✗）：%s" % (o,))
+    o = j8.update(route_mod.TAP_ON_S + 0.01, px=10.0, py=280.0)
+    check(o["dir"] == 0,
+          "点按：按够 `TAP_ON_S` 要**松开**（一路按着对面只算一次长按 ✗）：%s" % (o,))
+    o = j8.update(route_mod.TAP_PERIOD_S - 0.02, px=10.0, py=280.0)   # 还差一个点按周期
+    check(o["dir"] == 0 and j8._up_taps == 1,
+          "还没到一个「点按周期」不该再按（不然就是每拍狂按 ✗）：%s" % (o,))
+    o = j8.update(route_mod.TAP_PERIOD_S + 0.02, px=10.0, py=280.0)   # 到周期 ⇒ 再打一下
+    check(o["dir"] == 1 and j8._up_taps == 2,
+          "⭐ 到一个「点按周期」(`TAP_PERIOD_S` ✓ 180ms) 就该**再打一下** ⇒ **连续发点按** ✓："
+          "%s" % (o,))
+    # ⭐⭐ **与「移动操作尝试间隔」无关**（用户 2026-10-06 第二轮原话："**取消传送点通行方式
+    #   对齐的时候 ↑ 以「移动操作尝试间隔」按，直接连续发点按**"✓）：`retry_ms=0` 也照样
+    #   按「点按周期」连续发 ✓（`retry_ms` 只再管进容差之后 `WAIT` 相的补按 ↑ ✓）。
+    j9 = route_mod.PortalJob("上", p, ex, tol_px=2, hold_ms=0, retry_ms=0)
+    o = j9.update(0.0, px=10.0, py=280.0)
+    check(o["dir"] == 1 and j9._up_taps == 1,
+          "`retry_ms=0` 也**照样有开头那一下** ↑（「对齐过程开始时就可以按 ↑」✓）：%s" % (o,))
+    o = j9.update(route_mod.TAP_PERIOD_S + 0.02, px=10.0, py=280.0)
+    check(o["dir"] == 1 and j9._up_taps == 2,
+          "⭐ `retry_ms=0` 也**照样连续点按**（新口径：不再按「移动操作尝试间隔」✓）：%s" % (o,))
+
+    # ---- ⑦ 真规划那条路：`tol_px` / `hold_ms` 要真落进任务 ----
+    j7 = route_mod.job_for_edge(t, z, pe, tol_px=42, hold_ms=333, stall_s=1.0,
+                                jump_start_px=0)
+    check(type(j7).__name__ == "PortalJob" and int(j7.tol_px) == 42
+          and int(j7.hold_ms) == 333,
+          "`plan_jobs` 灌的「坐标对齐误差范围 / 时间」没进传送点任务：tol=%r hold=%r"
+          % (getattr(j7, "tol_px", None), getattr(j7, "hold_ms", None)))
+
+
+def t_portal_kind_and_cost():
+    """⭐⭐ **传送点**：出口解析 / **代价按用户那条公式** / 择路里真的参与比 / 执行器真跑一遍
+    （用户 2026-10-06 ✓ 口径与落地见 `docs/开发日志.md` **220** ＋ SKILL ✓）。
+
+    用户在问答里把口径一条条定死了 ✓：
+      · "**跨图传送点不支持**" ✓（跨图的门解析不出落点 ⇒ `portal_exit` 给 None ✓）；
+      · "**点一下 ↑**" ✓（`PortalJob` 按 `TAP_ON_S` 点按、不按住 ✓）；
+      · "至于**寻路代价**：我们应该能知道这个传送点通向哪里，寻路代价就等于**角色当前到传送
+        起点的距离** ＋ **传送终点距离到目标点的距离**" ✓ —— 这条**必须手算对**（本用例的核心 ✓）。
+
+    钉六件：
+      ① **出口解析**：同图门（`tm == 999999999`）按 `tn` 找到出口 ✓；**跨图 / tn 找不到
+         ⇒ None** ✓（不猜 ✓）；
+      ② **代价 = near + back**（手算对：人在 (100,300)、门在 (50,280)、出口在 (650,280)、
+         目标集合面在 x[600..700] y=300 ⇒ `sqrt(50²+20²) + (0 + 20)` ✓）；
+      ③ **择路里真参与比**：同一个 `at`，走很贵时挑传送点 ✓、人已经快到目标时挑走 ✓
+         （不是"传送点永远优先/永远靠后" ✗）；
+      ④ **建任务**：同图门 ⇒ `PortalJob`（且带上出口 ✓）；跨图门 ⇒ **抛**（如实说 ✗ 别静默）；
+      ⑤ **执行器真跑**：远处 ⇒ 朝门走；进门 ⇒ `dir=-1`（**点按 ↑** ✓）；按完 ⇒ 松手等；
+         到出口 / 踏上目标集合 ⇒ `done` ✓；
+      ⑥ `edge_text` 里**写得出是哪扇门**（同一对集合两扇门时靠它分辨 ✓）。
+    """
+    from decision import route as route_mod
+
+    t = _terrain([_fh(1, 0, 300, 100, 300),          # 「下」：x[0..100] y=300
+                  _fh(2, 600, 300, 700, 300)],       # 「上」：x[600..700] y=300
+                 portals=[{"pn": "h009", "pt": "1", "x": "50", "y": "280",
+                           "tm": "999999999", "tn": "h010"},
+                          {"pn": "h010", "pt": "1", "x": "650", "y": "280",
+                           "tm": "999999999", "tn": ""},
+                          {"pn": "zz", "pt": "1", "x": "900", "y": "280",
+                           "tm": "105090600", "tn": "yy"}])
+    z = zones.Zones(MAP_ID)
+    z.add_set("下", ["1"])
+    z.add_set("上", ["2"])
+
+    # ---- ① 出口解析：**先把"同图"的两种写法都钉住**（用户 2026-10-06 报的 bug ✓）----
+    #   ⚠⚠ 用户原话："**阳光沙滩的 h00x 这些传送点的地图 id 不就是阳光沙滩本身吗？为什么写着
+    #     跨图？**" ✓ —— 老判据只认 `tm == 999999999`（当成"本图内"✗），而**实数据里同图门的
+    #     `tm` 就是本图的地图 id**（`110040000` ✓）⇒ 整张图的同图门**全被误判成跨图** ✗
+    #     （`h009 → h010` 就在本图，也照样被挡 ✓）。
+    #   ⇒ 判据改成"**`tn` 指的那扇门在不在本图**"✓（`tm` 只用于话术 ✓）；这里真图回归。
+    t_real = mapdata.load("110040000")
+    if t_real is not None:                    # 老环境没导这张图 ⇒ 跳过（别红 ✗）
+        _e8 = zones.portal_exit(t_real, "h008")
+        check(_e8 is not None and _e8.pn == "h009",
+              "同图门（`tm` = 本图 id ✓ 实数据就是这样）解析不出出口 ⇒ 又回到「跨图」误判 ✗：%r"
+              % (_e8,))
+        check(zones.portal_exit(t_real, "h009") is not None
+              and zones.portal_exit(t_real, "h009").pn == "h010",
+              "用户点名的 `h009 → h010` 解析不出来 ✗：%r"
+              % (zones.portal_exit(t_real, "h009"),))
+        check(zones.portal_exit(t_real, "west00") is None,
+              "**真跨图**的门（`tn=east00` 不在本图）该给 None ✓：%r"
+              % (zones.portal_exit(t_real, "west00"),))
+        check(zones.portal_exit(t_real, "h006") is None,
+              "`tn` 是空的门（没配去向）该给 None ✓：%r"
+              % (zones.portal_exit(t_real, "h006"),))
+
+    # ---- ① 出口解析 ----
+    check(zones.portal_exit(t, "h009") is not None
+          and zones.portal_exit(t, "h009").pn == "h010",
+          "同图门没解析出出口：%r" % (zones.portal_exit(t, "h009"),))
+    check(zones.portal_exit(t, "zz") is None,
+          "**跨图**门居然解析出了出口（用户明确不支持跨图 ✓ 必须 None ✗）")
+    check(zones.portal_exit(t, "没有这扇门") is None, "本图没有的门该给 None")
+
+    pe = z.add_edge("下", "上", "portal", portal="h009", why="用例：本图内的门")
+    zw = z.add_edge("下", "上", "walk", why="用例：走")
+    # ---- ⑥ 行里写得出是哪扇门（⚠ `edge_cond` 那条在 t_removed_kinds 里钉 ✓）----
+    check("h009" in zones.edge_text(z, "下", "上", edge=pe),
+          "「命令前往」那行没写出哪扇门（两扇门就分不清了 ✗）：%r"
+          % zones.edge_text(z, "下", "上", edge=pe))
+
+    # ---- ② 代价 = near + back（手算）----
+    at = (100.0, 300.0)
+    near = ((100 - 50) ** 2 + (300 - 280) ** 2) ** 0.5        # 人 → 起点门 = 53.85
+    # 出口门 (650,280) → 目标面 x[600..700] y=300：横向落在面里 ⇒ 0 ✓ ＋ 垂直 20 ✓
+    back = 0.0 + abs(280 - 300)
+    c = route_mod.hop_cost(t, z, pe, at)
+    check(c is not None and abs(c - (near + back)) < 0.01,
+          "传送点代价不是「当前→起点门 ＋ 出口门→目标」（用户 2026-10-06 定的口径 ✗）："
+          "算得 %r，手算 %r" % (c, near + back))
+    # 跨图那条算不出来 ⇒ None（不猜 ✓；择路会把它排到最后 ✓）
+    zc = zones.Zones(MAP_ID)
+    zc.add_set("下", ["1"])
+    zc.add_set("上", ["2"])
+    zc.add_edge("下", "上", "portal", portal="zz")
+    check(route_mod.hop_cost(t, zc, zc.edges[0], at) is None,
+          "跨图门的代价该算不出来（None ⇒ 不猜 ✓）")
+
+    # ---- ③ 择路：走贵 ⇒ 挑门；快到目标 ⇒ 挑走（两个方向都要成立 ✗ 别只钉一边）----
+    p1 = route_mod.pick_edge(t, z, "下", "上", at=at)
+    check(p1 is not None and p1.get("kind") == "portal",
+          "人在起点这一头（离门 53.9、离目标面 500）⇒ 该挑传送点 ✓：%r" % (p1,))
+    p2 = route_mod.pick_edge(t, z, "下", "上", at=(650.0, 300.0))
+    check(p2 is not None and p2.get("kind") == "walk",
+          "人已经贴在目标那一头（离目标面 0、离门 600）⇒ 该挑走 ✓"
+          "（传送点**不是**永远优先 ✗）：%r" % (p2,))
+
+    # ---- ③b ⚠⚠ **按 `plan_jobs` 的传参方式**也得建得出 ------------------------------------
+    #   `plan_jobs` 给四种边**一起灌** `tol_px` / `hold_ms` / `stall_s` / `jump_start_px` ✓
+    #   ⇒ 传送点分支漏摘一个就 `TypeError: unexpected keyword argument` ✗ ——
+    #   **实测漏过 `tol_px`** ✓：直接 `job_for_edge(...)` 的用例看不出来（它没带那些 kw ✗），
+    #   而**真规划路径**全炸 ✗（"传送点边在实机上从来没生效过"✓ 这种最难查 ✓）。
+    j4 = route_mod.job_for_edge(t, z, pe, tol_px=6, hold_ms=250, stall_s=1.0,
+                                jump_start_px=0)
+    check(type(j4).__name__ == "PortalJob",
+          "带上 `plan_jobs` 那套参数就建不出来了（漏摘 kw ✗ 真机上一次都跑不起来）：%r"
+          % (type(j4).__name__,))
+
+    # ---- ④ 建任务：同图门 ⇒ PortalJob（带出口）；跨图 ⇒ 抛 ----
+    job = route_mod.job_for_edge(t, z, pe)
+    check(type(job).__name__ == "PortalJob" and getattr(job, "exit_portal", None) is not None
+          and job.exit_portal.pn == "h010",
+          "同图门该建出 PortalJob 且带上出口：%r" % (job,))
+    try:
+        route_mod.job_for_edge(t, zc, zc.edges[0])
+    except ValueError as ex:
+        check("跨图" in str(ex), "抛了，但没说清是「跨图」（用户口径要如实说 ✓）：%r" % (ex,))
+    else:
+        check(False, "**跨图**门居然也建出了任务（用户明确不支持 ✓ 该抛 ✗）")
+
+    # ---- ⑤ 执行器真跑：走 → 对齐 + **稳住** → 点按 ↑ → 等 → 到 ----
+    o = job.update(0.0, px=0.0, py=300.0)
+    check(o["move"] == 1, "门在右边（x=50、人在 0）⇒ 该往右走：%r" % (o,))
+    # ⭐ 进容差**先站住稳 `hold_ms`**（用户 2026-10-06："整套照搬对齐式爬绳梯的逻辑"✓
+    #   —— 爬绳就是"进容差 ⇒ 站住稳 hold_ms ⇒ 再动作"✓）
+    o = job.update(0.1, px=50.0, py=280.0)
+    check(o["dir"] == 0 and o["move"] == 0 and "对齐好了" in job.note,
+          "进「坐标对齐误差范围」的第一拍该**站住稳一会儿**（还没到点就按 ↑ = 路过也按 ✗）：%r / %r"
+          % (o, job.note))
+    _t = 0.1 + job.hold_ms / 1000.0 + 0.01        # 稳够 ⇒ 该点按 ↑ 了 ✓
+    o = job.update(_t, px=50.0, py=280.0)
+    check(o["dir"] == 1 and o["move"] == 0,
+          "稳够之后该**只按 ↑**（⚠ 按**消费点**的口径：`dir=+1` 才是 ↑ ✗ "
+          "—— `agent._climb_tick` 里是 `km.get(\"up\") if out[\"dir\"] > 0 else km.get(\"down\")` ✓；"
+          "这里**不能**照实现写期望 ✗ 那正是漏过这个 bug 的原因 ✓）：%r" % (o,))
+    # ⭐ **契约钉**（用户 2026-10-06 现场："站在传送点门口不按↑"✗ —— 根因就是 `dir` 正负写反 ✓）：
+    #   断言**消费点那行**还在（谁改了它的语义、或把 `dir` 的约定换掉，这条当场红 ✓）。
+    _ag = (ROOT / "decision" / "agent.py").read_text(encoding="utf-8")
+    check('km.get("up") if out["dir"] > 0 else km.get("down")' in _ag,
+          "`agent` 里「`dir > 0` ⇒ ↑」这条约定变了 ⇒ 传送点（以及爬绳/下跳）的竖直键会反向 ✗")
+    o = job.update(_t + route_mod.TAP_ON_S + 0.01, px=50.0, py=280.0)
+    check(o["dir"] == 0 and not o["done"],
+          "按够 `TAP_ON_S` 就该**松手**（用户定：点一下 ✓ 不是按住 ✗）：%r" % (o,))
+    o = job.update(_t + 0.5, px=650.0, py=280.0, here_sets=("上",))
+    check(o["done"], "已经到了目标集合 / 出口门上，还没判完成：%r" % (o,))
+    check(not o["failed"], "正常走到出口却判失败了：%r" % (o,))
+    check("到达" in job.note, "完成时那句说明不对：%r" % (job.note,))
 
 
 def t_pick_nearest_rope():
@@ -933,15 +1393,24 @@ TESTS = (
     ("可走建议（双向 + 理由）与「隔着墙不可走」", t_walk_suggestions_and_wall_guard),
     ("绳端差 45px 也要接上：攀爬建议（双向 + 绳 id + 没圈的一端）",
      t_rope_ends_and_climb_suggestions),
-    ("已移除的通行方式：传送门/待确认不在清单里、老数据残留要报警、add_edge 不再收 portal",
-     t_removed_kinds),
+    ("通行方式清单：**传送点 2026-10-06 加回**（五种、都有执行器）；「待确认」仍不是通行方式、"
+     "老数据残留要报警、传送点不指名门也要报警", t_removed_kinds),
+    ("⭐⭐ 传送点：出口按 `tn` 解析（跨图 ⇒ None）/ **代价 = 当前→起点门 ＋ 出口门→目标**（手算对）/ "
+     "择路里真参与比（走贵挑门、快到目标挑走）/ 跨图建任务要抛 / `PortalJob` 真跑（走到门 ⇒ "
+     "点按 ↑ ⇒ 到出口 done）", t_portal_kind_and_cost),
+    ("⭐⭐ 传送点的对齐与补按**与攀爬执行器同一套**（用户 2026-10-06）：对齐判据 = "
+     "「坐标对齐误差范围」（`tol_px` ✓ 不再用门的框）；**位置状态没回执 ⇒ 补按 ↑**"
+     "（过了「移动操作尝试间隔」才补 ✓）；不再自己判「按了多久还没到」（交给寻路超时 ✓）",
+     t_portal_align_like_climb),
     ("边图上的路径：走得通给逐步路线，走不通说清边界", t_find_path_over_edges),
     ("通行方式的显示名：带了键就不再拼一遍；跳 / 下跳 分得开", t_kind_label_text),
     ("爬绳的上下：按**起点**在哪端判；终点不在绳端时只有配了「中途跳下」才放行"
      "（说不清一律 None）", t_climb_direction),
+    ("⭐⭐⭐ 「绳只是**路过**这一层」也能爬（用户 2026-10-06）：方向看目标层贴哪端 / x 不含绳 x ⇒ "
+     "**默认斜跳上绳**（跳多远从数据算）/ 绳不路过仍 None / 任务·代价·规划都通 / 执行器真跑", t_climb_over_layer),
     ("走路的方向类型：存得住/默认不写文件/乱填当场拦住+校验报出", t_walk_dir),
-    ("边的身份含绳号：换一根绳是另一条边（原来静默当重复）；同类型多条取先出现的",
-     t_edge_identity_includes_ladder),
+    ("边的身份含**绳号 / 门**：换一根绳、换一扇门都是另一条边（原来静默当重复）；"
+     "同类型多条取先出现的", t_edge_identity_includes_ladder),
     ("择路：到目标集合有多条绳时挑**最近的**（没位置则退回类型优先级 → 文件顺序）",
      t_pick_nearest_rope),
     ("同一段内按**距离**挑边：跨类型也比 / 爬绳算「距离+绳长」/ 下跳算落差 / 没位置退回"

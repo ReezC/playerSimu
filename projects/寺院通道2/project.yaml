@@ -49,14 +49,15 @@ decision:
   min_attack_dist: 0
   attack_up_dist: 30
   attack_down_dist: 20
+  attack_fan_deg: 0.0
   chase_jump_enabled: true
   chase_jump_min: -10
   chase_jump_max: 8
   chase_jump_dash_ms: 200
-  chase_jump_edge_guard_enabled: false
-  chase_jump_edge_guard_px: 100
+  chase_jump_edge_guard_enabled: true
+  chase_jump_edge_guard_px: 150
   station_turn_interval_ms: 1000
-  mouse_speed: 1.1999999999999995
+  mouse_speed: 0.9999999999999999
   evade_type: jump
   jump_interval: 0
   jump_random_prob: 0.1
@@ -127,14 +128,14 @@ decision:
   probe_calib: {}
   hp_color: *id001
   mp_color: *id002
-  hp_threshold: 63
+  hp_threshold: 50
   mp_threshold: 7
   pot_cd: 1001
   mob_sets_ttl_s: 3.0
   auto_hp_pot: true
   auto_mp_pot: false
   strategy: patrol
-  vision_top: 150
+  vision_top: 120
   vision_bottom: 50
   vision_left: -1
   vision_right: -1
@@ -147,6 +148,11 @@ decision:
   sweep_turn_cd: 500
   back_range: 150
   sweep_edge_turn_px: 100
+  station_spot: {}
+  station_pickup_enabled: false
+  station_pickup_min_s: 0.0
+  station_pickup_max_s: 0.0
+  station_pickup_spots: []
   route_goto_set: 右下
   align_tol_px: 10
   align_hold_ms: 1000
@@ -154,10 +160,10 @@ decision:
   climb_align_near_px: 1
   climb_retry_delay_s: 1.0
   climb_retry_delay_inc_s: 1.0
-  goto_timeout_s: 15
+  goto_timeout_s: 15.0
   chase_goto_max_s: 0.0
   goto_timeout_key: 表情_无语
-  disable_chase_pathfinding: false
+  disable_chase_pathfinding: true
   jump_start_px: 100
   move_retry_ms: 1000
   debounce_conf: 0.3
@@ -348,6 +354,68 @@ label:
   downscale: 1
   region: null
   player_thresh: 0.6
+  player_min_distinct: 0.0
+  player_per_mob: 0
+  player_max_peaks: 1
+  player_downscale: 1
+  drop_min_distinct: 0.06
+  drop_per_mob: 20
+  drop_max_peaks: 3
+  pet_min_distinct: 0.06
+  pet_per_mob: 20
+  pet_max_peaks: 3
+  label_drops_on: false
+  drop_thresh: 0.2
+  drop_downscale: 1
+  label_pets_on: true
+  pet_thresh: 0.2
+  pet_downscale: 1
+  pets:
+  - pet: '5000003'
+    name: 小怪猫
+    equips:
+    - 01802014
+  drops:
+  - id: 09000000
+    name: ''
+  - id: 09000001
+    name: ''
+  - id: 09000002
+    name: ''
+  - id: 09000003
+    name: ''
+  frames_sel:
+    mob:7130100:
+    - attack1_0
+    - attack1_1
+    - attack1_2
+    - attack1_3
+    - attack1_4
+    - attack1_5
+    - attack1_6
+    - hit1_0
+    - move_0
+    - move_1
+    - move_2
+    - move_3
+    - move_4
+    - move_5
+    - stand_0
+    - stand_1
+    - stand_2
+    - stand_3
+    - stand_4
+    - stand_5
+    - stand_6
+    mob:4230100:
+    - jump_0
+    - move_0
+    - move_1
+    - move_2
+    - move_3
+    - stand_0
+    - stand_1
+    - stand_2
 dataset:
   val_ratio: 0.2
   min_boxes: 1
@@ -360,6 +428,8 @@ train:
   device: '0'
   patience: 40
   resume: false
+live:
+  weights: ''
 player_id: 数值策划
 verify:
   model: ''

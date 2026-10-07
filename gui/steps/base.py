@@ -23,8 +23,8 @@ from PyQt5.QtWidgets import (QCheckBox, QFileDialog, QFormLayout, QFrame,
                              QHBoxLayout, QLabel, QLineEdit, QPushButton,
                              QVBoxLayout)
 
-from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,
-                         NoWheelSpinBox)
+from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,   # noqa: F401
+                         NoWheelSpinBox, field_tip)
 
 CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩"
 
@@ -146,7 +146,28 @@ class StepCard(QFrame):
     # ---------------- 参数控件工厂 ----------------
 
     def field(self, form, key, label, kind="str", default=None, **kw):
-        """创建并登记一个参数控件。kind: str|int|float|bool|choice|path"""
+        """创建并登记一个参数控件。kind: str|int|float|bool|choice|path
+
+        ⭐ `tip="…"`（用户 2026-10-04 ✓ 第 3 条）：提示**挂在字段标题上** ✓ —— 传它就不用
+          再写 `self.widgets[key][0].setToolTip(...)` 了（挂控件上的写法见规范 §6 ✗）。
+        """
+        # ⭐⭐ 记下「这个 key 是在**哪个表单**里建的」✓ —— `tip()`（单独一句那种 ✗）得
+        #   靠它才找得到这一行的标题：参数搬进「段」自己那个 `QFormLayout` 之后，
+        #   `self.form.labelForField(w)` 返回 None ✗（实测：`per_mob` 搬进怪物段 ⇒ 三条用例红 ✓）。
+        #   ⚠ 不用 `QFormLayout` 的 buddy 反查 ✗ —— 实测那行 `addRow("标题", w)` 并**没**把
+        #   buddy 指到控件上 ✗（兜底不生效 ✓）。这里存一份是最直白的 ✓。
+        _forms = getattr(self, "_field_forms", None)
+        if _forms is None:
+            _forms = self._field_forms = {}
+        _forms[key] = form
+
+        def _finish(target):
+            """收尾：把 `tip=` 挂到这一行的**标题**上（`QFormLayout.labelForField` ✓
+            控件和行布局都吃 ✓ 见 `set_row_visible` 那处同样的用法 ✓）。"""
+            if kw.get("tip"):
+                field_tip(form.labelForField(target), kw["tip"])
+            return target
+
         if kind == "int":
             w = NoWheelSpinBox()
             w.setRange(int(kw.get("minimum", 0)), int(kw.get("maximum", 10 ** 9)))
@@ -173,7 +194,7 @@ class StepCard(QFrame):
             w.setMaxVisibleItems(int(kw.get("max_visible", 20)))
             form.addRow(label, w)
             self.widgets[key] = (w, kind)
-            return w
+            return _finish(w)
         elif kind == "path":
             w = QLineEdit(str(default or ""))
             w.setReadOnly(True)
@@ -193,12 +214,34 @@ class StepCard(QFrame):
             form.addRow(label, row)
             self.widgets[key] = (w, kind)
             self._extra[key] = btn
-            return w
+            return _finish(row)      # 行布局也能 `labelForField` ✓
         else:
             w = QLineEdit(str(default or ""))
         form.addRow(label, w)
         self.widgets[key] = (w, kind)
-        return w
+        return _finish(w)
+
+    def tip(self, key, text):
+        """把提示挂到**这一行的字段标题**上（用户 2026-10-04 ✓ 第 3 条）✓。
+
+        ⚠ 为什么要有它：老写法是 `self.widgets[key][0].setToolTip(...)`（**挂在控件上** ✗ 见
+          规范 §6 ✓）。迁移时把
+              `self.widgets["x"][0].setToolTip(`  ⇒  `self.tip("x", `
+          一行改一处即可（**不用**去动上面 `self.field(...)` 那一串长参数 —— 手改容易打错 ✗）。
+        ⚠ 搬完**别两处都留** ✗：控件上和标题上各一份 ⇒ 鼠标一指弹两个框 ✓ 比不搬还糟 ✓。
+        """
+        holder = (getattr(self, "widgets", None) or {}).get(key)
+        w = holder[0] if holder else None
+        if w is None:
+            return
+        form = getattr(self, "form", None)
+        # ⭐⭐ 2026-10-05：这一行的表单由 `field()` 记下来了 ✓ —— 参数**搬进「段」之后**
+        #   控件就不在主表单里 ✗ ⇒ 老写法 `self.form.labelForField(w)` 返回 None
+        #   ⇒ `field_tip(None, …)` = **一个提示都没有** ✗（实测：`per_mob` 搬进怪物段就红 ✓）。
+        #   ⚠ 别想用 `QLabel.buddy()` 反查兜底 ✗ —— 实测 `QFormLayout.addRow("标题", w)`
+        #   **没有**把 buddy 指到控件上 ✗（那条路走不通 ✓ 别绕回去了 ✓）。
+        _form = (getattr(self, "_field_forms", None) or {}).get(key) or form
+        field_tip(_form.labelForField(w) if _form is not None else None, text)
 
     def set_row_visible(self, key, on):
         """隐藏/显示一行（label + 控件 + 可能的额外按钮）。

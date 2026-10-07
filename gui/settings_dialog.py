@@ -362,9 +362,34 @@ class SettingsDialog(QDialog):
 
         # 类别框颜色**按类别表生成**：有几个类别就有几行，以后加类别这里自动多一行，
         # 不会出现「新类别没地方改颜色」。配置键 = 英文名 + "_color"（见 gui/theme.py）。
+        #
+        # ⭐⭐ 每一行**前面再给一个勾选框**（用户 2026-10-06 ✓ 原话："在设置→界面页签→
+        #   检测框颜色 每一项前面加勾选框，默认全部勾选，勾选后实时显示"✓）：
+        #   · 勾上 = **实时预览里画这一类**的框 ✓（默认**全勾** ✓ —— 见 `theme.CLASS_ON_KEYS`
+        #     / `VIS_DEFAULTS` ✓，所以不加这一组也不改观感 ✓）；
+        #   · 取消勾 = **不画那一类**（颜色**留着** ✓ 再勾回来照旧 ✓ 同「辅助线与标记」那套 ✓）；
+        #   · ⚠ 它**只管画** ✗ —— 关掉"宠物"只是看不见它的框，**不是**"不理它"✓
+        #     （决策链根本不认这几个键 ✓ 见 `live_thread.split_dets` ✓）。
+        #   ⚠ 走的是 `add_row` 早就写好、一直没人用的 **`on_key` 那条路**（`QFormLayout` 版 ✓）
+        #     —— 别在这儿各写一份勾选框 ✗（那就是第二份口径 ✓）。
         for cid, en, zh, _bgr in classes.CLASSES:
+            _on_key = "%s_on" % en
             add_row(vf, "%s框颜色" % zh, "%s_color" % en,
-                    "类别 %d（%s）—— 检测框颜色" % (cid, en))
+                    "类别 %d（%s）—— 检测框颜色" % (cid, en),
+                    on_key=_on_key,
+                    on_tip="勾上 = **实时预览里画这一类**的框（%s框）✓\n\n"
+                           "⚠ 它**只管画**：关掉只是看不见，**不影响决策** ✗\n"
+                           "（实时预览每秒重读一次配置 ⇒ 勾选**当场生效**，不用按确定 ✓）。"
+                           % zh)
+            # ⭐ **勾选即写盘 ⇒ 1 秒内就在实时预览上生效**（用户 2026-10-06："勾选后实时显示"✓）
+            #   —— 口径同上面那个"蒙版"滑条（拖动即时生效 ✓）：`save_vis` 是**合并写**
+            #   （只把这一键并进 `vis:` 段 ✓）⇒ 不会顺手把别的项冲掉 ✓。
+            #   ⚠ 只在**用户**勾/取消时写（`setChecked` 是在 `add_row` 里、连接之前做的 ✓）
+            #     ⇒ 不会"打开弹窗就写一遍盘"✓。
+            _ck = self._vis_on[_on_key]
+            _ck.stateChanged.connect(
+                lambda _st, k=_on_key: theme.save_vis(
+                    {k: bool(self._vis_on[k].isChecked())}))
 
         # ---- ④ 辅助线与标记（不是类别，是给操作者看的参照 ✓）----
         grp = QGroupBox("辅助线与标记（实时预览）")
@@ -495,8 +520,9 @@ class SettingsDialog(QDialog):
 
         # ⭐⭐ **现场录屏保留开关**（用户 2026-10-02 ✓ 原话："在设置（数据工作台上面的按钮
         #   弹窗）→ **保护与恢复页签 最顶部**加开关『保留测谎录屏』『保留断线录屏』" ✓）。
-        #   ⚠ 放在这一页**表单之外的最上面**（= "最顶部" ✓，与"判定参数"页那个顶层开关同款
-        #     版式 ✓ 见 `_page_judge` 的 `ck_no_chase_path`）：它管的是"**出问题（测谎 / 断线）时
+        #   ⚠ 放在这一页**表单之外的最上面**（= "最顶部" ✓，同款版式在本仓库还有几处：
+        #     「判定参数」页那个顶层开关**2026-10-06 已搬去「路线识别 → 寻路配置」** ✓
+        #     见 `gui/route_panel.ck_no_chase_path`）：它管的是"**出问题（测谎 / 断线）时
         #     要不要把现场留下**"✓ —— 与下面那些"什么时候停 / 怎么重连"是同一类事（出事怎么办 ✓），
         #     不属于"某个参数的数值" ✗。
         #   ⚠ 落 `config/live.yaml`（**与「性能日志」同款** ✓）：它不是决策参数 ⇒ 不进项目文件 ✓
@@ -571,15 +597,18 @@ class SettingsDialog(QDialog):
         self._head(
             lay, "断线自动重连",
             "玩家框丢失后自动判别界面（断线提示框 / 登录 / 选频道 / 排队 / 选角），"
-            "确认是断线就停止自动并按步骤走回游戏，回到游戏后恢复自动。\n"
-            "鼠标点服务器 / 点频道还没接（要先做鼠标标定），走到那一步会停下并提示。\n"
+            "确认是断线就停止自动并按步骤走回游戏；回到游戏后按「恢复自动」那格决定要不要接着打"
+            "（⚠ 会自动做一次「开自动前的检查」，条件没凑齐就**不恢复**并把原因写在状态栏 ✓）。\n"
+            "「点服务器 / 点频道」用鼠标：先撞到屏幕左上角（绝对原点）、再按比例走位、左键点。\n"
+            "⚠ 前提是下面那两件事都成立：**鼠标通道连上** + **鼠标标定过**（见「鼠标标定」那一行）。\n"
             "做判断用模板锚点，不读文字、不训模型。")
         self.ck_reconnect = QCheckBox("检测到断线后自动走回游戏")
         self.ck_reconnect.setChecked(bool(settings.reconnect_enabled))
         self.ck_reconnect.setToolTip(
             "⚠ **判到断线界面就停止自动** —— 这一半永远生效（2026-09-30 ✓），\n"
             "不受本开关影响 ✓；本开关管的是要不要**自动按回车走回游戏** ✓。\n"
-            "回到游戏后按「恢复自动」的设置决定要不要接着打 ✓。")
+            "回到游戏后按「恢复自动」的设置决定要不要接着打 ✓（那一格现在还要过一趟\n"
+            "「开自动前的检查」—— 条件没凑齐就**不恢复**，不弹窗，只写在状态栏 ✓）。")
         lay.addWidget(self.ck_reconnect)
 
         # 重连的**子参数**（2026-09-26 补：审计发现这 5 个"只能在配置文件里改" ✗ ——
@@ -628,15 +657,71 @@ class SettingsDialog(QDialog):
         self.ck_rc_resume = QCheckBox("回到游戏后自动恢复自动打怪")
         self.ck_rc_resume.setChecked(bool(settings.reconnect_resume_auto))
         self.ck_rc_resume.setToolTip(
-            "重连成功、回到游戏画面之后，自动把「自动打怪」重新打开。\n"
+            "重连成功、回到游戏画面之后，自动把「自动打怪」重新打开。\n\n"
+            "⚠ 打开前会做一次「开自动前的检查」（**与手动开自动是同一份**：地图 / 标定\n"
+            "几何 / 地形图）：条件没凑齐就**不恢复**，并在状态栏写清原因（不会弹窗 ——\n"
+            "挂机时人往往不在屏幕前 ✓）。修好后自己点「开启自动」就行。\n\n"
             "不勾就停在「已回到游戏、自动仍是关的」，由你自己决定。")
         rc_form.addRow("", self.ck_rc_resume)
+
+        # ⚠ 「频道」（想进第几格）**不在这儿** ✗ —— 用户 2026-10-07 点名要放在
+        #   **主窗口 → 挂机保护页签 → 「断线重连」组**里 ✓（见 `player_panel._build_reconnect_group` ✓）；
+        #   一开始做进这里、位置不对 ✗ ⇒ 已搬走 ✓（**一处控件** ✓ 免得两个地方各显示一份 ✗）。
+
+        # ⭐⭐ 「点服务器 / 点频道」要点的**画面比例位置**（用户 2026-10-06 要求把这两个
+        #   需要鼠标的界面打通 ✓）。**存比例（0~1）、不存像素** ✓ —— 换分辨率 / 窗口
+        #   大小自动适配（同 HP/MP 条那套思路 ✓，见设计文档 §7）。
+        #   默认值是 2026-10-06 **从断线素材里量出来的**（不是目测 ✗）：服务器第 1 格
+        #   (698,245)@1920×1080、频道面板第 1 格 (788,550) ⇒ 见
+        #   `decision/reconnect.py::CLICK_TARGETS` 上面那段说明 ✓。
+        #   客户端布局不一样就改这里（重量：`python -X utf8 -m tools._probe_disc_frames
+        #   --bars --t 15.0 --region 660,480,640,300` ✓）。
+        def _ratio_spin(val):
+            w = NoWheelDoubleSpinBox()
+            w.setRange(0.0, 1.0)
+            w.setDecimals(4)
+            w.setSingleStep(0.005)
+            w.setValue(float(val))
+            return w
+
+        self.sp_rc_srv_x = _ratio_spin(settings.reconnect_server_x)
+        rc_row("服务器 X 比例", self.sp_rc_srv_x,
+               "「选择频道（服务器列表）」界面里，要点的那一格在**画面上的横向位置**，\n"
+               "写成 0~1 的比例（0 = 最左、1 = 最右）。\n\n"
+               "默认 0.3635 = 素材里「1.蓝蜗牛」那一格的中心 x=698（1920 宽）。\n"
+               "⚠ 存比例不存像素：换分辨率 / 窗口大小不用重配 ✓。")
+        self.sp_rc_srv_y = _ratio_spin(settings.reconnect_server_y)
+        rc_row("服务器 Y 比例", self.sp_rc_srv_y,
+               "同上，纵向比例（0 = 最上、1 = 最下）。\n\n"
+               "默认 0.2074 = 真机校正过的**格子中心**（1080 高下 y≈224）。\n"
+            "⚠ 旧默认 0.2269 是素材里**名字那一行**的中心（y=245）⇒ 落点偏下约 15px ✗"
+            "（2026-10-07 真机真点发现的 ✓ 见设计文档 §11）。")
+        self.sp_rc_chan_x = _ratio_spin(settings.reconnect_channel_x)
+        rc_row("频道 X 比例", self.sp_rc_chan_x,
+               "频道面板弹出的界面里，要点的那一格（默认 = 第 1 格「频道1」）的横向比例。\n\n"
+               "默认 0.4104 = 素材里第 1 格的中心 x=788。\n"
+               "⚠ 哪个频道都能进（用户口径 ✓）⇒ 只需要点中**任意一格**，不必对口某个频道。")
+        self.sp_rc_chan_y = _ratio_spin(settings.reconnect_channel_y)
+        rc_row("频道 Y 比例", self.sp_rc_chan_y,
+               "同上，纵向比例。默认 0.5093 = 素材里面板第 1 行的中心 y=550。")
+
+        # ⭐ 「鼠标标定」现状（**只读** ✓）：它是"能不能点"的另一半 ——
+        #   比例再准，没标定也**一个字节都不会发**（`decision/mouse_aim.py` ✓）。
+        #   放一行在这儿，是为了让"它为什么不点"在**界面上就能看见** ✓
+        #   （否则只能去翻日志 ✗）。
+        self.lbl_rc_gain = QLabel()
+        self.lbl_rc_gain.setWordWrap(True)
+        rc_form.addRow("鼠标标定", self.lbl_rc_gain)
+        self._refresh_rc_gain()
+
         lay.addLayout(rc_form)
 
         # 总开关关着时子参数灰掉（改它没意义）—— 和「追击起跳」那一组同一个做法
         def _rc_enable(on):
             for w in (self.sp_rc_probe, self.sp_rc_step, self.sp_rc_queue,
-                      self.sp_rc_retry, self.ck_rc_resume):
+                      self.sp_rc_retry, self.ck_rc_resume,
+                      self.sp_rc_srv_x, self.sp_rc_srv_y,
+                      self.sp_rc_chan_x, self.sp_rc_chan_y):
                 w.setEnabled(bool(on))
         self.ck_reconnect.toggled.connect(_rc_enable)
         _rc_enable(self.ck_reconnect.isChecked())
@@ -690,27 +775,13 @@ class SettingsDialog(QDialog):
         """
         page, lay = self._page()
 
-        # ⭐ **顶层开关：禁用杀怪寻路**（用户 2026-09-28 要求 ✓ 原话："设置里**判定参数顶层**加个
-        #   开关「禁用杀怪寻路」：开启后**不再查询怪物框所属的 foothold 集合**（**也不显示**），
-        #   **不再因追怪而下达寻路任务**，而只是**单纯地走向锁定怪物**（**无寻路时的老逻辑**）"✓）。
-        # ⚠ 放在**表单之外的最上面**（"顶层"✓）：它管的是**这一页那些判据要不要参与**
-        #   （追击寻路整条链 ✓），不属于"某个判据的数值" ⇒ 塞进 `form` 里会和参数混在一起 ✗。
-        self.ck_no_chase_path = QCheckBox("禁用杀怪寻路")
-        self.ck_no_chase_path.setChecked(
-            bool(getattr(settings, "disable_chase_pathfinding", False)))
-        self.ck_no_chase_path.setToolTip(
-            "**开了之后，追怪不再走寻路**：\n\n"
-            "· **不再查询**「怪物框底下是哪块 foothold 集合」（画面上那行\n"
-            "  `查#怪号 集合名` 也不再出现 ✓）；\n"
-            "· **不再因为追怪而下达寻路任务**（含「朝方向逐层逼近」那条降级 ✓）；\n"
-            "· 只是**单纯地朝锁定怪物走**（= 没有寻路时的老逻辑：只按 ←/→ ✓）。\n\n"
-            "什么时候开：寻路那条线总判不准、或者只想让它先凑过去打的时候 ✓。\n"
-            "关了（默认）就是老行为：判得出怪在哪块平台就先下「前往」过去 ✓。\n\n"
-            "⚠ 它**不影响**这两件事（那是别的功能）：\n"
-            "· 「编辑战斗区域」里勾了「禁止战斗」时的**区域筛选**（那也在查集合，\n"
-            "  但它服务的是「别追出禁战区」，不是追怪寻路 ✗）；\n"
-            "· 追击起跳（由那个独立开关管 ✓）。")
-        lay.addWidget(self.ck_no_chase_path)
+        # ⭐ **顶层开关：禁用杀怪寻路** —— **2026-10-06 已从这一页搬走** ✗（用户要求 ✓
+        #   原话："**把禁用杀怪寻路从设置里移出来，移到路线识别→寻路配置→寻路编辑器按钮
+        #   下面**" ✓）⇒ 现在它在 `gui/route_panel.py` 的「寻路配置」卡里、紧跟
+        #   「寻路编辑器」按钮 ✓（控件 + 写回都在那边 ✓）。
+        # ⚠ **别再往这一页加回来** ✗：两个入口各存一份迟早分叉（本仓库"唯一入口"的纪律 ✓）；
+        #   而且它只服务寻路那一条链 ⇒ 和"寻路编辑器"摆一起才对得上人的心智 ✓。
+        #   （这一页原来那段"顶层开关 + 为什么不塞进 form"的说明随控件一起搬走了 ✓。）
 
         # 版式（2026-09-26 用户要求，见 docs/UI规范.md §9）：
         #   · **一行一个参数**：左边参数名（**带单位**）、右边配置 —— 扫一眼就找得到；
@@ -1067,6 +1138,30 @@ class SettingsDialog(QDialog):
         if not _ok:
             self.accept()                            # ⚠ **出错也必须关得掉** ✓
 
+    def _refresh_rc_gain(self):
+        """把「鼠标标定」现状写进那一行（**只读** ✓）。
+
+        判据只有一处：`decision.mouse_aim` 的**文件在不在 + 两个分量是不是正数**
+        （与真正点击时读的是同一份 ✓）—— 这里**不许自己再读一遍那份 json** ✗
+        （两处口径迟早分叉，本仓库踩过 ✓）。
+        """
+        try:
+            from decision import mouse_aim
+            g = mouse_aim.load_gain()
+            if g:
+                self.lbl_rc_gain.setText("已标定：%.4f / %.4f 画面像素每指令单位 ✓"
+                                         % (float(g[0]), float(g[1])))
+            else:
+                self.lbl_rc_gain.setText(
+                    "未标定 —— 点服务器 / 点频道这一步会**停在这里不动手**（不会乱点 ✗）。\n"
+                    "⚠ 在**跑工作台这台机器**上跑（不是游戏机 ✗ —— 鼠标指令会经 relay 打到游戏机 ✓）：\n"
+                    "    python -X utf8 -m tools.mouse_aim_calib\n"
+                    "跑之前：① **先停掉实时预览**（标定和它抢同一个 UDP 端口 ✗）；\n"
+                    "        ② 游戏停在**画面不动**的界面 + **鼠标指针可见**；\n"
+                    "        ③ 游戏机指针速度 6/11、关掉「提高指针精确度」。")
+        except Exception as e:                   # noqa: BLE001 —— 读不到就说读不到 ✓
+            self.lbl_rc_gain.setText("读不到标定状态：%s" % e)
+
     def _accept(self):
         # ---- 实时画面 · 地形叠加（2026-09-26 从路线识别页搬来的两项）----
         _draw = bool(self.ck_mmap_draw.isChecked())
@@ -1126,6 +1221,18 @@ class SettingsDialog(QDialog):
         if ra != bool(settings.reconnect_resume_auto):
             settings.reconnect_resume_auto = ra
             settings.save()
+        # ⚠ 「频道」不在这儿保存 ✗ —— 它由**主窗口「挂机保护」页**那个控件自己写回 ✓
+        #   （见 `player_panel._on_reconnect_channel` ✓ 一处控件一处落盘 ✓）。
+
+        # 「点服务器 / 点频道」的画面比例（2026-10-06 ✓）
+        for _attr, _w in (("reconnect_server_x", self.sp_rc_srv_x),
+                          ("reconnect_server_y", self.sp_rc_srv_y),
+                          ("reconnect_channel_x", self.sp_rc_chan_x),
+                          ("reconnect_channel_y", self.sp_rc_chan_y)):
+            _v = float(_w.value())
+            if _v != float(getattr(settings, _attr)):
+                setattr(settings, _attr, _v)
+                settings.save()
         # 定时清空按键
         t3 = self.sp_resetall.value()
         if t3 != settings.resetall_interval:
@@ -1177,12 +1284,11 @@ class SettingsDialog(QDialog):
         if gk != getattr(settings, "goto_timeout_key", None):
             settings.goto_timeout_key = gk
             settings.save()
-        # ⭐ 「**禁用杀怪寻路**」（2026-09-28 加 ✓）—— 和上面那些一样**跟着当前项目存** ✓
-        #   （字段进 `DecisionSettings.to_dict` ⇒ 自动跟着 `project.yaml` 的 `decision:` 段 ✓）。
-        ncp = bool(self.ck_no_chase_path.isChecked())
-        if ncp != bool(getattr(settings, "disable_chase_pathfinding", False)):
-            settings.disable_chase_pathfinding = ncp
-            settings.save()
+        # ⚠ 「**禁用杀怪寻路**」的写回**已搬走**（2026-10-06 ✓ 用户要求移到
+        #   「路线识别 → 寻路配置」里 ✓）—— 它现在是那边控件的**即改即存**
+        #   （`gui/route_panel._on_no_chase_path` ✓），这一页不再碰它 ✗。
+        #   老项目文件里的键**照旧读** ✓（`DecisionSettings.from_dict` 那份没动 ✓）⇒
+        #   配置与行为一个字不变 ✓，只是入口换了地方 ✓。
         # ⚠ 「卡住判定时长(s)」那一格的写回**已移除**（2026-09-27 用户要求：统一用
         #   「移动操作尝试间隔(ms)」✓）—— 那个键以后不再写；老配置里残留的值也不再读 ✓。
         # 可视化（颜色现在可能是 `#AARRGGBB` —— 带透明度 ✓，见 `_pick_color`）

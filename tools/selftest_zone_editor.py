@@ -1048,6 +1048,80 @@ def t_reach_ui_filter_and_style():
         shutil.rmtree(str(tmp), ignore_errors=True)
 
 
+def t_reach_dialog_portal_row():
+    """⭐⭐ 「增加可达」里的**传送点那一行**（用户 2026-10-06 ✓ 原话："现在增加一种新的通行方式
+    '传送点(portal)'供寻路编辑器→增加可达 弹窗里配置；选中后，可以选择传送点（例如黄金沙滩项目，
+    地形叠加图里的"h009"）"）。
+
+    钉六件：
+      ① **按类型显隐**：选「传送点」才出现 ✓、其它类型一律藏起来 ✓；
+      ② 行里**写得出这扇门通向哪儿**（出口门名 + 坐标 ✓ 用户口径："我们应该能知道这个传送点
+         通向哪里" ✓）—— 只写门名等于没写 ✓（同一对集合常常有好几扇门 ✓）；
+      ③ **跨图的门**在行里**当场标「不支持」** ✗（别让人选了个跑不通的门，等运行时才发现 ✓）；
+      ④ 「全部」勾选：默认只列与起点集合有关的 ✓、勾上放开 ✓、**无关的要标出来** ✓；
+      ⑤ 编辑一条**门不在「相关」里**的边 ⇒ **自动勾上「全部」并选中它** ✓（照绳那套 ✓）；
+      ⑥ 返回值带 `portal` ✓、`_edge_key` **含门**（两扇门 = 两条边 ✓）、
+         `_apply_reach` **真把它传下去**（AST 查 ✓ 注释里写一句不算 ✗）。
+    """
+    from PyQt5.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])   # noqa: F841 —— 建控件前必须有
+    rel = [("h009", "h009  x=50 y=280　→ 出口 h010(x=650 y=280)")]
+    all_ = rel + [("h020", "h020  x=900 y=280　→ 出口 h021(x=1000 y=280)"),
+                  ("zz", "zz  x=30 y=280　⚠ 跨图（tm=105090600）—— **不支持**")]
+
+    ad = ze.AddReachDialog(None, "甲平台", ["乙平台"], ["乙平台"],
+                           portals=rel, all_portals=all_)
+    check(ad.lbl_gate.isHidden() and ad.cmb_gate.isHidden(),
+          "默认（走）时「走哪扇门」不该露出来")
+    ad.cmb_kind.setCurrentIndex(ad.cmb_kind.findData("portal"))
+    check(not ad.cmb_gate.isHidden(), "选了「传送点」却没出「走哪扇门」那一行")
+    got = [ad.cmb_gate.itemData(i) for i in range(ad.cmb_gate.count())]
+    check(got == ["h009"], "默认该只列与起点集合有关的门：%r" % got)
+    check("出口 h010" in ad.cmb_gate.currentText(),
+          "行里没写出这扇门**通向哪儿**（用户口径要看得出来 ✗）：%r" % ad.cmb_gate.currentText())
+    check(not ad.ck_gate_all.isHidden(), "还有别的门可列时，「全部」该露出来")
+    ad.ck_gate_all.setChecked(True)
+    txt = [ad.cmb_gate.itemText(i) for i in range(ad.cmb_gate.count())]
+    check(len(txt) == 3, "勾「全部」之后该列全部门：%r" % txt)
+    check(any("不支持" in t for t in txt), "跨图的门没在行里标出来：%r" % txt)
+    check(any("走不到" in t for t in txt), "与起点集合无关的门没标出来：%r" % txt)
+    ad._accept()
+    check(ad.result_dict.get("portal") == "h009",
+          "返回值没带 `portal`（选的门存不下来 ✗）：%s" % ad.result_dict)
+
+    # ⑤ 编辑一条门不在「相关」里的边 ⇒ 自动放开「全部」并选中它
+    ad2 = ze.AddReachDialog(None, "甲平台", ["乙平台"], ["乙平台"],
+                            portals=rel, all_portals=all_,
+                            init={"to": "乙平台", "kind": "portal", "portal": "h020"})
+    check(ad2.ck_gate_all.isChecked() and ad2.cmb_gate.currentData() == "h020",
+          "编辑一扇不在「相关」里的门时没自动放开「全部」并选中它（人会以为「打开时选错了」✗）："
+          "%r / %r" % (ad2.ck_gate_all.isChecked(), ad2.cmb_gate.currentData()))
+
+    # ⑥ 身份含门（删 / 改靠它匹配 ✗ 少了这格会误伤另一条）
+    k = ze.ZoneEditorDialog._edge_key
+    check(k({"from": "A", "to": "B", "kind": "portal", "portal": "h009"})
+          != k({"from": "A", "to": "B", "kind": "portal", "portal": "h010"}),
+          "`_edge_key` 没含门 ⇒ 删 / 改其中一扇门时会误伤另一条 ✗")
+    check(k({"from": "A", "to": "B", "kind": "climb", "ladder": "L1"})
+          != k({"from": "A", "to": "B", "kind": "climb", "ladder": "L2"}),
+          "绳号那一格身份丢了 ✗")
+
+    # `_apply_reach` 真把 `portal=` 传下去了吗（⚠ 查 AST：注释里写一句不算 ✗）
+    import ast as _ast
+
+    _src = (ROOT / "gui" / "zone_editor.py").read_text(encoding="utf-8")
+    _fn = next(n for n in _ast.walk(_ast.parse(_src))
+               if isinstance(n, _ast.FunctionDef) and n.name == "_apply_reach")
+    _kw = set()
+    for _c in _ast.walk(_fn):
+        if isinstance(_c, _ast.Call) and getattr(_c.func, "attr", None) in ("add_edge",
+                                                                           "edit_edge"):
+            _kw |= {q.arg for q in _c.keywords}
+    check("portal" in _kw,
+          "`_apply_reach` 没把 `portal=` 传下去 ⇒ 弹窗里选的门**存不下来** ✗：%r" % _kw)
+
+
 def t_add_reach_dialog():
     """「增加可达」**一个弹窗问完**：终点 / 通行方式 / 绳或门，按类型显隐，缺料拦住。
 
@@ -1081,19 +1155,24 @@ def t_add_reach_dialog():
           "「跳」该排在「下跳」前面（先跳、再下跳）：%s" % kinds)
 
     # 默认类型是「走」⇒「爬哪根绳」那一行不占地方
-    # ⚠ 「走哪个门」那一行 2026-09-27 随「传送门」一起**移除**了 ✓ —— 现在
-    #   通行方式只有走/爬/下跳/跳 四种（见 `zones.EDGE_KINDS` ✓）。
+    # ⚠ 「走哪个门」那一行 2026-09-27 随「传送门」**移除**过、⭐ **2026-10-06 加回** ✓
+    #   （`zones.EDGE_KINDS` 现在是 走/爬/下跳/跳/**传送点** 五种 ✓ 都有执行器 ✓）。
     check(ad.cmb_lad.isHidden(), "选「走」时不该显示「爬哪根绳」")
+    check(ad.lbl_gate.isHidden() and ad.cmb_gate.isHidden(),
+          "选「走」时不该显示「走哪扇门」（那是传送点专用的 ✓）")
     ad.cmb_kind.setCurrentIndex(ad.cmb_kind.findData("climb"))
     check(not ad.cmb_lad.isHidden(),
           "按类型显隐没生效（选「爬」该出「爬哪根绳」那一行）")
+    check(ad.lbl_gate.isHidden(), "选「爬」时不该显示「走哪扇门」")
     ad.cmb_lad.setCurrentIndex(1)
     ad._accept()
     # ⚠ 2026-09-28：多了 `mid_dir`/`mid_y`（「爬」的**中途跳下** ✓）—— 与 `dir` 同款写法
     #   （**永远带这两个键**，非爬 / 没配时是 `None` ✓）⇒ 完全相等断言要跟上 ✓
+    # ⚠ ⭐ 2026-10-06 又多了 `portal`（走哪扇门 ✓ 同款写法：**永远带这个键** ✓）
     check(ad.result_dict == {"dst": "乙平台", "kind": "climb",
                              "ladder": "L3", "footholds": None,
-                             "dir": None, "mid_dir": None, "mid_y": None},
+                             "dir": None, "mid_dir": None, "mid_y": None,
+                             "portal": None},
           "返回值不对：%s" % ad.result_dict)
 
     # ---- 「走」的方向类型（2026-09-26 用户要求，**只是配置占位**）----
@@ -2061,10 +2140,15 @@ def t_edge_rows_merged():
         check(Z.edge_cond({"kind": "walk", "dir": "left"}) == "仅向左",
               "走的方向没取 WALK_DIR_LABELS")
         check(Z.edge_cond({"kind": "climb", "ladder": "L3"}) == "绳 L3", "绳号没写出来")
-        # ⚠ 「门」那一支 2026-09-27 随「传送门」一起移除 ⇒ 老数据残留时不该再写出「门 …」
-        check(Z.edge_cond({"kind": "portal", "portal": "洞口"}) == "",
-              "已移除的通行方式还会写出条件（该是空的）：%r"
+        # ⭐ 「门」那一支 2026-09-27 随「传送门」移除过、**2026-10-06 加回** ✓ ⇒ 现在
+        #   `kind == "portal"` 的边**必须写出是哪扇门**（同一对集合几扇门时靠它分辨 ✓
+        #   与「绳 L3」完全同理 ✓）；⚠ 老数据里的 `unconfirmed` 那种**不该**凑出条件 ✗。
+        check(Z.edge_cond({"kind": "portal", "portal": "洞口"}) == "门 洞口",
+              "传送点没写出是哪扇门（两扇门就分不清了 ✗）：%r"
               % Z.edge_cond({"kind": "portal", "portal": "洞口"}))
+        check(Z.edge_cond({"kind": "unconfirmed"}) == "",
+              "「待确认」不是通行方式，不该给它凑出条件 ✗：%r"
+              % Z.edge_cond({"kind": "unconfirmed"}))
         check(Z.edge_cond({"kind": "drop", "footholds": ["1", "2", "3"]}) == "起跳 3 处",
               "下跳的起跳点没写出来")
         check(Z.edge_cond({"kind": "jump"}) == "", "没条件的边不该硬凑一截条件")
@@ -2373,6 +2457,9 @@ TESTS = (
      "（只读、无按钮）/ 三栏并排 + 栏宽能拖 + 两栏可滚动 / 名字统一蓝",
      t_reach_ui_filter_and_style),
     ("增加可达：一个弹窗问完（终点/类型/绳/门，缺料拦住）", t_add_reach_dialog),
+    ("⭐⭐ 「走哪扇门」那一行（用户 2026-10-06）：按类型显隐 / 行里写出通向哪儿 / "
+     "跨图标不支持 / 全部勾选 / 自动勾全部 / 返回值带门 / `_edge_key` 含门 / `_apply_reach` 真透传",
+     t_reach_dialog_portal_row),
     ("「爬」的**中途跳下**接线：下拉/高度/二级联动/返回值/透传（用户 2026-09-28）",
      t_mid_jump_dialog_wired),
     ("三栏在默认尺寸下不出横向滚动条（初始栏宽按内容给）",

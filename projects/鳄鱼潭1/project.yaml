@@ -1,5 +1,5 @@
 name: 沼泽地3
-map_id: '107000300'
+map_id: '107000100'
 mobs:
 - '2130103'
 - '3110100'
@@ -16,16 +16,24 @@ calib:
   step: 0.1
   sample: 5
 bars: {}
-mmap_crop: null
+mmap_crop:
+- 20
+- 72
+- 240
+- 79
 decision:
-  attack_dist: 80.0
-  min_attack_dist: 0
+  attack_dist: 400.0
+  min_attack_dist: 60
   attack_up_dist: 30
   attack_down_dist: 20
+  attack_fan_deg: 15.0
   chase_jump_enabled: true
-  chase_jump_min: -10
+  chase_jump_min: -100
   chase_jump_max: 5
-  chase_jump_dash_ms: 0
+  chase_jump_dash_ms: 50
+  chase_jump_edge_guard_enabled: true
+  chase_jump_edge_guard_px: 150
+  station_turn_interval_ms: 1000
   mouse_speed: 1.1999999999999995
   evade_type: jump
   jump_interval: 0
@@ -64,7 +72,7 @@ decision:
     right: right
     up: up
     down: down
-    attack: t
+    attack: s
     jump: D
     hp_pot: g
     mp_pot: null
@@ -72,22 +80,27 @@ decision:
     shop: null
     enter: enter
   target_cd:
-  - 1500
+  - 1000
   - 2500
   input_device: local
   attack_cd: 300
   attack_lock_debounce_ms: 1000
-  min_turn_hold_ms: 1000
-  turn_output_delay_ms: 500
+  min_turn_hold_ms: 600
+  turn_output_delay_ms: 300
   player_track_jump: 200
+  player_foot_offset_px: -25
+  player_box_min_area_pct: 0.0
+  player_box_area_base_s: 1.0
+  player_box_area_tol_pct: 0.0
   hp_bar: null
   mp_bar: null
   probe_calib: {}
   hp_color: null
   mp_color: null
-  hp_threshold: 30
+  hp_threshold: 39
   mp_threshold: 7
-  pot_cd: 1500
+  pot_cd: 1000
+  mob_sets_ttl_s: 3.0
   auto_hp_pot: true
   auto_mp_pot: false
   strategy: patrol
@@ -98,44 +111,46 @@ decision:
   vision_center: false
   vision_off_x: 0
   vision_off_y: 0
+  big_mob_enabled: true
+  big_mob_ratio: 1.5
+  big_mob_range_px: 600.0
   sweep_turn_cd: 500
   back_range: 150
-  route_goto_set: 顶层
-  align_tol_px: 10
+  sweep_edge_turn_px: 100
+  station_spot: {}
+  station_pickup_enabled: false
+  station_pickup_min_s: 0.0
+  station_pickup_max_s: 0.0
+  station_pickup_spots: []
+  route_goto_set: 二楼
+  align_tol_px: 12
   align_hold_ms: 1000
-  climb_align_gap_ms: 180
+  climb_align_gap_ms: 200
   climb_align_near_px: 1
-  climb_retry_delay_s: 1.0
-  climb_retry_delay_inc_s: 1.0
+  climb_retry_delay_s: 0.0
+  climb_retry_delay_inc_s: 3.0
   goto_timeout_s: 15.0
-  goto_retry_s: 3.0
+  chase_goto_max_s: 5.0
+  goto_timeout_key: 表情_无语
+  disable_chase_pathfinding: false
   jump_start_px: 80
-  move_retry_ms: 1000
-  battle_zone_sets: []
-  debounce_conf: 0.6
+  move_retry_ms: 350
+  debounce_conf: 0.5
   debounce_ms: 2000
   custom_timers:
-  - name: 自动回避药水
+  - name: 自动喂宠
     seq:
     - type: down
-      key: 回避药水
+      key: feed_pet
     - type: up
-      key: 回避药水
+      key: feed_pet
     interval:
-    - 3.0
-    - 3.0
-  - name: 无语表情
-    seq:
-    - type: down
-      key: 表情_无语
-    - type: up
-      key: 表情_无语
-    interval:
-    - 5.0
-    - 10.0
+    - 8.0
+    - 12.0
+    pause_on_rest: false
   facing_timeout_min: 0.0
   player_lost_timeout_min: 3.0
-  resetall_interval: 60
+  resetall_interval: 30
   anti_afk_enabled: true
   anti_afk_type: hidden_rest
   anti_afk_min: 25.0
@@ -164,7 +179,15 @@ decision:
   - type: up
     key: 普攻
   - type: delay
-    ms: 200
+    ms: 1000
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
   - type: down
     key: 隐身术
   - type: up
@@ -191,8 +214,13 @@ decision:
   anti_afk_spot_set: ''
   anti_afk_spot_seq: []
   anti_afk_spot_after: ''
-  anti_afk_retry_on_interrupt: false
-  anti_afk_retry_sec: 60.0
+  anti_afk_spot_loop: false
+  anti_afk_spot_loop_items: []
+  anti_afk_spot_loop_min: 30.0
+  anti_afk_spot_loop_max: 60.0
+  anti_afk_spot_loop_hold: false
+  anti_afk_retry_on_interrupt: true
+  anti_afk_retry_sec: 10.0
   reconnect_enabled: false
   reconnect_probe_after_lost_sec: 0.0
   reconnect_step_timeout_ms: 3000
@@ -208,22 +236,97 @@ decision:
 notes: ''
 capture:
   source: file
-  file: D:/Media/record/mxd/2026-10-03 20-51-54.mp4
+  file: D:/Media/record/mxd/2026-10-05 00-35-13.mp4
   url: udp://0.0.0.0:5000
   fps: 5.0
-  stride: 30
+  stride: 80
   seconds: 120.0
   dedup: 0.01
   limit: 0
-  clean: true
+  clean: false
 label:
   thresh: 0.3
   min_distinct: 0.06
   per_mob: 20
-  max_peaks: 3
+  max_peaks: -1
   downscale: 1
   region: null
   player_thresh: 0.4
+  label_drops_on: true
+  drops:
+  - id: 09000000
+    name: ''
+  - id: 09000001
+    name: ''
+  - id: 09000002
+    name: ''
+  - id: 09000003
+    name: ''
+  - id: '04000032'
+    name: 鳄鱼皮
+  - id: '04000033'
+    name: 黑鳄鱼皮
+  - id: '04000034'
+    name: 蛇皮
+  drop_thresh: 0.3
+  drop_downscale: 1
+  label_pets_on: true
+  pet_thresh: 0.3
+  pet_downscale: 1
+  pets:
+  - pet: '5000020'
+    name: 小白雪人
+    equips: []
+  - pet: '5002828'
+    name: Lil Frieren
+    equips: []
+  - pet: '5002829'
+    name: Lil Fern
+    equips: []
+  - pet: '5002830'
+    name: Lil Stark
+    equips: []
+  - pet: '5002831'
+    name: Lil Übel
+    equips: []
+  - pet: '5000024'
+    name: 蝙蝠怪
+    equips: []
+  - pet: '5000006'
+    name: 雪犬
+    equips: []
+  - pet: '5000042'
+    name: 花蘑菇仔
+    equips:
+    - 01802054
+  player_min_distinct: 0.0
+  player_per_mob: 0
+  player_max_peaks: 1
+  player_downscale: 1
+  drop_min_distinct: 0.02
+  drop_per_mob: 20
+  drop_max_peaks: -1
+  pet_min_distinct: 0.06
+  pet_per_mob: 20
+  pet_max_peaks: -1
+  frames_sel:
+    pet:5000042__01802054:
+    - hungry_0
+    - hungry_1
+    - hungry_2
+    - hungry_3
+    - hungry_4
+    - jump_0
+    - move_0
+    - move_1
+    - move_2
+    - move_3
+    - move_4
+    - stand1_0
+    - stand1_1
+    - stand1_2
+    - stand1_3
+    - stand1_4
 dataset:
   val_ratio: 0.2
   min_boxes: 1
@@ -231,10 +334,13 @@ dataset:
 train:
   model: yolo26n.pt
   epochs: 120
-  imgsz: 960
+  imgsz: 1280
   batch: 8
   device: '0'
   patience: 40
+  resume: false
+live:
+  weights: E:\MyPrograms\playerSimu\projects\鳄鱼潭1\models\detect_v1.pt
 player_id: 珠缨
 verify: {}
 iterate: {}
@@ -245,6 +351,16 @@ mob_names:
 mobs_cleared: false
 player_scale: 1.406
 player_scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
+drop_scale: 1.406
+pet_scale: 1.406
+drop_scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
+pet_scale_at:
   width: 1920
   height: 1080
   confidence: manual

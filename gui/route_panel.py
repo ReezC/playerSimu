@@ -45,6 +45,33 @@ from perception import minimap as mm
 #   `live.yaml` 这里只剩**来源**（`mmap_src`）和叠图那几项 ✓。
 from core.config import load_live, update_live
 
+#: 「地形图」那一栏的**显示类型**（用户 2026-10-06 ✓ 原话：把「叠加实时小地图」那个勾选框
+#: 改成「显示类型」下拉，含 **仅地形图 / 实时小地图 / 像素差分地图** ✓）。
+#: 短键是**存进 `live.yaml` 的那个值**（`live_map_view` ✓ 本机外观偏好，和 `live_map_alpha`
+#: 同一处 ✓）；界面名字只是给人看的 ✓。
+LIVE_VIEWS = (("仅地形图", "terrain"),
+              ("实时小地图", "live"),
+              ("像素差分地图", "diff"))
+#: 默认 = **实时小地图**：那会儿这个勾选框**默认就是勾上的**（用户 2026-09-29 追加"怎么没在
+#: 路线识别页签→地形图里的视图区看到实时滚动的小地图"✗ ⇒ 默认关着等于没做 ✓）⇒ 不许改 ✗。
+LIVE_VIEW_DEFAULT = "live"
+#: 「像素差分地图」里"**背景档**"（整幅差的中位）大到这个灰阶 ⇒ 说明底图与游戏里那张小地图
+#: **不同源**（底色/线条不一样 ✓）⇒ 差分会整幅发亮、只能当辅助看。**那时必须在状态行说清**
+#: 并染橙色 ✗：静默的话人会拿它当判据去调标定 ✓（那方向是错的 ✓）。
+#: ⚠ **定义已经搬到 `perception/minimap.py`**（用户 2026-10-06「下一步」✓：同一根线现在还要
+#:   当"**差分层能不能拿来定位**"的闸 ✓ ⇒ 感知层是它的家 ✓，界面反过来 import 它 ✓
+#:   约定 10：一处实现 —— 两边各写一个 30 迟早分叉 ✗）。
+DIFF_FLOOR_WARN = mm.DIFF_FLOOR_WARN
+
+
+def norm_live_view(v):
+    """`live_map_view` 的值 → `LIVE_VIEWS` 里的短键（坏的 / 缺的 ⇒ 默认 ✓ 看的东西别抛 ✗）。"""
+    v = str(v or "")
+    for _zh, _k in LIVE_VIEWS:
+        if v == _k:
+            return _k
+    return LIVE_VIEW_DEFAULT
+
 
 def _mmss(sec):
     """秒 → `M:SS`（倒计时统一这个写法，和 player_panel 那边一致）。"""
@@ -334,13 +361,53 @@ class RoutePanel(QWidget):
         self.btn_zones.clicked.connect(self._on_edit_zones)
         root.addWidget(self.btn_zones)
 
+        # ---- ⭐⭐ 「**禁用杀怪寻路**」从「设置 → 判定参数」**搬到这里**（用户 2026-10-06 ✓
+        #      原话："把禁用杀怪寻路从设置里移出来，移到路线识别→寻路配置→寻路编辑器按钮下面"）----
+        # 为什么搬：它**只服务寻路这一条链**（追击那条 ✓ 见 `_on_no_chase_path` 与
+        #   `DecisionSettings.disable_chase_pathfinding` 的说明 ✓）⇒ 摆在"判定参数"里，
+        #   人根本想不到它和"寻路编辑器"是同一件事 ✗。
+        # ⭐⭐ **存储口径也是这一轮定的**（用户 2026-10-06 ✓ 原话："**从此 禁用杀怪寻路就是按
+        #   地图id存的数据，而不是在设置里全局一份**"✓）：它落在
+        #   `datasets/map/<id>.route.json`（`core/route_cfg.PARAM_KEYS` ✓ 与那 6 个攀爬/重试
+        #   参数同一份 ✓）⇒ **每张图各一份** ✓ —— 因为它管的是"**这张图**要不要用寻路追怪"
+        #   （寻路成不成立是**图**的属性 ✗ 不是项目的 ✓）。
+        #   ⚠ `project.yaml` 里那一格**留着当播种值**（老项目已经配过的会在某图第一次打开时
+        #     种进按图那份 ✓ 不丢配置 ✓ 同那 6 个 ✓）。
+        # ⚠ **旧入口已删**（`settings_dialog._page_judge` 里那一格 + 它的写回 ✓）——
+        #   两个入口各存一份迟早分叉 ✗（本仓库"唯一入口"的纪律 ✓）。
+        # ⚠ 保存时机随**这一组**的规矩：**即改即存**（`_on_no_chase_path` ✓）；
+        #   设置面板那边是"点确定才写"✗ —— 两种时机别混 ✓。
+        self.ck_no_chase_path = QCheckBox("禁用杀怪寻路")
+        self.ck_no_chase_path.setChecked(
+            bool(getattr(settings, "disable_chase_pathfinding", False)))
+        self.ck_no_chase_path.setToolTip(
+            "**开了之后，追怪不再走寻路**：\n\n"
+            "· **不再查询**「怪物框底下是哪块 foothold 集合」（画面上那行\n"
+            "  `查#怪号 集合名` 也不再出现 ✓）；\n"
+            "· **不再因为追怪而下达寻路任务**（含「朝方向逐层逼近」那条降级 ✓）；\n"
+            "· 只是**单纯地朝锁定怪物走**（= 没有寻路时的老逻辑：只按 ←/→ ✓）。\n\n"
+            "什么时候开：寻路那条线总判不准、或者只想让它先凑过去打的时候 ✓。\n"
+            "关了（默认）就是老行为：判得出怪在哪块平台就先下「前往」过去 ✓。\n\n"
+            "⚠ 它**只管「追击」这一条链**（用户 2026-10-06 澄清 ✓）—— 下面这三件\n"
+            "  **照旧生效**：\n"
+            "· 「编辑战斗区域」里勾了「可以战斗」时的**区域筛选**（那也在查集合，\n"
+            "  但它服务的是「别追出禁战区」，不是追怪寻路 ✗）；\n"
+            "· **「人不在允许战斗的区域 ⇒ 先回去」**（回区那条寻路任务**照下** ✓\n"
+            "  —— 它不是追击 ✗）；\n"
+            "· 追击起跳（由那个独立开关管 ✓）。\n\n"
+            "⚠ 开着它时**开自动前的体检会放宽**（地图 id / 标定 / 地形图那三件不再拦你 ✓\n"
+            "  —— 这个模式不读世界坐标 ✓ 见 `player_panel._precheck_problems` ✓）。")
+        self.ck_no_chase_path.toggled.connect(self._on_no_chase_path)
+        root.addWidget(self.ck_no_chase_path)
+
         # ---- 「框选小地图」（2026-09-27 从「设置 → 界面」搬来，用户要求）----
         # 为什么必须是**这一页、这一组、这个位置**：
         #   · **按项目**（地图）—— 不同地图的小地图面板尺寸/位置完全不同 ⇒ 它天生跟项目走，
         #     放"设置"（全局一份）里就是错的：换个项目还是上一张图的框 ⇒ 叠图/定位全错 ✗
         #     （用户 2026-09-27 现场报的就是这个）；
-        #   · 和「寻路编辑器」是**连续的同一件事**（先圈地形 → 再框面板位置），所以紧贴它
-        #     正下方 ✓。
+        #   · 和「寻路编辑器」是**连续的同一件事**（先圈地形 → 再框面板位置），
+        #     ⚠ 原来"紧贴按钮正下方"，2026-10-06 起中间隔了「禁用杀怪寻路」那一格
+        #     （用户要求把它挪到按钮下面 ✓）—— 仍是"接着寻路编辑器的那一串" ✓。
         # ⚠ 框选要**当前实时画面**：拿 `self.live_panel.current_frame()`（主窗口在
         #   `_bind_cards` 里塞进来的，和叠图同一处 ✓）；没开始预览会说清怎么开。
         # ⚠ 走 gui/region_selector（放大镜 + Esc + <4px 当误点，docs/UI规范.md §8）——
@@ -891,6 +958,10 @@ class RoutePanel(QWidget):
         #: 那一层的**透明度**（% ；用户 2026-09-29 追加："需要加个参数'透明度'"✓）。
         #: 落在 `config/live.yaml`（本机外观偏好，和 `mmap_draw` 同一处 ✓）。
         self._live_alpha = int(load_live().get("live_map_alpha", 75))
+        #: ⭐ **显示类型**（用户 2026-10-06 ✓ 从"一个勾选框"升级成三选一 ✓）：
+        #: `terrain` 只看地形图 / `live` 叠实时小地图（老行为 ✓）/ `diff` **像素差分地图**
+        #: （面板 − 底图那一块，看"底图上没有的东西" ✓ 见 `mm.diff_panel_vs_canvas` ✓）。
+        self._live_disp = norm_live_view(load_live().get("live_map_view"))
         #: ⭐ **这一层自己的「显示区」跟踪**（局部小地图 ✓ 用户 2026-09-29 追加："实时小地图的
         #: 位置没有跟着我的移动变化"✗）—— 以前它借的是**画面那层叠图**跟出来的 `_ov_view`
         #: （见 `_tick_world`），而那条路要求"叠图开着 + 世界坐标那行算得出来"才更新
@@ -933,31 +1004,46 @@ class RoutePanel(QWidget):
         self.lbl_map_img.setWordWrap(True)
         root.addWidget(self.lbl_map_img)
 
-        # ⭐⭐ **「叠加实时小地图」**（用户 2026-09-29 第 ⑦ 条 ✓ 原话："现在实时画面小地图
-        #   比较小很难看清是否对准，可以在路线识别页签→地形图里的图里实时滚动收流图
-        #   （我自己控制底图），这样我就方便观察局部了"）：
-        #   把那块小地图面板**按标定摆到地形图上**（`ImageCanvas.set_live_patch` ✓）——
-        #   于是"面板里画的是什么"和"它该在地图哪一块"**在同一张图上重叠**，放大（滚轮）
-        #   一看就知道标定 / 显示区跟踪对不对 ✓；底图完全由你自己缩放平移（中键拖 ✓）。
+        # ⭐⭐ **「显示类型」**（用户 2026-10-06 ✓ 原话：把「叠加实时小地图」改成「显示类型」
+        #   坐在里面：**仅地形图 / 实时小地图 / 像素差分地图** ✓ —— 起因是他那天问的
+        #   "是不是颜色相减"，想亲眼看一眼"面板减底图"长什么样 ✓）：
+        #     · **实时小地图**（= 老行为 ✓ 原来那个勾选框勾上）：把那块面板**按标定摆到
+        #       地形图上**（`ImageCanvas.set_live_patch` ✓）—— "面板里画的是什么"和"它该在
+        #       地图哪一块"**在同一张图上重叠**，放大（滚轮）一看就知道标定 / 显示区跟踪
+        #       对不对 ✓；
+        #     · **像素差分地图**：面板 **减** 底图上它盖住的那一块
+        #       （`mm.diff_panel_vs_canvas` ✓）⇒ 差出来的就是"**底图上没有的东西**"
+        #       （玩家点 / 实时元素 ✓）。
+        #   ⚠ 底图始终由你自己缩放平移（滚轮 / 中键拖 ✓），这里只管"叠什么" ✓。
         row_live = QHBoxLayout()
         row_live.setSpacing(6)
-        self.ck_live_map = QCheckBox("叠加实时小地图")
-        self.ck_live_map.setToolTip(
-            "把当前那块小地图面板**按标定摆到这张地形图上**（半透明），随时跟着滚动 ✓。\n\n"
-            "怎么用：滚轮放大到小地图那一带 —— 面板里的地形和底图**处处重合**就是对的；\n"
+        row_live.addWidget(QLabel("显示类型"))
+        self.cmb_live_view = NoWheelComboBox()
+        for _zh, _k in LIVE_VIEWS:
+            self.cmb_live_view.addItem(_zh, _k)
+        self.cmb_live_view.setMinimumWidth(120)
+        self.cmb_live_view.setToolTip(
+            "地形图上叠什么：\n"
+            "  实时小地图 —— 把当前那块小地图面板按标定摆到这张地形图上（半透明），"
+            "随时跟着滚动 ✓。滚轮放大到那一带：面板里的地形和底图处处重合就是对的；"
             "整块偏、或者越走越偏，就是标定或「显示区跟踪」的问题 ✓。\n"
-            "（图上那层的浓淡固定，看得清又不挡底图；底图怎么缩放平移由你操作 ✓。）\n\n"
-            "⚠ 面板从哪来跟「小地图来源」走：收流用 A 机那一口（画质好），\n"
+            "  像素差分地图 —— 面板 减 底图上它盖住的那一块，专门看「底图上没有的东西」"
+            "（玩家点 / 其它实时元素 ✓）。差分先减掉整幅的背景档再放大，"
+            "所以整幅都偏一点时也不至于糊成一片 ✓。\n"
+            "  仅地形图 —— 不叠，只看底图 ✓。\n\n"
+            "⚠ 差分只是「看」的：不参与定位、不写盘 ✓。\n"
+            "⚠ 底图是解码出来的地形画布、和游戏里那张小地图不一定同源 ⇒ "
+            "差分的背景档偏大就说明这张图上它只能当辅助（右边那行会把数字报出来 ✓）。\n\n"
+            "⚠ 面板从哪来跟「小地图来源」走：收流用 A 机那一口（画质好），"
             "从实时画面则按本项目的框选区域裁。")
-        # ⭐⭐ **默认就勾上**（用户 2026-09-29 追加："怎么没在路线识别页签→地形图里的视图区
-        #    看到实时滚动的真实小地图"✗）：这一层存在的**唯一**目的就是"让人一眼看见"，
-        #    默认关着 = 我做了但你看不到 ⇒ 等于没做 ✓。取不到面板时右边那行会写清为什么
-        #    （"还没收到小地图推流"/"这张图还没有标定"…）⇒ 不会静默 ✓。
-        # ⚠ 这里 `setChecked` **必须在 `connect` 之前**：不然构造期就触一次 toggled、
-        #   把 250ms 的节拍在"页面还没显示"的时候就开起来 ✓（要开也由 `showEvent` 开 ✓）。
-        self.ck_live_map.setChecked(True)
-        self.ck_live_map.toggled.connect(safe_slot(self._on_live_map_toggle))
-        row_live.addWidget(self.ck_live_map)
+        # ⚠ `setCurrentIndex` **必须在 `connect` 之前**（同老勾选框那条理由 ✓）：
+        #   不然构造期就触一次 `currentIndexChanged` ⇒ ① 把 250ms 的取帧节拍在"这一页
+        #   还没显示"的时候就开起来 ✗ ② 顺手往 `live.yaml` 写一次盘 ✗。
+        self.cmb_live_view.setCurrentIndex(
+            max(0, self.cmb_live_view.findData(self._live_disp)))
+        self.cmb_live_view.currentIndexChanged.connect(
+            safe_slot(self._on_live_view))
+        row_live.addWidget(self.cmb_live_view)
         # ⭐ **透明度**（用户 2026-09-29 追加："需要加个参数'透明度'，表示实时小地图的透明度"✓）
         #   —— 它压在底图上：太实看不清底图、太淡看不清面板，所以给一根**跟手**的拖动条 ✓。
         #   ⚠ 单位（%）写在**框外**（UI规范 ✓ 不许 `setSuffix`）、滚轮不改参数
@@ -969,10 +1055,14 @@ class RoutePanel(QWidget):
         self.sld_live_alpha.setMinimumWidth(90)
         self.sld_live_alpha.setMaximumWidth(150)
         self.sld_live_alpha.setToolTip(
-            "「叠加实时小地图」那一层的透明度（%）。\n\n"
+            "「显示类型」那一层的透明度（%，实时小地图 / 像素差分地图都用它）。\n\n"
             "0% = 完全看不见（等于关掉那一层）；100% = 完全不透明（会盖住底图）。\n"
-            "拖着调，**立刻生效**（不用等下一拍 ✓）。\n"
-            "默认 75%：既看得清面板里的地形，也还能看见底图对不对得上 ✓。")
+            "拖着调，立刻生效（不用等下一拍 ✓）。\n"
+            "默认 75%：既看得清面板里的地形，也还能看见底图对不对得上 ✓；\n"
+            "看差分时想看得更清楚，拉到 100% 即可 ✓。")
+        # 「仅地形图」= 没有那一层 ⇒ 这条跟着灰掉（同老勾选框那条口径 ✓；
+        # ⚠ 构造期 `setCurrentIndex` 在 `connect` 之前 ⇒ 得**自己**摆一次状态 ✓）
+        self.sld_live_alpha.setEnabled(self._live_disp != "terrain")
         self.sld_live_alpha.valueChanged.connect(safe_slot(self._on_live_alpha))
         # 松手才落盘（见 `_on_live_alpha` 的说明 ✓）
         self.sld_live_alpha.sliderReleased.connect(safe_slot(self._save_live_alpha))
@@ -1346,17 +1436,30 @@ class RoutePanel(QWidget):
             out.append("休息　下次%s" % left(settings.next_afk_monotonic))
         else:
             out.append("休息　未排期（防掉线关着）")
+        # ⭐⭐ **血条读空 ⇒ 定时行为整体被暂停**（用户 2026-10-05 ✓ 三轮原话："「血条读空」期间
+        #   连所有自定义定时行为也一起显式暂停（并留痕/显示）"）—— 这时**不许再写「剩余 M:SS」** ✗：
+        #   那是"马上要跑"的意思，可它其实已经停用 ✓（真实剩余在恢复那一刻会被**重摇** ✓
+        #   见 `agent._reseed_overdue_timers` ✓）。⚠ 判据**只问 agent**（`timers_suspended()` ✓
+        #   一处口径 ✓）—— 界面层不自己判断 ✗。
+        _t_sus = False
+        try:
+            _ag1 = self._live_agent()
+            _t_sus = bool(_ag1.timers_suspended()) if _ag1 is not None else False
+        except Exception:                       # noqa: BLE001 —— 老环境 / 替身 ⇒ 当没停 ✓
+            _t_sus = False
         for t in (getattr(settings, "custom_timers", None) or []):
             if t.get("paused"):
                 # **暂停的不列**（2026-09-26 用户要求）：它现在不会触发，列出来只会
                 # 让人以为"还有一项在跑"。暂停状态在「决策参数」页的列表里看得到。
+                # ⚠ 那是**用户自己按的**暂停（与"血条读空"这次整体暂停**两回事** ✓）。
                 continue
             name = str(t.get("name") or "?")
             nx = float((getattr(settings, "custom_timer_next", None) or {})
                        .get(name, 0.0))
             # 还没排期（刚加/刚编辑过）⇒ 按区间下限占位，别显示 0:00
-            tail = (left(nx) if nx > 0 else
-                    "　剩余 %s" % _mmss((t.get("interval") or [5, 10])[0] * 60.0))
+            tail = ("　已暂停（血条读空）" if _t_sus else
+                    (left(nx) if nx > 0 else
+                     "　剩余 %s" % _mmss((t.get("interval") or [5, 10])[0] * 60.0)))
             out.append("定时行为「%s」%s" % (name, tail))
         # ⚠ 「自动喂宠」那一行**已移除**（用户 2026-09-26 去掉整个功能：他会用「自定义定时
         #    行为」自己实现 ✓ ⇒ 它会作为一条普通定时行为出现在上面那段循环里 ✓）。
@@ -1452,8 +1555,23 @@ class RoutePanel(QWidget):
                     _dec += " → foothold#%s" % _ifid
         except Exception:                     # noqa: BLE001 —— 老环境/替身 ⇒ 不画 ✓
             _dec = ""
+        # ⭐⭐ **角色死了吗**（用户 2026-10-05 ✓ 原话："角色死了之后画面中心会出现这个弹窗
+        #   （原地复活），并且 HP 是 0%？…我们能否检查出角色死了？"）——
+        #   判据与"停手 + 留痕"全在 `agent._death_beat` ✓（血条连续几拍读出空 ✓）；
+        #   这里**只读数、只贴字符串** ✗（界面层别自己判断 ✓ 那是第二份口径 ✗）。
+        _dead = False
+        try:
+            _ag0 = self._live_agent()
+            _dead = bool(getattr(_ag0, "_dead", False)) if _ag0 is not None else False
+        except Exception:                     # noqa: BLE001 —— 老环境/替身 ⇒ 当没死 ✓
+            _dead = False
+        # ⚠ 它和世界坐标/决策那两行一样是**读数** ⇒ **不归「定时任务」开关管** ✓
+        #   （关掉那几行时它照样要露出来 ✓ —— 人死了却什么都不显示是最糟的 ✓）。
+        _death_line = ("⚠ 角色已死亡（等复活 / 回城再继续）·　自动喝药与定时行为已暂停",
+                       "#ff5252", False, 11)
+        _head = ([_death_line] if _dead else [])
         if not bool(_vis.get("timer_on", True)):
-            return [first] + ([_dec] if _dec else [])
+            return [first] + ([_dec] if _dec else []) + _head
         dst = self._current_goto_set()
         # 休息时「当前任务」写「**休息**」（用户 2026-09-26 要求）—— 休息**优先**于寻路：
         # 「定点休息」本来就会挂着一条"走过去"的任务，那行若还写「前往：X」，会让人以为
@@ -1489,6 +1607,9 @@ class RoutePanel(QWidget):
         lines = [first]                       # str ⇒ 保持黑底白字（读数是排查用的）
         if _dec:
             lines.append(_dec)                # 决策状态：与世界坐标同款式 ✓（见上）
+        # ⭐⭐ 角色死亡那行（构造在**上面** ✓ `_head`）—— 放「当前任务」**之前**：
+        #   那一行这时还写着"战斗"，得先说清"为什么不打了" ✓（红字 + 大字 ✓）。
+        lines += _head
         lines.append(("当前任务　%s%s" % ("休息" if _rest else
                                           ("前往：%s" % dst if dst else "战斗"), _tail),
                       col, False, 11))
@@ -1737,24 +1858,67 @@ class RoutePanel(QWidget):
         except Exception:                       # noqa: BLE001 —— 造不出来就让弹窗退回文本框 ✓
             return None
 
+    def make_element_picker(self, parent=None, multi=False, init=None):
+        """造「**地区选择**」通用弹窗（用户 2026-10-05 ✓）。
+
+        谁调：**玩家面板**的「站桩地点」（单选 ✓）与「拾取掉落地区」（多选 ✓）——
+        它俩走 `player_panel.set_element_picker_factory`（主窗口把这一个方法推过去 ✓）。
+        为什么由**本页**提供：弹窗要**地图与集合**（`terrain` / `zones`），只有本页知道
+        当前地图 id（`_map_id()` ✓）⇒ 同 `zone_sets` 那条"面板间推送"（✓）。
+
+        回值：选中的**地点列表**（空列表 = 用户清空了 ✓）/ `None` = **取消**
+        （调用方据此**一个字都不改** ✓）。
+        ⚠ 没打开项目 / 读不到地形 ⇒ 弹窗里**说清怎么办**并返回 `None`（**别开一个空的** ✗
+          —— 同 `_on_battle_zone_edit_clicked` 那条"不能编辑战斗区域"的教训 ✓）。
+        """
+        mid = self._map_id()
+        if not mid:
+            QMessageBox.information(
+                parent, "还没有地图",
+                "选地点要用**地图里的元素**，而现在没打开项目。\n\n"
+                "先在「路线识别」页**打开一个项目** ✓")
+            return None
+        try:
+            from gui.element_picker import ElementPickerDialog
+            t = mapdata.load(mid, with_canvas=True)     # ⚠ 要底图 ⇒ `with_canvas=True` ✓
+            if t is None:
+                QMessageBox.information(parent, "读不到地形",
+                                        "这张图（%s）的地形没加载出来，先确认文件在不在 ✓" % mid)
+                return None
+            z = self._load_zones(mid)
+            if z is None:
+                QMessageBox.information(parent, "读不到集合",
+                                        "这张图（%s）的集合文件没读出来 ✓" % mid)
+                return None
+            dlg = ElementPickerDialog(parent, t, z, multi=bool(multi), init=init)
+            if not dlg.exec_():
+                return None                              # 取消 ⇒ 不改设置 ✓
+            return dlg.selected_spots()
+        except Exception as ex:                          # noqa: BLE001
+            QMessageBox.warning(parent, "打不开「地区选择」",
+                                "%s: %s" % (type(ex).__name__, ex))
+            return None
+
     # ---------------- 路线规划：编辑战斗区域（2026-10-01 从决策参数页搬来 ✓）----------------
 
     def _bz_hint(self):
         """「编辑战斗区域」下面那行短说明（2026-09-28 用户重构后重写 ✓；2026-10-01 搬来）。"""
-        lbl = QLabel("点上面的「编辑战斗区域」增删改 ✓；每一项**勾了「可以战斗」**才等于旧的"
-                     "「限制战斗区域」（人在它外面 ⇒ 这一拍不打架、先走回去 ✓）。")
+        lbl = QLabel("点上面的「编辑战斗区域」增删改 ✓；每一项**勾了「可以战斗」**才算数 —— "
+                     "**没勾的项整个不生效**（它那几项参数也不跑 ✓）。")
         lbl.setStyleSheet("color: #80868b;")
         lbl.setWordWrap(True)
         lbl.setToolTip(
             "**每一项 = 一块集合（平台）的配置**（区域查询CD / idle 回归 foothold /\n"
             "最大战斗时长 / 到点去哪 / **可以战斗** ✓）。\n\n"
-            "「可以战斗」= **旧的「限制战斗区域」**（用户 2026-09-28 搬进每一项 ✓）：\n"
-            "  勾上 ⇒ 人**不在这块集合上**时这一拍**不打架**、先下「前往」回去 ✓，\n"
-            "          而且只打**本集合里**的怪 ✓；\n"
-            "  不勾 ⇒ 这块区域**只管它自己那几项参数**，不影响在哪打架 ✓\n"
-            "          （**新加的项默认勾上** ✓ —— 不勾的话它进不了能打名单，\n"
-            "            别的区域能打时人会被请出去，idle 回归也起不来 ✗）。\n\n"
-            "一个都没勾 = **不限制**（任何地方都打 ✓ 老行为）。\n\n"
+            "「可以战斗」= **这一项生效不生效的总开关**（用户 2026-10-04 ✓ 原话：\n"
+            "  \"刚才我没有勾选底层，但是他还是在底层打了30s\" —— 那次就是老口径的锅 ✗）：\n"
+            "  勾上 ⇒ ① 进「能打名单」：人**不在这块集合上**时这一拍**不打架**、先下\n"
+            "          「前往」回去 ✓，而且只打**本集合里**的怪 ✓；\n"
+            "        ② 它自己那几项参数**照样跑**（区域查询CD / idle 回归 / 最大战斗时长 ✓）。\n"
+            "  不勾 ⇒ **这一项整个不生效** ✓：不进能打名单 ✓，而且**它那几项参数也不跑** ✗\n"
+            "          —— 不会在这儿计「最大战斗时长」、也不会被 idle 回归/切换平台管 ✓\n"
+            "          （**新加的项默认勾上** ✓）。\n\n"
+            "一个都没勾 = **不限制**（任何地方都打 ✓ 老行为）**且所有项的参数都不生效** ✓。\n\n"
             "怎么配：点「编辑战斗区域」⇒ 打开列表 ——\n"
             "  点「添加」选一块集合 ⇒ 立刻弹出它的参数窗 ✓；\n"
             "  **双击一行**同样是改它 ✓；选中后点「删除」移除 ✓。\n\n"
@@ -1876,8 +2040,14 @@ class RoutePanel(QWidget):
             _ids_t = "、".join(_ids) if _ids else "（无）"
             # ⭐ 勾选框**就是**「可以战斗」（文本里不再重复写它 ✓ 免得两处表达同一件事 ✗）。
             #   ⚠ 先 `setChecked` 再 `connect`（否则重画时 `toggled` 会误写一次盘 ✗）。
-            cb = QCheckBox("%s　·　%s" % (n, "，".join(bits)) if bits else n)
+            # ⭐⭐ 没勾 ⇒ **当场**在行里说一句 + 变色（用户 2026-10-04 ✓ 原话："如果不生效动态
+            #   显示当前的配置有没有用并简短例如『该区域未启用，不会生效』"✓）——
+            #   措辞与「编辑战斗区域」弹窗里那句**同一套** ✓（改口令只改一处 ✓）。
+            _off = "" if z.get("can_fight") else "　⚠ 未启用，不会生效"
+            cb = QCheckBox(("%s　·　%s" % (n, "，".join(bits)) if bits else n) + _off)
             cb.setChecked(bool(z.get("can_fight")))
+            if not z.get("can_fight"):
+                cb.setStyleSheet("color:#b06000;")      # 一眼看出哪几项现在不生效 ✓
             cb.setToolTip("这一项的完整设置（**改参数请点上面的「编辑战斗区域」** ✓）：\n"
                           "  区域查询CD(s) = %s\n"
                           "  idle 回归 foothold（随机池） = %s\n"
@@ -2088,6 +2258,20 @@ class RoutePanel(QWidget):
             #   经保存钩子 / 三个写口 ✓），那时整份 9 键一起写 ✓。
             vals = self._seed_route_cfg()
         n = settings.apply_route_cfg(vals)
+        # ⭐ 「**禁用杀怪寻路**」（2026-10-06 起**按地图 id 存** ✓ 用户口径："从此 禁用杀怪寻路
+        #   就是按地图id存的数据"✓）⇒ 换图/换项目要**把控件摆成这张图的值** ✓。
+        #   ⚠⚠ **必须 `blockSignals`** ✗：它接的是 `_on_no_chase_path`（会 `settings.save()` ✓）
+        #     ⇒ 不挡信号就等于"切图时**伪装成用户改了参数** ⇒ 当场写盘" ✗ —— 那正是
+        #     `_apply_route_cfg` 上面那段血泪（"切图竟然写盘"✗ / `0xC0000409` 硬崩 ✗）里的
+        #     同一类坑 ✓。摆值**不是**用户操作 ✓ 落盘只发生在人真改的时候 ✓。
+        _ck = getattr(self, "ck_no_chase_path", None)
+        # ⚠ **用 `getattr` 护住** ✗：自检里这个"面板"常常是**替身**（`SimpleNamespace` ✓ 只带
+        #   本方法真正要动的那几个控件 ✓）⇒ 硬取会当场 `AttributeError` 把用例带崩 ✗
+        #   （同 `live_thread` 那条"两层都要 `getattr`"的教训 ✓）。
+        if _ck is not None:
+            _ck.blockSignals(True)
+            _ck.setChecked(bool(getattr(settings, "disable_chase_pathfinding", False)))
+            _ck.blockSignals(False)
         _crop = vals.get("mmap_crop")
         self._crop_override = ([int(v) for v in _crop]
                               if isinstance(_crop, (list, tuple)) and len(_crop) == 4
@@ -2994,6 +3178,35 @@ class RoutePanel(QWidget):
             if _vw_now != self._ov_view:
                 self._ov_view = _vw_now
                 self._refresh_overlay(view=_vw_now)
+        # ⭐⭐⭐ **坐标只认「唯一那一份」**（用户 2026-10-06 ✓ 原话："**为什么还是两条链？？**"
+        #   ✗ ⇒ "**全做完**"✓）：
+        #   `live_thread`（唯一写者 ✓）每拍把 `pos_state` 的广播抄到 `decision.agent.LAST_POS`
+        #   ✓ ⇒ **这一行从此读它** ✓，不再用下面那份 `self._locator` 的坐标 ✗。
+        #   为什么要收：两份 `PlayerLocator` **各自带跨帧锁定** ⇒ 同一帧"两套历史"⇒ 一个挑对、
+        #     一个锁假点 ✗（现场："你看的 1176 是对的、它用的 −1911 是错的"✓ 就是这么来的 ✓）。
+        #   ⚠⚠ **那份 locator 不能删** ✗ —— 它还在算"**显示区跟踪**"（`view` ✓ 叠图画在哪儿要用 ✓
+        #     那不是坐标 ✓，见上面 `_ov_view` 那一段 ✓）。**删的只是"它算出来的坐标"** ✓。
+        #   ⚠ 实时没在跑 ⇒ `LAST_POS is None` ⇒ **照实说"没有位置状态"** ✓（绝不自己再算一份 ✗
+        #     —— 那正是要拆掉的东西 ✓）。
+        from decision import agent as _agent_mod
+        _lp = getattr(_agent_mod, "LAST_POS", None)
+        if _lp and str(_lp.get("map_id") or "") == str(mid):
+            r = dict(r,
+                     world_x=_lp.get("world_x"), world_y=_lp.get("world_y"),
+                     foothold_id=_lp.get("foothold_id"),
+                     segment_id=_lp.get("segment_id"),
+                     # 唯一那一份的"新鲜度"也说出来（`at` = `time.monotonic()` ✓）
+                     note="（唯一那份：实时回路的位置状态 ✓ 人 y 与门 y 差多少按它判 ✓）",
+                     short="")
+            if r.get("world_x") is None:
+                r = dict(r, ok=False,
+                         short="位置状态这一拍没给出坐标")
+        else:
+            r = dict(r, ok=False, world_x=None, world_y=None,
+                     foothold_id=None, segment_id=None,
+                     short="实时没在跑 ⇒ 没有位置状态（这一行只显示 Agent 用的那份）",
+                     note="这一行现在只显示「实时回路的位置状态」（唯一那一份 ✓）——"
+                          "不实时跑就没有它。")
         if not r["ok"]:
             # 面板上写一句话，**详情进 tooltip**；画面上那行更短（见 _say 的说明）——
             # 完整诊断有一百多字，贴到画面上就是一条横穿半屏的黑带。
@@ -3170,11 +3383,24 @@ class RoutePanel(QWidget):
             self._ov_pix = (p, QPixmap(p))
         return self._ov_pix[1]
 
-    def _on_live_map_toggle(self, on):
-        """勾/去勾「叠加实时小地图」：开/停那条 250ms 的节拍，并立刻来一拍 ✓。"""
-        # 透明度那条只对"看得见的那一层"有意义 ⇒ 跟着开关**灰掉**（不藏掉：布局不跳 ✓，
-        # 和设置窗里「浓淡」对「叠图」的做法一致 ✓）
-        self.sld_live_alpha.setEnabled(bool(on))
+    def _on_live_view(self, *_a):
+        """「显示类型」变了（用户 2026-10-06 ✓）：记住 → 落盘 → 立刻按新类型来一拍 ✓。
+
+        ⚠ 签名吃 `*_a`：`currentIndexChanged` 会给槽带一个 int（不接住就是静默 TypeError ✓）。
+        """
+        self._live_disp = norm_live_view(self.cmb_live_view.currentData())
+        self._save_live_view()
+        self._apply_live_view()
+
+    def _apply_live_view(self):
+        """按当前「显示类型」开/停那条 250ms 的节拍，并立刻来一拍 ✓（= 老 `_on_live_map_toggle` ✓）。
+
+        「仅地形图」⇒ 那一层**收起来**（= 老版本"去勾" ✓），节拍也停（没人看就别取帧 ✓）。
+        """
+        on = self._live_disp != "terrain"
+        # 透明度那条只对"看得见的那一层"有意义 ⇒ 「仅地形图」时跟着**灰掉**
+        # （不藏掉：布局不跳 ✓，和设置窗里「浓淡」对「叠图」的做法一致 ✓）
+        self.sld_live_alpha.setEnabled(on)
         if on:
             self.canvas.set_live_patch_alpha(self._live_alpha / 100.0)
             self._live_map_timer.start()
@@ -3183,6 +3409,17 @@ class RoutePanel(QWidget):
             self._live_map_timer.stop()
             self.canvas.set_live_patch(None)        # 收起来（不是留一张空的 ✗）
             self.lbl_live_map.setText("")
+
+    def _save_live_view(self):
+        """把显示类型存进 `config/live.yaml`（本机外观偏好，和 `live_map_alpha` 同一处 ✓）。
+
+        ⚠ 与透明度那条不同：这个是**下拉**（一次点击一个事件），所以当场写 ✓；
+        （透明度是拖动条，拖一次几十个事件 ⇒ 那才要攒到松手 ✗。）
+        """
+        try:
+            update_live(live_map_view=str(self._live_disp))
+        except Exception:                       # noqa: BLE001 —— 存不下也不该把界面弄崩 ✗
+            pass
 
     def _on_live_alpha(self, v):
         """拖动透明度：**立刻**生效（跟手 ✓）。
@@ -3278,16 +3515,42 @@ class RoutePanel(QWidget):
         ch, cw = t.canvas.shape[:2]
         ox, oy, kx, ky = self._live_map_rect(cal, (cw, ch))
         hp, wp = panel.shape[:2]
-        ok = self.canvas.set_live_patch(np_to_pixmap(panel), (ox, oy), kx, ky)
+        # ⭐ **像素差分地图**（用户 2026-10-06 ✓）：摆上去的是"**面板 − 底图那一块**"，
+        #   不是面板本身 ✓ —— 于是"底图上没有的东西"（玩家点 / 实时元素 ✓）会跳出来 ✓。
+        #   ⚠ 算不出来（面板落在底图外 / 标定读不出 / 形状怪 ✓）⇒ **照旧摆面板**
+        #     （把画面弄空才是更坏的 ✗）＋ 一行说清 ✓ 不许静默 ✓。
+        show, diff_txt, diff_warn = panel, "", False
+        if self._live_disp == "diff":
+            # ⭐ `color=True`：**把点的颜色显示出来**（用户 2026-10-06 ✓ 原话："像素差分地图
+            #   能把点的颜色显示出来而不是纯白吗？"✓）—— 差得够亮的那块按**面板本来的颜色**
+            #   画 ✓（玩家点还是黄的 ✓）；默认那份灰阶留给**定位**（`dot_candidates_diff` ✓
+            #   它的门限是"峰值比例"⇒ 换颜色就变味 ✗ 见那边说明 ✓）。
+            vis, di = mm.diff_panel_vs_canvas(panel, t.canvas, cal, color=True)
+            if vis is None:
+                diff_txt = "　⚠ 差分算不出来（%s）⇒ 照旧摆面板" % (di.get("why") or "?")
+                diff_warn = True
+            else:
+                wx, wy = mm.panel_to_world(di["at"][0], di["at"][1], cal, t)
+                diff_txt = ("　差分 ×%g：背景档 %g 灰阶（整幅均值 %g · 最大 %g）· "
+                            "最突出 %g 在面板 (%d, %d) ⇒ 世界 (%d, %d)"
+                            % (di["gain"], di["floor"], di["raw_mean"], di["raw_peak"],
+                               di["peak"], di["at"][0], di["at"][1],
+                               round(wx), round(wy)))
+                show = vis
+                if di["floor"] >= DIFF_FLOOR_WARN:
+                    diff_txt += "（背景档偏大 ⇒ 这张图上底图与游戏小地图不同源，只能当辅助看）"
+                    diff_warn = True
+        ok = self.canvas.set_live_patch(np_to_pixmap(show), (ox, oy), kx, ky)
         if not ok:
             self.lbl_live_map.setText("地形图还没画出来（先点「生成地形图」）")
             return
-        warn = how.startswith("⚠")
+        warn = how.startswith("⚠") or diff_warn
         self.lbl_live_map.setText(
-            "面板 %d×%d 摆在地图 (%d, %d) 起、%.2f×（%s）%s"
+            "面板 %d×%d 摆在地图 (%d, %d) 起、%.2f×（%s）%s%s"
             % (wp, hp, round(ox), round(oy), kx, how,
                "" if cal.get("mode") == mm.MODE_CROP
-               else "　（全局小地图：整张底图都在面板里、不滚动 ✓）"))
+               else "　（全局小地图：整张底图都在面板里、不滚动 ✓）",
+               diff_txt))
         self.lbl_live_map.setStyleSheet("color: %s;" % ("#b06000" if warn else "#80868b"))
 
     def _calib_panel_wh(self, cal=None):
@@ -3471,7 +3734,20 @@ class RoutePanel(QWidget):
             self.lbl_map_img.setText("　".join(
                 x for x in (title, size, extra) if x))
             # 选了「选择平台」就把它框出来（只读覆盖层，图本身不变）
-            self.canvas.load(pm, self._preview_boxes(mid), editable=False, fit=True)
+            _pv = self._preview_boxes(mid)
+            self.canvas.load(pm, _pv, editable=False, fit=True)
+            # ⭐⭐ **预览框上的字改成「平台名」**（用户 2026-10-06 ✓ 原话："它上面写着"怪物"
+            #   ⇒ 换成平台名吧"✓）。
+            #   为什么会显示"怪物"：这个框走的是**通用画布 / 质检台同一套** `BBoxItem` ✓
+            #   （用户现场看到的就是"**就像一个标注框，跟质检台那个一样**"✓），而它的标签默认
+            #   取**类别名表**（`class_names=None` ⇒ "0=玩家 / 1=怪物" ✓）⇒ 一块**平台预览框**
+            #   被标成 **"怪物"** ✗ ⇒ 现场真的被当成"怪物检出框"来问 ✓（误导实锤 ✓）。
+            #   ⚠ 只在**这块预览框**上改字 ✗：不动类别、不动颜色表、不动质检台/工作台那边的
+            #     任何框（它们的标签仍归 `set_class_names` 管 ✓ 一处口径还在 ✓）。
+            _pv_name = self._goto_name()
+            if _pv and _pv_name:
+                for _it in self.canvas.boxes:
+                    _it.label.setText(_pv_name)
 
         # 没地图就没得生成；正在跑的时候也不让重复点
         self.btn_gen.setEnabled(bool(mid) and self.task is None)
@@ -3569,6 +3845,19 @@ class RoutePanel(QWidget):
         settings.move_retry_ms = max(0, int(v))
         settings.save()
 
+    def _on_no_chase_path(self, v):
+        """改了「**禁用杀怪寻路**」⇒ 即改即存（同这一组其它参数 ✓）。
+
+        ⚠ 它**不按地图 id 存**（与上面那几个攀爬参数不同 ✗）：它是 `DecisionSettings` 的字段
+          ⇒ 跟着**当前项目**走（`project.yaml` 的 `decision:` 段 ✓ 见 `to_dict` ✓）。
+        ⚠ 写的是**同一个 `settings` 单例**（agent 每拍读它 ✓）⇒ 改完**立刻生效**、
+          不用重启、也不用重开自动 ✓（同 `_on_retry_gap` 那批 ✓）。
+        """
+        b = bool(v)
+        if b != bool(getattr(settings, "disable_chase_pathfinding", False)):
+            settings.disable_chase_pathfinding = b
+            settings.save()     # 没打开项目时不落盘（见 decision/agent 的 set_save_hook）
+
     def _on_jump_start(self, v):
         """改了「起跳距离(px)」⇒ 写进配置（决策参数、跟着项目存 ✓）。
 
@@ -3606,6 +3895,11 @@ class RoutePanel(QWidget):
         self.sp_retry_gap.blockSignals(False)
         # ⛔ 这里原来回填「前往重下间隔(s)」—— 那一格 2026-09-28 移除了（搬进「战斗区域」
         #   弹窗、逐项配 ✓ 见 `DecisionSettings.battle_zones` ✓）。
+        # ⚠ 「禁用杀怪寻路」**不在这里回填** ✗ —— 它 2026-10-06 起是**按地图 id 存**的
+        #   （`datasets/map/<id>.route.json` ✓ 用户口径："从此…按地图id存的数据"✓）⇒ 它的值
+        #   由 `_apply_route_cfg()` 在**按图灌值之后**摆 ✓（在本函数**末尾**调 ✓ 见那儿 ✓）。
+        #   在这里回填读到的会是**上一个项目/上一张图**的值 ⇒ 正好串图 ✗（同 `_seed_route_cfg`
+        #   那条纪律："别拿 settings 内存值当按图参数的来源"✗）。
         # 「起跳距离(px)」（「跳」的临时参数 ✓）也是决策参数 ⇒ 换项目重读一遍 ✓
         self.sp_jump_start.blockSignals(True)
         self.sp_jump_start.setValue(int(getattr(settings, "jump_start_px", 0) or 0))
@@ -3633,11 +3927,11 @@ class RoutePanel(QWidget):
         if getattr(self, "project", None) is not None:
             self._refresh_mmap()
             self._refresh_map_image()
-        # ⭐ 「叠加实时小地图」那条 **只在看得见的时候跑**（切到别的页签就停 ——
-        #   4 次/秒的取帧+重绘虽然便宜，但没人看的时候白花 ✓）。默认是勾上的 ⇒
+        # ⭐ 「显示类型」那条 **只在看得见的时候跑**（切到别的页签就停 ——
+        #   4 次/秒的取帧+重绘虽然便宜，但没人看的时候白花 ✓）。默认是「实时小地图」⇒
         #   进这一页就该看见它在滚（取不到面板时右边那行会说清为什么 ✓）。
-        if (getattr(self, "ck_live_map", None) is not None
-                and self.ck_live_map.isChecked()):
+        if (getattr(self, "cmb_live_view", None) is not None
+                and self._live_disp != "terrain"):
             if not self._live_map_timer.isActive():
                 self._live_map_timer.start()
             self._live_map_tick()

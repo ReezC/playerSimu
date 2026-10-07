@@ -31,6 +31,7 @@
 from pathlib import Path
 
 from PyQt5.QtCore import QEvent, QObject, Qt
+from PyQt5.QtGui import QValidator
 from PyQt5.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
                              QAbstractSpinBox, QApplication, QComboBox,
                              QDoubleSpinBox, QFrame, QScrollArea, QScrollBar,
@@ -126,7 +127,45 @@ class NoWheelSpinBox(_NoWheel, QSpinBox):
 
 
 class NoWheelDoubleSpinBox(_NoWheel, QDoubleSpinBox):
-    pass
+    """⚠⚠ **修掉 `QDoubleSpinBox`「小上限时打不进第一位」那个坑**（用户 2026-10-04 ✓ 报的就是它：
+    「**我无法将框心力度小数点左边的数字改成 1**」✓）。
+
+    病根（**离屏实测** ✓）：上限 `1.0`、当前 `0.15` 时，**选中整数位那个 `0` 再敲 `1`** ⇒ Qt 把它
+    当 **`1.15`**（后面 `.15` 还在 ✗）⇒ **超上限** ⇒ `QDoubleValidator` 报 `Invalid` ⇒ **那一下
+    就是敲不进去** ✗✗（实测 `text` 原地不动 ✓）；**全选**后敲 `1` 才行 ✓ —— 但没人该知道要这么做 ✗。
+    ⇒ 两道补丁：
+      · `validate`：**"是个数字、但越界"** 时报 **`Acceptable`** ✓ ⇒ 文字**进得去** ✓
+        （⚠ **字母 / 格式错的仍 `Invalid`** ✗ 不放行 ✓）；
+      · `valueFromText`：**自己把值夹进范围** ✓✗ —— ⚠⚠ **不能省** ✗✗：越界文本丢给基类**实测拿到
+        的是 `0.0`**（不是上限 `1.0` ✗）⇒ 用户敲 `1.15` 回车会**跳到 `0.00`** ✗✗（比"敲不进去"还糟 ✓）；
+        ⚠ 也别指望 `setCorrectionMode` 那两档 ✗ —— 实测（`Intermediate` / `CorrectToNearestValue`）
+          **平台相关**（`offscreen` 恰好给 `1.0`、真实平台给 `0.00` ✗）⇒ 只有自己夹才**确定** ✓。
+    ⚠ 再送一条"**焦点进来先全选**"（Tab 过来直接敲一个字 = **整段替换** ✓ 最省事 ✓）。
+    """
+
+    def validate(self, text, pos):
+        _st, _tx, _ps = super().validate(text, pos)
+        if _st == QValidator.Acceptable or not text:
+            return _st, _tx, _ps
+        try:
+            float(text.replace(",", "."))   # ⚠ 只有"数字但越界"才放行 ✗（字母照旧不放 ✓）
+        except ValueError:
+            return _st, _tx, _ps
+        return QValidator.Acceptable, _tx, _ps
+
+    def valueFromText(self, text):
+        try:
+            _v = float(str(text).replace(",", "."))
+        except ValueError:
+            return self.value()             # 解析不了 ⇒ 保持原值 ✓（不猜）
+        return min(self.maximum(), max(self.minimum(), round(_v, self.decimals())))
+        #                        ↑ 夹进范围：`1.15 → 1.00` ✓ = 用户要的「改成 1」✓
+
+    def focusInEvent(self, ev):
+        super().focusInEvent(ev)
+        _le = self.lineEdit()
+        if _le is not None:
+            _le.selectAll()
 
 
 class NoWheelComboBox(_NoWheel, QComboBox):
@@ -283,6 +322,55 @@ def sound_player():
 
         _sound_player = QMediaPlayer()
     return _sound_player
+
+
+def make_copyable(w):
+    """让这个标签的文字**能被选中复制**（用户 2026-10-04 ✓ 第 4 条）→ 返回它自己 ✓。
+
+    ⚠ 大部分地方**不用手调**：窗口收尾（`theme.bind_window_state` ✓）会把整窗标签扫一遍 ✓
+      （见 `theme.enable_label_copy` 里那段"为什么按窗口扫" ✓）。这个函数给**当场就要**的
+      场景用（比如字段标题刚建好 ✓）。
+    """
+    from PyQt5.QtCore import Qt
+
+    try:
+        w.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    except Exception:                                # noqa: BLE001
+        pass
+    return w
+
+
+def field_tip(label, tip):
+    """把提示（tooltip）**挂到"字段标题"上**（用户 2026-10-04 ✓ 第 3 条原话："现在是在哪里编辑
+    （输入框、按钮、触控板等）就在哪里弹出，改成**指着字段标题时弹出**。例如「要标注的掉落物」"）
+    → 返回那个标题 ✓。
+
+    规矩见 `docs/UI规范.md` §6 ✓。两条要点：
+      · **提示归标题**：鼠标指标题看"这个字段是干嘛的" ✓ —— 指输入框/下拉只剩"怎么填"本身 ✓；
+      · ⚠ 搬完**必须把控件上那句删掉** ✗：两处都留 ⇒ 指控件弹两个框叠在一起 ✓ 比不搬还糟 ✓。
+    """
+    if label is not None:
+        try:
+            label.setToolTip(str(tip or ""))
+        except Exception:                            # noqa: BLE001
+            pass
+        make_copyable(label)
+    return label
+
+
+def title_label(text, tip="", parent=None):
+    """**字段标题标签**：文字**可复制** ✓ + 提示挂在它身上 ✓（新代码优先用它 ✓）。
+
+    ⚠ 为什么要有这个工厂：标题到处手写 `QLabel("…")` ⇒ "能不能复制""提示挂哪"两件事就
+      永远各写各的 ✗（正是用户 2026-10-04 第 3、4 条要收的那个口子 ✓）。
+    """
+    from PyQt5.QtWidgets import QLabel
+
+    lbl = QLabel(text, parent)
+    make_copyable(lbl)
+    if tip:
+        lbl.setToolTip(str(tip))
+    return lbl
 
 
 def stop_sound():

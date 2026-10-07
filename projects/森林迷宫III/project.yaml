@@ -1,9 +1,10 @@
 name: 森林迷宫III
-map_id: '105040303'
+map_id: '105040306'
 mobs:
 - '3210800'
 - '3230100'
 - '5130102'
+- '5150000'
 scale: 1.406
 mob_scales: {}
 scale_at:
@@ -43,13 +44,14 @@ bars:
 mmap_crop:
 - 5
 - 71
-- 109
-- 114
+- 129
+- 142
 decision:
   attack_dist: 80.0
   min_attack_dist: 0
   attack_up_dist: 30
   attack_down_dist: 22
+  attack_fan_deg: 0.0
   chase_jump_enabled: true
   chase_jump_min: -10
   chase_jump_max: 5
@@ -106,7 +108,7 @@ decision:
   - 1000
   - 2500
   input_device: remote
-  attack_cd: 300
+  attack_cd: 400
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 500
   turn_output_delay_ms: 200
@@ -144,20 +146,20 @@ decision:
   auto_hp_pot: true
   auto_mp_pot: false
   strategy: patrol
-  vision_top: -1
-  vision_bottom: -1
+  vision_top: 150
+  vision_bottom: 150
   vision_left: -1
   vision_right: -1
   vision_center: false
   vision_off_x: 0
   vision_off_y: 0
-  big_mob_enabled: true
+  big_mob_enabled: false
   big_mob_ratio: 1.5
   big_mob_range_px: 1000.0
   sweep_turn_cd: 500
   back_range: 150
   sweep_edge_turn_px: 100
-  route_goto_set: 底层
+  route_goto_set: 二层
   align_tol_px: 12
   align_hold_ms: 3000
   climb_align_gap_ms: 200
@@ -167,7 +169,7 @@ decision:
   goto_timeout_s: 15.0
   chase_goto_max_s: 5.0
   goto_timeout_key: 表情_无语
-  disable_chase_pathfinding: true
+  disable_chase_pathfinding: false
   jump_start_px: 80
   move_retry_ms: 350
   debounce_conf: 0.3
@@ -203,6 +205,15 @@ decision:
     - 10.0
     paused: true
     paused_left: 502.4470833913947
+  - name: 自动攻击药水
+    seq:
+    - type: down
+      key: 攻击药水
+    - type: up
+      key: 攻击药水
+    interval:
+    - 3.0
+    - 3.0
   facing_timeout_min: 0.0
   player_lost_timeout_min: 3.0
   resetall_interval: 30
@@ -285,10 +296,10 @@ decision:
 notes: ''
 capture:
   source: file
-  file: D:/Media/record/mxd/森林迷宫III二楼.mp4
+  file: D:/Media/record/mxd/巨人之森.mp4
   url: udp://0.0.0.0:5000
   fps: 5.0
-  stride: 100
+  stride: 200
   seconds: 120.0
   dedup: 0.01
   limit: 500
@@ -301,18 +312,60 @@ label:
   downscale: 2
   region: null
   player_thresh: 0.78
+  label_drops_on: true
+  drops:
+  - id: 09000000
+    name: ''
+  - id: 09000001
+    name: ''
+  - id: 09000002
+    name: ''
+  - id: 09000003
+    name: ''
+  - id: '04000013'
+    name: 风独眼兽之尾
+  - id: '04000025'
+    name: 黑石块
+  - id: 04000029
+    name: 香蕉
+  drop_thresh: 0.3
+  label_pets_on: true
+  pet_thresh: 0.3
+  pets:
+  - pet: '5000020'
+    name: 小白雪人
+    equips: []
+  - pet: '5000046'
+    name: 花蘑菇仔
+    equips: []
+  - pet: '5002828'
+    name: Lil Frieren
+    equips: []
+  - pet: '5002829'
+    name: Lil Fern
+    equips: []
+  - pet: '5002830'
+    name: Lil Stark
+    equips: []
+  - pet: '5002831'
+    name: Lil Übel
+    equips: []
+  drop_downscale: 1
+  pet_downscale: 1
 dataset:
   val_ratio: 0.2
   min_boxes: 1
   quality: 92
 train:
-  model: E:\MyPrograms\playerSimu\projects\石人寺院III\models\detect_v3.pt
-  epochs: 200
+  model: E:\MyPrograms\playerSimu\projects\森林迷宫III\models\detect_v6.pt
+  epochs: 120
   imgsz: 1280
   batch: 8
   device: '0'
   patience: 40
   resume: false
+live:
+  weights: ''
 player_id: 数值策划
 verify:
   source: E:/MyPrograms/playerSimu/projects/森林迷宫III/测试集
@@ -327,8 +380,10 @@ mob_names:
 - 猴子
 - 风独眼兽
 - 黑石头人
+- 混种石头人
 player_scale: 1.406
 player_scale_at:
   width: 1920
   height: 1080
   confidence: manual
+mobs_cleared: false

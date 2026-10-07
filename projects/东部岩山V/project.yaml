@@ -23,6 +23,8 @@ decision:
   min_attack_dist: 50
   attack_up_dist: 0
   attack_down_dist: 0
+  attack_fan_deg: 0.0
+  walk_stall_jump: true
   chase_jump_enabled: true
   chase_jump_min: -30
   chase_jump_max: 5
@@ -76,6 +78,7 @@ decision:
     down: down
     attack: s
     jump: D
+    pickup: z
     hp_pot: g
     mp_pot: null
     feed_pet: pagedown
@@ -84,11 +87,14 @@ decision:
   target_cd:
   - 1500
   - 2500
+  atk_target_count: -1
+  mob_atk_cd_ms: 0
   input_device: local
   attack_cd: 200
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 1000
   turn_output_delay_ms: 200
+  auto_pickup: false
   player_track_jump: 200
   player_foot_offset_px: 0
   player_box_min_area_pct: 0.0
@@ -101,16 +107,16 @@ decision:
   - - 0
     - 0
     - 137
-  - - 77
-    - 80
+  - - 76
+    - 79
     - 255
   mp_color:
-  - - 146
-    - 79
+  - - 144
+    - 80
     - 0
   - - 255
-    - 199
-    - 79
+    - 200
+    - 80
   hp_threshold: 30
   mp_threshold: 7
   pot_cd: 1500
@@ -131,6 +137,12 @@ decision:
   sweep_turn_cd: 1000
   back_range: 200
   sweep_edge_turn_px: 100
+  station_spot: {}
+  station_pickup_enabled: false
+  station_pickup_min_s: 0.0
+  station_pickup_max_s: 0.0
+  station_pickup_spots: []
+  multi_spots: []
   route_goto_set: ''
   align_tol_px: 6
   align_hold_ms: 250
@@ -218,6 +230,11 @@ decision:
   reconnect_queue_timeout_ms: 180000
   reconnect_max_retry: 3
   reconnect_resume_auto: true
+  reconnect_server_x: 0.3635
+  reconnect_server_y: 0.2074
+  reconnect_channel_x: 0.4104
+  reconnect_channel_y: 0.5093
+  reconnect_channel: 1
   custom_keys:
     攻击药水: grave
     回避药水: '5'
@@ -255,6 +272,8 @@ train:
   batch: 8
   device: '0'
   patience: 40
+live:
+  weights: ''
 mob_names:
 - 斧木妖
 - 黑斧木妖

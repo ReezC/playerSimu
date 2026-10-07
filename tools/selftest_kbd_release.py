@@ -297,60 +297,239 @@ def t_a_logs_are_forwarded_to_b():
         kc.A_LOG_PATH = old_path
 
 
-def t_pad_move_is_coalesced():
-    """⭐⭐ 触控板位移**累积 + 8 ms 合并成一条**（用户 2026-10-03 ✓ 现场："卡卡的" +
-    "A 机上一段一段一顿一顿"）。
+def t_pad_delta_from_tracker():
+    """⭐⭐⭐ 触控板位移**由跟踪线程按固定节拍产生**（用户 2026-10-05 ✓ 原话："直接2"）。
 
-    病：原来**每个事件直接发一条** ✗（触控板 60~125 Hz、快速滑还有突发）⇒ 每条都要走
-    ≈11 ms 往返（`perf.log` 的 `kbd_rtt_ms` ✓）⇒ 事件比往返快 ⇒ 必积压 ✓；且发送在
-    **GUI 主线程**、排在 `draw_ms`（中位 5 / p99 15~22 ms）后面 ⇒ 一帧攒的位移**同一拍
-    连发几条** ✗ = "一段一段"的形状来源 ✓（链路无缓冲：relay 原样转发 + 固件一批做完 ✓）。
+    病（实测，`perf.log` 18:40 那段按 F10 滑了两下）：位移原来只在 `TouchPad.mouseMoveEvent`
+    里产生 ✗（Qt 的 move 事件 ⇒ 跑在 GUI 主线程上）⇒ 主线程一被重绘 / 主回路拖住，Qt 就把连续
+    移动**合并**成一次：
+        `move_gap_ms` 中位 20 / p95 76 / p99 201 / **最大 467 ms**
+        `move_px`                             **最大 514**（一次跳半个屏幕 ✓）
+    ⇒ A 机"停一下、猛跳一下" ✓；而同一段 `send_ms` 中位 **0.15 ms**、`kbd_pending` ≤ 4
+    ⇒ **瓶颈不在链路也不在发送，在位移的产生** ✓。
+    方子（用户挑的"直接②"）：产生挪进 `decision/input.py::PointerTracker` 那条独立线程
+    （固定节拍 `GetCursorPos` ✓ + `SetCursorPos` 拨回钉点 ✓），出口**直接**喂 `_PadSender`
+    （不经 Qt 事件循环 ✓）。
 
-    钉四件：
-      ① `_on_pad_moved` **不再直接发** ✗（只累积 + 起节拍 ✓）；
-      ② `_flush_pad` 把累积量**合并成一条**发出去 ✓；
-      ③ **位移守恒**：整数发走、**小数留着**（慢速滑不会丢位移 ✓）；
-      ④ 没整像素时**停表**（不许空转 ✓）。
+    钉七件：
+      ① 每拍都算位移、并**把指针拨回钉点**（无限滑动 ✓）；
+      ② **位移守恒**：逐拍增量之和 == 总移动（不丢、不重复 ✓）；
+      ③ `on_delta` 在**跟踪线程**里被调（线程名 `pad-track` ✓ —— 这是"不经 Qt 事件循环"的
+         铁证：走 `moved` 信号会排队回到主线程 ✗）；
+      ④ **拨回失败也算对**：用的是 `pos - 上一次`，不是 `pos - 钉点` ✗
+         （后者会一次跳一大截、之后一路算 0 ✓）；
+      ⑤ `stop()` 之后线程真的退出、位移不再增加 ✓；
+      ⑥ 真 Win32 那条路能读能拨（**原样拨回去** ⇒ 不打扰正在用机器的人 ✓）；
+      ⑦ 源码钉：位移**不再是** Qt move 事件产生的 ✗ ＋ 面板出口接在跟踪线程上 ✓ ＋
+         跟踪线程里**不碰 Qt** ✗ ＋ **不自己调 `timeBeginPeriod`** ✗（精度只该 `core/winperf` 一处 ✓）。
     """
+    import threading as _thr
+    import time as _t
     from types import SimpleNamespace
 
-    from gui.player_panel import PlayerPanel
     from decision import input as dinput
+    from gui import player_panel as _pp
 
-    sent = []
-    _old = dinput.mouse_move
-    dinput.mouse_move = lambda dx, dy: sent.append((dx, dy))
+    # ⑥ 真 Win32：`GetCursorPos` 读得到 ✓；`SetCursorPos` **只钉契约**（不抛异常 + 回布尔 ✓）
+    #   ⚠ **不许**断言"拨得动"：锁屏 / 非交互桌面下 `SetCursorPos` 返回 0、指针纹丝不动、
+    #     `GetLastError` 还是 0（本机 2026-10-05 实测 ✓ 见 `decision/input.py::pointer_warp` ✓）
+    #     ⇒ 那样会让用例随"屏幕锁没锁"红绿 ✗。真拨动/拨不动两条路都在 ④ 用假指针钉住了 ✓。
+    _p0 = dinput.pointer_pos()
+    check(_p0 is not None, "`GetCursorPos` 读不到（真 Win32 这条路 ✗）")
+    _r = dinput.pointer_warp(_p0[0], _p0[1])
+    check(isinstance(_r, bool),
+          "`pointer_warp` 没回布尔（拨不动时上层没法判断 / 留痕 ✗）：%r" % (_r,))
+
+    pos = [100, 100]                    # 假指针：位置由测试说了算 ✓
+    warps = []
+    got = []                            # 每条回调：(dx, dy, 线程名)
+    warp_ok = [True]
+    _op, _ow = dinput.pointer_pos, dinput.pointer_warp
+    dinput.pointer_pos = lambda: (pos[0], pos[1])
+
+    def _fake_warp(x, y):
+        warps.append((x, y))
+        if warp_ok[0]:                  # 真拨回 ⇒ 假指针也跟着回钉点（模仿真实 ✓）
+            pos[0], pos[1] = int(x), int(y)
+        return warp_ok[0]               # ⚠ 拨不动就如实回 False（真 Windows 就这样 ✓）
+
+    dinput.pointer_warp = _fake_warp
+
+    def _wait(n, seq, tmo=2.0):
+        """等 `seq` 攒够 n 条：位置由测试摆好，线程下一拍就会看到 ✓
+        （确定性 ✓ 不靠猜时序 ✓）。
+
+        ⚠ 回调**记完位移之后**才拨回指针 ⇒ 断言 `warps` 前要**单独再等一拍** ✗
+          （只等 `got` 会在"回调已记、拨回还没发生"那一瞬看歪 ⇒ 用例随机红 ✓）。
+        """
+        t0 = _t.perf_counter()
+        while len(seq) < n and _t.perf_counter() - t0 < tmo:
+            _t.sleep(0.002)
+
+    t = dinput.PointerTracker(
+        (100, 100),
+        lambda dx, dy: got.append((dx, dy, _thr.current_thread().name)),
+        scale=2.0, interval=0.003)
+
+    def _move(dx, dy):
+        """把假指针从**当前位置**挪 (dx,dy) 物理像素。
+
+        ⚠ 必须这样建模（而不是写绝对坐标 ✓）：拨回成功时指针**已经回到钉点** ✓，
+          写绝对坐标会把"回到钉点"那一段也算进去 ⇒ 期望值看着像写错了 ✓（第一版就这么绕进去的 ✓）。
+        """
+        pos[0] += dx
+        pos[1] += dy
+
     try:
-        class _T:
-            def __init__(self):
-                self.stopped = 0
+        check(t.start(), "跟踪线程没起来（`GetCursorPos` 有值却起不来 ✗）")
+        _wait(len(got) + 1, got)                # 先空转一拍（第一拍没有"上一次"✓ settle ✓）
 
-            def stop(self):
-                self.stopped += 1
+        # ①② 挪两次 ⇒ 两条位移（按 scale=2 除回逻辑像素 ✓），每次都要拨回钉点
+        n0 = len(got)
+        _move(6, 0)                             # 6 物理像素 ⇒ 3 逻辑像素
+        _wait(n0 + 1, got)
+        _move(0, 10)                            # 再 10 ⇒ 5（拨回已生效 ⇒ 这次是纯 +y ✓）
+        _wait(n0 + 2, got)
+        _wait(2, warps)                         # 拨回发生在回调之后 ⇒ 单独等 ✓
+        # ⚠ 再晾几拍：**"我们拨回指针"这件事本身绝不许被读成位移** ✗ ——
+        #   `last` 没跟着挪到钉点的话，下一拍就会多一条反向位移（这里是 (-3,-5) ✓），
+        #   远程鼠标会每拍抖一下 ✓。假指针会立刻跟到钉点 ⇒ 这是**确定的红**、不是碰运气 ✓。
+        _t.sleep(0.05)
+        _d = [(dx, dy) for dx, dy, _n in got[n0:]]
+        check(_d == [(3.0, 0.0), (0.0, 5.0)],
+              "位移算得不对（该按 scale=2 除回逻辑像素 [(3,0),(0,5)]，实得 %r；"
+              "多出来的那条多半是「拨回指针」被读成了位移 ✗）" % (_d,))
+        check(len(warps) >= 2 and all(w == (100, 100) for w in warps),
+              "没把指针拨回钉点（那就成了「有限大的板子」✗，滑到屏幕边就动不了 ✓）：%r"
+              % (warps,))
+        _sum = (sum(dx for dx, _y in _d), sum(dy for _x, dy in _d))
+        check(_sum == (3.0, 5.0), "位移没守恒（丢/重复像素 ⇒ 鼠标会漏会跳 ✗）：%r" % (_sum,))
 
-        # ③ 整数发走、小数留着（3.4px ⇒ 发 3、留 0.4 ✓）
-        fake = SimpleNamespace(_pad_acc=[3.4, -1.7], _pad_idle=0, _pad_timer=_T())
-        PlayerPanel._flush_pad(fake)
-        check(sent == [(3, -1)], "累积位移没有合并成一条发出去：%r" % (sent,))
-        check(abs(fake._pad_acc[0] - 0.4) < 1e-9 and abs(fake._pad_acc[1] + 0.7) < 1e-9,
-              "小数部分被丢了（慢速滑动会丢位移 ✗）：%r" % (fake._pad_acc,))
+        # ③ 回调在跟踪线程里（不是主线程 ✓ 更不是"排队回 GUI"✗）
+        _names = sorted({n for _dx, _dy, n in got})
+        check(_names == ["pad-track"],
+              "回调不在跟踪线程里（线程名 %r）—— 那说明位移又绕回 Qt 事件循环了 ✗"
+              "（`moved` 信号是排队的 ⇒ 回 GUI 线程 ⇒ 又排在重绘后面 ✓）" % (_names,))
 
-        # ④ 没整像素 ⇒ 表停掉，不许空转
-        fake2 = SimpleNamespace(_pad_acc=[0.3, 0.4], _pad_idle=7, _pad_timer=_T())
-        before = len(sent)
-        PlayerPanel._flush_pad(fake2)
-        check(len(sent) == before, "不足 1px 也发了命令（空放 ✗）：%r" % (sent[before:],))
-        check(fake2._pad_timer.stopped == 1, "静下来没停表（会一直空转 ✗）")
+        # ④ 拨回失败 ⇒ 照样只算"这一拍真动了多少"（不许一次跳一大截、也不许一路算 0）
+        warp_ok[0] = False
+        n1 = len(got)
+        _move(10, 0)
+        _wait(n1 + 1, got)
+        _move(10, 0)
+        _wait(n1 + 2, got)
+        _d2 = [(dx, dy) for dx, dy, _n in got[n1:]]
+        check(_d2 == [(5.0, 0.0), (5.0, 0.0)],
+              "拨回失败时算的是 `pos - 钉点`（会一次跳一大截 ✗）：%r" % (_d2,))
 
-        # ① 每事件直发那条路必须**没了**（源码级，防止改回去 ✗）
-        src = (ROOT / "gui" / "player_panel.py").read_text(encoding="utf-8")
-        _body = src.split("def _on_pad_moved", 1)[1].split("def _flush_pad", 1)[0]
-        check("dinput.mouse_move(" not in _body,
-              "`_on_pad_moved` 又直接发命令了（每个事件一条 ⇒ 积压/一顿一顿回来 ✗）")
-        check("_flush_pad" in _body and "QTimer" in _body,
-              "没有起 8 ms 合并节拍（那就等于没改 ✗）")
+        # ⑤ stop 之后线程真的退出、也不再产生位移
+        _th_alive = t._th
+        t.stop()
+        _t.sleep(0.15)
+        check(_th_alive is not None and not _th_alive.is_alive(),
+              "`stop()` 之后跟踪线程还活着（会继续摸指针 ✗）")
+        _n_stop = len(got)
+        _t.sleep(0.05)
+        check(len(got) == _n_stop, "`stop()` 之后还在产生位移 ✗")
     finally:
-        dinput.mouse_move = _old
+        t.stop()                        # 幂等（已经停过就什么都不做 ✓）
+        dinput.pointer_pos, dinput.pointer_warp = _op, _ow
+
+    # ⑦ 面板出口：跟踪线程的原始位移 ⇒ 乘灵敏度 ⇒ **浮点**交给发送器（小数不许截 ✗）
+    class _S:
+        def __init__(self):
+            self.pushed = []
+
+        def push(self, dx, dy):
+            self.pushed.append((dx, dy))
+
+    _old_spd = _pp.settings.mouse_speed
+    try:
+        _pp.settings.mouse_speed = 2.0
+        fake = SimpleNamespace(_pad_sender=_S())
+        _pp.PlayerPanel._on_pad_tracked(fake, 3.4, -1.7)
+        _p = fake._pad_sender.pushed
+        check(len(_p) == 1 and abs(_p[0][0] - 6.8) < 1e-9 and abs(_p[0][1] + 3.4) < 1e-9,
+              "面板出口没乘灵敏度 / 把小数截了（慢速滑动会丢位移 ✗）：%r" % (_p,))
+    finally:
+        _pp.settings.mouse_speed = _old_spd
+
+    # ⑧ 源码钉（防哪天又悄悄把位移挪回 Qt 事件 / 挪回主线程 ✗）
+    #   ⚠ "**不许出现**某某"这类判据必须查 **AST 里的真实调用**，不能字符串匹配 ✗：
+    #     函数/类的说明文为了讲清病根**会写**`moved.emit` / `QCursor.setPos`（那是文字 ✓
+    #     不是代码 ✓）⇒ 字符串匹配会被自己的说明打红 ✓（第一次就是这么红的 ✓）。
+    import ast as _ast
+
+    def _code_calls(text, name=None):
+        """`text` 里**代码级**的调用（说明文字 / 注释不算 ✓）；给 `name` 就只查那个函数/类 ✓。"""
+        tree = _ast.parse(text)
+        if name is not None:
+            tree = next(n for n in _ast.walk(tree)
+                        if isinstance(n, (_ast.FunctionDef, _ast.ClassDef))
+                        and n.name == name)
+        return " ".join(_ast.dump(c) for c in _ast.walk(tree) if isinstance(c, _ast.Call))
+
+    tp = (ROOT / "gui" / "touchpad.py").read_text(encoding="utf-8")
+    _mv_calls = _code_calls(tp, "mouseMoveEvent")
+    check("moved" not in _mv_calls and "setPos" not in _mv_calls,
+          "`mouseMoveEvent` 里又**真的**调了 `moved.emit` / `QCursor.setPos` ⇒ 位移回到 Qt 事件里"
+          "产生了（GUI 一卡就成撮 ⇒ A 机一顿一顿回来 ✗）")
+    check("_start_track" in tp and "_stop_track" in tp and "set_delta_sink" in tp,
+          "触控板没有起停跟踪线程 / 没有那个「实时出口」✗")
+    check("timeBeginPeriod" not in _code_calls(tp),
+          "`gui/touchpad.py` 里调了 `timeBeginPeriod` —— 定时器精度只该 `core/winperf.py` 一处 ✓")
+
+    inp = (ROOT / "decision" / "input.py").read_text(encoding="utf-8")
+    _ptr = inp.split("def pointer_pos", 1)[1].split("class PointerTracker", 1)[0]
+    check("GetCursorPos" in _ptr and "SetCursorPos" in _ptr,
+          "指针读写没走 Win32（`GetCursorPos` / `SetCursorPos` ✓ 那是唯一能在非 GUI 线程跑的 ✓）")
+    check("QCursor" not in _ptr, "指针读写那里碰了 Qt（它要在非 GUI 线程里跑 ✗）")
+    _trk_calls = _code_calls(inp, "PointerTracker")
+    check("QCursor" not in _trk_calls,
+          "跟踪线程里**真的**碰了 Qt（非 GUI 线程调 `QCursor` 会偶发崩 ✗）")
+    check("timeBeginPeriod" not in _code_calls(inp),
+          "`decision/input.py` 里调了 `timeBeginPeriod` —— 定时器精度只该 `core/winperf.py` 一处 ✓")
+    check("pos[0] - last[0]" in inp,
+          "位移不是 `pos - 上一次`（拨回失败会一次跳一大截 ✗）")
+    check("pad_warp_fail" in inp,
+          "拨回失败没留痕（真出问题时「指针为什么跑掉了」会查不出来 ✗）")
+
+    pp = (ROOT / "gui" / "player_panel.py").read_text(encoding="utf-8")
+    check("set_delta_sink(self._on_pad_tracked)" in pp,
+          "面板没把位移出口接到跟踪线程上（那就又走 Qt 排队 ⇒ GUI 一卡就成撮 ✗）")
+    check("_on_pad_moved" not in pp and "_flush_pad" not in pp,
+          "面板还留着旧口径（经 Qt 事件的 8 ms 合并那条）✗")
+
+    # ⑨ 控件那条**接线**真起一次（`devicePixelRatioF` / 起 / 停 / 不留线程 ✓）——
+    #   ①②③④ 测的是**跟踪线程本身** ✓，这条测"触控板到底接上它没有" ✓
+    #   ⚠ 源码钉只能证明"写着"，证明不了"跑得起来" ✗（`devicePixelRatioF` 这类会当场炸 ✓）。
+    from PyQt5.QtWidgets import QApplication, QWidget
+
+    from gui.touchpad import TouchPad
+
+    # ⚠⚠ `QApplication` 必须**留个引用**（`_app = ...`）✗：写成
+    #   `QApplication.instance() or QApplication([])` 而不接住的话，PyQt 会在那条表达式
+    #   结束时把 app **析构掉** ✗ ⇒ 紧接着建 `QWidget()` 就是
+    #   `qFatal("Cannot create a QWidget without QApplication")` ⇒ 进程直接
+    #   **`0xC0000409`**（fail-fast ✓ **没有 traceback** ✓ 实测踩过 ✓ 靠逐行插桩才夹出来 ✓）。
+    _app = QApplication.instance() or QApplication([])
+    _host = QWidget()
+    _host.resize(800, 600)
+    _host.show()                     # 离屏平台 ⇒ 看不见 ✓ 只为让子控件"可见"（`grabMouse` 要 ✓）
+    pad = TouchPad(_host)
+    pad.set_delta_sink(lambda dx, dy: None)
+    try:
+        pad.set_active(True)
+        check(pad._tracker is not None and not pad._track_fail,
+              "触控板激活后没接上跟踪线程（板子会像坏的一样、一个字都不说 ✗）")
+        check("pad-track" in [t.name for t in _thr.enumerate()],
+              "没有 `pad-track` 线程在跑（激活等于没做 ✗）")
+    finally:
+        pad.set_active(False)
+    _t.sleep(0.2)
+    check(pad._tracker is None, "停用后没清掉 `_tracker`（下次激活会漏掉旧线程 ✗）")
+    check("pad-track" not in [t.name for t in _thr.enumerate()],
+          "停用后 `pad-track` 线程还在（关了还在后台摸指针 ✗）")
 
 
 def t_kbd_stats_reports_backlog():
@@ -508,14 +687,82 @@ def t_kbd_pending_is_sampled():
         c._sample_pending()
     check(rec and rec[-1][0] == "kbd_pending" and rec[-1][1] == 3,
           "在飞条数没进 `perf`：%r" % (rec,))
-    check(rec[-1][2].get("min_gap") == 1.0,
-          "没定频（连续量 ⇒ 每拍一条会把 `perf.log` 刷爆 ✗）：%r" % (rec[-1],))
+    # ⚠⚠ 2026-10-05 修正：**这里原来断言 `min_gap=1.0`，是错的** ✗ —— `core.perf.sample`
+    #   只吃 `(name, value)`（**没有 kwargs** ✓ 见它的签名 ✓），写成 `min_gap=` 会抛
+    #   `TypeError`，而调用处包着 `try/except` ⇒ 从写出来那天起**一条样本都没进过**
+    #   （全历史 1497 段里 `kbd_pending` 0 条 ✗）—— 这正是 `_sample_pending` docstring 里
+    #   那个"哑弹藏了三个月"✓。⇒ 现在钉的变成**相反的两件**：样本进得去 + **源码里不许再写
+    #   `min_gap=`**（防哑弹回来 ✓）。
+    check(rec[-1][2] == {},
+          "`perf.sample` 收到了多余关键字（`core.perf` 不吃 `min_gap=` ⇒ 会被静默吞掉 ✗）：%r"
+          % (rec[-1],))
+    _kc_src = (ROOT / "remote_kbd" / "kbd_client.py").read_text(encoding="utf-8")
+    _body = _kc_src.split("def _sample_pending(self):", 1)[1]
+    _body = _body.split("\n    def ", 1)[0]
+    # ⚠ 只扫**代码**：那段历史说明（docstring）里**故意写着** `min_gap=` 这几个字 ✓
+    #   （"别写它、为什么" ✓）⇒ 连注释一起扫会误报 ✗
+    _code = _body.split('"""', 2)[2] if _body.count('"""') >= 2 else _body
+    check("min_gap" not in _code,
+          "`_sample_pending` 里又写了 `min_gap=`（`core.perf.sample` 只吃 (name, value) ⇒ "
+          "TypeError 被吞 ⇒ 这条曲线重新变哑弹 ✗）")
 
     src = (ROOT / "remote_kbd" / "kbd_client.py").read_text(encoding="utf-8")
     check("def _sample_pending(self):" in src, "`_sample_pending` 没定义 ✗")
     check(src.count("self._sample_pending()") == 2,
           "调用点不是 2 处（`send()` 记涨 / `_take_rtt()` 记落 ⇒ 缺一处就只涨不落 ✗）：%d"
           % src.count("self._sample_pending()"))
+
+
+def t_pad_sender_off_gui_thread():
+    """⭐⭐ 触控板位移**由独立线程发**（用户 2026-10-05 ✓ 原话："B机F10控制A机鼠标，A机的鼠标
+    移动不连续"）。
+
+    病根（2026-10-03 那次只治了一半 ✗）：那时做了"累积 + 8 ms 合并" ✓，但**发送仍在 GUI
+    主线程**里同步调 `dinput.mouse_move` ✗ —— 它要等 socket + 背压
+    （`kbd_rtt_ms` 中位 **11 ms**、p95 更大 ✓），而主线程还要画（`draw_ms` 中位 5 /
+    p99 15~22 ms ✓）⇒ 那个"8 ms 节拍"实际是"**何时腾出手何时发**" ✗ ⇒ 一次发一大坨
+    ⇒ **A 机鼠标一顿一顿** ✓。
+    方子同 `decision/manual_input` 2026-10-02 那次 ✓：**上游只入队，发送归独立线程** ✓
+    （⚠ 2026-10-05 又查一层：上游"产生位移"那段也是挂在 GUI 事件上的 ✗ ⇒ 一并挪进
+    `PointerTracker` 独立线程 ✓ 见 `t_pad_delta_from_tracker` ✓）。
+
+    钉四件：
+      ① **`push()` 绝不阻塞**（假发送睡 120 ms ⇒ push 十次总耗时 < 5 ms ✓）—— 这是
+         "GUI 不被拖住"的全部保证 ✓；
+      ② **位移守恒**（多慢都一像素不丢：发出去的和 == 推进去的和 ✓）；
+      ③ **合并生效**（推得快 + 发得慢 ⇒ 发出条数 < 推入次数 ✓，但总量仍然守恒 ✓）；
+      ④ `stop()` 之后线程真的退出 ✓。
+    """
+    import time as _t
+
+    from gui.player_panel import _PadSender
+    from decision import input as dinput
+
+    sent = []
+    _old = dinput.mouse_move
+    dinput.mouse_move = lambda dx, dy: (sent.append((dx, dy)), _t.sleep(0.12))
+    s = _PadSender()
+    try:
+        # ① push 绝不阻塞（发送慢 120ms/条也拖不住它 ✓）
+        _t0 = _t.perf_counter()
+        for _i in range(10):
+            s.push(3, 1)                  # 共 30/10 px
+        _push_ms = (_t.perf_counter() - _t0) * 1000.0
+        check(_push_ms < 5.0,
+              "`push()` 被发送拖住了（%.1f ms ⇒ GUI 照样卡 ⇒ A 机一顿一顿 ✗）" % _push_ms)
+        # ②③ 等它把活干完（慢发送 120ms/条 ⇒ 给足时间），位移必须守恒、且确实合并过
+        _t.sleep(1.2)
+        check(sum(x for x, _y in sent) == 30 and sum(y for _x, y in sent) == 10,
+              "位移没守恒（丢像素 ⇒ 鼠标会跳/漏 ✗）：%r" % (sent,))
+        check(s.n_sent < s.n_push,
+              "没有合并（推 %d 次发了 %d 条 —— 等于每条单独发 ✗）" % (s.n_push, s.n_sent))
+        # ④ stop 之后线程退出（别留守护线程 ✓）
+        s.stop()
+        _t.sleep(0.3)
+        check(not s._th.is_alive(), "`stop()` 之后发送线程还活着 ✗")
+    finally:
+        dinput.mouse_move = _old
+        s.stop()
 
 
 TESTS = (
@@ -530,8 +777,10 @@ TESTS = (
      t_relay_trace_has_ms_timestamp),
     ("⭐⭐ A 机日志回传到 B 机（`#LOG` ⇒ `A_relay_trace.log`；不许污染回执计数）",
      t_a_logs_are_forwarded_to_b),
-    ("⭐⭐ 触控板位移累积 + 8 ms 合并成一条（位移守恒、静下来停表）",
-     t_pad_move_is_coalesced),
+    ("⭐⭐⭐ 触控板位移由**跟踪线程**产生（固定节拍 / 守恒 / 不经 Qt 事件；用户 2026-10-05）",
+     t_pad_delta_from_tracker),
+    ("⭐⭐ 触控板位移**由独立线程发**（push 不阻塞 / 守恒 / 合并 / stop 退出；用户 2026-10-05）",
+     t_pad_sender_off_gui_thread),
     ("⭐⭐⭐ A 侧把「键盘这条」也汇报给 B（发送率 / 写串口耗时 / 固件完成率 ⇒ 积压判据）",
      t_kbd_stats_reports_backlog),
     ("⭐⭐ A 侧 `trace()` 只推一次 + 回传绝不阻塞命令转发（队列满丢最旧）",

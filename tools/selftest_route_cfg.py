@@ -128,6 +128,54 @@ def t_apply_only_touches_param_keys():
     check(n >= 3, "返回值该报「真的灌了几项」：%r" % (n,))
 
 
+def t_no_chase_path_is_per_map():
+    """⭐ 「**禁用杀怪寻路**」**按地图 id 存**（用户 2026-10-06 ✓ 原话："**从此 禁用杀怪寻路就是
+    按地图id存的数据，而不是在设置里全局一份**"✓）。
+
+    为什么该按图：它决定的是"**这张图**要不要用寻路追怪"（寻路成不成立是**图**的属性 ✗），
+    跟"这个项目"不是一回事 —— 换图不该把它带过去，两张图各配各的 ✓。
+
+    钉四件：
+      ① 它在 `route_cfg.PARAM_KEYS` 里 ✓（登记了就自动"读 / 写 / 播种"三处齐 ✓）；
+      ② **按图隔离**：A 图开了 ⇒ B 图那份**读不到它** ✓（这正是这一套要治的"串图" ✗）；
+      ③ `apply_route_cfg` 能灌**真布尔**（开 ✓ 关 ✓ 都行）；
+      ④ ⚠ 手改坏的文件里写成 `"false"` **字符串** ⇒ **保留原值** ✗ ——
+         `bool("false")` 是 **True**（意思正好反了 ✗ 最坑 ✓）⇒ 那种值一律不收 ✓。
+    """
+    from core import route_cfg
+    from decision.agent import DecisionSettings
+
+    check("disable_chase_pathfinding" in route_cfg.PARAM_KEYS,
+          "没登记进 `PARAM_KEYS` ⇒ 它还是**按项目/全局**那份（用户 2026-10-06 要按图 ✗）：%r"
+          % (route_cfg.PARAM_KEYS,))
+
+    def run(_tmp=None):                         # ⚠ `_with_map_dir` 会传一个临时目录进来 ✓
+        route_cfg.save("700", {"disable_chase_pathfinding": True})
+        route_cfg.save("701", {"jump_start_px": 5})
+        check(route_cfg.load("700")["disable_chase_pathfinding"] is True,
+              "A 图没存住：%r" % (route_cfg.load("700"),))
+        check("disable_chase_pathfinding" not in (route_cfg.load("701") or {}),
+              "B 图读到了 A 图的开关 ⇒ 串图 ✗（按图存的意义就在这儿）：%r"
+              % (route_cfg.load("701"),))
+
+    _with_map_dir(run)
+
+    s = DecisionSettings()
+    s.disable_chase_pathfinding = False
+    s.apply_route_cfg({"disable_chase_pathfinding": True})
+    check(s.disable_chase_pathfinding is True,
+          "按图那份灌不进 settings（那按图存就白存了 ✗）：%r" % (s.disable_chase_pathfinding,))
+    s.apply_route_cfg({"disable_chase_pathfinding": False})
+    check(s.disable_chase_pathfinding is False, "关也灌不回来：%r" % (s.disable_chase_pathfinding,))
+    # ⚠ 原值必须取 **False** ✗ —— 拿 True 当原值时，坏值被错误收成 True 也**看不出来** ✗
+    #   （这条我自己先踩过一次：反向验证"居然过了"⇒ 说明用例没钉住 ✓ 现在这样才钉得住 ✓）。
+    s.disable_chase_pathfinding = False
+    s.apply_route_cfg({"disable_chase_pathfinding": "false"})
+    check(s.disable_chase_pathfinding is False,
+          "手改坏的 `\"false\"` 字符串被收下了 ⇒ `bool(\"false\")` 是 **True** ✗"
+          "（意思正好反了，最坑 ✓ 该保留原值 ✗）：%r" % (s.disable_chase_pathfinding,))
+
+
 def t_seed_comes_from_homes_not_from_memory():
     """③ **播种取自老家**（project.yaml / live.yaml ✓），**不是** settings 当前值 ✗。"""
     import gui.route_panel as rpmod
@@ -300,8 +348,11 @@ def t_wiring_is_in_place():
 TESTS = (
     ("按图存读：往返 + **两图互不影响** +「没配过」与「清空」分得开",
      t_roundtrip_and_two_maps_do_not_mix),
-    ("`apply_route_cfg` 只认 6 个参数键（别的键一个都不许动）+ 类型/坏值口径",
+    ("`apply_route_cfg` 只认 `PARAM_KEYS` 里的键（别的键一个都不许动）+ 类型/坏值口径",
      t_apply_only_touches_param_keys),
+    ("⭐ 「禁用杀怪寻路」**按地图 id 存**（用户 2026-10-06）：两图隔离 / 真布尔灌得进 / "
+     "`\"false\"` 字符串不收（`bool(\"false\")` 是 True ✗ 意思正好反了）",
+     t_no_chase_path_is_per_map),
     ("播种取自「老家」（project.yaml / live.yaml）——**不是** settings 内存值（否则串图 ✗）",
      t_seed_comes_from_homes_not_from_memory),
     ("切图/换项目是**只读**：一个字都不许写（现场踩过：播种写盘 ⇒ 假值污染真配置）",

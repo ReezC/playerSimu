@@ -27,6 +27,14 @@ from core.context import ConsoleContext, TaskContext
 
 CLASS_MOB = 1       # 类别表见 perception/classes.py（id 固定，别在本地另立一份）
 CLASS_PLAYER = 0
+#: ⭐ 掉落物（用户 2026-10-04 ✓）：**照 `perception/classes.py` 导入**（别在本地另立一份 ✗ ——
+#:   上面那两个是历史遗留的本地副本 ✓ 新的一律从类别表拿 ✓）。
+from perception.classes import CLASS_DROP, CLASS_PET               # noqa: E402
+#: 每个 mode 只合并**这一类**，`summary` 里用哪个中文名 —— **一处口径** ✓
+#: （加一类只改这张表 ✓ 别在下面各处再写 `if mode == ...` ✗）。
+MODE_CLASS = {"mob": CLASS_MOB, "player": CLASS_PLAYER, "drop": CLASS_DROP,
+              "pet": CLASS_PET}
+MODE_ZH = {"mob": "怪物", "player": "玩家", "drop": "掉落物", "pet": "宠物"}
 OVERLAP_THR = 0.3     # 和已有框的 IoU 超过它就认为重复，丢弃
 
 
@@ -215,7 +223,8 @@ def run_yolo_augment(params, ctx=None):
         weights           权重文件
         frames            画面目录
         out               标注目录（labels_auto，已有模板匹配标注）
-        mode              "mob" 只辅助怪物 / "player" 只辅助玩家（默认 mob）
+        mode              "mob" 只辅助怪物 / "player" 只辅助玩家 / "drop" 只补掉落物
+                          （默认 mob；类别号见 `MODE_CLASS` ✓ 一处口径 ✓）
         player_id         当前项目的玩家角色（mode=player 时用）
         weights_player_id 权重所属项目的玩家角色（mode=player 时要求 == player_id）
         conf              置信度阈值（默认 0.40，比模板匹配宽松以补召回）
@@ -274,6 +283,16 @@ def run_yolo_augment(params, ctx=None):
                 % (weights_player_id or "（无）", player_id or "（无）"))
         allowed = {CLASS_PLAYER}
         ctx.log("置信度 %.2f   只合并 class 0（玩家，角色已匹配）" % conf)
+    elif mode == "drop":
+        # ⭐ 掉落物（用户 2026-10-04 ✓）：与怪物同一套"只补不覆盖"的合并逻辑 ✓，
+        #   只是类别号不同（class 2 ✓）—— 模型吐 class 2 的框才要 ✓。
+        allowed = {CLASS_DROP}
+        ctx.log("置信度 %.2f   只合并 class %d（掉落物）" % (conf, CLASS_DROP))
+    elif mode == "pet":
+        # ⭐ 宠物（用户 2026-10-04 ✓ 方案 C ✓）：同上，类别号 **class 5（宠物）** ✓
+        #   —— 它是"干扰类"（标它只为让模型学会区分宠物 vs 怪 ✓ 见 `perception/classes.py` ✓）。
+        allowed = {CLASS_PET}
+        ctx.log("置信度 %.2f   只合并 class %d（宠物）" % (conf, CLASS_PET))
     else:
         allowed = {CLASS_MOB}
         ctx.log("置信度 %.2f   只合并 class 1（怪物）" % conf)
@@ -367,8 +386,7 @@ def run_yolo_augment(params, ctx=None):
         "seconds": dt,
         "weights": str(weights),
         "summary": "补充 %d 框 / %d 帧（%s）"
-                   % (n_boxes, n_merged,
-                      "玩家" if mode == "player" else "怪物"),
+                   % (n_boxes, n_merged, MODE_ZH.get(mode, "怪物")),
     }
 
 

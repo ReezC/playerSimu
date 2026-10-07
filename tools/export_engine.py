@@ -94,8 +94,12 @@ def pt_for(weights):
       ⇒ 走"按钮一键导出" ✓。）
 
     · 给 `.pt`      ⇒ 就是它 ✓；
-    · 给 `.engine`  ⇒ **同目录同名的 `.pt`**（引擎就是从它导出来的 ✓ 实测
-      `寺院通道2/models/detect_v5.engine` 旁边正有 `detect_v5.pt` ✓）；
+    · 给 `.engine`  ⇒ **同目录的 `.pt`** ✓ —— 先找"**名字一模一样**"那份 ✓
+      （`detect_v5.engine` ↔ `detect_v5.pt` ✓）；**找不到就再试一次"去掉结尾尺寸"** ✓✗
+      （`detect_v5_960.engine` ↔ `detect_v5.pt` ✓ —— ⚠⚠ **2026-10-05 补的** ✗✗：本模块自己把引擎
+       改名成 `<pt名>_<尺寸>.engine` ✗（见 `export_for` ✓），可这里原来只认"同名"✗
+       ⇒ **凡是用带尺寸的引擎，就必然弹出"找不到 detect_v5_960.pt"** ✓✓（用户 2026-10-05 撞上 ✓
+       —— 而旁边明明躺着 `detect_v5.pt` ✗）。⇒ 补这一步"**去掉结尾 `_数字` 再试**" ✓）；
     · 找不到 ⇒ 返回 `(None, 原因)` ✓ —— **不许猜** ✗（别自己去 `runs/**/best.pt` 里翻一个 ✗：
       那多半不是这份引擎的来源，按它导出来的东西会**名字对、内容错** ✓）。
     返回 `(Path | None, 说明文本)` ✓。
@@ -110,6 +114,17 @@ def pt_for(weights):
         cand = p.with_suffix(".pt")
         if cand.exists():
             return cand, ""
+        # ⭐⭐⭐⭐⭐ **带尺寸的引擎**（`<pt名>_<尺寸>.engine` ✓ = 本模块自己导出的默认名 ✓）：
+        #   去掉结尾的 `_数字` 再找一次 ✓（`detect_v5_960.engine` ⇒ `detect_v5.pt` ✓）。
+        import re
+        _base = re.sub(r"_\d+$", "", p.stem)
+        if _base and _base != p.stem:
+            cand2 = p.with_name(_base + ".pt")
+            if cand2.exists():
+                return cand2, ""
+            return None, ("找不到 %s —— 引擎是从一份 .pt 导出来的，同目录那份不在"
+                          "（找过 %s 和 %s）。\n请把该 .pt 放回 %s，或者把「权重」改选成 .pt 再导。"
+                          % (cand2.name, cand.name, cand2.name, p.parent))
         return None, ("找不到 %s —— 引擎是从一份 .pt 导出来的，同目录同名的那个不在。\n"
                       "请把该 .pt 放回 %s，或者把「权重」改选成 .pt 再导。"
                       % (cand.name, p.parent))

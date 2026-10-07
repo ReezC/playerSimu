@@ -1,12 +1,12 @@
 {
-  "frames": 206,
-  "boxes": 717,
-  "zero_frames": 29,
-  "max_boxes": 13,
-  "median_boxes": 3.0,
-  "size_median": 98.99531706160651,
-  "size_p10": 79.36404605049145,
-  "size_p90": 227.28810334023203,
+  "frames": 512,
+  "boxes": 3077,
+  "zero_frames": 2,
+  "max_boxes": 18,
+  "median_boxes": 6.0,
+  "size_median": 72.89024049872246,
+  "size_p10": 42.98850730137068,
+  "size_p90": 218.5137375929997,
   "img_size": [
     1920,
     1080

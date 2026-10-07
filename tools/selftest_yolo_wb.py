@@ -13,8 +13,11 @@
   ⑦ 标注页**筛选/排序** + **复制/粘贴/撤销** + 选帧弹窗 + 训练页按清单出 yaml
      （2026-09-30 用户要的四件 ✓）。
 """
+import os
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import cv2
@@ -391,12 +394,196 @@ def test_window_features():
         app.processEvents()
 
 
+# ══════════════════════════════════════════════════════════
+# ⭐⭐⭐⭐⭐ **Job Object：父进程一死（崩溃/强杀）⇒ 整棵树被系统收走**（用户 2026-10-05 ✓）
+# ══════════════════════════════════════════════════════════
+_NOWIN = 0x08000000          # CREATE_NO_WINDOW（与 `deploy/runner` / `core/procguard` 同一处口径 ✓）
+_PJ = {}                     # 记号文件路径（每次用例开头重建 ✓）
+
+
+def _pj_paths(d):
+    return {"father": d / "father_pid.txt", "train": d / "train_pid.txt",
+            "gc_up": d / "gc_up.txt", "gc_late": d / "gc_late.txt"}
+
+
+def _pj_scripts(d, guard):
+    """把**三级**脚本写进临时目录 ✓（⚠ 写成文件、**不用** `-c` 一锅串 ✗：三层嵌套的引号+换行
+    没人看得懂 ✓）。
+
+    形状**照真实那棵树**搭 ✓（这很重要 ✗ —— 只测一级的话，恰好绕过"孙进程才是最麻烦的"那点 ✓）：
+      父亲（= 工作台 ✓）→ 训练（= `QProcess` 那个 ✓）→ **孙进程**（= `ultralytics` 的 dataloader ✓
+      —— 它才是"没窗口、还在干活、单杀还不一定干净"的那个 ✓）。
+    """
+    _gc = d / "gc.py"                                  # 孙进程：报到 ✓ → 睡 6 秒 → 再报到 ✓
+    _gc.write_text(
+        "import os, time\n"
+        "open(r'%s', 'w', encoding='utf-8').write(str(os.getpid()))\n"
+        "time.sleep(6)\n"
+        "open(r'%s', 'w', encoding='utf-8').write('late')\n"
+        % (_PJ["gc_up"], _PJ["gc_late"]), encoding="utf-8")
+    _tr = d / "train.py"                               # 训练：报到 ✓ → 叉一个孙进程 ✓ → 一直睡 ✓
+    _tr.write_text(
+        "import os, subprocess, sys, time\n"
+        "open(r'%s', 'w', encoding='utf-8').write(str(os.getpid()))\n"
+        "subprocess.Popen([sys.executable, r'%s'])\n"
+        "time.sleep(300)\n" % (_PJ["train"], _gc), encoding="utf-8")
+    _fa = d / "father.py"                              # 父亲：可选 `guard` ✓ → 起训练 ✓ → 一直睡 ✓
+    _fa.write_text(
+        "import os, subprocess, sys, time\n"
+        "sys.path.insert(0, r'%s')\n"
+        "%s"
+        "open(r'%s', 'w', encoding='utf-8').write(str(os.getpid()))\n"
+        "p = subprocess.Popen([sys.executable, r'%s'])\n"
+        "%s"
+        "time.sleep(300)\n"
+        % (str(Path(__file__).resolve().parent.parent),
+           "from core import procguard\n" if guard else "",
+           _PJ["father"], _tr,
+           "procguard.guard(p.pid)\n" if guard else ""), encoding="utf-8")
+    return _fa
+
+
+def _pj_wait(path, timeout):
+    _t0 = time.time()
+    while time.time() - _t0 < timeout:
+        if path.exists():
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _pj_int(path):
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except Exception:                                  # noqa: BLE001
+        return 0
+
+
+def _pj_kill(pid, tree=False):
+    """杀一个 pid ✓。`tree=False` ⇒ **只杀它自己**（⚠ 这一档才是"**父进程自己死了**"那条路 ✓✓——
+    崩溃 / 任务管理器"结束进程"都是这样 ✓）；`tree=True` ⇒ 连树杀（**收尾**用 ✓）。
+
+    ⚠⚠ **踩过的坑**（很值 ✓）：我第一版"强杀父亲"也用了 `/T` ✗ ⇒ **两轮都被我自己连树杀了** ✗
+    ⇒ 反面那条立刻红 ✓（它红得**完全正确** ✓）—— 也就是说：如果不带这个反面，
+    这条用例会**假绿**（还以为 job 在起作用 ✗，其实是 `taskkill /T` 干的 ✓）。
+    """
+    if pid:
+        _cmd = ["taskkill", "/F", "/PID", str(int(pid))]
+        if tree:
+            _cmd.insert(1, "/T")
+        subprocess.run(_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       creationflags=_NOWIN)
+
+
+def test_procguard_kills_tree():
+    """⭐⭐⭐⭐⭐ **父进程一死（崩溃 / 强杀）⇒ 整棵树被系统收走**（用户 2026-10-05 ✓ 原话：
+    "**把训练/验证子进程塞进一个 Job Object（KILL_ON_JOB_CLOSE ✓）⇒ 父进程一死（崩溃、强杀
+    都算 ✓）整棵树被系统收走**" ✓✓ 见 `core/procguard.py` ✓）。
+
+    ⚠⚠ **实测病根**（用户问"有没有杀不掉的死进程" ✓）：`gui/yolo_workbench.py` 原来**关窗根本
+      不管**训练子进程 ✗ ⇒ 父进程退了它**照样在干活** ✗✗；而 `ultralytics` 自己还会叉
+      **dataloader 孙进程** ✗ ⇒ 留下一棵**看不见的进程树** ✓（没窗口、显存占着 ✓）= 用户说的
+      "杀不掉" ✓。
+
+    钉两条（一正一反 ✓）：
+      ① **父亲 `guard` 过** ⇒ `taskkill /F` **强杀父亲**（= 崩溃那条路 ✓ 走不到 `closeEvent` ✓）
+         ⇒ **孙进程永远不写"还在干活"** ✓（= 内核把整棵树收走了 ✓；
+         ⚠ 没这套 ⇒ 它会写 ⇒ 这条红 ✗✗）；
+      ② **反面：父亲没 `guard`** ⇒ 同一个强杀 ⇒ 孙进程**照写** ✓（= 证明"**是 job 在起作用**" ✓
+         —— ⚠ 一刀切以为"`taskkill` 会连树杀"就错了 ✗：`/T` 只在**按父 pid 杀**时才连树，
+         而"**父进程自己死掉**"这件事**没人去杀** ✓）。
+    ⚠ 非 Windows / 本机 `AssignProcessToJobObject` 不可用 ⇒ **跳过** ✓（退回老行为，不假绿 ✓）。
+    ⚠ 夹具**自己不留尾巴** ✓：两轮跑完都把"父亲/训练/孙进程"三个 pid 连根清一遍 ✓。
+    """
+    if os.name != "nt":
+        check(True, "跳过 Job Object 用例（非 Windows ⇒ `procguard` 空转 ✓）")
+        return
+    import core.procguard as PG
+    global _PJ
+    # ⚠ 先**用一个扔掉的子进程**试这套 API 在不在（**绝不能拿自己试** ✗：那会把自己也塞进 job ✓）
+    _pr = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.2)"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=_NOWIN)
+    _usable = PG.guard(_pr.pid)
+    _pr.wait(timeout=10)
+    if not _usable:
+        check(True, "跳过 Job Object 用例（本机 `AssignProcessToJobObject` 不可用 ⇒ 退回老行为 ✓）")
+        return
+
+    def _run(guard):
+        global _PJ                                  # ⚠ 少了这句 ⇒ `_pj_scripts` 读到的还是空字典 ✗（踩过 ✓）
+        _d = Path(tempfile.mkdtemp(prefix="pj_"))
+        _PJ = _pj_paths(_d)
+        _fa = _pj_scripts(_d, guard)
+        _f = subprocess.Popen([sys.executable, str(_fa)],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              creationflags=_NOWIN)
+        if not _pj_wait(_PJ["gc_up"], 25.0):            # 孙进程报到（首次 import 可能慢 ✓）
+            for _k in ("father", "train", "gc_up"):
+                _pj_kill(_pj_int(_PJ[_k]))
+            _pj_kill(_f.pid)
+            return None
+        # ⚠ **强杀父亲**（= 崩溃 / 任务管理器"结束进程" ✓ —— 走不到 `closeEvent` ✓）——
+        #   ⚠⚠ **必须只杀它自己**（`tree=False` ✓ 不带 `/T` ✗✗）：真实那条路**没有人**连树杀 ✓
+        _pj_kill(_f.pid, tree=False)
+        time.sleep(8.0)                                 # 孙进程 6 秒后才写「还在干活」✓
+        _late = _PJ["gc_late"].exists()
+        _pids = [_pj_int(_PJ[_k]) for _k in ("father", "train", "gc_up")]
+        for _p in _pids + [_f.pid]:                     # 收尾：**连根清** ✓（这里才用 `/T` ✓）
+            _pj_kill(_p, tree=True)
+        return _late, _pids
+
+    _g = _run(True)
+    check(_g is not None and not _g[0],
+          "① **父亲 `guard` 过 ⇒ 强杀父亲 ⇒ 孙进程不再干活** ✓（实测「还在干活」= %s ✓〔要 False ✓〕；"
+          "涉及 pid %s ✓）—— ⚠ 没这套 ⇒ 它会写 ⇒ 这条红 ✗✗（= 用户报的那棵看不见的进程树 ✓）"
+          % ("-" if _g is None else _g[0], "-" if _g is None else _g[1]))
+    _n = _run(False)
+    check(_n is not None and _n[0],
+          "② **反面：父亲没 `guard` ⇒ 孙进程照旧在干活** ✓（实测「还在干活」= %s ✓〔要 True ✓〕；"
+          "pid %s ✓ —— ⚠ 这正是修前的行为 ✓ = 证明**是 job 在起作用** ✓，不是 `taskkill` 自己连树"
+          " ✗：`/T` 只在按父 pid 杀时才连树，而「父进程自己死掉」这件事没人去杀 ✓）"
+          % ("-" if _n is None else _n[0], "-" if _n is None else _n[1]))
+
+
+def test_procguard_wired():
+    """⭐⭐⭐⭐⭐ **"栽进 job"与"连树杀"在界面上真的接上了**（用户 2026-10-05 ✓）。
+
+    ⚠ 为什么盯**源码**✗（不是行为 ✗）：真跑一遍训练要权重 + 数据集 + 几分钟 ✓（本套件
+      `test_window` 开头就写明"不跑训练"✓）⇒ 走**源码级**那一套 ✓（同 `selftest_lie_demo.
+      test_white_area_wired` ✓ 的手法 ✓）—— 钉的是"**接口还在不在**"✓，
+      行为那一半由上面 `test_procguard_kills_tree` 量 ✓。
+    ⚠ 四条缺一不可 ✓：
+      ① 训练页 `QProcess` 起来时**栽进 job** ✓；
+      ② 验证页（**另一个类** ✗）也得栽 ✓（所以 `guard_qprocess` 抽成模块级函数 ✓）；
+      ③ 「停止」按钮要**连树**杀 ✓（⚠ 退回 `self._proc.kill()` ⇒ 只杀直接孩子 ⇒ dataloader
+         孙进程留下 ✗✗ = 用户报的那条 ✓）；
+      ④ 关窗要**问一句 + 连树杀 + `release()` 清场** ✓（⚠ 只做 ① 不做 ④ ⇒ **正常关窗**时
+         子进程还在跑 ✗（job 只在**本进程死掉**时才兜底 ✓ —— 而工作台关窗后本进程就退 ✓，
+         所以 ④ 主要防"窗口关了但进程还在"那种情形 ✓，也算把话说清楚 ✓）。
+    """
+    _src = Path(W.__file__).read_text(encoding="utf-8")
+    check("self._proc.started.connect(lambda: guard_qprocess(self._proc))" in _src,
+          "① **训练页起来就栽进 job** ✓（`_proc.started → guard_qprocess` ✓ —— ⚠ 删掉这句 ⇒ 立刻红 ✗）")
+    check("self._vproc.started.connect(lambda: guard_qprocess(self._vproc))" in _src,
+          "② **验证页也栽了** ✓（⚠ 它是**另一个类** ✗ ⇒ `guard_qprocess` 必须是模块级的 ✓）")
+    check("procguard.kill_tree(int(self._proc.processId()))" in _src,
+          "③ **「停止」连树杀** ✓（`kill_tree` ＋ `kill()` 兜底 ✓ —— ⚠ 退回只 `kill()` ⇒ "
+          "dataloader 孙进程留下 ✗✗）")
+    check("procguard.kill_tree(int(_p.processId()))" in _src and "procguard.release()" in _src
+          and "还在跑" in _src and "e.ignore()" in _src,
+          "④ **关窗：问一句 ＋ 连树杀 ＋ `release()` 清场** ✓（缺一样 ⇒ 红 ✗ —— "
+          "`release()` 是把 job 里剩下的一网打尽 ✓）")
+
+
 def main():
     print("yolo工作台自检：")
     test_pure()
     test_window()
     test_window_features()
     test_settings_dialog_builds()
+    test_procguard_kills_tree()
+    test_procguard_wired()
     if _FAILED:
         print("自检：%d 条失败" % len(_FAILED))
         return 1

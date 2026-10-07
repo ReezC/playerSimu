@@ -7,7 +7,9 @@
 """
 
 import faulthandler
+import os
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -119,10 +121,52 @@ def _install_crash_handlers():
     sys.excepthook = hook
 
 
+#: ⭐⭐ **「关了必须走 / 卡住不许烧核」的两道看门狗**（用户 2026-10-05 ✓ 原话："保证以后
+#:   不要关了该占进程就行"）。为什么必须做成代码里的硬保证、而不是"下次注意"：
+#:   实测有 **4 个工作台进程卡在启动里烧满一个核、烧了 25.7 小时** ✗（`py-spy` 抓栈：
+#:   `theme._row_title_of` 那个已经修掉的死循环 ✓ —— 当时窗口**从来没出来**、进程活着、
+#:   没有任何异常 ⇒ 用户看到的就是"打不开 + 机器变卡"✓）。这类 bug 写下去能跑、不报错、
+#:   只是卡 ✗ ⇒ **只能靠一个到点就动手的东西兜底** ✓。
+#: 退出码分开（看日志一眼知道卡在哪一段 ✓）：**3 = 启动卡住** / **4 = 收尾卡住** ✓。
+WATCHDOG_STARTUP_S = 90.0
+WATCHDOG_EXIT_S = 20.0
+
+
+def _arm_watchdog(seconds, tag, done, code):
+    """起一条守护线程：`seconds` 秒后若 `done` 还没置上 ⇒ **留栈 + 强制退出** ✓。
+
+    · 留栈：`faulthandler.dump_traceback()` 写进 `crash.log`（**哪个线程卡在哪一行** ✓
+      —— 这正是这次定位 4 个僵尸进程用的那份证据 ✓）；
+    · 强制退出：`os._exit(code)` ✓ —— **不走解释器收尾**（卡住的收尾本来就是元凶 ✗）。
+    ⚠ 正常路径**绝不会**被误杀：`done` 一置上它就安静退出 ✓（用例钉着这条 ✓）。
+    ⚠ 只是"守护线程 + 等事件"，不 join、不占 CPU ✓。
+    """
+    def _fire():
+        if done.wait(timeout=max(0.1, float(seconds))):
+            return
+        try:
+            with open(CRASH_LOG, "a", encoding="utf-8") as fh:
+                fh.write("\n=== %s看门狗触发（%s：%.0f 秒没走完）===\n"
+                         % (tag, time.strftime("%Y-%m-%d %H:%M:%S"), seconds))
+                faulthandler.dump_traceback(fh)
+                fh.write("=== 已强制退出（exit=%d）—— 上面那份栈就是卡住的地方 ===\n"
+                         % int(code))
+        except Exception:                            # noqa: BLE001 —— 留不下证据也要退 ✗
+            pass
+        os._exit(int(code))
+
+    th = threading.Thread(target=_fire, name="watchdog-%s" % tag, daemon=True)
+    th.start()
+    return th
+
+
 def main():
     # 必须在最前面：后面所有库（包括崩溃处理）都可能碰 stdout
     _ensure_std_streams()
     _install_crash_handlers()
+    # ⭐ **启动看门狗**：从这一刻起到"窗口建好"为止（历史上这一段死过 ✗ 见上面那段）
+    _boot_done = threading.Event()
+    _arm_watchdog(WATCHDOG_STARTUP_S, "启动", _boot_done, 3)
 
     # 性能保活：向系统声明「别把我当后台程序降级」——关电源节流（EcoQoS 降频）、
     # 进程优先级→高于正常、定时器精度→1 ms、防挂起（见 core/winperf.py）。
@@ -160,6 +204,19 @@ def main():
                 "playerSimu.workbench")
         except Exception:
             pass
+
+    # ⭐⭐ **让主线程（Qt 事件循环）抢得到 GIL**（用户 2026-10-06 ✓ 现场原话：
+    #   "**视频预览只有 10~13fps，整个窗口都发木**"✓）。为什么是这一项：
+    #     · `draw_ms` 只有 **0.01 ms** ✓ ⇒ **不是画得慢，是轮不到它** ✗；
+    #     · 后台那条流水线每拍 ~24 ms ✓，里头全是 Python 级的 numpy / 格式化 / str ✓
+    #       ⇒ CPython 默认**每 5 ms 才切一次 GIL** ✓ ⇒ 主线程排队等 ✗ ⇒ 预览十几帧、
+    #       菜单/悬停全木 ✓（两个现象同一个原因 ✓）。
+    #   ⇒ `setswitchinterval(1 ms)`：**切得勤一点** ✓ —— 对吞吐几乎无损（切片开销可以忽略 ✓），
+    #     换来主线程"随叫随到" ✓。⚠ 必须在**起线程之前**设 ✓（后面那些线程都会继承它 ✓）。
+    try:
+        sys.setswitchinterval(0.001)
+    except Exception:                       # noqa: BLE001 —— 设不动就算了，别影响启动 ✓
+        pass
 
     app = QApplication(sys.argv)
     # 和窗口标题用同一个名字（定义在 gui/main_window.py，那边要拼上项目名）
@@ -208,7 +265,33 @@ def main():
             win.log("打开项目失败: %s" % e, "error")
 
     win.show()
+    # ⭐ 窗口出来了 ⇒ 启动看门狗收工（后面若还卡，就不是"打不开"那一段了 ✓）
+    _boot_done.set()
+
+    # ⭐⭐ **GC 调优**（用户 2026-10-06 ✓ 同一次现场：`pipe_ms` **最大 829 ms** ✗、
+    #   整个窗口发木 ✓；而**内存是稳定的** ✓ —— 2.8 GB 平台期，**不是泄漏** ✗）：
+    #     · `gc.freeze()`：把**此刻已经活着**的常驻对象（torch / onnxruntime / Qt / 本体 ✓）
+    #       挪进"永久代"⇒ 之后的 gen2 全扫**不再扫它们** ✓（这么大一堆每次全扫都是几十毫秒 ✓
+    #       ⇒ 正好对上那种"跑几秒突然一顿"✗）；
+    #     · `set_threshold` 放宽：少触发几轮 gen0/gen1 ✓（垃圾仍然会被回收 ✓ —— 只是
+    #       "什么时候扫"变稀 ✓）。
+    #   ⚠ 放在 `exec_()` **之前**：那时 torch 等大件都已经 import 完 ✓（模型本体是后面
+    #     懒加载的 ✓ ⇒ 它不在冻结集里 ✓ —— 这是明知的小折扣：宁可少冻一部分，
+    #     也不想把 freeze 塞进实时线程那条路上 ✓）。
+    try:
+        import gc as _gc
+        _gc.collect()
+        _gc.freeze()
+        _gc.set_threshold(50000, 30, 30)
+    except Exception:                       # noqa: BLE001 —— 调不动就算了 ✓
+        pass
+
     rc = app.exec_()
+
+    # ⭐⭐ **收尾看门狗**（"关了必须走" ✓）：关窗之后的清理——停实时/绘制线程、存界面状态、
+    #    释放保活——**任何一步卡住都可能是那个"关了还占进程"✗** ⇒ 到点留栈 + `os._exit(4)` ✓。
+    _exit_done = threading.Event()
+    _arm_watchdog(WATCHDOG_EXIT_S, "收尾", _exit_done, 4)
 
     # **退出顺序要定死**：先关窗、让 Qt 把销毁事件处理完，最后才轮到 QApplication。
     # 反过来的话（QApplication 先被回收）解释器退出时会去碰已经失效的 Qt 内部，
@@ -220,6 +303,7 @@ def main():
     # 把定时器精度还回去（timeEndPeriod）：不还的话，本进程占着 1 ms 精度的
     # 名额不放 —— 在高精度定时器是稀缺资源的系统上，别的程序会吃不到。
     _wp.release()
+    _exit_done.set()                 # ⭐ 收尾看门狗收工（正常路径绝不被误杀 ✓）
     return rc
 
 

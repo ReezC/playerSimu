@@ -51,6 +51,50 @@ _W = {}
 SKIP_ACTIONS = ("die",)
 
 
+#: 粗筛（"外观像不像"的廉价预判）把画面/模板缩到 1/`COARSE_FACTOR` ✓（代价约 1/64 ✓）。
+COARSE_FACTOR = 8
+#: 模板缩完**最短边**小于它就不做粗筛、直接精算 ✓（金币那种小图标 ✓ 缩完就没形状了 ✗）。
+COARSE_MIN_SIDE = 10
+#: 粗筛**放行线**：粗分低于它 ⇒ 连精算都不做 ✓。
+#: ⚠⚠ 必须**宽容** ✗：粗筛只负责掐"**完全不像**"的 ✓ —— 松了只是慢一点 ✓，紧了会**漏检** ✗
+#:   （用例钉着"加粗筛前后检出框一字不差" ✓ 实测 0.25 既不漏也省 ✓）。
+COARSE_MIN_SCORE = 0.25
+
+
+def coarse_gate(img_small, tpl_gray, h, w, factor=COARSE_FACTOR,
+                min_score=COARSE_MIN_SCORE):
+    """这一帧里**像不像**这个模板 ⇒ `True` = 值得精算 ✓ / `False` = 完全不像、跳过 ✓。
+
+    ⭐ 为什么要它（用户 2026-10-04 ✓ 原话："多姿态进组合外观，注意在匹配时，**外观不符合的
+      就不要运算了**"）：多姿态把宠物模板从 3 帧涨到 13 帧 ✓（实测耗时 **5.8s → 24.0s** ✗），
+      而**每帧里绝大多数模板都不像**（宠物只在少数帧出现、背景还各不相同 ✓）
+      ⇒ 先花约 1/64 的代价粗算一遍 ✓，明显不像的**不进 `matchTemplate`**（这条路上最贵的一步 ✓）。
+    ⚠ 判据用 `TM_CCOEFF_NORMED`（**不掩码** ✓ 便宜 ✓）：它比的是"形状/明暗格局像不像" ✓，
+      不是绝对分数 ⇒ **不能**拿它替代精算的阈值 ✗（那两套分数不可比 ✓），只当**门**用 ✓。
+    ⚠ 缩完最短边 < `COARSE_MIN_SIDE` ⇒ **放行**（不做粗筛 ✓）：那么小的模板缩下去没有形状可言 ✓，
+      掐了纯粹是漏检风险 ✗。
+    ⚠ 任何异常（尺寸不合法等）⇒ **放行** ✓ —— 粗筛只是省时间 ✓，**绝不许**因为它漏检 ✗。
+    """
+    if img_small is None:
+        return True
+    th, tw = max(1, int(h) // int(factor)), max(1, int(w) // int(factor))
+    if th < COARSE_MIN_SIDE or tw < COARSE_MIN_SIDE:
+        return True
+    if th >= img_small.shape[0] or tw >= img_small.shape[1]:
+        return True
+    try:
+        ts = cv2.resize(tpl_gray, (tw, th), interpolation=cv2.INTER_AREA)
+        # ⚠ **平坦模板**（标准差≈0 ✓ 例如纯色块）在 `TM_CCOEFF_NORMED` 下恒为 0/nan ✗
+        #   ⇒ 会被**误拦**（用例 `t_coarse_gate` 抓到的 ✓）⇒ 这种一律放行 ✓。
+        if float(ts.std()) < 1.0:
+            return True
+        cs = cv2.matchTemplate(img_small, ts, cv2.TM_CCOEFF_NORMED)
+        best = float(np.nanmax(cs))
+    except Exception:                                   # noqa: BLE001 —— 见上：放行 ✓
+        return True
+    return best >= float(min_score)
+
+
 def _pick_frames(files, max_per_mob=0):
     """挑出用作模板的帧：**排除死亡动画**，其余**全部**用。
 
@@ -110,11 +154,34 @@ def _pick_frames(files, max_per_mob=0):
     return picked
 
 
-def load_templates(root, mob_ids, max_per_mob=0):
+def load_templates(root, mob_ids, max_per_mob=0, min_side=20, min_alpha=200,
+                   frames_sel=None, should_stop=None, mirror=True):
     """载入模板并裁到 alpha 包围盒。
 
     max_per_mob 是**上限**（默认 20）：每只怪取"除死亡动画外的所有帧"，
     帧数超过这个上限时才按动作轮询取样。详见 _pick_frames 的说明。
+
+    ⭐ **`min_side` / `min_alpha` 是"多小的图算废图"那两道闸**（用户 2026-10-04 ✓ 加参数）：
+      · 默认 **20px / 200 不透明像素** = **怪物那条线的老行为，一字不变** ✓
+        （小图当模板会制造假匹配 ⇒ 怪物那边宁缺勿错 ✓）；
+      · 但**掉落物图标本来就小**（实测金币 4 帧：23×24 / 25×24 / 23×24 / **5×24** ✗，
+        不透明 116~468 ✓）—— 照老阈值，**那张 5×24 的侧视帧会被直接丢掉** ✗，
+        于是"金币转到侧面"这个相位永远匹配不上 ✓ ⇒ 掉落物那条传更松的值 ✓
+        （见 `tools/label_drops.py` ✓）。⚠ 放松会让假匹配变多 ⇒ 靠 `thresh`/`min_distinct`
+        两道阈值兜（掉落物那条就是那么配的 ✓）。
+
+    ⭐⭐ **`should_stop`：让这一步"边读边看有没有被取消"**（用户 2026-10-05 ✓ 原话："能不等他返回吗？"）：
+      这一趟要逐个 `imread` 几百张精灵 ✓（外加裁剪/镜像 ✓）—— 原来它是一个**整块调用** ✗，
+      点了取消只能等它整块读完才轮到调用方的 `ctx.canceled()` ✓ ⇒ 界面上就是
+      "已请求取消：正在收尾…"卡着不动 ✓（正是用户看到的那条 ✓）。
+      传一个"该停了吗"的可调用（调用方给 `ctx.canceled` ✓）⇒ 每读一张看一眼 ✓ ⇒ 几百毫秒内收工 ✓。
+      ⚠⚠ **被取消时返回的是"已经读到的"那部分** ✗ —— 调用方**必须紧接着查 `ctx.canceled()`**
+        并自己收工（别把它当成完整模板 ✗）；默认 `None` = 老行为，一字不变 ✓。
+
+    ⭐ **`mirror`（用户 2026-10-06 ✓）**：每张图要不要**再镜像一份**当模板 ✓。
+      · 默认 **True = 老行为**（怪会朝左右两个方向，镜像召回明显更好 ✓、宠物同理 ✓）；
+      · `False` 给**没有左右朝向的那一类**用（**掉落物图标** ✓）：省一半匹配时间，
+        也少一批"只有镜像才像"的假匹配 ✓（见 `tools/label_drops.py` ✓）。
     """
     out = []
     root = Path(root)
@@ -124,9 +191,23 @@ def load_templates(root, mob_ids, max_per_mob=0):
         if not d.is_dir():
             continue
 
-        files = _pick_frames(sorted(d.glob("*.png")), max_per_mob)
+        _all = sorted(d.glob("*.png"))
+        # ⭐⭐ **用户手工挑的模板帧**（任务 3 ✓ 用户 2026-10-05 ✓）：有名单 ⇒ **先过滤** ✓。
+        #   ⚠ 名单是**候选集**，不是替换 ✗ —— 后面 `_pick_frames` 那套（排除死亡动画 ✓
+        #     不超过「最大模板帧」就全用 ✓ 超了按动作轮询 ✓）**照旧在它之上跑** ✓
+        #     （两根轴正交 ✓ 见 `gui/frame_sel_dialog.py` 开头那段说明 ✓）。
+        #   ⚠ 名单里一个都没命中 ⇒ 这一条**没有模板** ✓ —— **不许**回落到全用 ✗：
+        #     用户把帧全取消勾，意思就是"这条这一趟别用" ✓ 如实照办 ✓。
+        if frames_sel and mid in frames_sel:
+            _want = {str(s) for s in frames_sel[mid]}
+            _all = [f for f in _all if f.stem in _want]
+        files = _pick_frames(_all, max_per_mob)
 
         for f in files:
+            # ⭐ 每读一张看一眼"该停了吗"（见 `should_stop` 的说明 ✓）：被取消 ⇒ 立刻返回
+            #   **已经读到的**那部分 ✓（调用方紧接着会再查一次 `ctx.canceled()` ✓）
+            if should_stop is not None and should_stop():
+                return out
             t = imread(f, cv2.IMREAD_UNCHANGED)
             if t is None or t.ndim != 3 or t.shape[2] != 4:
                 continue
@@ -135,19 +216,26 @@ def load_templates(root, mob_ids, max_per_mob=0):
 
             # 裁掉透明边框 —— 大片透明区会把整幅响应图抬高，制造假匹配
             ys, xs = np.nonzero(al > 128)
-            if len(xs) < 200:
+            if len(xs) < int(min_alpha):
                 continue
 
             b = b[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
             al = al[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
 
-            if b.shape[0] < 20 or b.shape[1] < 20:
+            if b.shape[0] < int(min_side) or b.shape[1] < int(min_side):
                 continue
 
             frame = f.stem   # 帧 stem（如 stand_0），供 per-帧 scale 查表
             out.append((mid, frame, b, al))
-            # 怪会朝左右两个方向，镜像多一份模板，召回明显更好
-            out.append((mid, frame, cv2.flip(b, 1), cv2.flip(al, 1)))
+            # 怪会朝左右两个方向，镜像多一份模板，召回明显更好 ✓ **默认开**（老行为 ✓）
+            # ⭐⭐ `mirror=False`（用户 2026-10-06 ✓ 掉落物那条用它）：
+            #   **道具图标没有左右朝向** ⇒ 镜像那一份纯属
+            #     ① 多花一倍匹配时间 ✗；② 多出一批"**只有镜像才像**"的假匹配 ✗
+            #     （实测：某图标在背景上"镜像之后才匹配得上"的那种峰，全是误标 ✓）。
+            #   ⚠ 默认仍 `True` ✗ —— 怪物 / 宠物那条**要吃镜像**（它们真有朝向 ✓），
+            #     只有明确说"这类没有朝向"的调用方才传 False ✓（见 `tools/label_drops.py` ✓）。
+            if mirror:
+                out.append((mid, frame, cv2.flip(b, 1), cv2.flip(al, 1)))
 
     return out
 
@@ -169,7 +257,13 @@ def clean_stale_outputs(out_dir, vis_dir, keep_n):
             continue
         for f in d.iterdir():
             m = re.fullmatch(r"frame_(\d+)\.(?:txt|jpg)", f.name)
-            if m and int(m.group(1)) >= keep_n:
+            # ⚠⚠ 判据是 **`> keep_n`**，不是 `>= keep_n` ✗ —— 帧号是**从 1 起**的
+            #   （`frame_00001` … `frame_00186` ✓ 见 `core.wincap` 的命名 ✓），而 `keep_n` 是
+            #   **帧数** ⇒ 写 `>=` 会把**最后一帧**当成"超界的残留"删掉 ✗（实测：`keep_n=2`
+            #   把 `frame_00002.txt` 删了 ✓）。后果是每跑一趟就丢最后一帧里**别的类的框**
+            #   （它会被 `work` 重建成"只有本类" ✓）—— 本轮就是被用例抓出来的 ✓
+            #   （`t_second_run_protects_and_reports` 的 class-0 框凭空消失 ✓）。
+            if m and int(m.group(1)) > keep_n:
                 try:
                     os.remove(str(f))
                     n += 1
@@ -203,6 +297,21 @@ def _masked_energy(gray, mask_bool, x, y):
         return 0.0
     patch = gray[y:y + h, x:x + w]
     return float((patch[mask_bool] ** 2).sum())
+
+
+# ══════════════════════════════════════════════════════════════
+# ⭐⭐ 框到**可见部分**（用户 2026-10-05 ✓）—— **实现已搬去 `perception/visible_box.py`** ✓
+# ══════════════════════════════════════════════════════════════
+# ⭐ 2026-10-06 搬迁（用户："**所有的匹配都需要「框到可见部分」参数**"✓）：这条判据要被
+#   **两条内核**共用 —— 本文件（怪物 / 宠物 / 掉落 ✓）与 `perception/player_locator`
+#   （玩家 ✓）。而 `perception` **不能**反向 import `tools/detect_mobs` ✗（本模块头上有
+#   `from gui.theme import class_color` ⇒ 会把 gui 拖进运行时依赖 ✓）⇒ 搬到中性层 ✓。
+#   ⚠ **"为什么这么做"那段说明（用户原话 + 判据 + 天花板）随实现一起搬过去了** ✓（在
+#   `perception/visible_box.py` 的模块头 ✓）—— 本文件只留**用它的地方**（`work` ✓）与
+#   那两个默认值（`VISIBLE_TOL` / `VISIBLE_KEEP` 得从那边 import ✓，见下面 ✓）。
+# ══════════════════════════════════════════════════════════════
+# ⭐ 实现搬去 `perception/visible_box.py`（见上面那段说明 ✓）—— 两条内核共用**那一份** ✓
+from perception.visible_box import VISIBLE_KEEP, VISIBLE_TOL, visible_box
 
 
 def nms(dets):
@@ -251,10 +360,13 @@ def _read_manual_mobs(cfg, stem, W, H):
         text = path.read_text(encoding="utf-8")
     except Exception:
         return []
+    # ⭐ 认哪一类的框跟着**本次目标类**走（`cfg["cls"]` ✓ 默认 class 1 怪物 = 老行为 ✓）——
+    #   否则标掉落物（class 2）时会拿**怪物**的人工框去比"太近"⇒ 白跳过一片 ✓
+    cls_s = str(int(cfg.get("cls", CLASS_MOB)))
     out = []
     for ln in text.splitlines():
         parts = ln.split()
-        if len(parts) < 5 or parts[0] != str(CLASS_MOB):
+        if len(parts) < 5 or parts[0] != cls_s:
             continue
         try:
             cx, cy, bw, bh = (float(v) for v in parts[1:5])
@@ -272,7 +384,13 @@ def _read_manual_mobs(cfg, stem, W, H):
 def init_worker(cfg):
     cv2.setNumThreads(1)
     _W["cfg"] = cfg
-    _W["tpl"] = load_templates(Path(cfg["sprites"]), cfg["mobs"], cfg["per_mob"])
+    _W["tpl"] = load_templates(Path(cfg["sprites"]), cfg["mobs"], cfg["per_mob"],
+                               cfg.get("min_side", 20), cfg.get("min_alpha", 200),
+                               # ⭐⭐ 任务 3：用户手工挑的模板帧（缺键 = 老逻辑 ✓）
+                               # ⚠ 子进程这条**必须一起传** ✗ —— 真正的匹配都在子进程里 ✓
+                               frames_sel=cfg.get("frames_sel") or {},
+                               # ⭐ 要不要镜像（缺键 = True = 老行为 ✓ 掉落物那条传 False ✓）
+                               mirror=bool(cfg.get("mirror", True)))
 
 
 def work(fp_str):
@@ -311,6 +429,22 @@ def work(fp_str):
     # 而黑区里几个杂散亮像素的能量比通常只有几个百分点。
     min_ratio = float(cfg.get("min_energy_ratio", 0.35))
 
+    # ⭐⭐ **框到可见部分**（用户 2026-10-05 ✓ **原话与判据见 `perception/visible_box.py` 头部** ✓）
+    #   —— **默认关** ✓（老项目 / 老调用方一字不变 ✓）；开了 ⇒ 被挡掉的像素不进框 ✓。
+    want_visible = bool(cfg.get("visible", False))
+    vis_tol = float(cfg.get("visible_tol", VISIBLE_TOL))
+    vis_keep = float(cfg.get("visible_keep", VISIBLE_KEEP))
+
+    # ⭐ 粗筛底图（**每帧一次** ✓）：缩到 1/COARSE_FACTOR ✓ 见 `coarse_gate` 的说明 ✓。
+    #   `cfg["coarse"]=False` ⇒ 不建、也不筛（对照用 ✓ 用例靠它证明"加粗筛前后一字不差" ✓）。
+    img_small = None
+    if cfg.get("coarse", True):
+        try:
+            img_small = cv2.resize(imgf, None, fx=1.0 / COARSE_FACTOR, fy=1.0 / COARSE_FACTOR,
+                                   interpolation=cv2.INTER_AREA)
+        except Exception:                               # noqa: BLE001 —— 建不出来就不筛 ✓
+            img_small = None
+
     for mid, frame, b, al in _W["tpl"]:
         # 尺度按「怪+帧 → 怪 → 全局默认」三级查找，支持逐帧微调
         sc = mob_scales.get("%s:%s" % (mid, frame),
@@ -330,6 +464,19 @@ def work(fp_str):
         e_t = float((tg[mbool] ** 2).sum())
         if e_t <= 0:
             continue                    # 全黑模板：匹配不出任何东西，别浪费一轮
+
+        # ⭐ 可见框要用模板的 Sobel ✓ —— **每个模板算一次**（别在"每个框"里重算 ✗：
+        #   一个模板可能出好几个峰 ✓）。不开这个功能 ⇒ 一次都不算 ✓（零开销 ✓）。
+        tgx = tgy = None
+        if want_visible:
+            tgx = cv2.Sobel(tg, cv2.CV_32F, 1, 0, ksize=3)
+            tgy = cv2.Sobel(tg, cv2.CV_32F, 0, 1, ksize=3)
+
+        # ⭐⭐ **先粗筛、再精算**（用户 2026-10-04 ✓ 原话："匹配时，外观不符合的就不要运算了" ✓）：
+        #   下面那句 `matchTemplate` 是这条路上**最贵**的一步（整幅 FFT ✓）
+        #   ⇒ 这一帧里"完全不像"的模板（多数情况 ✓）连进都不进 ✓ 见 `coarse_gate` ✓。
+        if not coarse_gate(img_small, tg, h, w, min_score=cfg.get("coarse_min", COARSE_MIN_SCORE)):
+            continue
 
         try:
             r = cv2.matchTemplate(img, t, cv2.TM_CCORR_NORMED, mask=m)
@@ -353,9 +500,15 @@ def work(fp_str):
 
         # 配额只按**收下的**峰算：退化解（能量不足）被否掉时不该消耗名额 ——
         # 否则黑区里几个杂散亮点就把这只怪的 3 个名额用完了。
+        # ⭐⭐ 用户 2026-10-05 ✓：`-1` = **无限**（有几个标几个 ✓ 给个安全上限防跑飞 ✓）、
+        #   `0` = **不标注**（这一类这一帧一个框都不写 ✓）。`n>0` 照旧 = 最多 n 个 ✓。
+        _cap = int(cfg["peaks"])
         got = 0
-        for _ in range(cfg["peaks"] * 4 + 4):
-            if got >= cfg["peaks"]:
+        if _cap == 0:
+            continue                     # 0 = 不标注 ⇒ 这一个模板直接跳过 ✓
+        _limit = (_cap * 4 + 4) if _cap > 0 else 4096
+        for _ in range(_limit):
+            if _cap > 0 and got >= _cap:
                 break
             _, mx, _, ml = cv2.minMaxLoc(r)
             if mx < cfg["thr"] or mx - p < cfg["dist"]:
@@ -370,8 +523,19 @@ def work(fp_str):
                     r[y, x] = 0.0
                     continue
 
-            dets.append((float(mx), x * ds + ox, y * ds + oy,
-                         w * ds, h * ds, mid))
+            # ⭐⭐ 写出去的框 = **可见部分**（开了才收 ✓ 见 `perception/visible_box.py` ✓）。
+            #   ⚠ 位置（峰值 x,y）与"抹掉邻域"用的 w/h **一律不动** ✗ —— 那些是**模板尺寸**的事 ✓
+            #     （收小了去抹 ⇒ 同一只怪会被反复计入 ✓）。
+            vx, vy, vw, vh = x, y, w, h
+            if want_visible:
+                # ⚠ `imgf` 是**这一帧的浮点灰度**、`tg/tgx/tgy/mbool` 是**当前模板**的
+                #   （都已和匹配同一尺度 ✓）—— 由 `visible_box` 自己判"证据够不够" ✓
+                #   （判不了就原样回全尺寸 ✓ 见那边的说明 ✓）。
+                vx, vy, vw, vh = visible_box(imgf, tg, tgx, tgy, mbool, x, y,
+                                             vis_tol, vis_keep)
+
+            dets.append((float(mx), vx * ds + ox, vy * ds + oy,
+                         vw * ds, vh * ds, mid))
             got += 1
 
             # 抹掉该峰邻域，避免同一只怪被反复计入
@@ -389,24 +553,41 @@ def work(fp_str):
     out_dir = Path(cfg["out"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # ⭐ **写哪一类**（`cfg["cls"]` ✓ 默认 class 1 = 怪物 = 老行为一字不变 ✓）：
+    #   掉落物（class 2）走同一条模板匹配，只是类别号不同 ✓（用户 2026-10-04 ✓）。
+    _cls = int(cfg.get("cls", CLASS_MOB))
     new_lines = ["%d %.6f %.6f %.6f %.6f" % (
-        CLASS_MOB, (x + w / 2) / W, (y + h / 2) / H, w / W, h / H)
+        _cls, (x + w / 2) / W, (y + h / 2) / H, w / W, h / H)
         for _, x, y, w, h, _ in kept]
-    # 覆盖怪物框（class 1），保留玩家框（class 0）—— 改尺度重标时不留旧怪物框
+    # 覆盖**本类**的旧框、保留别的类（例如标怪物时不动玩家框 ✓）—— 改尺度重标时不留旧框 ✓
     existing = out_path.read_text(encoding="utf-8") if out_path.exists() else ""
     keep = [ln for ln in existing.splitlines()
-            if ln.split() and ln.split()[0] != str(CLASS_MOB)]
-    lines = keep + new_lines
+            if ln.split() and ln.split()[0] != str(_cls)]
+    old_mine = [ln for ln in existing.splitlines()
+                if ln.split() and ln.split()[0] == str(_cls)]
+    # ⭐⭐ **这一帧本类一个都没检出、而它原来有本类的框 ⇒ 保留旧框**（用户 2026-10-05 ✓）。
+    #   起因是个真坑（用户现场："模板匹配怪物一波之后往后每次提示 检出 0 框"✓）：原来这里
+    #   **无条件覆盖**本类旧框 ✗ ⇒ 那一波标出来的框被**悄悄清空** ✓（实测那个项目：113 帧有怪框、
+    #   **59 帧只剩玩家/宠物框**、14 帧全空 ✓ 形状吻合 ✓）。
+    #   ⚠ **只在"这一帧本类 0 检出"时才保命** ✗：检出非空时**照旧覆盖** ✓ —— 那才是"重标一遍"
+    #     的正常语义（改了尺度/阈值就该整帧换新的 ✓ 新旧混一起更坏 ✓）。
+    protected = 0
+    if not new_lines and old_mine:
+        lines = keep + old_mine
+        protected = 1
+    else:
+        lines = keep + new_lines
     out_path.write_text(("\n".join(lines) + "\n") if lines else "\n",
                         encoding="utf-8")
 
     if cfg["vis"]:
-        color = cfg.get("box_color") or class_color(CLASS_MOB)
+        color = cfg.get("box_color") or class_color(_cls)
         for _, x, y, w, h, _ in kept:
             cv2.rectangle(full, (x, y), (x + w, y + h), color, 2)
         imwrite(Path(cfg["vis_dir"]) / (fp.stem + ".jpg"), full, quality=82)
 
-    return len(dets), len(kept)
+    # ⚠ 返回三元组（`protected` = 这一帧保住了旧框 ✓ 见上面那段 ✓）—— 收结果那边跟着改 ✓。
+    return len(dets), len(kept), protected
 
 
 # ══════════════════════════════════════════════════════════════
@@ -422,6 +603,10 @@ def collect_stats(labels_dir, frame_dir=None):
     counts = []
     sides = []          # 框的等效边长（像素）
     W = H = 0
+    # ⭐⭐ **按类别**记一份（用户 2026-10-05 ✓）：这一份是"**目录里有什么**"（含别的类、
+    #   含上一波的框 ✓）—— 与"本次这一类新增了几框"是**两回事** ✗，报告里必须分开念 ✓
+    #   （起因：跑第二趟时 0 检出，日志却报"每帧框数 中位 4"⇒ 看着自相矛盾 ✓）。
+    per_cls = {}
 
     if frame_dir:
         first = next(iter(sorted(Path(frame_dir).glob("*.png"))), None)
@@ -439,6 +624,8 @@ def collect_stats(labels_dir, frame_dir=None):
         counts.append(len(lines))
         for ln in lines:
             p = ln.split()
+            if p:                                   # ⭐ 按类别记一笔（报告要按类别念 ✓）
+                per_cls[p[0]] = per_cls.get(p[0], 0) + 1
             if len(p) >= 5:
                 try:
                     bw, bh = float(p[3]), float(p[4])
@@ -464,6 +651,8 @@ def collect_stats(labels_dir, frame_dir=None):
         "size_p10": m(sides, 10),
         "size_p90": m(sides, 90),
         "img_size": (W, H),
+        # ⭐ 各类别各有几框（报告按它念 ✓ 见 `per_cls` 上面那段 ✓）
+        "per_class": per_cls,
     }
 
 
@@ -484,6 +673,18 @@ def run_detect(params, ctx=None):
         thresh       匹配阈值
         min_distinct 区分度
         min_energy_ratio  窗口能量 / 模板能量 的下限（振幅比，默认 0.35）
+        coarse        ⭐ 粗筛开关（**默认 False = 关** ✗）：开了先把画面/模板缩到 1/8 粗算一遍 ✓，
+                      明显不像的模板**不进精算** ✓；⚠ 实测（同一批帧）：检出**完全一致** ✓，
+                      但**没省时间** ✗ ⇒ 默认关 ✓（见 `coarse_gate` 的说明 ✓）
+        coarse_min    粗筛放行线（默认 0.25 ✓ 见 `COARSE_MIN_SCORE` ✓ 只配 `coarse=True` 用 ✓）
+        cls          写进标注的**类别号**（默认 1 = 怪物 ✓；掉落物 = 2 ⇒ 同一条算法换类别 ✓）
+        target       台账记在谁名下（`"mob"` 默认 ✓ / `"drop"` / `"pet"` …）—— 选帧弹窗按它
+                     显示"已处理/未处理"✓；**不许写死**（见函数体里那段说明 ✓）
+        min_side     模板最短边小于它就丢掉（默认 20 ✓ = 老行为；掉落物传更松的 ✓）
+        min_alpha    模板不透明像素少于它就丢掉（默认 200 ✓ = 老行为 ✓）
+        mirror       ⭐ 每张模板要不要**再镜像一份**（默认 True = 老行为 ✓）。
+                     **没有左右朝向的那一类**（掉落物图标 ✓）传 False：省一半匹配时间，
+                     也少一批"只有镜像才像"的假匹配 ✓（见 `load_templates` 的说明 ✓）。
         per_mob      每种怪用几帧做模板，0=全部
         max_peaks    每个模板最多取几个峰
         region       "x,y,w,h" 或 None
@@ -527,6 +728,24 @@ def run_detect(params, ctx=None):
     if not Path(sprites).is_dir():
         raise FileNotFoundError("精灵库不存在：%s" % sprites)
 
+    # ⭐ 写进标注文件的**类别号**（`cls` ✓ 默认 class 1 怪物 ⇒ 老调用方一个字都不用改 ✓；
+    #   掉落物 = class 2，见 `perception/classes.py` ✓ 用户 2026-10-04 ✓）。
+    cls = int(params.get("cls", CLASS_MOB) or CLASS_MOB)
+    # ⭐⭐ **这一趟算哪一类标注**（= 台账那个 key ✓；用户 2026-10-04 ✓）：`"mob"`（默认 ✓ 老行为
+    #   一字不变 ✓）/ `"drop"` / `"pet"` … —— 决定**记进哪本台账**（`labelio.mark_processed` ✓）。
+    #   ⚠⚠ 原来这句是**写死的** `mark_processed(out, "mob", …)` ✗ ⇒ 掉落物/宠物跑完会**冒名**记进
+    #     「怪物」那本台账 ✗：① 选帧弹窗里"只选未处理"把掉落物跑过的帧当成**怪物标过了** ✗；
+    #     ② 真正该显示"未处理"的掉落物帧反倒显示成已处理 ✗（用户这轮接上选帧弹窗后必踩 ✓）。
+    #   ⚠ 与 `cls` 是**两件事**：`cls` 是"框写成几号类别"✓，`target` 是"台账记在谁名下"✓
+    #     —— 默认都对应怪物，所以老调用方什么都不用改 ✓。
+    target = str(params.get("target") or "mob").strip() or "mob"
+    # ⭐ 「多小的图算废图」那两道闸（默认 20px / 200 不透明像素 = 怪物那条的**老行为** ✓；
+    #   掉落物图标小，那条会传更松的值 ✓ 见 `load_templates` 的说明与 `tools/label_drops.py` ✓）
+    min_side = int(params.get("min_side", 20) or 20)
+    min_alpha = int(params.get("min_alpha", 200) or 200)
+    # ⭐ 要不要镜像（默认 True = 老行为 ✓ 见 `load_templates` 的说明 ✓）
+    mirror = bool(params.get("mirror", True))
+
     out = Path(params["out"])
     out.mkdir(parents=True, exist_ok=True)
 
@@ -534,6 +753,13 @@ def run_detect(params, ctx=None):
     # 键名沿用 per_mob 以兼容已有项目配置，语义是「上限」：
     # 非死亡帧数不超过它就不截断，全量使用。默认 20 足够覆盖绝大多数怪。
     per_mob = int(params.get("per_mob", 20))
+    # ⭐⭐ 用户手工挑的**模板帧**（任务 3 ✓）：整份字典是按 `<target>:<id>` 存的 ✓
+    #   ⇒ 这里按这一趟的 `target`（mob / drop / pet ✓）**摘出自己那一份** ✓，
+    #   再按**模板 id**（= 目录名 ✓）喂给 `load_templates` ✓。缺键 = 老逻辑 ✓。
+    _fs_all = params.get("frames_sel") or {}
+    frames_sel = {str(k).split(":", 1)[1]: list(v)
+                  for k, v in _fs_all.items()
+                  if str(k).startswith(target + ":") and ":" in str(k)}
     thr = float(params.get("thresh", 0.90))
     dist = float(params.get("min_distinct", 0.06))
     peaks = int(params.get("max_peaks", 4))
@@ -543,6 +769,10 @@ def run_detect(params, ctx=None):
     # （min_texture=4.0），而近黑区域里几个亮像素的 std 就有 5~7，根本拦不住。
     # 判据细节见 _masked_energy。
     min_energy_ratio = float(params.get("min_energy_ratio", 0.35))
+    # ⭐ 粗筛开关 —— **默认关** ✗（见 `coarse_gate` 的实测：检出保证一致 ✓ 但**没省时间** ✗，
+    #   因为同一只宠物的十几个姿态模板彼此太像 ✓ 粗筛掐不掉 ✓）。
+    #   `coarse=True` 时才开 ✓（模板彼此**不像**的场合才值得试 ✓，比如上百个掉落物图标 ✓）。
+    coarse = bool(params.get("coarse", False))
 
     region = params.get("region")
     if isinstance(region, str) and region.strip():
@@ -575,29 +805,58 @@ def run_detect(params, ctx=None):
         "dist": dist,
         "peaks": peaks,
         "min_energy_ratio": min_energy_ratio,
+        "coarse": coarse,                                   # ⭐ 粗筛开关 ✓ 见 `coarse_gate` ✓
+        "coarse_min": float(params.get("coarse_min", COARSE_MIN_SCORE)),
+        # ⭐⭐ **框到可见部分**（用户 2026-10-05 ✓ 见 `perception/visible_box.py` ✓）—— **默认关** ✗
+        #   ⇒ 老项目 / 老调用方一字不变 ✓（这是改"标注语义"⇒ 要开就按项目显式开 ✓）。
+        "visible": bool(params.get("visible", False)),
+        "visible_tol": float(params.get("visible_tol", VISIBLE_TOL)),
+        "visible_keep": float(params.get("visible_keep", VISIBLE_KEEP)),
         "per_mob": per_mob,
+        "frames_sel": frames_sel,                           # ⭐ 任务 3 ✓ 见上面那段 ✓
         "out": str(out),
         "manual_dir": str(out.parent / "labels"),   # 人工修正目录，重标时保留其怪物框
         "vis": vis,
         "vis_dir": vis_dir,
         "region": region,
-        # 可视化框颜色：用设置里配的怪物框颜色（跟着「设置 → 可视化」走，
+        # ⭐ 本次写哪一类（`cls` ✓ 默认 1 怪物；掉落物 = 2 ⇒ 同一条模板匹配只是换类别号 ✓）
+        "cls": cls,
+        # ⭐ 小图闸（子进程里 `load_templates` 要用 ✓ 默认 = 老行为 ✓）
+        "min_side": min_side,
+        "min_alpha": min_alpha,
+        # ⭐ 镜像开关（子进程里 `load_templates` 要用 ✓ 默认 True = 老行为 ✓）
+        "mirror": mirror,
+        # 可视化框颜色：用设置里配的**本类**框颜色（跟着「设置 → 可视化」走，
         # 和实时预览/质检台同一份）。在**主进程**取一次放进 cfg，
         # 免得每个子进程都去读一遍配置文件。
-        "box_color": class_color(CLASS_MOB),
+        "box_color": class_color(cls),
     }
 
     ctx.progress(0, 0, "加载怪物模板…")
-    n_tpl = len(load_templates(Path(sprites), mobs, per_mob))
+    # ⭐⭐ **边加载边看取消**（用户 2026-10-05 ✓ 原话："能不等他返回吗？"）—— 这一步要逐个
+    #   `imread` 几百张精灵 ✓，原来它是**整块**跑完才轮到下一个检查点 ✗ ⇒ 点了取消要干等它
+    #   读完 ✓（界面上就是那句"已请求取消：正在收尾…"卡着 ✓）。
+    #   ⚠ 传进去的是 `ctx.canceled`（可调用 ✓ 见 `load_templates` 的说明 ✓）；它被取消时返回的是
+    #     **半份** ✗ ⇒ 下面**立刻**再查一次、整趟收工 ✓（绝不拿半份往下走 ✗）。
+    _tpl = load_templates(Path(sprites), mobs, per_mob, min_side, min_alpha,
+                          frames_sel=frames_sel, should_stop=ctx.canceled,
+                          mirror=mirror)
+    if ctx.canceled():
+        ctx.log("已取消（模板加载到一半）", "warn")
+        return {"summary": "已取消", "frames": 0, "detections": 0}
+    n_tpl = len(_tpl)
     if n_tpl == 0:
         raise RuntimeError(
             "模板为空 —— 精灵库里找不到这些怪：\n  %s\n"
             "（检查 config/wz.yaml 的 sprite_dir，以及怪种 ID 是否补足 7 位）"
             % ", ".join(mobs[:8]))
 
-    ctx.log("模板 %d 个（%d 种怪，含镜像）" % (n_tpl, len(mobs)))
+    # ⚠ 日志要**说实话**（别写死"含镜像" ✗）：掉落物那条传 `mirror=False` ✓
+    ctx.log("模板 %d 个（%d 种怪%s）"
+            % (n_tpl, len(mobs), "，含镜像" if mirror else "，**不镜像**"))
+    ctx.log("写入类别 class %d" % cls)
     ctx.log("画面 %d 张   默认尺度 %.3f   降采样 %d" % (len(frames), cfg["scale"], ds))
-    ctx.log("阈值 %.2f   区分度 %.3f   每模板峰数 %d   最小能量比 %.2f"
+    ctx.log("阈值 %.2f   区分度 %.3f   每帧最多几个框 %d   最小能量比 %.2f"
             % (thr, dist, peaks, min_energy_ratio))
     if region:
         ctx.log("搜索区域 %s" % (region,))
@@ -610,6 +869,7 @@ def run_detect(params, ctx=None):
     t0 = time.perf_counter()
     total = 0
     frames_with = 0
+    protected = 0        # ⭐ 本类 0 检出 ⇒ 原样保留旧框的帧数（用户 2026-10-05 ✓ 见 `work` ✓）
     n = len(frames)
 
     def consume(iterator):
@@ -618,11 +878,12 @@ def run_detect(params, ctx=None):
         这里不再自己等结果 —— 直接 `for` 会在 worker 预热期间死等（十几秒），
         那段时间读不到取消。
         """
-        nonlocal total, frames_with
+        nonlocal total, frames_with, protected
         for i, r in enumerate(iterator, 1):
             if r:
-                _, kept = r
+                _, kept, prot = r
                 total += kept
+                protected += prot
                 if kept:
                     frames_with += 1
             if i % 20 == 0 or i == n:
@@ -669,40 +930,80 @@ def run_detect(params, ctx=None):
     except Exception:
         pass
 
-    # 台账：记下这一轮「怪物标注跑过哪些帧」——选帧弹窗靠它显示已处理/未处理。
+    # 台账：记下这一轮「**这一类的**标注跑过哪些帧」——选帧弹窗靠它显示已处理/未处理。
     # 取消（ok=False）时不记：那一轮的标注是半截的，宁可让它显示成未处理。
+    # ⚠ target 跟着调用方走（见上面那段说明 ✓），**不许再写死** `"mob"` ✗。
     try:
         from gui import labelio
-        labelio.mark_processed(out, "mob", [f.stem for f in frames])
+        labelio.mark_processed(out, target, [f.stem for f in frames])
     except Exception:
         pass
 
+    # ⭐⭐ **报告按类别分开念**（用户 2026-10-05 ✓）：`total` 是"**本次这一类**新收下的框" ✓，
+    #   而"每帧框数 / 空帧 / 框尺寸"扫的是**整个目录**（含别的类、含上一波的框 ✓
+    #   `collect_stats` 不分类 ✓）—— 以前两组并排念 ✗ ⇒ 跑第二趟 0 检出时会出现
+    #   "检出 0 框" 与 "每帧框数 中位 4" 并存的怪象 ✓（实测那个项目：793 框 = 玩家 133 +
+    #   怪 288 + 宠物 372 ✓）。现在把**口径写在字面上** ✓，谁也别猜 ✓。
+    try:
+        from perception.classes import ZH_NAMES as _ZH
+    except Exception:                       # noqa: BLE001 —— 名字取不到也不能耽误写日志 ✗
+        _ZH = {}
+
+    def _cn(c):
+        try:
+            return _ZH.get(int(c), "?")
+        except Exception:                   # noqa: BLE001
+            return "?"
+
+    _cls = int(cfg.get("cls", CLASS_MOB))
+    _per = stats.get("per_class") or {}
+    _dir_total = int(sum(_per.values()))
+    _dir_txt = " · ".join("%s %d" % (_cn(k), v) for k, v in sorted(_per.items()))
+
     ctx.log("")
     ctx.log("── 标注完成 ──", "ok")
-    ctx.log("  画面 %d 张 / 检出 %d 框 / 有检出 %d 帧（%.0f%%）"
-            % (n, total, frames_with, 100.0 * frames_with / max(1, n)))
-    ctx.log("  每帧框数: 中位 %.0f，最多 %d，空帧 %d"
+    ctx.log("  画面 %d 张 / **本次检出** %d 框（class %d %s）/ 本次有检出 %d 帧（%.0f%%）"
+            % (n, total, _cls, _cn(_cls), frames_with,
+               100.0 * frames_with / max(1, n)))
+    if _dir_total:
+        ctx.log("  该目录里的框（**含别的类**、**含上一波** ✓）: 合计 %d —— %s"
+                % (_dir_total, _dir_txt))
+    ctx.log("  每帧框数（照**该目录全部类**算 ✓）: 中位 %.0f，最多 %d，空帧 %d"
             % (stats["median_boxes"], stats["max_boxes"], stats["zero_frames"]))
     if stats["size_median"]:
-        ctx.log("  框尺寸:   中位 %.0f px（%.0f ~ %.0f）"
+        ctx.log("  框尺寸（同上口径 ✓）: 中位 %.0f px（%.0f ~ %.0f）"
                 % (stats["size_median"], stats["size_p10"], stats["size_p90"]))
     ctx.log("  用时 %.1fs（%.0f 帧/秒）" % (dt, n / max(dt, 0.001)))
+    if protected:
+        ctx.log("  ⚠ 有 %d 帧**本次一个都没检出、但原来有本类的框** ⇒ 已**原样保留**（没清空 ✓）"
+                "—— 这些帧要真清空，就自己把对应的 txt 删掉再跑 ✓" % protected, "warn")
     ctx.log("")
 
     # 诊断提示 —— 让用户不必自己看数字找问题
     if frames_with == 0:
-        ctx.log("没有任何帧检出目标。可能是：模板与画面姿态差异过大、"
-                "scale 不对、或搜索区域把目标排除了", "warn")
+        if protected:
+            ctx.log("本次没有任何帧检出目标（其中 %d 帧的旧框已原样保留 ✓）。"
+                    "先看 vis/ 里的可视化图：图上**一个框都没有** ⇒ 模板/尺度/区域不对；"
+                    "图上有框 ⇒ 那次跑的不是这批帧" % protected, "warn")
+        else:
+            ctx.log("没有任何帧检出目标。可能是：模板与画面姿态差异过大、"
+                    "scale 不对、或搜索区域把目标排除了", "warn")
     elif stats["zero_frames"] > n * 0.5:
-        ctx.log("过半帧没有检出（%d/%d）—— 检查 scale 是否标定正确"
+        ctx.log("过半帧没有检出（%d/%d，按目录算）—— 检查 scale 是否标定正确"
                 % (stats["zero_frames"], n), "warn")
 
-    summary = "%d 帧 / %d 框 / 有检出 %.0f%%" % (n, total, 100.0 * frames_with / max(1, n))
+    summary = "%d 帧 / 本次 %d 框 / 有检出 %.0f%%" % (n, total,
+                                                     100.0 * frames_with / max(1, n))
+    if protected:
+        summary += "（保留 %d 帧旧框）" % protected
 
     return {
         "frames": n,
         "detections": total,
         "frames_with_det": frames_with,
+        # ⭐ 本类 0 检出 ⇒ 原样保留旧框的帧数（用户 2026-10-05 ✓ 见 `work` ✓）——
+        #   卡片摘要 / 用例都读它 ✓（"检出 0" 与 "旧框还在" 这两件事必须能分开说 ✓）。
+        "protected": protected,
         "stats": stats,
         "seconds": dt,
         "out_dir": str(out),

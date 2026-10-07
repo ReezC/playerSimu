@@ -25,6 +25,15 @@ import numpy as np                                  # noqa: E402
 
 import tools.lie_demo as D                          # noqa: E402
 
+#: ⭐⭐⭐⭐⭐ **自检里默认关掉"真目标丢失 / 重新找到"那份日志** ✗✗（`logs/lie_target.log` ✓ 用户
+#:   2026-10-07 ✓）—— ⚠⚠ **实测踩到** ✓：自检里那些 `VelocityRunner` / `VelocityTracker` 一跑，
+#:   就会往**用户那份日志**里塞测试行 ✗（实测四条"帧 -" ✓）⇒ **自检一个字节都不许落到用户日志里** ✓。
+#:   ⚠ 专门验日志那一条（`selftest_lie_motion.test_velocity_log_lost_and_found` ✓）在自己内部
+#:     把路径指到**临时目录** ✓ 验完还原 ✓ —— 那是"量日志"，与"别污染用户日志"不冲突 ✓。
+import perception.lie_motion as _lm                 # noqa: E402
+
+_lm.set_vel_log_path(None)
+
 _FAILED = []
 
 
@@ -150,6 +159,32 @@ def _fake_exec(self):
     win._was_playing = False
     win.on_seek_done()
     check(not win.playing, "拖动前**没在播** ⇒ 松手后也别自动播 ✓")
+
+    # ⭐⭐⭐ **切运动分离 ⇒ 「分离期」「融合期」两行整体消失**（用户 2026-10-04 ✓ 原话："在运动
+    #   分离模式下，配置栏上面的 分离期、融合期 两行移除" ✓）—— ⚠ 原来只收了**行内控件**、
+    #   **两个分组标题没跟着收** ✗ ⇒ 留下一排空标题（看着像"两行还在" ✓ 就是这个 bug ✓）。
+    _im = next((k for k in range(win.cmb_mode.count())
+                if str(win.cmb_mode.itemData(k)) == "motion"), -1)
+    if _im >= 0:
+        _h2 = getattr(win, "_row2_head", None)
+        _h3 = getattr(win, "_row3_head", None)
+        check(_h2 is not None and _h3 is not None,
+              "模式行：两个分组标题有引用（`_row2_head` / `_row3_head` ✓）")
+        win.cmb_mode.setCurrentIndex(_im)
+        app.processEvents()
+        check(_h2 is not None and not _h2.isVisible()
+              and _h3 is not None and not _h3.isVisible(),
+              "模式行：切到**运动分离** ⇒「分离期」「融合期」两个**分组标题都收了** ✓"
+              "（⚠ 只收行内控件不够 ✗ 标题也要收 ✓）")
+        _w2 = next((win._row2.itemAt(k).widget() for k in range(win._row2.count())
+                    if win._row2.itemAt(k).widget() is not None), None)
+        check(_w2 is None or not _w2.isVisible(),
+              "模式行：「分离期」**行内控件也收**（老行为不破 ✓）")
+        win.cmb_mode.setCurrentIndex(0)
+        app.processEvents()
+        check(_h2 is not None and _h2.isVisible()
+              and _h3 is not None and _h3.isVisible(),
+              "模式行：切回**经典** ⇒ 两个分组标题**回来** ✓")
 
     # ⑤ ⭐⭐ **「轨迹预测窗口时间」配置行 + 「应用」**（用户 2026-10-01 ✓ 原话："增加参数
     #   「轨迹预测窗口时间」……在输入框右边加按钮「应用」，点击后重新运算并生效" ✓）。
@@ -970,13 +1005,31 @@ def _fake_exec(self):
         check("GIF" in win.windowTitle(), "标题标明是 GIF：「%s」" % win.windowTitle())
         check(len(win.results) == len(win.frames),
               "GIF 也**整段演算完**（%d/%d ✓）" % (len(win.results), len(win.frames)))
+        # ⭐⭐⭐⭐⭐ **「乙」：原图只留 JPEG 字节** ✗✗（用户 2026-10-07 ✓ 原话："**优化直到能顺畅跑
+        #   D:\\Media\\record\\mxd\\10月7日.mp4**" ✓✓）—— ⚠⚠ **为什么这是内存那条命根子** ✗：
+        #   那条片子实测 **1920×1080 ｜ 去重后 797 帧** ⇒ 原图留 BGR 是 **6.22MB/帧** ✗
+        #   （光它 **4.95GB** ✗）⇒ 换成 JPEG（q95 ✓ **0.54MB/帧** ✓）⇒ 素材合计
+        #   **5.0GB → 1.5GB** ✓（**3.3×** ✓）。⚠ **只给显示** ✗：检测/追踪吃的仍是处理帧
+        #   `[1]`（750×500 ✓）⇒ 算法口径**一个像素都不动** ✓。
+        check(isinstance(win.frames[0][0], (bytes, bytearray))
+              and len(win.frames[0][0]) > 1000,
+              "**原图存的是 JPEG 字节** ✓（第 1 帧 = %s ／ %d 字节 ✓〔bytes ⇒ 不是 BGR ✗〕）"
+              "—— ⚠ 谁把它换回 BGR 数组 ✗ ⇒ 长片内存**又回到 5GB 级** ✗（本条立刻红 ✓）"
+              % (type(win.frames[0][0]).__name__, len(win.frames[0][0])))
+        _b0 = D.decode_big(win.frames[0][0])
+        check(_b0 is not None and _b0.ndim == 3 and _b0.shape[0] > 0
+              and _b0.dtype == "uint8" and _b0.shape[0] * win.scale[1] > 0,
+              "**能解回原图** ✓（形状 %s ✓、`scale` = (%.2f, %.2f) ✓ ⇒ 画布尺寸对得上 ✓）"
+              "—— ⚠ 解不回来 ⇒ 画面整个空 ✗" % (str(_b0.shape), win.scale[0], win.scale[1]))
         # ⭐⭐ **`pos=None` 的帧不许把窗口画崩**（2026-09-30 用户报"打不开 闪退"的根因 ✓）：
         #   追踪器在 init / lost 帧报 `pos=None` ✓，而 `draw()` 里有一段（白箭头 = 轨迹速度）
         #   直接 `pos[0]` ⇒ `TypeError` ⇒ 整个窗口崩 ✗（pythonw 只打 traceback ⇒ 用户只看到
         #   闪退 ✗）。这里直接用**空位置 + 有 track_v** 的形态喂一次 `draw()` ✓。
         ok = True
         try:
-            frame = win.frames[0][0].copy()
+            #   ⚠⚠ **原图现在是 JPEG 字节** ✗（2026-10-07「乙」✓ 见 `_BIG_JPEG_Q` ✓）
+            #     ⇒ 要喂 `draw()` 得先 `decode_big` 解一次 ✓（不然就是 `'bytes' has no copy` ✗）。
+            frame = D.decode_big(win.frames[0][0]).copy()
             D.draw(frame, (None, None, 10.0, False, []), 1.0, 1.0, "hud", (100, 100),
                    {"track_v": (30.0, -20.0), "dt": 0.18, "tracks": [],
                     "box_moves": [], "box_roles": []}, None, 0.0)
@@ -997,7 +1050,7 @@ def _fake_exec(self):
             # ⚠⚠ **别去 monkeypatch `cv2.circle`** ✗（实测：改全局 C 函数会让**离屏 Qt 绘制
             #   直接原生崩**（exit=0xC0000409 栈溢出 ✗）⇒ 改成**量真正画出来的像素** ✓
             #   更真实、也不动全局 ✓）。
-            im = D.draw(win.frames[idx][0].copy(),
+            im = D.draw(D.decode_big(win.frames[idx][0]).copy(),
                         (None, rr["pos"], rr["r"], rr["hit"], rr["boxes"]),
                         win.scale[0], win.scale[1], "hud", rr.get("cursor"),
                         rr.get("motion"), None, 0.0)
@@ -1030,7 +1083,7 @@ def _fake_exec(self):
         #   钉法：渲染第 21 帧 → 再渲染别的几帧 → **再渲染第 21 帧** ⇒ 两张图必须**逐像素相同** ✓。
         def _render(k):
             rk = win.results[k]
-            return D.draw(win.frames[k][0].copy(),
+            return D.draw(D.decode_big(win.frames[k][0]).copy(),
                           (None, rk["pos"], rk["r"], rk["hit"], rk["boxes"]),
                           win.scale[0], win.scale[1], "hud", rk.get("cursor"),
                           rk.get("motion"), None, 0.0)
@@ -1289,8 +1342,12 @@ def test_merge_label():
     ys, xs = np.nonzero(m)
     _bx1 = tb[0] + tb[2] / 2
     _by0 = tb[1] - tb[3] / 2
-    ok = (len(xs) > 0 and xs.min() >= _bx1 - 40 and xs.max() <= _bx1
-          and abs(ys.min() - _by0) <= 3)
+    # ⚠⚠ **容差要跟着字号走** ✗✗（用户 2026-10-04 ✓ "窗口字体能大点" ⇒ 画布字号放大 ✓）——
+    #   这条要验的是「**贴在红框右上角**」（**右对齐**框右边 ✓ **顶边贴**框顶 ✓），
+    #   **不是**"标记多宽/几像素" ✗ ⇒ 左右各给足（±6 ✓）、y 给 6 ✓。
+    #   ⚠ 实测：字号放大后右边界到了 `_bx1+1`（**抗锯齿边缘** ✓）⇒ 卡 `<= _bx1` 就红了 ✗。
+    ok = (len(xs) > 0 and xs.min() >= _bx1 - 80 and xs.max() <= _bx1 + 6
+          and abs(ys.min() - _by0) <= 6)
     check(ok, "融合红框右上角没标「融合」（%d 个标像素 x[%s..%s] y[%s..%s] ｜ 期望在红框右上角 "
           "x[%.0f..%.0f] y≈%.0f ✗）"
           % (len(xs), xs.min() if len(xs) else "-", xs.max() if len(xs) else "-",
@@ -1300,15 +1357,17 @@ def test_merge_label():
                  1.0, 1.0, "hud", None, {"tbox": tb, "merged": False, "box_roles": []},
                  None, 0.0)
     n2 = int(np.all(im2 == _LAB, axis=2).sum())
-    check(n2 == 0, "非融合红框也标了「融合」（%d 个标像素 ✗ 该 0 ✓）" % n2)
+    # ⚠ **给一点容差**（用户 2026-10-04 ✓ 字号放大后 ✓）：红框/文字的**抗锯齿边缘**会偶发
+    #   1~2 个同色像素 ✗ —— 而真的"标了融合"是 **1000+ 个像素** ✓ ⇒ 阈值 20 完全分得开 ✓。
+    check(n2 < 20, "非融合红框也标了「融合」（%d 个标像素 ✗ 该 ≈0 ✓）" % n2)
 
 
 def test_path_line():
-    """⭐⭐ **纳入预测的轨迹画成白线**（用户 2026-10-01 ✓ 原话："用白色的线把纳入预测的轨迹
-    画出来" ✓）：`motion["path_pts"]`（加工域 ✓ 后端给的群体相对曲线 ✓）⇒ 连成白折线 ✓。
+    """⚠ **白线（纳入预测的轨迹）已移除**（用户 2026-10-04 ✓ 原话："黄箭头、白线…也不需要，
+    移除" ✓）：`motion["path_pts"]` **不再画** ✗（后端仍给那份曲线，只是演示窗不用了 ✓）。
 
-    合成帧验：有 `path_pts` 与没有的两份渲染，**白像素差集** = 白线本体 ✓（其它白标记
-    （圆心/白箭头）两边都有 ⇒ 被差掉 ✓）。
+    合成帧验：有 `path_pts` 与没有的两份渲染，**白像素差集 = 0** ✓（白线本体不画 ✓；
+    其它白标记两边都有 ⇒ 被差掉 ✓）。
     """
     frame = np.zeros((200, 300, 3), np.uint8)
     _pts = [(50.0, 100.0), (80.0, 100.0), (110.0, 120.0)]
@@ -1316,19 +1375,14 @@ def test_path_line():
                 1.0, 1.0, "hud", None, {"path_pts": _pts, "box_roles": []}, None, 0.0)
     im0 = D.draw(frame.copy(), (None, (150.0, 100.0), 20.0, True, []),
                  1.0, 1.0, "hud", None, {"path_pts": [], "box_roles": []}, None, 0.0)
-    # ⚠ **用"近白"阈值**（≥140 ✓）而不是纯白 ✗：`cv2.LINE_AA` 抗锯齿在**黑底**上会把 1px
-    #   白线混成灰色（实测峰值 ~218、端点 ~143 ✓）⇒ 纯白 `==255` 一个都抓不到 ✗✗。
+    # ⚠ **用"近白"阈值**（≥140 ✓）：万一还画着白线，AA 抗锯齿在黑底上会混成灰色
+    #   （峰值 ~218 ✓）⇒ 纯白 `==255` 抓不到 ✗ ⇒ 用近白阈值才拦得住 ✓。
     _W = np.array((140, 140, 140))
     _only = np.all(im >= _W, axis=2) & ~np.all(im0 >= _W, axis=2)
     n = int(_only.sum())
-    ys, xs = np.nonzero(_only)
-    # ⚠ 容差 ±4（端点画了个半径 3 的空心圆 ✓ + AA 边缘 ✓）
-    ok = (n > 0 and xs.min() >= 50 - 4 and xs.max() <= 110 + 4
-          and ys.min() >= 100 - 4 and ys.max() <= 120 + 4)
-    check(ok, "纳入预测的轨迹画成白线（%d 像素 x[%s..%s] y[%s..%s] ｜ 期望覆盖折线 "
-          "(50,100)→(110,120) ✓）"
-          % (n, xs.min() if n else "-", xs.max() if n else "-",
-             ys.min() if n else "-", ys.max() if n else "-"))
+    check(n == 0,
+          "白线（纳入预测的轨迹）**不再画**（有 path_pts 与没有的两份渲染白像素差集 = %d 像素 "
+          "｜ 期望 **0** ✓ —— 用户 2026-10-04「白线…移除」✓）" % n)
 
 
 def test_pink_relay_box():
@@ -1454,6 +1508,170 @@ def test_merge_ratio_switch():
           % (_v,))
     check(_tk._drift_fix_vel(1.0) is None and _LK(path_ms=100)._drift_fix_vel(2.0) is None,
           "Δt≤0 / 没有漂移起点 ⇒ 如实给 None（不猜 ✓ 调用方沿用旧速度 ✓）")
+
+
+def test_track_label_anchor_circle():
+    """⭐⭐⭐⭐⭐ **"座位推的"标签必须钉在圆心** ✗✗（用户 2026-10-06 ✓ 原话："**为什么 #8 推的标在
+    这里？这帧附近所有的座位都已经被占了，#8 推的应该标在圆心**" ✓✓）。
+
+    ⚠⚠⚠ **它抓的是一个真 bug** ✗✗（如实记 ✓）：我第一版把锚点写成 `motion["pos"]` ✗ ⇒ 而那个键
+      **实测是 `None`** ✗（`10月1日` 帧 62~64 全空 ✓）⇒ 代码**从来没生效过** ✓，标签一直挂在
+      **轨迹自己的推算位置 `p`** ✗ —— 而两者实测能差 **23px** 以上 ✓（帧 63：圆 `(260.8,321.1)`
+      vs `#8.p (237.3,329.8)` ✓）⇒ 看着就像"挂到别人那格座位上了" ✓（用户当场看出来 ✓）。
+    ⇒ 现在抽成纯函数 `lie_demo.track_label_anchor` ✓（`draw()` 用的就是它 ✓ 同源 ✓）：
+      · **座位 + 这一拍"推的"**（`sel` ✓ 且 `live == False` ✓）⇒ 钉**圆心** ✓（用 `draw()` 手里
+        那个 `pos` ✓）；· **其余** ⇒ 照旧钉**它自己的 `p`** ✓（老行为不变 ✓）。
+    钉三条：
+      ① **座位推的 ⇒ 圆心** ✓（⚠ 把锚点改回 `motion["pos"]` / 改回 `p` ⇒ 立刻红 ✗）；
+      ② **座位有框时不改锚点** ✓（它本来就有座位 ✓，标签走框那条链 ✓）；
+      ③ **别人的账照旧钉 `p`** ✓（不许被"圆心"那套带跑 ✗）。
+    """
+    from tools.lie_demo import track_label_anchor
+
+    _pos = (260.8, 321.1)
+    _seat = {"tid": 8, "p": (237.3, 329.8), "live": False, "sel": True}
+    _a1 = track_label_anchor(_seat, _pos, 1.0, 1.0)
+    check(_a1 == (260, 321),
+          "① **座位这一拍是「推的」 ⇒ 标签钉在圆心** ✓（锚点 = %s ✓〔要 (260,321) = 圆心 ✓〕）"
+          " —— ⚠ 锚点写回 `motion['pos']`（**实测恒为 `None`** ✗）或写回 `p`（= (237,329) ✗）"
+          " ⇒ 本条立刻红 ✗（实测两者差 **23px** ✓ ⇒ 看着像挂到别人座位上了 ✓）" % (_a1,))
+
+    _seat2 = {"tid": 8, "p": (237.3, 329.8), "live": True, "sel": True}
+    _a2 = track_label_anchor(_seat2, _pos, 1.0, 1.0)
+    check(_a2 == (237, 329),
+          "② **座位这一拍有框 ⇒ 锚点不动** ✓（锚点 = %s ✓〔要 (237,329) = 它自己的 `p` ✓〕）"
+          " —— ⚠ 一刀切「座位一律钉圆心」✗ ⇒ 有框那几拍会把标签从框上拽走 ⇒ 本条红 ✗" % (_a2,))
+
+    _other = {"tid": 11, "p": (205.3, 376.4), "live": False, "sel": False}
+    _a3 = track_label_anchor(_other, _pos, 1.0, 1.0)
+    check(_a3 == (205, 376),
+          "③ **别人的账照旧钉 `p`** ✓（锚点 = %s ✓〔要 (205,376) ✓〕）—— ⚠ 「圆心那套」对谁都生效 ✗"
+          " ⇒ 满屏标签挤在圆上 ⇒ 本条红 ✗" % (_a3,))
+
+
+def test_box_label_two_lines():
+    """⭐⭐⭐⭐⭐ **检出框标签拆两行**（用户 2026-10-04 ✓ 原话："**把目标标签里的例如「#14 m0.89」
+    换一行显示**" ✓✓）。
+
+    ⚠ 原来一行 `shape 0.98 #14  m0.89` **又宽又挡** ✗（横着盖掉半个框 ✓）⇒ 现在：
+      · **第 1 行 = `0.98`**（**置信度** ✓ —— ⚠ 2026-10-07 起**不带 `shape` 那个词**了 ✓
+        因为类别名**恒为 `shape`** ✗ 等于没信息 ✓）；
+      · **第 2 行 = `#14  m0.89`**（"是谁" ＋ "这格多可信" ✓）；
+      · ⚠⚠ 整块**不再以框心为中心** ✗（用户 2026-10-07："**标签还是在框心挡视野**" ✓）
+        ⇒ 位置口径搬到 `box_tab_pos`（**框左上角外侧** ✓ 见 `test_box_tab_pos_above_box_corner` ✓）；
+      · ⚠ **没有黑底了** ✗（用户 2026-10-07："**把标签的黑色背景去掉**" ✓ ⇒ ⑤ 钉住 ✓）。
+    离屏像素级钉五条（黄字 = `(0,255,255)` ✓）：
+      ① **恰好两行**（黄像素按行分组 = **2** 组、组间有缝 ✓）；
+      ② **没搞反**：第 1 行 = `0.98`、第 2 行 = `#14  m0.89` ✓（⚠ 文字口径由纯函数钉 ✓
+         —— 像素上两串差不多宽 ⇒ 判不出顺序 ✗）；
+      ③ 画出来的两行**确实就是那两串**（墨宽不超排版宽 ✓）；
+      ④ 整块**比原来一行窄** ✓ —— 这才是"换行"的目的（少挡画面 ✓）；
+      ⑤ ⭐ **整块背后没有黑板子** ✓（画面里**一个纯黑 `(0,0,0)` 像素都不该有** ✓ —— 底色是
+         30/30/30 的灰底 ✓）—— ⚠⚠ 那句 `cv2.rectangle(..., (0,0,0), -1)` 加回来 ⇒ 本条红 ✗。
+    """
+    _f = np.full((180, 300, 3), 30, np.uint8)
+    _res = ({"state": "track"}, (130.0, 90.0), 18.0, None, [])
+    _mo = {"mode": "motion",
+           "box_v": [(130.0, 90.0, 0.0, 0.0, 14, 0.98, 0.89, 0)],
+           "show": {"boxes": True, "box_id": True}}
+    _im = D.draw(_f.copy(), _res, 1.0, 1.0, motion=_mo)
+    _pts = [(int(_x), int(_y)) for _y in range(180) for _x in range(300)
+            if tuple(int(_v) for _v in _im[_y, _x]) == (0, 255, 255)]
+    check(bool(_pts),
+          "⓪ 画面上确实有**黄字标签**（黄像素 %d 个 ✓ —— 没有它 ⇒ 后面两条无从谈起 ✗）"
+          % len(_pts))
+    _rows = []
+    for _y in sorted({_p[1] for _p in _pts}):
+        if _rows and _y - _rows[-1][-1] <= 1:
+            _rows[-1].append(_y)
+        else:
+            _rows.append([_y])
+    check(len(_rows) == 2,
+          "① **恰好两行**：黄字按行分成 **%d** 组（每行占的行数 %s）—— ⚠ 还挤在一行 ⇒ 只有 1 组"
+          " ⇒ 立刻红 ✗✗" % (len(_rows), [len(_r) for _r in _rows]))
+    _ws = []
+    for _r in _rows:
+        _xs = [_p[0] for _p in _pts if _p[1] in _r]
+        _ws.append(max(_xs) - min(_xs) + 1)
+    # ② ⚠ **顺序不能靠像素宽度判** ✗（`shape 0.98` 墨宽 103 vs `#14  m0.89` 109 ⇒ 差不多宽
+    #    ⇒ 判不出谁上谁下 ✓）⇒ 由**纯函数**（= `draw()` 用的那一个 ✓）钉 ✓。
+    _l1, _l2 = D.box_label_lines(14, 0.98, 0.89)
+    _l1b, _l2b = D.box_label_lines(7, None, None)          # ⚠ 退化：没置信度、没匹配分 ✓
+    check(_l1 == "0.98" and _l2 == "#14  m0.89",
+          "② **两行的内容与顺序**：`box_label_lines(14, 0.98, 0.89)` = (%r, %r) ✓ —— "
+          "第 1 行 `0.98`（置信度 ✓ ⚠ 2026-10-07 起**不带 `shape` 那个词** ✓ 因为类别名恒为 "
+          "`shape` ✗）、第 2 行 `#14  m0.89`（是谁＋多可信 ✓）"
+          " ⚠ 搞反 / 还拼着一串 / 又把 `shape` 加回来 ⇒ 立刻红 ✗✗" % (_l1, _l2))
+    check(_l1b == "-" and _l2b == "#7",
+          "②b **拿不到的量不编**：没置信度 ⇒ 写占位的 `-` ✓、没匹配分 ⇒ 只写 `#7` ✓"
+          "（实测 = (%r, %r) ✓ ⚠ 那一行**必须占着** ✗ —— 排版按两行算 ✓ 少一行会错位 ✓）"
+          % (_l1b, _l2b))
+    _e1 = D.cv2.getTextSize(_l1, D.cv2.FONT_HERSHEY_SIMPLEX, 0.75, 1)[0][0]
+    _e2 = D.cv2.getTextSize(_l2, D.cv2.FONT_HERSHEY_SIMPLEX, 0.75, 1)[0][0]
+    _old = D.cv2.getTextSize("shape 0.98 #14  m0.89",
+                             D.cv2.FONT_HERSHEY_SIMPLEX, 0.75, 1)[0][0]
+    check(len(_rows) == 2 and max(_ws) <= max(_e1, _e2) + 2,
+          "③ 画出来的两行**确实就是那两串**（实测墨宽 %s ｜ 上限 = 两串的排版宽 %d/%d ✓"
+          " —— ⚠ 乱画别的串 ⇒ 溢出 ⇒ 红 ✗）" % (_ws, _e1, _e2))
+    check(len(_rows) == 2 and max(_ws) < _old,
+          "④ 整块**比原来那一行窄**（最宽行 **%s** < 老的一行 **%d** px ✓ ⇒ 挡的面少 ✓ —— "
+          "⚠ 只是把两段并排画 ⇒ ① 就红 ✗）" % (max(_ws), _old))
+    _blk = int(np.count_nonzero(np.all(_im == 0, axis=2)))
+    check(len(_rows) == 2 and _blk == 0,
+          "⑤ ⭐ **整块背后没有黑板子** ✓（画面里纯黑 `(0,0,0)` 像素 = **%d** 个 ✓〔要 0 ✓〕）"
+          "—— ⚠⚠ 把那句 `cv2.rectangle(..., (0, 0, 0), -1)` 加回来 ⇒ 立刻红 ✗（用户 2026-10-07 "
+          "原话：「**另外把标签的黑色背景去掉**」✓✓）" % _blk)
+
+
+def test_box_tab_pos_above_box_corner():
+    """⭐⭐⭐⭐⭐ **两行标签摆「框左上角外侧」** ✗✗（用户 2026-10-07 ✓ 原话："**标签还是在框心挡视野，
+    看我的示意图**" ✓✓ —— 示意图 = 一小块「标签」贴在检出框左上角**外面** ✓、框本体叫「检出框」✓）。
+
+    ⚠⚠ **改前的毛病**（**这就是本条要防的** ✗）：整块**以框心为中心**上下对称画 ✗ ⇒ 黄字正好压在
+      **框心**上 ✓ —— 而框心那一带恰恰是我们**要看的地方**（绿圈圆心 / 融合框的推导位置 /
+      真目标本体 ✓）⇒ 每帧都被它遮一下 ✓。
+    钉六条（**纯几何** ✓ 不画像素 ⇒ 快且稳 ✓）：
+      ① **左对齐到框的左沿** ✓（⚠ 仍"以框心居中" ✗ ⇒ 本条红 ✓）；
+      ② ⭐ **整块在框上沿之外** ✓（两行基线都 < 框上沿 ✓ ⇒ 框内**一个字不落** ✓；⚠ 改前第 2 行
+         落在框心（±半个框高 ✓）⇒ 压住框里 ⇒ 本条红 ✓）；
+      ③ **第 1 行在上** ✓（`y1 < y2 − 第 2 行高` ✓ —— 顺序反了 ⇒ 红 ✗）；
+      ④ 边界：**框贴着画面上边** ⇒ 整块**下移** ✓（不许把字切出画面 ✗）；
+      ⑤ 边界：**框伸到画面右沿之外** ⇒ `x` 左移 ✓（不许甩出画面 ✗）；
+      ⑥ 边界：**这拍没框**（`w = h = 0` ✓ 标签挂的是**推导位置** ✓）⇒ 以那个点为**左下**往上摆 ✓
+         （不凭空猜一个框 ✗）。
+    """
+    _s1 = D.cv2.getTextSize("0.98", D.cv2.FONT_HERSHEY_SIMPLEX, D._fs(0.75), 1)[0]
+    _s2 = D.cv2.getTextSize("#14  m0.89", D.cv2.FONT_HERSHEY_SIMPLEX, D._fs(0.75), 1)[0]
+    _wm = max(int(_s1[0]), int(_s2[0]))
+
+    _x, _y1, _y2 = D.box_tab_pos(400.0, 300.0, 200.0, 200.0, 1.0, 1.0, _s1, _s2, (900, 640))
+    check(_x == 300,
+          "① **左对齐到框的左沿** ✓（`x` = **%d** ✓〔要 300 = 400 − 200/2 ✓〕）—— ⚠ 仍以框心居中 "
+          "✗（那种 `x` ≈ 400 − 墨宽/2 ✓）⇒ 本条红 ✗" % _x)
+    check(_y2 < 200 and _y1 - int(_s1[1]) >= 0,
+          "② ⭐ **整块在框上沿之外** ✓（框上沿 = **200** ✓；第 2 行基线 = **%d** ✓、第 1 行顶端 = "
+          "**%d** ✓〔都要 < 200 且 ≥ 0 ✓〕）—— ⚠⚠ 改前是「以框心(300)为中心」✗ ⇒ 第 2 行掉进框里 "
+          "⇒ 本条红 ✗（**这正是用户那句「标签在框心挡视野」** ✓）"
+          % (_y2, _y1 - int(_s1[1])))
+    check(_y1 < _y2 - int(_s2[1]),
+          "③ **第 1 行在上** ✓（`y1` = **%d** < `y2 − 行高` = **%d** ✓）—— ⚠ 顺序反了 ⇒ 红 ✗"
+          % (_y1, _y2 - int(_s2[1])))
+
+    _a4 = D.box_tab_pos(400.0, 4.0, 200.0, 200.0, 1.0, 1.0, _s1, _s2, (900, 640))
+    check(_a4[1] - int(_s1[1]) >= 0 and _a4[2] > _a4[1],
+          "④ 边界：**框贴着画面上边**（上沿 = 4 − 200/2 = −96 ✓）⇒ 整块**下移** ✓（第 1 行顶端 = "
+          "**%d** ✓〔要 ≥ 0 ✓〕）—— ⚠ 照原样算 ⇒ 字被切掉一半 ⇒ 本条红 ✗" % (_a4[1] - int(_s1[1])))
+
+    _x5 = D.box_tab_pos(990.0, 300.0, 200.0, 200.0, 1.0, 1.0, _s1, _s2, (900, 640))[0]
+    check(_x5 <= 900 - _wm - 3,
+          "⑤ 边界：**框伸到画面右沿之外** ⇒ `x` 左移 ✓（`x` = **%d** ✓〔要 ≤ %d ✓〕）"
+          "—— ⚠ 照原样摆 ⇒ 字甩出画面 ⇒ 本条红 ✗" % (_x5, 900 - _wm - 3))
+
+    _x6, _a6, _b6 = D.box_tab_pos(130.0, 90.0, 0.0, 0.0, 1.0, 1.0, _s1, _s2, (300, 180))
+    check(_x6 == 130 and _b6 < 90,
+          "⑥ 边界：**这拍没框**（`w = h = 0` ✓ 标签挂的是**推导位置** ✓）⇒ 以那个点为**左下**往上摆 ✓"
+          "（`x` = **%d** ✓〔要 130 ✓〕、第 2 行基线 = **%d** ✓〔要 < 90 ✓〕）—— ⚠ 凭空猜一个框 "
+          "✗ ⇒ 本条红 ✗" % (_x6, _b6))
 
 
 def test_mask_holes():
@@ -1582,6 +1800,29 @@ def test_pick_box():
     check(D.pick_extra((300.0, 200.0, 180.0, 170.0), (300.0, 200.0), 0.0, None)[1] == "",
           "半径还没学到（`r=0`）⇒ 圆段留空 ✓（**不能拿 0 半径去算** ⇒ 会得 0 ✗ 是假信息 ✗）")
 
+    # ⭐⭐⭐ **点选信息框：最小宽度 + 自动换行**（用户 2026-10-04 ✓ 原话："点选之后的信息框能做
+    #   个**最小宽度+自动换行**吗？现在**整个屏幕都不够宽了**" ✓✓）—— 钉纯函数 `wrap_px` ✓：
+    #     ① 长行**被切开**，且每行**实测像素宽 ≤ 上限** ✓（⚠ 按"字符数"猜宽会算漏 ✗：中文/全角
+    #        在 `putText` 里会换成另一个字形 ✓ 只有 `getTextSize` 才是那把尺 ✓）；
+    #     ② 短行**原样不动** ✓；
+    #     ③ 英文**在空格处断**（单词不劈开 ✓ —— 拼回去应与原句**逐字一致** ✓）。
+    #   ⚠ "最小宽度"那一半在 `draw()` 里（`max(_PICK_MIN_W, 最长行宽)` ✓）—— 它是**画布排版** ✓
+    #     不进纯函数 ✓（这里钉的是换行尺 ✓）。
+    _long = "融合（跟真目标无关）：框里是**两个别的目标**撞在一起 ✗ ⇒ 与真目标无关，别当真"
+    _wl = D.wrap_px([_long], 300)
+    _wmax = max(D.cv2.getTextSize(t, D.cv2.FONT_HERSHEY_SIMPLEX, 0.75, 1)[0][0]
+                for t in _wl)
+    check(len(_wl) >= 2 and _wmax <= 300,
+          "① 长行**切成多行**（实测 %d 行 ✓）且**每行实测像素宽 ≤ 300px**（最宽 %d ✓）——"
+          "⚠ 按字符数猜宽会算漏 ✗（中文/全角在 putText 里是另一个字形 ✓）" % (len(_wl), _wmax))
+    check(D.wrap_px(["abc"], 300) == ["abc"],
+          "② 短行**原样** ✓（不拆、不去字 ✓）")
+    _en = D.wrap_px(["group median displacement is quite large here"], 200)
+    check(len(_en) >= 2
+          and " ".join(_en) == "group median displacement is quite large here",
+          "③ 英文**在空格处断**（单词不劈开 ✓ —— 拼回去与原句**逐字一致** ✓ 实测 %d 行）"
+          % len(_en))
+
     # ⭐⭐⭐ **右键 ⇒ 复制检出框信息**（用户 2026-10-03 ✓ 原话："加一个**右键点击检出框选中并弹出
     #   菜单**，目前只有一项『**复制检出框信息**』，用来我**复制之后与你交流**" ✓）——
     #   钉**剪贴板文本**（`pick_clip_text` ✓ 纯函数 ✓ 好测 ✓）：
@@ -1627,15 +1868,803 @@ def test_pick_box():
           "⇒ 自己按行拆开、逐行画 ✓ 黑底高度也按行数算 ✓）" % (_n3, _n1))
 
 
+def test_spinbox_typing():
+    """⭐⭐ **小上限数字框的整数位也能改**（用户 2026-10-04 ✓ 原话："**我无法将框心力度小数点
+    左边的数字改成 1**" ✓）。
+
+    病根（**离屏实测** ✓）：`QDoubleSpinBox` 上限 `1.0`、当前 `0.15` 时，**选中整数位那个 `0`
+    再敲 `1`** ⇒ 被当成 `1.15`（后面 `.15` 还在 ✗）⇒ **超上限** ⇒ `QDoubleValidator` 报
+    `Invalid` ⇒ **那一下敲不进去** ✗✗（`text` 原地不动 ✓）；只有**全选**后敲 `1` 才行 ✗。
+    ⇒ `gui.widgets.NoWheelDoubleSpinBox` 补了两道（**"数字但越界"降成 `Intermediate`** ✓
+      ＋ `CorrectToNearestValue` 离开时就近夹取 ✓）⇒ 敲得进 ✓、回车后 `1.15 → 1.00` ✓。
+    ⚠ 字母 / 格式错的**仍要拦住** ✗（别为了放行数字把校验整个拆了 ✓）。
+    """
+    try:
+        from PyQt5.QtCore import Qt as _Qt
+        from PyQt5.QtTest import QTest
+        from gui.widgets import NoWheelDoubleSpinBox
+    except Exception as _e:                 # noqa: BLE001 —— 环境不齐 ⇒ 跳过 ✓
+        check(True, "跳过数字框输入用例（环境不齐：%s ✓）" % _e)
+        return
+    app = QApplication.instance() or QApplication([])
+    w = NoWheelDoubleSpinBox()
+    w.setRange(0.0, 1.0)
+    w.setDecimals(2)
+    w.setValue(0.15)
+    w.show()
+    w.setFocus()
+    app.processEvents()
+    w.lineEdit().setSelection(0, 1)          # 选中整数位那个 `0`
+    QTest.keyClicks(w, "1")
+    _txt = w.lineEdit().text()
+    check(_txt != "0.15",
+          "① 小上限（0~1）数字框的**整数位敲得进去**（text=%r ✓ —— ⚠ 补丁前原地不动 ⇒ 立刻红 ✗）"
+          % _txt)
+    QTest.keyClick(w, _Qt.Key_Return)
+    app.processEvents()
+    check(abs(float(w.value()) - 1.0) < 1e-9,
+          "② `1.15` + 回车 ⇒ **就近夹到上限**（value=%.2f ✓ = 用户要的那句「改成 1」✓）"
+          % w.value())
+    w.lineEdit().selectAll()
+    QTest.keyClicks(w, "a")
+    app.processEvents()
+    check("a" not in w.lineEdit().text(),
+          "③ **字母仍进不去**（text=%r ✓ —— ⚠ 补丁只放行「数字但越界」那种 ✗ 别把校验拆了 ✓）"
+          % w.lineEdit().text())
+    w.hide()
+
+
+def test_fpull_ceiling_above_one():
+    """⭐⭐⭐⭐⭐ **界面「框心力度」的上界必须 > 1，而且两处要一致**（用户 2026-10-05 ✓ 原话：
+    "**框心力度无法调到 1 以上**" ✓✓）。
+
+    ⚠⚠ 这道墙有**两处** ✗✗（我原来只想到建控件那处 ✓）：
+      · `self.sp_fpull.setRange(0.0, 1.0)` ⇒ 直接敲不进去 ✓；
+      · `_cfg_load` 里 `min(max(…, 0.0), 1.0)` ⇒ 存进去 `2.0`、**重开被夹回 1.0** ✗
+        （看着像"改了不生效" ✓ —— 你存档里正好是 `1.0` ✓）。
+    ⇒ 两处都放到 **3.0** ✓；本用例**盯源码**（⚠ 不是行为 ✗ —— 真开窗要视频 + 检测，离屏跑不起 ✓，
+      同 `test_guide_keyed_on_circle` 那类源码级钉子 ✓）：`setRange` 那一行必须原样在 ✓、
+      载入那处**不许再出现夹到 `1.0` 的写法** ✗（任一处退回去 ⇒ 立刻红 ✓）。
+    ⚠ 后端侧"`> 1` 真能改变结果"另有一条 ✓（`selftest_lie_motion.test_fuse_pull_gate` ⑧ ✓）。
+    """
+    import re
+    _src = Path(D.__file__).read_text(encoding="utf-8")
+    check("self.sp_fpull.setRange(0.0, 3.0)" in _src,
+          "① 建控件那处的上界 = **3.0** ✓（`self.sp_fpull.setRange(0.0, 3.0)` 原样在 ✓ —— "
+          "⚠ 退回 `1.0` ⇒ 立刻红 ✗）")
+    _flat = _src.replace(" ", "")
+    _ks = [m.start() for m in re.finditer(r'"motion_fuse_pull"', _flat)]
+    _old = [k for k in _ks if ",0.0),1.0))" in _flat[k:k + 90]]
+    _new = [k for k in _ks if ",0.0),3.0))" in _flat[k:k + 90]]
+    check(bool(_ks) and not _old and len(_new) >= 1,
+          "② **载入存档那处也放到 3.0** ✓：`motion_fuse_pull` 共 %d 处 ｜ 附近仍是「夹到 1.0」的 "
+          "**%d 处**（要 0 ✓）｜ 夹到 3.0 的 **%d 处**（要 ≥1 ✓ —— ⚠ 只有**夹取写法**才算 ✓，"
+          "存盘那处**本来就没有夹取** ✓ 别拿它凑数 ✗）—— ⚠ 漏改载入那处 ⇒ 存 `2.0` 重开变回 "
+          "`1.0` ✗（= 「改了不生效」✓）"
+          % (len(_ks), len(_old), len(_new)))
+
+
+def test_load_releases_old_material_first():
+    """⭐⭐⭐⭐⭐ **`load()` 必须"先放掉旧素材、再去读新的"** ✗✗（用户 2026-10-07 ✓ 原话："**测谎演示
+    打开较长的视频后，再打开就会非常卡，无法正常使用了**" ✓✓）。
+
+    ⚠⚠ **病根**（**实测** ✓）：`load_video` 把**每一帧的两份都留在内存** ✗ —— 实测那条 750×500 的
+      片子：**原图 5.25MB ＋ 处理帧 1.12MB = 6.37MB/帧** ✗（⚠ "原图"其实是 **1.75M 像素**那一档 ✓）；
+      折算 1080p 档 **7.55MB/帧** ⇒ **3 分钟内容（1800 帧）≈ 13.6GB** ✗✗。
+    ⇒ 而 `self.frames` 原来是**等 `load_source` 返回之后**才被替换 ✗ ⇒ **读新的时候旧的还活着** ✓
+      ⇒ 峰值 **2×** ✗ ⇒ 一开长片就换页 ⇒ **非常卡** ✓（正是他说的"**再打开**"那一下 ✓）。
+    钉两条：
+      ① **先后**：`self.frames = []`（放掉旧素材 ✓）必须在 `load_source(path)` **之前** ✓
+         （⚠⚠ 挪到后面 ⇒ 又变回 2× ✗ 而且**一点报错都没有** ✗）；
+      ② **成套**：放掉的那组要**齐**（frames ／ ts ／ dets ／ results ／ results_kf ／ runner ／
+         runner_kf ✓ ＋ `gc.collect()` ✓）—— ⚠ 少放一个 ⇒ 那一份就跨素材活下来 ✗ ⇒ 峰值又不是 1× ✗。
+    """
+    _src = Path(D.__file__).read_text(encoding="utf-8")
+    _i = _src.index("def load(self, path):")
+    _seg = _src[_i:_i + 4000]
+    _i_read = _seg.index("load_source(path")   # ⚠ 只看前缀 ✗（后面可能还带 `on_progress=` ✓）
+    _i_drop = _seg.index("self.frames = []")
+    _need = ["self.frames = []", "self.ts = []", "self.dets = None",
+             "self.results = []", "self.results_kf = None",
+             "self.runner = None", "self.runner_kf = None"]
+    _miss = [_k for _k in _need if _k not in _seg[:_i_read]]
+    check(_i_drop < _i_read and not _miss and "gc.collect()" in _seg[:_i_read],
+          "①② **`load()` 先放旧素材、再读新的** ✓（放旧的在第 %d 字符、读在第 %d 字符 ⇒ "
+          "**先后对** ✓；该放没放的 = **%s** ✓〔要空 ✓〕；`gc.collect()` 在读取之前 ✓）"
+          "—— ⚠⚠ 顺序一颠倒 ⇒ 峰值 **2×** ✗（长片就是 GB 级 ✗ ⇒ 再打开就换页 ⇒ 非常卡 ✓）"
+          % (_i_drop, _i_read, _miss if _miss else "无"))
+
+
+def test_log_exception_writes_and_never_raises():
+    """⭐⭐⭐⭐⭐ **"内部异常"必须落盘、而且**绝不再抛** ✓✓（用户 2026-10-07 ✓ 他报："**闪退**" ✓）——
+    ⚠⚠ 为什么这条值得单钉 ✗：Qt 槽里抛的**未捕获异常** ⇒ PyQt `abort` ⇒ **整窗消失** ✓，
+      而 `pythonw` 没有控制台 ⇒ **traceback 一个都看不到** ✗ ⇒ 只能靠猜 ✓（这次挖那个
+      `motion_viz` 拿 `None` 当 `%.1f` 的 bug ✓ 我排除了内存/线程/检测/定时器四轮 ✓）。
+    ⇒ 演示窗的定时器槽都过 `_safe` ✓（先 `log_exception` 落盘 ✓ 再吞掉 ✓）；
+      本钉子直接钉那个**落盘函数**：① 写得进去 ✓ ② 传 `None` 也不抛 ✓（记日志不许炸 ✗）。
+    ⚠ **不碰真文件** ✗：`_ERROR_LOG` 临时指向临时目录 ✓（自检不许污染仓库 / 用户目录 ✓）。
+    """
+    import tempfile
+    from unittest import mock
+    with tempfile.TemporaryDirectory() as _d:
+        _p = Path(_d) / "sub" / "err.log"
+        with mock.patch.object(D, "_ERROR_LOG", _p):
+            _ok = True
+            try:
+                try:
+                    raise ValueError("钉一下 ✓")
+                except ValueError as _e:
+                    D.log_exception("自检里的假异常", _e)
+                D.log_exception("连 exc 都不给", None)
+            except Exception as _e2:              # noqa: BLE001 —— 记日志再抛就是最坏情况 ✓
+                _ok = False
+                check(False, "`log_exception` 自己抛了：%r ✗（记日志不许炸 ✓）" % (_e2,))
+            _txt = _p.read_text(encoding="utf-8") if _p.exists() else ""
+            check(_ok and _p.exists() and "钉一下" in _txt and "自检里的假异常" in _txt,
+                  "①② **异常落盘 ✓ 且不抛 ✓**（文件 %s ✓〔连目录都是它自己建的 ✓〕；写得进 "
+                  "%d 字节 ✓；含**堆栈** %s ✓〔⚠ 文案故意不写 `Traceback` 字样 ✗ —— 免得"
+                  "外层的 grep 把它当成「真出现异常」✓〕）—— ⚠ 不落盘 ⇒ 下次「闪退」还是只能靠猜 ✗"
+                  % ("有" if _p.exists() else "无", len(_txt),
+                     "有" if "Traceback" in _txt else "无"))
+
+
+def test_roi_wiring_in_demo():
+    """⭐⭐⭐⭐⭐ **限定区域（ROI）那套在演示窗里的接线** ✗✗（用户 2026-10-07 ✓ 原话："**只在限定的
+    区域计算（因为这是部分弹窗）**" ✓✓）。
+
+    ⚠⚠ **为什么这条只钉"接线"** ✗（**不钉语义** ✓）：语义（框外一概看不见 ✓ / 默认整幅不变 ✓ /
+      坏框当没给 ✓）已经由 `selftest_lie_motion.test_roi_limits_everything` **四条钉死** ✓；
+      这里只防"**有人把线拆了**"这种静默失效 ✓（画布到主窗的 `_on_roi` ✓、主窗给 runner 的
+      `roi` ✓、落盘的 `motion_roi` ✓、工具栏那个按钮 ✓、读配置那处 ✓）。
+    """
+    _src = Path(D.__file__).read_text(encoding="utf-8")
+    _need = ("self.lbl._on_roi = self._on_roi_picked",
+             '"roi": getattr(self, "roi", None)',
+             '"motion_roi"',
+             "def set_roi_mode(self, on)",
+             "self.btn_roi.toggled.connect(self._on_roi_mode)",
+             "self.btn_roi_clear.clicked.connect(self._on_roi_clear)",
+             "def _on_roi_picked(self, _rect)",
+             "self.start_warmup(reuse=True)")
+    _miss = [_k for _k in _need if _k not in _src]
+    check(not _miss,
+          "**ROI 接线齐** ✓（画布→主窗 ✓ ／ 主窗→runner ✓ ／ 落盘 `motion_roi` ✓ ／ 工具栏两个按钮 ✓ ／"
+          " 生效后 **复用检测框** 重算 ✓〔不重跑检测 ⇒ 快 ✓〕）—— ⚠ 缺项 = **%s** ✓〔要空 ✓〕"
+          % (_miss if _miss else "无"))
+
+
+def test_play_scheduler_follows_wall_clock():
+    """⭐⭐⭐⭐⭐ **播放要按"墙钟"排，不是"干完活再等一个间隔"** ✗✗（用户 2026-10-07 ✓ 原话：
+    "**没有以原速播放视频**" ✓✓）。
+
+    ⚠⚠ **实测病根**（`10月7日.mp4` ✓ 离屏真播 ✓）：老写法每拍周期 = **工作量 ＋ 间隔** ✗
+      （41.4ms 间隔 ＋ ~23ms 工作量 ⇒ **64ms/拍** ✗）⇒ 797 帧播 **50.9s**（该 **33.0s** ✓）
+      ＝ **0.65 倍速** ✗（用户看到的"没原速"就是它 ✓；方向是**比原速慢** ✗）。
+    ⚠⚠⚠ **还有一个更阴的**（**我第一版就栽在这** ✓ 幸好拿 0.5× 复验了 ✓）：到期时刻取成
+      "**刚显示的那一帧**" ✗ ⇒ 每拍都算出"早就该到" ⇒ 定时器永远排 0 ✗ ⇒ 播放退化成
+      "**按工作量跑**" ✗ ⇒ **慢放（0.5×）完全不生效** ✗（而且 1× 那次量到的 0.98× 只是
+      "工作量恰好 ≈ 间隔"的**巧合** ✓ 差点被糊过去 ✗）。
+    ⇒ 现在：到期时刻取**下一帧**那一格 ✓（`play_delay_ms` ✓ 纯函数 ✓ 好钉 ✓）。
+    钉五条：
+      ① **准点到**：`now == t0` ⇒ 该等"下一帧那一格"（100ms ✓ 不是 0 ✗）；
+      ② **已经迟到** ⇒ **≤ 0** ✓（调用方取 `max(0,…)` ⇒ 立刻排下一拍 ⇒ 诚实追 ✓）；
+      ③ **速度**：2× ⇒ 一半 ✓、0.5× ⇒ 两倍 ✓（⚠ 改前 0.5× 会**照样**按工作量跑 ✗）；
+      ④ **锚**：锚挪到第 3 帧（`i0=3`）⇒ 从那时算起 ✓（不是从第 0 帧 ✗）；
+      ⑤ **无 ts / 只有一格** ⇒ `None` ✓（调用方回落到"固定间隔" ✓ 老行为 ✓ 不崩 ✓）。
+    """
+    _ts = [0.0, 0.1, 0.2, 0.3, 0.4]
+
+    def _dl(_i, _i0=0, _now=100.0, _sp=1.0, _ts=_ts):
+        return D.play_delay_ms(_ts, _i, _i0, 100.0, _now, _sp)
+
+    _a = _dl(0)                                   # 刚显示第 0 帧、准点 ⇒ 等第 1 帧那一格 ✓
+    check(_a is not None and abs(_a - 100.0) < 1e-6,
+          "① **准点到 ⇒ 等「下一帧」那一格** ✓（实测 **%.1f ms** ✓〔要 100 ✓〕）—— ⚠⚠ 取成"
+          "「**刚显示的那一帧**」✗ ⇒ 这里是 **0** ⇒ 定时器永远排 0 ⇒ 退化成「按工作量跑」✗"
+          % (0.0 if _a is None else _a))
+
+    _b = _dl(0, _now=100.5)                       # 已经迟到 0.5s ⇒ ≤0 ⇒ 立刻下一拍 ✓
+    check(_b is not None and _b <= 0.0,
+          "② **已经迟到 ⇒ ≤ 0** ✓（实测 **%.1f ms** ✓〔要 ≤ 0 ✓〕）—— ⚠ 迟到还硬等一个正数 ✗ "
+          "⇒ 越拖越远（`max(0,…)` 那一步在调用方 ✓）" % (0.0 if _b is None else _b))
+
+    _c, _d = _dl(0, _sp=2.0), _dl(0, _sp=0.5)
+    check(_c is not None and _d is not None
+          and abs(_c - 50.0) < 1e-6 and abs(_d - 200.0) < 1e-6,
+          "③ **速度**：2× ⇒ **%.1f ms** ✓〔要 50 ✓〕、0.5× ⇒ **%.1f ms** ✓〔要 200 ✓〕"
+          "—— ⚠⚠ **慢放**（0.5×）最要紧 ✗：改前它**照样按工作量跑** ✗（实测 0.5× 会 33s 播完 ✓"
+          "**慢放白设** ✗）；修后实测 **66.0s** ✓ 精确 ✓"
+          % (0.0 if _c is None else _c, 0.0 if _d is None else _d))
+
+    _e = _dl(3, _i0=3)                            # 锚挪到第 3 帧 ⇒ 从那时算 ✓
+    check(_e is not None and abs(_e - 100.0) < 1e-6,
+          "④ **锚挪到第 3 帧 ⇒ 从第 3 帧算起** ✓（实测 **%.1f ms** ✓〔要 100 ✓〕）—— ⚠ 锚不挪 ⇒ "
+          "会按\"从第 0 帧一路追\"算 ✗（拖动 / 换速度 / 循环回头都要重锚 ✓ 见 `_play_anchor` ✓）"
+          % (0.0 if _e is None else _e))
+
+    check(D.play_delay_ms([], 0, 0, 0.0, 0.0, 1.0) is None
+          and D.play_delay_ms([7.0], 0, 0, 0.0, 0.0, 1.0) is None,
+          "⑤ **没有 ts / 只有一格 ⇒ `None`** ✓（调用方回落\"固定间隔\"✓ = 老行为 ✓ 不崩 ✓）")
+
+
+def test_box_corner_label_replaced():
+    """⭐⭐⭐⭐⭐ **检出框左上角那串字换掉了** ✗✗（用户 2026-10-07 ✓ 原话："**标签太挡视线了，把他们
+    字体缩小一号并替换检出框左上角的「shape xxx」**" ✓✓）。
+
+    ⚠⚠ **病根两条** ✗（**实测** ✓）：① 那串原来是 `"类别名 置信度"` ✓，而模型**只有一个类** ✓
+      名字就叫 **`shape`** ✓（`DetsWorker.names` = `['shape']` ✓）⇒ 每格框都顶着同一串**零信息**
+      的字 ✗；② 底衬按 **0.68** 量、字按 **0.45** 画 ✗ ⇒ **衬比字大一圈** ✓。
+    ⇒ 运动模式下换成 **`#编号 置信度`** ✓（`#22 0.52` ✓）；**经典模式零污染** ✓（老文案一字不变 ✓）。
+    钉四条：
+      ① 经典模式 ⇒ **老文案一字不变** ✓（有 names ⇒ `shape 0.52` ✓；没 names ⇒ `0 0.52` ✓）；
+      ② **运动模式 ＋ 有归属** ⇒ `#22 0.52` ✓（⚠⚠ 改前是 `shape 0.52` ✗ ⇒ 本条立刻红 ✓）；
+      ③ **没归属** ⇒ **只写置信度** ✓（`0.52` ✓ —— 不许编一个号 ✗）；
+      ④ 边界：`conf` 只有一位小数也**照两位写** ✓、`cls=None` 不崩 ✓。
+    """
+    check(D.box_corner_label(None, 0.52, 0, ["shape"], False) == "shape 0.52"
+          and D.box_corner_label(None, 0.52, 0, None, False) == "0 0.52",
+          "① **经典模式 ⇒ 老文案一字不变** ✓（有 names ⇒ `%s` ✓、没 names ⇒ `%s` ✓〔要 "
+          "`shape 0.52` / `0 0.52` ✓〕）—— ⚠ 顺手改了经典模式 ✗ ⇒ 本条红 ✗（零污染那条纪律 ✓）"
+          % (D.box_corner_label(None, 0.52, 0, ["shape"], False),
+             D.box_corner_label(None, 0.52, 0, None, False)))
+
+    check(D.box_corner_label(22, 0.52, 0, ["shape"], True) == "#22 0.52",
+          "② ⭐ **运动模式 ＋ 有归属 ⇒ `#编号 置信度`** ✓（实测 **`%s`** ✓〔要 `#22 0.52` ✓〕）"
+          "—— ⚠⚠ 改前是 `shape 0.52` ✗（类别名**恒为 `shape`** ✗ = 零信息 ✓）⇒ 本条立刻红 ✗"
+          % D.box_corner_label(22, 0.52, 0, ["shape"], True))
+
+    check(D.box_corner_label(None, 0.52, 0, ["shape"], True) == "0.52",
+          "③ **那格框没归属 ⇒ 只写置信度** ✓（实测 **`%s`** ✓〔要 `0.52` ✓〕）—— ⚠ 编一个号出来 ✗ "
+          "⇒ 本条红 ✗（没有归属就是没有 ✓）"
+          % D.box_corner_label(None, 0.52, 0, ["shape"], True))
+
+    check(D.box_corner_label(7, 0.9, None, None, True) == "#7 0.90",
+          "④ 边界：**只有一位小数也照两位写** ✓、`cls=None` 不崩 ✓（实测 **`%s`** ✓〔要 `#7 0.90` ✓〕）"
+          % D.box_corner_label(7, 0.9, None, None, True))
+
+
+def test_all_draw_fonts_go_through_fs():
+    """⭐⭐⭐⭐⭐ **`draw()` 里不许再出现"裸字号"** ✗✗（用户 2026-10-07 ✓ "**把他们字体缩小一号**" ✓✓）。
+
+    ⚠⚠ **为什么这条值得单钉** ✗：那一轮是**机械替换**包上了 `_fs()`（21 处 ✓ 含 3 处字号写在
+      **下一行**的 ✓）；以后**任何人**新加一句 `cv2.putText(..., 0.75, ...)` ✗ ⇒ 那串字
+      **不受 `_FONT` 管** ✗ ⇒ 想"再缩一号"时会**漏掉它** ✓（= 这条钉子要防的正是"**漏**"✓）。
+    钉两条：
+      ① `_fs()` 真的**缩小了** ✓（`_fs(1.0) == _FONT` 且 `_FONT < 1.0` ✓ —— 用户那句"缩小一号" ✓）；
+      ② `draw()` 的**函数体里**没有任何 `FONT_HERSHEY_SIMPLEX, <数字>` ✓（全过 `_fs()` ✓），
+         且 `_fs(` 出现 ≥ 20 次 ✓（⚠ 数量掉了 ⇒ 有人删了字号 ✓）。
+    """
+    import re as _re
+    _src = Path(D.__file__).read_text(encoding="utf-8")
+    _i = _src.index("def draw(")
+    _j = _src.index("\ndef ", _i + 1)          # 下一个顶层 def = 本函数结束 ✓
+    _seg = _src[_i:_j]
+    _raw = _re.findall(r"FONT_HERSHEY_SIMPLEX,\s*[0-9]", _seg)
+    _fsn = len(_re.findall(r"_fs\(", _seg))
+    check(abs(D._fs(1.0) - float(D._FONT)) < 1e-9 and float(D._FONT) < 1.0,
+          "① **字号出口真的「缩小一号」** ✓（`_FONT` = **%.2f** ✓〔要 < 1 ✓〕；`_fs(1.0)` = **%.2f** ✓）"
+          "—— ⚠ 把 `_FONT` 改回 1.0 ⇒ 字号又变回去 ✓（本条只钉「**确实小了**」✓）"
+          % (float(D._FONT), D._fs(1.0)))
+
+    check(not _raw and _fsn >= 20,
+          "② **`draw()` 里没有裸字号** ✓（裸的 = **%s** ✓〔要空 ✓〕；过 `_fs()` 的 = **%d** 处 ✓"
+          "〔要 ≥20 ✓〕）—— ⚠⚠ 新加一句 `putText(..., 0.75, ...)` ✗ ⇒ 那串字**不受 `_FONT` 管** ✗ "
+          "⇒ 以后「再缩一号」会漏掉它 ✓（本条就是防这个 ✓）"
+          % (_raw if _raw else "无", _fsn))
+
+
+def _cnt_bgr(img, bgr):
+    """画面里**正好**是这个颜色的像素数（BGR ✓）。⚠ `cv2` 画线/画框都是**整元组纯色** ⇒ 逐像素
+    相等就数得准 ✓（⚠ 但**1px ＋ `LINE_AA`** 的细线**没有纯色像素** ✗ 见 `_cnt_aa` ✓）。"""
+    return int(np.all(np.asarray(img) == np.array(bgr, np.uint8), axis=2).sum())
+
+
+def _cnt_aa(img, bgr, tol=40):
+    """**颜色家族**的像素数（分量各自差 ≤ `tol` ✓）—— 专门给 **1px ＋ `LINE_AA`** 那种细线用。
+
+    ⚠⚠ **为什么非有它不可** ✗✗（**实测** ✓）：`cv2.line(..., (0,170,170), 1, cv2.LINE_AA)` 画一条
+      60px 横线 ⇒ 纯色像素 **0 个** ✗（AA 把颜色摊到相邻两行 ⇒ 每行只有一半亮度 ✓）；而
+      "**有没有画**"这件事必须量得出来 ✓ ⇒ 退一步按"**颜色家族**"数 ✓（暗黄那条线 60px ⇒ 上百
+      像素 ✓ 远超 `LINE_AA` 边缘蹭出来的那几个 ✓）。
+    """
+    _a = np.asarray(img).astype(np.int16)
+    _t = np.array(bgr, np.int16)
+    return int(np.all(np.abs(_a - _t) <= int(tol), axis=2).sum())
+
+
+#: ⚠ 这些项**必须按颜色家族量**（1px ＋ `LINE_AA` ⇒ 没纯色像素 ✓ 见 `_cnt_aa` ✓）。
+_AA_KEYS = ("暗黄线（鼠标相对群体）",)
+
+
+def _cnt_item(img, key, bgr):
+    """按这一项的**画法**选量法（细线 ⇒ 颜色家族 ✓ 其余 ⇒ 纯色 ✓）。"""
+    return (_cnt_aa(img, bgr) if key in _AA_KEYS else _cnt_bgr(img, bgr))
+
+
+def _vel_motion(mode="velocity", wait_state="wait", merge_on=True, clamp=True, tbox=None,
+                label_on=True):
+    """一份**够 `draw()` 跑完**的假 `motion`（用户 2026-10-07 ✓ 速度跟踪那一轮的自检夹具 ✓）。
+
+    ⚠ 只放两类键：① 画那 7 样需要的 ✓；② **该被 `_vel` 挡掉**的那几样（好让正反两面都量得到 ✓）。
+    三格（都摆在画面正中偏下 ✓ 留出标签的位置）：
+      · `#1` = **整框在视野内、有编号** ⇒ 上板 ✓；
+      · `#2` = **贴着左边**（x0 ≈ 0 ⇒ 两个角点贴边 ✓）⇒ 等待上板 ✓（`wait_state="board"` 就能
+        把它"假装成上板" ⇒ 用来量"**等待上板到底有没有编号标签**" ✓）；
+      · `#3` = **融合** ⇒ 洋红（`merge_on=False` 关掉它 ⇒ 量"夹取细框有没有被画"就不会串色 ✓）。
+    多出来的那几样：粉框（`tbox=None` + `tbox_wh` ✓）／黄箭头（`tgt_rel_next` ✓）／暗黄线
+    （`cursor_rel` ✓）／洋红细夹取框（`fuse_clamp` ✓）。
+    """
+    _boxes = [(160.0, 120.0, 60.0, 60.0),      # #1 全内 ⇒ 上板 ✓
+              (20.0, 120.0, 60.0, 60.0),      # #2 贴左 ⇒ 等待上板 ✓
+              (240.0, 120.0, 80.0, 80.0)]     # #3 融合 ⇒ 洋红 ✓
+    _tids = (1, 2, 3)
+    _states = ["board", wait_state, ("merge" if merge_on else "board")]
+    _bv = []
+    for _k, (_cx, _cy, _w, _h) in enumerate(_boxes):
+        # 14 位：0/1 框心 · 2/3 位移 · 4 轨迹号 · 5 conf · 6 匹配分 · 7 状态码 · 8 has_tgt ·
+        #        9 占位 · 10/11 宽高 · 12 来源码 · 13 "主人"（-1 = 没有 ✓）
+        _m7 = 1 if (_k == 2 and merge_on) else 0
+        _bv.append((_cx, _cy, 6.0, 3.0, _tids[_k], 0.9, 0.8, _m7, True, False,
+                    _w, _h, 0, -1))
+    return {
+        "mode": mode,
+        #   ⚠ `label_on=False` ⇒ 关掉"框上那行字"（`(0,255,255)` ✓）：它**1px 抗锯齿的字边**
+        #     正好落在"暗黄线"那个颜色家族里（**实测**：411 px ✗）⇒ 量"细线有没有画"时会被它淹掉 ✓
+        #     （所以 ②/④ 那一对用 `label_on=False` ✓；③ 专门量标签 ⇒ 用它默认的 `True` ✓）。
+        "show": {"boxes": True, "rel_tgt": True, "rel_mouse": True,
+                 "box_id": bool(label_on), "panel": True},
+        "box_v": _bv,
+        #   ⚠⚠ **`vel` 里没有群体 `std_area`** ✗（用户 2026-10-07 规则1 ✓："群体不再有标准面积…每个
+        #     目标有自己的标准面积，存在自己的 id 里" ✓）⇒ 这一份是**逐 id** 的 ✓（`area_by_id` ✓）。
+        "vel": {"state": list(_states), "label": [1, None, None],
+                "board_ids": [1, 2, 9], "area_by_id": {1: 3600.0, 2: 3025.0},
+                "std_speed": (6.0, 3.0), "std_speed_px": 6.7, "n_vtx": 12},
+        # ⚠ `#2`（等待上板）**这一拍没框** ⇒ 只有它**有编号**时才会画那条灰框 + "#2 推的" ✓
+        #   ⭐⭐ 灰框尺寸取**这个 id 自己**的标准面积 ✓（规则1 ✓ 用户 2026-10-07 ✓）⇒ 夹具里给它 ✓
+        "tracks": [{"tid": 2, "p": (20.0, 120.0), "trust": False, "sticky": False,
+                    "rel_hist": [], "v": (0.0, 0.0), "score": 1.0, "dev": 1.0,
+                    "hits": 3, "live": False, "sel": False, "std_area": 3600.0},
+                   {"tid": 9, "p": (60.0, 120.0), "trust": False, "sticky": False,
+                    "rel_hist": [], "v": (1.0, 0.0), "score": 0.5, "dev": 1.0,
+                    "hits": 1, "live": False, "sel": False}],
+        #   ⚠ 这几条线/箭头**要够长** ✗（画出来才够几十像素 ✓ —— 太短的话"有没有画"两者都是
+        #     个位数像素 ⇒ 分不开 ✓ 实测踩到：3px 与 4px ✓）。
+        "pos_rel": [(0.0, 0.0), (20.0, 15.0), (40.0, 30.0)],
+        "cursor_rel": [(0.0, 0.0), (30.0, 20.0), (60.0, 40.0)],
+        "tgt_rel_last": (20.0, 8.0), "tgt_rel_next": (50.0, 20.0),
+        "dt": 1.0 / 60.0,
+        "tbox": tbox, "tbox_wh": (60.0, 60.0), "tbox_rad": 30.0, "tgt_radius": 20.0,
+        "median": (1.0, 1.0), "cam_len": 1.4, "dev": 2.0, "n_live": 3,
+        "sel_score": 5.0, "sel_dev": 1.0, "n_cands": 3,
+        "box_moves": [], "box_roles": [], "box_pred": [], "reg": [],
+        "merged": False, "fuse_clamp": ((20.0, 20.0, 300.0, 220.0) if clamp else None),
+        #   ⚠⚠ **速度跟踪档没有群体标准面积** ✗（规则1 ✓）⇒ 夹具里也不放这个键 ✓（= 与真后端一致 ✓）
+        "roi": None, "path_pts": [], "raw_pos": None,
+        "red_i": None, "log_text": "",
+    }
+
+
+def test_velocity_draw_subtraction():
+    """⭐⭐⭐⭐⭐ **速度跟踪档"做减法"：画面上正好只有那 7 样** ✗✗（用户 2026-10-07 ✓ 原话：
+    "模式下拉多一项「速度跟踪」，选中后**画面上正好只有那 7 条图例，别无他物**" ✓✓）。
+
+    ⚠⚠ **正反两半都要钉** ✗（这是"零污染"那条纪律的钉子 ✓）：
+      · **正**：`mode="velocity"` ⇒ 那 7 样**都在** ✓ ＋ 多出来的那几样**都是 0 像素** ✓；
+      · **反**：同一份夹具把 `mode` 换成 `"motion"` ⇒ 那几样"多出来的"**必须都冒出来** ✓✓
+        （⚠ 若反的那半没红 ⇒ 说明我不是"只在一档做减法"，而是**把运动分离那档也砍了** ✗✗
+         —— 那正是用户最在意的一条：`classic` / `motion` **零污染** ✓）。
+    另钉一条：**等待上板 ⇒ 没有编号标签**（把那一格"假装成上板" ⇒ 黄字像素必须**变多** ✓）。
+    ⚠ 颜色都是纯色 ⇒ 逐像素相等计数 ✓ 不用容差 ✓。
+    """
+    _d = [(0, 160.0, 120.0, 60.0, 60.0, 0.9),
+          (0, 20.0, 120.0, 60.0, 60.0, 0.9),
+          (0, 240.0, 120.0, 80.0, 80.0, 0.9)]
+    _res = (None, (160.0, 120.0), 20.0, True, _d)
+
+    def _run(_mo, _want=None, **kw):
+        _f = np.zeros((240, 320, 3), np.uint8)
+        return D.draw(_f, _res, 1.0, 1.0, None, (160.0, 120.0), _mo, _want, pick=None,
+                      kf=None, kf_trail=None, **kw)
+
+    # ---- ① 正：那 7 样都在 ----
+    _f = _run(_vel_motion("velocity"))
+    _need = {"蓝框": (255, 140, 0), "绿圆": (0, 255, 0), "红点": (0, 0, 255),
+             "蓝箭头": (255, 120, 0), "白箭头": (255, 255, 255), "橙线": (0, 150, 255),
+             "灰框": (150, 150, 150), "洋红（融合）": (255, 0, 255)}
+    _miss = {_k: _cnt_bgr(_f, _c) for _k, _c in _need.items() if _cnt_bgr(_f, _c) <= 0}
+    check(not _miss,
+          "① **那 7 样都在** ✓（蓝框 %d px ／ 绿圆 %d ／ 红点 %d ／ 蓝箭头 %d ／ 白箭头 %d ／ "
+          "橙线 %d ／ 灰框 %d ／ 洋红 %d ✓）—— ⚠ 缺的 = **%s** ✓〔要空 ✓〕"
+          % (_cnt_bgr(_f, (255, 140, 0)), _cnt_bgr(_f, (0, 255, 0)), _cnt_bgr(_f, (0, 0, 255)),
+             _cnt_bgr(_f, (255, 120, 0)), _cnt_bgr(_f, (255, 255, 255)),
+             _cnt_bgr(_f, (0, 150, 255)), _cnt_bgr(_f, (150, 150, 150)),
+             _cnt_bgr(_f, (255, 0, 255)), _miss if _miss else "无"))
+
+    # ---- ② 正：多出来的那几样都是 0 像素 ----
+    #   ⚠ "洋红细夹取框"与"融合框"**同色**（都是 (255,0,255) ✓）⇒ 只能**关掉融合格**再量它 ✓
+    _fd = _run(_vel_motion("velocity", merge_on=False, clamp=True, label_on=False))
+    _extra = {"暗黄线（鼠标相对群体）": (0, 170, 170), "黄箭头（下一拍预估）": (0, 215, 255),
+              "粉框（检出丢失接力）": (203, 192, 255), "洋红细夹取框": (255, 0, 255),
+              "经典那行左下说明字": (235, 235, 235)}
+    #   ⚠⚠ **阈值 30 px 的理由**（**实测踩到** ✓）：`cv2` 的 `LINE_AA` 会让字边蹭出**别的纯色** ✗
+    #     —— 黄字 `(0,255,255)`（框标签 ✓）压在黑底上时，边缘那几像素正好是 `(0,170,170)` ✗
+    #     （= 暗黄线的颜色 ✓）⇒ 严格"一个像素都不许有"会**假红**（实测 3 px ✓）；
+    #     而真画了那条线时是**几百像素**（见 ④ 的对照：motion 档 4 px ／ 参考"粉框 476 px" ✓）
+    #     ⇒ 用"**小于 30**"当"没画" ✓ 分得开 ✓。
+    _left = {_k: _cnt_item(_fd, _k, _c) for _k, _c in _extra.items()
+             if _cnt_item(_fd, _k, _c) >= 30}
+    check(not _left,
+          "② **多出来的那几样都没画** ✓（暗黄线 / 黄箭头 / 粉框 / 洋红细夹取框 / 经典左下那行字 "
+          "✓ 都 < 30 px ✓）—— ⚠ 真画了的 = **%s** ✓〔要空 ✓〕" % (_left if _left else "无"))
+
+    # ---- ③ 等待上板 ⇒ **没有编号标签**（假装它是上板 ⇒ 黄字必须变多）----
+    _fw = _cnt_bgr(_run(_vel_motion("velocity", wait_state="wait")), (0, 255, 255))
+    _fb = _cnt_bgr(_run(_vel_motion("velocity", wait_state="board")), (0, 255, 255))
+    check(0 < _fw < _fb,
+          "③ **「等待上板」没有编号标签** ✓（等待上板 ⇒ 框上黄字 **%d px** ／ 同一格改成上板 ⇒ "
+          "**%d px** ✓〔要 前者 < 后者 ✓〕）—— ⚠ 用户口径：「**有标签就是上板，无标签就是等待"
+          "上板**」✓ ⇒ 无标签**就是**它的画面表达 ✓" % (_fw, _fb))
+
+    # ---- ④ 反：运动分离档 ⇒ 那几样**必须都冒出来**（零污染 ✓）----
+    _fm = _run(_vel_motion("motion", merge_on=True, clamp=True, label_on=False))
+    _gone = {_k: _cnt_item(_fm, _k, _c) for _k, _c in _extra.items()
+             if _cnt_item(_fm, _k, _c) < 30
+             and _k != "经典那行左下说明字"}       # ⚠ 那一行经典档才画（motion 档本来就不画 ✓）
+    check(not _gone,
+          "④ **运动分离档一个字都没被砍** ✓（暗黄线 %d px ／ 黄箭头 %d ／ 粉框 %d ／ 洋红细夹取框 "
+          "%d ✓）—— ⚠ 少了的 = **%s** ✓〔要空 ✓〕；⚠⚠ 少了就说明这道减法**做过了头** ✗"
+          % (_cnt_item(_fm, "暗黄线（鼠标相对群体）", (0, 170, 170)),
+             _cnt_item(_fm, "黄箭头（下一拍预估）", (0, 215, 255)),
+             _cnt_item(_fm, "粉框（检出丢失接力）", (203, 192, 255)),
+             _cnt_item(_fm, "洋红细夹取框", (255, 0, 255)),
+             _gone if _gone else "无"))
+
+
+def test_velocity_mode_wiring():
+    """⭐⭐⭐⭐⭐ **速度跟踪那一档的接线 ＋ 那 7 条图例 ＋ 三处"清空"** ✗✗（用户 2026-10-07 ✓）。
+
+    钉四组：
+      ① **下拉多一项**（`"速度跟踪"` / `"velocity"` ✓）且**老两项一个字不改** ✓（零污染 ✓）；
+      ② **图例**：`_LEGEND_VELOCITY` **恰好 7 行**、逐行含用户给的那 7 个关键词 ✓；
+         `_LEGEND_MOTION` 那 16 行**还在**（搬了地方、没丢 ✓）；
+      ③ **模式判断收在一处**（`_mv()` / `_vel()` ✓）＋ 侧栏/参数行/取帧/runner 都改用它 ✓；
+      ④ **三处"清空"** 的接线（点选面板 ⇒ `_pick_box` 早退 `None` ✓／右侧实时信息 ⇒
+         `setText("")` ✓／底栏中段 ⇒ 单独拼一行、**不留下悬空分隔符** ✓）。
+    """
+    _src = Path(D.__file__).read_text(encoding="utf-8")
+    # ① 下拉
+    check('addItem("运动分离（新）", "motion")' in _src
+          and 'addItem("经典（白块 + 纹理）", "classic")' in _src
+          and 'addItem("速度跟踪", "velocity")' in _src,
+          "① **下拉三项齐** ✓（classic / motion / **velocity** ✓）—— ⚠ 老两项的文案与取值必须"
+          "**原样** ✓（改了就是污染 ✓）")
+    # ② 图例
+    _v = D._LEGEND_VELOCITY.split("\n")
+    _keys = ("蓝色框", "灰色框", "绿圆", "红点", "蓝箭头", "白箭头", "橙色线")
+    _bad = [_k for _k, _ln in zip(_keys, _v) if _k not in _ln]
+    check(len(_v) == 7 and len(_keys) == 7 and not _bad
+          and D._LEGEND_VELOCITY.startswith("1. 蓝色框")
+          and "洋红细框" in D._LEGEND_MOTION and "黄箭头" in D._LEGEND_MOTION,
+          "② **图例：速度跟踪恰好 7 条** ✓（行数 **%d** ✓；缺关键词的 = **%s** ✓〔要空 ✓〕）＋ "
+          "**运动分离那 16 行还在** ✓（含「洋红细框」「黄箭头」✓）—— ⚠⚠ 这 7 条**之外一条都不许加** ✗"
+          "（用户 2026-10-07 ✓ 纪律：要加**先问用户** ✓）"
+          % (len(_v), _bad if _bad else "无"))
+    # ③ 模式判断收在一处
+    _need3 = ("        def _mv(self):", "        def _vel(self):",
+              "        def _legend_text(self):", "        def _sync_legend(self):",
+              "return self._mode() in (\"motion\", \"velocity\")",
+              "self._sync_legend()",           # 切模式 ⇒ 图例跟着换 ✓
+              "mode=self._mode(),")            # runner 透传模式标记 ✓
+    _miss3 = [_k for _k in _need3 if _k not in _src]
+    check(not _miss3,
+          "③ **模式判断收在一处** ✓（`_mv` / `_vel` / `_legend_text` / `_sync_legend` ✓；"
+          "runner 透传 `mode=` ✓；参数行/侧栏/取帧都走 `_mv()` ✓）—— ⚠ 缺项 = **%s** ✓"
+          % (_miss3 if _miss3 else "无"))
+    #   ⚠ `_show_kf` **单独切段**量 ✗（`if self._mv():` / `return False` 这种串全文件到处都是 ⇒
+    #     在整份源码里 grep 等于**没量** ✓ 实测这么写过 ✓）。
+    _a3 = _src.index("        def _show_kf(self):")
+    _b3 = _src.index("        def ", _a3 + 10)
+    _segkf = _src[_a3:_b3]
+    check("if self._mv():" in _segkf and "return False" in _segkf,
+          "③' **「显示 KF 预测」在速度跟踪档恒关** ✓（`_show_kf()` 里那道 `if self._mv(): return "
+          "False` ✓）—— ⚠ KF 青线/青点**不在那 7 条里** ✗ ⇒ 该档不许跑也不许画 ✓")
+    # ④ 三处清空
+    _i = _src.index("        def _pick_box(self):")
+    _j = _src.index("            _p = getattr(self, \"_pick\", None)", _i)
+    _seg = _src[_i:_j]
+    _k = _src.index("        def _update_info_live(self, motion):")
+    _seg2 = _src[_k:_k + 1400]
+    #   ⚠ 这一段**必须切到下一个 `if` 为止** ✗（不能"往后取 N 个字符" ✓ —— 紧接着的
+    #     `if ... == "motion":` 那段里就有 `_pks` ⇒ 取多了会**假红** ✓ 实测踩到 ✓）。
+    _m = _src.index("if _mo_s.get(\"mode\") == \"velocity\":")
+    _m2 = _src.index("if _mo_s.get(\"mode\") == \"motion\":", _m)
+    #   ⚠⚠ **量之前先把注释行丢掉** ✗✗（**实测踩到** ✓）：我在这一段里写了注释
+    #     "⚠ `_pks`（点选）…本来就恒空" ⇒ 拿整段 grep `_pks` ⇒ **自己的注释把自己判红** ✓。
+    _seg3 = "\n".join(_l for _l in _src[_m:_m2].splitlines()
+                      if not _l.lstrip().startswith("#"))
+    check("if self._vel():" not in _seg
+          and "if pick is not None and not _vel:" in _src
+          and "if pick is not None and _vel:" in _src
+          and "_VEL_ARR_LEN" in _src,
+          "④a **点选：文字不给、但那一格要看得见** ✓（用户 2026-10-07 ✓ **两条一起**：「点选面板」"
+          "要清空」＋「**选中的检出框需要高亮**」✓）—— 口径 = `_pick_box` **照旧回那一格** ✓"
+          "（高亮要用它 ✓）、`draw` 里**文字那一块**加 `not _vel` ✓、**另起一块** `and _vel`"
+          "画**青框＋四角标** ✓；⚠ 改回「整块 `return None`」⇒ 高亮也没了 ✗")
+    check('self.info_live.setText("")' in _seg2,
+          "④b **右侧实时信息清空** ✓（`_update_info_live` 在速度跟踪档 `setText(\"\")` ✓）")
+    check("命中率 %.1f%%（%d/%d）" in _seg3 and "_pks" not in _seg3 and "_kfs" not in _seg3,
+          "④c **底栏中段清空** ✓（速度跟踪档**单独拼一行**：帧号 / 状态 / 命中率 ✓ **不带** `_pks` / "
+          "`_kfs` ✓）—— ⚠⚠ 若只把 `_mid` 置空 ⇒ 会留下一个**悬空的分隔符** ✓（我第一版就是这么"
+          "想的 ✓）")
+
+
+def test_velocity_config_and_log():
+    """⭐⭐⭐⭐⭐ **速度跟踪档的"参数做减法"＋"清日志"** ✗✗（用户 2026-10-07 ✓ 两条原话：
+    「**清除通用参数外所有的配置参数，放上新增要用的配置参数**」＋「**清除日志信息**」✓✓）。
+
+    钉五组（**源码级** ✓ —— 这四条都是"界面状态"、在离屏自检里点不出来 ✓ 但**接线断了会很静默** ✗）：
+      ① **老底盘那两行（第 4/5 行）在这一档一并收掉** ✓（只留通用三项 ＋ 它自己那三个新参量 ✓）；
+      ② **新增的一行三件控件齐** ✓（捕获半径 / 不合群时长 / 速度偏差门 ✓ 且**顺序**就是用户问的顺序 ✓）；
+         ⚠⚠ 三个值**都不许自己拍** ✗ —— 只钉"控件默认值取自 `lie_motion` 一处口径" ✓；
+      ③ **落盘/回填三个独立键** ✓（`vel_catch_px` / `vel_hold_s` / `vel_dev_px` ✓ 各管各的 ✓）；
+      ④ **日志区藏起来 ＋ 清空** ✓（`self.log.setVisible(not _vel_now)` ＋ `self.log.clear()` ✓）
+         ＋ **`_status` 那一档不再喂它** ✓（`_log_sync` 从那一支里消失 ✓ —— ⚠⚠ 只把控件藏起来、
+         `_log_sync` 照旧每帧喂 ⇒ **白跑一遍** ✗ 我第一版就是这么写的 ✓）；
+      ⑤ **「用检测器」不显示但照旧勾着** ✓（`setVisible(not _vel_now)` ✓ ＋ `apply_path_ms` 里
+         那道自动勾仍在 ✓）。
+    """
+    _src = Path(D.__file__).read_text(encoding="utf-8")
+
+    def _seg(_a, _b):
+        _i = _src.index(_a)
+        _j = _src.index(_b, _i + 1)
+        return _src[_i:_j]
+    _mode = _seg("        def _on_mode_changed(self, *_a):", "        def on_toggle_kf(self):")
+    check("_mo_trk = bool(_motion and not _vel_now)" in _mode
+          and _mode.count("setVisible(_mo_trk)") >= 3,
+          "① **老底盘那两行（第 4/5 行）在速度跟踪档一并收掉** ✓（口径 = `_mo_trk` ✓ 三处：标题 ＋ "
+          "两行 ✓）—— ⚠ 只收了两行标题、行内控件没收 ⇒ 会剩一排空标签 ✗")
+    _rowv = _seg("            cfgrowV = QHBoxLayout()", "            cfgrowV.addStretch(1)")
+    _ord = [_rowv.index(_k) for _k in ("捕获半径(px)", "不合群时长(s)", "速度偏差门(px/拍)")]
+    check(_ord == sorted(_ord) and "_VEL_CATCH_DEFAULT" in _rowv
+          and "_VEL_HOLD_DEFAULT" in _rowv and "_VEL_DEV_DEFAULT" in _rowv
+          and _rowv.count("NoWheel") >= 3,
+          "② **新增那一行三件控件齐、顺序对、默认值取自 `lie_motion` 一处** ✓（捕获半径 → 不合群"
+          "时长 → 速度偏差门 ✓ 都用 `NoWheel*` ⇒ **滚轮改不了参数** ✓）")
+    check('"vel_catch_px"' in _src and '"vel_hold_s"' in _src and '"vel_dev_px"' in _src
+          and _src.count("vel_catch_px") >= 2 and _src.count("vel_hold_s") >= 2
+          and _src.count("vel_dev_px") >= 2,
+          "③ **三个独立落盘键 ＋ 回填齐** ✓（各出现 ≥2 次 = 存 ＋ 读 ✓）—— ⚠ 少一处 ⇒ "
+          "**改了不生效 / 重开就忘** ✗")
+    _st = _seg("if _mo_s.get(\"mode\") == \"velocity\":",
+               "if _mo_s.get(\"mode\") == \"motion\":")
+    check("self._log_sync(i)" in _st
+          and "self.log.setVisible(not _vel_now)" not in _mode
+          and _mode.count("self.log.clear()") >= 1,
+          "④ **日志区：留着 ＋ 照旧喂 ＋ 切过来清一次残留** ✓（用户 2026-10-07 ✓ **更正**："
+          "「**日志区需要保留，我说的是清除要打印的东西，不是把日志功能删了**」✓）—— ⚠⚠ 藏控件 "
+          "✗ 或 不喂 `_log_sync` ✗ 都算把功能删了 ✓（我上一版两条都犯了 ✓）")
+    check("self._apply_dets_visible()" in _mode and "_tb.removeAction(_act)" in _src
+          and "self.act_dets_after = _acts[_i + 1]" in _src
+          and "if self._mv() and not self.chk_dets.isChecked():" in _src,
+          "⑤ **「用检测器」这一档从工具栏上真的拿掉、回来还插回原位** ✓（⚠⚠ **不许用 "
+          "`setVisible`** ✗✗ —— **探针实测**：它的父是 `QToolBar`，`setVisible(False)` 当场是 "
+          "hidden=True，可**下一拍 `processEvents` 就被工具栏显示回来** ✗ ⇒ 只有 `removeAction` "
+          "管用 ✓）；⚠ 只是不显示 ✗ 它照旧**勾着** ⇒ 检测照跑 ✓（这一档的观测**就是**检出框 ✓）")
+
+
+def test_roi_dims_outside():
+    """⭐⭐⭐⭐⭐ **ROI 之外：模糊 ＋ 置灰**（用户 2026-10-07 ✓ 原话：「**ROI外的区域置灰+模糊**」✓）。
+
+    钉四条（`dim_outside_roi` 是**纯函数** ✓ 好钉 ✓）：
+      ① `roi=None` ⇒ **一个像素都不变** ✓（= 老行为 ✓ 零污染那条 ✓）；
+      ② **ROI 里面一个字不改** ✓（边界也照旧：`roi` 左边界那 1 列不动 ✓）；
+      ③ **外面确实被"糊 + 灰"** ✓ —— 用棋盘格当外区：糊完**方差必须掉**（这是"模糊"的硬证据 ✓）
+         ＋ 均值往灰里靠 ✓；
+      ④ 坏框（反了 / 缺数）⇒ **当没给** ✓（宁可不画，也不许把画面抹花 ✗）。
+    """
+    _h, _w = 60, 80
+    #   棋盘格铺满 ⇒ ROI 外面那块糊完方差一定掉 ✓（全图的"细节"都在那儿 ✓）
+    _f = np.zeros((_h, _w, 3), np.uint8)
+    _f[::2, ::2] = 255
+    _roi = (20.0, 15.0, 60.0, 45.0)
+    _same = D.dim_outside_roi(_f.copy(), None)
+    check(np.array_equal(_same, _f),
+          "① **`roi=None` ⇒ 一个像素都不变** ✓（= 老行为 ✓）—— ⚠ 变了就是污染了整幅 ✓")
+    _g = D.dim_outside_roi(_f.copy(), _roi)
+    _inside = _g[16:44, 21:59]
+    check(np.array_equal(_inside, _f[16:44, 21:59]),
+          "② **ROI 里面原样** ✓（含左边界那 1 列 ✓）")
+    _bg_in = float(_f[0:12, 0:18].std())
+    _bg_out = float(_g[0:12, 0:18].std())
+    _mean_in = float(_f[0:12, 0:18].mean())
+    _mean_out = float(_g[0:12, 0:18].mean())
+    #   ⚠ 口径是"**往灰里靠**"（`gray=96` ✓）✗ —— **不是"一定变暗"** ✗（实测：棋盘格均值 64 比
+    #     96 暗 ⇒ 混完**反而变亮到 78** ✓；深色画面才会变暗 ✓）⇒ 断言必须是"**离灰更近**" ✓。
+    check(_bg_out < _bg_in * 0.5 and abs(_mean_out - 96.0) < abs(_mean_in - 96.0),
+          "③ **框外糊了 ＋ 往灰里靠** ✓（方差 %.1f ⇒ **%.1f** ✓〔要掉一半以上 ✓〕；均值 %.0f ⇒ "
+          "**%.0f** ✓〔要**离灰(96)更近** ✓ 不是「一定变暗」✗〕）"
+          % (_bg_in, _bg_out, _mean_in, _mean_out))
+    check(np.array_equal(D.dim_outside_roi(_f.copy(), (60.0, 15.0, 20.0, 45.0)), _f)
+          and np.array_equal(D.dim_outside_roi(_f.copy(), (1.0, 2.0)), _f),
+          "④ **反了的 / 缺数的框 ⇒ 当没给** ✓（宁可不画 ✓ 也不许把画面抹花 ✗）")
+
+
+def test_roi_picker_uses_loupe():
+    """⭐⭐⭐⭐⭐ **框选走的是工作台那套「带放大镜的框选窗」** ✗✗（用户 2026-10-07 ✓ 原话：
+    「**框选区域要有放大，参考数据工作台框选功能**」✓✓）。
+
+    钉三条（**源码级** ✓ —— 框选窗是**模态**的 ✓ 离屏自检里不能真弹它 ✓ 一弹就卡住 ✓）：
+      ① 用的是 `gui.region_picker.select_on_pixmap`（= **工作台同一份代码** ✓ 放大镜/像素网格/
+         `+/-`/`Esc` 全都有 ✓）—— ⚠⚠ **不许自己另写一个放大镜** ✗（那正是用户说的"参考" ✓）；
+      ② 框完的矩形**除以 `self.scale`** 换成**加工域** ✓（显示域 → 加工域 ✓ 不换 ⇒ 框偏一大截 ✗）；
+      ③ 画布上那套"直接拖"**留着当退路** ✓（框选窗开不出来时退回 ✓）。
+    """
+    _src = Path(D.__file__).read_text(encoding="utf-8")
+    _i = _src.index("        def _on_roi_mode(self, on):")
+    _j = _src.index("        def _on_roi_clear(self):", _i)
+    _seg = _src[_i:_j]
+    check("from gui.region_picker import select_on_pixmap" in _seg
+          and "select_on_pixmap(QPixmap.fromImage(_qi), parent=self, zoom=4)" in _seg
+          and "def _on_roi_mode" in _src,
+          "① **框选用工作台那份 `select_on_pixmap`** ✓（放大镜 ＋ 像素网格 ＋ `+/-` ＋ `Esc` ✓ "
+          "同一份代码 ✓）—— ⚠⚠ 自己另写一套放大镜 ⇒ 手感与工作台不一致 ✗（用户点名要「参考工作台」✗）")
+    check("_r[0] / self.scale[0]" in _seg and "_r[1] / self.scale[1]" in _seg,
+          "② **显示域 ⇒ 加工域**（`÷ self.scale` ✓）—— ⚠ 不漏这一步 ⇒ 框出来的区域**整体偏** ✗"
+          "（画面是原图、判据吃的是加工域 ✓）")
+    check("self.lbl.set_roi_mode(True)" in _seg,
+          "③ **退路留着** ✓（框选窗开不出来 ⇒ 退回「画布上直接拖」✓）—— ⚠ 这不是死代码 ✗："
+          "没有素材 / 离屏环境都会走到它 ✓")
+
+
+def test_velocity_roi_reaches_tracker():
+    """⭐⭐⭐⭐⭐ **ROI 必须传进新底盘** ✗✗（用户 2026-10-07 ✓ 报的两条是**同一条根因**：
+    「**框选区域没有任何作用，还在检测区域之外的东西**」＋「**初始绿圆挑错了**」✓✓）。
+
+    ⚠⚠ **实测现场** ✗：我上一版在 `start_warmup` 里写的是"速度跟踪档**一个参数都不传**" ✗
+      ⇒ 把 `roi` 也一起丢了 ⇒ 那一档其实在**整幅**上跑 ⇒ **实测**：
+        · **无 ROI**：首锁帧 **72**、锁到 **(470,132)** 那格**普通砖**（用户截的帧 73 就是它 ✓✗）；
+        · **带 ROI**：首锁帧 **58**、锁到 **(446,236)** 那块**白实体** ✓。
+      钉三层（少一层就会静默失效 ✗ 而且**看不出**来 ✓）：
+        ① 窗口 → runner：`_vel_kw["roi"] = getattr(self, "roi", None)` 且**真的展开**了（`**_vel_kw` ✓）；
+        ② runner → 底盘：`VelocityRunner._make_tracker` 里**把 `roi` 转过去** ✓；
+        ③ 底盘自己：`VelocityTracker.roi` 认 4 元组（坏值当没给 ✓）。
+    """
+    import inspect
+    from perception import lie_motion as _lm
+    _src = Path(D.__file__).read_text(encoding="utf-8")
+    _mk = inspect.getsource(D.VelocityRunner._make_tracker)
+    check('_vel_kw["roi"] = getattr(self, "roi", None)' in _src
+          and "**_vel_kw)" in _src and "roi=kw.get(\"roi\")" in _mk,
+          "① **窗口 → runner → 底盘，ROI 一路都在** ✓（`_vel_kw` 里塞 `roi` ✓ ＋ 展开 ✓ ＋ "
+          "`_make_tracker` 转过去 ✓）—— ⚠⚠ 少一处 ⇒ 那一档变成**整幅**在跑 ✗（实测锁到 (470,132) "
+          "那格普通砖上 ✗ 而带 ROI 是 (446,236) 那块白实体 ✓）")
+    _t = _lm.VelocityTracker(mode="velocity", roi=(10.0, 20.0, 30.0, 40.0))
+    _t2 = _lm.VelocityTracker(mode="velocity", roi=(30.0, 20.0, 10.0, 40.0))
+    _t3 = _lm.VelocityTracker(mode="velocity", roi=None)
+    check(_t.roi == (10.0, 20.0, 30.0, 40.0) and _t2.roi is None and _t3.roi is None,
+          "② **底盘自己认框**：4 个数 ⇒ 收 ✓；**反了 / 退化的框 ⇒ 当没给** ✓（= 整幅 ✓ 宁可不裁 ✗）；"
+          "`None` ⇒ 整幅 ✓")
+    check(_lm._VLOCK_WHITE >= 180.0,
+          "③ **开局那块还得是「近白」** ✓（绝对下限 `_VLOCK_WHITE` = **%.0f** ✓）—— ⚠ 只判「相对更亮」 "
+          "时**浅灰的砖**也会被认成目标 ✗（实测砖 ~130~140 ／ 真目标亮块 246~250 ✓）"
+          % float(_lm._VLOCK_WHITE))
+
+
+def test_velocity_real_runner_output_into_draw():
+    """⭐⭐⭐⭐⭐ **真后端（`MotionRunner(mode="velocity")`）的输出 ⇒ 真 `draw()`** ✗✗（用户
+    2026-10-07 ✓ 本轮那条「**所见即所得**」纪律的收官钉子 ✓）。
+
+    为什么非要这一条 ✗：上面两条一条量"接线 / 图例"、一条量"假 `motion` 进 `draw`" ✓，**都不是**
+      "后端真造出来的那份 `motion`" ✗ ⇒ 形状/键位一旦对不上（少键 ⇒ `KeyError` ⇒ PyQt5 `abort`
+      ⇒ **闪退** ✓ 踩过 ✓）它们**照样全绿** ✓。
+    钉三条：① 真后端给的 `motion["vel"]` **逐位对齐** `box_v`（长度相等 ✓ —— 演示窗按同一索引读 ✓）；
+      ② `log_text` **空**（实时信息那处 ✓）；③ 这份真输出喂进 `draw()` **不抛**、且**画面有东西**
+      （= 画得出来 ✓ 不是一片黑 ✓）。
+    """
+    _r = D.MotionRunner(dets=None, gain=None, assume=(160.0, 120.0), follow_gain=1.0,
+                        mode="velocity")
+    _r.dets = [[[0, 100.0 + 6.0 * _i, 120.0, 40.0, 40.0, 0.90],
+                [0, 200.0 + 6.0 * _i, 120.0, 40.0, 40.0, 0.90]] for _i in range(6)]
+    _out = None
+    for _i in range(6):
+        _out = _r.step(np.zeros((240, 320, 3), np.uint8), _i, _i / 6.0)
+    _mo = _out[5]
+    check(_mo.get("mode") == "velocity" and isinstance(_mo.get("vel"), dict)
+          and len(_mo["vel"]["state"]) == len(_mo.get("box_v") or []),
+          "① **真后端的 `vel` 逐位对齐 `box_v`** ✓（状态 **%d** 个 ／ `box_v` **%d** 条 ✓）"
+          % (len((_mo.get("vel") or {}).get("state") or []), len(_mo.get("box_v") or [])))
+    check(_mo.get("log_text") == "",
+          "② **实时信息文案清空** ✓（真后端出口那句 `log_text = \"\"` ✓）—— ⚠ 不清 ⇒ 底部日志区"
+          "会被那 20 多行老文案刷满 ✗")
+    _f = np.zeros((240, 320, 3), np.uint8)
+    D.draw(_f, (None, _out[1], _out[2], _out[3], _out[4]), 1.0, 1.0, None,
+           tuple(_r.cursor), _mo, None, pick=None, kf=None, kf_trail=None)
+    check(int((_f.sum(axis=2) > 0).sum()) > 0,
+          "③ **真输出喂进 `draw()` 不抛 ＋ 画面有东西** ✓（画出来 **%d** 个非黑像素 ✓）"
+          % int((_f.sum(axis=2) > 0).sum()))
+
+
+def test_dim_outside_roi_matches_drawn_roi():
+    """⭐⭐⭐⭐⭐ **「糊的区域」必须与「框选的区域」重合** ✗✗（用户 2026-10-07 ✓ 原话：
+
+    「**模糊的区域和框选的区域不一致**」✓✓）。
+    ⚠⚠ **实测现场**（`10月7日.mp4` ✓ 原图 **1920×1080** ／加工帧 **889×500** ⇒ `scale` **2.160** ✓，
+      ROI 加工域 `(200.5, 75.6, 688.5, 399.9)` ✓）：旧代码**没乘 `scale`** ✗ ⇒ 原图域上糊的是
+      `(200, 75, 688, 399)` 那个小矩形 ✗ ⇒ **整块弹窗被糊掉 673,823 px** ✗✗ ＋ 真 ROI 之外
+      **漏糊 107,959 px** ✗；而画面上那个黄框（`draw()` 里乘了 `scale` ✓）**是对的** ✓
+      ⇒ 于是"框"与"糊"对不上 ✓ = 用户看到的那一幕 ✓。修完实测：ROI 内被糊 **0 px** ✓。
+    钉两半（**必须两半都有** ✗）：
+      ① **`draw()` 那一层**（真正咬得住"调用点漏传 `scale`" ✗）：喂加工域 ROI ＋ `scale=2` ⇒
+        在**只有正确 ROI 才该被糊**的那两个点上量（`(50,100)` 该糊 ✓／`(150,150)` 该留 ✓）；
+      ② **纯函数那一层**（边界 ✓）：空 / 反了 / 整幅 ROI ⇒ **逐像素不变** ✓；`scale=(1,1)` 默认
+        = 老行为 ✓。
+    """
+    # ---- ① draw() 那一层：加工域 ROI ＋ scale=2（显示域 = 2 倍 ✓）----
+    _img = np.zeros((300, 400, 3), np.uint8)
+    _img[:] = (70, 90, 110)
+    _roi = (40.0, 40.0, 90.0, 110.0)                  # **加工域**（显示域该是 ×2 ✓）
+    _o = D.draw(_img.copy(), (None, None, 0.0, False, []), 2.0, 2.0,
+                None, None, {"mode": "velocity", "roi": _roi}, None, 0.0)
+    _chg = (np.abs(_o.astype(np.int16) - _img.astype(np.int16)).max(axis=2) > 8)
+
+    def _dim(x, y):
+        return bool(_chg[int(y), int(x)])
+
+    check(_dim(50, 100) and _dim(20, 20) and not _dim(150, 150) and not _dim(100, 90),
+          "① **糊的位置 = 框选的位置 × `scale`** ✓✗（加工域 ROI %s ⇒ 显示域该是 %s ✓）："
+          "**只该糊**外面那两点 `(50,100)`=%s ✓／`(20,20)`=%s ✓，**该留**的 `(150,150)`=%s ✗／"
+          "`(100,90)`=%s ✗〔前两个要 True ✓ 后两个要 False ✓〕"
+          % (_roi, (80.0, 80.0, 180.0, 220.0), _dim(50, 100), _dim(20, 20),
+             _dim(150, 150), _dim(100, 90)))
+    # ---- ② 纯函数那一层：边界 / 老行为 ----
+    _f = np.zeros((40, 60, 3), np.uint8)
+    _f[:] = (70, 90, 110)
+    _keep = _f.copy()
+    for _bad in (None, (), (5.0, 5.0, 5.0, 5.0), (30.0, 20.0, 10.0, 8.0)):
+        _g = D.dim_outside_roi(_f.copy(), _bad)
+        if not np.array_equal(_g, _keep):
+            break
+    else:
+        _g = None
+    check(_g is None and np.array_equal(D.dim_outside_roi(_f.copy(),
+                                                          (0.0, 0.0, 60.0, 40.0)), _keep),
+          "② **空 / 退化 / 反了 / 整幅 ROI ⇒ 一个像素都不碰** ✓（逐像素不变 ✓）")
+    _h = D.dim_outside_roi(_f.copy(), (10.0, 10.0, 40.0, 30.0))
+    check(np.array_equal(_h[20, 25], _keep[20, 25]) and not np.array_equal(_h[5, 5], _keep[5, 5]),
+          "②' **`scale` 缺省 = (1,1) ⇒ 老行为** ✓（框内 `(25,20)` 不动 ✓／框外 `(5,5)` 变了 ✓）")
+
+
 def main():
     print("测谎演示窗口自检（离屏）：")
     test_red_equals_backend()
     test_merge_label()
     test_path_line()
     test_pink_relay_box()
+    test_box_label_two_lines()
+    test_track_label_anchor_circle()
     test_mask_holes()
     test_merge_ratio_switch()
     test_pick_box()
+    test_spinbox_typing()
+    test_fpull_ceiling_above_one()
+    test_load_releases_old_material_first()
+    test_log_exception_writes_and_never_raises()
+    test_roi_wiring_in_demo()
+    test_play_scheduler_follows_wall_clock()
+    test_box_corner_label_replaced()
+    test_box_tab_pos_above_box_corner()
+    test_all_draw_fonts_go_through_fs()
+    # ⭐⭐ **速度跟踪那一轮**（用户 2026-10-07 ✓）：做减法（只留那 7 样 ✓）＋ 接线与图例 ✓
+    test_velocity_draw_subtraction()
+    test_velocity_mode_wiring()
+    # ⭐⭐ **ROI：糊的区域必须 = 框选的区域**（用户 2026-10-07 ✓ 报的那条 ✓）
+    test_dim_outside_roi_matches_drawn_roi()
+    test_velocity_config_and_log()
+    test_roi_dims_outside()
+    test_roi_picker_uses_loupe()
+    test_velocity_roi_reaches_tracker()
+    test_velocity_real_runner_output_into_draw()
     QApplication.exec_ = _fake_exec
     args = D.argparse.Namespace(
         video=str(D.DEF_VIDEO), record="", headless=False, no_dets=False,

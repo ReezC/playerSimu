@@ -172,6 +172,13 @@ def t_screen_beat_bridge():
     logf = Path(_tf.mkdtemp(prefix="lie_bridge_")) / "behavior.log"
     old_log, old_en = behavior.LOG, behavior.ENABLED
     th = types.SimpleNamespace(_screen_state="combat", _screen_last=0.0)
+    # ⚠ 这个替身是**绕过 `__init__`** 造的（只摆被测路径要用的字段 ✓）—— 而
+    #   `_screen_beat` 里后来多了**断线录屏**那条分支（2026-10-02 加 ✓：判到
+    #   `ui_state.UI_LOGIN_ERR` ⇒ `_lie_rec_start("disc")`）⇒ 替身得给它个空实现 ✓。
+    #   本用例管的是"状态切换 + 存帧 + 打点"（✓ 那三件照旧真跑）；**录屏是另一件
+    #   单独测的事** ✗ ⇒ 这里空实现是对的，不是把断言放水 ✓。
+    th._lie_rec_start = lambda kind="lie": False
+    th._lie_rec_stop = lambda why="": None
     frame = np.full((768, 1366, 3), 60, np.uint8)
     caps = []
     try:

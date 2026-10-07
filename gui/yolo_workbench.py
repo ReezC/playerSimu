@@ -34,12 +34,32 @@ from PyQt5.QtWidgets import (
     QMessageBox, QProgressBar, QPushButton, QShortcut, QSplitter, QTabWidget,
     QVBoxLayout, QWidget)
 
+from core import procguard
 from gui import theme
 from gui.canvas import ImageCanvas
 from gui.widgets import NoWheelComboBox, NoWheelSlider, NoWheelSpinBox
 
 ROOT = Path(__file__).resolve().parent.parent
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp"}
+
+
+def guard_qprocess(proc):
+    """⭐⭐⭐⭐⭐ **把刚起来的 `QProcess` 栽进"父死即全灭"的 job**（用户 2026-10-05 ✓ 见
+    `core/procguard.py` 的模块头 ✓）。
+
+    ⚠⚠ 为什么两页（训练 / 验证）都要接 ✗：它们**是两个类** ✓（各自 `QProcess` ✗）⇒
+      放在某一个页上的方法在另一个页里根本不存在 ✗ ⇒ 抽成**模块级**函数 ✓。
+    ⚠ 绑定**只管"绑定之后"新叉出来的进程** ✗ ⇒ 必须**尽早**叫 ✓（`QProcess.started` 就是
+      最早能拿到 pid 的时刻 ✓；训练那行 `from ultralytics import YOLO` 要好几秒 ✓、
+      dataloader 更晚 ✓ ⇒ 实测够早 ✓）。
+    ⚠ 真正兜住"**崩溃 / 强杀**"的是那个 job 本身 ✓（本进程一死 ⇒ 句柄被系统收掉 ⇒ 内核把
+      整棵树干掉 ✓）；这里只是"把树栽进去" ✓；**正常关窗**那条另走 `closeEvent` 的
+      `kill_tree` ✓（两条一起才不留尾巴 ✓）。
+    """
+    try:
+        return procguard.guard(int(proc.processId()))
+    except Exception:                      # noqa: BLE001 —— 兜底代码，绝不抛 ✓
+        return False
 
 
 # ══════════════════════════════════════════════════════════
@@ -1336,7 +1356,13 @@ class _TrainTab(QWidget):
 
     def _toggle(self):
         if self._proc is not None:
-            self._proc.kill()                 # 停止 = 杀掉训练进程 ✓（早停交给 ultralytics ✓）
+            # ⭐⭐⭐⭐⭐ **停止 = 连树杀** ✗✗（用户 2026-10-05 ✓ 原话："**把训练/验证子进程塞进
+            #   一个 Job Object**" ✓✓ 见 `core/procguard.py` ✓）—— ⚠⚠ 原来这里是
+            #   `self._proc.kill()` ✗ = **只杀直接孩子** ✗ ⇒ `ultralytics` 的 **dataloader
+            #   孙进程会留下来** ✓（没窗口、显存还占着 ✓ = 用户说的"杀不掉的死进程" ✓）；
+            #   `kill()` 留作**兜底** ✓（`taskkill` 万一不可用 ✓）。
+            if not procguard.kill_tree(int(self._proc.processId())):
+                self._proc.kill()
             self._proc = None
             self.btn_run.setText("开始训练")
             return
@@ -1355,6 +1381,8 @@ class _TrainTab(QWidget):
         self._proc.readyReadStandardOutput.connect(self._pump)
         self._proc.readyReadStandardError.connect(self._pump_err)
         self._proc.finished.connect(self._done)
+        # ⭐ 尽早把这棵树栽进"父死即全灭"的 job ✓（见 `guard_qprocess` / `core/procguard.py` ✓）
+        self._proc.started.connect(lambda: guard_qprocess(self._proc))
         self._proc.start(sys.executable, ["-c", code])
         self.btn_run.setText("停止")
         self.log.appendPlainText("$ 训练已启动（ultralytics，日志实时刷新 ↓）")
@@ -1461,6 +1489,7 @@ class _ValTab(QWidget):
         self.btn_val.setEnabled(False)
         self.log.appendPlainText("$ 验证已启动（ultralytics val，日志实时刷新 ↓）")
         self._vproc = QProcess(self)
+        self._vproc.started.connect(lambda: guard_qprocess(self._vproc))   # ⭐ 同训练页 ✓
         self._vproc.readyReadStandardOutput.connect(self._pump_val)
         self._vproc.readyReadStandardError.connect(self._pump_val_err)
         self._vproc.finished.connect(self._val_done)
@@ -1775,9 +1804,37 @@ class YoloWorkbench(QMainWindow):
         }
 
     def closeEvent(self, e):
-        """关窗 = **保存数据状态**（本机偏好 → config/ui.yaml ✓ 同 §11 ✓）。
+        """关窗 = **先收掉训练/验证那两棵进程树** ✓，再**保存数据状态**（→ config/ui.yaml ✓ 同 §11 ✓）。
+
         ⚠ 存不上也别拦关窗 ✓；自检里 `_save_session_on_close = False` ✗
-        「自检绝不许改用户的 config/ui.yaml」（§11 ✓）。"""
+        「自检绝不许改用户的 config/ui.yaml」（§11 ✓）。
+
+        ⭐⭐⭐⭐⭐ **收孩子那一段**（用户 2026-10-05 ✓ 原话："**把训练/验证子进程塞进一个
+        Job Object（KILL_ON_JOB_CLOSE ✓）⇒ 父进程一死（崩溃、强杀都算）整棵树被系统收走**" ✓✓
+        见 `core/procguard.py` ✓）—— ⚠⚠ **实测病根**：关窗后子进程**照样在干活** ✗✗，
+        而且训练会再叉 `ultralytics` 的 **dataloader 孙进程** ✗ ⇒ 留下一棵**看不见的进程树**
+        ✓（没窗口、显存占着、单杀还不一定干净 ✓）= 用户说的"杀不掉" ✓。两条腿一起走 ✓：
+          · **正常关窗**（这里）⇒ 问一句 ✓ ⇒ `kill_tree` **连树**杀 ✓（只 `kill()` 留孙进程 ✗）
+            ⇒ 最后 `release()` 把 job 里剩的**一网打尽** ✓；
+          · **崩溃 / 强杀**（走不到这里 ✗）⇒ 由那个 **job** 兜底 ✓（本进程一死 ⇒ 句柄被系统
+            收掉 ⇒ 内核把整棵树干掉 ✓✓）。
+        """
+        _pn = [(_n, _p) for _n, _p in (
+            ("训练", getattr(getattr(self, "tab_train", None), "_proc", None)),
+            ("验证", getattr(getattr(self, "tab_val", None), "_vproc", None)))
+            if _p is not None]
+        if _pn:
+            _r = QMessageBox.question(
+                self, "还在跑",
+                "「%s」还在跑 —— 关窗会**连它的整棵进程树**一起中止"
+                "（含 dataloader 子进程）。\n继续关窗吗？" % "」「".join(_n for _n, _ in _pn),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if _r != QMessageBox.Yes:
+                e.ignore()
+                return
+            for _n, _p in _pn:
+                procguard.kill_tree(int(_p.processId()))
+            procguard.release()               # ⚠ 再扫一遍：job 里还剩下的整棵树也一起清 ✓
         if getattr(self, "_save_session_on_close", True):
             try:
                 theme.set_yolo_session(self._collect_session())

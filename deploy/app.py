@@ -683,25 +683,38 @@ def _mmap_display_text(kind):
     """小地图卡片那两行**只读文字**（用户 2026-10-02 ✓）—— 文案**只有这一处** ✓。
 
     内容全部**现读** `tools/mmap_regions`（B 机随时可能告诉本机换图 ⇒ 不能缓 ✗）：
-      · `"mmap_current"` = 当前图 id（+ 是谁/什么时候说的）；
+      · `"mmap_current"` = 当前图（+ 是谁/什么时候说的）；
       · `"mmap_region"` = **当前这张图**那份框（屏幕坐标 + zoom），没框过就说没框过。
+    ⭐ **地图一律用 `{地图名}_{id}`**（用户 2026-10-04 ✓ 原话："A 机部署台的当前地图显示格式
+      应该是 `{地图名}_{id}`"✓）—— 光给一串 `105040306` 人认不出是哪张图 ✓
+      （而且"项目叫森林迷宫III、地图却是巨人之林"这种事，一眼就看出来了 ✓）。
+      口径只此一处：`wzexport.map_label` ✓（查不到名字 ⇒ 只显示 id ✓ 不编 ✗）。
     ⚠ 不猜、不编默认值：没有就说"还没有/还没框过"（编一个数出来会让人以为框好了 ✗）。
     """
+    from core import wzexport
     from tools import mmap_regions
     cur = mmap_regions.current() or {}
     mid = str(cur.get("map_id") or "")
+
+    def _label(m):
+        """`{名}_{id}`（查不到名字 ⇒ 只给 id ✓）；连 id 都没有 ⇒ 空串 ✓。"""
+        try:
+            return wzexport.map_label(m)
+        except Exception:                            # noqa: BLE001 —— 目录不在/清单坏了都别崩 ✗
+            return str(m or "")
+
     if kind == "mmap_current":
         if not mid:
             return "（还没有 —— 先在 B 机开始实时）"
         _by = str(cur.get("by") or "")
         _t = str(cur.get("updated") or "")
-        return "%s（%s%s）" % (mid, ("%s 说的" % _by) if _by else "别人说的",
+        return "%s（%s%s）" % (_label(mid), ("%s 说的" % _by) if _by else "别人说的",
                               ("　%s" % _t[11:]) if len(_t) >= 16 else "")
     if not mid:
         return "（还没有图 —— 等 B 机告诉本机是哪张图）"
     got = mmap_regions.load(mid)
     if not got:
-        return "「%s」还没框过 —— 点右边「框选…」" % mid
+        return "「%s」还没框过 —— 点右边「框选…」" % _label(mid)
     return "屏幕 (%d,%d) %dx%d　zoom=%d" % (got["x"], got["y"], got["w"], got["h"],
                                           int(got["zoom"]))
 

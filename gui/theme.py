@@ -121,6 +121,19 @@ def clamp(v):
 # 「存在的类别」—— 以后加一个类别，设置里自动多一行，不会漏掉某一类的框色。
 CLASS_COLOR_KEYS = tuple(c[1] + "_color" for c in classes.CLASSES)
 
+#: ⭐⭐ **每一类检出的「显示开关」**（用户 2026-10-06 ✓ 原话："在设置→界面页签→
+#:   检测框颜色 每一项前面加勾选框，默认全部勾选，勾选后实时显示"）—— 键名 = 类别
+#:   英文名 + "_on"（`player_on` / `mob_on` / `drop_on` / `npc_on` / `other_player_on`
+#:   / `pet_on` ✓）。
+#:
+#: ⚠ 与颜色**同一个来源**（类别表 ✓）：以后加一个类别，颜色 + 开关**自动各多一条**
+#:   —— 加类别时只改 `perception/classes.py` 一处就够 ✓（这正是用户当初要的"按类别表
+#:   生成"那个口径 ✓ 别在这儿手写一份清单 ✗）。
+#: ⚠ 语义**只管画**（实时预览里那一类的框画不画 ✓）—— **一律不影响决策** ✗
+#:   （决策那条链的入口是 `live_thread.split_dets` ✓，它根本不认这几个键 ✓）：
+#:   所以关掉"宠物"只是**看不见**它的框，不是"不理它"✓（后者本来就没发生过 ✓）。
+CLASS_ON_KEYS = tuple("%s_on" % c[1] for c in classes.CLASSES)
+
 
 def _class_color_defaults():
     """类别框颜色的默认值（RGB hex）—— 就是类别表（perception/classes.py）的最后一列。"""
@@ -136,7 +149,11 @@ def _class_color_defaults():
 #   ② 「辅助线与标记」组里**每项前面有开关**（`*_on`，True = 画 ✓）——
 #      关掉只是不画，颜色留着（下次开回来还在 ✓）。
 VIS_DEFAULTS = dict(
-    {"%s_color" % en: v for en, v in _class_color_defaults().items()},
+    # 类别框颜色（按类别表生成 ✓）+ 每类检出的**显示开关**：**默认全勾**（= 画 ✓ 用户
+    # 2026-10-06 点名"默认全部勾选"✓）—— 于是"加这一组开关"本身**不改任何观感** ✓
+    # （老配置里没有这些键 ⇒ 读出来也是 True ✓）。
+    {**{"%s_color" % en: v for en, v in _class_color_defaults().items()},
+     **{k: True for k in CLASS_ON_KEYS}},
     lock_color="#ff0000",         # 锁定目标框 红
     attack_color="#f9ab00",       # 「攻击范围框」黄（2026-09-27 前叫"最大攻击距离线"）
     min_attack_color="#ffa500",   # 「攻击盲区框」橙（前叫"最小攻击距离线"）
@@ -199,8 +216,10 @@ _VIS_COLOR_KEYS = CLASS_COLOR_KEYS + ("lock_color", "attack_color",
                                       "player_arrow_color")
 
 #: 「显示开关」的键（布尔；缺省/写坏一律按 `True` = 画 ✓ —— 老配置里没有它们 ✓）
-_VIS_ON_KEYS = ("lock_on", "attack_on", "min_attack_on", "jump_attack_on",
-                "chase_jump_on", "vision_on", "timer_on", "player_arrow_on")
+#: ⚠ 前六个是**类别框的开关**（`CLASS_ON_KEYS` ✓ 用户 2026-10-06 ✓）；后面那些是
+#:   「辅助线与标记」的 ✓ —— 两类**同一套读回口径**（`load_vis` ✓ 只认真布尔 ✓）。
+_VIS_ON_KEYS = CLASS_ON_KEYS + ("lock_on", "attack_on", "min_attack_on", "jump_attack_on",
+                                "chase_jump_on", "vision_on", "timer_on", "player_arrow_on")
 
 
 def _load():
@@ -373,6 +392,163 @@ def save_window(key, rect):
     _save(cfg)
 
 
+def _field_layout_of(form, w):
+    """`QFormLayout` 里**装着 `w` 的那个字段布局**（`addRow("标题", 行布局)` 那种 ✓）。
+    找不到 ⇒ `None` ✓（直接 `addRow("标题", 控件)` 的情况本来就不用它 ✓）。
+    """
+    from PyQt5.QtWidgets import QFormLayout
+
+    try:
+        rows = form.rowCount()
+    except Exception:                                   # noqa: BLE001
+        return None
+    for i in range(rows):
+        it = form.itemAt(i, QFormLayout.FieldRole)
+        lay = it.layout() if it is not None else None
+        if lay is not None:
+            try:
+                if lay.indexOf(w) >= 0:
+                    return lay
+            except Exception:                           # noqa: BLE001
+                continue
+    return None
+
+
+def _row_title_of(w):
+    """配置控件 `w` **那一行的标题标签**（找不到 ⇒ `None` ✓）。
+
+    两种行都要认（gui 里的配置行就这两种 ✓）：
+      · **`QFormLayout` 的行** —— `labelForField(控件或行布局)` ✓（`addRow("标题", w)` 和
+        `addRow("标题", 装有 w 的 QHBoxLayout)` 都给得出来 ✓）；
+      · **普通 `QHBoxLayout` 的行**（手拼的"标题 + 控件 + 按钮" ✓）—— 取同一布局里
+        **排在它前面**的那个 `QLabel` ✓。
+    """
+    from PyQt5.QtWidgets import QFormLayout, QLabel
+
+    holder = w.parentWidget()
+    node, outer = (holder.layout() if holder else None), None
+    # ⚠⚠ **防环是必须的**（2026-10-04 ✓ 现场：整个工作台**卡死在启动里** ✗ —— 窗口永远出不来、
+    #   进程活着、没有任何异常 ✓ 用户报的就是"数据工作台打不开了"✓）：
+    #   控件在**普通 HBox 行**里时，`node.parentWidget().layout()` 返回的**还是同一个布局** ✗
+    #   ⇒ 原来那个 `while node is not None` **原地打转、永不退出** ✗ ⇒ UI 线程死锁 ✓
+    #   （当时"PlayerPanel 探针跑不完 / 套件 400s 超时"就是这个 ✗，我误判成"面板太重"绕过去了 ✗）。
+    #   ⇒ 两道保险：**见过的不再走** + 层数上限 ✓（就算将来又出现奇怪的父子关系，也只会
+    #     "找不到标题 ⇒ 提示留在原处" ✓，绝不会再把界面卡死 ✗）。
+    seen = set()
+    for _ in range(24):
+        if node is None or id(node) in seen:
+            break
+        seen.add(id(node))
+        if isinstance(node, QFormLayout):
+            # ① 直接当字段加进去的（`addRow("标题", w)` ✓）
+            lab = node.labelForField(w)
+            # ② 外面还套了一层/几层布局（`addRow("标题", 行布局)` ✓）—— 先看链上的那层，
+            #    再退一步：**扫这一表单每一行的字段槽**，谁装着 w 谁就是那一行 ✓
+            #    （⚠ 没有这一步，嵌套行的标题永远找不到 ⇒ 提示留在原处 ✗ 见离屏实测 ✓）
+            if lab is None and outer is not None:
+                lab = node.labelForField(outer)
+            if lab is None:
+                lab = node.labelForField(_field_layout_of(node, w))
+            return lab if isinstance(lab, QLabel) else None
+        outer = node
+        parent = node.parentWidget()
+        node = parent.layout() if parent else None
+
+    lay = holder.layout() if holder else None
+    if lay is not None:
+        i = lay.indexOf(w)
+        for k in range(i - 1, -1, -1):
+            it = lay.itemAt(k)
+            cand = it.widget() if it is not None else None
+            if isinstance(cand, QLabel):
+                return cand
+    return None
+
+
+def move_tips_to_titles(root, include_buttons=False):
+    """把"挂在**配置控件**上的提示"搬到**它那一行的标题**上 → 返回搬了几处 ✓。
+
+    ⚠ 为什么要有这个"自动扫"（用户 2026-10-04 二次反馈 ✓ 原话："**实测没有实现提示挂字段标题**……
+      我说的是 gui **所有的配置项**"）：上一版只搬了**手写过的**那一处（卡片 14 处 ✓）✗ ——
+      而 gui 里这样的提示有 **近 300 处**（`player_panel` 62 / `route_panel` 10 / …）✗
+      逐个手搬既不现实、也**必然漏**（漏一处就还是"指标题没反应、指控件乱弹" ✓ 正是用户看到的 ✓）
+      ⇒ 改成**在窗口收尾处自动扫一遍** ✓（`finish_window` ✓ 与"可复制"同一处保证 ✓）。
+
+    规则：
+      · 只搬**配置控件**（下拉 / 输入框 / 数字框 / 滑块 / 勾选框 ✓；`include_buttons=True`
+        时连按钮一起搬 ✓ —— 默认不搬：工具栏按钮**没有字段标题**，搬了会把提示弄丢 ✗）；
+      · 目标 = `_row_title_of(w)` ✓；⚠ **标题已经有提示就不覆盖** ✓（手写的更具体 ✓）；
+      · ⚠ **找不到标题 ⇒ 原样留着** ✗（宁可留在控件上，也别把提示弄丢 ✓）；
+      · 搬完把标题设成**可复制** ✓（用户第 4 条 ✓）。
+    """
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtWidgets import (QAbstractSlider, QAbstractSpinBox, QCheckBox,
+                                 QComboBox, QLineEdit, QPushButton,
+                                 QRadioButton, QWidget)
+
+    kinds = (QComboBox, QLineEdit, QAbstractSpinBox, QAbstractSlider,
+             QCheckBox, QRadioButton)
+    if include_buttons:
+        kinds = kinds + (QPushButton,)
+
+    n = 0
+    for w in root.findChildren(QWidget):
+        tip = w.toolTip()
+        if not tip or not isinstance(w, kinds):
+            continue
+        lab = _row_title_of(w)
+        if lab is None or lab.toolTip():
+            continue
+        lab.setToolTip(tip)
+        # ⚠ 口径与 `gui.widgets.make_copyable` 一致 ✓（那边是给"当场就要"的场景用的 ✓）——
+        #   这里是整窗扫，顺手设上 ✓（免得标题搬了提示却选不中 ✗）。
+        lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        w.setToolTip("")                 # ⚠ 搬完必须清掉 ✗ 否则一指弹两个框 ✓
+        n += 1
+    return n
+
+
+def finish_window(w, copyable=True, move_tips=True):
+    """**窗口 / 面板收尾**：① 提示搬到字段标题上 ② 标题与说明可复制 ✓ → 返回 `(搬了几处, 标签数)` ✓。
+
+    ⚠ 为什么要单独一个"收尾"函数（原来把这活塞在 `bind_window_state` 里 ✗）：
+      `bind_window_state` **只有弹窗在调** ✗ —— 而用户反馈的正是**页签里的面板**
+      （决策参数 ✓）⇒ 那条路根本走不到 ✗（"实测没有实现"就是这么来的 ✓）。
+      ⇒ 现在有两条路都走它：**弹窗**（`bind_window_state` 里调 ✓）与
+      **主窗口 / 每个页签面板**（`MainWindow` 建完 + 页签工厂各调一次 ✓）。
+    """
+    n_tips = move_tips_to_titles(w) if move_tips else 0
+    n_lbl = enable_label_copy(w) if copyable else 0
+    return n_tips, n_lbl
+
+
+def enable_label_copy(root, flags=None):
+    """把这个窗口里**所有 QLabel 的文字设成可选中复制**（用户 2026-10-04 ✓ 第 4 条：
+    "所有字段标题、灰字说明文本希望能够复制文本"）→ 返回改了多少个 ✓。
+
+    ⚠ **为什么是"按窗口扫一遍"而不是一个全局开关**：Qt 没有"给所有 QLabel 默认开选中"的开关 ✗
+      —— `setTextInteractionFlags` 是**每个控件**自己的属性 ✓。逐个调用点去设 ⇒ 全文上百处 ✗
+      且**新加的标签必然漏** ✗；在窗口收尾处扫一遍 ⇒ 建完就全有了 ✓。
+    ⚠ 只加 `TextSelectableByMouse`（**故意不加** `TextSelectableByKeyboard` ✓）：键盘选中会把
+      每个标签变成**可聚焦** ⇒ Tab 顺序里多出一堆"只能选字"的停靠点 ✗，`←/→` 那类快捷键
+      也会先在标签里跑 ✗。
+    ⚠ **谁会调**：`bind_window_state()`（每个窗口 / 面板的收尾都走它 ✓ 见那里那一行）——
+      新窗口只要照常调它就有 ✓ 别各写一份 ✗。
+    """
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtWidgets import QLabel
+
+    n = 0
+    try:
+        for lbl in root.findChildren(QLabel):
+            lbl.setTextInteractionFlags(flags if flags is not None
+                                       else Qt.TextSelectableByMouse)
+            n += 1
+    except Exception as e:                            # noqa: BLE001
+        print("⚠ 标签可复制没设上（%s: %s）" % (type(e).__name__, e))
+    return n
+
+
 def bind_window_state(dlg, key):
     """让一个弹窗**记住自己拉成多大、摆在哪儿**（用户 2026-09-27 要求，已进规范 ✓）。
 
@@ -403,6 +579,11 @@ def bind_window_state(dlg, key):
     """
     from PyQt5.QtCore import QEvent, QObject, QRect
     from PyQt5.QtGui import QGuiApplication
+
+    # ⭐ **窗口收尾**：提示搬到字段标题上 + 标签可复制（用户 2026-10-04 ✓ 第 3、4 条）。
+    #   ⚠ 这里只能覆盖**弹窗**（只有弹窗会调 `bind_window_state` ✓）—— 页签面板走的是
+    #   `MainWindow` / 页签工厂里的 `finish_window` ✓ 两处都指同一份实现 ✓。
+    finish_window(dlg)
 
     if getattr(dlg, "_winstate", None) is not None:
         return                          # 已经绑过（重复调用无害 ✓）

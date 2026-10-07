@@ -25,6 +25,10 @@ A_LOG_MAX = 4 * 1024 * 1024
 A_LOG_PREFIX = b"#LOG "
 
 
+#: 「`kbd_pending` 打点失败」只报一次（见 `_sample_pending` ✓ 别在发指令的路上刷屏 ✗）
+_SAMPLE_WARNED = False
+
+
 def _perf():
     """性能打点（**可选**）：`core.perf` 只在控制机（B）上有 —— 这个模块要保持能单独
     在别的机器上跑（它是"发指令"那半边 ✓），拿不到就静默不算 ✓（绝不因此报错 ✗）。"""
@@ -33,6 +37,39 @@ def _perf():
         return perf
     except Exception:                       # noqa: BLE001
         return None
+
+
+def silence_seconds(sent, oldest_unacked_t0, now):
+    """「**最老那条还没等到回执的指令**等了多久」（秒）；0 = 正常 / 无从判断 ✓。
+
+    ⚠⚠ **口径只此一处**：`KbdClient.silent_for` 与 `SerialKbd.silent_for`（`serial_kbd.py`）
+    都走它 ✓ —— 那两个后端各写一份判据，迟早漂 ✗（2026-10-04 就是这样：两份**同时错**✓）。
+
+    **为什么必须是"最老那条没回执的等了多久"**（2026-10-04 现场 ✓ 用户原话："角色不听使唤、
+    键很久才生效、越堆越多" + "agent 一直按住、玩家却一直往左走直到地图边缘卡住了还在往左"）：
+      · 现场（B 侧 `perf.log` 02:57–03:04）：**每秒还在发 8~13 条**（`send` 233~395/30s ✓）、
+        **`fail_*` 一个没有**（`sendall` 全成功 ✓）、而 **`kbd_rtt_ms` 零样本**（回执一条没回 ✗）；
+      · A 侧 `remote_kbd/A_relay_trace.log`：那段时间**命令 0 条** ⇒ 那条连接已死（半开 ✗），
+        直到 `03:04:16` 才重连 ✓；
+      · 结果：停下那一刻正好停在 `PRESS LEFT` ⇒ 固件**按着 LEFT 7 分 46 秒** ✗（trace 重放：
+        `468.39s LEFT 02:56:29.570 → 03:04:17.955` ✓）⇒ 角色一直往左撞墙 ✓。
+    ⇒ 而原来的判据量的是 **`now - last_send_at`（距上次「发送」多久）** ✗ —— 只要 B **还在发**，
+      它就**恒在 0.1 秒级** ⇒ 永远够不到 `REPLY_SILENCE_LIMIT`(5s) ⇒ `link_health()["ok"]` 恒真
+      ⇒ `_link_beat` 的**重连一次都不触发**（本该 ≤15 秒就自愈 ✗ 它哑了 7 分 46 秒 ✓）。
+      它只在"发完就彻底哑了"时才响 —— 正好是危险情形的**反面** ✗。
+
+    ⚠ 时钟：`oldest_unacked_t0` 与 `now` 都必须是 **`time.perf_counter()`**（和
+      `kbd_rtt_ms` / `_rtt_t0` 同一个 ✓）；别混 `monotonic` ✗。
+    ⚠ 没有在等的指令（`oldest_unacked_t0 is None`）⇒ **0** ✓：空闲期不是延迟 ✓；
+      也**不再**加"30 秒没发过就当正常"那条老规矩 ✗ —— 那正是把上面的现场判成正常的原因 ✓
+      （一条 30 秒都没回执的指令本来就该判死链 ✓，重连还会顺手清键 ✓）。
+    """
+    if not sent or oldest_unacked_t0 is None:
+        return 0.0
+    try:
+        return max(0.0, float(now) - float(oldest_unacked_t0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def set_nodelay(sock):
@@ -139,15 +176,13 @@ class KbdClient:
         只靠「发送有没有报错」是不够的 —— relay 卡在串口写上时，我们的 TCP
         发送照样成功，命令却全都没到固件，那就是「无限左走 + 停自动无效」
         的真实场景（发什么都当成功，实际什么也没发生）。
+        ⚠⚠ **判据在 `silence_seconds` 里**（"最老那条还没回执的等了多久" ✓ 一处口径 ✓）——
+          2026-10-04 现场证明原来那句 `now - last_send_at` 是**反的** ✗（B 一直发 ⇒ 恒 0.1 秒
+          ⇒ 永远判不出死链 ⇒ 卡键 7 分 46 秒 ✓ 见那个纯函数的说明 ✓）。
+        ⚠ `last_send_at` / `last_reply_at` 仍留着给外部读（界面 / 旧用例 ✓），
+          **但判据不再用它们** ✗。
         """
-        if self.sent == 0:
-            return 0.0
-        now = time.monotonic()
-        if now - self.last_send_at > 30.0:
-            return 0.0          # 近期没发过指令，无从判断，别拿旧账报错
-        if self.last_reply_at >= self.last_send_at:
-            return 0.0          # 最后一条指令有回执 → 正常
-        return now - self.last_send_at
+        return silence_seconds(self.sent, self._rtt_t0, time.perf_counter())
 
     def _take_rtt(self, n):
         """收到 n 条回执 ⇒ 记一次往返延迟 + 把"还没对上回执"的账减掉 ✓（一处口径 ✓）。
@@ -174,17 +209,26 @@ class KbdClient:
         ⇒ 这个数一路涨 ✓；而 `kbd_rtt_ms` 只说"**最老的**那条等了多久"、看不出**攒了几条** ✗
         ⇒ 两个一起看才能定案（配 A 侧 `KBD 节拍` 那行的"发送率 vs 完成率"✓）。
 
-        ⚠ `min_gap=1.0`：它是**连续量**（每发一条就变，~10 条/秒 ✗）⇒ 不定频就是每拍一条、
-        把 `perf.log` 刷爆 ✓（口径同 `chase_dist` / `mmap_age_ms` ✓）。
-        ⚠ 吞异常：打点不许把发指令这条路搞挂 ✗（拿不到 `core.perf` 的老环境也是静默 ✓）。
+        ⚠⚠ **别写 `min_gap=`**（2026-10-04 复查"指令堆积"现场时发现的哑弹 ✓）：那个形参属于
+        `core.behavior.sample` ✓，而这里打的是 `core.perf.sample` —— 它**只有 `(name, value)`**
+        ✗ ⇒ 写成 `min_gap=` 会抛 `TypeError`，而外面包着 `try/except` ⇒ **从写出来那天起一条
+        样本都没进过 `perf.log`** ✗（全历史 1497 段里 `kbd_pending` **0 条** ✓ 那个数正是
+        "攒了几条"、排查这次堆积时最想看的一条曲线 ✗）。连续量本来也不必节流：
+        同量级的 `agent_ms`（~25 条/秒）、`pipe_ms` 都是这么打的 ✓。
+        ⚠ 吞异常：打点不许把发指令这条路搞挂 ✗（拿不到 `core.perf` 的老环境也是静默 ✓）——
+          **但第一次失败必须说一声** ✗（见下：一律 `pass` 正是上面那个哑弹藏了三个月的原因 ✓）。
         """
         _p = _perf()
         if _p is None:
             return
         try:
-            _p.sample("kbd_pending", int(self._pending), min_gap=1.0)
-        except Exception:                       # noqa: BLE001
-            pass
+            _p.sample("kbd_pending", float(self._pending))
+        except Exception as e:                  # noqa: BLE001
+            global _SAMPLE_WARNED
+            if not _SAMPLE_WARNED:              # 只报一次，别在发指令的路上刷屏 ✗
+                _SAMPLE_WARNED = True
+                print("⚠ kbd_pending 打点失败（%s: %s）⇒ 这条曲线会是空的 ✓"
+                      % (type(e).__name__, e))
 
     def _take_a_logs(self, data):
         """把 A 机**回传的日志行**（`#LOG …`）挑出来落盘，返回**剩下的**给回执计数用 ✓。

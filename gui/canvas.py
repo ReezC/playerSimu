@@ -25,6 +25,14 @@ from perception.classes import (CLASS_MOB, CLASS_PLAYER, ZH_NAMES, bgr_to_hex,
 HANDLE = 10        # 控制点判定半径（图片像素）
 MIN_SIZE = 8       # 框的最小边长
 
+#: 左键在**空白处**拖时干什么（用户 2026-10-04 ✓ 第 3 条：质检台右上角那个「适应窗口」
+#: 按钮改成"操作模式"下拉 ✓ 默认标注模式 ✓ 快捷键 Q/W ✓）：
+MODE_LABEL = "label"    # 拉出一个**新框**（老行为 ✓ 默认 ✓）
+MODE_SELECT = "select"  # 只拉一个**黑虚线**框来**选中**里面的框（**不建框** ✓ 批量删误检用 ✓）
+#: 框选范围的颜色 —— 用户指定"**黑色虚线**"✓（标注模式那个是新框预览，所以按类别上色 ✓，
+#: 两种模式一眼能分出来 ✓）
+SELECT_BAND_COLOR = "#000000"
+
 # 类别名/颜色都来自 perception/classes.py（唯一定义处）—— 类别清单只在那里维护
 CLASS_NAMES = ZH_NAMES
 
@@ -72,6 +80,9 @@ class BBoxItem(QGraphicsRectItem):
         self._orig_pos = None
         self.on_changed = None   # 拖动/缩放后由画布注入的回调
         self.on_press = None     # 拖动/缩放开始前由画布注入的回调（撤销记录用）
+        #: 按下**之前**由画布注入的回调（收 `e.modifiers()` ✓）—— 「选择模式」要借它把
+        #: 上一次的选中清掉（点一下就换成只选这一个 ✓ 标准手感 ✓）；标注模式里画布不做啥 ✓。
+        self.on_select = None
 
     def _label_text(self, names=None):
         """框上的类名文本：**注入的类别名表优先** ✓（`names` = 按 id 的名字列表 ✓）；
@@ -134,6 +145,9 @@ class BBoxItem(QGraphicsRectItem):
         self._orig_rect = QRectF(r)
         self._orig_pos = QPointF(self.pos())
 
+        # ⭐ 按下之前先问画布一声（「选择模式」= 一次干净的单选：不按 Ctrl 就清掉别的 ✓）
+        if self.on_select:
+            self.on_select(e.modifiers())
         self.setSelected(True)
         if self.on_press:
             self.on_press()   # 拖动开始，通知画布记录撤销快照
@@ -269,11 +283,14 @@ class ImageCanvas(ZoomPanView):
     交互（缩放/平移/双击见 ZoomPanView）：
         在框上拖        → 移动
         在框边缘拖      → 缩放（8 个方向）
-        在空白处拖      → 拉一个新框
-        Del             → 删除选中的框
+        在空白处拖      → **标注模式**：拉一个新框 ✓
+                          **选择模式**：拉一个黑虚线框 ⇒ 选中被框住的框（不建框 ✓）
+        Del             → 删除选中的框（选择模式框一批 ⇒ 一次删掉 ✓）
         滚轮            → 缩放视图
         中键拖          → 平移画布（放大后看边角用）
         双击            → 适应窗口
+
+    两种模式见 `set_mode` / `MODE_LABEL` / `MODE_SELECT` ✓（快捷键 Q / W 在质检台上 ✓）。
     """
 
     boxes_changed = pyqtSignal()
@@ -281,6 +298,10 @@ class ImageCanvas(ZoomPanView):
     copy_requested = pyqtSignal()    # Ctrl+C
     paste_requested = pyqtSignal()   # Ctrl+V
     undo_requested = pyqtSignal()    # Ctrl+Z
+    #: 选中数变了（框选/点框都发 ✓）—— 面板拿它写一句"选中 N 个框" ✓。
+    #: ⚠ **选中不算修改**：不许借此发 `boxes_changed` ✗（那会把"只看了一遍"的帧标成
+    #:   人工改过 ✓ 见 `_select_in_rect` ✓）。
+    selection_changed = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -306,6 +327,12 @@ class ImageCanvas(ZoomPanView):
         self._draw_start = None
         self._rubber = None
         self._draw_cls = None     # 正在拉的框用哪个类（按下时定，Ctrl 会临时改）
+        #: ⭐ **操作模式**（用户 2026-10-04 ✓ 第 3 条）—— `MODE_LABEL` 拉新框（老行为 ✓）、
+        #:   `MODE_SELECT` 拉黑虚线框**选中**里面的框（不建框 ✓）。默认标注模式 ✓。
+        self.mode = MODE_LABEL
+        self._select_band = False   # 手上这个橡皮筋是"框选"还是"建框"（按下时定 ✓）
+        self._band_add = False      # 框选时按住了 Ctrl（= 加选，别清旧的 ✓）
+        self._apply_mode_cursor()
         #: ⭐ 「实时小地图」那一层（`set_live_patch` ✓）—— 只在**路线识别 → 地形图**
         #: 用得上：把 A 机实时小地图面板**按标定摆到地形图上**，方便放大看对齐 ✓。
         #: ⚠ `load()` 会 `scene_.clear()` ⇒ 每一轮都要**重新挂**（见 load ✓），
@@ -348,6 +375,70 @@ class ImageCanvas(ZoomPanView):
         self._apply_mask()
         self.boxes_changed.emit()
 
+    # ---------------- 操作模式（用户 2026-10-04 ✓ 第 3 条）----------------
+
+    def set_mode(self, mode):
+        """切**操作模式**（`MODE_LABEL` / `MODE_SELECT` ✓）→ 返回生效的那个 ✓。
+
+        `MODE_SELECT`：空白处拖**不建框** ✓，只拉一个**黑色虚线**框 ⇒ 松手**选中被框住的框**
+        （拖完按 Del 就能一次删掉一批 ✗ 误检 ✓ —— 这正是用户要它解决的事 ✓）。
+        🚫 传别的值一律当 `MODE_LABEL`（老行为 ✓）—— 宁可回到最熟的那个，也别进一个
+        "什么都不做"的僵尸模式 ✗。
+        """
+        self.mode = MODE_SELECT if str(mode) == MODE_SELECT else MODE_LABEL
+        self._apply_mode_cursor()
+        return self.mode
+
+    def _apply_mode_cursor(self):
+        """光标：标注模式十字（要画框 ✓）、选择模式箭头（要挑框 ✓）。"""
+        try:
+            self.viewport().setCursor(
+                Qt.ArrowCursor if self.mode == MODE_SELECT else Qt.CrossCursor)
+        except Exception:                            # noqa: BLE001
+            pass
+
+    def _on_box_pressed(self, modifiers):
+        """某个框被按下**之前**（`BBoxItem.on_select` ✓）。
+
+        **选择模式**：不按 Ctrl ⇒ 先清掉别的选中（点一下就换成只选这一个 ✓ 是"选择"该有的
+          手感 ✓）；按住 Ctrl ⇒ 加选 ✓。
+        **标注模式**：什么都不做（保持老行为：点几个就选几个 ✓ 别在本轮顺手改掉它 ✗）。
+        """
+        if self.mode == MODE_SELECT and not (modifiers & Qt.ControlModifier):
+            self.clear_selection()
+
+    def clear_selection(self):
+        """取消所有选中 → 返回被清掉的个数 ✓（框选新起一次时先清 ✓）。"""
+        n = 0
+        for it in self.boxes:
+            if it.isSelected():
+                it.setSelected(False)
+                n += 1
+        if n:
+            self.selection_changed.emit(0)
+        return n
+
+    def selected_count(self):
+        return sum(1 for it in self.boxes if it.isSelected())
+
+    def _select_in_rect(self, rect, add=False):
+        """把**与 rect 相交**的框选中 → 返回选中总数 ✓（框选那一下的实际动作 ✓）。
+
+        ⚠⚠ **绝不发 `boxes_changed`** ✗：选中不是修改 —— 发了的话"只是框选看了一眼"的帧
+          会被当成**人工改过**（`ReviewPanel._on_boxes_changed` ⇒ `_dirty` ⇒ 翻页时写盘 ✗），
+          于是「只看未经人工修改」里忽进忽出 ✓（同 `_save_current` 那条"以落盘为准"的教训 ✓）。
+        """
+        r = QRectF(rect)
+        for it in self.boxes:
+            hit = it.sceneBoundingRect().intersects(r)
+            if hit:
+                it.setSelected(True)
+            elif not add:
+                it.setSelected(False)
+        n = self.selected_count()
+        self.selection_changed.emit(n)
+        return n
+
     # ---------------- 载入 ----------------
 
     def load(self, pixmap, boxes=(), editable=True, fit=True):
@@ -356,6 +447,8 @@ class ImageCanvas(ZoomPanView):
         self.pix_item = None
         self._rubber = None
         self._draw_start = None
+        self._select_band = False     # 换帧时手上那根橡皮筋一律作废 ✓（别把上一帧的框选带过来 ✗）
+        self._band_add = False
 
         self.pix_item = self.scene_.addPixmap(pixmap)
         self.pix_item.setPos(0, 0)
@@ -474,6 +567,7 @@ class ImageCanvas(ZoomPanView):
         it.setEnabled(self.editable)
         it.on_changed = self._on_item_changed   # 框挪/缩 ⇒ 蒙版洞跟手 + 照常发信号 ✓
         it.on_press = self.before_change.emit   # 拖动前记录撤销快照
+        it.on_select = self._on_box_pressed     # 选择模式：按下一框就换成只选它 ✓
         self.scene_.addItem(it)
         self.boxes.append(it)
         self._apply_mask()                      # 新框 = 新洞 ✓
@@ -559,15 +653,28 @@ class ImageCanvas(ZoomPanView):
                         and all(it is self.pix_item
                                 for it in self.items(e.pos())
                                 if it.data(0) != "helper"))):
-                self._draw_cls = (CLASS_PLAYER
-                                  if (e.modifiers() & Qt.ControlModifier)
-                                  else self.current_cls)
                 self._draw_start = self.mapToScene(e.pos())
                 self._rubber = QGraphicsRectItem()
-                hex_, _rgb = self._colors.get(self._draw_cls,
-                                              self._colors[CLASS_MOB])
-                self._rubber.setPen(QPen(QColor(hex_), 2, Qt.DashLine))
                 self._rubber.setZValue(20)
+                if self.mode == MODE_SELECT:
+                    # ⭐ **选择模式**（用户 2026-10-04 ✓ 第 3 条）：只拉一个**黑色虚线**框，
+                    #   松手**选中被框住的框**、**不建框** ✓（批量删误检用 ✓）。
+                    #   ⚠ 不按 Ctrl ⇒ 先把旧的选中清掉（"框一次 = 选这一批" ✓）；
+                    #     按住 Ctrl ⇒ 加选 ✓。
+                    self._band_add = bool(e.modifiers() & Qt.ControlModifier)
+                    self._select_band = True
+                    self._draw_cls = None
+                    if not self._band_add:
+                        self.clear_selection()
+                    self._rubber.setPen(QPen(QColor(SELECT_BAND_COLOR), 2, Qt.DashLine))
+                else:
+                    self._draw_cls = (CLASS_PLAYER
+                                      if (e.modifiers() & Qt.ControlModifier)
+                                      else self.current_cls)
+                    self._select_band = False
+                    hex_, _rgb = self._colors.get(self._draw_cls,
+                                                  self._colors[CLASS_MOB])
+                    self._rubber.setPen(QPen(QColor(hex_), 2, Qt.DashLine))
                 self.scene_.addItem(self._rubber)
                 e.accept()
                 return
@@ -586,9 +693,21 @@ class ImageCanvas(ZoomPanView):
     def mouseReleaseEvent(self, e):
         if self._rubber is not None:
             r = self._rubber.rect()
+            band, add = self._select_band, self._band_add
+            self._select_band = False
+            self._band_add = False
             self.scene_.removeItem(self._rubber)
             self._rubber = None
             self._draw_start = None
+
+            if band:
+                # ⭐ 选择模式：松手只**选中**（不建框 ✓）—— 太小的一下当"点空白" ⇒ 只清选择 ✓
+                #   ⚠ 这里**不发 `boxes_changed`**（选中不算修改 ✓ 见 `_select_in_rect` ✓）
+                if r.width() >= MIN_SIZE and r.height() >= MIN_SIZE:
+                    self._select_in_rect(r, add)
+                self._draw_cls = None
+                e.accept()
+                return
 
             if r.width() >= MIN_SIZE and r.height() >= MIN_SIZE:
                 self.before_change.emit()   # 加框前记录撤销快照

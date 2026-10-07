@@ -30,6 +30,8 @@ import cv2
 
 from core.context import ConsoleContext, TaskContext, cancelable
 from core.imgio import imread, imwrite
+# ⭐⭐ 「框到可见部分」的两个默认值（与怪物/宠物/掉落**同一份** ✓ 见 `perception/visible_box.py` ✓）
+from perception.visible_box import VISIBLE_KEEP, VISIBLE_TOL
 # 可视化框颜色跟「设置 → 可视化」走（gui.theme 不 import PyQt5，子进程可用）
 from gui.theme import class_color
 
@@ -44,7 +46,20 @@ def init_worker(cfg):
     _W["loc"] = PlayerLocator(
         cfg["player_id"], root=cfg["player_root"], scale=cfg["scale"],
         threshold=cfg["thresh"], filter_prefix=cfg.get("filter_prefix"),
-        frame_scales=cfg.get("frame_scales", {}))
+        frame_scales=cfg.get("frame_scales", {}),
+        # ⭐ 2026-10-05：玩家那 5 个参数（见 `run_detect_player` 的 cfg 段说明 ✓）
+        #   ⚠⚠ 子进程这条**必须一起传** ✗ —— 只改主进程那个预检等于**没接上** ✓
+        #     （真正的定位都发生在子进程 / `workers<=1` 时的这条初始化里 ✓）。
+        per_mob=cfg.get("per_mob", 0), min_distinct=cfg.get("min_distinct", 0.0),
+        max_peaks=cfg.get("max_peaks", 1), downscale=cfg.get("ds", 1.0),
+        # ⭐ 任务 3：用户手工挑的模板帧（缺 = 老逻辑 ✓；⚠ 子进程这条必须一起传 ✗）
+        frames_sel=cfg.get("frames_sel") or None,
+        # ⭐⭐ **框到可见部分**（用户 2026-10-06 ✓ "所有的匹配都需要这个参数" ✓）——
+        #   ⚠⚠ 子进程这条**必须一起传** ✗（真正的定位发生在这里 / 下面的预检 ✓）；
+        #   缺键 = 关 = 老行为 ✓（老项目 / 老调用方一字不变 ✓）。
+        visible=bool(cfg.get("visible", False)),
+        visible_tol=cfg.get("visible_tol"),
+        visible_keep=cfg.get("visible_keep"))
 
 
 def work(fp_str):
@@ -63,7 +78,8 @@ def work(fp_str):
     # 搜索范围：粗定位给了区域就只在区域内找（快得多）；没给（漏检帧 / 没开
     # 粗定位）就是 None → 全图，与优化前**完全一致**（locate 会把偏移加回，
     # 所以 cx/cy 仍是画面坐标，写出的标注格式不变）。
-    r = _W["loc"].locate(full, search_rect=(cfg.get("roi") or {}).get(fp.stem))
+    r = _W["loc"].locate(full, search_rect=(cfg.get("roi") or {}).get(fp.stem),
+                         downscale=cfg.get("ds", 1.0))
 
     # 玩家框（class 0）一律重写，不做「断点续标」：重新采集后旧 txt 里
     # 残留的 class 0 框位置是错的，若按「已有 class 0 就跳过」会整批跳过，
@@ -140,6 +156,21 @@ def run_detect_player(params, ctx=None):
         "player_root": params.get("player_root", "datasets/sprites/player"),
         "scale": float(params.get("scale", 1.0)),
         "thresh": float(params.get("thresh", 0.78)),
+        # ⭐ 2026-10-05（用户："参数都放，缺功能的就补功能" ✓）—— 玩家这一段也有了自己的
+        #   「区分度 / 最大模板帧 / 每模板峰数 / 降采样」✓（④ 那一段要摆这 5 个 ✓）。
+        #   ⚠⚠ **默认值全部 = 老行为**（老项目 / 老调用方一字不变 ✓）：
+        #     `per_mob=0` ⇒ 模板帧不截断 ✓；`min_distinct=0.0` ⇒ 不设"最佳/次佳差距"闸 ✓；
+        #     `max_peaks=1` ⇒ 每模板只取一个峰 ✓；`downscale=1.0` ⇒ 不缩 ✓。
+        #   语义见 `perception/player_locator.py` 里那两段说明（尤其"区分度"对玩家是
+        #   **可信度闸**而不是去重闸 ✓）—— 改默认值前先读那两段 ✗。
+        "per_mob": int(params.get("per_mob", 0) or 0),
+        "min_distinct": float(params.get("min_distinct", 0.0) or 0.0),
+        "max_peaks": int(params.get("max_peaks", 1)),   # ⚠ 0/-1 都要原样传 ✓（`or 1` 会把 0 吃掉 ✗）
+        "ds": float(params.get("downscale", 1.0) or 1.0),
+        # ⭐⭐ 玩家这条手工挑的**模板帧**（任务 3 ✓）：整份字典按 `<target>:<id>` 存 ✓
+        #   ⇒ 这里摘出 `player:<角色id>` 那一份（缺 = 老逻辑"全用" ✓）。
+        "frames_sel": [str(s) for s in ((params.get("frames_sel") or {})
+                                        .get("player:%s" % pid) or [])],
         "filter_prefix": params.get("filter_prefix"),   # None = 加载所有动作帧
         "frame_scales": params.get("frame_scales") or {},  # {player_id:帧stem -> scale}
         "out": str(out),
@@ -150,6 +181,14 @@ def run_detect_player(params, ctx=None):
         # 粗定位结果 {帧stem: (x,y,w,h)}：**主进程算好**再随 initargs 下发
         # （子进程里绝不能碰模型）；空表 = 全部全图匹配
         "roi": {},
+        # ⭐⭐ **框到可见部分**（用户 2026-10-06 ✓ 原话："**所有的匹配都需要「框到可见部分」
+        #   参数**"）—— 玩家这条链 2026-10-06 才补上（之前只有 阈值/尺度 + 那 5 个 ✓）。
+        #   ⚠ **默认关** ✗（改的是**标注语义**、不是修 bug ✓ ⇒ 老项目 / 老调用方一字不变 ✓）；
+        #     要开就按项目显式开（设置里那个勾 ✓）；开了之后同一帧的框会变小 ⇒ 要重跑标注 ✓。
+        #   ⚠ 实现是 `perception/visible_box.py`（与怪物/宠物/掉落**共用那一份** ✓）。
+        "visible": bool(params.get("visible", False)),
+        "visible_tol": float(params.get("visible_tol", VISIBLE_TOL)),
+        "visible_keep": float(params.get("visible_keep", VISIBLE_KEEP)),
     }
 
     # 重新采集后帧数变少时，清掉帧号超界的旧标注/可视化（同 detect_mobs）
@@ -161,10 +200,25 @@ def run_detect_player(params, ctx=None):
     # 主进程先验一次模板能不能加载，避免开了几十个进程才发现模板空
     ctx.progress(0, 0, "加载玩家模板…")
     from perception.player_locator import PlayerLocator
+    # ⭐⭐ **边加载边看取消**（用户 2026-10-05 ✓ 原话："能不等他返回吗？"）—— 逐张 `imread`
+    #   原来是个整块动作 ✗ ⇒ 点了取消得干等它读完 ✓；传 `ctx.canceled` 就能几百毫秒内收工 ✓
+    #   （与怪物那条**同一份口径** ✓ 见 `perception/player_locator.PlayerLocator.__init__` ✓）。
     loc = PlayerLocator(pid, root=cfg["player_root"], scale=cfg["scale"],
                         threshold=cfg["thresh"],
                         filter_prefix=cfg["filter_prefix"],
-                        frame_scales=cfg["frame_scales"])
+                        frame_scales=cfg["frame_scales"],
+                        per_mob=cfg["per_mob"], min_distinct=cfg["min_distinct"],
+                        max_peaks=cfg["max_peaks"], downscale=cfg["ds"],
+                        frames_sel=cfg.get("frames_sel") or None,
+                        should_stop=ctx.canceled,
+                        # ⭐⭐ **框到可见部分**（用户 2026-10-06 ✓）—— 预检这个 locator 也一起给 ✓
+                        #   （`workers<=1` 时定位就是用它跑的 ✓ 见上面那段"必须一起传" ✓）
+                        visible=bool(cfg.get("visible", False)),
+                        visible_tol=cfg.get("visible_tol"),
+                        visible_keep=cfg.get("visible_keep"))
+    if ctx.canceled():
+        ctx.log("已取消（模板加载到一半）", "warn")
+        return {"summary": "已取消", "frames": 0, "hits": 0}
     if loc.template_count == 0:
         raise RuntimeError("玩家模板为空：%s/%s" % (cfg["player_root"], pid))
 

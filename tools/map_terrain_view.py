@@ -177,13 +177,49 @@ def render(t, out_path, use_canvas=True, target_w=1280, k=None, dx=0, dy=0,
                 n_fh += 1
                 if f.is_wall:
                     n_wall += 1
+        # ⭐⭐ **这一版也把「集合名」标上**（用户 2026-10-06 ✓ 原话："底图相减后，把地形线条绘制
+        #   上去（**包含所有的地图元素命名**）"✓）：叠图（`<id>_overlay.png`）走的就是"不传
+        #   `zones`"这条支 ✓ ⇒ 以前它只有**段号** ✗ ⇒ 界面上叠着看时，"这是哪块平台"要靠
+        #   人去数段号 ✗。这里**只加名字、不改配色** ✓（线的颜色仍是"每条段一色"——
+        #   叠图要看的是"所有几何位置对不对"，不是"我圈了哪几块"✓ 见 `render` 的说明 ✓）。
+        #   ⚠ 集合从磁盘现读 ✓（调用方没传时）—— 读不到就**不标** ✓（绝不编名字 ✗）。
+        try:
+            _z = zones if zones is not None else zones_mod.load(t.id)
+        except Exception:                       # noqa: BLE001 —— 读不到就别标 ✓
+            _z = None
+        for name, s in (getattr(_z, "sets", None) or {}).items():
+            sp = zones_mod.set_span(t, s.get("footholds") or [])
+            if sp is None:
+                continue
+            x0, x1, y0, _y1 = sp
+            col = hex_bgr(s.get("color") or zones_mod.PALETTE[0])
+            cx, cy = P((x0 + x1) / 2.0, y0)
+            tw = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0][0]
+            _label(vis, name, (int(cx - tw / 2), max(30, cy - 10)), col, 0.8)
 
     # ---- 绳梯 / 绳子 ----
-    for L in t.ladders:
+    # ⭐ **绳梯号**（`L1`/`L2`… ✓ 用户 2026-10-06："包含所有的地图元素命名"✓）：
+    #   ⚠ 编号必须**与位置状态广播的 `ladder_id` 同一套** ✗（它来自 `zones.ladder_ids` ✓ ——
+    #     这里自己数一遍就是"第二套编号"，日志里 `L3` 和图上 `L3` 会指到两根不同的绳 ✗）；
+    #     拿不到就**不标** ✓（宁可没有，也别给个对不上号的数字 ✗）。
+    _lids = []
+    try:
+        _lids = list(zones_mod.ladder_ids(t))
+    except Exception:                           # noqa: BLE001 —— 拿不到就不标 ✓
+        _lids = []
+    for _i, L in enumerate(t.ladders):
         a, b = P(L.x, min(L.y1, L.y2)), P(L.x, max(L.y1, L.y2))
         cv2.line(vis, a, b, (255, 255, 0), 2)
         cv2.circle(vis, a, 4, (255, 255, 0), -1)
         cv2.circle(vis, b, 4, (255, 255, 0), -1)
+        if _i < len(_lids):
+            _nm = _lids[_i]
+            # ⚠⚠ **只印真正的"绳号"（字符串）** ✗：这张图上 `ladder_ids` 给的是 **`id()` 内部数字**
+            #   （实测 `2236014911760…` ✓）—— 印出来就是"**对不上号的假编号**" ✗（比不印更糟 ✗）。
+            #   绳号本来由**集合编辑器**给（"与编辑器画在绳上的、以及「爬」边里写的绳号同一套"✓）；
+            #   这张图还没命名过 ⇒ 就**不印** ✓（这就是上面那句"宁可没有，也别给对不上号的数字"✓）。
+            if isinstance(_nm, str) and _nm:
+                _label(vis, _nm, (a[0] + 8, a[1] - 6), (255, 255, 0), 0.8)
 
     # ---- 传送点 ----
     for p in t.portals:

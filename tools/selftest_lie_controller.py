@@ -228,8 +228,13 @@ def t_follow_gain():
     check(LieMouseController(follow_gain=99.0).follow_gain == 5.0,
           "⑥ 上界 5（防手输离谱值 ✓）")
     import perception.lie_controller as _LC
-    check(LieMouseController().follow_gain == float(_LC._FOLLOW_GAIN) == 1.0,
-          "⑥ `None` ⇒ 模块默认 %.2f（= 全量 ⇒ 老行为一字不变 ✓）" % float(_LC._FOLLOW_GAIN))
+    # ⚠ **默认值 2026-10-04 由 1.0 改成 0.6** ✗（**实测**：1.0 = "一拍全量贴上去" ⇒ 下一拍
+    #   目标一动就反向修正 ⇒ 鼠标那条相对轨迹**折角多**（夹角 90% 分位 57° ✗）；
+    #   0.6 ⇒ **23°** ✓ 而**命中率仍是 100%** ✓ 见 `lie_controller._FOLLOW_GAIN` ✓）。
+    #   ⚠ 所以"老行为一字不变"那句**不再成立** ✓ —— 这条现在钉的是"**默认值 = 0.6**" ✓。
+    check(LieMouseController().follow_gain == float(_LC._FOLLOW_GAIN) == 0.6,
+          "⑥ `None` ⇒ 模块默认 %.2f（**平滑与贴得住**的平衡点 ✓ 命中率不掉 ✓）"
+          % float(_LC._FOLLOW_GAIN))
     # ④ ⭐ **不影响位置计算**：本项只改指令，不碰任何"游戏像素"的目标点 ✓（同一局面下
     #    目标点一致 ⇒ 只是发多少不同 ✓）—— 这条由①的三档比例关系间接钉住 ✓。
     check(_c1[0] * 0.5 == _c2[0] and _c1[0] * 2.0 == _c5[0],

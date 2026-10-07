@@ -15,6 +15,13 @@
 import threading
 import time
 
+# 「最老那条还没回执的指令等了多久」——**判据与 TLS 那条共用一份** ✓（`kbd_client.py` ✓）。
+#   两种跑法都要能用（部署时当脚本 / 从仓库根当包 ✓ 同 `relay.py` 那个 try/except ✓）。
+try:
+    from .kbd_client import silence_seconds as _silence_seconds
+except ImportError:                         # noqa: BLE001 —— 当脚本跑时走这条 ✓
+    from kbd_client import silence_seconds as _silence_seconds
+
 # Pro Micro / Leonardo / Micro 的 USB VID:PID（换 USB 口后串口号会变，靠它自动发现）
 _PRO_MICRO_VIDPIDS = ("2341:8036", "2341:8037", "1B4F:9205", "1B4F:9206")
 
@@ -58,6 +65,12 @@ class SerialKbd:
         self.replies = 0
         self.last_send_at = 0.0
         self.last_reply_at = 0.0
+        #: ⭐ **还没等到回执的条数 + 最早那条发出的时刻**（同 `kbd_client` ✓）——
+        #:   `silent_for()` 的判据就靠它俩（"最老那条等了多久" ✓ 见 `silence_seconds` ✓）。
+        #:   ⚠ 2026-10-04 之前这里没有这两个字段 ⇒ 判据用的是"距上次**发送**多久" ✗
+        #:   ⇒ 一直发就永远判不出死链（现场卡键 7 分 46 秒 ✓）。
+        self._pending = 0
+        self._rtt_t0 = None
         # 后台读线程：读走固件回传的 DONE/READY，否则串口输入缓冲堆积、
         # 固件 Serial.println 阻塞，整条链路卡死（表现为按键发不出）。
         self._reader = threading.Thread(target=self._drain, daemon=True)
@@ -72,6 +85,10 @@ class SerialKbd:
                 self.ok = True
                 self.sent += 1
                 self.last_send_at = time.monotonic()
+                # 回执起点：只记**最早那条还没对上回执的**（口径同 `kbd_client.send` ✓）
+                self._pending += 1
+                if self._rtt_t0 is None:
+                    self._rtt_t0 = time.perf_counter()
                 return True
             except Exception as e:
                 self.ok = False
@@ -80,18 +97,16 @@ class SerialKbd:
                 return False
 
     def silent_for(self):
-        """多久没收到固件回执了（秒）。0 = 正常。见 kbd_client.silent_for。"""
-        if self.sent == 0:
-            return 0.0
-        now = time.monotonic()
-        if now - self.last_send_at > 30.0:
-            return 0.0
-        if self.last_reply_at >= self.last_send_at:
-            return 0.0
-        return now - self.last_send_at
+        """多久没收到固件回执了（秒）。0 = 正常（或无从判断）。
+
+        ⚠ **判据与 TLS 那条共用同一段**（`kbd_client.silence_seconds` ✓）—— 这个文件原来
+          自己抄了一份，抄的还是**错的**那版（"距上次**发送**多久" ✗ 一直发就恒 0.1 秒 ⇒
+          判不出死链 ✗ 2026-10-04 现场卡键 7 分 46 秒 ✓）⇒ 两处各写一份必然漂 ✓。
+        """
+        return _silence_seconds(self.sent, self._rtt_t0, time.perf_counter())
 
     def _drain(self):
-        """持续读走固件回传，避免输入缓冲堆积；顺带统计回执。"""
+        """持续读走固件回传，避免输入缓冲堆积；顺带统计回执（并推进 `silent_for` 的账 ✓）。"""
         while not self._stop.is_set():
             try:
                 data = self._ser.read(256)
@@ -102,6 +117,10 @@ class SerialKbd:
                 if n:
                     self.replies += n
                     self.last_reply_at = time.monotonic()
+                    # 账减掉（口径同 `kbd_client._take_rtt` ✓）：减完还有 ⇒ 起点挪到"现在"，
+                    # 没有 ⇒ 清空 ✓（不清的话空闲期会被算成延迟 ✗）
+                    self._pending = max(0, self._pending - n)
+                    self._rtt_t0 = time.perf_counter() if self._pending > 0 else None
 
     def close(self):
         self._stop.set()

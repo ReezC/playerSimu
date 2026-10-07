@@ -62,7 +62,21 @@ NEAR_PX = 20.0
 #: 推理 ✗（2026-09-27 就是这么误判过一次：见 `ClimbJob._dir_tap_at` 那条 ⚠）。
 #: ⚠ 点按的"按住多久"是**按时长**算的、**与帧率无关**（`ClimbJob.update` 里"只在新按下
 #: 时记时刻"那条 ✓；用例 `t_climb_align_tap_releases_any_fps` 按 15 / 34fps 两档钉着 ✓）。
-TAP_ON_S = 0.06
+#: ⭐⭐ **0.06 ⇒ 0.03**（用户 2026-10-06 ✓ 原话："**直接做成 30ms**"✓ —— 起因：现场观察到
+#:   "对齐过程中方向键按住的时间有点长"✓，而"点按"这一档按的是这个数 ✓）。
+#: ⚠⚠ **这是**全局**一个数**（不是某一种任务专属 ✗）—— 改它 = 下面这些都跟着变 30ms：
+#:   · 爬绳对齐 x 的近处点按 / 「跳下绳梯」的点按跳 / 「中途跳下」的点按跳 ✓；
+#:   · 下跳（`DropJob`）的「↓ ＋ 点按跳」与"脱离绳"那几下的跳 ✓；
+#:   · 走不动时那个「单点跳」、走路的"微调"点按（`WalkJob` ✓）；
+#:   · 传送点（`PortalJob`）：对齐期间那几下的 ↑ 点按、以及进容差后那一下"正式的 ↑" ✓。
+#: ⚠ **"实际按住"仍受帧率量化**（这一点改不了、也别糊弄自己 ✗）：
+#:   松手是"到点后的**下一拍决策**"才发的 ⇒ 推流 ≈30fps（一帧 33ms）⇒ 30ms 只够 **1 帧**
+#:   （≈33ms，比原来的 2 帧 ≈66ms 短一半 ✓）；**窗口抓帧 15fps**（一帧 67ms）⇒ 30ms 也还是
+#:   **1 帧 ≈67ms** ⇒ **低帧率下这个改动几乎看不出效果** ✗（真要让低帧率也变短，得改成
+#:   "按 N 帧"的口径 —— 那是另一件事，用户没要求 ⇒ 没做 ✗）。
+#: ⚠ `TAP_PERIOD_S - TAP_ON_S`（下爬"先松再按"那段的松窗 ✓）现在是 0.18−0.03 = **0.15** ✓
+#:   仍然远大于一帧 ✓ 不受影响 ✓。
+TAP_ON_S = 0.03
 TAP_PERIOD_S = 0.18
 
 # ⚠ 这里原来有 `OFF_X_PX = 18.0` / `OFF_X_GRACE_S = 0.6`（「偏离绳梯」判据的两个阈值）
@@ -1183,41 +1197,33 @@ class ClimbJob(_PausableJob):
             # 按住走"天然满足 ✓（而且远距离点按会走得太慢、直接撞超时 ✗）。
             # 真正受它约束的是**快到位时的一下一下点按**（原来写死的 `TAP_PERIOD_S`
             # 周期就是这里的默认值 ✓）：按够 `TAP_ON_S` 就松开，下一次按要等间隔到 ✓。
-            _held = (self._press_dir == sign)
-            _since = (None if self._press_at is None
-                      else float(now) - self._press_at)
-            if (_held and abs(dx) <= self.near_px
-                    and (float(now) - self._press_at) >= TAP_ON_S):
-                # 点按的"松开那一下"（快到位时别一路蹭过去 = 冲过头 ✓）
-                self._press_dir = 0
-                self.note = "微调：差 %.0f px（松开这一拍，别冲过头）" % dx
+            # ⭐⭐ **对齐的规则搬进 `align_x_decide`**（**一处实现** ✓ 约定 10 ✓）——
+            #   用户 2026-10-06："我们应该**整套照搬对齐式爬绳梯的逻辑**，**还要补按方向**"✓
+            #   ⇒ 规则抽成模块级函数，**爬绳与走传送点都调它** ✓（原来只在这儿内联着 ✓）。
+            #   ⚠ **`retry_ms=0`：爬绳的对齐相不补按** ✓（它 CLIMB 相本来就有自己的"补按 ↑"✓
+            #     别叠两层 ✗）—— 用户要的那个新行为**只给传送点** ✓ **这边行为一个字不改** ✓。
+            #   记账仍写在 `ClimbJob` 自己那几个字段上 ✓（别的地方也在读它们 ✓ 不搬走 ✗）。
+            _kind, _move, _unused_re, _why, _st = align_x_decide(
+                now, dx, press_dir=self._press_dir, press_at=self._press_at,
+                progress_at=getattr(self, "_alx_progress_at", None),
+                best_dx=getattr(self, "_alx_best_dx", None),
+                gap_ms=self.align_gap_ms, near_px=self.near_px,
+                tol_px=self.tol_px, retry_ms=0)
+            self._press_dir = _st["press_dir"]
+            self._press_at = _st["press_at"]
+            self._alx_progress_at = _st["progress_at"]
+            self._alx_best_dx = _st["best_dx"]
+            # 点按的"松开那一下" / "等移动延迟"两拍 ⇒ 什么都不按 ✓（note 由函数给 ✓）
+            if _kind == "wait":
+                self.note = _why
                 return self._out(0, False)
-            if (not _held and _since is not None and self.align_gap_ms > 0
-                    and _since * 1000.0 < self.align_gap_ms):
-                # 上一次按下还没到「移动延迟」⇒ 这一拍**不按**（站住等）——
-                # 过冲之后往回按（换了方向）也走这条 ⇒ 不会在绳两边来回抖 ✓
-                self._press_dir = 0
-                self.note = "对齐中：差 %.0f px（等移动延迟 %d ms）" % (
-                    dx, self.align_gap_ms)
-                return self._out(0, False)
-            # ⚠ **只有"新的一次按下"才记时刻**（2026-09-27 修）：原来这里每一拍都写
-            #   `_press_at = now` ⇒ `now - _press_at` 永远只有**一帧**（决策跟着收流帧
-            #   跑，≈30fps 时一帧 33ms），而上面那条"按够 `TAP_ON_S`(60ms) 就松开"正是
-            #   拿它算的 ⇒ **永不成立** ⇒ 进了「开始对齐绳梯x的距离」以内也一直**按住
-            #   不放** ✗（用户 2026-09-27 报的"对齐 x 时方向键按了很久"就是这个：
-            #   一帧 29~33ms < 60ms ⇒ 松开那一条永远不满足 ⇒ 变成一口气按住走）。
-            #   按住期间**不刷**它 ⇒ "松开"是从**按下那一下**起算的，与帧率无关 ✓。
-            if not _held:
-                self._press_at = now
-            self._press_dir = sign
-            if abs(dx) <= self.near_px:
-                # 已经走近了 ⇒ 斜跳**重新武装**（这一轮的下一次"离远"还能再试一次 ✓）
-                self._diag_done = False
-                self.note = "微调：差 %.0f px（点按 %s）" % (
-                    dx, "→" if sign > 0 else "←")
-            else:
-                self.note = "对齐中：差 %.0f px（容许 %d）" % (dx, self.tol_px)
-            return self._out(sign, False)
+            if _kind == "press":
+                if abs(dx) <= self.near_px:
+                    # 已经走近了 ⇒ 斜跳**重新武装**（这一轮的下一次"离远"还能再试一次 ✓）
+                    self._diag_done = False
+                self.note = _why
+                return self._out(_move, False)
+            # `in_tol` ⇒ 落到下面的"站住 `hold_ms` ⇒ 按跳"（note 与后续动作都由那儿管 ✓）
         # ⭐ **本轮还没发过方向键 ⇒ 先朝绳点按一次**（用户 2026-09-28 要求，原话："朝目标绳梯
         #   的 x 方向对齐 x（**至少发 1 次点按方向键**）→ 跳 → 按住 ↑，这三步要循环"）。
         #   ⛔ 原来这一支直接"站住等 `hold_ms` ⇒ 跳"，**一次方向键都不发** ✗ —— 用户要的是
@@ -1870,12 +1876,25 @@ class DropJob(_PausableJob):
         **向上抖不算**（那是读数噪声，不是"开始下落"✗），而且**没有 y 读数就不按跳**
         （基准都拿不到 ⇒ 判不出下落 ⇒ 只能一路按到超时 ✗）；
       ⑤ 落到目标 foothold ⇒ 成功。
-      ③ 之后还有一条重试（同一条要求）：在「**移动操作尝试间隔(ms)**」内 Y **没动** ⇒
-        **补发一个"松开 ↓"**，然后重新 ③（按住 ↓ + 点按跳）。
 
-    ⚠ 为什么"补发一个松开 ↓"而不是"再按一次 ↓"：`KeyState` 只在**键集变化**时才发键 ⇒
-      一直按着 ↓ 再"按一次"对面根本收不到新的按下 ✗ —— 这正是爬绳那边「补按 ↑」要解决的
-      同一个坑（见 `ClimbJob._reassert_at` 那一段的说明 ✓）。
+    ⭐⭐ **③ 之后三条出口（用户 2026-10-06 的流程图定稿 ✓，照抄别自己发明）**：
+
+      · **位置状态说上绳了** ⇒ 松开 ↓、按方向 + 跳 **脱离**（→ `DETACH` 相 ✓，
+        方向 = 有锁定目标朝目标、否则任意 ✓）；
+      · **正常下落**（Y 真的往下走了 ✓）⇒ 离开"触发"这一环，转 `LANDING`/到达判定 ✓；
+      · **「移动操作尝试间隔」内没反应**（既没下落、也没上绳）⇒ **回入口**：
+        重新判"**当前这块 foothold 还能不能下跳**"（= 回到 `ALIGN` 相 ✓，
+        `_to_entry` 那一步；判下来还是这块 ⇒ 重新"按住 ↓ + 跳" ✓，
+        不是这块了 ⇒ 就近挑一块走过去 ✓）。
+
+    ⛔ **"按键补按（重发 PRESS）"那套已删**（2026-10-06 ✓ 用户原话："**下跳 drop 执行器的
+      按键补按逻辑移除**，改为当在「移动操作尝试间隔」内没反应就从最开始的判断走"✓）：
+      `_reassert_at` / `_reassert_n` / `_hold_reassert()` / `out["reassert"]` 全部不在下跳里 ✗
+      —— **爬绳那边的「补按 ↑」照旧保留**（那是另一条口径 ✓）。
+    ⚠ 回入口那一拍**一个键都不按**（`_out(0, False)` ⇒ ↓ 真的松开一拍 ✓）：`KeyState` 只在
+      **键集变化**时才发键 ⇒ 不松这一下、下一轮那个"按住 ↓"对面**根本收不到新的按下** ✗
+      （人**不趴** ⇒ 后面每一下跳都只是**原地跳** ✓）—— 这正是原来 `_hold_reassert` 要解决的
+      同一个坑，现在改用"**真的松一下 → 真的一次新按下**"来解（**不靠重发** ✓）。
     ⚠ 「点按跳」而不是"按住跳"：用户 2026-09-26 定的动作是**两次**按下（先 ↓ 再跳），
       一直按住跳会被游戏当成"还挂在上面"✗（`_jump_down_beat` 那套也是点按 ✓）。
 
@@ -1941,13 +1960,12 @@ class DropJob(_PausableJob):
         self.hold_ms = max(0, int(hold_ms))
         #: 「坐标对齐误差范围」（世界像素）：Y 变化超过它才算**真的开始下落** ⇒ 松开 ↓ ✓
         self.y_tol_px = max(1.0, float(y_tol_px))
-        #: 「按住 ↓」那几拍的重发观察窗（见 `_hold_reassert` ✓）：第一次按住 ↓ 的时刻；
-        #: 每过「移动操作尝试间隔」重发一次「按下 ↓」（对面把键丢了也能救回来 ✓）。
-        self._reassert_at = None
         #: ⭐ **下落过程中「补按跳」**的锚（用户 2026-09-28 口径 ✓ 原话："下落过程中也按照
         #:   『移动操作尝试间隔』补按 **按住 ↓ + 跳**"）—— 见 `_falling_jump` ✓。
-        #:   ⚠ 与 `_reassert_at`（补按 ↓）**同一份节拍**（都用「移动操作尝试间隔」✓），
-        #:     但**分开记账**：一个管 ↓ 的重发、一个管跳的补按 ⇒ 互不挤掉 ✓。
+        #: ⛔ **曾经还有一个 `_reassert_at`（"按下 ↓"的重发观察窗 ✓）—— 2026-10-06 删掉** ✗：
+        #:   用户改口径了（原话："**按键补按逻辑移除**，改为当在「移动操作尝试间隔」内没反应
+        #:   就**从最开始的判断走**（当前 foothold 是否可下跳）"✓）⇒ "没反应"的处置**不再是
+        #:   重发一次 PRESS**，而是**回入口重判**（`_to_entry` ✓）。见 `update` 的 DROP 相 ✓。
         self._jump_reassert_at = None
         #: **已经在往下掉了**（Y 变化越过误差范围 ✓）：从这一刻起**不再点按跳**，
         #: 但 **↓ 一直按着** —— 直到 `_arrived` 说"位置状态到目的地了"才松 ✓
@@ -1978,13 +1996,10 @@ class DropJob(_PausableJob):
         #: ⚠ 2026-09-27 之前 DropJob **没继承** `_PausableJob`（所以它从不跳过打架时长 ✗，
         #:   还吃不到 `_result` 那套统一回值 ✗ —— 本轮补齐 ✓）。`_y0/_y_base` 是 **y 值**不是
         #:   时刻 ⇒ 不在里面 ✓。
-        #: ⭐ **补按「按住 ↓」发了几次**（用户 2026-09-28 报 bug 之后加的**打点** ✓）——
-        #:   现场形状是"**没有补按「按下 ↓」、只补按了跳，然后超时**"✗，而"补按 ↓"这件事
-        #:   原来**在日志里看不出来**（`act keys=down` 只报键集、不报"发了几次 PRESS" ✗）
-        #:   ⇒ 加这个计数，跟 `drop_taps` 并排看：**一个涨、一个不涨** ⇒ 一眼定位 ✓。
-        self._reassert_n = 0
+        #: ⛔ **`_reassert_n`（补按「按住 ↓」发了几次）也一起删了**（2026-10-06 ✓ 补按没了，
+        #:   这个计数就没有来源了 ✗；日志里 `drop_reassert` 那条 `sample` 同步删 ✓）。
         self._ANCHORS = ("_in_tol_since", "_armed_at", "_attempt_at", "_jump_at",
-                         "_landing_at", "_next_round_at", "_reassert_at",
+                         "_landing_at", "_next_round_at",
                          "_jump_reassert_at", "_detach_tap_at")
         self._in_tol_since = None
         self._armed_at = None
@@ -2057,6 +2072,24 @@ class DropJob(_PausableJob):
         #     `FOOT_GAP_PX` 与 `foothold_below` 的 40 同口径 ✓）。
         _foot_gap = (None if ground_y is None or py is None
                      else abs(float(py) - float(ground_y)))
+        # ⭐⭐ **"被绳吸住"要分两档判**（用户 2026-10-06 ✓ 现场原话："**drop 触发 → 人上绳梯 →
+        #   位置状态显示到了 fh：6 → 然后就不动了**"✓ —— 我按他的现象回查日志，完全对上 ✓）：
+        #   ① 老那档（2026-09-28 那条 ✓ 不动它）：**在绳段里 且 脚下那块面离我超过
+        #      `FOOT_GAP_PX`** ✓ = 人悬在绳中 ✓；
+        #   ② ⭐ **新那档**：**在绳段里 且 相位已经是"要往下跳"那几相**（ARMED / DROP /
+        #      LANDING ✓）—— 这几相的意图就是**往下跳**，人却在绳段里 ⇒ 说明**游戏把按住的 ↓
+        #      当成"顺绳往下爬"、把他吸在绳上了** ✗。
+        #      ⚠ 为什么非加这一档（实测证据 ✓）：人挂在**绳梯下部**时，脚下那块面就在 40px 内
+        #      ⇒ ① 那档**判不出来** ✗ ⇒ 从不脱离 ⇒ 现场 `drop_phase=5`（DETACH）**一次都没进过** ✓
+        #      （与日志完全吻合 ✓）。
+        #   ⚠ **只在这几相**放宽 ✗：ALIGN 相（走去下跳点）路过绳段不算被吸住 ✓ 不许乱脱 ✗。
+        #   ⚠⛔ **"在绳段里 + 那几相"这一档试过、又撤了**（2026-10-06 ✓ 如实记）：`on_rope_pos`
+        #     和 `ladder_id` **两种信号都分不出**"人挂在绳梯上"与"人站在绳底平台上" ✗ ——
+        #     **下跳点本来就常紧贴绳底**（`on_rope_pos` 真 ✓），而 ARMED/DROP 那几拍我们**正按着 ↓**
+        #     ⇒ 许可开着 ⇒ 站在绳底平台上时 `ladder_id` **也报得出绳号** ✗ ⇒ 加这一档会把
+        #     "规规矩矩站在下跳点上、准备往下跳"判成"被绳吸住" ⇒ 自己按的 ↓ 把自己判死 ✗
+        #     （既有用例 `t_drop_detach_ladder` 当场按住 ✓ 它钉的就是这条 ✓）。
+        #   ⇒ **要治"人被吸在绳梯上"，先得有一个能分辨这两者的信号** ✗（见开发日志里那条待办 ✓）。
         _hanging = bool(on_rope_pos) and (_foot_gap is None or _foot_gap > FOOT_GAP_PX)
         if _hanging:
             if self.phase != self.DETACH:
@@ -2084,6 +2117,9 @@ class DropJob(_PausableJob):
             #   "问题出在 ALIGN 上"；流程图：入口先判「**当前是否可下跳**」⇒ **是** 就直接
             #   ARMED/DROP/LANDING；**否** 就"**就近挑一块『可下跳 foothold』并前往**" ⇒
             #   **进入范围** ⇒ **回入口再判** ✓）。
+            #   ⭐ 2026-10-06：③''' 那条"「移动操作尝试间隔」内没反应"**就是回到这里** ✓
+            #   （`_to_entry()` 把相位打回 `ALIGN` ✓）—— 所以本相**必须**保持"先判再决定"
+            #   这个形状，别改成"直接从 ARMED 续上" ✗（那样就绕过了入口判断 ✓）。
             #
             # ⚠⚠ **改之前的病**（现场 2026-09-28 18:17 那次「三楼 → 二楼」超时 ✗）：
             #   老判据是"人的 x 落进**某一小块** foothold 的 `[left-tol, right+tol]`，
@@ -2184,8 +2220,11 @@ class DropJob(_PausableJob):
                 self._attempt_at = None      # 下一拍开始第一次尝试 ✓
                 self.note = "按住 ↓ + 点按跳"
             else:
-                return self._out(0, False, hold_dir=True,
-                                 reassert=self._hold_reassert(now))
+                # ⚠ 这里就是流程图那个"**通知位置状态：允许判为在绳梯上**"的落点 ✓ ——
+                #   按住 ↓（`hold_dir=True` ⇒ `_last_vert = -1` ✓）⇒ `agent.climbing_vertical()`
+                #   为真 ⇒ 位置状态机**才**允许判"在绳上" ✓（2026-09-28 诉求 1 ✓）。
+                #   **不另加一个"通知"开关** ✗：那会有第二份真相（同 `_last_vert` 打架 ✓）。
+                return self._out(0, False, hold_dir=True)
 
         # ---- ④⑤ 到了没有（下跳中 / 已松开 ↓ 等落地，都要判）----
         if self.phase in (self.DROP, self.LANDING):
@@ -2229,8 +2268,7 @@ class DropJob(_PausableJob):
             if self._y_base is None:
                 if py is None:
                     self.note = "按住 ↓：等一个 y 读数（没读数就没法判「开始下落了没有」）"
-                    return self._out(0, False, hold_dir=True,
-                                     reassert=self._hold_reassert(now))
+                    return self._out(0, False, hold_dir=True)
                 self._y_base = float(py)
                 self.note = ("按住 ↓ + 连按跳（第 %d 轮，%.1f s 内看 Y 动不动）"
                              % (self._tap_n, self.stall_s))
@@ -2257,8 +2295,28 @@ class DropJob(_PausableJob):
                 #   ⚠ ↓ 仍由 `hold_dir=True` 保证**全程按着**（用户 2026-09-27："除非位置状态
                 #     到了目的地，否则 ↓ 不能松开" ✓）—— 这里只决定"跳"按不按 ✓。
                 jp = self._falling_jump(now)
-                return self._out(0, jp, hold_dir=True,
-                                 reassert=self._hold_reassert(now))
+                return self._out(0, jp, hold_dir=True)
+            # ⭐⭐ **③'''  「移动操作尝试间隔」内没反应 ⇒ 回入口**（用户 2026-10-06 流程图 ✓
+            #   原话："**当在「移动操作尝试间隔」内没反应就从最开始的判断走**
+            #   （**当前 foothold 是否可下跳**）"）。
+            #   · "**没反应**" = 既**没有正常下落**（`_y_changed` 上面那条没命中 ✓）、
+            #     也**没被位置状态判成上绳**（那条更早、在 `update` 最前面 ✓）⇒ 走到这儿
+            #     就是"按住 ↓ + 跳了半天，游戏**一点动静都没有**" ✓。
+            #   · 处置 = `_to_entry()`（相位打回 `ALIGN` = 流程图顶部那个判断 ✓）⇒
+            #     下一拍重新判"**当前这块 foothold 还能不能下跳**"：**是** ⇒ 重新"按住 ↓ + 跳"
+            #     ✓；**否** ⇒ 就近挑一块、走过去 ✓。
+            #   ⚠ **窗口从"进 DROP 那一刻"算**（`_attempt_at` ✓，进相时打的点 ✓），
+            #     与流程图里"按住↓+跳 ⇒ 间隔到点还没反应"那一支对齐 ✓。
+            #   ⚠ `retry_ms <= 0` ⇒ **不回头**（用户在设置里把重试关掉 = 老行为：一路按住 ↓
+            #     连按，交给「寻路超时」✓ —— 尊重设置 ✓）。
+            if (self.retry_ms > 0 and self._attempt_at is not None
+                    and (float(now) - float(self._attempt_at)) * 1000.0 >= self.retry_ms):
+                # ⚠ `_to_entry` 返回的那一拍**一个键都不按**（= 真的松开一拍 ✓）——
+                #   那正是"下一轮按住 ↓ 是**新的一次按下**"的保证 ✓（见它的 docstring ✓）。
+                return self._to_entry(
+                    "按住 ↓ + 跳了 %.0f ms（「移动操作尝试间隔」）既**没下落**、也没**上绳** "
+                    "⇒ 回入口，重新判「当前这块 foothold 还能不能下跳」"
+                    % float(self.retry_ms))
             # ⛔⛔ **2026-09-28 整段删掉**：这里原来有"**一轮窗口（「卡住判定时长」`stall_s`）
             #   到点、Y 还没动 ⇒ 松开 ↓ 起身** ⇒ 隔「移动操作尝试间隔」再来一轮"✗。
             #   用户口径（2026-09-28 ✓ 原话）："**到点 Y 还没动，也不应该松开 ↓ 起身，只要进了
@@ -2266,13 +2324,15 @@ class DropJob(_PausableJob):
             #   ⇒ 那段"松手起身"**正是永远趴不下去的根因** ✗：每一轮只活 ~0.35 s 就站直一次
             #     （日志里 `drop_round` 3→9 ✓），游戏里**根本来不及趴** ⇒ 每一下跳都是**站着
             #     原地跳** ✓ —— 现场（用户 2026-09-28 报"又卡了、在原地跳"）就是这个 ✓。
-            #   ⇒ 现在这一相**只剩两件事**：
+            #   ⇒ 现在这一相**只剩三件事**：
             #     ① `_falling`（真开始落了 ⇒ 继续补按跳 ✓，见上面那段）；
-            #     ② ③''「连按跳」（按 `TAP_ON_S` / `TAP_PERIOD_S` 的节奏 ✓）。
-            #   ⚠ **↓ 松手的时机只剩两处**（与用户流程图**一致** ✓）：
+            #     ② ⭐ **③'''「移动操作尝试间隔」内没反应 ⇒ 回入口**（2026-10-06 加 ✓）；
+            #     ③ ③''「连按跳」（按 `TAP_ON_S` / `TAP_PERIOD_S` 的节奏 ✓）。
+            #   ⚠ **↓ 松手的时机只剩三处**（与用户流程图**一致** ✓）：
             #     · 落地 `DONE` / `FAILED`（`_arrive_step` / `_fail` ✓ 该松了 ✓）；
             #     · `_detach_step`（**判定上绳梯** ⇒ 脱离，那几拍传 `vert=0` **主动松 ↓** ✓）——
-            #       这正是用户说的"**只有判定 drop 上绳梯了才松开 ↓**"✓。
+            #       这正是用户说的"**只有判定 drop 上绳梯了才松开 ↓**"✓；
+            #     · ⭐ **回入口那一拍**（③''' ✓ 一个键都不按 —— **必须**松一下，理由见下 ✓）。
             #   ⚠ `stall_s` / `_tap_n` 从这一刻起**不再参与决策**（留着字段只为日志/用例 ✗
             #     不删定义：设置里那两项还在，别让别的调用方当场炸 ✗）。
             # ③'' **连按**：到「点按周期」就**再按一下**（`_jump_at` = 这一下的起点 ✓）——
@@ -2290,21 +2350,22 @@ class DropJob(_PausableJob):
             #     这样最差也只是"按一拍、松一拍"（周期 = 2 拍 ⇒ 慢拍下约 2.5 下/秒 ✓），
             #     **绝不会**再退化成按住 ✓。
             if self._jump_on and (float(now) - self._jump_at) >= TAP_ON_S:
-                return self._out(0, False, hold_dir=True,
-                                 reassert=self._hold_reassert(now))
+                return self._out(0, False, hold_dir=True)
             if (self._jump_at is None
                     or (float(now) - self._jump_at) >= TAP_PERIOD_S):
                 self._jump_at = now
                 self.note = ("按住 ↓ + 连按跳（第 %d 轮，%.1f s 内看 Y 动不动）"
                              % (self._tap_n, self.stall_s))
-                #                    ↓ 按住 + 这一下跳按下 ✓（↓ 也一起重发：它要是被对面丢了，
-                #                      人就**不趴** ⇒ 这一下跳只会变成**原地跳** ✗）
-                return self._out(0, True, reassert=self._hold_reassert(now))
+                #                    ↓ 按住 + 这一下跳按下 ✓
+                # ⛔ 原来这里带 `reassert=`（"顺手把 ↓ 也重发一次"✓）—— 2026-10-06 删 ✗：
+                #   用户要求"**按键补按逻辑移除**"。对面要是把 ↓ 丢了，靠的是**③''' 那条
+                #   回入口**（回入口那一拍把键全松开 ⇒ 下一轮的"按住 ↓"是**真正的新按下** ✓），
+                #   不再靠"键集没变也重发一遍" ✗。
+                return self._out(0, True)
             if (float(now) - self._jump_at) < TAP_ON_S:
-                # 这一下还没够时长 ⇒ 继续按着 ✓（同样带上 ↓ 的重发 ✓）
-                return self._out(0, True, reassert=self._hold_reassert(now))
-            return self._out(0, False, hold_dir=True,
-                             reassert=self._hold_reassert(now))   # ↓ 继续按着，等下一 下 ✓
+                # 这一下还没够时长 ⇒ 继续按着 ✓
+                return self._out(0, True)
+            return self._out(0, False, hold_dir=True)   # ↓ 继续按着，等下一 下 ✓
 
         # ---- ④ 等落地：↓ 已经松开（用户口径"Y 变化超过误差范围**才能**松开 ↓"）⇒ 什么都不按 ----
         # ⚠ **"松了却没落下去"必须有退路**（否则它会一直"什么都不按"地挂到「寻路超时」✗）：
@@ -2313,54 +2374,39 @@ class DropJob(_PausableJob):
         #   （对面把键丢了 / 按早按晚了 / 人根本没离地 ✓）。
         if (self.retry_ms > 0 and self._landing_at is not None
                 and (now - self._landing_at) * 1000.0 >= self.retry_ms):
-            self.phase = self.ALIGN
-            self.attempt += 1
-            self._in_tol_since = None
-            self._attempt_at = None
-            self._y_base = None
-            self._jump_at = None
-            self._landing_at = None
-            self._next_round_at = None
-            self.note = ("松开 ↓ 后 %.0f ms 还没落地 ⇒ **回入口**重来（第 %d 次；"
-                         "整体由「寻路超时时间」兜底）" % (self.retry_ms, self.attempt))
+            return self._to_entry("松开 ↓ 后 %.0f ms 还没落地 ⇒ **回入口**重来" % self.retry_ms)
         return self._out(0, False)
 
-    def _hold_reassert(self, now):
-        """「按住 ↓」的那几拍：**按「移动操作尝试间隔」的间隔请求重发一次 ↓** ✓。
+    def _to_entry(self, why):
+        """**回入口**：相位打回 `ALIGN`（= 流程图顶部那个"**当前 foothold 是否可下跳**" ✓）
+        + 把这一轮的运行时状态**全部清干净**。
 
-        用户 2026-09-27 报（原话）："现在执行 drop 被卡住时，没有看到「按住 ↓ → 点按跳」，
-        而是**一直原地跳**" —— 病根和爬绳「补按 ↑」/ 许可门「按住 + 重发」是**同一个** ✗：
-        本机 `KeyState` **只在键集变化时**才发键 ⇒ 对面（中继 / 固件）把那次「按下 ↓」丢了，
-        本机根本不知道 ⇒ 人**不趴** ⇒ 之后每一下跳都只是**原地跳** ✗（下跳要求"趴着时按跳"）。
+        两处调用它（**一处实现** ✓，别各写一遍 ✗）：
+          · ⭐ ③'''「**移动操作尝试间隔**」内没反应（用户 2026-10-06 ✓ 本轮改的口径）；
+          · ④ 「松开 ↓ 之后 `retry_ms` 还没落地」（2026-09-27 的退路 ✓）。
 
-        做法（**不新造参数** ✓）：间隔复用「移动操作尝试间隔」`retry_ms`（它本来就是这一段的
-        重试节拍 ✓），到点返回 `True` ⇒ 调用方把它塞进 `_out(..., reassert=True)` ⇒
-        agent 那边对当前几个键**再 PRESS 一次** ✓（固件侧 `addHeld` 会去重、本地后端幂等 ✓）。
-        `retry_ms <= 0`（用户在设置里把重试关掉）⇒ **不重发**（尊重设置 ✓）。
-        进 ARMED 那一刻把窗重新计（第一次按住 ↓ 就算那次"assert" ✓）。
+        ⚠ `_pick = None` ⇒ 回到 `ALIGN` 会**重新就近挑**一块可下跳 foothold（流程图"否"那条 ✓）；
+          ⚠ `_falling = False`：走到这儿就说明"这一轮没能落下去"，下一轮从头看 ✓；
+          ⭐ **它的返回值就是"回入口那一拍"**（`_out(0, False)` ⇒ **一个键都不按** ✓）：
+            调用方一律 `return self._to_entry(...)` ✓ —— 这一拍"真的松开"是**故意的**，
+            因为 `KeyState` 只在**键集变化**时才发键 ⇒ 不松这一下，下一轮那个"按住 ↓"
+            对面**收不到新的按下** ⇒ 人**不趴** ⇒ 以后每一下跳都只是**原地跳** ✗
+            （原来靠"补按"绕开，现在靠"真的松一下 ⇒ 真的一次新按下"解 ✓ 见类 docstring ✓）。
         """
-        if self.retry_ms <= 0:
-            return False
-        if self._reassert_at is None:
-            self._reassert_at = float(now)
-            # ⭐⭐ **第一拍就补发一次 ↓**（用户 2026-09-28 报的 bug ✓ 原话："刚才出现 drop
-            #   没有补按『按下 ↓』只补按了跳的情况，然后超时了"）。
-            #   ⚠ 原来这一支**只记时、返回 `False`** ⇒ 要**等满** `retry_ms`（「移动操作尝试
-            #     间隔」，默认 **3000ms**）才第一次补 ✗ —— 而一个 drop 任务常常**活不到 3 秒**
-            #     （一轮 `stall_s` 到了没动静就松 ↓ / 整个任务被重下 ⇒ `_reassert_at` 跟着新
-            #     任务从 `None` 重算 ✗）⇒ **那一次补按永远等不到** ✗✗。
-            #     于是现场就正好是用户看到的形状：**跳那边是"第一下就按"**（连按跳、
-            #     `_falling_jump` 都不等间隔 ✓）⇒ 只有跳看得出在补、↓ 从头到尾没补过一次 ✗。
-            #   ⚠ 重复 PRESS 是**幂等**的（固件侧 `addHeld` 去重、本地后端幂等 ✓，见上面那段
-            #     注释 ✓）⇒ 第一拍多发一次**无害**，而且正好治"首按被对面丢了"那个病根 ✓
-            #     —— 那才是本函数存在的理由 ✓。
-            self._reassert_n += 1
-            return True
-        if (float(now) - self._reassert_at) * 1000.0 >= self.retry_ms:
-            self._reassert_at = float(now)
-            self._reassert_n += 1              # ⭐ 打点：又补了一次（见 `_reassert_n` 的说明 ✓）
-            return True
-        return False
+        self.attempt += 1
+        self.phase = self.ALIGN
+        self._in_tol_since = None
+        self._pick = None
+        self._armed_at = None
+        self._attempt_at = None
+        self._y_base = None
+        self._jump_at = None
+        self._landing_at = None
+        self._next_round_at = None
+        self._falling = False
+        self._jump_reassert_at = None
+        self.note = ("%s（第 %d 次；整体由「寻路超时时间」兜底）" % (why, self.attempt))
+        return self._out(0, False)
 
     def _falling_jump(self, now):
         """**下落过程中**这一拍要不要按跳 —— 按「移动操作尝试间隔」补按（用户 2026-09-28 ✓）。
@@ -2371,9 +2417,12 @@ class DropJob(_PausableJob):
           **触发**下落的、已经在掉了" —— 可下落途中**自己也会卡住**：**被绳吸住 / 卡在半空的
           绳上**（`_detach_step` 那条"被绳吸住"正是靠按跳脱离 ✓）⇒ 只按 ↓ 会**一路干等到
           寻路超时** ✗（现场就是"按住 ↓ 时没有按跳，也没有补按，直到超时"✗）。
-        ⚠ 节奏**照抄**「移动操作尝试间隔」`retry_ms`（与 `_hold_reassert` **同一份**节拍 ✓，
-          不新造时长 ✓）：到一个间隔按一下跳、按满一小段就松开，如此反复 ✓；
+        ⚠ 节奏**照抄**「移动操作尝试间隔」`retry_ms`（**同一份**节拍 ✓，不新造时长 ✓）：
+          到一个间隔按一下跳、按满一小段就松开，如此反复 ✓；
           `retry_ms <= 0` ⇒ **不补**（用户在设置里关掉重试 ⇒ 尊重设置 ✓）。
+        ⚠⚠ **只有这一处在"补按"了**（2026-10-06 ✓）—— "按住 ↓ 的重发"那套（`_hold_reassert`）
+          已按用户要求删掉 ✗；这里的"补按跳"是**另一件事**（下落途中跳一下也救"被绳吸住"✓），
+          且它是**真的重新按下跳**（键集变了 ⇒ 对面收得到 ✓），不是"重发一个已经在按的键"✓。
         ⚠ **第一下立刻按**（进"下落"那一拍就按 ✓）：下跳的触发条件是"**趴着时按跳**" ✓，
           早按不亏，还能救"被绳吸住"那种 ✓。
         ⚠ 这段**只判"跳"**：↓ 由调用方 `hold_dir=True` 保证**全程按着** ✓（用户 2026-09-27：
@@ -2431,8 +2480,7 @@ class DropJob(_PausableJob):
         self._landing_at = None
         self._tap_n = 1
         self._next_round_at = None      # "松着 ↓ 等间隔"也收干净（新的一轮从对齐开始 ✓）
-        self._reassert_at = None        # "按住 ↓ 的重发窗"同理（下次按住时重新计 ✓）
-        self._reassert_n = 0            # ⭐ 打点也重新计（新任务从头数 ✓，见 `_reassert_n` 说明）
+        self._jump_reassert_at = None   # "下落中补按跳"那笔账同理（下次下落重新计 ✓）
         self._falling = False           # "已经在掉"同样收干净 ✓
         self._detach_tap_at = None      # "被绳吸住、正在脱离"同理收干净 ✓
         # ⚠ 不写分母（同 `ClimbJob.retry`：没有"最多试几次"了 ✓）
@@ -2566,32 +2614,26 @@ class DropJob(_PausableJob):
     def round_n(self):
         """现在是第几轮「按住 ↓ + 连按跳」（1 起 ✓）—— 看轮次**有没有在转** ✓。
 
-        每轮 = 「卡住判定时长」那么久的连按，轮与轮之间隔「移动操作尝试间隔」**空等**
-        （那几拍一个键都不按 ✓，见 `update` 的 DROP 相 ✓）。
+        ⚠ 2026-10-06 起"轮"的含义变了：一轮 = **一次"按住 ↓ + 连按跳"的尝试**，
+        轮与轮之间是 **③''' 回入口**（相位打回 `ALIGN` ⇒ 重新判"当前这块 fh 还能不能下跳" ✓），
+        不再是"松 ↓ 空等「移动操作尝试间隔」"（那套早删了 ✗）。
         """
         return int(self._tap_n)
 
-    def reassert_count(self):
-        """⭐ **补按「按住 ↓」发了几次**（打点用 ✓，照 `tap_count` 的样式 ✓ —— 
-        ⚠ 它俩都是**普通方法**、不是 `@property` ✓ 调用方要 `()` ✗ 写成属性会
-        `TypeError: 'int' object is not callable` ✓ 2026-09-28 刚踩过 ✓）。
+    # ⛔ **`reassert_count()` 已删**（2026-10-06 ✓ 用户要求"按键补按逻辑移除"）：
+    #   它数的是"重发了几次「按下 ↓」"，而这个机制本身没了 ✗ ⇒ 没有来源 ✓
+    #   （`behavior.log` 里那条 `drop_reassert` 探针同步删 ✓）。"有没有反应"现在看
+    #   **`drop_round`（轮次转不转）** + `route_phase`（回没回 `ALIGN`）✓。
 
-        用途：`behavior.log` 里跟 `drop_taps` **并排**看 —— 跳在涨、它不涨 ⇒
-        "只有跳在补、↓ 没补"那种形状**一眼定位** ✓（用户 2026-09-28 报的那个 bug
-        原来在日志里**看不出来**，因为 `act keys=down` 只报键集、不报"发了几次 PRESS" ✗）。
-        """
-        return int(self._reassert_n)
-
-    def _out(self, move, jump, hold_dir=False, reassert=False, vert=None, replan=False):
+    def _out(self, move, jump, hold_dir=False, vert=None, replan=False):
         """`vert`：这一拍要不要发 ↓（`None` = 老规则：按跳或 `hold_dir` 时发 `self.dir`=↓ ✓）。
 
         ⚠ 「**被绳吸住要脱离**」那几拍必须传 `vert=0`：在绳上按 ↓ 是"还挂在绳上"（口径同
           `ClimbJob._out` ✓）⇒ 按 ↓ 等于把自己按回去 ✗；那几拍只按**左右 + 跳** ✓。
 
-        `reassert`：请调用方**再 PRESS 一次**当前这几个键（同 `ClimbJob._out` ✓）——
-        用户 2026-09-27 报："执行 drop 被卡住时，没有看到「按住 ↓ → 点按跳」，而是**一直原地跳**"✗：
-        本机 `KeyState` **只在键集变化时**才发键 ⇒ 对面把那次「按下 ↓」丢了本机是不知道的 ✗
-        ⇒ 人**不趴** ⇒ 后面每一下跳都只是原地跳 ✗（见 `_hold_reassert` ✓）。
+        ⛔ **没有 `reassert` 这个参数了**（2026-10-06 ✓ 用户要求"按键补按逻辑移除"）——
+          `ClimbJob._out` 那边**照旧有**（爬绳的「补按 ↑」是另一条口径 ✓）。下跳不再"重发
+          已经在按的键"，改成"**回入口**那一拍真的松开全部键"（见 `_to_entry` ✓）。
         """
         d = (self.dir if (jump or hold_dir) else 0) if vert is None else int(vert)
         # ⭐ **点按跳的"上升沿"计数**（见 `tap_count` ✓）：`jump` 会连着几拍为真（要按满
@@ -2602,7 +2644,7 @@ class DropJob(_PausableJob):
         self._jump_on = bool(jump)
         # ⭐ 记下这一拍请他按的竖直键（给 ladder_id 许可的「执行器通知」用，同 ClimbJob ✓）
         self._last_vert = int(d)
-        return self._result(move, jump, d, reassert=reassert, replan=replan)
+        return self._result(move, jump, d, replan=replan)
 
 
 def drop_job_for_edge(terrain, z, edge, **kw):
@@ -2691,7 +2733,7 @@ class WalkJob(_PausableJob):
 
     def __init__(self, dst_set, spots, tol_px=WALK_TOL_PX, hold_ms=None,
                  timeout_s=DEFAULT_TIMEOUT_S,
-                 stall_s=STALL_S, walk_dir=""):
+                 stall_s=STALL_S, walk_dir="", stall_jump=True):
         #: ⚠ `stall_s`（"走不动了"的判定时长）**故意只认这个常量默认值** ——
         #: 设置里那格「卡住判定时长(s)」**只管攀爬**（用户 2026-09-27 明确："移除对走的
         #: 相关判定，走用超时配置兜底"⇒ `job_for_edge` 会把那一格从走的参数里摘掉 ✓）。
@@ -2738,10 +2780,14 @@ class WalkJob(_PausableJob):
         #:   `_hopped` = 这一轮（一次 `retry` 周期内）跳过没 —— **一轮只跳一次** ✓（跳过
         #:     还走不动才 `_fail`，别无限跳 ✗）；`_hop_at` = 跳键按下去的时刻（点按
         #:     `TAP_ON_S`，None = 没在跳）—— 走不动被小台阶挡住时跳一下就过去了 ✓。
-        #:   ⚠ 这两个**不进 `_ANCHORS`**：跳进行中只有 `TAP_ON_S`(60ms) 那么短，而且战斗
+        #:   ⚠ 这两个**不进 `_ANCHORS`**：跳进行中只有 `TAP_ON_S`(30ms) 那么短，而且战斗
         #:     打断回来也不该接着跳（keys 已经清空，重新走就行 ✓）。
         self._hopped = False
         self._hop_at = None
+        #: ⭐⭐ 「**走不动按跳**」（用户 2026-10-06 ✓ 见 `DecisionSettings.walk_stall_jump`）：
+        #:   **关** ⇒ 走不动**直接判失败**（= 加这个单点跳之前的老行为 ✓）。
+        #:   ⚠ 由 `agent.start_climb` **一处**灌进来（所有走任务都过那儿 ✓ 见那边的说明 ✓）。
+        self.stall_jump = bool(stall_jump)
         #: 被战斗打断时要"跳过时长"的锚点（见 `_PausableJob`）：不扣的话，打完架回来
         #: 第一拍就 `now - _best_at ≥ stall_s` ⇒ 当场报"走不动了" ✗。
         #: （`_t0` **不在里面** —— 它由 `interrupted()` 直接**重打**：每次进战斗超时重算 ✓。）
@@ -2780,7 +2826,7 @@ class WalkJob(_PausableJob):
             return self._out(0)
         # ---- 单点跳进行中（走不动后那一跳）：按够 `TAP_ON_S` 就松，回到正常走 ----
         # 用户 2026-09-28：走不动先"单点跳一下"跳过小台阶，别直接判失败（见 `_hop_or_fail`）。
-        # 跳键是**点按**（按 `TAP_ON_S` ≈ 60ms 就松，和「跳下绳梯」同一份节奏，不新造时长 ✓）。
+        # 跳键是**点按**（按 `TAP_ON_S` ≈ 30ms 就松，和「跳下绳梯」同一份节奏，不新造时长 ✓）。
         if self._hop_at is not None:
             if (now - self._hop_at) < TAP_ON_S:
                 self.note = "跳一下：跳过小台阶（走不动了，先跳一下试试）"
@@ -2901,9 +2947,13 @@ class WalkJob(_PausableJob):
           （被真墙挡住时不会无限跳 ✗）；
         · 跳的那一下**只跳、不横挪**（`move=0`）—— 跳起来横着挪会挪歪，和上绳"跳失败后
           站住等 y 稳定"同一个道理 ✓；
-        · 跳键是**点按**（按 `TAP_ON_S` ≈ 60ms 就松，见 `update` 里那段"跳进行中"），
+        · 跳键是**点按**（按 `TAP_ON_S` ≈ 30ms 就松，见 `update` 里那段"跳进行中"），
           不新造时长常数 ✓。
         """
+        # ⭐⭐ **开关**（用户 2026-10-06 ✓ "走不动按跳"）：关掉 ⇒ 走不动**直接判失败** ✓
+        #   （= 加这个单点跳之前的老行为 ✓ 一字不差：`note` 还是原来那句"走不动了…" ✓）。
+        if not self.stall_jump:
+            return self._fail(why)
         if not self._hopped:
             self._hopped = True
             self._hop_at = now
@@ -2949,6 +2999,524 @@ def walk_job_for_edge(terrain, z, edge, **kw):
     # 逐边的走法（`dir`）灌进来；调用方显式给了就以调用方为准（写用例时用得上 ✓）
     kw.setdefault("walk_dir", zones.walk_dir(edge))
     return WalkJob(edge.get("to"), spots, **kw)
+
+
+#: 传送点**到达**判据的容差：抄 `core.mapdata.Terrain.PORTAL_DX/PORTAL_DY`（`portal_at` 同一口径 ✓
+#: —— 那边判"人在某扇门的判定框里"用的就是这两个数 ✓ 别各写一份 ✗）。
+#: ⚠ 它管的是"**我已经站在出口门上了**"这件事 ✓；**对齐**（走多准才按 ↑）用的是
+#:   「坐标对齐误差范围」(`tol_px` ✓ 用户 2026-10-06 ✓) —— 两件事别混 ✗。
+PORTAL_TOL_X, PORTAL_TOL_Y = 15.0, 12.0
+
+
+#: 「**对齐 x 有进步**」的判据（世界像素）：`|dx|` 比纪录**小了这么多**才算真的靠近了 ✓
+#: （读数的抖动不算进步 ✗ —— 不然"补按方向"永远不触发 ✓）。
+ALIGN_PROGRESS_PX = 1.0
+
+
+def align_x_decide(now, dx, *, press_dir, press_at, gap_ms, near_px, tol_px,
+                   retry_ms=0, progress_at=None, best_dx=None):
+    """「**把 x 对齐到某个数**」这一拍该怎么办 —— **爬绳与走传送点共用的一处实现** ✓。
+
+    ⭐ 来源与用户口径（2026-10-06 ✓ 原话："我们应该**整套照搬对齐式爬绳梯的逻辑**，
+      **还要补按方向**"✓）：规则**逐条**都是 2026-09-27/28 在爬绳上踩出来的 ✓
+      （原实现内联在 `ClimbJob._align_step` ✓ 现在两边都调这里 ✓ 约定 10：一处实现 ✓）。
+
+    规则（`kind` 三选一）：
+      · `"wait"` —— 这一拍**不按键**（`move` 无意义 ✓）：
+        ⓐ 近处（`|dx| ≤ near_px`）点按**按够了 `TAP_ON_S`(30ms)** ⇒ 松开
+           （"别一路蹭过去 = 冲过头"✓）；
+        ⓑ ⭐ 上一次按下距今**还没到「对齐绳梯移动延迟」`gap_ms`** ⇒ 站住等 ——
+           ⚠⚠ **过冲之后往回按（换了方向）也走这一条** ⇒ **不会在目标两边来回抖** ✗✓
+           （用户 2026-10-06 现场："在从5到4的 h010 传送门**左右来回晃**"✗ = 老 `PortalJob`
+            每拍都按方向键 ✓ 这条正是治它的 ✓）；
+      · `"press"` —— 这一拍按 `move`（±1 的横向方向键 ✓）；`reassert=True` ⇒ 调用方
+        **再发一次 PRESS**（键集没变也发 ✓ —— `KeyState` 只在键集变化时发键，
+        "对面把键丢了"本机不知道 ✗ 同 `ClimbJob` 那套补按 ✓）；
+      · `"in_tol"` —— `|dx| ≤ tol_px` ⇒ **对齐好了**（调用方站住 / 稳住 `hold_ms` / 动作 ✓）。
+
+    ⚠ **"远（> `near_px`）一口气按住 / 近了点按"** 这个分档也在里面：远距离点按会走得太慢、
+      直接撞超时 ✗（同 `ClimbJob` 的口径 ✓）。
+    ⚠ **只有"新的一次按下"才记 `press_at`**（2026-09-27 修的坑 ✓）：每拍都记 ⇒
+      `now - press_at` 只有一帧(<60ms) ⇒ "按够 60ms 就松"**永不成立** ⇒ 变成一路按住 ✗（⚠ 那时 `TAP_ON_S` 是 **60ms**；**2026-10-06 起改成 30ms** ✓ 这条说的是当年的现象 ✓）。
+    ⭐ **补按方向**（`retry_ms > 0` 才开 ✓ 用户 2026-10-06："还要补按方向"✓）：已经按着某个
+      方向、可 `|dx|` 在「移动操作尝试间隔」(`retry_ms` ✓) 内**没进步**（改善 < `ALIGN_PROGRESS_PX`）
+      ⇒ 回 `reassert=True` ⇒ 再发一次 PRESS ✓。
+      ⚠ `ClimbJob` 的对齐相**用 `retry_ms=0` 关掉它** ✓（那边行为一个字不改 ✓ 它 CLIMB 相
+        本来就有自己的补按 ↑ ✓ 别叠两层 ✗）。
+
+    → `(kind, move, reassert, why, state)`；`state` 是**该写回**的记账
+      `{press_dir, press_at, progress_at, best_dx, reasserts}` ✓（调用方自己存哪儿都行 ✓）。
+    """
+    now = float(now)
+    dx = float(dx)
+    gap_ms = max(0, int(gap_ms or 0))
+    retry_ms = max(0, int(retry_ms))
+    near_px = max(1.0, float(near_px))
+    tol_px = max(1.0, float(tol_px))
+    st = {"press_dir": int(press_dir or 0),
+          "press_at": None if press_at is None else float(press_at),
+          "progress_at": None if progress_at is None else float(progress_at),
+          "best_dx": best_dx,
+          "reasserts": 0}
+    # ---- 进步记账（只服务"补按方向" ✓）：真的靠近了才刷新 ✓ ----
+    _d = abs(dx)
+    if st["best_dx"] is None or _d < float(st["best_dx"]) - ALIGN_PROGRESS_PX:
+        st["best_dx"] = _d
+        st["progress_at"] = now
+    elif st["progress_at"] is None:
+        st["progress_at"] = now
+    # ---- ① 对齐好了 ⇒ 松开方向（"站住"✓ 剩下的交给调用方 ✓）----
+    if _d <= tol_px:
+        st["press_dir"] = 0
+        return ("in_tol", 0, False,
+                "对齐好了：差 %.0f px（容许 %d）—— 站住 ✓" % (dx, int(tol_px)), st)
+    sign = 1 if dx > 0 else -1
+    _held = (st["press_dir"] == sign)
+    _since = (None if st["press_at"] is None else now - st["press_at"])
+    # ---- ② 近处点按：按够 TAP_ON_S 就松开（别冲过头 ✓）----
+    if (_held and _d <= near_px and _since is not None and _since >= TAP_ON_S):
+        st["press_dir"] = 0
+        return ("wait", 0, False, "微调：差 %.0f px（松开这一拍，别冲过头）" % dx, st)
+    # ---- ③ 两次按下之间要隔 gap_ms（**换方向回来按也算** ⇒ 不会两边来回抖 ✓）----
+    if (not _held and _since is not None and gap_ms > 0
+            and _since * 1000.0 < gap_ms):
+        st["press_dir"] = 0
+        return ("wait", 0, False,
+                "对齐中：差 %.0f px（等移动延迟 %d ms）" % (dx, gap_ms), st)
+    # ---- ④ 补按方向（可选）：按着却一直没进步 ⇒ 再发一次 PRESS ✓ ----
+    if (retry_ms > 0 and _held and st["progress_at"] is not None
+            and (now - float(st["progress_at"])) * 1000.0 >= retry_ms):
+        st["press_at"] = now
+        st["progress_at"] = now
+        st["reasserts"] += 1
+        return ("press", sign, True,
+                "对齐：差 %.0f px 一直没动 ⇒ **补按一次 %s**（第 %d 次 ✓）"
+                % (dx, "→" if sign > 0 else "←", st["reasserts"]), st)
+    # ---- ⑤ 按下去（远距离 ⇒ 一口气按住 ✓ / 近距离 ⇒ 一下一下点 ✓）----
+    if not _held:
+        st["press_at"] = now          # ⚠ 只有"新的一次按下"才记 ✓
+    st["press_dir"] = sign
+    if _d <= near_px:
+        return ("press", sign, False,
+                "微调：差 %.0f px（点按 %s）" % (dx, "→" if sign > 0 else "←"), st)
+    return ("press", sign, False, "对齐中：差 %.0f px（容许 %d）" % (dx, int(tol_px)), st)
+
+
+class PortalJob(_PausableJob):
+    """一次「走传送点」：**走到门前 ⇒ 点按一下 ↑** ⇒ 等到达（用户 2026-10-06 ✓）。
+
+    用户原话："操作方式是走到该点位按↑" ＋ "点一下↑" ✓（按 `TAP_ON_S` ≈30ms 就松 ✓ 不拍新常数 ✓）。
+    对外形状同 `WalkJob` / `ClimbJob` / `DropJob`（`update()` 纯函数 + `retry` / `cancel` ✓）
+    ⇒ `agent._climb_tick` 那一套（任务优先 / 有怪先打 / 失败延迟重来 / 原因挂画面）**一行都不用改** ✓。
+
+    三段（`phase`）：
+      WALK —— 朝**门**的 x 走（进步跟踪借 `_stalled_since` ✓ 卡住如实报 ✓ 同走路那条 ✓）；
+      TAP  —— 人**进了「坐标对齐误差范围」**(`tol_px` ✓) 且 y 也对 ⇒ **点按一下 ↑**（`dir=+1` ✓）；
+      WAIT —— 松手之后等"真到了那边"；**位置状态没回执 ⇒ 补按 ↑**（见下 ✓）。
+
+    ⭐⭐ **对齐与补按：与攀爬执行器**同一套**（用户 2026-10-06 ✓ 原话："去传送门的对齐需要调用
+      攀爬执行器对齐那个方法：在「坐标误差范围」内就可以按 ↑ ＋ **位置状态没回执补按 ↑**"✓）：
+      · **对齐判据用 `tol_px`**（= 设置里的「**坐标对齐误差范围**」✓ 与 `ClimbJob.tol_px`
+        是**同一把尺** ✓ 由 `plan_jobs` 一处灌进来 ✓）—— 不再自己拍一个"门的框"当对齐线 ✗；
+      · **没回执 ⇒ 补按 ↑**：在 WAIT 相里，"已经到了"就是**回执** ✓；还没到 ⇒ 每
+        「**移动操作尝试间隔**」(`retry_ms` ✓ 与爬绳 / 下跳同一个参数 ✓) **再发一次 PRESS ↑**
+        （`reassert=True` ✓ 由 `agent._climb_tick` 统一执行 —— `KeyState` 只在键集变化时才发键，
+        对面把键丢了本机不知道 ✗，见那里那段说明 ✓）。
+      ⚠ **不再自己判"按了 ↑ 多久还没到"** ✗：原来那个 `PORTAL_WAIT_S`(2.5s) 会在**第一次补按
+        还没到点**时就把任务判死 ✗（补按间隔默认 3s > 2.5s，等于**永远补不上**✗✓）。
+        现在与爬绳同一口径：**真过不去由「寻路超时时间」兜底**（用户 2026-09-29 定的 ✓
+        见 `agent._climb_tick` 那道总闸 ✓）。
+
+    ⚠ **判到达优先看集合**（与 `WalkJob` 同一套口径 ✓）：传送的落点由**出口门**决定 ✓
+      （`zones.portal_exit` 按 `tn` 解析 ✓ —— 这正是 2026-09-27 移除这个通行方式时缺的"落点" ✓），
+      而"目标集合"由用户在编辑器里指 ✓（通常就是出口门所在那个集合 ✓）。
+    ⚠ 拿不到坐标 / 门 / 落点 ⇒ **如实说、不乱走**（宁可失败，也别瞎按 ↑ 把自己送错地方 ✓）。
+    ⚠ **这里不接「走不动按跳」** ✗：那个开关管的是**走路**执行器（见 `WalkJob._hop_or_fail` ✓）；
+      传送点这一段走不动就如实报 ✓（两件事别混 ✓）。
+    ⚠ **寻路代价**（用户 2026-10-06 定的口径 ✓）：代价 = **当前 → 起点门** + **出口门 → 目标**
+      ⇒ 前一半由"走到门口"这段本身体现 ✓、后一半由 `exit_portal` 的坐标给 ✓
+      （规划那边取代价时按这个算 ✓ 见 `zones.portal_exit` 的说明 ✓）。
+    """
+
+    # ⚠ `DONE` / `FAILED` **必须自己定义** ✗ —— 它们**不在基类上**（每个任务各一份 ✓，
+    #   `_PausableJob._result` 里 `self.phase == self.DONE` 就是这么判的 ✓）：
+    #   实测漏定义 ⇒ `AttributeError: 'PortalJob' object has no attribute 'DONE'` ✓，
+    #   而且**第一拍就炸** ✓（因为它一进 `update` 就要拼回值 ✓）。取值与走/爬/下跳那三个一致 ✓。
+    WALK, TAP, WAIT = "walk", "tap", "wait"
+    DONE, FAILED = "done", "failed"
+
+    def __init__(self, dst_set, portal, exit_portal=None, tol_px=ALIGN_TOL_PX,
+                 hold_ms=250, near_px=NEAR_PX, align_gap_ms=None, retry_ms=0,
+                 timeout_s=DEFAULT_TIMEOUT_S, stall_s=STALL_S):
+        self.dst_set = str(dst_set or "")
+        self.portal = portal
+        self.exit_portal = exit_portal          # 出口门（`tn` 解析出来的 ✓ 可能是 None ✓）
+        #: 「**坐标对齐误差范围**」（世界像素 ✓）—— 与 `ClimbJob.tol_px` **同一把尺** ✓
+        #: （`plan_jobs` 一处灌进来 ✓ 用户 2026-10-06："在「坐标误差范围」内就可以按 ↑"✓）。
+        self.tol_px = max(1, int(tol_px))
+        #: 「**坐标对齐误差时间**」(ms)：进了容差还要**稳这么久**才按 ↑ ✓（与爬绳同一把尺 ✓
+        #: 用户 2026-10-06："整套照搬对齐式爬绳梯的逻辑"✓）—— 免得"路过一下"就按 ↑ ✗。
+        self.hold_ms = max(0, int(hold_ms))
+        #: 「**开始对齐…的距离(px)**」（`near_px` ✓）：差得比它远 ⇒ **一口气按住走**；
+        #: 进到它以内 ⇒ **改成点按**（一下一下，受 `align_gap_ms` 约束 ✓）—— 同 `ClimbJob` ✓。
+        self.near_px = max(1.0, float(NEAR_PX if near_px is None else near_px))
+        #: 「**对齐绳梯移动延迟(ms)**」：两次按下方向键之间至少隔这么久 ✓（0 = 不限制 ✓）。
+        #: 默认 = `TAP_PERIOD_S`（= 原来那个点按周期 ✓ 老行为 ✓）；由 `agent.start_climb`
+        #: 一处灌进来 ✓（它对**每个**任务都灌 ✓ 所以这里只需给个默认 ✓）。
+        self.align_gap_ms = (int(TAP_PERIOD_S * 1000.0) if align_gap_ms is None
+                             else max(0, int(align_gap_ms)))
+        #: 「**移动操作尝试间隔**」(ms) ⇒ `_iv` 秒没回执就**补按一次 ↑** ✓（0 = 不补 ✓ 老行为 ✓）。
+        #: ⚠ `agent.start_climb` 会给每个任务灌 `job.retry_ms`（它读设置 ✓ 一处换算 ✓）——
+        #:   `DropJob` 用毫秒、这里也用毫秒 ✓（爬绳那边是秒，见 `ClimbJob.reassert_s` ✓）。
+        self.retry_ms = max(0, int(retry_ms))
+        self.timeout_s = float(timeout_s)
+        self.stall_s = max(0.2, float(stall_s))
+        self.phase = self.WALK
+        self.attempt = 0
+        self.note = ("走传送点：「%s」—— 走到门 %s（对齐到 ±%d px）、按一下 ↑"
+                     % (self.dst_set, getattr(portal, "pn", "?"), self.tol_px))
+        self._t0 = None
+        self._best_d = None
+        self._best_at = None
+        self._tap_at = None
+        self._wait_at = None
+        #: **上一次发 ↑ 的时刻**（补按的节拍锚 ✓ 见 WAIT 相 ✓）。
+        self._press_at = None
+        #: 补按了几次（只给 note / 排查看 ✓）。
+        self._retap_n = 0
+        # ---- 对齐相的记账（`align_x_decide` 的 `state` 就存这几个 ✓ 一处写、一处读 ✓）----
+        #: 现在按着哪边（0 = 没按 ✓）—— 也是"这一次按下"的判据（同 `ClimbJob._press_dir` ✓）。
+        self._alx_dir = 0
+        #: 这一次按下的时刻（⚠ 只有"新的一次按下"才写 ✓ 见 `align_x_decide` ✓）。
+        self._alx_press_at = None
+        #: 上一次"真的靠近了"的时刻（**补按方向**的判据 ✓）。
+        self._alx_progress_at = None
+        #: 目前为止最小的 `|dx|`（进步记账 ✓）。
+        self._alx_best_dx = None
+        #: 对齐相补按了几次（note / 排查 ✓）。
+        self._alx_reasserts = 0
+        #: **进容差的时刻**（稳 `hold_ms` 用 ✓）。
+        self._in_tol_since = None
+        # ---- ⭐ **对齐期间"点按 ↑"的记账**（用户 2026-10-06 新口径 ✓ 传送点**专属** ✓）----
+        # 「**增加传送点的特殊对齐逻辑**：对齐过程开始时就可以按 ↑，并以「移动操作尝试间隔」
+        #   连续点按 ↑」 —— 为什么要它：门是**按 ↑ 才开**的 ✓，而"先对齐到 ±10px 再按 ↑"
+        #   等于把人**钉在门口**等对齐 ✗ ⇒ 只要人已经走到门的判定框附近，**站着点按 ↑**
+        #   就有可能直接开门（用户口径：对齐过程里就该一直试 ✓）。
+        #: 这一下 ↑ 是从哪一刻按下的（`None` = 现在没按着 ✓）—— 按满 `TAP_ON_S` 就松 ✓
+        #:   （与后面 `TAP` 相**同一个时长口径** ✓ 不新造时长 ✓）。
+        self._up_tap_at = None
+        #: 下一按该在什么时候（`None` = **还没打过** ⇒ 这一拍就开打 ✓
+        #:   —— 这就是"**对齐过程开始时就可以按 ↑**"那一条 ✓）。
+        self._up_next_at = None
+        #: ⭐ **连续点按的节拍 = 全项目那份「点按周期」`TAP_PERIOD_S`(180ms)**（用户 2026-10-06
+        #:   第二轮 ✓ 原话"**取消传送点通行方式对齐的时候 ↑ 以「移动操作尝试间隔」按，直接连续
+        #:   发点按**"✓）—— ⚠ **不再有 `_up_repeat` 这个开关** ✗：原来"`retry_ms=0` ⇒ 只打开头
+        #:   那一下"是按「移动操作尝试间隔」那个口径来的 ✓ 现在一律连续 ✓ 与它无关 ✓
+        #:   （`retry_ms` 只再管进容差之后 `WAIT` 相的"补按 ↑"✓ 那条一个字没动 ✓）。
+        #: 打了多少下（note / 排查 ✓，同 `_retap_n` 的用法 ✓）。
+        self._up_taps = 0
+        # 被战斗打断时要把这几个时刻整体往后挪（`_PausableJob` ✓ 同 WalkJob 的取舍 ✓）
+        # ⚠ `_press_at` 也要挪 ✗：不挪的话"打完架回来"会拿打架前那个锚算 ⇒ 一回来就立刻补按 ✗。
+        # ⚠ 对齐相的 `_alx_press_at` / `_alx_progress_at` / `_in_tol_since` **同样要挪** ✗ ——
+        #   不挪就是"打完架回来立刻补按一次方向 / 立刻算稳够 hold_ms"✓（假的 ✓）。
+        # ⚠ 那里↑点按的两个锚点也一样（`_up_tap_at` / `_up_next_at`）✗：不挪 ⇒ 打完架回来
+        #   立刻又打一下 ↑（假的 ✓ 而且那一下本该在打架前就打完 ✓）。
+        self._ANCHORS = ("_best_at", "_tap_at", "_wait_at", "_press_at",
+                         "_alx_press_at", "_alx_progress_at", "_in_tol_since",
+                         "_up_tap_at", "_up_next_at")
+
+    # ---- 内部 ----
+
+    def _arrived(self, px, py, here_sets):
+        """到了没有：**集合优先、出口门兜底**（见类说明 ✓）。"""
+        if here_sets and self.dst_set and self.dst_set in set(here_sets):
+            return "到达：脚下已经是「%s」" % self.dst_set
+        ep = self.exit_portal
+        if (self.phase == self.WAIT and ep is not None
+                and px is not None and py is not None
+                and abs(float(px) - float(ep.x)) <= PORTAL_TOL_X
+                and abs(float(py) - float(ep.y)) <= PORTAL_TOL_Y):
+            return "到达：已经站在出口门 %s 上" % getattr(ep, "pn", "?")
+        return ""
+
+    def _fail(self, why):
+        self.phase = self.FAILED
+        self.note = why
+        return self._out(0)
+
+    def _out(self, move):
+        """走/等的时候不按跳、不按上下（`dir` 恒 0 ✓）—— 回值走统一形状 ✓。"""
+        return self._result(move)
+
+    def _up_tap_step(self, now):
+        """⭐ 对齐期间**点按 ↑** 的节拍（用户 2026-10-06 传送点专属口径 ✓）—— True = 这一拍按 ↑。
+
+        口径（用户原话："**增加传送点的特殊对齐逻辑**：**对齐过程开始时就可以按 ↑**，
+        并以「**移动操作尝试间隔**」连续点按 ↑"✓）：
+          · **进对齐第一拍就打**（`_up_next_at is None` ⇒ 立刻开打 ✓）—— **不等对齐好** ✓；
+          · ⭐ **之后一"下"接一"下"，直接连续发点按**（用户 2026-10-06 第二轮 ✓ 原话：
+            "**取消传送点通行方式对齐的时候 ↑ 以「移动操作尝试间隔」按，直接连续发点按**"✓）：
+            两"下"起点之间隔 `TAP_PERIOD_S`(180ms ✓ = 全项目那份点按周期 ✓ 不新造时长 ✓)，
+            每"下"按 `TAP_ON_S` 就松 ✓（与 `TAP` 相**同一个时长口径** ✓）；
+          · ⚠ **与 `retry_ms`「移动操作尝试间隔」无关** ✗（那个默认 3 秒 ⇒ 太稀 ✓ 用户实测 ✓）——
+            它只再管进容差之后 `WAIT` 相的"补按 ↑" ✓（那条口径一个字没动 ✓）。
+        ⚠ 与横向对齐**互不干扰** ✓：`update` 把两路并进**同一份回值**（`move` ＋ `dir` ✓）——
+          消费端 `agent._climb_tick` 本来就是分开装配的（`_steer` 管横向、`dir` 管竖直 ✓
+          同一拍可以都有 ✓ = 爬绳"朝绳走 + 按住 ↑"那条路 ✓）。
+        ⚠ 这几下 ↑ **不算**「爬绳 / 下跳的执行器通知」✓：`agent.climbing_vertical()` 只认
+          `ClimbJob` / `DropJob` ✗ ⇒ 走传送点时**不会**打开"能上绳梯"的口 ✓ —— **正是要这样**
+          （用户 2026-09-27 定的"碰到绳子不许判在绳上"✓；走传送点更不该被判成在爬绳 ✗）。
+        """
+        now = float(now)
+        if self._up_tap_at is not None and (now - float(self._up_tap_at)) < TAP_ON_S:
+            return True                                  # 这一下还按着 ✓
+        self._up_tap_at = None                           # 按够 `TAP_ON_S` ⇒ 松手 ✓
+        # ⭐ **一"下"接一"下"，直接连续发点按**（用户 2026-10-06 第二轮 ✓ 原话："**取消传送点
+        #   通行方式对齐的时候 ↑ 以「移动操作尝试间隔」按，直接连续发点按**"✓）：
+        #   两"下"的**起点**之间隔 `TAP_PERIOD_S`(180ms ✓) —— 全项目**同一份点按周期** ✓
+        #   不新造时长 ✓（同爬绳对齐 / 走路微调那套节奏 ✓）。
+        #   ⚠ **不再看 `retry_ms`** ✗：那是「移动操作尝试间隔」（默认 3 秒 ✓ 用户实测"太稀"✓）；
+        #     它仍然管**进容差之后 `WAIT` 相的"补按 ↑"** ✓（那条口径一个字没动 ✓）。
+        #   ⚠ "开头那一下"仍然**不等对齐好** ✓（`_up_next_at is None` ⇒ 立刻打 ✓）。
+        if self._up_next_at is None or now >= float(self._up_next_at):
+            self._up_tap_at = now
+            self._up_next_at = now + TAP_PERIOD_S
+            self._up_taps += 1
+            return True
+        return False
+
+    # ---- 对外 ----
+
+    def update(self, now, px, py=None, ladder_id=None, here_sets=None, at_top=None,
+               at_bottom=None, ground_y=None, on_rope_pos=None, **kw):
+        if self._t0 is None:
+            self._t0 = float(now)
+        if here_sets is None:
+            here_sets = ()
+        # ① 超时（口径同走路：这一段跑了多久 ✓）
+        if self.timeout_s > 0 and (float(now) - self._t0) >= self.timeout_s:
+            return self._fail("走传送点超时：这一段已经跑了 %.0f 秒（门 %s）"
+                              % (self.timeout_s, getattr(self.portal, "pn", "?")))
+        # ② 到达（集合优先 ✓ 出口门兜底 ✓）
+        why = self._arrived(px, py, here_sets)
+        if why:
+            self.phase = self.DONE
+            self.note = why
+            return self._out(0)
+        p = self.portal
+        if p is None:
+            return self._fail("这条传送点边没指名哪扇门（数据坏了 ⇒ 回编辑器选一个 ✓）")
+        if px is None:
+            # 定不了位就别乱走、更别按 ↑（按了可能把自己送到别处 ✗）
+            self.note = "走传送点：拿不到世界坐标（小地图定位没有输出）"
+            return self._out(0)
+
+        dx = float(p.x) - float(px)
+        # ⭐ **按 ↑ 只看 x 对齐**（⚠ 不再拿 `dy_ok` 当门 ✗）：这是**照搬爬绳那条口径** ✓ ——
+        #   用户 2026-09-27 在爬绳上定的："**对齐了就按跳开始爬啊，不需要判定别的**"✓
+        #   （原话，见 `ClimbJob._align_step` 里"按跳的许可条件"那段 ✓）⇒ 传送点同理：
+        #   **x 对齐 + 稳够 `hold_ms` ⇒ 按 ↑** ✓，不再额外要求"人正在门的判定框里"✗。
+        #   ⚠ y 差多少**照样写进 note** ✓：人在别的那层时按了也不动 ⇒ **必须从日志看得出来** ✗
+        #     （用户 2026-10-06 就是盯着日志发现"左右晃却不按 ↑"的 ✓ 别再让他猜 ✓）。
+        _dy = None if py is None else abs(float(p.y) - float(py))
+        _y_tip = ("" if (_dy is None or _dy <= PORTAL_TOL_Y)
+                  else "　⚠ 人 y=%.0f 与门 y=%.0f 差 %.0f px（> %d）：按 ↑ 只看 x ✓"
+                       " 但这一层未必是门那层 ⇒ 按了可能不动 ✓"
+                       % (float(py), float(p.y), _dy, int(PORTAL_TOL_Y)))
+
+        # ③ ↑ 正按着（TAP 相）⇒ 按够 `TAP_ON_S` 就松手、进 WAIT ✓
+        # ⚠⚠ **`dir` 的正负号是"↑ = +1"** ✗（权威在 `agent._climb_tick` 的消费点：
+        #   `dk = km.get("up") if out["dir"] > 0 else km.get("down")` ✓ —— 与 `ClimbJob`
+        #   的"向上爬 d=+1"同一套 ✓）。
+        #   ⛔ 这里原来写的是 **`dir=-1`** ✗ ⇒ **一直按的是 ↓** ⇒ 用户报的"**站在传送点门口
+        #     不按↑**" ✓（现场：走到门口就停住、什么都不发生 ✓ 因为发出去的是"↓"、
+        #     而人正站在地上，看着就是"没按"✗）。**自检也没抓住** ✗ —— 因为用例里的期望
+        #     （`o["dir"] == -1`）是**照着实现写的** ✗（把 bug 钉成了"期望"✓ 教训同 SKILL **273**）⇒
+        #     现在用例改成断言 **`+1`** ✓（照**消费点**的口径，而不是照实现 ✗）。
+        #   ⚠ 这里**只看"按够 `TAP_ON_S` 没有"**、不看"人还在不在容差里" ✓：走到一半滑出去也把
+        #     这一下按完 ✓（老版下半段那条 ✓ 同一件事 ✓ 别拆成两处 ✗）。
+        if self.phase == self.TAP:
+            if (float(now) - float(self._tap_at or now)) < TAP_ON_S:
+                return self._result(0, dir=1)      # 只按 ↑、不横挪 ✓
+            self._tap_at = None
+            self.phase = self.WAIT
+            self._wait_at = float(now)
+            self.note = ("已按 ↑（门 %s）—— 等到达「%s」%s"
+                         % (getattr(p, "pn", "?"), self.dst_set, _y_tip))
+            return self._out(0)
+
+        # ④ 按过 ↑ 之后的等待窗：**位置状态还没回执 ⇒ 补按 ↑**（用户 2026-10-06 ✓ 同爬绳那套 ✓）
+        #   "回执" = **已经到了那边**（上面 `_arrived` 已经判过 ✓）⇒ 走到这儿就是**还没到** ✓。
+        #   ⚠ **不自己判"按了多久还没到"** ✗：老那版 `PORTAL_WAIT_S`(2.5s) 会在**第一次补按
+        #     还没到点**时就把任务判死 ✗（补按间隔默认 3s > 2.5s ⇒ 等于**永远补不上** ✗✓）；
+        #     现在与爬绳同一口径 —— **真过不去由「寻路超时时间」兜底** ✓（见类说明 ✓）。
+        #   ⚠ 节拍 = 「**移动操作尝试间隔**」(`retry_ms` ✓ 用户 2026-10-06 追问确认 ✓)。
+        if self.phase == self.WAIT:
+            waited = float(now) - float(self._wait_at or now)
+            _iv = self.retry_ms / 1000.0
+            _last = float(self._press_at if self._press_at is not None
+                          else (self._wait_at or now))
+            if _iv > 0 and (float(now) - _last) >= _iv:
+                self._press_at = float(now)
+                self._retap_n += 1
+                self.note = ("按过 ↑ 之后 %.1f 秒还没到「%s」⇒ **补按一次 ↑**"
+                             "（第 %d 次；对面把键丢了也能救回来 ✓）%s"
+                             % (waited, self.dst_set, self._retap_n, _y_tip))
+                return self._result(0, dir=1, reassert=True)
+            self.note = ("已经按过 ↑（门 %s），等到达「%s」（%.1fs%s）%s"
+                         % (getattr(p, "pn", "?"), self.dst_set, waited,
+                            "，补按过 %d 次" % self._retap_n if self._retap_n else "",
+                            _y_tip))
+            return self._out(0)
+
+        # ⑤ **对齐 x** —— ⭐ **与爬绳同一处实现**（`align_x_decide` ✓）。
+        #   用户 2026-10-06 原话："我们应该**整套照搬对齐式爬绳梯的逻辑**，**还要补按方向**"✓ ——
+        #   现场症状："在从 5 到 4 的 h010 传送门**左右来回晃**、**但是没有按 ↑**"✗。
+        #   三个要点（都在那个函数里，逐条有注释 ✓）：
+        #     · 远（> `near_px`）⇒ 一口气按住；近 ⇒ 一下一下**点按**（按够 `TAP_ON_S` 就松 ✓）；
+        #     · ⭐ **两次按下之间隔「对齐绳梯移动延迟」**（默认 180ms ✓）—— **过冲之后往回按
+        #       也照样等** ⇒ **不会在目标两边来回晃** ✗✓（老版这里是"这一拍按一下、下一拍
+        #       看方向又按回来"✗ ⇒ 人就在门口抖 ✓）；
+        #     · ⭐ **补按方向**（"还要补按方向"✓）：按着某个方向却一直没进步 ⇒
+        #       `reassert=True` ⇒ 调用方**再发一次 PRESS** ✓（对面把键丢了也能救 ✓）。
+        #   ⭐⭐ **另一半：对齐期间**同时**"点按 ↑"**（用户 2026-10-06 追加的**传送点专属**口径 ✓
+        #   原话："**增加传送点的特殊对齐逻辑：对齐过程开始时就可以按 ↑，并以「移动操作尝试
+        #   间隔」连续点按 ↑**"✓）—— 门是**按 ↑ 才开**的 ✓，而原来"先对齐到 ±`tol_px`
+        #   再按 ↑"等于把人**钉在门口**等对齐 ✗ ⇒ 现在**一进对齐就开打** ✓、之后每
+        #   「移动操作尝试间隔」再打一下 ✓（节拍口径全在 `_up_tap_step` ✓）。
+        #   两路（横向 / ↑）**同一拍一起发** ✓ —— 消费端分开装配（`_steer` / `dir` ✓）。
+        _up = self._up_tap_step(now)        # ⭐ 这一拍要不要点按 ↑（见方法说明 ✓）
+        kind, move, _re, why, st = align_x_decide(
+            now, dx, press_dir=self._alx_dir, press_at=self._alx_press_at,
+            progress_at=self._alx_progress_at, best_dx=self._alx_best_dx,
+            gap_ms=self.align_gap_ms, near_px=self.near_px, tol_px=self.tol_px,
+            retry_ms=self.retry_ms)
+        self._alx_dir = st["press_dir"]
+        self._alx_press_at = st["press_at"]
+        self._alx_progress_at = st["progress_at"]
+        self._alx_best_dx = st["best_dx"]
+        self._alx_reasserts = st["reasserts"]
+        if kind == "in_tol":
+            # 对齐好了 ⇒ **站住稳 `hold_ms`** 再按那一下「正式的 ↑」（照搬爬绳"站住等 hold_ms
+            #   ⇒ 按跳"✓）：⚠ 不做这一道就是"路过一下也按 ↑"✗（过冲经过门口那一瞬也按 ✓）。
+            # ⚠⚠ 但**稳住的这几拍不再把 ↑ 停下** ✗（用户 2026-10-06 新口径："**对齐过程**
+            #   开始时就可以按 ↑" ✓ —— 稳住也是对齐过程的一部分 ✓）：继续按 `_up_tap_step`
+            #   的节拍点按 ✓；门真在这一下开了 ⇒ 上面 ② 的到达判据当场接走 ✓。
+            if self._in_tol_since is None:
+                self._in_tol_since = float(now)
+                self.note = ("%s（站住稳 %d ms；对齐期间一直在点按 ↑，已打 %d 下）%s"
+                             % (why, self.hold_ms, self._up_taps, _y_tip))
+                if self.hold_ms > 0:
+                    return self._result(0, dir=1) if _up else self._out(0)
+            elif (float(now) - float(self._in_tol_since)) * 1000.0 < self.hold_ms:
+                self.note = ("对齐好了，保持中（差 %.0f px；对齐期间点按 ↑ 已打 %d 下）%s"
+                             % (dx, self._up_taps, _y_tip))
+                return self._result(0, dir=1) if _up else self._out(0)
+            self._tap_at = float(now)
+            self._press_at = float(now)            # 补按 ↑ 的节拍从这一下起算 ✓
+            self.phase = self.TAP
+            self._best_d = self._best_at = None
+            self.note = ("走到门 %s 了（差 %.0f px ≤ 容许 %d，已稳 %d ms）⇒ 点按一下 ↑%s"
+                         % (getattr(p, "pn", "?"), abs(dx), self.tol_px,
+                            self.hold_ms, _y_tip))
+            return self._result(0, dir=1)
+        # ---- 还没对齐：站住等的那几拍**别把"进容差"那次记账留着** ✗（不然下次进容差秒按 ✓）----
+        self._in_tol_since = None
+        # 走不动就如实报（被墙/台阶挡住、或者门不在这层 ✓ —— 老版那条兜底，留着 ✓）
+        self._best_d, self._best_at, _stalled = self._stalled_since(
+            now, abs(dx), self._best_d, self._best_at, self.stall_s,
+            lambda v, b: v < b - 1.0)
+        if _stalled:
+            return self._fail(
+                "走传送点走不动了：卡在 x=%.0f（门 %s 在 x=%d，还差 %.0f px）"
+                "—— 可能被墙/台阶挡住，或者这扇门不在你站的这层%s"
+                % (float(px), getattr(p, "pn", "?"), int(p.x), abs(dx), _y_tip))
+        # ⚠ 说明里**报的是「点按周期」**（用户 2026-10-06 第二轮 ✓）：现在是**连续发点按** ✓
+        #   —— 节拍与「移动操作尝试间隔」**无关** ✓（那个只再管 `WAIT` 相的补按 ↑ ✓）。
+        _cad = "每 %d ms 一下（连续发点按）" % int(TAP_PERIOD_S * 1000.0)
+        self.note = ("%s（对齐期间点按 ↑：%s，已打 %d 下）%s"
+                     % (why, _cad, self._up_taps, _y_tip))
+        if kind == "press":
+            # ⭐ 横向「press」与 ↑ 的点按**同一拍一起发** ✓（`dir=1` 叠加在 `move` 上 ✓）
+            return (self._result(move, dir=1, reassert=_re) if _up
+                    else self._result(move, reassert=_re))
+        # "wait"（横向这一拍不按：点按松开 / 等移动延迟 ✓）—— ↑ 的点按**照旧**可能要发 ✓
+        return self._result(0, dir=1) if _up else self._out(0)
+
+    def retry(self):
+        """失败后重新激活（同上绳/下跳：回到起始状态重来一遍 ✓）。"""
+        self.attempt += 1
+        self.phase = self.WALK
+        self._t0 = None
+        self._best_d = self._best_at = None
+        self._tap_at = self._wait_at = None
+        self._press_at = None            # 补按的节拍锚也清掉 ✓（新一轮从头算 ✓）
+        self._retap_n = 0
+        # 对齐相的记账**全部**清掉 ✓（新一轮从头对齐 ✓ —— 留着"上一轮已经按着哪边/稳了多久"
+        # 就是脏状态：会一上来就判"早按够了"⇒ 立刻按 ↑ ✗）
+        self._alx_dir = 0
+        self._alx_press_at = None
+        self._alx_progress_at = None
+        self._alx_best_dx = None
+        self._alx_reasserts = 0
+        self._in_tol_since = None
+        # 对齐期间"点按 ↑"的记账也清干净 ✓（⚠ `_up_next_at = None` = **下一拍就开打** ✓
+        # 正是"新的一轮从对齐开始就按 ↑" ✓；留着旧值 ⇒ 新一轮一上来先空等一个间隔 ✗）
+        self._up_tap_at = None
+        self._up_next_at = None
+        self._up_taps = 0
+        self.note = ("第 %d 次尝试：走传送点「%s」（门 %s）"
+                     % (self.attempt, self.dst_set, getattr(self.portal, "pn", "?")))
+        return self._out(0)
+
+    def cancel(self, why="取消"):
+        self.phase = self.FAILED
+        self.note = why
+        return self._out(0)
+
+
+def portal_job_for_edge(terrain, z, edge, **kw):
+    """从一条「传送点」边造出任务（用户 2026-10-06 ✓）：**必须指名门** ✓，且落点要能解析出来 ✓。
+
+    抛 ValueError 的三种（都**如实说清** ✓ 绝不静默 ✗；上层会照实报给界面 ✓）：
+      · 边里没写 `portal`（哪扇门 ✗）—— 编辑器里选一个 ✓；
+      · 本图没有这扇门（换了地图 / 地形重导过 ✓）；
+      · 这扇门**跨图**、或 `tn` 指的门本图里找不到 ⇒ **本功能不支持跨图** ✓（用户明确 ✓）。
+    """
+    # ⚠ `core.zones` **在 route 里没有顶层 import** ✗（别处用的是函数内懒加载 ✓）——
+    #   照同款在这里懒加载 ✓（实测：写成 `zones.portal_by_pn(...)` 而不 import ⇒
+    #   `NameError: name 'zones' is not defined` ✓ 而且**只有走到这条边才炸** ✓）。
+    from core import zones
+
+    pn = str(edge.get("portal") or "").strip()
+    if not pn:
+        raise ValueError("「传送点」边没指名是哪扇门：%s → %s（编辑器里选一个 ✓）"
+                         % (edge.get("from"), edge.get("to")))
+    p = zones.portal_by_pn(terrain, pn)
+    if p is None:
+        raise ValueError("「传送点」边引用的门本图里没有：%r（换一扇，或重导地形 ✓）" % pn)
+    ex = zones.portal_exit(terrain, pn)
+    if ex is None:
+        # ⚠ 判据（2026-10-06 修正后 ✓）：`portal_exit` 只看"**`tn` 指的那扇门在不在本图**"✓
+        #   ⇒ 走到这儿就是"目标门不在本图"（真跨图 ✓ 如 `west00 → east00` ✓）或 `tn` 是空的 ✓。
+        raise ValueError("「传送点」%r 的目标门**不在本图**（跨图 / 或 WZ 里没配去向）⇒ "
+                         "不支持跨图 ✓（换一扇本图内的门，或改成别的通行方式）" % pn)
+    # ⚠⚠ **吃什么 / 不吃什么**（各自有主 ✓ —— `plan_jobs` 是给四种边**一起灌**参数的 ✓，
+    #   漏摘一个就是 `PortalJob.__init__() got an unexpected keyword argument` ✗ 实测漏过 ✓）：
+    #   · `stall_s`「卡住判定时长」⇒ **摘** ✗（那是攀爬 / 跳跃的 ✓ 走也摘 ✓）；
+    #   · `jump_start_px`「起跳距离」⇒ **摘** ✗（那是跳 / 斜跳的 ✓）；
+    #   · ⭐ `hold_ms`「坐标对齐误差**时间**」⇒ **留着** ✓（用户 2026-10-06："整套照搬
+    #     对齐式爬绳梯的逻辑"✓ —— 爬绳就是"进容差 ⇒ **站住稳 hold_ms** ⇒ 再动作"✓，
+    #     传送点现在同一套 ✓ 点按 ↑ 那一下仍然只按 `TAP_ON_S`(30ms) ✓ 两件事不混 ✗）；
+    #   · ⭐ `tol_px`「坐标对齐误差**范围**」⇒ **留着** ✓（用户 2026-10-06 ✓："在「坐标误差
+    #     范围」内就可以按 ↑" ✓ —— 与攀爬**同一把尺** ✓；**原来这里把它摘掉了** ✗，
+    #     于是传送点用的是自己那个"门的框"当对齐线 ✓）。
+    #   ⚠⚠ **只摘这两个** ✗（`tol_px` / `hold_ms` 都留着 ✓ —— 见上面两条 ✓ 实测漏改过一次：
+    #     注释写着"留着 `hold_ms`"、而这行还摘着它 ⇒ 任务里永远是最默认的 250 ✗
+    #     被自检 `t_portal_align_like_climb` ⑦ 当场抓住 ✓ 教训：**注释和代码要对得上** ✗）。
+    for _k in ("stall_s", "jump_start_px"):
+        kw.pop(_k, None)
+    return PortalJob(edge.get("to"), p, ex, **kw)
 
 
 #: 「跳(jump)」的**起跳距离**（世界像素）——⚠ **临时参数**，只是"先配一个测试用"：
@@ -3301,6 +3869,7 @@ def hop_cost(terrain, z, edge, at):
     | **跳 `jump`** | **横向**：玩家 → 目标集合 foothold 端点的距离 + **垂直段**：按 `_vert_cost`（**往下按 `FALL_DISCOUNT` 折算**✓、往上原值 ✓）—— 跳**可以原地起跳**，所以**不加**"源集合边缘"下限 ✓ |
     | **爬 `climb`** | 玩家 → **入绳点**的距离（上爬下端 `L.bottom` / 下爬上端 `L.top` ✓）+ **绳长**（`abs(y2-y1)` ✓ —— 爬得越高越贵 ✓）⚠ **不折扣**（爬上去不是"自然下落" ✓）|
     | **下跳 `drop`** | 玩家 → **最近那条「允许下跳的 foothold」**的**横向**距离 + **该 foothold → 落点的落差**（要落多深 ✓；**往下 ⇒ 按 `FALL_DISCOUNT` 折算** ✓；落点 = 目标集合里离它最近的那片面 ✓） |
+    | **传送点 `portal`** ⭐ | 用户 2026-10-06 定："**角色当前到传送起点的距离 ＋ 传送终点距离到目标点的距离**" ✓ ⇒ 玩家 → **起点门**（那扇门 ✓）＋ **出口门** → 目标集合（横向间隙 + 垂直，**不打折** ✓ 落点之后是走过去、不是自然下落 ✓）|
 
     ⚠ **为什么垂直段要折扣**（用户 2026-09-28）：**掉下去是"自然下落"，比走过去 / 跳上去快得多**
     ⇒ 不折算的话"从高处绕一格"会被算得和"平地走一格"一样贵 ⇒ 择路会挑错 ✓
@@ -3382,6 +3951,42 @@ def hop_cost(terrain, z, edge, at):
         if d is None:
             return None
         pt = L.bottom if d > 0 else L.top
+        # ⭐ 「绳只是**路过**起点这一层」（2026-10-06 用户口径 ✓ 见 `zones.climb_via_jump`）：
+        #   这种情况**入绳点不是绳端** ✗ —— 是"**人跳到绳上的那一点**" = `(L.x, 这一层的面 y)` ✓；
+        #   **爬升也不是整根绳** ✗ —— 只有"这一层 → **绳的那一端**"那一段 ✓（见下面那段 ⚠⚠）。
+        #   ⚠ 照绳端算入绳点会**离谱地大** ⇒ 择路永远不选它 ⇒ "建得出来却从不被用" ✗
+        #     （与上一轮传送点那个坑**同一个形状** ✓ 所以必须一起接 ✓）。
+        #   ⚠ 判据 = **只看"起点不在绳两端"** ✓（老情形"起点在绳端"一个字不变 ✓）——
+        #     ⛔ 原来这里还 `and climb_via_jump(...)` ✗：那只是"要不要**斜**跳"（x 含不含绳 x ✓
+        #       `job_for_edge` 灌斜跳区间时才用它 ✓），**与"从哪上绳"无关** ✗ ——
+        #       起点不在绳端 + **x 罩住绳 x**（人正站在绳**底下** ⇒ 原地跳就够 ✓ 不用斜跳 ✓）时，
+        #       老条件会把代价打回老分支 ⇒ 按**绳端**算入绳点 ⇒ 距离虚大 ⇒ **能建却几乎不被选** ✗
+        #       （与上一轮传送点那个坑**同一个形状** ✓ 这正是用户要我"检查"出来的第二处 ✓）。
+        #     ⇒ 这类边一律：入绳点 = **(L.x, 这一层的面 y)** ✓（人从这一层跳到绳上 ✓
+        #       斜跳还是原地跳，是 `climb_via_jump` 的事 ✗ 与代价无关 ✓）。
+        _up, _dn = zones_mod.ladder_ends(terrain, L)
+        _su = {n for f in (_up,) if f is not None for n in z.set_of(str(f.fid))}
+        _sd = {n for f in (_dn,) if f is not None for n in z.set_of(str(f.fid))}
+        if str(edge.get("from")) not in (_su | _sd):
+            a = zones_mod.set_span(
+                terrain, (z.sets.get(str(edge.get("from"))) or {}).get("footholds") or [])
+            if a is None:
+                return None
+            near = ((x - float(L.x)) ** 2 + (float(at[1]) - float(a[2])) ** 2) ** 0.5
+            # ⚠⚠ **爬升那一段必须跟执行器的"停止点"同一套**（用户 2026-10-06 ✓ 原话：
+            #   "注意这种寻路代价算法与斜跳上升算法一样，检查一下" ✓）——
+            #   执行器爬到哪儿由 `ClimbJob._arrived` / `_target_y` 说了算 ✓：
+            #     · **上爬（d>0）** ⇒ 停在**绳梯上端** ✓（用户 2026-09-26 改的口径 ✓
+            #       "改为绳子上端的 y" ✓ —— `dst_y`（目标平台面）**不参与上爬判定** ✗）；
+            #     · **下爬（d<0）** ⇒ 停在**绳梯下端**（广播 `at_bottom` ✓；落到目标平台面
+            #       `dst_y` 也算 ✓ 而本支的放行条件保证"目标层贴着某一端" ⇒ 两者同一处 ✓）。
+            #   ⇒ 一律取**绳的那一端**到**起点这一层的面 y** ✓（**不是**目标层的 y ✗：
+            #     那是我第一版写错的地方 ✓ 差虽小（本图 2px）但口径必须一处 ✓）。
+            #   ⚠ 老分支（起点在绳端）那行 `abs(L.y2 - L.y1)`（整根绳长）**不用改** ✓ ——
+            #     起点在绳端 ⇒ 起点层就是那一端 ⇒ 整根绳长**恰好等于**"从起点层爬到另一端" ✓
+            #     （两套写法在这里是同一个数 ✓ 这也是它当年能对的原因 ✓）。
+            _end_y = min(float(L.y1), float(L.y2)) if d > 0 else max(float(L.y1), float(L.y2))
+            return near + abs(_end_y - float(a[2]))
         near = ((x - float(pt[0])) ** 2
                 + (float(at[1]) - float(pt[1])) ** 2) ** 0.5
         return near + abs(float(L.y2) - float(L.y1))
@@ -3400,6 +4005,33 @@ def hop_cost(terrain, z, edge, at):
         # ⭐ 横向 + **落差**（用户 2026-09-28：**往下 ⇒ 按「自然下落折扣」折算** ✓）——
         #   原来是 `abs(lf[2] - fy)`（1:1 全算）✗ ⇒ 下跳会被算得比实际贵得多 ✓。
         return _x_span_gap(x, left, right) + _vert_cost(fy, lf[2])
+    if kind == "portal":
+        # ⭐⭐ **传送点的代价**（用户 2026-10-06 ✓ **原话**）："至于寻路代价：我们应该能知道这个
+        #   传送点通向哪里，**寻路代价就等于角色当前到传送起点的距离 ＋ 传送终点距离到目标点的
+        #   距离**" ✓ ⇒ 拆成两段，跟用户说的一字对应 ✓：
+        #     · 前半 `near` = 玩家 → **起点门**（那扇门在哪儿很清楚 ✓ 见 `portal_by_pn` ✓）；
+        #     · 后半 `back` = **出口门** → 目标集合（出口 = `tn` 指的那扇门 ✓ 见 `portal_exit` ✓）。
+        #   ⚠ 拿不到门 / 出口（跨图 ✓ 用户明确不支持 ✓）⇒ **`None`：不猜** ✓ ——
+        #     `pick_edge` 会把这条排到最后，`job_for_edge` 那边也会如实抛 ✓ 两处口径一致 ✓。
+        #   ⚠ 后半**不打折**（同 `climb` 的取舍 ✓）：传送落点之后是**走过去**，不是自然下落 ✓
+        #     ⇒ 只有 `jump` 往下 / `drop` 才用 `_vert_cost` ✓。
+        _pn = str((edge or {}).get("portal") or "")
+        p = zones_mod.portal_by_pn(terrain, _pn)
+        if p is None:
+            return None
+        ex = zones_mod.portal_exit(terrain, _pn)
+        if ex is None:
+            return None
+        spans = _set_spans(terrain, z, edge.get("to"))
+        if not spans:
+            return None
+        back = None
+        for a_, b_, fy, _i in spans:
+            c = _x_span_gap(float(ex.x), a_, b_) + abs(float(ex.y) - float(fy))
+            if back is None or c < back:
+                back = c
+        near = ((x - float(p.x)) ** 2 + (float(at[1]) - float(p.y)) ** 2) ** 0.5
+        return near + back
     return None
 
 
@@ -3407,7 +4039,10 @@ def hop_cost(terrain, z, edge, at):
 #: 中文名一律走 `core.zones.kind_label`（`走(walk)` / `爬（绳梯）(climb)` / `跳(jump)` /
 #: `下跳(drop)` ✓），别在这儿再抄一份 ✗（两边一旦不一致，界面说的和日志说的就对不上了）。
 JOB_KINDS = {"ClimbJob": "climb", "DropJob": "drop",
-             "WalkJob": "walk", "JumpJob": "jump"}
+             "WalkJob": "walk", "JumpJob": "jump",
+             # ⭐ 传送点（2026-10-06 ✓ 见 `PortalJob` ✓）—— 少这一格，画面/日志里就会
+             #   显示成裸类名 `PortalJob` ✗（这一处只做映射，中文名一律走 `zones.kind_label` ✓）。
+             "PortalJob": "portal"}
 
 
 def job_label(job):
@@ -3441,9 +4076,10 @@ def pick_edge(terrain, z, a, b, at=None):
       （用户 2026-09-27 明确："路径仍按最少段数、距离只在同一段内比"）。
 
     判据（按顺序）：
-      1. **只留能用的边**：不在 `zones.EDGE_KINDS` 里的（老数据残留的 `portal` /
-         `unconfirmed`）、以及**建不出任务**的（爬：绳找不到 / 上下说不清；走·跳·下跳：
-         目标集合没有非墙 foothold）⇒ **不参选** ✓（不然会挑出一条根本执行不了的边 ✗）；
+      1. **只留能用的边**：不在 `zones.EDGE_KINDS` 里的（老数据残留的 `unconfirmed` ✓；
+         ⚠ `portal` **2026-10-06 起是正经通行方式了** ✓ 见 `EDGE_KINDS` ✓）、以及
+         **建不出任务**的（爬：绳找不到 / 上下说不清；走·跳·下跳：目标集合没有非墙 foothold；
+         传送点：门找不到 / **跨图** ✓）⇒ **不参选** ✓（不然会挑出一条根本执行不了的边 ✗）；
       2. 有玩家位置 ⇒ 按 **`hop_cost`**（纯距离 ✓）取**最小**的那条；
          代价**算不出来**的边排到最后 ✓；
       3. 并列 / 没有位置 / 全算不出 ⇒ 退回**老口径**：类型优先级
@@ -3639,6 +4275,11 @@ def job_for_edge(terrain, z, edge, **kw):
         kw.pop("stall_s", None)
         kw.pop("jump_start_px", None)
         return walk_job_for_edge(terrain, z, edge, **kw)
+    if kind == "portal":
+        # ⭐ 传送点（用户 2026-10-06 ✓）：**走到门 ⇒ 点按一下 ↑** ✓ 见 `PortalJob` ✓。
+        #   ⚠ 它**不吃**「卡住判定时长」/「起跳距离」（那两个是攀爬 / 跳的参数 ✓）；
+        #   ⚠ 也**不接**「走不动按跳」那个开关 ✗（那是走路执行器的事 ✓ 见 `PortalJob` 说明 ✓）。
+        return portal_job_for_edge(terrain, z, edge, **kw)
     if kind == "jump":
         # 「跳」**吃**「卡住判定时长」（按跳后多久没落到目标集合就回入口 ✓）
         # 和「起跳距离」（临时参数 ✓）—— 两个都留着 ✓。
@@ -3672,6 +4313,21 @@ def job_for_edge(terrain, z, edge, **kw):
     #   ⚠ `mid_y` 只有配了方向才有意义（老边两个都没有 ⇒ `None`/`""` ⇒ 执行器那条路整条不走 ✓）
     kw.setdefault("mid_dir", zones.mid_jump_dir(edge))
     kw.setdefault("mid_y", edge.get("mid_y"))
+    # ⭐⭐ **「斜跳上绳」默认判定**（用户 2026-10-06 ✓ 原话："这个比较特殊，在 x 范围不包含绳梯 x
+    #   的情况下默认走斜跳上绳梯，攀爬执行器需要默认判定出来并支持" ✓）：
+    #   `ClimbJob` 里那条「斜跳上绳」（①' ✓ 2026-09-27 用户的设计 ✓）**默认是关的** ——
+    #   要人在设置里配「起跳距离」才开 ✗。这里替它**从数据判**：
+    #     · 判据就一条（用户给的 ✓）：**起点那一层的 x 范围不含绳的 x** ⇒ 人不在绳底下 ⇒
+    #       **斜着跳**过去抓绳 ✓（`zones.climb_via_jump` ✓）；含 ⇒ 原地跳就够 ✓ 不启用 ✓；
+    #     · 跳得够不够得着 ⇒ 上界 = **这一层离绳最近的那条边到绳的距离** ✓
+    #       （`zones.climb_jump_reach` ✓ 现场 7/L6 = 44px ✓ —— **从数据算，不拍数字** ✓）。
+    #   ⚠ 只在调用方**没显式配**（`jump_start_px` ≤ 0 ✓）时才兜底 ✗ —— 别盖掉设置里的值 ✓
+    #     （那还是那个"兼容开关"：老项目没配 + 判据不成立 ⇒ 一个字不变 ✓）。
+    if float(kw.get("jump_start_px") or 0.0) <= 0 and \
+            zones.climb_via_jump(terrain, z, L, edge.get("from")):
+        _reach = zones.climb_jump_reach(terrain, z, L, edge.get("from"))
+        if _reach and float(_reach) > 0:
+            kw["jump_start_px"] = float(_reach)
     return ClimbJob(want, L.x, L.y1, L.y2, d, dst_set=edge.get("to"),
                     # src_set：没上绳时用来分"跳没生效（接着按跳）"和"真掉下来了"（要求 ②）
                     src_set=edge.get("from"),

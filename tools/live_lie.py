@@ -138,10 +138,18 @@ class LiveLieEngine:
     ⚠ **惰性建**（第一帧才知道加工尺度的实际高宽 ✓）：所以 `reset()` 之后要先喂一帧 ✓。
     """
 
-    def __init__(self, cfg=None, gain=None, proc_w=PROC_W, detector=None):
+    def __init__(self, cfg=None, gain=None, proc_w=PROC_W, detector=None, mode="motion"):
         self._cfg = dict(cfg or {})
         self.gain = gain
         self.proc_w = int(proc_w or PROC_W)
+        #: ⭐⭐⭐⭐⭐ **走哪条管线**（用户 2026-10-05 ✓ 原话："**把我们当前的进展做进实时测谎.bat
+        #:   用于实时验证**" ✓✓）——
+        #:     · `"motion"`（**默认** ✓）= `MotionRunner`（运动分离 ✓ 我们这几轮**所有**改动都在这条
+        #:       上：`pred` 由绿圈推 / 夹取 / 夹取增益 / 拆框 / 融合必含真目标 ✓）；
+        #:     · `"classic"` = 老的 `Runner`（`LieTracker` ✓ 留着对照 ✓）。
+        #:   ⚠ 参数分别取两套 ✓（`load_motion_cfg` / `load_lie_cfg` ✓ 都是**你界面上调好的那些** ✓）。
+        self.mode = str(mode or "motion")
+        self.mcfg = (dict(load_motion_cfg()) if self.mode == "motion" else {})
         #: ⭐⭐⭐ **检测器**（用户 2026-10-03 ✓ 原话："实时测谎：**没有任何检出框**" ✓）——
         #:   任何有 `.detect(bgr) -> [(cls,cx,cy,w,h,conf), …]` 的东西都行 ✓
         #:   （真货 = `lie_demo.DetsWorker` ✓ 自检里塞**桩** ✓ ⇒ 这条链在离屏也能测 ✓）。
@@ -165,22 +173,34 @@ class LiveLieEngine:
             return None
         if self.runner is None:
             self.size = (_p.shape[1], _p.shape[0])
-            self.runner = Runner(dets=None, assume=(self.size[0] / 2.0, self.size[1] / 2.0),
-                                 gain=self.gain, **self._cfg)
+            if self.mode == "motion":
+                # ⚠ `MotionRunner` 与 `Runner` **同签名、同 6 元组** ✓（见它那段注释 ✓）
+                #   ⇒ 上面"渲染 / 点选 / 拖动"那一整套**一行都不用改** ✓。
+                from perception.lie_motion import MotionRunner
+                self.runner = MotionRunner(dets=None, **self.mcfg)
+            else:
+                self.runner = Runner(dets=None,
+                                     assume=(self.size[0] / 2.0, self.size[1] / 2.0),
+                                     gain=self.gain, **self._cfg)
         _ts = float(ts) if ts is not None else time.time()
         # ⚠ 检出跑在**加工尺度那份图**上 ✓（与 `lie_demo` / `ab_compare` 那条路**同一把尺** ✓）
         #   ⇒ 检出框坐标就是"加工域"✓，与 tracker / 画面 / 点选**全对得上** ✓
         #   （⚠ 别在原生 1080p 上检：既慢又和"喂给 tracker 的那份"不是同一个坐标 ✗）。
+        _raw = None
         if self.detector is not None:
             try:
                 _raw = self.detector.detect(_p)
             except Exception:                 # noqa: BLE001 —— 检测失败不该把整条链带死 ✓
                 _raw = None
-            # ⚠ `Runner` 是拿 `dets[i]` 取"本拍"的 ✗ ⇒ 把**本拍这一份**塞成单元素列表、
-            #   `i` 恒传 0 ✓（`Runner` 里 `i` **只**用于这个索引 ✓ 实测安全 ✓ 不改它 ✓）。
-            self.runner.dets = [_raw] if _raw else None
+        # ⚠⚠⚠ **两条管线对 `dets` 的要求不一样** ✗✗（**踩过** ✓ 见 `MotionRunner` 那段注释 ✓）：
+        #   · 经典 `Runner`：**没有框 ⇒ `None`** ✓（它自己判"本拍没观测" ✓）；
+        #   · 运动 `MotionRunner`：**必须是个列表** ✗ —— 它按拍取 `self.dets[i]` ✓
+        #     ⇒ 给 `None` 会 `TypeError` ⇒ PyQt5 里就是**闪退** ✗✗
+        #     ⇒ 一律塞**单元素列表** ✓（没检出就 `[None]` ✓ 它当"这拍没框" ✓），`i` 恒传 0 ✓。
+        if self.mode == "motion":
+            self.runner.dets = [_raw]
         else:
-            self.runner.dets = None
+            self.runner.dets = [_raw] if _raw else None
         _out = self.runner.step(_p, 0, _ts)
         self.n += 1
         return _out
@@ -202,6 +222,62 @@ def load_lie_cfg():
     except Exception:                       # noqa: BLE001 —— 读不到配置不算错误 ✓ 用默认就是 ✓
         return {}
     return {k: _c.get(k) for k in _LIE_CFG_KEYS if _c.get(k) is not None}
+
+
+#: ⭐⭐⭐⭐⭐ **运动分离那条的参数**（用户 2026-10-05 ✓ 原话："**把我们当前的进展做进实时测谎.bat
+#:   用于实时验证**" ✓✓）—— 键名与 `lie_demo._motion_kw` **同一套** ✓（`config/ui.yaml` 里
+#:   就是 `motion_*` ✓ 别各叫一套 ✗）；左 = 配置键 ✓ 右 = `MotionTracker` 的形参名 ✓。
+#:   ⚠ **一个参数都不硬编** ✗：`ui.yaml` 里没有的键 ⇒ 不传 ⇒ 用追踪器自己的默认 ✓
+#:     （与 `load_lie_cfg` 同一条纪律 ✓）。
+_MOTION_CFG_MAP = (("motion_pair_gate", "pair_gate"),
+                   ("motion_score_decay", "score_decay"),
+                   ("motion_switch_margin", "switch_margin"),
+                   ("motion_min_hits", "min_hits"),
+                   ("motion_white_w", "white_w"),
+                   ("motion_smooth", "smooth"),
+                   ("motion_q_min", "q_min"),
+                   ("motion_q_need", "q_need"),
+                   ("motion_stuck_ratio", "stuck_ratio"),
+                   ("motion_pred_max", "kf_pred_max"),
+                   ("motion_dir_n", "dir_n"),
+                   ("motion_fuse_pull", "fuse_pull"),
+                   ("motion_clamp_gain", "clamp_gain"))
+#: ⚠ 这几个是**整数**（其余是浮点 ✓）—— ⚠⚠ 别一律 `float(...)` ✗：`min_hits` / `q_need` /
+#:   `dir_n` 收 `float` 也能跑，但**日志/界面上就不是整数**了 ✓（`MotionTracker` 里会 `int()` ✓
+#:   所以不算错 ✗；这里写清楚只是别踩"看起来像 4.0 拍"这种困惑 ✓）。
+_MOTION_INT_KEYS = ("min_hits", "q_need", "dir_n")
+
+
+def load_motion_cfg():
+    """**运动分离**那条的参数（同 `load_lie_cfg` ✓ 只是键名不同 + 带类型 ✓）。"""
+    try:
+        from gui import theme
+        _c = dict(theme.load_section("lie_demo") or {})
+    except Exception:                       # noqa: BLE001 —— 读不到就全用默认 ✓
+        return {}
+    _out = {}
+    for _ck, _pk in _MOTION_CFG_MAP:
+        _v = _c.get(_ck)
+        if _v is None:
+            continue
+        try:
+            _out[_pk] = (int(float(_v)) if _pk in _MOTION_INT_KEYS else float(_v))
+        except (TypeError, ValueError):
+            continue
+    #   ⭐⭐⭐⭐⭐ **限定区域（ROI ✓ 用户 2026-10-07 ✓ 原话："**只在限定的区域计算（因为这是
+    #     部分弹窗）**" ✓✓）** —— ⚠⚠ **它是个 4 元组** ✗ ⇒ **不能进上面那张"标量表"** ✗
+    #     （那张表一律 `float(...)` ✓ ⇒ 列表会被打散 / 直接报错 ✓）⇒ 单独读 ✓：
+    #     `motion_roi: [x0, y0, x1, y1]`（**加工域**坐标 ✓）；非法（数量不对 / 反了 / 退化）
+    #     ⇒ **当没给** ✓（= 整幅 ✓ 与改动前逐位一致 ✓）。
+    _roi = _c.get("motion_roi")
+    if isinstance(_roi, (list, tuple)) and len(_roi) == 4:
+        try:
+            _v4 = [float(_x) for _x in _roi]
+            if _v4[2] > _v4[0] and _v4[3] > _v4[1]:
+                _out["roi"] = tuple(_v4)
+        except (TypeError, ValueError):
+            pass
+    return _out
 
 
 # ══════════════════════════════════════════════════════════
@@ -432,7 +508,9 @@ def run_window(args):
             self.screen_rect = None           # **屏幕坐标**（屏幕那条 ✓）
             self.crop = None                  # **画面里的 ROI**（收流那条 ✓）
             self.url = args.stream or DEFAULT_URL
-            self.engine = LiveLieEngine(cfg=load_lie_cfg())
+            # ⚠ 默认**运动分离**（= 我们当前的进展 ✓ 见 `LiveLieEngine` 那段 ✓）
+            self.engine = LiveLieEngine(cfg=load_lie_cfg(),
+                                        mode=str(getattr(args, "mode", "motion") or "motion"))
             self.worker = None
             self._det = None                  # 检测器（**常驻子进程** ✓ ⇒ 停的时候必须关 ✗）
             self._raw_q = None
@@ -491,6 +569,21 @@ def run_window(args):
                 "⚠ 开着会慢一些：每拍一次推理（约二三十 ms）⇒ 帧率会掉。\n"
                 "⚠ 改这个要**停一下再开始**才生效。")
             bar.addWidget(self.chk_dets)
+            # ⭐⭐⭐⭐⭐ **管线选择**（用户 2026-10-05 ✓ 原话："**把我们当前的进展做进实时测谎.bat
+            #   用于实时验证**" ✓✓）—— **默认「运动分离」** ✓（我们这几轮所有改动都在这条上 ✓）；
+            #   「经典」留着对照 ✓。⚠ 换这个要**停一下再开始**才生效 ✓（与检测器开关同一条 ✓）。
+            bar.addWidget(QLabel("管线"))
+            self.cmb_mode = QComboBox()
+            self.cmb_mode.addItem("运动分离（当前进展）", "motion")
+            self.cmb_mode.addItem("经典 LieTracker", "classic")
+            _m0 = str(getattr(args, "mode", "motion") or "motion")
+            self.cmb_mode.setCurrentIndex(0 if _m0 != "classic" else 1)
+            self.cmb_mode.setToolTip(
+                "**运动分离**：这几轮的所有改动（绿圈推预测 / 融合框夹取 / 夹取增益 / 拆框 /\n"
+                "融合必含真目标）全在这条管线上 ⇒ **实时验证用它** ✓。\n"
+                "**经典**：老的 `LieTracker`（对照用 ✓）。\n"
+                "⚠ 改这个要**停一下再开始**才生效。")
+            bar.addWidget(self.cmb_mode)
             bar.addWidget(QLabel("置信度"))
             self.sp_conf = NoWheelDoubleSpinBox()
             self.sp_conf.setRange(0.05, 0.95)
@@ -628,6 +721,17 @@ def run_window(args):
             if _src is None:
                 return
             self._open_detector()                 # ⭐ 先接检测器（见它 ✓ 关着就只有白块跟踪 ✓）
+            # ⚠ 管线开关在**这里**生效 ✓（改完要"停一下再开始" ✓ 与检测器开关同一条 ✓）——
+            #   `reset()` 会把 `runner` 清掉 ✓ ⇒ 下次 `step` 按新 `mode` 重建 ✓（参数也重读 ✓）。
+            self.engine.mode = str(self.cmb_mode.currentData() or "motion")
+            self.engine.mcfg = (load_motion_cfg() if self.engine.mode == "motion" else {})
+            if self.engine.mode == "motion" and not self.chk_dets.isChecked():
+                # ⚠⚠ **运动分离对检出框是"硬依赖"** ✗✗（**实测**：检测器关着 ⇒ 状态永远是 `init`
+                #    ✓ 屏幕上什么都不动 ✓ 与经典那条不同 ✗ —— 经典还有"白块跟一跟"兜底 ✓）
+                #   ⇒ 必须**明说** ✓，不然看着就像"这个工具坏了" ✗。
+                self.statusBar().showMessage(
+                    "⚠ 运动分离**必须有检出框**（整条判据都建立在框上 ✗）—— 请勾上「用检测器」"
+                    "（经典那条才有「白块跟一跟」的兜底 ✗）", 20000)
             self.engine.reset()
             self.worker = GrabWorker(_src, self.crop, self.engine)
             self.worker.frame_ready.connect(self._on_frame)
@@ -719,6 +823,8 @@ def main(argv=None):
     ap.add_argument("--weights", default="", help="YOLO 权重（不给就自动找 ✓）")
     ap.add_argument("--video", default="", help="[调试/自检] 录像当实时源（**界面上不暴露** ✓）")
     ap.add_argument("--loop", action="store_true", help="[调试] 录像放完循环")
+    ap.add_argument("--mode", default="motion", choices=("motion", "classic"),
+                    help="哪条管线：motion=运动分离（默认 ✓ 我们当前进展）/ classic=老 LieTracker")
     return run_window(ap.parse_args(argv))
 
 

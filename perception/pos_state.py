@@ -13,6 +13,7 @@
 | `here_span` | 脚下这些集合横着占的 **x 范围** `(左, 右)`（非墙 foothold 的并集 ✓）—— "我这块平台有多宽" ✓ | `agent._reachable_without_path`（"够得着就不用下寻路任务"那条豁免 ✓） |
 | `ladder_id` | 现在**贴在哪根绳**上（`"L1"` 这种稳定编号；不在绳上 = `None`）—— ⚠ **带许可**：许可的入口是「**climb 执行器按住 ↑/↓ 后发起通知**」（2026-09-28 诉求 1：不再是"按住 ↑"这个本机按键状态 ✓）| 决策层（上绳/下爬执行器、"掉下来了" ✓）与界面 ✓ |
 | `on_rope_pos` | ⭐ **只看位置**编出来的绳号（**不管按没按 ↑/↓** ✓）—— 治的是那条**循环依赖**：执行器自己会松键 ⇒ 带许可的 `ladder_id` 当场变空 ⇒ 执行器"自己把自己判成没上绳" ✗ | `ClimbJob`（"位置还在绳段里"那条记忆 ✓）与 `agent`（"攀爬进行中不打架" ✓） |
+| `on_rope_align` | ⭐⭐ **「坐标符合在绳梯上」**（用户 2026-10-06 ✓）：在绳段里 ✓ **且** `\|角色 x − 绳子的 x\| ≤ 「坐标对齐误差范围」` ✓ —— 比 `on_rope_pos` **紧**（那份 x 半宽 24 ✗ 站在绳边打怪也成立 ✗） | `agent._chase_hop_beat`（"追怪被绳吸住 ⇒ 单点跳脱绳" ✓ 见 SKILL **283** ✓）|
 | `at_ladder_top` | **到没到某根绳的上端**（绳号）—— 上爬的"到达"判据 ✓ | `ClimbJob` ✓（**它不再自己比坐标** ✗） |
 | `at_ladder_bottom` | **到没到某根绳的下端**（绳号）—— 下爬的"到达"判据 ✓ | `ClimbJob` ✓（同上 ✗） |
 | `ground_y` | **脚下那块面的 y**（在该 foothold 上、玩家 x 处取的 y ✓）—— 下爬"落地面"的判据 ✓ | `ClimbJob` ✓ |
@@ -81,6 +82,14 @@ class PosSnapshot:
     at_ladder_bottom: str | None = None
     ground_y: float | None = None
     on_rope_pos: str | None = None
+    #: ⭐⭐ **「坐标符合在绳梯上」**（用户 2026-10-06 ✓ 原话：能不能加个类似"**角色坐标符合在
+    #:   绳梯上**"的判定 ✓）：位置落在某根绳的**绳段**里 ✓ **而且** `|角色 x − 绳子的 x| ≤
+    #:   「坐标对齐误差范围」`（`align_tol_px` ✓ 默认 10）✓。
+    #:   ⚠ 比 `on_rope_pos` **紧得多**：那份的 x 半宽是 `mapdata.LADDER_DX`(**24** ✓) ⇒
+    #:     "站在绳边打怪 / 路过"也算在绳上 ✗（用户 2026-10-06 报的"**还是乱跳**"就是它 ✗）；
+    #:     这一份只认"**x 真的对在这根绳上**" ✓。用途：`agent._chase_hop_beat` 判
+    #:     "追怪时被绳梯吸住 ⇒ 单点跳一下脱绳" ✓（现场见 SKILL **283** ✓）。
+    on_rope_align: bool = False
     here_span: tuple | None = None
     climb_failed: bool = False
     climb_stalled: bool = False
@@ -115,6 +124,7 @@ class PosSnapshot:
                    at_ladder_bottom=getattr(obj, "at_ladder_bottom", None),
                    ground_y=getattr(obj, "ground_y", None),
                    on_rope_pos=getattr(obj, "on_rope_pos", None),
+                   on_rope_align=bool(getattr(obj, "on_rope_align", False)),
                    here_span=getattr(obj, "here_span", None),
                    climb_failed=bool(getattr(obj, "climb_failed", False)),
                    climb_stalled=bool(getattr(obj, "climb_stalled", False)))
@@ -168,6 +178,7 @@ class PositionStateMachine:
         self.here_span = None
         self.ladder_id = None
         self.on_rope_pos = None
+        self.on_rope_align = False
         self.at_ladder_top = None
         self.at_ladder_bottom = None
         self.ground_y = None
@@ -240,6 +251,16 @@ class PositionStateMachine:
         lad_pos = self._ladder_at(terrain, x, y)
         self.on_rope_pos = self._lid_of(terrain, lad_pos)
         self.ladder_id = self._lid_of(terrain, lad_pos if hold_vert else None)
+        # ②'' ⭐⭐ **「坐标符合在绳梯上」**（用户 2026-10-06 ✓ 见 `PosSnapshot.on_rope_align` ✓）：
+        #   与按键许可无关 ✓，但在 `on_rope_pos`（绳段里 ✓ x 半宽 24 ✗ 松）之上**再收一道 x**：
+        #   `|角色 x − 绳子的 x| ≤ tol`（`tol` = 「坐标对齐误差范围」✓ 默认 10 —— **执行器
+        #   判"对齐好了"用的就是它** ✓ 同一把尺 ✓ 不新造数 ✓）。
+        #   ⚠ 为什么需要它：追怪那条路（`_chase_hop_beat`）要判"**被绳吸住**"⇒ 单点跳脱绳 ✓，
+        #     而"站在绳边打怪、人也不能动"（用户 2026-10-06 原话：**"attack 状态期间人是不能
+        #     移动的"** ✓）会拿松的那份**误判成在绳上** ⇒ **乱跳** ✗（用户报的 ✓）。
+        self.on_rope_align = bool(
+            lad_pos is not None
+            and abs(float(x) - float(getattr(lad_pos, "x", 0.0))) <= tol)
         # ②' 「攀爬失败」(2a) **挪到 ③c 之后才算**（见下面那段 ✓）：它还要看"y 僵没僵"，
         #   而那个窗口（`_moved`）到 ③c 才建好 ✗（2026-09-28 修 ✓）。先按"不算"起步 ——
         #   中途走"不在绳上 ⇒ 早退"那支时也不会留旧值 ✓。
@@ -369,6 +390,7 @@ class PositionStateMachine:
                            at_ladder_bottom=self.at_ladder_bottom,
                            ground_y=self.ground_y,
                            on_rope_pos=self.on_rope_pos,
+                           on_rope_align=self.on_rope_align,
                            here_span=self.here_span,
                            climb_failed=self.climb_failed,
                            climb_stalled=self.climb_stalled)
@@ -376,6 +398,7 @@ class PositionStateMachine:
     def _clear(self):
         self.here_sets, self.here_span = [], None
         self.ladder_id, self.on_rope_pos = None, None
+        self.on_rope_align = False
         self.at_ladder_top, self.at_ladder_bottom = None, None
         self.ground_y = None
         self.climb_failed = False

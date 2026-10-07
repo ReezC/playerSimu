@@ -66,6 +66,18 @@ C_LIFE = QColor("#c5221f")         # 刷怪点
 C_SEL = QColor("#ffd54f")          # 选中
 C_IN_SET = QColor("#0b8043")       # 属于当前高亮的集合
 
+#: 传送点圆点的半径（世界像素）×2 种尺寸 + 名字的字号（用户 2026-10-06 ✓ 原话两条：
+#:   "**在 foothold 集合编辑器里，传送点的名称没有标出来**" ＋
+#:   "**选中传送点后，要放大传送点的图形呼吸高亮，不然看不出来**"）。
+#: ⚠ 为什么"选中要**画大**"而不是只换颜色：门的图形本来就小（半径 6 世界像素 ✓ 图上几像素
+#:   ✗），只换颜色在小缩放下**照样看不出来** —— 用户的原话就是"不然看不出来"✓ ⇒ 半径翻近一倍
+#:   ＋ 换选中色（`C_SEL` 同"选中的 foothold / 绳梯"✓）＋ 一起呼吸 ✓ 三样一起才够醒目 ✓。
+PORTAL_R = 6.0
+PORTAL_SEL_R = 11.0
+#: 门名文字的字号（世界像素；绳梯编号那一套 `LADDER_PX` 的同学 ✓ —— 门名比绳号长，
+#: 稍微小一点免得糊住旁边的线 ✓）。
+PORTAL_PX = 13
+
 #: 呼吸高亮的节拍（毫秒）与相位步长。**为什么用 QTimer 而不是 QPropertyAnimation**：
 #: 高亮的是一批 QGraphicsLineItem（不是单个控件），按节拍统一改笔刷最直接，
 #: 而且停止逻辑只有一处（closeEvent）。
@@ -139,9 +151,11 @@ def edge_row_key(e, focus):
     中文按**码点**排（不是拼音）：只求稳定可预期，不求像字典。
     """
     other = e.get("from") if e.get("to") == focus else e.get("to")
-    # ⚠ 排序键里原来还有 `portal`（走哪个门）那一格 —— 2026-09-27 随「传送门」移除 ✓
+    # ⭐ `portal`（走哪个门）2026-09-27 随「传送门」移除过 ✓、**2026-10-06 加回** ✓ ——
+    #   它和 `ladder` 是同一回事：同一对集合、同类型、**不同门/不同绳**是几条**不同的边** ✓，
+    #   排序键里少了它 ⇒ 两条边的相对次序由"谁先被加进来"决定 ⇒ 编辑一次就跳一次 ✗。
     return (str(other or ""), _KIND_ORDER.get(e.get("kind") or "?", 99),
-            str(e.get("ladder") or ""))
+            str(e.get("ladder") or ""), str(e.get("portal") or ""))
 
 
 #: 列表行里"非名字"部分的文字颜色：交给调色板（**不是**写死的黑）——
@@ -213,6 +227,28 @@ def pick_ladder(terrain, x, y, tol):
         d = dist_to_ladder(L, x, y)
         if d <= tol and (best_d is None or d < best_d):
             best, best_d = L, d
+    return best
+
+
+def dist_to_portal(p, x, y):
+    """点到某个传送点的距离（门是个**点** ✓ 所以就是两点距离 ✓）。"""
+    return ((x - float(p.x)) ** 2 + (y - float(p.y)) ** 2) ** 0.5
+
+
+def pick_portal(terrain, x, y, tol):
+    """(x, y) 附近最近的**传送点** → Portal / None（口径与 `pick_at` / `pick_ladder` 同一把尺 ✓）。
+
+    用户 2026-10-06 要求："**选中传送点后，要放大传送点的图形呼吸高亮，不然看不出来**"
+    ⇒ 先得**点得中**它 ✓：门是个小圆点（半径 6 世界像素 ✓），缩小时更小 ⇒ 和绳梯同理，
+    `tol` 由调用方按当前缩放换算（`PICK_PX` ✓）保证"看着点中了 = 真的点中了" ✓。
+    ⚠ 与绳梯**同一套语义**：只用来"**看**"（状态行 + 画布高亮 ✓），
+      不进选择集、不写文件、不进撤销栈 ✗。
+    """
+    best, best_d = None, None
+    for p in (getattr(terrain, "portals", None) or []):
+        d = dist_to_portal(p, x, y)
+        if d <= tol and (best_d is None or d < best_d):
+            best, best_d = p, d
     return best
 
 
@@ -528,7 +564,8 @@ class AddReachDialog(QDialog):
     applied = pyqtSignal(dict)
 
     def __init__(self, parent, src, dst_all, dst_related=(), ladders=(),
-                 drop_choices=(), init=None):
+                 drop_choices=(), init=None, all_ladders=(),
+                 portals=(), all_portals=()):
         super().__init__(parent)
         self.src = str(src)                 # 起点（外面加边时要用）
         self.mode = "add"                   # "add" / "edit" —— 由调用方设（见 _on_edit_edge）
@@ -585,22 +622,65 @@ class AddReachDialog(QDialog):
             "  走       —— 走过去（同层、无缝）\n"
             "  爬（绳梯）—— 爬绳 / 梯子（要指名哪根绳）\n"
             "  跳       —— 站在 foothold **边缘按跳键**，平着 / 斜着蹦过去\n"
-            "  下跳     —— **按住 ↓ 再按跳**，从平台上穿下去、落到下一层\n\n"
+            "  下跳     —— **按住 ↓ 再按跳**，从平台上穿下去、落到下一层\n"
+            "  传送点   —— **走到那扇门、按一下 ↑**（要指名**哪扇门**；2026-10-06 加的）\n\n"
             "⚠ 「跳」和「下跳」是**两种不同的按法**，别混：跳是往前蹦，下跳是往下穿。\n"
-            "这两种都要用到跳键 ⇒ 真执行前得先做**跳跃标定**（现在先把位置标出来即可）。")
+            "这两种都要用到跳键 ⇒ 真执行前得先做**跳跃标定**（现在先把位置标出来即可）。\n\n"
+            "⚠ **传送点不支持跨图**（明确的口径）：这里只能选**本图内有出口**的门 ✓\n"
+            "（跨图的门在下拉里会标出来、选不了它就没意义 ✓ 导出数据里也只给得到目标地图号 ✓）。")
         form.addRow("通行方式", self.cmb_kind)
 
         # ---- 类型要求的东西：按类型显隐（这正是一个弹窗才做得到的事）----
         self.lbl_lad = QLabel("爬哪根绳")
         self.cmb_lad = NoWheelComboBox()
-        # 排序（2026-09-26 要求"自动 sort"）：绳号按**自然序**（L2 在 L10 前面）、
-        # 门按 id。候选是外面给的，顺序不该由"谁先被扫描到"决定。
-        for lid, text in sorted(ladders, key=lambda x: _natural(x[0])):
-            self.cmb_lad.addItem(text, lid)
-        form.addRow(self.lbl_lad, self.cmb_lad)
+        # ⭐⭐ **「全部」勾选**（用户 2026-10-06 ✓ 原话（问答里定的）："加全部勾选"）——
+        #   照**终点**那一格的同款做法（`ck_all` ✓ 见 `_fill_dst` ✓）：默认只列
+        #   **与起点集合有关**的绳（`ladders_touching` ✓ 见 `_reach_ladder_choices` ✓），
+        #   勾上就列**本图全部**绳 ✓ —— 并且把"**跟起点集合无关**"的那些**在行里标出来** ✓
+        #   （`（⚠ … 从「起点」走不到它）` ✓）。
+        #   ⚠ 起因（用户 2026-10-06 现场）："为什么从 7 去 6 不能选 L6 绳子？" ✓ ——
+        #     候选按**起点集合**筛（穿过它 / 某端落在它上 ✓）⇒ L6 与 7 无关就**根本不出现** ✗
+        #     而界面上**一句话都没说** ⇒ 只能猜"是不是程序少做了功能" ✓。
+        #   ⚠ 勾上之后**不**改变校验口径 ✗：真要走不到那根绳，运行时照样会失败 ✓
+        #     （行里那句"走不到它"就是提醒 ✓ 见 `_fill_lad` ✓）。
+        self._lad_rel = sorted(ladders, key=lambda x: _natural(x[0]))
+        self._lad_all = sorted(all_ladders or ladders, key=lambda x: _natural(x[0]))
+        lad_row = QHBoxLayout()
+        lad_row.addWidget(self.cmb_lad, 1)
+        self.ck_lad_all = QCheckBox("全部")
+        self.ck_lad_all.setToolTip(
+            "默认只列**与起点集合有关**的绳（穿过起点集合的、或某一端落在它上面的）——\n"
+            "集合一多，全列出来根本找不着。勾上就列**这张图的全部绳** ✓。\n\n"
+            "⚠ 与起点集合**无关**的那些会**在行里标出来**："
+            "「（⚠ 从「…」走不到它）」—— 选了它，运行时多半会走不过去 ✗\n"
+            "（正确做法一般是拆成两步：先「走」到那根绳所在的那个集合，再「爬」它 ✓）。")
+        self.ck_lad_all.toggled.connect(lambda _v: self._fill_lad())
+        lad_row.addWidget(self.ck_lad_all)
+        form.addRow(self.lbl_lad, lad_row)
+        self._fill_lad()
 
-        # ⚠ 这里原来还有「走哪个门」（传送门）那一行 —— 2026-09-27 随「传送门」这种
-        #   通行方式一起**移除**了（`zones.EDGE_KINDS` 现在只有走/爬/下跳/跳 ✓）。
+        # ---- 「走哪个门」（传送点 ✓ 2026-10-06 加回 ✓）----
+        # 用户原话："现在增加一种新的通行方式'传送点(portal)'供寻路编辑器→增加可达 弹窗里配置；
+        #   选中后，可以选择传送点（例如黄金沙滩项目，地形叠加图里的"h009"），操作方式是走到该
+        #   点位按↑" ✓ ⇒ 这一行就是"选哪扇门" ✓。
+        # 写法与**绳那一行同款**（默认只列与起点集合有关的 + 「全部」放开 + 无关的标出来 ✓）。
+        self.lbl_gate = QLabel("走哪扇门")
+        self.cmb_gate = NoWheelComboBox()
+        self._gate_rel = sorted(portals, key=lambda x: _natural(x[0]))
+        self._gate_all = sorted(all_portals or portals, key=lambda x: _natural(x[0]))
+        gate_row = QHBoxLayout()
+        gate_row.addWidget(self.cmb_gate, 1)
+        self.ck_gate_all = QCheckBox("全部")
+        self.ck_gate_all.setToolTip(
+            "默认只列**与起点集合有关**的门（落在起点集合那一带 ±24px 内的 ✓）——\n"
+            "集合一多，全列出来根本找不着。勾上就列**这张图的全部门** ✓。\n\n"
+            "⚠ 与起点集合**无关**的、以及**跨图**的门会**在行里标出来**：\n"
+            "「（⚠ 从「…」走不到它）」/「（⚠ 跨图 —— 不支持）」—— 选了它们，运行时走不过去 ✗\n"
+            "（跨图是**明确不支持**的：导出数据里只给得到目标**地图号**，目标点位没有 ✓）。")
+        self.ck_gate_all.toggled.connect(lambda _v: self._fill_gate())
+        gate_row.addWidget(self.ck_gate_all)
+        form.addRow(self.lbl_gate, gate_row)
+        self._fill_gate()
 
         # ---- 走(walk) 的方向类型（2026-09-26 用户要求）----
         self.lbl_wd = QLabel("类型")
@@ -750,16 +830,88 @@ class AddReachDialog(QDialog):
         j = self.cmb_kind.findData(d.get("kind"))
         if j >= 0:
             self.cmb_kind.setCurrentIndex(j)     # 触发 _sync_kind ⇒ 绳那一行跟着显隐
-        for cmb, key in ((self.cmb_lad, "ladder"),):
+        # ⭐ 绳 / 门**同一套**（2026-10-06 ✓）：编辑一条**它不在"相关"里**的边时，自动勾上
+        #   「全部」再找一次 ✓（照终点那格对 `ck_all` 的做法 ✓ —— 否则预填不上、界面停在
+        #   第一项上 ✗，而人看到的只是"打开时选错了"，根本联想不到是候选被收窄了 ✓）。
+        for cmb, key, ck, avail in (
+                (self.cmb_lad, "ladder", self.ck_lad_all, "_lad_all_avail"),
+                (self.cmb_gate, "portal", self.ck_gate_all, "_gate_all_avail")):
             v = d.get(key)
-            if v:
+            if not v:
+                continue
+            k = cmb.findData(v)
+            if k < 0 and getattr(self, avail, False):
+                ck.setChecked(True)                  # 触发重填
                 k = cmb.findData(v)
-                if k >= 0:
-                    cmb.setCurrentIndex(k)
+            if k >= 0:
+                cmb.setCurrentIndex(k)
         # 「走」的方向类型（默认方向 = 不写这一格 ⇒ 找不到就用第 0 项）
         k = self.cmb_wd.findData(zones.walk_dir(d))
         if k >= 0:
             self.cmb_wd.setCurrentIndex(k)
+
+    def _fill_lad(self):
+        """按「全部」勾选重填绳候选（照 `_fill_dst` 的同款做法 ✓ 用户 2026-10-06 ✓ "加全部勾选"）。
+
+        ⚠ 与起点集合**无关**的绳要**在行里标出来** ✗ —— 只列出来不吭声，等于递给人一个陷阱 ✓
+          （用户现场那句"为什么从 7 去 6 不能选 L6"就是"看不见 / 说不清"逼出来的 ✓）。
+          判据只此一处：**在不在** `self._lad_rel` 里（= `ladders_touching(起点集合)` ✓）。
+        ⚠ 重填时**保住当前选中**（预填 / 编辑模式靠它 ✓ 同 `_fill_dst` ✓）。
+        """
+        cur = self.cmb_lad.currentData()
+        rel = {lid for lid, _t in self._lad_rel}
+        use = self._lad_all if self.ck_lad_all.isChecked() else self._lad_rel
+        self.cmb_lad.blockSignals(True)
+        self.cmb_lad.clear()
+        for lid, text in use:
+            if lid not in rel:
+                text = ("%s（⚠ 从「%s」走不到它 —— 一般先「走」到它所在的集合、再「爬」它）"
+                        % (text, self._src))
+            self.cmb_lad.addItem(text, lid)
+        j = self.cmb_lad.findData(cur)
+        self.cmb_lad.setCurrentIndex(j if j >= 0 else 0)
+        self.cmb_lad.blockSignals(False)
+        # 没有"相关"可收窄时就没有这个开关（勾了也没意义 ✓ 同 `_fill_dst` ✓）
+        # ⚠⚠ 判据**必须**存成显式标志 ✗ —— 别用 `self.ck_lad_all.isVisible()`：控件在
+        #   弹窗 `show()` 之前 `isVisible()` **恒为 False** ✓（实测：构造完就问它 ⇒ 永远 False，
+        #   "该隐藏"那条分支根本不执行 ✗；而"该显示"的那次 `setVisible(True)` 其实已经记下了 ✓
+        #   —— 于是行为看着"时对时不对"，最难查 ✓）。
+        self._lad_all_avail = len(self._lad_all) > len(self._lad_rel)
+        self.ck_lad_all.setVisible(self._lad_all_avail)
+        if not self._lad_all_avail and self.ck_lad_all.isChecked():
+            self.ck_lad_all.blockSignals(True)
+            self.ck_lad_all.setChecked(False)
+            self.ck_lad_all.blockSignals(False)
+
+    def _fill_gate(self):
+        """按「全部」勾选重填门候选（照 `_fill_lad` 同款 ✓ 用户 2026-10-06 ✓ "走哪个门"）。
+
+        ⚠ 三类都要**在行里说清**（别静默 ✗）：与起点集合**无关**的 ✓、**跨图**的 ✗、
+          落点查不到的 ✗ —— 后两类的标记由调用方揉进行文（`ZoneEditorDialog._portal_row` ✓），
+          这里只补"与起点无关"那一句 ✓（判据只此一处：在不在 `self._gate_rel` ✓）。
+        ⚠ 重填时**保住当前选中** ✓（预填 / 编辑模式靠它 ✓）。
+        ⚠ 判据用显式标志 `_gate_all_avail`（**别用 `isVisible()`** ✗ —— 弹窗 `show()` 之前
+          恒为 False ✓ 同 `_fill_lad` 那个坑 ✓）。
+        """
+        cur = self.cmb_gate.currentData()
+        rel = {pn for pn, _t in self._gate_rel}
+        use = self._gate_all if self.ck_gate_all.isChecked() else self._gate_rel
+        self.cmb_gate.blockSignals(True)
+        self.cmb_gate.clear()
+        for pn, text in use:
+            if pn not in rel:
+                text = ("%s（⚠ 从「%s」走不到它 —— 一般先「走」到它所在的那个集合）"
+                        % (text, self._src))
+            self.cmb_gate.addItem(text, pn)
+        j = self.cmb_gate.findData(cur)
+        self.cmb_gate.setCurrentIndex(j if j >= 0 else 0)
+        self.cmb_gate.blockSignals(False)
+        self._gate_all_avail = len(self._gate_all) > len(self._gate_rel)
+        self.ck_gate_all.setVisible(self._gate_all_avail)
+        if not self._gate_all_avail and self.ck_gate_all.isChecked():
+            self.ck_gate_all.blockSignals(True)
+            self.ck_gate_all.setChecked(False)
+            self.ck_gate_all.blockSignals(False)
 
     def _fill_dst(self):
         cur = self.cmb_dst.currentData()
@@ -782,6 +934,9 @@ class AddReachDialog(QDialog):
         kind = self.cmb_kind.currentData()
         self.lbl_lad.setVisible(kind == "climb")
         self.cmb_lad.setVisible(kind == "climb")
+        # ⭐ 「走哪扇门」只对「传送点」有意义（2026-10-06 加回 ✓）
+        self.lbl_gate.setVisible(kind == "portal")
+        self.cmb_gate.setVisible(kind == "portal")
         self.lbl_wd.setVisible(kind == "walk")      # 「类型」只对「走」有意义
         self.cmb_wd.setVisible(kind == "walk")
         # ⭐ 「中途跳下」只对「爬」有意义；⚠ 「高度」还要**方向非空**才出现（**二级联动** ✓ ——
@@ -796,6 +951,12 @@ class AddReachDialog(QDialog):
         if kind == "climb" and self.cmb_lad.count() == 0:
             why = ("「%s」附近没有可爬的绳 —— 换个类型，或者先把绳另一端那块地形"
                    "圈成集合。" % self._src)
+        if kind == "portal" and self.cmb_gate.count() == 0:
+            # ⭐ 一条都没得选 ⇒ 告诉人**为什么**（别让人对着空下拉猜 ✗ 2026-10-06 ✓）：
+            #   这张图**根本没有传送点**、或者（可本图的都在别的集合那一带 ⇒ 勾「全部」能看到 ✓）。
+            why = ("这张图（或「%s」这一带）没有可选的传送点 —— 换个类型；"
+                   "或者勾上门的「全部」看看这张图到底有哪些门（与起点无关的会标出来 ✓）。"
+                   % self._src)
         if kind == "drop" and not self._drop_ids:
             why = "一个可下跳的 foothold 都没有了 —— 至少留一个（点「加一个…」）。"
         self.lbl_note.setText(why)
@@ -874,6 +1035,9 @@ class AddReachDialog(QDialog):
             "dst": self.cmb_dst.currentData(),
             "kind": kind,
             "ladder": (self.cmb_lad.currentData() if kind == "climb" else None),
+            # ⭐ 走哪扇门（2026-10-06 ✓）：与 `ladder` 同款 —— **非传送点一律 None** ✓
+            #   （`edit_edge` 那边见 None 就把这一格删掉 ⇒ 换类型不会留下上一任的门 ✓）。
+            "portal": (self.cmb_gate.currentData() if kind == "portal" else None),
             # 下跳：**只有人工改过才带这一格**（没改 = 用起点集合的全部 ⇒ 不写文件）
             "footholds": (list(self._drop_ids)
                           if kind == "drop" and self._drop_changed() else None),
@@ -941,6 +1105,11 @@ class ZoneEditorDialog(QDialog):
         #: 不参与 `register` / 增删成员 / 写文件 / 撤销栈 ✗ —— 只影响状态行那几行字
         #: 与画布上那根绳的颜色/呼吸 ✓（见 `_pick_ladder` / `_refresh_status`）。
         self._sel_ladder = None
+        #: 「**点选着的传送点**」（存 `Portal` 对象本身；`None` = 没选）—— 用户 2026-10-06 ✓
+        #: 原话："**选中传送点后，要放大传送点的图形呼吸高亮，不然看不出来**"✓。
+        #: 与 `_sel_ladder` **完全同款**：只影响状态行 + 画布那扇门（画大 + 选中色 + 呼吸 ✓），
+        #: **不碰** `_sel` / 集合高亮 / 文件 / 撤销栈 ✗；两者**互斥**（一次只亮一样 ✓）。
+        self._sel_portal = None
         self._undo, self._redo = [], []
         self._highlight = None              # 当前高亮的集合名
         self._items = {}
@@ -1043,6 +1212,7 @@ class ZoneEditorDialog(QDialog):
         # 「看着的绳梯」同理要收掉：它用的是**同一个选中色**（`C_SEL` ✓），留着就又是
         # "两样东西一起亮" ✗（用户 2026-09-26 定的"一次只编辑一样"✓）。
         self._sel_ladder = None
+        self._sel_portal = None                 # 传送点同理（2026-10-06 ✓）
         self._commit(snap)
         self._refresh_status()
         return out
@@ -1394,8 +1564,10 @@ class ZoneEditorDialog(QDialog):
             "按数据算出**候选边**，由你逐条确认（自动只产建议，不会自己变成边）：\n"
             "  · 走（walk）：两组地形严丝合缝（§12.2 的 Δy=0 且 gap=0）；\n"
             "  · 爬（climb）：同一根绳两端各有一个集合；\n"
-            "  · 传送门**不是通行方式**（2026-09-27 已移除）；\n"
-            "  · 「另一端还没圈」也会列出来 —— 那不是边，是提示你**该圈哪块地形**。")
+            "  · 「另一端还没圈」也会列出来 —— 那不是边，是提示你**该圈哪块地形**。\n\n"
+            "⚠ **传送点（portal）给不出信任的建议**，要自己用「增加可达」加 ✗ ——\n"
+            "  「哪扇门通向哪儿」是导出数据里的 `tn`，但「值不值得用它」是玩法判断，\n"
+            "  而且**跨图的门明确不支持**（用户 2026-10-06 定）✓ 所以不自动产候选 ✓。")
         self.btn_sug.clicked.connect(self._on_suggest)
         right.addWidget(self.btn_sug)
 
@@ -1608,13 +1780,26 @@ class ZoneEditorDialog(QDialog):
             if hit or sel:
                 self._hl_items.append((it, color))
         for p in self.terrain.portals:
-            it = scene.addEllipse(p.x - 6, p.y - 6, 12, 12,
-                                  self.view._pen(C_PORTAL), QBrush(C_PORTAL))
-            it.setZValue(6)
+            # ⭐ 传送点（用户 2026-10-06 ✓ 两条要求都在这儿）：
+            #   · **名称一直标出来** ✓（原来只画个圆点，图上根本读不出是哪扇门 ✗）；
+            #   · **点选的那扇 ⇒ 画大 + 换选中色 + 呼吸** ✓（照绳梯那套 ✓ 见 `_pick_portal`）。
+            #   ⚠ 颜色必须走 `lines` 那一份（`_apply_widths` 每次缩放会按它重写笔 ✗）。
+            sel = (p is self._sel_portal)
+            color = C_SEL if sel else C_PORTAL
+            r = PORTAL_SEL_R if sel else PORTAL_R
+            it = scene.addEllipse(p.x - r, p.y - r, r * 2, r * 2,
+                                  self.view._pen(color), QBrush(color))
+            it.setZValue(7 if sel else 6)
             hit = p in hl_por
-            lines.append((it, C_PORTAL, None, hit))
-            if hit:
-                self._hl_items.append((it, C_PORTAL))
+            lines.append((it, color, None, hit or sel))
+            if hit or sel:
+                self._hl_items.append((it, color))
+            # 名字标在**右上**（圆点右上角外一点 ✓）：压在圆点/线上会读不清 ✗。
+            # ⚠ 名字**不进 `_hl_items`**（同绳梯编号那条理由 ✓）：呼吸会把字染色，而"染色"
+            #   在这儿专门表示状态；名字只需要**读得清** ✓。
+            if p.pn:
+                self._text_item(p.pn, PORTAL_PX, color,
+                                p.x + PORTAL_PX * 0.45, p.y - PORTAL_PX * 1.15)
         for lf in self.terrain.life:
             try:
                 x, y = float(lf.get("x")), float(lf.get("cy"))
@@ -1893,6 +2078,28 @@ class ZoneEditorDialog(QDialog):
         self._rebuild_scene()
         self._refresh_status()
 
+    # ⭐⭐ 传送点的点选（用户 2026-10-06 ✓ 原话："**选中传送点后，要放大传送点的图形呼吸高亮，
+    #   不然看不出来**"）—— 与绳梯那套**完全同款**（`_pick_ladder` / `_clear_ladder_sel` ✓）：
+    #   只影响显示（状态行 + 画布上那扇门 ✓），**不碰** `_sel` / 集合高亮 / 文件 / 撤销栈 ✗。
+    #   ⚠ 两样**互斥**（"一次只亮一样" ✓ 本仓库的老规矩 ✓）：点门 ⇒ 清绳；点绳 ⇒ 清门 ✓。
+    def _pick_portal(self, p):
+        """点中一扇传送点 ⇒ 记着它（状态行出信息 + 那扇门**画大 + 选中色 + 呼吸** ✓）。"""
+        self._sel_ladder = None             # 一次只亮一样（同上 ✓）
+        if self._sel_portal is p:
+            self._refresh_status()
+            return
+        self._sel_portal = p
+        self._rebuild_scene()               # 那扇门要放大 + 换色 + 呼吸 ✓
+        self._refresh_status()
+
+    def _clear_portal_sel(self):
+        """取消"点选着的传送点"（点到别处 / 框选时 ✓）；没选 ⇒ **什么都不做**（别白重建 ✗）。"""
+        if self._sel_portal is None:
+            return
+        self._sel_portal = None
+        self._rebuild_scene()
+        self._refresh_status()
+
     def _on_picked(self, what, mode):
         """视窗里的主动选择。**replace 模式（没按修饰键）会让出集合高亮**。
 
@@ -1909,15 +2116,23 @@ class ZoneEditorDialog(QDialog):
         """
         if what[0] == "click":
             _t, x, y, tol = what
-            # ⭐ **先看绳梯**（用户 2026-09-27 ✓）：⚠ 只在**没点到 foothold** 时才认它 ——
-            #   绳脚下那两条 foothold 才是这张图的主业（编辑集合 ✓），别被绳子抢走 ✗；
-            #   而且它**只用来"看信息"** ✓，不动任何选择 ✓。
+            # ⭐ **先看绳梯 / 传送点**（用户 2026-09-27 ✓ / 2026-10-06 ✓）：⚠ 只在**没点到
+            #   foothold** 时才认它们 —— 绳脚下那两条 foothold 才是这张图的主业（编辑集合 ✓），
+            #   别被绳子/门抢走 ✗；而且它们**只用来"看信息"** ✓，不动任何选择 ✓。
+            #   ⚠ 顺序：**绳梯在前**（老行为不变 ✓）；门排在它后面（两者很少叠在一起 ✓
+            #     真叠在一起时，先点的那个优先 —— 有 `_pick_*` 里的互斥收拾 ✓）。
             if pick_at(self.terrain, x, y, tol) is None:
                 L = pick_ladder(self.terrain, x, y, tol)
                 if L is not None:
+                    self._pick_portal(None)     # 一次只亮一样 ✓
                     self._pick_ladder(L)
                     return
+                p = pick_portal(self.terrain, x, y, tol)
+                if p is not None:
+                    self._pick_portal(p)
+                    return
             self._clear_ladder_sel()        # 点到别处 ⇒ 取消"看着的绳梯"（点选语义 ✓）
+            self._clear_portal_sel()        # 传送点同理 ✓
             f = pick_at(self.terrain, x, y, tol)
             if f is None:
                 if mode == "replace":
@@ -1929,6 +2144,7 @@ class ZoneEditorDialog(QDialog):
             return
         _t, rect, box_mode = what
         self._clear_ladder_sel()            # 框选是明确的编辑动作 ⇒ 取消"看着的绳梯" ✓
+        self._clear_portal_sel()            # 传送点同理 ✓
         fs = pick_in_rect(self.terrain, rect, box_mode)
         ids = [str(f.fid) for f in fs]
         if not ids and mode == "replace":
@@ -2009,6 +2225,30 @@ class ZoneEditorDialog(QDialog):
         # **点选着的绳梯**（用户 2026-09-27："点选绳梯为了快速查看它的信息" ✓）：
         # 把"它的信息"直接摆出来 —— 绳号 / 位置 / **两端各压着哪条 foothold** /
         # 那些 foothold 又属于哪些集合（这几样正是要看的 ✓，纯只读 ✓，改集合还是走 foothold ✓）。
+        # ⭐ **点选着的传送点**（用户 2026-10-06 ✓："选中传送点后要放大图形呼吸高亮"＋
+        #   他后面那条疑问"h009 是连着 h010 的…为什么写着跨图？"）：把**名字 / 坐标 /
+        #   WZ 那两个字段 / 出口是谁**都摆出来 ✓ —— 判据走修好的 `zones.portal_exit`
+        #   （**按 `tn` 在本图找** ✓ 不再看 `tm` ✗ 见那儿的说明 ✓）。
+        if self._sel_portal is not None:
+            _P = self._sel_portal
+            _ex = zones.portal_exit(self.terrain, _P.pn)
+            where += ("　｜　传送点 %s：x=%d　y=%d" % (_P.pn, round(_P.x), round(_P.y)))
+            _pt = ["点选传送点 %s（只读：不动选择集、不写文件 ✓）" % _P.pn,
+                   "  x=%d　y=%d　pt=%d（0=出生点 / 1=普通 / 2、7=小地图上的）"
+                   % (round(_P.x), round(_P.y), int(getattr(_P, "pt", 0) or 0)),
+                   "  WZ 字段：tm=%s　tn=%s" % (getattr(_P, "tm", "?"),
+                                              getattr(_P, "tn", "") or "（空）")]
+            if _ex is not None:
+                _pt.append("  ⭐ **通向**本图的 %s（x=%d　y=%d）" % (_ex.pn, _ex.x, _ex.y))
+            elif not str(getattr(_P, "tn", "") or "").strip():
+                _pt.append("  ⚠ 没配目标（WZ 里 `tn` 是空的）⇒ 这扇门**没有去向** ✓")
+            else:
+                _pt.append("  ⚠ 目标门 `%s` **不在本图** ⇒ 跨图（本功能不支持 ✗）"
+                           % getattr(_P, "tn", ""))
+            tip = (tip + "\n\n" if tip else "") + "\n".join(_pt)
+        # **点选着的绳梯**（用户 2026-09-27："点选绳梯为了快速查看它的信息" ✓）：
+        # 把"它的信息"直接摆出来 —— 绳号 / 位置 / **两端各压着哪条 foothold** /
+        # 那些 foothold 又属于哪些集合（这几样正是要看的 ✓，纯只读 ✓，改集合还是走 foothold ✓）。
         if self._sel_ladder is not None:
             _L = self._sel_ladder
             _lid = zones.ladder_ids(self.terrain).get(id(_L)) or "?"
@@ -2038,21 +2278,23 @@ class ZoneEditorDialog(QDialog):
     # ---------------- 边 ----------------
 
     def add_edge(self, src, dst, kind, ladder=None, footholds=None,
-                 walk_dir=None, mid_dir=None, mid_y=None, why=""):
+                 walk_dir=None, mid_dir=None, mid_y=None, why="", portal=None):
         """加一条边（走撤销栈）。失败**不登记撤销点**（见 _commit 的说明）。"""
         snap = self._snapshot()
         e = self.zones.add_edge(src, dst, kind, ladder=ladder,
                                 footholds=footholds, walk_dir=walk_dir,
-                                mid_dir=mid_dir, mid_y=mid_y, why=why)
+                                mid_dir=mid_dir, mid_y=mid_y, why=why,
+                                portal=portal)
         self._commit(snap)
         return e
 
     def del_edge(self, edge):
-        """删掉一条边（按 from/to/kind/portal/**ladder** 匹配，避免拿错对象）。
+        """删掉一条边（按 from/to/kind/**ladder/portal** 匹配，避免拿错对象）。
 
         ⚠ 绳号也要进判据（2026-09-27）：同一对集合、同一类型、**不同绳**是两条不同的边
           （`二楼 →(爬 L3)→ 三楼` 与 `二楼 →(爬 L7)→ 三楼`）—— 少了这一格，删其中一条
           会把**两条一起删掉** ✗（与 `core.zones.add_edge` 的去重判据必须是同一套 ✓）。
+        ⭐ **传送点的门**同理（2026-10-06 ✓）：`h009` 与 `h010` 是两条不同的边 ✓。
         """
         snap = self._snapshot()
         key = self._edge_key(edge)
@@ -2061,14 +2303,17 @@ class ZoneEditorDialog(QDialog):
 
     @staticmethod
     def _edge_key(e):
-        """边的**身份**：`(from, to, kind, ladder)`。
+        """边的**身份**：`(from, to, kind, ladder, portal)`。
 
         **一处实现**：`del_edge` / `edit_edge` 的匹配都用它 —— 各写一份必然分叉
         （`core.zones.add_edge` 的去重判据与此同义 ✓）。
-        ⚠ 原来还有 `portal` 那一格（走哪个门）—— 2026-09-27 随「传送门」一起移除 ✓。
+        ⭐ `portal` 那一格 2026-09-27 随「传送门」移除过 ✓、**2026-10-06 加回** ✓ ——
+        ⚠ 加回时**必须同时进这个身份** ✗：同一对集合、同是传送点、**不同门**（`h009` vs
+        `h010`）是**两条不同的边** ✓ —— 少了这一格，删其中一条会把**两条一起删掉** ✗、
+        改一条会改到**另一条** ✗（与 `add_edge` 的去重判据同一套 ✓）。
         """
         return (e.get("from"), e.get("to"), e.get("kind"),
-                str(e.get("ladder") or ""))
+                str(e.get("ladder") or ""), str(e.get("portal") or ""))
 
     def rev_edge(self, edge):
         """反向复制一条边 → 新边（已经有了就返回 None）。"""
@@ -2078,20 +2323,25 @@ class ZoneEditorDialog(QDialog):
         snap = self._snapshot()
         e = self.zones.add_edge(src, dst, edge.get("kind"),
                                 ladder=edge.get("ladder"),
+                                # ⭐ 传送点反向复制时**哪扇门也要跟着** ✗ —— 漏了它，
+                                #   反向那条边就没指名门 ⇒ 保存时校验会拦（说"没指定哪扇门"）
+                                #   而人会觉得"明明是照原样复制的" ✓（2026-10-06 加回 portal 时一起补 ✓）。
+                                portal=edge.get("portal"),
                                 why=(edge.get("why") or "") + "（反向复制）")
         self._commit(snap)
         return e
 
     def edit_edge(self, edge, dst, kind, ladder=None, footholds=None,
-                  walk_dir=None, mid_dir=None, mid_y=None):
-        """改一条边（**终点 / 类型 / 绳**）。失败抛 ValueError。
+                  walk_dir=None, mid_dir=None, mid_y=None, portal=None):
+        """改一条边（**终点 / 类型 / 绳 / 门**）。失败抛 ValueError。
 
-        按 `_edge_key`（from/to/kind/**ladder**）匹配（与 `del_edge` 同一套）：
+        按 `_edge_key`（from/to/kind/**ladder/portal**）匹配（与 `del_edge` 同一套）：
         列表里拿到的是 Qt 转过的**副本**，不能按对象身份找。**起点在这里不动** ——
         见 `_on_edit_edge`。
 
-        类型换了要把**不再需要的那一格删掉**：走/跳不该留着上一任的绳号。保存时的校验
-        只认当前类型，留着不至于报错，但会在下次改回"爬"时**突然复活**（那是上次的绳）。
+        类型换了要把**不再需要的那一格删掉**：走/跳不该留着上一任的绳号、也不该留着
+        上一任的门（2026-10-06 加回 portal 时一起补 ✓）。保存时的校验只认当前类型，
+        留着不至于报错，但会在下次改回"爬"/"传送点"时**突然复活**（那是上次的绳/门）。
         """
         snap = self._snapshot()
         key = self._edge_key(edge)
@@ -2110,17 +2360,20 @@ class ZoneEditorDialog(QDialog):
         for e in self.zones.edges:
             if e is hit:
                 continue
-            # 「改成和另一条一模一样」才算重复：**绳号不同不算**（那是两条不同的边 ✓）
+            # 「改成和另一条一模一样」才算重复：**绳号/门不同不算**（那是两条不同的边 ✓）
             if (e.get("from") == hit.get("from") and e.get("to") == dst
                     and e.get("kind") == kind
-                    and str(e.get("ladder") or "") == str(ladder or "")):
+                    and str(e.get("ladder") or "") == str(ladder or "")
+                    and str(e.get("portal") or "") == str(portal or "")):
                 raise ValueError("已经有一条一样的了（%s → %s，%s%s）—— 不用改。"
                                  % (hit.get("from"), dst,
                                     zones.kind_label(kind),
-                                    ("　%s" % ladder) if ladder else ""))
+                                    ("　%s" % (ladder or portal)) if (ladder or portal) else ""))
         hit["to"] = dst
         hit["kind"] = kind
-        for k, v in (("ladder", ladder),):
+        # ⚠ `portal` 与 `ladder` **同一套写法**：给了就存、没给（None / 空）就**删掉** ✓ ——
+        #   类型从「传送点」换成别的时，旧门名必须消失 ✗（不然下次换回"传送点"会**突然复活** ✓）。
+        for k, v in (("ladder", ladder), ("portal", portal)):
             if v:
                 hit[k] = str(v)
             else:
@@ -2365,6 +2618,53 @@ class ZoneEditorDialog(QDialog):
                 for L in zones.ladders_touching(self.terrain,
                                                 self.zones.sets[src]["footholds"])]
 
+    def _all_ladder_choices(self):
+        """**本图全部**绳 → `[(绳号, 那行字)]`（用户 2026-10-06 ✓ "加全部勾选" 用 ✓）。
+
+        行里**不**带"有没有关系"的标记 ✓ —— 那件事由弹窗按 `self._lad_rel` 判 ✓
+        （一处口径：`AddReachDialog._fill_lad` ✓ 别在两边各写一份"算不算相关" ✗）。
+        ⚠ 排序照 `_reach_ladder_choices` 同款（绳号**自然序** ✓ 弹窗那边也会再排一次 ✓）。
+        """
+        lids = zones.ladder_ids(self.terrain)
+        return [(lids.get(id(L), "?"),
+                 "%s  x=%d  y[%d..%d]  %s"
+                 % (lids.get(id(L), "?"), L.x, min(L.y1, L.y2), max(L.y1, L.y2),
+                    "绳子" if L.l else "梯子"))
+                for L in (getattr(self.terrain, "ladders", None) or [])]
+
+    def _portal_row(self, p):
+        """一个传送点 → 「增加可达」下拉里那行字（2026-10-06 ✓）。
+
+        ⭐ **能走到哪儿就写在行里** ✓（用户那条口径："我们应该能知道这个传送点通向哪里" ✓）：
+        同图门写出**出口门名 + 坐标** ✓；跨图 / 落点查不到的**当场说清为什么** ✗
+        （别让人选了个跑不通的门，等运行时才发现 ✓）。
+        """
+        ex = zones.portal_exit(self.terrain, p.pn)
+        if ex is not None:
+            return ("%s  x=%d y=%d　→ 出口 %s(x=%d y=%d)"
+                    % (p.pn, p.x, p.y, ex.pn, ex.x, ex.y))
+        if int(getattr(p, "tm", 0) or 0) != 999999999:
+            return ("%s  x=%d y=%d　⚠ 跨图（tm=%s）—— **不支持**（只给得到目标地图号）"
+                    % (p.pn, p.x, p.y, getattr(p, "tm", "?")))
+        return ("%s  x=%d y=%d　⚠ 落点查不到（tn=%r 在本图里没有那扇门）"
+                % (p.pn, p.x, p.y, getattr(p, "tn", "") or ""))
+
+    def _reach_portal_choices(self, src):
+        """「走哪扇门」的候选 → [(门名, 界面上那行字)]，给「增加可达」那个弹窗用。
+
+        用 `zones.portals_of`（落在**起点集合**包围盒 ±`ATTACH_PAD` 内的门 ✓）：这里问的是
+        "从我这一层够得着哪扇门" ✓ —— 够不着的由弹窗的「全部」勾选放开 ✓（同绳那条 ✓）。
+        ⚠ 与绳那条**同一套写法**（默认收窄 + 全部放开 + 无关的标出来 ✓）—— 见 `_fill_gate` ✓。
+        """
+        return [(str(p.pn), self._portal_row(p))
+                for p in zones.portals_of(self.terrain,
+                                          self.zones.sets[src]["footholds"])]
+
+    def _all_portal_choices(self):
+        """**本图全部**门 → `[(门名, 那行字)]`（"全部"勾选用 ✓ 用户 2026-10-06 ✓）。"""
+        return [(str(p.pn), self._portal_row(p))
+                for p in (getattr(self.terrain, "portals", None) or [])]
+
     def _open_reach(self, dlg, key):
         """开「增加 / 编辑可达」窗口：**非模态 + 单实例**（2026-09-26 用户要求）。
 
@@ -2414,7 +2714,10 @@ class ZoneEditorDialog(QDialog):
                                    footholds=r.get("footholds"),
                                    walk_dir=r.get("dir"),
                                    mid_dir=r.get("mid_dir"),
-                                   mid_y=r.get("mid_y"))
+                                   mid_y=r.get("mid_y"),
+                                   # ⭐ 走哪扇门（2026-10-06 ✓）：和 `ladder` 同一层 —— 漏传
+                                   #   就等于"编辑时把门弄丢了"（保存后校验会拦 ✓ 但人会觉得莫名 ✓）。
+                                   portal=r.get("portal"))
             else:
                 n0 = len(self.zones.edges)
                 e = self.add_edge(dlg.src, r["dst"], r["kind"], ladder=r["ladder"],
@@ -2422,6 +2725,7 @@ class ZoneEditorDialog(QDialog):
                                   walk_dir=r.get("dir"),
                                   mid_dir=r.get("mid_dir"),
                                   mid_y=r.get("mid_y"),
+                                  portal=r.get("portal"),
                                   why="手工加的（%s → %s）" % (dlg.src, r["dst"]))
                 if len(self.zones.edges) == n0:
                     extra = str(e.get("ladder") or e.get("portal") or "")
@@ -2502,6 +2806,14 @@ class ZoneEditorDialog(QDialog):
         lads = self._reach_ladder_choices(src)
         dlg = AddReachDialog(self, src, others, self._related_sets(src),
                              ladders=lads,
+                             # ⭐ 本图**全部**绳（用户 2026-10-06 ✓ "加全部勾选"）——
+                             #   勾上就能选到与起点集合**无关**的那些（行里会标出来 ✓）
+                             all_ladders=self._all_ladder_choices(),
+                             # ⭐ 门：与起点集合有关的 / 本图全部（2026-10-06 ✓ 同绳那套 ✓）
+                             #   ⚠ 「全部」里会把**跨图**的门也列出来（行里标"不支持" ✓）——
+                             #     列出来才说得清"这张图有哪些门"，标出来才不至于让人选错 ✓。
+                             portals=self._reach_portal_choices(src),
+                             all_portals=self._all_portal_choices(),
                              drop_choices=self._drop_choices(src))
         # **非模态 + 单实例**（见 _open_reach）：同一个起点再点一次 ⇒ 只聚焦，不新开
         self._open_reach(dlg, ("add", src))
@@ -2546,6 +2858,14 @@ class ZoneEditorDialog(QDialog):
         lads = self._reach_ladder_choices(src)
         dlg = AddReachDialog(self, src, others, self._related_sets(src),
                              ladders=lads,
+                             # ⭐ 本图**全部**绳（用户 2026-10-06 ✓ "加全部勾选"）——
+                             #   勾上就能选到与起点集合**无关**的那些（行里会标出来 ✓）
+                             all_ladders=self._all_ladder_choices(),
+                             # ⭐ 门：与起点集合有关的 / 本图全部（2026-10-06 ✓ 同绳那套 ✓）
+                             #   ⚠ 「全部」里会把**跨图**的门也列出来（行里标"不支持" ✓）——
+                             #     列出来才说得清"这张图有哪些门"，标出来才不至于让人选错 ✓。
+                             portals=self._reach_portal_choices(src),
+                             all_portals=self._all_portal_choices(),
                              drop_choices=self._drop_choices(src), init=e)
         dlg.mode = "edit"
         dlg.edge = e
@@ -2643,6 +2963,7 @@ class ZoneEditorDialog(QDialog):
         if name:
             self._sel = set()
             self._sel_ladder = None         # 同上：别让"看着的绳梯"和集合高亮一起亮 ✓
+            self._sel_portal = None         # 传送点同理（2026-10-06 ✓）
         self._rebuild_scene()
         self._refresh_status()
         self._refresh_edges()       # 焦点变了 ⇒ 可达列表跟着收窄/放开

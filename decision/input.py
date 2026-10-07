@@ -8,6 +8,7 @@ GetAsyncKeyState 有效（大多数 ARPG）；个别用 DirectInput 读扫描码
 """
 
 import ctypes
+import os
 import threading
 import time
 from ctypes import wintypes
@@ -74,6 +75,10 @@ DEFAULT_KEYMAP = {
     "down": "down",     # 移动↓
     "attack": "ctrl",   # 输出（攻击）
     "jump": "alt",      # 跳跃
+    #: ⭐ 「拾取」（用户 2026-10-06 ✓）：**只给「战斗参数 → 自动拾取」用** ✓（那个开关开了
+    #:   才会被点按 ✓）。默认 `"z"` = 这类游戏的常见拾取键 ✓ —— 不对就在
+    #:   「键盘映射」组里点一下那个按钮、再按你游戏里的拾取键（Esc 取消 ✓）。
+    "pickup": "z",      # 拾取（自动拾取）
     "hp_pot": None,     # 补血（自动喝药）
     "mp_pot": None,     # 补蓝（自动喝药）
     "feed_pet": None,   # 喂宠
@@ -260,6 +265,99 @@ _blocked = False
 # use_network（同一线程重入），普通 Lock 会把自己锁死。
 _link_rlock = threading.RLock()
 
+# ---- ⭐⭐ 「离屏（自检 / 冒烟）**绝不连被控机**」的唯一闸（用户 2026-10-05 ✓ 治根）----
+#: 显式"我就是要连"（专门的链路自检 `tools/selftest_link.py`、无头部署那种场合 ✓）
+_ALLOW_NET_ENV = "PSIMU_ALLOW_NET"
+#: 闸关着时的留痕标记（同一 kind 只记一次，别刷爆日志 ✗ 见 `_note_net_skip`）
+_net_skip_kind = None
+
+
+def net_allowed():
+    """这条进程**允不允许**去连被控机（远端 relay / 串口硬件键盘）。
+
+    ⭐⭐ 为什么要有它（用户 2026-10-05 ✓ 原话："**从源头彻底封死**"）：
+      病根是**打桩打在了用例里、而且只打了一个套件** ✗ —— 原来只有
+      `tools/selftest_main_window._win()` 在 monkeypatch 面板方法 ✓，而
+      `gui_smoke` / `selftest_minimap` / `selftest_screen_state` / `selftest_decision`
+      里那几个 `PlayerPanel()` **都没打** ✗ ⇒ 只要项目配置是 `input_device: remote`
+      （`config/decision.json` 与好几个项目就是 ✓）它们照样起那条**后台连接线程** ✗
+      ⇒ 线程在**几秒后**才超时返回，而那时用例早跑完、Qt 对象已销毁 ⇒
+      **偶发原生崩 `0xC0000005`** ✗（时机性 ⇒ "多跑几次"不算验证 ✗）。
+
+    判据（先显式、后推断 ✓；**每次都读环境**，不缓存 ✓ 用例要能当场摆判据）：
+      · `PSIMU_ALLOW_NET=1` ⇒ **一律允许**（`tools/selftest_link.py` 这种"就是要连"的 ✓）；
+      · 否则 `QT_QPA_PLATFORM=offscreen` ⇒ **不允许**：离屏 = 没人看得见画面，此时去连被控机
+        **只可能**是自检 / 冒烟在跑（~20 个套件 + `gui_smoke` 都用它 ✓）；
+      · 其余（正常工作台 / **部署台**，真平台）⇒ 允许 ✓ —— `deploy/` 侧不设 offscreen（已核 ✓）。
+
+    ⚠ 只管一件事：**连不连被控机**。本地 SendInput 那条路不归它管 ✓。
+    """
+    if str(os.environ.get(_ALLOW_NET_ENV, "")).strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    return str(os.environ.get("QT_QPA_PLATFORM", "")).strip().lower() != "offscreen"
+
+
+def _note_net_skip(kind):
+    """留痕：闸关着、**没去连**（不许静默 ✗）—— 同一 kind 只记一次 ✓。"""
+    global _net_skip_kind
+    if _net_skip_kind != kind:
+        _net_skip_kind = kind
+        try:
+            perf.count("net_skip_" + str(kind or "?"))
+        except Exception:                       # noqa: BLE001 —— 打点坏了别影响行为 ✗
+            pass
+
+
+def use_blocked(why=""):
+    """切到「**什么都不发**」的后端（`_blocked` ✓）：连不上被控机时**绝不能**退化成把按键
+    打到控制机上（控制机正是人在用的机器 ✗ —— 老口径见 `_blocked` 的说明 ✓）。
+
+    ⭐ 新用途（用户 2026-10-05 ✓）：闸关着（离屏自检 / 显式关闸 ✓）时走这儿 ——
+      **不连、也不发**（比"退化成本地"安全 ✓ 也比"静默"诚实 ✓）。
+    """
+    global _blocked
+    with _link_rlock:
+        _drop_remote()
+        _blocked = True
+        _note_net_skip(why or "blocked")
+
+
+def connect_async(kind, on_done=None, **kw):
+    """按 `kind` 起一条**后台连接线程**（GUI 用，`PlayerPanel._apply_input_device` 调它）。
+
+    ⚠⭐ **全仓库唯一**去连被控机的地方（原来那两处 `threading.Thread(...)` 在面板里 ✗）——
+      用户 2026-10-05 要求"从源头彻底封死"：**线程的出生地和闸放同一处** ✓ ⇒ 谁调都绕不过去 ✓。
+
+    闸关着（离屏自检 / `PSIMU_ALLOW_NET` 没开 ✓ 见 `net_allowed`）⇒ **连线程都不起** ✓
+    （**不是**"起一条马上返回"✗ —— 那样它仍可能在解释器收尾时活着 ✗ 正是要治的病 ✓）
+    ＋ 转 `use_blocked`（什么都不发 ✓）。
+
+    返回 `True` = 起了线程；`False` = **没起**（`on_done` 也不会被叫 ✓ 调用方自己给提示 ✓）。
+
+    `on_done(status)` 在**后台线程**里被叫：`"ok"` / `"fail"` —— 回调里碰 Qt 对象必须自己兜
+    `RuntimeError`（窗口可能已经销毁 ✓ 见 `PlayerPanel._on_device_connected` ✓）。
+    """
+    if not net_allowed():
+        use_blocked(str(kind))
+        return False
+
+    def _run():
+        status = "ok"
+        try:
+            if kind == "serial":
+                use_serial(kw.get("port"))
+            else:
+                use_network(kw.get("host"), kw.get("port"), kw.get("cert"))
+        except Exception:                       # noqa: BLE001 —— 连不上是常态（对面没开机 ✓）
+            status = "fail"
+        if on_done is not None:
+            on_done(status)
+
+    threading.Thread(target=_run, daemon=True,
+                     name="input-connect-%s" % kind).start()
+    return True
+
+
 _CMD_KEY = {
     "left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN",
     "ctrl": "CTRL", "alt": "ALT", "shift": "SHIFT",
@@ -350,8 +448,14 @@ def reconnect_remote():
 
     重连失败**不会**退化成本机 SendInput（那会把按键打到控制机上），而是进入
     _blocked：什么都不发，等下次重连成功。
+
+    ⚠ 闸关着（离屏自检 / `PSIMU_ALLOW_NET` 没开 ✓ 见 `net_allowed`）⇒ **不重连**、
+      直接转"什么都不发"并返回 `False`（"通道不可用"是**实话** ✓ 别报 True 骗上层 ✗）。
     """
     global _remote, _blocked
+    if not net_allowed():
+        use_blocked("retry")
+        return False
     with _link_rlock:               # 与其它换后端的调用串行（见 _link_rlock 说明）
         if _remote is None or _cfg is None:
             _blocked = False
@@ -468,6 +572,136 @@ def mouse_available():
     return _remote is not None
 
 
+# ---- ⭐⭐ 指针跟踪：触控板位移的**产生**侧（用户 2026-10-05 ✓ 原话："直接2"）----
+#
+# **为什么要这一块**：触控板的位移原来只在 `TouchPad.mouseMoveEvent` 里产生 ✗（Qt 的
+#   move 事件 ⇒ 跑在 GUI 主线程上）—— 主线程一被重绘 / 主回路拖住，Qt 就会把连续移动
+#   **合并**成一次。实测（`perf.log` 2026-10-05 18:40 那段，按 F10 滑了两下）：
+#     `move_gap_ms` 中位 20 / p95 76 / p99 201 / **最大 467 ms**
+#     `move_px`                             **最大 514**（一次跳半个屏幕 ✓）
+#   ⇒ A 机看到的就是"停一下、猛跳一下" ✓；而同一段里 `send_ms` 中位才 **0.15 ms**、
+#   `kbd_pending` 最大 4 ⇒ **瓶颈既不在链路也不在发送，在位移的产生** ✓
+#   （发送那条早已挪出主线程 ✓ 见 `gui/player_panel.py::_PadSender`）。
+# ⇒ 现在由下面这条**独立线程**按固定节拍读系统指针、算位移 ⇒ 节拍只受"线程能不能被调度"
+#   影响，与 GUI 卡不卡无关 ✓。
+
+#: 轮询节拍（秒）：250 Hz（比触控板本身的事件率还高 ⇒ 不丢节拍 ✓）。
+#: ⚠ 能不能真的到 4 ms 取决于**系统定时器精度**：Windows 默认 ~15.6 ms ⇒ 实际约 64 Hz，
+#:   但**仍然均匀** ✓ —— 而"均匀"正是要害（用户要的不是"更快"，是"别一顿一顿" ✓）。
+#:   本仓库只在 `core/winperf.py` **一处**声明精度（工作台启动时按「性能保活」设置应用 ✓，
+#:   实测见 `tools/selftest_winperf.py` ✓）⇒ **这里绝不自己再调 `timeBeginPeriod`** ✗
+#:   （同一件事只该有一处实现 ✓）。实际节奏看打点 **`pad_poll_gap_ms`** ✓。
+TRACK_INTERVAL_S = 0.004
+
+
+def pointer_pos():
+    """当前指针位置（**物理像素**，Win32 屏幕坐标 ✓）；读不到返回 None ✓。"""
+    try:
+        pt = wintypes.POINT()
+        if _user32.GetCursorPos(ctypes.byref(pt)):
+            return (int(pt.x), int(pt.y))
+    except Exception:                   # noqa: BLE001 —— 读不到就当"这拍没数据"✓ 不炸 ✓
+        pass
+    return None
+
+
+def pointer_warp(x, y):
+    """把指针摆到 (x, y)（**物理像素** ✓）。返回是否成功 ✓。
+
+    ⚠ **会失败，而且是"无声失败"**：本机实测（2026-10-05）在**锁屏 / 非交互桌面**下
+      `SetCursorPos` 返回 0、指针纹丝不动，而 `GetLastError` **还是 0** ✗（查不出原因 ✓）
+      —— 这不是缺陷，是桌面的规矩 ✓。所以调用方必须**按返回值行事**、不能想当然 ✓
+      （`PointerTracker` 因此用 `pos - 上一次` 算位移 ✓：拨回成不成功都不影响位移正确 ✓）。
+    """
+    try:
+        return bool(_user32.SetCursorPos(int(x), int(y)))
+    except Exception:                   # noqa: BLE001
+        return False
+
+
+class PointerTracker:
+    """⭐ 按**固定节拍**轮询系统指针、算位移的线程（用户 2026-10-05 ✓ "直接2"）。
+
+    它干的活（每拍）：读位置 → 减掉**上一次读到的位置**得位移 → 位移非零就
+      `on_delta(dx, dy)` → 把指针 `SetCursorPos` 拨回钉点（钉点 = 进触控模式时的板心 ✓）。
+
+    ⚠⚠ 三条纪律（违反了就是另一个 bug ✗）：
+      · **只用 Win32**（`GetCursorPos` / `SetCursorPos`）—— **绝不碰 Qt** ✗：
+        `QCursor.setPos()` 只许在 GUI 线程调，而这条线程不是 ✓；
+      · `on_delta` **在这条线程里被调** ⇒ 回调只许做线程安全的事（加法 / 入队 / 置事件 ✓），
+        **绝不许碰界面** ✗ —— 要通知界面就走 Qt 信号（那是排队的 ✓ 见 `gui/touchpad.py`）；
+      · 位移用 **`pos - 上一次`**，**不是** `pos - 钉点` ✗ —— 后者在"拨回失败 / 指针被别的
+        东西挪走"那一下会**算出一大跳**（而且之后一路算 0 ✗）；前者不管拨回成不成功，
+        都只算"这一拍真的动了多少" ✓。
+
+    ⚠ 钉点是**物理像素**（`GetCursorPos` 的原生坐标 ✓）⇒ 高分屏下与 Qt 的逻辑坐标差一个
+      比例 ⇒ 位移由调用方除回去（`scale` ✓ = `devicePixelRatio` ✓）；钉点本身不用换算 ✓
+      （它来自 `GetCursorPos` 自己 ✓）。
+    """
+
+    def __init__(self, ref, on_delta, scale=1.0, interval=TRACK_INTERVAL_S):
+        self.ref = (int(ref[0]), int(ref[1]))
+        self.on_delta = on_delta
+        self.scale = max(1e-6, float(scale))
+        self.interval = max(0.001, float(interval))
+        self.n_poll = 0          # 轮询拍数（自检/诊断用 ✓）
+        self.n_delta = 0         # 其中有位移的拍数 ✓
+        self._stop = False
+        self._th = None
+
+    def start(self):
+        """起线程。返回 True/False：`GetCursorPos` 读不到 ⇒ False（调用方自己给提示 ✓）。"""
+        if pointer_pos() is None:
+            return False
+        self._th = threading.Thread(target=self._run, daemon=True, name="pad-track")
+        self._th.start()
+        return True
+
+    def stop(self, timeout=0.3):
+        """收工：置停止 + **等线程真的退出**（别留一条守护线程在后台摸指针 ✗）。"""
+        self._stop = True
+        th = self._th
+        self._th = None
+        if th is not None:
+            th.join(timeout)             # 一拍之内必退（interval 只有几 ms ✓）
+
+    def _run(self):
+        last = None                      # 上一次读到的位置（`pos - last` ✓ 见纪律第三条）
+        last_t = None
+        while not self._stop:
+            pos = pointer_pos()
+            if pos is not None:
+                now = time.perf_counter()
+                if last_t is not None:
+                    perf.sample("pad_poll_gap_ms", (now - last_t) * 1000.0)
+                last_t = now
+                self.n_poll += 1
+                if last is not None:
+                    dx = pos[0] - last[0]
+                    dy = pos[1] - last[1]
+                    if dx or dy:
+                        self.n_delta += 1
+                        perf.sample("pad_poll_px",
+                                    (abs(dx) + abs(dy)) / self.scale)
+                        try:
+                            self.on_delta(dx / self.scale, dy / self.scale)
+                        except Exception:       # noqa: BLE001 —— 回调坏了别把跟踪线程弄死 ✗
+                            pass
+                        # ⚠⚠ 拨回成功 ⇒ **指针此刻就在钉点** ⇒ `last` 必须跟着改成钉点 ✗：
+                        #   不改，下一拍就会把"**我们自己拨回去**"读成一次**反向位移** ✗
+                        #   （(-dx,-dy) ⇒ 远程鼠标每拍抖一下 ✓ 实测就是这么抓出来的 ✓
+                        #    用例里假指针会立刻跟到钉点 ✓ 所以它是**确定的红**、不是碰运气 ✓）。
+                        # ⚠ 拨回可能失败（锁屏 / 非交互桌面：返回 0 且 `GetLastError` 也是 0 ✓
+                        #   见 `pointer_warp` 的说明 ✓）—— **失败不算错**（位移照旧正确 ✓ 因为
+                        #   用的是 `pos - 上一次` ✓），但要**留痕**：否则"指针跑掉了"查不出来 ✗
+                        if pointer_warp(self.ref[0], self.ref[1]):
+                            pos = self.ref
+                        else:
+                            perf.count("pad_warp_fail")
+                last = pos
+            time.sleep(self.interval)
+
+
 def _drop_remote():
     """关闭当前远程/串口后端（socket / 串口不泄漏），切到别的后端前调用。"""
     global _remote
@@ -484,8 +718,15 @@ def use_network(host, port, cafile):
 
     拿锁期间会做完整的 TLS 握手（可能要几秒）—— 这是故意的：握手和「关旧连接」
     必须互斥，否则会互相打断（见 _link_rlock 的说明）。
+
+    ⚠⭐ 闸关着（离屏自检 / `PSIMU_ALLOW_NET` 没开 ✓ 见 `net_allowed`）⇒ **一个 socket
+      都不建**、直接转"什么都不发"（`use_blocked` ✓）—— 这条是**兜底**：正常 GUI 走
+      `connect_async`（它自己先问闸 ✓，连线程都不起 ✓）。
     """
     global _remote, _cfg, _blocked
+    if not net_allowed():
+        use_blocked("remote")
+        return
     with _link_rlock:
         _drop_remote()
         from remote_kbd.kbd_client import KbdClient
@@ -498,8 +739,14 @@ def use_serial(port):
     """切到本地直连 Pro Micro（USB CDC 串口），无需 relay。
 
     port 为空或打开失败时，自动扫描 Arduino/SparkFun 串口（换 USB 口不用改配置）。
+
+    ⚠⭐ 闸关着（离屏自检 / `PSIMU_ALLOW_NET` 没开 ✓ 见 `net_allowed`）⇒ **串口也不开**、
+      直接转"什么都不发"（`use_blocked` ✓）—— 同 `use_network`：谁直接调都绕不过去 ✓。
     """
     global _remote, _cfg, _blocked
+    if not net_allowed():
+        use_blocked("serial")
+        return
     with _link_rlock:
         _drop_remote()
         from remote_kbd.serial_kbd import SerialKbd, find_pro_micro_port

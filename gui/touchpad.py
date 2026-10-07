@@ -20,17 +20,37 @@
     改成 F10 开关：本地一个键、只走本窗口的按键事件，不经过任何转发路径
     （F10 也在 `decision/input.py` 的「本机操作键」名单里，永不发给游戏）。
 
+实现要点 —— **位移由跟踪线程按固定节拍产生**：
+    ⭐⭐ 2026-10-05（用户原话："B机F10控制A机鼠标，A机的鼠标移动不连续" ⇒ 选"直接②" ✓）：
+    位移**不再由 Qt 的 move 事件产生** ✗ —— 那跑在 GUI 主线程上，主线程一被重绘 /
+    主回路拖住，Qt 就把连续移动**合并**成一次 ⇒ 实测（`perf.log` 18:40 那段）
+    `move_gap_ms` 最大 **467 ms**、`move_px` 最大 **514** ⇒ "停一下、猛跳一下" ✓
+    （而同一段 `send_ms` 中位才 **0.15 ms** ⇒ 瓶颈不在发送 ✓）。
+    现在：`decision/input.py::PointerTracker` 起一条**独立线程**，按固定节拍
+    （`TRACK_INTERVAL_S` ✓）`GetCursorPos` 算位移、再把指针 `SetCursorPos` 拨回钉点
+    ⇒ 节拍只受"线程能不能被调度"影响，与 GUI 卡不卡无关 ✓。
+
+    位移的**去向**分两路（这是本模块最要紧的一处口径 ✓）：
+      · **要发出去的那部分**走 `set_delta_sink`（面板接它直接喂发送器 ✓）——
+        **在跟踪线程里同步调**，不经 Qt 事件循环 ✓✓（这是"均匀"的全部保证 ✓）；
+      · `moved` 信号（Qt 排队投递 ⇒ 回到 GUI 线程 ✓）只给**拖拽阈值**这类判定用 ✓
+        —— 它晚几毫秒到没关系（判的是累计距离 ✓），位移本身一个像素都不会少 ✓。
+
 实现要点 —— **光标钉住（warp）**：
     本地鼠标在屏幕上是有限的，滑到边缘就滑不动了。进入触控模式时把光标挪到
-    板子中心并记下位置，之后每次拿到位移就 `QCursor.setPos()` 复位回原点，
+    板子中心并记下位置，之后每一拍（跟踪线程 ✓）把指针 `SetCursorPos` 拨回原点，
     等于一块「无限大的触控板」；同时光标视觉上停在板子上，正好符合「鼠标指着
     这块板」，点击 / 滚轮也都发生在这一小块区域内，不会因为光标跑远而点丢。
 
     先挪到**中心**是为了四个方向都有余量：F10 是随时按的，光标原本可能就在
-    屏幕最边上，往那一侧滑就没反应了。
+    屏幕最边上，往那一侧滑就没反应了。⚠ 现在每 4 ms 就拨回一次（原来只在
+    "下一个事件到来时"拨 ✗）⇒ 手指能跑出去的空间**极小** ✓ ⇒ 屏幕边缘那点
+    限制基本不可能碰到 ✓。
 
 信号：
-    moved(dx, dy)   —— 原始位移（未乘灵敏度），由调用方决定映射比例
+    moved(dx, dy)   —— 原始位移（**未乘灵敏度、浮点** ✓）：**由跟踪线程发出** ⇒ 连接方
+                       拿到的是排队投递（在 GUI 线程执行 ✓）；只给"拖拽阈值"这类判定用 ✓。
+                       真正要发出去的位移走 `set_delta_sink`（不经 Qt ✓ 见上）。
     clicked(btn)    —— 点击（"left" / "right" / "middle"）：按一下没怎么动就松开
     pressed(btn)    —— 按住不放（拖拽开始）：按下后滑动超过阈值
     released(btn)   —— 松开拖拽中的按钮
@@ -49,7 +69,7 @@ class TouchPad(QWidget):
     #: 按下后滑动超过这么多像素才算「拖拽」（否则松开当点击）—— 真实触控板也是这个逻辑
     HOLD_PX = 4
 
-    moved = pyqtSignal(int, int)
+    moved = pyqtSignal(float, float)
     clicked = pyqtSignal(str)     # 点击："left" / "right" / "middle"
     pressed = pyqtSignal(str)     # 按住不放（拖拽开始）
     released = pyqtSignal(str)    # 松开拖拽中的按钮
@@ -69,16 +89,33 @@ class TouchPad(QWidget):
             "用 F10 而不是按住 Ctrl：Ctrl 是默认攻击键，按住它会打出去。")
         self._enabled = True
         self._active = False
-        self._ref = None          # 光标原点（全局坐标）
-        self._warping = False     # 标记「下一次 move 是 warp 触发的」，要跳过
+        self._ref = None          # 光标钉点（**物理像素** ✓ 由 GetCursorPos 读回 ✓ 见 _start_track）
         self._wheel_rem = 0       # 滚轮余数：触摸板会给出不足一格（120）的增量
+        # ⭐⭐ 位移的**产生**：跟踪线程 + 它的实时出口（用户 2026-10-05 ✓ "直接②" ✓ 见模块文档）
+        self._tracker = None      # `decision.input.PointerTracker`（没进触控模式时为 None ✓）
+        self._delta_sink = None   # 面板接的出口（**在跟踪线程里被调** ✓ 只许线程安全的事 ✓）
+        self._track_fail = False  # 跟踪线程起不来（界面会说清 ✓ 别静默 ✗）
         # 拖拽状态：按下先不发，滑动超过 HOLD_PX 那一刻才补发 PRESS
         self._down = None         # 按着没松的按钮名（还没进入拖拽）
         self._dragging = False    # 已经发过 PRESS，松开时要发 RELEASE
         self._drag_moved = 0.0    # 按下之后累计走了多少像素（判阈值用）
         self._drag_btn = None     # 拖拽中的按钮名
+        # `moved` **由跟踪线程发出** ⇒ 这里自己再收一份（排队投递 ⇒ 回到 GUI 线程 ✓）
+        # 只用来判拖拽阈值 ✓（真发送走 `_delta_sink` ✓ 见 `_on_tracked`）
+        self.moved.connect(self._note_drag_move)
 
     # ---------------- 对外 ----------------
+
+    def set_delta_sink(self, fn):
+        """接上位移的**实时出口**（面板调 ✓）：`fn(dx, dy)` —— **在跟踪线程里被同步调** ✓。
+
+        为什么要这么个口子（而不是用 `moved` 信号）：信号是**排队**投递的 ⇒ 回到 GUI 线程
+        执行 ⇒ 又会排在重绘 / 主回路后面 ✗ —— 那正是"位移的节拍挂在主线程上"的老毛病 ✓
+        （用户 2026-10-05 ✓ 见模块文档）。所以"要发出去的位移"必须由跟踪线程**直接**交出去 ✓。
+
+        ⚠ `fn` 只许做线程安全的事（加法 / 入队 / 置事件 ✓）；碰界面一律走 `moved` 信号 ✓。
+        """
+        self._delta_sink = fn
 
     def set_capture_enabled(self, on):
         """ProMicro 未连接时禁用（本地模式没有硬件鼠标）。"""
@@ -114,10 +151,12 @@ class TouchPad(QWidget):
         self._wheel_rem = 0
         self._forget_press()
         # 光标挪到板子中心再钉住：四个方向都留出滑动余量（见模块文档）
+        # ⚠ 这一次 `setPos` 必须走 Qt（GUI 线程 ✓）；之后每一拍由**跟踪线程**用
+        #   `SetCursorPos` 拨回（非 GUI 线程不能用 `QCursor` ✗ 见 `PointerTracker` 的纪律 ✓）
         self._ref = self.mapToGlobal(self.rect().center())
-        self._warping = True           # 这次 setPos 会带回一个 move 事件，忽略掉
         QCursor.setPos(self._ref)
         self.grabMouse()               # 捕获鼠标：滑出方块也能继续收到事件
+        self._start_track()            # ⭐ 位移的产生交给跟踪线程（见模块文档 ✓）
         self.active_changed.emit(True)
         self.update()
 
@@ -130,12 +169,12 @@ class TouchPad(QWidget):
         self._end_drag()
         self._forget_press()
         self._active = False
+        self._stop_track()             # ⭐ 先收掉跟踪线程（别让它继续摸指针 ✗ 见模块文档）
         try:
             self.releaseMouse()
         except Exception:
             pass
         self._ref = None
-        self._warping = False
         self._wheel_rem = 0
         self.active_changed.emit(False)
         self.update()
@@ -152,29 +191,90 @@ class TouchPad(QWidget):
         self._drag_moved = 0.0
         self._drag_btn = None
 
+    # ---------------- 位移的产生（跟踪线程，见模块文档） ----------------
+
+    def _start_track(self):
+        """起**指针跟踪线程**（位移从这儿来 ✓）：钉点用 `GetCursorPos` 读回**物理像素** ✓。
+
+        ⚠ 必须在 `QCursor.setPos(板心)` **之后**读：这样钉点是物理像素，高分屏下不用换算 ✓
+          （位移由 `PointerTracker` 按 `scale=devicePixelRatio` 除回逻辑像素 ✓）；
+          起不来就 `_track_fail`（界面会说清 ✓ 别静默 —— 静默的后果是"板子像坏的"✗）。
+        """
+        from decision import input as dinput
+
+        self._stop_track()                          # 幂等（重复激活不会漏掉旧线程 ✓）
+        pos = dinput.pointer_pos()
+        t = None
+        if pos is not None:
+            t = dinput.PointerTracker(
+                pos, self._on_tracked,
+                scale=max(1e-6, float(self.devicePixelRatioF() or 1.0)))
+            if not t.start():
+                t = None
+        self._tracker = t
+        self._track_fail = t is None
+        if self._track_fail:
+            try:
+                from core import perf
+                perf.count("pad_track_fail")        # 记一笔：这条功能没在工作 ✓
+            except Exception:                       # noqa: BLE001 —— 打点坏了别影响行为 ✗
+                pass
+
+    def _stop_track(self):
+        """收工：停跟踪线程 + **等它真的退出**（别留一条守护线程在后台摸指针 ✗）。"""
+        t = self._tracker
+        self._tracker = None
+        if t is not None:
+            t.stop()
+
+    def _on_tracked(self, dx, dy):
+        """跟踪线程每拍的回调 —— **在跟踪线程里执行** ✗⏰ ⇒ 只做两件线程安全的事：
+
+        ① 位移交给**实时出口**（`set_delta_sink` ✓）：面板接它直接喂发送器 ⇒
+           **不经 Qt 事件循环** ✓✓（"GUI 卡不卡都均匀"的全部保证 ✓）；
+        ② `moved` 信号（Qt 排队投递 ⇒ 回到 GUI 线程 ✓）：只给拖拽阈值这类判定用 ✓。
+
+        ⚠ 这里**绝对不许碰界面** ✗（`self.xxx.setText()` / `QCursor` / `update()` 都不行 ✓）——
+          非 GUI 线程碰 Qt 控件会偶发崩 ✓；要改界面就发信号让 GUI 线程去改 ✓。
+        """
+        sink = self._delta_sink
+        if sink is not None:
+            try:
+                sink(dx, dy)
+            except Exception:                       # noqa: BLE001 —— 出口坏了别弄死跟踪线程 ✗
+                pass
+        try:
+            self.moved.emit(float(dx), float(dy))
+        except Exception:                           # noqa: BLE001 —— 窗口正在销毁时 emit 会抛 ✓
+            pass
+
+    def _note_drag_move(self, dx, dy):
+        """拖拽阈值：按下后累计滑动超过 `HOLD_PX` 才补发 PRESS（进入拖拽 ✓）—— GUI 线程里跑 ✓。
+
+        ⚠ 位移是跟踪线程**排队**送来的（会晚几毫秒 ✓）—— 没关系：这里判的是**累计距离**
+          （阈值 4 px ✓），迟到只意味着"拖拽晚几毫秒开始" ✓；位移本身一个像素都不会少
+          （它走的是实时出口 ✓ 见模块文档）。那几像素也照常发出去，不丢 ✓。
+        """
+        if self._down is None or self._dragging:
+            return
+        self._drag_moved += (dx * dx + dy * dy) ** 0.5
+        if self._drag_moved >= self.HOLD_PX:
+            self._dragging = True
+            self._drag_btn = self._down
+            self.pressed.emit(self._drag_btn)
+
     # ---------------- 事件 ----------------
 
     def mouseMoveEvent(self, ev):
-        if self._warping:
-            self._warping = False     # 这次 move 是 setPos 触发的，忽略
-            return
-        if not self._active:
-            return                    # 非触控模式：板子上滑动不做事
-        gp = ev.globalPos()
-        dx = gp.x() - self._ref.x()
-        dy = gp.y() - self._ref.y()
-        if dx or dy:
-            self.moved.emit(dx, dy)
-            # 按下状态下累计滑动超过阈值 → 这一刻补发 PRESS（进入拖拽）。
-            # 上面那几像素位移已经发出去了、不丢，只是拖拽晚 HOLD_PX 生效。
-            if self._down is not None and not self._dragging:
-                self._drag_moved += (dx * dx + dy * dy) ** 0.5
-                if self._drag_moved >= self.HOLD_PX:
-                    self._dragging = True
-                    self._drag_btn = self._down
-                    self.pressed.emit(self._drag_btn)
-            self._warping = True
-            QCursor.setPos(self._ref)     # 光标钉回原点 → 无限滑动
+        """⚠ 位移**不在这里产生**（用户 2026-10-05 ✓ "直接2"）：这里只是"跟踪线程每拍把指针
+        拨回板心"带回来的**回声** ⇒ 什么都不做 ✓。
+
+        原来位移在这里算（`ev.globalPos() - 钉点` ⇒ `moved` ⇒ `QCursor.setPos` 拨回 ✗）——
+        那等于把位移的节拍**挂在 Qt 的事件投递上**：GUI 主线程一被重绘 / 主回路拖住，Qt 就把
+        连续移动**合并**成一次 ⇒ 一次跳几百像素 ✗（实测 `move_px` 最大 **514** / `move_gap_ms`
+        最大 **467 ms** ✓）⇒ A 机"停一下、猛跳一下" ✓。见模块文档 ✓。
+        """
+        ev.accept()
 
     def mousePressEvent(self, ev):
         # 触控模式下：左/右/中键**先只记下来**，不立刻发 —— 等滑动超过阈值再发
@@ -239,6 +339,9 @@ class TouchPad(QWidget):
         p.setPen(fg)
         if not self._enabled:
             txt = "鼠标控制\n需要 ProMicro"
+        elif self._active and self._track_fail:
+            # ⚠ 跟踪线程起不来（`GetCursorPos` 不可用那种）⇒ **说清楚**：别让人以为板子坏了 ✓
+            txt = "触控模式已开\n⚠ 指针跟踪起不来\n（滑动不会动鼠标）"
         elif self._active:
             txt = "触控模式已开\n滑动 / 点击 / 拖拽 / 滚轮\n再按 F10 关闭"
         else:

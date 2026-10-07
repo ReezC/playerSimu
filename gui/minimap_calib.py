@@ -1518,11 +1518,24 @@ class MinimapCalibDialog(QDialog):
         #   ⇒ 世界坐标 y 轴按**错的缩放**算（实测 106010105：自动定位后 scale=1.874 等比，
         #   却残留 scale_y=1.940285539…，两轴差 3.5%，正是用户看到的"两种标定法数据不一样" ✗）。
         #   同理 `src`/`score` 也该被这次的几何口径整体接管，别让旧值糊着 ✓。
-        for _k in ("scale", "scale_y", "offset", "view", "src", "score"):
+        for _k in ("scale", "scale_y", "offset", "view", "src", "score", "panel"):
             cal.pop(_k, None)
         # 只更新量出来的几何 + 方式：显示方式仍算「你在界面里选的」
         cal.update(self.calib())
         cal["picked_by"] = "gui"
+        # ⭐⭐ **把"量的时候那块面板多大"写下来**（用户 2026-10-06 ✓ —— 这是补一个**老缺口**）：
+        #   `panel` 这个字段在 `gui/route_panel._calib_panel_wh` 里**一直被读** ✗，而**全项目
+        #   没有任何地方写它** ✗（`core/mapdata.zoom_of` 的说明就是点名这条 ✓）。
+        #   ⇒ A 机 zoom 一变（或换框选区域 ⇒ 面板尺寸变 ✓），旧标定照套会让世界坐标
+        #     **整倍数错**，而 `perf.mmap_ok` 一直是 1.00 ✗ —— "**自信地错**"：
+        #     2026-10-06 现场就是这么一路怼墙的（反推标定那块是 588×296，实际推来 1164×585 ✓）。
+        #   写下来之后，`perception.minimap.panel_mismatch` 就能在**用之前**拒用，
+        #   并把两个尺寸摆给人看 ✓（"请重新标定"✓）。
+        #   ⚠ 写的是**这一帧**的尺寸（就是喂给定位器的那块像素 ✓，它已含 zoom ✓）——
+        #     与运行时比的是同一个东西 ✓。
+        if self._frame is not None:
+            _h, _w = self._frame.shape[:2]
+            cal["panel"] = [int(_w), int(_h)]
         cal.pop("legacy", None)         # 老格式的标记不写回文件（见 mapdata.save_calib）
         # 写文件这步**必须自己兜住异常**：这个槽外面还包着 safe_slot，而它只
         # `traceback.print_exc()` —— 正常启动走的是 pythonw（没有控制台），
