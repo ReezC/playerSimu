@@ -48,6 +48,158 @@ def t_detect_synthetic():
     check(st == "combat", "空画布判成了 %s（误报 ✗）：%r" % (st, det))
 
 
+def t_scale_invariant_by_normalizing():
+    """⭐⭐⭐ **换分辨率也要认得出**（用户 2026-10-10 ✓ 原话："为什么测谎开始后 Agent 还在操作
+    角色按方向键？" ✓）。
+
+    病（真帧实测 ✓ 见开发日志 286 ✓）：三块模板是从 **1366×768** 那一路流裁的 ✓，而
+    `cv2.matchTemplate` 只对**平移**宽容、对**缩放**不宽容 ✗ ⇒ 本机「本地窗口」那块是
+    **1920×1080** ⇒ `lie_warn` 从 **0.857** 掉到 **0.659** ✗ ⇒ 判成 `combat` ⇒
+    `_takeover_st` 不动 ⇒ **Agent 照旧按方向键** ✓✓（用户两轮看到的就是这个 ✓）。
+    ⇒ 匹配前**先把帧归一到 `BASE_W/BASE_H`** ✓（`_prepare_gray` ✓）。
+
+    钉三件：
+      ① **基准尺寸**照旧判得出（老行为一字不变 ✓）；
+      ② **放大 / 缩小**到 1920×1080 / 1600×900 / 1024×576 / 2560×1440 ⇒ 仍然判得出 ✓
+         （⚠ 这条就是"用户那台机器"的情形 ✓ 少一个尺寸就等于没修 ✓）；
+      ③ 反过来：**空画布**在任何尺寸下都不许判成 lie（归一化不许把误报带回来 ✗）。
+    """
+    for w, h in ((1366, 768), (1920, 1080), (1600, 900), (1024, 576), (2560, 1440)):
+        f = _frame_with("lie_warn")
+        if (w, h) != (1366, 768):
+            f = cv2.resize(f, (w, h), interpolation=cv2.INTER_AREA)
+        st, det = screen_state.check_frame(f)
+        check(st == "lie_warn",
+              "%dx%d 上判成了 %s ⇒ 换分辨率就认不出测谎 ⇒ Agent 在测谎里继续按方向键 ✗：%r"
+              % (w, h, st, det))
+        blank = np.full((h, w, 3), 60, np.uint8)
+        st2, det2 = screen_state.check_frame(blank)
+        check(st2 == "combat",
+              "%dx%d 的空画布判成了 %s（归一化把误报带回来了 ✗）：%r" % (w, h, st2, det2))
+
+
+def t_ui_variants_score_best():
+    """⭐⭐⭐ 一块锚点可以挂**多份模板**（变体），判分取最高 —— 治「本地窗口那版认不出登录界面」。
+
+    病（用户 2026-10-10 现场 ✓ 原话："**我现在就在本地实时的登陆界面，鳄鱼潭1项目。没有任何
+    警报**"）：模板是照**旧客户端**裁的 ✓，而用户这台**本地窗口**那一版渲染不一样 ✗ ⇒
+    「连接」按钮只 0.781（< 0.80 ✗）、底部健康忠告那条只 0.51（新版换行带标点 ✗）
+    ⇒ `login` 判不出 ⇒ **没警报** ✓。按真帧重裁后 0.977/0.932 ✓ —— 但同一套重裁模板拿去判
+    **收流那版**（1366×768）又判不出 ✗（两边不是同一版渲染 ✓ ⇒ **一套服务不了两边** ✗）。
+
+    ⇒ 改法：`ui_state` 支持 `<name>.png`（主）+ `<name>.<n>.png`（变体 ✓），
+      **判分取最高**（`score_best` ✓）、门限照旧 0.80 ✓（不放松标准 ✓）。
+
+    钉四件：
+      ① 变体路径命名（`template_path(name, 1)` ⇒ `<name>.1.png` ✓）；
+      ② `login` 的两块锚点**真的有变体**（本地窗口那版 ✓ 否则这条就白写了 ✗）；
+      ③ **行为级**：把**变体**贴进一张 1920×1080 画布的锚点位置 ⇒ `detect` 必须判出 `login` ✓
+         （证明变体**真的被用上了** ✓ 不是摆着看 ✓）；
+      ④ 空画布 ⇒ `None` ✓（加了变体不许把误报带来 ✗）。
+    """
+    import shutil
+    import tempfile
+
+    from core.imgio import imread
+
+    from perception import ui_state
+
+    _old_dir = ui_state.TEMPLATE_DIR
+    _old_anchors = dict(ui_state.ANCHORS)
+
+    check(ui_state.template_path("x", 1).name == "x.1.png",
+          "变体命名不是 `<name>.<n>.png`（那 `load_variants` 就找不到它 ✗）")
+
+    has = [n for n, _r, _t, _d in ui_state.ANCHORS["login"]
+           if ui_state.template_path(n, 1).exists()]
+    check(len(has) == 2,
+          "`login` 的两块锚点都得有「本地窗口那版」变体（现在只有 %r ✗ —— "
+          "少了它这台机器上登录界面就判不出、警报不响 ✓）" % (has,))
+
+    # ③ 行为级：把**变体**贴到锚点位置 ⇒ 必须判出 login ✓
+    base = np.full((ui_state.BASE_H, ui_state.BASE_W, 3), 60, np.uint8)
+    for name, rect, _ts, _desc in ui_state.ANCHORS["login"]:
+        t = imread(str(ui_state.template_path(name, 1)))
+        h, w = t.shape[:2]
+        x, y = int(rect[0]), int(rect[1])
+        base[y:y + h, x:x + w] = t
+    ui_state.clear_cache()
+    try:
+        check(ui_state.detect(base) == ui_state.UI_LOGIN,
+              "把**变体**贴到锚点位置却判不出 login ✗（那变体等于没接上 ✓）：%r"
+              % (ui_state.scores(base)[0],))
+        # ④ 空画布不许误判 ✗
+        check(ui_state.detect(np.full((ui_state.BASE_H, ui_state.BASE_W, 3), 60,
+                                      np.uint8)) is None,
+              "空画布被判成了某个界面（变体把误报带回来了 ✗）")
+
+        # ②′ 只留主模板（删掉变体）⇒ 那一版就**应该**判不出 ✓（反向验证：证明确实是变体在起作用）
+        _d = Path(tempfile.mkdtemp(prefix="uitpl_"))
+        try:
+            for nm in [n for n, _r, _t, _dsc in ui_state.ANCHORS["login"]]:
+                shutil.copy2(str(ui_state.template_path(nm)), str(_d / (nm + ".png")))
+            for ui, anchors in ui_state.ANCHORS.items():        # 别的锚点照旧（否则缺模板跳过 ✓）
+                for nm, _r, _t, _dsc in anchors:
+                    p = ui_state.template_path(nm)
+                    if p.exists() and not (_d / (nm + ".png")).exists():
+                        shutil.copy2(str(p), str(_d / (nm + ".png")))
+            ui_state.TEMPLATE_DIR = _d
+            ui_state.clear_cache()
+            check(ui_state.detect(base) is None,
+                  "**删掉变体后**居然还判得出 login ✗ ⇒ 说明起作用的不是变体"
+                  "（那这条用例等于没验到东西 ✓ 要重看 ✓）")
+        finally:
+            ui_state.TEMPLATE_DIR = _old_dir
+            ui_state.clear_cache()
+            shutil.rmtree(str(_d), ignore_errors=True)
+    finally:
+        ui_state.TEMPLATE_DIR = _old_dir
+        ui_state.ANCHORS.clear()
+        ui_state.ANCHORS.update(_old_anchors)
+        ui_state.clear_cache()
+
+
+def t_login_banner_is_optional():
+    """⭐⭐⭐ 登录界面底部的**健康忠告横幅**只是"可选锚点"，不参与"必须全过"（用户 2026-10-10 ✓）。
+
+    病（实测 ✓）：那条横幅（`login_agree` ✓）**同一台机器上两帧之间就 0.93 → 0.61** ✗
+    （旧版单行无标点 / 新版两行带标点 + 多一行「我已详细阅读并同意《隐私政策》…」✓）
+    ⇒ 拿它当"必须过"的门 = 登录识别**看运气** ✗（21:19:55 恰好判出了 `login` ✓、
+    紧接着另一帧又判不出 ✗ —— 用户看到的就是"时有时无"✓）。
+
+    钉三件：
+      ① `login_agree` 在 `OPTIONAL_ANCHORS` 里 ✓（口径写在一处 ✓）；
+      ② **行为级**：画布上**只贴「连接」按钮**（登录界面独有的那块 ✓）⇒ 必须判出 `login` ✓
+         （横幅缺失/变了都不该挡住 ✓）；
+      ③ 反向：把「连接」按钮也去掉（空画布）⇒ **必须判不出** ✗（可选锚点不等于"什么都放行"✓）。
+    """
+    from core.imgio import imread
+
+    from perception import ui_state
+
+    check("login_agree" in ui_state.OPTIONAL_ANCHORS,
+          "`login_agree`（底部通用健康忠告横幅）该是**可选**锚点 —— 它内容会变、别处也有 ✗ "
+          "（不放可选 ⇒ 登录识别时灵时不灵 ✓ 用户报过 ✓）")
+
+    only = np.full((ui_state.BASE_H, ui_state.BASE_W, 3), 60, np.uint8)
+    for name, rect, _ts, _desc in ui_state.ANCHORS["login"]:
+        if name in ui_state.OPTIONAL_ANCHORS:
+            continue                                  # ② **故意不贴横幅** ✓
+        t = imread(str(ui_state.template_path(name, 1)))
+        h, w = t.shape[:2]
+        only[int(rect[1]):int(rect[1]) + h, int(rect[0]):int(rect[0]) + w] = t
+    ui_state.clear_cache()
+    check(ui_state.detect(only) == ui_state.UI_LOGIN,
+          "只贴「连接」按钮（登录界面独有的那块）却判不出 `login` ✗ —— "
+          "横幅那条可选锚点没生效 / 或者又把必须过的门加回去了 ✗：%r"
+          % (ui_state.scores(only)[0],))
+
+    # ③ 空画布（连按钮都没有）⇒ 必须判不出 ✓
+    check(ui_state.detect(np.full((ui_state.BASE_H, ui_state.BASE_W, 3), 60,
+                                  np.uint8)) is None,
+          "空画布也判成 `login` ✗ ⇒ 可选锚点被当成「什么都放行」了 ✓（那就不是判据了 ✗）")
+
+
 def t_threshold_reverse():
     """反向钉：阈值拉到不可能命中 ⇒ 一律 combat（没有阈值就没有「没弹窗」可言 ✗）。"""
     st, _ = screen_state.check_frame(_frame_with("lie_warn"), threshold=1.1)
@@ -127,8 +279,18 @@ def t_wiring_source_pins():
           "没把**原生帧**喂进界面状态检测拍（喂显示帧会被画框污染 ✗）")
     check(lt.count("self._screen_last") >= 3,
           "检测没限流（整帧匹配 ~0.1s，每帧都跑会吃掉推理预算 ✗）")
-    check(lt.count("ws.screen = self._screen_state") >= 2,
-          "两路 ws（推理 / 纯画面）都得带上界面状态 ✗")
+    # ⭐⭐⭐⭐⭐ **两路 ws 都要带"接管版"界面状态**（用户 2026-10-10 ✓ 本行 2026-10-10 改口径 ✓）：
+    #   原来钉的是 `ws.screen = self._screen_state`（**原生识别结果** ✓）——那条被现场否掉 ✗：
+    #   测谎**小游戏那段画面匹配不上任何模板**（`live_thread` 自己的实测写着"是常态"✓）
+    #   ⇒ 原生结果回落 `combat` ⇒ Agent 当场把方向盘拿回去、**又开始按方向键** ✗✗
+    #   （用户原话："**为什么测谎开始后 Agent 还在操作角色按方向键？**"✓）。
+    #   ⇒ 现在两路都报 `_takeover_st`（**留住接管**后的那份 ✓ 见 `_screen_beat` 末段 ✓）；
+    #     ⚠ **原生 `_screen_state` 照旧单独给录屏/样本/状态行**（下面那条 `"screen":` 钉着 ✓）
+    #       —— 两件事**故意分开** ✗ 别合并 ✓。
+    check(lt.count('ws.screen = (getattr(self, "_takeover_st", None)') >= 2,
+          "两路 ws（推理 / 纯画面）都得带上**接管版**界面状态（`_takeover_st`）✗ —— "
+          "用原生 `_screen_state` 就是「测谎中小游戏画面匹配不上 ⇒ 回落 combat ⇒ "
+          "Agent 恢复按键」那个老毛病 ✗")
     check('"screen": self._screen_state' in lt,
           "状态行载荷没带 screen ✗")
     for pin in ('screen_state.check_frame', 'behavior.event("screen_state"',
@@ -198,6 +360,203 @@ def t_screen_beat_bridge():
           "screen_state 事件没落 behavior.log ✗：%r" % txt[:200])
 
 
+def t_lie_game_threshold_widened():
+    """⭐⭐⭐⭐ **`lie_game` 单独放宽门限**（用户 2026-10-10 第二轮 ✓ 原话："**测谎的时候 Agent
+    还在操作移动、跳跃**"✗）。
+
+    **实测**（真录像 `data/recordings/lie_20261010_015650.mp4` ✓ `check_frame(fr, threshold=0)`
+    拿"最像哪块 + 多少分"✓ 见开发日志 **271** ✓）：
+      · `lie_warn` **0.867~0.869** ✓（干净 ✓）；**`lie_game` 0.783~0.785** ✗ —— **低于 0.80**
+        ⇒ 小游戏那 18 秒**根本认不出来** ⇒ 状态回落 `combat` ⇒ **Agent 恢复按键** ✗✗
+        （同一场：`lie_rec` 录满 300 秒上限、而 `perf.log` 每段 `agent_why=-` ✓ 对得上 ✓）。
+      · ⚠⚠ 反面：普通战斗帧对这块模板能到 **0.805~0.836** ✗（比真的还高 ✓ 10-08 那 4 次误判 ✓）
+        ⇒ **只降门限挡不住假阳性** ⇒ 真正的判据是 `_screen_beat` 那条 **A 规则**（必须先见
+        `lie_warn` ✓）⇒ **两条合起来**才完整 ✓（本用例只钉"放宽"这一半 ✓ 另一半由
+        `t_lie_needs_warn` 钉着 ✓）。
+
+    钉三件：① 这块的门限必须**低于基础门限**、且**低于实测真小游戏分**（0.783 ✓ 留出余量）；
+    ② `check_frame` 的**显式** `threshold=` 语义不许被改（自检/调试用 ✓）；
+    ③ 走默认门限时，那块模板确实吃自己的门限（源码级：`MATCH_THRESHOLD_BY` 被查过 ✓）。
+    """
+    base = float(screen_state.MATCH_THRESHOLD)
+    by = dict(getattr(screen_state, "MATCH_THRESHOLD_BY", {}) or {})
+    check("lie_game" in by, "`lie_game` 没有自己的门限 ⇒ 真小游戏 0.783 还是认不出来 ✗")
+    thr = float(by["lie_game"])
+    check(thr < base, "`lie_game` 的门限没放宽（%g 不低于基础 %g）⇒ 小游戏照旧认不出来 ✗"
+          % (thr, base))
+    check(thr <= 0.78 and thr >= 0.70,
+          "`lie_game` 门限取 %g：要**低于实测真分 0.783**（否则还是认不出 ✗）又不该低到没边"
+          "（滥用会淹掉 A 规则那道闸 ✓）" % thr)
+    src = (ROOT / "perception" / "screen_state.py").read_text(encoding="utf-8")
+    check("MATCH_THRESHOLD_BY.get(best_name, threshold)" in src,
+          "`check_frame` 没查每模板门限（白设了 ✗）")
+    # ② 显式 threshold 必须照旧是"字面值"（用例/调试靠它 ✓）
+    import numpy as np
+    fr = np.full((768, 1366, 3), 60, np.uint8)
+    st, det = screen_state.check_frame(fr, threshold=0.0)   # 阈值 0 ⇒ 一定"命中" ✓
+    check(st != "combat",
+          "显式 `threshold=0.0` 时应当给出最像的那块（显式门限的语义被改了 ✗）：%r" % st)
+
+
+def t_lie_needs_warn():
+    """⭐⭐⭐⭐⭐ **A ＋ C：测谎状态的两道门** ✗✗（用户 2026-10-08 ✓ 两条都是他选的 ✓）。
+
+      · **A** 原话："**加一条「必须先见过 lie_warn 才算测谎」—— 真测谎一定有 warn 在前**" ✓
+        ⇒ `lie_game` / `lie_success` 只有"这一场开着"（`LIE_SESSION_MAX_S` = **60 秒**内见过
+        `lie_warn` ✓）才认 ✓；否则**当 combat**（不起录、不报警 ✓）＋ 记一条 `lie_state_denied` ✓；
+      · **C** 原话："**进 lie_* 后若一直没见到 lie_warn/lie_success、且 lie_game 分数贴着门槛 ⇒
+        到点就停，别录满 5 分钟**" ✓ ⇒ **没见到成功弹窗**、且这一场 `lie_game`/`lie_success` 的
+        **最高分 < 门限＋0.05 = 0.85** ⇒ 录到 **90 秒**收工 ✓（老逻辑 5 分钟 ✗）；
+        ⚠ **每拍都评** ✗（不是在"状态变了"那一拍才评 ✓ —— 画面卡住时那样永远评不到 ✓ 见源码注释 ✓）。
+
+    实测依据（`10月7日.mp4` ＋ `behavior.log` ✓）：今天那 4 次误判全是 `combat → lie_game`
+      （**0.805~0.836** ✓）**没有一次 `lie_warn`** ⇒ A 当场全灭 ✓；真 `lie_warn`/`lie_success` =
+      **0.857 / 0.879** ⇒ C 那条 0.85 两边都留了余量 ✓。
+    """
+    import types
+
+    from core import behavior
+
+    from gui import live_thread as _lt
+    from perception import ui_state
+
+    _NOW = [1000.0]
+    frame = np.full((768, 1366, 3), 60, np.uint8)
+
+    def _mk():
+        th = types.SimpleNamespace(
+            _screen_state="combat", _screen_last=0.0, _lie_rec=None, _lie_rec_pending=0.0,
+            _lie_rec_stop_at=0.0, _lie_rec_saw_success=False, _lie_rec_last_lie=0.0,
+            _rec_kind="", _lie_warn_at=0.0, _lie_sess_t0=0.0, _lie_rec_top_game=0.0)
+        calls = {"start": [], "stop": []}
+
+        def _start(kind="lie"):
+            calls["start"].append(kind)
+            if kind == "lie":                       # 真起录 ⇒ 置上"在录"那两个字段 ✓（C 靠它判 ✓）
+                th._rec_kind, th._lie_rec_pending = "lie", 1.0
+            return True
+
+        def _stop(why=""):
+            calls["stop"].append(why)
+            th._rec_kind, th._lie_rec_pending = "", 0.0
+        th._lie_rec_start, th._lie_rec_stop = _start, _stop
+        #   ⚠ 这个替身**绕过 `__init__`** ⇒ 类属性也得搬过来 ✗（`_screen_beat` 里会读它们 ✓：
+        #     `LIE_REC_GAP_S` / `LIE_REC_HOLD_S` ✓ —— 不搬 ⇒ 走到那条兜底时 `AttributeError` ✗，
+        #     实测踩到 ✓）。
+        for _k in ("LIE_REC_HOLD_S", "LIE_REC_GAP_S"):
+            setattr(th, _k, getattr(_lt.LiveThread, _k))
+        return th, calls
+
+    def _beat(th, st, score):
+        with mock.patch.object(screen_state, "check_frame",
+                               lambda f: (st, {"score": score})), \
+             mock.patch.object(ui_state, "detect", lambda f: None), \
+             mock.patch.object(screen_state, "capture_frame", lambda f, s: None), \
+             mock.patch.object(_lt.time, "monotonic", lambda: _NOW[0]):
+            _lt.LiveThread._screen_beat(th, frame)
+
+    logf = Path(tempfile.mkdtemp(prefix="lie_warn_gate_")) / "behavior.log"
+    old_log, old_en = behavior.LOG, behavior.ENABLED
+    try:
+        behavior.configure(True, log=logf)
+        th, calls = _mk()
+        # ① **A 反向**：像今天那 4 次一样 —— `combat` 直接跳 `lie_game`（0.83 ✓）⇒ 不认 ✗
+        _NOW[0] = 1000.0
+        _beat(th, "lie_game", 0.83)
+        check(th._screen_state == "combat" and not calls["start"],
+              "① **没 warn 打头的 lie_game ⇒ 不认**（实测状态 %r ／ 起录 %d 次〔该 0 ✓〕）"
+              % (th._screen_state, len(calls["start"])))
+        # ② **A 正向**：`lie_warn` ⇒ 进状态 ＋ 起录
+        _NOW[0] = 1002.0
+        _beat(th, "lie_warn", 0.86)
+        check(th._screen_state == "lie_warn" and calls["start"] == ["lie"]
+              and th._rec_kind == "lie",
+              "② **lie_warn ⇒ 进状态 ＋ 起录**（实测 %r ／ start %r ✓）"
+              % (th._screen_state, calls["start"]))
+        # ③ 同一场里的 `lie_game` ⇒ 认（**不重开录屏** ✓）
+        _NOW[0] = 1006.0
+        _beat(th, "lie_game", 0.81)
+        check(th._screen_state == "lie_game" and calls["start"] == ["lie"],
+              "③ **同一场里的 lie_game ⇒ 认**（实测 %r ／ 起录还是 %d 次 ✓〔该 1 ✓〕）"
+              % (th._screen_state, len(calls["start"])))
+        # ④ **C**：离开 `lie_*` 不急着停；到 90 秒才收 ＋ 关掉这一场
+        _NOW[0] = 1010.0
+        _beat(th, "combat", 0.55)
+        check(not calls["stop"],
+              "④ **刚离开 lie_* 不急着停**（还没见到成功弹窗 ⇒ 照旧一路录 ✓）")
+        _NOW[0] = 1002.0 + _lt.LIE_REC_SOFT_S + 1.0
+        _beat(th, "combat", 0.55)
+        check(len(calls["stop"]) == 1 and "贴着门槛" in calls["stop"][0]
+              and not th._lie_warn_at,
+              "④ **C：到 %g 秒收工 ＋ 把这一场关掉**（实测 stop=%r ／ `_lie_warn_at`=%r ✓）"
+              % (_lt.LIE_REC_SOFT_S, calls["stop"], th._lie_warn_at))
+        # ⑤ 关场之后再来的 `lie_game` ⇒ 又被 A 拦（不来回切 ✓）
+        _NOW[0] += 5.0
+        _beat(th, "lie_game", 0.82)
+        check(th._screen_state == "combat" and len(calls["start"]) == 1,
+              "⑤ **关场之后再来的 lie_game 不认**（实测 %r ✓ ／ 起录仍 %d 次 ✓）"
+              % (th._screen_state, len(calls["start"])))
+        # ⑥ **反例**：这场分数够高（0.88 ≥ 0.85 ✓）⇒ C **不许**收（收了就是把真场面掐掉 ✗）
+        #   ⚠⚠ **沿途必须喂一拍 `lie_game`** ✗（2026-10-10 修 ✗ 这条原来写漏了 ✓）：
+        #      C 的门槛（`LIE_REC_SOFT_S` = 90 秒 ✓）**比 GAP 兜底（`LIE_REC_GAP_S` = 60 秒 ✓）
+        #      长** ⇒ 中间一次 `lie_*` 都不喂的话，**先触发的是 GAP** ✗ —— 那是**另一条规则**
+        #      （"整场失败 / 界面卡住 ⇒ 不能无限录" ✓ 见它自己的用例 ⑧ ✓），不是 C ✗。
+        #      原来这条一口气跳到 91 秒 ⇒ 拿到的 `stop` 是 GAP 的 ✓ ⇒ 期望写错了（实测 stop=
+        #      `['长时间没再见到测谎（60 秒）⇒ 收工']` ✗）。
+        #      ⚠ 而且**只喂 `lie_*` 不算数** ✗：`_lie_rec_last_lie` 只在**状态变化**那一拍更新
+        #        （它排在 `_screen_beat` 的早退**之后** ✓）⇒ 中间那拍必须是一次**真变化**
+        #        （`combat → lie_game` ✓ 现场小游戏期间"偶尔匹得上几拍"就是这个样子 ✓）。
+        th2, calls2 = _mk()
+        _NOW[0] = 2000.0
+        _beat(th2, "lie_warn", 0.86)
+        _NOW[0] = 2002.0
+        _beat(th2, "lie_game", 0.88)
+        _NOW[0] = 2004.0
+        _beat(th2, "combat", 0.5)                # 中间几拍匹不上（**常态** ✓）
+        _NOW[0] = 2000.0 + _lt.LIE_REC_SOFT_S / 2.0
+        _beat(th2, "lie_game", 0.88)             # ← 又匹上了（把 GAP 按住 ✓ 分数依旧够高 ✓）
+        _NOW[0] = 2000.0 + _lt.LIE_REC_SOFT_S + 1.0
+        _beat(th2, "combat", 0.5)
+        check(not calls2["stop"],
+              "⑥ **分数够高（0.88 ≥ %.2f）⇒ C 不收工**（实测 stop=%r ✓ —— ⚠ 收了就是掐真场面 ✗）"
+              % (_lt.LIE_REC_STRONG, calls2["stop"]))
+        # ⑦ `lie_warn` 早过 60 秒 ⇒ 后面的 `lie_game` 照样不认
+        th3, calls3 = _mk()
+        _NOW[0] = 3000.0
+        _beat(th3, "lie_warn", 0.86)
+        _NOW[0] = 3000.0 + _lt.LIE_SESSION_MAX_S + 1.0
+        _beat(th3, "combat", 0.5)
+        _beat(th3, "lie_game", 0.9)
+        check(th3._screen_state == "combat",
+              "⑦ **warn 早过 %g 秒 ⇒ lie_game 不认**（实测 %r ✓）"
+              % (_lt.LIE_SESSION_MAX_S, th3._screen_state))
+        # ⑧ ⭐ **GAP 兜底**（既有规则 ✓ **本轮才补上它的用例** ✗）：整场失败 / 界面卡住 ⇒
+        #    `LIE_REC_GAP_S` 秒没再见到**任何** `lie_*` 就收工 ✓（不许无限录 ✗）。
+        #    ⚠ 它必须**远大于**中间小游戏那一截（现场实测 **18 秒**没有任何 `lie_*` ✓
+        #      这就是它取 60 的原因 ✓）—— 与 C（90 秒、看**分数贴不贴门槛** ✓）是**两条**规则 ✓：
+        #      这条只看"还见不见得到 `lie_*`" ✓。
+        th4, calls4 = _mk()
+        _NOW[0] = 4000.0
+        _beat(th4, "lie_warn", 0.86)
+        _NOW[0] = 4002.0
+        _beat(th4, "combat", 0.55)
+        check(not calls4["stop"],
+              "⑧ 刚离开 `lie_*` 不该停（宽限还没到 ✓）")
+        _gap = float(_lt.LiveThread.LIE_REC_GAP_S)     # ⚠ **类属性** ✗（不是模块级 ✓）
+        _NOW[0] = 4002.0 + _gap + 1.0
+        _beat(th4, "combat", 0.55)
+        check(len(calls4["stop"]) == 1 and "长时间" in calls4["stop"][0],
+              "⑧ **`LIE_REC_GAP_S` = %g 秒没再见到任何 `lie_*` ⇒ 收工**"
+              "（实测 stop=%r ✗ —— 不收就会无限录 ✗）"
+              % (_gap, calls4["stop"]))
+    finally:
+        behavior.configure(old_en, log=old_log)
+    txt = logf.read_text(encoding="utf-8") if logf.exists() else ""
+    check("lie_state_denied" in txt,
+          "**被拦下来的那几拍如实打点**（`lie_state_denied` 落 behavior.log ✓ 事后能核 ✓）：%r"
+          % txt[-200:])
+
+
 def t_protection_page():
     """「挂机保护」页（行为级）：防掉线组 **re-parent** 过来 + 「防挂机」可配 ✓。"""
     from PyQt5.QtWidgets import QApplication
@@ -243,6 +602,16 @@ TESTS = [
     ("agent 接管：停手 / 任务保留 + interrupted / 恢复 / 事件落盘", t_agent_takeover),
     ("断线桥接（行为级）：ui_state 判出 login_err ⇒ 状态切换 + 报警 + 存帧 + 打点",
      t_screen_beat_bridge),
+    ("测谎两道门（A 必须先见 warn ＋ C 贴门槛 90 秒收工）", t_lie_needs_warn),
+    ("⭐⭐⭐⭐ 「`lie_game` 单独放宽门限」（用户 2026-10-10）：真录像实测 0.783~0.785 低于基础"
+     "门限 ⇒ 小游戏认不出来 ⇒ Agent 在测谎里还在按移动/跳跃；放宽 + 保留 A 规则才是完整口径",
+     t_lie_game_threshold_widened),
+    ("⭐⭐⭐ 换分辨率也要认得出（归一化到模板基准尺寸）——治「测谎里 Agent 还在按方向键」",
+     t_scale_invariant_by_normalizing),
+    ("⭐⭐⭐ `ui_state` 一块锚点可挂多份模板（变体取最高分）——治「本地窗口那版认不出登录界面」",
+     t_ui_variants_score_best),
+    ("⭐⭐⭐ 登录底部那条通用健康横幅只是**可选**锚点（治「登录识别时灵时不灵」）",
+     t_login_banner_is_optional),
     ("挂机保护页：防掉线组 re-parent + 防挂机组可配", t_protection_page),
     ("接线钉子（live_thread / live_panel / agent）", t_wiring_source_pins),
 ]

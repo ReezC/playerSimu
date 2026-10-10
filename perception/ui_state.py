@@ -146,10 +146,6 @@ def anchor_rects():
             for name, rect, ts, desc in anchors]
 
 
-def template_path(name):
-    return TEMPLATE_DIR / (name + ".png")
-
-
 def load_template(name):
     """读模板图并缩到匹配比例（带缓存）。缺失或没有对比度返回 None。
 
@@ -174,12 +170,72 @@ def load_template(name):
 def clear_cache():
     """丢掉模板缓存（重新生成模板图后调用）。"""
     _cache.clear()
+    _variants.clear()
+
+
+def template_path(name, alt=0):
+    """模板图路径：`alt=0` = 主模板（`<name>.png` ✓）；`alt≥1` = 变体（`<name>.<alt>.png` ✓）。"""
+    p = TEMPLATE_DIR / (((name + ".png") if not alt else ("%s.%d.png" % (name, alt))))
+    return p
+
+
+#: 变体缓存：{锚点名: [缩放后的模板, …]} ✓（主模板排在最前 ✓ 见 `load_variants`）
+_variants = {}
+
+
+def load_variants(name, max_alt=4):
+    """这块锚点的**全部模板变体** ⇒ `[模板, …]`（缺的跳过 ✓ 一个都没有 ⇒ `[]` ✓）。
+
+    ⚠⚠ **为什么允许一块锚点挂多份模板**（2026-10-10 ✓ 用户现场原话："**我现在就在本地实时的
+      登陆界面，鳄鱼潭1项目。没有任何警报**" ✓ 查出来的 ✓）：
+      同一块锚点，**不同客户端渲染出来的像素不一样** ✗ —— 实测同一个「连接」按钮：
+        · 旧模板判**本地窗口**那一版 ⇒ 0.781（< 0.80 ✗ 判不出 ⇒ 没警报 ✓）；
+        · 按本地窗口那一帧**重裁**后 ⇒ 0.977 ✓；
+        · 但同一套重裁模板拿去判**收流那一版**（1366×768）⇒ 又掉到判不出 ✗
+          （两边不是同一版渲染 ✓ ⇒ **一套模板服务不了两边** ✗）。
+      ⇒ 一块锚点允许挂 `.<n>.png` 几份变体 ✓，**判分取最高**（`score_best` ✓）
+        ⇒ 两边各自命中各自的 ✓。
+    ⚠ 变体是**同一个界面**的不同渲染 ✓，**不是"把标准放松"** ✗ ⇒ 门限照旧 0.80 ✓ 不降 ✓。
+    """
+    if name in _variants:
+        return _variants[name]
+    out = []
+    for alt in range(0, max_alt + 1):
+        p = template_path(name, alt)
+        if not p.exists():
+            continue
+        img = cv2.imread(str(p), cv2.IMREAD_COLOR)   # 文件名是 ASCII，不用绕中文路径
+        if img is None or float(img.std()) < 3.0:
+            continue
+        if MATCH_SCALE != 1.0:
+            img = cv2.resize(img, None, fx=MATCH_SCALE, fy=MATCH_SCALE,
+                             interpolation=cv2.INTER_AREA)
+        if img.shape[0] >= 4 and img.shape[1] >= 4:
+            out.append(img)
+    _variants[name] = out
+    return out
+
+
+def score_best(img, name, rect=None, margin=SEARCH_MARGIN):
+    """这块锚点的**最高分**（所有变体里取最大 ✓；没有可用模板 ⇒ -1.0 ✓）。"""
+    best = -1.0
+    for tpl in load_variants(name):
+        best = max(best, _score(img, tpl, rect, margin))
+        if best >= 1.0:
+            break
+    return best
+
+
 
 
 def missing_templates():
-    """返回还没生成 / 不可用的模板名；空列表表示判别器可用。"""
+    """返回还没生成 / 不可用的模板名；空列表表示判别器可用。
+
+    ⚠ 判据是**有没有任何变体**（`load_variants` ✓）—— 主模板缺、但变体在 ⇒ **算有** ✓
+      （见 `load_variants` 上面那段"两边不是同一版渲染"✓）。
+    """
     return [name for _ui, name, _r, _t, _d in anchor_rects()
-            if load_template(name) is None]
+            if not load_variants(name)]
 
 
 def available():
@@ -227,17 +283,43 @@ def scores(frame):
     """调试用：每个锚点的匹配分 + 各界面是否判定命中。
 
     返回 ({"锚点名": 分数}, {"界面id": bool})。
+    ⚠ 分数取**变体里的最高分** ✓（同 `detect` 的口径 ✓ 别两处不一样 ✗）。
     """
     img = prepare(frame)
     per = {}
     for _ui, name, rect, _t, _d in anchor_rects():
-        tpl = load_template(name)
-        per[name] = -1.0 if tpl is None else _score(img, tpl, rect)
+        per[name] = score_best(img, name, rect)
     hit = {}
     for ui, anchors in ANCHORS.items():
-        names = [n for n, _r, _t, _d in anchors if load_template(n) is not None]
-        hit[ui] = bool(names) and all(per[n] >= THRESHOLD for n in names)
+        # ⚠ 与 `detect` **同一口径**（含可选锚点那条 ✓ 见 `_required_anchors` ✓）
+        need = [n for n, _r in _required_anchors(anchors)]
+        hit[ui] = bool(need) and all(per[n] >= THRESHOLD for n in need)
     return per, hit
+
+
+#: ⭐⭐ **可选锚点**：只算分、**不参与"必须全过"** ✓（判定时只要求**其余锚点**全过 ✓）。
+#:
+#: ⚠ 为什么是 `login_agree`（2026-10-10 ✓ 现场实测 ✓ 用户："**我就在本地实时的登录界面，
+#:   没有任何警报**" ✓）：
+#:   · 它是登录木牌**底部那条通用健康忠告横幅**（"抵制不良游戏 拒绝盗版游戏…"✗）——
+#:     别处也有那类条 ✗ ⇒ 它本来就不是"登录界面独有"的证据 ✓；
+#:   · 而且**内容会变**：旧版单行无标点 / 用户这台两行带标点 + 多一行「我已详细阅读并同意
+#:     《隐私政策》…」✓ ⇒ **同一台机器上两帧之间就 0.93 → 0.61** ✗（实测 ✓）
+#:     ⇒ 拿它当"必须过"的门 = 让登录识别**看运气** ✗（时灵时不灵 ✓ 最难查 ✓）。
+#:   · 而「连接」按钮（`login_connect` ✓）是**登录界面独有**的 ✓（实测 0.91~0.98 ✓）
+#:     ⇒ 让它单独当门就够 ✓。
+#: ⚠ 别顺手往这儿加 ✗ —— 每加一个都要说得出"它是这个界面**独有**的证据" ✓。
+OPTIONAL_ANCHORS = {"login_agree"}
+
+
+def _required_anchors(anchors):
+    """该界面的**必需**锚点（滤掉可选 ✓）⇒ `[(名, rect), …]`。
+
+    ⚠ 一个界面**一个必需锚点都不剩** ⇒ 退回"全部都要"✓（否则它会变成"永远命中"✗）。
+    """
+    ready = [(n, r) for n, r, _t, _d in anchors if load_variants(n)]
+    need = [(n, r) for n, r in ready if n not in OPTIONAL_ANCHORS]
+    return need or ready
 
 
 def detect(frame, threshold=THRESHOLD):
@@ -254,9 +336,12 @@ def detect(frame, threshold=THRESHOLD):
     img = prepare(frame)
     for ui in PRIORITY:
         anchors = ANCHORS.get(ui) or []
-        ready = [(n, r) for n, r, _t, _d in anchors if load_template(n) is not None]
-        if not ready:
+        # ⚠ "有没有这块模板"要看**全部变体**（`load_variants` ✓）；判分取变体最高分
+        #   （`score_best` ✓）—— 不同客户端渲染各命中各的 ✓ 见 `load_variants` 那段 ✓。
+        #   ⚠ 可选锚点（`OPTIONAL_ANCHORS` ✓）**不算门** ✗ —— 见它上面那段实测 ✓。
+        need = _required_anchors(anchors)
+        if not need:
             continue
-        if all(_score(img, load_template(n), r) >= threshold for n, r in ready):
+        if all(score_best(img, n, r) >= threshold for n, r in need):
             return ui
     return None

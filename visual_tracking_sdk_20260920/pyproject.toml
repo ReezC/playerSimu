@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "visual-tracking-sdk"
+version = "0.1.0"
+description = "Standalone visual tracking integration and video test GUI"
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["liescd*", "liescc*", "vision_sdk*", "examples*"]
+
+[tool.setuptools.package-data]
+liescd = ["models/*.pt"]
+"liescd._vendor.ocsort" = ["LICENSE", "README.md"]
+liescc = ["*.png", "tw/*.png"]

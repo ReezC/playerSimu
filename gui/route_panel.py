@@ -24,6 +24,8 @@
 
 import time
 
+import numpy as np
+
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QGroupBox, QHBoxLayout, QLabel,
@@ -2190,15 +2192,29 @@ class RoutePanel(QWidget):
         return self._map_id(), vals
 
     def _save_route_cfg(self):
-        """把当前这 9 个键写回**当前这张图**那份（没选图 ⇒ 一个字都不写 ✓ 别瞎存 ✗）。"""
+        """把当前这 9 个键写回**当前这张图**那份（没选图 ⇒ 一个字都不写 ✓ 别瞎存 ✗）。
+
+        ⭐⭐ **多实例**（用户 2026-10-09："必须支持开 2 个工作台" ✓）：带 `_route_cfg_base`
+        （= 本窗口**上次见到的**那份 ✓ 见 `_load_route_cfg` ✓）⇒ `route_cfg.save` 只盖
+        "相对它改过的键" ✓ —— 另一个窗口刚改的**留住** ✓（这一路尤其要紧：保存钩子在**任何**
+        `settings.save()` 之后都会顺手调本方法 ✓ ⇒ 不放基准就是"动个别处的参数也把这 9 键整份盖掉"✗）。
+        两边改了**同一个**键 ⇒ 记进 `_route_cfg_conflicts` ✓，由 `main_window` 写进日志 ✓。
+        """
         from core import route_cfg
         mid, vals = self._route_cfg_values()
         if not mid:
             return None
+        cf = []
         try:
-            return route_cfg.save(mid, vals)
+            p = route_cfg.save(mid, vals,
+                               base=getattr(self, "_route_cfg_base", None), conflicts=cf)
         except Exception:                       # noqa: BLE001 —— 存不下不该炸界面 ✗
             return None
+        # ⚠ 存完把基准刷成"刚写下去的那份" ✓（不刷的话，下次会把"我刚写的"也当成"我改过的"再盖
+        #   一遍 ✓ 幂等，但冲突记账会失真 ✗ —— 同 `Project.save` 那条纪律 ✓）
+        self._route_cfg_base = dict(vals)
+        self._route_cfg_conflicts = cf
+        return p
 
     def _seed_route_cfg(self):
         """这张图**第一次打开**时的播种值（用户 2026-10-03 选的 ① ✓）—— 来源就是**老家**：
@@ -2257,6 +2273,9 @@ class RoutePanel(QWidget):
             #   真正落盘的时刻只有一个 —— 用户**改了**任何一个参数（走 `_save_route_cfg` ✓
             #   经保存钩子 / 三个写口 ✓），那时整份 9 键一起写 ✓。
             vals = self._seed_route_cfg()
+        # ⭐⭐ 记**基准**：我这次"从文件里见到的 / 播下去的"那份 ⇒ 落盘时只盖"相对它改过的
+        #   键" ✓（多实例 ✓ 用户 2026-10-09："必须支持开 2 个工作台" ✓ 见 `core.route_cfg.save`）。
+        self._route_cfg_base = {str(k): v for k, v in (vals or {}).items()}
         n = settings.apply_route_cfg(vals)
         # ⭐ 「**禁用杀怪寻路**」（2026-10-06 起**按地图 id 存** ✓ 用户口径："从此 禁用杀怪寻路
         #   就是按地图id存的数据"✓）⇒ 换图/换项目要**把控件摆成这张图的值** ✓。
@@ -2513,9 +2532,35 @@ class RoutePanel(QWidget):
             return
         r = mm.check_calib(panel, t, cal)
         if r["err_world"] is None:
-            self.lbl_check_note.setText("核对不了：%s" % r["why"])
-            self.lbl_check_note.setStyleSheet("color: #b06000;")
-            self.lbl_check_detail.setText("")
+            # ⭐⭐ **先把现场存下来再说话**（用户 2026-10-09 ✓ 原话："这些提示是不正确的，
+            #   因为我的手动标定对齐地图已经接近完美了"）—— 旧版这里只写面板一行 ✗ ⇒
+            #   事后谁也分不清"压糊了 / 框多了 / 底图不对" ✗（三件事看一眼图就分得清 ✓）。
+            _dir = mm.dump_diag(panel, getattr(t, "canvas", None), cal, tag="check",
+                                extra={"map_id": str(mid), "src": str(src),
+                                       "why": r.get("why"),
+                                       "raw_scores": r.get("raw_scores")})
+            # ⭐⭐ 报的是**重合率**那条结论（模板匹配在本图天生够不着门槛 ✗ 见
+            #   `perception.minimap.calib_overlap` ✓）—— 它是回答"我标得准不准"的那条路 ✓，
+            #   也是用户 2026-10-09 要的那句（他手工对齐近乎完美 ✓ 工具却说量不出来 ✗）。
+            _ov_txt = str(r.get("overlap_text") or "")
+            _ok = bool(r.get("overlap")) and float((r["overlap"] or {}).get("iou") or 0.0) >= mm.OVERLAP_OK
+            if _ov_txt:
+                self.lbl_check_note.setText(
+                    "模板匹配不适用（本图天花板低）；按**地形重合**看：%s" % _ov_txt)
+                self.lbl_check_note.setStyleSheet(
+                    "color: %s;" % ("#188038" if _ok else "#b06000"))
+            else:
+                self.lbl_check_note.setText("核对不了：%s" % r["why"])
+                self.lbl_check_note.setStyleSheet("color: #b06000;")
+            self.lbl_check_detail.setText(
+                ("%s\n" % (r.get("hint") or ""))
+                + ("现场已存：%s（panel.png / canvas.png / meta.json）" % _dir if _dir else ""))
+            try:
+                from core import behavior as _bh
+                _bh.event("mmap_check_fail", map_id=str(mid), src=str(src),
+                          why=str(r.get("why") or "")[:180], diag=str(_dir))
+            except Exception:                        # noqa: BLE001 —— 记账坏了别影响界面 ✓
+                pass
             return
         # `verdict` 里那对 `**` 是给命令行看的（Qlabel 不认 markdown）⇒ 去掉 ✓
         self.lbl_check_note.setText(r["verdict"].replace("**", ""))
@@ -2533,7 +2578,10 @@ class RoutePanel(QWidget):
                [round(float(v), 2) for v in r["offset_ref"]],
                r["px_per_world"],
                "" if r["trust"] else "；⚠ 尺子匹配分只有 %.2f（< %.2f）⇒ 只能当参考"
-               % (r["score"], mm.TRUST_SCORE)))
+               % (r["score"], mm.TRUST_SCORE))
+            # ⭐ 顺带把"地形重合率"也写上（2026-10-09 ✓ 用户要看的就是"我标得准不准" ✓）：
+            #   它是**对覆盖层/渲染差异不敏感**的那个判据 ✓（见 `mm.calib_overlap` ✓）。
+            + ("\n%s" % r["overlap_text"] if r.get("overlap_text") else ""))
 
     def _on_zones_saved(self, map_id, n_sets):
         """编辑器保存后更新面板提示 + **立刻重画集合图**。
@@ -2626,7 +2674,11 @@ class RoutePanel(QWidget):
         """
         if getattr(self, "_src_override", None):
             return self._src_override
-        return mm.live_src(load_live())     # 口径只有一处（`perception.minimap.live_src` ✓）
+        # 口径只有一处：`perception.minimap.source_for_map`（**按地图 id**那份优先 ✓，
+        # 没灌过才回退全局 `live.yaml` ✓）—— 它和上面 `_src_override` 的来路是同一份数据 ✓，
+        # 所以两条路给出同一个答案 ✓。⚠ 2026-10-10：体检那边原来读的是**全局** `live_src()`
+        # ✗ ⇒ 与本页分叉（"我标定过了还显示没标定"✓）⇒ 那边已改走这个函数 ✓。
+        return mm.source_for_map(self._map_id(), load_live())
 
     def _track_now(self):
         """**当前这张图**的黄点跟踪参数（没灌过 ⇒ 回退全局 `config/live.yaml` ✓）。
@@ -3190,6 +3242,16 @@ class RoutePanel(QWidget):
         #     —— 那正是要拆掉的东西 ✓）。
         from decision import agent as _agent_mod
         _lp = getattr(_agent_mod, "LAST_POS", None)
+        # ⭐⭐ **把三种状态分清楚**（2026-10-10 ✓ 用户报："刚开始推流 + 推理**大概率一直**显示
+        #   「世界坐标：实时没在跑」"✗）：以前只有"有坐标"和"没在跑"两种说法 ✗ ⇒
+        #   明明在跑、只是**还没定上位**（刚开 / 黄点还没锁住 ✓）也被说成"没在跑" ✓ = 假话 ✗。
+        #   ⇒ 现在分：①没在跑（从没收到过）②在跑但这一拍没定上位 ③在跑且有坐标 ✓。
+        _age = None
+        if _lp:
+            try:
+                _age = time.monotonic() - float(_lp.get("at") or 0.0)
+            except (TypeError, ValueError):
+                _age = None
         if _lp and str(_lp.get("map_id") or "") == str(mid):
             r = dict(r,
                      world_x=_lp.get("world_x"), world_y=_lp.get("world_y"),
@@ -3200,7 +3262,19 @@ class RoutePanel(QWidget):
                      short="")
             if r.get("world_x") is None:
                 r = dict(r, ok=False,
-                         short="位置状态这一拍没给出坐标")
+                         short="实时在跑，但**这一拍还没定上位**（刚开 / 黄点还没锁住）")
+            elif _age is not None and _age > 2.0:
+                # 有坐标、但**很久没更新** ⇒ 实时多半已经停了（`LAST_POS` 从来不清 ✓）
+                r = dict(r, ok=False,
+                         short="位置状态已经 %.0f 秒没更新（实时可能停了）" % _age)
+        elif _lp:
+            # 收到过、但**是另一张图**的（换图之后实时还在按旧图算 ⇒ 别拿它当这一张的坐标 ✗）
+            r = dict(r, ok=False, world_x=None, world_y=None,
+                     foothold_id=None, segment_id=None,
+                     short="实时在算的是另一张图（%s）⇒ 这一行不显示它"
+                           % (_lp.get("map_id") or "?"),
+                     note="这一行只显示「实时回路的位置状态」（唯一那一份 ✓）——"
+                          "它现在给的 map_id 与这张图不一致，按「换图还没跟上」处理 ✓。")
         else:
             r = dict(r, ok=False, world_x=None, world_y=None,
                      foothold_id=None, segment_id=None,
@@ -3451,6 +3525,61 @@ class RoutePanel(QWidget):
         return (bx * z, by * z,
                 z / max(1e-6, float(sx)), z / max(1e-6, float(sy)))
 
+    #: 差分视图里那个"圈"的**平滑系数**（一阶低通 ✓ 越大越跟手、越小越稳 ✓）。
+    #: ⚠ 用户 2026-10-10："你的锁定标记会**乱飘**到别的点上去，根本没坐标偏差有做任何平滑"✗
+    #: ⇒ 取 0.55：跟得上走、又不跟着单像素噪声跳 ✓。
+    #: ⚠ 口径出处：`E:\MyPrograms\Maple_xfeat\src\vision\tracker.py` 里那套也是"连通域**质心** +
+    #:   跨拍平滑"✓（那边 EMA α=0.85 是**喂速度**用的、不拿去当显示坐标 ✓ 见它的注释 ✓）。
+    _DOT_EMA = 0.55
+    #: 一跳超过这么多（面板像素 ✓）⇒ 判"真的换了个点" ⇒ **重锚**（不平滑过去 ✓）。
+    #: 量级照 `Maple_xfeat` 的模板搜索半径（20px ✓ 见 `tracker.py` ✓）。
+    _DOT_JUMP_PX = 20.0
+
+    def _diff_dot_center(self, mask, di, cal, cw):
+        """差分掩模里挑"最像玩家点"的那一块 ⇒ **质心**（面板像素 ✓）；挑不出来 ⇒ None ✓。
+
+        为什么不直接用 `di["at"]`（= 差得最厉害的那个**像素** ✗）：那是 **argmax** ✗
+        ⇒ ① 不是点的中心（用户："你**瞄准的不是黄点正中心**"✗）；
+           ② 每拍在块内最亮的那个像素上跳 ⇒ **看着乱飘** ✗（用户："锁定标记会乱飘"✗）。
+        挑法照 `Maple_xfeat` 的 `MinimapTracker`（`src/vision/tracker.py` ✓）那一套思路：
+          · **连通域**（8 邻域 ⇒ 一个点不会碎成几块 ✓），太碎的（面积<3）和成片的（>900）都丢 ✓；
+          · 打分 = **方**（长宽比）+ **实**（面积/外接框密度）− **离上一拍多远**（连续性 ✓
+            ⇒ "锁住就不许乱跳" ✓）；
+          · 取**质心**（`np.mean` ✓ 亚像素 ✓）当这一拍的观测 ✓，再做一阶低通（`_DOT_EMA` ✓）。
+        """
+        try:
+            import cv2
+            n, _lab, stats, cents = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        except Exception:                           # noqa: BLE001 —— 算不动就不画圈（别乱画 ✗）
+            return None
+        prev = getattr(self, "_dot_ema", None)
+        _pw = float(mask.shape[1]) if getattr(mask, "shape", None) else 240.0
+        best, best_s = None, -1e9
+        for i in range(1, n):
+            x, y, w, h, area = stats[i]
+            if area < 3 or w < 3 or h < 3 or area > 900:
+                continue
+            dens = area / float(max(1, w * h))
+            sq = 1.0 - abs(w - h) / float(max(1, max(w, h)))
+            cx, cy = float(cents[i][0]), float(cents[i][1])
+            d = 0.0 if prev is None else float(np.hypot(cx - prev[0], cy - prev[1]))
+            # ⭐⭐ **"像不像玩家那个点"也算进来**（2026-10-10 ✓ 与识别层同一把尺子 ✓ 见
+            #   `perception/minimap.dot_player_like` ✓）：这样圈出来的那个点，与
+            #   Agent 锁的那个点是**同一套判据**挑的 ✓（不然会出现"圈的是 A、锁的是 B"✗）。
+            like = mm.dot_player_like({"w": w, "h": h, "area": area}, _pw)
+            s = 1.6 * like + 1.2 * dens + 1.0 * sq - 0.04 * d
+            if s > best_s:
+                best_s, best = s, (cx, cy, d)
+        if best is None:
+            return None
+        cx, cy, d = best
+        if prev is None or d > self._DOT_JUMP_PX * 3:
+            self._dot_ema = (cx, cy)                   # 首次 / 真换点了 ⇒ 重锚 ✓
+        else:
+            a = self._DOT_EMA
+            self._dot_ema = (a * cx + (1 - a) * prev[0], a * cy + (1 - a) * prev[1])
+        return self._dot_ema
+
     def _live_map_tick(self):
         """把当前那块小地图面板按标定摆到地形图上（每 250ms 一拍 ✓）。
 
@@ -3465,6 +3594,11 @@ class RoutePanel(QWidget):
         # ⚠ **不要**先判"有没有 live_panel"：来源=收流时那块面板是从 A 机那一口来的，
         #   跟本机实时页在不在跑没关系 ✓（那条路要 `live_panel` 的是"从实时画面框选"，
         #   由 `_mmap_panel_for_check` 自己按来源判 ✓）。
+        # ⭐⭐ **每拍先把上一拍圈出来的点清掉**（2026-10-10 ✓）：不然那些**早退分支**
+        #   （取不到面板 / 没标定 / 没底图 ✓）会把**上一拍那个圈**留在图上 ⇒ 看着像"它还在动"✗
+        #   —— 而那正是"看得见的假结果"，比没有更坏 ✓。成功那条路会在本拍再画上去 ✓。
+        self._live_mark = []
+        self.canvas.set_markers([])
         mid = self._map_id()
         if not mid:
             self.canvas.set_live_patch(None)
@@ -3520,6 +3654,8 @@ class RoutePanel(QWidget):
         #   ⚠ 算不出来（面板落在底图外 / 标定读不出 / 形状怪 ✓）⇒ **照旧摆面板**
         #     （把画面弄空才是更坏的 ✗）＋ 一行说清 ✓ 不许静默 ✓。
         show, diff_txt, diff_warn = panel, "", False
+        #: 差分那一层的**差异掩模**（给"透明底"和"找点"两处共用 ✓ 别各算一遍 ✗）
+        _diff_alpha = None
         if self._live_disp == "diff":
             # ⭐ `color=True`：**把点的颜色显示出来**（用户 2026-10-06 ✓ 原话："像素差分地图
             #   能把点的颜色显示出来而不是纯白吗？"✓）—— 差得够亮的那块按**面板本来的颜色**
@@ -3537,13 +3673,100 @@ class RoutePanel(QWidget):
                                di["peak"], di["at"][0], di["at"][1],
                                round(wx), round(wy)))
                 show = vis
+                # ⭐⭐⭐ **把"这一拍找到的那个点"圈到地形图上**（用户 2026-10-10 ✓ 原话：
+                #   "你是应该以**差分地图**来找玩家坐标的，那我需要**在这里看到你的结果**，
+                #    例如把你**找到的黄点圈出来**" ✓✓）。
+                #   ⚠⚠ 但**不能用 `di["at"]`** ✗ —— 它是"差得最**厉害**那个**像素**"（argmax ✓）：
+                #     ① 不是点的**中心**（用户："你**瞄准的不是黄点正中心**"✗）；
+                #     ② 每拍在最亮的那个像素上跳来跳去 ⇒ **看着乱飘** ✗（用户第二条 ✓）；
+                #   ⇒ 改成"**连通块质心 + 跨拍平滑**"（口径与 `E:\MyPrograms\Maple_xfeat`
+                #     `src/vision/tracker.py` 一致 ✓ 那也是**连通域质心**而不是 argmax ✓）：
+                #     ① 取"够亮"的像素做连通域（阈值 = 峰值的一半，且不低于噪声底线 ✓）；
+                #     ② 挑"最像玩家点"的那一块（**离上一拍最近** + 块**圆一点、大一点** ✓）；
+                #     ③ 用**质心**（`np.mean` ✓ 亚像素 ✓）当这一拍的观测；
+                #     ④ 再对位置做**一阶低通**（`_DOT_EMA` ✓）—— 人眼看的就是它 ✓ 不能飘 ✓。
+                # 差异掩模：阈值 = 峰值一半、且不低于噪声底线（`mm.DOT_DIFF_MIN_CONTRAST` ✓）
+                #   —— 同一张掩模**两用** ✓：① 给这层加 alpha（只画差异、其余透明 ✓ 用户第四条 ✓）；
+                #   ② 给"挑点"用（连通域 ✓ 见 `_diff_dot_center` ✓）。
+                _pk = float(di.get("peak") or 0.0)
+                _thr = max(float(mm.DOT_DIFF_MIN_CONTRAST), 0.5 * _pk)
+                _diff_alpha = ((vis.max(axis=2).astype(np.float32) >= _thr)
+                               .astype(np.uint8) * 255)
+                # ⛔⛔ **这里原来把"差分自己挑的点"当玩家圈上去** —— **2026-10-10 用户否掉** ✗
+                #   （原话："**地形图都锁到红点上去了，报的坐标也与信息栏不一致，这个不应该
+                #    自己走独立逻辑，它就应该根据最终信息栏读到的玩家世界坐标来绘制**"✓）：
+                #   · `_diff_dot_center` 挑的是"**差得够亮的那一块**"（连通域质心 ✓）——
+                #     底图/地图上只要"与面板不同源"的东西（**墙的红点**、地形线、集合色块 ✓）
+                #     差得够亮就会被当成玩家 ⇒ **锁到红点上** ✗（截图现场 ✓）；
+                #   · 而它报的世界坐标与信息栏那行**必然是两个数** ✗（两条链 ✓ ——
+                #     这正是 2026-10-06 拆过一次的老毛病 ✓ 见 `decision/agent.LAST_POS` ✓）。
+                #   ⇒ 玩家圈**只认唯一那一份**（下面那段 ✓）；差分**照旧画**（它是给人看
+                #     "差在哪"的一层 ✓ 用户 2026-10-06 定的 ✓）—— 但它**不再代表玩家** ✗。
+                #   ⚠ 那一层自己挑出来的块**照样算出来、只是只写成一句文字** ✓（用户 2026-10-10
+                #     要过"我要在这里看到你的结果"✓ ⇒ 不能干脆删掉 ✓；但它**不许再当玩家位置** ✗）
+                #     —— 这样 `_diff_dot_center` 也不必变成死代码 ✓。
+                _dpt = self._diff_dot_center(_diff_alpha, di, cal, cw)
+                if _dpt is not None:
+                    _dwx, _dwy = mm.panel_to_world(_dpt[0], _dpt[1], cal, t) \
+                        if cal.get("mode") != mm.MODE_CROP else (None, None)
+                    diff_txt += "　（差分那层自己挑的块在面板 (%.0f, %.0f)%s —— 仅供看，**不代表玩家** ✗）" \
+                        % (_dpt[0], _dpt[1],
+                           "" if _dwx is None else
+                           "，按标定算出来是 (%d, %d)" % (round(_dwx), round(_dwy)))
                 if di["floor"] >= DIFF_FLOOR_WARN:
                     diff_txt += "（背景档偏大 ⇒ 这张图上底图与游戏小地图不同源，只能当辅助看）"
                     diff_warn = True
-        ok = self.canvas.set_live_patch(np_to_pixmap(show), (ox, oy), kx, ky)
+        # ⭐⭐⭐⭐⭐ **玩家那个圈 = 唯一那一份世界坐标**（用户 2026-10-10 ✓ 原话："**地形图都锁到
+        #   红点上去了，报的坐标也与信息栏不一致，这个不应该自己走独立逻辑，它就应该根据
+        #   最终信息栏读到的玩家世界坐标来绘制**"✓）。
+        #   · 来源：`decision.agent.LAST_POS` ✓（**实时回路是唯一写者** ✓ 见
+        #     `gui/live_thread._fill_route_ctx` ✓）—— 与信息栏那行、Agent 决策**同一个数** ✓；
+        #   · 换算：只走**地形**（`terrain.world_to_canvas` ✓ ⇒ 与标定/显示区那套**无关** ✓
+        #     —— 所以它不会因为 `view` 跟丢而漂 ✗）；
+        #   · ⚠ 换图 / 实时没在跑 / 这一拍还没定上位 ⇒ **不画** ✓（绝不自己再算一份 ✗
+        #     —— 那正是要拆掉的东西 ✓）；沿用上一帧的（`held` ✓）照画 ✓ 但**如实标注** ✓。
+        _lp = None
+        try:
+            from decision import agent as _agent_mod
+            _lp = getattr(_agent_mod, "LAST_POS", None)
+        except Exception:                       # noqa: BLE001 —— 公开失败不该弄坏绘制 ✓
+            _lp = None
+        if isinstance(_lp, dict) and str(_lp.get("map_id") or "") == str(mid):
+            _wx, _wy = _lp.get("world_x"), _lp.get("world_y")
+            if _wx is not None and _wy is not None:
+                try:
+                    _cx, _cy = t.world_to_canvas(float(_wx), float(_wy))
+                    _z = float(mm.overlay_zoom(cw))
+                    self._live_mark = [(
+                        _cx * _z, _cy * _z,
+                        "玩家 世界(%d, %d)%s" % (round(float(_wx)), round(float(_wy)),
+                                                "·沿用上一帧" if _lp.get("held") else ""),
+                        "#ffd400", 12.0)]
+                except Exception:               # noqa: BLE001
+                    pass
+        # ⭐⭐ **差分那一层要"只把差异画出来、其余透明"**（用户 2026-10-10 ✓ 第四条：
+        #   "还是没有在像素差分地图汇总**看到我编辑的地形**（foothold 集合、楼梯、传送点…）"✗）：
+        #   原因很具体 —— `mode=fit`（全局小地图）时**面板正好盖住整张底图** ✗，而差分图
+        #   背景是黑的 ⇒ 黑底一铺 ⇒ **底下那张地形图（集合颜色 / 楼梯 / 传送点）全被盖掉** ✓✓。
+        #   ⇒ 这里给它加 **alpha 通道**：差异像素不透明（点看得见 ✓）、其它全透明（地形透出来 ✓）。
+        _patch = np_to_pixmap(show)
+        if self._live_disp == "diff" and not diff_warn and _diff_alpha is not None:
+            try:
+                if _diff_alpha.shape[:2] == show.shape[:2]:
+                    # ⚠ 必须走**四通道**那条（`np_to_pixmap` 认 BGRA ⇒ `Format_ARGB32` ✓）——
+                    #   三通道的图会被当成 BGR 逐像素错读 ✗（见 `gui/minimap_calib.np_to_pixmap` ✓）。
+                    _patch = np_to_pixmap(np.dstack([show, _diff_alpha]))
+            except Exception:                       # noqa: BLE001 —— 加不上就照旧（别把画面弄空 ✗）
+                pass
+        ok = self.canvas.set_live_patch(_patch, (ox, oy), kx, ky)
         if not ok:
             self.lbl_live_map.setText("地形图还没画出来（先点「生成地形图」）")
             return
+        # ⭐⭐ 把这一拍算出来的点**圈**上去（`set_markers` ✓ 见它说明 ✓）；
+        #   ⚠ 放在 `set_live_patch` **之后** ✓ —— 它要场景里已经有地形图才画得上 ✓。
+        n_mark = self.canvas.set_markers(self._live_mark)
+        if n_mark:
+            diff_txt += "　· 已在地形图上**圈出 %d 个点**（黄圈 = 差分找到的那个 ✓）" % n_mark
         warn = how.startswith("⚠") or diff_warn
         self.lbl_live_map.setText(
             "面板 %d×%d 摆在地图 (%d, %d) 起、%.2f×（%s）%s%s"

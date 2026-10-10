@@ -523,6 +523,93 @@ def _take_done():
     return n
 
 
+# ══════════════════════════════════════════════════════════════
+# ⭐⭐ 「问 A 机光标在哪」—— relayer **自己答**，**不写串口** ✗（2026-10-10 ✓）
+# ══════════════════════════════════════════════════════════════
+#: 用户原话："**这个过程不能每次都发现错然后跑命令吧 太麻烦了 不能自动吗？**" ✓
+#:   ⇒ 鼠标是经 relay 打到 **A 机**的 ✓ ⇒ B 机**看不见 A 机的光标** ✗ ⇒ 标定只能人手工量 ✓。
+#:   有了这一条，B 就能自己动一小步、读前后位置、把「一单位走多少像素」**自己算出来** ✓
+#:   ⇒ 帧尺寸变了**自己量一次** ✓（`decision/mouse_aim.auto_measure` ✓）。
+#: ⚠ 固件**不认识**这条 ✗（写进串口只会换回一个 `ERR` ✓ 还会污染 `DONE/ERR` 回执计数 ✓）
+#:   ⇒ 在**转发之前**挑出来 ✓、由 relay 直接回 ✓（见 `bridge` 里那一步 ✓）。
+#: ⚠ 客户端要**单独发**这一条 ✓（一条 `sendall` 走到底 ✓）：这边按"整包里包含它"来挑 ✓
+#:   —— 半行拼在别的指令里**不保证**能拆干净 ✗（见 `KbdClient.cursor` 的说明 ✓）。
+CURSOR_QUERY = b"CURSOR?"
+
+
+def _virtual_screen():
+    """A 机虚拟屏 `(vx, vy, vw, vh)`（`GetSystemMetrics` 76~79 ✓ 物理坐标 ✓，多屏时 x/y 可能为负 ✓）。"""
+    import ctypes
+    u = ctypes.windll.user32
+    return (int(u.GetSystemMetrics(76)), int(u.GetSystemMetrics(77)),
+            int(u.GetSystemMetrics(78)), int(u.GetSystemMetrics(79)))
+
+
+def _cursor_pos():
+    """A 机光标 `(x, y)`；问不到 ⇒ `None` ✓。"""
+    import ctypes
+    from ctypes import wintypes
+    pt = wintypes.POINT()
+    ok = ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return (int(pt.x), int(pt.y)) if ok else None
+
+
+def _capture_region_size():
+    """推流**抓的是哪块屏** ⇒ `(w, h)`；说不准 ⇒ `None` ✓（**不许猜** ✗ 见下面说明 ✓）。
+
+    ⚠ 为什么它必须有：B 机要拿它把「一单位走多少**屏幕**像素」（它能量到 ✓）折成
+      「一单位走多少**帧**像素」（它真正要的 ✓）—— 折算比 = `推流分辨率 ÷ 抓的区域尺寸` ✓
+      ⇒ 抓的区域缺了就只能猜 ✓（拿猜当准是本仓库明令禁止的 ✓ 见 `decision/mouse_aim`
+      的 `auto_measure` / `gain_mismatch` ✓）。
+    判据（读 A 机自己的 `config/deploy.json` ✓ 不猜 ✓）：
+      · `push.capture` 以 **`ddagrab`** 开头（桌面复制 ✓ —— 本机现在用的就是它 ✓）
+        ⇒ 抓的是**整块桌面** ✓ ⇒ 区域 = **虚拟屏尺寸** ✓；
+      · 带 `push.rect`（显式框 ✓）⇒ 用那个框 ✓；
+      · 认不出 ⇒ `None` ✓（宁可让人**手工量一次**，也别猜 ✓）。
+    """
+    try:
+        import json
+        from pathlib import Path
+        p = Path(__file__).resolve().parent.parent / "config" / "deploy.json"
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:                            # noqa: BLE001 —— 读不到 ⇒ 就当"说不准" ✓
+        return None
+    push = d.get("push") or {}
+    cap = str(push.get("capture") or "").lower()
+    if cap.startswith("ddagrab"):
+        _vx, _vy, vw, vh = _virtual_screen()
+        return (vw, vh) if vw > 0 and vh > 0 else None
+    r = push.get("rect")
+    if isinstance(r, (list, tuple)) and len(r) == 4:
+        try:
+            if int(r[2]) > 0 and int(r[3]) > 0:
+                return (int(r[2]), int(r[3]))
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def cursor_reply_text():
+    """A 机光标 + 屏幕 + 抓取区域 ⇒ **一行**回给 B 机 ✓（拿不到 ⇒ `CUR -` ✓）。
+
+    格式：`CUR x y vx vy vw vh [cap_w cap_h]` ✓
+      · `x y`          = 光标（**A 机屏幕坐标** ✓ 可能是负的 ✓）
+      · `vx vy vw vh`  = A 机虚拟屏 ✓（B 机拿它当"绝对原点"✓ 见 `mouse_aim.counts_for` ✓）
+      · `cap_w cap_h`  = 推流抓的区域尺寸（**可选** ✓ 没有就省略 ✓ 见 `_capture_region_size` ✓）
+    """
+    try:
+        p = _cursor_pos()
+        if p is None:
+            return "CUR -"
+        vx, vy, vw, vh = _virtual_screen()
+        r = _capture_region_size()
+        if r:
+            return "CUR %d %d %d %d %d %d %d %d" % (p[0], p[1], vx, vy, vw, vh, r[0], r[1])
+        return "CUR %d %d %d %d %d %d" % (p[0], p[1], vx, vy, vw, vh)
+    except Exception:                            # noqa: BLE001 —— 不许把桥搞挂 ✗
+        return "CUR -"
+
+
 def bridge(conn, link):
     """双向桥：TCP -> 串口，串口 -> TCP。
 
@@ -598,6 +685,16 @@ def bridge(conn, link):
                 continue
             if not data:
                 break
+            if CURSOR_QUERY in data:
+                # ⭐⭐ 「问光标在哪」**不写串口** ✗ —— 固件不认识它 ✓（写进去只会换回 ERR ✓
+                #   还会污染 `DONE/ERR` 回执计数 ✓）⇒ 由 relay 自己答 ✓（见 `CURSOR_QUERY` ✓）。
+                data = data.replace(CURSOR_QUERY, b"")
+                try:
+                    conn.sendall((cursor_reply_text() + "\n").encode("ascii"))
+                except Exception:                # noqa: BLE001 —— 回不了就当没问过 ✓
+                    pass
+                if not data:
+                    continue                      # 就这一条 ⇒ 不用再写串口 ✓
             trace("tcp->serial %s"
                   % data.decode("ascii", "replace").replace("\n", "|")[:60])
             # ⭐ **写串口耗时**（`KbdStats` 要它）：这就是"下游堵没堵"的直接证据 ✓

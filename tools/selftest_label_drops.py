@@ -3006,6 +3006,72 @@ def t_frame_sel_dialog_shows_images():
         d3.deleteLater()
 
 
+def t_yolo_augment_output_name_follows_frame():
+    """⭐⭐ **YOLO 辅助的输出名必须跟「画面目录里的帧」走**（用户 2026-10-09 ✓）。
+
+    现场（鳄鱼潭1 ✓ 原话："YOLO 标注的怪物…显示有很多新框但是质检台打开看不到新的框"✓）：
+    `--frames` 指到了**另一个**目录（那批图叫 `image0.jpg…image178.jpg` ✓）、`--out` 指到本项目
+    ⇒ `labels_auto/` 里多出 **163 个 `image0.txt…image178.txt`** ✗（而画面叫
+    `frame_00000.png…` ✓）⇒ **质检台按帧名找标注** ⇒ 那 163 帧看到的还是**旧**标注 ✗
+    = 用户那句"看不到新的框" ✓（数据集那边同样读不到 ✓）。
+
+    钉三件：
+      ① `_stem_of`：帧目录里的真图 ⇒ 帧 stem ✓；**别的目录的图 ⇒ None** ✓（调用方跳过 ✓）；
+         同名不同路径写法 ⇒ 也能认 ✓；空 path ⇒ None ✓；
+      ② **源码级**：循环里**不许**再拿 `path.stem` 当输出名 ✗（那次病根就是它 ✓）；
+      ③ **源码级**：对不上的要**跳过并报出来** ✗（`skipped` 进日志与返回摘要 ✓ 不静默 ✓）。
+    """
+    import shutil
+    import tempfile
+
+    from tools.yolo_augment import _stem_of
+
+    tmp = Path(tempfile.mkdtemp(prefix="yolo_aug_"))
+    try:
+        fd = tmp / "frames"
+        fd.mkdir()
+        for n in ("frame_00000.png", "frame_00001.png"):
+            (fd / n).write_bytes(b"")
+        fm = {f.resolve(): f.stem for f in sorted(fd.glob("*.png"))}
+        check(_stem_of(fd / "frame_00000.png", fm) == "frame_00000",
+              "帧目录里的真图没映射回帧名 ✗")
+        check(_stem_of(tmp / "elsewhere" / "image0.jpg", fm) is None,
+              "**别的目录**的图没被挡住（2026-10-09 那个病根就是它 ✗）")
+        check(_stem_of(fd / "frame_00001.png", fm) == "frame_00001",
+              "同名不同路径写法认不出来 ✗")
+        check(_stem_of("", fm) is None, "空 path 没返回 None（会写出个空的 .txt ✗）")
+    finally:
+        shutil.rmtree(tmp, True)
+
+    _src = (ROOT / "tools" / "yolo_augment.py").read_text(encoding="utf-8")
+    check("stem = _stem_of(path, frame_map)" in _src and "stem = path.stem" not in _src,
+          "输出名又跟「喂进来的图」走了 ✗（`stem = path.stem` 那行正是 2026-10-09 的病 ✓）")
+    check("skipped.append(" in _src and "跳过 %d 张对不上帧的图" in _src,
+          "对不上帧的图没被跳过 / 没报出来（会静默写出孤儿标注 ✗）")
+    # ⭐⭐ 还要留一份"这趟干了什么"的**磁盘记录**（2026-10-09 ✓）：日志只在界面里 ⇒
+    #   事后分不清「没跑 / 被取消 / 被跳过 / 补了 0 框」✗（用户"重新跑了一趟却什么都没变"
+    #   当场就是这个局面 ✓）⇒ `last_augment.json` 里必须有 `frames_dir`（指错目录一眼看见 ✓）
+    #   和 `canceled`（被取消也记 ✓）。
+    # ⛔ 一张都对上时不许只报"模型不适应"✗ —— 必须**明说**是"画面目录指错了"✓（用户 2026-10-09
+    #   现场：`画面 180 张 / 补充 0 框 / 跳过 180 张` ⇒ 他第一反应是"模型没检出"✗）。
+    # ⭐⭐ 版本号（2026-10-10 ✓ 现场逼出来的）：工作台进程若在**跑过一次之后**一直开着，
+    #   `sys.modules` 里就是**旧模块** ✗ ⇒"改了却还是老行为"✓ ⇒ 每次跑都报版本、并写进记录 ✓
+    #   ⇒ 人**当场**就能确认"到底跑的是不是新代码" ✓（不用再来回猜三轮 ✓）。
+    check("AUGMENT_BUILD" in _src and 'ctx.log("版本' in _src and '"build": AUGMENT_BUILD' in _src,
+          "没报版本号 / 没写进记录 ⇒ 又会陷入「改了却还是老行为」的分不清 ✗")
+    # ⭐⭐ **`r.path` 靠不住**（2026-10-10 实测 ✓）：给 `predict` 传路径列表时，ultralytics 把回报的
+    #   `path` 写成 `image0.jpg / image1.jpg …`（内部序号名 ✓）⇒ 必须**按顺序兜底** ✗
+    #   （不兜底 = 整趟跳过 ⇒ 用户看到"点了 YOLO标注 什么都没变"✓ 这就是 2026-10-10 现场 ✓）。
+    check("order_fixed" in _src and "frames[i - 1].stem" in _src and '"order_mapped"' in _src,
+          "`r.path` 被 ultralytics 换成 `imageN.jpg` 时没有**顺序兜底**（会整趟跳过 ✗）"
+          "／或者没把这件事记进日志与记录 ✗")
+    check("这一趟一张都对不上" in _src and "别指向临时导出的那一份" in _src,
+          "「一张都对不上」时没给最响的提示（会被人当成「模型没检出」✗）")
+    check("last_augment.json" in _src and '"frames_dir"' in _src and '"canceled"' in _src,
+          "跑完没落一份记录（`last_augment.json` / `frames_dir` / `canceled`）⇒ "
+          "下次又说不清「没跑 / 被取消 / 被跳过 / 补了 0 框」✗")
+
+
 def main():
     # ⚠⚠ **整套自检一律不碰用户真实的 `config/wz.yaml`**（2026-10-04 血的教训 ✗）：有一个用例
     #   直接拿 `wzexport.CONFIG_PATH` 当草稿纸写 ⇒ 把用户配置覆盖成了临时目录 ✓，现场就是
@@ -3087,6 +3153,9 @@ def main():
          t_template_load_is_cancellable),
         ("⭐⭐ 「每帧最多几个框」= -1..999（负数无限 / 0 ⇒ 按钮灰 / tips 补上；用户 2026-10-05）",
          t_max_peaks_range_and_zero_gates_buttons),
+        ("⭐⭐ YOLO 辅助的输出名**必须跟画面目录的帧走**（用户 2026-10-09「质检台看不到新框」）："
+         "别的目录的图一律**跳过并报出来**（`imageN.txt` 那 163 个孤儿就是这么来的 ✗）",
+         t_yolo_augment_output_name_follows_frame),
     ]
     ok = 0
     try:

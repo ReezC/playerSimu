@@ -23,6 +23,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np                                          # noqa: E402
 
+# ⭐⭐ **整个套件只建一次 `QApplication`，而且用模块级名字一直握着**（2026-10-10 ✓）：
+#   各条用例原来都写 `app = QApplication.instance() or QApplication([])` 并赋给**局部变量** ✗
+#   ⇒ 那个 app 一出作用域就被回收，而它名下建的控件还活着 ✗ ⇒ 到后面**再建控件**时 Qt 直接
+#   fail-fast（`0xC0000409` ✓ **连 Python traceback 都没有** ✗）—— 本套件 2026-10-10 就在
+#   新加的一条用例上撞到（跑到那条**静默死掉、连通过数都不打** ✓）。
+#   ⚠ 同族的坑本仓库踩过多次（`selftest_decision` / `selftest_main_window` 都是这么修的 ✓
+#     见它们的 `_APP` ✓）⇒ 这里也用**模块级**握着 ✓（各条用例里的 `QApplication.instance()`
+#     照样拿到它 ✓ 不用改 ✓）。
+from PyQt5.QtWidgets import QApplication as _QApp             # noqa: E402
+
+_APP = _QApp.instance() or _QApp([])                          # noqa: F841
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -874,7 +886,16 @@ def t_src_lag_degrades_display():
     """
     from gui.live_thread import (PREVIEW_FPS_MIN, PREVIEW_HOLD_S, PREVIEW_TIER_MID,
                                  SRCLAG_CLEAR_SEC, SRCLAG_SEC, preview_fps_target,
-                                 src_lag_watchdog)
+                                 src_lag_signal, src_lag_watchdog)
+
+    # ①′ ⭐⭐ **"跟不上源"不能只看速率**（2026-10-10 现场 ✓）：主回路**故意丢帧**（只留最新 ✓）
+    #    ⇒ `proc < recv` 是**常态**⇒ 只看它会在健康段一直判落后 ⇒ 预览被**永久**压在最低档
+    #    ⇒ 用户喊"卡得很"✗（实测那时端到端只有 **131 ms** ✓ 而 `src_lag=on` ✗）。
+    check(src_lag_signal(True, 131.0) is False,
+          "延迟才 131ms（健康 ✓）却还判「跟不上源」⇒ 预览被永久压到最低档 ✗")
+    check(src_lag_signal(True, 900.0) is True, "延迟锁死时没判落后 ✗")
+    check(src_lag_signal(False, 900.0) is False, "速率够快时只凭延迟判落后（会误降档 ✗）")
+    check(src_lag_signal(True, None) is True, "探针没开时没退回「只看速率」✗")
 
     # ① 纯函数
     st = [None, False, None]
@@ -906,8 +927,16 @@ def t_src_lag_degrades_display():
           "够用（延迟 60ms、无负载告警）时没用满用户配的上限（不够流畅 ✗）")
     check(preview_fps_target(50.0, 300.0, "", False, 0.1, pv) == 25.0,
           "有点吃紧（延迟 300ms）没降到半速：%r" % pv)
-    check(preview_fps_target(50.0, 60.0, "负载告警：内存 2.2/31.8GB", False, 0.2, pv) == 25.0,
-          "有负载告警也没降档（那正是「为什么变慢」的解释 ✗）")
+    # ⭐⭐ 用户 2026-10-10 口径修正（原话："**健康 肯定 用满**"✓）：**探针开着**时**以延迟为准** ✗ ——
+    #   延迟 60ms（健康）而"别人开着别的程序"（负载告警）⇒ **不许**因此砍一半 ✓
+    #   （实景：延迟 131ms 却把预览压到 12fps ⇒ 人喊"卡得很"✗）。
+    pv_up = [None, 0.0]
+    check(preview_fps_target(50.0, 60.0, "负载告警：内存 2.2/31.8GB", False, 0.0, pv_up) == 50.0,
+          "延迟健康（60ms）却因为「别的程序占着机器」就砍一半 ✗（用户：「健康 肯定 用满」✓）")
+    # 探针**没开**（delay=None）⇒ 没有延迟可比 ⇒ 退回"负载告警 ⇒ 半速"（老口径 ✓ 不然就瞎了 ✓）
+    pv_lw = [None, 0.0]
+    check(preview_fps_target(50.0, None, "负载告警：内存 2.2/31.8GB", False, 0.0, pv_lw) == 25.0,
+          "探针没开又无延迟可比时，负载告警没兜住（老口径丢了 ✗）")
     # 降档**立刻**生效（升档才要等）
     check(preview_fps_target(50.0, 900.0, "", True, 0.3, pv) == PREVIEW_FPS_MIN,
           "锁死/跟不上源时没降到最低档：%r" % pv)
@@ -1360,19 +1389,39 @@ def t_lie_recording():
     t._lie_rec_stop(why="空停")               # 没在录时停 ⇒ 必须无害 ✓
     check(t._lie_rec is None and t._lie_rec_pending == 0.0, "空停把状态搞脏了")
 
-    t._lie_rec_start()
-    check(t._lie_rec_pending > 0.0, "触发（进 lie_*）没起录")
-    t._lie_rec_stop(why="单元")
-    check(t._lie_rec_pending == 0.0 and t._lie_rec is None, "停录没清状态")
+    # ⚠⚠ 用例**不许依赖用户配置**（2026-10-09 ✓ 逮到过一次 ✗）：起录前读的是 `_rec_allowed`
+    #   （它看 `config/live.yaml` 的 `rec_lie` / `rec_disc` ✓）—— 而用户完全可能把
+    #   「保留测谎录屏」关掉（他现在的配置就是 `rec_lie: false` ✓）⇒ 这条用例会红在
+    #   "触发（进 lie_*）没起录"上，**看着像功能坏了** ✗，其实是被自己的配置挡住 ✓。
+    #   ⇒ 按本文件已有的手法**注入配置**（下面那一段也这么干 ✓），测完立刻还原 ✓。
+    #   ⚠ 别去罩 `_rec_allowed` 本身 ✗：这条用例后半段**就是要测它**（开关关掉要如实回 False ✓）。
+    _old_live0 = cfg.load_live
+    cfg.load_live = lambda: {"rec_lie": True, "rec_disc": True}
+    try:
+        t._lie_rec_start()
+        check(t._lie_rec_pending > 0.0, "触发（进 lie_*）没起录")
+        t._lie_rec_stop(why="单元")
+        check(t._lie_rec_pending == 0.0 and t._lie_rec is None, "停录没清状态")
+    finally:
+        cfg.load_live = _old_live0
 
     _d = tempfile.TemporaryDirectory()
     _old = cfg.record_dir
     cfg.record_dir = lambda: Path(_d.name)
     try:
-        t._lie_rec_start()
-        _raw = _frame(7)
-        t._lie_rec_write(_raw, _time.monotonic())
-        t._lie_rec_write(_raw, _time.monotonic())
+        # ⚠ 这一段（起录 + 写两帧）**同样要注入开关** ✗（同上面那一段的口径 ✓）：不注入的话，
+        #   用户把「保留测谎录屏」关着（他现在的 `live.yaml` 就是 `rec_lie: false` ✓）⇒
+        #   `_lie_rec_start()` 直接返回 False ⇒ `_lie_rec_write` 什么都不做 ⇒ 红在
+        #   "没按帧写进容器（实际写 0 帧）"上 ✗ —— **看着像录制坏了**，其实是被自己的配置挡住 ✓。
+        _old_live1 = cfg.load_live
+        cfg.load_live = lambda: {"rec_lie": True, "rec_disc": True}
+        try:
+            t._lie_rec_start()
+            _raw = _frame(7)
+            t._lie_rec_write(_raw, _time.monotonic())
+            t._lie_rec_write(_raw, _time.monotonic())
+        finally:
+            cfg.load_live = _old_live1
         check(t._lie_rec is not None and t._lie_rec_n == 2,
               "没按帧写进容器（实际写 %d 帧）" % t._lie_rec_n)
         check(int(_raw[0, 0, 0]) == 7,
@@ -1752,6 +1801,140 @@ def t_live_weights_selectable():
           % src.count("self.cur_weights()"))
     check('p.sec("live")["weights"]' in src,
           "手选结果没写进项目的 `live.weights`（那就等于没记住 ✗）")
+
+
+def t_live_params_follow_project():
+    """⭐⭐⭐ 「实时」页那一排参数**跟着项目走**（用户 2026-10-09 ✓ 原话："把主视区所有的配置
+    根据项目存一下 —— 现在本地窗口来源、框选区域、怪 conf 等等参数每次都要重新填"）。
+
+    钉五件：
+      ① 改一格 ⇒ **真落盘**进项目（`project.yaml` 的 `live` 段 ✓）；**同时也写一份全局
+         `config/live.yaml`** ✓（那是"新项目的播种值"、也是命令行工具读的那份 ✓）；
+      ② **来源 ＋ 框选区域**也在清单里 ✓（用户点名的就是这两项 ✓）；
+      ③ ⭐ **回填是只读动作** ✗：`bind()` 全程不许写盘（程序性 `setValue/setChecked` 不许
+         伪装成"人改了参数"✗ —— 同 `route_panel._apply_route_cfg` 那条教训 ✓）；
+      ④ 项目里**没存过的键** ⇒ 保持现在的值（= 全局那份 ✓ 老项目行为一字不变 ✓）；
+      ⑤ 存档口**只有一处**（`_save_project_params` ✓）：控件 / 来源 / 框选 / `start()` 全汇到它 ✓。
+    """
+    import shutil
+    import tempfile
+    import unittest.mock as mock
+
+    from PyQt5.QtWidgets import QApplication
+
+    import gui.live_panel as lp
+    from gui.project import Project
+
+    app = QApplication.instance() or QApplication([])
+    check(app is not None, "建不起 QApplication")
+
+    tmp = Path(tempfile.mkdtemp(prefix="live_p_"))
+    try:
+        pa = Project.create(tmp / "a", name="项目A", map_id="107000100")
+        pb = Project.create(tmp / "b", name="项目B", map_id="105090600")
+
+        # 全局那份**换成假的**：真 `config/live.yaml` 一个字节都不许动 ✗（自检纪律 ✓）
+        written = []
+        with mock.patch.object(lp, "update_live",
+                               lambda **kw: written.append(dict(kw))):
+            pnl = lp.LivePanel()
+            try:
+                # ① 改一格 ⇒ 按项目落盘 ＋ 同步写全局
+                pnl.bind(pa)
+                n0 = len(written)
+                pnl.sp_conf_mob.setValue(0.55)      # 真信号 ⇒ 走 `_save_live_params` ✓
+                v = Project.open(pa.root).sec("live")
+                check(abs(float(v.get("conf_mob") or 0) - 0.55) < 1e-6,
+                      "改了「怪conf」却**没按项目存**（下次打开又得重填 ✗）：%r"
+                      % (v.get("conf_mob"),))
+                check(len(written) > n0
+                      and abs(float(written[-1].get("conf_mob") or 0) - 0.55) < 1e-6,
+                      "没同步写全局 live.yaml（命令行工具读的是它 ✗）：%r"
+                      % (written[-1:] or None,))
+
+                # ② 来源 ＋ 框选区域也进项目
+                pnl.cmb_source.setCurrentIndex(pnl.cmb_source.findData("window"))
+                pnl._rect = [10, 20, 300, 400]
+                pnl._save_project_params()
+                v = Project.open(pa.root).sec("live")
+                check(str(v.get("capture_source")) == "window",
+                      "「本地窗口来源」没按项目存：%r" % (v.get("capture_source"),))
+                check([int(x) for x in (v.get("rect") or [])] == [10, 20, 300, 400],
+                      "「框选区域」没按项目存（这是最烦的重填项 ✗）：%r" % (v.get("rect"),))
+
+                # ②b 「抓屏方式」（`wgc` / `bitblt` ✓ 用户 2026-10-09 ✓ 那圈"莫名其妙的描边"
+                #     就是它：Win11 会给被 WGC 采集的窗口画系统边框 ✗）也要按项目存 ✓
+                pnl.cmb_wcap.setCurrentIndex(pnl.cmb_wcap.findData("bitblt"))
+                check("window_capture" in lp.PROJ_LIVE_KEYS,
+                      "`window_capture` 不在「按项目存」的清单里（那就不会回填 ✗）")
+                v = Project.open(pa.root).sec("live")
+                check(str(v.get("window_capture")) == "bitblt",
+                      "「抓屏方式」没按项目存：%r" % (v.get("window_capture"),))
+
+                # ③ 回填是只读：切到"啥都没存过"的项目 B ⇒ 一个字节都不许写 ✗
+                n1 = len(written)
+                pnl.bind(pb)
+                check(len(written) == n1,
+                      "`bind()` 回填时写盘了（程序性 setValue 被当成「人改了参数」✗）：%r"
+                      % (written[n1:],))
+                # ⚠ 项目**建出来时**就带一条 `live.weights: ''`（`Project.create` 的默认段 ✓）
+                #   ⇒ 判据是"**没多出别的键**"（回填不许把这一排参数写进去 ✗）。
+                check(set(Project.open(pb.root).sec("live") or {}) <= {"weights"},
+                      "回填把项目 B 的 live 段写脏了（多出：%r）"
+                      % (sorted(set(Project.open(pb.root).sec("live") or {}) - {"weights"}),))
+
+                # ④ 项目里没存过的键 ⇒ 保持现在的值（老项目一字不变 ✓）
+                check(abs(pnl.sp_conf_mob.value() - 0.55) < 1e-6,
+                      "项目 B 没存过 conf_mob，控件却被改掉（老项目会被改坏 ✗）：%r"
+                      % (pnl.sp_conf_mob.value(),))
+
+                # ⑤ 换回项目 A ⇒ 回填成 A 那一份（含来源/框选区域）
+                pnl.bind(pa)
+                check(abs(pnl.sp_conf_mob.value() - 0.55) < 1e-6,
+                      "换回项目 A 没回填它那份 conf：%r" % (pnl.sp_conf_mob.value(),))
+                check(pnl.cmb_source.currentData() == "window",
+                      "换回项目 A 没回填来源：%r" % (pnl.cmb_source.currentData(),))
+                check(list(pnl._rect or []) == [10, 20, 300, 400],
+                      "换回项目 A 没回填框选区域：%r" % (pnl._rect,))
+                check(pnl.cmb_wcap.currentData() == "bitblt",
+                      "换回项目 A 没回填抓屏方式：%r" % (pnl.cmb_wcap.currentData(),))
+            finally:
+                pnl.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ⑤ 源码级：这一排参数的存档口**只有一处**（`_save_project_params` ✓）——
+    #   ⚠ 别去数"整个文件里 `update_live(` 出现了几次" ✗：`live.yaml` 里还有别的语义
+    #   （「自动测谎」那一组参数也写它 ✓ 而且那组**故意不进项目** ✓ 见 `PROJ_LIVE_KEYS` 上面那段
+    #   说明里"那几个键不许按项目存"的理由 ✓）⇒ 数总数会把别人的正常写口当成漂 ✓
+    #   （2026-10-09 踩过：那条 pin 报"2 处"红 ✓）。
+    src = (ROOT / "gui" / "live_panel.py").read_text(encoding="utf-8")
+    check(src.count("self._save_project_params()") >= 3,
+          "存档口没汇到一处：`self._save_project_params()` 出现 %d 次"
+          % src.count("self._save_project_params()"))
+    check('p.sec("live").update(' in src,
+          "没把这一排参数写进项目的 `live` 段（那就等于没记住 ✗）")
+    # ⭐ 「抓屏方式」必须真的**传到抓帧那一路**（用户 2026-10-09 ✓ 界面上选了 BitBlt，
+    #   抓帧却还是 WGC ⇒ 那圈系统描边照样在 ✗ —— 这种"选了没用"正是最该钉的 ✓）
+    _lt = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    check("use_wgc=use_wgc" in _lt and "window_capture" in _lt,
+          "本地窗口那条路没把「抓屏方式」传下去（界面上选了 BitBlt 也不会有用 ✗）")
+    # ⚠⚠ **不许把"抓屏方式"改写成"只抓源窗口"** ✗（2026-10-09 ✓ 我改过一版、被用户否掉 ✓）：
+    #   用户原话："**我需要的是盖住的窗口和游戏都显示**，因为**登陆界面是外接的窗口**，
+    #   你不显示断线重连会有问题" ✓ —— 也就是：这条路的帧必须**如实反映屏幕** ✓
+    #   （BitBlt = 屏幕合成 ✓），否则**外接登录窗不进画面** ⇒ 断线重连 / 测谎判不出界面 ✗。
+    check("hwnd=win_hwnd" not in _lt and "is_occluded" not in _lt,
+          "又把「抓屏方式」改成「只抓认死的那个窗口」了 ✗ —— 那样盖在游戏上的外接登录窗"
+          "就不进画面 ⇒ 断线重连 / 测谎会判不出界面 ✗（用户 2026-10-09 明确否掉过 ✓）")
+    # 同一件事的下游：`wincap` / `wgc_capture` 也不许再长回"认死 hwnd"那套 ✗
+    _wc = (ROOT / "core" / "wincap.py").read_text(encoding="utf-8")
+    _wc_body = _wc.split("def grab_rect(rect, use_wgc=True)")[-1][:400]
+    check("hwnd" not in _wc_body,
+          "`wincap.grab_rect` 又长出了 hwnd 参数 ✗（那条路已被用户否掉 ✓ 见它 docstring ✓）")
+    _wg = (ROOT / "core" / "wgc_capture.py").read_text(encoding="utf-8")
+    check("盖在它上面的别的窗口不会进画面" in _wg,
+          "`wgc_capture` 没把「**单窗口采集** ⇒ 盖在它上面的窗口不进画面」写清楚 ✗ "
+          "（那正是「选错抓屏方式 ⇒ 断线重连判不出界面」的根源 ✓）")
 
 
 def t_missing_weights_msg():
@@ -2809,7 +2992,1251 @@ def t_class_box_switches():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def t_vt_lie_sdk():
+    """⭐⭐ 「自动测谎（visual_tracking SDK）」的接线（2026-10-09 接入 ✓）。
+
+    钉八件（全是"接错了就不工作 / 危及画面"的点 ✓）：
+      ① 喂的是 **`raw`（画框之前的原生帧）** —— SDK 明说"输入图不能包含人为绘制的检测框"
+         （`INTEGRATION.md:28` ✓）；喂 `vis` 就是把蓝框/绿框当目标 ✗；
+      ② 投递口**只留最新一帧** + 推理在**独立线程**（`_vt_loop`）—— 探针实测单帧中位 ~40ms、
+         **最慢 2232ms** ✗ ⇒ 放主回路就是"画面卡住两秒"；
+      ③ 成功后点「确定」**走现成口径** `decision.mouse_aim.click_ratio`（换算只有一处 ✓），
+         且**只对本机窗口**来源发（收流是远端坐标，点了没用 ✗）；
+      ④ 点完要**重开一轮**（`_vt_cmd = "reset"`）—— 不重开整个会话就停在 ENDED ✗；
+      ⑤ 界面要有开关 + 状态行（`vt_status` 接上了才看得见"它在干什么"✓），
+         开关要随「开始」进线程（否则重开预览后状态对不上 ✗）。
+
+    ⚠ **行为层**（真喂帧、真匹配、真成功）在 `tools/selftest_vt_sdk.py` 里量 ✓ —— 那边要
+      GPU + 素材，跑一次 ~30s ⇒ 这两条分工：这里钉"接线"，那边钉"数" ✓。
+    """
+    lt = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    lp = (ROOT / "gui" / "live_panel.py").read_text(encoding="utf-8")
+    # ⚠ 钉**第一参数必须是 `raw`** ✓，别钉后面那两个 ✗：原点现在会**跟着窗口**走
+    #   （2026-10-10 ✓ 窗口挪了也要把画面坐标折回屏幕 ⇒ 传的是 `_ox/_oy` ✓
+    #    见 `gui/live_thread` 里那句"原点跟着窗口"的说明 ✓）—— 钉死 `origin_x, origin_y`
+    #   会变成**假红** ✗（真正要钉的是"喂原帧"这一条 ✓）。
+    check("self._vt_beat(raw," in lt,
+          "喂的不是画框前的原生帧 `raw` ✗（SDK 要求输入不能带人为绘制的框）")
+    check("self._vt_frame = (frame," in lt,
+          "没有「只留最新一帧」的投递口 ⇒ 会排队积压 ✗")
+    check("threading.Thread(target=self._vt_loop" in lt,
+          "SDK 没跑在独立线程里 ✗（实测单帧最慢 2232ms ⇒ 会卡住实时画面）")
+    check("from perception.vt_sdk import VtLieSdk" in lt and "mouse_aim.click_ratio" in lt,
+          "接入 SDK 或「点确定」没走现成口径 ✗（换算必须只有一处）")
+    check('!= "window"' not in lt and "vt_confirm_click" in lt,
+          "又按「来源」拦鼠标了 ✗ —— 鼠标是**经 relay 打到游戏机**的 ✓ 不该看 `source` ✓"
+          "（2026-10-09 现场：收流那套被这条拦成「一帧都没发」✗）")
+    check('self._vt_cmd = "reset"' in lt,
+          "点完不重开一轮 ⇒ 下一局不会动 ✗")
+    check("vt_status.connect(self._on_vt_status)" in lp,
+          "实时线程的状态没接上 ⇒ 人看不到它在干什么 ✗")
+    check("vt_status = pyqtSignal(str)" in lp and "self.vt_status.emit" in lp,
+          "「实时」页没把状态**转发**出去 ⇒ 搬去挂机保护页的那行永远是一句死的 ✗")
+    pp_src = (ROOT / "gui" / "player_panel.py").read_text(encoding="utf-8")
+    check("set_vt_status" in pp_src and "vt_status.connect(self.set_vt_status)" in pp_src,
+          "挂机保护页那行**没接**转发信号 ⇒ 状态停在那儿不动 ✗")
+    check("lbl_vt" not in lp and "lbl_vt" in pp_src,
+          "状态行没搬干净（实时页还留着一份 / 挂机保护页没有）✗"
+          "（用户 2026-10-09：这个状态肯定要一起迁移过去 ✓）")
+    pp = pp_src                       # 同一份源码（读两次没必要 ✓ 一处口径 ✓）
+    check("_build_vt_group" in pp and "lay.addWidget(self._build_vt_group())" in pp,
+          "「自动测谎（视觉追踪）」组没建 / 没挂进「挂机保护」页 ✗（用户 2026-10-09 点名的位置）")
+    check("update_live(vt_on=" in pp and "vt_cool_s=" in pp,
+          "组里的参数没写回 `live.yaml` ⇒ 实时线程读不到、改完不生效 ✗")
+    check('self._vt_want = bool(_live.get("vt_on"' in lt and "self._vt_cfg[" in lt,
+          "实时线程没**热读**那几格 ⇒ 「挂机保护」页改了不生效（要等重开 ✗）")
+    check('"show_fps", "vt_on")' not in lp
+          and '"vt_on": bool(getattr(self, "ck_vt"' not in lp,
+          "`live_panel` 里还留着 `vt_on` 的**按项目**存取 ⇒ 控件已经搬走，它会把这格写成 "
+          "False ⇒ **每存一次参数就把开关自己关掉** ✗（2026-10-09 的连带坑 ✓）")
+    # ⭐ 2026-10-09 现场补的两条真事（用户原话：没看到鼠标指着真目标 / 没看到描边和框 ✓）
+    ma_src = (ROOT / "decision" / "mouse_aim.py").read_text(encoding="utf-8")
+    check("def _vt_act" in lt and "aim_to(" in lt and "def _vt_aim_loop" in lt,
+          "「鼠标指着目标」没接全：要有 `aim_to`（设目标 ✓）+ `_vt_aim_loop`（逐拍插值 ✓）")
+    check("def aim_to" in ma_src and "def aim_tick" in ma_src
+          and "def aim_ratio" not in ma_src,
+          "「平滑瞄准」那套不对：该是 `aim_to` + `aim_tick`（旧的 `aim_ratio` 已废 ✗）")
+    check("0.0 <= age <= 0.2" in lt,
+          "「什么时候该动鼠标」的新鲜度闸丢了（该照抄 SDK 的 `MouseOutput`：0.2 秒 ✓）")
+    check(') not in ("LOCKED", "COAST")' in lt,
+          "只有 `LOCKED`/`COAST` 才许动鼠标 —— 丢了就会在成功界面上乱指 ✗")
+    check("aim_tick(" in lt and 'get("aim_ms"' in lt,
+          "逐拍插值的走位线程没了 ⇒ 又变回「一顿一顿跳」✗（用户 2026-10-09 报的 ✓）")
+    check("ck_vt_aim_ms" not in lt and "sp_vt_aim_ms" in pp,
+          "「鼠标跟随间隔(ms)」那格没接上 / 没落盘 ✗")
+    check("def _vt_overlay" in lt and "frame_rect_of" in lt,
+          "没把 ROI 描边 / 目标框画到显示帧上 ✗（用户原话：没看到剪裁窗口描边、没看到框 ✓）")
+    check("_vt_overlay(vis, self._vt_last_obs)" in lt,
+          "画框那一段没调 `_vt_overlay`（画了也没人画 ✗）")
+    check("ck_vt_aim" in pp and "ck_vt_draw" in pp and "vt_aim=" in pp and "vt_draw=" in pp,
+          "两个新开关没进「挂机保护」那一组 / 没落 `live.yaml` ✗")
+    # ⭐ 2026-10-09 第三条（用户原话：测谎触发时"玩家、怪物检测还在跑"✗）
+    check("_lie_mode" in lt and 'startswith("lie")' in lt and "res = None" in lt,
+          "测谎期间没停掉「玩家/怪物」那条链（还在推理/还在画框 ✗）")
+    check("_vt_aim_logged" in lt and "vt_aim_ok" in lt,
+          "「鼠标发成功」没留痕 ⇒ 下次还是只能靠猜（用户现场问过「到底发了没」✓）")
+    check("_vt_reset_recent" in lt and 'phase == "ENDED"' in lt,
+          "`ENDED`（120 秒上限 / 出错）没自动重开一轮 ⇒ 跑两分钟就哑了 ✗")
+    check("aim_available()" in lt and "_ok, _why = mouse_aim.aim_available()" in lt,
+          "`aim_available()` 又当布尔用了 ✗（它返回 `(ok, why)` 元组 ⇒ 那道闸恒不拦 ✓）")
+
+
+def t_vt_group_writes_live():
+    """⭐⭐ 「自动测谎」那组控件**真的会写配置**（2026-10-09 ✓ 用户要求：挂机保护页单独一组）。
+
+    为什么还要一条行为层（`t_vt_lie_sdk` 只钉"那几个字在不在" ✗）：这一组的通路是
+    `控件改动 → _on_vt_changed → update_live(...)`，任何一环接错（信号没连 / 键名写错 /
+    "构造期开闸" 那一步漏了）现象都是「**改了没反应**」✗ —— 那正是这次要避免的。
+
+    ⚠ 自检**绝不写用户配置**（本仓库硬规矩 ✓）：把 `player_panel.update_live` 换成**记账器** ✓
+      （回调调的是那个模块名字空间里的 `update_live` ✓ ⇒ 换掉它即可 ✓）。
+    ⚠ 也不建整个 `PlayerPanel`（那要项目 / 地形 / 一堆面板 ✗）：直接用**裸对象**接住那个方法 ✓
+      —— 它只往 `self.xxx` 上挂控件 ✓（见 `_build_vt_group` ✓），不需要别的成员 ✓。
+    """
+    from PyQt5.QtWidgets import QApplication
+
+    import gui.player_panel as pp
+
+    app = QApplication.instance() or QApplication([])
+    rec = []
+    orig = pp.update_live
+    pp.update_live = lambda **kw: rec.append(kw)          # 记账，不落盘 ✓
+    try:
+        holder = type("_VTHolder", (), {})()
+        # ⚠ 回调必须**绑到这个裸对象**上（组里连的是 `self._on_vt_changed` ✓）—— 不绑就是
+        #   `AttributeError: '_VTHolder' object has no attribute '_on_vt_changed'` ✗
+        #   （这条用例第一次写出来就是这么红的 ✓）。
+        holder._on_vt_changed = pp.PlayerPanel._on_vt_changed.__get__(holder)
+        # ⚠ **必须留住返回值**（`grp`）：Qt 的父对象回收靠的是 Python 引用 —— 组一丢引用，
+        #   它和它里面的复选框会**当场被删** ⇒ 后面 `setChecked` 就是
+        #   `RuntimeError: wrapped C/C++ object … has been deleted` ✗（第一次写这条用例就踩了 ✓）。
+        holder._vt_grp = pp.PlayerPanel._build_vt_group(holder)
+        for n in ("ck_vt", "ck_vt_click", "sp_vt_conf", "cmb_vt_region", "sp_vt_cool"):
+            check(getattr(holder, n, None) is not None, "「自动测谎」组少了控件 %s ✗" % n)
+        check(rec == [], "**构造期**就写盘了（`_vt_built` 闸没生效 ⇒ 会拿半套默认值覆盖 ✓）：%r"
+              % (rec,))
+        # ① 拨一下开关 ⇒ 必须写一条 `vt_on=<新值>`，而且**五个键一起落** ✓
+        #   ⚠ **取反**、不要写死 `setChecked(True)` ✗：初始值是从**用户的 live.yaml** 读的
+        #     （他已经把它设成 True 了 ✓）⇒ 再 `setChecked(True)` 是**空操作**、不发信号 ✗
+        #     ⇒ 用例会红在"没写 vt_on"上，看着像接线断了，其实是"这一下等于没动" ✓
+        #     （2026-10-09 第一次写就是这么红的 ✓）。取反 ⇒ 与配置无关 ✓。
+        want = not bool(holder.ck_vt.isChecked())
+        holder.ck_vt.setChecked(want)
+        check(rec and rec[-1].get("vt_on") is want,
+              "拨了「启用」却没写 `vt_on`（信号没连 / 键名写错）：%r" % (rec,))
+        for k in ("vt_click", "vt_aim", "vt_draw", "vt_conf", "vt_region", "vt_cool_s",
+                  "vt_aim_ms"):
+            check(k in rec[-1], "写回时漏了 %s（八个键要一起落 ✓）" % k)
+        # ② 改冷却 ⇒ 值要真的进去
+        rec.clear()
+        holder.sp_vt_cool.setValue(7.5)
+        check(rec and abs(float(rec[-1]["vt_cool_s"]) - 7.5) < 1e-6,
+              "改「成功冷却」没写对：%r" % (rec,))
+        # ③ 地区下拉的**值**必须是 SDK 认的那两个（`region='CN'/'TW'` ✓）
+        check(holder.cmb_vt_region.itemData(0) == "CN"
+              and holder.cmb_vt_region.itemData(1) == "TW",
+              "「成功模板地区」下拉值不是 CN/TW ⇒ SDK 建会话时会 `ValueError` ✗")
+        check(app is not None, "")
+    finally:
+        pp.update_live = orig
+
+
+def t_vt_aim_is_smooth():
+    """⭐ 「瞄准」必须**只发增量**（用户 2026-10-09 ✓ 原话："鼠标不是平滑的，而是在左上角和
+    目标点之间高频来回跳动" ✗）。
+
+    根因：瞄准备是**每 100~200ms 发一次**的连续动作，而绝对值定位每发都要先撞角归零 ⇒
+    光标被甩回左上角再走向目标 ⇒ 看着就是来回抽 ✗（`click_ratio` 那种低频点击看不出 ✓）。
+
+    用**替身 dinput**（不碰真硬件 ✓）钉三件：
+      ① 第一发 ⇒ 先撞角归零建原点，再走一个**绝对增量**；
+      ② 紧接第二发 ⇒ **不再撞角**，只发差值 ✓（就是这条治"来回抽"）；
+      ③ 停顿超过 `AIM_FRESH_S`（人可能碰过鼠标 / 换了一轮）⇒ **重新归零一次** ✓。
+    """
+    import decision.mouse_aim as ma
+
+    moves = []
+
+    class _Fake:
+        @staticmethod
+        def mouse_available():
+            return True
+
+        @staticmethod
+        def mouse_move(dx, dy):
+            moves.append((dx, dy))
+
+    old_d, old_gain, old_ttl = ma.dinput, ma.load_gain, ma.AIM_TGT_TTL_S
+    # ⚠ 本条只验"小步插值" ✓，不验标定口径 ✓ ⇒ 把"这个尺寸量过没有"那条守卫挡住 ✓
+    #   （2026-10-10 ✓ 改成按**帧尺寸**找标定之后 ✓，200 宽的小画布在本机那份真标定里
+    #    当然找不到 ✗ ⇒ 会判"没量过 ⇒ 不点" ⇒ **假红** ✗ —— 守卫自己由
+    #    `selftest_decision.t_mouse_gain_frame_mismatch` 专门验 ✓）。
+    _old_chk = ma.gain_mismatch_block
+    ma.gain_mismatch_block = lambda _fs: (False, "")
+    # ⚠ 把虚拟屏钉成**单显示器**（`0,0` ✓）：多屏那件事由
+    #   `selftest_decision.t_corner_zero_multimonitor` 专门钉 ✓；这一条只验"小步插值" ✓
+    #   ⇒ 钉成单显示器，`moves[1:]` 才全是插值小步 ✓。
+    #   （⚠ 2026-10-10 记一笔：`corner_zero()` 现在**永远只发那一下** ✓ —— 之前有一版会
+    #    "再补一发"把基准挪到主屏 ✗，那会让**副屏够不着** ✗，已经改掉了 ✓ 见它说明 ✓。）
+    import core.wincap as _wc
+    _old_vs = _wc.virtual_screen
+    _wc.virtual_screen = lambda: (0, 0, 1920, 1080)
+    ma.dinput = _Fake
+    ma.load_gain = lambda *a, **k: (1.0, 1.0)   # gain=1 ⇒ 画面像素 == 指令单位（好对数 ✓）
+    try:
+        ma.aim_reset()
+        ok, why = ma.aim_to((100, 200, 3), 0.25, 0.50)   # frame_shape=(h,w,c) ⇒ 目标 (50, 50)
+        check(ok, "设目标就失败了：%s" % why)
+        check(moves == [], "`aim_to` 该**只设目标**、不动鼠标 ✗：%r" % (moves,))
+        n = 0
+        for _ in range(40):
+            if ma.aim_tick(tick_ms=16.0, settle_ms=120.0):
+                n += 1
+        check(n >= 3, "只走了 %d 拍 ⇒ 又成「跳」了（要逐拍小步 ✓）" % n)
+        check(moves[0] == (-4000, -4000), "第一拍没先建原点：%r" % (moves[:2],))
+        _steps = moves[1:]
+        check(max(max(abs(a), abs(b)) for a, b in _steps) <= 26,
+              "单步太大（不是小步插值 ⇒ 光标会跳）：%r" % (_steps[:6],))
+        _sum = (sum(a for a, _b in _steps), sum(b for _a, b in _steps))
+        check(_sum == (50, 50), "多拍加起来没走到目标（插值走歪了）：%r" % (_sum,))
+        moves.clear()
+        ma.AIM_TGT_TTL_S = -1.0                # 假装"目标过期"（不动真时钟 ✓）
+        check(ma.aim_tick(tick_ms=16.0, settle_ms=120.0) is False and moves == [],
+              "目标过期了还在发指令（会对着过期点晃 ✗）：%r" % (moves,))
+    finally:
+        ma.dinput, ma.load_gain, ma.AIM_TGT_TTL_S = old_d, old_gain, old_ttl
+        ma.gain_mismatch_block = _old_chk
+        _wc.virtual_screen = _old_vs
+        ma.aim_reset()
+
+
+def t_run_shared_names_defined_before_split():
+    """⭐⭐⭐ `_run` 里**两个来源共用的那段**，只许读「按 source 分岔之前就赋过值」的名字。
+
+    病（用户 2026-10-10 现场：点「开始推理」⇒
+    `失败: UnboundLocalError: cannot access local variable 'cap_ref'`）：新加的口袋
+    `cap_ref` 只在 `if source == "window":` 里 `= [""]` ✗ —— 而它被**两个来源共用**的
+    `stats_ready.emit`（`cap_note` ✓）读 ⇒ 走**收流**时必炸 ✓。
+
+    ⚠ **这是第三次同一类**（`interval` ✗ / 画框那几个名字 ✗ / 这次 `cap_ref` ✗ ——
+    见 `budget = 0.0` 上面那段说明与 `t_draw_args_defined_when_stream_only` ✓）
+    ⇒ 这次**按结构钉**：AST 找出「按 `source` 分岔的那个 if」✓，把它**内部才赋值**的名字
+    列出来 ✓，再看**它之后**（= 共用尾段 ✓）有没有读 ✗ —— 有就是那颗雷 ✓。
+    ⚠ 判据刻意做**窄**（只报"分岔里赋值 + 之后被读"✗）：宁可漏掉别的形态，也**不许假红** ✗
+      （假红会让人开始无视这条 ❗）。
+    """
+    import ast
+    import builtins
+
+    def _stores(nodes):
+        """这些语句里**被赋值**的名字（含 for 目标 / with as / except as / import ✓）。
+
+        ⚠⚠ **不许进嵌套函数 / 类体** ✗（那是它们**自己的作用域** ✓）——
+          第一版图省事用了 `ast.walk` ✗ ⇒ 把函数体里的名字也算成"已定义" ⇒ **连真雷都被
+          当成安全的** ⇒ 这条守卫**空转** ✗（2026-10-10 自查时当场发现 ✗ 所以下面还有
+          一段**自检**：拿一个合成的坏样例确认它**真的会报**✓）。
+        """
+        out = set()
+
+        def rec(n):
+            for x in ast.iter_child_nodes(n):
+                if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    out.add(x.name)          # 只收"这个名字被定义了" ✓ 里面的局部名不算 ✓
+                    continue
+                if isinstance(x, ast.Lambda):
+                    continue
+                if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
+                    out.add(x.id)
+                elif isinstance(x, ast.ExceptHandler):
+                    if x.name:
+                        out.add(x.name)
+                elif isinstance(x, ast.alias):
+                    out.add((x.asname or x.name).split(".")[0])
+                rec(x)
+
+        for n in nodes:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                out.add(n.name)
+                continue
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                out.add(n.id)
+            elif isinstance(n, ast.alias):
+                out.add((n.asname or n.name).split(".")[0])
+            rec(n)
+        return out
+
+    def _loads(nodes):
+        """这些语句里**被读**的名字（同样不进嵌套函数 ✓ 宁窄勿假红 ✓）。"""
+        out = set()
+
+        def rec(n):
+            for x in ast.iter_child_nodes(n):
+                if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load):
+                    out.add(x.id)
+                rec(x)
+
+        for n in nodes:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                out.add(n.id)
+            rec(n)
+        return out
+
+    def _scan(src):
+        """⇒ **只在某一支里赋值、却在之后（共用尾段）被读**的名字 ✓。
+
+        ⚠ 判据要**窄**（下面三条都是实测踩出来的假红 ✗ 2026-10-10 ✓）：
+          · 两个分支**都**赋了值 ⇒ 安全 ✓（`_reader` ✓ 窗口与收流各定义一份 ✓）；
+          · 尾段自己**也**赋了值 ⇒ 按"安全"处理 ✓（`_win` / `v` ✓ 那是尾段自己的局部量 ✓
+            —— ⚠ 这属**放宽**：真雷 `cap_ref` 尾段从来没有赋值 ✓ 所以照样抓得住 ✓）；
+          · 分岔之前 / 模块级 / 内置 ⇒ 安全 ✓。
+        """
+        tree = ast.parse(src)
+        fn = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_run":
+                fn = node
+        if fn is None:
+            return None
+        split = None
+        for i, st in enumerate(fn.body):
+            if isinstance(st, ast.If) and "source" in ast.dump(st.test):
+                split = i
+                break
+        if split is None:
+            return None
+        # 各支的语句（含 elif 链 ✓）
+        bodies = [fn.body[split].body]
+        el = fn.body[split].orelse
+        while el:
+            if len(el) == 1 and isinstance(el[0], ast.If):
+                bodies.append(el[0].body)
+                el = el[0].orelse
+            else:
+                bodies.append(el)
+                el = []
+        _any = set()
+        for b in bodies:
+            _any |= _stores(b)
+        _every = set(_stores(bodies[0]))
+        for b in bodies[1:]:
+            _every &= _stores(b)
+        safe = (_stores(fn.body[:split]) | _stores(tree.body) | set(dir(builtins))
+                | _every | _stores(fn.body[split + 1:]))
+        safe.add("self")
+        return sorted((_any - safe) & _loads(fn.body[split + 1:]))
+
+    # ---- ⭐ 先**自检守卫本身**（防它空转 / 防它假红 ✗ —— 两个都真踩过 ✓）----
+    _demo = ("def _run(self):\n"
+             "    source = 1\n"
+             "    if source == 'window':\n"
+             "        b = ['']          # 只在窗口那支赋值、尾段又要读 ⇒ 真雷 ✓\n"
+             "        both = 1\n"
+             "        later = 1\n"
+             "    else:\n"
+             "        both = 2          # 两支都赋 ⇒ 安全 ✓\n"
+             "    later = 3             # 尾段自己也赋 ⇒ 安全 ✓\n"
+             "    print(b, both, later)\n")
+    check(_scan(_demo) == ["b"],
+          "这条守卫自己不对 ✗ —— 期望**只报 b**（真雷 ✓），实际 %r；"
+          "（「两支都赋」与「尾段自己赋」都该放行 ✓，唯独一支赋的必须报 ✓）"
+          % (_scan(_demo),))
+
+    _src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    _bad = _scan(_src)
+    check(_bad is not None,
+          "`gui/live_thread.py` 里找不到 `_run` 或「按 source 分岔」那个 if（结构变了 ⇒ "
+          "这条要跟着改 ✓）")
+    check(not _bad,
+          "这些名字**只在「按 source 分岔」里面**赋值，却被**两个来源共用**的代码读 ✗ ⇒ "
+          "另一个来源一跑就 `UnboundLocalError`（用户现场：点「开始推理」当场失败 ✓）：%r"
+          % (_bad,))
+
+
+def t_pick_rect_auto():
+    """⭐⭐⭐ 「对准窗口」自动框选（用户 2026-10-10 ✓ 原话："**框选窗口能做个自适应吗？就是我
+    鼠标指着的时候它自动匹配窗口画面的尺寸 —— 不然我每次自己框都会有偏差**"✓）。
+
+    钉五件：
+      ① 界面有那个按钮 ✓ 且跟着"本地窗口"来源显隐 ✓（收流时它没意义 ✓）；
+      ② **取的是客户区**（`wincap.client_rect` ✓ = 游戏真正绘制的画面 ✓ 不含标题栏/边框 ✓）
+         —— ⚠ 与 `window_geom`（DWM 外框 ✓ 给 `rect_rel` 当基准 ✓）**不是一回事** ✗；
+      ③ **连续两拍同一个窗口才认账** ✓（鼠标扫过去那一瞬不算 ✓）；
+      ④ 认账后：`_rect` = 客户区 ✓、`_rect_win` = 那个窗口 ✓、`_rect_rel` 基准对得上 ✓、
+         **按项目存了**（`_save_project_params` ✓）；
+      ⑤ 超时 ⇒ **什么都不改** ✓ + 说清怎么办 ✓（不许静默 ✓ 也不许乱框 ✗）。
+    """
+    from PyQt5.QtCore import QTimer
+    from PyQt5.QtWidgets import QLabel, QPushButton
+
+    import core.wincap as wc
+    from gui.live_panel import LivePanel
+
+    fake_client = (300, 200, 1600, 900)
+    fake_frame = (292, 168, 1616, 942)          # DWM 外框（比客户区大一圈 ✓）
+    win = {"hwnd": 424242, "title": "冒险岛怀旧服", "rect": fake_client, "pid": 999}
+
+    def _panel():
+        # ⚠⚠ **用普通替身对象**，再调**真实方法**（`LivePanel._pick_rect_auto(p)` ✓）——
+        #   别用 `LivePanel.__new__(LivePanel)` 造"半成品 Qt 对象" ✗：那种壳子没有跑过
+        #   `__init__`，销毁时踩 sip 的雷 ⇒ **静默原生崩**（2026-10-10 ✓ 本用例第一版就是这么
+        #   把整个套件带崩的 ✗ 20 行就没了 ✓）。
+        class _Stub:
+            pass
+
+        p = _Stub()
+        # ⚠ 替身没有类的常量 ⇒ 手工挂上（`_pick_rect_auto` 要读它们 ✓）
+        p.AUTO_PICK_SEC = LivePanel.AUTO_PICK_SEC
+        p.AUTO_PICK_MS = LivePanel.AUTO_PICK_MS
+        p._rect = None
+        p._rect_rel = None
+        p._rect_win = None
+        p._saved = 0
+        p.lbl_rect = QLabel()
+        p.lbl_stats = QLabel()
+        p.btn_pick_win = QPushButton()
+        p._auto_timer = QTimer()
+        p._dead = lambda: False
+        p._refresh_rect_label = lambda: None            # 不依赖界面回填 ✓（那件事别处钉 ✓）
+        p._save_project_params = lambda: setattr(p, "_saved", p._saved + 1)
+        # ⚠ 把**真实方法**绑到这个替身上（替身只是"没有 Qt 的壳"✓ 逻辑一行都不改 ✓）
+        p._pick_rect_auto = lambda: LivePanel._pick_rect_auto(p)
+        p._auto_rect_tick = lambda: LivePanel._auto_rect_tick(p)
+        p._bind_rect_window = lambda *a, **k: LivePanel._bind_rect_window(p, *a, **k)
+        return p
+
+    src = (ROOT / "gui" / "live_panel.py").read_text(encoding="utf-8")
+    check("btn_pick_win = QPushButton" in src and
+          "self.btn_pick_win.setVisible(is_win)" in src,
+          "「对准窗口」按钮没建 / 没跟着「本地窗口」来源显隐 ✗")
+    check("skip_pid=os.getpid()" in src,
+          "自动框选没**排掉工作台自己** ✗ ⇒ 指着工作台就会把它框进去（比手框还糟 ✗）")
+
+    _o_under = wc.window_under_cursor
+    _o_geom = wc.window_geom
+    _o_event = None
+    try:
+        import core.behavior as _bh
+        _o_event = _bh.event
+        _bh.event = lambda *a, **k: None                # 打点别写进真日志 ✓
+    except Exception:                                   # noqa: BLE001
+        pass
+    try:
+        wc.window_geom = lambda h: (fake_frame if int(h) == win["hwnd"] else None)
+        wc.window_under_cursor = lambda **k: dict(win)
+
+        # ---- ③ 第一拍：只记下、**不认账** ✓ ----
+        p = _panel()
+        p._pick_rect_auto()
+        check(p._rect is None, "第一拍就认账了 ✗（鼠标扫过去那一瞬会被抓成区域 ✓）：%r" % (p._rect,))
+        p._auto_rect_tick()
+        check(p._rect is None, "第二拍（同一窗口 ✓）之前就写进去了 ✗")
+        p._auto_rect_tick()                             # 第二次看到同一个 ⇒ 认账 ✓
+        check(tuple(p._rect) == tuple(fake_client),
+              "自动框选取到的不是**客户区** ✗（客户区 = 游戏画面本身 ✓ 手框差的就是这一圈 ✓）：%r"
+              % (p._rect,))
+        check(p._rect_win and p._rect_win[0] == win["hwnd"] and "冒险岛" in p._rect_win[1],
+              "没记住「相对哪个窗口」✗（那样窗口挪了又要重框 ✓）：%r" % (p._rect_win,))
+        check(p._rect_rel == wc.rel_from_rect(fake_client, fake_frame),
+              "`rect_rel` 的基准不对 ✗ —— 它必须是**相对 `window_geom`（DWM 外框 ✓）**\n"
+              "（用客户区当基准 ⇒ 运行期 `binding_rect` 折算出来的区域会偏 ✓）：%r"
+              % (p._rect_rel,))
+        check(p._saved == 1, "自动框完没**按项目存** ✗（重启/换项目就得再框一遍 ✓）：%d" % p._saved)
+
+        # ---- ⑤ 超时：什么都不改 + 说清 ✓ ----
+        p2 = _panel()
+        wc.window_under_cursor = lambda **k: None
+        p2._pick_rect_auto()
+        for _ in range(LivePanel.AUTO_PICK_SEC * 1000 // LivePanel.AUTO_PICK_MS + 3):
+            p2._auto_rect_tick()
+        check(p2._rect is None and p2._saved == 0,
+              "超时了还在动区域 ✗（宁可不动，也别框错 ✓）：%r" % (p2._rect,))
+        check("超时" in p2.lbl_stats.text(),
+              "超时了**不说一声** ✗（人只会以为点了没用 ✓）：%r" % (p2.lbl_stats.text(),))
+    finally:
+        wc.window_under_cursor = _o_under
+        wc.window_geom = _o_geom
+        if _o_event is not None:
+            try:
+                import core.behavior as _bh2
+                _bh2.event = _o_event
+            except Exception:                           # noqa: BLE001
+                pass
+
+
+def t_covered_note_wired():
+    """⭐⭐ 「本地窗口来源**被别的窗口盖住** ⇒ 改抓整屏」必须**接上**（用户 2026-10-10 ✓）。
+
+    病（用户原话："把本地实时窗口来源被遮挡的问题修掉" ✓）：`window_capture: wgc` 是
+    **单窗口采集** ✗ ⇒ 盖在源窗口上的外接登录窗 / 断线提示框**不进画面** ✗（断线重连、
+    测谎判不出界面 ✓）；WGC 还按**框中心那个点**重挑窗口 ⇒ 中心被占就抓成遮挡物 ✗。
+
+    口径（用户选的 ✓）：**盖住的东西也要显示** ⇒ 被盖住时这一拍改走整屏合成 ✓，
+    没被盖照旧 WGC ✓。判据与"换抓法"在 `core/wincap.py`（**行为级**用例见
+    `selftest_winperf.t_covered_switches_to_screen` ✓）—— 这里只钉**接线**：
+      ① 实时线程要**读** `wincap.last_note()` ✓（不读 ⇒ 日志与状态行永远是空的 ✓）；
+      ② 只**在变化时**记一条 `capture_covered` ✓（每拍都记 = 拿日志刷屏 ✗）；
+      ③ `cap_note` 要**带进 stats** ✓、面板要把它**缀进状态行** ✓（否则人只会看到
+         "帧里突然多了别的窗口"，不知道是换了抓法 ✓）；
+      ④ ⚠ **不许认死窗口** ✗：`live_thread` 里不许出现 `hwnd=` / `is_occluded` ✓
+         （那是用户 2026-10-09 明确否掉过的方向 ✓ 见上面那条反向钉 ✓）。
+    """
+    lt = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    check("wincap.last_note()" in lt,
+          "实时线程没读 `wincap.last_note()` ⇒ 「被谁盖住」这件事一个字都不会进日志/状态行 ✗")
+    check("capture_covered" in lt,
+          "没把「换抓法」记进 `behavior.log`（`capture_covered` ✓）⇒ 事后没法复盘 ✗")
+    # ⭐⭐ 框选区域那条（用户 2026-10-10 "把两台显示器的全部内容展示了" ✓）：
+    #   判定必须走 `wincap.binding_rect`（一处实现 ✓ 行为级用例在 winperf 里 ✓），
+    #   而且"退回你框的那块"这件事要**记得进日志/状态行** ✗（不许静默 ✓）。
+    check("wincap.binding_rect(" in lt,
+          "实时线程没走 `wincap.binding_rect` ⇒ 「窗口问不到」时会去按虚拟屏幕折算 ⇒ "
+          "抓成整块桌面（两台显示器全屏 ✗ 用户报过 ✓）")
+    check("capture_rect" in lt,
+          "「框选区域退回固定区域」没进 `behavior.log`（`capture_rect` ✓）⇒ 事后没法复盘 ✗")
+    check('"cap_note": "；".join(' in lt or 'rect_note_ref[0]' in lt,
+          "框选区域那句提示没带进 stats ⇒ 状态行不会说\"它按哪块屏在抓\" ✗")
+    # ⭐⭐ **警报专用那一格要用"留住接管"版**（用户 2026-10-10 ✓ "本地实时断线后没有重连警报" ✓）：
+    #   面板报警音是"`combat → 非 combat` 的**沿**" ✓ 读的是 stats 里 `alarm` 那一格 ✓ ——
+    #   给它**原生** `_screen_state` 的话，测谎小游戏那段匹配不上 ⇒ 回落 combat ⇒ 沿被反复
+    #   触发 ✗（响个不停 ✓）；断线那种"外接窗时有时无"的抖动也会把沿打散 ✗（该响没响 ✓）。
+    #   ⚠ `screen` 那一格**保持原生** ✗（录屏/样本/状态行读它 ✓ `selftest_screen_state` 里
+    #     有一条**故意**钉着它 ✓ 两件事不许合并 ✗）。
+    check('"alarm": (getattr(self, "_takeover_st", None)' in lt,
+          "stats 里没有**警报专用**的 `alarm` 格（或它退回原生值 ✗）⇒ 报警沿会在测谎小游戏"
+          "那段反复触发、断线那一下反而漏响 ✗")
+    check('"screen": self._screen_state' in lt,
+          "`screen` 那格不是**原生识别结果**了 ✗ —— 录屏/样本/状态行（还有 "
+          "`selftest_screen_state` 里那条钉子）都指望它是原生值 ✓ 别合并 ✗")
+    lp2 = (ROOT / "gui" / "live_panel.py").read_text(encoding="utf-8")
+    check('s.get("alarm")' in lp2,
+          "面板的报警音没读 `alarm` 那一格（读了就拿不到\"留住接管\"的口径 ✗）")
+    check("hwnd=" not in lt and "is_occluded" not in lt,
+          "又改回\"只抓认死的那个窗口\"了 ✗ —— 那样盖住游戏的外接登录窗不进画面 ⇒ "
+          "断线重连 / 测谎判不出界面 ✗（用户 2026-10-09 否掉过 ✓）")
+    lp = (ROOT / "gui" / "live_panel.py").read_text(encoding="utf-8")
+    check('s.get("cap_note")' in lp,
+          "面板没把 `cap_note` 缀进状态行 ⇒ 人看不出\"它换了抓法\"（只会觉得画面变怪 ✗）")
+
+
+def t_live_map_marker_is_authoritative():
+    """⭐⭐⭐⭐⭐ **地形图上的玩家圈只能用「唯一那一份」世界坐标**（用户 2026-10-10 ✓ 原话：
+    "**地形图都锁到红点上去了，报的坐标也与信息栏不一致，这个不应该自己走独立逻辑，
+    它就应该根据最终信息栏读到的玩家世界坐标来绘制**"✓）。
+
+    **病根**：`gui/route_panel._refresh_live_map` 原来把"**差分自己挑的那块连通域**"
+    （`_diff_dot_center` ✓ "差得够亮的那一块"）当成玩家圈上去 ✗ ⇒ 底图/地图上任何
+    **与面板不同源**的东西（**墙的红点**、地形线、集合色块 ✓）差得够亮就会被当成玩家
+    ⇒ **锁到红点上** ✗，而且它报的世界坐标与信息栏那行**必然是两个数** ✗
+    （两条链 —— 正是 2026-10-06 拆过一次的老毛病 ✓ 见 `decision/agent.LAST_POS` ✓）。
+
+    口径（本次）：圈**只**来自 `LAST_POS` ✓（实时回路是唯一写者 ✓）、换算只走**地形**
+    （`terrain.world_to_canvas` ✓ 与标定/显示区无关 ⇒ 不会因为 `view` 跟丢而漂 ✓）、
+    **换图 / 没在跑 / 还没定上位 ⇒ 不画** ✓（绝不自己再算一份 ✗）；
+    差分那层**照旧画**（它是给人看"差在哪"的 ✓）但**不再是玩家** ✗。
+
+    钉四件：① 全文件里**只有一处**把 `_live_mark` 设成"带点的列表"；
+    ② 那句在 `LAST_POS` 之后、且带 `map_id` 比对；③ 换算走 `t.world_to_canvas`；
+    ④ **"差分找到点"这种当玩家的措辞不许再出现** ✗（回潮就红 ✓）。
+    """
+    src = (ROOT / "gui" / "route_panel.py").read_text(encoding="utf-8")
+    check(src.count("self._live_mark = [(") == 1,
+          "① 设玩家圈的写法不止一处（又长出第二条链 ✗）：%d 处" % src.count("self._live_mark = [("))
+    _i_lp = src.find('LAST_POS')
+    _i_mk = src.find("self._live_mark = [(")
+    check(_i_lp >= 0 and _i_mk > _i_lp,
+          "② 玩家圈不是从 `LAST_POS` 读出来的（先读坐标再画 ✓ 顺序反了 ✗）")
+    check(src[_i_lp:_i_mk].count("str(mid)") >= 1,
+          "② 没比 `map_id` ⇒ 换图之后会拿别的图的坐标往这张图上画 ✗")
+    # ⚠ 换算那两行在**赋值之前**（先算 `_cx/_cy` 再拿去拼标记 ✓）⇒ 窗口要往前也取一段 ✓
+    check("t.world_to_canvas(float(_wx), float(_wy))" in src[max(0, _i_mk - 800):_i_mk + 200],
+          "③ 换算没走地形（`terrain.world_to_canvas` ✓）⇒ 会随标定/显示区漂 ✗")
+    check("差分找到点" not in src,
+          "④ 又把「差分找到点」当成玩家位置了 ✗（用户 2026-10-10 明确否掉：它锁到墙的红点上 ✓）")
+
+
+def t_lie_rec_stops_after_success():
+    """⭐⭐⭐⭐⭐ **测谎成功后必须收工**（用户 2026-10-10 ✓ 原话："**测谎了录屏录了很久，
+    没有在成功后切断**"✗）。
+
+    **现场**（用户给的录像 `lie_20261010_025017.mp4` ✓ 逐帧扫出来 ✓）：`lie_warn`(t≈0s, 0.856 ✓)
+    → 小游戏（匹不上 ✗）→ **`lie_success`(t≈18s, **0.879** ✓ 认出来了 ✓)** → `combat`
+    ⇒ **此后再也不变** ✗；而那两段"按时间到点就该做"的判据（"待停到点了吗" ✓ /"太久没再见
+    测谎了吗"✓）原来待在 `if st == self._screen_state: return` 的**后面** ✗ ⇒
+    **只有"状态又变一次"才会被评估** ✗✗ ⇒ 待停时刻永远没人检查 ⇒ 录屏一路录到
+    `LIE_REC_MAX_S`=300 秒的保险才切 ✗（实测那段录像 **6819 帧 / 02:50:17→02:55:17 = 整 300 秒** ✓）。
+
+    钉三件：
+      ① **状态不再变**（同一拍 `st == _screen_state`）时，只要"待停到点" ⇒ **必须停** ✓；
+      ② 同理"太久没再见到 `lie_*`"（GAP 兜底 ✓）也要在**不变**的那一拍生效 ✓；
+      ③ 源码级：这两条必须在 `if st == self._screen_state` **之前** ✗（挪回去就红 ✓）。
+    """
+    import time as _time
+
+    from gui.live_thread import LiveThread
+    from perception import screen_state as ss
+    from perception import ui_state as us
+
+    t = LiveThread.__new__(LiveThread)
+    t._screen_state = "combat"
+    t._takeover_st = "combat"
+    t._lie_seen_game = False
+    t._lie_warn_at = 0.0
+    t._lie_sess_t0 = 0.0
+    t._lie_rec_top_game = 0.0
+    t._lie_rec = object()                  # 假装"正在录"（只要非 None ✓）
+    t._lie_rec_pending = 0.0
+    t._lie_rec_saw_success = False
+    t._lie_rec_last_lie = 0.0
+    t._lie_rec_stop_at = 0.0
+    t._rec_kind = "lie"
+    stopped = []
+    t._lie_rec_stop = lambda why="": stopped.append(str(why))
+    t._lie_rec_start = lambda *a, **k: None
+    t._lie_rec_write = lambda *a, **k: None
+
+    cur = {"st": "combat"}
+    _o_cf, _o_ui, _o_cap = ss.check_frame, us.detect, ss.capture_frame
+    ss.check_frame = lambda raw: (cur["st"], {"score": 0.9})
+    us.detect = lambda raw: None
+    ss.capture_frame = lambda *a, **k: None
+    try:
+        # ⚠ **必须先 `lie_warn` 开一场** ✗ —— 不然 `lie_success` 会被 A 规则故意判成 `combat`
+        #   （用户 2026-10-08 定的："必须先见过 `lie_warn` 才算测谎"✓），这条用例第一版就是这么红的 ✓
+        cur["st"] = "lie_warn"
+        t._screen_beat(None)
+        check(bool(t._lie_warn_at), "warn 没开成一场（那后面认什么都白搭 ✗）")
+
+        # 走到"见到成功弹窗 ⇒ 离开 lie_* ⇒ 记下待停时刻"
+        cur["st"] = "lie_success"
+        t._screen_beat(None)
+        check(t._lie_rec_saw_success, "成功弹窗没被记下来（那后面就永远不收了 ✗）")
+        cur["st"] = "combat"
+        t._screen_beat(None)
+        check(bool(t._lie_rec_stop_at), "离开测谎没记下「待停时刻」✗")
+
+        # ① 让待停时刻**过期**，然后在"状态**不变**"的一拍上再 beat 一次 ⇒ 必须收工 ✓
+        t._lie_rec_stop_at = _time.monotonic() - 1.0
+        stopped[:] = []
+        t._screen_beat(None)                    # st 仍是 combat == _screen_state ⇒ 早退那条路
+        check(stopped, "⭐⭐ 状态不变的那一拍**没有收工** ⇒ 录屏会一路录到 300 秒保险 ✗✗"
+                       "（用户 2026-10-10 报的就是这个 ✓）")
+
+        # ② GAP 兜底（没见过成功弹窗、太久没再见 lie_*）也要在"不变"的一拍生效 ✓
+        t._lie_rec_saw_success = False
+        t._lie_rec_stop_at = 0.0
+        t._lie_rec_last_lie = _time.monotonic() - (float(LiveThread.LIE_REC_GAP_S) + 5.0)
+        stopped[:] = []
+        t._screen_beat(None)
+        check(stopped, "⭐ 「太久没再见到测谎 ⇒ 收工」也没在状态不变的那一拍生效 ✗")
+
+        # ③ 源码级：两条必须在早退之前
+        src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+        _i_ret = src.find("if st == self._screen_state:\n            return")
+        _i_stop = src.find('self._lie_rec_stop("离开测谎（已稳定')
+        check(_i_ret > 0 and _i_stop > 0 and _i_stop < _i_ret,
+              "两条按时间的收工判据又被放到早退后面了 ✗（只有状态再变一次才会被评估 ✓）")
+    finally:
+        ss.check_frame, us.detect, ss.capture_frame = _o_cf, _o_ui, _o_cap
+
+
+def t_locate_skipped_while_taken_over():
+    """⭐⭐⭐⭐ **界面接管期间这一拍不定位**（用户 2026-10-10 ✓ 原话："实时在跑 单这一拍还没定上位？
+    我们定位有这么慢吗？在黑色背景里找个大黄点很难吗？"✓）。
+
+    **实测**（`perf.log` 2026-10-10 01:55~01:57 ✓ 挨着的四段）：正常战斗 `locate_ms`
+    **0.39 / 0.44 ms** ✓ vs `agent_why=界面接管（lie_warn）` 那两段 **73.04 / 42.97 ms** ✗
+    —— 慢两个数量级 ✓。
+    **为什么**：接管时小地图面板被弹窗盖住 ⇒ 认不出 ⇒ `PlayerLocator._search` 的兜底
+    "小块里不像玩家点 ⇒ 退回**全画面重找**"（那条注释实测 62 ms ✗）⇒ 每拍都走重路 ✓
+    （离线复盘同期真画面报的是「颜色层不可用（被淹）」✓ 对得上 ✓）。
+    ⇒ 这段时间位置没人要（角色被锁操作 + Agent 早已停手 ✓）⇒ **直接不定位** ✓。
+
+    钉三件：
+      ① 接管态（`_takeover_st != combat`）⇒ **一次都不调定位器** ✓ 且返回 `None` ✓；
+      ② 回到 `combat` ⇒ **照旧定位** ✓（正常路径一个字不许被碰 ✗）；
+      ③ 源码级：这道闸必须在 `perf.ms("locate_ms", …)` **之前** ✗ —— 否则跳过的拍会被记成
+         "0 ms 的定位"，`locate_ms` 这把尺子从此不可信 ✓（本次定案正是靠它 ✓）；且判据必须是
+         **接管版** `_takeover_st`（用原生 `_screen_state` ⇒ 小游戏那段一回落就又去烧 60 ms ✗）。
+    """
+    from unittest import mock
+
+    from core import perf as _perf
+    from gui.live_thread import LiveThread
+
+    src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    _i_gate = src.find('if str(self.__dict__.get("_takeover_st") or "combat") != "combat":')
+    # ⚠ 找**代码形**（带 `t0` 那个实参 ✓）：注释里也出现过 `perf.ms("locate_ms", …)` ✗
+    #   ⇒ 光找函数名会命中注释、把这条断言变成"恒真/恒假"（本轮就这么翻过一次车 ✓）
+    _i_ms = src.find('perf.ms("locate_ms", t0)')
+    check(_i_gate >= 0 and _i_ms > _i_gate,
+          "① 闸没装在 `perf.ms(\"locate_ms\")` 之前 ✗（跳过的拍会被记成 0 ms ⇒ 那把尺子废了 ✓）")
+    check('perf.count("locate_skip")' in src[_i_gate:_i_gate + 400],
+          "① 没记 `locate_skip`（事后看不出这段省了多少 ✗）")
+
+    t = LiveThread.__new__(LiveThread)          # ⚠ QThread 只能 __new__（见本文件另一条 ✓）
+    calls = []
+    t._locate_mmap = lambda panel: (calls.append(panel) or {"ok": True})
+    with mock.patch.object(_perf, "ms", lambda *a, **k: None), \
+         mock.patch.object(_perf, "count", lambda *a, **k: None):
+        for st in ("lie_warn", "lie_game", "login_err"):
+            t._takeover_st = st
+            calls[:] = []
+            check(t._locate_latest() is None and calls == [],
+                  "① 接管态（%s）还在每拍定位 ⇒ 白烧 40~70ms（面板被弹窗盖住，**认不出来** ✗）"
+                  % st)
+        t._takeover_st = "combat"
+        calls[:] = []
+        check(t._locate_latest() is not None and len(calls) == 1,
+              "② 正常战斗时必须照旧定位（这条优化不许碰正常路径 ✗）：calls=%d" % len(calls))
+
+
+def t_lie_takeover_holds_through_minigame():
+    """⭐⭐⭐⭐⭐ **测谎开始后 Agent 不许再操作角色**（用户 2026-10-10 ✓ 原话："**为什么测谎开始后
+    Agent 还在操作角色按方向键？**"✓）。
+
+    **病根**：Agent 的停手判据是 `ws.screen != "combat"`（`decision/agent.py` 的「界面状态接管」✓），
+    而**测谎小游戏那段画面本来就匹配不上任何模板** ✗（`gui/live_thread.py` 那段实测自己写着
+    "中间那段'画面不匹配任何模板'是**常态**"✓）⇒ 状态回落 `combat` ⇒
+    **Agent 当场把方向盘拿回去、又开始按方向键** ✗✗。
+    ⚠ 录屏那侧早就用"宽限 ＋ 没见过成功弹窗一律不停"绕过了同一个坑 ✓（`_lie_rec_stop_at` /
+      `_lie_rec_saw_success` ✓）—— **Agent 这侧漏了** ✗（本轮补 ✓：`_takeover_st` ✓）。
+
+    钉七件（真跑 `_screen_beat` ✓ 三级判据全打桩 ⇒ 不起线程、不要流 ✓）：
+      ① 平时（`combat`）⇒ 照样报 `combat` ✓（正常打怪**一字不变** ✓）；
+      ② `lie_warn` ⇒ 立刻接管 ✓；
+      ③ **warn 弹窗关掉、还没进小游戏**那几秒 ⇒ **也要一直接管** ✓（宽限 `LIE_REC_HOLD_S` ✓）；
+      ④ `lie_game` ⇒ 接管 ✓（且记住"这场进过小游戏" ✓）；
+      ⑤ ⭐⭐ **小游戏里画面匹配不上（回落 `combat`）30 秒** ⇒ **必须仍然接管** ✗✗
+         （以前 1 拍回落 ⇒ Agent 就动了 ✓ 这条就是用户报的那个病 ✓）；
+      ⑥ `lie_success` ⇒ 仍接管 ✓；回到 `combat` ⇒ **还权** ✓（测谎完了该恢复打怪 ✓）；
+      ⑦ **没 `lie_warn` 打头的 `lie_game`**（误判路线 ✓）⇒ **不算数** ✓ 照旧报 `combat` ✓；
+      ⑧ ⭐⭐ **`lie_warn` 响过 ⇒ 这一场（60s 内）一直留接管** ✗ —— ⚠ 这条 **2026-10-10 第二轮
+         改了口径**（原来是"只见过 warn、没进小游戏 ⇒ 宽限一到就还权"✗）：`lie_game` 模板裁坏了
+         （真小游戏 0.788~0.794 **低于门限 0.80** ⇒ 那段**根本认不出来**✓ 仓库里早记着 ✓）
+         ⇒ 等"进过小游戏"= **永不接管** ✗（现场：`lie_rec` 录满 300 秒、而 `agent_why=-` ✓
+         ⇒ Agent 全程在按移动/跳跃 ✓ 正是用户第二轮报的 ✓）；场次超时 ⇒ **必须还权** ✓。
+    """
+    import time as _time
+
+    from gui import live_thread as LT
+    from gui.live_thread import LiveThread
+    from perception import screen_state as ss
+    from perception import ui_state as us
+
+    # ⚠ `LiveThread` 是 `QThread` ⇒ 只能 `__new__`（`object.__new__` 会抛 ✗ 见本文件另一条 ✓）
+    t = LiveThread.__new__(LiveThread)
+    t._screen_state = "combat"
+    t._takeover_st = "combat"
+    t._lie_seen_game = False
+    t._lie_warn_at = 0.0
+    t._lie_sess_t0 = 0.0
+    t._lie_rec_top_game = 0.0
+    t._lie_rec = None
+    t._lie_rec_pending = 0.0
+    t._lie_rec_path = ""
+    t._lie_rec_n = 0
+    t._lie_rec_t0 = 0.0
+    t._lie_rec_err = ""
+    t._lie_rec_saw_success = False
+    t._lie_rec_last_lie = 0.0
+    t._lie_rec_stop_at = 0.0
+    t._rec_kind = ""
+    t._lie_rec_start = lambda *a, **k: None      # 录屏不测（测的是"报给 Agent 的状态"✓）
+    t._lie_rec_stop = lambda *a, **k: None
+
+    cur = {"st": "combat"}
+    _o_cf, _o_ui, _o_cap = ss.check_frame, us.detect, ss.capture_frame
+    ss.check_frame = lambda raw: (cur["st"], {"score": 0.9})
+    us.detect = lambda raw: None
+    ss.capture_frame = lambda *a, **k: None
+    try:
+        def _beat():
+            t._screen_beat(None)
+
+        _beat()
+        check(t._takeover_st == "combat", "① 平时不该接管：%r" % (t._takeover_st,))
+
+        cur["st"] = "lie_warn"
+        _beat()
+        check(t._takeover_st == "lie_warn",
+              "② `lie_warn` 出现后必须立刻接管（Agent 该停手）：%r" % (t._takeover_st,))
+
+        cur["st"] = "combat"
+        _beat()
+        check(t._takeover_st != "combat",
+              "③ warn 弹窗关掉、还没进小游戏那几秒就被还权了 ⇒ Agent 会立刻动 ✗：%r"
+              % (t._takeover_st,))
+
+        cur["st"] = "lie_game"
+        _beat()
+        check(t._takeover_st == "lie_game" and t._lie_seen_game,
+              "④ 进小游戏后必须接管且记住这场进过小游戏：%r / seen=%r"
+              % (t._takeover_st, t._lie_seen_game))
+
+        # ⑤ 小游戏里画面匹配不上（回落 combat）—— 已过 30 秒（远小于一场的上限 60 秒 ✓）
+        t._lie_warn_at = _time.monotonic() - 30.0
+        cur["st"] = "combat"
+        _beat()
+        check(t._takeover_st != "combat",
+              "⑤⭐⭐ **小游戏里画面匹配不上就回落 `combat`** ⇒ Agent 当场拿回方向盘、"
+              "又开始按方向键 ✗✗（用户 2026-10-10 报的就是这个）：%r" % (t._takeover_st,))
+
+        cur["st"] = "lie_success"
+        _beat()
+        check(t._takeover_st == "lie_success",
+              "⑥ 成功弹窗期间仍该接管：%r" % (t._takeover_st,))
+
+        cur["st"] = "combat"
+        _beat()
+        check(t._takeover_st == "combat",
+              "⑥ 测谎完了该**还权**（不然永不恢复打怪 ✗）：%r" % (t._takeover_st,))
+
+        # ⑦-1 没有 warn 打头的 lie_game（误判路线）⇒ 不算数
+        cur["st"] = "lie_game"
+        _beat()
+        check(t._takeover_st == "combat",
+              "⑦ **没见过 `lie_warn` 的 `lie_game` 不算测谎**（误判不许冻住 Agent ✗）：%r"
+              % (t._takeover_st,))
+
+        # ⑦-2 ⭐⭐ **`lie_warn` 响过 ⇒ 这一场之内一直留接管**（用户 2026-10-10 第二轮 ✓
+        #    原话："**测谎的时候 Agent 还在操作移动、跳跃**"✗）—— ⚠ 这条**替掉了**上一版
+        #    "只见过 warn、没进小游戏 ⇒ 宽限一过就还权"✗✗：因为 `lie_game` 那块模板**裁坏了**
+        #    （仓库里早记着：真小游戏 0.788~0.794 **低于门限 0.80** ⇒ 小游戏那段**根本认不出来** ✗）
+        #    ⇒ 等"进过小游戏"= **永不接管** ✗（现场就是 `lie_rec` 录满 300 秒、而 `agent_why=-` ✓）。
+        #    真测谎 warn 之后几秒进小游戏、全程 ≈25 秒 ⇒ 60 秒窗口完全盖得住 ✓。
+        cur["st"] = "lie_warn"
+        _beat()
+        check(t._takeover_st == "lie_warn", "⑦ 重启一场的 warn 该接管 ✓")
+        t._lie_warn_at = _time.monotonic() - 30.0        # 小游戏进行到 30 秒（仍在这一场里 ✓）
+        cur["st"] = "combat"
+        _beat()
+        check(t._takeover_st != "combat",
+              "⑦⭐ warn 响过、小游戏**认不出来**（画面回落 `combat`）时把操作权还回去了 ⇒ "
+              "Agent 又开始按移动/跳跃 ✗✗（用户 2026-10-10 第二轮报的就是这个）：%r"
+              % (t._takeover_st,))
+        # 这一场超时（> LIE_SESSION_MAX_S）⇒ 必须还权（不许把 Agent 永久冻住 ✗）
+        t._lie_warn_at = _time.monotonic() - (float(LT.LIE_SESSION_MAX_S) + 1.0)
+        cur["st"] = "combat"
+        _beat()
+        check(t._takeover_st == "combat",
+              "⑧ 这一场都超时 %g 秒了还留着接管（把 Agent 永久冻住 ✗）：%r"
+              % (float(LT.LIE_SESSION_MAX_S), t._takeover_st))
+    finally:
+        ss.check_frame, us.detect, ss.capture_frame = _o_cf, _o_ui, _o_cap
+
+
+def t_convert_only_when_wanted():
+    """⭐⭐ **解出来的帧"没人要"就不做颜色转换**（用户 2026-10-10 ✓ 原话："**A 推流 60fps 不影响吧，
+    我们的重点是提升 B 机的效率，A 就算推 240fps 我们也需要能应对**"✓）。
+
+    本机实测（走产品这条路 ✓ 见 `tools/perf_audit` 以外的这次直接基准 ✓）：
+      · **纯解码 0.71 ms/帧（1399 帧/秒）** ✓；
+      · **解码 + `bgr24` 转换 5.93 ms/帧（169 帧/秒）** ✗ —— **贵 8 倍** ✓。
+    ⇒ 瓶颈**不在解码**，在"AV帧 → numpy BGR"那一步 ✓；而它原来是**每帧都做** ✗
+      ⇒ 输入 60fps 就烧掉约三分之一核、**240fps 要一个半核** ✗✗（"推 240 扛不住"的真因 ✓）。
+
+    做法：`PyAVSource(keep_check=…)` —— **解码照旧喂满**（UDP 下跳包会破坏参考帧 ✗ 这是两回事 ✓），
+    只有 `keep_check()` 为真才做那步昂贵转换 ✓ ⇒ 转换成本被**消费速度**封顶 ✓
+    （判据 `_LatestSlot.is_idle` ✓ = "槽里没有待取走的帧，这帧真有人要" ✓）。
+
+    钉四件（前两条源码级、后两条真跑）：
+      ① 跳过必须发生在 `to_ndarray` **之前** ✗（放后面 = 白省 ✓）；
+      ② 主回路必须传判据 + 记 `convert_skip`（"省了多少活"的证据 ✓）；
+      ③ **真跑**：拒绝前 5 帧 ⇒ 恰好 5 帧被丢、第 6 帧正常返回 ✓（误差 0 ✓）；
+      ④ `keep_check=None` ⇒ **老行为一字不变** ✓（不传就不省 ✓）。
+      ⚠ ⑤ 没有样本视频 ⇒ 只跑源码那两条（本仓库有跳过依赖的先例 ✓ 别让用例硬失败 ✗）。
+    """
+    src = (ROOT / "link" / "pyav_source.py").read_text(encoding="utf-8")
+    _i_chk = src.find("if self.keep_check is not None:")
+    _i_nd = src.find("av_frame.to_ndarray(format=self.decode_format)")
+    check(_i_chk >= 0 and _i_nd > _i_chk,
+          "`keep_check` 的跳过没放在 `to_ndarray` **之前** ⇒ 那一步照样白做 ✗")
+    ltsrc = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    check("keep_check=_want_frame" in ltsrc and 'perf.count("convert_skip")' in ltsrc
+          and "def is_idle(self):" in ltsrc,
+          "主回路没把「有人要吗」的判据传下去（或没记 `convert_skip`）⇒ 这条优化不会生效 ✗")
+
+    files = sorted((ROOT / "data" / "recordings").glob("*.mp4"))
+    if not files:
+        return          # ⑤ 没样本 ⇒ 只跑源码那两条 ✓
+    sys.path.insert(0, str(ROOT))
+    from link import PyAVSource
+    n_seen = [0]
+
+    def _kc():
+        n_seen[0] += 1
+        return n_seen[0] > 5
+
+    s = PyAVSource(str(files[0]), decode_format="bgr24", keep_check=_kc)
+    try:
+        s.open()
+        f = s.read()
+    finally:
+        s.close()
+    check(f is not None and s.skipped_convert == 5,
+          "「没人要就不转换」不精确：期望丢 5 帧、返回第 6 帧，实际丢 %d 帧、返回 %s ✗"
+          % (s.skipped_convert, "有帧" if f is not None else "None"))
+
+    s2 = PyAVSource(str(files[0]), decode_format="bgr24", keep_check=None)
+    try:
+        s2.open()
+        f2 = s2.read()
+    finally:
+        s2.close()
+    check(f2 is not None and s2.skipped_convert == 0,
+          "不传判据时行为被改了（老路应当**每帧都转换** ✓）：skipped=%d ✗" % s2.skipped_convert)
+
+
+def t_heavy_gate_when_machine_busy():
+    """⭐⭐ **重载保命闸**：每秒最多跑多少拍「推理＋追踪＋决策＋画框」（用户 2026-10-10 ✓
+    原话："**我就是想在挂游戏+浏览器+音乐+steam+玩大型游戏的时候，实时还能流畅跑**"✓）。
+
+    为什么要这道闸（实测 ✓）：`pipe_ms` 里**推理占 66~70%**（`infer_ms` 13ms / `pipe_ms` 20ms ✓），
+    而输入推流是 **60fps** ⇒ 天棚只比输入高一点点 ⇒ 机器上再有人抢 GPU/CPU ⇒ **必然积压** ✗
+    （2026-10-10 现场：e2e 3.7~4.7 秒、`src_lag=on` ✓，而人**就是**要同时开游戏/浏览器/音乐 ✓）。
+    ⇒ 唯一的出路是**给每秒的活量封顶** ✓（不是"等机器空出来"✗）。
+
+    做法：到点才跑那条重链（`_infer` 分支 ✓），不到点的帧**直接丢**（同 `_LatestSlot` ✓）
+    —— 我们永远只处理**最新**帧 ⇒ **延迟不升** ✓（反而因为收流侧更松而降 ✓）。
+
+    钉四件（源码级 ✓ 这几条只在真跑起来时才看得出 ✗）：
+      ① `pipe_fps` 必须来自 **live 配置热读** ✓（能现场调、1 秒生效 ✓）；
+      ② 闸必须在**重活之前**、且**跳过的拍 `continue`** ✓（不是"跑完再丢"✗）；
+      ③ ⚠⚠ **跳过的拍必须照喂时间拍**（`agent.tick_timing` ✓）—— 输出CD / delay / 跳间隔
+         那条序列走**本机绝对时钟** ✓ ⇒ 跳拍**不影响精确度** ✓；漏了这条就是"限了速 ⇒
+         攻击节奏变慢/延迟漂移"✗（很难查 ✓）；
+      ④ `0` = **不限制** ⇒ 这一整段等于不存在 ✓（**老行为一字不变** ✓ 默认值必须是 0 ✓）。
+    """
+    src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    check('_live.get("pipe_fps"' in src and "self._pipe_fps = max(0.0" in src,
+          "重活闸没从 live 配置热读 `pipe_fps`（现场调不了 ✗）")
+    check("if self._pipe_fps > 0.0 and self._infer.is_set():" in src,
+          "闸没装在**重活之前**（跑完再丢 = 白跑 ✗）")
+    _i_gate = src.find("if self._pipe_fps > 0.0 and self._infer.is_set():")
+    _i_cnt = src.find('perf.count("skip_heavy")')
+    check(_i_gate >= 0 and _i_cnt > _i_gate,
+          "跳过的那一帧没计数（`skip_heavy` ✓ ⇒ 事后看不出闸有没有在干活 ✗）")
+    _mid = src[_i_gate:_i_cnt]
+    check("agent.tick_timing(ws)" in _mid,
+          "⚠⚠ 跳过的帧**没喂时间拍**（`agent.tick_timing`）⇒ 输出CD/delay/跳间隔会跟着变慢 ✗"
+          "（那条序列走本机绝对时钟 ✓ 跳拍本可以完全不影响它 ✓）")
+    check("continue" in src[_i_cnt:_i_cnt + 260],
+          "跳过的帧没**跳过重活**（该 `continue` 去取下一帧 ✗）—— 那就成了「跑完再丢」白跑 ✗")
+    check("self._pipe_fps = 0.0\n" in src and "self._heavy_at = 0.0" in src,
+          "默认不是「不限制」（0）⇒ 老行为被改了 ✗")
+
+
+def t_arrow_can_show_facing():
+    """⭐⭐ **x 箭头 = 玩家「真实」朝向**（用户 2026-10-10 ✓ 原话："**我想让坐标箭头代表玩家的
+    真实朝向（需要尽量高效）**"✓）。
+
+    ⚠⚠ **两轮都在这里翻车** ✗ ⇒ 这条用例要把两次的病一次钉住：
+      · 第一次：把"**意图**那份"（`action["facing"]` ✓ = `CombatAgent.facing` ✓ **「攻击范围框」
+        用的就是它** ✓）当成了真实的 ✗（用户当场纠正 ✓）；
+      · 第二次：改读 `ws.player.facing` ✓ —— 可那个字段**唯一的写者**（`perception/player_state.py`
+        里靠 `@L` **镜像模板**那条链 ✓）**根本没接进实时回路** ✗ ⇒ 全场恒默认 `+1` ⇒
+        **箭头永久朝右** ✗（用户 2026-10-10 现场报的 ✓ —— 典型的"读了一个**没有写者**的字段"✗，
+        正是 `docs/架构-AI三层.md` 里 R1 要防的事 ✓）。
+      · 第三次：改用"**猜外观**"（玩家框左右亮度差 + 走目标定 ✓）⇒ 用户实测"**并不灵敏**"✗
+        ⇒ 当天撤掉 ✓（三条硬伤见 `live_thread._face_beat` 的撤销留痕 ✓）。
+      ⇒ 现来源 = `live_thread.move_face_dir` ✓：**角色「世界坐标」x 的真实位移**
+        （`Player.world_x` ✓ 小地图那份 ✓ **与相机无关** ✓ —— 用户 2026-10-10 纠正过：
+        "**应该用世界状态坐标的位移算，因为画面里相机镜头是会移动的**"✓）；
+        连几拍**同向**且净位移够 ✓ 成本 **0** ✓ 不裁图、不标定、不用模板 ✓；
+        ⚠ 只有**角色在走**时才有读数 ✓ 停下 / 抖动 / 这一拍没定位 ⇒ **不画** ✓（不猜 ✓）。
+
+    钉六件：
+      ① 开关**关着** ⇒ 恒 `+1`（世界 x 正方向 ✓ ⇒ 老观感一字不变 ✓）；
+      ② `face_ok=True` ⇒ 用估出来的方向（`-1` / `+1` ✓）；
+      ③ ⚠⚠ **没有可信读数 ⇒ 返回 `0` ＝ 这根箭头不画**（**绝不假装朝右** ✗ —— 那就是"永久
+         朝右"那条病 ✓）；只有"**上一拍有过**"时才保持上一拍（短时丢读数 ⇒ 不乱跳 ✓）；
+      ④ **判据纯函数真跑**（`move_face_dir` ✓）：连几拍同向 + 净位移够 ⇒ `±1` ✓；
+         **站着不动 / 来回抖 / 净位移太小 / 样本不够 / 坏值 ⇒ 一律 `0`** ✓（不猜 ✓）；
+      ⑤ **状态机真跑**（`_face_beat` ✓ 拿 `__new__` 替身直接调 ✓）：世界坐标连着走 ⇒ 判对 ✓；
+         ⚠⚠ **`world_held=True`（沿用上一帧）/ 没定位 / `world_x=None` ⇒ 必须清历史 + 不画** ✗
+         （沿用值→真值那一下**跳变**会被当成"在走"⇒ 给错方向 ✓）；开关关着 ⇒ 不攒样本 ✓；
+      ⑤ 接线（源码级）：主回路调 `_face_beat` ✓、画那段走 `arrow_real_face_dir(` ✓ 且取
+         **`self._face_dir/_face_ok`** ✓（**不许**回头读 `ws.player.facing` ✗ 那是本轮那个
+         "没有写者的字段" ✓）、**「攻击范围框」照旧读 `action["facing"]`** ✓（两条链分开 ✓）；
+      ⑥ 配置：`vis:` 有这个键、**默认 `False`** ✓、**不在 `_VIS_ON_KEYS`** ✗（那批是
+         "缺省 ⇒ True"✗ 会偷改所有人观感 ✗）；**存得进读得回**（坏值回 `False` ✓ 且**还原** ✓）。
+    """
+    from gui import live_thread as LT
+    from gui import theme
+
+    # ①②③ 三件判据（⚠ 第三条是"**0 = 不画**"✓ —— 本轮的病就是在这儿）
+    check(LT.arrow_real_face_dir(-1, True, 0, False) == 1,
+          "开关关着 ⇒ 必须恒 +1（世界 x 正方向 = 老观感 ✓）：%r"
+          % (LT.arrow_real_face_dir(-1, True, 0, False),))
+    check(LT.arrow_real_face_dir(-1, True, 0, True) == -1,
+          "有可信读数 + 估出朝左 ⇒ 箭头朝左（-1）：%r"
+          % (LT.arrow_real_face_dir(-1, True, 0, True),))
+    check(LT.arrow_real_face_dir(1, True, -1, True) == 1,
+          "有可信读数 + 估出朝右 ⇒ 箭头朝右（+1）：%r"
+          % (LT.arrow_real_face_dir(1, True, -1, True),))
+    check(LT.arrow_real_face_dir(1, False, 0, True) == 0,
+          "⚠⚠ **没有可信读数又没上一拍 ⇒ 必须返回 0（= 不画）** ✗ —— "
+          "**绝不假装朝右** ✓（用户 2026-10-10 报的「箭头永久朝右」就是这么来的 ✓）：%r"
+          % (LT.arrow_real_face_dir(1, False, 0, True),))
+    check(LT.arrow_real_face_dir(1, False, -1, True) == -1,
+          "短时丢读数（之前朝左）⇒ 保持上一拍（不乱跳 ✓）：%r"
+          % (LT.arrow_real_face_dir(1, False, -1, True),))
+
+    # ④ 判据纯函数**真跑**（`move_face_dir`：一连串**世界坐标** x → 方向 ✓）
+    check(LT.move_face_dir([100.0, 104.0, 108.0, 112.0]) == 1,
+          "连几拍**同向往右** + 净位移够 ⇒ 该判 +1：%r"
+          % (LT.move_face_dir([100.0, 104.0, 108.0, 112.0]),))
+    check(LT.move_face_dir([112.0, 108.0, 104.0, 100.0]) == -1,
+          "连几拍**同向往左** ⇒ 该判 -1：%r"
+          % (LT.move_face_dir([112.0, 108.0, 104.0, 100.0]),))
+    check(LT.move_face_dir([100.0, 100.0, 100.0, 100.0]) == 0,
+          "**站着不动** ⇒ 判不出（0 ✓ 不猜 ✓）：%r"
+          % (LT.move_face_dir([100.0, 100.0, 100.0, 100.0]),))
+    check(LT.move_face_dir([100.0, 105.0, 99.0, 104.0]) == 0,
+          "**来回抖 / 反向** ⇒ 判不出（0 ✓ 不猜 ✓）：%r"
+          % (LT.move_face_dir([100.0, 105.0, 99.0, 104.0]),))
+    check(LT.move_face_dir([100.0, 108.0, 102.0, 110.0]) == 0,
+          "⚠ **抖动但净位移够**（+8 / −6 / +8 ⇒ 净 10px ≥ 门槛）⇒ **仍必须判不出** ✓"
+          "（「连几拍同向」要的是**单调**：中间夹一个反向就不算 ✓ —— "
+          "只看净位移是最骗人的写法 ✗）：%r"
+          % (LT.move_face_dir([100.0, 108.0, 102.0, 110.0]),))
+    check(LT.move_face_dir([100.0, 101.0, 102.0, 103.0]) == 0,
+          "**净位移太小**（3px < 门槛 6px）⇒ 判不出（0 ✓ 站着微抖不算 ✓）：%r"
+          % (LT.move_face_dir([100.0, 101.0, 102.0, 103.0]),))
+    check(LT.move_face_dir([100.0, 101.0]) == 0,
+          "**样本不够**（<3 拍）⇒ 判不出（0 ✓）：%r" % (LT.move_face_dir([100.0, 101.0]),))
+    check(LT.move_face_dir(None) == 0 and LT.move_face_dir(["x", "y", "z"]) == 0,
+          "喂进来的东西不对 ⇒ 判不出（0 ✓ 且**绝不抛** ✓）")
+
+    # ⑤ **状态机真跑**（`_face_beat` 只碰三个字段 ⇒ 能拿 `__new__` 替身直接调 ✓）
+    #    ⚠⚠ 这一层专钉**"读的是世界坐标、且只用新鲜读数"**（用户 2026-10-10 纠正 ✓：
+    #      "**应该用世界状态坐标的位移算，因为画面里相机镜头是会移动的**"✓）
+    class _Pl:                            # 冒充 `ws.player`（只要两个字段 ✓）
+        def __init__(self, wx, held=False):
+            self.world_x, self.world_held = wx, held
+
+    def _stub(on=True):
+        _t = LT.LiveThread.__new__(LT.LiveThread)
+        _t._arrow_real_face_on = bool(on)
+        _t._face_hist, _t._face_dir, _t._face_ok = [], 0, False
+        return _t
+
+    _t1 = _stub()
+    for _wx in (100.0, 104.0, 108.0, 112.0):
+        _t1._face_beat(_Pl(_wx))
+    check(_t1._face_dir == 1 and _t1._face_ok,
+          "世界坐标连着往右 ⇒ 该判 +1（实测 %r / ok=%r）" % (_t1._face_dir, _t1._face_ok))
+    _t2 = _stub()
+    for _wx in (112.0, 108.0, 104.0, 100.0):
+        _t2._face_beat(_Pl(_wx))
+    check(_t2._face_dir == -1, "世界坐标连着往左 ⇒ 该判 -1（实测 %r）" % (_t2._face_dir,))
+    # ⚠ `world_held=True`（这一拍没认出黄点、坐标是**沿用上一帧**的 ✓）⇒ 不许当读数 ✗
+    _t3 = _stub()
+    for _wx in (100.0, 104.0, 108.0):
+        _t3._face_beat(_Pl(_wx))
+    _t3._face_beat(_Pl(140.0, held=True))
+    check(not _t3._face_ok and _t3._face_hist == [],
+          "`world_held=True`（沿用上一帧）⇒ 该**清历史 + 不给读数** ✗"
+          "（不然「沿用值 → 真值」那一下跳变会被当成在走 ✓）：ok=%r / hist=%r"
+          % (_t3._face_ok, _t3._face_hist))
+    # ⚠ 这一拍没定位（`player=None` / `world_x=None`）⇒ 同上
+    for _mk, _why in ((lambda: None, "player=None（没定位 / 被闸拦 ✓）"),
+                      (lambda: _Pl(None), "world_x=None（没算出世界坐标 ✓）")):
+        _t4 = _stub()
+        for _wx in (100.0, 104.0, 108.0):
+            _t4._face_beat(_Pl(_wx))
+        _t4._face_beat(_mk())
+        check(not _t4._face_ok and _t4._face_hist == [],
+              "%s ⇒ 该清历史 + 不给读数 ✗（实测 ok=%r / hist=%r）"
+              % (_why, _t4._face_ok, _t4._face_hist))
+    _t5 = _stub(on=False)
+    for _wx in (100.0, 104.0, 108.0, 112.0):
+        _t5._face_beat(_Pl(_wx))
+    check(not _t5._face_ok and _t5._face_hist == [],
+          "开关关着 ⇒ 一个样本都不攒（老行为 + 零成本 ✓）")
+
+    # ⑤ 接线（源码级）
+    _lt = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    check("def _face_beat(" in _lt, "`_face_beat` 没了（真实朝向没有计算处 ✗）")
+    # ⚠⚠ **按"行"判，不按子串判** ✗ —— 本仓库注释密度极高：把调用**注释掉**之后
+    #   `"self._face_beat(vis, player_box)" in 源码` 仍然成立 ⇒ 判据被注释骗 ✗
+    #   （2026-10-10 实测踩到 ✓ 用**反向验证**才发现 ✓）。
+    _calls = [ln.strip() for ln in _lt.splitlines()
+              if ln.strip().startswith("self._face_beat(")]
+    check(bool(_calls),
+          "主回路没**真的**调 `_face_beat`（估计器白写 / `_face_ok` 恒 False ⇒ 箭头永远不画 ✗）")
+    _i_arrow = _lt.find("_fdir = arrow_real_face_dir(")
+    check(_i_arrow > 0, "画箭头那段没走 `arrow_real_face_dir(`（勾了不生效 ✗）")
+    _win = _lt[_i_arrow - 600:_i_arrow + 600]
+    # ⚠ 同样按行判（只在**真代码**里找，注释不算 ✓）
+    _code = [ln for ln in _win.splitlines() if not ln.strip().startswith("#")]
+    check(any('getattr(self, "_face_ok", False)' in ln for ln in _code)
+          and any("_face_dir" in ln for ln in _code),
+          "画箭头那段取的不是 `self._face_dir/_face_ok`（估计器的结果 ✗）")
+    check("player.facing" not in _win,
+          "⚠ 又回头去读 `ws.player.facing` 了 ✗ —— 那个字段在**实时回路里没有写者** ✓"
+          "（用户报的「永久朝右」就是这么来的 ✓）")
+    check('facing = action.get("facing", 1)' in _lt,
+          "⚠ 「攻击范围框」那份必须**照旧**取 `action[\"facing\"]`（Agent 的意图 ✓）——"
+          "被这次改动顺手改掉 = 另一条链断了 ✗")
+    # ⚠⚠ 必须读**世界坐标**（用户 2026-10-10 纠正 ✓："**应该用世界状态坐标的位移算，
+    #    因为画面里相机镜头是会移动的**"✓），而且**不许**出现画面 x ✗
+    check('getattr(player, "world_x", None)' in _lt and "world_held" in _lt,
+          "`_face_beat` 没读**世界坐标**（`world_x` / `world_held` ✗）—— "
+          "画面 x 会被相机带走 ✓（人没走镜头一动也像在走 ✓）")
+    _i_fb = _lt.find("def _face_beat(")
+    check(_i_fb > 0, "`_face_beat` 没了（真实朝向没有计算处 ✗）")
+    _fb_body = _lt[_i_fb:_lt.find("    def _locate_latest", _i_fb)]
+    _fb_code = [ln for ln in _fb_body.splitlines() if not ln.strip().startswith("#")]
+    check(not any("pb[0]" in ln or "player_box[" in ln for ln in _fb_code),
+          "⚠ `_face_beat` 里又出现**画面**坐标（`pb[0]` ✗）—— 相机一动就假了 ✓")
+    # ⚠ 调用点必须在**写世界坐标之后**（`mm.apply_to_player` ✓）—— 否则用的是上一拍的值 ✓
+    _i_apply = _lt.find("mm.apply_to_player(ws.player, _loc)")
+    _i_call = _lt.find("self._face_beat(ws.player if _loc is not None else None)")
+    check(0 < _i_apply < _i_call,
+          "`_face_beat` 的调用点排在 `apply_to_player` **之前** ⇒ 读的是**上一拍**的世界坐标 ✗")
+
+    # ⑤ 配置：默认关 + 不混进「缺省 ⇒ True」那个名单 + 存读回
+    check(theme.VIS_DEFAULTS.get("player_arrow_real_face") is False,
+          "`player_arrow_real_face` 默认不是 False（= 老观感被改了 ✗）：%r"
+          % (theme.VIS_DEFAULTS.get("player_arrow_real_face"),))
+    check("player_arrow_real_face" not in theme._VIS_ON_KEYS,
+          "它被塞进了 `_VIS_ON_KEYS` ✗ —— 那批的读回是「缺省 / 写坏 ⇒ **True**」"
+          "⇒ 会让**所有人**的箭头默认改成「真实朝向」（偷改观感 ✗）")
+    _bak = theme.load_vis().get("player_arrow_real_face")
+    try:
+        theme.save_vis({"player_arrow_real_face": True})
+        _got = theme.load_vis().get("player_arrow_real_face")
+        theme.save_vis({"player_arrow_real_face": "yes"})     # 坏值
+        _bad2 = theme.load_vis().get("player_arrow_real_face")
+    finally:
+        theme.save_vis({"player_arrow_real_face": bool(_bak)})
+    check(_got is True,
+          "勾上存了却读不回来（`load_vis` 漏了这道 ⇒ 表现是「改了没用」✗）：%r" % (_got,))
+    check(_bad2 is False,
+          "坏值该回默认 False（「坏值当没存过」✓）：%r" % (_bad2,))
+
+    # ⑥ 接线（界面侧）
+    check('_vis_cfg.get("player_arrow_real_face", False)' in _lt,
+          "画的时候没读这个键（勾了不生效 ✗）")
+    _sd = (ROOT / "gui" / "settings_dialog.py").read_text(encoding="utf-8")
+    check("ck_arrow_real_face" in _sd and 'vis_cfg["player_arrow_real_face"]' in _sd,
+          "设置界面没把这个开关存下去（勾了保存不了 ✗）")
+
+
+def t_precheck_source_per_map():
+    """⭐⭐⭐ 「开自动前的检查」必须与**路线识别页**用**同一处来源口径**（用户 2026-10-10 ✓
+    原话：**"为什么我标定过了还显示这个"** ✓）。
+
+    现场（一条命令量的 ✓）：
+      · `datasets/map/107000100.route.json` 里 `mmap_src: "live"`（=「从实时画面」✓
+        标定就在这条下 ✓ 有 `mode`/`scale`/`offset` ✓）；
+      · 全局 `config/live.yaml` 里是 `stream`（=「独立推流」✗ 那一格**只有 `alpha`** ✗）；
+      · 来源 **2026-10-03 起按地图 id 存** ✓，而体检当时读的是**全局**那份 ✗
+        ⇒ 去问 `stream` ⇒ 报"还没标定" ✗ —— **人明明刚标过** ✓（标定按来源分开存 ✓
+        见 `core/mapdata.calib_path` ✓）。
+
+    钉四件：
+      ① `mm.source_for_map(map_id)`：**按图优先** ✓、本图没灌过才回退全局 ✓、非法值回退 ✓；
+      ② 体检**真的**用按图那份（喂"本图 = live 且有几何" ⇒ **不许报问题** ✓）；
+      ③ 当前来源没量、**另一条来源量过** ⇒ 提示里要**点名那条来源** ✓
+         （别让人对着"没标定"发呆 ✓）；
+      ④ **源码级**：体检里**不许**再出现裸 `mm.live_src()` ✗ —— 那正是口径分叉的入口 ✓。
+    """
+    import core.mapdata as md
+    import perception.minimap as mm
+    from core import route_cfg
+    from gui.player_panel import PlayerPanel
+
+    _geo = {"mode": "fit", "scale": 1.0, "offset": [0.0, 0.0]}
+    _saved = (md.load_calib, md.load_calibs, md.load, mm.source_for_map, route_cfg.load)
+    try:
+        # ---- ① `source_for_map`：按图优先 / 回退全局 / 非法值回退 ✓ ----
+        route_cfg.load = lambda mid: {"mmap_src": "live"}
+        check(mm.source_for_map("107000100") == mm.SRC_LIVE,
+              "本图灌过来源 ⇒ 该用它（体检与路线识别页必须同一条）✗")
+        route_cfg.load = lambda mid: {"mmap_src": "不合法"}
+        check(mm.source_for_map("107000100", {"mmap_src": "stream"}) == mm.SRC_STREAM,
+              "本图那份不合法 ⇒ 该回退全局 `live.yaml` ✗")
+        route_cfg.load = lambda mid: {}
+        check(mm.source_for_map("107000100", {"mmap_src": "live"}) == mm.SRC_LIVE,
+              "本图没灌过 ⇒ 该用全局那份 ✗")
+
+        # ---- ② 体检真的用按图那份（现场就是这首 ✓）----
+        route_cfg.load = lambda mid: {"mmap_src": "live"}     # 本图 = live（有几何 ✓）
+        md.load_calib = lambda mid, src, zoom=None: (_geo if src == "live" else {"alpha": 77})
+        md.load_calibs = lambda mid: {"live": _geo, "stream": {"alpha": 77}}
+
+        class _T:
+            canvas = object()
+
+        md.load = lambda mid, with_canvas=False: _T()
+        _p = PlayerPanel._precheck_problems("107000100", need_mmap=True)
+        check(not _p,
+              "本图那条来源（live ✓）**量过了**却仍报问题 ✗ —— 体检读错来源了 ✓"
+              "（= 用户现场\"我标定过了还显示这个\"✓）：%r" % (_p,))
+
+        # ---- ③ 当前来源没量、另一条量过 ⇒ 点名那条 ✓ ----
+        route_cfg.load = lambda mid: {"mmap_src": "stream"}
+        _p2 = PlayerPanel._precheck_problems("107000100", need_mmap=True)
+        _t2 = "\n".join(_p2)
+        check("还没标定" in _t2, "当前来源确实没量 ⇒ 该报\"还没标定\"：%r" % (_t2,))
+        check("从实时画面" in _t2,
+              "另一条来源（live =「从实时画面」✓）量过了却**没点名** ⇒ 人只能对着"
+              "\"没标定\"发呆 ✗（用户 2026-10-10 ✓）：%r" % (_t2,))
+    finally:
+        (md.load_calib, md.load_calibs, md.load,
+         mm.source_for_map, route_cfg.load) = _saved
+
+    # ---- ④ 源码级：体检里不许再用裸 `mm.live_src()` ✗ ----
+    _txt = (ROOT / "gui" / "player_panel.py").read_text(encoding="utf-8")
+    _body = _txt.split("def _precheck_problems", 1)[-1].split("def _auto_precheck_problems",
+                                                             1)[0]
+    check("mm.source_for_map(" in _body,
+          "体检没走 `mm.source_for_map` ⇒ 又和路线识别页分叉了 ✗（按图存的那份会被忽略 ✓）")
+    check("mm.live_src()" not in _body,
+          "体检又出现裸 `mm.live_src()` 了 ✗ —— 那是**全局**那份，正是"
+          "\"我标定过了还显示没标定\"的病根 ✓（用户 2026-10-10 ✓）")
+
+    # ---- ⑤ 全仓库不许再出现「拿**全局**来源去读本图标定」✗ ----
+    #      （那是同一族病：本图那份会被忽略 ✓ 现场 `stream` 桶里只剩 `alpha:77` ✓
+    #        就是 `settings_dialog` 存浓淡时用全局来源写出来的 ✓）
+    for _f in ("gui/player_panel.py", "gui/settings_dialog.py", "gui/route_panel.py"):
+        _bad = [ln.strip() for ln in (ROOT / _f).read_text(encoding="utf-8").splitlines()
+                if "load_calib(" in ln and "live_src(" in ln]
+        check(not _bad,
+              "%s 里还拿**全局** `live_src()` 去读标定 ✗ ⇒ 本图那份被忽略（同一族病 ✓）：%r"
+              % (_f, _bad))
+
+
 TESTS = (
+    ("⭐⭐⭐ 「x 箭头 = 玩家真实朝向」（用户 2026-10-10「现在箭头永久朝右」）：判据 = **世界坐标** x"
+     " 的真实位移（小地图那份 · **与相机无关** · 连几拍同向 + 净位移够 · 成本 0）· 沿用值/没定位"
+     "**清历史不画** · 判不出**不画**（不许假装朝右）· 与「攻击范围框」（意图那份）**分开** · 默认关",
+     t_arrow_can_show_facing),
+    ("⭐⭐⭐⭐⭐ 「地形图的玩家圈只用唯一那一份世界坐标」（用户 2026-10-10）：不许再用「差分自己"
+     "挑的点」当玩家（会锁到墙的红点上 · 与信息栏两个数）· 换算只走地形 · 换图/没跑/没定上位不画",
+     t_live_map_marker_is_authoritative),
+    ("⭐⭐⭐⭐⭐ 「测谎成功后必须收工」（用户 2026-10-10「录了很久没在成功后切断」）：按时间的"
+     "收工判据必须在早退**之前**——状态不再变的那一拍也要到点收 · GAP 兜底同理 · 源码级钉住顺序",
+     t_lie_rec_stops_after_success),
+    ("⭐⭐⭐⭐ 「界面接管期间这一拍不定位」（用户 2026-10-10「定位有这么慢吗」）：实测 0.4ms vs"
+     "接管时 43~73ms（面板被弹窗盖住 ⇒ 每拍退回全画面重找）⇒ 接管时直接不定位",
+     t_locate_skipped_while_taken_over),
+    ("⭐⭐⭐⭐⭐ 「测谎开始后 Agent 不许再按方向键」（用户 2026-10-10）：小游戏那段画面匹配不上"
+     "也不许把操作权还回去（留住接管）· 全程接管到成功弹窗 · 测谎完自动还权 · "
+     "没 warn 的 lie_game / warn 误判都不许冻住 Agent",
+     t_lie_takeover_holds_through_minigame),
+    ("⭐⭐ 「重载保命闸」：每秒最多跑 N 拍重活（用户 2026-10-10「挂游戏+浏览器+音乐+steam+大型游戏"
+     "也要流畅」）—— 到点才跑 · 跳过的帧只喂时间拍（CD/delay 精度不受影响）· 默认 0 = 不限制",
+     t_heavy_gate_when_machine_busy),
+    ("⭐⭐ 「解出来没人要 ⇒ 不做颜色转换」（用户 2026-10-10「重点是提升 B 机的效率，A 就算推"
+     "240fps 也要能应对」）：实测解码 0.71ms vs 转换 5.93ms（贵 8 倍）⇒ 转换成本按消费速度封顶",
+     t_convert_only_when_wanted),
     ("⭐⭐⭐ 只收流（没开推理）时画框段不许崩：调用点用到的名字都要在块前有值（用户 2026-10-05）",
      t_draw_args_defined_when_stream_only),
     ("⭐⭐ 「目标被攻击CD」的灰框 + 右下角剩余 CD（用户 2026-10-06）", t_mob_cd_gray_box),
@@ -2821,10 +4248,26 @@ TESTS = (
      t_pot_zero_means_dead),
     ("⭐⭐ 测谎现场录屏：进 lie_* 起录 / 离开即停、录原生帧副本（不污染 raw）",
      t_lie_recording),
+    ("⭐⭐ 自动测谎（visual_tracking）：喂画框前的 raw / 独立线程 / 成功点「确定」走 "
+     "mouse_aim 且只在本机窗口 / 点完重开一轮 / 开关与状态行接通（行为见 selftest_vt_sdk）",
+     t_vt_lie_sdk),
+    ("⭐⭐ 自动测谎那组控件**真的会写配置**：构造期不写 · 勾开关五键一起落 · 冷却值进得去 · "
+     "地区下拉只能是 CN/TW（挂机保护页 ✓）", t_vt_group_writes_live),
+    ("⭐⭐ 自动测谎「瞄准」是**增量**的：第一发建原点 · 第二发只发差值（治「左上角⇄目标来回抽」）· "
+     "久停之后肯重建原点", t_vt_aim_is_smooth),
     ("⭐⭐ 采集：选中文件后显示预估张数（公式与 extract_frames 一份 + MKV 容器时长兜底）",
      t_capture_est_frames),
+    ("⭐⭐ 本地窗口被别的窗口盖住 ⇒ 改抓整屏的那条**接线**（用户 2026-10-10）",
+     t_covered_note_wired),
+    ("⭐⭐⭐ `_run` 共用尾段只许读「分岔之前就赋过值」的名字（治 UnboundLocalError）",
+     t_run_shared_names_defined_before_split),
+    ("⭐⭐⭐ 「对准窗口」自动框选：取客户区 · 两拍确认 · 记住那个窗口 · 超时不乱框（用户 2026-10-10）",
+     t_pick_rect_auto),
     ("⭐⭐ 开自动前体检：标定/地形没凑齐要先弹窗说清（用户 2026-09-29；⚠ 光有函数没接上=没有）",
      t_auto_precheck),
+    ("⭐⭐⭐ 体检的来源要与路线识别页同一处（按地图 id ✓）：本图量过就不许报、"
+     "另一条量过要点名（用户 2026-10-10「我标定过了还显示这个」）",
+     t_precheck_source_per_map),
     ("⭐⭐⭐ 断线重连回到游戏 ⇒ 体检通过才恢复自动（用户 2026-10-07 选「体检」；"
      "不过就不恢复 + 写清原因）", t_reconnect_resume_gate),
     ("连推 10 帧只画最新那帧（合并，不排队）", t_coalesce),
@@ -2861,6 +4304,8 @@ TESTS = (
      t_mmap_note_says_ok_on_recovery),
     ("⭐⭐⭐ 实时页「权重」能自己选（候选同训练卡片口径 + 按项目记住 + 「自动」可退回）",
      t_live_weights_selectable),
+    ("⭐⭐⭐ 实时页那一排参数按项目存（来源/框选区域/conf… ＋ 回填只读 ＋ 老项目不变）",
+     t_live_params_follow_project),
     ("⭐⭐⭐ 导出成功后**当场接管新引擎**（旧 `<名字>.engine` 会被改名走 ⇒ 不许再捏着它 ✗）",
      t_export_done_takes_over),
     ("⭐⭐ 权重路径失效时要说清「怎么办」（别只甩一行 does not exist）",

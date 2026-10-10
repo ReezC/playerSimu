@@ -6,6 +6,7 @@
     · 显示三个分开的速度指标
 """
 
+from PyQt5 import sip
 from PyQt5.QtCore import QRect, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPainter, QPixmap
 from PyQt5.QtWidgets import (QCheckBox, QDialog, QFileDialog, QFormLayout,
@@ -13,6 +14,7 @@ from PyQt5.QtWidgets import (QCheckBox, QDialog, QFileDialog, QFormLayout,
                              QPlainTextEdit, QProgressBar, QPushButton,
                              QSizePolicy, QVBoxLayout, QWidget)
 
+import os
 import time
 from pathlib import Path
 
@@ -30,6 +32,36 @@ from core.config import ROOT, get, load_live, update_live
 #: ⇒ **正常时它不是限速者** ✓，只在"一小段时间里被请求多次"（换帧 + 叠图 + 那行读数 ✓）
 #: 时把重复的那些**合并掉** ✓ ⇒ 主线程开销封顶 ✓、画面永远是最新那一帧 ✓。
 RENDER_MIN_MS = 20.0
+
+#: ⭐⭐ **这一页要"跟着项目走"的参数**（用户 2026-10-09 ✓ 原话："把主视区所有的配置根据项目存一下
+#: —— 现在**本地窗口来源**、**框选区域**、**怪 conf** 等等参数**每次都要重新填**"）。
+#:
+#: 存两处（**两处都要写** ✓，别只写一处 ✗）：
+#:   · **项目自己**：`projects/<名>/project.yaml` 的 `live` 段 ✓（和手选的 `live.weights` 同一处 ✓）
+#:     —— 这是"打开哪个项目就回填哪一份"的**唯一来源** ✓；
+#:   · **`config/live.yaml`**：仍然照旧写一份 ✓ —— 它是"**新项目的播种值**" ✓，也是**命令行工具**
+#:     读的那一份（`tools/infer_probe.py` 读 `imgsz/device/conf_mob` ✓、`tools/mouse_gain_calib.py`
+#:     读 `rect` ✓）⇒ 不写它会把那些工具变成"看不到项目设置" ✗（见 `tools/config_sync.py` 的清单 ✓）。
+#:
+#: ⚠ **缺键 ⇒ 用全局那份**（不清空、不塞 0 ✗）：老项目、以及从没改过这一排的项目，
+#:   行为与以前**一字不差** ✓（回填只在"项目里真有这个键"时才动控件 ✓）。
+#: ⚠ 语义上属于"本机外观偏好"的（`live_map_alpha` / `live_map_view` / `mmap_draw` / `perf_log` /
+#:   `rec_*`）**故意不进这个清单** ✗ —— 它们跟项目无关（换项目不该变浓淡/开关 ✓）。
+#: ⚠ 键名用 **`capture_source`**（不是 `source` ✗）：`live.yaml` 里已经有一个语义完全不同的
+#:   `mmap_src`（小地图来源：`live`/`stream` ✓），两个 `source` 摆在一起必然被读错 ✓。
+#:  ⚠⚠ 「自动测谎」那几个键**故意不在**这一份里（2026-10-09 ✓ 用户要求把开关搬到
+#:     「挂机保护」页那一组 ⇒ 控件不在这页了 ✗）：它是**本机偏好**（SDK 装在哪、
+#:     鼠标标不标定得动，都是**这台机器**的事），与"换项目"无关 ⇒ 落 `config/live.yaml`
+#:     的 `vt_on` / `vt_click` / `vt_conf` / `vt_region` / `vt_cool_s`，**不进项目文件** ✓
+#:     （同 `rec_*` / `perf_log` 那条口径 ✓）。⚠ 留在这儿会出真事：控件一旦不存在，
+#:     这份"按项目取的值"会写成 `vt_on=False` ⇒ **每存一次参数就把开关自己关掉** ✗。
+PROJ_LIVE_KEYS = ("capture_source", "rect", "rect_rel", "rect_win",
+                  "url", "conf_mob", "conf_player", "imgsz",
+                  "device", "capture_fps", "draw", "half", "show_fps",
+                  # ⭐ 「本地窗口的抓屏方式」（`wgc` / `bitblt` ✓ 用户 2026-10-09 加 ✓）：
+                  #   它决定"有没有那圈 Win11 系统采集边框" ✓（见 `cmb_wcap` 的 tooltip ✓）
+                  #   ⇒ 与"这台机器/这块画面怎么取像素"绑在一起 ✓ 跟项目走 ✓。
+                  "window_capture")
 
 
 def _bgr_to_pixmap(img):
@@ -319,6 +351,10 @@ class EngineExportDialog(QDialog):
 
 class LivePanel(QWidget):
     potions_ready = pyqtSignal(float, float)   # (hp, mp) 比例，转发给决策参数页
+    #: ⭐ 自动测谎的状态文字**转发口**（2026-10-09 ✓）：线程那一路先到 `_on_vt_status` ✓，
+    #:   显示那行控件已经搬到「挂机保护」页 →「自动测谎（视觉追踪）」组 ✓（用户要求"一起迁" ✓）
+    #:   ⇒ 这里只做转发（一处显示 ✓ 不在这儿留第二份 ✗）。
+    vt_status = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -332,6 +368,12 @@ class LivePanel(QWidget):
         self._render_pending = False
         self._last_bgr = None   # 最近一帧画面（BGR），供 HP/MP 条在画面上框选
         self._rect = None       # 本地窗口模式下框选的区域 (x, y, w, h)
+        #: ⭐⭐ 同一个框的**比例版** + 框选那一刻底下的那个**窗口**（2026-10-10 ✓
+        #:   用户："我们当然选用性能最好的、能满足**截取部分屏幕**需求的" ✓）：
+        #: 实时回路拿它**每拍**折算屏幕矩形（`wincap.rect_from_rel` ✓）⇒ **窗口挪了 /
+        #: 换分辨率 / 改窗口大小都不用重框** ✓；老项目只有 `rect` ⇒ 照旧用绝对坐标 ✓。
+        self._rect_rel = None   # [nx, ny, nw, nh]（相对那个窗口 ✓）
+        self._rect_win = None   # [hwnd, 标题]（框选那一刻记一次 ✓）
         # 绘制合并（见 _on_frame）：只保留最新一帧，渲染慢时丢中间帧而不是排队
         self._pending = None
         self._render_pending = False
@@ -349,6 +391,11 @@ class LivePanel(QWidget):
         self._mmap_src = "stream"
         self._mmap_crop = None
         self._mmap_track = None     # 黄点容差（界面上那排，键名见 mm.TRACK_KEYS）
+        #: ⭐ **`_build()` 跑完了吗**（2026-10-09 ✓ 见 `_on_source` / `_save_project_params`）：
+        #:   控件是**边建边连信号**的 ✓ ⇒ 任何"要读一整排控件"的回调都必须先问这一句 ✗
+        #:   （否则读到还不存在 / 已销毁的 C++ 对象 ⇒ **原生崩 `0xC0000005`** ✗
+        #:    2026-10-09 在 `tools/selftest_main_window` 上抓到 ✓）。
+        self._built = False
         self._build()
 
     # ---------------- 界面 ----------------
@@ -400,6 +447,22 @@ class LivePanel(QWidget):
         self.btn_pick_rect.setToolTip("全屏拖拽框选要识别的屏幕区域")
         self.btn_pick_rect.clicked.connect(self._pick_rect)
         bar.addWidget(self.btn_pick_rect)
+
+        # ⭐⭐ **「对准窗口」= 自动框选**（用户 2026-10-10 ✓ 原话："**框选窗口能做个自适应吗？
+        #   就是我鼠标指着的时候它自动匹配窗口画面的尺寸 —— 不然我每次自己框都会有偏差**"✓）：
+        #   手拖永远差几个像素 ✗；**指一下窗口**、直接取它的**客户区**（= 游戏真正绘制的画面 ✓
+        #   不含标题栏 / 边框 ✓）就是零偏差 ✓。
+        self.btn_pick_win = QPushButton("对准窗口")
+        self.btn_pick_win.setToolTip(
+            "**自动框选**：点一下，然后在 %d 秒内把鼠标移到游戏窗口上（**悬停在那儿别动**）✓\n"
+            "  工具会认出鼠标底下那个窗口，直接取它的**客户区**——就是游戏画面本身，\n"
+            "  不含标题栏和边框 ⇒ **零偏差**（手拖总会差几个像素 ✗）。\n\n"
+            "  · 鼠标底下是**工作台自己** ⇒ 会跳过（不会把工作台框进去 ✓ 放心点 ✓）；\n"
+            "  · 会顺手记下「相对哪个窗口」⇒ 以后窗口挪了 / 换分辨率**不用重框** ✓；\n"
+            "  · 框完**马上面板生效**；实时预览正在跑的话，**重开一次预览**才会用新区域 ✓。"
+            % self.AUTO_PICK_SEC)
+        self.btn_pick_win.clicked.connect(self._pick_rect_auto)
+        bar.addWidget(self.btn_pick_win)
 
         self.lbl_rect = QLabel("（未选）")
         self.lbl_rect.setStyleSheet("color:#80868b;")
@@ -531,6 +594,54 @@ class LivePanel(QWidget):
         row2.addWidget(self.lbl_capfps)
         row2.addWidget(self.sp_capfps)
 
+        # ⭐⭐ **抓屏方式**（用户 2026-10-09 ✓ 原话："本地的实时窗口不是框选屏幕区域实现的，
+        #   好像是捕获程序窗口，而且框选后**有莫名其妙的描边**"）：那圈描边是 **Win11 给"正在被
+        #   WGC 采集的窗口"画的系统边框** ✗（`GraphicsCaptureSession.IsBorderRequired` 默认开 ✓，
+        #   而且 `wgc-python` 没暴露关它的接口 ✗）⇒ 只能选抓屏方式 ✓。
+        self.lbl_wcap = QLabel("抓屏")
+        self.cmb_wcap = NoWheelComboBox()
+        self.cmb_wcap.addItem("WGC（DWM 合成层 · 单窗口采集）", "wgc")
+        self.cmb_wcap.addItem("BitBlt（屏幕合成 · 无采集边框）", "bitblt")
+        self.cmb_wcap.setToolTip(
+            "本地窗口这条路的取帧方式 ⚠ **这条很关键**：它决定"
+            "「盖在游戏上的别的窗口（外接登录窗 / 断线提示框）在不在画面里」。\n\n"
+            "  · **BitBlt** ⭐ **要用断线重连 / 测谎就选它**：读**桌面 DC**（`GetDesktopWindow`\n"
+            "    + `BitBlt` ✓ 见 `core/wincap.grab_rect_fast`）⇒ **屏幕上是啥就抓啥** ✓ ——\n"
+            "    外接的登录窗、断线提示框照样进画面 ✓（那两个功能都靠**看画面**判界面 ✓\n"
+            "    少了它们就**判不出来** ✗）。没有那圈采集边框 ✓ 所见即所得 ✓。\n"
+            "  · **WGC**：系统 API（DWM 合成层 ✓ 按窗口采 ✓）；⚠⚠ 但它是**单窗口采集** ✗ ——\n"
+            "    **盖在那个窗口上面的别的窗口不进画面** ✗（外接登录窗看不到 ⇒ 断线重连 / 测谎\n"
+            "    会判不出界面 ✗）；另外 **Win11 会给被采集的窗口画一圈边框** ✗（Windows 自己画的 ✓\n"
+            "    关不掉：`wgc-python` 没暴露那个开关 ✗）。\n\n"
+            "⚠ **别为「反作弊」选**（2026-10-10 用户问「反作弊难道还管抓屏吗」✓ 一次说清）✗：\n"
+            "   反作弊一般**不管抓屏** ✓（它管的是进程 / 模块 / 内存 / 注入输入 ✓）；\n"
+            "   我们这条 BitBlt 读的是**桌面 DC**（= 屏幕合成结果 ✓）⇒ 在反作弊眼里和\n"
+            "   **录屏软件（OBS / 截图工具）同一类** ✓；WGC 也是**系统自带**的截图 API（Win+G）✓。\n"
+            "   真正会发生的只有两类，且都不是「封号」：\n"
+            "     ① 窗口设了 `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` ⇒ **抓到黑** ✗\n"
+            "        （那是「防录制」✓ 不是「抓你」✓）；\n"
+            "     ② 少数反作弊**在游戏进程内** hook GDI 抓外挂取色器 ✗ —— 那只作用在**游戏自己\n"
+            "        那个进程** ✓，而我们是**另一个进程读桌面 DC** ✓ 走不到它的 hook ✓。\n"
+            "   ⇒ 按**功能**选，别按「怕被抓」选 ✓（真要担心就担心①那种黑屏 ✓）。\n\n"
+            "⚠ 两条路都是「**按你框的那块屏幕区域**裁出来」✓ —— 区别只是「从哪儿取像素」 ✓\n"
+            "   （BitBlt = 屏幕合成结果 ✓；WGC = 那个窗口自己 ✓）。\n"
+            "⚠ 2026-10-09 试过「WGC 认死源窗口、被遮挡也照抓」✗ —— 用户当场否掉 ✓ 原话：\n"
+            "   \"**我需要的是盖住的窗口和游戏都显示**，因为登陆界面是外接的窗口\" ✓ 别再改回去 ✗。\n\n"
+            "⭐⭐ **2026-10-10 起：选了 WGC 也不会「被盖住还只抓一个窗口」** ✓（用户报的\n"
+            "   「本地实时窗口来源被遮挡」✓）：工具每拍会**采样 9 个点**看这块矩形是不是\n"
+            "   跨了不止一个窗口 ✓（`core/wincap.covered_by` ✓ 只按窗口**标题**判 ✓）——\n"
+            "     · 被别的窗口盖住 ⇒ 这一拍**自动改走整屏合成** ✓（盖住的登录窗 / 断线提示框\n"
+            "       照样进画面 ✓）⇒ 状态行末尾会写「画面被别的窗口盖住 ⇒ 已改抓整屏」✓\n"
+            "       （`behavior.log` 里是 `capture_covered` ✓ 什么时候盖的、什么时候恢复都有 ✓）；\n"
+            "     · 没被盖住 ⇒ **照旧走 WGC** ✓（不吃白饭 ✓）。\n"
+            "   ⚠ 这条**不是**「认死窗口」✗（那版被否过 ✓ 见上 ✓）：它只在\"画面里确实有\n"
+            "     两个窗口\"时**换抓法**，从来不把采集绑到某一个窗口上 ✓。")
+        _wcap = str(_live.get("window_capture") or "wgc").strip().lower()
+        self.cmb_wcap.setCurrentIndex(max(0, self.cmb_wcap.findData(_wcap)))
+        self.cmb_wcap.currentIndexChanged.connect(self._save_live_params)
+        row2.addWidget(self.lbl_wcap)
+        row2.addWidget(self.cmb_wcap)
+
         self.ck_draw = QCheckBox("画框")
         self.ck_draw.setChecked(bool(_live.get("draw", True)))
         row2.addWidget(self.ck_draw)
@@ -546,6 +657,11 @@ class LivePanel(QWidget):
 
         row2.addStretch(1)
         root.addLayout(row2)
+
+        # 行 2b：⭐ 这里原来有一行「测谎状态」（2026-10-09 加、当天又搬走 ✓）—— **整块搬去**
+        #   「挂机保护」页 →「自动测谎（视觉追踪）」组 ✓（用户原话："这个状态肯定要一起迁移
+        #   过去啊" ✓）。文字由 `_on_vt_status` 原样转发（`LivePanel.vt_status` 信号 ✓），
+        #   **这里不再留第二份** ✗（一处显示 ✓ 两处迟早不一致 ✗）。
 
         # 行 3（延迟探针：开关 / 采样几何显示 / 框选）—— 这一行到这儿结束
         row3 = QHBoxLayout()
@@ -633,18 +749,43 @@ class LivePanel(QWidget):
         self.lbl_hint.setWordWrap(True)
         root.addWidget(self.lbl_hint)
 
-        self._on_source()     # 初始可见性：默认收流模式
+        # 初始可见性：默认收流模式 —— ⚠ 只刷显示 ✗（**别调 `_on_source`**：它现在会顺手
+        # 按项目存一次 ✓，而"刚建好还没绑项目"这一刻根本不该写盘 ✗）。
+        self._refresh_source_ui()
+        self._built = True    # 从这一刻起，那一排控件可以安全读了（见 `_built` 的说明 ✓）
 
     # ---------------- 来源切换 ----------------
 
     def _on_source(self, _idx=None):
+        """来源改了：**先刷显示、再按项目记下来**（用户 2026-10-09 ✓ 原话"每次都要重新填"✗）。
+
+        ⚠ 拆成两个函数的原因是**回填**（`_apply_project_params` ✓）：那条路只许刷显示 ✗、
+          不许顺手存一次（否则"打开项目"这个只读动作会写盘 ✗）。
+        ⚠⚠ **没建完就什么都不做** ✗：组合框在 `_build()` 中途就连上了这个信号 ✓，而
+          `_save_project_params()` 要读**一整排**控件（`sp_conf_mob` 那些还没建 ✗）⇒
+          早触发就是"访问还不存在的 C++ 对象" ⇒ **原生崩 `0xC0000005`** ✗
+          （2026-10-09 在 `tools/selftest_main_window` 上抓到 ✓ 判据见 `_built` ✓）。
+        """
+        if self._dead() or not self.__dict__.get("_built"):
+            return
+        self._refresh_source_ui()
+        self._save_project_params()
+
+    def _refresh_source_ui(self):
+        """按当前来源显隐那几格（**纯显示** ✓ 不落盘 ✓ 回填时也走它 ✓）。"""
+        if self._dead():
+            return
         is_stream = self.cmb_source.currentData() == "stream"
         is_win = not is_stream
         self.ed_url.setVisible(is_stream)
         self.btn_pick_rect.setVisible(is_win)
+        self.btn_pick_win.setVisible(is_win)      # 「对准窗口」（自动框选 ✓）同进退 ✓
         self.lbl_rect.setVisible(is_win)
         self.lbl_capfps.setVisible(is_win)
         self.sp_capfps.setVisible(is_win)
+        # 「抓屏方式」只对本地窗口那条路有意义 ✓（收流时它不参与 ✓）
+        self.lbl_wcap.setVisible(is_win)
+        self.cmb_wcap.setVisible(is_win)
 
     # ---------------- 探针几何（人工框选标定） ----------------
 
@@ -938,7 +1079,127 @@ class LivePanel(QWidget):
         if rect is None:
             return
         self._rect = rect
-        self.lbl_rect.setText("%d,%d  %d×%d" % rect)
+        self._bind_rect_window(rect)          # 绑定"框中心那个窗口"（见它说明 ✓）
+        self._refresh_rect_label()
+        # ⭐ 框完**立刻按项目记下来**（用户 2026-10-09 ✓）：以前只在内存里 ✗ ⇒ 重启/换项目
+        #   就得重新框一遍（"每次都要重新填"里最烦的那一项 ✓）。
+        self._save_project_params()
+
+    #: 「对准窗口」那个倒计时窗口期（秒）—— 期间每 `AUTO_PICK_MS` 毫秒看一次"鼠标底下是谁" ✓
+    AUTO_PICK_SEC = 6
+    AUTO_PICK_MS = 100
+    #: 自动框选的临时状态（**类属性给默认值** ✓：`_auto_rect_tick` 万一在 `_pick_rect_auto`
+    #: 之前被触发，读到 None 也不会 `AttributeError` ✓ —— 本文件的定时器踩过这类坑 ✓）
+    _auto_timer = None
+    _auto_seen = None
+    _auto_left = 0
+
+    def _bind_rect_window(self, rect, hwnd=None, title=""):
+        """记下「这块区域**相对哪个窗口**」+ 是谁 ✓（2026-10-10 ✓ 手框与自动框共用一处 ✓）。
+
+        ⭐ 两条路共用（别各写一份 ✗ —— 两处的基准一旦漂，运行期就抓错区域 ✓）：
+          · `hwnd` 给了 ⇒ 就是它（**自动框选**那条：鼠标指着谁就是谁 ✓）；
+          · 没给 ⇒ 按**框中心那个点**反查（**手框**那条 ✓ 老行为一字不变 ✓）。
+        ⚠ `rel` 的基准是 `window_geom`（**DWM 外框** ✓ 含标题栏 ✓）—— 与运行期
+          `binding_rect` 用的是**同一个** ✓（客户区只管"画面从哪儿开始"✗ 见 `wincap.client_rect` ✓）。
+        ⚠⚠ **退回绝对区域的两种情形**（2026-10-10 ✓ 用户报"把两台显示器的全部内容展示了"✓）：
+          ① 框中心不在任何窗口上（框的是桌面 ✓）；② 窗口在、但**它自己的几何问不到**
+          （最小化 / 占位矩形 ✓ 见 `window_geom` ✓）⇒ 这时**绝不能**去存"相对虚拟屏幕"的比例 ✗
+          （运行期 `binding_rect` 一看窗口还在、又会把它当**相对窗口**折算 ⇒ 两个基准对不上 ✓）。
+        """
+        try:
+            from core import wincap
+            if hwnd is None:
+                w = wincap.window_at(int(rect[0]) + int(rect[2]) // 2,
+                                     int(rect[1]) + int(rect[3]) // 2)
+                if w is not None:
+                    hwnd, title = int(w[0]), str(w[1])
+            g = wincap.window_geom(hwnd) if hwnd else None
+            if hwnd and g is not None:
+                self._rect_win = [int(hwnd), str(title)]
+                self._rect_rel = wincap.rel_from_rect(rect, g)
+            else:
+                self._rect_win = None
+                self._rect_rel = None
+        except Exception:                            # noqa: BLE001 —— 记不上就按老行为（绝对 rect）✓
+            self._rect_rel, self._rect_win = None, None
+
+    def _pick_rect_auto(self):
+        """⭐⭐ **「对准窗口」= 自动框选**（用户 2026-10-10 ✓ 原话："**框选窗口能做个自适应吗？
+        就是我鼠标指着的时候它自动匹配窗口画面的尺寸 —— 不然我每次自己框都会有偏差**"✓）。
+
+        做法：**倒计时窗口期**（`AUTO_PICK_SEC` 秒 ✓）里每 `AUTO_PICK_MS` 毫秒看一次
+        "鼠标底下是谁"（`wincap.window_under_cursor` ✓）——
+          · **连续两拍是同一个窗口**才认账 ✓（手抖 / 鼠标扫过去那一瞬不算 ✓）；
+          · 取它的**客户区** ✓（= 游戏真正绘制的画面 ✓ 不含标题栏 / 边框 ✓ ⇒ **零偏差** ✓）；
+          · 顺手把它当成"相对窗口"记下来 ✓（以后窗口挪了 / 换分辨率不用重框 ✓）；
+          · **工作台自己会被跳过** ✓（见 `window_under_cursor(skip_pid=…)` ✓ 指着它也不会抓 ✓）。
+        ⚠ 只碰"选区域"这件事：**不动**画面来源、不动抓屏方式、不动自动开关 ✓。
+        """
+        if self._dead():
+            return
+        self._auto_seen = None            # (hwnd, title, rect) 上一拍看到的 ✓
+        self._auto_left = int(max(1, self.AUTO_PICK_SEC * 1000 / self.AUTO_PICK_MS))
+        self.lbl_rect.setText("把鼠标移到**游戏窗口**上、停住不动…（还剩 %d 秒）"
+                              % self.AUTO_PICK_SEC)
+        self.btn_pick_win.setEnabled(False)
+        if getattr(self, "_auto_timer", None) is None:
+            from PyQt5.QtCore import QTimer
+            self._auto_timer = QTimer(self)
+            self._auto_timer.setInterval(self.AUTO_PICK_MS)
+            self._auto_timer.timeout.connect(self._auto_rect_tick)
+        self._auto_timer.start()
+
+    def _auto_rect_tick(self):
+        """倒计时里的一拍：看"鼠标底下是谁" ⇒ 连续两拍同一个 ⇒ 认它 ✓（见 `_pick_rect_auto` ✓）。"""
+        from core import wincap
+        self._auto_left -= 1
+        w = wincap.window_under_cursor(skip_pid=os.getpid())
+        if w is None:
+            self._auto_seen = None
+        else:
+            key = (w["hwnd"], w["rect"])
+            if self._auto_seen is not None and self._auto_seen[0] == key:
+                self._auto_timer.stop()
+                self.btn_pick_win.setEnabled(True)
+                self._rect = list(w["rect"])
+                self._bind_rect_window(self._rect, hwnd=w["hwnd"], title=w["title"])
+                self._refresh_rect_label()
+                self._save_project_params()
+                try:
+                    from core import behavior
+                    behavior.event("rect_auto", hwnd=w["hwnd"], rect=list(w["rect"]),
+                                   title=str(w["title"])[:60])
+                except Exception:                    # noqa: BLE001 —— 打点而已 ✓
+                    pass
+                self.lbl_stats.setText(
+                    "已对准窗口「%s」⇒ 区域 %d,%d %d×%d（客户区 ✓ 零偏差）"
+                    % (str(w["title"])[:20], w["rect"][0], w["rect"][1],
+                       w["rect"][2], w["rect"][3]))
+                return
+            self._auto_seen = (key, w["title"])
+        if self._auto_left <= 0:
+            self._auto_timer.stop()
+            self.btn_pick_win.setEnabled(True)
+            self._refresh_rect_label()
+            self.lbl_stats.setText(
+                "自动框选超时：这几秒里鼠标底下没停住一个够大的窗口 —— "
+                "把鼠标移到游戏画面上停住再点一次（指着工作台会被跳过 ✓）")
+            return
+        self.lbl_rect.setText("把鼠标移到**游戏窗口**上、停住不动…（还剩 %d 秒）"
+                              % int(self._auto_left * self.AUTO_PICK_MS / 1000.0 + 0.5))
+
+    def _refresh_rect_label(self):
+        """那行框选摘要：**绝对坐标 + 相对谁**（比例 ✓）—— 让人一眼看出"挪了也不用重框" ✓。"""
+        if not self._rect:
+            self.lbl_rect.setText("（未选）")
+            return
+        _who = ""
+        if self._rect_win:
+            _who = "　相对窗口「%s」" % (str(self._rect_win[1])[:18] or "?")
+        elif self._rect_rel:
+            _who = "　相对屏幕"
+        self.lbl_rect.setText("%d,%d  %d×%d%s" % (tuple(self._rect) + (_who,)))
 
     # ---------------- 项目 ----------------
 
@@ -960,8 +1221,163 @@ class LivePanel(QWidget):
             self.thread.set_mmap(map_id=map_id, src=src, crop=crop,
                                  track=track)
 
+    # ---------------- 这一页的参数：按项目存（用户 2026-10-09 ✓）----------------
+
+    def _dead(self):
+        """这个面板的 **C++ 对象还在吗**（`deleteLater()` 之后就不在了 ✗）。
+
+        ⚠⚠ 为什么必须有这一句（2026-10-09 ✓）：离屏自检里"删掉面板 → `processEvents()`"会让
+          **排队中的信号**在对象**已经销毁之后**才投递 ✗ ⇒ 回调里读控件就是"访问已释放的
+          C++ 对象" ⇒ **原生崩 `0xC0000005`** ✗（`tools/selftest_main_window` 复现 ✓：
+          加这一句之前必崩、之后干净 ✓）。`_built` 只管"构造期"那一段，管不了"已销毁" ✗。
+        """
+        try:
+            return bool(sip.isdeleted(self))
+        except Exception:                            # noqa: BLE001
+            return False
+
+    def _live_params(self):
+        """这一排控制**现在**是什么 → dict（键名见 `PROJ_LIVE_KEYS` ✓ 可直接喂 `update_live` ✓）。
+
+        ⚠⚠ **唯一**的取值口（`_save_project_params` 拿它喂 `update_live` 的 `**vals` ✓）——
+          ⚠ 注释里**别写出** `update_live(` 那串字 ✗：自检是按字面数"落盘口只剩一处"的
+            （`t_live_params_by_project` ⑤ ✓），多一处就在那儿，等于把好钉子弄红 ✗。
+          2026-10-09 重构时它一度变成"建好 dict 却漏了 `return`" ⇒ 返回 `None` ⇒ 那句 `**vals`
+          抛 `TypeError: argument after ** must be a mapping` ⇒ **实时参数一个都存不下来** ✗，
+          而它只在 `print` 里留一句 ⚠（不弹窗）⇒ 很容易被误判成"没存上是因为别的原因" ✗。
+          ⇒ 以后再动这个函数：**先确认它一定有返回** ✓。
+        """
+        return {
+            "capture_source": str(self.cmb_source.currentData() or "stream"),
+            "rect": ([int(v) for v in self._rect] if self._rect else None),
+            # ⭐ 比例版 + 那个窗口（见 `_pick_rect` ✓）：有了它，窗口挪了/换分辨率不用重框 ✓
+            "rect_rel": ([float(v) for v in self._rect_rel] if self._rect_rel else None),
+            "rect_win": ([int(self._rect_win[0]), str(self._rect_win[1])]
+                         if self._rect_win else None),
+            "url": self.ed_url.text().strip(),
+            "conf_mob": float(self.sp_conf_mob.value()),
+            "conf_player": float(self.sp_conf_player.value()),
+            "imgsz": int(self.sp_imgsz.value()),
+            "device": self.ed_device.text().strip() or "0",
+            "capture_fps": int(self.sp_capfps.value()),
+            "draw": bool(self.ck_draw.isChecked()),
+            "half": bool(self.ck_half.isChecked()),
+            "show_fps": int(self.sp_show_fps.value()),
+            # 「本地窗口」的抓屏方式（`wgc` / `bitblt` ✓；控件只在窗口来源时可见 ✓，
+            #  但**任何来源下都照原样存** ⇒ 切回收流也不会把它写丢 ✓）
+            "window_capture": str(self.cmb_wcap.currentData() or "wgc"),
+        }
+
+    def _save_project_params(self):
+        """按项目记下这一排参数 ＋ 同步写一份全局 `config/live.yaml`（见 `PROJ_LIVE_KEYS` ✓）。
+
+        ⚠ 没打开项目时**只写全局那份** ✓（照旧能用 ✓）；存不上**不许拦人** ✗（只读目录 /
+          yaml 坏了 ⇒ 打印一句就走，本次设置照旧生效 ✓ —— 口径同 `_remember_weights` ✓）。
+        """
+        # ⚠ 同一个守卫（见 `_on_source` ✓）：控件没建完 或 面板已销毁时**一个都别读** ✗
+        if self._dead() or not self.__dict__.get("_built"):
+            return
+        vals = self._live_params()
+        try:
+            update_live(**vals)
+        except Exception as e:                       # noqa: BLE001
+            print("⚠ 实时参数没写进 live.yaml（%s: %s）" % (type(e).__name__, e))
+        p = self.project
+        if p is None:
+            return
+        try:
+            p.sec("live").update(vals)               # 段内改：`weights` 那些键原样留着 ✓
+            p.save()
+        except Exception as e:                       # noqa: BLE001
+            print("⚠ 实时参数没存进项目（%s: %s）" % (type(e).__name__, e))
+
+    def _apply_project_params(self, project):
+        """`bind()` 时按该项目**回填这一排控件**（**缺键 ⇒ 保留现在的值** = 全局那份 ✓）。
+
+        ⚠⚠ 回填一律 `blockSignals` ✗：`sp_conf_mob` / `sp_show_fps` / `ck_half`
+          都连着存档回调 ✓ ⇒ 程序性 `setValue/setChecked` 会被当成"人改了参数"**当场写盘** ✗
+          （同 `gui/route_panel._apply_route_cfg` 那条教训 —— 它当年为此崩过 `0xC0000409` ✓）。
+          也**不许**在这里调 `_on_source()`（它会顺手存一次 ✗）⇒ 只调 `_refresh_source_ui()` ✓。
+        """
+        if project is None or self._dead():
+            return
+        try:
+            v = dict(project.sec("live") or {})
+        except Exception as e:                       # noqa: BLE001
+            print("⚠ 项目里的实时参数读不出来（%s: %s）" % (type(e).__name__, e))
+            return
+
+        def _spin(w, key, cast):
+            if v.get(key) is None:
+                return
+            w.blockSignals(True)
+            try:
+                w.setValue(cast(v[key]))
+            except Exception:                       # noqa: BLE001 —— 坏值当没有 ✓
+                pass
+            finally:
+                w.blockSignals(False)
+
+        def _chk(w, key):
+            if v.get(key) is None:
+                return
+            w.blockSignals(True)
+            try:
+                w.setChecked(bool(v[key]))
+            finally:
+                w.blockSignals(False)
+
+        _spin(self.sp_conf_mob, "conf_mob", float)
+        _spin(self.sp_conf_player, "conf_player", float)
+        _spin(self.sp_imgsz, "imgsz", int)
+        _spin(self.sp_capfps, "capture_fps", int)
+        _spin(self.sp_show_fps, "show_fps", int)
+        _chk(self.ck_draw, "draw")
+        _chk(self.ck_half, "half")
+        # ⚠ 自动测谎的开关**不在这儿回填** ✗：它在「挂机保护」页那一组里，控件建的时候
+        #   自己从 `live.yaml` 取初值 ✓（见 `player_panel._build_vt_group` ✓）。
+        for w, key in ((self.ed_device, "device"), (self.ed_url, "url")):
+            if v.get(key) is None:
+                continue
+            txt = str(v[key])
+            if w.text() != txt:
+                w.blockSignals(True)
+                try:
+                    w.setText(txt)
+                finally:
+                    w.blockSignals(False)
+        # 两个"按值选"的下拉：来源（`capture_source` ✓）与本地窗口抓屏方式（`window_capture` ✓）
+        #   —— 一律 `findData` 找那一项 ✓，找不到就留在现在这个 ✓（老项目/坏值都不动它 ✓）。
+        for _cmb, _key in ((self.cmb_source, "capture_source"),
+                           (self.cmb_wcap, "window_capture")):
+            if v.get(_key) is None:
+                continue
+            _i = _cmb.findData(str(v[_key]))
+            if _i >= 0:
+                _cmb.blockSignals(True)
+                _cmb.setCurrentIndex(_i)
+                _cmb.blockSignals(False)
+        self._refresh_source_ui()                    # 显隐跟着来源（纯显示 ✓ 不落盘 ✓）
+        # 框选区域（本地窗口那条）：有就回填，坏值当没有 ✓
+        if v.get("rect") is not None:
+            try:
+                r = [int(x) for x in v["rect"]]
+                if len(r) == 4:
+                    self._rect = r
+            except Exception:                       # noqa: BLE001
+                pass
+        # ⭐ 比例版 + 那个窗口（2026-10-10 ✓）：老项目没有这两个键 ⇒ 留 None ✓（退回绝对 rect ✓）
+        try:
+            rr = v.get("rect_rel")
+            self._rect_rel = [float(x) for x in rr] if rr else None
+            rw = v.get("rect_win")
+            self._rect_win = [int(rw[0]), str(rw[1])] if rw else None
+        except Exception:                           # noqa: BLE001
+            self._rect_rel, self._rect_win = None, None
+        self._refresh_rect_label()
+
     def bind(self, project):
-        """绑定项目：自动找最新的模型权重。"""
+        """绑定项目：按项目回填这一排参数 ＋ 自动找最新的模型权重。"""
         self.project = project
         # 地图跟着项目走：小地图定位要用它去读地形与标定（见 set_mmap）
         self.set_mmap(map_id=((project.get("map_id") or "").strip()
@@ -978,6 +1394,9 @@ class LivePanel(QWidget):
         #   存的地方是项目自己的 `live.weights` ✓（同「基础权重」记在 `train.model` 的口径 ✓）
         #   —— 不存成"全局一份"：换个项目就该换模型 ✓。
         self._fill_weight_options(str(project.sec("live").get("weights") or ""))
+        # ⭐⭐ **这一排参数也按项目回填**（用户 2026-10-09 ✓："本地窗口来源 / 框选区域 / 怪 conf
+        #   每次都要重新填" ✗）—— 缺键的项目原样不变（= 全局 `live.yaml` 的播种值 ✓）。
+        self._apply_project_params(project)
 
     #: 「权重」下拉里**自动那项**的 userData（选它 = 清掉手选、回到"自动挑最新" ✓）
     WEIGHTS_AUTO = "\x00auto"
@@ -1153,22 +1572,22 @@ class LivePanel(QWidget):
     # ---------------- 起停 ----------------
 
     def _save_live_params(self, *_):
-        """conf 改动实时写 config，让运行中的实时预览立即生效（其余参数下次启动生效）。"""
+        """参数改了：**当场存**（按项目一份 ＋ 全局 `live.yaml` 一份 ✓ 见 `PROJ_LIVE_KEYS` ✓）。
+
+        存档口径只有一处（`_save_project_params` ✓）—— 这一排控件的存档、来源下拉、
+        框选完那一下、`start()` 全都汇到它 ✓（各写一份必然漂 ✗）。
+        """
+        self._save_project_params()
+
+    def _on_vt_status(self, text):
+        """实时线程报的测谎状态 ⇒ **原样转发**给「挂机保护」页那一行 ✓（见类头的 `vt_status`）。
+
+        ⚠ 这里**不再自己显示** ✗：那行控件已经搬过去了（用户 2026-10-09："这个状态肯定要
+          一起迁移过去啊" ✓）—— 两处都显示就成了两份状态、迟早不一致 ✗。
+        """
         try:
-            # 走 update_live（不是 save_live）：后者是整文件覆盖，会把别处写的键
-            # （perf_log / perf_keepalive）一起抹掉 —— 现象是「设置里明明开着，
-            # 重启后文件里没了、选项变回默认」，很难归因。
-            update_live(
-                conf_mob=self.sp_conf_mob.value(),
-                conf_player=self.sp_conf_player.value(),
-                imgsz=self.sp_imgsz.value(),
-                device=self.ed_device.text().strip() or "0",
-                capture_fps=self.sp_capfps.value(),
-                draw=self.ck_draw.isChecked(),
-                show_fps=self.sp_show_fps.value(),
-                half=self.ck_half.isChecked(),
-            )
-        except Exception:
+            self.vt_status.emit(str(text))
+        except Exception:                                # noqa: BLE001
             pass
 
     def start(self):
@@ -1205,20 +1624,10 @@ class LivePanel(QWidget):
         if self.project is not None:
             pid = self.project.get("player_id") or ""
 
-        # 保存实时参数，下次开 GUI 不用再调。
-        # 走 update_live：其余键（perf_log / perf_keepalive）原样留着 ——
-        # 以前这里整文件覆盖，还得手工把 perf_log 抄一遍补回来，那正是
-        # 「整文件覆盖丢键」这个坑的症状。
-        update_live(
-            conf_mob=self.sp_conf_mob.value(),
-            conf_player=self.sp_conf_player.value(),
-            imgsz=self.sp_imgsz.value(),
-            device=self.ed_device.text().strip() or "0",
-            capture_fps=self.sp_capfps.value(),
-            draw=self.ck_draw.isChecked(),
-            show_fps=self.sp_show_fps.value(),
-            half=self.ck_half.isChecked(),
-        )
+        # 保存实时参数：**按项目一份 ＋ 全局 live.yaml 一份**（见 `PROJ_LIVE_KEYS` ✓）——
+        # 走 `update_live`（不是 `save_live`）：后者整文件覆盖会把别处写的键（`perf_log` /
+        # `perf_keepalive`）一起抹掉 ✗，症状是"设置里明明开着、重启后没了"，很难归因 ✓。
+        self._save_project_params()
 
         common = {
             "weights": w,
@@ -1236,6 +1645,9 @@ class LivePanel(QWidget):
             "mmap_src": self._mmap_src,
             "mmap_crop": self._mmap_crop,
             "mmap_track": self._mmap_track,
+            # ⚠ 「自动测谎」的开关与参数**不在这里** ✗：它们在「挂机保护」页那一组里，
+            #   落 `config/live.yaml`、由实时线程**热读**（见 `player_panel._build_vt_group` ✓）
+            #   ⇒ 线程自己取得到，不必随 `common` 再传一份（放了就是第二处口径 ✗）。
         }
 
         if source == "window":
@@ -1247,7 +1659,14 @@ class LivePanel(QWidget):
                 **common,
                 "source": "window",
                 "rect": rect,
+                # ⭐ 比例 + 那个窗口（见 `_pick_rect` ✓）：线程每拍按窗口**现在的**几何折算
+                #   屏幕矩形 ⇒ 窗口挪了/换分辨率不用重框 ✓（老项目没有 ⇒ 走绝对 rect ✓）
+                "rect_rel": ([float(v) for v in self._rect_rel] if self._rect_rel else None),
+                "rect_win": ([int(self._rect_win[0]), str(self._rect_win[1])]
+                             if self._rect_win else None),
                 "capture_fps": self.sp_capfps.value(),
+                # ⭐ 抓屏方式（`wgc` 默认 / `bitblt` 无系统采集边框 ✓ 见那格 tooltip ✓）
+                "window_capture": str(self.cmb_wcap.currentData() or "wgc"),
                 "probe": False,      # 本地窗口没有跨机传输延迟
             })
         else:
@@ -1279,6 +1698,9 @@ class LivePanel(QWidget):
         self.thread.failed.connect(self._on_failed)
         # ⭐ 「这份权重不是本项目训的」⇒ 状态行 + 弹一次（2026-10-03 ✓ 见那个槽的说明 ✓）
         self.thread.weights_warn.connect(self._on_weights_warn)
+        # ⭐⭐ 自动测谎：只把**状态行**接上 ✓（开关/参数在「挂机保护」页那一组里，落
+        #   `live.yaml`、实时线程自己热读 ✓ ⇒ 这里什么都不用下发 ✓）
+        self.thread.vt_status.connect(self._on_vt_status)
         # ⭐ 「imgsz 填的值与引擎输入不符 ⇒ 已按引擎的跑」⇒ 弹**指引**（用户 2026-10-03 ✓
         #   见 `LiveThread.imgsz_mismatch`：光 print 进控制台人看不到 ✗）。
         self.thread.imgsz_mismatch.connect(self._on_imgsz_mismatch)
@@ -1695,11 +2117,30 @@ class LivePanel(QWidget):
         #    「combat → 非combat」的过渡播一次「触发音效」（挂机保护页可配 ✓）。
         #    QMediaPlayer 必须在 **GUI 线程** ⇒ 收流线程发不了，放这里正好 ✓；
         #    流程内的界面切换（登录→选频道→排队…）不连响 ✓。
-        _scr = str(s.get("screen") or "combat")
+        # ⚠⚠ **读 `alarm` 那一格、不是 `screen`**（2026-10-10 ✓ 用户："本地实时断线后没有
+        #   重连警报" ✓）：`screen` 是**原生识别结果** ✓（录屏/样本/状态行读它 ✓ 故意分开 ✓）；
+        #   而报警判的是"**这一场**有没有进过弹窗" ✓ ⇒ 要读**留住接管**后的那份 ✓
+        #   （`_takeover_st` ✓ 与 `ws.screen`、Agent 同一口径 ✓）—— 用原生值时，测谎小游戏那段
+        #   匹配不上 ⇒ 回落 combat ⇒ **报警沿被反复触发** ✗（响个不停 ✓）；断线那种
+        #   "外接窗时有时无"的抖动也会把沿打散 ✗（该响的那一下正好没响 ✓）。
+        _scr = str(s.get("alarm") or s.get("screen") or "combat")
         _prev = getattr(self, "_alarm_prev_screen", "combat")
         self._alarm_prev_screen = _scr
         if _scr != "combat" and _prev == "combat":
             play_sound(getattr(settings, "lie_alarm_sound", ""))
+            # ⭐⭐ **警报本身也要留痕**（2026-10-10 ✓ 用户："没有任何警报" ✓）：以前这一步
+            #   **一个字都不记** ✗ ⇒ 事后分不清"没识别到"还是"识别到了但没响" ✓
+            #   （现场就是后者：日志里 `st=login` 明明有 ✓ 却没声音 ✓）⇒ 记一条
+            #   `alarm` 事件（带"实际怎么响的"`how` ✓ 见 `widgets.last_sound_note` ✓）。
+            try:
+                from core import behavior
+                from gui.widgets import last_sound_note
+                _n = last_sound_note()
+                behavior.event("alarm", st=_scr, prev=_prev,
+                               how=str(_n.get("how") or ""),
+                               path=str(_n.get("path") or "")[:80])
+            except Exception:                 # noqa: BLE001 —— 打点而已，别影响报警 ✓
+                pass
         self._verify_calib_if_due(s)
         w, h = s.get("size") or (0, 0)
         d = s.get("delay_ms")
@@ -1855,6 +2296,14 @@ class LivePanel(QWidget):
         #   只会以为是程序坏了 ✗（明细在 tooltip ✓ 短句只写"降了预览" ✓）。
         if s.get("preview_capped") and _limit_txt:
             _limit_txt += "（预览已自动降到 %g fps）" % float(s.get("preview_fps") or 0.0)
+        # ⭐⭐ 本地窗口那条路的**两句短提示**（用户 2026-10-10 连报两条 ✓）：① 被别的窗口盖住
+        #   ⇒ 改抓整屏 ✓（`wincap.covered_by` ✓）；② 框绑定的窗口问不到 ⇒ 按你框的那块
+        #   固定区域抓 ✓（`wincap.binding_rect` ✓）。**句子本体由线程给** ✓（这里不自己编 ✗
+        #   —— 编了就会跟线程里实际做的不一致 ✓）；长话在两个函数的说明 + `behavior.log`
+        #   （`capture_covered` / `capture_rect` ✓）里 ✓。
+        #   ⚠ 只对**本地窗口**来源有值 ✓（收流的 stats 里 `cap_note` 一直是空串 ✓）。
+        if s.get("cap_note"):
+            _limit_txt += "　⚠ %s" % s.get("cap_note")
         # ⭐ 推图那一行每来一份状态就刷新一次（用户 2026-10-04 ✓ 常显 ✓ 见 `_show_mmap_push`）
         self._show_mmap_push(s.get("mmap_push"))
         self.lbl_stats.setText(

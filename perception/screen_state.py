@@ -33,7 +33,40 @@ ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE_DIR = ROOT / "datasets" / "lie" / "templates"
 CAPTURE_DIR = ROOT / "datasets" / "lie" / "captures"
 MATCH_SCALE = 0.25          # 匹配前整体缩放（见 docstring 的性能账 ✓）
+#: ⭐⭐⭐ **模板的基准分辨率**（2026-10-10 ✓ 用户报"**测谎开始后 Agent 还在操作角色按方向键**"
+#: 查出来的 ✓ —— 与 271 那条"小游戏门限"是**两件事** ✗，两条都得有 ✓）。
+#:
+#: 这三块模板是从 **1366×768** 那一路流裁下来的 ✓，而匹配是**纯像素**的：
+#: `cv2.matchTemplate` 只对**平移**宽容 ✓、对**缩放**不宽容 ✗ ⇒ 给一张别的尺寸的帧
+#: （本机"本地窗口"那块是 **1920×1080** ✓）分数会**掉一大截** ⇒ 判成 `combat`
+#: ⇒ `_takeover_st` 不动 ⇒ **Agent 照旧按方向键** ✓✓（用户两轮看到的就是这个 ✓）。
+#:
+#: **实测**（真帧 `datasets/lie/captures/lie_warn_20261010_025017.png` ✓ 见开发日志 272 ✓）：
+#:     1366×768（原尺寸）→ **0.857** ✓ 判得出 `lie_warn` ✓
+#:     1920×1080（放大）→ **0.659** ✗ 判成 `combat` ✓（差 0.20 分 ✓ 门限 0.80 够不着 ✓）
+#:     1600×900 → 0.558 ✗ ／ 1024×576 → 0.501 ✗
+#: ⇒ 匹配前**先把帧归一到这个基准尺寸** ✓（见 `_prepare_gray` ✓）；本来就是基准尺寸的帧
+#:   一个像素都不动 ✓（老行为一字不变 ✓）。
+#: ⚠ 将来**重裁模板**（用 `capture_frame` 存下来的真帧 ✓）时，模板出自哪个尺寸，
+#:   就把这里改成那个尺寸 ✓（三块模板必须**同源同尺寸**，否则老问题会回来 ✓）。
+BASE_W, BASE_H = 1366, 768
 MATCH_THRESHOLD = 0.80
+#: ⭐⭐⭐⭐⭐ **每块模板自己的门限**（2026-10-10 ✓ 实测定的 ✓ —— 用户原话：
+#:   "**测谎的时候 Agent 还在操作移动、跳跃**"✗，第二轮报的同一件事 ✓）。
+#:   **实测**（真录像 `data/recordings/lie_20261010_015650.mp4` ✓ 用 `check_frame(fr, threshold=0)`
+#:   拿"最像哪块 + 多少分"✓ 见开发日志 **271** ✓）：
+#:     · `lie_warn`    **0.867~0.869** ✓ 很干净（记录早就说过 ✓）
+#:     · **`lie_game` 0.783~0.785** ✗ —— **低于 0.80** ⇒ **小游戏那 18 秒根本认不出来** ✗✗
+#:       ⇒ 状态回落 `combat` ⇒ Agent 恢复按键 ⇒ 用户两轮看到的就是这个 ✓（录像里录满 300 秒
+#:       上限 ✓ 而同期 `perf.log` 每段都是 `agent_why=-` ⇒ **Agent 全程没进接管** ✓ 对得上 ✓）
+#:     · `lie_success` 0.578~0.618（那一场没走到成功弹窗 ✓ 不能据此判它坏 ✗）
+#:   ⚠⚠ **为什么敢把 `lie_game` 单独放宽到 0.75**：这块模板**裁坏了**（普通战斗帧能到
+#:     **0.805~0.836** ✗ 比真的还高 ✓ 2026-10-08 实测 ✓ —— 那次 4 次误判就是它 ✓）
+#:     ⇒ **光降门限挡不住假阳性** ✗；**真正的判据是 `_screen_beat` 里那条 A 规则** ✓
+#:     （`lie_game`/`lie_success` **必须先见过 `lie_warn`** ✓ 而 warn 那块干净 ✓ 0.867 ✓）
+#:     ⇒ 假阳性照样按 `combat` 处理 ✓ ⇒ **两条合起来才是完整口径** ✓ 缺一条都不行 ✗。
+#:   ⚠ 改这里要连着看 `LIE_REC_STRONG`（= **基础**门限 + 0.05 ✓ C 那条保险用 ✓ 不跟着动 ✓）。
+MATCH_THRESHOLD_BY = {"lie_game": 0.75}
 TEMPLATES = ("lie_warn", "lie_game", "lie_success")
 
 _cache = None               # {name: 缩放后的灰度模板}；None = 还没加载 ✓
@@ -67,6 +100,27 @@ def reset_cache():
     _cache = None
 
 
+def _prepare_gray(frame_bgr):
+    """整帧 → 匹配用的灰度图：**先归一到基准分辨率**，再按 `MATCH_SCALE` 缩小 ✓。
+
+    ⚠ 归一那一步是 2026-10-10 补的（见 `BASE_W/BASE_H` 的实测说明 ✓）——
+      没有它，换分辨率就认不出测谎 ⇒ Agent 在测谎里照旧按方向键 ✓✓。
+    ⚠ 用 `INTER_AREA` 缩小 ✓、放大时才用 `INTER_LINEAR` ✗（`AREA` 放大会块状 ✓）。
+    """
+    if frame_bgr is None or getattr(frame_bgr, "size", 0) == 0:
+        return None
+    h, w = frame_bgr.shape[:2]
+    if w and abs(w / float(BASE_W) - 1.0) > 0.02:      # ±2% 以内当"就是基准尺寸"✓ 不动它 ✓
+        k = BASE_W / float(w)
+        _nh = max(1, int(round(h * k)))
+        frame_bgr = cv2.resize(frame_bgr, (BASE_W, _nh),
+                               interpolation=(cv2.INTER_AREA if k < 1.0
+                                              else cv2.INTER_LINEAR))
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(gray, None, fx=MATCH_SCALE, fy=MATCH_SCALE,
+                      interpolation=cv2.INTER_AREA)
+
+
 def check_frame(frame_bgr, threshold=MATCH_THRESHOLD):
     """判一帧的界面状态 → `(state, detail)`。
 
@@ -78,9 +132,9 @@ def check_frame(frame_bgr, threshold=MATCH_THRESHOLD):
     tmpls = load_templates()
     if not tmpls:
         return "combat", {"why": "no templates"}
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, None, fx=MATCH_SCALE, fy=MATCH_SCALE,
-                      interpolation=cv2.INTER_AREA)
+    gray = _prepare_gray(frame_bgr)          # ⭐ 先归一到基准分辨率（见 `BASE_W/BASE_H` ✓）
+    if gray is None:
+        return "combat", {"why": "no frame"}
     best_name, best_score = "", -1.0
     for name, t in tmpls.items():
         if gray.shape[0] < t.shape[0] or gray.shape[1] < t.shape[1]:
@@ -89,7 +143,11 @@ def check_frame(frame_bgr, threshold=MATCH_THRESHOLD):
         _mn, mx, _mnl, _mxl = cv2.minMaxLoc(res)
         if mx > best_score:
             best_name, best_score = name, float(mx)
-    if best_name and best_score >= threshold:
+    # ⭐ 门限：调用方**显式给了** `threshold` 就按它（自检/调试要能指定 ✓ 语义不变 ✓）；
+    #   用默认值时，**每块模板可以有自己的门限**（`MATCH_THRESHOLD_BY` ✓ 见那段实测说明 ✓
+    #   —— 这就是"小游戏认不出来 ⇒ Agent 在测谎里还在按移动/跳跃"的修法 ✓）。
+    if best_name and best_score >= (threshold if threshold != MATCH_THRESHOLD
+                                    else MATCH_THRESHOLD_BY.get(best_name, threshold)):
         return best_name, {"name": best_name, "score": round(best_score, 4)}
     return "combat", {"score": round(best_score, 4) if best_name else -1.0}
 

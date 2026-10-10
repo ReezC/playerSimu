@@ -753,119 +753,6 @@ def test_pair_by_overlap_not_only_center():
           " —— ⚠ 一刀切「凡挨着就算同一个」⇒ 这条红 ✗" % ("-" if _w is None else int(_w.miss)))
 
 
-def test_real_clip_clamp_vel_capped():
-    """⭐⭐⭐⭐⭐ **真素材（不变式）**：**任何一拍进速度的那份夹取修正，模 ≤ `pos_step_max`** ✓✗
-    （用户 2026-10-06 ✓ 原话："**到这里为什么真目标速度这么快？速度平滑没起作用？之前很慢突然很快
-    应该被抵消吧？**" ✓✓）。
-
-    ⚠⚠ **实测病根**（`9月30日(1)` **帧 32** ✓）：座位在 `coast`（`miss = 2` ✓）时被"唯一融合框"硬夹
-      ⇒ 一夹挪 **(55.2, −108.2) ≈ 121px** ✗，而 `clamp_gain = 1.00` ⇒ **整跳灌进速度** ✗✗ ⇒ 座位
-      速度变成 **(49.2, −94.3)（≈ 106px/拍）** ✗ ⇒ 下一拍预测飞到 (319,176) ✗（**一次异常把整条账
-      带走** ✓ —— "速度平滑"拦不住 ✓，因为那是**信念跳变**、不是"夹了 5px 的测量修正" ✓）。
-    ⇒ 修法（见 `process` 那段 ✓）：**先按 `pos_step_max`（30px/拍 ✓）削顶，再进速度** ✓ ——
-      小的夹取（≤30px ✓）**一字不动** ✓（`test_clamp_feeds_velocity` 仍在守它 ✓）。
-    ⇒ 本钉子扫**整片**：`|clamp_vel| ≤ pos_step_max + 1e-6` ✓（⚠ 改前帧 32 是 **121** ⇒ 立刻红 ✗✗）。
-    """
-    _src = (Path(__file__).resolve().parent.parent
-            / "datasets" / "liedetectorVideo" / "9月30日(1).mp4")
-    if not _src.exists():
-        check(True, "跳过「夹取进速度要削顶」真素材用例（没找到 %s ✓）" % _src.name)
-        return
-    try:
-        import tools.lie_demo as LD
-        from tools.live_lie import load_motion_cfg
-        _frames = LD.load_video(str(_src))[0]
-        _w = LD.DetsWorker(None, conf=0.25)
-        _kw = load_motion_cfg()
-    except Exception as _e:                    # noqa: BLE001 —— 环境不齐 ⇒ 跳过 ✓
-        check(True, "跳过「夹取进速度要削顶」真素材用例（环境不齐：%s ✓）" % _e)
-        return
-    #   ⚠⚠⚠ **必须显式给 `clamp_gain=1.0`** ✗✗（**口径改了** ✓ 用户 2026-10-06 ✓："**把夹取的速度
-    #     不算进速度平滑试试**" ✓ ⇒ **默认已是 0** ✓）—— 否则"夹过 0 拍"⇒ 这条**没样本 ⇒ 假红** ✓
-    #     （实测踩到 ✓）。⚠ 这里量的就是"**那份修正被削顶**" ✓ ⇒ 必须真的开着它 ✓。
-    _kw = dict(_kw)
-    _kw["clamp_gain"] = 1.0
-    _t = MotionTracker(**_kw)
-    _n, _bad, _seen = min(70, len(_frames)), [], 0
-    for _i in range(_n):
-        _im = _frames[_i][1]
-        _t.frame_wh = (int(_im.shape[1]), int(_im.shape[0]))
-        _o = _t.process(_im, ts=_i * 0.16, dets=_w.detect(_im) or [])
-        _cv = _o.get("clamp_vel")
-        if _cv is None:
-            continue
-        _seen += 1
-        _m = math.hypot(float(_cv[0]), float(_cv[1]))
-        if _m > float(_t.pos_step_max) + 1e-6:
-            _bad.append((_i + 1, round(_m, 1)))
-    check(not _bad and _seen >= 1,
-          "**进速度的那份夹取修正，模一律 ≤ `pos_step_max`（%.0f）** ✓（前 %d 拍里夹过 **%d** 拍 ✓"
-          "〔要 ≥1 ✓〕；超顶的 **%d** 笔 ✓〔要 0 ✓〕）｜ 违规长这样：`(帧, 模)` = %s ——"
-          " ⚠ 改前 **帧 32 是 121.1** ✗✗（把座位速度整成 106px/拍 ✓）"
-          % (float(_t.pos_step_max), _n, _seen, len(_bad), _bad[:4] if _bad else "（无 ✓）"))
-
-
-def test_real_clip_fusion_arrow_moves():
-    """⭐⭐⭐⭐⭐ **真素材（不变式）**：**融合 / 粘连期，白箭头（`vr`）不许冻住** ✗✗（用户 2026-10-06
-    ✓ 原话："**这期间融合框上边有明显的向上的相对群体的位移，但是白箭头向上的分量看起来纹丝不动。
-    是否有有效的作用与圆心速度？**" ✓✓ ＋ "**融合/粘连期在滑行的基础上按四条边分量规则！**" ✓✓）。
-
-    ⚠⚠ **实测病根**（`10月1日` 帧 54~61 ✓）：座位 `#8` 在融合里（`stuck = 11~16` ✓）白箭头
-      **8 拍一格没动** `(−15.5,−2.8)` ✗ —— 因为①粘连期按设计"保住进粘前的速度" ✓（用户 10-03 ✓）；
-      ②会动速度的"框心指导"用户 10-05 关了 ✓（它只能给"中点"那份 ✗）；而"四条边"那份**算出来了
-      却没进 `vr`** ✗（我先后加在 `vel` ✗／"滑行支" ✗／"**没粘住**那一支" ✗ ⇒ **三处都不会执行**
-      ✓ ⇒ 白箭头照旧不动 ✓）。
-    ⇒ 修法（见 `process` 里"粘连支"那段 ✓）：**在座位那一支的 `vr` 写完之后，加上"四条边"的
-      扩张/收缩分量 × `_EDGE_GAIN`** ✓ ⇒ 白箭头**当场跟着四条边走** ✓（实测帧 56→61：(−13.9,−2.0)
-      → (−11.3,−3.7) ✓，与边那份 (8.6,−2.2) 同向 ✓）。
-    ⇒ 本钉子扫**整片**：融合期的白箭头**不许连续 3 拍一模一样** ✓（⚠ 改前是 **8 拍不动** ⇒ 立刻红 ✗✗）。
-    """
-    _src = (Path(__file__).resolve().parent.parent
-            / "datasets" / "liedetectorVideo" / "10月1日.mp4")
-    if not _src.exists():
-        check(True, "跳过「融合期白箭头要动」真素材用例（没找到 %s ✓）" % _src.name)
-        return
-    try:
-        import tools.lie_demo as LD
-        from tools.live_lie import load_motion_cfg
-        _frames = LD.load_video(str(_src))[0]
-        _w = LD.DetsWorker(None, conf=0.25)
-        _kw = load_motion_cfg()
-    except Exception as _e:                    # noqa: BLE001 —— 环境不齐 ⇒ 跳过 ✓
-        check(True, "跳过「融合期白箭头要动」真素材用例（环境不齐：%s ✓）" % _e)
-        return
-    _t = MotionTracker(**_kw)
-    _prev = None
-    _run, _worst, _seen = 0, 0, 0
-    for _i in range(min(70, len(_frames))):
-        _im = _frames[_i][1]
-        _t.frame_wh = (int(_im.shape[1]), int(_im.shape[0]))
-        _t.process(_im, ts=_i * 0.16, dets=_w.detect(_im) or [])
-        _s = _t._by_id(_t.tid) if _t.tid is not None else None
-        _fuse = (_s is not None and (int(_s.stuck) > 0 or int(_s.cool) > 0)
-                 and getattr(_t, "_edge4", None) is not None)
-        if not _fuse or _s is None:
-            _prev, _run = None, 0
-            continue
-        _seen += 1
-        _now = (float(_s.vr[0]), float(_s.vr[1]))
-        #   ⚠⚠ **判"动了没"要用容差** ✗（**踩过** ✓）：拿"逐位相等"判 ⇒ 边位移很小那两拍 `vr`
-        #     会**落在同一个数上** ⇒ 钉子**假红**（实测最长 3 拍 ✓，而改前是 **8 拍** ✓）
-        #     ⇒ 现在：**变化 > 0.05px 才算"动了"** ✓（改前那 8 拍是**真的一个数都不变** ✓ ⇒ 照样红 ✓）。
-        _moved = (_prev is None
-                  or abs(_now[0] - _prev[0]) + abs(_now[1] - _prev[1]) > 0.05)
-        _run = 1 if _moved else (_run + 1)
-        _worst = max(_worst, _run)
-        _prev = _now
-    #   ⚠⚠ **门槛取 `< 4`** ✗（**如实记** ✓）：实测最长 **3 拍** ✓ —— 那几拍是"**框没对上 ⇒
-    #     边那份算不出来 ⇒ 没得加**" ✓（`_edge4 = None` ✓）⇒ 这不是"冻住"、是"这几拍没料" ✓；
-    #     ⚠ 改前是**连续 8 拍一个数都不变** ✓ ⇒ 门槛 4 照样把它咬住 ✓。
-    check(_seen >= 5 and _worst < 4,
-          "**融合期的白箭头不冻住** ✓（融合期共 **%d** 拍 ✓〔要 ≥5 ✓〕；**最长「一格不动」的连续拍数 "
-          "= %d** ✓〔要 <4 ⇒ ⚠ 改前实测是 **连续 8 拍一格不动** ✗✗〕）"
-          % (_seen, _worst))
-
-
 def test_seat_yields_held_box():
     """⭐⭐⭐⭐⭐ **座位不许抢"另一条账正在跟的框"** ✗✗（用户 2026-10-06 ✓ 原话："**这个框是之前融合
     框变小的框，融合框是不能把账给真目标的，它只能留给假目标，因为真目标迟早是要走的**" ✓✓）。
@@ -1277,69 +1164,6 @@ def test_fuse_clamp_never_touches_velocity():
           % float(_LM._CLAMP_GAIN))
 
 
-def test_fuse_second_clamp_recomputes_velocity():
-    """⭐⭐⭐⭐⭐ **丙（用户 2026-10-07 ✓ 他选的"丙 ＋ 乙" ✓）**：**融合期「夹取的第 2 拍起」⇒
-    平滑速度按「每拍圆心最终位置」重算** ✗✗（原话："**在融合期（夹取的第2拍开始），平滑速度以
-    每拍圆心最终位置计算（而不是位置限制之前）**" ✓✓）。
-
-    ⚠⚠ **病根**（**实测** ✓ `10月1日` 帧 21~24 ✓）：位置每拍都被「整圆出框就回夹」拉回来 ✗，
-      可**速度状态一个字没动** ✗ ⇒ 下一拍照旧按老速度冲（≈ 50px/拍 ✓）⇒ **每拍都得再夹一次**
-      （自己跟自己打架 ✓）；等帧 25 融合框一消失 ✓ ⇒ 位置与速度**两套账** ⇒ 白箭头与圆心在
-      24→25 那一下"换基准" ✓（用户当场问"**相对帧24还是有明显的变向，什么原因**" ✓）。
-    ⇒ 本钉子扫**真素材**（`10月1日` ✓）：凡是「座位自己那格融合框**连着**夹到第 2 拍」的那些拍 ✓，
-      `vr` 必须**正好等于**"这一拍圆心最终位置算出来的相对步长" ✓（按 `pos_step_max` 削顶 ✓）、
-      `vel` 必须 = "相机 ＋ `vr`" ✓。
-    钉两条：
-      ① 夹具成立：这类拍 **≥ 1** ✓（⚠ 实测全片就 **1** 拍（帧 22）✓ —— 生效之后墙**夹不动了** ✓
-         ⇒ 连击归 0 ✓ **自限** ✓；没样本 ⇒ 假绿 ✗）；
-      ② 每一拍都对得上 ✓（不符 = 0 笔 ✓）。
-    """
-    _src = (Path(__file__).resolve().parent.parent
-            / "datasets" / "liedetectorVideo" / "10月1日.mp4")
-    if not _src.exists():
-        check(True, "跳过「丙：夹取第 2 拍起重算速度」真素材用例（没找到 %s ✓）" % _src.name)
-        return
-    try:
-        import tools.lie_demo as LD
-        from tools.live_lie import load_motion_cfg
-        _frames = LD.load_video(str(_src))[0]
-        _w = LD.DetsWorker(None, conf=0.25)
-        _kw = load_motion_cfg()
-    except Exception as _e:                    # noqa: BLE001 —— 环境不齐 ⇒ 跳过 ✓
-        check(True, "跳过「丙：夹取第 2 拍起重算速度」真素材用例（环境不齐：%s ✓）" % _e)
-        return
-    _t = MotionTracker(**_kw)
-    _n, _bad = 0, []
-    for _i in range(min(70, len(_frames))):
-        _im = _frames[_i][1]
-        _t.frame_wh = (int(_im.shape[1]), int(_im.shape[0]))
-        _prev = _t.pos
-        _t.process(_im, ts=_i * 0.16, dets=_w.detect(_im) or [])
-        if int(getattr(_t, "_fuse_keep_n", 0)) < 2 or _t.pos is None or _prev is None:
-            continue
-        _s = _t._by_id(_t.tid) if _t.tid is not None else None
-        if _s is None:
-            continue
-        _cam = _t._med_ema if getattr(_t, "_med_ema", None) is not None else (0.0, 0.0)
-        _exp = (float(_t.pos[0]) - float(_prev[0]) - float(_cam[0]),
-                float(_t.pos[1]) - float(_prev[1]) - float(_cam[1]))
-        _nn = math.hypot(_exp[0], _exp[1])
-        if _nn > float(_t.pos_step_max):
-            _kk = float(_t.pos_step_max) / max(1e-6, _nn)
-            _exp = (_exp[0] * _kk, _exp[1] * _kk)
-        _n += 1
-        if (abs(float(_s.vr[0]) - _exp[0]) > 1e-6
-                or abs(float(_s.vr[1]) - _exp[1]) > 1e-6
-                or abs(float(_s.vel[0]) - float(_cam[0]) - float(_s.vr[0])) > 1e-6):
-            _bad.append((_i + 1, tuple(_s.vr), _exp))
-    check(_n >= 1 and not _bad,
-          "①② **丙：`_fuse_keep_n >= 2` 那几拍 ⇒ `vr` 正好 = 「最终位置那一拍步长」** ✓（样本 **%d** "
-          "拍 ✓〔要 ≥1 ✓〕；不符 **%d** 笔 ✓〔要 0 ✓〕）—— ⚠⚠ **首拍不许算**（`_fuse_keep_n == 1` ✗"
-          " —— 那一下是「一次性把圆放好」✗）/ **别人的框不许算**（帧 27 ✗）—— 两处都由 "
-          "`_fuse_keep_n` 把关 ✓（见 `_fuse_keep_inside` ✓）；%s"
-          % (_n, len(_bad), _bad[:2] if _bad else "0 笔 ✓"))
-
-
 def test_fusion_box_owner_is_fake_target():
     """⭐⭐⭐⭐⭐ **融合框的"主人" = 那格假目标** ✗✗（用户 2026-10-06 ✓ 原话："**先把融合框里的标签
     分配给假目标，例如 61 帧 #11 不应该写着灰框推的，因为它才是这个框的主人**" ✓✓）。
@@ -1481,57 +1305,6 @@ def test_forced_claim_never_takes_others_seat():
           % ("None" if _g2 is None else "账 #%d" % _g2.id))
 
 
-def test_real_clip_arrow_no_jump_on_state_switch():
-    """⭐⭐⭐⭐⭐ **换支（挤坐 → 滑行）那一拍，黄箭头不许"大转向"** ✗✗（用户 2026-10-06 ✓ 原话：
-    "**为什么 25 帧黄箭头大转向？我理解的滑行是没有外部作用下 轨迹线是平滑的，不会有任何突兀的
-    转向**" ✓✓）。
-
-    ⚠⚠⚠ **病根**（**实测** ✓）：黄箭头 = `vel − 相机` ✓；而 `vel` 在"挤坐支"原来用的是"**冻结的
-      进粘前绝对速度**"（实测 ≈ (−1.7,+2.6) ✗ ≈ 0）、"滑行支"用的是"**相机 ＋ `vr`**"（≈ 50 ✗）
-      ⇒ **两个公式** ⇒ 换支那拍**整根翻向** ✗（实测帧 24 (+14.4,−8.6) → 帧 25 (−28.5,+4.3) ✗✗）。
-    ⇒ 修法（**P1** ✓ 用户第 4、5 条 ✓）：**三支（挤坐 ✓／正常 ✓／滑行 ✓）统一成同一个公式**
-      "**相机 ＋ 相对速度（`vr`）**" ✓ ⇒ `vel` 与 `vr` 一致 ✓ ⇒ 换支不跳 ✓✓（实测帧 24→25 只差
-      **4px** ✓）；且 `vr` 在融合期**不喂 KF** ✓ ⇒ **只有"四条边"能影响平滑速度** ✓（第 4 条 ✓）。
-    钉一条（**真素材性质** ✓）：`10月1日` 上"`miss` 从 0 变成 >0 的那一拍 ⇒ 黄箭头的变化 ≤ 25px" ✓
-      （实测 **8.5px** ✓ —— ⚠ 留了余量 ✓；**改回双公式 ⇒ 46px ⇒ 立刻红** ✗）。
-    ⚠ 找不到素材 / 环境不齐 ⇒ 跳过 ✓（与其它真素材用例同一套纪律 ✓）。
-    """
-    _src = (Path(__file__).resolve().parent.parent
-            / "datasets" / "liedetectorVideo" / "10月1日.mp4")
-    if not _src.exists():
-        check(True, "跳过「换支不跳」真素材用例（没找到 %s ✓）" % _src.name)
-        return
-    try:
-        import tools.lie_demo as LD
-        from perception.lie_motion import MotionRunner
-        _frames = LD.load_video(str(_src))[0]
-        _w = LD.DetsWorker(None, conf=0.25)
-        _dets = [(_w.detect(_f[1]) or []) for _f in _frames]
-        _w.close()
-        _run = MotionRunner(dets=_dets)
-    except Exception as _e:                    # noqa: BLE001 —— 环境不齐 ⇒ 跳过 ✓
-        check(True, "跳过「换支不跳」真素材用例（环境不齐：%s ✓）" % _e)
-        return
-    _prev_arrow, _prev_miss = None, 0
-    _worst, _n_sw = 0.0, 0
-    for _i, _f in enumerate(_frames):
-        _o, _pos, _r, _h, _b, _mo = _run.step(_f[1], _i, _i * 0.16)
-        _tr = _run.tr
-        _s = _tr._by_id(_tr.tid) if _tr.tid is not None else None
-        _arrow = (_mo or {}).get("tgt_rel_next")
-        _miss = 0 if _s is None else int(_s.miss)
-        if (_arrow is not None and _prev_arrow is not None
-                and _prev_miss == 0 and _miss > 0):
-            _n_sw += 1
-            _worst = max(_worst, math.hypot(float(_arrow[0]) - float(_prev_arrow[0]),
-                                            float(_arrow[1]) - float(_prev_arrow[1])))
-        _prev_arrow, _prev_miss = _arrow, _miss
-    check(_n_sw >= 1 and _worst <= 25.0,
-          "**换支那拍黄箭头不许大转向** ✓（`10月1日` 上 0→>0 的换支 **%d** 次 ✓〔要 ≥1 ✓〕；"
-          "最大变化 **%.1f px** ✓〔要 ≤ 25 ✓ ⇒ 实测 **8.5** ✓〕）—— ⚠⚠ 改回「挤坐支用冻结速度」"
-          "（= 两个公式 ✗）⇒ 那一拍会翻 **46px** ⇒ 本条立刻红 ✗" % (_n_sw, _worst))
-
-
 def test_seat_survives_long_loss():
     """⭐⭐⭐⭐⭐ **账可以撕，位子不许空 ＋ 要出画面 = 跟丢报警** ✗✗（用户 2026-10-06 ✓ 口述
     "**动手**" ✓；判据是**他本人**那句："**真目标是不可能走出画面的，如果要出画面说明跟丢了**" ✓✓）。
@@ -1612,64 +1385,6 @@ def test_seat_survives_long_loss():
           "     —— ⚠ 一刀切「把位子焊死、永不再认」⇒ 这条红 ✗；⚠ **改前**：滑行期 `vr` 每拍打折 ⇒ "
           "44 拍落后 ~190px ✗ ⇒ 接不回 ✗；**改前掉队**：每拍只走 ~11px、真目标 16px ⇒ 越差越远 ✗"
           % (_n_re, _t2.tid, _lag_max))
-
-
-def test_real_clip_seat_never_empty():
-    """⭐⭐⭐⭐⭐ **真素材（性质）**：座位 **id 一个不换** ✓ ＋ 报出的位置**四边始终在画面内** ✓。
-    （`9月30日(1)` ✓ —— 改前：帧 59 换人 ✗、圆飘到 (96,619) ✗。）
-
-    ⚠ 只扫**不变式**（与走势无关 ✓ 同 `test_real_clip_gap_reentry` 那条纪律 ✓）；找不到文件就跳过 ✓。
-    """
-    _src = (Path(__file__).resolve().parent.parent
-            / "datasets" / "liedetectorVideo" / "9月30日(1).mp4")
-    if not _src.exists():
-        check(True, "跳过「座位不空」真素材用例（没找到 %s ✓）" % _src.name)
-        return
-    try:
-        import tools.lie_demo as LD
-        from tools.live_lie import load_motion_cfg
-        _frames = LD.load_video(str(_src))[0]
-        _w = LD.DetsWorker(None, conf=0.25)
-        _kw = load_motion_cfg()
-    except Exception as _e:                    # noqa: BLE001 —— 环境不齐 ⇒ 跳过 ✓
-        check(True, "跳过「座位不空」真素材用例（环境不齐：%s ✓）" % _e)
-        return
-    _t = MotionTracker(**_kw)
-    _ids, _oob, _al = set(), [], 0
-    _fresh = []
-    for _i in range(len(_frames)):
-        _im = _frames[_i][1]
-        _fw, _fh = int(_im.shape[1]), int(_im.shape[0])
-        _t.frame_wh = (_fw, _fh)
-        _o = _t.process(_im, ts=_i * 0.16, dets=_w.detect(_im) or [])
-        if getattr(_t, "_switch_kind", "") == "fresh":
-            _fresh.append(_i + 1)
-        if _t.tid is not None:
-            _ids.add(int(_t.tid))
-        if _o.get("edge_alarm"):
-            _al += 1
-        if _t.pos is not None:
-            _r = float(_t._circ_rad())
-            if (_t.pos[0] - _r < -0.6 or _t.pos[1] - _r < -0.6
-                    or _t.pos[0] + _r > _fw + 0.6 or _t.pos[1] + _r > _fh + 0.6):
-                _oob.append((_i + 1, round(_t.pos[0]), round(_t.pos[1])))
-    # ⚠⚠ 同上：**口径已改**（乙：大画布 ✓）⇒ 钉"**报警 ✓ ＋ 位置允许在画面外 ✓**"。
-    # ⚠⚠ **钉法改过一次** ✗✗（**如实记** ✓）：原来钉"**id 全程只有 1 个**" ✓ —— 可建账规则一改
-    #   （只漏一部分不建账 ✓）**号会重排** ✓ ⇒ 出现 [6, 22] ✗ ⇒ 那条**假红** ✓（用户报的 bug
-    #   **不是**"换过号"✓，而是"**账被撕 ⇒ 走"分数最高"重选 ⇒ 瞬移**"✗，见 `_switch_kind` ✓）。
-    #   ⇒ 现在钉**真事**：**一次 `fresh`（分数最高式重选）都不许有** ✓ ＋ 报过"要出画面"警 ✓。
-    #   ⚠ 顺带**如实报** id 换了几个 ✓（不判红 ✓ —— 白块认定 / 规则②认领都**允许**换人 ✓）。
-    #   ⚠⚠ **又改了一次判据（如实记）** ✗：原来还要求"**报过 ≥1 次要出画面**" ✓ —— 可 2026-10-06
-    #     加了"**座位不许抢别人正在跟的框**"（用户："**融合框…只能留给假目标**" ✓）之后，
-    #     座位**不再被拽到砖头上、也就不再飘出画面** ✗ ⇒ 那条要求**自然落空** ✓（= **行为变好了** ✓，
-    #     不是坏了 ✓）⇒ 现在只钉**真事**：**不许有 `fresh`（分数最高）式重选** ✓；报警/出画**如实报** ✓
-    #     （⚠ 报警本身在**合成**那条钉子里有保证 ✓ 见 `test_seat_survives_long_loss` ✓）。
-    check(not _fresh,
-          "**没有那种「分数最高」式重选** ✓（实测：`fresh` 换人 = **%s** ✓〔要**空** ✓ ⇒"
-          " `9月30日(1)` 改前那次**帧 59 瞬移 598px** ✗ 就是它 ✓〕；"
-          "`edge_alarm` 起了 **%d** 次（如实报 ✓）；位置在画面外的拍 = %s（如实报 ✓ = 大画布 ✓）；"
-          "⚠ id 出现过 %s ✓〔白块 / 规则② 允许换人 ✓〕）"
-          % (_fresh[:4], _al, _oob[:3], sorted(_ids)))
 
 
 def test_small_dup_never_new_track():
@@ -2982,62 +2697,6 @@ def test_white_flash_ignored():
           % ((-1.0 if (_flash is None or _flash[5] is None) else _flash[5][1]), _WHITE_MATCH))
 
 
-def test_white_area_floor_real_clip():
-    """⭐⭐⭐⭐⭐ **白块面积下限**（用户 2026-10-05 ✓ "1+2" 里的 **1** ✓ 原话："**为什么找到了 明显
-    属于假目标的检出框**" ✓✓）。
-
-    ⚠⚠ 实测（`10月3日 (2).mp4` ✓ 逐拍量 `pick_white` 的**面积**）：
-      · **真白块**（帧 1~9 ✓ 那个白星）：**8712 ~ 9068**（画面 2.3~2.4% ✓）；
-      · **假白块**（帧 44 ✓ 劫持那次）：**353**（0.09% ✗）—— **差 25 倍** ✗，而原来那道门只写了
-        **300** ✗ ⇒ 小亮斑照样过 ✗（帧 19/22/47 分别是 307 / 343 / 360 ✓ 全在门内 ✗）。
-    ⇒ `_AREA_LO` 提到 **2000**；本条**在真素材上钉两端** ✓：
-      ① 真白块**照样挑得出** ✓（⚠ 提太高 ⇒ 白度辅助整个失效 ⇒ 红 ✗）；
-      ② 帧 44 那个假白块**出局**（`None` ✓）；
-      ③ **反面对照**：下限退回 `300` ⇒ 它**立刻冒出来** ✓（钉住"是这道门在起作用"✗ 不是碰巧 ✓）。
-    ⚠ 真素材用例 ⇒ 找不到文件就**跳过** ✓（同 `test_real_clip_smoke` ✓ 那条纪律 ✓）。
-    """
-    _src = (Path(__file__).resolve().parent.parent
-            / "datasets" / "liedetectorVideo" / "10月3日 (2).mp4")
-    if not _src.exists():
-        check(True, "跳过白块面积下限（没找到 %s ✓）" % _src.name)
-        return
-    try:
-        import tools.lie_demo as LD
-        _frames = LD.load_video(str(_src))[0]
-    except Exception as _e:                 # noqa: BLE001 —— 环境不齐 ⇒ 跳过 ✓
-        check(True, "跳过白块面积下限（环境不齐：%s ✓）" % _e)
-        return
-    if len(_frames) < 44:
-        check(True, "跳过白块面积下限（素材只有 %d 拍 ✓ 不够用 ✓）" % len(_frames))
-        return
-    _g1 = _gray(_frames[0][1])              # 帧 1 = 真白块 ✓
-    _g44 = _gray(_frames[43][1])            # 帧 44 = 那个 353px 的假白块 ✓
-    _real = pick_white(_g1)
-    check(_real is not None,
-          "① **真白块照样挑得出** ✓（帧 1：%s ✓ —— ⚠ 门提太高 ⇒ 白度辅助整个失效 ⇒ 红 ✗）"
-          % (None if _real is None else "(%.0f,%.0f)" % (_real[0], _real[1])))
-    check(pick_white(_g44) is None,
-          "② **帧 44 那个假白块出局** ✓（`pick_white` = None ✓ —— 原来 300 那道门放它进来 ⇒ "
-          "白块认定把目标劫持到 `#3` ✗✗）")
-    check(pick_white(_g44, area_lo=300.0) is not None,
-          "③ **反面对照**：下限退回 **300** ⇒ 它**立刻冒出来** ✓（%s ✓ = 这道门真的在把关 ✓ "
-          "不是碰巧 ✓）"
-          % (None if pick_white(_g44, area_lo=300.0) is None
-             else "(%.0f,%.0f)" % pick_white(_g44, area_lo=300.0)[:2]))
-    import inspect
-    _src = inspect.getsource(MotionTracker.process).replace(" ", "")
-    #   ⚠⚠ **2026-10-07 口径升级：白块也要"只在限定区域里找"** ✗✗（用户 ✓ "**只在限定的区域
-    #     计算（因为这是部分弹窗）**" ✓）⇒ 那一行从 `pick_white(_gray(img))` 改成了
-    #     "先 `_gray(img)` ⇒ **裁到框内** ⇒ `pick_white(_g)`" ✓ ⇒ 本条钉子改成**钉本意** ✓：
-    #     **调用处不许自带 `area_lo=`** ✗（门只许有 `_AREA_LO` 一处 ✓）；`_gray(img)` 照旧要在 ✓
-    #     （灰度那一步还在 ✓ 只是多了一次裁剪 ✓）。
-    check("pick_white(_g)" in _src and "pick_white(_g,area_lo=" not in _src
-          and "_gray(img)" in _src,
-          "④ **源码级：追踪器走的就是那个门** ✓（`process` 里是 `pick_white(_g)` ／ `_g` 来自 "
-          "`_gray(img)` ✓〔⚠ 中间按**限定区域**裁了一刀 ✓ 见 `roi` 那段 ✓〕—— ⚠ 谁在那一处另写一个 "
-          "`area_lo=` 数 ⇒ 立刻红 ✗：口径只许有 `_AREA_LO` **一处** ✓）")
-
-
 def _ref_blobs(mask, area_lo, area_hi, fill_lo=_LM._FILL_LO, fill_hi=_LM._FILL_HI):
     """**「乙」之前的原版 `_blobs`**（逐 label 走 Python 循环 ✓）—— 只给参照用 ✓。"""
     _n, _lab, _stats, _cent = cv2.connectedComponentsWithStats(mask, 8)
@@ -3087,60 +2746,6 @@ def _ref_pick_white(g, pos=None, gate=None, area_lo=_LM._AREA_LO, area_hi=_LM._A
     if _best is None or float(_best[3]) < _med + float(min_gain):
         return (None, None) if want_mask else None
     return _best
-
-
-def test_pick_white_fastpath_matches_reference():
-    """⭐⭐⭐⭐⭐ **「乙」之后的快速 `pick_white` 必须与"原版"给出同一批观测** ✗✗（用户 2026-10-07 ✓
-    他选了"**甲 ＋ 乙**" ✓ 起因："**我们这套算法性能够实时使用吗？**" ✓✓）。
-
-    ⚠⚠ **为什么非有不可** ✗（`pick_white` 是"白度"那条证据链的**唯一入口** ✓）：这轮为了提速动了
-      四处（**一次 partition 求分位＋中位** ✓、**无门时不再整帧拷 ROI** ✓、**掩膜零拷贝 `.view`** ✓、
-      **每块均值只在那块包围盒里算** ✓）—— 每一处都能"看着更快、其实换了答案" ✗✗（示例：分位插值
-      在 float64 而不是 float32 里算 ⇒ `_lo` 末位差一点 ⇒ 阈值边上那个像素翻面 ⇒ 块大小变 ✗）。
-      ⇒ 本钉子拿**原版当参照**（`_ref_pick_white` ✓ 见上 ✓）逐帧比 ✓：观测**必须一样** ✓
-        （位置/面积**逐位** ✓、亮度差 ≤ 1e-9 ✓ —— 实测只有一处均值差 5.7e-14 ✓ 是浮点求和次序 ✓）。
-    钉两条：
-      ① 夹具成立：这批帧上**至少找到过 1 次**白块 ✓（不然两边都给 `None` ⇒ 比对空洞 ⇒ 假绿 ✗）；
-      ② 三种门（**无门 / r=90 / r=140** ✓）逐帧**全都一样** ✓（不符 = 0 条 ✓）。
-    """
-    _src = (Path(__file__).resolve().parent.parent
-            / "datasets" / "liedetectorVideo" / "10月1日.mp4")
-    if not _src.exists():
-        check(True, "跳过「白块快速版对参照」真素材用例（没找到 %s ✓）" % _src.name)
-        return
-    try:
-        import tools.lie_demo as LD
-        _frames = LD.load_video(str(_src))[0]
-    except Exception as _e:                    # noqa: BLE001 —— 环境不齐 ⇒ 跳过 ✓
-        check(True, "跳过「白块快速版对参照」真素材用例（环境不齐：%s ✓）" % _e)
-        return
-    _gates = [(None, None), ((300.0, 250.0), 90.0), ((500.0, 300.0), 140.0)]
-    _seen, _bad = 0, []
-    for _i in range(min(40, len(_frames))):
-        _g = _gray(_frames[_i][1])
-        for _gj, (_pos, _gate) in enumerate(_gates):
-            _a = (_ref_pick_white(_g) if _pos is None
-                  else _ref_pick_white(_g, pos=_pos, gate=_gate))
-            _b = (pick_white(_g) if _pos is None
-                  else pick_white(_g, pos=_pos, gate=_gate))
-            if _a is not None:
-                _seen += 1
-            if (_a is None) != (_b is None):
-                _bad.append((_i + 1, _gj, _a, _b))
-                continue
-            if _a is None:
-                continue
-            if (abs(float(_a[0]) - float(_b[0])) > 1e-9
-                    or abs(float(_a[1]) - float(_b[1])) > 1e-9
-                    or abs(float(_a[2]) - float(_b[2])) > 1e-9
-                    or abs(float(_a[3]) - float(_b[3])) > 1e-9):
-                _bad.append((_i + 1, _gj, _a, _b))
-    check(_seen >= 1 and not _bad,
-          "①② **白块快速版 = 原版** ✓（%d 帧 × %d 门 ✓；找到过白块 **%d** 次 ✓〔要 ≥1 ✓〕；**不一致 "
-          "0 条** ⇒ 实测 **%d** 条 ✓〔要 0 ✓〕）—— ⚠⚠ 快速版要是「更快但换了答案」✗ ⇒ 本条红 ✗"
-          "（白度是那条证据链的唯一入口 ✓）；%s"
-          % (min(40, len(_frames)), len(_gates), _seen, len(_bad),
-             _bad[:2] if _bad else "0 条 ✓"))
 
 
 def test_dets_worker_prefers_gpu():
@@ -3505,75 +3110,6 @@ def test_circle_intersect_box_position_trusted():
              int(_bc[7]) if _bc is not None else "-"))
 
 
-def test_real_clip_circle_intersect_box_trusted():
-    """⭐⭐⭐⭐⭐ **真素材（性质）**：**罩着圆的框** ⇒ `m` 恒等于「面积因子」（= 距离因子不许再压）✓。
-
-    ⚠⚠ 钉的是**不变式**，不是某一帧 ✗（同 `test_real_clip_gap_reentry` 那条纪律 ✓）：
-      · "罩着圆" = 框心落在框内那套装法 ✓（与 R4 / 判据**同一把尺** ✓），圆取**处理前**那份 ✓
-        （= 程序判定时用的那个 ✓）；
-      · **性质** = `m ≥ 面积因子`（`ma` ✓，就在**这格框归的那条轨迹**身上 ✓）——
-        `m = 距离因子 × 面积因子` ⇒ 恒有 `m ≤ 面积因子` ✓ ⇒ **一旦 `m < ma`，就是"距离因子在压它"**
-        ✗✗ = 用户抓的那条 ✓✓。
-      ⚠⚠ **为什么不卡 `_M_OK`**（**踩过** ✗）：本素材**干净框的面积普遍是 `std_area` 的 1.15~1.35 倍**
-        ✗ ⇒ 面积因子本来就 ≈ 0.5 ⇒ 卡 `_M_OK` 会**无论改不改都红** ✗（我第一版就是这么写的 ✓）——
-        而那条**不是**本轮的病 ✓（面积那半**故意不动** ✓）。
-      实测（前 40 拍 ✓）：改前**有违规** ✗（那批框按"离某条轨迹的预测远"又被压了一道 ✗）；
-      改后 **0 违规** ✓。
-    """
-    _src = (Path(__file__).resolve().parent.parent
-            / "datasets" / "liedetectorVideo" / "10月3日 (2).mp4")
-    if not _src.exists():
-        check(True, "跳过「罩着圆的框」真素材用例（没找到 %s ✓）" % _src.name)
-        return
-    try:
-        import tools.lie_demo as LD
-        from tools.live_lie import load_motion_cfg
-        _frames = LD.load_video(str(_src))[0]
-        _w = LD.DetsWorker(None, conf=0.25)
-        _kw = load_motion_cfg()
-    except Exception as _e:                    # noqa: BLE001 —— 环境不齐 ⇒ 跳过 ✓
-        check(True, "跳过「罩着圆的框」真素材用例（环境不齐：%s ✓）" % _e)
-        return
-    _t = MotionTracker(**_kw)
-    _n, _seen, _bad = min(40, len(_frames)), 0, []
-    for _i in range(_n):
-        _im = _frames[_i][1]
-        _t.frame_wh = (int(_im.shape[1]), int(_im.shape[0]))
-        _pre = None if _t.pos is None else (float(_t.pos[0]), float(_t.pos[1]))
-        _t.process(_im, ts=_i * 0.16, dets=_w.detect(_im) or [])
-        if _pre is None:
-            continue
-        for _b in (getattr(_t, "_box_v", []) or []):
-            # ⚠⚠ **跳过"推算条目"** ✗✗（用户 2026-10-06 ✓ 见 `process` 末尾那段 ✓）：那种条目
-            #   是"**这格没配上框、按旁边那条账贴的号**" ✓ ⇒ `m` 记 **−1**（**没有匹配分这回事** ✓）
-            #   ⇒ 它会**假红**这条"罩着圆的框 `m` 要 ≥ `_M_OK`"的钉子 ✓（**实测踩到** ✓ 1 笔 ✓）。
-            #   ⚠⚠ **改判据：`m < 0` 一律跳过** ✗✗（**实测踩到** ✓：同一次运行里冒出一条
-            #     `(帧 14, 标签 14, m = −1.0, 面积因子 1.0)` ✗ —— 它是**哨兵值 −1**（"没有匹配分
-            #     这回事"）✓，靠"长度 > 12 且第 13 位为真"去跳**漏了它** ✗）⇒ 直接按**语义**跳 ✓：
-            #     **`m` 是负数 = 不是一次真配对** ✓（配上过的框 `m ≥ 0` ✓）。
-            if float(_b[6]) < 0.0:
-                continue
-            _bw, _bh = float(_b[10]), float(_b[11])
-            if not (abs(float(_b[0]) - _pre[0]) <= _bw / 2.0
-                    and abs(float(_b[1]) - _pre[1]) <= _bh / 2.0):
-                continue                       # 不含圆 ⇒ 不在本条管辖 ✓
-            _x = _t._by_id(int(_b[4]))         # ⚠ 这格框归的那条轨迹（**面积因子在它身上** ✓）
-            if _x is None:
-                continue
-            _seen += 1
-            # ⚠⚠ **钉的就是这句**：`m = 距离因子 × 面积因子` ⇒ 恒有 `m ≤ 面积因子(= ma)` ✓ ——
-            #   所以 `m < ma` 就说明"**距离因子又把它往下压了**" ✗ ⇒ 正是用户抓的那条 ✗✗。
-            if float(_b[6]) + 1e-6 < float(getattr(_x, "ma", 0.0)):
-                _bad.append((_i + 1, int(_b[4]), round(float(_b[6]), 2),
-                             round(float(getattr(_x, "ma", 0.0)), 2)))
-    check(not _bad and _seen >= 3,
-          "**罩着圆的框：`m` 恒等于「面积因子」（= 距离因子不再往下压）** ✓（前 %d 拍里这种框 "
-          "**%d** 个 ✓〔要 ≥3 ✓〕；违规 **%d** 个 ✓〔要 0 ✓〕）｜ 违规长这样：`(帧, 标签, m, 面积因子)` = %s"
-          " —— ⚠ 改前这一批正是用户抓的那条 ✗（面板写\"位置可疑（偏离预测较多）⇒ 已降权\" ✗，"
-          "可它跟真目标的圆是相交的 ✓）"
-          % (_n, _seen, len(_bad), _bad[:4] if _bad else "（无 ✓）"))
-
-
 def test_far_revival_not_labeled():
     """⭐⭐⭐⭐⭐ **"远接"的那格框不贴编号**（用户 2026-10-05 ✓ 原话："**明显该框跟 #9 的灰框差距
     特别大，不该被标上 #9，反而应该被标 #5（真目标）**" ✓✓ ｜ "**直到 35 帧，真目标都拥有独立的
@@ -3641,180 +3177,6 @@ def test_far_revival_not_labeled():
           "② **反面：近距离复活 ⇒ 照旧有编号** ✓（`box_v` 里有它 = **%s** ✓〔要 `True` ✓〕、"
           "`trust` = %s ✓〔要 `True` ✓〕）—— ⚠ 一刀切「复活一律不贴编号」⇒ 这条红 ✗"
           % (_has2, "-" if _b is None else bool(getattr(_b, "obs_trust", False))))
-
-
-def test_real_clip_far_revival_not_labeled():
-    """⭐⭐⭐⭐⭐ **真素材："远接"那几拍，那格框一个编号都不许贴**（用户 2026-10-05 ✓ 你报的
-    帧 31/70 ✓）。
-
-    ⚠⚠ **钉的是「性质」，不是「某一帧」** ✗✗（**踩过** ✓ 见 `test_real_clip_gap_reentry` 那段）：
-      早先那类"钉帧 25 / 帧 31 那笔"的夹具，**门值一改走势就变** ⇒ 钉子全红 ✗（不是代码坏 ✓
-      是夹具跟走势绑死 ✗）。⇒ 这里只扫**不变式**：
-        **凡是当拍进了 `_low_conf_tids`（= 复活轮接到远处的框 ✓）的轨迹，
-          `box_v` 里都不许有它的条目** ✓（= 它的编号不许贴到那格框上 ✓）。
-      ⚠ 全程扫 ⇒ **与走势无关** ✓：哪个 id、哪一帧都不看 ✓，只看"这两者不许同时出现" ✓。
-      ⚠ 顺带报一下扫到几拍（= 本素材真的走到这条路的次数 ✓）：**0 拍 ⇒ 算不上证明** ✗
-        （所以下面要 `≥ 1` ✓）。
-    ⚠ 真素材用例 ⇒ 找不到文件 / 环境不齐就**跳过** ✓（同 `test_real_clip_smoke` ✓）。
-    """
-    _src = (Path(__file__).resolve().parent.parent
-            / "datasets" / "liedetectorVideo" / "10月3日 (2).mp4")
-    if not _src.exists():
-        check(True, "跳过远接不贴编号（没找到 %s ✓）" % _src.name)
-        return
-    try:
-        import tools.lie_demo as LD
-        from tools.live_lie import load_motion_cfg
-        _frames = LD.load_video(str(_src))[0]
-        _w = LD.DetsWorker(None, conf=0.25)
-        _kw = load_motion_cfg()
-    except Exception as _e:                    # noqa: BLE001 —— 环境不齐 ⇒ 跳过 ✓
-        check(True, "跳过远接不贴编号（环境不齐：%s ✓）" % _e)
-        return
-    _t = MotionTracker(**_kw)
-    # ⚠⚠⚠ **窗口不能太短** ✗✗（**踩过** ✓）：前 40 拍里"远接"原来有 5 次 ✓，如今规则/夹具一改
-    #   就成了 **0 次** ✗ ⇒ 这条钉子**自己要求 `≥1`** ⇒ 于是**假红** ✗（行为没坏 ✓ —— 只是
-    #   前 40 拍没走到那条路 ✓）。⇒ 扫**全片**（76 拍 ✓）：⚠ 与 `test_brick_vr_always_zero`
-    #   那条的 40 拍窗口**不必一致** ✗（它钉的是"每条非座位 `vr` 恒 0"，窗口长短不影响 ✓）。
-    _n, _bad, _seen, _baddev = min(76, len(_frames)), [], [], []
-    for _i in range(_n):
-        _im = _frames[_i][1]
-        _t.frame_wh = (int(_im.shape[1]), int(_im.shape[0]))
-        _t.process(_im, ts=_i * 0.16, dets=_w.detect(_im) or [])
-        _lc = set(int(x) for x in (getattr(_t, "_low_conf_tids", None) or set()))
-        # ⚠⚠ **座位那条要排除** ✗（用户 2026-10-05 ✓："**反而应该被标 #5（真目标）**" ✓✓）——
-        #   规则是"**只放行位子上那位**" ✓：它远接的可能是它自己的框 ✓ ⇒ 照旧贴编号、照旧算 `dev` ✓；
-        #   本条钉的是**砖**（别人）那半边 ✓ ✓。
-        if _t.tid is not None:
-            _lc.discard(int(_t.tid))
-        if _lc:
-            _hit = sorted(int(_v[4]) for _v in (getattr(_t, "_box_v", []) or [])
-                          if int(_v[4]) in _lc)
-            _seen.append((_i + 1, sorted(_lc), _hit))
-            if _hit:
-                _bad.append((_i + 1, _hit))
-            # ⭐⭐⭐⭐⭐ **用户 2026-10-05 第二句**（"**因为假目标是位于理想中的假目标检出框框心的，
-            #   它不该有任何超过噪声允许的位移，有就是你算错了**" ✓✓）：远接那几拍，
-            #   那几条轨迹的 `dev` **必须是 0** ✓（⚠ 改前：帧 31 记 **11.1** ✗、随后一路
-            #   **10.5 → 21.4 → 29.3** ✗✗ = 用户报的那条 ✓）。
-            for _x in _t.tracks:
-                if int(_x.id) in _lc and abs(float(getattr(_x, "dev", 0.0))) > 1e-6:
-                    _baddev.append((_i + 1, int(_x.id), round(float(_x.dev), 2)))
-    check(not _bad and not _baddev and len(_seen) >= 1,
-          "**远接那几拍：那格框一个编号都没贴 ✓、那几条轨迹的 `dev` 也全是 0** ✓"
-          "（前 %d 拍里走到「远接」的 **%d** 拍 ✓〔要 ≥1 ✓〕；"
-          "编号违规 **%d** 笔 ✓、`dev` 违规 **%d** 笔 ✓〔都要 0 ✓〕）｜ `dev` 违规长这样："
-          "`(帧, id, dev)` = %s —— ⚠ 改前正是帧 31 的 **11.1** 开头那串 ✗✗（砖本来一寸都不该动 ✓，"
-          "可它把真目标那格框认成了自己的 ✗）"
-          % (_n, len(_seen), len(_bad), len(_baddev),
-             _baddev[:3] if _baddev else (_bad[:3] if _bad else _seen[:3])))
-
-
-def test_real_clip_gap_reentry():
-    """⭐⭐⭐⭐⭐ **真素材：认领的"该认的认上、不该认的别认"**（用户 2026-10-05 ✓ 你贴的两条日志 ✓）。
-
-    ⚠⚠ **钉的是"性质"，不是"某一帧"** ✗（**踩过** ✓）：早先这条钉"帧 25 那笔幽灵的 `dev` ≤ 门" ✓、
-      "帧 31 那笔正当认领必须在" ✓ —— 可**门值一改（0.30 → 0.55 ✓）整段走势就变了** ✗✗
-      ⇒ 那几笔**根本不出现了** ⇒ 钉子全红 ✗（**不是**代码坏了 ✓ 是夹具**跟走势绑死**了 ✗）。
-    ⇒ 现在只钉**与走势无关**的东西 ✓（机制本身由**合成**那条 `test_gap_reentry_dev_uses_crowd_baseline`
-      钉死 ✓ 确定性 ✓、不依赖素材 ✓）：
-        ④ **帧 28 那笔"认了个连着跟的框"不许再有** ✓（`#3` 连跟 27 拍、分只 1.72 = 砖 ✗）；
-        ⑤ **门值 `_CLAIM_UNREC_IOU` ≥ 0.45** ✓（邻居 IoU 实测到 0.44 ✗ ⇒ 0.30 会冤杀 ✓）；
-        ⑥ **帧 14 那笔"位置可疑但面积正常、分很高"的必须认上** ✓（你报的 ✓ —— 它原来被
-           `st == 0` 那道门刷掉 ✗，现在只排除融合框 ✓）。
-    ⚠⚠ **"帧 45/46 那笔必须认上"这条我撤了** ✗（如实说 ✓）：帧 14 一改（目标回到 `#5` ✓）⇒
-      帧 46 那笔"**症状**"自己就没了 ✓（上游好了 ⇒ 那格框跟着正确轨迹走 ⇒ 不需要认领 ✓）
-      ⇒ 钉它 = 钉一个**已经不存在**的场面 ✗（一改门值就翻面 ✓ 我踩过两次 ✓）。
-    ⚠⚠ **用的是你自己 `ui.yaml` 那套参数** ✓（`load_motion_cfg` ✓ —— 换参数会换场面 ✓）。
-    ⚠ 真素材用例 ⇒ 找不到文件 / 环境不齐就**跳过** ✓（同 `test_real_clip_smoke` ✓ 那条纪律 ✓）。
-    """
-    _src = (Path(__file__).resolve().parent.parent
-            / "datasets" / "liedetectorVideo" / "10月3日 (2).mp4")
-    if not _src.exists():
-        check(True, "跳过真素材认领用例（没找到 %s ✓）" % _src.name)
-        return
-    try:
-        import tools.lie_demo as LD
-        from tools.live_lie import load_motion_cfg
-        _frames = LD.load_video(str(_src))[0]
-        _w = LD.DetsWorker(None, conf=0.25)
-        _kw = load_motion_cfg()
-    except Exception as _e:                 # noqa: BLE001 —— 环境不齐 ⇒ 跳过 ✓
-        check(True, "跳过真素材认领用例（环境不齐：%s ✓）" % _e)
-        return
-    _t = MotionTracker(**_kw)
-    _claims = []                            # `[帧, 换法, 认来的 id, 事后 5 拍 dev, 噪声底]`
-    _inc = {}                               # 帧 ⇒ 当时**现任**（旧目标）的 `(ma, dev)` ✓
-    for _i in range(min(50, len(_frames))):
-        _im = _frames[_i][1]
-        # ⚠ `MotionRunner.step` 每拍会刷这一句 ✗（只影响「贴边 / 半个框」那两条判据 ✓）
-        #   ⇒ 裸 `MotionTracker` 得自己补 ✓ 否则跑的是**另一个场面** ✗（我踩过 ✓）。
-        if getattr(_im, "shape", None) is not None:
-            _t.frame_wh = (int(_im.shape[1]), int(_im.shape[0]))
-        _old = _t.tid
-        _t.process(_im, ts=_i * 0.16, dets=_w.detect(_im) or [])
-        _k = getattr(_t, "_switch_kind", "") or ""
-        # ⚠ 现任那两项要取**这一拍处理完之后**的值 ✓（门就是在那一刻看的 ✓；旧目标的 `ma/dev`
-        #   不会被认领本身改动 ✓）。
-        _o = _t._by_id(int(_old)) if _old is not None else None
-        _inc[_i + 1] = (None if _o is None else
-                        (float(_o.ma), float(_o.dev), float(_o.score)))
-        if _k in ("forced", "claim") and _t.tid is not None:
-            _claims.append([_i + 1, _k, int(_t.tid), [], float(_t._dev_med)])
-            _claims[-1].append(_inc[_i + 1])                 # ⚠ 第 6 位 = 当时的现任 ✓
-            _c = _t._by_id(int(_t.tid))
-            _claims[-1].append((None if _c is None else          # 第 7 位 = 认来的那条 ✓
-                                (float(_c.score), int(_c.hits))))
-        for _c in _claims[-2:]:                                  # ⚠ 事后 5 拍 ✓
-            _x = _t._by_id(_c[2])
-            if _x is not None and len(_c[3]) < 5:
-                _c[3].append(float(_x.dev))
-    _w.close()
-    _f28 = [c for c in _claims if c[0] == 28]
-    check(not _f28,
-          "④ **帧 28 那笔「认了一个连着跟的框」没有了** ✓（实测帧 28 的认领 = %s ✓ ｜ 前 50 拍全部"
-          "认领 = %s ✓）—— ⚠ 老口径帧 28 会把 `#3`（**连跟 27 拍** ✓、分只有 **1.72** = 砖 ✗）认成"
-          "目标 ⇒ 圆被**硬搬 200px** ✗✗"
-          % (_f28 or "[]", [(c[0], c[1], c[2]) for c in _claims]))
-    # ⚠⚠ **"帧 45/46 那笔必须认上"这条我撤了** ✗（2026-10-05 ✓ 如实说）：帧 14 一改（目标回到
-    #   `#5` ✓）⇒ **帧 46 那笔"症状"自己就没了** ✓（上游好了、那格框跟着正确轨迹走 ⇒ 不需要认领 ✓）
-    #   ⇒ 钉它 = 钉一个**已经不存在**的场面 ✗（而且一改门值它就翻面 ✓ 我踩过两次 ✓）。
-    #   ⇒ 改成钉**门值本身**（与走势无关 ✓）：邻居框的 IoU 实测能到 **0.44** ✗ ⇒ 门必须 > 它 ✓。
-    _iou = float(getattr(_LM, "_CLAIM_UNREC_IOU", -1.0))
-    check(_iou >= 0.45,
-          "⑤ **「未被记录」的门值必须 ≥ 0.45** ✓（实测 %s ✓ —— 用户 2026-10-05 那笔冤杀里，"
-          "**仅仅挨着**的四条模拟框 IoU 达 **0.32 / 0.34 / 0.35 / 0.44** ✗ ⇒ 门 0.30 会把**任何"
-          "挤在一起的新框**都冤杀 ✓；而「**就是原来那一格**」该是 0.7 以上 ✓ ⇒ 0.45~0.7 之间 ✓）"
-          % (_iou,))
-    # ⭐⭐⭐⭐⭐⭐ **现任保护（用户 2026-10-05 ✓ 他挑的 (乙) ✓ 见 `_incumbent_strong` ✓）**：
-    #   ⚠⚠ "帧 14 那笔必须认上"这条**又撤了** ✗（如实说 ✓）：帧 10 加了现任保护 ⇒ **冤枉换人不发生** ✓
-    #     ⇒ 目标一直留在 `#5` ✓ ⇒ 帧 14 那格框**本来就归目标** ✓ ⇒ **根本不需要认领** ✓（症状消失 ✓）。
-    #   ⇒ 改成钉**不变量**（与走势无关 ✓）：**凡是"现任还健康"的时候，一笔认领都不许发生** ✓。
-    _bad = [c for c in _claims
-            if len(c) > 5 and c[5] is not None and float(c[5][0]) >= float(_LM._M_OK)
-            and float(c[5][1]) >= 2.0 * max(1.0, float(c[4]))]
-    check(not _bad,
-          "⑥ **现任健康时一笔认领都没有** ✓（现任保护 ✓：现任那格框 `ma ≥ %.2f` ✓ **且** 它这一拍自己"
-          "还在不合群（`dev ≥ 2 × 噪声底` ✓）⇒ 不许抢 ✗ ｜ 实测违规 **%d 笔**（要 0 ✓）｜ 全部认领 = %s）"
-          "—— ⚠ 没这条门时：`10月3日 (2)` **帧 10** 会用分 **11.4** 的弱候选（`dev` 刚过门 ✓）把分 "
-          "**156.6**、`ma = 1.00`、`dev = 9.4` 的现任 `#5`（= 开局白块认下的**真目标** ✓）赶走 ✗✗"
-          " ⇒ 后面整条链全歪（`#5` 被降级 ⇒ 预测不带自己的相对速度 ⇒ **帧 14** 回来时显得"
-          "「位置可疑」✗ ⇒ 用户连报两帧 ✓）"
-          % (float(_LM._M_OK), len(_bad), [(c[0], c[1], c[2]) for c in _claims]))
-    # ⭐⭐⭐⭐⭐ **"老轨迹不许拿比现任更弱的证据顶替"** ✓（用户 2026-10-05 ✓ 原话："**真假目标怎么交换
-    #   身份了？#5 是真目标，#9 是那一格子的假目标**" ✓✓ 见 `_CLAIM_STRONG_K` ✓）——
-    #   ⚠ **刚出生的新框不受此限** ✓（它没有历史可分 ✓ 见 `_CLAIM_FRESH_N` ✓）。
-    _weak = [c for c in _claims
-             if len(c) > 6 and c[6] is not None and c[5] is not None
-             and int(c[6][1]) > int(_LM._CLAIM_FRESH_N)
-             and float(c[6][0]) < float(c[5][2]) * float(_LM._CLAIM_STRONG_K)]
-    check(not _weak,
-          "⑦ **老轨迹不许拿比现任更弱的证据顶替** ✓（`_CLAIM_STRONG_K` = %.2f ✓ ｜ 违规 **%d 笔**"
-          "（要 0 ✓）｜ 全部认领 = %s）—— ⚠ 没这条门时：`10月3日 (2)` **帧 31** 会用**跟了 21 拍**、"
-          "分只有 **7.3** 的 `#9`（那条**假目标** ✓）顶掉分 **26.2** 的 `#5`（**真目标** ✓ —— 只因它"
-          "帧 28~30 **一直在融合** ⇒ 帧 31 那一拍没框 ✗）⇒ 就是你看到的「**真假目标交换身份**」✗✗"
-          % (float(_LM._CLAIM_STRONG_K), len(_weak),
-             [(c[0], c[1], c[2]) for c in _claims]))
 
 
 def test_clamp_protection_when_own_clean():
@@ -4281,37 +3643,6 @@ def test_pos_rel_is_group_relative():
              _bad_intent[:2], _bad_same[:2]))
 
 
-def test_real_clip_smoke():
-    """真素材短冒烟：**用真 YOLO 跑前几拍** ⇒ 报的位置与**白星真值**几乎重合 ✓（唯一有真值的时刻 ✓）。"""
-    _src = (Path(__file__).resolve().parent.parent
-            / "datasets" / "liedetectorVideo" / "10月1日.mp4")
-    if not _src.exists():
-        check(True, "跳过真素材冒烟（没找到 %s ✓）" % _src.name)
-        return
-    try:
-        import tools.lie_demo as LD
-        _frames, _ts, _p, _s, _f = LD.load_source(str(_src))
-        _w = LD.DetsWorker(None, conf=0.25)
-    except Exception as _e:                 # noqa: BLE001 —— 环境不齐 ⇒ 跳过 ✓
-        check(True, "跳过真素材冒烟（环境不齐：%s ✓）" % _e)
-        return
-    _t = MotionTracker(min_hits=3)
-    _ds = []
-    for _i in range(min(10, len(_frames))):
-        _o = _t.process(_frames[_i][1], ts=_ts[_i], dets=_w.detect(_frames[_i][1]) or [])
-        _ref = pick_white(_gray(_frames[_i][1]))
-        if _o["pos"] is not None and _ref is not None:
-            _ds.append(math.hypot(_o["pos"][0] - _ref[0], _o["pos"][1] - _ref[1]))
-    _w.close()
-    # ⚠ 别拿**最大**值当门槛 ✗ —— 前几拍还在"攒分"（`min_hits=3` ✓）⇒ 偶有一拍选中别人的框 ⇒
-    #   峰值会很跳（实测 max 163 / 中位 **2.5** ✓）⇒ **中位**才是这条冒烟要看的 ✓。
-    check(bool(_ds) and float(np.median(_ds)) < 15.0,
-          "真素材（`10月1日` 前 10 拍，**真 YOLO**）：报的位置与「白星真值」差 —— **中位 %.1f px**"
-          "（峰值 %.1f ✓ 出现在还没攒够分的头几拍 ✓）—— ⚠ 这个差本来就该有几 px：轨迹选的是"
-          "**框中心**、白星是**块重心** ✓"
-          % (float(np.median(_ds)) if _ds else -1.0, max(_ds) if _ds else -1.0))
-
-
 def test_add_along_component():
     """⭐⭐⭐ **`_pull_to`：把速度"整体"拉向目标向量**（用户 2026-10-04 ✓ 原话："受框心引导后的
     圆心相对群体速度 = **力度 × (2×框心相对群体速度 − 当前圆心相对群体速度)**" ✓✓，并按助手建议
@@ -4628,87 +3959,6 @@ def test_forced_claim_rule():
           % ([(_r[0], _r[1]) for _r in _bad[:4]],))
 
 
-def test_brick_vr_always_zero():
-    """⭐⭐⭐⭐⭐ **不变式：假目标（= 非座位轨迹）的 `vr` 必须恒为 0**（用户 2026-10-05 ✓ 原话：
-    "**所有假目标的 vr（它自己的相对速度）应该等于0**" ✓✓）。
-
-    ⚠⚠ **实测病根**（全仓 `vr` 写入点共 **4 处** ✓，两处漏看座位 ✗✗）：
-      · 粘住支 ✓、滑行支的步长 ✓ —— **有**座位判断 ✓；
-      · **正常配对支** ✗✗ —— 无条件写 KF 值 ⇒ **任何砖只要配上框就带上"假相对速度"** ✓；
-      · **滑行支尾部** ✗✗ —— 把上面刚记好的 0 **又覆盖回去** ✓（白记 ✓）；
-      ⇒ 而下面 `pred` 用的就是 `_t.vr` **原值** ✓ ⇒ **下一拍的配对基准也跟着偏** ✓ ⇒
-        砖"自己越跑越偏" ✓✗（= 用户报的那条 ✓）。
-    ⇒ 修法：4 处**各自补座位判断** ✓ ＋ ⑥ 之前**再扫一遍兜底** ✓（将来谁又加写入点也不至于破防 ✓）。
-
-    钉两条（合成确定性 ＋ 真素材性质 ✓）：
-      ① **合成**：3 条大部队框 ＋ 相机平移抖动 ⇒ 跑 12 拍 ⇒ **除座位外每条都必须 `vr == (0,0)`**
-         ✓（⚠ 改前：KF 学到的噪声级速度会留在 `vr` 上 ✗ ⇒ 立刻红 ✓）；
-      ② **真素材（性质）**：同上 40 拍；**并顺带证明"座位那条确实带非零 `vr`"** ✓
-         （⚠ 防"一刀切把所有人的 `vr` 都压 0"✗ —— 那样真目标就不动了 ✓）。
-    """
-    # ---- ① 合成：相机一起动 ⇒ 砖们的 KF 会学到"噪声级"相对速度 ✗（不该写进 `vr` ✓）----
-    # ⚠⚠ **抖动必须"独立"** ✗✗（**踩过两次** ✓）：`_frame(jitter=…)` 是**全场同步**抖动 ✓
-    #   ⇒ 群体中位一减就没了 ✗ ⇒ 砖的 KF 相对速度还是**恰好 0** ✓ ⇒ 这条**咬不住** ✗；
-    #   真素材那半边才咬出 **212 笔** ✓。⇒ 这里**手工**给"一个框"独有的小抖动 ✓ ⇒ 它的 KF 会
-    #   学到"噪声级"速度 ✓ ⇒ 一旦漏进 `vr` 就当场红 ✓✓。
-    _rng = np.random.RandomState(3)
-    _fake0 = _frame(3)
-    _t = MotionTracker(min_hits=2)
-    for _i in range(12):
-        _cam = (7.0 * _i, 3.0 * _i)
-        _d = _shift(_fake0, _cam[0], _cam[1])
-        _d = _d + [(0, 375.0 + _cam[0] + float(_rng.normal(0.0, 0.8)),
-                    250.0 + _cam[1] + float(_rng.normal(0.0, 0.8)), 150.0, 150.0, 0.9),
-                   # ⚠ **两块**都要抖 ✗（只抖一块时，它很可能**自己成了座位** ✗ ⇒ 被排除 ⇒ 咬不住 ✓）
-                   (0, 620.0 + _cam[0] + float(_rng.normal(0.0, 0.8)),
-                    380.0 + _cam[1] + float(_rng.normal(0.0, 0.8)), 150.0, 150.0, 0.9)]
-        _t.process(None, ts=_i * 0.16, dets=_d)
-    _tid = None if _t.tid is None else int(_t.tid)
-    _bad = [(int(_x.id), tuple(round(float(v), 2) for v in _x.vr))
-            for _x in _t.tracks
-            if int(_x.id) != _tid and (float(_x.vr[0]) or float(_x.vr[1]))]
-    _n_other = sum(1 for _x in _t.tracks if int(_x.id) != _tid)
-    check(not _bad and _n_other >= 2,
-          "① **合成：除座位外每条 `vr` 都恰好是 (0,0)** ✓（查了 **%d** 条非座位轨迹 ✓〔要 ≥2 ✓〕；"
-          "违规 **%d** 条 ✓〔要 0 ✓〕）｜ 违规 = %s —— ⚠ 改前：KF 那点**噪声级**速度会留在 `vr` 上 ✗ "
-          "（就是它让砖的**预测**越跑越偏 ✓）"
-          % (_n_other, len(_bad), _bad[:3] if _bad else "（无 ✓）"))
-    # ---- ② 真素材（性质）：非座位恒 0，**座位确实非 0**（防一刀切 ✓）----
-    _src = (Path(__file__).resolve().parent.parent
-            / "datasets" / "liedetectorVideo" / "10月3日 (2).mp4")
-    if not _src.exists():
-        check(True, "跳过 vr 不变式的真素材半边（没找到 %s ✓）" % _src.name)
-        return
-    try:
-        import tools.lie_demo as LD
-        from tools.live_lie import load_motion_cfg
-        _frames = LD.load_video(str(_src))[0]
-        _w = LD.DetsWorker(None, conf=0.25)
-        _kw = load_motion_cfg()
-    except Exception as _e:                    # noqa: BLE001 —— 环境不齐 ⇒ 跳过 ✓
-        check(True, "跳过 vr 不变式的真素材半边（环境不齐：%s ✓）" % _e)
-        return
-    _tr = MotionTracker(**_kw)
-    _n, _bad2, _seat_moved = min(40, len(_frames)), [], 0
-    for _i in range(_n):
-        _im = _frames[_i][1]
-        _tr.frame_wh = (int(_im.shape[1]), int(_im.shape[0]))
-        _tr.process(_im, ts=_i * 0.16, dets=_w.detect(_im) or [])
-        _tid2 = None if _tr.tid is None else int(_tr.tid)
-        for _x in _tr.tracks:
-            _v = (float(_x.vr[0]), float(_x.vr[1]))
-            if int(_x.id) == _tid2:
-                if math.hypot(_v[0], _v[1]) > 0.5:
-                    _seat_moved += 1
-            elif _v != (0.0, 0.0):
-                _bad2.append((_i + 1, int(_x.id), tuple(round(_v[k], 2) for k in (0, 1))))
-    check(not _bad2 and _seat_moved >= 1,
-          "② **真素材（前 %d 拍）：非座位的 `vr` 一次都没漏** ✓（违规 **%d** 条 ✓〔要 0 ✓〕）"
-          "｜**并且座位那条确实带非零 `vr`**（**%d** 拍 ✓〔要 ≥1 ✓ —— ⚠ 防一刀切把所有人都压 0 ✗，"
-          "那真目标就不动了 ✓〕）｜ 违规 = %s"
-          % (_n, len(_bad2), _seat_moved, _bad2[:3] if _bad2 else "（无 ✓）"))
-
-
 def _vel_bv(cx, cy, w, h, tid, dx=0.0, dy=0.0, st=0):
     """造一格"当拍账本"（`_box_v` 的布局 ✓ 见 `VelocityChassis` 的说明 ✓ 14 位 ✓）。
 
@@ -4864,6 +4114,194 @@ def test_velocity_arrow_from_in_view_vertices():
           "就**不画箭头** ✓ 不猜一个方向 ✗）")
 
 
+def test_velocity_form_metrics_and_merge():
+    """⭐⭐⭐⭐⭐ **"框可不可信"那三个量 ＋ 融合/分离状态机** ✗✗（用户 2026-10-07 ✓ 授权
+    "**按你的想法做一下**" ✓ ⇒ 我把上面几轮量过、推荐过的那套落下来的 ✓）。
+
+    钉五组：
+      ① 三个量的**定义**（纯函数 `vel_seat_metrics` ✓）：`shear` = 宽/高变化率的一半 ✓
+        （**平移无关** ✓）；`jvec` = 框心位移**扣掉群体** ✓；`size_dev` = 面积 ÷ **它自己**的标准 ✓；
+        ⚠ 没有上一拍框（新格 / 丢过）⇒ **一律 0** ✓（不猜 ✗）；
+      ② 融合状态机（纯函数 `vel_merge_next` ✓）：进 = `entry_ok` ✓；出 = `split_ok` ✓；
+        ⛔ 挂太久也出 ✓；
+      ③ **端到端①**：邻居被并进它怀里（`被并` 事件 ✓）⇒ 那一拍就**进融合** ✓；
+      ④ **端到端②**：融合期圆心**不走框心** ✗ ⇒ 走到"**在动的那一半**"（框心 ± `sep/2` ✓ 符号由
+        "框心相对群体"定 ✓）—— 这是"跟框只能夹取"那条的正解 ✓；
+      ⑤ **端到端③**：崭新的框在它 bbox 里**连续 `_VFUS_SPLIT_N` 拍** ⇒ **出融合** ✓
+        （⚠ 实测两次"分离"只有 1~2 拍就又被并回去 ⇒ 连击就是为滤掉它们 ✓）。
+    """
+    # ---- ① 三个量的定义 ----
+    _sh, _jv, _jr, _sd = _LM.vel_seat_metrics((100.0, 100.0, 60.0, 60.0),
+                                              (110.0, 100.0, 70.0, 60.0),
+                                              (5.0, 0.0), 3600.0)
+    check(abs(_sh - 5.0) < 1e-6 and abs(_jv[0] - 5.0) < 1e-6 and abs(_jv[1]) < 1e-6
+          and abs(_jr[0] - 0.0) < 1e-6 and abs(_jr[1] - 10.0) < 1e-6
+          and _sd is not None and abs(_sd - abs(4200.0 - 3600.0) / 3600.0) < 1e-6,
+          "① **`shear` = 宽变化率的一半** ✓（宽 60→70 ⇒ **%.1f px/拍** ✓）；**`jvec` 扣掉群体** ✓"
+          "（框心 +10、群体 +5 ⇒ **%.1f** ✓）；**`jred` = 四条边各自相对群体** ✓（左 %.1f ／ 右 "
+          "**%.1f** ✓〔宽涨了 10 ⇒ 左边 −5、右边 +5、再各减群体 5 ✓〕）；**`size_dev` 用它自己的"
+          "基准** ✓（%.2f ✓）" % (_sh, _jv[0], _jr[0], _jr[1], _sd))
+    _z = _LM.vel_seat_metrics(None, (10.0, 10.0, 5.0, 5.0), (9.0, 9.0), 25.0)
+    check(_z[0] == 0.0 and _z[1] == (0.0, 0.0) and _z[2] == (0.0, 0.0, 0.0, 0.0)
+          and _z[3] is None,
+          "①' **没有上一拍框 ⇒ 各量一律 0 / None** ✓（不猜 ✗ —— 与「跨 gap 不给位移」同一条纪律 ✓）")
+    #   ⚠⚠⚠ **整框不在镜头内 ⇒ 同样"量不出来"** ✗✗（用户 2026-10-08 ✓ 原话："**屏幕边缘的框
+    #     当然在计算上会被撑大，不是全位于镜头内的，面积相关的计算、判据都应该失效**" ✓✓）——
+    #     边缘那格的宽高本来就抽风 ✗（被裁一截 / 被补一截 ✓）⇒ 它的"宽高变化 / 面积比"全是假的 ✓。
+    _z2 = _LM.vel_seat_metrics((100.0, 100.0, 60.0, 60.0), (110.0, 100.0, 70.0, 60.0),
+                               (5.0, 0.0), 3600.0, in_view=False)
+    check(_z2[0] == 0.0 and _z2[1] == (0.0, 0.0) and _z2[2] == (0.0, 0.0, 0.0, 0.0)
+          and _z2[3] is None,
+          "①'' **这一格不全在镜头内 ⇒ 也一律 0 / None** ✓✗（同上那条纪律 ✓ —— ⚠ 少了它，边缘那格"
+          "「被裁一截 / 被补一截」的宽高变化会被当成「它在被撑大」✗）")
+    # ---- ② 状态机 ----
+    check(_LM.vel_merge_next(False, 0.0, 0.1, True, False) == (True, 0.0)
+          and _LM.vel_merge_next(True, 2.0, 0.1, False, False) == (True, 2.1)
+          and _LM.vel_merge_next(True, 2.0, 0.1, False, True) == (False, 0.0)
+          and _LM.vel_merge_next(True, _LM._VFUS_MAX, 0.1, False, False) == (False, 0.0),
+          "② **状态机（全是秒 ✓ 用户 2026-10-07 ✓：「不能用拍算了」✓）**：`entry_ok` ⇒ 进 ✓；"
+          "`split_ok` ⇒ 出 ✓；**挂太久（> %.1f 秒）⇒ 也出** ✓" % _LM._VFUS_MAX)
+    # ---- ③④⑤ 端到端（真 `VelocityTracker` ✓；800×400 的画布 ✓）----
+    #   ⚠⚠ **目标放在右边、邻居放左边** ✗（**实测踩到** ✓）：并集框的框心在两块**中点** ⇒ 谁继承
+    #     这个号其实由"谁离中点近"决定 ✓ ⇒ 两边一样大时是**平手** ✗ ⇒ 号可能落到邻居身上 ✓
+    #     （= 用户说的"410 把编号给错了"那种情形 ✓）。所以这里先让并集出现一拍、**看它落在哪个号
+    #     上**，再把这个号当"它自己那个编号" ✓（我们测的是"融合期圆心怎么走" ✓ 不是号怎么分 ✓）。
+    _t = _LM.VelocityTracker(mode="velocity")
+    _t.frame_wh = (800.0, 400.0)
+    _blank = np.zeros((100, 200, 3), np.uint8)
+    _s = 60.0
+    _TGT = lambda _i: [0, 500.0 + 10.0 * _i, 200.0, _s, _s, 0.9]     # noqa: E731 —— 目标（相对群体动 ✓）
+    _NB = lambda _i: [0, 200.0 + 5.0 * _i, 200.0, _s, _s, 0.9]       # noqa: E731 —— 邻居（跟着群体 ✓）
+    _crowd = lambda _i: [[0, 380.0 + 5.0 * _i, 360.0, _s, _s, 0.9],   # noqa: E731
+                         [0, 600.0 + 5.0 * _i, 360.0, _s, _s, 0.9],
+                         [0, 760.0 + 5.0 * _i, 360.0, _s, _s, 0.9]]
+    for _i in range(10):                    # 先攒够目标**自己那份**标准面积（`_VAREA_MIN` = 8 ✓）
+        _t.process(_blank, dets=[_NB(_i), _TGT(_i)] + _crowd(_i), idx=_i)
+
+    def _union(_i):
+        """并集框（两块的外接框 ✓）= `(中心, 宽)` ✓。"""
+        _a, _b = 500.0 + 10.0 * _i, 200.0 + 5.0 * _i
+        return ((_a + _b) / 2.0, _s + abs(_a - _b))
+
+    def _warm():
+        """再造一个"攒够标准面积"的底盘 ✓（合成 ✓ 给下面几组各用一份 ✓）。"""
+        _x = _LM.VelocityTracker(mode="velocity")
+        _x.frame_wh = (800.0, 400.0)
+        for _j in range(10):
+            _x.process(_blank, dets=[_NB(_j), _TGT(_j)] + _crowd(_j), idx=_j)
+        return _x
+
+    #   ⭐⭐ **"被并"那条改了** ✗✗（用户 2026-10-07 ✓ 原话："**把刚消失改为现在是消失的 ＋ 压着
+    #     绿圈**" ✓✓）：原来只认"上一拍刚丢"✗ ⇒ 实测**漏掉真事** ✗（帧 345 #5 把真目标那块砖吞了
+    #     ✓，可真目标那格 #4 早在 328 就丢了、到 345 已经缺 18 拍 ✗）。现在 = **还在消失中** ✓
+    #     ＋ **它压着绿圈** ✓。
+    _u0, _w0 = _union(10)
+    _t.pos = (500.0 + 10.0 * 10.0, 200.0)       # ⚠ **圆要摆在那儿**（= 目标真身 ✓ 见下那条注释 ✓）
+    _t.tgt_rad = 30.0
+    _t.process(_blank, dets=[[0, _u0, 200.0, _w0, _s, 0.9]] + _crowd(10), idx=10)
+    _tid = next((int(_k) for _k, _v in _t._seats.items() if bool((_v.get("fm") or {}).get("mg"))),
+                None)
+    check(_tid is not None,
+          "③ **消失在绿圈里的号被并进大框 ⇒ 那一拍就进融合** ✓（并集框 %s 落在那条号上 ⇒ "
+          "`mg` = True ✓）" % ("#" + str(_tid) if _tid is not None else "**没落上** ✗"))
+    #   ⚠⚠ **反向（这条钉的就是用户新加的那半句"压着绿圈" ✓）**：同一个局面、只把圆挪到左上角
+    #     ⇒ **一个 `mg` 都不许有** ✗ —— 少了这半句，早就丢了的号（实测那种号有十几个 ✗）会到处
+    #     乱判融合 ✗。
+    _t2 = _warm()
+    _t2.pos = (40.0, 360.0)
+    _t2.tgt_rad = 30.0
+    _t2.process(_blank, dets=[[0, _u0, 200.0, _w0, _s, 0.9]] + _crowd(10), idx=10)
+    check(not any(bool((_v.get("fm") or {}).get("mg")) for _v in _t2._seats.values()),
+          "③' **同一个局面、圆不在它身上 ⇒ 不进融合** ✓✗（要一个 `mg` 都没有 ✓）")
+    #   ⭐⭐ **尺寸过大也能进门**（用户 2026-10-07 ✓ 亲口选的 **B**："看尺寸不对进门" ✓✓）——
+    #     实测第 345 帧那一下就是"**一跳 ＋ 定住**" ✗：靠 `shear` 持续过门永远进不去 ✗。
+    #     ① 持续 ≥ `_VFUS_SHEAR_T` ⇒ 进 ✓；② 只大 1 拍 ⇒ **不进** ✗（= 345 那一下 ✓）。
+    _t3 = _warm()
+    _nid = int(min(_t3._seats, key=lambda _k: abs(_t3._seats[_k]["c"][0] - 245.0)))
+    for _i in range(10, 14):                    # 4 拍 × 0.0414s = 0.166s ≥ 0.15 ✓
+        #   ⚠⚠ **锁定要给出编号** ✗✗（**实测踩到** ✓）：`locked = True` 但 `locked_tid = None`
+        #     ⇒ `process` ④ 里 `int(None)` **当场崩** ✗ ⇒ 这里把锁定号指到**那格自己** ✓
+        #     （它就压在圈上 ✓ 正是"融合"该有的样子 ✓）；⚠ `pos` / `tgt_rad` 每拍也摆一遍 ✓
+        #     （不锁定那几拍 `process` 会把 `pos` 清掉 ✗ ⇒ 圈就没了 ✗）。
+        _t3.locked, _t3.locked_tid = True, _nid
+        _t3.pos = (200.0 + 5.0 * _i, 200.0)
+        _t3.tgt_rad = 30.0
+        _t3.process(_blank, dets=[[0, 200.0 + 5.0 * _i, 200.0, 100.0, 100.0, 0.9],
+                                  _TGT(_i)] + _crowd(_i), idx=_i)
+    _dv = float((_t3._seats[_nid].get("fm") or {}).get("dsd") or 0.0)
+    check(bool((_t3._seats[_nid].get("fm") or {}).get("mg")),
+          "③'' **「比它自己大一半以上」＋ 压着绿圈，连续 %.2f 秒 ⇒ 进融合** ✓（那格此刻 `size_dev` "
+          "= **%.2f** ✓〔它自己的面积 3600 ✓ 框 100×100 ✓〕—— ⚠ 门 `_VFUS_DEV_MIN` = %.2f ✓）"
+          % (_LM._VFUS_SHEAR_T, _dv, _LM._VFUS_DEV_MIN))
+    #   ⚠⚠⚠ **反向：撑大但圆不在它身上 ⇒ 一个 `mg` 都不许有** ✗✗（**用户 2026-10-07 抓到的
+    #     帧 219** ✓：那格在 (653,159)、圆在 (447,239) ⇒ 离 **221px** ✗ 却因为"尺寸那条"被判成
+    #     融合 ✓ 他的原话："**这个框什么情况，都没跟圆相交就融合框了**" ✓；⚠ 他 2026-10-04
+    #     早就定过："**不跟真目标圆相交的检出框肯定不是融合框**" ✓）
+    _t5 = _warm()
+    _nid5 = int(min(_t5._seats, key=lambda _k: abs(_t5._seats[_k]["c"][0] - 245.0)))
+    #   ⚠ "锁定号"要指一条**真存在**的座位 ✗（不然 `process` ④ 里 `int(None)` 崩 ✗）——
+    #     拿右下那格观众（≈380,360 ✓）即可 ✓（它离要测的那格 ≈200px ✓ 不会把圈带过去 ✓）。
+    _cid = int(min(_t5._seats, key=lambda _k: abs(_t5._seats[_k]["c"][0] - 380.0)))
+    for _i in range(10, 14):
+        #   ⚠ 锁定号指到**观众那格**（右下方 ✓ 离得远 ✓）；`pos` 每拍摆到**左上方远处** ✓
+        #     （⚠ `locked_tid` 必须是**真存在**的号 ✗ 见上一条坑 ✓）。
+        _t5.locked, _t5.locked_tid = True, _cid
+        _t5.pos = (700.0, 380.0)                # ⚠ 圆离得**远远的** ✓
+        _t5.tgt_rad = 30.0
+        _t5.process(_blank, dets=[[0, 200.0 + 5.0 * _i, 200.0, 100.0, 100.0, 0.9],
+                                  _TGT(_i)] + _crowd(_i), idx=_i)
+    check(not bool((_t5._seats[_nid5].get("fm") or {}).get("mg")),
+          "③'''' **同样撑大、但绿圈不在它身上 ⇒ 不进融合** ✓✗（= 用户帧 219 那格 ✓ —— ⚠ 少了"
+          "这条，满屏「自己变大」的砖全会变成融合框 ✗）")
+    #   ⚠⚠⚠ **同样撑大、圆也压在它身上、但那一格有一半在镜头外 ⇒ 仍不许进** ✗✗（用户 2026-10-08 ✓：
+    #     "**屏幕边缘的框当然在计算上会被撑大，不是全位于镜头内的，面积相关的计算、判据都应该
+    #     失效**" ✓✓）—— ⚠ 边缘那格的宽高本来就抽风 ✗ ⇒ 它"比标准面积大多少"这个数**不作数** ✗。
+    _t6 = _LM.VelocityTracker(mode="velocity")
+    _t6.frame_wh = (800.0, 400.0)
+    for _i in range(10):                    # 60×60 摆在 (760,200) ⇒ **整框在画面里** ✓（730~790 ✓）
+        _t6.process(_blank, dets=[[0, 760.0, 200.0, 60.0, 60.0, 0.9]], idx=_i)
+    _nid6 = int(min(_t6._seats, key=lambda _k: abs(_t6._seats[_k]["c"][0] - 760.0)))
+    for _i in range(10, 14):                # 撑成 100×100（710~810 ⇒ **右边出画** ✗）＋ 圆压在它身上 ✓
+        _t6.locked, _t6.locked_tid = True, _nid6
+        _t6.pos, _t6.tgt_rad = (760.0, 200.0), 30.0
+        _t6.process(_blank, dets=[[0, 760.0, 200.0, 100.0, 100.0, 0.9]], idx=_i)
+    _f6 = _t6._seats[_nid6].get("fm") or {}
+    check(not bool(_f6.get("mg")) and float(_f6.get("dsn", 0.0)) == 0.0,
+          "③''''' **撑大 ＋ 压着圈，但那一格有一半在镜头外 ⇒ 仍不进融合** ✓✗（`dsn` = **%.3f** ✓"
+          "〔它本该是 %.2f 倍大 ✓ 可那格的面积判据**失效** ⇒ 一秒都没累计 ✓〕）"
+          % (float(_f6.get("dsn", 0.0)), 100.0 * 100.0 / 3600.0))
+    _t4 = _warm()
+    _nid4 = int(min(_t4._seats, key=lambda _k: abs(_t4._seats[_k]["c"][0] - 245.0)))
+    _t4.process(_blank, dets=[[0, 250.0, 200.0, 100.0, 100.0, 0.9], _TGT(10)] + _crowd(10), idx=10)
+    _t4.process(_blank, dets=[[0, 255.0, 200.0, 60.0, 60.0, 0.9], _TGT(11)] + _crowd(11), idx=11)
+    check(not bool((_t4._seats[_nid4].get("fm") or {}).get("mg")),
+          "③''' **只大 1 拍 ⇒ 不进融合** ✓✗（= 实测第 345 帧那一下 ✓ —— 这一条正是「尺寸进门」"
+          "要配的那半条 ✓）")
+    if _tid is not None:
+        _t.locked, _t.locked_tid = True, int(_tid)
+        _t.pos = (500.0 + 10.0 * 10.0, 200.0)               # 圆心先摆在目标真身上 ✓
+        _t._obs, _t._gap, _t.vel = _t.pos, 0, (10.0, 0.0)
+        for _i in range(11, 13):
+            _u, _w = _union(_i)
+            _t.process(_blank, dets=[[0, _u, 200.0, _w, _s, 0.9]] + _crowd(_i), idx=_i)
+        _c1, _p1 = tuple(_t._seats[_t.locked_tid]["c"]), tuple(_t.pos)
+        _a12 = 500.0 + 10.0 * 12.0
+        check(abs(_p1[0] - _a12) < 2.0 and _p1[0] > _c1[0],
+              "④ **融合期圆心落在「在动的那一半（右 ✓）」** ✓（框心 %.0f ／ **圆心 %.0f** ／ 目标"
+              "真身 %.0f ⇒ 差 **%.1f px** ✓）—— ⚠ 只会「夹在并集框心」的话这里差 **%.0f px** ✗"
+              "（= 你说的「跟框只是个夹取作用」那句 ✓ 现在不是了 ✓）"
+              % (_c1[0], _p1[0], _a12, abs(_p1[0] - _a12), abs(_c1[0] - _a12)))
+        for _i in range(13, 17):                            # 冒出来的框**连续 ≥3 拍**还在 ⇒ 出融合 ✓
+            _u, _w = _union(_i)
+            _t.process(_blank, dets=[[0, _u, 200.0, _w, _s, 0.9],
+                                     [0, 500.0 + 10.0 * _i - 12.0, 200.0, _s, _s, 0.9]]
+                       + _crowd(_i), idx=_i)
+        check(not bool(_t._seats[_t.locked_tid]["fm"]["mg"]),
+              "⑤ **冒出来的框连续 %.2f 秒还在 ⇒ 出融合** ✓（`mg` 已回 False ✓）—— ⚠ 实测那两次"
+              "**1~2 拍的「分离」是假的**（立刻又被并回 ✓）⇒ 连击就是为滤掉它们 ✓"
+              % _LM._VFUS_SPLIT_T)
+
+
 def test_velocity_circle_hits_box():
     """⭐⭐⭐⭐⭐ **规则2 的那把尺：圆 ↔ 轴对齐矩形** ✗✗（用户 2026-10-07 ✓ 选的就是这一条 ✓
     原话："等待上板的检测框 4 条边都在视野里且**不与真目标圆重叠**时可以上板" ✓✓）。
@@ -4983,16 +4421,25 @@ def test_velocity_chassis_area_and_speed():
     #     （= 8 ✓）⇒ 得连喂 9 拍；而"顶点位移"只认**相邻两拍**（`n_vtx` 就是样本数 ✓）⇒
     #     连喂 9 拍会让 `n_vtx` 变成几十 ✗ 而且每拍都把框摆在同一处 ⇒ 位移恒 0 ✗（第一版就这么错的 ✓）。
     _c = _LM.VelocityChassis()
-    _o1 = _c.step([_vel_bv(100.0, 60.0, 40.0, 40.0, 7)], _fw)
+    #   ⚠⚠⚠ **"真目标这一拍有没有框"必须给** ✗✗（**实测踩到** ✓ —— 这条钉子 ①④ 一直是红的，就是
+    #     这个原因 ✓）：`step(..., tgt_box=None)` ⇒ 底盘认为**真目标丢框了** ⇒ 走**规则2**（"丢框
+    #     期间只有**从屏幕边缘进来的新生框**才够资格等待上板" ✓ 见 `vel_issue_label` ✓）⇒ 这格
+    #     `100×100` 的老框**本来就不该发编号** ✓ ⇒ ①④ 拿不到 `board`/`area_by_id` 是**对的** ✗✗。
+    #   ⚠ **功能没坏** ✓（真素材 80 帧实测：`board_ids` **11** 条 ／ `area_by_id` **10** 条 ／
+    #     状态 **10 上板 ＋ 1 等待上板** ✓）⇒ 只是**这条钉子的夹具少给了一个入参** ✗。
+    #   ⇒ 一律把"真目标框"给上 ✓（坐标不重要 ✓ 底盘只看**有没有** ✓）。
+    _TB = (60.0, 150.0, 40.0, 40.0)
+    _o1 = _c.step([_vel_bv(100.0, 60.0, 40.0, 40.0, 7)], _fw, tgt_box=_TB)
     for _i in range(1, 9):                          # 每拍**各走 10px** ✓（面积不变 40×40 ✓）
-        _c.step([_vel_bv(100.0 + 10.0 * _i, 60.0, 40.0, 40.0, 7, dx=10.0)], _fw)
-    _a7 = (_c.step([_vel_bv(180.0, 60.0, 40.0, 40.0, 7, dx=10.0)], _fw)["area_by_id"] or {}).get(7)
+        _c.step([_vel_bv(100.0 + 10.0 * _i, 60.0, 40.0, 40.0, 7, dx=10.0)], _fw, tgt_box=_TB)
+    _a7 = (_c.step([_vel_bv(180.0, 60.0, 40.0, 40.0, 7, dx=10.0)], _fw,
+                   tgt_box=_TB)["area_by_id"] or {}).get(7)
     _c1 = _LM.VelocityChassis()
-    _c1.step([_vel_bv(100.0, 60.0, 40.0, 40.0, 7)], _fw)
+    _c1.step([_vel_bv(100.0, 60.0, 40.0, 40.0, 7)], _fw, tgt_box=_TB)
     #   ⚠⚠ **报数那几项一律"先取值、再判空"** ✗✗（**反向验证当场踩到** ✓）：直接把
     #     `std_speed[0]` 写进 `%` 里 ⇒ 一旦它真是 `None` ⇒ **格式化先抛 `TypeError`** ✗ ⇒
     #     钉子**崩掉**（连 `[NG]` 都打不出来 ✓）⇒ 反向验证会误判成"这条钉子咬不住" ✗✗。
-    _s2 = _c1.step([_vel_bv(110.0, 60.0, 40.0, 40.0, 7, dx=10.0)], _fw)
+    _s2 = _c1.step([_vel_bv(110.0, 60.0, 40.0, 40.0, 7, dx=10.0)], _fw, tgt_box=_TB)
     _sp1 = _s2["std_speed"]
     check(_o1["state"] == [_LM.VEL_BOARD] and _o1["label"] == [7]
           and _a7 is not None and abs(float(_a7) - 1600.0) < 1e-6
@@ -5029,8 +4476,8 @@ def test_velocity_chassis_area_and_speed():
           "⚠⚠ 谁把群体那份加回来 ⇒ 当场红 ✗")
     # ③ 座位记忆：发过号 ⇒ 一直是上板（哪怕这拍半可见 / 哪怕这拍没框）
     _c3 = _LM.VelocityChassis()
-    _c3.step([_vel_bv(100.0, 60.0, 40.0, 40.0, 7)], _fw)
-    _s2 = _c3.step([_vel_bv(10.0, 60.0, 40.0, 40.0, 7)], _fw)       # 同一号、变成半可见
+    _c3.step([_vel_bv(100.0, 60.0, 40.0, 40.0, 7)], _fw, tgt_box=_TB)
+    _s2 = _c3.step([_vel_bv(10.0, 60.0, 40.0, 40.0, 7)], _fw, tgt_box=_TB)   # 同一号、变成半可见
     _s3 = _c3.step([], _fw)                                          # 这一拍没框
     check(_s2["state"] == [_LM.VEL_BOARD] and 7 in _s2["board_ids"]
           and _s3["state"] == [] and 7 in _s3["board_ids"],
@@ -5184,7 +4631,11 @@ def test_velocity_log_lost_and_found():
         _ls = [ln for ln in (_p.read_text(encoding="utf-8").splitlines()
                              if _p.exists() else []) if ln.strip()]
         check(len(_ls) == 2 and "帧 12" in _ls[0] and "丢失" in _ls[0]
-              and "帧 14" in _ls[1] and "重新找到" in _ls[1] and "滑行了 2 拍" in _ls[1],
+              and "帧 14" in _ls[1] and "重新找到" in _ls[1]
+              #   ⚠ 「滑行了 N 拍」**早就改成按秒了** ✗（用户 2026-10-07 ✓："不能用拍算了，因为
+              #     实时不能保证帧长" ✓✓ 见 `vel_event_text` ✓）⇒ 这条钉子原来钉"2 拍" ⇒ **过期** ✗
+              #     （**实测** ✓ 跑一次就是红的 ✓）⇒ 改钉"滑行了…秒" ✓。
+              and "滑行了" in _ls[1] and "秒" in _ls[1],
               "② **端到端：丢一次 ＋ 回一次 ⇒ 正好 2 行** ✓〔要 2 行 ✓〕—— 丢在**帧 12** ✓、"
               "回在**帧 14** ✓、中间滑行的那两拍**没有再写** ✓；实测两行 = \n      %s"
               % ("\n      ".join(_ls) if _ls else "(一行都没有 ✗)"))
@@ -5208,6 +4659,12 @@ def test_velocity_lost_seat_follows_group():
     ⚠⚠ **实测现场**（`10月7日.mp4` ✓ 某条有编号的座位连续掉框 44 拍 ✓）：那个锚点
       **位移恒为 (0.0, 0.0)** ✗（冻在原地 ✓）而同期画面走了 **≈64px** ✓ ⇒ 灰框（图例第 2 条 ✓）
       和 `#N 推的` 越差越远 ✗ —— 因为 `_match` 里"没配上框的座位"是**原样搬**的 ✗。
+    ⚠⚠⚠ **2026-10-07 试过"改成群体累计位移"（更准 ✗）—— 已退回** ✗✗：它确实更准（全片实测：
+      掉 ≥60 拍从欠 **19.16px** ⇒ **13.40px** ✓；量法 = 拿"掉框段两拍都在的别的砖"当尺子 ✓），
+      **但把真目标的重接整个弄坏了** ✗✗ —— 全片 A/B（797 帧 ✓ 真 YOLO ✓ 同一份 dets ✓）：
+      **本口径 15 次事件**（帧 506/520/728/732/734/751/753 都接得上 ✓）／累计位移那版**只剩 1 次**
+      ✗（座位配对是"最近的那条赢"✗ ⇒ 锚点一挪，回来那格框就被隔壁座位抢走 ✗ ⇒ 永久滑行 ✗）。
+      ⇒ **本口径这份"欠"是明知代价**：欠一点也比**接不上**强 ✓。
     钉三条（合成 ✓ 不需要素材 ✓）：
       ① 丢了的那条：锚点每拍**推进 ≈ 群体中位位移** ✓（不是 0 ✗）；
       ② **没丢**的那条：锚点**就是它这一拍那格框的框心** ✓（一个字不许挪 ✗）；
@@ -5246,43 +4703,425 @@ def test_velocity_lost_seat_follows_group():
              len(_lost.get("areas") or []), _areas0))
 
 
+def test_quant_pair_uint8_no_overflow():
+    """⭐⭐⭐⭐⭐ **`_quant_pair` 的 `uint8` 溢出** ✗✗（**实测抓到的真 bug** ✓ 用户 2026-10-08 ✓
+    原话："**单独修 + 补钉子**" ✓✓）。
+
+    ⚠⚠ **病根**：`pick_white` 喂进来的是**灰度原值**（`uint8` ✓）⇒ 中位那两个中项相加是
+      **uint8 相加** ✗ ⇒ `250 + 250 = 244` **回绕** ✗ ⇒ 中位被压到 **122** ✗ ⇒ 白度那两道
+      相对门（`_lo` / `_med` ✓）整条偏 ✗ ⇒ **白块认定跟着抖** ✓（那条
+      `RuntimeWarning: overflow encountered in scalar add` 就是它 ✓ —— 之前一直被当噪声忽略 ✓）。
+    ⚠ 口径**一个字不许变** ✗：`float32` 输入时 `np.float32(x)` 就是原值 ⇒ 与 numpy **逐位一致** ✓
+      （见那个函数自己那段"照抄 numpy 口径" ✓）。
+    """
+    import warnings
+    _had = warnings.filters[:]
+    warnings.simplefilter("error")                 # ⚠ 溢出警告 ⇒ **当错**（它正是这个 bug 的哨兵 ✓）
+    try:
+        _lo, _med = _LM._quant_pair(np.array([250, 250], np.uint8), 50.0)
+    finally:
+        warnings.filters[:] = _had
+    check(abs(float(_med) - 250.0) < 1e-9 and abs(float(_lo) - 250.0) < 1e-9,
+          "**`uint8` 的两个中项不许回绕** ✓（实测 中位 = **%.0f** ✓ ／ 分位 = **%.0f** ✓ —— "
+          "⚠ 老写法是 `250+250 → 244` ⇒ 中位 **122** ✗✗，白度门就跟着偏 ✓）" % (_med, _lo))
+    _rng = np.random.RandomState(4)
+    _u8 = _rng.randint(0, 256, 4096).astype(np.uint8)
+    _f32 = _rng.rand(4096).astype(np.float32)
+    _k1 = _LM._quant_pair(_u8, 95.0)
+    _k2 = _LM._quant_pair(_f32, 95.0)
+    check(abs(_k1[1] - float(np.median(_u8))) <= 0.5
+          and abs(_k1[0] - float(np.percentile(_u8, 95))) <= 0.5
+          and abs(_k2[0] - float(np.percentile(_f32, 95))) <= 1e-5
+          and abs(_k2[1] - float(np.median(_f32))) <= 1e-6,
+          "**随机 `uint8` / `float32` 都与 numpy 对得上** ✓（uint8 中位 %.1f vs %.1f ／ 分位 %.1f vs "
+          "%.1f ✓；float32 分位 %.6f vs %.6f ✓ —— ⚠ uint8 那条按 ±0.5 量：numpy 走 float64 算 ✓）"
+          % (_k1[1], float(np.median(_u8)), _k1[0], float(np.percentile(_u8, 95)),
+             _k2[0], float(np.percentile(_f32, 95))))
+
+
+def test_velocity_vtx_alarm():
+    """⭐⭐⭐⭐⭐ **"顶点在群体坐标系里的档案"＋异常报警** ✗✗（用户 2026-10-08 ✓ 原话："**每个有编号的
+    假目标上板后是有一份记录的，这份记录数据有它的编号、四个顶点在群体坐标系中的坐标…在不与真目标
+    融合的情况下理应是几乎稳定不变的（即使检出框丢了）**" ＋ "**在日志中将超过波动阈值的顶点打印
+    出来。例如「#6顶点异常波动：左上，{你记录的信息}」**" ✓✓）。
+
+    ⚠⚠ **实测定门**（`10月7日.mp4` ✓ 39160 个顶点样本 ✓）：天然抖动**中位 9.1px / p90 26.5px** ✗
+      （群体坐标系是**估出来的** ⇒ 天生就晃十几像素 ✓）；真被拉扯时 **47~71px** ✓。⇒ 门 =
+      `max(32px, 它自己边长/4, 3 × 它自己平时晃多少)` ✓（一路收紧：46 → 33 → 31 → **6 批/430 帧** ✓，
+      而 #5 帧 348、#6 帧 412 那些**该抓的一个不落** ✓）。
+    钉四件：
+      ① **纯函数那把尺**：`vel_vtx_thr(小框)` = 绝对下限 ✓／`vel_vtx_thr(大框)` = 边长/4 ✓；
+      ② **端到端（真 `VelocityTracker` ✓）**：稳 60 拍立档 ⇒ 猛拉（100×100 → 100×300 ✓）⇒
+         **报出来** ✓ 且**四个角都报** ✓、文案带"顶点异常波动"＋角名＋偏离＋门＋群体坐标 ✓；
+      ③ **不刷屏**：再喂 20 拍**同一个**猛拉框 ⇒ **只报那一批** ✗（一次异常一行 ✓ 回门内才重新武装 ✓）；
+      ④ ⭐ **"顶点在群体坐标系里的坐标"那把尺** `vel_vtx_group` ✓（用户 2026-10-08 ✓ 当日第二次点名：
+         "**增加功能：点选检出框时，显示 4 个顶点的群体坐标系坐标**" ✓✓）—— ⚠ 它**同时**是①**档案**
+         与②**演示窗"点选"面板**的**唯一口径** ✓（两处必须逐项一致 ✓ 不然用户点着面板核不了日志 ✗）；
+      ⑤ ⭐ **"顶点记录" = 窗口内的 min / max / 中位** ✓（用户 2026-10-08 ✓ 第三条原话见 `_VGRP_WIN` ✓）
+         —— `vel_vtx_band` ✓：min/max/中位都留 ✓、报的时候**把本次事件自己摘掉** ✓、空 ⇒ `None` ✓；
+      ⑥ **报警行里真带上那句「它自己常态 …」** ✓；⑦ **记录跨丢框存活** ✓（丢 3 拍后样本一条不少 ✓）。
+    """
+    # ---- ① 纯函数 ----
+    check(abs(_LM.vel_vtx_thr(80.0) - float(_LM._VGRP_DEV_MIN)) < 1e-6
+          and abs(_LM.vel_vtx_thr(400.0) - 100.0) < 1e-6,
+          "① **门 = `max(绝对下限 %.0f, 边长/4)`** ✓（80px 的框 ⇒ **%.0f** ✓〔走下限 ✓〕；"
+          "400px 的框 ⇒ **%.0f** ✓〔走边长/4 ✓〕）"
+          % (float(_LM._VGRP_DEV_MIN), _LM.vel_vtx_thr(80.0), _LM.vel_vtx_thr(400.0)))
+    # ---- ③' **顶点偏离那道门：比例必须真的能动** ✗✗（用户 2026-10-08 ✓ 原话："**还是改不了 2.5 倍
+    #   顶点偏离比例**" ✓✓）—— 老式子 `max(32, k×常态)` 里那个 **32 会把比例压死** ✗（实测 #6 常态
+    #   只有 12.1px ⇒ 2.5×12.1 = 30.3 < 32 ✗ ⇒ 改 3.0/2.5/2.0/1.5 跑全片都只报 **1 拍** ✓）。
+    _k0 = float(_LM._VGRP_SELF_K_DEF)
+    _g_def = _LM.vel_vtx_gate(400.0, 10.0, _k0)
+    check(abs(_g_def - max(_LM.vel_vtx_thr(400.0), _k0 * 10.0)) < 1e-6,
+          "③' **默认比（%.1f）时 = 老口径 `max(边长门, k×常态)`** ✓（实测 %s ✓〔默认行为一个字不差 ✓〕）"
+          % (_k0, _g_def))
+    #   夹具：常态取 **0**（= 绝对门那一支说了算 ✓）—— 老式子下这四档**全是 32** ✗（比例完全不动 ✗）；
+    #   新式子下必须**跟着比例走** ✓。
+    _gs = [_LM.vel_vtx_gate(100.0, 0.0, _x) for _x in (3.0, 2.5, 2.0, 1.5)]
+    check(_gs[0] > _gs[1] > _gs[2] > _gs[3]
+          and all(abs(a - b) > 0.5 for a, b in zip(_gs, _gs[1:])),
+          "③' **常态 = 0 时，门也必须跟着比例走** ✓（实测 %s ✓ —— ⚠ 老式子这里恒等于 "
+          "%.0f ✗✗：用户「改不了」就是它 ✓）" % (_gs, float(_LM._VGRP_DEV_MIN)))
+    # ---- ④ 顶点坐标那把尺（纯函数 ✓ 用户 2026-10-08 ✓）----
+    #   夹具：框心 (300,200)、100×80、相机累计 (50,30) ⇒
+    #     左上 = (300 − 50 − 50, 200 − 40 − 30) = **(200,130)** ✓；右上 **(300,130)** ✓；
+    #     右下 **(300,210)** ✓；左下 **(200,210)** ✓（顺序 = 左上/右上/右下/左下 ✓ 与日志同一顺序 ✓）。
+    _g4 = _LM.vel_vtx_group(300.0, 200.0, 100.0, 80.0, (50.0, 30.0))
+    check(_g4 == ((200.0, 130.0), (300.0, 130.0), (300.0, 210.0), (200.0, 210.0)),
+          "④ **顶点 = 画面顶点 − 相机累计** ✓（顺序 左上/右上/右下/左下 ✓ 实测 %s ✓ —— ⚠ 演示窗"
+          "「点选检出框」那个面板走的**就是这一个函数** ✓ ⇒ 面板上的数**就是**日志里的数 ✓）"
+          % (_g4,))
+    check(_LM.vel_vtx_group(300.0, 200.0, 100.0, 80.0, (0.0, 0.0))[0] != _g4[0],
+          "④ **相机累计真的减进去了** ✗（同一格、相机取 (0,0) ⇒ 左上 %s ≠ %s ✓ —— ⚠ 别写成"
+          "「扣掉相机」却扣了个 0 ✗）"
+          % (_LM.vel_vtx_group(300.0, 200.0, 100.0, 80.0, (0.0, 0.0))[0], _g4[0]))
+    # ---- ⑤ **「顶点记录」：窗口内的 min / max / 中位**（用户 2026-10-08 ✓ 第 3 条 ✓）----
+    _sm = [(0.0, 10.0, 100.0), (1.0, 20.0, 102.0), (2.0, 30.0, 104.0), (3.0, 40.0, 106.0)]
+    check(_LM.vel_vtx_band(_sm) == (10.0, 40.0, 25.0, 100.0, 106.0, 103.0),
+          "⑤ **记录 = 窗口内的 min / max / 中位** ✓（实测 %s ✓〔x：10/40，中位 25 ✓ 走 `np.median` "
+          "✓ 偶数个样本取中间两个的平均 ✓ 别自己写「取第 n/2 个」✗〕）" % (_LM.vel_vtx_band(_sm),))
+    check(_LM.vel_vtx_band(_sm, 1.0) == (10.0, 20.0, 15.0, 100.0, 102.0, 101.0),
+          "⑤ **报「常态」时把本次事件自己摘掉** ✓（`skip_after=1` ⇒ 只算 t≤1 的样本：%s ✓ —— "
+          "⚠ 不摘的话**突变自己就成了新的 max** ⇒ 报出来的「常态」是假的 ✗）"
+          % (_LM.vel_vtx_band(_sm, 1.0),))
+    check(_LM.vel_vtx_band([]) is None and _LM.vel_vtx_band(None) is None,
+          "⑤ **一个样本都没有 ⇒ `None`** ✓（刚上板那几拍 ⇒ 日志里**不写这一段** ✓ 不猜 ✗）")
+    # ---- ⑥ 端到端：报警行里真的带上「它自己常态」✓ ----
+    #   ⚠ 这份夹具**自己带一张空图** ✗（这段在 ②③ 之前 ✓ 那里也有一个 `_blank` ✓ 别抢名 ✓）。
+    _blk = np.zeros((100, 200, 3), np.uint8)
+    _t6 = _LM.VelocityTracker(mode="velocity")
+    _t6.frame_wh = (889.0, 500.0)
+    for _i in range(60):
+        _t6.process(_blk, dets=[[0, 400.0, 250.0, 100.0, 100.0, 0.9]], idx=_i)
+    _l6 = ""
+    for _i in range(60, 84):
+        _t6.process(_blk, dets=[[0, 400.0, 250.0, 100.0, 300.0, 0.9]], idx=_i)
+        if _t6.log_text and "顶点异常波动" in _t6.log_text:
+            _l6 = _t6.log_text
+            break
+    check("常态 x[" in _l6 and "中" in _l6,
+          "⑥ **报警行里带上「它自己常态 x[..]中.. y[..]中..」** ✓（实测 …%s）—— ⚠ 用户就是拿它"
+          "**自己定「多大算没变」** ✓（见 `_VGRP_WIN` ✓）" % (_l6[-96:],))
+    # ---- ⑦ 「顶点记录」跨丢框存活（用户那句"即使检出框丢了" ✓）----
+    _t7 = _LM.VelocityTracker(mode="velocity")
+    _t7.frame_wh = (889.0, 500.0)
+    for _i in range(6):
+        _t7.process(_blk, dets=[[0, 400.0, 250.0, 100.0, 100.0, 0.9]], idx=_i)
+    _tid7 = next(iter(_t7._seats))
+    _n7 = len(list(_t7._seats[_tid7]["vhist"][0]))
+    for _i in range(6, 9):                       # 丢 3 拍（这一拍一个框都没有 ✓）
+        _t7.process(_blk, dets=[], idx=_i)
+    _n7b = len(list(_t7._seats[_tid7]["vhist"][0]))
+    check(_n7 >= 4 and _n7b == _n7,
+          "⑦ **「顶点记录」跨丢框存活** ✓（丢框前 **%d** 条样本 ⇒ 丢 3 拍后还是 **%d** 条 ✓："
+          "⚠ 丢框那几拍**只搬不更新** ✗ —— 队列被清掉的话「常态范围」就没了 ✗）" % (_n7, _n7b))
+    # ---- ⑧ **可见性"一个顶点一个"** ＋ **记录只记看得见的那些** ✗✗（用户 2026-10-08 ✓ 第 2 条：
+    #   "**#6 的异常从 402 帧开始持续到 409 帧，这期间只有右下顶点是理应是正常的（虽然在屏幕外面），
+    #   但是你却没有正常把他记录下来**" ✓✓）----
+    _roi8 = (200.0, 100.0, 500.0, 300.0)
+    check(_LM.vtx_vis4(300.0, 200.0, 100.0, 100.0, None, (600.0, 400.0))
+          == (True, True, True, True),
+          "⑧ **没给框选区域 ⇒ 退回按画面判** ✓（四角都在画面里 ⇒ 全可见 ✓）")
+    check(_LM.vtx_vis4(300.0, 200.0, 100.0, 100.0, _roi8, None)
+          == (True, True, True, True),
+          "⑧ **整框在框选区域里 ⇒ 四个顶点都可见** ✓")
+    _v8 = _LM.vtx_vis4(300.0, 280.0, 100.0, 100.0, _roi8, None)
+    check(_v8 == (True, True, False, False),
+          "⑧ **底边压着框选区下沿 ⇒ 只剩上面两个顶点可见** ✓（实测 %s ✓ —— 用户 #6 那格"
+          "**从帧 399 起**就是这个样子 ✓〔我实测：帧 399 的可见性 = `1100` ✓〕）" % (_v8,))
+    _t8 = _LM.VelocityTracker(mode="velocity", roi=_roi8)
+    _t8.frame_wh = (600.0, 400.0)
+    _blk8 = np.zeros((100, 200, 3), np.uint8)
+    for _i in range(6):
+        _t8.process(_blk8, dets=[[0, 300.0, 280.0, 100.0, 100.0, 0.9]], idx=_i)
+    _s8 = _t8._seats[min(_t8._seats)]
+    _c8 = [len(list(_s8["vhist"][_j])) for _j in range(4)]
+    check(_c8[0] > 0 and _c8[1] > 0 and _c8[2] == 0 and _c8[3] == 0,
+          "⑧ **只记看得见的那两个顶点** ✓（四个队列的样本数 = %s ✓ —— ⚠⚠ 老口径是"
+          "「四角全可见才记」✗✗ ⇒ 一格里**看得见的那两个也没被记** ✗ 用户点名的就是这个 ✓）"
+          % (_c8,))
+    # ---- ②③ 端到端 ----
+    _blank = np.zeros((100, 200, 3), np.uint8)
+    _t = _LM.VelocityTracker(mode="velocity")
+    _t.frame_wh = (889.0, 500.0)
+    for _i in range(60):                     # 稳 60 拍（立档 ✓ 也够攒"标准面积" ✓）
+        _t.process(_blank, dets=[[0, 400.0, 250.0, 100.0, 100.0, 0.9]], idx=_i)
+    _hit = []
+    for _i in range(60, 84):                 # ⚠ 猛拉：100×100 → 100×300（4 个角各动 100px ✓）
+        _t.process(_blank, dets=[[0, 400.0, 250.0, 100.0, 300.0, 0.9]], idx=_i)
+        if _t.log_text and "顶点异常波动" in _t.log_text:
+            _hit.append((_i, _t.log_text))
+    _line = _hit[0][1] if _hit else ""
+    check(len(_hit) == 1 and all(_nm in _line for _nm in ("左上", "右上", "右下", "左下"))
+          and "群体坐标" in _line and "偏离" in _line,
+          "② **猛拉一个角也拉不动、四个角一起动 ⇒ 报一行** ✓（总共 **%d 批** ✓〔该 1 ✓〕；文案 = "
+          "%s）" % (len(_hit), (_line[:90] + "…") if _line else "**没报** ✗"))
+    #   ⚠ **"缓过来"要够长** ✗（实测踩到 ✓ 只缓 16 拍 ⇒ **不再报** ✗）：两个原因叠加 · 基准 EMA
+    #     要 ~2 秒才归位 ✓ · 而且"它自己平时晃多少"那个 1.5 秒窗口里**还留着刚才那次大值** ✗
+    #     ⇒ 门被顶高 ✓ ⇒ 所以这里缓 **66 拍（≈2.7 秒 ✓）** 再来 ✓。
+    for _i in range(84, 150):                # 缓过来（100×100 ✓ 够 2.7 秒 ✓）
+        _t.process(_blank, dets=[[0, 400.0, 250.0, 100.0, 100.0, 0.9]], idx=_i)
+    _hit2 = []
+    for _i in range(150, 170):               # 同样的猛拉**再来一次** ⇒ 该**再报一批** ✓
+        _t.process(_blank, dets=[[0, 400.0, 250.0, 100.0, 300.0, 0.9]], idx=_i)
+        if _t.log_text and "顶点异常波动" in _t.log_text:
+            _hit2.append(_i)
+    check(len(_hit) == 1 and len(_hit2) == 1,
+          "③ **「一次异常一行」＋「缓过来重新武装」** ✓（同一个猛拉连拉 24 拍 ⇒ **只 1 批** ✓；"
+          "回到正常 **66 拍（≈2.7 秒 ✓ 基准与「平时」窗口都归位 ✓）** 后再猛拉一次 ⇒ **又 1 批** ✓"
+          "〔实测 %d / %d ✓〕）"
+          % (len(_hit), len(_hit2)))
+
+
+def test_velocity_dup_detection():
+    """⭐⭐⭐⭐⭐ **速度跟踪档：YOLO 重复检出 ⇒ 只留更大的那个** ✗✗（用户 2026-10-08 ✓ 原话：
+    "**以下 2 个框是重复检出，需要判定并排除干扰，保留更大的**" ✓✓）。
+
+    用户给的那两格（**帧 408 ✓ 真素材实测**）：`113×113 @(580,344)` 与 `110×80 @(582,360)`
+      —— 小的（110×80）**整个**落在大的里 ⇒ 覆盖率 **1.00** ✓ ⇒ **丢小的、留大的** ✓。
+    钉四件：
+      ① **判得出来** ✓（`dups` 一条 ✓ 宿主 = 大的那格 ✓ 覆盖率 ≈ 1.00 ✓）；
+      ② **小的不许占一条座位** ✗（同一块砖投两票 ⇒ 会把"群体中位位移"与"标准面积"带歪 ✗）；
+      ③ **留下的是大的** ✓（那条座位的宽高 = **113×113** ✓ 不是 110×80 ✗）；
+      ④ ⚠⚠ **布局陷阱**（**实测踩到** ✓）：`_dedup` / `_cover` 认的是**原始检出布局**
+         `(类别, cx, cy, w, h, …)` ✓（取 `[1][2]` 当框心、`[3][4]` 当宽高 ✓），而这一档的 `_bs`
+         是**去掉类别**的 ⇒ **必须补一个第 0 位** ✓ —— 不补 ⇒ 索引整体错位 ⇒ **一个都判不出来** ✗
+         （我第一版实测：帧 408 那对**一格不报** ✗，反而报出一堆"高 1px 的细条" ✓）。这条就是咬它的 ✓。
+    """
+    _fw = (889.0, 500.0)
+    _blank = np.zeros((100, 200, 3), np.uint8)
+    _big = [0, 580.0, 344.0, 113.0, 113.0, 0.29]
+    _small = [0, 582.0, 360.0, 110.0, 80.0, 0.26]
+    _other = [0, 400.0, 250.0, 100.0, 100.0, 0.9]
+    _t = _LM.VelocityTracker(mode="velocity")
+    _t.frame_wh = _fw
+    for _i in range(3):
+        _t.process(_blank, dets=[_big, _small, _other], idx=_i)
+        if _i == 0:
+            check(len(_t.dups) == 1
+                  and abs(float(_t.dups[0][0]) - 582.0) < 1e-6
+                  and abs(float(_t.dups[0][2]) - 110.0) < 1e-6
+                  and abs(float(_t.dups[0][4]) - 580.0) < 1e-6
+                  and float(_t.dups[0][6]) >= 0.99,
+                  "① **110×80 那格判成重复** ✓（`dups` = %s ⇒ 宿主 (%.0f,%.0f) ✓ 覆盖率 **%.2f** ✓）"
+                  "—— ⚠ 布局错位的话这里就是空的 ✗"
+                  % (["(%.0f,%.0f %.0fx%.0f→宿主 %.0f,%.0f 覆盖 %.2f)"
+                      % (_r[0], _r[1], _r[2], _r[3], _r[4], _r[5], _r[6]) for _r in _t.dups],
+                     float(_t.dups[0][4]) if _t.dups else 0.0,
+                     float(_t.dups[0][5]) if _t.dups else 0.0,
+                     float(_t.dups[0][6]) if _t.dups else 0.0))
+    _ids = sorted(_t._seats)
+    _wh = [tuple(round(float(_v), 0) for _v in _t._seats[_k]["wh"]) for _k in _ids]
+    check(len(_ids) == 2 and (113.0, 113.0) in _wh and (110.0, 80.0) not in _wh,
+          "②③ **只留两条座位、且留下的是大的那格** ✓（座位 %d 条 ✓〔该 2 ✓：大的 ＋ 那格无关的 ✓〕；"
+          "尺寸 %s ✓〔该有 (113,113) ✓ 不该有 (110,80) ✗〕）" % (len(_ids), _wh))
+    check(_LM._dedup([(0, 582.0, 360.0, 110.0, 80.0), (0, 580.0, 344.0, 113.0, 113.0)])[1] == [False, True],
+          "④ **`_dedup` 要的是原始布局**（第 0 位 = 类别 ✓）：按这个布局递进去 ⇒ "
+          "`keep = [False, True]` ✓（**去掉类别**再递 ⇒ `[True, True]` ✗ 一个都不判 ✓ 那就是我"
+          "踩过的错位 ✓）")
+    #   ⚠⚠ **两道门一起**：①`host_k`（宿主"跟它大小差不多" ✓ 110×80 ÷ 113×113 = **1.45** ✓ ≤ 1.7 ✓）
+    #     ⇒ 还是丢 ✓；②**反向**：宿主是**"并集框"**（比小框大得多 ⇒ 那是**两块砖** ✓）⇒ **一块都不许丢** ✗✗
+    #     （**新钉子当场咬住** ✓：融合期并集框盖着两块砖 ⇒ 不设门 ⇒ 每块砖都被丢掉 ⇒ **融合再也分不开** ✗）。
+    check(_LM._dedup([(0, 582.0, 360.0, 110.0, 80.0), (0, 580.0, 344.0, 113.0, 113.0)],
+                     host_k=_LM._DUP_HOST_K)[1] == [False, True],
+          "④ **门放开一点也照样丢** ✓（`host_k = %.1f` ✓ 比值 **1.45** ≤ 它 ✓）" % _LM._DUP_HOST_K)
+    _keep_u = _LM._dedup([(0, 400.0, 250.0, 60.0, 60.0), (0, 470.0, 250.0, 300.0, 60.0)],
+                         host_k=_LM._DUP_HOST_K)[1]
+    check(_keep_u == [True, True],
+          "④ **反向：宿主是并集框（300×60 ÷ 60×60 = 5.0 ⇒ 两块砖）⇒ 一块砖都不丢** ✓✗（实测 %s ✓ "
+          "—— ⚠ 没有这道门的话这里会是 `[False, True]` ✗ ⇒ 融合期每块砖都被丢掉 ⇒ 分不开 ✗）"
+          % (_keep_u,))
+
+
+def test_velocity_fuse_split_viz():
+    """⭐⭐⭐⭐⭐ **拆框可视化** ✗✗（用户 2026-10-08 ✓ 原话："**需要你把拆框的结构可视化，表现为将
+    大融合框绘制成 2 个重叠框：与假目标检出框记录顶点、尺寸一致的洋红色框 ＋ 真目标认领的红色框，
+    并标上编号**" ✓✓）。
+
+    钉三件：
+      ① `vel_rec_box`（**记录框** ✓ 纯函数）：中心 = 四角**各自的中位**再平均 ＋ 相机累计 ✓、
+         边长 = √标准面积 ✓；**缺标准面积 / 过滤后没样本 ⇒ `None`** ✓（不猜 ✗）；
+      ② `vel_fuse_two`（**拆两块** ✓ 纯函数）：大框 200×100 ＋ 记录框在左半边 ⇒ **红框摆到右半边** ✓
+         （"剩下那块 = 真目标占据" ✓；⚠ 也钉一下"记录框在右 ⇒ 红框摆左" ✓ 免得写死方向 ✗）；
+      ③ **不够大 ⇒ 只给一块** ✓（`real_box is None` ✓ —— 演示窗就只画洋红 ✓）；
+      ④ 端到端：真 `VelocityTracker` 喂出"框被撑到两块宽"那一拍 ⇒ 出口 `fuse_split` 里**有它** ✓，
+         且洋红框 = **记录框**（不是当前那个大框 ✗）、红框 = **同一尺寸、摆在另一头** ✓。
+    """
+    # ---- ① 记录框 ----
+    _vh = [[(0.0, 100.0, 200.0), (1.0, 102.0, 202.0)],
+           [(0.0, 200.0, 200.0), (1.0, 202.0, 202.0)],
+           [(0.0, 200.0, 300.0), (1.0, 202.0, 302.0)],
+           [(0.0, 100.0, 300.0), (1.0, 102.0, 302.0)]]
+    _b1 = _LM.vel_rec_box(_vh, 10000.0, (10.0, 5.0))
+    check(_b1 == (161.0, 256.0, 100.0, 100.0),
+          "① **记录框 = 四角各自中位 ⇒ 平均 ＋ 相机累计，边长 = √标准面积** ✓（实测 %s ✓"
+          "〔中心 (151,251) ＋ cam(10,5) = (161,256) ✓ 边长 √10000 = 100 ✓〕）" % (_b1,))
+    check(_LM.vel_rec_box(_vh, None, (0.0, 0.0)) is None
+          and _LM.vel_rec_box(_vh, 100.0, (0.0, 0.0), skip_after=-1.0) is None,
+          "① **缺标准面积 / 过滤后一个样本都不剩 ⇒ `None`** ✓（不猜 ✗ —— 编一个中心出来就是假信息 ✓）")
+    # ---- ② 拆两块 ----
+    _f2, _r2 = _LM.vel_fuse_two((300.0, 200.0, 200.0, 100.0), (250.0, 200.0, 100.0, 100.0))
+    check(_f2 == (250.0, 200.0, 100.0, 100.0) and _r2 == (350.0, 200.0, 100.0, 100.0),
+          "② **大框 200×100 ＋ 记录框在左半边 ⇒ 红框摆到右半边** ✓（实测 洋红 %s ／ 红 %s ✓"
+          "〔「剩下空的代表是真目标占据」✓ 他 2026-10-05 那句的字面 ✓〕）" % (_f2, _r2))
+    _f2b, _r2b = _LM.vel_fuse_two((300.0, 200.0, 200.0, 100.0), (350.0, 200.0, 100.0, 100.0))
+    check(_r2b == (250.0, 200.0, 100.0, 100.0),
+          "② **反过来（记录框在右）⇒ 红框摆左** ✓（实测 %s ✓ —— ⚠ 方向写死就错一边 ✗）" % (_r2b,))
+    _f2c, _r2c = _LM.vel_fuse_two((300.0, 200.0, 100.0, 200.0), (300.0, 250.0, 100.0, 100.0))
+    check(_r2c == (300.0, 150.0, 100.0, 100.0),
+          "② **竖着在分 ⇒ 红框摆上/下那一头** ✓（实测 %s ✓〔记录框在下 ⇒ 红框摆上 ✓〕）" % (_r2c,))
+    # ---- ③ 不够大 ⇒ 只给一块 ----
+    _f3, _r3 = _LM.vel_fuse_two((300.0, 200.0, 120.0, 100.0), (300.0, 200.0, 100.0, 100.0))
+    check(_f3 == (300.0, 200.0, 100.0, 100.0) and _r3 is None,
+          "③ **大框还没到一个目标 ×`_VFUS_BIG_K`（%.1f）⇒ 只给洋红、红框 `None`** ✓"
+          "（实测 %s ／ %s ✓ —— 演示窗据此**只画一块** ✓ 不硬编第二个框 ✗）"
+          % (float(_LM._VFUS_BIG_K), _f3, _r3))
+    # ---- ④ 端到端 ----
+    _fk = _LM.VelocityTracker(mode="velocity")
+    _fk.frame_wh = (900.0, 600.0)
+    _blk = np.zeros((120, 240, 3), np.uint8)
+    for _i in range(14):                       # 先攒够"它自己那份标准面积"（100×100 ✓）
+        _fk.process(_blk, dets=[[0, 300.0, 300.0, 100.0, 100.0, 0.9]], idx=_i)
+    _tid4 = min(_fk._seats)
+    _sa4 = float(_fk._seats[_tid4].get("std_area") or 0.0)
+    for _i in range(14, 20):                   # 撑成"两块宽"（200×100 ✓ = 两块并排 ✓）
+        _fk.process(_blk, dets=[[0, 300.0, 300.0, 200.0, 100.0, 0.9]], idx=_i)
+    #   ⚠⚠ **这里改成"注入状态"再调 `_split_now`** ✗✗（**实测** ✓）：合成序列喂不出"开局锁定"
+    #     （`self.pos` 恒 `None` ✓）⇒ 加了"必须压着圆"那道门之后 ⇒ 清单恒空 ✗ ⇒ 老夹具直接 NG ✗。
+    #     ⇒ 自己摆好一条座位（`c/wh/std_area/vhist` ✓ 记录顶点用群坐标 ✓ cam 取 0 ✓）＋ 圆 ✓。
+    _fk.pos, _fk.rad, _fk.locked_tid = (300.0, 300.0), 36.9, int(_tid4)
+    _fk._cam_arc, _fk._t = (0.0, 0.0), 0.0
+    _fk._split_viz = []
+    _fk._split_clamp()
+
+    def _seat4(_cx, _cy, _w, _h, _sa):
+        _hw, _hh = float(_w) / 2.0, float(_h) / 2.0
+        return {"c": (float(_cx), float(_cy)), "wh": (float(_w), float(_h)),
+                "std_area": float(_sa), "miss": 0, "lab": True, "fm": {},
+                "vhist": [[(0.0, _cx - _hw, _cy - _hh)], [(0.0, _cx + _hw, _cy - _hh)],
+                          [(0.0, _cx + _hw, _cy + _hh)], [(0.0, _cx - _hw, _cy + _hh)]]}
+
+    _fk._seats = {int(_tid4): _seat4(300.0, 300.0, 200.0, 100.0, 10000.0)}
+    _fs4 = _fk._split_now()
+    _e4 = next((_e for _e in _fs4 if int(_e.get("tid") or 0) == int(_tid4)), None)
+    check(_e4 is not None and float(_e4["box"][2]) < 150.0
+          and _e4["real_box"] is not None and abs(float(_e4["real_box"][2]) - float(_e4["box"][2])) < 1e-6,
+          "④ **出口 `fuse_split` 给出拆好的两块** ✓（实测 洋红 %s ／ 红 %s ✓〔标准面积 %.0f ⇒ 边长 "
+          "%.0f ✓〕）—— ⚠ 洋红必须是**记录框**（约一个目标那么大 ✓）✗，不是当前那个 200 宽的大框 ✗"
+          % (None if _e4 is None else _e4["box"], None if _e4 is None else _e4["real_box"],
+             _sa4, math.sqrt(max(1.0, _sa4))))
+    # ---- ⑤ **夹进红框那把尺**（纯函数 ✓ 用户 2026-10-08 ✓："**拆框的第一拍将圆夹取到红框内**" ✓✓）----
+    check(_LM.vel_box_clamp((300.0, 300.0), (350.0, 300.0, 100.0, 100.0), 20.0) == (320.0, 300.0),
+          "⑤ **圆在框左边之外 ⇒ 夹到「框左边 ＋ 一个半径」** ✓（实测 %s ✓〔整圈落进框里 ✓〕）"
+          % (_LM.vel_box_clamp((300.0, 300.0), (350.0, 300.0, 100.0, 100.0), 20.0),))
+    check(_LM.vel_box_clamp((350.0, 300.0), (350.0, 300.0, 100.0, 100.0), 20.0) == (350.0, 300.0),
+          "⑤ **圆本来就在框里 ⇒ 一个字不动** ✓（实测 %s ✓ —— ⚠ 别写成「每拍都夹到框心」✗）"
+          % (_LM.vel_box_clamp((350.0, 300.0), (350.0, 300.0, 100.0, 100.0), 20.0),))
+    check(_LM.vel_box_clamp((300.0, 300.0), (350.0, 300.0, 100.0, 100.0), 80.0) == (350.0, 300.0),
+          "⑤ **圈比框还大 ⇒ 退化成「夹到框心」** ✓（实测 %s ✓〔不出现负的允许区把圆推到框外 ✗〕）"
+          % (_LM.vel_box_clamp((300.0, 300.0), (350.0, 300.0, 100.0, 100.0), 80.0),))
+    # ---- ⑥ ⭐ **"不跟圆相交 ⇒ 不是融合框、不拆"** ✗✗（用户 2026-10-08 ✓ 原话："**不跟圆相交不会
+    #   被判定为融合框→不是融合框不用拆框，以下纯属误检**" ✓✓ —— 他给的帧 219 那格 25×51、
+    #   `圆矩IoU 0.00` ✗ 就是这一笔 ✓）----
+    #   夹具（注入状态 ✓ 同上）：真目标那格**压着圆** ✓ ＋ **另一格很大、但离圆 500px** ✗。
+    _f6 = _fk                                  # ⚠ 复用上面那台（`_seats` 我等会儿自己重摆 ✓）
+    _f6._seats = {1: _seat4(300.0, 300.0, 200.0, 100.0, 10000.0),     # 压着圆 ✓ 该拆 ✓
+                  2: _seat4(800.0, 80.0, 200.0, 100.0, 10000.0)}      # 离圆 500px ✗ 不该拆 ✗
+    _fs6 = _f6._split_now()
+    _tids6 = sorted(int(_e["tid"]) for _e in _fs6)
+    check(_tids6 == [1],
+          "⑥ **只有「压着圆」的那一格进清单** ✓（实测 %s ✓ —— ⚠ 离圆 500px 的那格（200×100 ✓、"
+          "面积比也够 ✓）**一个都不许进** ✗✗：老版按尺寸判 ⇒ 它就冒出来了 ✓ = 用户那笔帧 219 误检 ✓）"
+          % (_tids6,))
+    # ---- ⑦ **"第一拍"三个字：只夹一次** ✗✗（用户 2026-10-08 ✓ 同上原话 ✓）----
+    _f7 = _f6
+    #   ⚠ 清单要**趁圆还压着框的时候**算 ✗（圆一挪走 ⇒ 那道门就把这条筛掉了 ✗ 实测踩到 ✓）——
+    #     算完再把圆摆到框外 ⇒ 看"夹不夹" ✓。
+    _f7.pos, _f7.rad, _f7._split_seen = (300.0, 300.0), 36.9, set()
+    _f7._split_viz = _f7._split_now()
+    _e7 = next((_e for _e in _f7._split_viz if int(_e["tid"]) == 1), None)
+    _f7.pos = (595.0, 165.0)                   # 圆摆到红框外 ✓
+    _f7._split_clamp()                         # 第 1 拍 ⇒ 该夹 ✓
+    _p7 = (float(_f7.pos[0]), float(_f7.pos[1]))
+    _f7.pos = (595.0, 165.0)                   # 假装它又漂了出去 ✓
+    _f7._split_clamp()                         # 第 2 拍（还在拆 ✓）⇒ **不许再夹** ✗
+    check(_e7 is not None and _e7.get("real_box") is not None
+          and _p7 != (595.0, 165.0) and float(_f7.pos[0]) == 595.0 and float(_f7.pos[1]) == 165.0,
+          "⑦ **第一拍夹进红框 ✓、第二拍不再夹 ✓**（第 1 拍：(595,165) ⇒ **%s** ✓ 落在红框 %s 里 ✓；"
+          "第 2 拍：故意摆回 (595,165) ⇒ **它没被动** ✓〔实测仍 %s ✓〕—— ⚠ 每拍都夹 = 把圆钉死 ✗）"
+          % (tuple(round(float(x), 1) for x in _p7),
+             None if _e7 is None else tuple(round(float(x), 1) for x in _e7["real_box"]),
+             (round(float(_f7.pos[0]), 1), round(float(_f7.pos[1]), 1))))
+
+
+def test_velocity_box_in_roi():
+    """⭐⭐⭐ **"这一格整框在不在「框选区域」里"那把尺** ✗✗（用户 2026-10-08 ✓）。
+
+    用户原话："**当有编制的假目标检出框有部分到了视野外时，我们也要把记录的那部分灰框绘制
+    出来**" ✓✓ —— ⚠ 他嘴里的"视野"**实测指框选区域** ✓：拿"画面边"量，整条素材 **797 帧里一次
+    都不触发** ✗（框选区域本来就在画面里头 ✓）；而 #6 那格正好压着框选区下边沿 ✓。
+    钉三件：① 整框在里面 ⇒ 真 ✓；② **压出边界一点** ⇒ 假 ✓（= 要补灰框那种 ✓）；
+    ③ `None` / 空 ⇒ **恒真** ✓（= "整幅"的老行为 ✓ 没框选时一个像素都不多画 ✓）。
+    """
+    _roi = (100.0, 50.0, 300.0, 250.0)
+    check(bool(_LM.box_in_roi(200.0, 150.0, 40.0, 40.0, _roi))
+          and not bool(_LM.box_in_roi(115.0, 150.0, 40.0, 40.0, _roi))
+          and bool(_LM.box_in_roi(200.0, 150.0, 40.0, 40.0, None))
+          and bool(_LM.box_in_roi(200.0, 150.0, 40.0, 40.0, ())),
+          "① 整框在框选区里 ⇒ **真** ✓；② 压出边界（框 `(115,150)` 40×40 ⇒ 左边界 95 < 100 ✓）"
+          " ⇒ **假** ✓〔= 要补灰框那种 ✓〕；③ `None` / 空 ⇒ **恒真** ✓（= 整幅 ✓ 老行为 ✓）")
+
+
 def main():
     print("运动不合群（YOLO 候选 + 偏离群体中位）自检：")
+    test_quant_pair_uint8_no_overflow()
+    test_velocity_vtx_alarm()
+    test_velocity_fuse_split_viz()
+    test_velocity_dup_detection()
     test_picks_the_odd_one()
     test_wave_immune()
     test_briefly_missing_keeps_pos()
     test_white_helper()
     test_white_locks_target()
     test_white_flash_ignored()
-    test_white_area_floor_real_clip()
     test_far_revival_not_labeled()
-    test_real_clip_far_revival_not_labeled()
     test_small_dup_never_new_track()
     test_seat_survives_long_loss()
-    test_real_clip_seat_never_empty()
     test_fuse_keep_whole_circle_inside()
-    test_pick_white_fastpath_matches_reference()
     test_dets_worker_prefers_gpu()
     test_log_never_raises_on_missing_q()
     test_roi_limits_everything()
     test_rel_arrow_uses_final_pos_in_fusion()
     test_fuse_clamp_never_touches_velocity()
-    test_fuse_second_clamp_recomputes_velocity()
     test_edge_turn_keeps_speed_magnitude()
     test_fusion_box_owner_is_fake_target()
     test_forced_claim_never_takes_others_seat()
-    test_real_clip_arrow_no_jump_on_state_switch()
     test_orphan_box_reports_nearby_track()
     test_pair_by_overlap_not_only_center()
     test_seat_yields_held_box()
-    test_real_clip_clamp_vel_capped()
-    test_real_clip_fusion_arrow_moves()
     test_circle_intersect_box_position_trusted()
-    test_real_clip_circle_intersect_box_trusted()
-    test_brick_vr_always_zero()
     test_gap_reentry_dev_uses_crowd_baseline()
     test_fuse_guide_switch()
-    test_real_clip_gap_reentry()
     test_clamp_protection_when_own_clean()
     test_params_really_work()
     test_runner_same_shape()
@@ -5299,6 +5138,7 @@ def main():
     test_velocity_rule2_board_gate()
     test_velocity_no_fake_step_after_gap()
     test_velocity_arrow_from_in_view_vertices()
+    test_velocity_form_metrics_and_merge()
     # ⚠ `test_persist_beats_burst()` 已删（持续性整体移除 ✓ 见它原位那段注释 ✓）
     test_has_tgt_geometry()
     test_std_area_ignores_edge_and_merged()
@@ -5325,7 +5165,6 @@ def main():
     test_forced_claim_rule()
     # ⚠ `test_persist_skips_fused_frames()` 已删（同上 ✓）
     test_pos_rel_is_group_relative()
-    test_real_clip_smoke()
     if _FAILED:
         print("自检：%d 条失败" % _FAILED)
         return 1

@@ -258,6 +258,14 @@ _cfg = None
 # 断开期间宁可什么都不发，等重连成功再恢复。
 _blocked = False
 
+#: 最近一次**连后端失败**的原因（人话 ✓；空串 = 没失败过 ✓）—— 给界面 / `behavior.log` 用。
+#: ⚠⚠ 为什么必须留（2026-10-10 ✓ 用户报「**本地ProMicro连接失败**」✗ 而界面只有
+#:   「Pro Micro 连接失败，已回退本地」八股 ✓）：`connect_async` 把异常**整个吞掉**了 ✗
+#:   （`except Exception: status = "fail"` ✓）⇒ **为什么失败**在哪儿都查不到 ✓ 人只能猜 ✓
+#:   —— 现场原因是 `PermissionError(13, 拒绝访问)` = **串口被另一个工作台占着** ✓
+#:   （一个串口只能被一个进程独占 ✓ 而当时有**两个工作台**在跑 ✓）。
+_connect_err = ""
+
 # 换后端（连 / 断 / 重连）**必须串行**：这几件事都是「先关旧的、再建新的」。
 # 两个线程同时做就会出现「一边正在 TLS 握手，另一边把那个 socket 关掉」——
 # 表现是 relay 侧刷「客户端在 TLS 握手阶段断开」（实测踩过：手动的「重置指令通道」
@@ -322,6 +330,57 @@ def use_blocked(why=""):
         _note_net_skip(why or "blocked")
 
 
+def last_connect_err():
+    """最近一次**连后端失败**的原因（人话 ✓；空串 = 没失败过 ✓）—— 见 `_connect_err` ✓。"""
+    return _connect_err
+
+
+def cursor_probe():
+    """**现在光标在哪**（＋ 那台机器的屏幕信息）⇒ `(x, y, vx, vy, vw, vh, cap)`；问不到 ⇒ None ✓。
+
+    · **本地后端**（本机 SendInput / 串口 ProMicro ✓）⇒ 本机 `GetCursorPos` ✓（`cap = None` ✓）；
+    · **网络 relay**（鼠标动在**被控机** ✓）⇒ 问 A 机（`KbdClient.cursor` ✓ 见 relay 那边 ✓）。
+
+    ⚠ 这一条就是"**能不能自己量鼠标标定**"的闸 ✓（`decision/mouse_aim.auto_measure` ✓）：
+      问不到 ⇒ 只能请人**手工量一次** ✓（当帧尺寸变了的时候 ✓ 见 `gain_mismatch_block` ✓）。
+    ⚠ 为什么非要能"看见光标"：gain 是「帧像素 / 指令单位」✓ ⇒ 只能**发已知单位、看走了多少像素**
+      量出来 ✓ ⇒ 看不见光标 ⇒ 量不出来 ✓（这是用户 2026-10-10："**不能自动吗？**" 的那道坎 ✓）。
+    """
+    if _remote is not None and hasattr(_remote, "cursor"):
+        # 网络后端（`KbdClient` ✓）：**问 A 机** ✓ 见 `remote_kbd/relay.py` 的 `CURSOR_QUERY` ✓
+        try:
+            return _remote.cursor()
+        except Exception:                        # noqa: BLE001 —— 问不到就当我们量不了 ✓
+            return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        pt = wintypes.POINT()
+        if not u.GetCursorPos(ctypes.byref(pt)):
+            return None
+        return (int(pt.x), int(pt.y),
+                int(u.GetSystemMetrics(76)), int(u.GetSystemMetrics(77)),
+                int(u.GetSystemMetrics(78)), int(u.GetSystemMetrics(79)), None)
+    except Exception:                            # noqa: BLE001
+        return None
+
+
+def _note_connect_fail(kind, why):
+    """留痕：连不上时**把原因记下来**（日志 + 打点 ✓ 不许静默 ✗ 见 `_connect_err` ✓）。"""
+    try:
+        # ⚠ 是 `core.behavior` ✗（原来写成裸 `import behavior` ⇒ 这里**每次都抛** ✓
+        #   被下面那句 except 吃掉 ⇒ **这条日志一直没写出去** ✓ 2026-10-10 顺手修 ✓）。
+        from core import behavior
+        behavior.event("connect_fail", kind=str(kind or "?"), why=str(why)[:160])
+    except Exception:                           # noqa: BLE001 —— 打点坏了别影响连接 ✗
+        pass
+    try:
+        perf.count("connect_fail_" + str(kind or "?"))
+    except Exception:                           # noqa: BLE001
+        pass
+
+
 def connect_async(kind, on_done=None, **kw):
     """按 `kind` 起一条**后台连接线程**（GUI 用，`PlayerPanel._apply_input_device` 调它）。
 
@@ -342,14 +401,21 @@ def connect_async(kind, on_done=None, **kw):
         return False
 
     def _run():
+        global _connect_err
         status = "ok"
         try:
             if kind == "serial":
                 use_serial(kw.get("port"))
             else:
                 use_network(kw.get("host"), kw.get("port"), kw.get("cert"))
-        except Exception:                       # noqa: BLE001 —— 连不上是常态（对面没开机 ✓）
+        except Exception as e:                  # noqa: BLE001 —— 连不上是常态（对面没开机 ✓）
             status = "fail"
+            # ⚠⚠ **不许静默**（2026-10-10 ✓ 用户现场）：原来这里把异常整个吞掉 ✗ ⇒ 界面只剩
+            #   "Pro Micro 连接失败" ✗、`behavior.log` 里也没线索 ⇒ 只能靠人猜 ✓
+            #   （实际原因是**串口被另一个工作台占着** ✓ 见 `_connect_err` ✓）。
+            if not _connect_err:
+                _connect_err = "%s: %s" % (type(e).__name__, e)
+            _note_connect_fail(kind, _connect_err)
         if on_done is not None:
             on_done(status)
 
@@ -418,8 +484,10 @@ def link_health():
     后者能抓到 relay 卡在串口写上这种「发送成功、实际什么都没发生」的情况。
     """
     if _remote is None:
+        # ⚠ 连不上时 `_remote` 就是 None ✗ ⇒ 这里**必须**把 `_connect_err` 带出去 ✓
+        #   （不然界面 / 日志只有"连接失败"四个字 ✓ 见 `_connect_err` 的说明 ✓）。
         return {"backend": "blocked" if _blocked else "local",
-                "ok": not _blocked, "err": "", "fails": 0, "silent": 0.0}
+                "ok": not _blocked, "err": _connect_err, "fails": 0, "silent": 0.0}
     kind = _cfg[0] if _cfg else "remote"
     send_ok = bool(getattr(_remote, "ok", True))
     silent = 0.0
@@ -723,9 +791,10 @@ def use_network(host, port, cafile):
       都不建**、直接转"什么都不发"（`use_blocked` ✓）—— 这条是**兜底**：正常 GUI 走
       `connect_async`（它自己先问闸 ✓，连线程都不起 ✓）。
     """
-    global _remote, _cfg, _blocked
+    global _remote, _cfg, _blocked, _connect_err
     if not net_allowed():
         use_blocked("remote")
+        _connect_err = "闸关着（离屏自检 / `PSIMU_ALLOW_NET` 没开）⇒ 没去连被控机"
         return
     with _link_rlock:
         _drop_remote()
@@ -733,6 +802,34 @@ def use_network(host, port, cafile):
         _remote = KbdClient(host, port, cafile)
         _cfg = ("remote", host, port, cafile)   # 记下来给 reconnect_remote 用
         _blocked = False
+        _connect_err = ""                       # 连上了 ⇒ 清掉上次的失败原因 ✓
+
+
+def _serial_fail_text(port, exc, found=True):
+    """把「串口打不开」翻译成**能照着做的人话**（见 `_connect_err` 的说明 ✓）。
+
+    ⚠ 为什么要分这么细（2026-10-10 ✓ 用户现场「本地ProMicro连接失败」✗）：
+      **设备在不在**和**能不能打开**是两件事 ✗ —— 当时设备好好的（`COM8 Arduino Leonardo`
+      ✓ 自动找口也找得到 ✓），可 `serial.Serial(...)` 抛
+      `PermissionError(13, 拒绝访问)` ✗ = **串口被别的进程占着** ✓
+      （Windows 串口是**独占**的 ✓ —— 当时有**两个工作台**在跑 ✓）。
+      这两种病要给**完全相反**的建议（一个"拔插 USB"、一个"关掉另一个工作台" ✓）
+      ⇒ 混成一句"连不上"等于没说 ✓。
+    """
+    s = ("%s: %s" % (type(exc).__name__, exc)) if exc is not None else ""
+    low = str(exc).lower() if exc is not None else ""
+    if found is None:
+        return ("找不到 Pro Micro 串口（USB 插着吗？也可以看看 `config/link.yaml` 的 "
+                "`serial_local` ✓ 换 USB 口后串口号会变、这儿会自动找 ✓）")
+    busy = (isinstance(exc, PermissionError) or "拒绝访问" in s or "access is denied" in low
+            or "permissionerror" in low or "busy" in low or "占用" in s)
+    if busy:
+        # ⚠ 只说**这一种病**该怎么做 ✓ —— 别把"拔插 USB"混进来 ✗：那是"插都没插"那一种的
+        #   建议 ✓ 两种病建议**相反** ✓（混着说是把人往反方向推 ✓ 见上面那段说明 ✓）。
+        return ("串口 %s 被**别的进程占用**了（%s）⇒ 一个串口同时只能被一个进程打开 ✓："
+                "**多半是另一个工作台 / relay 还开着** ✓ 关掉多余的那个、再点连接 ✓"
+                % (port, s))
+    return ("串口 %s 打不开（%s）⇒ 拔插一次 USB、或换个 USB 口试试 ✓" % (port, s))
 
 
 def use_serial(port):
@@ -742,10 +839,14 @@ def use_serial(port):
 
     ⚠⭐ 闸关着（离屏自检 / `PSIMU_ALLOW_NET` 没开 ✓ 见 `net_allowed`）⇒ **串口也不开**、
       直接转"什么都不发"（`use_blocked` ✓）—— 同 `use_network`：谁直接调都绕不过去 ✓。
+
+    ⚠⚠ 连不上时**抛出的那句话就是给人看的**（见 `_serial_fail_text` ✓）—— 别把它简化成
+      "连接失败" ✗（那正是 2026-10-10 现场"查不出原因"的由来 ✓）。
     """
-    global _remote, _cfg, _blocked
+    global _remote, _cfg, _blocked, _connect_err
     if not net_allowed():
         use_blocked("serial")
+        _connect_err = "闸关着（离屏自检 / `PSIMU_ALLOW_NET` 没开）⇒ 没去连串口"
         return
     with _link_rlock:
         _drop_remote()
@@ -755,19 +856,34 @@ def use_serial(port):
                 _remote = SerialKbd(port)
                 _cfg = ("serial", port)
                 _blocked = False
+                _connect_err = ""
                 return
-            except Exception:
-                pass   # 配置的串口打不开，走自动发现
+            except Exception as e:              # noqa: BLE001 —— 记下**第一手**原因 ✓（下面要说清 ✓）
+                _first = e
+        else:
+            _first = None
         found = find_pro_micro_port()
         if found is None:
-            raise RuntimeError("找不到 Pro Micro 串口（确认已插入，或检查 config/link.yaml 的 serial_local）")
-        _remote = SerialKbd(found)
+            _connect_err = _serial_fail_text(port, _first, found=None)
+            raise RuntimeError(_connect_err)
+        try:
+            _remote = SerialKbd(found)
+        except Exception as e:                  # noqa: BLE001 —— 找到了却打不开（多半是被占用 ✓）
+            _connect_err = _serial_fail_text(found, e)
+            raise RuntimeError(_connect_err)
         _cfg = ("serial", found)
         _blocked = False
+        _connect_err = ""
 
 
 def use_local():
-    """切回本地 SendInput，并关闭远程连接（socket / 串口不泄漏）。"""
+    """切回本地 SendInput，并关闭远程连接（socket / 串口不泄漏）。
+
+    ⚠⚠ **不清 `_connect_err`** ✗（2026-10-10 ✓ 特意留的）：连不上时 `PlayerPanel` 会调
+      它**回退本地** ✓，接着就要把"为什么没连上"显示出来 ✓ ⇒ 这里清掉的话
+      界面又只剩"连接失败"四个字 ✗（那正是要治的病 ✓ 见 `_connect_err` ✓）。
+      真正该清的地方是**连接成功**那两条路（`use_serial` / `use_network` ✓）。
+    """
     global _blocked
     with _link_rlock:
         _drop_remote()

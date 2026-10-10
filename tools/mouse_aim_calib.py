@@ -178,6 +178,231 @@ def _open_stream():
     return src, url
 
 
+#: 量位移前要不要遮掉「屏幕时间码探针」那条带（**只在收流那条路有意义** ✗）：
+#: 那条带是 **A 机画在流画面顶部**的叠层 ✓；本地窗口那一路**没有它** ✗ ⇒ 还按
+#: `link.yaml` 的坐标去遮 ⇒ **会在本地画面上涂黑一条无关的带** ✗（把光标那块也涂掉 ⇒ 量不到 ✓）。
+_PROBE_MASK = True
+
+
+def _cursor_pos():
+    """本机光标位置（屏幕像素）⇒ `(x, y)`；拿不到 ⇒ `None` ✓。
+
+    ⚠⚠ 为什么本地那条路必须改用它（2026-10-10 ✓ 现场实测）：**本地窗口的画面里没有系统光标** ✗
+      —— WGC / BitBlt / DXGI 三条取帧路**都不含**硬件光标 ✓（实测：`--source live` 跑下去直接
+      报「量不到光标位移」✓）。而本机 ProMicro 是**硬件 HID** ⇒ 光标就在**本机屏幕上** ✓
+      ⇒ 直接问操作系统要坐标才是**真值** ✓（比在图像里找小箭头还准 ✓，而且**不要求画面静止** ✓）。
+    """
+    try:
+        import win32api
+        p = win32api.GetCursorPos()
+        return (int(p[0]), int(p[1]))
+    except Exception:                          # noqa: BLE001
+        return None
+
+
+def measure_pos(kbd, units, rounds=3, settle=0.15):
+    """发 `units` 个单位 ⇒ 量**系统光标**的横向位移（px）⇒ `(px, n_agree)`；量不到 ⇒ `(None, 0)` ✓。
+
+    ⚠ 每轮**走回来**（`-units` ✓）：下一轮从同一处出发 ⇒ 不会被"撞到屏幕边"夹住 ✓
+      （和图像法那边"每档都回同一处"同一个道理 ✓）。
+    """
+    vals = []
+    for _ in range(max(1, int(rounds))):
+        a = _cursor_pos()
+        if a is None:
+            return None, 0
+        kbd.send("MOVE %d 0" % int(units))
+        time.sleep(float(settle))
+        b = _cursor_pos()
+        if b is None:
+            return None, 0
+        vals.append(abs(b[0] - a[0]))
+        kbd.send("MOVE %d 0" % int(-units))    # 走回来 ✓
+        time.sleep(float(settle))
+    return agree_px(vals)
+
+
+def calib_live_by_cursorpos(a, out_path):
+    """**本地那条路的标定**：本机 ProMicro（硬件 HID）+ 读系统光标坐标 ⇒ 直接写 gain ✓。
+
+    判据与收流那条**同一套标准**（别放松 ✗）：两档小位移要成比例 ✓、校验档要被预测准 ✓、
+    **快慢两条必须相当** ✓（不等 ⇒ 「提高指针精确度」还在生效 ⇒ 拒绝写 ✓ 见 `SLOW_TOL` ✓）。
+    """
+    from remote_kbd.serial_kbd import SerialKbd, find_pro_micro_port
+
+    from core.config import get
+
+    port = str(get("kbd", "serial_local", "") or "").strip()
+    if not port:
+        port = find_pro_micro_port() or ""
+    print("[2/4] 本地 ProMicro：%s" % (port or "（没配也没自动找到 ✗）"))
+    if not port:
+        print("      ⇒ 检查 `config/link.yaml` 的 `kbd.serial_local`（本机那块 ProMicro 的串口 ✓）")
+        return 2
+    try:
+        kbd = SerialKbd(port)
+    except Exception as e:                            # noqa: BLE001
+        print("[X] 打不开 %s（%s: %s）—— 是不是工作台正占着它？先「停止」/关掉再跑 ✓"
+              % (port, type(e).__name__, e))
+        return 2
+
+    # 基准帧尺寸：只用来**记进文件**（gain 是"帧像素/指令单位"口径 ✓ 见 `ref_w` ✓）。
+    # ⚠ 本机这条路 gain 是用**屏幕像素**量的 ✓；用的时候帧≈屏幕（本地窗口 ≈ 1920 ✓）
+    #   ⇒ 把基准记成**帧**的宽高 ✓（差 0.1% 级别 ✓ 可忽略 ✓）。
+    ref_w = ref_h = 0
+    try:
+        live = _LiveSrc()
+        live.open()
+        f = _grab(live, timeout=3.0)
+        if f is not None:
+            ref_h, ref_w = int(f.shape[0]), int(f.shape[1])
+        live.close()
+    except Exception:                                 # noqa: BLE001
+        pass
+    print("      基准帧 = %dx%d（记进文件 ✓ 以后换尺寸会自己报警 ✓）" % (ref_w, ref_h))
+
+    print("[3/4] 撞角归零 → 量位移（读系统光标坐标 ✓ 不需要画面静止 ✓）")
+    kbd.send("MOVE -4000 -4000")                      # 撞到屏幕左上角（已知原点 ✓）
+    time.sleep(0.35)
+
+    def _one(units, rounds):
+        px, n = measure_pos(kbd, units, rounds=rounds)
+        if px is None or px <= 0:
+            return None, 0
+        return px / float(units), n
+
+    g_s, n_s = _one(STEP_SMALL, a.rounds)
+    if g_s is None:
+        print("[X] 量不到光标位移 → 光标其实动了吗？（本机 ProMicro 在不在、是不是被占着 ✓）")
+        kbd.close()
+        return 2
+    kbd.send("MOVE -4000 -4000")
+    time.sleep(0.35)
+    g_b, n_b = _one(STEP_BIG, a.rounds)
+    if g_b is None:
+        print("[X] 大档量不到位移 ✗")
+        kbd.close()
+        return 2
+    print("      %d 单位 ⇒ gain %.4f（%d 轮一致）" % (STEP_SMALL, g_s, n_s))
+    print("      %d 单位 ⇒ gain %.4f（%d 轮一致）" % (STEP_BIG, g_b, n_b))
+    rel = abs(g_s - g_b) / max(1e-9, (g_s + g_b) / 2.0)
+    print("[4/4] 两档线性度差 %.0f%%（容忍 %.0f%% ✓）" % (rel * 100.0, LINEAR_TOL * 100.0))
+    if rel > LINEAR_TOL:
+        print("[X] 两档不成比例 ⇒ 指针加速 / 速度设置不对 ✗ 拒绝写文件 ✓")
+        kbd.close()
+        return 2
+    gain_x = (g_s + g_b) / 2.0
+
+    # 校验档 + 慢发对照（与收流那条**同一套闸** ✓ 别放松 ✗）
+    kbd.send("MOVE -4000 -4000")
+    time.sleep(0.35)
+    px_v, n_v = measure_pos(kbd, STEP_VERIFY, rounds=a.rounds)
+    rel_v = None
+    if px_v:
+        pred = gain_x * STEP_VERIFY
+        rel_v = abs(px_v - pred) / max(1e-9, pred)
+        print("      校验档 %d 单位 ⇒ 实际 %.1f px（按 gain 预测 %.1f ⇒ 差 %.0f%%）"
+              % (STEP_VERIFY, px_v, pred, rel_v * 100.0))
+
+    # 慢发对照：拆成小条慢慢发 ✓（≈ 人手速 ⇒ 加速不介入 ✓）
+    kbd.send("MOVE -4000 -4000")
+    time.sleep(0.35)
+    a0 = _cursor_pos()
+    n_step = max(1, int(round(float(SLOW_TOTAL) / float(SLOW_CHUNK))))
+    for i in range(n_step):
+        kbd.send("MOVE %d 0" % (SLOW_CHUNK + (1 if i % 2 else 0)))
+        time.sleep(SLOW_GAP)
+    time.sleep(0.3)
+    a1 = _cursor_pos()
+    slow_gain = None
+    if a0 and a1:
+        d = abs(a1[0] - a0[0])
+        # ⚠ 拆条时每两条交替 ±1（见收流那边的说明 ✓）⇒ 实际发出去的**总数**要自己算 ✓
+        sent = sum(SLOW_CHUNK + (1 if i % 2 else 0) for i in range(n_step))
+        slow_gain = d / float(sent)
+        print("      慢发对照：发 %d 单位 ⇒ %.1f px ⇒ gain %.4f" % (sent, d, slow_gain))
+    if slow_gain and abs(slow_gain - gain_x) / max(1e-9, (slow_gain + gain_x) / 2.0) > SLOW_TOL:
+        print("[X] ⭐⭐ **快慢两条 gain 不一致** ⇒ 「**提高指针精确度**」还在生效 ✗")
+        print("    ⇒ **本机**：鼠标设置 → 指针选项 → 取消勾选「提高指针精确度」、滑块停 6/11 ✓")
+        print("    ⇒ **拒绝写文件**（宁可不做，也不乱点 ✓）。要强行写：--force")
+        kbd.close()
+        if not a.force:
+            return 2
+
+    # ⭐⭐ 写盘走 `mouse_aim.save_gain`（**按帧尺寸存 ✓ 别的尺寸那几份原样保留 ✓**）——
+    #   用户 2026-10-10 原话："**这个过程不能每次都发现错然后跑命令吧 太麻烦了
+    #   不能自动吗？**" ✓ ⇒ 每条约来源**只量一次** ✓，以后在窗口/收流之间来回切会
+    #   **自动挑对应尺寸那份** ✓（`decision/mouse_aim.load_gain(frame_shape)` ✓）。
+    #   ⚠ 原来这里是**整个文件覆盖** ✗ ⇒ 量一种尺寸就把另一种顶掉 ✓ ⇒ 于是每次都得重量 ✓。
+    import decision.mouse_aim as _ma
+    _ma.save_gain(gain_x, gain_x, frame_shape=(ref_h, ref_w),
+                  extra={"probe": {"units": [STEP_SMALL, STEP_BIG, STEP_VERIFY],
+                                   "measured_px": [round(g_s * STEP_SMALL, 2),
+                                                   round(g_b * STEP_BIG, 2), px_v],
+                                   "n": [n_s, n_b, n_v],
+                                   "linear_rel": round(rel, 4),
+                                   "verify_rel": (None if rel_v is None
+                                                  else round(rel_v, 4)),
+                                   "source": "live-cursorpos"}})
+    print("已写 %s ✓（来源 = 本机 ProMicro + 系统光标坐标 ✓ 基准帧 %dx%d ✓）"
+          % (out_path, ref_w, ref_h))
+    kbd.close()
+    return 0
+
+
+class _LiveSrc:
+    """**本地窗口**那条路的"帧源"（与实时页**同一路画面** ✓ —— 这是那条禁忌的要求 ✓）。
+
+    ⚠⚠ 为什么非要能选来源（2026-10-10 ✓ 用户："**操作不对，鼠标点歪了**" ✓ 定案）：
+      gain 的单位是「**帧像素** / 指令单位」✓（见 `decision/mouse_aim.counts_for` ✓）——
+      帧被缩放 / 换了来源 ⇒ 物理像素与帧像素**差一个比例** ✗ ⇒ 混用就差这个比例 ✓。
+      本文件开头那句警告说的就是这件事 ✓：**gain 必须在同一路画面上量** ✓。
+      现场：标定是 10-07 在**收流**（1366 宽）上量的 ✗，而实时用的是**本地窗口**（1918 宽）✗
+      ⇒ 走位长了约 40% ⇒ 「点服务器」10 次全停在原界面 ✗（用户看到的"点歪"✓）。
+    ⇒ 这条来源让工具能在**用户当前那一路画面**上重量 ✓（原来只有流 ✗ ⇒ 用户根本没法重标 ✗）。
+    """
+
+    def __init__(self, rect=None, use_wgc=None):
+        self._rect = rect
+        self._use_wgc = use_wgc
+
+    def open(self):
+        from core import wincap
+        if self._rect is None:
+            # 用**最近打开的那个项目**的 live 段（与实时页同一个来源 ✓ 见 `gui.project` ✓）
+            try:
+                from gui.project import last_opened
+                prj = last_opened()
+                live = (prj.get("live") or {}) if prj is not None else {}
+            except Exception:                   # noqa: BLE001
+                live = {}
+            rect = tuple(int(v) for v in (live.get("rect") or (0, 0, 0, 0)))
+            win = live.get("rect_win")
+            win_h = int(win[0]) if isinstance(win, (list, tuple)) and win else None
+            rel = live.get("rect_rel")
+            r, why = wincap.binding_rect(rel, win_h, rect) if rel else (rect, "")
+            self._rect = tuple(int(v) for v in r)
+            if self._use_wgc is None:
+                self._use_wgc = (str(live.get("window_capture") or "wgc") != "bitblt")
+            print("      （本地窗口来源：抓 %r ✓ 抓法 %s ✓%s）"
+                  % (self._rect, "wgc" if self._use_wgc else "bitblt",
+                     ("　" + why) if why else ""))
+        return self
+
+    def close(self):
+        pass
+
+    def read(self):
+        """要一帧（**最新那一张** ✓ 同 `_grab` 的口径 ✓）⇒ 带 `.image` 的小壳 / None ✓。"""
+        from types import SimpleNamespace
+
+        from core import wincap
+        img = wincap.grab_rect(self._rect, use_wgc=bool(self._use_wgc))
+        if img is None:
+            return None
+        return SimpleNamespace(image=img)
+
+
 def _grab(src, timeout=5.0, refresh=0.25):
     """要一帧 —— ⭐⭐ **要"最新"的那一张**，不是管道里排在前面那张 ✗。
 
@@ -311,6 +536,9 @@ def measure_auto(src, units, rounds=6, max_scale=8, dump=None, anchor=None):
 def probe_band_rect(w, h):
     """「屏幕时间码探针」那一条在**流画面**里的矩形 ⇒ `(x, y, w, h)` | `None`。
 
+    ⚠ 只有**收流**那条来源才有这条带（A 机画上去的 ✓）；`_PROBE_MASK=False` 时**一律不遮** ✓
+      —— 本地窗口那一路按 `link.yaml` 的坐标去遮，只会把无关的一块涂黑 ✗（2026-10-10 ✓）。
+
     **为什么标定要管它**（2026-10-07 实测 ✓）：探针是 A 机在画面**顶部**画的一条时间码方块带
     （`link.yaml` 的 `probe` 段：`x: 99, y: 19, cell: 16, gap: 2.25, bits: 40` @1366 流）——
     ⚠ 它**每帧都在变** ⇒ 帧差里一堆块，`_cursor_delta` 那句"恰好两个块 = 光标新旧位"的判据
@@ -321,6 +549,8 @@ def probe_band_rect(w, h):
     （带 y≈19..35、光标 y≈0..16 ✓），而带子从 x=99 才开始 ✓。
     ⚠ 读不到配置 / 探针没开 ⇒ `None` = **什么都不遮** ✓（绝不猜 ✗）。
     """
+    if not _PROBE_MASK:                                # 本地窗口那一路没有这条带 ⇒ 不遮 ✓
+        return None
     try:
         from core.config import get
         if not bool(get("probe", "enabled", True)):
@@ -420,23 +650,60 @@ def main():
     ap.add_argument("--dump", default="", metavar="DIR",
                     help="把每轮**算法真正看到的**两帧 + 差分存进 DIR "
                          "（量不到 / 不过时先看它 ✓ —— 别再靠猜 ✗ 2026-10-07 的教训）")
+    # ⭐⭐ **标定在"哪一路画面"上量**（2026-10-10 ✓ 补）：gain 是「**帧像素** / 指令单位」，
+    #   换来源就**差一个比例** ✗（本文件开头那条禁忌 ✓）⇒ 必须在**实时页正在用的那一路**上量 ✓。
+    ap.add_argument("--source", choices=("stream", "live"), default="stream",
+                    help="在**哪一路画面**上量：stream=收流（老行为 ✓）"
+                         "/ live=本地窗口（实时页选「本地窗口」时用这个 ✓）")
     a = ap.parse_args()
+
+    global _PROBE_MASK
+    src_kind = a.source
+
+    # ⭐⭐ **本地那条路走"读系统光标坐标"的量法**（2026-10-10 ✓）：本地窗口的画里**没有系统光标** ✗
+    #   （三条取帧路都不含 ✓ 实测：`--source live` 直接报"量不到光标位移" ✓）⇒ 换成
+    #   「本机 ProMicro + `GetCursorPos`」✓（见 `calib_live_by_cursorpos` ✓ 不需要画面静止 ✓）。
+    if src_kind == "live":
+        # ⚠ **不去连 A 机那台 relay** ✗（本地这条路用的是**本机**那块 ProMicro ✓ 见下 ✓）
+        return calib_live_by_cursorpos(a, OUT)
 
     ok, why = _connect_input()
     print("[1/4] %s" % why)
     if not ok:
         return 2
     try:
-        src, url = _open_stream()
+        if src_kind == "live":
+            src = _LiveSrc().open()
+            url = "本地窗口（与实时页同一路 ✓）"
+            _PROBE_MASK = False        # ⚠ 本地窗口没有 A 机那条探针带 ✗ 别乱涂黑 ✓
+        else:
+            src, url = _open_stream()
     except Exception as e:                      # noqa: BLE001
-        print("[X] 开不了流（%s: %s）" % (type(e).__name__, e))
-        print("    检查 A 机在推流、config/link.yaml 的 stream.url / format 对得上。")
+        print("[X] 开不了画面来源（%s: %s）" % (type(e).__name__, e))
+        print("    · --source stream：检查 A 机在推流、config/link.yaml 的 stream.url / format ✓")
+        print("    · --source live ：检查工作台已经打开项目（`gui.project.last_opened` ✓）"
+              "、项目里「本地窗口」的区域/窗口是对的 ✓")
         return 2
-    print("[2/4] 已开流：%s" % url)
+    print("[2/4] 画面来源：%s" % url)
     # ⚠ 量位移前会遮掉「屏幕时间码探针」那条带（它每帧都在变 ✓ 见 `probe_band_rect` ✓）
     #   ——**遮了就明说** ✓ 别默默换判据 ✗（2026-10-07：不遮时 60/200 两个单位数量出来的
     #   gain 自相矛盾，工具却报"线性度不过 ⇒ 疑似开了指针加速" ⇒ 把人引错方向 ✗）。
-    print("      （量位移前遮掉「屏幕时间码探针」带：读 `link.yaml` 的 probe 段 ✓）")
+    if _PROBE_MASK:
+        print("      （量位移前遮掉「屏幕时间码探针」带：读 `link.yaml` 的 probe 段 ✓）")
+    else:
+        print("      （本地窗口那路**没有** A 机的探针带 ⇒ 不遮 ✓ 见 `_PROBE_MASK` ✓）")
+
+    # ⭐ 先要一帧记下**基准帧尺寸**（gain 的单位是帧像素 ⇒ 这个尺寸要写进文件 ✓ 见 `ref_w` ✓）
+    _f0 = _grab(src)
+    if _f0 is None:
+        print("[X] 拿不到画面（这条来源现在没帧 ✓）—— 先让它出画面再跑 ✓")
+        try:
+            src.close()
+        except Exception:                       # noqa: BLE001
+            pass
+        return 2
+    ref_h, ref_w = int(_f0.shape[0]), int(_f0.shape[1])
+    print("      基准帧 = %dx%d（gain 会按这个尺寸记下来 ✓）" % (ref_w, ref_h))
 
     try:
         # 撞角归零 + **挪到探针带下面**（见 `PARK_DY` 那段说明 ✓）—— 不这么做的话，
@@ -588,19 +855,27 @@ def main():
     if a.dry_run:
         print("（--dry-run ⇒ 不写 %s）" % OUT)
         return 0
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(json.dumps(
-        {"gain_x": gain_x, "gain_y": gain_x,
-         "probe": {"units": [u_s, u_b, u_v],
-                   "measured_px": [small[0], big[0],
-                                   (None if verify is None else verify[0])],
-                   "n": [small[2], big[2], (None if verify is None else verify[2])],
-                   "linear_rel": round(rel, 4),
-                   "verify_rel": (None if rel_v is None else round(rel_v, 4)),
-                   "source": "stream"}},
-        ensure_ascii=False, indent=2), encoding="utf-8")
+    # ⭐⭐ 写盘走 `mouse_aim.save_gain`（**按帧尺寸存 ✓ 别的尺寸那几份原样保留 ✓**）——
+    #   用户 2026-10-10："**这个过程不能每次都发现错然后跑命令吧 太麻烦了 不能自动吗？**" ✓
+    #   ⇒ 每条约来源**只量一次** ✓ 以后来回切**自动挑对应尺寸那份** ✓
+    #   （原来这一行是**整个文件覆盖** ✗ ⇒ 量一种尺寸就把另一种顶掉 ⇒ 每次都得重量 ✓）。
+    import decision.mouse_aim as _ma
+    _ma.save_gain(gain_x, gain_x, frame_shape=(ref_h, ref_w),
+                  extra={"probe": {"units": [u_s, u_b, u_v],
+                                   "measured_px": [small[0], big[0],
+                                                   (None if verify is None
+                                                    else verify[0])],
+                                   "n": [small[2], big[2],
+                                         (None if verify is None else verify[2])],
+                                   "linear_rel": round(rel, 4),
+                                   "verify_rel": (None if rel_v is None
+                                                  else round(rel_v, 4)),
+                                   "source": src_kind}})
     print("已写 %s ✓（断线重连「点服务器 / 点频道」下一拍就会用它 ✓）" % OUT)
-    print("⚠ 换了「指针速度 / 加速状态 / 推流分辨率」都要**重新标定** ✓。")
+    print("     基准帧 = %sx%s（来源 %s ✓）—— 这份按尺寸存着 ✓"
+          "以后**切回这个尺寸不用重量** ✓" % (ref_w, ref_h, src_kind))
+    print("⚠ 换了「指针速度 / 加速状态 / 画面来源」或**换到另一个帧尺寸**"
+          "（推流分辨率 / 窗口大小 ✓）⇒ 那个尺寸量一次即可 ✓")
     return 0
 
 

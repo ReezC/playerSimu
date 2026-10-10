@@ -1,0 +1,218 @@
+{
+  "algorithm": "V2.5.1",
+  "model": "V4",
+  "files": {
+    "alert/star1.png": {
+      "bytes": 8185,
+      "sha256": "11c2044380c5dbd1209cabf7b16d9ff4d6e09070cf23ef75322b3ff86886cb9f"
+    },
+    "alert/star2.png": {
+      "bytes": 8440,
+      "sha256": "b7c4282b72866990696eb844fe6e0a8d0514e6836638de659aa2807db83e42c0"
+    },
+    "alert/star3.png": {
+      "bytes": 8198,
+      "sha256": "83cd47992a117bbdcb76d3da32767f0f4b57b88cfb9fba850f45799715807316"
+    },
+    "docs/gui_preview.png": {
+      "bytes": 34182,
+      "sha256": "f4dd1b1c2888342de1c6594ae2fd754adc5a5544032c858e5c4dd3e137f4ea24"
+    },
+    "docs/INTEGRATION.md": {
+      "bytes": 8735,
+      "sha256": "92bfd8a77c56557865f1a4c577055b141efcfd5303d96c03200dfd2321781748"
+    },
+    "docs/PRIVACY_AND_SCOPE.md": {
+      "bytes": 1800,
+      "sha256": "d3a2c487979c0ad90bd291ba9b9c9b89439503d915afa425d49f808c57ec7782"
+    },
+    "examples/__init__.py": {
+      "bytes": 37,
+      "sha256": "e75b45007c4e0d5700069253c25fbf2a9171d4e70dc0b4bb5b900145df9c64a5"
+    },
+    "examples/live.py": {
+      "bytes": 2456,
+      "sha256": "f0bdf12c4294d3253c619cac1d0e84aefc063ff631e9900b1e8b395b483df6a8"
+    },
+    "examples/video.py": {
+      "bytes": 1572,
+      "sha256": "3d171cb81098d7e8b60fb67de9fb6461799547f1e1399b3808da60a14bb4a475"
+    },
+    "liescc/__init__.py": {
+      "bytes": 201,
+      "sha256": "3da16dd814dc27de9b1c27d8fa33b3344d1e2370acef5f81bbb3db2d670ebdd4"
+    },
+    "liescc/cg.png": {
+      "bytes": 72495,
+      "sha256": "656091744d62fd70db4e3880f4a41b916cec74d38dd93c1f357c7a9e254e5149"
+    },
+    "liescc/locate.py": {
+      "bytes": 30732,
+      "sha256": "8462e186dad3e4b82d24450d4ab69c73aa997d7d6e8a25067cfe3ee001eb7f70"
+    },
+    "liescc/qr.png": {
+      "bytes": 3962,
+      "sha256": "98665a0ede0192b217eb7f7e2dc89be4dfdf4326b5b7338950d53dae58b9e09a"
+    },
+    "liescc/startlies2.png": {
+      "bytes": 93721,
+      "sha256": "81a7a728bcdef1333125badff7d23267021d664b60ca34b2ec51a348b6158eff"
+    },
+    "liescc/tw/tw-cg.png": {
+      "bytes": 9565,
+      "sha256": "c075ff6d901db42ea1056b54ffd2c8a32a3ecf6798975d80528e1eb1a6623a91"
+    },
+    "liescc/tw/tw-qr.png": {
+      "bytes": 1464,
+      "sha256": "6afef015a14379f5408696702889905b5fb96e7b671e97a0f21055442308bdcc"
+    },
+    "liescd/__init__.py": {
+      "bytes": 746,
+      "sha256": "9d77aab86cb94fbe964520434903451c1edf0df67e8f2882d1184136549c672e"
+    },
+    "liescd/_vendor/__init__.py": {
+      "bytes": 66,
+      "sha256": "362a3021e994531fe746d947ee2b01267409dad5148c9aa5463b9879b3d6ecdc"
+    },
+    "liescd/_vendor/ocsort/__init__.py": {
+      "bytes": 110,
+      "sha256": "298191e8a9bc5c3e336283d788bef4370decdf6d269d0fdd1616d515b342c567"
+    },
+    "liescd/_vendor/ocsort/association.py": {
+      "bytes": 13717,
+      "sha256": "cd837b1eb64022afc1ef519baaa3f21bd953b745c83e511614994a652aa4cf00"
+    },
+    "liescd/_vendor/ocsort/kalmanfilter.py": {
+      "bytes": 62485,
+      "sha256": "6287f7f1b2d45480d00f8eb45e258befcbbad97ecc60c5317f630edf602f46ac"
+    },
+    "liescd/_vendor/ocsort/LICENSE": {
+      "bytes": 1088,
+      "sha256": "d55e22251df27e2011d431efdd7478e03771db5f5d81dcca45f59072fa0844e8"
+    },
+    "liescd/_vendor/ocsort/ocsort.py": {
+      "bytes": 19300,
+      "sha256": "8ab3739646ec6dd2925ee3068b46f3dd832519351a1df666fe2b39eb6aff978a"
+    },
+    "liescd/_vendor/ocsort/README.md": {
+      "bytes": 1302,
+      "sha256": "f92d2ce22896f40d6da4cdb0ab2d661807b1c865dc62a7f6aea026fda817ac39"
+    },
+    "liescd/detector.py": {
+      "bytes": 13139,
+      "sha256": "df9233abc98adf3598b13437ae4dd766d8fa228f1869300004f30c21eead9f3d"
+    },
+    "liescd/edge_identity.py": {
+      "bytes": 14090,
+      "sha256": "e3208667de624bd762981e67baae69a538d379321c1ddc5151332097c5843c20"
+    },
+    "liescd/experimental/__init__.py": {
+      "bytes": 490,
+      "sha256": "ab56a68575f0b5734cdf61919c5b55b6e4f5b2f47333f0251459dde5538faaec"
+    },
+    "liescd/experimental/branch_tracker.py": {
+      "bytes": 97323,
+      "sha256": "d89844568221056cb1d3319b1c8cb9cfcd52c25db0e8dd5f9b110e3c52a2babf"
+    },
+    "liescd/gui.py": {
+      "bytes": 38277,
+      "sha256": "a35dd75fde59affbfc126f5557fa8b42bdf287492695ad0d9d99662b31c43307"
+    },
+    "liescd/inference_profile.py": {
+      "bytes": 1266,
+      "sha256": "67e617051846dbb612a3b3c493ca10ae0b059e51c7b0f16a0b2b1ca83b98ddf6"
+    },
+    "liescd/models/geometry.pt": {
+      "bytes": 6257950,
+      "sha256": "5f221f06bf1bf0891abf284ffd2255426a51b5114cbf4467e0b3de814cc439ea"
+    },
+    "liescd/ocsort_tracker.py": {
+      "bytes": 31430,
+      "sha256": "7e01b391d0c14d09651cedf828c2037ab5c6f267c6851b73e986b3721666d142"
+    },
+    "liescd/realtime_stream.py": {
+      "bytes": 5486,
+      "sha256": "c5f3ae78728ce628d954e60ad21e8ca333f80728a7def3989c9f42d828355001"
+    },
+    "liescd/recorded_input.py": {
+      "bytes": 3950,
+      "sha256": "38d778710e4f68f522f1d18351dba1951eed341c8c5b59223fe49da7245b9d7c"
+    },
+    "liescd/runtime_tracker.py": {
+      "bytes": 1206,
+      "sha256": "e0ab9dd11e78d704671ea6d545d970106ace6cfc4a6ab0c972c797cde6b1bb7a"
+    },
+    "liescd/tracker.py": {
+      "bytes": 11576,
+      "sha256": "92954288b1a399cadf260fd9ffee826648bfa8528bca89aff07ed006db407d29"
+    },
+    "liescd/trajectory.py": {
+      "bytes": 7906,
+      "sha256": "d5ce6919743b7db43f4b77726b56c67a3b1dc9be2152c5b90cd99dac59dd0a19"
+    },
+    "liescd/video_io.py": {
+      "bytes": 5909,
+      "sha256": "b142d5b377f35be23f87ff257b8d6f175bce02cc951eb15a25765a4e2cc90816"
+    },
+    "liescd/widgets.py": {
+      "bytes": 530,
+      "sha256": "e31307720748388540a1b8ce792d2872883e544ce9acbb7aab2e58212c7803af"
+    },
+    "pyproject.toml": {
+      "bytes": 590,
+      "sha256": "b95b3a8f11a03efce75d6d15be3b8a549803e472ae198d6637154c5404a21821"
+    },
+    "README.md": {
+      "bytes": 7926,
+      "sha256": "bb7443f3603cc4b835cbe965f20d7f8d92d989cd02bec15141aa04451afb7c28"
+    },
+    "requirements.txt": {
+      "bytes": 209,
+      "sha256": "e4601e288cb135612b5e09ef003acf80bdbed68c9c0a92b9be024ffe0fa9e7ec"
+    },
+    "run_gui.bat": {
+      "bytes": 185,
+      "sha256": "037b0d04a66705932827e9f26d689c9f55cdeec102da3f7b640a61386da14ea7"
+    },
+    "SANITIZATION_REPORT.json": {
+      "bytes": 1388,
+      "sha256": "c31b1b3ee5988c3213ab6ba77dbc3eade045b89b79ab8f21eeb65861cc885964"
+    },
+    "SOURCE_PROVENANCE.json": {
+      "bytes": 3610,
+      "sha256": "6e921646b169ae6de89293252b4c2e4f5efc672e7711cfa0705bc793d32881bf"
+    },
+    "tests/test_sdk.py": {
+      "bytes": 5480,
+      "sha256": "c06152190e3c6bc560513982b86017d180b2a8c639a4868841546232cf325250"
+    },
+    "THIRD_PARTY_NOTICES.md": {
+      "bytes": 884,
+      "sha256": "f95f734ea19ee36e35d65841529f9210a6bbf5974abe5217c5a59baadac16536"
+    },
+    "VALIDATION.json": {
+      "bytes": 729,
+      "sha256": "54a6c4ea34047b34dee9c8af1aaccab36317d9b44600f99b1cf57f3574ea6c7b"
+    },
+    "VERIFIED_ENVIRONMENT.json": {
+      "bytes": 276,
+      "sha256": "289367f604047509d3342b2bf0899321d9665a821673d691c327b5d77551d5bf"
+    },
+    "verify_package.py": {
+      "bytes": 638,
+      "sha256": "93024802b411cfac61f56f5a843cd0d6e861a8af849b9625908d4b29cb18327e"
+    },
+    "vision_sdk/__init__.py": {
+      "bytes": 190,
+      "sha256": "cc21bf9ec28f0b277ae31f8bb390c9b3a03a988e504e77778950a2a8d0279fb0"
+    },
+    "vision_sdk/session.py": {
+      "bytes": 9275,
+      "sha256": "15b70fbe3c9b42422273e32388dba0fb364fcc4c9686cb431879cde96957983c"
+    },
+    "vision_sdk/success.py": {
+      "bytes": 1809,
+      "sha256": "aa39bf8546c0ced5ef42135f0e265dc88fdecda2d4d78bba6379bb3517de8689"
+    }
+  }
+}

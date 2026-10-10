@@ -379,16 +379,60 @@ def stop_sound():
         _sound_player.stop()
 
 
+#: 上一次「响警报」**实际怎么响的**（给人看 ✓ 状态行/日志用 ✓）：`"mp3"` / `"beep"` / `""` ✓
+_last_sound = {"how": "", "path": ""}
+
+
+def last_sound_note():
+    """最近一次 `play_sound` **到底响没响、走的是哪条路** ⇒ `{"how": …, "path": …}` ✓。
+
+    ⚠ 为什么非要留这个（2026-10-10 ✓ 用户："**没有任何警报**" ✓ 查出来的第二层）：
+      `QMediaPlayer.play()` **失败不抛异常** ✗（编解码器缺失 / 音频后端插件不在 ✓ 都会静默失败 ✓）
+      ⇒ 只看返回值**根本不知道响没响** ✓ ⇒ 加这一份"实际怎么响的"给日志 ✓。
+    """
+    return dict(_last_sound)
+
+
+def _beep():
+    """**保证听得见**的兜底（Windows 优先走 `winsound` ✓ 返回走了哪条路）。
+
+    ⚠⚠ 为什么不能只用 `QApplication.beep()`（2026-10-10 ✓ 实测踩到）：Qt 在 Windows 上
+      这个调用**经常是空操作** ✗（用户"没有警报"就是这么哑掉的 ✓）⇒ 换成
+      `winsound.MessageBeep` ✓（系统警告音 ✓ 一定出声 ✓）。
+    """
+    try:
+        import winsound
+        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        return "beep"
+    except Exception:                     # noqa: BLE001 —— 非 Windows / 没 winsound ✓
+        pass
+    try:
+        QApplication.beep()
+        return "beep"
+    except Exception:                     # noqa: BLE001
+        return ""
+
+
 def play_sound(path):
     """播放音效文件（测谎/掉线弹窗的「触发音效」+「试听」✓ **一处实现**）。
 
     相对路径按仓库根解析 ✓；文件缺失 / QtMultimedia 不可用 ⇒ 退回系统提示音 ✓
-    —— **报警不能因为音效配置坏了就哑掉** ✓。返回 **True = 真的在播**（「试听」
+    —— **报警不能因为音效配置坏了就哑掉** ✓。返回 **True = 音效文件起播了**（「试听」
     按钮据它决定要不要变「停止」✓）；`QMediaPlayer` 必须在 **GUI 线程** ✓。
+
+    ⚠⚠⚠ **2026-10-10 起：先响一声系统提示音，再起音效文件** ✓（用户："本地实时断线后
+    没有重连警报" ✓ 现场查到底：**识别是对的**（日志 21:19:55 `st=login` ✓），
+    哑在**声音这一层** ✗）。理由：
+      · `QMediaPlayer.play()` **失败不抛** ✗（后端插件缺失 / 编解码器缺失 ⇒ 静默哑 ✗）
+        ⇒ 光靠返回值判断不了 ✓；
+      · 旧的兜底 `QApplication.beep()` 在 Windows 上**常常是空操作** ✗。
+    ⇒ **报警这类"必须吵醒人"的声音，宁可多响一声，也不能哑** ✓（故不加开关 ✓）。
     """
     p = Path(path) if path else None
     if p is not None and not p.is_absolute():
         p = Path(__file__).resolve().parent.parent / p
+    # ① 先保证"一定出声" ✓（见上面那段：Qt 的媒体管线能静默失败 ✗）
+    _how = _beep()
     if p is not None and p.exists():
         try:
             from PyQt5.QtCore import QUrl
@@ -397,8 +441,10 @@ def play_sound(path):
             player = sound_player()
             player.setMedia(QMediaContent(QUrl.fromLocalFile(str(p))))
             player.play()
+            _last_sound.update({"how": "mp3+%s" % _how if _how else "mp3",
+                                "path": str(p)})
             return True
         except Exception:                 # noqa: BLE001 —— 编解码器缺失等 ✓
             pass
-    QApplication.beep()
+    _last_sound.update({"how": _how or "（连蜂鸣都没响成 ✗）", "path": str(p or "")})
     return False

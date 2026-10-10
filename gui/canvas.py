@@ -13,7 +13,8 @@
 from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt5.QtGui import (QBrush, QColor, QKeySequence, QPainter, QPainterPath,
                          QPen, QTransform)
-from PyQt5.QtWidgets import (QGraphicsItem, QGraphicsPathItem,
+from PyQt5.QtWidgets import (QGraphicsEllipseItem, QGraphicsItem,
+                             QGraphicsLineItem, QGraphicsPathItem,
                              QGraphicsPixmapItem, QGraphicsRectItem,
                              QGraphicsScene, QGraphicsSimpleTextItem,
                              QGraphicsView)
@@ -342,6 +343,13 @@ class ImageCanvas(ZoomPanView):
         #: ⚠ 存在这里、`load()` 重挂时**再贴一次** —— 否则换图/重画地形图之后
         #: 它悄悄回到不透明（看着像"参数没生效" ✗）。
         self._live_alpha = 0.8
+        #: ⭐⭐ 「**标记**」那一层（`set_markers` ✓ 2026-10-10 ✓ 用户："你是应该以差分地图
+        #: 来找玩家坐标的，那我需要在这里看到你的结果，例如把你**找到的黄点圈出来**"✓）：
+        #: `_marks` = 最近一次要求的那些点（**画布坐标** ✓）；`_mark_items` = 场景里那几件。
+        #: ⚠ 同 `_live_item`：`load()` 会 `scene_.clear()` ⇒ 存一份、`load()` 完**自动重挂** ✓
+        #:   （否则一换图/一重画地形图圈就没了 ✓ 人只会以为"又不好使了" ✗）。
+        self._marks = []
+        self._mark_items = []
 
     @staticmethod
     def _tag_helper(item):
@@ -485,6 +493,10 @@ class ImageCanvas(ZoomPanView):
         self._tag_helper(self._live_item)     # 贴图层只是"看"的 ✓ 别挡交互/空白判定 ✓
         self.scene_.addItem(self._live_item)
 
+        # ⭐⭐ 标记层（`set_markers`）也要**重新挂**（同上 ✓）：把最近一次那几个点重画一遍 ✓
+        self._mark_items = []
+        self._draw_marks()
+
         self.editable = editable
         self._colors = _box_colors()   # 读一次可视化配置，所有框共用
         for box in boxes:
@@ -558,6 +570,71 @@ class ImageCanvas(ZoomPanView):
             self.set_live_patch_alpha(opacity)
         self._live_item.setVisible(True)
         return True
+
+    # ---------------- ⭐⭐ 标记层（只读覆盖层：把"算出来的点"圈在地形图上 ✓）----------------
+
+    def set_markers(self, marks):
+        """放 / 换 / 收「**标记**」那一层 —— 把**算出来的点**圈在地形图上 ✓（2026-10-10 ✓）。
+
+        用户原话（路线识别 → 地形图 → 像素差分地图）："你是应该以**差分地图**来找玩家坐标的，
+        那我需要**在这里看到你的结果**，例如把你**找到的黄点圈出来**" ✓✓ —— 也就是：不光要
+        "差分图像摆上去"，还要把**这一拍认出来的那个点**在地形图上**画出来**（圈 + 十字 + 一行字）✓。
+
+        `marks` = `[(x, y, 人话), …]`（**画布坐标** ✓ 与 `set_live_patch` 同一套 ✓）；
+        空列表 / None ⇒ 全收起来 ✓（不是留个空圈 ✗）。
+        返回画上去的**标记个数** ✓（调用方可以据此写状态行 ✓）。
+
+        ⚠ 它**只是"看"的**：不吃鼠标（`_tag_helper` ✓）、不参与"空白"判定、不进撤销 ✗ ✓
+          —— 否则在地形图上会点不动 / 拉不出框（蒙版那条老坑 ✓）。
+        """
+        self._marks = [tuple(m) for m in (marks or [])]
+        self._draw_marks()
+        return len(self._marks)
+
+    def _draw_marks(self):
+        """把 `self._marks` 画成场景里的圆圈 + 十字 + 小字（**先清旧的** ✓ 幂等 ✓）。"""
+        for it in self._mark_items:
+            try:
+                self.scene_.removeItem(it)
+            except Exception:                       # noqa: BLE001 —— 已经没了 ✓
+                pass
+        self._mark_items = []
+        for m in self._marks:
+            try:
+                x, y = float(m[0]), float(m[1])
+                label = str(m[2]) if len(m) > 2 and m[2] else ""
+                color = QColor(str(m[3]) if len(m) > 3 and m[3] else "#ffd400")
+                r = float(m[4]) if len(m) > 4 and m[4] else 12.0
+            except Exception:                       # noqa: BLE001 —— 坏条目跳过，别影响别的 ✓
+                continue
+            pen = QPen(color)
+            pen.setWidthF(2.0)
+            ring = QGraphicsEllipseItem(x - r, y - r, 2 * r, 2 * r)
+            ring.setPen(pen)
+            ring.setBrush(QBrush(Qt.NoBrush))       # 空心圈 ✓（PyQt 只收 QBrush/QColor ✓）
+            ring.setZValue(12)                      # 压住贴图层（10）✓
+            self._tag_helper(ring)
+            self.scene_.addItem(ring)
+            self._mark_items.append(ring)
+            # 十字：圆心那一下更醒目（放大到看不清圈时也有个准心 ✓）
+            for x1, y1, x2, y2 in ((x - r * 1.7, y, x - r * 0.5, y),
+                                   (x + r * 0.5, y, x + r * 1.7, y),
+                                   (x, y - r * 1.7, x, y - r * 0.5),
+                                   (x, y + r * 0.5, x, y + r * 1.7)):
+                ln = QGraphicsLineItem(x1, y1, x2, y2)
+                ln.setPen(pen)
+                ln.setZValue(12)
+                self._tag_helper(ln)
+                self.scene_.addItem(ln)
+                self._mark_items.append(ln)
+            if label:
+                txt = QGraphicsSimpleTextItem(label)
+                txt.setBrush(QBrush(color))
+                txt.setZValue(13)
+                txt.setPos(x + r * 0.8, y - r * 2.0)
+                self._tag_helper(txt)
+                self.scene_.addItem(txt)
+                self._mark_items.append(txt)
 
     # ---------------- 框操作 ----------------
 

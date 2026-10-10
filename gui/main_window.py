@@ -20,7 +20,7 @@ import html
 import time
 from pathlib import Path
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (QFileDialog, QHBoxLayout, QInputDialog,
                              QLabel, QMainWindow, QMessageBox, QPlainTextEdit,
@@ -318,6 +318,9 @@ class MainWindow(QMainWindow):
         # 「开关自动」的映射（默认 F11），改了映射会动态重新注册。
         self._hotkey_id = 1
         self._auto_shortcut = None   # 全局热键注册失败时的窗口内快捷键降级
+        #: 现在哪一层在生效：`hotkey`（注册制 ✓）/ `hook`（键盘钩子 ✓）/
+        #: `window`（只在本窗口 ✓）/ `none`（键无效 ✓）—— 见 `_register_auto_hotkey` ✓
+        self._hotkey_how = ""
         self._register_auto_hotkey()
 
         # ⭐⭐ **窗口收尾：提示搬到字段标题 + 标签可复制**（用户 2026-10-04 ✓ 第 3、4 条）。
@@ -720,6 +723,20 @@ class MainWindow(QMainWindow):
                     rp._save_route_cfg()
                 except Exception:                   # noqa: BLE001
                     pass
+            # ⭐⭐ 多实例（用户 2026-10-09："**必须支持能开 2 个工作台**"✓）：上面两处落盘都是
+            #   **读-改-写、只盖本窗口改过的那几处**（`Project.save` / `core.route_cfg.save` ✓）
+            #   ⇒ 两个窗口改**不同**参数**互不覆盖** ✓
+            #   （原来整份覆盖 ⇒ 现场症状："这边选了平台站桩、那边一存变成 patrol" ✗）。
+            #   ⚠ 剩下"**同一个**项被两边都改过"无法两全（后写的赢 ✓）⇒ **必须说出来** ✗，
+            #     别让人以为"我改的怎么没了"（记账：`Project._conflicts` ＋ 面板的
+            #     `_route_cfg_conflicts` ✓）。⚠ 这段放在**两处都存完之后** ✓（先读的话路线那半还没产出 ✗）。
+            _cf = list(getattr(p, "_conflicts", None) or [])
+            if rp is not None:
+                _cf += list(getattr(rp, "_route_cfg_conflicts", None) or [])
+            if _cf:
+                _more = "（还有 %d 项）" % (len(_cf) - 6) if len(_cf) > 6 else ""
+                self.log("⚠ 另一个工作台也改过这些项 ⇒ 已按**本窗口**的值写：%s%s"
+                         % ("、".join(_cf[:6]), _more), "warn")
         set_save_hook(_save_everywhere)
 
     def _on_map_changed(self, map_id):
@@ -1236,26 +1253,53 @@ class MainWindow(QMainWindow):
         # 注销 F11 全局热键，避免残留占着系统快捷键
         from decision import hotkey as _hotkey
         _hotkey.unregister(int(self.winId()), self._hotkey_id)
+        # ⚠⚠ 键盘钩子也**必须卸** ✗（它挂在**系统钩子链**上 ✓ 不卸 ⇒ 关掉工作台后
+        #   还会被叫进来、拖慢整机按键 ✓ —— 而且进程退出时系统才收，体验很差 ✓）
+        _hotkey.remove_hook()
         e.accept()
 
     def _register_auto_hotkey(self):
-        """按「开关自动」映射动态注册全局热键；失败降级为窗口内快捷键。"""
+        """按「开关自动」的映射注册全局热键 —— **三层**：注册制 → 键盘钩子 → 窗口内快捷键。
+
+        ⚠⚠ 为什么要三层（2026-10-10 ✓ 用户原话：**"我需要 F11 全局生效"**）：
+          · `RegisterHotKey`（第 1 层）是**独占**的 ✗ —— 同一个键**只允许一个进程**注册 ✓
+            现场实测 `RegisterHotKey(…, VK_F11)` **返回 0** ✗（`F12` 也被占着 ✓ 只有 `F10` 能 ✓）
+            ⇒ 本进程只能退到"本窗口聚焦时"✗ ⇒ 用户把焦点切到游戏后按 F11 **毫无反应** ✓；
+          · `WH_KEYBOARD_LL`（第 2 层 ✓ 见 `decision/hotkey.install_hook`）是**观察型** ✓
+            —— 别人占着同一个键，我们**照样收得到** ✓（**不吞键** ✓ 游戏那边照旧 ✓）；
+          · 最后一层仍是窗口内快捷键 ✓（两层都失败时才用 ✓ 语义 = "本窗口聚焦时有效" ✓）。
+        ⚠ 第 1 层成功时要**把钩子卸掉** ✗（两路都活着 = 按一下触发两回 ⇒ 开了又关 ✓）。
+        """
         from decision import hotkey as _hotkey
         from decision.agent import settings
         from decision.input import resolve_vk
         key_name = settings.keymap.get("auto", "f11")
         vk = resolve_vk(key_name)
         if vk is None:
+            self._hotkey_how = "none"
             self.log("「开关自动」映射的键无效，全局热键未注册", "warn")
             return
         _hotkey.unregister(int(self.winId()), self._hotkey_id)
         if _hotkey.register(int(self.winId()), self._hotkey_id, vk):
-            # 注册成功：禁用降级用的窗口内快捷键（如果有）
+            _hotkey.remove_hook()               # ⚠ 别两路都活着（不然按一下 = 开+关 ✓）
+            self._hotkey_how = "hotkey"
             if self._auto_shortcut is not None:
                 self._auto_shortcut.setEnabled(False)
+            self._refresh_hotkey_ui()
             return
-        # 注册失败（多半是另一个本程序实例已占用这个全局热键）：
-        # 降级为窗口内快捷键，保证本窗口聚焦时仍能用同一键开关自动。
+        # ---- 第 2 层：键盘钩子（**不独占** ⇒ 别人占着也能全局生效 ✓）----
+        _ok, _why = _hotkey.install_hook(vk, self._on_auto_hotkey_fired)
+        if _ok:
+            self._hotkey_how = "hook"
+            if self._auto_shortcut is not None:
+                self._auto_shortcut.setEnabled(False)
+            self.log("`%s` 已被别的进程注册 ⇒ 改用键盘钩子（不独占，照样在任何窗口生效）"
+                     % key_name, "info")
+            self._note_hotkey_fallback("hook", key_name, "")
+            self._refresh_hotkey_ui()
+            return
+        # ---- 第 3 层：窗口内快捷键 ----
+        self._hotkey_how = "window"
         if self._auto_shortcut is None:
             self._auto_shortcut = QShortcut(QKeySequence(key_name), self)
             # ⚠ 显式写出来（§10）：这里**故意**用 WindowShortcut（默认值）—— 降级语义就是
@@ -1265,15 +1309,55 @@ class MainWindow(QMainWindow):
         else:
             self._auto_shortcut.setKey(QKeySequence(key_name))
         self._auto_shortcut.setEnabled(True)
-        self.log("全局热键被占用（可能是另一个本程序实例），已降级为窗口内快捷键", "info")
+        # ⚠⚠ 这句要**说清"怎么办"** ✗（原来只说"被占用"⇒ 人只能猜 ✓ 用户 2026-10-10 现场 ✓）：
+        #   多半是**另一个本程序实例**还开着（它先注册的 ✓ 见 295 条那次"两个工作台"✓）。
+        self.log("全局热键 `%s` 被别的进程占用，键盘钩子也没装上（%s）"
+                 "⇒ 现在**只在本窗口聚焦时**有效。"
+                 "想让它在游戏里也生效：关掉多余的**本程序实例**（多半是它占着），"
+                 "或在「决策参数 → 键位」里换一个键 ✓" % (key_name, _why), "warn")
+        self._note_hotkey_fallback("window", key_name, _why)
+        self._refresh_hotkey_ui()
+
+    def _note_hotkey_fallback(self, how, key_name, why):
+        """留痕：全局热键降级了（**别静默** ✗ —— 人在游戏里按 F11 没反应会以为程序坏了 ✓）。"""
+        try:
+            from core import behavior            # ⚠ 是 `core.behavior` ✓（写成裸 `import behavior`
+            behavior.event("hotkey_fallback", how=str(how), key=str(key_name),
+                           why=str(why or "")[:120])
+        except Exception:                        # noqa: BLE001 —— 打点坏了别影响启动 ✓
+            pass
+
+    def _refresh_hotkey_ui(self):
+        """把"热键现在哪种生效"写进按钮 tooltip（**让人看得见** ✓ —— 见 `_register_auto_hotkey`）。"""
+        try:
+            _how = getattr(self, "_hotkey_how", "")
+            _txt = {"hotkey": "全局热键已注册：任何窗口聚焦都生效 ✓",
+                    "hook": ("全局热键被别的进程占着 ⇒ 已改用**键盘钩子**："
+                             "照样在任何窗口生效 ✓（它不独占 ✓）"),
+                    "window": ("⚠ 全局热键和键盘钩子都被挡住了 ⇒ **只在本窗口聚焦时**有效。"
+                               "想让游戏里也生效：关掉多余的本程序实例，或换个键 ✓"),
+                    "none": "⚠ 映射的键无效，没注册 ✓"}.get(_how)
+            if _txt:
+                self.player_panel.btn_auto.setToolTip(
+                    "开始/停止自动打怪。\n%s" % _txt)
+        except Exception:                        # noqa: BLE001 —— 只是提示，别把启动弄崩 ✓
+            pass
 
     def _on_auto_key_changed(self, key):
         self._register_auto_hotkey()
+
+    def _on_auto_hotkey_fired(self):
+        """热键**真的被按下**了 —— 注册制与键盘钩子**两路共用的唯一出口** ✓。
+
+        ⚠⚠ 钩子那一路是在**系统钩子链里**被叫的 ✗ ⇒ 这里**不许做重活**（慢了会拖全系统的
+          按键 ✓ 见 `decision/hotkey.install_hook` 的说明 ✓）⇒ 丢回 Qt 事件循环再开关自动 ✓。
+        """
+        QTimer.singleShot(0, self.player_panel.toggle_auto)
 
     def nativeEvent(self, eventType, message):
         """接收系统级 WM_HOTKEY 全局热键，任何窗口聚焦都能触发。"""
         from decision import hotkey as _hotkey
         if _hotkey.is_hotkey(message, self._hotkey_id):
-            self.player_panel.toggle_auto()
+            self._on_auto_hotkey_fired()
             return True, 0
         return super().nativeEvent(eventType, message)

@@ -89,11 +89,69 @@ CHANNEL_GRID_COLS = 4
 CHANNEL_GRID_ROWS = 5
 CHANNEL_GRID_DX = 131.0 / 1920.0     # ≈ 0.0682（横向格距，比例 ✓）
 CHANNEL_GRID_DY = 43.0 / 1080.0      # ≈ 0.0398（纵向格距，比例 ✓）
-CHANNEL_GRID_MAX = CHANNEL_GRID_COLS * CHANNEL_GRID_ROWS      # 20 ✓
+CHANNEL_GRID_MAX = CHANNEL_GRID_COLS * CHANNEL_GRID_ROWS      # 20 = **一屏**看得见的格数 ✓
+
+#: ⭐⭐ **面板一页 = 4 列 × 5 行 = 20 格；第 21~60 个靠滚轮**（**用户 2026-10-09 真机口述
+#: 确认** ✓ 原话："频道选择界面，**一页 5 行 4 列**，**滚轮往下滑一下会往下滚动一行**" ✓✓）。
+#:
+#: ⚠ 这段说明折腾过一轮，把经过记在这儿（免得下一个人再走一遍 ✗）：
+#:   · 2026-10-08：做了"一长串 60 格 + 滚轮到位"（下面这套 ✓）；
+#:   · 2026-10-09 第一版怀疑：用户说"22 频道不需要滚轮啊"⇒ 以为频道号是"世界 × 20"编的 ✗
+#:     ⇒ 一度改成"先点第 2 个世界、再点该世界第 2 格"✗ ——**改错了** ✓（用户马上澄清：
+#:     **就是同一页往下滚一行** ✓）。**已改回本套** ✓。
+#:   · 真机样本帧（`datasets/lie/captures/channel_panel_*.png` ✓）也对得上：一页
+#:     **频道1..20**（4 列 × 5 行 ✓），右侧有滚动条 ✓ ⇒ 60 个频道 = 15 行 ⇒ **要往下滚才能到 22** ✓。
+#:
+#: ⚠⚠ **滚法：只往下滚"需要的那几行"、让目标落在最下面一行**（**用户 2026-10-10 真机核定**
+#: ✓ 原话："选频道**没有滚轮操作**，而且就算有，**22 频道也是滚轮滚一下后的最下面一行**，
+#: 现在点的还是 2 频道" ✓✓ —— 两句话把上一版的两处错都点出来了 ✓）：
+#:     ① **先把光标放到列表上**（滚轮只作用于光标底下的控件 ✗ 见 `mouse_aim.scroll` ✓）；
+#:     ② **只往下滚 `need` 行** —— `need = max(0, row − (行数−1))` ✓（`row = (频道号−1) // 4` ✓
+#:        0 起 ✓）：**22 ⇒ `need = 1`** ✓（22 是第 6 行 ⇒ 往下滚 **1** 行 ⇒ 它正好落在
+#:        **屏上最下面一行** ✓ 与用户口径一致 ✓）；**≤ 20 的频道**在第一页里 ⇒ `need = 0`
+#:        ⇒ **一个字节都不滚** ✓。
+#:     ③ 屏上第几行 = `row − need` ✓（⇒ 目标要么在第一页原位、要么在滚动后的最下面一行 ✓）。
+#:   ⚠⚠ **"先往上滚到顶"那一版已删** ✗（2026-10-10 ✓）：它先发 **20 格向上**、再发 5 格向下 ✗
+#:     ⇒ **客户端把这种瞬时爆发当成一下** ✗（真机 00:49 那次 `up=20, down=5` ⇒ 列表
+#:     **根本没动** ⇒ 接着点"第 1 行第 2 列" ⇒ **频道 2** ✓ —— 用户的现场 ✓ 一字不差 ✓）。
+#:     ⇒ 一次只发"人也会那么滚"的那 1 格 ✓，客户端才吃 ✓。
+#:   ⚠ 代价（说清楚 ✓）：**假定频道面板一打开就在顶部** ✓（真机如此 ✓）；要是列表在这之前
+#:     被人手动滚过 ⇒ 会点错行 ✗（那就重开一次频道面板 ✓ 别在这儿加"回顶"空爆 ✗）。
+CHANNEL_TOTAL = 60                                       # 面板总频道数 ✓（1~60 参数上限 ✓）
+CHANNEL_TOTAL_ROWS = CHANNEL_TOTAL // CHANNEL_GRID_COLS  # 15 行 ✓
+CHANNEL_MAX_SCROLL_ROWS = max(0, CHANNEL_TOTAL_ROWS - CHANNEL_GRID_ROWS)   # 最多需要滚 10 行 ✓
+#:   ⚠ 它现在**只是上界**（1~60 里最靠后的 60 号才需要 10 行 ✓）：`need` 超过它 = 算错 ✗
+#:     ⇒ 那就不点（宁可不动手 ✓）。
+
+#: ⚠⚠ **滚几格 = 走一行** —— **用户 2026-10-09 真机口述量掉了** ✓ 原话：
+#:   "滚轮往下滑一下会往下滚动一行" ✓✓ ⇒ 就是 **1** ✓（这个数以前是估的 ✗ 现在有出处 ✓）。
+#:   ⚠ 客户端要是换了 / 鼠标驱动改了"每次滚动行数"，**只改这一个数** ✓
+#:     （别的地方都是按行算的 ✓）。
+CHANNEL_WHEEL_NOTCHES_PER_ROW = 1
+#: 滚完等多久再点（秒 ✓）。⚠ **不在实时回路里睡** ✗ —— 交给状态机**下一拍** ✓
+#: （同双击那套 ✓ 见 `DOUBLE_CLICK_GAP` ✓）。
+SCROLL_SETTLE = 0.35
 
 # 判到这些界面就认为「人已经不在游戏里」→ 停自动 + 开始重连
 RECONNECT_UIS = tuple(STEPS)
 
+#: ⭐⭐⭐ **"自动关着 ⇒ 重连不接手"这个老口径已经删掉**（2026-10-09 两轮真机日志定的 ✓）。
+#:
+#: 走过三段（都记在这儿，别再走回去 ✗）：
+#:   ① **老口径**：自动没开 ⇒ **一律不插手** ✗（理由：自动是关的 = 人在自己操作 ✓）。
+#:      真机 22:47 踩到：**掉线 ⇒ 血条读空 ⇒ 被当成「角色死亡」⇒ 自动被停** ✗ ⇒ 报警响了却
+#:      **什么都不做** ✗（用户："勾选后还是没有任何操作" ✓）。
+#:   ② **窄口径**（同日晚些）：自动关着时**只接「登录界面 / 断线提示框」** ✓ ——
+#:      理由：**选频道 / 选角**人自己换频道时也会走到 ✗ 怕跟手动操作打架 ✗。
+#:   ③ ⭐ **现在（用户 23:51 那段日志定的 ✓）**：那条窄口径**也不对** ✗ ——
+#:      日志里三次明明白白：判到「选择频道（服务器列表）」「（频道面板）」「选择角色」✓
+#:      而**自动是关的** ⇒ 我**拒绝接手** ✗ ⇒ 用户看到的就是"断线重连触发后没有操作" ✓✓。
+#:      ⇒ 口径收成一句：**要不要它插手，只看那个总开关（`reconnect_enabled` ✓）** ✗
+#:        不再看"自动开没开"✓（自动开没开只决定"回来要不要恢复自动"✓ 见 `_auto_was_on` ✓）。
+#:      ⚠ 代价说清：**开关开着 + 自动关着 + 人自己在换频道** ⇒ 它**也会去点** ✓（可能抢手 ✓）。
+#:        不想让它插手就**关掉那个总开关** ✓ —— 那才是"我要不要它管"的正确控件 ✓。
+#:
+#: （原来那个 `HARD_DISCONNECT_UIS` 白名单随之**删除** ✗ —— 留着只会让人以为还有那道闸 ✓。）
 # 探界面的最小间隔（秒）。detect() 实测 ~4ms（窗口匹配 + 0.5 缩放），
 # 1 秒一次足够跟上界面切换，又不跟推理抢时间。
 PROBE_INTERVAL = 1.0
@@ -166,11 +224,19 @@ class Reconnector:
         self._declined = ""
         #: 最近一条**已经写进 behavior.log** 的状态文字（`_say` 判变化用 ✓ —— 防刷屏）。
         self._logged = None
+        #: 最近一条**已经写进 behavior.log** 的「**没出手**的原因」（见 `_idle` ✓）。
+        #: ⚠ 与 `_logged` 分开记 ✗：一个是"我在干什么"，一个是"我为什么没动" ✓ 两条线各去各的重 ✓。
+        self._idle_logged = None
         #: ⭐⭐ 「双击」用（见 `DOUBLE_CLICK_UIS` / `DOUBLE_CLICK_GAP` ✓）：
         #: `_click_at` = 第一次点击那一拍的时刻（0 = 还没点 ✓）；
         #: `_doubled` = 这一轮里第二下**已经补过**（别每拍都补 ✗）。
         self._click_at = 0.0
         self._doubled = False
+        #: ⭐⭐ 「先滚再点」用（第 21~60 个频道 ✓ 见 `CHANNEL_TOTAL` 那段 ✓）：
+        #: `_scroll_pending` = 滚完之后要点的那个坐标（`(x, y, 人话)` ✓ 没有 = 不用滚 ✓）；
+        #: `_scroll_at` = 发出滚动动作那一拍的时刻 ✓（到点再出点击 ✓ 同双击那套 ✓）。
+        self._scroll_pending = None
+        self._scroll_at = 0.0
 
     # ---------------- 唯一入口 ----------------
 
@@ -216,14 +282,13 @@ class Reconnector:
             self._lost_since = now
 
         if not self.active:
-            # 没在重连：必须「自动开着」才参与 —— 自动本来就是关的，
-            # 说明人在自己操作（比如手动重连），别去插手。
-            if not s.enabled:
-                self._decay_note(now)
-                return None
             # 丢一会儿再说：被树挡住/走出视野也会丢框，先等够时间
             wait = max(0.0, float(s.reconnect_probe_after_lost_sec))
             if now - self._lost_since < wait:
+                # ⚠ 这句**别把已等秒数写进去** ✗（那它每 0.1 秒就变一次 ⇒ `_idle` 的去重失效
+                #   ⇒ 60fps 下拿日志刷屏 ✗）。
+                self._idle("玩家框刚丢，还没到「丢失多久后开始探界面 = %.1f 秒」⇒ 先等着（不动手 ✓）"
+                           % wait)
                 self._decay_note(now)
                 return None
 
@@ -237,21 +302,37 @@ class Reconnector:
         if ui not in RECONNECT_UIS:
             if self.active:
                 self._say("等待画面…（当前判不出界面）")
+            else:
+                # 闸④：**报警那套认得出、重连这套认不出** 也会长这样 ✗ ⇒ 把"认出了什么"
+                #   记下来（`ui=None` = 一个都没认出来 ✓ 那就要看模板/画面来源 ✓）。
+                self._idle("玩家框丢了，但界面没认出（判到 %s）⇒ 重连只认：%s"
+                           % (ui_state.UI_NAMES.get(ui, ui) if ui else "无",
+                              "、".join(ui_state.UI_NAMES.get(k, k)
+                                        for k in RECONNECT_UIS)))
             return None
 
         # 断线判断成立 → 先停自动，再开始走流程
         if not self.active:
             self.active = True
+            self._idle_logged = None      # 接上手了 ⇒ 下一轮"没出手原因"重新记 ✓
             self._scene = None
             self._tries = 0
             self._last_fail = ""
             self._declined = ""
             self._scene_at = now
-            self._auto_was_on = True      # 能走到这里说明 s.enabled 是开的
+            # ⚠⚠ 记下"接手这一刻自动到底是什么状态"（2026-10-09 修 ✗）：原来**硬写 True** ——
+            #   可"自动本来就是关的"那一路（掉线把自动停了 ✓ 见 `HARD_DISCONNECT_UIS` 那段 ✓）
+            #   也会被记成 True ⇒ 回到游戏后**请求开自动** ✗ = 用户根本没让它开 ✓ 那是越权 ✗。
+            self._auto_was_on = bool(s.enabled)
             s.enabled = False
             if reconnect_on:
-                self._say("检测到%s —— 已停止自动，开始重连"
-                          % ui_state.UI_NAMES.get(ui, ui))
+                if self._auto_was_on:
+                    self._say("检测到%s —— 已停止自动，开始重连"
+                              % ui_state.UI_NAMES.get(ui, ui))
+                else:
+                    self._say("检测到%s —— 自动本来就是关的 ⇒ 照常接手重连 ✓"
+                              "（要不要它管，看「断线后自动走回游戏」那个开关 ✓）"
+                              % ui_state.UI_NAMES.get(ui, ui))
             else:
                 self._say("检测到%s —— 已停止自动（重连未开启：不会自动按键 ✓）"
                           % ui_state.UI_NAMES.get(ui, ui))
@@ -268,7 +349,24 @@ class Reconnector:
             self._tries = 0
             self._click_at = 0.0            # 换界面 ⇒ 双击那一轮作废 ✓
             self._doubled = False
+            self._scroll_pending = None     # 换界面 ⇒ "先滚再点"那一轮也作废 ✓
             return self._do(act, desc, now)
+
+        # ⭐⭐ **「先滚再点」的第二拍**（第 21~60 个频道 ✓ 见 `CHANNEL_TOTAL` 那段 ✓）：
+        #   滚动动作上面已经发了（`_do` ✓），滚完**隔一会儿**再点 ✓ —— ⚠ 一样**不在实时回路里
+        #   睡** ✗（交给这一拍 ✓ 同双击那套 ✓）。
+        #   ⚠ 点完照旧要**双击**（频道面板 ✓）⇒ 这里顺手把双击那一轮起个头 ✓（第二次由上面补 ✓）。
+        if (self._scroll_pending is not None and self._scroll_at
+                and now - self._scroll_at >= SCROLL_SETTLE):
+            xr, yr, name = self._scroll_pending
+            self._scroll_pending = None
+            if self.ui in DOUBLE_CLICK_UIS:
+                self._click_at = now
+                self._doubled = False
+            self._declined = ""
+            self._say("%s：滚动到位 —— 点%s（画面比例 %.3f, %.3f）" % (desc, name, xr, yr))
+            return {"act": "click", "x": xr, "y": yr, "desc": desc,
+                    "double": self.ui in DOUBLE_CLICK_UIS}
 
         # ⭐⭐ **「频道格要双击」的第二下**（2026-10-07 ✓ 真机验出来：单击只是"选中" ✗）：
         #   第一下由 `_do` 发（撞角归零 + 走位 + 左键 ✓）；**隔一小会儿**再补一条**光左键** ✓
@@ -334,9 +432,27 @@ class Reconnector:
                 self._say("%s：暂时不动手 —— %s（已停在这里 %.0f 秒）"
                           % (desc, why, max(0.0, now - self._scene_at)))
                 return None
-            xr, yr, name = tgt
+            xr, yr, name, scroll = tgt
             self._tries += 1
             self._declined = ""
+            # ⭐⭐ 第 21~60 个频道**不在第一页**里 ⇒ 只往下滚需要的那几行（见 `CHANNEL_TOTAL`
+            #   那段 ✓），滚完由 `update()` **下一拍**再出点击动作 ✓（实时回路不许 sleep ✗）。
+            if scroll:
+                self._scroll_pending = (xr, yr, name)
+                self._scroll_at = now
+                self._say("%s：先把光标放到列表上，再往下滚 %d 行（目标落到最下面一行 ✓），"
+                          "然后点%s" % (desc, scroll[1], name))
+                # ⚠⚠ **坐标必须一起带上**（2026-10-09 真机修的 ✗ 用户："我选的 22 频道，
+                #   怎么断线重连去 2 了？"）：滚轮**只作用在光标底下那个控件**上 ✗ ——
+                #   不带坐标 ⇒ 光标还停在上一步"点服务器"的位置（画面上方 ✗ 不在列表里）
+                #   ⇒ 列表一格没滚 ⇒ 接着点"第一页第 1 行第 2 列" ⇒ **进了频道 2** ✗
+                #   （真机日志 23:16 ✓；那条 `reconnect_click ok=True` 只证明"滚轮指令发出去了"
+                #    ✗ 证明不了"列表滚了" ✓ —— 记这一笔，免得以后再被它骗 ✓）。
+                # ⚠⚠ **`up` 恒为 0** ✗（2026-10-10 ✓ 用户："选频道**没有滚轮操作**"）：
+                #   上一版先发 20 格"回到顶" ✗ ⇒ 客户端把这一串爆发当成一下 ⇒ **列表没动** ✗
+                #   ⇒ 点第一行 ⇒ 频道 2（现场 ✓）。一次只发"人也会那么滚"的那 1 格 ✓。
+                return {"act": "scroll", "up": scroll[0], "down": scroll[1],
+                        "x": xr, "y": yr, "desc": desc}
             # ⭐ 这一步要不要**双击**（`DOUBLE_CLICK_UIS` ✓）：要 ⇒ 记下这一拍的时刻，
             #   下一拍 `update()` 到点会补第二下（`click2` ✓ 见那边 ✓）。
             if self.ui in DOUBLE_CLICK_UIS:
@@ -372,6 +488,7 @@ class Reconnector:
             return None, "点击位置不在画面里（要看 0~1：%s=%s %s=%s）" % (xf, x, yf, y)
         # ⭐⭐ 「想去第几个频道」：把格号折算成落点（见 `CHANNEL_GRID_*` ✓ 一处实现 ✓）。
         #   ⚠ 只对**频道面板**这一步生效 ✓（服务器行永远是第 1 格 ✓ 真机验过 ✓ 别顺手也挪 ✗）。
+        scroll = None
         if ui == ui_state.UI_CHANNEL_PANEL:
             try:
                 # ⚠ **别写 `or 1`** ✗（反向验证时正是这么漏掉的 ✓）：0 会被悄悄当成 1 ⇒
@@ -379,21 +496,34 @@ class Reconnector:
                 n = int(getattr(self.s, "reconnect_channel", 1))
             except (TypeError, ValueError):
                 return None, "「频道」不是整数（去「挂机保护 → 断线重连 → 频道」改 ✓）"
-            if not (1 <= n <= CHANNEL_GRID_MAX):
-                return None, ("「频道」填的是 %d，超出面板格数（1~%d ✓ %d 列 × %d 行）"
-                              "⇒ 不点（改小一点 ✓）"
-                              % (n, CHANNEL_GRID_MAX, CHANNEL_GRID_COLS, CHANNEL_GRID_ROWS))
-            x += ((n - 1) % CHANNEL_GRID_COLS) * CHANNEL_GRID_DX
-            y += ((n - 1) // CHANNEL_GRID_COLS) * CHANNEL_GRID_DY
-            name = "%s（第 %d 格）" % (name, n)
+            if not (1 <= n <= CHANNEL_TOTAL):
+                return None, ("「频道」填的是 %d，超出总频道数（1~%d ✓）⇒ 不点（改小一点 ✓）"
+                              % (n, CHANNEL_TOTAL))
+            col = (n - 1) % CHANNEL_GRID_COLS          # 第几列（0 起 ✓）
+            row = (n - 1) // CHANNEL_GRID_COLS         # 第几行（0 起 ✓ 从左到右、从上到下数 ✓）
+            # ⭐⭐ **只滚"需要的那几行"、让目标落在最下面一行**（用户 2026-10-10 真机核定 ✓
+            #   见上面那段说明 ✓）。⚠ 别再改回"先往上滚到顶" ✗ —— 那个空爆会被客户端
+            #   当成一下 ⇒ 列表不动 ⇒ 点第一行 ⇒ **进错频道**（真机 00:49 ✓ 点了 2 ✗）。
+            need = max(0, row - (CHANNEL_GRID_ROWS - 1))
+            if need > CHANNEL_MAX_SCROLL_ROWS:
+                # 只可能是算错了（1~60 里最靠后的 60 号也只要 10 行 ✓）⇒ 不点 ✓
+                return None, ("第 %d 个频道要往下滚 %d 行，超过上界 %d ⇒ 不点（宁可不做 ✓）"
+                              % (n, need, CHANNEL_MAX_SCROLL_ROWS))
+            on_screen = row - need          # 屏上第几行（0 起 ✓ 目标在最下面一行 ✓）
+            # ⚠ `up=0`（**不许**再发"回顶"那一下 ✗）；`need=0` ⇒ 干脆不出滚动这一步 ✓
+            scroll = ((0, need * CHANNEL_WHEEL_NOTCHES_PER_ROW) if need else None)
+            x += col * CHANNEL_GRID_DX
+            y += on_screen * CHANNEL_GRID_DY
+            name = "%s（频道 %d ⇒ %s%d 行第 %d 列）" % (
+                name, n, "滚动后 " if scroll else "", on_screen + 1, col + 1)
             if not (0.0 <= x <= 1.0) or not (0.0 <= y <= 1.0):
                 # 格号合法但算出来出界（配置把"第 1 格"配到画面右下角之类 ✓）⇒ 照样不点 ✓
-                return None, ("第 %d 格算出来跑到画面外了（%.3f, %.3f）—— 先把「频道 X/Y 比例」"
-                              "配成第 1 格的中心 ✓" % (n, x, y))
+                return None, ("第 %d 个频道算出来跑到画面外了（%.3f, %.3f）—— 先把"
+                              "「频道 X/Y 比例」配成第 1 格的中心 ✓" % (n, x, y))
         ok, why = mouse_aim.aim_available()
         if not ok:
             return None, why
-        return (x, y, name), ""
+        return (x, y, name, scroll), ""
 
     def feedback(self, ok, why):
         """调用方**执行完一个动作**后回填结果（`ok` + 人话）⇒ 写进状态文字 / 日志。
@@ -465,6 +595,28 @@ class Reconnector:
         self.ui = None
         self._last_fail = ""
         self._declined = ""
+
+    def _idle(self, why):
+        """**这一步为什么没出手** —— 只在变化时进 `behavior.log`（诊断 ✓ 不打扰界面 ✓）。
+
+        ⚠⚠ 为什么非有不可（用户 2026-10-09 ✓ 原话："**断线重连 功能现在不生效了，断线警报
+          响了但是没有任何操作**"）：`update()` 前面有**四道闸** ——
+            ① 自动没开着（重连只在自动开着时接手 ✓）
+            ② `reconnect_enabled` 没开（那一支会 `_say` ✓ 能看见 ✓）
+            ③ 玩家框丢了但**还没到**「丢失多久后开始探界面」
+            ④ 界面**没认出来**（不在 `RECONNECT_UIS` 里）
+          —— ①②③④ 任何一道不满足都**静默返回** ✗ ⇒ 现场只剩"报警响了、什么都没发生" ✗，
+          事后翻日志也查不出**是哪道闸** ✗（今晚这一轮就是这么卡的 ✓）。
+        ⇒ 每道闸把"我是谁"记一条 ✓。⚠ 走 `behavior.event` 而不是 `_say` ✗：`_say` 会改界面那行
+          状态文字（每拍的"还没到"会把它顶掉 ✓ 反而把真正有用的结论冲了 ✗）。
+        """
+        if why == self._idle_logged:
+            return
+        self._idle_logged = why
+        try:
+            behavior.event("reconnect_idle", why=why)
+        except Exception:                            # noqa: BLE001 —— 诊断不许把重连弄崩 ✓
+            pass
 
     def _say(self, text, now=None):
         """更新状态文字。非空的会在 NOTE_KEEP 秒后过期（见 _decay_note）。

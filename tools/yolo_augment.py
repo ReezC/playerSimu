@@ -110,6 +110,45 @@ def _read_boxes(path):
     return out
 
 
+#: ⭐⭐ **这一支的版本号**（用户 2026-10-10 ✓ 现场逼出来的）：`run_yolo_augment` 是**在任务里
+#:   才 `import` 的** ⇒ 工作台进程一旦**早就启动过**、跑过一次，`sys.modules` 里就**一直是旧的那份**
+#:   ✗ —— 于是"我明明改了，跑出来还是老行为"✓（2026-10-10 现场：跑了三趟，记录里都没有新加的
+#:   `first_inputs` 字段 ⇒ 说明那颗进程里是旧模块 ✓ 而人以为"已经是最新的"✗）。
+#:   ⇒ 每次跑都在日志第一行与记录里写下它 ✓：**看到 `版本` 与代码里一致 = 真的是新代码** ✓。
+AUGMENT_BUILD = "2026-10-10b"
+
+
+def _stem_of(path, frame_map):
+    """`r.path` → **画面目录里那一帧的 stem**；对不上 ⇒ `None`（调用方跳过 ✓）。
+
+    ⭐⭐ **为什么不能直接用 `path.stem`**（2026-10-09 现场 ✓）：`run_yolo_augment` 是**通用**工具
+    ✓ —— 谁都能用 `--frames <别的目录>` 跑它（CLI / 别的卡片 ✓，本函数的参数就叫 `frames` ✓）。
+    那种情况下"喂进来的图叫什么、标注就叫什么" ✗ ⇒ 写出一堆**对不上任何画面**的标注 ✗：
+    实测（鳄鱼潭1）`--frames` 指到了另一个目录（那批图叫 `image0.jpg…image178.jpg` ✓）
+    ⇒ `labels_auto/` 里多出 **163 个 `image0.txt…image178.txt`** ✗ 而画面叫
+    `frame_00000.png…` ✓。
+    后果很安静也很坏 ✓：**质检台按帧名找标注** ⇒ 那些帧看到的还是**旧**标注 ✗
+    （用户报的"YOLO 标注了 frame_179 往后、质检台打开看不到新的框"✓ 就是它 ✓）；
+    数据集那边同样读不到 ✓。
+    ⇒ 一律**映射回画面目录里的帧名** ✓；对不上就**跳过**（并汇总报出来 ✓ 不静默 ✗）。
+    """
+    if not path:
+        return None
+    try:
+        key = Path(path).resolve()
+    except Exception:                        # noqa: BLE001
+        return None
+    stem = frame_map.get(key)
+    if stem:
+        return stem
+    # 兜底：同一个**文件名**（软链 / 相对路径写法不同 ⇒ 解析出来不一样 ✓）
+    name = Path(path).name
+    for p, s in frame_map.items():
+        if p.name == name:
+            return s
+    return None
+
+
 def _overlap(cx, cy, w, h, boxes, thr=OVERLAP_THR):
     """判断 (cx,cy,w,h) 是否和 boxes 里任一个框 IoU 超过 thr。"""
     x1, y1, x2, y2 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
@@ -265,6 +304,17 @@ def run_yolo_augment(params, ctx=None):
     out = Path(params["out"])
     out.mkdir(parents=True, exist_ok=True)
 
+    # ⭐⭐ **输出名一律走"画面目录里的帧名"**（2026-10-09 ✓ 见 `_stem_of` 的说明）：
+    #   对不上的图**跳过**，跑完汇总报出来 —— 绝不把标注写到"没人认的名字"上 ✗。
+    frame_map = {f.resolve(): f.stem for f in frames}
+    skipped = []
+    #: 有多少条是**靠"顺序"**对回帧名的（= ultralytics 把回报名写成 `imageN.jpg` 的那些 ✓
+    #: 见下面循环里那段说明 ✓）。正常情况它 == 总条数 ✓，说明"顺序映射"这条路在干活 ✓。
+    order_fixed = 0
+    #: ⭐ 头几条"**模型回报的名字**"（与"喂入"那行对照 ✓ 见下面 ✓）：2026-10-09 那次
+    #:   "目录记对了、喂进去的却是别的名字"的局面，就是靠这两行才分得清 ✗✓。
+    seen_paths = []
+
     conf = float(params.get("conf", 0.40))
     iou = float(params.get("iou", 0.45))
     imgsz = int(params.get("imgsz", 960))
@@ -274,6 +324,8 @@ def run_yolo_augment(params, ctx=None):
     player_id = (params.get("player_id") or "").strip()
     weights_player_id = (params.get("weights_player_id") or "").strip()
 
+    # ⭐⭐ 第一行就报版本 ✓：让人**当场**就能确认"跑的是不是最新代码" ✗✓（见 `AUGMENT_BUILD` ✓）
+    ctx.log("版本       %s（yolo_augment）" % AUGMENT_BUILD)
     ctx.log("权重       %s" % weights)
     ctx.log("画面       %s（%d 张）" % (frames_dir, len(frames)))
     if mode == "player":
@@ -297,12 +349,28 @@ def run_yolo_augment(params, ctx=None):
         allowed = {CLASS_MOB}
         ctx.log("置信度 %.2f   只合并 class 1（怪物）" % conf)
     ctx.log("输出       %s" % out)
+    # ⭐⭐ **"喂给模型的到底是哪些图"要留证据**（2026-10-09 ✓）：这次现场出现了一种**对不上**的
+    #   局面 —— `last_augment.json` 里 `frames_dir` 记的是**正确的**项目画面目录（359 张
+    #   `frame_*.png` ✓），可这趟实际喂进去的是 **180 张 `imageN.jpg`** ✗。而"枚举源头"和
+    #   "预测源"都是同一份 `frames` 列表 ✓ ⇒ 只报"目录 + 条数"已经分不清了 ✗ ⇒ 直接把**实际的
+    #   前几个名字**打出来 ✓（推理前一次、推理中再记 ultralytics 回给我们的 `r.path` 前几个 ✓）。
+    ctx.log("喂入       %d 张；前 3 个：%s"
+            % (len(frames), "、".join(f.name for f in frames[:3]) or "（空）"))
     ctx.log("")
 
     # 轮到这个阶段时任务可能已经被取消了 —— 别为一个已取消的任务去加载模型：
     # YOLO(...) 首次加载要几秒到几十秒（还要初始化 CUDA），这一下拦不住。
     if ctx.canceled():
         ctx.log("已取消，跳过 YOLO 辅助", "warn")
+        # ⭐⭐ **取消也要留记录**（2026-10-09 ✓）：用户现场"重新跑了一趟、却什么都没变" ✗
+        #   —— "被取消 / 没跑 / 补了 0 框"三种在磁盘上长得一模一样 ✓ ⇒ 这一条专门区分它们 ✓
+        #   （模型加载要几秒~几十秒 ✓ 期间点取消/被新任务顶掉，是最常见的"跑了但没写"✓）。
+        _write_last_run(out, {
+            "when": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "build": AUGMENT_BUILD,
+            "frames_dir": str(frames_dir), "out": str(out), "weights": str(weights),
+            "mode": mode, "frames": 0, "boxes_added": 0, "frames_merged": 0,
+            "skipped": 0, "skipped_names": [], "seconds": 0.0, "canceled": True})
         return {"frames": 0, "boxes_added": 0, "frames_merged": 0, "mode": mode,
                 "seconds": 0.0, "weights": str(weights), "summary": "已取消"}
 
@@ -332,8 +400,26 @@ def run_yolo_augment(params, ctx=None):
             break
 
         path = Path(getattr(r, "path", "") or "")
-        stem = path.stem
-        if not stem:
+        # ⭐ 头 3 条把"ultralytics 回报的路径"也打出来 ✓（与上面"喂入"那行对照 ⇒ 一眼看出
+        #   是"喂错了"还是"回报的名字变了"✓ —— 2026-10-10 就是靠这行才分得清 ✓）
+        if i <= 3:
+            seen_paths.append(path.name or "（空 path）")
+            ctx.log("  回报 %d/%d：%s" % (i, n, path.name or "（空 path）"))
+        # ⭐⭐ **`r.path` 靠不住**（2026-10-10 实测 ✓）：给 `predict` 传**路径列表**时，ultralytics
+        #   会把回报里的 `path` 写成 `image0.jpg / image1.jpg …`（**它内部的序号名** ✗），跟喂进去的
+        #   `frame_00179.png` 对不上 ✓ —— 最小复现（真权重、喂 3 张真帧）：
+        #     `喂入 ['frame_00179.png','frame_00180.png','frame_00181.png']`
+        #     `回报 path='image0.jpg' / 'image1.jpg' / 'image2.jpg'`
+        #     （`orig_shape` 是**真的** (1080,1920) ✓、框也检出来了 ✓ ⇒ 图本身没喂错 ✓）
+        #   ⇒ 所以**绝不能拿 `r.path` 当"图喂错了"的判据** ✗（上一版就是这么误判的 ✓）。
+        #   规则：先按路径 / 文件名对 ✓；对不上 ⇒ **按顺序**（第 i 条 ↔ 第 i 张 ✓ ——
+        #   `stream` 是**按输入顺序**吐的 ✓ 上面那个复现也印证了：1→image0、2→image1 ✓）。
+        stem = _stem_of(path, frame_map)
+        if stem is None and i <= len(frames):
+            stem = frames[i - 1].stem
+            order_fixed += 1
+        if stem is None:
+            skipped.append(path.name or "（空 path）")
             continue
 
         target = out / (stem + ".txt")
@@ -370,24 +456,89 @@ def run_yolo_augment(params, ctx=None):
     dt = time.perf_counter() - t0
 
     ctx.log("")
+    # ⛔⛔ **全军覆没 = 目录指错了**（2026-10-09 ✓ 用户现场就是这条 ✓）：一张都对不上时，
+    #   别把它混进普通的"0 框"里（那句"模型不适应"会把人带偏 ✗）—— 这次实测用户的日志就是
+    #   `画面 180 张 / 补充 0 框 / 跳过 180 张` ✗，人第一反应是"模型没检出"✗，其实是**画面目录
+    #   指到了临时导出的那一份**（名字对不上 ⇒ 一张都没处理 ✓）。
+    if order_fixed:
+        # ⚠ 这条**不是**错误 ✓：ultralytics 对"路径列表"输入会把回报的 `path` 写成 `imageN.jpg`
+        #   （内部序号名 ✓ 见循环里那段实测 ✓）⇒ 我们按**顺序**对回帧名 ✓ 照样干活 ✓。
+        ctx.log("  ⓘ ultralytics 把回报里的 `path` 换成了 `imageN.jpg`（它的内部序号名 ✓）"
+                "⇒ **已按顺序**对应回帧名：%d 条 ✓" % order_fixed, "info")
+    # ⛔ 只有"**连顺序都兜不住**"（`order_fixed == 0`）时才是真的"这批图不属于这个目录" ✗
+    if skipped and order_fixed == 0:
+        ctx.log("⛔ **这一趟一张都对不上**：喂给模型的 %d 张图，路径与 `--frames` 那个画面目录里的"
+                "**一个都不匹配** ✗ ⇒ 「画面目录」要指向**项目的画面目录**"
+                "（`projects/<项目>/frames` ✓），别指向临时导出的那一份 ✗。"
+                "（`last_augment.json` 里已记下 `frames_dir` 与这些名字样本 ✓）"
+                % len(skipped), "warn")
+    if skipped:
+        _u = sorted(set(skipped))
+        ctx.log("  ⚠ **跳过 %d 张对不上帧的图** ✗ —— 写出去也没人认 ✓，所以宁可跳过：%s%s"
+                % (len(skipped), "、".join(_u[:5]), "…" if len(_u) > 5 else ""), "warn")
     ctx.log("── YOLO 辅助标注完成 ──", "ok")
-    ctx.log("  画面 %d 张 / 补充 %d 框 / 涉及 %d 帧" % (n, n_boxes, n_merged))
+    ctx.log("  画面 %d 张 / 补充 %d 框 / 涉及 %d 帧%s"
+            % (n, n_boxes, n_merged,
+               "／跳过 %d 张" % len(skipped) if skipped else ""))
     ctx.log("  用时 %.1fs" % dt)
     if n_boxes == 0:
-        ctx.log("  一个框都没补 —— 模型对这些画面不适应，或画面里本就没有目标",
-                "warn")
+        ctx.log("  一个框都没补 —— 模型对这些画面不适应，或画面里本就没有目标"
+                "（⚠ 已有框若**和预测框重叠**则按「只补不覆盖」不补 ✓）", "warn")
+    # ⭐⭐ 落盘一份"这趟干了什么"（见 `_write_last_run` ✓）：日志只在界面里，过一会儿查不了 ✗
+    if _write_last_run(out, {
+            "when": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "build": AUGMENT_BUILD,
+            "frames_dir": str(frames_dir),
+            "out": str(out),
+            "weights": str(weights),
+            "mode": mode,
+            "frames": n,
+            "boxes_added": n_boxes,
+            "frames_merged": n_merged,
+            "skipped": len(skipped),
+            "skipped_names": sorted(set(skipped))[:20],
+            # ⭐ "喂入的"与"模型回报的"各留几个名字 ⇒ **"目录对不上"还是"名字被换了"一眼分得清** ✓
+            "first_inputs": [f.name for f in frames[:5]],
+            "first_returned": seen_paths,
+            #: 靠"顺序"对回帧名的条数（`r.path` 被 ultralytics 换成 `imageN.jpg` 的那些 ✓）
+            "order_mapped": order_fixed,
+            "seconds": round(dt, 1),
+            "canceled": False}):
+        ctx.log("  记录 %s" % (out / "last_augment.json"))
     ctx.log("")
 
     return {
         "frames": n,
         "boxes_added": n_boxes,
         "frames_merged": n_merged,
+        "skipped": len(skipped),
         "mode": mode,
         "seconds": dt,
         "weights": str(weights),
-        "summary": "补充 %d 框 / %d 帧（%s）"
-                   % (n_boxes, n_merged, MODE_ZH.get(mode, "怪物")),
+        "summary": "补充 %d 框 / %d 帧（%s）%s"
+                   % (n_boxes, n_merged, MODE_ZH.get(mode, "怪物"),
+                      "，跳过 %d 张对不上的" % len(skipped) if skipped else ""),
     }
+
+
+def _write_last_run(out, rec):
+    """把"这一趟干了什么"落到 `out/last_augment.json`（**写不进去也不许把这一趟判失败** ✗）。
+
+    ⭐⭐ **为什么要它**（2026-10-09 现场 ✓）：任务的日志只在**界面**里（`gui/worker.py` 的
+    `sig_log` ⇒ 只有当时看得见 ✓）⇒ 过一会儿就说不清"上次那趟到底写了没有" ✗。今天就卡在
+    这儿：用户"重新跑了一趟"，而 `labels_auto/` 里**一个 mtime 都没变** ✓ —— 但"没变"到底是
+    "**没跑** / **被跳过**（`--frames` 指错 ✓）/ **补了 0 框**（预测框都被已有框盖住 ✓
+    「只补不覆盖」✓）"这三种里哪一种，**从磁盘上看不出来** ✗。
+    ⇒ 每次跑完留一份：含 `frames_dir` ✓（**指错目录一眼就看见** ✓）、`skipped` 与它的名字样本 ✓、
+    补了多少 ✓。人（和排查的人）不用猜 ✓。
+    """
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "last_augment.json").write_text(
+            json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception:                    # noqa: BLE001 —— 记不上不该把这一趟判失败 ✗
+        return False
 
 
 def run_detect_mob_augmented(params, ctx=None):

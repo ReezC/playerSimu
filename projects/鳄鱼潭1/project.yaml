@@ -17,25 +17,26 @@ calib:
   sample: 5
 bars: {}
 mmap_crop:
-- 20
-- 72
+- 7
+- 76
 - 240
 - 79
 decision:
-  attack_dist: 400.0
+  attack_dist: 600.0
   min_attack_dist: 60
   attack_up_dist: 30
   attack_down_dist: 20
   attack_fan_deg: 15.0
+  walk_stall_jump: true
   chase_jump_enabled: true
   chase_jump_min: -100
-  chase_jump_max: 5
+  chase_jump_max: 10
   chase_jump_dash_ms: 50
-  chase_jump_edge_guard_enabled: true
-  chase_jump_edge_guard_px: 150
+  chase_jump_edge_guard_enabled: false
+  chase_jump_edge_guard_px: 100
   station_turn_interval_ms: 1000
   mouse_speed: 1.1999999999999995
-  evade_type: jump
+  evade_type: back
   jump_interval: 0
   jump_random_prob: 0.1
   back_jump_seq:
@@ -74,6 +75,7 @@ decision:
     down: down
     attack: s
     jump: D
+    pickup: space
     hp_pot: g
     mp_pot: null
     feed_pet: pagedown
@@ -82,11 +84,14 @@ decision:
   target_cd:
   - 1000
   - 2500
-  input_device: local
+  atk_target_count: 1
+  mob_atk_cd_ms: 1000
+  input_device: serial
   attack_cd: 300
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 600
   turn_output_delay_ms: 300
+  auto_pickup: false
   player_track_jump: 200
   player_foot_offset_px: -25
   player_box_min_area_pct: 0.0
@@ -103,25 +108,28 @@ decision:
   mob_sets_ttl_s: 3.0
   auto_hp_pot: true
   auto_mp_pot: false
-  strategy: patrol
-  vision_top: -1
-  vision_bottom: -1
-  vision_left: -1
-  vision_right: -1
+  strategy: sweep
+  vision_top: 100
+  vision_bottom: 100
+  vision_left: 800
+  vision_right: 800
   vision_center: false
   vision_off_x: 0
   vision_off_y: 0
-  big_mob_enabled: true
+  big_mob_enabled: false
   big_mob_ratio: 1.5
   big_mob_range_px: 600.0
   sweep_turn_cd: 500
-  back_range: 150
-  sweep_edge_turn_px: 100
-  station_spot: {}
+  back_range: 400
+  sweep_edge_turn_px: 400
+  station_spot:
+    kind: set
+    name: 右上平台
   station_pickup_enabled: false
   station_pickup_min_s: 0.0
   station_pickup_max_s: 0.0
   station_pickup_spots: []
+  multi_spots: []
   route_goto_set: 二楼
   align_tol_px: 12
   align_hold_ms: 1000
@@ -221,18 +229,25 @@ decision:
   anti_afk_spot_loop_hold: false
   anti_afk_retry_on_interrupt: true
   anti_afk_retry_sec: 10.0
-  reconnect_enabled: false
+  reconnect_enabled: true
   reconnect_probe_after_lost_sec: 0.0
   reconnect_step_timeout_ms: 3000
   reconnect_queue_timeout_ms: 180000
-  reconnect_max_retry: 3
+  reconnect_max_retry: 10
   reconnect_resume_auto: true
+  reconnect_server_x: 0.3635
+  reconnect_server_y: 0.2074
+  reconnect_channel_x: 0.4104
+  reconnect_channel_y: 0.5093
+  reconnect_channel: 14
   custom_keys:
     攻击药水: grave
     回避药水: '5'
     隐身术: a
     普攻: f
     表情_无语: f6
+  sweep_turn_cd_enabled: false
+  sweep_edge_turn_enabled: true
 notes: ''
 capture:
   source: file
@@ -340,7 +355,31 @@ train:
   patience: 40
   resume: false
 live:
-  weights: E:\MyPrograms\playerSimu\projects\鳄鱼潭1\models\detect_v1.pt
+  weights: E:\MyPrograms\playerSimu\projects\鳄鱼潭1\models\detect_v1_640.engine
+  capture_source: window
+  rect:
+  - -2547
+  - 44
+  - 1920
+  - 1080
+  url: udp://0.0.0.0:5000
+  conf_mob: 0.25
+  conf_player: 0.75
+  imgsz: 640
+  device: '0'
+  capture_fps: 60
+  draw: true
+  half: true
+  show_fps: 50
+  window_capture: wgc
+  rect_rel:
+  - 0.00052
+  - 0.027878
+  - 0.998959
+  - 0.971223
+  rect_win:
+  - 983398
+  - 冒险岛怀旧服
 player_id: 珠缨
 verify: {}
 iterate: {}

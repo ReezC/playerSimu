@@ -54,7 +54,8 @@ class PyAVSource(FrameSource):
     """
 
     def __init__(self, url, options=None, decode_format="rgb24",
-                 decode_all=False, skip_nonref=False, container_format=None):
+                 decode_all=False, skip_nonref=False, container_format=None,
+                 keep_check=None):
         """
         skip_nonref: 只解参考帧（I/P），跳过 B 帧等非参考帧。
             能显著减轻解码负担，但帧率会掉到 GOP 内的参考帧数量
@@ -65,12 +66,32 @@ class PyAVSource(FrameSource):
             没有容器头（既不是 mpegts 也不是 mp4），PyAV 的自动探测会失败：
                 InvalidDataError: Invalid data found when processing input
             这时传 container_format="mjpeg" 就能正常打开。
+
+        keep_check: ⭐⭐ **"这一帧还有人要吗"的判据**（`None` = 老行为：解出来就转 ✓）。
+            **为什么必须有它**（用户 2026-10-10 ✓ 原话："A 推流 60fps 不影响吧，我们的重点是
+            **提升 B 机的效率**，A 就算推 **240fps** 我们也需要能应对"✓）—— 本机实测（1080p 级
+            样本、走产品这条路 ✓）：
+
+                ① 纯解码            1399 帧/秒（0.71 ms/帧）✓
+                ② 解码 + bgr24 转换  169 帧/秒（5.93 ms/帧）✗  **贵 8 倍** ✗
+
+            ⇒ 瓶颈**根本不在解码**，在"AV帧 → numpy BGR"那一步 ✓；而它原来是**每帧都做** ✗
+            ⇒ A 推 60 就烧掉约三分之一核 ✓、推 **240 直接一个半核** ✗✗（正是"推 240 扛不住"的
+            真因 ✓）。有了 `keep_check`：**解码照旧喂满**（保持解码器与流同步 ✓ 这是 UDP 下
+            必须的 —— 跳包会破坏参考帧 ✗），但**只有 `keep_check()` 为真才做那步昂贵的转换** ✓
+            ⇒ 转换成本被**消费速度**封顶（谁要谁付钱 ✓），输入 60 / 240 / 1000fps 都不会压垮 B ✗。
+            ⚠ 被丢掉的帧**不影响流同步** ✓（包已解、帧已产出，只是没转成 numpy ✓）——
+              和"跳包/不解码"是两回事 ✗（后者会让解码器缺参考帧、画面糊 ✓）。
+            ⚠ 拿不到新帧时 `next(self._gen)` 会**阻塞等下一个包** ⇒ 这里不会空转烧 CPU ✓。
         """
         self.url = url
         self.options = {**LOW_LATENCY_OPTIONS, **(options or {})}
         self.decode_format = decode_format
         self.decode_all = decode_all
         self.skip_nonref = skip_nonref
+        self.keep_check = keep_check
+        #: 「解出来但没人要 ⇒ 没做转换」的帧数（**B 机省下来多少活的直接证据** ✓）
+        self._skipped_convert = 0
         self.container_format = container_format
 
         self._container = None
@@ -174,6 +195,17 @@ class PyAVSource(FrameSource):
                 continue
 
             for av_frame in frames:
+                # ⭐⭐ **"没人要 ⇒ 不转换"**（用户 2026-10-10 ✓ 见 `keep_check` 那段实测 ✓）：
+                #   解码已经发生（便宜 ✓ 0.71ms），这里省掉的是**贵的那一步**（5.93ms ✓）。
+                #   ⚠ 必须在 `to_ndarray` **之前** ✗ —— 放到后面就等于白省 ✓。
+                if self.keep_check is not None:
+                    try:
+                        _want = bool(self.keep_check())
+                    except Exception:                # noqa: BLE001 —— 判据出事 ⇒ 宁可要 ✓
+                        _want = True
+                    if not _want:
+                        self._skipped_convert += 1
+                        continue                    # 继续解下一帧（**流同步不受影响** ✓）
                 t_mono = time.perf_counter()
                 t_wall = time.time()
                 try:
@@ -215,6 +247,11 @@ class PyAVSource(FrameSource):
     @property
     def bad_packets(self):
         return self._bad_packets
+
+    @property
+    def skipped_convert(self):
+        """「解出来但没人要、因此**没做颜色转换**」的帧数（见 `keep_check` ✓）。"""
+        return self._skipped_convert
 
     def to_bgr(self, img):
         return img[..., ::-1]

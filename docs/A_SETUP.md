@@ -43,6 +43,31 @@ python -m venv .venv
 `remote_kbd/requirements.txt` 里的 `cryptography` 只在**重新生成 TLS 证书**时才要
 （证书已随仓库放在 `remote_kbd/certs/`）。
 
+---
+
+## ⚠ B 机的 `.venv` 现在是**链接**（2026-10-10 改的，别删错 ✗）
+
+为了把编辑器拖卡的一大根源挪出工作区（实测 `.venv` = **8,847 MB / 52,001 个文件** ✗），
+B 机的 venv **真身已经搬到**：
+
+```
+E:\venvs\playerSimu-venv-3119        ← 真身（8.8 GB，别当垃圾删 ✗）
+E:\MyPrograms\playerSimu\.venv      ← 原位置，现在是一个 **Junction（目录联接）** 指向上面
+```
+
+**为什么要用联接而不是直接搬** ✗：仓库里一堆地方写死了 `.\\.venv\\Scripts\\python*.exe`
+（本文件上面那几行、`docs/交接.md`、`visual_tracking_sdk_20260920/README.md`、
+`一键测延迟.bat` / `被控机部署台.bat`），venv 内部也记着绝对路径（`pyvenv.cfg` 的 `command=`、
+`Scripts/*.exe` 里内嵌的路径）。**直接搬会把这些全打死** ✗；留联接 ⇒ **路径一个字都不用改** ✓
+（实测 `pip.exe` 照旧可用 ✓）。
+
+**两条纪律**：
+1. **别删 `E:\venvs\playerSimu-venv-3119`** ✗（那才是真身 ✓；删工作区里那个 `.venv` 只是删链接 ✓）；
+2. 想重建环境 ⇒ 直接对 `E:\venvs\playerSimu-venv-3119` 动手 ✓，或先删掉工作区的联接、
+   再按上面那几行重建 ✓（**别在联接上装东西** ✗，会写进真身、以后自己都说不清 ✓）。
+⚠ 顺手记一笔已有的风险：这个 venv 的 base 是 **CodeBuddy 自带的 Python 3.11.9**
+（`C:\Users\Locker\.workbuddy\binaries\python\versions\3.11.9`）—— 它若被升级/搬走，venv 会坏 ✗。
+
 pip 之外还要的：
 
 | 要什么 | 谁需要 | 怎么来 |

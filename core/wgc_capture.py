@@ -2,9 +2,15 @@
 
 基于 wgc-python（封装 Windows.Graphics.Capture 的 C++ DLL + Python 绑定）。
 
-与 BitBlt 的区别：
-  - 不经过 GDI（GetWindowDC/BitBlt），走 DWM 合成层，反作弊更难检测
-  - 能抓被遮挡 / 后台的窗口（BitBlt 要求窗口可见）
+与 BitBlt 的区别（2026-10-10 校正 ✓ 原来那句"反作弊更难检测"是**判断不是实测** ✗）：
+  - 走 DWM 合成层（系统 API ✓ 按**单个窗口**采 ✓）：**盖在该窗口上面的别的窗口不进画面** ✗；
+  - ⚠⚠ 反作弊**一般不管抓屏** ✓（它管进程 / 模块 / 内存 / 注入输入 ✓）—— 本仓库两款实现
+    读的都是"系统合成出来的像素"（BitBlt = 桌面 DC ✓ 与录屏软件同类 ✓），**不需要**为
+    "会不会被察觉"在两者之间取舍 ✓；真正会发生的只有两类 ✗：① 窗口设了
+    `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` ⇒ **抓到黑** ✗（"防录制" ✓ 不是"抓你" ✓）；
+    ② 少数反作弊**在游戏进程内** hook GDI 抓取色器 ⇒ 那只作用于游戏自己那个进程 ✓
+    （我们是另一个进程读桌面 DC ✓ 走不到它的 hook ✓）。
+    口径原文在 `gui/live_panel.py` 的「抓屏」tooltip（**一处说清** ✓ 别各处再写一份 ✗）。
 
 为什么不用 wgc-python 的 client_area_only=True：它算客户区有偏差（实测
 1920x1080 的客户区只抓到 1906x1072，还带 7px 水平偏移）。这里改成抓**整个
@@ -100,7 +106,17 @@ def _get_cap(root, title, cls):
 
 
 def grab_rect(rect):
-    """WGC 抓屏幕矩形 rect=(x, y, w, h)，返回 BGR ndarray；失败返回 None。"""
+    """WGC 抓屏幕矩形 rect=(x, y, w, h)，返回 BGR ndarray；失败返回 None。
+
+    ⚠⚠ **它抓的是"那个点上的窗口自己"**（单窗口采集 ✗）—— 所以：
+      · **盖在它上面的别的窗口不会进画面** ✗（外接的登录窗 / 断线提示框等都看不到 ✓
+        见 `gui/live_panel.py` 里「抓屏方式」那格 tooltip ✓）⇒ 靠**看画面**判界面的
+        功能（断线重连 / 测谎）会**判不出来** ✗ ⇒ 那种用法要用 **BitBlt** ✓；
+      · 窗口被别的窗口盖住时，这里按"框中心那个点"找到的是**盖它的那个窗口** ✓
+        —— 2026-10-09 试过"认死 hwnd 只抓源窗口" ✗ **当场被用户否掉** ✓
+        （用户原话："**我需要的是盖住的窗口和游戏都显示，因为登陆界面是外接的窗口，
+        你不显示断线重连会有问题**" ✓）⇒ **已改回本行为** ✓ 别再往回改 ✗。
+    """
     x, y, w, h = (int(v) for v in rect)
     if w <= 0 or h <= 0:
         return None
@@ -109,7 +125,11 @@ def grab_rect(rect):
     now = time.monotonic()
     if (st["geom"] is None or st["key"] != (x, y, w, h)
             or now - st["t"] > _GEOM_TTL):
-        geom = _geom_at(x, y)
+        # ⚠⚠ **按"框的中心点"找窗口**（2026-10-09 修 ✗ 用户现场："本地的实时窗口不是框选屏幕
+        #   区域实现的，好像是捕获程序窗口"）：以前用 rect 的**左上角**那个点 ✗ ⇒ 只要那个角
+        #   压到别的窗口 / 任务栏 / 工作台，就**抓到别的窗口** ✗；中心点更符合"我框的是哪块屏幕" ✓。
+        #   中心点也取不到（窗口无标题那种 ✓）⇒ 退回左上角（老行为 ✓ 不倒退）。
+        geom = _geom_at(x + w // 2, y + h // 2) or _geom_at(x, y)
         if geom is None:
             return None
         st["key"] = (x, y, w, h)

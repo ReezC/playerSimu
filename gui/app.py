@@ -39,14 +39,18 @@ for _s in (sys.stdout, sys.stderr):
 #
 # 为什么不直接 import torch：那样每次启动都要多花 3~5 秒导入 torch，
 # 哪怕这次根本不训练。预加载只要约 1 毫秒。
-import ctypes as _ctypes
+#
+# ⭐⭐ 2026-10-09：这段**抽成 `core/win_dlls.py` 一处实现** ✓ —— 因为它不止工作台要用：
+#   自检套件（`tools/selftest_decision` ✓）同样会"先加载 PyQt5 / cv2、之后再 import torch"，
+#   而那条路在 Windows 上不只是报错，而是**当场 access violation（`0xC0000005`）** ✗
+#   ⇒ 套件跑着跑着突然死掉、连失败清单都打不出来 ✓（那天就是这么查了半天 ✓）。
+#   ⚠ 一个模块一个说法的地方只留这一份 ✗（两边各写一遍迟早分叉 ✓ 见那模块的说明 ✓）。
+from core.win_dlls import preload_msvc_runtime as _preload_msvc
 
-for _dll in ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
-             "vcruntime140.dll", "vcruntime140_1.dll"):
-    try:
-        _ctypes.CDLL(_dll)
-    except OSError:
-        pass
+try:
+    _preload_msvc()
+except Exception:                                # noqa: BLE001 —— 预载失败不许拦住启动 ✓
+    pass
 
 from PyQt5.QtCore import Qt                      # noqa: E402
 from PyQt5.QtWidgets import QApplication          # noqa: E402

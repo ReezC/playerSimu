@@ -63,3 +63,7 @@ config/wz.yaml
 perf_push_A.json
 perf_push_B.json
 remote_kbd/certs/
+# 2026-10-10 分卷前的原文备份（别进搜索/别进 git ✓ 确认无误后可删 ✓）
+docs/.bak-*/
+# 2026-10-10：会话导出落到工作区的目录（3 个 json 62 MB ✗ 已清 ✓ 别再进 git ✓）
+codebuddy/

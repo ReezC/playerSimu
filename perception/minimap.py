@@ -32,6 +32,7 @@ import struct
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from pathlib import Path
 
@@ -44,6 +45,29 @@ from core import mapdata, zones
 from core.imgio import imread, imwrite   # 支持中文路径（cv2.imread 遇中文静默失败）
 
 ROOT = Path(__file__).resolve().parent.parent
+
+#: ⭐⭐ **还活着的收流客户端**（弱引用 ✓ 不拦 GC ✓）：只为**进程退出前把它们停掉** ✗。
+#: 为什么非要有（2026-10-09 ✓ 实测定位）：
+#:   `start()` 起的是 **daemon 线程**（`minimap-recv` ✓），它常年**阻塞在 `recv` 上** ✗；
+#:   解释器退出时不打招呼就拆线程脚下的 socket / numpy 缓冲 ⇒ **access violation
+#:   （`0xC0000005`）** ✗ —— 表现是"**跑完所有用例之后不清不楚地崩掉、连失败清单都不打**" ✗
+#:   （`tools/selftest_decision` 就是这样 ✓ 因为里面有几条用例**真建** `RoutePanel` /
+#:    `PlayerPanel` ✓ 它们会惰性起收流线程 ✓）。
+#: ⚠ 生产里是同一件事（关工作台时偶发 ✓）⇒ 出口统一收一遍：`stop_all_clients()` ✓
+#:   （工作台关窗那条路见 `gui/player_panel.shutdown` ✓）。
+_CLIENTS = weakref.WeakSet()
+
+
+def stop_all_clients():
+    """把还活着的收流客户端**全部停掉**（进程退出 / 自检收尾各调一次 ✓）。
+
+    幂等 ✓；单条停失败不影响别的 ✓（收尾动作不该把退出流程弄崩 ✗）。
+    """
+    for c in list(_CLIENTS):
+        try:
+            c.stop()
+        except Exception:                       # noqa: BLE001
+            pass
 
 
 class MiniMapClient:
@@ -73,12 +97,14 @@ class MiniMapClient:
             self._th = threading.Thread(target=self._run, daemon=True,
                                         name="minimap-recv")
             self._th.start()
+            _CLIENTS.add(self)          # 登记 ⇒ 进程退出前 `stop_all_clients()` 收得到 ✓
         return self
 
     def stop(self):
         self._stop.set()
         if self._th is not None:
             self._th.join(timeout=2)
+        _CLIENTS.discard(self)
 
     def _run(self):
         while not self._stop.is_set():
@@ -543,6 +569,37 @@ def live_src(cfg=None):
     """
     v = (cfg or {}).get("mmap_src")
     return v if v in (SRC_STREAM, SRC_LIVE) else SRC_STREAM
+
+
+def source_for_map(map_id, live_cfg=None):
+    """**这一张图**现在用哪条小地图来源 —— 全仓库唯一口径（体检 / 路线识别页都用它 ✓）。
+
+    ⚠⚠ 为什么单独立一个（2026-10-10 ✓ 用户现场："**为什么我标定过了还显示这个**"✗）：
+      · 来源 **2026-10-03 起按地图 id 存**（用户要求"路线识别页签所有配置按地图 id 存"✓
+        见 `core/route_cfg.py` ✓），只在**没灌过**这张图时才回退全局 `config/live.yaml` ✓；
+      · 而"开自动前的检查"（`gui/player_panel._auto_precheck_problems`）当时读的是
+        **全局** `mm.live_src()` ✗ ⇒ 与路线识别页**不是同一处** ✗：
+        现场这张图按图存的是 `live`（「从实时画面」✓ 标定就在这条下 ✓），
+        全局那份是 `stream`（「独立推流」✗）⇒ 体检去问 `stream` ⇒ 报"还没标定" ✗，
+        而人明明刚标过 ✓（**标定是按来源分开存的** ✓ 见 `core/mapdata.calib_path` ✓）。
+      ⇒ 口径收在这一处：谁要问"这张图用哪条来源"，都走它 ✓。
+
+    ⚠ `live_cfg` 不给 ⇒ 自己读 `config/live.yaml` ✓（调用方已经读过就传进来，省一次 IO ✓）。
+    """
+    try:
+        from core import route_cfg
+        v = (route_cfg.load(str(map_id or "")) or {}).get("mmap_src")
+    except Exception:                            # noqa: BLE001 —— 读不到就回退全局 ✓
+        v = None
+    if v in (SRC_STREAM, SRC_LIVE):
+        return v
+    if live_cfg is None:
+        try:
+            from core.config import load_live
+            live_cfg = load_live()
+        except Exception:                        # noqa: BLE001
+            live_cfg = {}
+    return live_src(live_cfg)
 
 
 def crop_of(project, cfg=None):
@@ -1583,6 +1640,211 @@ def region_match_score(frame, rect, terrain, mode=None, ok_score=TRUST_SCORE):
             "why": "" if sc >= ok_score else "偏低（%.1f 以上才算对上）" % ok_score}
 
 
+def _fmt_score(v):
+    """分数 → 人话（`None` = 一次都没量出来 ✓）。"量出来"是 0~1 的小数 ✓。"""
+    return "没量出" if v is None else "%.3f" % float(v)
+
+
+def dump_diag(panel, canvas, calib=None, tag="x", extra=None, dir=None):
+    """把"这次量不出来的**现场**"存一份 ⇒ 返回目录（失败返回 `""` ✓ 绝不影响调用方 ✓）。
+
+    ⚠⚠ 为什么非要它（2026-10-09 ✓ 用户原话："这些提示是不正确的，因为我的手动标定对齐地图
+      已经接近完美了"）：失败时界面只给一句**结论 + 一串"可能"** ✗ ⇒ 人看不了、我也查不了 ✗，
+      只能猜（"框多了？压糊了？底图不对？"✓）—— 而这三件事**看一眼图就分得清** ✓
+      （和鼠标标定那一晚的教训同一条：**先看图，别猜** ✗ 见 SKILL ✓）。
+    存：`<tag>_panel.png`（喂进去的那块面板 ✓）/ `<tag>_canvas.png`（底图 ✓）/
+        `<tag>_meta.json`（面板与底图尺寸、当时的几何、附带信息 ✓）。
+    """
+    try:
+        import json
+        import time
+        from pathlib import Path
+
+        import cv2
+
+        # ⚠ `dir` 是给**自检**用的（临时目录 ✓）：不传就写 `data/mmap_diag` ✓ ——
+        #   自检**不许**去删用户的现场 ✗（2026-10-09 踩过：用例 `rmtree` 把现场删了 ✗）。
+        d = Path(dir) if dir else (Path("data") / "mmap_diag")
+        d.mkdir(parents=True, exist_ok=True)
+        if panel is not None:
+            cv2.imwrite(str(d / ("%s_panel.png" % tag)), panel)
+        if canvas is not None:
+            cv2.imwrite(str(d / ("%s_canvas.png" % tag)), canvas)
+        meta = {
+            "tag": tag,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "panel_wh": (None if panel is None
+                         else [int(panel.shape[1]), int(panel.shape[0])]),
+            "canvas_wh": (None if canvas is None
+                          else [int(canvas.shape[1]), int(canvas.shape[0])]),
+            "calib": (dict(calib) if isinstance(calib, dict) else None),
+            "extra": (extra or {}),
+        }
+        # ⭐ 叠图 / 差分也存一份（用户 2026-10-09 ✓）：**人眼判"偏了多少"这条路要留着** ✓
+        #   —— 逐像素匹配分在这张图上天生够不着门槛 ✗（见 `calib_overlap` 的说明 ✓），
+        #   而"把底图按这份几何投到面板上叠起来看"对**人**来说是最好用的判据 ✓。
+        if panel is not None and canvas is not None and isinstance(calib, dict):
+            try:
+                warped = warp_canvas_to_panel(canvas, calib,
+                                              (panel.shape[1], panel.shape[0]))
+                if warped is not None:
+                    cv2.imwrite(str(d / ("%s_overlay.png" % tag)),
+                                cv2.addWeighted(panel, 0.55, warped, 0.45, 0))
+                    dg = cv2.cvtColor(
+                        cv2.absdiff(cv2.cvtColor(panel, cv2.COLOR_BGR2GRAY),
+                                    cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)),
+                        cv2.COLOR_GRAY2BGR)
+                    cv2.imwrite(str(d / ("%s_diff.png" % tag)),
+                                cv2.applyColorMap(cv2.convertScaleAbs(dg, alpha=3.0),
+                                                  cv2.COLORMAP_JET))
+                    meta["overlay"] = True
+            except Exception:                        # noqa: BLE001 —— 叠图失败不影响取证 ✓
+                pass
+        (d / ("%s_meta.json" % tag)).write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8")
+        return str(d)
+    except Exception:                                # noqa: BLE001 —— 取证坏了别影响判断 ✓
+        return ""
+
+
+#: 「地形掩码」的梯度阈值（见 `terrain_mask` ✓）。45 是 2026-10-09 现场扫出来的：
+#: 面板/底图覆盖率 29.3% / 35.0% ✓（两边接近 ✓）、对齐处 IoU 最高（0.667 ✓）。
+TERRAIN_THR = 45.0
+#: 「重合良好」的下限（`calib_overlap` 的 IoU ✓）。现场那份"人眼近乎完美"的标定 = **0.667** ✓
+#: ⇒ 0.55 这条线两边都有余量 ✓（差 8px 时掉到 0.603 ✓ 再差就明显下台阶 ✓）。
+OVERLAP_OK = 0.55
+#: 报"偏了几个像素"时，多大才算**真的要挪**（px ✓）。人眼看不出 1~2px ✓，别拿它吓人 ✗。
+OVERLAP_SHIFT_OK = 2
+
+
+def terrain_mask(img, thr=TERRAIN_THR):
+    """一张小地图 / 底图 → 「**地形在哪**」的二值图（`uint8` 0/1 ✓）。
+
+    ⭐⭐ 为什么用**梯度**（2026-10-09 ✓ 现场把三种口径都量了 ✓）：
+      · 「亮 + 去饱和」✗：游戏小地图整体更亮 ⇒ 覆盖率 33.8% vs 底图 2.7% ✗ 掩码根本不是一回事；
+      · 「局部纹理（标准差）」✓ 能用（0.253 → 单调 ✓）但覆盖率 7.6%/4.6% 偏小；
+      · ⭐ 「**梯度幅值**」✓：覆盖率 29.3%/35.0% ✓ 两边接近、对齐处 IoU 最高（0.667 ✓）——
+        而且它天然躲开"逐像素相关"栽的那个坑 ✗：**小地图上的图标/按钮是纯色块**（梯度少 ✓），
+        地形（平台 / 藤蔓 / 台阶的边）梯度丰富 ✓。
+    """
+    g = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (3, 3), 0)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    return (cv2.magnitude(gx, gy) > float(thr)).astype(np.uint8)
+
+
+def canvas_to_panel_matrix(calib):
+    """「底图 → 面板」的 2×3 仿射（**口径照抄 `world_to_panel` ✓ 一处不差**）。
+
+    `panel_to_canvas` 是"面板 → 底图" ✓（`canvas = (面板 − offset)/scale + view·crop` ✓），
+    这里就是它的逆：`面板 = 底图 × scale + offset − view·scale`（crop ✓；fit 没有 view ✓）。
+    ⚠ 别自己另拍一套（写反一个符号 ⇒ 叠图/重合率整块错位 ⇒ 又变成"工具说人错了" ✗）。
+    """
+    sx, sy = scales_of(calib)
+    ox, oy = (calib.get("offset") or (0, 0))[:2]
+    ox, oy = float(ox), float(oy)
+    if calib.get("mode") == MODE_CROP:
+        vx, vy = (calib.get("view") or (0, 0))[:2]
+        ox, oy = ox - float(vx) * sx, oy - float(vy) * sy
+    return np.float32([[sx, 0.0, ox], [0.0, sy, oy]])
+
+
+def warp_canvas_to_panel(canvas, calib, size):
+    """把底图整幅投到**面板坐标系**（`size=(w, h)` ✓）→ 图 / `None`（几何不合法 ✓）。
+
+    用在两处：`calib_overlap`（算地形重合 ✓）和 `dump_diag`（存叠图/差分 ✓）。
+    """
+    if canvas is None or not isinstance(calib, dict) or not has_geometry(calib):
+        return None
+    try:
+        M = canvas_to_panel_matrix(calib)
+        return cv2.warpAffine(canvas, M, (int(size[0]), int(size[1])),
+                              flags=cv2.INTER_NEAREST,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    except Exception:                                # noqa: BLE001 —— 诊断用，失败当没有 ✓
+        return None
+
+
+def calib_overlap(panel, terrain, calib, search=8, tol=1, thr=TERRAIN_THR):
+    """这份几何下「面板地形」与「底图地形」的**重合度** ＋「最好要挪几像素」→ dict / None。
+
+    ⭐⭐ 为什么必须有它（用户 2026-10-09 ✓ 原话："**这些提示是不正确的**，因为我的手动标定对齐
+      地图已经接近完美了"）：**逐像素相关**（`locate_fit`/`locate_crop` 那条）在这张图上
+      **天花板只有 0.45 左右** ✗（底图是项目按 wz **重绘**的、面板是客户端渲染 + 图标叠加 ✓）
+      ⇒ 拿它当"标定对不对"的判据是**错的** ✗。现场实测（`data/mmap_diag/check_*.png` ✓）：
+        灰度相关 0.135 / 边缘相关 0.478 / 抹掉覆盖层 0.45 —— 而人眼手工那份**只差 ~2px** ✓。
+      这个判据换成**地形掩码重合**（`terrain_mask` ✓ 对覆盖层与渲染差异不敏感 ✓）：
+        · 对齐处最高、往外单调下降（0.667 → 0.603 @+8px ✓）；
+        · **最好那个平移量**直接告诉你"偏了几像素、往哪偏" ✓✓ —— 这才答得了"我标得准不准" ✓。
+
+    返回（`None` = 面板/底图/几何缺 ✓）：
+      · `iou`   最好那个平移下的 IoU ✓（**判"重合好不好"用这个** ✓）
+      · `shift` 最好那个平移 `(dx, dy)` ✓（**判"要不要挪"用这个** ✓ 均在 ±`search` 内 ✓）
+      · `iou0`  不挪时（= 当前这份几何）的 IoU ✓
+      · `cover_panel` / `cover_canvas` 两边掩码覆盖率 ✓（差太多说明掩码本身不可比 ✓）
+
+    ⚠ 容差 `tol`：两边掩码各膨胀 `tol` px 再算 ✓ —— 人眼对齐本来就允许 1~2px ✓（真值差 ~2px ✓）。
+    """
+    if panel is None or calib is None:
+        return None
+    # `terrain` 既可以是地形对象（`.canvas` ✓ 惯用形 ✓），也可以**直接是底图那张图** ✓
+    #   —— 标定弹窗手里只有 `self.canvas` 那张图（没有地形对象 ✓），别为它再造一个 ✗。
+    cv_img = getattr(terrain, "canvas", terrain)
+    if cv_img is None or not hasattr(cv_img, "shape"):
+        return None
+    if not isinstance(calib, dict) or not has_geometry(calib):
+        return None
+    mp = terrain_mask(panel, thr)
+    mc = terrain_mask(cv_img, thr)
+    warped = warp_canvas_to_panel(mc, calib, (panel.shape[1], panel.shape[0]))
+    if warped is None:
+        return None
+    k = np.ones((3, 3), np.uint8)
+    a = cv2.dilate(mp, k, iterations=int(tol)) if tol > 0 else mp
+    b = cv2.dilate(warped, k, iterations=int(tol)) if tol > 0 else warped
+    na, nb = int((a > 0).sum()), int((b > 0).sum())
+    if na == 0 or nb == 0:
+        return None
+    # ⚠ 一次算完**所有偏移**（别在 Python 里 one-by-one 做 warp ✗ 大面板上会卡）：
+    #   二进制掩码的 `TM_CCORR` 就是"交集像素数" ✓ ⇒ 每对偏移都拿得到 inter ✓
+    #   （上面把 b 采成 0/1 ✓）union = na + nb − inter ✓ ⇒ IoU 直接出 ✓。
+    pad = int(search)
+    big = cv2.copyMakeBorder(a.astype(np.float32), pad, pad, pad, pad,
+                             cv2.BORDER_CONSTANT, value=0.0)
+    corr = np.nan_to_num(cv2.matchTemplate(big, b.astype(np.float32),
+                                           cv2.TM_CCORR))
+    inter = corr
+    union = float(na + nb) - inter
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ious = np.where(union > 0, inter / union, 0.0)
+    iy, ix = np.unravel_index(int(np.argmax(ious)), ious.shape)
+    shift = (int(ix) - pad, int(iy) - pad)           # (dx, dy) ✓
+    iou0 = float(ious[pad, pad])
+    return {"iou": float(ious[iy, ix]), "shift": shift, "iou0": iou0,
+            "cover_panel": float(mp.mean()), "cover_canvas": float(mc.mean())}
+
+
+def overlap_verdict(ov):
+    """`calib_overlap` 的结果 → **一句人话**（界面/命令行直接用 ✓；`None` ⇒ 空串 ✓）。
+
+    ⚠ 这句话要回答的正是用户那个问题："**我这份标定，到底准不准？**" ✓
+      ⇒ 不许再拿"匹配分低"当结论 ✗（那在本图上是"尺子不适用"，不是"你错了" ✓）。
+    """
+    if not ov:
+        return ""
+    iou, (dx, dy) = float(ov.get("iou") or 0.0), (ov.get("shift") or (0, 0))
+    mag = max(abs(int(dx)), abs(int(dy)))
+    if iou >= OVERLAP_OK:
+        if mag <= OVERLAP_SHIFT_OK:
+            return ("地形重合 **%.2f**、最优点就在原地（偏 %+d,%+d px）⇒ "
+                    "**与实际重合良好** ✓" % (iou, dx, dy))
+        return ("地形重合 %.2f，但**最好再挪 %+d,%+d px** ⇒ 这份几何偏了约 %d px ✓"
+                % (iou, dx, dy, mag))
+    return ("地形重合只有 %.2f（%+d,%+d px 处最好）⇒ 这份几何与底图**对不太上**，"
+            "建议重标或按提示挪一下 ✓" % (iou, dx, dy))
+
+
 def check_calib(panel, terrain, calib, mode=None, min_score=LOCATE_MIN_SCORE,
                 ok_world_px=10.0):
     """量一遍「**当前这份标定到底差多少**」—— 拿真帧，一律报**世界像素**。
@@ -1617,7 +1879,13 @@ def check_calib(panel, terrain, calib, mode=None, min_score=LOCATE_MIN_SCORE,
             "refined": False, "err_world": None, "err_world_x": None,
             "err_world_y": None, "err_px": None, "worst_panel": None,
             "px_per_world": None, "scale_cur": None, "scale_ref": None,
-            "scale_delta_pct": None, "offset_cur": None, "offset_ref": None}
+            "scale_delta_pct": None, "offset_cur": None, "offset_ref": None,
+            # ⭐ 量不出来时给"能查的东西"（2026-10-09 ✓ 见下面那段说明 ✓）：
+            #   `raw_scores` = 两种方式**真实**的匹配分（`min_score=0` 量的 ✓ 不许提前判死 ✗）；
+            #   `hint` = 一段人话（界面把它放进详情行 ✓）；`panel_wh` / `canvas_wh` = 尺寸对账 ✓。
+            "raw_scores": None, "hint": "", "panel_wh": None, "canvas_wh": None,
+            # ⭐ 「匹配尺子不适用」时的**兜底判据**（地形重合 ✓ 见 `calib_overlap` / `overlap_verdict` ✓）
+            "overlap": None, "overlap_text": ""}
     if panel is None or terrain is None or getattr(terrain, "canvas", None) is None:
         return dict(base, why="没有画面 / 这张图还没有底图（先「生成地形图」）")
     if not calib or not has_geometry(calib):
@@ -1625,8 +1893,53 @@ def check_calib(panel, terrain, calib, mode=None, min_score=LOCATE_MIN_SCORE,
     mode = mode or calib.get("mode") or MODE_FIT
     ref = locate(panel, terrain.canvas, mode)
     if ref is None:
-        return dict(base, why="尺子没量出来（匹配分低于 %.2f）：画面里小地图没框全、"
-                              "被游戏 UI 挡住，或「显示方式」选错了" % min_score)
+        # ⭐⭐ **"量不出来"要给能查的东西，不是一串"可能"** ✗（用户 2026-10-09 ✓ 原话：
+        #   "**这些提示是不正确的**，因为我的手动标定对齐地图已经接近完美了"）。
+        #   旧文案把原因一律推给"没框全 / 被挡住 / 显示方式选错" ✗ ⇒ 三件事全对的人也被告知
+        #   是他的错 ✗。事实是：
+        #     · 这里量的是「**面板像素 vs 底图像素长得像不像**」（模板匹配 ✓）；
+        #     · 手工对齐量的是「**人眼看叠图重合**」✓ —— 两者**可以不一致** ✓
+        #       （手工那份连 `score` 都没有：`src=manual` ⇒ 0 ✓ 见 `save_calib` ✓）；
+        #   ⇒ 所以先把**事实**说清（两种方式各自的真实分数 + 门槛 ✓），再列可查的项 ✓，
+        #     并把现场交给调用方落盘（`dump_diag` ✓）。
+        raw = {}
+        try:
+            _r = locate_fit(panel, terrain.canvas, min_score=0.0)
+            raw["fit"] = (None if _r is None else round(float(_r["score"]), 3))
+        except Exception:                            # noqa: BLE001 —— 诊断不许把核对弄崩 ✓
+            raw["fit"] = None
+        try:
+            _r = locate_crop(panel, terrain.canvas, min_score=0.0,
+                             seed=(calib if mode == MODE_CROP else None))
+            raw["crop"] = (None if _r is None else round(float(_r["score"]), 3))
+        except Exception:                            # noqa: BLE001
+            raw["crop"] = None
+        # ⭐⭐ **兜底：改用"地形重合率"**（见 `calib_overlap` 的说明 ✓）—— 这是回答
+        #   "标定准不准"的那条路 ✓；匹配分低只说明"这把尺子在本图不适用"✗，不许当结论 ✗。
+        try:
+            ov = calib_overlap(panel, terrain, calib)
+        except Exception:                            # noqa: BLE001 —— 诊断不许把核对弄崩 ✓
+            ov = None
+        _ow = overlap_verdict(ov)
+        return dict(
+            base,
+            overlap=ov,
+            overlap_text=_ow,
+            why=("模板匹配没对上面板（全局 %s / 局部 %s，门槛 %.2f）—— 这条尺子在本图不适用，"
+                 "**改看重合率**：%s"
+                 % (_fmt_score(raw["fit"]), _fmt_score(raw["crop"]), min_score,
+                    _ow or "重合率也算不出来（面板/底图缺 ✓）")),
+            raw_scores=raw,
+            panel_wh=[int(panel.shape[1]), int(panel.shape[0])],
+            canvas_wh=[int(terrain.canvas.shape[1]), int(terrain.canvas.shape[0])],
+            hint=("⚠ **这不代表你的手工对齐错了** ✗ —— 手工对齐量的是「人眼看叠图重合」✓，"
+                  "这里量的是「面板像素和底图像素像不像」✓（模板匹配），**两件事可以不一致** ✓"
+                  "（手工那份本来就没有匹配分 ✓）。\n"
+                  "按分数往下看：两种都很低 ⇒ 多半是「像素不像」：来源画质（H.264 压糊 ✗）/ "
+                  "面板里混进了非小地图的像素（框多了、被 UI 挡了一角 ✗）/ 底图不是这张图的；\n"
+                  "只有**当前这种**低、另一种挺高 ⇒ 是「显示方式」（全局/局部小地图）选错了 ✓。\n"
+                  "⇒ 现场已存 `data/mmap_diag/`（panel.png ＋ canvas.png ＋ 那份几何 ✓）："
+                  "**先看图再定** ✓（别再猜 ✗）。"))
 
     fh, fw = panel.shape[:2]
     ppw = float(terrain.px_per_world) or 1.0
@@ -1657,9 +1970,17 @@ def check_calib(panel, terrain, calib, mode=None, min_score=LOCATE_MIN_SCORE,
                % (err, err_px, cname, axis, score,
                   "" if trust else "（**偏低，这个数只能当参考**）"))
     ok = trust and err <= float(ok_world_px)
+    # ⭐ **这一份也要给"重合率"读数**（2026-10-09 ✓）：两个按钮任何时候都该能回答
+    #   "跟底图重合得怎么样" ✓ —— 尤其"尺子分低"时，重合率是**唯一还能看**的那个数 ✓
+    #   （匹配分低只说明"这把尺子在本图不适用"✗，**不许**翻译成"你的画面不对" ✗）。
+    try:
+        ov = calib_overlap(panel, terrain, calib)
+    except Exception:                                # noqa: BLE001 —— 诊断不许把核对弄崩 ✓
+        ov = None
+    _ow = overlap_verdict(ov)
     if not trust:
-        why = ("尺子本身不可信（匹配分 %.2f < %.2f）⇒ 偏差只能当参考：画面里小地图"
-               "没框全、被游戏 UI 挡住，或「显示方式」选错了" % (score, TRUST_SCORE))
+        why = ("尺子匹配分偏低（%.2f < %.2f）⇒ 上面那个偏差**只能当参考**。%s"
+               % (score, TRUST_SCORE, _ow or "（重合率也算不出来：面板/底图缺 ✓）"))
     elif not ok:
         why = "偏差 %.0f 世界像素 > %.0f（≈1 个实时像素）" % (err, ok_world_px)
     else:
@@ -1676,7 +1997,8 @@ def check_calib(panel, terrain, calib, mode=None, min_score=LOCATE_MIN_SCORE,
             "scale_cur": float(sx_c), "scale_ref": float(sx_r),
             "scale_delta_pct": dlt,
             "offset_cur": [float(v) for v in (calib.get("offset") or (0, 0))],
-            "offset_ref": [float(v) for v in (ref.get("offset") or (0, 0))]}
+            "offset_ref": [float(v) for v in (ref.get("offset") or (0, 0))],
+            "overlap": ov, "overlap_text": _ow}
 
 
 def stream_panel(timeout=5.0):
@@ -2103,6 +2425,34 @@ DOT_ROI_PAD = 18
 DOT_GHOST_DECAY = 0.75
 DOT_GHOST_MAX_SHIFT = 8.0        # 幽灵外推的总位移上限（面板像素）
 
+#: ⭐⭐⭐ 「**哪一个才是玩家那个点**」—— 2026-10-10 照用户指的路补的三件
+#: （`E:\MyPrograms\Maple_xfeat\src\vision\tracker.py` 的认法 ✓ 用户原话三条：
+#:   "**队友橙色点头上的小标记也是黄点，大黄点锁定错了**"✗ /
+#:   "你的锁定标记会**乱飘**到别的点上去，根本没坐标偏差有做任何平滑"✗ /
+#:   "你**瞄准的不是黄点正中心**"✗）。
+#:
+#: 病根一句话：**以前挑点是"谁离上一拍最近就锁谁"** ✗（见 `find_player_dot` 里那段
+#: `min(cands, key=距离)` ✓）—— 于是队友头上那个**小黄标记**只要离得近，就能把
+#: **大黄点**（真玩家标记）顶掉 ✓；两块分数接近时还会**来回翻** ⇒ 读数乱飘 ✓。
+#: ⇒ 补三件：
+#:   ① **尺寸要像玩家点**（`DOT_PLAYER_SIDE_REL` ✓）：玩家标记是**大**的（实测
+#:      26×25 像素 @ 面板宽 753 ≈ **3.2%** ✓ 见 `DOT_CORE_*` 那段量测 ✓）⇒
+#:      队友那种小标记、碎块、糊成一片的黄，尺寸分都低 ✓；
+#:   ② **滞后**（`DOT_LOCK_MARGIN` ✓）：新候选要在分数上**明显赢**过现在锁着的那个
+#:      才换 ✗ —— 从此不再"谁近就锁谁" ✓（那正是乱飘的原因 ✓），但**传送**那种
+#:      真跳变照样能靠"分数差得够大"换过去 ✓（同 `DOT_JUMP_GIVEUP_N` 那条纪律 ✓）；
+#:   ③ **报出去的位置做一阶低通**（`DOT_SMOOTH_ALPHA` ✓）—— 只抹抖动、不引入明显滞后 ✓。
+#: ⚠ 为什么不用 Maple_xfeat 那套 **HSV 窄黄**：他们那张图上"自己"是**唯一黄点**
+#:   （队友是**红**点 ✓）⇒ 颜色一分就完事 ✓；我们这张图上**队友头上也是黄** ✗
+#:   ⇒ 颜色分不开，**尺寸 + 连续性**才是判据 ✓（而且本仓的颜色判据是**量测**出来的
+#:   `BGR(108,255,255)` ✓ 见 `DOT_CORE_*` ✓，动它风险大于收益 ✗ —— 这条记在这儿，
+#:   免得下一个人又去改颜色 ✗）。
+DOT_PLAYER_SIDE_REL = 0.032       # 玩家点短边 ≈ 面板宽 × 3.2%（实测 ✓ 判据见上）
+#: 换锁要赢这么多分（0~1 尺度 ✓）：太小 = 来回跳 ✗，太大 = 传送时换不过去 ✗。
+DOT_LOCK_MARGIN = 0.12
+#: 报出去的位置做一阶低通：**1 = 不过滤** ✓；取 0.6 = 抹抖但不拖泥带水 ✓。
+DOT_SMOOTH_ALPHA = 0.6
+
 #: 上面这四个可以**从 config/live.yaml 覆盖**（界面在「路线识别 → 小地图定位」里调）。
 #: 键名 → 默认值：改键名要一起改 `track_params()` 和界面那排输入框。
 TRACK_KEYS = (("mmap_hold_ms", DOT_HOLD_MS),
@@ -2233,6 +2583,51 @@ def dot_side_max(panel_w):
     return max(6, int(panel_w) // DOT_SIDE_MAX_DIV)
 
 
+def dot_player_like(c, panel_w):
+    """这个候选块**像不像「玩家那个点」** ⇒ 0~1 分（越大越像 ✓）；坏形状 ⇒ 0 ✓。
+
+    ⭐ 2026-10-10 加（用户三条抱怨见 `DOT_PLAYER_SIDE_REL` 上面那段 ✓）。三个因子相乘，
+    任一项离谱就把总分拉低 ✓：
+
+      · **尺寸**：期望短边 `exp = DOT_PLAYER_SIDE_REL × 面板宽` ✓（= 玩家标记的实测比例 ✓）。
+        用**对数距离**算分 ⇒ "大两倍"和"小一半"等价地扣分 ✓ —— 关键是**偏心小那一侧**：
+        队友头上的小标记远小于 `exp` ⇒ 分数直接掉下去 ✓；糊成一大片黄也掉 ✓；
+      · **密度**（面积 / 外接框）：越实越像 ✓；低于候选门槛 `DOT_FILL_MIN` ⇒ 直接 0 ✓
+        （碎块 / 细线不算点 ✓）;
+      · **方圆**（短边 / 长边）：≈1 才像方块点 ✓（描边、地形线是细长的 ✓）。
+
+    ⚠ 口径出处：`E:\\MyPrograms\\Maple_xfeat\\src\\vision\\tracker.py` 那边是
+      「尺寸白名单 + 面积 5~60 + 密度 ≥ 0.28，按**最像那个 6×6 黄点**排」✓ ——
+      它那里的"6×6"是**它那张图的尺度** ✗，我们这张图的面板尺寸差 5.6 倍（753 宽 ↔ 134 宽 ✓
+      见 `DOT_FLOOD_PX` 那段 ✓）⇒ 这里换算成**相对面板宽的比例** ✓（换分辨率不用重调 ✓）。
+    """
+    try:
+        w = float(c.get("w") or 0.0)
+        h = float(c.get("h") or 0.0)
+        a = float(c.get("area") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if w <= 0.0 or h <= 0.0:
+        return 0.0
+    exp = max(4.0, float(DOT_PLAYER_SIDE_REL) * max(1.0, float(panel_w)))
+    side = 0.5 * (w + h)
+    d = abs(float(np.log(max(1e-6, side / exp))))
+    # ⚠⚠ **两侧不对称**（2026-10-10 ✓ 现场定的）：真玩家点比预期**大**是常事
+    #   （抗锯齿、描边、和底图糊在一起 ✓）⇒ 宽容一点（σ=0.60 ✓）；
+    #   而比预期**明显小**的，几乎都是**队友头上那种小标记** / 碎块 ✗ ⇒ 罚得重（σ=0.32 ✓）。
+    #   ⚠ 这条不对称正是"大黄点 vs 小标记"能分开的关键 ✓ —— 对称 σ 时两者只差 0.1 分，
+    #     `DOT_LOCK_MARGIN` 的滞后分足以让**锁错的那个小点一直赖着** ✗（实测过 ✓）。
+    _sd = 0.32 if side < exp else 0.60
+    size = float(np.exp(-(d * d) / (2.0 * _sd * _sd)))
+    if max(w, h) > DOT_ASPECT_MAX * min(w, h):
+        return 0.0                      # 细长条（描边 / 地形线 / 好几块糊一起）**不是点** ✓
+    fill = min(1.0, max(0.0, a / (w * h)))
+    if fill < DOT_FILL_MIN:
+        return 0.0
+    sq = min(w, h) / max(w, h)
+    return float(size * min(1.0, fill / 0.85) * sq)
+
+
 def _dot_candidates(m, panel_w):
     """掩码 → (像「点」的连通块列表, 成片像素数)。
 
@@ -2263,8 +2658,14 @@ def _dot_candidates(m, panel_w):
             continue
         out.append({"x": float(cent[i][0]), "y": float(cent[i][1]),
                     "w": w, "h": h, "area": a, "fill": round(fill, 2)})
-    # 越大越方越像点：给个稳定顺序（多候选时先看像的那个）
-    out.sort(key=lambda c: (-c["area"], -c["fill"]))
+    # ⭐⭐ **排序口径 2026-10-10 改**（原来是"越大越方" ✓）：先按「**像不像玩家那个点**」
+    #   （`dot_player_like` ✓ 尺寸比例 + 密度 + 方圆 ✓），再按大小/实心度兜底 ✓
+    #   ⇒ "兜底挑第一个"时挑到的是**最像玩家标记的那个** ✓，而不是"最大的那一坨" ✗
+    #   （用户："队友橙色点头上的小标记也是黄点，**大黄点锁定错了**"✗）。
+    #   ⚠ **算分不写进候选字典** ✗（`all` 是要给界面/诊断看的 ✓ 加字段会牵动一堆比较 ✓）：
+    #     排序时现算（候选通常个位数 ✓ 便宜 ✓）。
+    _pw = float(panel_w)
+    out.sort(key=lambda c: (-dot_player_like(c, _pw), -c["area"], -c["fill"]))
     return out, dense
 
 
@@ -2873,12 +3274,30 @@ def find_player_dot(panel, calib=None, terrain=None, roi=None, near=None,
             cands = _core_ok
     except Exception:                       # noqa: BLE001 —— 筛不动就照旧 ✓
         pass
+    # ⭐⭐⭐ **挑哪一个：分数 = "像玩家点" − 距离惩罚，再加"锁定滞后"**（2026-10-10 ✓
+    #   用户三条："**队友橙色点头上的小标记也是黄点，大黄点锁定错了**"✗ /
+    #   "你的锁定标记会**乱飘**到别的点上去"✗ / "**瞄准的不是黄点正中心**"✗
+    #   ⇒ 见 `DOT_PLAYER_SIDE_REL` 上面那段完整说明 ✓）。
+    #   ⚠⚠ 老写法是 `min(cands, key=离上一拍的距离)` ✗ —— **谁近就锁谁**：
+    #     队友头上那个**小黄标记**只要离得近，就能把**大黄点**（真玩家标记）顶掉 ✓；
+    #     两块分数接近时还会**来回翻** ⇒ 读数乱飘 ✓（这就是"乱飘"的来源 ✓）。
+    _pw = float(ref_w or panel.shape[1])
+    _exp = max(4.0, float(DOT_PLAYER_SIDE_REL) * _pw)
     if near is not None:
-        # 有上一帧位置 → **离它最近的那个**就是它（距离比"哪块更大"可靠得多）
-        c = min(cands, key=lambda t: (t["x"] - near[0]) ** 2
-                + (t["y"] - near[1]) ** 2)
+        def _score(t):
+            """像不像玩家点（越大越好 ✓）− 距离惩罚；**还贴着上一拍那个点**再加滞后分 ✓。"""
+            _like = dot_player_like(t, _pw)
+            _dist = ((t["x"] - near[0]) ** 2 + (t["y"] - near[1]) ** 2) ** 0.5
+            # 距离惩罚按"预期点尺寸"归一 ⇒ 面板大、点大时允许的偏移也大 ✓
+            _s = _like - 0.35 * min(2.0, _dist / max(2.0, 3.0 * _exp))
+            if _dist <= max(_exp, 3.0):
+                _s += DOT_LOCK_MARGIN        # ⭐ 还是"现在锁着的那个" ⇒ 滞后 ✓ 不轻易换 ✓
+            return _s
+        c = max(cands, key=_score)
     else:
-        c = cands[0]
+        # 没有上一帧（首帧 / 重捕后）⇒ 取"**最像玩家点**"的那个 ✓
+        #   （`_dot_candidates` 已按它排过序 ✓；差分层那份在这里现算一遍 ⇒ 口径一处 ✓）
+        c = max(cands, key=lambda t: (dot_player_like(t, _pw), t.get("area") or 0))
     cx, cy = int(round(c["x"])), int(round(c["y"]))
     patch = panel[max(0, cy - 3):cy + 4, max(0, cx - 3):cx + 4]
     # 颜色取**这个族判据命中的那些像素**的中位 —— 直接取补丁中位会被周围压暗，
@@ -3106,7 +3525,22 @@ class PlayerDotTracker:
             self._vy = 0.5 * self._vy + 0.5 * (r["y"] - self.y)
         else:
             self._vx = self._vy = 0.0
-        self.x, self.y = r["x"], r["y"]
+        # ⭐⭐ **报出去的位置做一阶低通**（2026-10-10 ✓ 用户："根本没做任何平滑"✗）：
+        #   ⚠ 只抹抖动、不引入明显滞后 ⇒ α = `DOT_SMOOTH_ALPHA`（0.6 ✓）；
+        #   ⚠⚠ **只在"接着上一拍"时滤** ✗：① 刚重捕 / 上一拍没能看见（间隔久了）⇒
+        #     **直接到位** ✓（那时平滑会把"我现在其实在这"拖住 ✓）；② 位移本身就很大
+        #     （真在跑动 / 传送那一下）⇒ 不滤 ✓（滤了读数就钝 ⇒ 寻路跟着钝 ✓）。
+        _rx, _ry = float(r["x"]), float(r["y"])
+        _a = float(DOT_SMOOTH_ALPHA)
+        if self.x is not None and 0.0 < _a < 1.0 and (now - float(self._last_seen or 0.0)) <= 0.5:
+            _d = ((_rx - self.x) ** 2 + (_ry - self.y) ** 2) ** 0.5
+            if _d <= max(6.0, 2.0 * dot_side_max(panel.shape[1])):
+                _rx = _a * _rx + (1.0 - _a) * self.x
+                _ry = _a * _ry + (1.0 - _a) * self.y
+        _raw_x, _raw_y = float(r["x"]), float(r["y"])
+        self.x, self.y = _rx, _ry
+        r = dict(r, x=_rx, y=_ry,
+                 smoothed=bool(abs(_rx - _raw_x) > 1e-9 or abs(_ry - _raw_y) > 1e-9))
         # ⚠⚠ **接受时"什么都不做"** ✗（第一版清零 ✗、第二版减一 ✗ 都被现场打脸 ✓）：
         #   计数现在是"**同一个时间窗里被丢了几次**"（见 `DOT_JUMP_WINDOW_S` ✓）——
         #   它只由"丢"推进、由"时间窗过期"回落 ✓ ⇒ **接受不再影响它** ✓。

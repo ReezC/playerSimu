@@ -21,6 +21,24 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# ⭐⭐ **整个套件只建一次 `QApplication`，并用模块级名字一直握着**（2026-10-09 ✓）。
+#   各条用例原来都写 `app = QApplication.instance() or QApplication([])` 并赋给**局部变量**
+#   ✗ ⇒ 那个 app 一出作用域就被回收，而它名下建的窗口还活着 ✗ ⇒ 到后面**再建控件**时
+#   Qt 直接 fail-fast（`0xC0000409` / `0xC0000005` ✓ **连 Python traceback 都没有** ✗）——
+#   本套件实测"跑十次里崩一两次"就是这么来的 ✓（同 `selftest_decision` 第 91 条那个坑 ✓
+#   那边也是这么修的 ✓ 见它的 `_APP`）。
+from PyQt5.QtWidgets import QApplication as _QApp               # noqa: E402
+_APP = _QApp.instance() or _QApp([])                            # noqa: F841
+
+# ⭐⭐ **整套一律不许写"最近打开的项目"** ✗（2026-10-09 ✓）：本套件的用例到处拿**临时项目**
+#   建 `MainWindow`（`tempfile.mkdtemp` ✓）⇒ `open_project` 结尾那句 `remember_open(...)`
+#   会把**用户真实的 `config/session.json`** 改成那个临时目录 ✗，而临时目录 `atexit` 一删
+#   ⇒ 用户下次开工作台就去找一个**不存在的项目** ✗（实测用户那份里躺着的正是
+#   `...\Temp\startup_proj_prvy_649\用例项目` ✓ 本套件留下 ✓）。
+#   所以在这里**整体**拦住"写"这个动作 ✓（`t_startup...` 里还有一处更细的说明 ✓）。
+from gui import main_window as _mw                              # noqa: E402
+_mw.remember_open = lambda root: None                           # 只拦写，不动真文件 ✓
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -518,6 +536,13 @@ def t_startup_opens_last_project_and_says_where_params_go():
     #   用例崩 ✓）。⇒ 交给 `atexit` 在**进程退出**时删 ✓。
     atexit.register(shutil.rmtree, tmp, True)
     orig = _mw.last_opened
+    # ⭐⭐ **"记住最近项目"也必须打桩** ✗（2026-10-09 实测抓到 ✓）：这条用例建的是**临时项目**
+    #   （`tempfile.mkdtemp` ✓）—— 只打桩**读**（`last_opened`）的话，`MainWindow` 打开它时会
+    #   照旧 `remember_open(...)` ⇒ **把用户真实的 `config/session.json` 改成这个临时项目** ✗
+    #   ⇒ 下次开工作台就去找那个（`atexit` 已删掉的）目录 ✗：实测用户那份里就躺着
+    #   `...\Temp\startup_proj_mc8zo_73\用例项目` ✓ —— 正是本用例留下的 ✓（本轮顺手修掉 ✓）。
+    orig_remember = _mw.remember_open
+    _mw.remember_open = lambda root: None       # 只拦"写"这个动作，不动真文件 ✓
     try:
         # ⚠ 目录名跟项目名**一致** ✓：那行提示显示的是 `project.root.name`（目录名 ✓）
         proj = Project.create(tmp / "用例项目", name="用例项目", map_id="105090600")
@@ -565,6 +590,7 @@ def t_startup_opens_last_project_and_says_where_params_go():
             app.processEvents()
     finally:
         _mw.last_opened = orig
+        _mw.remember_open = orig_remember
 
 
 def t_offscreen_never_connects_device():
@@ -847,7 +873,178 @@ def t_run_export_uses_workbench_bar():
     check(seen2 == [True], "慢任务没正常结算：%r" % (seen2,))
 
 
+def t_two_workbenches_share_one_project():
+    """⭐⭐ **必须能开 2 个工作台**（用户 2026-10-09 原话 ✓）：两个窗口共用一个项目文件时，
+    **各改各的参数不许互相覆盖** ✗。
+
+    现场（2026-10-09 ✓，日志与文件时间戳对得上）：两个 `gui.app` 实例**同时**在 22:51:25
+    启动、`project.yaml` 在 22:51:29 被改写 ✗ —— 一边选的「平台站桩 ＋ 站桩地点」被另一边
+    整份覆盖成 `strategy: patrol` ＋ 没有 `station_spot` ✗。
+    根因：`Project.save()` 原来是 `yaml.safe_dump(self.data)` **整份覆盖** ✗（进程内那份是
+    开项目时读的快照 ⇒ 后写的把先写的**整片**抹掉 ✓）。
+
+    改法 = **读-改-写 ＋ 键级 diff**（`Project._merge_disk` ✓）：落盘前重读磁盘（别人刚写的
+    在里面 ✓）⇒ 只把"**本窗口相对上次见到的内容改过的那几处**"盖回去 ✓。钉五件：
+      ① 两个窗口改**不同**参数 ⇒ **两边都留得住** ✓（本轮的全部意义 ✓）；
+      ② A 改**顶层**（`name`）、B 改 `decision` ⇒ **都不丢** ✓（原来整文件覆盖 ⇒ 顶层也被抹 ✗）；
+      ③ 改**同一个**键 ⇒ 后写的赢 ✓ ＋ 记进 `_conflicts` ✓（主窗口据此在日志里**说出来** ✓，
+         别让人以为"我改的怎么没了"✗）；
+      ④ 某窗口**没碰过**的键：别人写过之后它再存 ⇒ **不许被它那份旧快照写回去** ✗
+         （"存一次打回原形"是最恶心的形态 ✓）；
+      ⑤ **反向证明**（就在本用例里 ✗ 不改产品）：按**老写法**（整份覆盖）写一次 ⇒ ① 那种局面
+         必然丢 ✓ ⇒ 说明上面那几条钉子真咬得住（不是恒真断言 ✓）。
+    """
+    import atexit
+    import shutil
+    import tempfile
+    from pathlib import Path as _P
+
+    import yaml as _yaml
+
+    from gui.project import Project
+
+    tmp = _P(tempfile.mkdtemp(prefix="two_win_proj_"))
+    # ⚠ 交给 `atexit` 删（同本套件其它用例 ✓）：当场删会让"后面还握着这个项目对象的用例"
+    #   撞上 `0xC0000005` ✗（那坑踩过 ✓ 见上面那条用例的说明 ✓）。
+    atexit.register(shutil.rmtree, tmp, True)
+    pdir = tmp / "双开用例"
+    Project.create(pdir, name="双开用例", map_id="110040000")
+
+    def _dec(p):
+        d = p.get("decision")
+        return dict(d) if isinstance(d, dict) else {}
+
+    # 两个"窗口" = 两个 `Project` 对象（各自 data / _loaded ✓ 就是两个 `gui.app` 进程的形态 ✓）
+    a = Project.open(pdir)
+    b = Project.open(pdir)
+
+    # ① 各改各的 ⇒ 两边都留得住（含「站桩地点」这种嵌套 dict ✓）
+    a.set("decision", dict(_dec(a), strategy="platform",
+                           station_spot={"kind": "set", "set": "右上平台"}))
+    a.save()
+    b.set("decision", dict(_dec(b), attack_dist=133.0))
+    b.save()
+    got = _dec(Project.open(pdir))
+    check(got.get("strategy") == "platform" and float(got.get("attack_dist") or 0) == 133.0,
+          "两个窗口各改一个参数，结果只剩一边（就是整份覆盖那个病 ✗）：strategy=%r attack_dist=%r"
+          % (got.get("strategy"), got.get("attack_dist")))
+    check((got.get("station_spot") or {}).get("set") == "右上平台",
+          "A 窗口的「站桩地点」被 B 窗口写没了 ✗：%r" % (got.get("station_spot"),))
+
+    # ② 别的段（顶层）也不许被抹 ✓
+    a.set("name", "甲窗口改的名字")
+    a.save()
+    b.set("decision", dict(_dec(b), attack_dist=140.0))
+    b.save()
+    p2 = Project.open(pdir)
+    check(p2.get("name") == "甲窗口改的名字"
+          and float(_dec(p2).get("attack_dist") or 0) == 140.0,
+          "一个窗口改顶层、另一个改 decision ⇒ 互相抹 ✗：name=%r attack_dist=%r"
+          % (p2.get("name"), _dec(p2).get("attack_dist")))
+
+    # ③ 同一个键两边都改 ⇒ 后写的赢 ＋ 冲突记账
+    a.set("decision", dict(_dec(a), strategy="patrol"))
+    a.save()
+    check(not a._conflicts, "没人跟我抢却记了冲突（假警报 ✗）：%r" % (a._conflicts,))
+    b.set("decision", dict(_dec(b), strategy="multi"))
+    b.save()
+    check("decision/strategy" in (b._conflicts or []),
+          "两个窗口改了同一个键（strategy）却没记冲突 ⇒ 主窗口没法提示 ✗：%r" % (b._conflicts,))
+    check(_dec(Project.open(pdir)).get("strategy") == "multi",
+          "同一个键两边都改时不是「后写的赢」：%r" % (_dec(Project.open(pdir)).get("strategy"),))
+
+    # ④ 没碰过的键不许被旧快照写回去：B 先开（还没有 12.0 ✓）⇒ A 写它 ⇒ B 再存别处 ✓
+    b2 = Project.open(pdir)
+    a3 = Project.open(pdir)
+    a3.set("decision", dict(_dec(a3), attack_fan_deg=12.0))
+    a3.save()
+    b2.set("decision", dict(_dec(b2), pot_cd=7))
+    b2.save()
+    got3 = _dec(Project.open(pdir))
+    check(float(got3.get("attack_fan_deg") or 0) == 12.0 and int(got3.get("pot_cd") or 0) == 7,
+          "B 没碰过的键被 B 那份旧快照写回去了（存一次打回原形 ✗）：attack_fan_deg=%r pot_cd=%r"
+          % (got3.get("attack_fan_deg"), got3.get("pot_cd")))
+
+    # ⑤ 反向证明（老写法 = 整份覆盖）：同一局面下 **必然丢** ⇒ 钉子不是恒真 ✓
+    c = Project.open(pdir)
+    d = Project.open(pdir)
+    c.set("decision", dict(_dec(c), strategy="sweep"))
+    c.save()
+    d.set("decision", dict(_dec(d), attack_dist=150.0))
+    with open(d.path, "w", encoding="utf-8") as f:      # ⚠ 老写法：把 d 那份整份覆盖上去
+        _yaml.safe_dump(d.data, f, allow_unicode=True, sort_keys=False)
+    old_way = _dec(Project.open(pdir))
+    check(old_way.get("strategy") != "sweep",
+          "反向验证没成立（整份覆盖居然没丢东西 ⇒ 上面几条可能测不到真东西 ✗）：strategy=%r"
+          % (old_way.get("strategy"),))
+
+
+def t_auto_hotkey_three_layers():
+    """⭐⭐⭐ 「开关自动」的热键要**三层**：注册制 → 键盘钩子 → 窗口内快捷键
+    （用户 2026-10-10 ✓ 原话：**「我需要 F11 全局生效」**）。
+
+    病（就在这台机器上实测的 ✓）：`RegisterHotKey(…, VK_F11)` **返回 0** ✗
+    （`F12` 也被占着 ✓ 只有 `F10` 能注册 ✓）—— 而 `RegisterHotKey` 是**独占**的 ✗
+    （一个键**只允许一个进程**注册 ✓，现场多半是**另一个本程序实例**先注册走了 ✓，
+    见 295 条那次「两个工作台」✓）⇒ 代码只能降级成「**本窗口聚焦时**」✗
+    ⇒ 焦点切到游戏后按 F11 **毫无反应** ✓（用户要的正是它 ✗）。
+
+    钉五件：
+      ① 钩子**真装真卸**（行为级 ✓ 不依赖那个键有没有被占 ✓）：装 ⇒ `hook_installed()`
+         True ⇒ 卸 ⇒ False ✓，而且**幂等** ✓（重复装/重复卸都不炸 ✓）；
+      ② 钩子**不许吞键** ✗：回调末尾无条件 `CallNextHookEx` ✓（吞了 ⇒ 游戏里按 F11 就废 ✓）；
+      ③ 回调对象**留在模块级** ✗（Python 侧一回收 ⇒ 系统再调进来是野指针 ⇒ **崩** ✓）；
+      ④ 注册失败后**要试钩子** ✓ —— 不许直接退到"本窗口" ✗（那正是用户抱怨的那层 ✓）；
+      ⑤ 三层共用**一个出口** ✓（`_on_auto_hotkey_fired` ✓ 且经 `QTimer.singleShot` 丢回事件循环 ✓
+         —— 钩子回调里**不许做重活** ✓）+ 关闭时**必须卸钩子** ✓（不然它一直挂在系统钩子链上 ✓）。
+    """
+    from decision import hotkey as hk
+
+    # ---- ① 行为级：真装真卸 + 幂等（⚠ 用 F24 试，绝不用 F11 ✗ 免得惊动别的工作台 ✓）----
+    try:
+        ok, why = hk.install_hook(0x87, lambda: None)
+        check(ok, "键盘钩子装不上（%s）⇒ 全局热键就只剩「本窗口聚焦」那一层 ✗" % why)
+        check(hk.hook_installed(), "装上了 `hook_installed()` 却是 False ✗")
+        ok2, _why2 = hk.install_hook(0x87, lambda: None)
+        check(ok2 and hk.hook_installed(), "重复装该「先卸旧的再装」✓（幂等 ✗）")
+        hk.remove_hook()
+        check(not hk.hook_installed(), "卸掉后该是 False ✗")
+        hk.remove_hook()                                # 幂等：再卸一次不许炸 ✓
+        check(not hk.hook_installed(), "重复卸之后状态还是 False ✓")
+    finally:
+        hk.remove_hook()
+
+    # ---- ②③ 源码级：不吞键 + 回调留在模块级 ----
+    _hk = (ROOT / "decision" / "hotkey.py").read_text(encoding="utf-8")
+    _body = _hk.split("def install_hook", 1)[-1].split("def remove_hook", 1)[0]
+    check("CallNextHookEx" in _body,
+          "钩子回调里没有 `CallNextHookEx` ⇒ **会吞键** ✗（游戏里按 F11 就废了 ✓）")
+    check("global _hook_proc" in _body and "_hook_proc =" in _body,
+          "回调对象**没留在模块级** ✗ ⇒ 被回收就是野指针 ⇒ 进程会崩 ✓")
+    check("def hook_installed" in _hk and "def remove_hook" in _hk,
+          "缺 `hook_installed()` / `remove_hook()` ⇒ 没法判断也没法卸 ✗")
+
+    # ---- ④⑤ 源码级：三层顺序 + 共用出口 + 关闭卸载 ----
+    _mw = (ROOT / "gui" / "main_window.py").read_text(encoding="utf-8")
+    _fn = _mw.split("def _register_auto_hotkey", 1)[-1].split("def _note_hotkey_fallback",
+                                                              1)[0]
+    check("install_hook" in _fn,
+          "注册失败后**没试键盘钩子** ✗ ⇒ 键被别人占着时就只能「本窗口聚焦」✗"
+          "（用户 2026-10-10 报的正是这个 ✓）")
+    check("_auto_shortcut" in _fn, "第三层（窗口内快捷键）丢了 ✗（两层都失败时还得能用 ✓）")
+    check("remove_hook()" in _fn,
+          "注册成**成功**时没把钩子卸掉 ✗ ⇒ 两路都活着 ⇒ 按一下 = 开又关 ✓")
+    check("_on_auto_hotkey_fired" in _mw and "singleShot" in _mw,
+          "两路没共用「唯一出口」/ 没丢回事件循环 ✗ ⇒ 钩子回调里做重活会拖慢整机按键 ✓")
+    _close = _mw.split("def closeEvent", 1)[-1].split("def ", 1)[0]
+    check("remove_hook()" in _close,
+          "关闭时没卸键盘钩子 ✗ ⇒ 它一直挂在**系统钩子链**上（关掉工作台还拖慢按键 ✓）")
+
+
 TESTS = (
+    ("⭐⭐⭐ 「开关自动」热键三层：注册制 → 键盘钩子 → 窗口内快捷键（用户 2026-10-10"
+     "「我需要 F11 全局生效」）；钩子不吞键 · 装在模块级 · 关闭必卸",
+     t_auto_hotkey_three_layers),
     ("⭐⭐ 卡片之外的小任务**也走工作台那条读条**（补导宠物图库用；用户 2026-10-05）",
      t_run_export_uses_workbench_bar),
     ("⭐⭐ 「关了必须走 / 卡住不许烧核」：两道看门狗（留栈 + 退出码 3/4；用户 2026-10-05）",
@@ -856,6 +1053,9 @@ TESTS = (
      t_offscreen_never_connects_device),
     ("启动自动打开上次项目 + 参数页说明「参数存到哪儿」（用户 2026-10-04）",
      t_startup_opens_last_project_and_says_where_params_go),
+    ("⭐⭐ **必须能开 2 个工作台**（用户 2026-10-09）：共用一个项目文件时各改各的参数"
+     "**互不覆盖**（键级合并）· 同键后写者赢 + 冲突记账 · 顶层与别的段也不许被抹",
+     t_two_workbenches_share_one_project),
     ("主视区页签开合：开一次/不重复/关掉不销毁/起始页关不掉", t_view_open_close_flow),
     ("「实时」是常驻页签：关不掉、且页签上没有「×」（用户 2026-09-28）",
      t_closing_live_tab_says_it_keeps_running),

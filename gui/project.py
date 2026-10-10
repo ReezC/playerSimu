@@ -136,6 +136,48 @@ def _deep_merge(base: dict, over: dict) -> dict:
     return out
 
 
+#: 「这个键原来不存在」的哨兵（`_leaf_diff` / 冲突记账用 ✓ 与"值是 None"分开 ✓）。
+_MISSING = object()
+
+
+def _leaf_diff(base, now, prefix=()):
+    """`now` 相对 `base` **改过 / 新增了哪些"叶子"** ⇒ `{路径元组: 值}`（递归进 dict ✓）。
+
+    为什么要键级 diff（用户 2026-10-09 原话："**我们必须要支持能开 2 个工作台**"✓）：
+    落盘**不能整份覆盖** ✗ —— 另一个窗口刚写进去的会被抹掉 ✗ ⇒ 只把"**本窗口改过的
+    那几处**"盖回磁盘 ✓（见 `Project.save` / `Project._merge_disk` ✓）。
+
+    ⚠ 只认"**改值 / 加键**"，**不认删键** ✗（这类配置里"少一个键"没有语义、实际也没人这么用 ✓）：
+      要"清掉"某样东西就把值写成空（`{}` / `""` / `0` ✓ 那是改值 ⇒ 照样盖得上 ✓）。
+    """
+    out = {}
+    if not isinstance(now, dict):
+        return out
+    for k, v in now.items():
+        p = prefix + (k,)
+        b = (base or {}).get(k, _MISSING) if isinstance(base, dict) else _MISSING
+        if isinstance(v, dict):
+            if isinstance(b, dict):
+                out.update(_leaf_diff(b, v, p))
+            else:
+                out.update(_leaf_diff({}, v, p))      # 原来不是 dict ⇒ 整棵都算我改的 ✓
+        elif b is _MISSING or b != v:
+            out[p] = copy.deepcopy(v)
+    return out
+
+
+def _set_leaf(doc, path, val):
+    """按路径把 `val` 写进 `doc`（中间缺的 dict 现造 ✓）—— `_leaf_diff` 的反操作 ✓。"""
+    cur = doc
+    for k in path[:-1]:
+        nxt = cur.get(k)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[k] = nxt
+        cur = nxt
+    cur[path[-1]] = copy.deepcopy(val)
+
+
 class Project:
     def __init__(self, root):
         # 必须存绝对路径。相对路径（比如 "projects/某图"）传给 ultralytics
@@ -144,6 +186,11 @@ class Project:
         self.root = Path(root).resolve()
         self.path = self.root / "project.yaml"
         self.data = _deep_merge(DEFAULTS, {})
+        #: ⭐⭐ **本窗口"上一次见到的磁盘内容"**（开项目时刷 ✓、每次 `save()` 后再刷 ✓）——
+        #:   多实例合并的**基准**：落盘时只把"相对它的改动"盖回去 ✓（见 `save` / `_merge_disk` ✓）。
+        self._loaded = copy.deepcopy(self.data)
+        #: 上一次落盘时"**两个窗口都改过**"的键（`/` 连接的路径 ✓；空 = 没冲突 ✓）。
+        self._conflicts = []
 
     # ---------------- 创建 / 打开 / 保存 ----------------
 
@@ -166,11 +213,51 @@ class Project:
         with open(p.path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
         p.data = _deep_merge(DEFAULTS, raw)
+        p._loaded = copy.deepcopy(p.data)        # ⭐ 合并基准（见 `save` ✓）
         for d in SUBDIRS:
             (p.root / d).mkdir(exist_ok=True)
         return p
 
+    def _merge_disk(self):
+        """重读磁盘 ⇒ `(合并后的 data, 冲突键列表)`（多实例：**只盖本窗口改过的那几处** ✓）。
+
+        `conflicts` = "**两个窗口都改过、而且值不一样**"的键（`/` 连接 ✓）—— 后写的赢 ✓，
+        但要让主窗口把这件事**说出来**（见 `main_window._save_everywhere` ✓）。
+        """
+        if not self.path.exists():
+            return copy.deepcopy(self.data), []
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f) or {}
+        except Exception:                       # noqa: BLE001 —— 读不出来就照旧整份写（保住我这边的 ✓）
+            return copy.deepcopy(self.data), []
+        if not isinstance(raw, dict):
+            return copy.deepcopy(self.data), []
+        base = getattr(self, "_loaded", None) or {}
+        fresh = _deep_merge(DEFAULTS, raw)
+        mine = _leaf_diff(base, self.data)       # 本窗口改过 / 新增的 ✓
+        theirs = _leaf_diff(base, fresh)         # 别人改过 / 新增的 ✓
+        conflicts = ["/".join(str(x) for x in p) for p, v in mine.items()
+                     if p in theirs and theirs[p] != v]
+        for p, v in mine.items():
+            _set_leaf(fresh, p, v)               # ⭐ 只盖我那几处 ⇒ 别人的改动留住 ✓
+        return fresh, conflicts
+
     def save(self):
+        """落盘（⭐⭐ **多实例安全** ✓ 用户 2026-10-09："**我们必须要支持能开 2 个工作台**"）。
+
+        做法 = **读-改-写**：先**重读磁盘**（另一个窗口刚写进去的也在里面 ✓）⇒ 只把"本窗口
+        相对**上次见到的内容**改过的那几处"盖上去 ✓ ⇒ 再整份写回 ✓（见 `_merge_disk` ✓）。
+          · 两个窗口改**不同**参数 ⇒ **两边都留得住** ✓（原来是谁后写谁把对方**整片**抹掉 ✗，
+            现场就是"这边选了平台站桩、那边一存变成 patrol"✗）；
+          · 改**同一个**键 ⇒ 后写的赢 ✓（无法两全 ✓）＋ 记进 `self._conflicts` ✓，主窗口会写日志 ✓。
+        ⚠ **不做文件锁** ✗：这文件小、写得也不密（人改一个控件写一次 ✓）⇒ 读-改-写在实用上够 ✓；
+          加锁反而会在"两个窗口同时开着"时带来卡顿/死锁风险 ✗（而这正是用户要的用法 ✓）。
+        ⚠ 合并基准 `self._loaded` **每次写完跟着刷** ✓ —— 不刷的话下一次 save 会把"我刚写过的"
+          当成"我改过的"再盖一遍 ✓（幂等，但会让冲突记账失真 ✗）。
+        """
+        self.data, self._conflicts = self._merge_disk()
+        self._loaded = copy.deepcopy(self.data)  # ⭐ 基准跟着走（下次 diff 从这儿算 ✓）
         self.root.mkdir(parents=True, exist_ok=True)
         with open(self.path, "w", encoding="utf-8") as f:
             yaml.safe_dump(self.data, f, allow_unicode=True,

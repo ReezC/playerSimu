@@ -1,0 +1,10 @@
+numpy>=1.26,<3
+scipy>=1.10,<2
+filterpy==1.4.5
+lap==0.5.13
+opencv-python>=4.8,<5
+av>=18.1,<19
+PySide6>=6.6,<7
+ultralytics==8.4.114
+mss>=9,<11
+# Install torch/torchvision for your CPU or CUDA environment first.

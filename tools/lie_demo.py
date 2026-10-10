@@ -67,6 +67,20 @@ from perception.lie_motion import VelocityRunner                        # noqa: 
 from perception.lie_motion import (VEL_CATCH_DEF as _VEL_CATCH_DEFAULT,   # noqa: E402
                                    VEL_DEV_DEF as _VEL_DEV_DEFAULT,
                                    VEL_HOLD_DEF as _VEL_HOLD_DEFAULT)
+#: ⭐⭐⭐⭐⭐ **"顶点偏离多少算异常"的比例的默认值**（用户 2026-10-08 ✓ 第 3 条："**把他做成配置**"
+#:   ✓✓）—— ⚠ 口径**只在 `perception/lie_motion.py` 一处** ✓（界面别抄数 ✗ 见 `_VGRP_SELF_K_DEF` ✓）。
+from perception.lie_motion import _VGRP_SELF_K_DEF as _VEL_VTXK_DEFAULT       # noqa: E402
+#: ⭐⭐⭐⭐⭐ **第四档：锚定追踪**（用户 2026-10-08 ✓ 原话："**尽量抛弃旧的思路，把新的方案落地，
+#:   做成新的模式给我验收，你取名字**" ✓✓）—— 名字我取 **「锚定追踪」** ✗：这一档的骨架就是
+#:   "**拿一堆静止的同形片当锚**"（锚住相机 ✓ 锚住身份 ✓ 只有那一片在动 ✓ 见 `perception/
+#:   anchor_track.py` 的模块头 ✓）—— ⚠ 它与 `MotionRunner` **同签名同返回** ✓ ⇒ 演示窗**只换构造** ✓。
+from perception.anchor_track import (ANCHOR_MODE as _ANCHOR_MODE,           # noqa: E402
+                                     ANCHOR_NAME as _ANCHOR_UI_NAME,
+                                     AnchorRunner,
+                                     #   ⚠ 那三条旋钮的**默认值**也只从后端那一处取 ✓
+                                     #     （界面别抄数 ✗ 会漂 ✓ 与"顶点偏离比例"同一个套路 ✓）。
+                                     _ANC_CAM_SMOOTH, _ANC_CAM_STEP_MAX,
+                                     _ANC_WAVE_T, anc_angle_line)
 # ⭐⭐⭐ **速度跟踪（velocity）那三档状态码 + 那两个"等待上板"有关的常量**（用户 2026-10-07 ✓）——
 #   ⚠ 一律从 `perception/lie_motion.py` **同一处口径取** ✗ 别在界面里抄字符串 ✗（"merge" 之类
 #     写错一个字 ⇒ 画面上就不洋红 ✓ 而且不留痕 ✓）；本文件只会用到这几个 ✓。
@@ -92,6 +106,11 @@ from perception.lie_motion import _FUSE_PULL as _MOTION_FPULL_DEFAULT  # noqa: E
 #:   慢了，夹取也要算进速度平滑。因为夹取是修正你的预测误差，夹取是较准确的测量值**" ✓✓）
 #:   —— 见 `_CLAMP_GAIN` ✓；⚠ **不许界面另抄一份数** ✗（同「框心力度」那条纪律 ✓）。
 from perception.lie_motion import _CLAMP_GAIN as _MOTION_CGAIN_DEFAULT  # noqa: E402
+#: ⭐⭐⭐ **"顶点在群体坐标系里的坐标"那份口径**（用户 2026-10-08 ✓ 原话："**增加功能：点选检出框
+#:   时，显示 4 个顶点的群体坐标系坐标**" ✓✓）—— ⚠ **一处口径** ✗：与后端"顶点档案 /
+#:   「顶点异常波动」那条日志"**同一个函数** ✓（见 `pick_vtx_label` ✓）⇒ 用户能拿面板上的数
+#:   去核日志里的数 ✓ 各写一份就对不上了 ✗。
+from perception.lie_motion import vel_vtx_group                              # noqa: E402
 from perception.lie_tracker import LieTracker  # noqa: E402
 # ⭐ 轨迹预测观察窗 / 融合框判定阈值的**默认值**（界面初值用它 ✓ 与追踪器同一处口径 ✓）
 # ⭐⭐ 重叠尺统一在 `perception/geom.py` ✓（用户 2026-10-03 ✓）：点选检出框时要按
@@ -1079,6 +1098,37 @@ def pick_extra(box, pos=None, rad=0.0, bricks=None):
     return _btxt, _rtxt
 
 
+#: ⭐⭐⭐ **"四个顶点"那一段的顶点名** ✗（**只用 ASCII** ✗✗ —— `cv2.putText` 不认中文 ✓ 写"左上"
+#:   会画成 `??` ✓ 同 `pick_label` 那条注释 ✓）—— `TL / TR / BR / BL` = 左上 / 右上 / 右下 / 左下 ✓；
+#:   ⚠ 顺序**必须**与 `lie_motion.vel_vtx_group` **一致** ✓（日志里那串也是这个顺序 ✓ 能逐项对 ✓）。
+_PICK_VTX_NAMES = ("TL", "TR", "BR", "BL")
+
+
+def pick_vtx_label(box, cam_cum):
+    """点选框的**「四个顶点在群体坐标系里的坐标」那一段**（**纯函数** ✓ 好测 ✓ 窗口与自检共用 ✓）。
+
+    ⭐⭐⭐⭐⭐ 用户 2026-10-08 ✓ 原话："**增加功能：点选检出框时，显示 4 个顶点的群体坐标系
+      坐标**" ✓✓ —— ⚠ 项目纪律：面板文字要新增**必须先问用户** ✓（见 `draw` 那段注释 ✓）⇒
+      这一条正是**用户点名要的** ✓ 不是我私自加的 ✓。
+
+    ⚠⚠ **口径一处** ✗✗：顶点坐标**一律**走 `lie_motion.vel_vtx_group` ✓（= 画面顶点 − 相机累计
+      位移 ✓）—— 与**顶点档案 / 「顶点异常波动」那条日志**是**同一个函数** ✓ ⇒ 面板上的数字
+      **就是**日志里的数字 ✓（点一格看到报警 ⇒ 点那个框就能看到四个角各挪了多少 ✓ 这正是
+      用户要的用法 ✓）。⚠ 各写一份 ⇒ 两处数字对不上 ⇒ 白做 ✗。
+
+    ⚠ 尾部那个 `cam(...)` = **这一拍的相机累计位移** ✓ —— 留着它才解释得通"**为什么这四个数
+      和屏幕上的坐标不是一个数**"（屏幕 = 群体坐标 ＋ 它 ✓）；⚠ 不要也可以 ⇒ 说一声我去掉 ✓。
+    ⚠ 拿不到相机累计（**经典 / 运动分离档** ✓ 或还没建立 ✓）⇒ 回 **`""`** ✓（面板/状态栏
+      照旧不出现这一段 ✓ **不猜** ✗ —— 拿屏幕坐标冒充"群体坐标"就是骗人 ✓）。
+    """
+    if cam_cum is None:
+        return ""
+    _q = vel_vtx_group(float(box[1]), float(box[2]), float(box[3]), float(box[4]), cam_cum)
+    return ("V(group) " + " ".join("%s(%.0f,%.0f)" % (_n, float(_p[0]), float(_p[1]))
+                                   for _n, _p in zip(_PICK_VTX_NAMES, _q))
+            + "  cam(%.0f,%.0f)" % (float(cam_cum[0]), float(cam_cum[1])))
+
+
 #: ⭐⭐⭐ **点选信息框的排版**（用户 2026-10-04 ✓ 原话："点选之后的信息框能做个**最小宽度+自动换行**
 #:   吗？现在**整个屏幕都不够宽了**" ✓✓）——
 #:   · `_PICK_MIN_W` = **最小宽度**（px ✓）：短信息也撑成一块像样的面板 ✓ 不缩成一条 ✗；
@@ -1093,9 +1143,12 @@ _PICK_TOP = 54
 
 #: ⭐⭐⭐⭐⭐ **两档模式各自的「图例」文字**（用户 2026-10-07 ✓「速度跟踪」那一轮）——
 #:   · `_LEGEND_MOTION` = **运动分离**那 16 行（**原样搬过来** ✗ 一个字不改 ✓ 零污染 ✓）；
-#:   · `_LEGEND_VELOCITY` = **速度跟踪**的**初始图例**（用户 2026-10-07 ✓ **原话给的、只这 7 条** ✓）。
+#:   · `_LEGEND_VELOCITY` = **速度跟踪**的**初始图例**（用户 2026-10-07 ✓ **原话给的 7 条** ✓）＋
+#:     **第 8 条**（用户 2026-10-07 ✓ 我按纪律**先问、他答"1"批准** ✓："**洋红框是什么？没有在图例里
+#:     显示**" ⇒ 选①"加一条图例" ✓）—— 因为这一轮我把"融合态"接上了（`box_v[7] = 1` ✓）
+#:     ⇒ 洋红**第一次真会出现** ✓ 再不写进图例就成了"画面有、图例不解释" ✗。
 #:   ⚠⚠⚠ **项目纪律**（用户 2026-10-07 ✓ 原话："以后**不得私自新增**任何观测参数 / 图例条目 /
-#:     面板文字 / 底栏提示。要新增**必须先问用户、得到同意**才做"✓）⇒ **这 7 条之外一条都不许加** ✗
+#:     面板文字 / 底栏提示。要新增**必须先问用户、得到同意**才做"✓）⇒ **这 7＋1 条之外一条都不许加** ✗
 #:     （自检脚本内部的输出不算 ✓ 调试日志不算 ✓）。
 #:   ⚠ 中文照用 ✓（这个 QLabel 是 **Qt** 画的 ⇒ 支持 Unicode ✓；`cv2.putText` 那一路才只认 ASCII ✓）。
 _LEGEND_MOTION = (
@@ -1116,7 +1169,8 @@ _LEGEND_MOTION = (
     "🟡黄粗框：我刚点选的那一格\n"
     "框上的蓝/绿/黄小箭头：该框这一拍的运动方向\n"
     "（开「显示 KF 预测」时另有青色线/点/箭头）")
-#: ⚠ **只这 7 条**（用户原话 ✓ 逐字 ✓）—— 画面里**只留**这 7 样东西（见 `draw` 里那道 `_vel` 闸 ✓）。
+#: ⚠ **这 7 条是用户原话逐字** ✓ ＋ **第 8 条**（用户 2026-10-07 ✓ 我问他、他答"1"批准 ✓ 见上）✓
+#:   —— 画面里**只留**这 8 样东西（见 `draw` 里那道 `_vel` 闸 ✓）。
 _LEGEND_VELOCITY = (
     "1. 蓝色框：yolo检出框（若注册过框左上有标签）\n"
     "2. 灰色框：有标签的假目标丢失检出框时的记录\n"
@@ -1124,7 +1178,22 @@ _LEGEND_VELOCITY = (
     "4. 红点：此时鼠标位置\n"
     "5. 蓝箭头：检出框的绝对速度\n"
     "6. 白箭头：真目标的相对群体速度\n"
-    "7. 橙色线：圆心相对群体轨迹")
+    "7. 橙色线：圆心相对群体轨迹\n"
+    "8. 洋红框：融合框（真目标和假目标粘成一个框）")
+#: ⭐⭐⭐⭐⭐ **第四档：锚定追踪的图例**（用户 2026-10-08 ✓ 原话："**尽量抛弃旧的思路，把新的方案
+#:   落地，做成新的模式给我验收，你取名字**" ✓✓）—— ⚠⚠ **项目纪律**（"不得私自新增图例条目 /
+#:   面板文字 / 底栏提示，要加先问用户" ✓ 见 `_LEGEND_VELOCITY` 那段 ✓）：**这一档是新模式** ✓
+#:   ⇒ 它**必须**有自己的图例（不然画面上的东西没人解释 ✓ 那更糟 ✗），但这几条是**我拟的** ✗
+#:   ⇒ **你点哪条要删 / 要改，我就改** ✓（与"老两档一个字不改"那条纪律不冲突 ✓ 它们照旧 ✓）。
+#:   ⚠ 中文照用 ✓（这个 QLabel 是 Qt 画的 ✓ 支持 Unicode ✓ 只有 `cv2.putText` 那条路只认 ASCII ✓）。
+_LEGEND_ANCHOR = (
+    "1. 蓝色框：检出框（本档**只当观测**用：它给位置，不判身份）\n"
+    "2. 绿色粗框：**当前认定的目标**（那片在动的）＋ 穿过它的白线 = 它的**角度**\n"
+    "3. 绿圆：报出的目标位置（= 群体坐标 ＋ 相机累计）\n"
+    "4. 青色十字：**群体坐标系的原点**（相机累计位移的落点 —— 静止片在这套坐标里应当不动）\n"
+    "5. 左上角那行字：相机这一拍走了多少 / 波浪分 / 目标号 / 角度\n"
+    "6. 底栏日志：目标丢失、重新认领、以及**波浪段的开始与结束**\n"
+    "⚠ 本档**没有**：融合 / 上板 / 认领分数那一套（老两档的东西 ✗ 一条都不继承 ✓）")
 #: ⭐⭐⭐ **速度跟踪档里蓝箭头的显示长度**（**固定** ✓ 用户 2026-10-07 ✓ **最终口径**：原话
 #:   "**蓝箭头不再以长短展示速度大小，只代表速度方向，固定长度**" ✓✓）。
 #:   ⚠ 所以这一档：**长度恒 = 它**（显示域 px ✓）、**方向**取后端给的每拍位移 ✓；
@@ -1207,6 +1276,39 @@ def pick_label(pick, names=None):
                 _segs.append(_ln)
     _l2 = " | ".join(_segs)
     return ("%s\n%s" % (_l1, _l2)) if _l2 else _l1
+
+
+def coord_clip_text(frame_no, x, y):
+    """**"复制坐标"** 的剪贴板文本 ✗✗（用户 2026-10-09 ✓ 原话："**你先给我做一个右键菜单功能：复制坐标
+    ｜ 复制的内容是 xx帧 (x,y)**" ✓✓）。
+
+    ⇒ 形如 `400帧 (554,298)` ✓ —— **帧号 1 起**（与界面帧号一致 ✓）＋ **加工域坐标** ✓
+      （= 画面上那个绿十字显示的同一把尺 ✓ 与后端判据/日志同一把尺 ✓ ⇒ 用户拿它跟我交流
+      不用换算 ✓✓）。
+
+    ⚠ 两个口径（都不新立 ✗）：
+      · **取整**：用户给的三个真值点就是整数（`(554,298)` ✓）⇒ 这里也取整 ✓（小数位对交流没用 ✗）；
+      · **不写总帧数 / 不写状态** ✗：用户点名了格式就是 `xx帧 (x,y)` ✓ —— 多写反而要他删 ✓。
+    ⚠ `frame_no` 拿不到 ⇒ 回空串 ✓（**不编帧号** ✗ 见 `_on_pick_menu` ✓）。
+    """
+    if frame_no is None:
+        return ""
+    return "%d帧 (%d,%d)" % (int(frame_no), int(round(float(x))), int(round(float(y))))
+
+
+def pick_menu_labels(has_box):
+    """**右键菜单的条目**（顺序 = 显示顺序 ✓）—— **纯函数** ✓ 好钉 ✓。
+
+    用户 2026-10-09 ✓ 新要求："**右键菜单功能：复制坐标**" ✓ ⇒ **"复制坐标"永远第一项** ✓
+      （点哪儿都能复制 ✓ 命中没命中都一样 ✓）；
+    ⚠ 老那项 "复制检出框信息" **只在真的点在检出框上时才出现** ✓（用户 2026-10-03 定过
+      "没命中就不开菜单" ✗ ⇒ 现在菜单会开 ✓，但**那一项仍然只在命中时出现** ✓ —— 不拿空选中
+      糊弄他 ✓）。
+    """
+    _out = ["复制坐标"]
+    if has_box:
+        _out.append("复制检出框信息")
+    return _out
 
 
 def pick_clip_text(pick, names=None, frame_no=None, total=None, state=None):
@@ -1412,17 +1514,29 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
     ✓ —— 纯显示层：不动任何判定、不改帧数据 ✓（与红框/绿圈/登记同一把尺 = **加工域坐标** ✓）。
     传 `(cls, cx, cy, w, h[, conf])`（与检出框同布局 ✓）；`None` ⇒ 不画 ✓。
     """
-    _out, pos, r, hit, d = res
+    #   ⚠⚠⚠ **`res[0]` 是**没人用的**旧画布** ✗✗**（**实测抓到** ✓ 用户 2026-10-08 ✓）：调用点给的
+    #     一律是 `None`（见 `show_frame(draw(big.copy(), (None, …)))` ✓）⇒ 而下面 ROI 那块**原来
+    #     画在 `_out` 上** ✗ ⇒ `cv2.rectangle(None, …)` 是**空操作** ✗✗ ⇒ **框选区域那个黄框从来
+    #     就没画出来过** ✗ —— 用户因此以为"**框选区域没保存、一关就重置了**" ✓（**查过了：其实存了
+    #     也回填了** ✓ 启动后程序内部拿到的就是那 4 个数 ✓，纯属**看不见** ✗）。
+    #   ⇒ 画面上一切（含 ROI ✓）一律画在 **`frame`** 上 ✓（它就是 `draw()` 末尾 `return frame` 的
+    #     那个画布 ✓ —— 全篇只有"放框 / 放字 / 放圈"这几行用 `_out` ✗ 其余都在 `frame` ✓）。
+    _, pos, r, hit, d = res
     # ⭐⭐⭐⭐⭐ **模式闸**（用户 2026-10-07 ✓「速度跟踪」那一轮）—— ⚠ 口径 = **后端给的那个键**
     #   （`motion["mode"]` ✓ **不是**界面下拉 ✓ —— 两者在"点应用 ⇒ 重建 runner"之后一致 ✓）。
     #   · `"motion"` ⇒ **运动分离**：下面所有老分支**一个字不改** ✓（零污染 ✓）；
-    #   · `_vel`（= `"velocity"`）⇒ **做减法**：整幅画面**只留那 7 样**（见 `_LEGEND_VELOCITY` ✓）
+    #   · `_vel`（= `"velocity"`）⇒ **做减法**：整幅画面**只留那 7 样 ＋ 洋红那条**（见
+    #     `_LEGEND_VELOCITY` ✓ 用户 2026-10-07 ✓ 批准的第 8 条 ✓）
     #     ⇒ 每一处"多出来的东西"都由这一道闸挡掉 ✓（挡法一律 `and not _vel` ✓ 一句话 ✓）。
     #   ⚠⚠ **项目纪律**（用户 2026-10-07 ✓ 原话）："以后**不得私自新增**任何观测参数 / 图例条目 /
     #     面板文字 / 底栏提示。要新增**必须先问用户、得到同意**才做" ✓ ⇒ 所以速度跟踪档一律是
     #     **"清空"** ✗ 不是"换一套速度跟踪专用的新文字" ✓（要加先问 ✓）。
     _mo_now = str((motion or {}).get("mode") or "")
     _vel = (_mo_now == "velocity")
+    #: ⭐⭐⭐⭐⭐ **第四档：锚定追踪**（用户 2026-10-08 ✓ 原话："**尽量抛弃旧的思路，把新的方案落地，
+    #:   做成新的模式给我验收，你取名字**" ✓✓）—— ⚠ 与 `_vel` **并列** ✓：老两档那些标记
+    #:   （KF / HUD / 点选面板 / 洋红夹取框 / 融合那套 ✓）**一条都不画** ✓（见各处 `_vel` 闸 ✓）。
+    _anchor = (_mo_now == _ANCHOR_MODE)
     # ⭐⭐⭐⭐⭐ **限定区域（ROI）画出来** ✗✗（用户 2026-10-07 ✓ 原话："**只在限定的区域计算（因为
     #   这是部分弹窗）**" ✓✓）—— ⚠⚠ **所见即所得** ✓：画面上这个框**就是判据用的那个框** ✓
     #   （框里的检出框 / 白块 / 轨迹才算 ✓ 框外一概看不见 ✓）。
@@ -1435,9 +1549,39 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
         _ry0 = int(round(float(_roi[1]) * scale_y))
         _rx1 = int(round(float(_roi[2]) * scale_x))
         _ry1 = int(round(float(_roi[3]) * scale_y))
-        cv2.rectangle(_out, (_rx0, _ry0), (_rx1, _ry1), (0, 200, 255), 2)
-        cv2.putText(_out, "ROI", (_rx0 + 6, max(18, _ry0 + 20)),
+        #   ⭐⭐⭐⭐⭐ **"描面"：把框选区域整块染一层淡色** ✗✗（用户 2026-10-08 ✓ 原话："**用颜色
+        #     描面展示一下我框选的区域**" ✓✓）—— ⚠⚠ **只有描边不够** ✗：他因此以为"**框选区域
+        #     没保存、一关就重置了**" ✓（**实测澄清** ✓：其实存了也回填了 ✓ —— 启动后程序内部拿到的
+        #     就是 `(200.5, 75.6, 688.5, 399.9)` ✓，只是**画面上看不出来** ✗）。
+        #   ⚠ 做法 = 只对**框内那一块**做 `addWeighted` ✓（**框外一个像素都不碰** ✗ —— 框外那层
+        #     "压暗 + 模糊"是另一个函数的事 ✓ 见 `dim_outside_roi` ✓ 两者别混 ✓）；⚠ **纯显示** ✗：
+        #     一个判据都不碰 ✓；⚠ 描边仍旧留着 ✓（色块太淡 ⇒ 边界还得靠那条线 ✓）。
+        _cx0, _cy0 = max(0, _rx0), max(0, _ry0)
+        _cx1, _cy1 = min(frame.shape[1], _rx1), min(frame.shape[0], _ry1)
+        if _cx1 > _cx0 and _cy1 > _cy0:
+            _sub = frame[_cy0:_cy1, _cx0:_cx1]
+            _tint = np.empty_like(_sub)
+            _tint[:] = (0, 200, 255)               # ⚠ 与描边**同一个色**（橙黄 ✓ BGR ✓）
+            cv2.addWeighted(_sub, 0.88, _tint, 0.12, 0.0, _sub)
+        cv2.rectangle(frame, (_rx0, _ry0), (_rx1, _ry1), (0, 200, 255), 2)
+        cv2.putText(frame, "ROI", (_rx0 + 6, max(18, _ry0 + 20)),
                     cv2.FONT_HERSHEY_SIMPLEX, _fs(0.6), (0, 200, 255), 2, cv2.LINE_AA)
+    #   ⭐⭐⭐⭐⭐ **速度跟踪档：ROI 之外的检出框**一个都不画** ✗✗**（用户 2026-10-08 ✓ 原话：
+    #     "**为什么旁边还有检出框？我们所有的逻辑都要限制在 roi 之内，非 ROI 默认用蒙版置灰**"
+    #     ✓✓）——
+    #     · ⚠ 后端**本来就不算**框外的框 ✓（`VelocityTracker.process` 开头那道 ROI 过滤 ✓）、
+    #       `box_v` / 座位 / 编号也全在 ROI 里 ✓；**病在画面** ✗：这里画的是**整批 YOLO 原框** ✗
+    #       ⇒ 框外那些照样画上去 ✓ 而且**压灰在前、画框在后** ⇒ 它们亮在灰底上 ✗✗
+    #       （**实测**：帧 44 那个 `(40.6, 229.1)` 就在 ROI 左边 **160px** ✗ —— 用户报的就是它 ✓）；
+    #     · ⚠ 口径与后端**同一把尺** ✓：**框心落在 ROI 里**才算 ✓（**不是**"框有交集" ✗ ——
+    #       两处必须一致 ✓ 否则又变成"画出来的和算进去的不是一批" ✗）；
+    #     · ⚠ 顺带**蒙版的挖洞也只剩 ROI 里的** ✓（下面 `apply_mask` 读的就是这个 `d` ✓）
+    #       ⇒ 框外**一整块干净置灰** ✓ 正是用户要的"非 ROI 默认置灰" ✓；
+    #     · ⚠ 只在**速度跟踪档**做 ✗（经典 / 运动分离**一个字不改** ✓ 零污染 ✓）。
+    if _vel and _roi is not None:
+        d = [b for b in (d or [])
+             if float(_roi[0]) <= float(b[1]) <= float(_roi[2])
+             and float(_roi[1]) <= float(b[2]) <= float(_roi[3])]
     # ⭐⭐ **绿圈半径 = 目标框半宽**（用户 2026-09-30 口径 ✓ 原话："将绿圈半径恒=目标框半宽" ✓）：
     #   红框（`_choose_target_box` ✓）与绿圈**同一个目标** ⇒ 半径取那格框的**半宽 × 显示缩放** ✓。
     #   ⚠ 没有目标框时（建档/丢帧）+ 没有框 ⇒ 退回原来的"面积等效半径" ✓（不留空 ✗）。
@@ -1894,8 +2038,10 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
     #   · 为什么不用黄框 ✗：黄色已经是"框左上角那行编号"的颜色 ✓（`(0,255,255)` ✓）⇒ 撞色分不清 ✓；
     #   · 为什么还要角标 ✗：这一档一帧十几格框 ✓ 只描一圈边容易被旁边框的边混掉 ✓
     #     ⇒ 四个 L 角把"我选的那一格"圈出来 ✓ 一眼认得出 ✓；
-    #   · ⚠ **一个字都不写** ✗（"面板文字"按 2026-10-07 那轮口径**保持清空** ✓ —— 要写什么字
-    #     **先问用户** ✓ 项目纪律 ✓）。
+    #   · ⚠ 文字：2026-10-07 那轮是**一个字都不写** ✗（"面板文字要新增**必须先问用户**" ✓ 项目
+    #     纪律 ✓ 见 `draw` 开头那段 ✓）—— ⭐⭐⭐⭐⭐ 2026-10-08 ✓ **用户点名要了一条** ⇒ 这一档的
+    #     面板**只写那一条** ✓（原话："**增加功能：点选检出框时，显示 4 个顶点的群体坐标系坐标**"
+    #     ✓✓）⇒ 字串 = `pick_vtx_label` ✓（**第 9 位** `pick[8]` ✓ 由 `_pick_box` 算好 ✓）。
     if pick is not None and _vel:
         _vx1 = int(round((float(pick[1]) - float(pick[3]) / 2.0) * scale_x))
         _vy1 = int(round((float(pick[2]) - float(pick[4]) / 2.0) * scale_y))
@@ -1908,52 +2054,64 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
                                          (_vx2, _vy2, -1, -1), (_vx1, _vy2, 1, -1)):
             cv2.line(frame, (_sx2, _sy2), (_sx2 + _dx2 * _cl, _sy2), _vc, 5, cv2.LINE_AA)
             cv2.line(frame, (_sx2, _sy2), (_sx2, _sy2 + _dy2 * _cl), _vc, 5, cv2.LINE_AA)
-    if pick is not None and not _vel:
+    #   ⚠⚠ **两档共用这一块** ✗（面板摆位 / 换行 / 底板那一套**只写一份** ✓ 别复制一套 ✗）——
+    #     只有"写什么字"分档 ✓：速度跟踪档 = `pick[8]`（四个顶点的群体坐标系坐标 ✓ 用户 2026-10-08 ✓）；
+    #     老两档 = `pick_label`（原来的两行 ✓ 一个字不动 ✓）。
+    if pick is not None:
         _pcx, _pcy = float(pick[1]), float(pick[2])
         _pw, _ph = float(pick[3]), float(pick[4])
         _q1 = (int(round((_pcx - _pw / 2.0) * scale_x)), int(round((_pcy - _ph / 2.0) * scale_y)))
         _q2 = (int(round((_pcx + _pw / 2.0) * scale_x)), int(round((_pcy + _ph / 2.0) * scale_y)))
-        cv2.rectangle(frame, _q1, _q2, (0, 255, 255), 3)          # 🟡 黄：点选高亮 ✓
-        # 标签（**两行** ✓ 用户 2026-10-03 ✓ 见 `pick_label` ✓）：
-        #   第 1 行 = `类别 置信度 | (cx,cy) WxH=面积`（用户要的 `(360.4,323.0) 179x208=37232` ✓）；
-        #   第 2 行 = `IoU最大砖 … | 圆矩IoU … | 圆矩∩框 …`（重叠量 ✓ 用户点名放这行 ✓）。
-        #   ⚠ 只用 ASCII ✗ —— `cv2.putText` 不认全角 `｜`/`×` ⇒ 会画成 `?` ✗。
-        #   ⚠ `cv2.putText` **不认 `\n`** ✗ ⇒ 自己按行拆开逐行画 ✓（黑底高度 = 行数 × 行高 ✓）。
-        _ptxt = pick_label(pick, names)
-        # ⭐⭐⭐ **自动换行 + 最小宽度**（用户 2026-10-04 ✓ 原话："点选之后的信息框能做个**最小宽度+
-        #   自动换行**吗？现在**整个屏幕都不够宽了**" ✓✓ —— 见 `_PICK_*` / `wrap_px` ✓）：
-        #   · 换行宽 = `min(最大宽, 画面宽 − 2×留白)` ✓ ⇒ **绝不顶出屏幕** ✓；
-        #   · 面板宽 = `max(最小宽, 最长那行的宽)` ✓ ⇒ 短信息也像块面板 ✓。
-        _pwrap = max(120, min(_PICK_MAX_W, frame.shape[1] - 2 * _PICK_MARGIN))
-        _pln = wrap_px([t for t in _ptxt.split("\n") if t], _pwrap, _fs(0.75))
-        _psz = [cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, _fs(0.75), 1)[0] for t in _pln]
-        _pth = max(s[1] for s in _psz)
-        _pwmax = max([s[0] for s in _psz] + [_PICK_MIN_W])         # ⭐ 最小宽度 ✓
-        _plh = _pth + 8                       # 行高（含行距 ✓）
-        # ⚠ **竖着也得放得下** ✗：换了行 ⇒ 行数会涨 ✓ ⇒ 从 `_PICK_TOP` 到画面底能摆几行就摆几行 ✓
-        #   多的**截断**（末行加 ASCII 的 `...` ✓ —— `cv2.putText` **不认 `…`** ✗ 会画成 `?` ✓）。
-        _pmaxln = max(1, (frame.shape[0] - _PICK_TOP - 6) // _plh)
-        if len(_pln) > _pmaxln:
-            _pln = _pln[:_pmaxln]
-            _pln[-1] = _pln[-1][:max(1, len(_pln[-1]) - 3)] + "..."
+        if _vel:
+            # ⚠ 文案**就是** `_pick_box` 附在第 9 位的那一串 ✓（**不在这儿再算一遍** ✗ ⇒ 面板 /
+            #   状态栏 / 剪贴板**字字一致** ✓）；⚠ 空串（拿不到相机累计 ✓ 本档不该发生 ✓）⇒
+            #   连底板都不画 ✓（省得屏幕上多一块空黑块 ✗）。
+            _ptxt = (str(pick[8]) if len(pick) > 8 else "")
+            _pcol = (255, 255, 0)             # 🩵 与那圈"选中"同色 ✓（一眼看出"这是这一格的信息"✓）
+        else:
+            cv2.rectangle(frame, _q1, _q2, (0, 255, 255), 3)          # 🟡 黄：点选高亮 ✓
+            # 标签（**两行** ✓ 用户 2026-10-03 ✓ 见 `pick_label` ✓）：
+            #   第 1 行 = `类别 置信度 | (cx,cy) WxH=面积`（用户要的 `(360.4,323.0) 179x208=37232` ✓）；
+            #   第 2 行 = `IoU最大砖 … | 圆矩IoU … | 圆矩∩框 …`（重叠量 ✓ 用户点名放这行 ✓）。
+            #   ⚠ 只用 ASCII ✗ —— `cv2.putText` 不认全角 `｜`/`×` ⇒ 会画成 `?` ✗。
+            #   ⚠ `cv2.putText` **不认 `\n`** ✗ ⇒ 自己按行拆开逐行画 ✓（黑底高度 = 行数 × 行高 ✓）。
+            _ptxt = pick_label(pick, names)
+            _pcol = (0, 255, 255)
+        if _ptxt:
+            # ⭐⭐⭐ **自动换行 + 最小宽度**（用户 2026-10-04 ✓ 原话："点选之后的信息框能做个**最小宽度+
+            #   自动换行**吗？现在**整个屏幕都不够宽了**" ✓✓ —— 见 `_PICK_*` / `wrap_px` ✓）：
+            #   · 换行宽 = `min(最大宽, 画面宽 − 2×留白)` ✓ ⇒ **绝不顶出屏幕** ✓；
+            #   · 面板宽 = `max(最小宽, 最长那行的宽)` ✓ ⇒ 短信息也像块面板 ✓。
+            _pwrap = max(120, min(_PICK_MAX_W, frame.shape[1] - 2 * _PICK_MARGIN))
+            _pln = wrap_px([t for t in _ptxt.split("\n") if t], _pwrap, _fs(0.75))
             _psz = [cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, _fs(0.75), 1)[0] for t in _pln]
             _pth = max(s[1] for s in _psz)
-            _pwmax = max([s[0] for s in _psz] + [_PICK_MIN_W])
-        _phbox = _plh * len(_pln)
-        _pbot = _q2[1] + _phbox + 10          # 默认贴框**下方** ✓
-        if _pbot > frame.shape[0] - 4:                            # 框贴底 ⇒ 标签挪到框内上方 ✓
-            _pbot = max(_phbox + 4, _q1[1] - 8)
-        _px0 = max(_PICK_MARGIN, min(_q1[0], frame.shape[1] - _pwmax - _PICK_MARGIN))
-        _ptop = _pbot - _phbox
-        # ⚠⚠ **别顶到 HUD** ✗（用户 2026-10-04 ✓ 字号调大后暴露的 ✓）—— HUD 画在 `y≈38` ✓
-        #   而面板最高能顶到 `y≈0` ⇒ **第 1 行被 HUD 的黑描边压住** ✗ ⇒ 让它从 `_PICK_TOP` 起 ✓。
-        if _ptop < _PICK_TOP:
-            _ptop = _PICK_TOP
-            _pbot = _ptop + _phbox
-        cv2.rectangle(frame, (_px0, _ptop), (_px0 + _pwmax + 8, _pbot), (0, 0, 0), -1)
-        for _pk_i, _pk_t in enumerate(_pln):
-            cv2.putText(frame, _pk_t, (_px0 + 4, _ptop + _plh * _pk_i + _pth + 3),
-                        cv2.FONT_HERSHEY_SIMPLEX, _fs(0.75), (0, 255, 255), 1, cv2.LINE_AA)
+            _pwmax = max([s[0] for s in _psz] + [_PICK_MIN_W])         # ⭐ 最小宽度 ✓
+            _plh = _pth + 8                       # 行高（含行距 ✓）
+            # ⚠ **竖着也得放得下** ✗：换了行 ⇒ 行数会涨 ✓ ⇒ 从 `_PICK_TOP` 到画面底能摆几行就摆几行 ✓
+            #   多的**截断**（末行加 ASCII 的 `...` ✓ —— `cv2.putText` **不认 `…`** ✗ 会画成 `?` ✓）。
+            _pmaxln = max(1, (frame.shape[0] - _PICK_TOP - 6) // _plh)
+            if len(_pln) > _pmaxln:
+                _pln = _pln[:_pmaxln]
+                _pln[-1] = _pln[-1][:max(1, len(_pln[-1]) - 3)] + "..."
+                _psz = [cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, _fs(0.75), 1)[0] for t in _pln]
+                _pth = max(s[1] for s in _psz)
+                _pwmax = max([s[0] for s in _psz] + [_PICK_MIN_W])
+            _phbox = _plh * len(_pln)
+            _pbot = _q2[1] + _phbox + 10          # 默认贴框**下方** ✓
+            if _pbot > frame.shape[0] - 4:                            # 框贴底 ⇒ 标签挪到框内上方 ✓
+                _pbot = max(_phbox + 4, _q1[1] - 8)
+            _px0 = max(_PICK_MARGIN, min(_q1[0], frame.shape[1] - _pwmax - _PICK_MARGIN))
+            _ptop = _pbot - _phbox
+            # ⚠⚠ **别顶到 HUD** ✗（用户 2026-10-04 ✓ 字号调大后暴露的 ✓）—— HUD 画在 `y≈38` ✓
+            #   而面板最高能顶到 `y≈0` ⇒ **第 1 行被 HUD 的黑描边压住** ✗ ⇒ 让它从 `_PICK_TOP` 起 ✓。
+            if _ptop < _PICK_TOP:
+                _ptop = _PICK_TOP
+                _pbot = _ptop + _phbox
+            cv2.rectangle(frame, (_px0, _ptop), (_px0 + _pwmax + 8, _pbot), (0, 0, 0), -1)
+            for _pk_i, _pk_t in enumerate(_pln):
+                cv2.putText(frame, _pk_t, (_px0 + 4, _ptop + _plh * _pk_i + _pth + 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, _fs(0.75), _pcol, 1, cv2.LINE_AA)
     if hud:
         # ⚠ **字号调大后基线也得往下挪** ✗（用户 2026-10-04 ✓ "窗口字体能大点" ✓）——
         #   原来 `y=26` 是配 `0.7` 的 ✓；现在字高 ~30px ✗ ⇒ 会**顶到画面上边缘**。
@@ -2211,10 +2369,37 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
             #   ⚠ 运动分离档 ⇒ `_bids_v is None` ⇒ 那道闸**不生效** ✓（老画面一个字不变 ✓）。
             _bids_v = (set((motion.get("vel") or {}).get("board_ids") or []) if _vel else None)
             for _t in (motion.get("tracks") or []):
-                if _bids_v is not None and int(_t.get("tid") or 0) not in _bids_v:
+                _tidv0 = int(_t.get("tid") or 0)
+                #   ⚠⚠⚠ **"半出画"那条记录**不许被"没编号"挡掉** ✗✗（用户 2026-10-08 ✓ **第二次**
+                #     点名 ✓ 原话："**399 帧 #6 的下边缘就贴视野边界了，然而你到 409 帧还没把其
+                #     视野外的灰框部分绘制出来，认真检讨**" ✓✓）——
+                #     病根：这道闸原来写成"**不在 `board_ids`（= 有编号）里就 `continue`**" ✗✗
+                #     ⇒ 可 #6 那几拍是**融合/等待**（框是并集 ⇒ 压根没号 ✗）⇒ 它**明明有框、
+                #     只是半出画** ✓ 却被闸掉 ⇒ **那块"它应该多大"的记录灰框一个像素都没画** ✗
+                #     （实测：帧 399 起 `tracks` 里就有它、`in_roi=False` ✓ 但屏幕上什么都没有 ✗）。
+                #   ⇒ 现在：**"半出画 ＋ 这一拍有框"⇒ 一律画**（有没有号都画 ✓ 号只是"归谁"✗
+                #     不是"画不画"✓）；⚠ "**没号又没框**"（纯靠推的那种）照旧不给画 ✗
+                #     （= 老口径 ✓ 用户 2026-10-07 那条"等待上板不给画灰框"一个字没动 ✓）。
+                _half0 = ((_t.get("in_view") is False) or (_t.get("in_roi") is False))
+                if (_bids_v is not None and _tidv0 not in _bids_v
+                        and not (_half0 and _tidv0 in _bids)):
                     continue
-                if int(_t.get("tid") or 0) in _bids or int(_t.get("tid") or 0) in _owners:
-                    continue                     # 有框 / 是融合框的主人 ⇒ 上面已经写过 ✓ 不重复 ✗
+                _tidv = _tidv0
+                _has_box = _tidv in _bids
+                #   ⭐⭐⭐⭐⭐ **有框、但那格有一半在视野外 ⇒ 记录那块灰框也要画** ✗✗（用户 2026-10-08 ✓
+                #     原话："**当有编制的假目标检出框有部分到了视野外时，我们也要把记录的那部分
+                #     灰框绘制出来**" ✓✓）—— 理由：边缘那格的**宽高本来就失真** ✓（同一天他定的
+                #     那条 ✓ 见 `lie_motion` 里 `vel_seat_metrics` 的 `in_view` ✓）⇒ 画面上得留一个
+                #     "它**应该**多大"的记录 ✓ 才看得出那几拍到底在发生什么 ✓。
+                #   ⚠ 这种情况**不写「#N 推的」** ✗（它这一拍**有**框 ✓ 位置不是推的 ✓ 别撒谎 ✗）
+                #     ⇒ 见下面那道 `if _has_box:` ✓。
+                #   ⚠ 老两档没有 `in_view` 这个键 ⇒ `is not False` ⇒ 行为**一个字不变** ✓（零污染 ✓）。
+                if _tidv in _owners:
+                    continue                     # 融合框的主人 ⇒ 号已经写在那格框上了 ✓ 不重复 ✗
+                #   ⚠ "半出画" = **画面** 或 **框选区域** 任一没装下整框 ✓（两把尺 ✓ 见后端 ✓）。
+                _half = ((_t.get("in_view") is False) or (_t.get("in_roi") is False))
+                if _has_box and not _half:
+                    continue                     # 有框 ＋ 整框在视野内 ⇒ 上面已写过 ✓ 不重复 ✗
                 _tx, _ty = track_label_anchor(_t, pos, scale_x, scale_y)
                 #   ⚠ 上面这个函数里写清了**锚点口径** ✓（座位"推的"⇒ 钉在**圆心** ✓；其余 ⇒ 钉它
                 #     自己的推算位置 `p` ✓）—— ⚠⚠ **别改回 `motion["pos"]`** ✗（实测它是 `None` ✓
@@ -2232,6 +2417,10 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
                 # ⭐⭐⭐ **这块牌子"整块都是编号"** ✗ ⇒ 关掉「检出框编号」就**整个不画** ✓
                 #   （用户 2026-10-04 ✓）—— ⚠ 但**上面那个灰框照留** ✗：它表达的是
                 #   "**目标大概在这儿**"（位置信息 ✓）而不是"它是几号"（归属 ✗）。
+                #   ⚠ **"有框、只是半出画"那种 ⇒ 灰框照画、但**不写「推的」** ✗**（它没在推 ✓
+                #     位置就是它这一拍那格框 ✓ —— 见上面那段 ✓）。
+                if _has_box:
+                    continue
                 if not _sh_ok.get("box_id", True):
                     continue
                 _bt2 = "#%d 推的" % int(_t.get("tid") or 0)
@@ -2243,6 +2432,96 @@ def draw(frame, res, scale_x, scale_y, hud=None, cursor=None, motion=None,
                 cv2.putText(frame, _bt2, (_x2, _y2),
                             cv2.FONT_HERSHEY_SIMPLEX, _fs(0.75),
                             (190, 190, 190), 1, cv2.LINE_AA)
+        #   ⭐⭐⭐⭐⭐ **大融合框 → 2 个重叠框** ✗✗（用户 2026-10-08 ✓ 原话："**需要你把拆框的结构
+        #     可视化，表现为将大融合框绘制成 2 个重叠框：与假目标检出框记录顶点、尺寸一致的洋红色框
+        #     ＋ 真目标认领的红色框，并标上编号**" ✓✓）——
+        #     · 两个框的数据**全在后端算好** ✓（`motion["fuse_split"]` ✓ **口径一处** ✓ 见
+        #       `VelocityTracker.motion_viz` ✓）：
+        #         **洋红** = **假目标**（融合框那格的宿主 ✓）的**记录框** —— 中心 = 它自己的
+        #                   **记录顶点** ✓、边长 = 它自己的**标准面积**开方 ✓（用户那句"与假目标
+        #                   检出框记录顶点、尺寸一致"的字面 ✓）；
+        #         **红**   = **真目标这一拍认领的框**（后端 `tbox` ✓）—— ⚠ 滑行那几拍它是 `None`
+        #                   ✓ ⇒ **只画洋红** ✓（不猜一个位置出来 ✗）。
+        #     · ⚠ 坐标系 = 与 `box_v` **同一层**（加工域 ✓）⇒ 一样按 `scale_x/scale_y` 缩放 ✓
+        #       （所见即所得 ✓）；
+        #     · ⚠ **只在速度跟踪档**画 ✓（老两档没有这个键 ⇒ 那边一个字不变 ✓ 零污染 ✓）。
+        if _vel:
+            for _fz in (motion.get("fuse_split") or []):
+                _fk = _fs(0.7)
+                for _fbox, _ftid, _fcol in (
+                        (_fz.get("box"), _fz.get("tid"), (255, 0, 255)),
+                        (_fz.get("real_box"), _fz.get("real_tid"), (0, 0, 255))):
+                    if not _fbox:
+                        continue
+                    _fx1 = int(round((float(_fbox[0]) - float(_fbox[2]) / 2.0) * scale_x))
+                    _fy1 = int(round((float(_fbox[1]) - float(_fbox[3]) / 2.0) * scale_y))
+                    _fx2 = int(round((float(_fbox[0]) + float(_fbox[2]) / 2.0) * scale_x))
+                    _fy2 = int(round((float(_fbox[1]) + float(_fbox[3]) / 2.0) * scale_y))
+                    cv2.rectangle(frame, (_fx1, _fy1), (_fx2, _fy2), _fcol, 2)
+                    #   ⚠ 编号**只用 ASCII** ✓（`cv2.putText` 不认中文 ✓）；⚠ 框贴顶 ⇒ 标签
+                    #     压在框沿上（往下挪一点 ✓）免得画到画面外看不见 ✗。
+                    if _ftid is not None:
+                        _ftxt = "#%d" % int(_ftid)
+                        _fty = _fy1 - 4
+                        if _fty < int(_fk) + 4:
+                            _fty = _fy1 + int(_fk) + 4
+                        cv2.putText(frame, _ftxt, (_fx1, _fty),
+                                    cv2.FONT_HERSHEY_SIMPLEX, _fk, _fcol, 1, cv2.LINE_AA)
+        #   ⭐⭐⭐⭐⭐ **锚定追踪档：目标粗框 ＋ 角度线 ＋ 群体原点 ＋ 一行读数** ✗✗（用户 2026-10-08 ✓
+        #     原话："**尽量抛弃旧的思路，把新的方案落地，做成新的模式给我验收，你取名字**" ✓✓）——
+        #     ⚠ 数据**全在后端算好** ✓（`motion["theta"] / ["cam_cum"] / ["wave"] / ["target_tid"]` ✓
+        #     见 `AnchorTracker.motion_viz` ✓）⇒ 这里**只画** ✓（一个判据都不在这儿算 ✓）。
+        #     · **绿粗框** = 当前认定的目标（那片在动的 ✓）；**白线** = 它的角度 ✓；
+        #     · **青十字** = 群体坐标系的原点（= 相机累计位移那个点 ✓ —— 静止片就该钉在它周围不动 ✓）；
+        #     · 左上角那一行 = 相机这一拍走了多少 / 波浪分 / 目标号 / 角度 ✓（**只用 ASCII** ✗ ——
+        #       `cv2.putText` 不认中文 ✓ 与别处同一条纪律 ✓）。
+        #     ⚠ 只在**这一档**画 ✓（老两档 ⇒ 一个字不变 ✓ 零污染 ✓）。
+        if _anchor and _sh_ok.get("boxes", True):
+            _tidA = int((motion or {}).get("target_tid") or -1)
+            #   ⚠⚠⚠ **目标框优先取 `target_box`** ✗✗（用户 2026-10-08 ✓ 原话："**真目标大部分时候
+            #     都是没有检出框的**" ✓✓）—— 那个键是**外观跟踪**自己算出来的 ✓（没框也有 ✓）；
+            #     `box_v` 那条路只在"还没模板 / 老后端"时兜底 ✓（否则**大部分拍都画不出目标框** ✗）。
+            _tbA = (motion or {}).get("target_box")
+            _boxA = (list(_tbA) if _tbA else
+                     next(([_itA[0], _itA[1], _itA[10], _itA[11]]
+                           for _itA in (motion.get("box_v") or [])
+                           if int(_itA[4]) == _tidA), None))
+            for _itA in ([_boxA] if _boxA else []):
+                #   ⚠⚠ `_boxA` 是**四元组**（cx, cy, w, h ✓ 与 `target_box` 同一个形状 ✓）——
+                #     不是 `box_v` 那条 14 位账 ✗（我第一版照抄了 `[10]/[11]` ⇒ 会 `IndexError` ✗）。
+                _ax1 = int(round((float(_itA[0]) - float(_itA[2]) / 2.0) * scale_x))
+                _ay1 = int(round((float(_itA[1]) - float(_itA[3]) / 2.0) * scale_y))
+                _ax2 = int(round((float(_itA[0]) + float(_itA[2]) / 2.0) * scale_x))
+                _ay2 = int(round((float(_itA[1]) + float(_itA[3]) / 2.0) * scale_y))
+                cv2.rectangle(frame, (_ax1, _ay1), (_ax2, _ay2), (0, 255, 0), 3)
+                _acx = int(round(float(_itA[0]) * scale_x))
+                _acy = int(round(float(_itA[1]) * scale_y))
+                _pA = anc_angle_line((_acx, _acy), float((motion or {}).get("theta") or 0.0),
+                                     max(16.0, 0.6 * max(_ax2 - _ax1, _ay2 - _ay1)))
+                cv2.line(frame, (int(_pA[0][0]), int(_pA[0][1])),
+                         (int(_pA[1][0]), int(_pA[1][1])), (255, 255, 255), 2, cv2.LINE_AA)
+                break
+            _cmA = (motion or {}).get("cam_cum") or (0.0, 0.0)
+            cv2.drawMarker(frame, (int(round(float(_cmA[0]) * scale_x)),
+                                   int(round(float(_cmA[1]) * scale_y))),
+                           (255, 255, 0), cv2.MARKER_CROSS, 26, 2)
+            _lmA = (motion or {}).get("cam_mv") or (0.0, 0.0)
+            cv2.putText(frame,
+                        ("ANCHOR  cam(%.0f,%.0f) step(%.1f,%.1f)  wave %.2f%s  tgt #%s  ang %.0f  "
+                         "match %.2f%s"
+                         % (float(_cmA[0]), float(_cmA[1]), float(_lmA[0]), float(_lmA[1]),
+                            float((motion or {}).get("wave") or 0.0),
+                            ("  <<WAVE" if (motion or {}).get("wave_now") else ""),
+                            ("-" if _tidA < 0 else str(_tidA)),
+                            float((motion or {}).get("theta") or 0.0),
+                            float((motion or {}).get("tpl_score") or 0.0),
+                            #   ⚠ `match` 那一段 = **这一拍是不是真的"看着目标"** ✓（≥ `_ANC_PATCH_NCC`
+                            #     才算 ✓ 见那段）；低了就是**在滑行**（目标被挡 / 全透明 ✓）—— 用户
+                            #     拿这个数就能分辨"跟得住"和"在硬撑" ✓。
+                            ("  <<COAST" if float((motion or {}).get("tpl_score") or 0.0)
+                             < 0.45 else ""))),
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, _fs(0.7), (255, 255, 0), 1,
+                        cv2.LINE_AA)
         for _it in ((motion.get("box_v") or []) if _sh_ok.get("boxes", True) else []):
             # ⚠⚠ **蓝箭头（每个框的瞬时速度）也归「检出框」开关管** ✗（用户 2026-10-04 ✓）——
             #   它画的就是"**检出框的速度**" ✗ ⇒ 框都关了、箭头还留着 ⇒ 一屏蓝箭头 ✓✗
@@ -2839,6 +3118,13 @@ def run_window(args):
             #   ⚠⚠ **绝不许改动 `classic` 与 `motion` 两个模式的任何行为** ✗✗（用户原话"零污染"✓）：
             #     它俩的取值 / 分支 / 文案**一个字不改** ✓，新档只**多一条路** ✓。
             self.cmb_mode.addItem("速度跟踪", "velocity")
+            # ⭐⭐⭐⭐⭐ **第四档：锚定追踪**（用户 2026-10-08 ✓ 原话："**尽量抛弃旧的思路，把新的
+            #   方案落地，做成新的模式给我验收，你取名字**" ✓✓）—— 名字 = **「锚定追踪」** ✗
+            #   （骨架 = "拿一堆静止的同形片当锚" ✓ 见 `perception/anchor_track.py` 模块头 ✓）；
+            #   ⚠⚠ **老两档（经典 / 运动分离 / 速度跟踪）一个字节都不许动** ✗✗（零污染 ✓）：新档
+            #   只**多一条路** ✓；⚠ 它**不用**老底盘那批参数 ✓（配对 / 打分 / 融合 / 上板 ✓ 一条
+            #   都不继承 ✓）⇒ 那几行整行收掉 ✓（见 `_on_mode_changed` ✓）。
+            self.cmb_mode.addItem(_ANCHOR_UI_NAME, _ANCHOR_MODE)
             self.cmb_mode.setToolTip(
                 "**经典**：在纹理里认那个白色图形（原来那套）。\n"
                 "**运动分离（新）**：按你 2026-10-03 给的规律 —— **用「颜色」当观测、用「运动」\n"
@@ -3409,6 +3695,30 @@ def run_window(args):
                 "  ⇒ 先给 8（落在两者之间、留余量）。\n\n"
                 "⚠⚠ **本轮判据还没接** ⇒ 这个值先只落盘、**还没生效**（下一步接上）。")
             cfgrowV.addWidget(self.sp_vdev)
+            #   ⭐⭐⭐⭐⭐ **"顶点偏离多少算异常"的比例** ✗✗（用户 2026-10-08 ✓ 第 3 条原话：
+            #     "**现在顶点超过历史中位的比例多少算异常？把他做成配置**" ✓✓）——
+            #     ⚠ 与上面那三个不同 ✗：**这一个当场生效** ✓（改完下一拍就算 ✓ 不用重跑 ✓），
+            #     因为它是在 `_match` 里**现算**的门 ✓（`set_vtx_k` ✓）。
+            cfgrowV.addWidget(QLabel("顶点偏离比例"))
+            self.sp_vtxk = NoWheelDoubleSpinBox()
+            self.sp_vtxk.setRange(0.5, 20.0)
+            self.sp_vtxk.setSingleStep(0.5)
+            self.sp_vtxk.setDecimals(1)
+            self.sp_vtxk.setSuffix(" 倍")
+            self.sp_vtxk.setValue(float(_VEL_VTXK_DEFAULT))
+            self.sp_vtxk.setToolTip(
+                "「**顶点偏离多少算异常**」的比例（用户 2026-10-08 点名要做成配置）\n"
+                "· 口径：门 = max(32 px × **本值/3.0**, **本值 × 它自己常态波动幅度**)；\n"
+                "  ⚠ 那个 32 px 会跟本值一起缩放（用户 2026-10-08：「还是改不了 2.5 倍」\n"
+                "    —— 老式子 32 是死的 ⇒ 常态小的格子上比例完全不起作用）；\n"
+                "  「常态波动幅度」= 最近 20 秒里它自己「最晃那一角」逐拍偏离的中位；\n"
+                "· **调大 ⇒ 更不敏感**（少报、也可能漏真事）；调小 ⇒ 更灵敏、噪声也一起上来；\n"
+                "· 实测（10月7日.mp4 全片 430 帧）：3.0 ⇒ 6 批 ／ 2.5 ⇒ 7 批 ／ 2.0 ⇒ 13 批 ／"
+                " 1.5 ⇒ 16 批；\n\n"
+                "✅ 这一项**已经生效**（改完下一拍就算，不用重跑）；\n"
+                "⚠ 日志里那句「它自己常态 x[..] y[..]」就是它的参照（先看常态、再定比例）。")
+            self.sp_vtxk.valueChanged.connect(self._on_vtx_k)
+            cfgrowV.addWidget(self.sp_vtxk)
             cfgrowV.addStretch(1)
             cfgrow.addWidget(QLabel("噪声容差(px)"))
             self.sp_ntol = NoWheelDoubleSpinBox()
@@ -3644,6 +3954,60 @@ def run_window(args):
             self._rowV_head = _wV
             _cfgcol.addWidget(_wV)
             _cfgcol.addLayout(cfgrowV)
+            # ⭐⭐⭐⭐⭐ **锚定追踪专用那一行**（用户 2026-10-08 ✓ 见 `perception/anchor_track.py` ✓）——
+            #   ⚠⚠ 项目纪律："不得私自新增观测参数 / 图例条目 / 面板文字，要加先问用户" ✓ ——
+            #   **新模式自己那一行**属于"这个模式要能调"的必要件 ✓（不给旋钮反而没法验收 ✓），
+            #   所以先摆三条**这一档真会用到**的 ✓ 你点哪条要删我就删 ✓。
+            _wA = _group("锚定追踪",
+                         "相机平滑 / 相机限幅 / 波浪门"
+                         "（⚠ 这一档**只吃**这几条：视觉源仍用检出框 ✓ 角度与锚定在代码里 ✓）")
+            _wA.setVisible(False)               # 默认经典 ⇒ 先藏 ✓（切模式时同步 ✓）
+            self._rowA_head = _wA
+            _cfgcol.addWidget(_wA)
+            cfgrowA = QHBoxLayout()
+            cfgrowA.setContentsMargins(6, 2, 6, 2)
+            self._rowA = cfgrowA
+            cfgrowA.addWidget(QLabel("相机平滑"))
+            self.sp_asmooth = NoWheelDoubleSpinBox()
+            self.sp_asmooth.setRange(0.05, 1.0)
+            self.sp_asmooth.setSingleStep(0.05)
+            self.sp_asmooth.setDecimals(2)
+            self.sp_asmooth.setValue(float(_ANC_CAM_SMOOTH))
+            self.sp_asmooth.setToolTip(
+                "相机位移的 EMA 系数（越大越信「本拍测到的」）\n"
+                "· 相机**慢 + 纯平移** ⇒ 取小一点更稳（滤波比单拍测量准）；\n"
+                "· 取 1.00 = 完全信本拍（抖会被原样带进群体坐标）；\n"
+                "✅ 改完**下一拍就生效**（判据在 process 里现读）。")
+            self.sp_asmooth.valueChanged.connect(self._on_anchor_cfg)
+            cfgrowA.addWidget(self.sp_asmooth)
+            cfgrowA.addWidget(QLabel("相机限幅(px/拍)"))
+            self.sp_astep = NoWheelDoubleSpinBox()
+            self.sp_astep.setRange(2.0, 200.0)
+            self.sp_astep.setSingleStep(2.0)
+            self.sp_astep.setDecimals(1)
+            self.sp_astep.setSuffix(" px")
+            self.sp_astep.setValue(float(_ANC_CAM_STEP_MAX))
+            self.sp_astep.setToolTip(
+                "相机每拍位移的上限（超过就算被波浪 / 误配骗了 ⇒ 削平）\n"
+                "· 慢速平移下这一步很小；\n ✅ 改完下一拍就生效。")
+            self.sp_astep.valueChanged.connect(self._on_anchor_cfg)
+            cfgrowA.addWidget(self.sp_astep)
+            cfgrowA.addWidget(QLabel("波浪门"))
+            self.sp_awave = NoWheelDoubleSpinBox()
+            self.sp_awave.setRange(0.1, 1.0)
+            self.sp_awave.setSingleStep(0.05)
+            self.sp_awave.setDecimals(2)
+            self.sp_awave.setValue(float(_ANC_WAVE_T))
+            self.sp_awave.setToolTip(
+                "波浪分 ≥ 它 ⇒ 这一拍算「波浪段」\n"
+                "· 波浪段内：相机与静止档案**都冻住**（拿被搅过的帧立档 = 把波浪写进基准）；\n"
+                "· 波浪分 = max(相位相关主峰变弱, 静止片位移的离散度变大, 与相机一致的片占比变少)；\n"
+                "· 调小 ⇒ 更敏感（宁可冻住）；调大 ⇒ 更宽松（但相机会跟着波纹抖）。\n"
+                "✅ 改完下一拍就生效。")
+            self.sp_awave.valueChanged.connect(self._on_anchor_cfg)
+            cfgrowA.addWidget(self.sp_awave)
+            cfgrowA.addStretch(1)
+            _cfgcol.addLayout(cfgrowA)
             _cfgbox = QHBoxLayout()
             _cfgbox.setContentsMargins(0, 0, 6, 2)
             _cfgbox.addLayout(_cfgcol)
@@ -3938,6 +4302,22 @@ def run_window(args):
                                                            _VEL_HOLD_DEFAULT)), 0.0), 30.0))
                 self.sp_vdev.setValue(min(max(float(c.get("vel_dev_px",
                                                           _VEL_DEV_DEFAULT)), 0.0), 500.0))
+                #   ⭐ **"顶点偏离比例"也读回来** ✓（用户 2026-10-08 ✓ 第 3 条："**把他做成配置**" ✓✓）——
+                #     ⚠ 它在 runner 造好之后会被推给 tracker ✓（见建 runner 那段 ＋ `_on_vtx_k` ✓）。
+                self.sp_vtxk.setValue(min(max(float(c.get("vel_vtx_k",
+                                                          _VEL_VTXK_DEFAULT)), 0.5), 20.0))
+            except Exception:
+                pass
+            # ①'' ⭐⭐⭐ **锚定追踪那三条也读回来** ✓（用户 2026-10-08 ✓ 见 `_rowA` ✓）——
+            #   ⚠ 同一个套路：**单独 try** ✓（别让一个坏值把其余参数连带跳过 ✗ 见上面那段 ✓）；
+            #   ⚠ runner 造好之后由 `_on_anchor_cfg()` 推给底盘 ✓（下一次 push 在"建 runner"那段 ✓）。
+            try:
+                self.sp_asmooth.setValue(min(max(float(c.get("anchor_cam_smooth",
+                                                             _ANC_CAM_SMOOTH)), 0.05), 1.0))
+                self.sp_astep.setValue(min(max(float(c.get("anchor_cam_step_max",
+                                                           _ANC_CAM_STEP_MAX)), 2.0), 200.0))
+                self.sp_awave.setValue(min(max(float(c.get("anchor_wave_t",
+                                                           _ANC_WAVE_T)), 0.1), 1.0))
             except Exception:
                 pass
             # ①' 融合框判定 IoU
@@ -4138,6 +4518,13 @@ def run_window(args):
                     "vel_catch_px": float(self.sp_vcatch.value()),
                     "vel_hold_s": float(self.sp_vhold.value()),
                     "vel_dev_px": float(self.sp_vdev.value()),
+                    #   ⭐ **"顶点偏离比例"也落盘** ✓（用户 2026-10-08 ✓ 第 3 条："**把他做成配置**" ✓✓）
+                    "vel_vtx_k": float(self.sp_vtxk.value()),
+                    #   ⭐⭐⭐ **锚定追踪那三条也落盘** ✓（用户 2026-10-08 ✓ 见 `_rowA` ✓）——
+                    #     独立键名 ✓（同"速度跟踪那三个"的理由：混进 `motion_*` 会互相覆盖 ✓）。
+                    "anchor_cam_smooth": float(self.sp_asmooth.value()),
+                    "anchor_cam_step_max": float(self.sp_astep.value()),
+                    "anchor_wave_t": float(self.sp_awave.value()),
                     # ⭐ **融合框判定 IoU**（用户 2026-10-03 ✓ 键名同步 ✓）
                     "merge_iou": round(float(self.sp_merge.value()), 3),
                     # ⭐ **融合框判定 IoU · 退出**（迟滞下半段 ✓ 用户 2026-10-03 ✓）
@@ -4583,14 +4970,24 @@ def run_window(args):
             ⚠ 两档**共用同一条底盘**（`MotionRunner` + `MotionTracker` ✓）⇒ 侧栏 / 参数行 / 取帧
               都照同一套走 ✓；**差别只在一个地方** = `draw()` 里那道 `_vel` 闸 ✓（速度跟踪做减法 ✓）。
             """
-            return self._mode() in ("motion", "velocity")
+            return self._mode() in ("motion", "velocity", _ANCHOR_MODE)
 
         def _vel(self):
             """是不是**速度跟踪**档（做减法那一档 ✓ 见 `_LEGEND_VELOCITY` ✓）。"""
             return self._mode() == "velocity"
 
+        def _anchor(self):
+            """是不是**锚定追踪**档（用户 2026-10-08 ✓ 见 `perception/anchor_track.py` ✓）。
+
+            ⚠ 与 `_vel` **并列**、互斥 ✓（两个都做减法：老两档那批标记一律不画 ✓）；差别只在
+              "各自读自己那套出口键" ✓（`cam_cum/wave/target_tid/theta` 是本档的 ✓）。
+            """
+            return self._mode() == _ANCHOR_MODE
+
         def _legend_text(self):
-            """当前该显示哪份图例（速度跟踪 ⇒ **只那 7 条** ✓ 其余 ⇒ 运动分离那 16 行 ✓）。"""
+            """当前该显示哪份图例（三档各一份 ✓ 见那三个常量 ✓）。"""
+            if self._anchor():
+                return _LEGEND_ANCHOR
             return _LEGEND_VELOCITY if self._vel() else _LEGEND_MOTION
 
         def _sync_legend(self):
@@ -4635,7 +5032,8 @@ def run_window(args):
             #     参数，放上新增要用的配置参数**" ✓）：它**不用**老底盘那批参数（配对 / 打分 /
             #     换人 / 平滑 / 自检 / 粘连 ✓ 新底盘 `VelocityTracker` 一条都不吃 ✗）
             #     ⇒ 第 4/5 行**一并收掉** ✓（只留通用三项 ＋ 它自己那三个新参量 ✓）。
-            _mo_trk = bool(_motion and not _vel_now)
+            _anchor_now = self._anchor()          # ⭐ 第四档（用户 2026-10-08 ✓ 见 `_LEGEND_ANCHOR` ✓）
+            _mo_trk = bool(_motion and not _vel_now and not _anchor_now)
             _h = getattr(self, "_rowM_head", None)
             if _h is not None:
                 _h.setVisible(_mo_trk)
@@ -4662,6 +5060,16 @@ def run_window(args):
                     _w = _layV.itemAt(_i).widget()
                     if _w is not None:
                         _w.setVisible(_vel_now)
+            # ②''' ⭐⭐⭐⭐⭐ **锚定追踪那一行**（用户 2026-10-08 ✓）—— 只有第四档放出来 ✓
+            _hA = getattr(self, "_rowA_head", None)
+            if _hA is not None:
+                _hA.setVisible(_anchor_now)
+            _layA = getattr(self, "_rowA", None)
+            if _layA is not None:
+                for _i in range(_layA.count()):
+                    _w = _layA.itemAt(_i).widget()
+                    if _w is not None:
+                        _w.setVisible(_anchor_now)
             # ③ ⚠ **第 1 行是混着的**（"模式" / "鼠标跟随效率倍率" 两边都要 ✓）⇒ **整行藏不得** ✗
             #    ⇒ 只把"新模式**用不上**"的那几项**逐项**收掉（连它**紧挨着的那个标签** ✓ ——
             #    布局是"标签, 控件, 标签, 控件…"⇒ 前一个 item 就是它的标签 ✓）。
@@ -4923,7 +5331,11 @@ def run_window(args):
                 #   **一条"挑谁是真目标"的逻辑都没有** ✗ 见那里 ✓）⇒ 其余全沿用 ✓。
                 #   ⚠ 老底盘那批参数（第 4/5 行 ✓ `_motion_kw()`）在本档**已经被收掉** ✗
                 #     ⇒ **一个都不传** ✓（新底盘也不吃 ✓ 见 `VelocityTracker.__init__` ✓）。
-                _rcls = VelocityRunner if self._vel() else MotionRunner
+                # ⭐⭐⭐⭐⭐ **第四档：锚定追踪**（用户 2026-10-08 ✓ 见 `perception/anchor_track.py` ✓）
+                #   —— 与速度跟踪**同一个套路** ✓：只换底盘 ✓ 老底盘那批参数**一个都不传** ✓
+                #   （本底盘一条都不吃 ✓ 见 `AnchorTracker.__init__` ✓），只传 `roi` ✓。
+                _rcls = (AnchorRunner if self._anchor()
+                         else (VelocityRunner if self._vel() else MotionRunner))
                 # ⚠⚠⚠ **ROI 必须转过去** ✗✗（**实测翻车** ✓）：我上一版写的是"速度跟踪档
                 #   **一个参数都不传**" ✗ ⇒ 把 `roi` 也一起丢了 ⇒ 那一档实际是**整幅**在跑 ✗
                 #   （用户 2026-10-07 报"**框选区域没有任何作用**" ＋ "**初始绿圆挑错了**" ✓ 同一条根因 ✓
@@ -4931,7 +5343,10 @@ def run_window(args):
                 #   而用户截图是"帧 73 时圆停在 (469,132) 那格普通砖上" ⇒ 完全对上 ✓）。
                 #   ⇒ 这一档只传 `roi`（老底盘那批参数仍**一个都不传** ✓ 新底盘不吃 ✓）。
                 _vel_kw = {}
-                if self._vel():
+                if self._vel() or self._anchor():
+                    #   ⚠⚠ **ROI 必须转过去** ✗✗（速度跟踪那一档曾经漏了它 ⇒ 用户当场报"框选区域
+                    #     没有任何作用" ✓ 见上面那段 ✓）；锚定追踪**同一把尺** ✓（也在"只在框选
+                    #     区域里算"这个前提下工作 ✓）。
                     _vel_kw["roi"] = getattr(self, "roi", None)
                 self.runner = _rcls(
                     # ⚠⚠ **`gain` 千万别填 `self._follow_gain()`** ✗✗（那是"跟随效率倍率"，
@@ -4953,10 +5368,21 @@ def run_window(args):
                     mode=self._mode(),
                     #   ⚠ 速度跟踪档**不传** `_motion_kw()`（那批参数已被收掉 ✓ 新底盘不吃 ✓）
                     #     —— 但 `**_vel_kw` 里那个 **`roi` 要传** ✓（见上面那段 ✓）。
-                    **({} if self._vel() else self._motion_kw()),
+                    **({} if (self._vel() or self._anchor()) else self._motion_kw()),
                     **_vel_kw)
                 self.runner_kf = None
                 self.results_kf = None
+                #   ⭐ **把"顶点偏离比例"推给刚造出来的 tracker** ✗✗（用户 2026-10-08 ✓ 见
+                #     `sp_vtxk` ✓）—— ⚠ 光靠"数字框一变就推"不够 ✗：**开窗时箱子里那个值
+                #     （配置里读回来的 ✓）也得先生效** ✓（换模式 / 换素材重造 runner 之后同理 ✓）。
+                if self._vel() and getattr(self, "sp_vtxk", None) is not None:
+                    if hasattr(self.runner.tr, "set_vtx_k"):
+                        self.runner.tr.set_vtx_k(self.sp_vtxk.value())
+                #   ⭐⭐⭐ **锚定追踪那三条也推一次** ✗✗（用户 2026-10-08 ✓ 见 `_rowA` ✓）——
+                #     同一个理由：**开窗时箱子里那些值（配置里读回来的 ✓）也得先生效** ✓
+                #     （换模式 / 换素材重造 runner 之后同理 ✓）。
+                if self._anchor() and hasattr(self.runner.tr, "set_cfg"):
+                    self._on_anchor_cfg()
                 if getattr(self, "col2", None) is not None:
                     self.col2.setVisible(False)
             self.warm_n = 0
@@ -4980,6 +5406,44 @@ def run_window(args):
                 except Exception:                 # noqa: BLE001
                     pass
                 return None
+
+        def _on_vtx_k(self, _v=None):
+            """「顶点偏离比例」那格数字框变了 ⇒ **马上推给 tracker** ✓（用户 2026-10-08 ✓ 第 3 条 ✓）。
+
+            ⚠ **下一拍就生效** ✓（门是在 `_match` 里现算的 ✓ ⇒ 不用重跑整段 ✓ —— 这是这一项
+              与上面那三个"只落盘"参数的区别 ✓）；
+            ⚠ runner 还没造好 / 不是速度跟踪档 ⇒ **什么都不做** ✓（不猜 ✗ 不炸 ✗）。
+            """
+            _r = getattr(self, "runner", None)
+            if _r is None or getattr(_r, "tr", None) is None:
+                return
+            #   ⚠⚠⚠ **必须探一探那个方法在不在** ✗✗（**实测踩到** ✓）：`set_vtx_k` 只有
+            #     **速度跟踪档**那个底盘有 ✓（老两档的 `tr` 是 `LieTracker` / `MotionTracker` ✗）
+            #     —— 这格数字框在别的档也能被点到 ✗ ⇒ 直接调 ⇒ `AttributeError` 冒进 Qt 事件循环
+            #     ⇒ PyQt `abort` ⇒ **整个窗消失** ✗✗（= 用户嘴里的"闪退" ✓ —— 他说"**改 2.5 失败**"
+            #     ✓ 很可能是这个 ✓）。⇒ 探不到 ⇒ **什么都不做** ✓（不猜 ✗）。
+            if not hasattr(_r.tr, "set_vtx_k"):
+                return
+            _sp = getattr(self, "sp_vtxk", None)
+            if _sp is not None:
+                _r.tr.set_vtx_k(_sp.value())
+
+        def _on_anchor_cfg(self, *_a):
+            """「锚定追踪」那三格数字框变了 ⇒ **马上推给底盘** ✓（用户 2026-10-08 ✓ 见 `_rowA` ✓）。
+
+            ⚠ 与「顶点偏离比例」同一个套路 ✓：**下一拍就生效** ✓（判据在 `process` 里现读 ✓）；
+              runner 还没造好 / 不是这一档 ⇒ **什么都不做** ✓（不猜 ✗ 不炸 ✗ —— 拿别的底盘调
+              `set_cfg` 会 `AttributeError` 冒进 Qt ⇒ **闪退** ✓ 踩过 ✓）。
+            """
+            _r = getattr(self, "runner", None)
+            if _r is None or not hasattr(getattr(_r, "tr", None), "set_cfg"):
+                return
+            _r.tr.set_cfg(cam_smooth=(getattr(self, "sp_asmooth", None).value()
+                                      if getattr(self, "sp_asmooth", None) else None),
+                          cam_step_max=(getattr(self, "sp_astep", None).value()
+                                        if getattr(self, "sp_astep", None) else None),
+                          wave_t=(getattr(self, "sp_awave", None).value()
+                                  if getattr(self, "sp_awave", None) else None))
 
         def warm_tick(self):
             """⭐ **边检测边演算**（整段一次算完 ✓ 用户要求 ②）：检测 + 追踪 + 控制
@@ -5513,7 +5977,15 @@ def run_window(args):
             _btxt, _rtxt = pick_extra((float(_b[1]), float(_b[2]),
                                        float(_b[3]), float(_b[4])),
                                       _row.get("pos"), _row.get("tgt_rad"), _br)
-            return tuple(_b) + (_btxt, _rtxt)
+            #   ⭐⭐⭐⭐⭐ **第 9 位 = "四个顶点的群体坐标系坐标"** ✗✗（用户 2026-10-08 ✓ 原话：
+            #     "**增加功能：点选检出框时，显示 4 个顶点的群体坐标系坐标**" ✓✓）——
+            #     · 算法走 `pick_vtx_label` ⇒ `lie_motion.vel_vtx_group` ✓（与后端"顶点档案 /
+            #       「顶点异常波动」那条日志"**同一个函数** ✓ ⇒ 两处数字能互相印证 ✓）；
+            #     · ⚠ 拿不到相机累计（**经典 / 运动分离档** ✓）⇒ **空串** ✓ ⇒ 状态栏与剪贴板
+            #       那一段**不出现** ✓（不猜 ✗ —— 拿屏幕坐标冒充"群体坐标"是假信息 ✗）；
+            #     · ⚠ 画布上那个面板**只在速度跟踪档**读它 ✓（见 `draw` 里 `_vel` 那支 ✓）。
+            return tuple(_b) + (_btxt, _rtxt,
+                                pick_vtx_label(_b, _mo.get("cam_cum")))
 
         def _on_pick_box(self, pt):
             """左键点了画面（`pt` = **加工域坐标** ✓）⇒ 命中那格检出框并显示其几何/面积。
@@ -5534,29 +6006,44 @@ def run_window(args):
             self._status(_i)                            # 状态栏写上这一格的数字 ✓
 
         def _on_pick_menu(self, pt):
-            """**右键点选检出框 ⇒ 选中 + 弹菜单**（用户 2026-10-03 ✓ 原话："加一个**右键点击检出框
-            选中并弹出菜单**，目前只有一项『**复制检出框信息**』，用来我**复制之后与你交流**" ✓）。
+            """**右键 ⇒ 弹菜单**（老：命中检出框才有；**新（用户 2026-10-09 ✓）：点哪儿都开 ✓**）。
 
-            · 命中逻辑与左键**同一份**（`pick_box_at` ✓ 里层优先 / 差一点取最近 ✓ 不各写一份 ✗）；
-            · ⚠ **没点在检出框上 ⇒ 不开菜单** ✓（不猜 ✗ —— 那唯一一项对"空选中"没有意义 ✓）；
-            · 选中后**照左键那条路**刷新（高亮 + 状态栏 ✓），再弹菜单 ✓；
-            · 菜单目前**只有一项** ✓（用户明说"目前只有一项" ✓ 结构留好 ✓ 以后加项就在这加 ✓）。
-            ⚠ 纯显示层 ✗：不改任何判定 / 参数 ✓ —— 只是把这一格的数字**放进剪贴板** ✓。
+            用户 2026-10-09 ✓ 原话："**你先给我做一个右键菜单功能：复制坐标 ｜ 复制的内容是
+              xx帧 (x,y)**" ✓✓ ⇒ 现在是：
+              · **"复制坐标"** = 永远第一项 ✓（把**加工域坐标** ＋ 当前帧号放进剪贴板 ✓ ⇒ 用户
+                点一下就能把真值点发给我 ✓ 不用自己抄 ✓）；
+              · **"复制检出框信息"** = 只在真点在检出框上时出现 ✓（老口径 ✓ 不拿空选中糊弄 ✗）。
+            ⚠ 命中逻辑与左键**同一份**（`pick_box_at` ✓ 不各写一份 ✗）；
+            ⚠ 命中时**照左键那条路**刷新（高亮 + 状态栏 ✓）；没命中**也不再有"什么都不弹"** ✓
+              （那时菜单里就只剩"复制坐标"一项 ✓）。
+            ⚠ 纯显示层 ✗：不改任何判定 / 参数 ✓ —— 只是把数字**放进剪贴板** ✓。
             """
             if not self.results or not self.frames:
                 return
             _i = max(0, min(getattr(self, "i", 0), len(self.results) - 1))
             _best = pick_box_at(self.results[_i].get("boxes"), pt)
-            if _best is None:
-                return                              # 没命中 ⇒ 不开菜单 ✓
-            self._pick = {"frame": _i, "box": _best}
-            self._show_precomputed()
-            self._status(_i)
-            _txt = self._pick_clip_text()
+            if _best is not None:
+                self._pick = {"frame": _i, "box": _best}
+                self._show_precomputed()
+                self._status(_i)
             _m = QMenu(self)
-            _m.addAction("复制检出框信息").triggered.connect(
-                lambda _=False: self._copy_pick_text(_txt))
+            for _lb in pick_menu_labels(_best is not None):
+                if _lb == "复制坐标":
+                    _t2 = coord_clip_text(_i + 1, pt[0], pt[1])     # ⚠ 帧号 1 起 ✓
+                    _m.addAction(_lb).triggered.connect(
+                        lambda _=False, _t=_t2: self._copy_coord_text(_t))
+                else:
+                    _t2 = self._pick_clip_text()
+                    _m.addAction(_lb).triggered.connect(
+                        lambda _=False, _t=_t2: self._copy_pick_text(_t))
             _m.exec_(QCursor.pos())                 # 在**鼠标处**弹（右键就该在指的地方 ✓）
+
+        def _copy_coord_text(self, txt):
+            """**"复制坐标"的落地**：写剪贴板 ＋ 状态栏回执 ✓（与 `_copy_pick_text` 同一套 ✓）。"""
+            if not txt:
+                return
+            QApplication.clipboard().setText(txt)
+            self.statusBar().showMessage("已复制坐标：%s ⇒ 直接粘贴即可 ✓" % txt, 6000)
 
         def _pick_clip_text(self):
             """当前点选框的**剪贴板文本**（组装在纯函数 `pick_clip_text` 里 ✓ 好测 ✓）。"""

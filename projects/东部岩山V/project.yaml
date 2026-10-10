@@ -241,6 +241,8 @@ decision:
     隐身术: a
     普攻: f
     表情_无语: f6
+  sweep_turn_cd_enabled: true
+  sweep_edge_turn_enabled: true
 notes: ''
 capture:
   source: file

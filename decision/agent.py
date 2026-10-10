@@ -156,6 +156,13 @@ TIMING_TICK = 0.01
 #: 兜着），所以按到"转过来"就够，不该按到"走起来"。
 TURN_TAP_S = 0.15
 
+#: ⭐⭐ **扫平台「两条换向规则都不勾」时的兜底回头距离（px）**（用户 2026-10-09 ✓ 原话：
+#:   "在「换朝向延迟」、「距离平台边缘回头」前面加勾选；**当都不勾选时默认走到平台边缘
+#:   100px 回头**"✓）。
+#: ⚠ 它是**内置常数**（= 用户原话里那个 100 ✓），**不是**「距离平台边缘回头」那个格子的值 ✗：
+#:   两个勾都不勾时那个格子填多少**都不看** ✓（面板会把格子置灰提示 ✓）。
+SWEEP_EDGE_FALLBACK_PX = 100.0
+
 #: ⭐ 「自动拾取」连续点按的**间隔**（秒；用户 2026-10-06 ✓ 原话："当玩家与掉落物接触时
 #:   **连续点按**拾取"）。
 #:
@@ -419,6 +426,15 @@ class DecisionSettings:
         self.big_mob_range_px = 600
         self.sweep_turn_cd = 1000   # 扫平台：当前朝向没怪持续此时间（毫秒）才换朝向
         self.back_range = 100       # 扫平台：允许锁定背后多远距离内的怪（像素）
+        # ⭐⭐ **两条换向规则各有一个开关**（用户 2026-10-09 ✓ 原话："在「换朝向延迟」、
+        #   「距离平台边缘回头」**前面加勾选**；**当都不勾选时默认走到平台边缘 100px 回头**"✓）：
+        #     · `sweep_turn_cd_enabled` —— 「换朝向延迟」那条（B ✓）；
+        #     · `sweep_edge_turn_enabled` —— 「距离平台边缘回头」那条（A ✓）；
+        #     · **都不勾** ⇒ **兜底**：按**内置 `SWEEP_EDGE_FALLBACK_PX`(100px)** 走到平台边缘
+        #       回头 ✓（**不看**上面那个格子填了多少 ✗ —— 用户原话就是"默认 100px"✓）。
+        #   ⚠ 默认**都勾上** ✓（= 现在正在跑的行为 ✓ 老项目/老配置**一字不变** ✓ 兼容底线 ✓）。
+        self.sweep_turn_cd_enabled = True
+        self.sweep_edge_turn_enabled = True
         # 扫平台：距当前 foothold 集合边缘 ≤ 此距离（px）⇒ 回头（**即使该方向有怪也转** ✓
         # 2026-09-29 新增）。集合 x 范围 = 广播的 `here_span`（世界坐标）；判不出集合
         # （没圈集合 / 没定位）⇒ 这条不生效，退回上面的「换朝向延迟」老逻辑 ✓。
@@ -828,6 +844,9 @@ class DecisionSettings:
                 "sweep_turn_cd": self.sweep_turn_cd,
                 "back_range": self.back_range,
                 "sweep_edge_turn_px": self.sweep_edge_turn_px,
+                # ⭐ 两条换向规则的开关（用户 2026-10-09 ✓ 见 `__init__` 那段 ✓）
+                "sweep_turn_cd_enabled": self.sweep_turn_cd_enabled,
+                "sweep_edge_turn_enabled": self.sweep_edge_turn_enabled,
                 # ⭐ 「平台站桩」三组（用户 2026-10-05 ✓）：站桩地点 + 定时拾取掉落
                 #   （开关 / 时间区间 / 掉落地区列表 ✓）
                 "station_spot": self.station_spot,
@@ -1041,6 +1060,10 @@ class DecisionSettings:
         self.sweep_turn_cd = int(data.get("sweep_turn_cd", 1000))
         self.back_range = int(data.get("back_range", 100))
         self.sweep_edge_turn_px = int(data.get("sweep_edge_turn_px", 100))
+        # ⭐ 两条换向规则的开关（用户 2026-10-09 ✓）：**老配置没有这两格 ⇒ 默认都勾上** ✓
+        #   = 现在正在跑的行为 ✓（兼容底线 ✓ 见 `__init__` 那段 ✓）。
+        self.sweep_turn_cd_enabled = bool(data.get("sweep_turn_cd_enabled", True))
+        self.sweep_edge_turn_enabled = bool(data.get("sweep_edge_turn_enabled", True))
         # ⭐ 「平台站桩」三组（用户 2026-10-05 ✓）—— 老配置没有这几格 ⇒
         #   **默认 = 没选地点 / 拾取关**（一字不变 ✓ 见 `__init__` 那段注释 ✓）。
         #   ⚠ 一律过清洗器（手改坏的 json 不许带进运行期 ✗，同 `_load_battle_zones` 的口径 ✓）。
@@ -3534,6 +3557,26 @@ class CombatAgent:
             # ⚠ 回来之后**自动恢复** ✓（`_resume` 一收掉 `_paused_at`，下一拍就照旧按
             #   `_last_vert` 判 ✓）—— 别在这里写"永久关闭"的标记 ✗。
             return False
+        # ⭐⭐⭐ **下跳（`DropJob`）：整段都开着这口许可**（用户 2026-10-10 ✓ 原话："**drop 刚开始时
+        #   就需要让位置状态允许能判定上绳梯，现在貌似没有走这一步判定**"✗）。
+        #   为什么下跳要特殊（不能照旧"真按了 ↓ 才算"✗）：**下跳本身就是一次竖直动作** ✓ ——
+        #   从"对齐下跳点 / 站住"到"按压跳 / 落地"整段都在为那一下 ↓+跳服务 ✓；而老口径下
+        #   `ALIGN` 相（可能要走好几秒）**一个竖直键都不发** ⇒ `_last_vert == 0` ⇒ 许可关 ✗
+        #   ⇒ 位置状态**判不出"在绳梯上"** ⇒ 执行器手里那份 `ladder_id` 恒 `None` ✗
+        #   （用户说的"没走这一步判定"就是这个 ✓）。
+        #   ⚠ 这也正是用户 2026-09-28 追加那条的**原意** ✓（原文："drop 按 ↓ 时也发通知，
+        #     **直到 drop 收工再关上**"✓）—— 本次把它落实成"**整段开着**" ✓，不再依赖
+        #     "按过 ↓ 之后 `_last_vert` 恰好还留着"这种巧合 ✓（`LANDING` 相发 `vert=0` ✗
+        #     本来就会把它关掉 ⇒ 落地那几拍又判不出在不在绳上 ✓）。
+        #   ⚠⚠ **只对 `DropJob` 这样** ✗：`ClimbJob` 照旧"**真发了 ↑/↓ 才算**" ✓ —— 它中途
+        #     "对齐绳的 x / 走去绳"都是**水平**相位 ✓，放开就会把"路过绳边"判成在绳上 ✓
+        #     （用户 2026-09-27 那条防线："**除非按住了 ↑ 或 ↓，不能主动判定为在绳梯上**"✓）。
+        #   ⚠ 上面 `_paused_at` 那条过滤**照旧生效** ✓（这一拍没跑任务 ⇒ 一律 False ✓
+        #     用户 2026-10-06 ✓）—— 别把"被战斗打断 / 界面接管"那几拍也开成在绳上 ✗。
+        if type(job).__name__ == "DropJob":
+            # ⚠ **收工 / 失败那一拍就关** ✓（就是用户 2026-09-28 那句话的后半截：
+            #   "**直到 drop 收工再关上**"✓）—— 别让"任务已经报 done"之后还继续把人判在绳上 ✗。
+            return str(getattr(job, "phase", "")) not in ("done", "failed")
         return bool(getattr(job, "_last_vert", 0) != 0)
 
     # ⛔ `current_target_sets()`（"锁定目标在哪块集合" → 给锁定框下方那行用）**已删** ✗：
@@ -4565,6 +4608,24 @@ class CombatAgent:
         # 位置挑过：① 在"拿不到坐标"那道**之后**（连自己在哪都不知道就没法重算 ✓）；
         # ② 在下面 `job.update` **之前**（这一拍就按新计划走，不空转一拍 ✓）；
         # ③ 在「寻路超时」那道总闸**之后**（真卡住了该如实超时，不许用重算把它盖掉 ✗）。
+        # ⭐⭐⭐ **被打断够久 ⇒ 回来"连目的地一起重新算"**（用户 2026-10-08/09 ✓ 原话：
+        #   "「走 / 爬」也统一成『回来重新挑起点』" + "连目的地也重新算"）。
+        #   怎么做到（**复用现成的重算入口** ✓ 不自造一套 ✗）：把 `_loc_state` 砸成一个
+        #   "必然与现状不等"的哨兵 ⇒ 紧跟着的 `_maybe_replan` 当拍就判成"位置变了" ⇒
+        #   按**现在站的地方**重新解析到 `_route_final_dst(job)`（= 这条路线**最终要去哪** ✓）
+        #   ⇒ 起点与目的地**一起重算** ✓（`start_route` 会换掉整条 route、当前这一步也跟着换 ✓）。
+        #   ⚠ 阈值读 `job.PAUSE_MIN_S`（就是 `route.PAUSE_MIN_S` 那个常量 ✓ 挂成类属性了 ✓
+        #     一处口径 ✓ **不在 agent 里抄一个数** ✗ —— agent 里没有 `route` 这个名字 ✓）。
+        #   ⚠ 只认"**真被打断过**"（`_paused_at` 非空 ✓ 由 `_task_settle` 每拍报信置上 ✓）：
+        #     正常拍间隔（16~33ms ✓）远小于 0.25s ⇒ 不会每拍都重算 ✗（那会来回抖 ✓）。
+        #   ⚠ 位置挑得对 ✓：这一段在 `job.update` **之前** ⇒ 这一拍就按**新计划**走 ✓ 不空转 ✓。
+        _paused_at = getattr(job, "_paused_at", None)
+        if (_paused_at is not None
+                and (float(now) - float(_paused_at))
+                >= float(getattr(job, "PAUSE_MIN_S", 0.25) or 0.25)):
+            self._loc_state = ("", None)   # 哨兵：必然 ≠ 现状 ⇒ 逼下面当拍重算 ✓
+            behavior.sample("replan_on_resume",
+                            round(float(now) - float(_paused_at), 1))
         if self._maybe_replan(p):
             job = self._climb          # 重算会换掉当前这一步（`start_route` → `start_climb` ✓）
             if job is None:
@@ -5136,7 +5197,17 @@ class CombatAgent:
             # ⚠ 已经在账里（同一只怪被重复盖）不算"新占名额" ⇒ 允许续盖 ✓
             if key not in self._mob_atk_cd and len(self._mob_atk_cd) >= limit:
                 return
+        _was = key in self._mob_atk_cd
         self._mob_atk_cd[key] = now + self._mob_atk_cd_s()
+        # ⭐⭐ **留痕**（2026-10-10 ✓ 用户报"**经常出现重复打灰框的现象**"✗ 时加）：
+        #   以前盖戳/续盖**一个字都不留** ✗ ⇒ 事后只能看到 `target_steal`（抢锁 ✓）而不知道
+        #   "到底是不是同一只怪被反复盖"✗ —— 只能靠猜 ✓。
+        #   `ext=1` = **续盖**（这只怪本来就在账里，CD 被**往后推** ✓）—— 连着一串 `ext=1`
+        #   就是"灰框反复亮"/"灰框赖着不走"的直接证据 ✓；`ext=0` = 新怪进账 ✓。
+        #   ⚠ 只在**真盖**时打 ✓（名额满那条**不打** —— 它每拍都会命中，打了就把日志淹了 ✗）。
+        behavior.event("mob_atk_cd", mob=key, ext=1 if _was else 0,
+                       cd_ms=int(self._mob_atk_cd_s() * 1000),
+                       n=len(self._mob_atk_cd))
 
     def _drop_mob_atk_cd(self, mobs, now):
         """把**还在「目标被攻击CD」里**的怪摘掉（用户 2026-10-06 ✓）。
@@ -6084,6 +6155,15 @@ class CombatAgent:
                 # ⭐ **签注 = idle 切平台**（用户 2026-10-04 ✓ 同上）⇒ 信息栏写
                 #   「前往：二楼(切平台  剩余 00:15)」✓（它和"打够时长"都可能去别的层，
                 #   只有签注能分清是谁下的 ✓）。
+                # ⛔⛔ **"防来回横跳"那道闸已撤**（2026-10-10 同日 ✓ 用户原话：
+                #   "**怎么现在不会因为 idle 切平台了？？**"✗）：它记的是"上一次切换的起点" ✓，
+                #   而被下一次**成功切换**才覆盖 ✗ ⇒ 只配了两个平台（互指）时 ⇒ 切过去一次之后
+                #   **再也切不回来** ✗✗（用户自己那份配置正是这样 ✓）⇒ "idle 切平台"看起来
+                #   整个失效 ✓。⇒ 撤销 ✓，**恢复原口径**（想切就切 ✓）。
+                #   ⚠ 记一笔（免得下次又犯 ✓）："来回横跳"是**用户配置出来的 farming 节奏** ✓
+                #     （两平台互指 = 轮着打 ✓），**不是 bug** ✗ —— 要改它得先问一句 ✓；
+                #     真要治，做法应该是"**带超时的阻尼**"（过一阵允许切回去 ✓）或让配置改成
+                #     **链状**（`6→5`、`5→→别处/留空` ✓ 不互指 ✓），**不是**我这道"永久记忆" ✗。
                 self.plan_and_start_route(
                     _idle_dst, why="idle：切换平台 →「%s」" % _idle_dst,
                     origin={"kind": "idle"})
@@ -6803,6 +6883,48 @@ class CombatAgent:
                 now, getattr(ws.player, "world_x", None), keys, ws):
             self._set_state("climb")
         return bool(self._climb)
+
+    def _leave_zone_idle_beat(self, now, ws, keys):
+        """**待机时也不许留在能打区外** —— 平地巡逻 idle 那一拍的回区（用户 2026-10-09 ✓ 选 3）。
+
+        为什么非得再有一条（`tick` 里那条门不够 ✗）：那道门要求"**本来要打了**"
+        （`in_range or candidates` ✓ 见它上面那段说明）才会回区，而"眼前那点怪"**恰好也是被
+        同一份白名单筛掉的**（`_candidates → _zone_only`）⇒ 待机 + 无怪时**死结**：
+        **要靠怪触发回区，可唯一能触发的怪正好被丢掉了** ✗。
+        实测（2026-10-09 「黄金海滩」，`here_sets=['4']`、名单 `{5,6}`、人站在 4 号层）：
+        `agent_why=无怪` + `act move=0` —— **一步都不走** ✓；而 `mob_zone_out mob=1485/1589`
+        证明"怪确实被检出、又被区域筛掉了" ✓。
+
+        口径（用户 2026-10-09 ✓）：**待机 + 定位明确 + 不在能打区 ⇒ 先回战区**。
+          · 目的地照旧走 `_leave_battle_zone_tick`（它内部 `_pick_battle_zone` 挑
+            「**代价最低**」那块 ✓ = 用户原话"5、6 中近的那个" ✓），签注 = `zone` ✓；
+          · ⚠ **`here_sets` 读不到 ⇒ 不判**（这条**故意**和 `_in_battle_zone` 的
+            "拿不到也算不在"不同 ✗）：待机本来就没有危险，没必要在"不知道自己在哪"时
+            乱跑；打架那条不能等（宁可先回去也别瞎打 ✓）。
+          · ⚠ **临时战斗**（休息收工 / 寻路失败后）⇒ 不抢：同 `tick` 那道门 ✓。
+        回 True = 这一拍的理由该报"不在战斗区域，先回去"（调用方按它写 `reason` ✓）。
+
+        ⚠ 调用点只有"平地巡逻的无怪 idle"那一支 ⇒ 那儿**必然是 `_climb is None`**
+          （`tick` 那条链的第一支就是"有任务 ⇒ `_climb_tick`"✓ 走不到 idle 支 ✓）。
+          路线起来之后**由那一支接着推** ✓（本支是早退支，推不到它 ⇒ 不靠它 ✓）。
+        """
+        if self._temp_fight:
+            return False                      # 临时战斗 ⇒ 别抢（同 `tick` 那道门 ✓）
+        if self._climb is not None:
+            return False                      # 有任务在跑 ⇒ 让路（见上面那条 ⚠ ✓）
+        # ⛔ **点位类策略不抢**（用户 2026-10-09 ✓ 同 `tick` 那道门的口径 ✓）：多点巡逻 /
+        #   平台站桩的**点位允许在战斗区外** ✓，走位归它们自己（`_multi_beat` / `_platform_beat`）。
+        #   ⚠ 正常情况**到不了这里**（那两支在 `tick` 的链里排在平地巡逻的 `else` **之前** ✓），
+        #     写在这是把口径摆明 ✓ —— 免得以后有人调了链的顺序，这条悄悄又出来抢方向盘 ✗。
+        if str(getattr(self.settings, "strategy", "") or "") in ("multi", "platform"):
+            return False
+        here = getattr(getattr(ws, "player", None), "here_sets", None) or ()
+        if not here:
+            return False                      # 不知道自己在哪 ⇒ 不动（见上面那条 ⚠ ✓）
+        if self._in_battle_zone(ws):
+            return False                      # 在能打区里 / 没配区域（= 不限制）⇒ 照旧闲 ✓
+        self._leave_battle_zone_tick(now, ws, keys)
+        return True
 
     def _attack_state(self, target, best, mobs, ws):
         """攻击范围内有框时的状态选择（attack / 规避贴脸）。返回 keys。"""
@@ -8292,9 +8414,24 @@ class CombatAgent:
         #     那正是当初加这道闸门要避免的那个副作用 ✓ 现在两头都保住 ✓：
         #     任务照下 ✓ ＋ 落下去走 attack（`_attack_state` 里"挂着任务只许**站桩 attack**、
         #     不许走位"✓ 正好对上 ✓）。
+        # ⛔⛔ **「点位类」策略（多点巡逻 / 平台站桩）下，这道门整个不生效** ✗
+        #   （用户 2026-10-09 现场 ✓ 黄金海滩 `multi_spots`=13 个 foothold、战斗区={5,6}）：
+        #   那两种策略的**点位 / 站点本来就允许在战斗区域之外** ✓ —— "我要去哪几个 foothold"
+        #   与"只在哪几个集合里打架"是**两件事** ✗（前者由用户按巡逻路线选 ✓）。
+        #   现场症状（原话："到了 3 应该去 3 坐标的 foothold，但是 Agent 却指挥他去 4"✓）：
+        #   `behavior.log` 里两条**交替**出现 —— `platform_goto dst=3`（去点位 ✓）与
+        #   `zone_pick dst=5` ＋ `task_start 限制战斗区域：先回「5」`（这道门 ✓）
+        #   ⇒ 人刚走到点位那一层就被拽回 5 ✗，点位永远走不全 ✓。
+        #   ⚠ 只关**这道门** ✗：下面 `if in_range and not _on_rope:` 那条**照旧最高优先级** ——
+        #     点位类策略下"攻击范围内的怪照打"正是用户 2026-10-05/06 明确要的组合 ✓
+        #     （多点巡逻本来就写着"路上/到点遇怪照打"✓ 见 `_multi_beat` 的类说明 ✓）。
+        #   ⚠ 与"要不要**追**够不着的怪"无关 ✗：那由 `_zone_only`（`_candidates` ✓）管着 ✓，
+        #     一个字没动 ✓。
+        _spot_strategy = str(getattr(s, "strategy", "") or "") in ("multi", "platform")
         if (self._climb is None and (in_range or candidates)
                 and not self._in_battle_zone(ws)
-                and not self._temp_fight):
+                and not self._temp_fight
+                and not _spot_strategy):
             _zk = set()
             self._leave_battle_zone_tick(now, ws, _zk)
             if not _no_chase_path:
@@ -8472,30 +8609,65 @@ class CombatAgent:
                 #   B（旧，保留）：倾向方向没怪持续「换朝向延迟」⇒ 回头 ✓（一字不动 ✓）。
                 #   ⚠ 换向必须放在**算行走键之前**：到边当场折返，不然还要多走一步
                 #     才生效（贴着集合边缘走可能直接走出去 ✗）。
+                # ⭐⭐ **两条规则各有一个开关**（用户 2026-10-09 ✓ 见 `sweep_edge_turn_enabled`
+                #   那段原话）：`sweep_edge_turn_enabled` = A（到集合边缘 ✓）、
+                #   `sweep_turn_cd_enabled` = B（前方没怪持续 ✓）。
+                #   ⛔ **都不勾** ⇒ **兜底**：按**内置 `SWEEP_EDGE_FALLBACK_PX`(100px)** 走到平台
+                #      边缘回头 ✓ —— **不看**那个格子填了多少 ✗（用户原话就是"默认 100px"✓）；
+                #      （兜底是"总得有一条"✓ 不然两个都不勾就成了"一直朝一个方向走出平台"✗）。
+                _sw_edge = bool(getattr(s, "sweep_edge_turn_enabled", True))
+                _sw_cd = bool(getattr(s, "sweep_turn_cd_enabled", True))
+                _edge_want = max(0.0, float(getattr(s, "sweep_edge_turn_px", 100) or 0))
+                _edge_fb = False
+                if not _sw_edge and not _sw_cd:
+                    _sw_edge, _edge_want, _edge_fb = True, SWEEP_EDGE_FALLBACK_PX, True
                 _wx = getattr(ws.player, "world_x", None)
                 _span = getattr(ws.player, "here_span", None)
                 _edge_turn = False
+                _edge_d = None                     # ⭐ 打点用（判不出集合就是 None ✓）
                 if _wx is not None and _span and len(_span) >= 2:
                     try:
                         _d = ((float(_span[1]) - float(_wx)) if self._patrol_dir > 0
                               else (float(_wx) - float(_span[0])))
-                        _edge_turn = _d <= max(0.0, float(s.sweep_edge_turn_px))
+                        _edge_d = _d
+                        _edge_turn = _sw_edge and _d <= _edge_want
                     except (TypeError, ValueError):
                         _edge_turn = False
+                # ⭐⭐ **扫平台"回头"必须留下证据**（用户 2026-10-09 ✓ 原话："扫平台策略类型，
+                #   没有到配置的 foothold 集边缘距离就回头了"）：这一支原来**一个打点都没有** ✗
+                #   ⇒ 现场分不出回头是 A（到**集合边缘** ✓ 该转）还是 B（**前方没怪**到点 ✓ 也转）
+                #   ⇒ 只能靠读代码猜 ✗（用户这次报的就是这个局面：日志里扫平台零打点 ✓）。
+                #   现在：① 转身那一刻记一条 `sweep_turn`（`why` = `edge` / `no_front` ✓ ＋
+                #   距离/阈值、或等了多久/延迟 ✓）；② 另加一条**定频**的距离采样 `sweep_edge_d`
+                #   （`min_gap=1.0` ✓ 同 `chase_dist` 的取舍 ✓ 别每拍一条 ✗）。
+                if _edge_d is not None:
+                    behavior.sample("sweep_edge_d", round(float(_edge_d), 1), min_gap=1.0)
                 _front_has_mob = any((m.x - px) * self._patrol_dir >= 0 for m in mobs)
                 if _edge_turn:
                     self._patrol_dir = -self._patrol_dir
                     self._no_target_since = None      # B 的计时重来 ✓
+                    behavior.event("sweep_turn", why="edge",
+                                   d=round(float(_edge_d), 1),
+                                   want=int(_edge_want),      # ⚠ 兜底时它是 100 ✓（打点自证 ✓）
+                                   fb=int(_edge_fb),
+                                   to=int(self._patrol_dir))
                 else:
-                    if _front_has_mob:
-                        self._no_target_since = None   # 倾向方向有怪：重置换向计时（B ✓）
+                    if _front_has_mob or not _sw_cd:
+                        # 前方有怪 ⇒ 计时重来 ✓；「换朝向延迟」这条**关了** ⇒ 计时压根不起 ✓
+                        # （不然重新勾上那一刻会"攒够了 ⇒ 立刻回头" ✗）
+                        self._no_target_since = None
                     else:
                         if self._no_target_since is None:
                             self._no_target_since = now
                         turn_cd = max(0.0, float(s.sweep_turn_cd)) / 1000.0
                         if now - self._no_target_since >= turn_cd:
+                            _waited_ms = int((now - float(self._no_target_since)) * 1000.0)
                             self._patrol_dir = -self._patrol_dir
                             self._no_target_since = None
+                            behavior.event("sweep_turn", why="no_front",
+                                           waited_ms=_waited_ms,
+                                           cd_ms=int(max(0.0, float(s.sweep_turn_cd))),
+                                           to=int(self._patrol_dir))
                 self.set_facing(self._patrol_dir)
                 keys.add(s.keymap["right"] if self._patrol_dir > 0 else s.keymap["left"])
                 # ⭐ **这一拍也算"闲"**（`quiet=` 见 `_set_state` 的说明 ✓）：扫平台巡逻
@@ -8536,7 +8708,16 @@ class CombatAgent:
                 #   ⚠ 它**在这条早退里**，所以键要自己带上（`keys` 字段 ✓）；没配 / 没注入
                 #     解析器 ⇒ `_idle_walk_beat` 一个键都不加 ⇒ 行为和以前**一模一样** ✓。
                 _ikeys = set()                # ⚠ `_steer` 往里 `add` ⇒ 必须是 **set** ✗ list 会炸
-                self._idle_walk_beat(_ikeys, ws)
+                # ⭐⭐ **待机也不许留在能打区外**（用户 2026-10-09 ✓ 选 3，见
+                #   `_leave_zone_idle_beat` 的说明）：不在能打区 ⇒ 先回战区（挑代价最低那块 ✓）。
+                #   它动手时这一拍的理由改报"不在战斗区域，先回去"✓ —— 比"无怪"诚实
+                #   （"下不去"那条由 `zone_goto_fail` 打点留痕 ✓）。
+                #   ⚠ 两件事**天然互斥**：回战区只在 `_in_battle_zone` 为假时动手 ⇒
+                #     `_zone_of_sets(here_sets)` 必然 `None` ⇒ `_idle_walk_beat` 本来就是 no-op ✓
+                #     （所以这里"跳过它"只是把口径写明白，不是在压掉一段真会走的逻辑 ✓）。
+                _zone_back = self._leave_zone_idle_beat(now, ws, _ikeys)
+                if not _zone_back:
+                    self._idle_walk_beat(_ikeys, ws)
                 _ikeys = self._gate_turn_keys(_ikeys, now)   # ⭐ 同款（见 `_gate_turn_keys`）
                 # ⚠⚠ **必须紧跟一次 `self.keys.set(...)`**（2026-09-29 实测踩坑：
                 #   "森林迷宫III 二楼 idle→fh26 没生效"）—— 这里和休息分支一样是**早退**，
@@ -8545,7 +8726,9 @@ class CombatAgent:
                 #   `act move=1`（想按）而 `keys` 字段是空（真按着的键一个没有）✗。
                 #   同款修复见休息分支那条（"早退必须紧跟 keys.set" ✓）。
                 self.keys.set(_ikeys)
-                return {"state": "idle", "reason": "无怪", "keys": list(_ikeys),
+                return {"state": (self.state if _zone_back else "idle"),
+                        "reason": "不在战斗区域，先回去" if _zone_back else "无怪",
+                        "keys": list(_ikeys),
                         "kill_mobs": self._take_kill_mobs()}
 
         # 发键前再检查一次自动开关：主线程可能在这一帧决策中途把自动关掉并

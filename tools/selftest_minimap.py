@@ -129,6 +129,122 @@ def t_locate_fit_refined():
               % (float(coarse["score"]), float(ref["score"])))
 
 
+def t_calib_overlap_is_a_ruler():
+    """⭐ 「**地形重合率**」当尺子（2026-10-09 ✓ 用户原话："我的手动标定对齐地图已经接近完美了"✓
+    而两个按钮只给"量不出来"✗ —— 因为逐像素匹配分在本图上**天生够不着门槛** ✗，
+    现场实测：灰度 0.135 / 边缘 0.478 / 抹掉 UI 覆盖 0.45，而人眼手工那份**只差 ~2px** ✓）。
+
+    钉四件：
+      ① **对的那份几何** ⇒ `shift ≈ 0`、IoU 过 `OVERLAP_OK`、判词说「与实际重合良好」✓；
+      ② **推偏 N px** ⇒ 报出的 `shift ≈ −N`（方向要**反**：offset 加正 ⇒ 面板得往回挪 ✓）、
+         且 `iou0` 掉下来 ⇒ **它真的能区分准 / 不准** ✓（这是它存在的全部理由 ✓）；
+      ③ 缺面板 / 缺底图 / 几何为空 ⇒ `None`（**不许炸** ✓ 它只是诊断 ✓）；
+      ④ 判词口径：重合良好时说"良好"✓、推偏了说"要挪/对不太上"✓ —— **不许**反过来 ✗。
+    """
+    mid, canvas = pick_map()
+    if mid is None:
+        print("      （没有可用的底图，跳过）")
+        return
+    scale, ox, oy = 1.5, 40, 40
+    panel = synth_fit_panel(canvas, scale, ox, oy, pad=40)
+    cal = {"mode": mm.MODE_FIT, "scale": scale, "offset": [float(ox), float(oy)],
+           "view": [0.0, 0.0], "score": 0.0, "src": "manual"}
+
+    ov = mm.calib_overlap(panel, canvas, cal)
+    check(ov is not None, "重合率算不出来（面板/底图/几何都齐 ✓）")
+    check(abs(ov["shift"][0]) <= 1 and abs(ov["shift"][1]) <= 1,
+          "对的几何却被判成偏了 %s（尺子先得对自己准 ✓）" % (ov["shift"],))
+    check(ov["iou"] >= mm.OVERLAP_OK,
+          "对的几何重合率只有 %.3f（< %.2f ⇒ 会误报「对不上」✗）：%r"
+          % (ov["iou"], mm.OVERLAP_OK, ov))
+    check("重合良好" in mm.overlap_verdict(ov),
+          "判词没说「重合良好」：%r" % (mm.overlap_verdict(ov),))
+    for d in (4, 8):
+        bad = dict(cal, offset=[float(ox + d), float(oy)])
+        ov2 = mm.calib_overlap(panel, canvas, bad)
+        check(ov2 is not None, "推偏 %d px 后算不出来" % d)
+        check(abs(ov2["shift"][0] + d) <= 1,
+              "推偏 %d px 没被报成 shift≈%d（报的是 %s）✗" % (d, -d, ov2["shift"]))
+        check(ov2["iou0"] <= ov["iou0"] + 1e-9,
+              "推偏之后 `iou0` 反而没降（那样它当不了尺子 ✗）：%.3f vs %.3f"
+              % (ov2["iou0"], ov["iou0"]))
+        _v2 = mm.overlap_verdict(ov2)
+        check("挪" in _v2 or "对不太上" in _v2,
+              "推偏 %d px 的判词却说没事（%r）✗" % (d, _v2))
+    check(mm.calib_overlap(None, canvas, cal) is None, "面板为 None 时该给 None ✓")
+    check(mm.calib_overlap(panel, None, cal) is None, "底图为 None 时该给 None ✓")
+    check(mm.calib_overlap(panel, canvas, {}) is None, "几何为空时该给 None ✓")
+
+
+def t_check_calib_fail_says_numbers():
+    """`check_calib` / 「自动定位」量不出来时：**先给事实，别甩猜测**（用户 2026-10-09 ✓ 原话：
+    "**这些提示是不正确的**，因为我的手动标定对齐地图已经接近完美了"✗）。
+
+    病根是那句文案 ✗：它一口咬定"画面里小地图没框全 / 被游戏 UI 挡住 / 「显示方式」选错了" ——
+    三件事**全对**的人也会被告知是自己的错 ✗。事实是这里量的是**模板匹配**（面板像素 vs 底图像素
+    像不像 ✓），和"人眼看叠图重合"（手工对齐 ✓）**是两件事** ✓，而且手工标定本来就没有匹配分 ✓。
+
+    钉四件：
+      ① 两种方式的**真实分数**都报出来（`raw_scores` ⇒ `fit`/`crop` 两个键 ✓，值是分数或 None ✓）
+         —— 这才能分清"两种都低（像素不像）"和"只有当前这种低（方式选错 ✓）"；
+      ② 文案里**不许**再出现那三句一口咬定 ✗，必须明说「**这不代表你的手工对齐错了**」✓；
+      ③ `hint` 给出"按分数往下看"的路（两种都低 ⇒ 像素不像 / 只有一种低 ⇒ 方式问题 ✓）；
+      ④ `dump_diag` 真把现场存下来（panel / canvas / meta ✓），且失败不抛 ✓。
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path as _P
+
+    mid, canvas = pick_map()
+    if mid is None:
+        print("      （没有可用的底图，跳过）")
+        return
+    t = mapdata.load(mid, with_canvas=True)
+    # 一份**有几何**、但与底图完全不像的面板（噪声 ✓）＋ 把门槛抬到 0.99 ⇒ 必然"量不出来" ✓
+    cal = {"mode": mm.MODE_FIT, "scale": 1.0, "offset": [0, 0], "view": [0, 0],
+           "score": 0.0, "src": "manual"}
+    bad = np.random.RandomState(7).randint(0, 255, (60, 80, 3)).astype(np.uint8)
+    r = mm.check_calib(bad, t, cal, min_score=0.99)
+    check(r["err_world"] is None, "噪声面板竟然也量出了偏差？%r" % (r.get("err_world"),))
+    check(set(r.get("raw_scores") or {}) == {"fit", "crop"},
+          "没把两种方式的**真实分数**报出来（那就分不清「像素不像」还是「方式选错」✗）：%r"
+          % (r.get("raw_scores"),))
+    for k, v in (r.get("raw_scores") or {}).items():
+        check(v is None or isinstance(v, float),
+              "`raw_scores[%s]` 不是分数也不是 None：%r" % (k, v))
+    check("门槛" in r["why"], "结论里没写**门槛**（人无法判断差多远 ✗）：%r" % (r["why"],))
+    check("重合" in r["why"],
+          "结论里没提**改看重合率**（用户 2026-10-09 要的就是这个读数 ✓）：%r" % (r["why"],))
+    check(r.get("overlap") is None or isinstance(r.get("overlap"), dict),
+          "`overlap` 字段形状不对（该是 dict 或 None ✓）：%r" % (r.get("overlap"),))
+    for _bad in ("没框全", "被游戏 UI 挡住", "显示方式」选错"):
+        check(_bad not in r["why"],
+              "又回到「一口咬定是用户的框/UI/方式不对」✗（用户 2026-10-09 明确说这条不对）：%r"
+              % (r["why"],))
+    check("这不代表你的手工对齐错了" in (r.get("hint") or ""),
+          "`hint` 里没给「这不等于你手工对齐错了」这句（那正是用户要的 ✓）：%r"
+          % (r.get("hint"),))
+    check("两种都" in (r.get("hint") or "") and "只有" in (r.get("hint") or ""),
+          "`hint` 没给「按分数往下看」的路（两种都低 vs 只有一种低 ✓）：%r"
+          % (r.get("hint"),))
+    # ⚠⚠ 取证**必须写临时目录**（`dir=…` ✓）：默认那份是 `data/mmap_diag` = **用户的现场** ✓，
+    #   第一版用例在 `finally` 里 `rmtree` 了它 ⇒ 把用户刚点出来的现场删了 ✗（当天踩的 ✓）。
+    _tmp_diag = _P(tempfile.mkdtemp(prefix="mmap_diag_"))
+    try:
+        out = _P(mm.dump_diag(bad, canvas, cal, tag="_selftest_diag",
+                              extra={"k": 1}, dir=str(_tmp_diag)))
+        check(out.is_dir() and (out / "_selftest_diag_panel.png").exists()
+              and (out / "_selftest_diag_meta.json").exists(),
+              "现场取证没落盘（panel / meta ✓）：%r" % (str(out),))
+        check((out / "_selftest_diag_overlay.png").exists()
+              and (out / "_selftest_diag_diff.png").exists(),
+              "没把**叠图 / 差分**存下来（人眼判「偏了多少」就靠它们 ✓）：%r" % (str(out),))
+        # 取证本身**永远不许抛** ✓ —— 连全 None 也不该炸 ✓
+        mm.dump_diag(None, None, None, tag="_selftest_diag2", dir=str(_tmp_diag))
+    finally:
+        shutil.rmtree(str(_tmp_diag), ignore_errors=True)   # 只删自己那份 ✓
+
+
 def t_calib_check_and_reverse():
     """`check_calib`（量"这份标定差多少"）+ `world_to_panel`（反向换算，一处实现）。
 
@@ -4096,6 +4212,82 @@ def t_dot_tracker_confirm_and_jump():
           % r4["reason"])
 
 
+def t_dot_player_like_and_lock():
+    """⭐⭐ 「**哪一个才是玩家那个点**」：尺寸要像玩家点 + 锁住之后不许乱换
+    （用户 2026-10-10 ✓ 原话："**队友橙色点头上的小标记也是黄点，大黄点锁定错了**"✗ /
+      "你的锁定标记会**乱飘**到别的点上去，根本没坐标偏差有做任何平滑"✗）。
+
+    旧口径是「**谁离上一拍近就锁谁**」✗ ⇒ 队友头上那个**小黄标记**只要紧挨着，就能把
+    大黄点（真玩家标记）顶掉 ✓；两块分数接近时还会来回翻 ⇒ 读数乱飘 ✓。
+    新口径（照 `E:\\MyPrograms\\Maple_xfeat\\src\\vision\\tracker.py` 的认法 ✓）：
+      · `dot_player_like`：**尺寸比例**（玩家点 ≈ 面板宽 3.2% ✓ 实测）+ 密度 + 方圆；
+        ⚠ 尺寸那项**两侧不对称**（比预期**小**的罚得重 ✓ —— 队友小标记就在那一侧 ✓）；
+      · 挑点 = 那个分 − 距离惩罚；**还贴着上一拍那个点**再加一点滞后分 ✓（不轻易换 ✓）。
+    """
+    pw = 240.0
+    big = {"x": 100.0, "y": 50.0, "w": 8, "h": 8, "area": 64, "fill": 1.0}
+    small = {"x": 106.0, "y": 50.0, "w": 3, "h": 3, "area": 9, "fill": 1.0}
+    strip = {"x": 100.0, "y": 60.0, "w": 12, "h": 2, "area": 20, "fill": 0.83}
+    hole = {"x": 100.0, "y": 70.0, "w": 10, "h": 10, "area": 20, "fill": 0.2}
+    sb = mm.dot_player_like(big, pw)
+    ss = mm.dot_player_like(small, pw)
+    check(sb > 0.8, "真正的玩家点（8×8 @ 面板宽 240）分数该接近 1：%.2f" % sb)
+    check(sb > ss + 0.5,
+          "**小标记**没被压下去（大 %.2f vs 小 %.2f）⇒ 就会锁错点" % (sb, ss))
+    check(mm.dot_player_like(strip, pw) < 0.05, "细长条（描边 / 地形线）不该像玩家点")
+    check(mm.dot_player_like(hole, pw) == 0.0, "低密度的空块不该像玩家点")
+    # 尺寸口径**跟着面板宽度缩放**：同一相对尺寸、面板宽翻倍 ⇒ 分数该一致 ✓
+    #   （⚠ 别拿"大点的面板上 8×8 vs 小面板上 3×3"比 ✗ —— 那两个在"预期尺寸"的两侧，
+    #     而两侧的容差是**故意不对称**的 ✓ 见 `dot_player_like` 里那段 ✓）
+    _big2 = dict(big, w=16, h=16, area=256)
+    check(abs(mm.dot_player_like(big, 240.0) - mm.dot_player_like(_big2, 480.0)) < 1e-9,
+          "尺寸判据没跟着**面板宽度**缩放（换分辨率 / 换窗口就废）")
+
+    # 面板里同时有"大黄点"和**紧挨着**的小黄标记，而且**上一拍锁在小标记上** ⇒ 必须纠回来 ✓
+    panel = _dot_panel(w=240, h=109)
+    panel[46:54, 96:104] = (65, 243, 245)          # 大黄点 8×8 ⇒ 中心 (100, 50)
+    panel[47:50, 106:109] = (65, 243, 245)         # 小标记 3×3 ⇒ 中心 (107.5, 48.5)
+    r = mm.find_player_dot(panel, near=(106.0, 48.0))
+    check(r["ok"], "面板里两个黄点都没找到：%s" % r["reason"])
+    check(abs(r["x"] - 100.0) < 2.5 and abs(r["y"] - 50.0) < 2.5,
+          "锁在**小标记**上了（挑到 (%.1f, %.1f)）——「大黄点锁定错了」就是这个"
+          % (r["x"], r["y"]))
+
+
+def t_dot_tracker_smoothing():
+    """⭐⭐ 报出去的位置**要平滑**（用户 2026-10-10 ✓："根本没做任何平滑"✗），
+    但**重捕 / 传送那一下不许被拖住**（那时拖住 = 告诉寻路"我还在老地方"✗）。
+
+    规矩（见 `DOT_SMOOTH_ALPHA` 那段 ✓）：只在"接着上一拍、且位移不大"时做一阶低通 ✓。
+    """
+    tr = mm.PlayerDotTracker()
+    p1 = _dot_panel(w=240, h=109)
+    p1[50:58, 100:108] = (65, 243, 245)            # 8×8 ⇒ 中心 (103.5, 53.5)
+    r1 = tr.update(p1)
+    check(r1["ok"], "第一拍没找到点：%s" % r1["reason"])
+    x1 = float(r1["x"])
+    check(float(r1["y"]) > 50.0, "重心 y 不对：%.1f" % r1["y"])
+
+    p2 = _dot_panel(w=240, h=109)
+    p2[50:58, 106:114] = (65, 243, 245)            # 右移 6px ⇒ 原始中心 (109.5, 53.5)
+    r2 = tr.update(p2)
+    check(r2["ok"], "第二拍没找到点：%s" % r2["reason"])
+    check(x1 < float(r2["x"]) < 109.5,
+          "第二拍直接跳到位（%.1f ⇒ %.1f，原始 109.5）⇒ **没做平滑**"
+          % (x1, float(r2["x"])))
+    check(bool(r2.get("smoothed")), "回执里没标记「这一拍平滑过」（复盘看不出来 ✓）")
+
+    # 重捕之后必须**直接到位**（`.force_reacquire` 见 agent 那条："位置状态把黄点认错了"✓）
+    tr.force_reacquire("自检：模拟认错点后的重捕")
+    p3 = _dot_panel(w=240, h=109)
+    p3[20:28, 40:48] = (65, 243, 245)              # 远角 ⇒ 中心 (43.5, 23.5)
+    r3 = tr.update(p3)
+    check(r3["ok"], "重捕后没找到点：%s" % r3["reason"])
+    check(abs(float(r3["x"]) - 43.5) < 2.0 and abs(float(r3["y"]) - 23.5) < 2.0,
+          "重捕后被平滑拖住了（该**直接到位**）：(%.1f, %.1f)"
+          % (float(r3["x"]), float(r3["y"])))
+
+
 def t_segment_of_basics():
     """`segment_of` / `find_below`：拿**真实地形**验「点 → 脚下平台 → 哪条段」。
 
@@ -4529,11 +4721,29 @@ def t_live_thread_mmap_panel_copy():
               "裁下来的是原帧的**视图**不是副本 —— 主回路画上去的框线会串进"
               "黄点识别（黄点就是按饱和色找的）")
 
+        # ⭐⭐ **主回路裁好的那块，必须真喂到定位那一路**（2026-10-09 修 ✗ 现场：用户报
+        #   "本地来源的标定→自动定位不好使 / 认不出黄点坐标"，而标定弹窗里对得好好的 ✓）：
+        #   那时候主回路 `_mmap_panel_from_frame(vis)` 算完**就扔了** ✗，而
+        #   `_locate_latest()` 里写死传 `None` ✗ ⇒ 来源=live 每拍都回
+        #   "没有可裁的小地图区域"（整条 live 来源在实时回路里**必然失败** ✗）。
+        #   ⇒ 这里按**运行期那条路**走一遍：主回路存字段（那一步）→ `_locate_latest()` ✓。
+        seen = {}
+        _real = th._locate_mmap
+
+        def _spy(panel, *a, **kw):
+            seen["panel"] = panel
+            return _real(panel, *a, **kw)
+
+        th._locate_mmap = _spy
+        th._mmap_panel_cur = got          # = 主回路每拍存下来的那份（见 live_thread ✓）
         with mock.patch.object(mapdata, "load_calib",
                                lambda _m, src=None: dict(
                                    mode=mm.MODE_FIT, scale=1.0, offset=[0, 0],
                                    view=[0, 0], score=1.0)):
-            r = th._locate_mmap(got)
+            r = th._locate_latest()
+        check(seen.get("panel") is got,
+              "`_locate_latest()` 没把主回路裁好的面板喂给定位 ✗ ⇒ live 来源会每拍都回"
+              "「没有可裁的小地图区域」（用户 2026-10-09 报的就是这个）")
         check(r is not None and r.get("ok"),
               "实时回路这条定位没跑通：%s" % ((r or {}).get("note"),))
         check(r["segment_id"] == seg.index,
@@ -8405,6 +8615,10 @@ TESTS = (
      t_locate_fit_refined),
     ("标定核对：差多少 + 反向换算（一处实现）",
      t_calib_check_and_reverse),
+    ("核对/定位量不出来时：报两种方式的真实分数 ＋ 现场取证（用户 2026-10-09 说旧提示不对）",
+     t_check_calib_fail_says_numbers),
+    ("⭐ 「地形重合率」当尺子：对的报「重合良好」、推偏 N px 报「要挪 -N」",
+     t_calib_overlap_is_a_ruler),
     ("「实测精度」按钮：一次点击做完核对",
      t_route_panel_mmap_check),
     ("fit 往返：合成整图 → 量回缩放/偏移",
@@ -8545,6 +8759,11 @@ TESTS = (
      t_dot_flood_scale_invariant),
     ("跨帧：连续两拍才算确认；跳变当噪声",
      t_dot_tracker_confirm_and_jump),
+    ("⭐⭐ 「哪个才是玩家那个点」：尺寸要像玩家点（队友小黄标记要压下去）+ 锁住不轻易换"
+     "（用户 2026-10-10：大黄点锁定错了 / 乱飘）",
+     t_dot_player_like_and_lock),
+    ("⭐⭐ 报出去的位置要有平滑，但**重捕 / 传送不许被拖住**（用户 2026-10-10：没做任何平滑）",
+     t_dot_tracker_smoothing),
     ("segment_of / find_below：真实地形上验一遍",
      t_segment_of_basics),
     ("面板黄点 → 世界坐标 → 哪条段（整链）",

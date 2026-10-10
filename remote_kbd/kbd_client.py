@@ -91,6 +91,36 @@ def set_nodelay(sock):
         return False
 
 
+def parse_cursor_line(line):
+    """relay 回的 `CUR …` 一行 ⇒ `(x, y, vx, vy, vw, vh, cap)`；不像 / 失败 ⇒ `None` ✓。
+
+    `cap` = `(w, h)` 或 `None` ✓（= A 机**推流抓的那块屏**的尺寸 ✓ 见 `relay.py` 的
+    `_capture_region_size` ✓ —— 有它 B 才能把"一单位走多少**屏幕**像素"折成
+    "一单位走多少**帧**像素" ✓ **不用猜缩放** ✓）。
+    ⚠ 单独一个纯函数是为了**能直接测** ✓（协议这种东西最容易一边改一边歪 ✓）。
+    """
+    try:
+        s = (line.decode("ascii", "replace") if isinstance(line, (bytes, bytearray))
+             else str(line)).strip()
+    except Exception:                            # noqa: BLE001
+        return None
+    parts = s.split()
+    if len(parts) < 2 or parts[0] != "CUR":
+        return None
+    if parts[1] == "-":                          # A 机自己也没问到光标 ✓
+        return None
+    try:
+        nums = [int(v) for v in parts[1:]]
+    except (TypeError, ValueError):
+        return None
+    if len(nums) < 2:
+        return None
+    x, y = nums[0], nums[1]
+    v = (nums[2:6] + [0, 0, 0, 0])[:4]
+    cap = (nums[6], nums[7]) if len(nums) >= 8 else None
+    return (x, y, v[0], v[1], v[2], v[3], cap)
+
+
 class KbdClient:
     def __init__(self, host, port, cafile, timeout=5.0):
         ctx = ssl.create_default_context(cafile=cafile)
@@ -128,6 +158,12 @@ class KbdClient:
         self._log_carry = b""
         self.a_log_lines = 0
         self._a_log_banner = False
+        #: ⭐⭐ 「问 A 机光标在哪」的回包（2026-10-10 ✓ 用户："**两边一起**" ✓）——
+        #:   `_cur_ev` = 收到了、`_cur_box` = 内容（`parse_cursor_line` 的返回值 ✓）。
+        #:   ⚠ 这条**不是**固件回执 ✗（是 relay 自己答的 ✓ 见 `remote_kbd/relay.py` 的
+        #:   `CURSOR_QUERY` ✓），也不许混进 `DONE/ERR` 计数 ✗（它俩都不含 ✓ 天然分开 ✓）。
+        self._cur_ev = threading.Event()
+        self._cur_box = None
         # 后台读线程：relay 会把固件的 DONE 应答回传，这里持续读走丢弃，
         # 否则回传缓冲被 DONE 塞满后，relay/固件/控制机整条链路会连锁卡死
         # （表现为：按键发不出、推理丢帧暴增、RELEASE 丢失导致卡键）。
@@ -168,6 +204,24 @@ class KbdClient:
                 self.fails += 1
                 self.last_err = "%s: %s" % (type(e).__name__, e)
                 return False
+
+    def cursor(self, timeout=0.8):
+        """问 **A 机光标在哪** ⇒ `(x, y, vx, vy, vw, vh, cap)`；问不到 ⇒ `None` ✓。
+
+        ⚠ 走的是 `CURSOR?`（**relay 自己答** ✓ 不碰串口 ✓ 见 `remote_kbd/relay.py` ✓）——
+          这是 B 机**唯一**能"看见 A 机光标"的办法 ✓：画面里**没有**光标 ✗
+          （三条取帧路 / 推流都不含硬件光标 ✓ 见 `tools/mouse_aim_calib.py` 开头 ✓）。
+        ⚠ 必须**单独发**这一条 ✗（别和别的指令拼在一个包里）：relay 是按"整包里包含
+          `CURSOR?`"来挑的 ✓ 拼在一起就得拆半行，容易拆歪 ✓。
+        ⚠ 收发用**事件**等（不许 sleep 轮询 ✗）：`_cur_ev` = 回包到了、`_cur_box` = 内容 ✓。
+        """
+        self._cur_box = None
+        self._cur_ev.clear()
+        if not self.send("CURSOR?"):
+            return None
+        if not self._cur_ev.wait(float(timeout)):
+            return None
+        return self._cur_box
 
     def silent_for(self):
         """多久没收到固件回执了（秒）。0 = 正常（或无从判断）。
@@ -306,6 +360,14 @@ class KbdClient:
                 # ⭐ **先把 A 机日志挑走**再数回执（2026-10-03 ✓ 见 `_take_a_logs`）——
                 #   挑走的行不许参与 `DONE`/`ERR` 计数 ✗（否则日志字眼会骗到 RTT / 死链判据 ✓）
                 data = self._take_a_logs(data)
+                # ⭐⭐ 「问 A 机光标」的回包（`CUR …` ✓ 由 relay 自己答的 ✓）——
+                #   ⚠ 它既不是 `DONE` 也不是 `ERR` ✗ ⇒ 天然不会被下面那句计数混进去 ✓
+                #   （2026-10-10 ✓ 见 `self._cur_ev` / `parse_cursor_line` ✓）。
+                if b"CUR " in data:
+                    for _ln in data.split(b"\n"):
+                        if _ln.lstrip().startswith(b"CUR "):
+                            self._cur_box = parse_cursor_line(_ln)
+                            self._cur_ev.set()
                 n = data.count(b"DONE") + data.count(b"ERR")
                 if n:
                     self.replies += n

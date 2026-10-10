@@ -1,0 +1,28 @@
+{
+  "when": "2026-10-10 00:50:28",
+  "build": "2026-10-10b",
+  "frames_dir": "E:\\MyPrograms\\playerSimu\\projects\\鳄鱼潭1\\frames",
+  "out": "E:\\MyPrograms\\playerSimu\\projects\\鳄鱼潭1\\labels_auto",
+  "weights": "E:\\MyPrograms\\playerSimu\\projects\\鳄鱼潭1\\models\\detect_v1.pt",
+  "mode": "mob",
+  "frames": 180,
+  "boxes_added": 480,
+  "frames_merged": 158,
+  "skipped": 0,
+  "skipped_names": [],
+  "first_inputs": [
+    "frame_00179.png",
+    "frame_00180.png",
+    "frame_00181.png",
+    "frame_00182.png",
+    "frame_00183.png"
+  ],
+  "first_returned": [
+    "image0.jpg",
+    "image1.jpg",
+    "image2.jpg"
+  ],
+  "order_mapped": 180,
+  "seconds": 22.9,
+  "canceled": false
+}

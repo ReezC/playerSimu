@@ -20,7 +20,7 @@ bars:
   - 0.973958
   - 0.120791
   - 0.018229
-  hp_color: &id001
+  hp_color:
   - - 0
     - 0
     - 137
@@ -32,7 +32,7 @@ bars:
   - 0.973958
   - 0.120791
   - 0.018229
-  mp_color: &id002
+  mp_color:
   - - 144
     - 80
     - 0
@@ -45,20 +45,20 @@ mmap_crop:
 - 208
 - 105
 decision:
-  attack_dist: 70.0
+  attack_dist: 80.0
   min_attack_dist: 0
   attack_up_dist: 30
   attack_down_dist: 20
   attack_fan_deg: 0.0
-  walk_stall_jump: false
+  walk_stall_jump: true
   chase_jump_enabled: false
   chase_jump_min: -10
   chase_jump_max: 5
-  chase_jump_dash_ms: 50
+  chase_jump_dash_ms: 200
   chase_jump_edge_guard_enabled: false
   chase_jump_edge_guard_px: 100
   station_turn_interval_ms: 600
-  mouse_speed: 0.9999999999999999
+  mouse_speed: 1.2000000000000002
   evade_type: jump
   jump_interval: 0
   jump_random_prob: 0.1
@@ -86,20 +86,22 @@ decision:
   - type: up
     key: forward
   output_seq:
-  - type: down
-    key: attack
-  - type: up
-    key: attack
-  - type: down
-    key: attack
-  - type: up
-    key: attack
-  - type: down
-    key: attack
+  - key: attack
+    type: down
+  - key: attack
+    type: up
+  - ms: 50
+    type: delay
+  - key: attack
+    type: down
+  - key: attack
+    type: up
+  - key: attack
     prob: 15
     then:
-    - type: up
-      key: attack
+    - key: attack
+      type: up
+    type: down
   keymap:
     auto: f11
     left: left
@@ -117,12 +119,12 @@ decision:
   target_cd:
   - 1000
   - 2500
-  atk_target_count: 0
-  mob_atk_cd_ms: 1000
-  input_device: remote
+  atk_target_count: 1
+  mob_atk_cd_ms: 2000
+  input_device: local
   attack_cd: 800
   attack_lock_debounce_ms: 1000
-  min_turn_hold_ms: 600
+  min_turn_hold_ms: 400
   turn_output_delay_ms: 200
   auto_pickup: true
   player_track_jump: 200
@@ -141,15 +143,27 @@ decision:
   - 0.120791
   - 0.018229
   probe_calib: {}
-  hp_color: *id001
-  mp_color: *id002
+  hp_color:
+  - - 0
+    - 0
+    - 137
+  - - 76
+    - 79
+    - 255
+  mp_color:
+  - - 144
+    - 80
+    - 0
+  - - 255
+    - 200
+    - 80
   hp_threshold: 39
   mp_threshold: 7
   pot_cd: 1000
   mob_sets_ttl_s: 3.0
   auto_hp_pot: true
   auto_mp_pot: false
-  strategy: multi
+  strategy: patrol
   vision_top: 100
   vision_bottom: 100
   vision_left: 400
@@ -169,19 +183,46 @@ decision:
   station_pickup_max_s: 0.0
   station_pickup_spots: []
   multi_spots:
-  - kind: foothold
-    fid: '63'
+  - fid: '63'
+    kind: foothold
     ratio: 100.0
-  - kind: foothold
-    fid: '65'
+  - fid: '65'
+    kind: foothold
     ratio: 100.0
-  - kind: foothold
-    fid: '60'
+  - fid: '60'
+    kind: foothold
     ratio: 100.0
-  - kind: foothold
-    fid: '54'
+  - fid: '57'
+    kind: foothold
     ratio: 100.0
-  route_goto_set: 底层
+  - fid: '44'
+    kind: foothold
+    ratio: 100.0
+  - fid: '21'
+    kind: foothold
+    ratio: 100.0
+  - fid: '29'
+    kind: foothold
+    ratio: 100.0
+  - fid: '36'
+    kind: foothold
+    ratio: 100.0
+  - fid: '39'
+    kind: foothold
+    ratio: 100.0
+  - fid: '6'
+    kind: foothold
+    ratio: 100.0
+  - fid: '4'
+    kind: foothold
+    ratio: 100.0
+  - fid: '116'
+    kind: foothold
+    ratio: 100.0
+  - fid: '105'
+    kind: foothold
+    ratio: 100.0
+  route_goto_set: '4'
   align_tol_px: 12
   align_hold_ms: 1000
   climb_align_gap_ms: 180
@@ -191,7 +232,7 @@ decision:
   goto_timeout_s: 15.0
   chase_goto_max_s: 5.0
   goto_timeout_key: 表情_无语
-  disable_chase_pathfinding: false
+  disable_chase_pathfinding: true
   jump_start_px: 0
   move_retry_ms: 3000
   debounce_conf: 0.3
@@ -222,7 +263,7 @@ decision:
     paused_left: 5.35204582685401
   facing_timeout_min: 0.0
   player_lost_timeout_min: 3.0
-  resetall_interval: 0
+  resetall_interval: 20
   anti_afk_enabled: false
   anti_afk_type: spot_rest
   anti_afk_min: 25.0
@@ -309,7 +350,7 @@ decision:
   reconnect_server_y: 0.2074
   reconnect_channel_x: 0.4104
   reconnect_channel_y: 0.5093
-  reconnect_channel: 19
+  reconnect_channel: 22
   custom_keys:
     攻击药水: grave
     回避药水: '5'
@@ -318,6 +359,8 @@ decision:
     表情_无语: f6
     拾取: space
     椅子: x
+  sweep_turn_cd_enabled: true
+  sweep_edge_turn_enabled: true
 notes: ''
 capture:
   source: file
@@ -437,6 +480,25 @@ train:
   resume: false
 live:
   weights: E:\MyPrograms\playerSimu\projects\黄金海滩\models\detect_v3_960.engine
+  capture_source: stream
+  rect:
+  - 1184
+  - 617
+  - 1366
+  - 768
+  url: udp://0.0.0.0:5000
+  conf_mob: 0.25
+  conf_player: 0.75
+  imgsz: 960
+  device: '0'
+  capture_fps: 60
+  draw: true
+  half: true
+  show_fps: 50
+  vt_on: true
+  window_capture: wgc
+  rect_rel: null
+  rect_win: null
 verify: {}
 iterate: {}
 mob_names:

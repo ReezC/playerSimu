@@ -1,0 +1,29 @@
+{
+  "detached_imports": true,
+  "frames": 240,
+  "tracking_mismatches": 0,
+  "detection_mismatches": 0,
+  "model_detection_comparisons": 6,
+  "gui_worker_frames": 45,
+  "gui_offscreen_render": true,
+  "os_mouse_calls": 0,
+  "unit_tests_passed": 8,
+  "real_game_or_vm_input_tested": false,
+  "locator_template_scales_tested": [
+    0.4,
+    0.6,
+    1.0
+  ],
+  "pip_wheel_build": true,
+  "installed_package_resources": true,
+  "gui_screenshot_reviewed": true,
+  "tracking_fields_compared": [
+    "state",
+    "target_id",
+    "smoothed_aim_point",
+    "trail_break"
+  ],
+  "numeric_tolerance": 1e-06,
+  "direction_checkbox_default_off_live_toggle_both_overlays": true,
+  "source_gui_tests_passed": 14
+}

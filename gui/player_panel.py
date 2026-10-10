@@ -28,6 +28,8 @@ from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboB
 
 from core import behavior           # 重连回来"没恢复自动"要落一条日志（`reconnect_resume` ✓）
 from core import zones as zones_mod
+# ⭐ 「自动测谎（视觉追踪）」组的参数落 `config/live.yaml`（本机偏好 ✓ 2026-10-09）
+from core.config import load_live, update_live
 from decision import input as dinput
 from decision.agent import (ANTI_AFK_TYPES, ZONE_GOTO_RETRY_S, load_rect,
                             settings)
@@ -1977,13 +1979,22 @@ class PlayerPanel(QWidget):
         sf.addRow("", self.lbl_strategy_note)
 
         # 换朝向延迟（仅「扫平台」策略用）：当前朝向没怪持续此时间才换
+        # ⭐⭐ **这一行的"标签"就是勾选框**（用户 2026-10-09 ✓ 原话："在「换朝向延迟」、
+        #   「距离平台边缘回头」**前面加勾选**"✓）⇒ 勾选框就落在数字格**前面** ✓。
+        self.ck_turn_cd = QCheckBox("换朝向延迟(ms)")
+        self.ck_turn_cd.toggled.connect(self._on_turn_cd_on)
+        self.ck_turn_cd.setToolTip(
+            "勾上 ⇒ 「当前朝向没怪持续这么多毫秒就换向」这条生效 ✓；\n"
+            "不勾 ⇒ **这条关掉** ✗（不会因为前方暂时没怪就掉头 ✓）。\n"
+            "⚠ 两条都不勾 ⇒ 按**内置 100px** 走到平台边缘回头（见下一行说明 ✓）。")
         self.sp_turn_cd = self._spin(0, 10000, 1000, 0)
         self.sp_turn_cd.valueChanged.connect(self._on_turn_cd)
         self.sp_turn_cd.setToolTip(
             "当前朝向没怪持续此时间（毫秒）才换朝向。\n"
-            "防止某帧漏检/抖动导致频繁换向。")
-        sf.addRow("换朝向延迟(ms)", self.sp_turn_cd)
-        self._lbl_turn_cd = sf.labelForField(self.sp_turn_cd)
+            "防止某帧漏检/抖动导致频繁换向。\n"
+            "⚠ 前面那个勾**不勾**时这一格不生效（会置灰 ✓）。")
+        sf.addRow(self.ck_turn_cd, self.sp_turn_cd)
+        self._lbl_turn_cd = self.ck_turn_cd        # ⚠ 老名字继续可用（显隐照旧按它走 ✓）
 
         # 背后锁定距离（仅「扫平台」策略用）
         self.sp_back_range = self._spin(0, 2000, 100, 0)
@@ -1995,15 +2006,31 @@ class PlayerPanel(QWidget):
         self._lbl_back_range = sf.labelForField(self.sp_back_range)
 
         # 距离平台边缘多远回头（仅「扫平台」策略用，2026-09-29 新增 ✓）
+        # ⭐⭐ 同上一行：**勾选框就是这一行的标签**（用户 2026-10-09 ✓ 原话同上 ✓）。
+        self.ck_edge_turn = QCheckBox("距离平台边缘回头(px)")
+        self.ck_edge_turn.toggled.connect(self._on_edge_turn_on)
+        self.ck_edge_turn.setToolTip(
+            "勾上 ⇒ 「离当前 foothold 集合边缘 ≤ 这么多像素就回头」这条生效 ✓；\n"
+            "不勾 ⇒ **这条关掉** ✗（哪怕一直走到边缘也不按它转）。\n"
+            "⚠ 两条都不勾 ⇒ 按**内置 100px** 走到平台边缘回头（用户 2026-10-09 定的默认 ✓\n"
+            "   这时**下面那格填多少都不看** ✓）。")
         self.sp_edge_turn = self._spin(0, 2000, 100, 0)
         self.sp_edge_turn.valueChanged.connect(self._on_edge_turn)
         self.sp_edge_turn.setToolTip(
             "扫平台：距离当前 foothold 集合边缘 ≤ 此距离（像素）就回头，\n"
             "即使该方向有怪也转（旧口径会被赖在另一头不走的怪一直拽向边缘）。\n"
             "判不出当前集合（平台没圈集合 / 定位缺）时这条不生效，\n"
-            "退回「换朝向延迟」的老逻辑。")
-        sf.addRow("距离平台边缘回头(px)", self.sp_edge_turn)
-        self._lbl_edge_turn = sf.labelForField(self.sp_edge_turn)
+            "退回「换朝向延迟」的老逻辑。\n"
+            "⚠ 前面那个勾不勾、以及两个都不勾时的兜底（100px），见上一行说明 ✓。")
+        sf.addRow(self.ck_edge_turn, self.sp_edge_turn)
+        self._lbl_edge_turn = self.ck_edge_turn    # ⚠ 老名字继续可用（显隐照旧按它走 ✓）
+
+        # ⭐ 两条都不勾时的**兜底说明**（用户 2026-10-09 ✓："默认走到平台边缘 100px 回头"✓）
+        #   ⚠ 纯文本，别写 markdown ✗（QLabel 不认 ✓ 同本页那条纪律 ✓）
+        self.lbl_sweep_hint = QLabel("")
+        self.lbl_sweep_hint.setStyleSheet("color: #80868b;")
+        self.lbl_sweep_hint.setWordWrap(True)
+        sf.addRow("", self.lbl_sweep_hint)
 
         # ---- 「平台站桩」专属（用户 2026-10-05 ✓）----
         # ⚠ 这几行**只在策略 = 「平台站桩」时显示**（见 `_refresh_strategy_ui` 的**三态** ✓）
@@ -2479,7 +2506,13 @@ class PlayerPanel(QWidget):
         try:
             from core import mapdata
             from perception import minimap as mm
-            _src = str(src or mm.live_src())    # 与实时层**同一口径**（live.yaml 的 mmap_src ✓）
+            # ⚠⚠ 来源必须与**路线识别页**同一处口径（`mm.source_for_map` ✓）——
+            #   2026-10-10 用户现场："**为什么我标定过了还显示这个**" ✗：
+            #   这张图按 id 存的是 `live`（从实时画面 ✓ 标定也在那条下 ✓），而这里原来读
+            #   **全局** `live.yaml` 的 `mmap_src`（= `stream` 独立推流 ✗）⇒ 去问另一条来源
+            #   ⇒ 明明刚标过却报"还没标定" ✓（标定是**按来源分开存**的 ✓ 见
+            #   `core/mapdata.calib_path` ✓）。⇒ 现在统一走 `source_for_map` ✓。
+            _src = str(src or mm.source_for_map(mid))   # `mid` 已非空 ✓（上面查过 ✓）
             # ① 标定几何：⚠ 就用 `has_geometry`（它**不看 score**、只问"几何量出来没有"✓，
             #    缺 `scale`/`offset` 即 False ⇒ 正是本次踩的坑 ✓）
             calib = None
@@ -2488,10 +2521,24 @@ class PlayerPanel(QWidget):
             except Exception:
                 calib = None
             if not mm.has_geometry(calib or {}):
+                # ⭐⭐ **另一条来源下量过就直接点名** ✓（别让人对着"没标定"发呆 ✓）：
+                #   这是本次现场最费解的一点 —— 人刚在「从实时画面」下量完，提示却说
+                #   当前来源没量 ✗ ⇒ 把"你这张图在**哪条来源**下是量过的"写在同一条提示里 ✓。
+                _others = []
+                try:
+                    for _s, _c in (mapdata.load_calibs(mid) or {}).items():
+                        if _s and _s != _src and mm.has_geometry(_c or {}):
+                            _others.append("「%s」" % mm.SRC_LABEL.get(_s, _s))
+                except Exception:              # noqa: BLE001 —— 这条只是加个提示，别弄坏体检 ✗
+                    _others = []
+                _hint = ("\n  ⚠ 这张图在 %s 下**是量过的** ✓ ⇒ 要么把「小地图来源」切到那条"
+                         "（路线识别页那个下拉 ✓），要么就按当前来源「%s」重量一次 ✓"
+                         % ("、".join(_others), mm.SRC_LABEL.get(_src, _src))) if _others else ""
                 probs.append(
                     "· **地图「%s」在来源「%s」下还没标定**（缺「面板 → 底图」换算）\n"
                     "  ⇒ 玩家坐标会一直是空的 ⇒ 开一会儿自动自己就会停掉\n"
-                    "  → 去「路线识别」页点「标定…」量一次并**保存**。" % (mid, _src))
+                    "  → 去「路线识别」页点「标定…」量一次并**保存**。%s"
+                    % (mid, mm.SRC_LABEL.get(_src, _src), _hint))
             # ② 地形 / 底图：`canvas is None` = 没生成过地形图（同 route_panel 的口径 ✓）
             try:
                 t = mapdata.load(mid, with_canvas=True)
@@ -2585,6 +2632,23 @@ class PlayerPanel(QWidget):
           · **体检不过** ⇒ **不恢复** ✓ + 状态栏写清"为什么不恢复" ✓ + 落一条日志 ✓；
           · 旗子**没人消费**（headless / 别的宿主 ✓）⇒ 自动就一直不开 ✓（安全的一侧 ✓）。
         """
+        # ⭐ 顺手刷新「断线重连 → 鼠标标定」那一行（**只在这一组看得见时**才读那个 json ✓）：
+        #   标定是外部 CLI 做的（`tools.mouse_aim_calib` ✓）⇒ 不刷的话界面上永远停在打开
+        #   工作台那一刻的状态 ✗ —— 而这一行存在的意义就是"它为什么不点"**在界面上就能看见** ✓
+        #   （否则又得去翻文件 / 翻日志 ✗ 用户 2026-10-09 报的正是这类"看不出来" ✓）。
+        # ⚠⚠ **两道闸防"控件已经析构"** ✗（2026-10-09 ✓ 自检里踩到）：有些用例会用
+        #   `sip.delete` **当场析构**面板（`tests/_kill_qt` ✓ 本仓库的老手法 ✓），而本函数
+        #   挂在 500ms 定时器上 ✓ —— 定时器虽然是面板的子对象、本该一起没 ✓，但**已经排队
+        #   的那次事件**仍可能落到一个**已经析构的 C++ 对象**上 ⇒ 直接 fail-fast
+        #   （`0xC0000409`，**连 Python traceback 都没有** ✗；自检表现就是"跑到某条用例
+        #   突然死掉、失败清单都不打" ✓）。⇒ `sip.isdeleted` + try 各一道 ✓。
+        try:
+            from PyQt5 import sip
+            _grp = getattr(self, "_rc_group", None)
+            if _grp is not None and not sip.isdeleted(_grp) and _grp.isVisible():
+                self._refresh_rc_gain()
+        except Exception:                        # noqa: BLE001 —— 刷新失败不该打断这一拍 ✓
+            pass
         if not bool(getattr(settings, "reconnect_resume_pending", False)):
             return
         # ⚠ **先清旗子、再体检**：体检自己抛了也不至于每 500ms 重来一遍 ✓（幂等 ✓）
@@ -3537,6 +3601,45 @@ class PlayerPanel(QWidget):
         settings.sweep_edge_turn_px = int(val)
         settings.save()
 
+    # ---- ⭐⭐ 「扫平台」两条换向规则的开关（用户 2026-10-09 ✓ 原话："在「换朝向延迟」、
+    #      「距离平台边缘回头」**前面加勾选**；**当都不勾选时默认走到平台边缘 100px 回头**"✓）----
+
+    def _on_turn_cd_on(self, on):
+        """「换朝向延迟」前面那个勾：不勾 ⇒ 这条规则**关掉** ✗（不会因为前方暂时没怪掉头 ✓）。"""
+        settings.sweep_turn_cd_enabled = bool(on)
+        self._sync_sweep_switches()
+        settings.save()
+
+    def _on_edge_turn_on(self, on):
+        """「距离平台边缘回头」前面那个勾：不勾 ⇒ 这条规则**关掉** ✗。"""
+        settings.sweep_edge_turn_enabled = bool(on)
+        self._sync_sweep_switches()
+        settings.save()
+
+    def _sync_sweep_switches(self):
+        """两个勾 ↔ 两个数字格 ＋ 说明行（**一处口径** ✓ 构造回填与勾选都调它 ✓）。
+
+        ⚠⚠ **都不勾不是"永远不回头"** ✗ —— 按**内置 100px** 走到平台边缘回头 ✓
+          （用户 2026-10-09 原话 ✓ 实现见 `decision/agent.py::SWEEP_EDGE_FALLBACK_PX` ✓）；
+          这时「距离平台边缘回头」那格**填多少都不看** ✓（所以置灰 ✓）。
+        ⚠ 说明行**纯文本** ✗（QLabel 不认 markdown ✓ 同本页那条纪律 ✓）。
+        """
+        _cd_on = bool(self.ck_turn_cd.isChecked())
+        _edge_on = bool(self.ck_edge_turn.isChecked())
+        self.sp_turn_cd.setEnabled(_cd_on)
+        self.sp_edge_turn.setEnabled(_edge_on)
+        if not _cd_on and not _edge_on:
+            self.lbl_sweep_hint.setText(
+                "两条都不勾 ⇒ 按内置 100px 走到平台边缘回头（上面那格填多少都不看）")
+        elif not _cd_on:
+            self.lbl_sweep_hint.setText(
+                "只按「距离平台边缘回头」转：走到边缘附近就回头，前方没怪也不掉头")
+        elif not _edge_on:
+            self.lbl_sweep_hint.setText(
+                "只按「换朝向延迟」转：前方没怪够久才掉头，走到边缘也不按它转")
+        else:
+            self.lbl_sweep_hint.setText("")
+
     # ---- 「挂机保护」页（2026-09-29：右侧新页签，见 main_window ✓）----
 
     def build_protection_page(self):
@@ -3554,9 +3657,205 @@ class PlayerPanel(QWidget):
         # ⭐⭐ 「断线重连」组（用户 2026-10-07 ✓ 原话："是数据工作台主窗口「挂机保护页签」"
         #   —— 一开始做进了**设置弹窗**，位置不对 ✗ 在这儿才对 ✓）。
         lay.addWidget(self._build_reconnect_group())
+        # ⭐⭐ 「自动测谎（视觉追踪）」组（用户 2026-10-09 ✓ 原话："勾选框参数放到挂机保护
+        #   页签，单独一个组" ✓ —— 一开始做在「实时」页那一行，位置不对 ✗ 在这儿才对 ✓）
+        lay.addWidget(self._build_vt_group())
         lay.addWidget(self.afk)               # ⭐ re-parent（见上 ✓）
         lay.addStretch(1)
         return page
+
+    def _build_vt_group(self):
+        """⭐ 「自动测谎（视觉追踪）」组（2026-10-09 ✓ 用户要求：挂机保护页签 · 单独一个组）。
+
+        这一组管的是**接进外部 `visual_tracking` 包**的那条路（见 `perception/vt_sdk.py` ✓）：
+        把「实时画面」那一块（**画框之前的原生帧** ✓）交给它跟踪，报成功时用鼠标点一下「确定」。
+
+        参数落 `config/live.yaml`（**本机偏好** ✓ 同「保留测谎录屏」那两项 ✓，不进项目文件 ✗）：
+        实时线程**每拍热读**它（见 `live_thread` 里那段 `load_live()` ✓）⇒ 这里改完
+        **最多 1 秒生效**、**不用重开预览** ✓（也就不用把线程引用塞到这里来 ✓）。
+        """
+        _lv = load_live()
+        grp = QGroupBox("自动测谎（视觉追踪）")
+        f = QFormLayout(grp)
+
+        # ⭐⭐ **状态行**（用户 2026-10-09 ✓ 原话："这个状态肯定要一起迁移过去啊" ✓）——
+        #   从「实时」页整块搬来 ✓（那边只剩一句"已搬走"的注释 ✓）。
+        #   ⚠ 文字**只有实时线程发得出来**（`LiveThread.vt_status` ✓）：那一路先到「实时」页的
+        #     `_on_vt_status`，它**原样转发**（`LivePanel.vt_status` ✓）⇒ 这里显示 ✓。
+        #     **一处显示** ✓ —— 两边各显示一份就是"两份状态、迟早不一致" ✗。
+        self.lbl_vt = QLabel("测谎：未启用")
+        self.lbl_vt.setStyleSheet("color: #5f6368;")
+        self.lbl_vt.setWordWrap(True)
+        self.lbl_vt.setToolTip(
+            "它是跟踪包的**实时状态**（跟着实时线程走 ✓），按这几种循环：\n"
+            "  · `加载模型…` / `模型就绪` —— 第一次启用时的模型加载（约 10 秒 ✓）；\n"
+            "  · `LOCATING` —— 还在画面里找弹窗 ⇒ 这时描边和框都**不会**出现 ✓；\n"
+            "  · `WAITING` / `LOCKED` / `COAST` —— 已找到内容区，锁定目标 / 预测延续；\n"
+            "  · `LOST` —— 跟丢了（**不代表任务结束** ✓ 它会自己找回来）；\n"
+            "  · `SUCCESS_PENDING` / `SUCCESS` —— 成功面板出现 ⇒ 按上面那格去点「确定」；\n"
+            "  · `不可用 —— …` —— 起不来（原因就写在这行文字里 ✓）。")
+        f.addRow("当前状态", self.lbl_vt)
+        # ⚠ **不在这里自己起线程 / 碰线程**：那条线归「实时」页 ✓ —— 它转发过来就行 ✓
+        #   （`main_window` 建这一页之前，已经把实时面板挂在 `PlayerPanel.live_panel` 上了 ✓）。
+        _lp = getattr(self, "live_panel", None)
+        if _lp is not None:
+            try:
+                _lp.vt_status.connect(self.set_vt_status)
+            except Exception:                # noqa: BLE001 —— 连不上也不该让页面建不出来 ✓
+                pass
+
+        self.ck_vt = QCheckBox("启用（把实时画面交给 visual_tracking 跟踪）")
+        self.ck_vt.setChecked(bool(_lv.get("vt_on", False)))
+        self.ck_vt.setToolTip(
+            "勾上就把「实时画面」里**框选的那块窗口**（画框之前的原生帧 ✓）喂给外部视觉追踪包\n"
+            "`visual_tracking_sdk_20260920`：它自己会在画面里找游戏弹窗、并跟踪那个目标。\n\n"
+            "  · 它**只检测、不点击**（`INTEGRATION.md:105` ✓）—— 报成功之后点不点「确定」\n"
+            "    由下面那一格决定 ✓；\n"
+            "  · 第一次开会加载模型（YOLO 权重，约 10 秒）；加载/推理都在**独立线程**里，\n"
+            "    **不影响实时画面** ✓；\n"
+            "  · ⚠ 要鼠标点得动，得**标定过鼠标**（`config/mouse_gain.json` ✓ 同断线重连那套 ✓）——\n"
+            "    鼠标指令是**经 relay 打到游戏机**的 ✓ **收流 / 本机窗口都行** ✓（跟画面从哪来无关 ✓）；\n\n"
+            "状态看本组最上面那一行（定位中 / 跟踪中 / 成功⇒已点确定 / 不可用的原因 ✓）。")
+        self.ck_vt.stateChanged.connect(self._on_vt_changed)
+        f.addRow("", self.ck_vt)
+
+        self.ck_vt_click = QCheckBox("成功后自动用鼠标点「确定」")
+        self.ck_vt_click.setChecked(bool(_lv.get("vt_click", True)))
+        self.ck_vt_click.setToolTip(
+            "跟踪包报「成功面板出现了」之后，**我们**去找面板上那个「确定」按钮并点一下\n"
+            "（按钮位置是拿它自带的按钮模板在面板范围里匹配出来的 ✓ 不猜坐标 ✓）。\n\n"
+            "  · 匹配不到（阈值 0.86 内没有）⇒ **不点**（点错比不点糟 ✗），日志里留一条\n"
+            "    `vt_confirm_miss` ✓；\n"
+            "  · 取消勾选 ⇒ 只报不点（想自己确认时用 ✓）。\n\n"
+            "⚠ 点一下走的是断线重连那套硬件鼠标（`mouse_aim`）：会先**撞角归零**再走位 ✓。")
+        self.ck_vt_click.stateChanged.connect(self._on_vt_changed)
+        f.addRow("", self.ck_vt_click)
+
+        self.ck_vt_aim = QCheckBox("鼠标跟着目标走（指着它）")
+        self.ck_vt_aim.setChecked(bool(_lv.get("vt_aim", True)))
+        self.ck_vt_aim.setToolTip(
+            "跟踪状态是 `LOCKED` / `COAST`、而且点**不超过 0.2 秒新**时，让硬件鼠标**指过去**\n"
+            "（撞角归零 → 走位 —— **不点** ✓ 同断线重连那套后端 ✓）。\n\n"
+            "  · 「什么时候该动鼠标」这套规矩**照抄跟踪包自己的适配器**（`MouseOutput` ✓\n"
+            "    只认锁定/预测态、超时点不补发、成功界面一律停手 ✓）—— 不是我们自己定的 ✓；\n"
+            "  · ⚠ 绝对值定位每次都要**撞角归零** ⇒ 一格点只发一次，不会疯狂甩动 ✓；\n"
+            "  · ⚠ 鼠标指令**经 relay 打到游戏机** ✓ ⇒ **收流 / 本机窗口都有效** ✓（前提：标定是在\n"
+            "    **同一画面几何**下做的 —— 你那份 `mouse_gain.json` 记着 `source: stream` ✓ 正是如此 ✓）；\n"
+            "  · ⚠ 要**标定过鼠标**（`config/mouse_gain.json` ✓）。\n\n"
+            "想自己接管鼠标时把它关掉 ⇒ 只跟不指 ✓。")
+        self.ck_vt_aim.stateChanged.connect(self._on_vt_changed)
+        f.addRow("", self.ck_vt_aim)
+
+        self.ck_vt_draw = QCheckBox("在画面上描边（ROI / 目标框 / 瞄点）")
+        self.ck_vt_draw.setChecked(bool(_lv.get("vt_draw", True)))
+        self.ck_vt_draw.setToolTip(
+            "在「实时画面」上画三件（都在**显示帧**上 ✓ 喂给跟踪包的那份一个像素都不动 ✓）：\n"
+            "  · **橙黄矩形 + `VT <阶段>`** = 跟踪包自己定位到的**弹窗内容区**（ROI ✓）——\n"
+            "    没看到它就说明它还没定位到（阶段会写 LOCATING ✓）；\n"
+            "  · **品红粗框** = 它认的**目标框**；\n"
+            "  · **品红十字** = 鼠标正要指的**瞄点**。\n\n"
+            "调试期建议开着（「它到底跟没跟上」一眼就看出来 ✓）；不想让画面花就关掉 ✓。\n"
+            "⚠ 要看到这些 ⇒ 「实时画面」那边的「**画框**」也得开着（同其它标记 ✓）。")
+        self.ck_vt_draw.stateChanged.connect(self._on_vt_changed)
+        f.addRow("", self.ck_vt_draw)
+
+        self.sp_vt_aim_ms = NoWheelSpinBox()
+        self.sp_vt_aim_ms.setRange(4, 200)
+        self.sp_vt_aim_ms.setSingleStep(4)
+        self.sp_vt_aim_ms.setValue(int(_lv.get("vt_aim_ms", 16)))
+        self.sp_vt_aim_ms.setToolTip(
+            "平滑走位的**插值间隔**（毫秒，默认 **16** ≈ 60 次/秒）。\n\n"
+            "它管的是「光标走得多细」：**调小 = 更顺滑**（每拍走更小的一步 ✓，越接近连续移动 ✓）、\n"
+            "调大 = 更省固件带宽但会看出「一顿一顿」✗。\n\n"
+            "⚠ 它**不是**「多久指一次」✗：目标每一拍都在刷新（跟着跟踪结果 ✓），鼠标每拍走一小步 ✓；\n"
+            "⚠ 只有「位置不可信」时才归零一次（每轮开头 / 停顿超过 1 秒 ⇒ 人可能碰过鼠标 ✓），\n"
+            "   所以不会再出现「在左上角和目标之间来回跳」✓。\n\n"
+            "  · 还是觉得顿 ⇒ **调到 8**（更顺 ✓，代价是固件要收更多指令）；\n"
+            "  · 固件带宽吃紧 / 卡 ⇒ 调大到 24~33 ✓。")
+        self.sp_vt_aim_ms.valueChanged.connect(self._on_vt_changed)
+        f.addRow("鼠标跟随间隔(ms)", self.sp_vt_aim_ms)
+
+        self.sp_vt_conf = NoWheelDoubleSpinBox()
+        self.sp_vt_conf.setRange(0.05, 0.90)
+        self.sp_vt_conf.setDecimals(2)
+        self.sp_vt_conf.setSingleStep(0.05)
+        self.sp_vt_conf.setValue(float(_lv.get("vt_conf", 0.15)))
+        self.sp_vt_conf.setToolTip(
+            "跟踪包内部检测的置信度门限（默认 **0.15**，与它交付时验过的那套一致 ✓）。\n\n"
+            "  · 调**高** ⇒ 只认更像的框：漏检变多，但误检少；\n"
+            "  · 调**低** ⇒ 更不容易漏，但会有低分框混进来。\n\n"
+            "⚠ 它的算法内部另有一条低分通道（BYTE 辅助）用于跟踪 ⇒ 这一格不是「越低越好 / "
+            "越高越好」⇒ **没特殊原因别动它** ✓；要动就先跑一遍素材对照（同一目标、同一段）。")
+        self.sp_vt_conf.valueChanged.connect(self._on_vt_changed)
+        f.addRow("检测置信度", self.sp_vt_conf)
+
+        self.cmb_vt_region = NoWheelComboBox()
+        self.cmb_vt_region.addItem("国服（CN）", "CN")
+        self.cmb_vt_region.addItem("繁中（TW）", "TW")
+        _rg = str(_lv.get("vt_region", "CN") or "CN").upper()
+        self.cmb_vt_region.setCurrentIndex(0 if _rg != "TW" else 1)
+        self.cmb_vt_region.setToolTip(
+            "「成功面板」模板用哪一套（跟游戏客户端语言走 ✓）：\n"
+            "  · **国服** = `liescc/cg.png`（默认 ✓）；\n"
+            "  · **繁中** = `liescc/tw/tw-cg.png`。\n\n"
+            "⚠ 选错不会有任何反应（永远等不到成功）—— 语言拿不准时先按默认开一次，\n"
+            "   若日志里一直是 LOCKED 却从不出现 SUCCESS，再来这儿换 ✓。")
+        self.cmb_vt_region.currentIndexChanged.connect(self._on_vt_changed)
+        f.addRow("成功模板地区", self.cmb_vt_region)
+
+        self.sp_vt_cool = NoWheelDoubleSpinBox()
+        self.sp_vt_cool.setRange(1.0, 60.0)
+        self.sp_vt_cool.setDecimals(1)
+        self.sp_vt_cool.setSingleStep(1.0)
+        self.sp_vt_cool.setValue(float(_lv.get("vt_cool_s", 3.0)))
+        self.sp_vt_cool.setToolTip(
+            "点完「确定」之后，隔多少秒才**重开一轮**（默认 **3.0 秒**）。\n\n"
+            "为什么要它：成功面板关掉需要一两秒，立刻重开一轮的话，新一轮会在**旧画面**上\n"
+            "又认出同一个面板 ⇒ **连点两下** ✗（可能把游戏的下一步操作也点掉）。\n\n"
+            "  · 觉得开下一局太慢 ⇒ 调小（但别小于 1 秒）；\n"
+            "  · 面板消失得慢（网络卡）⇒ 调大。")
+        self.sp_vt_cool.valueChanged.connect(self._on_vt_changed)
+        f.addRow("成功冷却（秒）", self.sp_vt_cool)
+
+        note = QLabel("改完**最多 1 秒生效**（不用重开预览 ✓）。第一次启用会加载模型约 10 秒，"
+                      "加载/推理都在独立线程，不影响实时画面。")
+        note.setStyleSheet("color: #80868b;")
+        note.setWordWrap(True)
+        f.addRow("", note)
+        # ⚠ **最后才开闸**（见 `_on_vt_changed` ✓）：上面那几行 `setValue/setCurrentIndex` 已经
+        #   把初始值灌进去了（那几次 `valueChanged` 要**被闸挡住** ✓），从这一刻起人才改得动 ✓。
+        self._vt_built = True
+        return grp
+
+    def set_vt_status(self, text):
+        """「实时」页转发过来的测谎状态 ⇒ 写进组里那一行 ✓（见 `_build_vt_group` ✓）。"""
+        try:
+            self.lbl_vt.setText(str(text))
+        except Exception:                    # noqa: BLE001 —— 显示而已，出错不许冒泡 ✓
+            pass
+
+    def _on_vt_changed(self, *_):
+        """「自动测谎」组任一格改动 ⇒ 写回 `config/live.yaml`（实时线程热读 ✓）。
+
+        ⚠⚠ **构造期不许写**（`_vt_built` 闸 ✓）：`setValue` / `setCurrentIndex` 在**建控件时**
+          就会触发 `valueChanged` ✗ —— 那一刻后面几个控件还没建，读它们就是 `AttributeError`
+          （被 except 吞掉、只留一句 ⚠），而且会**拿半套默认值先写一次盘** ✗。
+        ⚠ 只写这几个键（`update_live` 是**合并**写 ✓）—— 别整份覆盖，否则会把
+          `perf_log` / 录屏开关那些键冲掉 ✗（本仓库在这上面栽过，见 `live_panel._save_live_params` 的注释 ✓）。
+        """
+        if not getattr(self, "_vt_built", False):
+            return
+        try:
+            update_live(vt_on=bool(self.ck_vt.isChecked()),
+                        vt_click=bool(self.ck_vt_click.isChecked()),
+                        vt_aim=bool(self.ck_vt_aim.isChecked()),
+                        vt_draw=bool(self.ck_vt_draw.isChecked()),
+                        vt_conf=float(self.sp_vt_conf.value()),
+                        vt_region=str(self.cmb_vt_region.currentData() or "CN"),
+                        vt_cool_s=float(self.sp_vt_cool.value()),
+                        vt_aim_ms=int(self.sp_vt_aim_ms.value()))
+        except Exception as e:                # noqa: BLE001 —— 存不上不该炸面板 ✓
+            print("⚠ 自动测谎参数没存进 live.yaml（%s: %s）" % (type(e).__name__, e))
 
     def _build_antihang_group(self):
         """「防挂机」组：测谎/掉线弹窗出现时的**触发音效**（用户 2026-09-29 ✓）。"""
@@ -3589,45 +3888,265 @@ class PlayerPanel(QWidget):
         return grp
 
     def _build_reconnect_group(self):
-        """⭐ 「断线重连」组（2026-10-07 ✓ 用户要求：**主窗口 → 挂机保护页签 → 新组「断线重连」
-        → 参数「频道」（整数）**）。
+        """⭐⭐ 「断线重连」组（**主窗口 → 挂机保护页签** ✓ 用户 2026-10-07 点名的位置 ✓）。
 
-        ⚠ 这里**只有"想进第几格"这一个参数** ✓ —— 断线重连的其余参数（探测延时 / 步骤超时 /
-        排队超时 / 重试上限 / 恢复自动 / 四个点击比例 / 鼠标标定那一行）仍在**设置弹窗**的
-        「保护与恢复 → 断线自动重连」里 ✓（2026-10-06 落的地方 ✓ 见设计文档 §7 ✓）；
-        用户点名要「频道」放这儿 ✓ 就放这儿 ✓（要其它也搬过来随时说 ✓）。
+        **2026-10-09 全搬过来**（用户原话："把「检测到断线后自动走回游戏」这几个开关+子参数
+        也搬到「挂机保护 → 断线重连」组" ✓）：原来这一组只有「频道」一个参数 ✓，其余十格
+        （总开关 / 探测延时 / 步骤超时 / 排队超时 / 重试上限 / 恢复自动 / 四个点击比例 ✓）
+        全散在**设置弹窗 → 保护与恢复**里 ✗ ⇒ 断线这块东西要**跨两个窗口**找 ✗。
+        ⚠ 仓库纪律是「**一处控件**」✓ ⇒ 是**搬**、不是复制 ✗（设置窗那份已删 ✓ 只留一行指路 ✓）。
 
         ⚠ 落点怎么算**不在这儿** ✗：`decision/reconnect.py::CHANNEL_GRID_*` 一处实现 ✓
           （界面只收一个整数 ✓ 省得两处口径分叉 ✗）。
         """
         grp = QGroupBox("断线重连")
+        self._rc_group = grp                      # 给"只在看得见时才刷新标定那行"用 ✓
         f = QFormLayout(grp)
 
+        # ---- ① 总开关 ----
+        self.ck_reconnect = QCheckBox("检测到断线后自动走回游戏")
+        self.ck_reconnect.setChecked(bool(settings.reconnect_enabled))
+        self.ck_reconnect.setToolTip(
+            "⚠ **判到断线界面就停止自动** —— 这一半永远生效（2026-09-30 ✓），不受本开关影响 ✓；\n"
+            "本开关管的是要不要**自动按回车 / 点鼠标走回游戏** ✓。\n\n"
+            "⭐ **自动本来就关着**时也会接手（2026-10-09 放宽 ✓ —— 常见现场：掉线把血条读空 ⇒\n"
+            "  被当成「角色死亡」⇒ 自动被停 ✗ ⇒ 老口径「自动没开就不插手」⇒ 报警响了却什么都不做 ✗）：\n"
+            "  · 判到**登录界面 / 断线提示框**（人正常玩**到不了**的界面 ✓）⇒ **照样接手** ✓；\n"
+            "  · **选频道 / 选角 / 排队**（人自己换频道时也会到 ✓）⇒ 自动关着就**不抢** ✓\n"
+            "    （抢了就是跟手动操作打架 ✗）。\n\n"
+            "回到游戏后按下面「回到游戏后自动恢复自动打怪」决定要不要接着打 ✓\n"
+            "（⚠ 还要过一趟「开自动前的检查」—— 条件没凑齐就**不恢复**，不弹窗，只写在状态栏 ✓）。")
+        self.ck_reconnect.toggled.connect(self._on_reconnect_param)
+        f.addRow("", self.ck_reconnect)
+
+        # ---- ② 子参数（版式遵守 UI 规范 §9：一行一个、单位进标签、说明进 tooltip ✓）----
+        self.sp_rc_probe = NoWheelDoubleSpinBox()
+        self.sp_rc_probe.setRange(0.0, 600.0)
+        self.sp_rc_probe.setDecimals(1)
+        self.sp_rc_probe.setSingleStep(0.5)
+        self.sp_rc_probe.setValue(float(settings.reconnect_probe_after_lost_sec))
+        self.sp_rc_probe.valueChanged.connect(self._on_reconnect_param)
+        self.sp_rc_probe.setToolTip(
+            "玩家框丢多久之后开始判别界面（0 = 立刻）。\n\n"
+            "默认 0：断线提示框只显示两三秒，等 5 秒再探就错过它了，客户端会一直卡在\n"
+            "提示框上等人按确定。探一次只要约 4 ms，不必为省这点开销推迟。")
+        f.addRow("丢失多久后开始探界面(s)", self.sp_rc_probe)
+
+        self.sp_rc_step = NoWheelSpinBox()
+        self.sp_rc_step.setRange(0, 60000)
+        self.sp_rc_step.setSingleStep(500)
+        self.sp_rc_step.setValue(int(settings.reconnect_step_timeout_ms))
+        self.sp_rc_step.valueChanged.connect(self._on_reconnect_param)
+        self.sp_rc_step.setToolTip(
+            "重连每一步（点服务器 / 点频道 / 排队 / 选角）等「界面真的变了」的超时。\n"
+            "到点还没变就按下面的次数重试。")
+        f.addRow("每步等待超时(ms)", self.sp_rc_step)
+
+        self.sp_rc_queue = NoWheelSpinBox()
+        self.sp_rc_queue.setRange(0, 600000)
+        self.sp_rc_queue.setSingleStep(1000)
+        self.sp_rc_queue.setValue(int(settings.reconnect_queue_timeout_ms))
+        self.sp_rc_queue.valueChanged.connect(self._on_reconnect_param)
+        self.sp_rc_queue.setToolTip(
+            "排队那一步专用的长超时：排队可能要等很久，用上面那个 3 秒会一直重试。")
+        f.addRow("排队弹窗超时(ms)", self.sp_rc_queue)
+
+        self.sp_rc_retry = NoWheelSpinBox()
+        self.sp_rc_retry.setRange(0, 20)
+        self.sp_rc_retry.setValue(int(settings.reconnect_max_retry))
+        self.sp_rc_retry.valueChanged.connect(self._on_reconnect_param)
+        self.sp_rc_retry.setToolTip(
+            "同一步骤最多重试几次；到上限就停下并提示（不会无限重连）。")
+        f.addRow("同一步最多重试(次)", self.sp_rc_retry)
+
+        self.ck_rc_resume = QCheckBox("回到游戏后自动恢复自动打怪")
+        self.ck_rc_resume.setChecked(bool(settings.reconnect_resume_auto))
+        self.ck_rc_resume.toggled.connect(self._on_reconnect_param)
+        self.ck_rc_resume.setToolTip(
+            "重连成功、回到游戏画面之后，自动把「自动打怪」重新打开。\n\n"
+            "⚠ 打开前会做一次「开自动前的检查」（**与手动开自动是同一份**：地图 / 标定\n"
+            "几何 / 地形图）：条件没凑齐就**不恢复**，并在状态栏写清原因（不会弹窗 ——\n"
+            "挂机时人往往不在屏幕前 ✓）。修好后自己点「开启自动」就行。\n\n"
+            "不勾就停在「已回到游戏、自动仍是关的」，由你自己决定。\n"
+            "⭐ 另外：**接手时自动本来就是关的**（掉线把自动停了 ✓ 见上 ✓）⇒ 回到游戏也**不会**\n"
+            "自作主张打开 ✓（那属于越权 ✓ 2026-10-09 修的 ✓）。")
+        f.addRow("", self.ck_rc_resume)
+
+        # ---- ③ 「频道」（想进第几格 ✓ 用户 2026-10-07 点名要放这儿 ✓）----
         self.sp_rc_channel = NoWheelSpinBox()
-        self.sp_rc_channel.setRange(1, 20)         # 4 列 × 5 行 ✓ 见 reconnect.CHANNEL_GRID_MAX ✓
+        self.sp_rc_channel.setRange(1, 60)         # 1~60 ✓ 见 reconnect.CHANNEL_TOTAL ✓
         self.sp_rc_channel.setValue(int(getattr(settings, "reconnect_channel", 1) or 1))
         self.sp_rc_channel.setToolTip(
-            "断线重连时想进**第几个频道**（频道面板 4 列 × 5 行 ⇒ 1~20）。\n\n"
-            "**1 = 面板左上角那一格** ✓，从左到右、从上到下数 ✓。\n"
-            "落点 = 那对「频道 X/Y 比例」（= 第 1 格的位置）＋ 格距 × (格号−1) ✓\n"
-            "—— 格距是量出来的常数、存的是**比例** ⇒ 换分辨率不用重配 ✓。\n\n"
+            "断线重连时想进**第几个频道**（1~60 ✓）。\n\n"
+            "**1 = 面板左上角那一格** ✓，从左到右、从上到下数 ✓（顺序已真机验过 ✓）。\n"
+            "一页看得见 20 格（4 列 × 5 行）✓ —— 第 **21~60** 个不在第一页里：\n"
+            "工具会**先把光标放到列表上、再往下滚「需要的那几行」**，让目标正好落在\n"
+            "**最下面一行**，然后点那一格（滚轮 ✓ 不会乱点 ✓）。\n"
+            "例：**22 ⇒ 往下滚 1 行**（22 是第 6 行 ⇒ 滚 1 行后它落在最下面一行 ✓）；\n"
+            "≤ 20 的频道在第一页里 ⇒ **一行都不滚** ✓。\n"
+            "落点 = 那对「频道 X/Y 比例」（= 第 1 格的位置）＋ 格距 × 行号 ✓\n"
+            "—— 存的是**比例** ⇒ 换分辨率不用重配 ✓。\n\n"
+            "⚠ 一次**只发 1 格**（人也是这么滚的 ✓）：连发一大串滚轮会被客户端当成一下、\n"
+            "  列表**根本不动** ⇒ 接着就点错频道（2026-10-10 真机踩过：up=20/down=5 ⇒ 点了频道 2 ✗）。\n"
+            "⚠ 它**假定频道面板一打开就在顶部** ✓（真机如此 ✓）；要是列表在这之前被人手动滚过，\n"
+            "  会点错行 ⇒ 重开一次频道面板即可 ✓。\n"
             "⚠ 服务器那一格不受这里影响（永远是第 1 个服务器 + 单击 ✓）。\n"
-            "⚠ 填成超出 1~20 的数 ⇒ **一个字节都不点**、只在状态栏说清 ✓"
-            "（宁可不做，也不乱点 ✓）。")
+            "⚠ 填成超出 1~60 ⇒ **一个字节都不点**、只在状态栏说清 ✓（宁可不做，也不乱点 ✓）。")
         self.sp_rc_channel.valueChanged.connect(self._on_reconnect_channel)
         f.addRow("频道", self.sp_rc_channel)
 
-        note = QLabel("断线重连时进第几个频道；1 = 面板左上角（从左到右、从上到下数）。"
-                      "越界不会乱点，只会在状态栏提示。")
+        # ---- ④ 「点服务器 / 点频道」要点的**画面比例位置**（用户 2026-10-06 ✓）----
+        #   **存比例（0~1）、不存像素** ✓ ⇒ 换分辨率 / 窗口大小自动适配（同 HP/MP 条那套 ✓）。
+        #   默认值是 2026-10-06 **从断线素材里量出来的**（不是目测 ✗）：服务器第 1 格
+        #   (698,245)@1920×1080、频道面板第 1 格 (788,550) ⇒ 见
+        #   `decision/reconnect.py::CLICK_TARGETS` 上面那段说明 ✓。
+        #   客户端布局不一样就改这里（重量：`python -X utf8 -m tools._probe_disc_frames
+        #   --bars --t 15.0 --region 660,480,640,300` ✓）。
+        def _ratio_spin(val, tip):
+            w = NoWheelDoubleSpinBox()
+            w.setRange(0.0, 1.0)
+            w.setDecimals(4)
+            w.setSingleStep(0.005)
+            w.setValue(float(val))
+            w.setToolTip(tip)
+            w.valueChanged.connect(self._on_reconnect_param)
+            return w
+
+        self.sp_rc_srv_x = _ratio_spin(
+            settings.reconnect_server_x,
+            "「选择频道（服务器列表）」界面里，要点的那一格在**画面上的横向位置**，\n"
+            "写成 0~1 的比例（0 = 最左、1 = 最右）。\n\n"
+            "默认 0.3635 = 素材里「1.蓝蜗牛」那一格的中心 x=698（1920 宽）。\n"
+            "⚠ 存比例不存像素：换分辨率 / 窗口大小不用重配 ✓。")
+        f.addRow("服务器 X 比例", self.sp_rc_srv_x)
+        self.sp_rc_srv_y = _ratio_spin(
+            settings.reconnect_server_y,
+            "同上，纵向比例（0 = 最上、1 = 最下）。\n\n"
+            "默认 0.2074 = 真机校正过的**格子中心**（1080 高下 y≈224）。\n"
+            "⚠ 旧默认 0.2269 是素材里**名字那一行**的中心（y=245）⇒ 落点偏下约 15px ✗"
+            "（2026-10-07 真机真点发现的 ✓ 见设计文档 §11）。")
+        f.addRow("服务器 Y 比例", self.sp_rc_srv_y)
+        self.sp_rc_chan_x = _ratio_spin(
+            settings.reconnect_channel_x,
+            "频道面板弹出的界面里，要点的那一格（默认 = 第 1 格「频道1」）的横向比例。\n\n"
+            "默认 0.4104 = 素材里第 1 格的中心 x=788。\n"
+            "「频道」选了第 2~60 个时，落点 = 这一格 ＋ 格距 × 格号 ✓。")
+        f.addRow("频道 X 比例", self.sp_rc_chan_x)
+        self.sp_rc_chan_y = _ratio_spin(
+            settings.reconnect_channel_y,
+            "同上，纵向比例。默认 0.5093 = 素材里面板第 1 行的中心 y=550。")
+        f.addRow("频道 Y 比例", self.sp_rc_chan_y)
+
+        # ---- ⑤ 「鼠标标定」现状（**只读** ✓）：它是"能不能点"的另一半 ——
+        #   比例再准，没标定也**一个字节都不会发**（`decision/mouse_aim.py` ✓）。
+        #   放一行在这儿，是为了让"它为什么不点"**在界面上就能看见** ✓（否则只能去翻日志 ✗）。
+        self.lbl_rc_gain = QLabel()
+        self.lbl_rc_gain.setWordWrap(True)
+        f.addRow("鼠标标定", self.lbl_rc_gain)
+        self._refresh_rc_gain()
+
+        # ---- ⑥ 总开关关着 ⇒ 子参数灰掉（改它没意义 ✓ 同「追击起跳」那一组的做法 ✓）----
+        self.ck_reconnect.toggled.connect(self._rc_enable)
+        self._rc_enable(self.ck_reconnect.isChecked())
+
+        note = QLabel("断线时不读文字、不训模型（模板锚点判界面 ✓）。"
+                      "「点服务器 / 点频道」要先撞到屏幕左上角再按比例走位 —— "
+                      "所以**鼠标必须标定过**，没标定就会停在原地不动手（不会乱点 ✓）。")
         note.setStyleSheet("color: #80868b;")
         note.setWordWrap(True)
         f.addRow("", note)
         return grp
 
+    def _rc_enable(self, on):
+        """总开关关着 ⇒ 这一组子参数灰掉（`_sync_reconnect_group` 回填时也会调 ✓）。"""
+        for w in (self.sp_rc_probe, self.sp_rc_step, self.sp_rc_queue,
+                  self.sp_rc_retry, self.ck_rc_resume, self.sp_rc_channel,
+                  self.sp_rc_srv_x, self.sp_rc_srv_y,
+                  self.sp_rc_chan_x, self.sp_rc_chan_y):
+            w.setEnabled(bool(on))
+
     def _on_reconnect_channel(self, _val=None):
         """「频道」改了 ⇒ 写回设置并落盘 ✓（与会话里的其它参数同一个做法 ✓）。"""
         settings.reconnect_channel = int(self.sp_rc_channel.value())
         settings.save()
+
+    def _on_reconnect_param(self, *_a):
+        """断线重连这一组**任何一个**参数改了 ⇒ 整组写回设置 + 落盘 ✓。
+
+        为什么整组写、不按改动那个写：`settings` 是本进程唯一的真相 ✓，而这些控件的初值
+        **就是从它来的** ✓（见 `_sync_reconnect_group` ✓）⇒ 整组回写的值 == 控件上的值 ✓
+        不会串号 ✓；省掉十个一模一样的槽函数 ✓（少写一处就少一处"改了没落盘" ✗）。
+        ⚠ 「频道」不走这儿 ✗ —— 它有自己的槽（`_on_reconnect_channel` ✓ 一处控件一处落盘 ✓）。
+        """
+        settings.reconnect_enabled = bool(self.ck_reconnect.isChecked())
+        settings.reconnect_probe_after_lost_sec = float(self.sp_rc_probe.value())
+        settings.reconnect_step_timeout_ms = int(self.sp_rc_step.value())
+        settings.reconnect_queue_timeout_ms = int(self.sp_rc_queue.value())
+        settings.reconnect_max_retry = int(self.sp_rc_retry.value())
+        settings.reconnect_resume_auto = bool(self.ck_rc_resume.isChecked())
+        settings.reconnect_server_x = float(self.sp_rc_srv_x.value())
+        settings.reconnect_server_y = float(self.sp_rc_srv_y.value())
+        settings.reconnect_channel_x = float(self.sp_rc_chan_x.value())
+        settings.reconnect_channel_y = float(self.sp_rc_chan_y.value())
+        settings.save()
+
+    def _sync_reconnect_group(self):
+        """打开项目 / 设置变了 ⇒ 把「断线重连」这组控件**按当前 settings 回填** ✓。
+
+        ⚠⚠ **必须判 hasattr** ✗：`_sync_from_settings()` 在 `__init__` 里就会跑 ✓，而本页是
+          **按需**才建（`build_protection_page` ✓ 主窗口 addTab 时才调 ✓）⇒ 那一刻这些控件
+          还不存在 ✗（2026-10-07 真栽过：不判就直接 `AttributeError` ⇒ **整个面板建不起来** ✗✗）。
+        ⚠ `blockSignals` 必须包住 ✗：`setValue` / `setChecked` 会触发信号 ⇒ 又走
+          `_on_reconnect_param` ⇒ 把"回填动作"当成人改的**再写一遍盘** ✓（无害但白写 ✓
+          更糟的是"打开项目"变成"改设置" ✗）。
+        """
+        if not hasattr(self, "sp_rc_channel"):
+            return
+        _ws = (self.ck_reconnect, self.sp_rc_probe, self.sp_rc_step, self.sp_rc_queue,
+               self.sp_rc_retry, self.ck_rc_resume, self.sp_rc_channel,
+               self.sp_rc_srv_x, self.sp_rc_srv_y, self.sp_rc_chan_x, self.sp_rc_chan_y)
+        for _w in _ws:
+            _w.blockSignals(True)
+        try:
+            self.ck_reconnect.setChecked(bool(settings.reconnect_enabled))
+            self.sp_rc_probe.setValue(float(settings.reconnect_probe_after_lost_sec))
+            self.sp_rc_step.setValue(int(settings.reconnect_step_timeout_ms))
+            self.sp_rc_queue.setValue(int(settings.reconnect_queue_timeout_ms))
+            self.sp_rc_retry.setValue(int(settings.reconnect_max_retry))
+            self.ck_rc_resume.setChecked(bool(settings.reconnect_resume_auto))
+            self.sp_rc_channel.setValue(int(getattr(settings, "reconnect_channel", 1) or 1))
+            self.sp_rc_srv_x.setValue(float(settings.reconnect_server_x))
+            self.sp_rc_srv_y.setValue(float(settings.reconnect_server_y))
+            self.sp_rc_chan_x.setValue(float(settings.reconnect_channel_x))
+            self.sp_rc_chan_y.setValue(float(settings.reconnect_channel_y))
+            self._rc_enable(bool(settings.reconnect_enabled))
+        finally:
+            for _w in _ws:
+                _w.blockSignals(False)
+
+    def _refresh_rc_gain(self):
+        """把「鼠标标定」现状写进那一行（**只读** ✓）。
+
+        判据只有一处：`decision.mouse_aim` 的**文件在不在 + 两个分量是不是正数** ✓
+        （与真正点击时读的是同一份 ✓）—— 这里**不许自己再读一遍那份 json** ✗
+        （两处口径迟早分叉，本仓库踩过 ✓）。
+        """
+        try:
+            from decision import mouse_aim
+            g = mouse_aim.load_gain()
+            if g:
+                self.lbl_rc_gain.setText("已标定：%.4f / %.4f 画面像素每指令单位 ✓"
+                                         % (float(g[0]), float(g[1])))
+            else:
+                self.lbl_rc_gain.setText(
+                    "未标定 —— 点服务器 / 点频道这一步会**停在这里不动手**（不会乱点 ✗）。\n"
+                    "⚠ 在**跑工作台这台机器**上跑（不是游戏机 ✗ —— 鼠标指令会经 relay 打到游戏机 ✓）：\n"
+                    "    python -X utf8 -m tools.mouse_aim_calib\n"
+                    "跑之前：① **先停掉实时预览**（标定和它抢同一个 UDP 端口 ✗）；\n"
+                    "        ② 游戏停在**画面不动**的界面 + **鼠标指针可见**；\n"
+                    "        ③ 游戏机指针速度 6/11、关掉「提高指针精确度」。")
+        except Exception as e:                   # noqa: BLE001 —— 读不到就说读不到 ✓
+            self.lbl_rc_gain.setText("读不到标定状态：%s" % e)
 
     def _on_alarm_sound(self):
         settings.lie_alarm_sound = self.ed_alarm_sound.text().strip()
@@ -3747,7 +4266,10 @@ class PlayerPanel(QWidget):
             self.lbl_strategy_note.setText(
                 "以角色脚底为基准：上阈值往上、下阈值往下，范围外的怪不追踪")
         # 扫平台那三个（只在 sweep 显示 ✓）
-        for w in (self.sp_turn_cd, self.sp_back_range, self.sp_edge_turn):
+        # ⚠ `sp_*` 那三格 + 说明行（`lbl_sweep_hint` ✓）归这里；两行的"标签"就是勾选框 ✓
+        #   ⇒ 它们走下面那个 `_lbl_*` 循环（`_lbl_turn_cd` / `_lbl_edge_turn` 就是勾选框本身 ✓）
+        for w in (self.sp_turn_cd, self.sp_back_range, self.sp_edge_turn,
+                  self.lbl_sweep_hint):
             w.setVisible(is_sweep)
         for a in ("_lbl_turn_cd", "_lbl_back_range", "_lbl_edge_turn"):
             lb = getattr(self, a, None)
@@ -4342,9 +4864,17 @@ class PlayerPanel(QWidget):
             else:
                 self.lbl_device_state.setText("已连接 ProMicro(远程)")
         else:
+            # ⚠⚠ **把原因一起说出来** ✗（2026-10-10 ✓ 用户现场："本地ProMicro连接失败" ✗
+            #   而真正原因是**串口被另一个工作台占着** ✓ —— 界面只有八个字，等于没说 ✓
+            #   见 `decision.input.last_connect_err` 的说明 ✓）。
+            from decision import input as _din
+            _why = str(_din.last_connect_err() or "").strip()
             settings.input_device = "local"
             settings.save()
-            self.lbl_device_state.setText("Pro Micro 连接失败，已回退本地")
+            self.lbl_device_state.setText(
+                "Pro Micro 连接失败，已回退本地" + (" —— %s" % _why if _why else ""))
+            # ⚠ 长原因挂 tooltip ✓（状态栏一行放不下全部 ✓ 但别让它消失 ✗）
+            self.lbl_device_state.setToolTip(_why)
             self.cmb_device.blockSignals(True)
             idx = self.cmb_device.findData("local")
             if idx >= 0:
@@ -4738,6 +5268,14 @@ class PlayerPanel(QWidget):
         self.sp_edge_turn.blockSignals(True)
         self.sp_edge_turn.setValue(getattr(settings, "sweep_edge_turn_px", 100))
         self.sp_edge_turn.blockSignals(False)
+        # ⭐ 两个勾：回填 + 同步"格子置灰 / 说明行"（用户 2026-10-09 ✓ 见 `_sync_sweep_switches` ✓）
+        #   ⚠ 一律 `blockSignals`：摆值**不是**用户操作 ⇒ 不许顺手落盘 ✗（本页那条纪律 ✓）。
+        for _ck, _attr, _dflt in ((self.ck_turn_cd, "sweep_turn_cd_enabled", True),
+                                  (self.ck_edge_turn, "sweep_edge_turn_enabled", True)):
+            _ck.blockSignals(True)
+            _ck.setChecked(bool(getattr(settings, _attr, _dflt)))
+            _ck.blockSignals(False)
+        self._sync_sweep_switches()
 
         self.sp_debounce_conf.blockSignals(True)
         self.sp_debounce_conf.setValue(settings.debounce_conf)
@@ -4751,18 +5289,15 @@ class PlayerPanel(QWidget):
         self.sp_big_mob_ratio.setValue(getattr(settings, "big_mob_ratio", 1.5))
         self.sp_big_mob_ratio.blockSignals(False)
 
-        # ⭐ 「频道」（挂机保护页 → 断线重连组 ✓）：打开项目时得**跟着项目值走** ✓
-        #   （⚠ 不接这一步的后果很具体：界面上显示的还是上一个项目的数 / 默认 1 ✗
-        #     —— 而真正花的是 `settings.reconnect_channel` ✓ ⇒ "看到的不是用的" ✗）
-        # ⚠⚠ **必须判 hasattr** ✗：`_sync_from_settings()` 是在 `__init__` 里调的 ✓，
+        # ⭐⭐ 「断线重连」整组（挂机保护页 → 断线重连 ✓）：打开项目时得**跟着项目值走** ✓
+        #   （⚠ 不接这一步的后果很具体：界面上显示的还是上一个项目的数 / 默认值 ✗
+        #     —— 而真正花的是 `settings.reconnect_*` ✓ ⇒ "看到的不是用的" ✗）
+        # ⚠⚠ **实现里必须判 hasattr** ✗：`_sync_from_settings()` 是在 `__init__` 里调的 ✓，
         #   而「挂机保护页」是**按需**才建（`build_protection_page` ✓ 主窗口 addTab 时才调 ✓）
-        #   ⇒ 这一步跑的时候 `sp_rc_channel` 可能**还不存在** ✗
+        #   ⇒ 这一步跑的时候那些控件可能**还不存在** ✗
         #   —— 2026-10-07 真栽过：不判就直接 `AttributeError` ⇒ **整个面板建不起来** ✗✗
         #   （而控件建好之后它照旧会被同步 ✓ 见 `_build_reconnect_group` 里的初值 ✓）。
-        if hasattr(self, "sp_rc_channel"):
-            self.sp_rc_channel.blockSignals(True)
-            self.sp_rc_channel.setValue(int(getattr(settings, "reconnect_channel", 1) or 1))
-            self.sp_rc_channel.blockSignals(False)
+        self._sync_reconnect_group()
 
         self.sp_big_mob_range_px.blockSignals(True)
         self.sp_big_mob_range_px.setValue(getattr(settings, "big_mob_range_px", 600))
@@ -4878,6 +5413,15 @@ class PlayerPanel(QWidget):
 
     def shutdown(self):
         settings.enabled = False
+        # ⭐⭐ **顺手收掉小地图收流线程**（2026-10-09 ✓）：它们是 **daemon** ✓ 且常年阻塞在
+        #   `recv` 上 ✗ —— 不显式停，解释器退出时脚下的 socket 缓冲会被拆 ⇒ 偶发
+        #   **access violation（`0xC0000005`）** ✗（"关工作台时不清不楚地崩一下" ✓）。
+        #   一处出口统一收（同套件收尾那条 ✓ 见 `perception.minimap.stop_all_clients` ✓）。
+        try:
+            from perception.minimap import stop_all_clients
+            stop_all_clients()
+        except Exception:                        # noqa: BLE001 —— 收尾不该拦住关窗 ✓
+            pass
         # ⭐⭐ 触控板这两条线程都要收掉，**顺序不能反**（用户 2026-10-05 ✓）：
         #   ① 先停**跟踪线程**（`pad-track` ✓ 它每拍都在往发送器里 push ✓）；
         #   ② 再停**发送线程**（`pad-send` ✓）。

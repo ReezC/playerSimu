@@ -21,5 +21,15 @@ pyarrow>=15.0
 # 本地窗口采集：WGC（Windows Graphics Capture，走 DWM，替代 BitBlt）
 wgc-python>=2.0
 
+# 本地窗口采集：**DXGI 桌面复制**（最快那条 ✓ 2026-10-10 加 ✓ 用户："我们当然选用性能最好的、
+# 能满足**截取部分屏幕**需求的"✓）。本机实测 1920×1080 整屏 **16.9ms**、960×540 **5.7ms**
+# （对照 BitBlt 50.5 / 23.4ms ✓）⇒ 15fps 的预算从"吃掉 67%"降到 25% ✓。
+# 走 DWM 合成结果 ⇒ **外接登录窗照样进画面** ✓（断线重连 / 测谎要的正是这个 ✓）。
+# ⚠ 它只在**画面有变化**时给新帧（`grab()` 给 None ✓）⇒ 调用方沿用上一帧即可 ✓
+#   （见 `core/dxgi_capture.py` 的模块头 + `core/wincap.grab_rect` 的排队顺序 ✓）。
+# ⚠ `comtypes` 是它的依赖（pip 会一起装 ✓）；没装也照旧 —— 会自动退回 WGC / BitBlt ✓。
+dxcam>=0.3.0
+comtypes>=1.4
+
 # 可选：NDI 方案
 # ndi-python

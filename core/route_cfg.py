@@ -80,15 +80,37 @@ def load(map_id):
     return None
 
 
-def save(map_id, values):
+def save(map_id, values, base=None, conflicts=None):
     """把（调用方已收拾好的）值写进 per-map 文件。
 
     ⚠ 写**全部**给进来的键（包括"认不出来的"✓）：这样"手上那份"是完整的，
       下次读回来不会因为漏写某项而退回默认 ✗。
+
+    ⭐⭐ **多实例（用户 2026-10-09 原话："我们必须要支持能开 2 个工作台"）**：
+    给了 `base`（= 调用方**上次从这份文件里见到的那份** ✓ 见 `RoutePanel._load_route_cfg`
+    记的 `_route_cfg_base` ✓）就做**读-改-写** —— 只把"**相对 `base` 改过的键**"盖回磁盘 ✓，
+    另一个窗口刚改的键**留住** ✓。
+      · 两边改了**同一个**键 ⇒ 后写的赢 ✓（无法两全 ✓）＋ 名字记进 `conflicts`（list ✓
+        由调用方决定要不要说给用户听 ✓）；
+      · `base=None` ⇒ **老行为**（整份写 ✓ 新建 / 没记基准时用它 ✓）。
+    为什么这个文件也要管：`main_window` 的保存钩子在**任何** `settings.save()` 之后都会顺手
+    调 `_save_route_cfg()` ✓ ⇒ 另一个窗口只是动了别的参数，也会把这 9 个键整份盖一遍 ✗。
     """
+    vals = {str(k): v for k, v in (values or {}).items()}
+    if base is not None:
+        cur = load(map_id)                      # 磁盘上现在那份（另一个窗口可能刚写过 ✓）
+        if isinstance(cur, dict):
+            kept = {str(k): v for k, v in cur.items()}
+            for k, v in vals.items():
+                if k in base and base.get(k) == v:
+                    continue                    # 我没改过它 ⇒ 磁盘上那份说话 ✓
+                if (k in kept and k in base and base.get(k) != kept[k]
+                        and kept[k] != v and conflicts is not None):
+                    conflicts.append("route_cfg:" + k)   # 两边都改过 ⇒ 记账 ✓
+                kept[k] = v
+            vals = kept
     p = path(map_id)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"map_id": str(map_id),
-                             "values": {str(k): v for k, v in (values or {}).items()}},
+    p.write_text(json.dumps({"map_id": str(map_id), "values": vals},
                             ensure_ascii=False, indent=2), encoding="utf-8")
     return p

@@ -294,7 +294,13 @@ def t_apply_is_read_only():
 
     rp = _src("gui/route_panel.py")
     _body = rp.split("def _apply_route_cfg", 1)[-1].split("def _refresh_crop_status", 1)[0]
-    check("route_cfg.save" not in _body,
+    # ⚠⚠ **扫之前先去注释**（2026-10-10 ✓ 修一次假红）：那段说明里写着
+    #   "真正落盘的时刻只有一个 —— 用户改了参数（走 `_save_route_cfg` ✓ 见 `core.route_cfg.save`）"
+    #   ⇒ 裸子串 `route_cfg.save` **在注释里也会命中** ✗ ⇒ 报"又写盘了" ✗（其实一个写都没有 ✓）。
+    #   ⇒ 只钉**真的那一下调用**（`route_cfg.save(` ✓ 前后不留白：`core.route_cfg.save` 这种
+    #     引用**不会**命中 ✓），并且先把注释切掉 ⇒ 以后注释里怎么写都不会假红 ✓。
+    _code = "\n".join(ln.split("#", 1)[0] for ln in _body.splitlines())
+    check("route_cfg.save(" not in _code,
           "`_apply_route_cfg` 里又写盘了（切图是只读动作 ✗）")
 
 

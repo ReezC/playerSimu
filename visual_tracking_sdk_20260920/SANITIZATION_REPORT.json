@@ -1,0 +1,70 @@
+{
+  "whitelist_only": true,
+  "text_files_scanned": 44,
+  "python_files_without_host_imports": 30,
+  "model_pickle_strings_scanned": 607,
+  "png_metadata_scanned": {
+    "alert/star1.png": [
+      "srgb",
+      "gamma",
+      "dpi"
+    ],
+    "alert/star2.png": [
+      "srgb",
+      "gamma",
+      "dpi"
+    ],
+    "alert/star3.png": [
+      "srgb",
+      "gamma",
+      "dpi"
+    ],
+    "docs/gui_preview.png": [
+      "dpi"
+    ],
+    "liescc/cg.png": [
+      "srgb",
+      "gamma",
+      "dpi"
+    ],
+    "liescc/qr.png": [
+      "srgb",
+      "gamma",
+      "dpi"
+    ],
+    "liescc/startlies2.png": [
+      "gamma",
+      "icc_profile",
+      "chromaticity",
+      "dpi"
+    ],
+    "liescc/tw/tw-cg.png": [
+      "srgb",
+      "gamma",
+      "dpi"
+    ],
+    "liescc/tw/tw-qr.png": [
+      "srgb",
+      "gamma",
+      "dpi"
+    ]
+  },
+  "private_pattern_matches": [],
+  "model_state_dict_tensors_verified": 355,
+  "source_project_unchanged": true,
+  "excluded": [
+    "main_window",
+    "remote_host",
+    "accounts",
+    "combat",
+    "navigation",
+    "training_data",
+    "videos",
+    "annotations",
+    "API_keys",
+    "pairing_credentials",
+    "proxy_configuration",
+    "Git_history"
+  ],
+  "limits": "Rule-based scan and explicit file review; not proof against every possible unknown secret encoding."
+}

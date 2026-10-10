@@ -1263,10 +1263,38 @@ class MinimapCalibDialog(QDialog):
             extra = ("\n底图只有 %dx%d、面板 %dx%d 更大 —— 面板装不下整张底图，"
                      "所以不可能是「局部小地图」，多半是「全局小地图」"
                      "（去「路线识别」里换，这里不替你改）。" % (cw, ch, w, h))
-        self._say("没对上 —— 可能：画面来源那块框得不对（A 机推流区域 / 本机框选区域"
-                  "不只是小地图）/ 画面不是这张图 / 面板被游戏 UI 挡住。"
-                  "参考分：%s%s" % ("、".join(bits), extra),
-                  bad=True)
+        # ⭐⭐ **先落现场再说话**（用户 2026-10-09 ✓ 原话："这些提示是不正确的，因为我的手动标定
+        #   对齐地图已经接近完美了"）：旧文案一律甩"框得不对 / 不是这张图 / 被 UI 挡住" ✗ ——
+        #   对"手工已经对得很准"的人等于说他做错了 ✗。事实是这量的是**模板匹配**（像素像不像 ✓），
+        #   和"人眼看叠图重合"是两件事 ✓ ⇒ 把面板 + 底图 + 手上这套几何存一份，先看图再定 ✓。
+        # ⭐⭐ **兜底判据：地形重合率**（见 `perception.minimap.calib_overlap` ✓）——
+        #   模板匹配在本图天生够不着门槛 ✗（底图重绘、面板带图标 ✓），重合率才是
+        #   回答"我标得准不准"的那条路 ✓；它说"重合良好"时**不许把整行染红** ✗。
+        try:
+            _ov = mm.calib_overlap(self._frame, self.canvas, self.calib())
+            _ov_txt = mm.overlap_verdict(_ov)
+            _ok = bool(_ov) and float(_ov.get("iou") or 0.0) >= mm.OVERLAP_OK
+        except Exception:                            # noqa: BLE001 —— 诊断不许把界面弄崩 ✓
+            _ov, _ov_txt, _ok = None, "", False
+        _dir = mm.dump_diag(self._frame, self.canvas, self.calib(), tag="locate",
+                            extra={"mode": self.mode, "scores": list(bits),
+                                   "overlap": _ov,
+                                   "client": str(getattr(self.client, "err", "") or "")})
+        try:
+            from core import behavior as _bh
+            _bh.event("mmap_locate_fail", mode=str(self.mode),
+                      scores="|".join(bits), overlap=(_ov or {}).get("iou"),
+                      diag=str(_dir))
+        except Exception:                            # noqa: BLE001 —— 记账坏了别影响界面 ✓
+            pass
+        self._say("模板匹配没对上面板（参考分：%s；门槛 %.2f）—— 这条尺子在本图不适用。\n"
+                  "%s\n"
+                  "⚠ **这不等于你的手工对齐错了** ✗：手工对齐看的是叠图重合 ✓、"
+                  "这里比的是像素像不像 ✓，两件事可以不一致（手工那份本来就没有匹配分 ✓）。\n"
+                  "现场已存 data/mmap_diag/（panel / canvas / overlay / diff）⇒ 看图最直接 ✓%s"
+                  % ("、".join(bits), mm.LOCATE_MIN_SCORE,
+                     _ov_txt or "（重合率也算不出来：面板/底图缺 ✓）", extra),
+                  bad=not _ok)
 
     def _say(self, text, bad=False):
         """动作结果（定位/保存/抓帧）。**只写这一行**，不和连接状态抢地方。"""

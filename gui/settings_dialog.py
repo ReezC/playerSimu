@@ -1,9 +1,11 @@
-"""设置弹窗：按用途分成三个页签。
+"""设置弹窗：按用途分成**五个**页签。
 
 | 页签 | 装什么 | 判断标准 |
 |---|---|---|
 | **界面** | 界面字号、可视化颜色/线宽、**实时画面那块小地图**（叠不叠 / 浓淡） | 只管**长什么样**、只动**本机配置**，改了立刻看得见 |
 | **保护与恢复** | 停止自动的条件、防卡键、断线重连 | 管**出问题怎么办** |
+| **判定参数** | 爬绳对齐、寻路超时、各类阈值 | "**怎么算数**" |
+| **链路** | `config/link.yaml` 里**原来只能手改**的那些格（两台机器 IP / 推流 / **键盘通道与两个串口** / 小地图 / 对时 / 探针 / 路径） | 管**这台工作台跟谁说话、走哪条通道** |
 | **诊断** | 性能日志开关、性能保活 | 只在排查问题时动 |
 
 **为什么分页签**：原来是一根长列表，找一项得一路往下扫；而且「外观」和「安全」
@@ -16,14 +18,19 @@
 性能日志开关不是决策参数，它落在 config/live.yaml（和实时预览同一份配置）；
 性能保活也是（进程优先级/电源节流/定时器精度，见 core/winperf.py）。
 
+⚠ **「链路」页写的是 `config/link.yaml`**（**机器级**、不按项目走 ✓）：那份文件
+**注释密集**（每格都写着"为什么这么填"✓）⇒ **只能逐行改**，整文件重写会把注释
+全抹掉 ✗ ⇒ 一律走 `core/config.update_link()`（见那边的说明 ✓）。
+
 代码顺序 = 页签顺序 = 视觉顺序（docs/UI规范.md §4）。
 """
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (QCheckBox, QColorDialog, QDialog,
                              QDialogButtonBox, QFormLayout, QFrame, QGroupBox,
-                             QGridLayout, QHBoxLayout, QLabel, QPushButton,
-                             QScrollArea, QTabWidget, QVBoxLayout, QWidget)
+                             QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+                             QPushButton, QScrollArea, QTabWidget, QVBoxLayout,
+                             QWidget)
 
 from core import mapdata, perf, winperf
 from decision.agent import settings
@@ -34,11 +41,11 @@ from perception import minimap as mm
 # NoWheel* 必须模块级导入：控件在 __init__ 里建，方法里的懒导入到不了那儿。
 # （详见 docs/UI规范.md：滚轮不许改参数）
 from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSlider,
-                         NoWheelSpinBox, scroll_page)
-from core.config import load_live, update_live
+                         NoWheelSpinBox, scroll_page, title_label)
+from core.config import load_link, load_live, update_link, update_live
 
 #: 页签名（顺序 = 显示顺序）。测试和文档都按这份来。
-TAB_NAMES = ("界面", "保护与恢复", "判定参数", "诊断")
+TAB_NAMES = ("界面", "保护与恢复", "判定参数", "链路", "诊断")
 
 #: 页签栏样式：**与部署台（A 机）的设置弹窗共用一份**（gui/theme.TAB_QSS）。
 #: 对话框不继承主窗口的 QSS，两边都得自己带 —— 但只该有一处定义。
@@ -70,8 +77,12 @@ class SettingsDialog(QDialog):
         # 路线识别面板，所以地图 id 只能从"最近打开的项目"取（和那边同一处来源 ✓）。
         _p = last_opened()
         self._map_id = str((_p.get("map_id") if _p else "") or "").strip()
+        # ⚠⚠ 来源必须与路线识别页**同一处**（`mm.source_for_map`：按地图 id 那份优先 ✓）——
+        #   原来读**全局** `live_src(load_live())` ✗ ⇒ 本图那条是 `live`（从实时画面 ✓）、
+        #   全局是 `stream` 时，这里读/写的都是**另一条来源**的浓淡 ✗（2026-10-10 ✓
+        #   现场：`stream` 桶里就只剩一个 `alpha:77` ✓ 而图用的是 `live` ✓）。
         self._alpha0 = mm.overlay_alpha_pct(
-            mapdata.load_calib(self._map_id, mm.live_src(load_live()))
+            mapdata.load_calib(self._map_id, mm.source_for_map(self._map_id, load_live()))
             if self._map_id else None)
         self._draw0 = bool(load_live().get("mmap_draw", False))
 
@@ -88,7 +99,9 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._page_appearance(), TAB_NAMES[0])
         self.tabs.addTab(self._page_protect(), TAB_NAMES[1])
         self.tabs.addTab(self._page_judge(), TAB_NAMES[2])
-        self.tabs.addTab(self._page_diagnose(), TAB_NAMES[3])
+        # ⭐ 「链路」= `config/link.yaml` 里原来只能手改的那些格（2026-10-09 用户要求 ✓）
+        self.tabs.addTab(self._page_link(), TAB_NAMES[3])
+        self.tabs.addTab(self._page_diagnose(), TAB_NAMES[4])
         self.tabs.setStyleSheet(_TAB_QSS)
         root.addWidget(self.tabs, 1)
 
@@ -486,6 +499,29 @@ class SettingsDialog(QDialog):
         vf2.addWidget(QLabel("箭头尖大小(%)（占线长）"), _tr, 0)
         vf2.addWidget(self.sp_arrow_tip, _tr, 2)
 
+        # ⭐⭐ **x 箭头 = 玩家真实朝向**（用户 2026-10-10 ✓ 原话："**我想让坐标箭头代表玩家的
+        #   真实朝向（需要尽量高效）**"✓）—— 与上面三格**同一组**（数值列**同一条竖线** ✓
+        #   守着"网格对齐 + 参数名显示完整"那条要求 ✓）。
+        #   ⚠ 它是**改语义**的开关（不是"画不画"✗）⇒ 默认**不勾** ✓（老观感一字不变 ✓）。
+        self.ck_arrow_real_face = QCheckBox("x 箭头 = 真实朝向")
+        self.ck_arrow_real_face.setChecked(bool(
+            self._vis.get("player_arrow_real_face", False)))
+        self.ck_arrow_real_face.setToolTip(
+            "勾上 ⇒ 那根 **x 箭头**不再画「世界 x 正方向」，而是按**角色真实朝向**朝左 / 朝右。\n"
+            "判据：**角色「世界坐标」x 的真实位移**（小地图那份，**与相机无关**）——\n"
+            "连几拍**同向**且净位移够才算（抖动 / 来回走不猜），成本 **0**（它本来每拍就有）。\n\n"
+            "⚠ 为什么不用画面坐标：镜头会动 —— 人没走、镜头一动也「看起来在走」，\n"
+            "  而镜头跟着人走时画面又几乎不动 ⇒ 画面 x 判这个不准。\n\n"
+            "⚠ **只有角色在走的时候才画**：停下 / 抖动 / 这一拍没定位 ⇒ **这根箭头不画**。\n"
+            "  （诊断工具也要诚实 —— 宁缺勿错，绝不拿默认值凑一个方向出来。）\n\n"
+            "⚠⚠ 它和**「攻击范围框」不是同一份**：那个框按 **Agent 的方向键 / 意图**走\n"
+            "（站桩时它跟的是「怪在哪一侧」）—— **两个不一致的时候正是要看的东西**。\n\n"
+            "⚠ 不勾（默认）= 老口径：x 箭头 = 世界 x 正方向（对着调「脚底偏移」用）。\n"
+            "⚠ 勾着时 x 箭头就**不再能**验世界正方向了（y 箭头照旧 ✓ 脚底偏移仍可对着它调）。")
+        _fr = _grid_rows[0]
+        _grid_rows[0] += 1
+        vf2.addWidget(self.ck_arrow_real_face, _fr, 2)
+
         # ---- ⑤ foothold 集合编辑器（只管它那个窗口，和实时预览无关 ⇒ 单独一组）----
         grp = QGroupBox("foothold 集合编辑器 · 线宽(px)")
         lay = QVBoxLayout(grp)
@@ -594,137 +630,22 @@ class SettingsDialog(QDialog):
         lay.addWidget(self.sp_resetall)
 
         lay.addSpacing(8)
-        self._head(
-            lay, "断线自动重连",
-            "玩家框丢失后自动判别界面（断线提示框 / 登录 / 选频道 / 排队 / 选角），"
-            "确认是断线就停止自动并按步骤走回游戏；回到游戏后按「恢复自动」那格决定要不要接着打"
-            "（⚠ 会自动做一次「开自动前的检查」，条件没凑齐就**不恢复**并把原因写在状态栏 ✓）。\n"
-            "「点服务器 / 点频道」用鼠标：先撞到屏幕左上角（绝对原点）、再按比例走位、左键点。\n"
-            "⚠ 前提是下面那两件事都成立：**鼠标通道连上** + **鼠标标定过**（见「鼠标标定」那一行）。\n"
-            "做判断用模板锚点，不读文字、不训模型。")
-        self.ck_reconnect = QCheckBox("检测到断线后自动走回游戏")
-        self.ck_reconnect.setChecked(bool(settings.reconnect_enabled))
-        self.ck_reconnect.setToolTip(
-            "⚠ **判到断线界面就停止自动** —— 这一半永远生效（2026-09-30 ✓），\n"
-            "不受本开关影响 ✓；本开关管的是要不要**自动按回车走回游戏** ✓。\n"
-            "回到游戏后按「恢复自动」的设置决定要不要接着打 ✓（那一格现在还要过一趟\n"
-            "「开自动前的检查」—— 条件没凑齐就**不恢复**，不弹窗，只写在状态栏 ✓）。")
-        lay.addWidget(self.ck_reconnect)
+        # ⚠⚠ **「断线自动重连」这一整块 2026-10-09 已搬到主窗口**（用户原话："把「检测到断线后
+        #   自动走回游戏」这几个开关+子参数也搬到「挂机保护 → 断线重连」组" ✓）——
+        #   现在**一处控件**：`gui/player_panel._build_reconnect_group` ✓（总开关 / 探测延时 /
+        #   步骤超时 / 排队超时 / 重试上限 / 恢复自动 / 频道 / 四个点击比例 / 鼠标标定现状 ✓）。
+        #   这里**只留一行指路** ✗（放两份迟早分叉 ✗ —— 本仓库为"两处各显示一份"踩过多次 ✓；
+        #   2026-10-07「频道」也是这么搬走的 ✓ 见 `t_reconnect_channel_num` ⑦ 那条源码钉 ✓）。
+        self._head(lay, "断线自动重连",
+                   "**这一整组已搬到主窗口**：**「挂机保护」页签 →「断线重连」组** ✓\n"
+                   "（开关 / 丢失多久后开始探界面 / 每步等待超时 / 排队弹窗超时 / 同一步最多重试 /\n"
+                   "  回到游戏后恢复自动 / 频道 / 服务器与频道的 X·Y 比例 / 鼠标标定现状 ✓ 全在那边 ✓）\n\n"
+                   "为什么搬：断线这块的开关、参数、标定现状是**同一件事** ✓ 分在两个窗口里找很别扭 ✗；\n"
+                   "⚠ 而且**只能有一处控件** ✗（两处各一份 ⇒ 迟早出现「改了这个、用的那个」✗）。")
 
-        # 重连的**子参数**（2026-09-26 补：审计发现这 5 个"只能在配置文件里改" ✗ ——
-        # 页面上原本只有上面那个总开关）。版式同样遵守 UI 规范 §9：一行一个、单位进标签、
-        # 说明进 tooltip、毫秒一律**整数**控件。
-        rc_form = QFormLayout()
-        rc_form.setLabelAlignment(Qt.AlignLeft)
-        rc_form.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        # （子参数 / 频道 / 四个比例 / 鼠标标定那一行：2026-10-09 全部搬到主窗口了 ✓
+        #   见上面那段说明与 `gui/player_panel._build_reconnect_group` ✓ —— 这里**一行控件都不留** ✗）
 
-        def rc_row(label, w, tip):
-            w.setToolTip(tip)
-            rc_form.addRow(label, w)
-            return w
-
-        self.sp_rc_probe = NoWheelDoubleSpinBox()
-        self.sp_rc_probe.setRange(0.0, 600.0)
-        self.sp_rc_probe.setDecimals(1)
-        self.sp_rc_probe.setSingleStep(0.5)
-        self.sp_rc_probe.setValue(float(settings.reconnect_probe_after_lost_sec))
-        rc_row("丢失多久后开始探界面(s)", self.sp_rc_probe,
-               "玩家框丢多久之后开始判别界面（0 = 立刻）。\n\n"
-               "默认 0：断线提示框只显示两三秒，等 5 秒再探就错过它了，客户端会一直卡在\n"
-               "提示框上等人按确定。探一次只要约 4 ms，不必为省这点开销推迟。")
-
-        self.sp_rc_step = NoWheelSpinBox()
-        self.sp_rc_step.setRange(0, 60000)
-        self.sp_rc_step.setSingleStep(500)
-        self.sp_rc_step.setValue(int(settings.reconnect_step_timeout_ms))
-        rc_row("每步等待超时(ms)", self.sp_rc_step,
-               "重连每一步（点服务器 / 点频道 / 排队 / 选角）等「界面真的变了」的超时。\n"
-               "到点还没变就按下面的次数重试。")
-
-        self.sp_rc_queue = NoWheelSpinBox()
-        self.sp_rc_queue.setRange(0, 600000)
-        self.sp_rc_queue.setSingleStep(1000)
-        self.sp_rc_queue.setValue(int(settings.reconnect_queue_timeout_ms))
-        rc_row("排队弹窗超时(ms)", self.sp_rc_queue,
-               "排队那一步专用的长超时：排队可能要等很久，用上面那个 3 秒会一直重试。")
-
-        self.sp_rc_retry = NoWheelSpinBox()
-        self.sp_rc_retry.setRange(0, 20)
-        self.sp_rc_retry.setValue(int(settings.reconnect_max_retry))
-        rc_row("同一步最多重试(次)", self.sp_rc_retry,
-               "同一步骤最多重试几次；到上限就停下并提示（不会无限重连）。")
-
-        self.ck_rc_resume = QCheckBox("回到游戏后自动恢复自动打怪")
-        self.ck_rc_resume.setChecked(bool(settings.reconnect_resume_auto))
-        self.ck_rc_resume.setToolTip(
-            "重连成功、回到游戏画面之后，自动把「自动打怪」重新打开。\n\n"
-            "⚠ 打开前会做一次「开自动前的检查」（**与手动开自动是同一份**：地图 / 标定\n"
-            "几何 / 地形图）：条件没凑齐就**不恢复**，并在状态栏写清原因（不会弹窗 ——\n"
-            "挂机时人往往不在屏幕前 ✓）。修好后自己点「开启自动」就行。\n\n"
-            "不勾就停在「已回到游戏、自动仍是关的」，由你自己决定。")
-        rc_form.addRow("", self.ck_rc_resume)
-
-        # ⚠ 「频道」（想进第几格）**不在这儿** ✗ —— 用户 2026-10-07 点名要放在
-        #   **主窗口 → 挂机保护页签 → 「断线重连」组**里 ✓（见 `player_panel._build_reconnect_group` ✓）；
-        #   一开始做进这里、位置不对 ✗ ⇒ 已搬走 ✓（**一处控件** ✓ 免得两个地方各显示一份 ✗）。
-
-        # ⭐⭐ 「点服务器 / 点频道」要点的**画面比例位置**（用户 2026-10-06 要求把这两个
-        #   需要鼠标的界面打通 ✓）。**存比例（0~1）、不存像素** ✓ —— 换分辨率 / 窗口
-        #   大小自动适配（同 HP/MP 条那套思路 ✓，见设计文档 §7）。
-        #   默认值是 2026-10-06 **从断线素材里量出来的**（不是目测 ✗）：服务器第 1 格
-        #   (698,245)@1920×1080、频道面板第 1 格 (788,550) ⇒ 见
-        #   `decision/reconnect.py::CLICK_TARGETS` 上面那段说明 ✓。
-        #   客户端布局不一样就改这里（重量：`python -X utf8 -m tools._probe_disc_frames
-        #   --bars --t 15.0 --region 660,480,640,300` ✓）。
-        def _ratio_spin(val):
-            w = NoWheelDoubleSpinBox()
-            w.setRange(0.0, 1.0)
-            w.setDecimals(4)
-            w.setSingleStep(0.005)
-            w.setValue(float(val))
-            return w
-
-        self.sp_rc_srv_x = _ratio_spin(settings.reconnect_server_x)
-        rc_row("服务器 X 比例", self.sp_rc_srv_x,
-               "「选择频道（服务器列表）」界面里，要点的那一格在**画面上的横向位置**，\n"
-               "写成 0~1 的比例（0 = 最左、1 = 最右）。\n\n"
-               "默认 0.3635 = 素材里「1.蓝蜗牛」那一格的中心 x=698（1920 宽）。\n"
-               "⚠ 存比例不存像素：换分辨率 / 窗口大小不用重配 ✓。")
-        self.sp_rc_srv_y = _ratio_spin(settings.reconnect_server_y)
-        rc_row("服务器 Y 比例", self.sp_rc_srv_y,
-               "同上，纵向比例（0 = 最上、1 = 最下）。\n\n"
-               "默认 0.2074 = 真机校正过的**格子中心**（1080 高下 y≈224）。\n"
-            "⚠ 旧默认 0.2269 是素材里**名字那一行**的中心（y=245）⇒ 落点偏下约 15px ✗"
-            "（2026-10-07 真机真点发现的 ✓ 见设计文档 §11）。")
-        self.sp_rc_chan_x = _ratio_spin(settings.reconnect_channel_x)
-        rc_row("频道 X 比例", self.sp_rc_chan_x,
-               "频道面板弹出的界面里，要点的那一格（默认 = 第 1 格「频道1」）的横向比例。\n\n"
-               "默认 0.4104 = 素材里第 1 格的中心 x=788。\n"
-               "⚠ 哪个频道都能进（用户口径 ✓）⇒ 只需要点中**任意一格**，不必对口某个频道。")
-        self.sp_rc_chan_y = _ratio_spin(settings.reconnect_channel_y)
-        rc_row("频道 Y 比例", self.sp_rc_chan_y,
-               "同上，纵向比例。默认 0.5093 = 素材里面板第 1 行的中心 y=550。")
-
-        # ⭐ 「鼠标标定」现状（**只读** ✓）：它是"能不能点"的另一半 ——
-        #   比例再准，没标定也**一个字节都不会发**（`decision/mouse_aim.py` ✓）。
-        #   放一行在这儿，是为了让"它为什么不点"在**界面上就能看见** ✓
-        #   （否则只能去翻日志 ✗）。
-        self.lbl_rc_gain = QLabel()
-        self.lbl_rc_gain.setWordWrap(True)
-        rc_form.addRow("鼠标标定", self.lbl_rc_gain)
-        self._refresh_rc_gain()
-
-        lay.addLayout(rc_form)
-
-        # 总开关关着时子参数灰掉（改它没意义）—— 和「追击起跳」那一组同一个做法
-        def _rc_enable(on):
-            for w in (self.sp_rc_probe, self.sp_rc_step, self.sp_rc_queue,
-                      self.sp_rc_retry, self.ck_rc_resume,
-                      self.sp_rc_srv_x, self.sp_rc_srv_y,
-                      self.sp_rc_chan_x, self.sp_rc_chan_y):
-                w.setEnabled(bool(on))
-        self.ck_reconnect.toggled.connect(_rc_enable)
-        _rc_enable(self.ck_reconnect.isChecked())
 
         lay.addStretch(1)
         return page
@@ -764,6 +685,13 @@ class SettingsDialog(QDialog):
         try:
             self._fill_goto_timeout_key()
         except Exception:      # noqa: BLE001 —— 填选项这种小事不该拦住整个设置窗 ✗
+            pass
+        # ⭐ 顺手把「链路」页的**当前文件值**重灌一遍（2026-10-09 ✓）：`link.yaml` 可能刚被
+        #   人手工改过 / 被部署台改过 ⇒ 不重灌的话，窗里显示的是**上次打开时**的旧值 ✗
+        #   （而保存时我又只写"与文件不同"的格 ✓ ⇒ 旧值会被当成"用户改的"写回去 ✗ 更糟 ✓）。
+        try:
+            self._sync_link_page()
+        except Exception:      # noqa: BLE001
             pass
 
     def _page_judge(self):
@@ -986,7 +914,213 @@ class SettingsDialog(QDialog):
         lay.addStretch(1)
         return page
 
-    # ---------------- 页签 4：诊断 ----------------
+    # ---------------- 页签 4：链路 ----------------
+
+    #: ⭐⭐ 「链路」页的字段表（**数据驱动** ✓ 加一格只要加一行 ✓）：
+    #: `(分组名, 分组说明, [(键, 标签, 控件, 提示), …])`
+    #:   · 键 = `"section.key"`；**顶层标量直接写键名**（`a_host` ✓ 见 `config.update_link` ✓）；
+    #:   · 控件 = `bool` / `int` / `float` / `text` / `choice:a|b|c` ✓。
+    #: ⚠ 只放**本来就该让人改**的格 ✓；`probe` 那组的位置值特意标注"框选优先" ✗
+    #:   （别让人以为手填就管事 ✓）。
+    _LINK_GROUPS = (
+        ("主机", "两台机器是谁。⚠ 改完要**重连**（面板上重选一次输入设备）或重启工作台才生效 ✓。", (
+            ("a_host", "A 机 IP（仿真 / 推流端）", "text",
+             "被控机（游戏机）的地址：键盘中继、小地图、对时都默认用它 ✓。"),
+            ("b_host", "B 机 IP（本机）", "text",
+             "工作机自己的地址；A 机推流打到这个 IP（OBS / 部署台卡片里填的也是它 ✓）。"),
+        )),
+        ("推流（A 机 → B 机）", "工作台看到的那幅画面从哪来、多大。", (
+            ("stream.protocol", "协议", "choice:udp|srt|rtsp", "默认 udp（局域网够用 ✓）。"),
+            ("stream.port", "端口", "int", "默认 5000；要和 A 机推流的输出端口一致 ✓。"),
+            ("stream.url", "监听 URL", "text",
+             "PyAV 直接用的地址（默认 udp://0.0.0.0:5000 ✓）。\n"
+             "⚠ 改端口通常**两处一起改**（这里 + 上面的「端口」✓）。"),
+            ("stream.format", "容器格式", "choice:mpegts|mjpeg",
+             "h264 推流用 mpegts ✓；mjpeg 裸流改成 mjpeg ✓（否则会报 InvalidDataError ✗）。"),
+            ("stream.width", "输出宽", "int",
+             "推流输出尺寸（默认 1366 ✓）。探针坐标 / 画面比例都按它算 ✓。"),
+            ("stream.height", "输出高", "int", "同上（默认 768 ✓）。"),
+            ("stream.fps", "帧率", "int", "要和 A 机推流的帧率对齐 ✓ 否则会重复帧 / 丢帧 ✓。"),
+        )),
+        ("键盘通道（Pro Micro）",
+         "⭐ **「两个工作台一个远程、一个本地」靠的就是下面两个串口格** ✓。", (
+            ("kbd.enabled", "启用远程键盘", "bool",
+             "勾上 = 按键走**远程 Pro Micro**（经中继）；不勾 = 本机 SendInput ✗（会打到本机自己 ✓）。"),
+            ("kbd.host", "中继 IP（游戏机）", "text",
+             "跑 remote_kbd/relay.py 的那台机器（默认同 A 机 IP ✓）。"),
+            ("kbd.port", "中继端口", "int", "默认 9000 ✓。"),
+            ("kbd.cert", "证书路径", "text",
+             "TLS 证书，默认 remote_kbd/certs/cert.pem ✓（随仓库带着 ✓）。"),
+            ("kbd.serial", "游戏机侧串口", "text",
+             "**只在游戏机跑中继时用**（agent 不用 ✓）：那台机器上 Pro Micro 的串口号，如 COM4 ✓。"),
+            ("kbd.serial_local", "本机串口（ProMicro(本地)）", "text",
+             "**面板选「ProMicro(本地)」时读的就是这一格** ✓（本机 USB 直连、不需要中继 ✓）。\n"
+             "⚠ 填错也未必连不上：程序会按 VID:PID 自动找板子 ✓（Leonardo 2341:8036/8037、"
+             "SparkFun Pro Micro 1B4F:9205/9206 ✓）—— 但填对更稳 ✓。"),
+        )),
+        ("小地图定位（寻路用）", "只在用「路线识别 → 小地图定位」时才起 ✓。", (
+            ("minimap.port", "端口", "int",
+             "A 机部署台「小地图推流」卡片监听的 TCP 口（默认 5003 ✓）。"),
+        )),
+        ("推流自检握手", "「推流自检」时 A、B 两边对表用的口。", (
+            ("sweep.port", "端口", "int",
+             "两边必须一致（对不上会一直退回「按清单顺序走」✗）；部署台环境自检会比对 ✓。"),
+        )),
+        ("双机对时", "测端到端延迟时 A、B 的时钟对齐。", (
+            ("clock_sync.server_port", "A 机监听端口", "int",
+             "A 机跑 tools/clock_server.py 监听它（默认 5001 ✓）。"),
+            ("clock_sync.samples", "采样次数", "int", "默认 200 ✓ 越大越稳、越慢 ✓。"),
+            ("clock_sync.interval_ms", "采样间隔(ms)", "int", "默认 10 ✓。"),
+        )),
+        ("屏幕时间码探针",
+         "⚠ **位置别手填**：实时预览页的「框选探针」会存成**画面比例**，并**优先于**这里 ✓。", (
+            ("probe.enabled", "启用探针", "bool", "关掉 = 整条「屏幕时间码」都不用了 ✓。"),
+            ("probe.x", "左上角 x（回退值）", "int", "没做过人工框选时才用这几个像素值 ✓。"),
+            ("probe.y", "左上角 y（回退值）", "int", "同上 ✓。"),
+            ("probe.cell", "方块边长(px)", "int",
+             "⚠ 必须 ≥ 16px：太小会把 40 位时间戳磨糊、解出**假值** ✗。"),
+            ("probe.gap", "方块间距(px)", "float", "实测「相邻方块中心距 = cell + gap」✓。"),
+            ("probe.bits", "位宽", "int", "时间戳位数（默认 40 ✓）。"),
+            ("probe.out_scale", "A→流 缩放比", "float",
+             "= 流分辨率 ÷ A 机屏幕**逻辑**分辨率（默认 0.8004 ✓）。\n"
+             "⚠ A 机分辨率 / DPI 变了就改这里，然后 B 机 re-solve 一次 ✓。"),
+        )),
+        ("路径", "录像 / 数据集放哪。", (
+            ("paths.record_dir", "录像目录", "text", "默认 data/recordings ✓（相对仓库根 ✓）。"),
+            ("paths.dataset_dir", "数据集目录", "text", "默认 data/datasets ✓。"),
+        )),
+    )
+
+    @staticmethod
+    def _link_cur(cfg, dotted):
+        """从读回来的配置里取某格的值（顶层标量 / 嵌套都吃 ✓）。"""
+        sec, _, key = dotted.partition(".")
+        if not key:
+            return cfg.get(sec)
+        return (cfg.get(sec) or {}).get(key)
+
+    @staticmethod
+    def _link_widget(kind):
+        """按类型造控件（**唯一一处** ✓ 加字段别在各处 new ✗）。"""
+        if kind == "bool":
+            return QCheckBox("启用")
+        if kind == "int":
+            w = NoWheelSpinBox()
+            w.setRange(0, 65535)
+            return w
+        if kind == "float":
+            w = NoWheelDoubleSpinBox()
+            w.setRange(0.0, 99.0)
+            # ⚠⚠ **小数位要够** ✗：`probe.out_scale` 是 `0.8004`（4 位 ✓）——
+            #   设成 3 位会被**截成 0.800** ⇒ 和文件一比"以为用户改过" ⇒ 一按确定就
+            #   把值**静默改坏** ✗（2026-10-09 实测逮到 ✓）。给 6 位，够用且不动原值 ✓。
+            w.setDecimals(6)
+            w.setSingleStep(0.05)
+            return w
+        if kind.startswith("choice:"):
+            w = NoWheelComboBox()
+            for c in kind.split(":", 1)[1].split("|"):
+                w.addItem(c, c)
+            return w
+        return QLineEdit()
+
+    def _page_link(self):
+        """页签 4：**链路**（`config/link.yaml` ✓ 2026-10-09 用户要求 ✓）。
+
+        为什么要有这一页 ✗：那份文件原来**只能手改** —— 尤其是"两个工作台、一个远程一个本地"
+        这种要动串口的场景（`kbd.serial` vs `kbd.serial_local` ✓）；手改还容易把注释写坏、
+        缩进写错（YAML 缩进错了**整份读不出来** ✗）。
+
+        ⚠ 写回**只改动的格** ✓，而且走 `core/config.update_link`（**逐行改、保注释** ✓）——
+          别在这儿自己 `yaml.safe_dump` 整写 ✗：那会把那份"说明书"全抹掉 ✓（见 `LIVE_CONFIG`
+          上面那行注释 ✓）。
+        """
+        page, lay = self._page()
+        self._link_widgets = {}
+        #: 每一格的**提示挂在哪**（给用例查"交互直观"用 ✓ 见 `_page_link` 里的规矩 ✓）
+        self._link_tip_holders = {}
+        #: 分组之间给一点空气感（视觉分组 ✓ docs/UI规范.md）
+        for _i, (title, note, rows) in enumerate(self._LINK_GROUPS):
+            box = QGroupBox(title)
+            form = QFormLayout(box)
+            form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if note:
+                tip = QLabel(note)
+                tip.setStyleSheet("color: #5f6368;")
+                tip.setWordWrap(True)
+                form.addRow("", tip)
+            for key, label, kind, hint in rows:
+                w = self._link_widget(kind)
+                if kind == "bool":
+                    # 勾选框：**它自己的文字就是字段名** ⇒ 提示挂它身上 ✓（没有独立标题 ✓）
+                    w.setToolTip(hint)
+                    self._link_tip_holders[key] = w
+                    form.addRow("", w)
+                else:
+                    # ⭐⭐ 规矩（`docs/UI规范.md` §6 / `gui.widgets.title_label` ✓）：
+                    #   **提示挂在「字段标题」上** ✓ 指标题看"这一格是干嘛的"；
+                    #   ⛔ **控件上不许再挂** ✗（两处都留 ⇒ 指控件弹两个框叠一起 ✓ 比不挂还糟）
+                    #   —— 2026-10-09 第一版就挂在控件上了 ✗（`check_ui` 的提示里报了 ✓）。
+                    lbl = title_label(label, hint)
+                    self._link_tip_holders[key] = lbl
+                    form.addRow(lbl, w)
+                self._link_widgets[key] = (w, kind)
+            if _i:
+                lay.addSpacing(2)
+            lay.addWidget(box)
+        self._sync_link_page()
+        lay.addStretch(1)
+        return page
+
+    def _sync_link_page(self):
+        """把 `link.yaml` 的**当前值**灌到控件上（建页时 + 每次露头都调 ✓）。"""
+        cfg = load_link()
+        for dotted, (w, kind) in getattr(self, "_link_widgets", {}).items():
+            cur = self._link_cur(cfg, dotted)
+            try:
+                if kind == "bool":
+                    w.setChecked(bool(cur))
+                elif kind == "int":
+                    w.setValue(int(cur if cur is not None else 0))
+                elif kind == "float":
+                    w.setValue(float(cur if cur is not None else 0.0))
+                elif kind.startswith("choice:"):
+                    i = w.findData(str(cur))
+                    w.setCurrentIndex(i if i >= 0 else 0)
+                else:
+                    w.setText("" if cur is None else str(cur))
+            except (TypeError, ValueError):
+                pass
+
+    def _collect_link(self) -> dict:
+        """收集「链路」页里**与文件不同的**那些格 ⇒ 交给 `update_link` ✓（没变的绝不写 ✓）。"""
+        cfg = load_link()
+        out = {}
+        for dotted, (w, kind) in self._link_widgets.items():
+            cur = self._link_cur(cfg, dotted)
+            if kind == "bool":
+                v = bool(w.isChecked())
+            elif kind == "int":
+                v = int(w.value())
+            elif kind == "float":
+                v = round(float(w.value()), 4)
+            elif kind.startswith("choice:"):
+                v = str(w.currentData())
+            else:
+                v = str(w.text()).strip()
+            # 比"有没有变"：数字按数比 ✓（`5000` 与 `"5000"` 不算变 ✓），其余按字符串 ✓
+            if isinstance(v, bool) or isinstance(cur, bool):
+                same = bool(cur) == v
+            else:
+                try:
+                    same = (float(cur) == float(v)) and not isinstance(v, str)
+                except (TypeError, ValueError):
+                    same = (str(cur) == str(v))
+            if not same:
+                out[dotted] = v
+        return out
+
+    # ---------------- 页签 5：诊断 ----------------
 
     def _page_diagnose(self):
         """排查问题用的开关。平常不用动这一页。"""
@@ -1138,30 +1272,6 @@ class SettingsDialog(QDialog):
         if not _ok:
             self.accept()                            # ⚠ **出错也必须关得掉** ✓
 
-    def _refresh_rc_gain(self):
-        """把「鼠标标定」现状写进那一行（**只读** ✓）。
-
-        判据只有一处：`decision.mouse_aim` 的**文件在不在 + 两个分量是不是正数**
-        （与真正点击时读的是同一份 ✓）—— 这里**不许自己再读一遍那份 json** ✗
-        （两处口径迟早分叉，本仓库踩过 ✓）。
-        """
-        try:
-            from decision import mouse_aim
-            g = mouse_aim.load_gain()
-            if g:
-                self.lbl_rc_gain.setText("已标定：%.4f / %.4f 画面像素每指令单位 ✓"
-                                         % (float(g[0]), float(g[1])))
-            else:
-                self.lbl_rc_gain.setText(
-                    "未标定 —— 点服务器 / 点频道这一步会**停在这里不动手**（不会乱点 ✗）。\n"
-                    "⚠ 在**跑工作台这台机器**上跑（不是游戏机 ✗ —— 鼠标指令会经 relay 打到游戏机 ✓）：\n"
-                    "    python -X utf8 -m tools.mouse_aim_calib\n"
-                    "跑之前：① **先停掉实时预览**（标定和它抢同一个 UDP 端口 ✗）；\n"
-                    "        ② 游戏停在**画面不动**的界面 + **鼠标指针可见**；\n"
-                    "        ③ 游戏机指针速度 6/11、关掉「提高指针精确度」。")
-        except Exception as e:                   # noqa: BLE001 —— 读不到就说读不到 ✓
-            self.lbl_rc_gain.setText("读不到标定状态：%s" % e)
-
     def _accept(self):
         # ---- 实时画面 · 地形叠加（2026-09-26 从路线识别页搬来的两项）----
         _draw = bool(self.ck_mmap_draw.isChecked())
@@ -1170,7 +1280,9 @@ class SettingsDialog(QDialog):
             update_live(mmap_draw=_draw)
         if self._map_id and _alpha != self._alpha0:
             try:
-                _src = mm.live_src(load_live())
+                # ⚠⚠ 同上：来源走**按地图 id**那份 ✓（`mm.live_src` 是全局的 ✗ ⇒
+                #   会把浓淡写进**另一条来源**那一格 ✓ 现场正是这么来的 ✓）。
+                _src = mm.source_for_map(self._map_id, load_live())
                 _cal = mapdata.load_calib(self._map_id, _src) or {}
                 _cal["alpha"] = _alpha
                 mapdata.save_calib(self._map_id, _cal, _src)
@@ -1195,44 +1307,10 @@ class SettingsDialog(QDialog):
         if t2 != settings.player_lost_timeout_min:
             settings.player_lost_timeout_min = t2
             settings.save()
-        # 断线自动重连
-        rc = self.ck_reconnect.isChecked()
-        if rc != bool(settings.reconnect_enabled):
-            settings.reconnect_enabled = rc
-            settings.save()
-        # 重连子参数（2026-09-26 新增到界面上）
-        rp = float(self.sp_rc_probe.value())
-        if rp != float(settings.reconnect_probe_after_lost_sec):
-            settings.reconnect_probe_after_lost_sec = rp
-            settings.save()
-        rs = int(self.sp_rc_step.value())
-        if rs != int(settings.reconnect_step_timeout_ms):
-            settings.reconnect_step_timeout_ms = rs
-            settings.save()
-        rq = int(self.sp_rc_queue.value())
-        if rq != int(settings.reconnect_queue_timeout_ms):
-            settings.reconnect_queue_timeout_ms = rq
-            settings.save()
-        rr = int(self.sp_rc_retry.value())
-        if rr != int(settings.reconnect_max_retry):
-            settings.reconnect_max_retry = rr
-            settings.save()
-        ra = bool(self.ck_rc_resume.isChecked())
-        if ra != bool(settings.reconnect_resume_auto):
-            settings.reconnect_resume_auto = ra
-            settings.save()
-        # ⚠ 「频道」不在这儿保存 ✗ —— 它由**主窗口「挂机保护」页**那个控件自己写回 ✓
-        #   （见 `player_panel._on_reconnect_channel` ✓ 一处控件一处落盘 ✓）。
-
-        # 「点服务器 / 点频道」的画面比例（2026-10-06 ✓）
-        for _attr, _w in (("reconnect_server_x", self.sp_rc_srv_x),
-                          ("reconnect_server_y", self.sp_rc_srv_y),
-                          ("reconnect_channel_x", self.sp_rc_chan_x),
-                          ("reconnect_channel_y", self.sp_rc_chan_y)):
-            _v = float(_w.value())
-            if _v != float(getattr(settings, _attr)):
-                setattr(settings, _attr, _v)
-                settings.save()
+        # ⚠⚠ **「断线自动重连」这一整组不在这儿保存** ✗（2026-10-09 ✓）：开关 / 子参数 /
+        #   四个比例 / 频道 全都搬到**主窗口「挂机保护」页 →「断线重连」组**了 ✓
+        #   —— 那边**一处控件一处落盘**（`player_panel._on_reconnect_param` 整组回写 ✓、
+        #   `_on_reconnect_channel` 单写频道 ✓）。这里再存一次就是**两处落盘** ✗（迟早打架 ✓）。
         # 定时清空按键
         t3 = self.sp_resetall.value()
         if t3 != settings.resetall_interval:
@@ -1302,6 +1380,10 @@ class SettingsDialog(QDialog):
         vis_cfg["player_arrow_len"] = int(self.sp_arrow_len.value())
         # ⭐ 箭头**尖大小**（用户 2026-09-28 ✓"再加个箭头 size 配置"）✓ 与长度同一段存 ✓
         vis_cfg["player_arrow_tip_pct"] = int(self.sp_arrow_tip.value())
+        # ⭐⭐ **x 箭头 = 玩家真实朝向**（用户 2026-10-10 ✓ 见 `theme.VIS_DEFAULTS` 那段说明 ✓）——
+        #   ⚠ 它是**改语义**的开关 ✗（不是"画不画"✓）⇒ 不放进下面那个 `_vis_on` 循环 ✗
+        #   （那批的读回语义是"缺省 ⇒ True"✗ 会把所有人的箭头默认改掉 ✗）。
+        vis_cfg["player_arrow_real_face"] = bool(self.ck_arrow_real_face.isChecked())
         # 每项的**显示开关**（用户 2026-09-27："辅助线与标记组里每项参数前加开关"）：
         # 和颜色存在同一段（`config/ui.yaml` 的 `vis:` ✓），`theme.load_vis` 一并读回 ✓
         vis_cfg.update({k: bool(ck.isChecked()) for k, ck in self._vis_on.items()})
@@ -1335,4 +1417,14 @@ class SettingsDialog(QDialog):
             winperf.apply()
         else:
             winperf.release()
+        # ⭐⭐ 「链路」页（2026-10-09 ✓）：**只写改动过的格** ✓，而且走 `update_link`
+        #   （**逐行改、保注释** ✓）—— `link.yaml` 是注释密集的说明书，整份 `safe_dump`
+        #   会把说明全抹掉 ✗（`live.yaml` 之所以单独成文件，就是为了躲这件事 ✓）。
+        #   ⚠ 写失败不拦：链路参数没存下去是坏事，但**不能连"关窗"都不让** ✗。
+        try:
+            _ch = self._collect_link()
+            if _ch:
+                update_link(**_ch)
+        except Exception:                       # noqa: BLE001
+            pass
         self.accept()
