@@ -19880,9 +19880,9 @@ def t_auto_measure_async_no_block():
         check("auto_measure_async" in _src,
               "`%s` 没走后台量 ✗ ⇒ 要是在回路上直接等 relay 回包就是**卡住实时回路** ✓"
               "（用户 2026-10-10 现场 ✓）" % _fn.__name__)
-        check("_AUTO_BUSY" in _src,
+        check("_auto_busy(" in _src,
               "`%s` 没查「正在后台量」✗ ⇒ 会跟量那个动作插在一起（量出来的数是错的 ✓）"
-              % _fn.__name__)
+              "（⚠ 走 `_auto_busy()` ✓ —— 它带**超时自愈** ✓ 见那条 ✓）" % _fn.__name__)
     _asrc = inspect.getsource(ma.auto_measure_async)
     check("threading.Thread(" in _asrc and "_AUTO_LOCK" in _asrc,
           "`auto_measure_async` 没起线程 / 没串行锁 ⇒ 还是卡回路（或两条量打架 ✓）")
@@ -19919,10 +19919,11 @@ def t_auto_measure_async_no_block():
         def cursor_probe():
             return (0, 0, 0, 0, 1920, 1080, (1920, 1080))
 
-    _o = (ma.dinput, ma._AUTO_BUSY)
+    _o = (ma.dinput, ma._AUTO_BUSY, ma._AUTO_BUSY_AT)
     try:
         ma.dinput = _Fake
         ma._AUTO_BUSY = True
+        ma._AUTO_BUSY_AT = time.monotonic()          # ⚠ 忙标记要带**时刻**（见下面自愈那条 ✓）
         for _call in (lambda: ma.click_ratio((540, 960, 3), 0.5, 0.5),
                       lambda: ma.aim_to((540, 960, 3), 0.5, 0.5),
                       lambda: ma.scroll(0, 1, (540, 960, 3), 0.5, 0.5)):
@@ -19930,6 +19931,14 @@ def t_auto_measure_async_no_block():
             check(_ok is False, "忙着量标定的时候还敢动鼠标 ✗：%r" % (_why,))
         check(_cmds == [],
               "忙着量标定的时候**发了指令** ✗（量到一半插进来 ⇒ 白量 + 点歪 ✓）：%r" % (_cmds,))
+
+        # ---- ⑥ ⭐⭐ **忙标记不许把鼠标永久锁死**（2026-10-10 ✓ 用户："进入选频道界面后
+        #      A 机的鼠标**没有被操控**" ✓ —— 忙标记万一卡住 ⇒ 三个出口全被挡 ⇒ 正是这一幕 ✓）----
+        ma._AUTO_BUSY = True
+        ma._AUTO_BUSY_AT = time.monotonic() - (ma.AUTO_BUSY_MAX_S + 5.0)   # 早就超时了 ✓
+        check(ma._auto_busy() is False,
+              "忙标记超时了还算「在忙」✗ ⇒ 鼠标会被**永久锁死**（用户看到的就是这个 ✓）")
+        ma._AUTO_BUSY = False
 
         # ---- ⑤ ⭐⭐⭐ **总开关默认必须是【关】**（2026-10-10 ✓ 同一句症状报了三次之后定的 ✓）----
         import json
@@ -19967,7 +19976,7 @@ def t_auto_measure_async_no_block():
         finally:
             ma.GAIN_PATH, ma._AUTO_BUSY = _o2
     finally:
-        ma.dinput, ma._AUTO_BUSY = _o
+        ma.dinput, ma._AUTO_BUSY, ma._AUTO_BUSY_AT = _o
 
 
 CHECKS = [

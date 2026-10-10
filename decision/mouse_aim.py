@@ -376,6 +376,24 @@ def auto_measure(frame_shape, force=False):
 
 #: 自动量**正在后台跑**吗 ✓（跑的时候**谁都不许再动鼠标** ✗ —— 两步插在一起就白量了 ✓）。
 _AUTO_BUSY = False
+#: 忙标记是**什么时候**立起来的（见 `AUTO_BUSY_MAX_S` ✓）。
+_AUTO_BUSY_AT = 0.0
+#: ⭐⭐ 忙标记最多算"忙"这么久（秒 ✓）—— **自愈** ✓。
+#: ⚠⚠ 为什么必须有它（2026-10-10 ✓ 用户："**进入选频道界面后 A 机的鼠标没有被操控**" ✓）：
+#:   只要忙标记**被永久卡住**（那条线程出意外没走到 `finally` ✓）⇒ 三个鼠标出口
+#:   （点 / 瞄 / 滚 ✓）就**永远返回"正在后台自动量"** ✗ ⇒ 表现就是"**鼠标完全没被操控**"✓
+#:   —— 正好是用户看到的那一幕 ✓。⇒ 超时就当它**没在忙** ✓（宁可偶尔让两步插一下，
+#:   也绝不把鼠标**永久锁死** ✗ 那等于这个功能废了 ✓）。
+AUTO_BUSY_MAX_S = 30.0
+
+
+def _auto_busy():
+    """现在**真的**在量吗 ✓（超过 `AUTO_BUSY_MAX_S` 没动静 ⇒ 当它没在忙 ✓ 见那段说明 ✓）。"""
+    if not _AUTO_BUSY:
+        return False
+    if (time.monotonic() - _AUTO_BUSY_AT) > AUTO_BUSY_MAX_S:
+        return False
+    return True
 #: 自动量的串行锁（同一时刻只允许一条量 ✓）。
 _AUTO_LOCK = threading.Lock()
 #: ⭐⭐ 失败记忆：帧尺寸键 → `(时刻, 人话)` ⇒ **冷却期内不再重试** ✓（见 `AUTO_RETRY_S` ✓）。
@@ -427,7 +445,7 @@ def auto_measure_async(frame_shape):
     ⚠⚠⚠ **失败不许当没发生** ✗（那是"每拍都撞一次角"的根 ✓ 见 `_AUTO_FAIL` ✓）：
       记下失败 + 冷却 + 最多 `AUTO_MAX_TRIES` 次 ✓ ⇒ 试完就**明说"请手工量一次"** ✓。
     """
-    global _AUTO_BUSY
+    global _AUTO_BUSY, _AUTO_BUSY_AT
     key = gain_frame_key(frame_shape)
     if not key:
         return False, "拿不到画面尺寸"
@@ -440,7 +458,7 @@ def auto_measure_async(frame_shape):
                        "`python -X utf8 -m tools.mouse_aim_calib --source stream` ✓"
                        "（要开自动量：在 `config/mouse_gain.json` 里加一行 "
                        "`\"auto_measure\": true` ✓）")
-    if _AUTO_BUSY:
+    if _auto_busy():
         return False, "正在**后台自动量**标定 ✓ ⇒ 这一拍不动鼠标 ✓（量完下一拍就能点 ✓）"
     _t, _why = _AUTO_FAIL.get(key, (0.0, ""))
     if _why:
@@ -454,10 +472,11 @@ def auto_measure_async(frame_shape):
             return False, ("刚自动量过没成（%s）⇒ **%.0f 秒内不再试** ✓（免得一直挪鼠标 ✓）"
                            % (_why, AUTO_RETRY_S))
     _AUTO_BUSY = True
+    _AUTO_BUSY_AT = time.monotonic()          # ⚠ 记时刻 ⇒ 超时自愈 ✓
     _AUTO_TRIES[key] = _AUTO_TRIES.get(key, 0) + 1
 
     def _run():
-        global _AUTO_BUSY
+        global _AUTO_BUSY, _AUTO_BUSY_AT
         try:
             with _AUTO_LOCK:
                 _ok, _w = auto_measure(frame_shape, force=True)
@@ -467,6 +486,7 @@ def auto_measure_async(frame_shape):
             _AUTO_FAIL[key] = (time.monotonic(), "%s: %s" % (type(e).__name__, e))
         finally:
             _AUTO_BUSY = False
+            _AUTO_BUSY_AT = 0.0
 
     threading.Thread(target=_run, daemon=True, name="mouse-auto-measure").start()
     return True, ("正在**后台**自动量这个尺寸的鼠标标定 ✓（这一拍先不动鼠标 ✓"
@@ -671,7 +691,7 @@ def scroll(up=0, down=0, frame_shape=None, xr=None, yr=None, origin=None):
     moved = ""
     if frame_shape is not None and xr is not None and yr is not None:
         h, w = int(frame_shape[0]), int(frame_shape[1])
-        if _AUTO_BUSY:
+        if _auto_busy():
             # ⚠ 后台正在量标定 ⇒ **连光标都不许挪** ✗（见 `_AUTO_BUSY` ✓）
             return False, ("正在**后台自动量**鼠标标定 ✓ ⇒ 这一拍先不动 ✓"
                            "（量完下一拍就能点 ✓）")
@@ -761,7 +781,7 @@ def aim_to(frame_shape, xr, yr, gain=None, origin=None):
     global _AIM_TGT, _AIM_TGT_AT
     if frame_shape is None or len(frame_shape) < 2:
         return False, "拿不到画面尺寸"
-    if _AUTO_BUSY:
+    if _auto_busy():
         # ⚠⚠ 后台正在量标定（那条线程在动鼠标 ✓）⇒ 这里**一个字都不许发** ✗
         #   （两步插在一起 ⇒ 量出来的数是错的 ✓ 而且点也点不准 ✓）
         return False, ("正在**后台自动量**鼠标标定 ✓ ⇒ 这一拍先不动鼠标 ✓"
@@ -776,7 +796,7 @@ def aim_to(frame_shape, xr, yr, gain=None, origin=None):
         #   ⇒ 这一拍先不动鼠标、**下一拍量好了就接着点** ✓（状态机本来就会重试 ✓）；
         #   只有"**起不来**"（冷却中 / 看不见光标 ✓）才回落到"说清 + 不点" ✓。
         _am_ok, _am_why = auto_measure_async(frame_shape)
-        if _am_ok or _AUTO_BUSY:
+        if _am_ok or _auto_busy():
             return False, (_am_why or "正在**后台自动量**标定 ✓ ⇒ 这一拍不动鼠标 ✓")
         gain = load_gain(frame_shape)
         if not gain:
@@ -855,7 +875,7 @@ def click_ratio(frame_shape, xr, yr, gain=None, origin=None):
     """
     if frame_shape is None or len(frame_shape) < 2:
         return False, "拿不到画面尺寸"
-    if _AUTO_BUSY:
+    if _auto_busy():
         # ⚠⚠ 后台正在量标定（那条线程在动鼠标 ✓）⇒ 这里**一个字都不许发** ✗
         #   （两步插在一起 ⇒ 量出来的数是错的 ✓ 而且点也点不准 ✓）
         return False, ("正在**后台自动量**鼠标标定 ✓ ⇒ 这一拍先不动鼠标 ✓"
@@ -870,7 +890,7 @@ def click_ratio(frame_shape, xr, yr, gain=None, origin=None):
         #   ⇒ 这一拍先不动鼠标、**下一拍量好了就接着点** ✓（状态机本来就会重试 ✓）；
         #   只有"**起不来**"（冷却中 / 看不见光标 ✓）才回落到"说清 + 不点" ✓。
         _am_ok, _am_why = auto_measure_async(frame_shape)
-        if _am_ok or _AUTO_BUSY:
+        if _am_ok or _auto_busy():
             return False, (_am_why or "正在**后台自动量**标定 ✓ ⇒ 这一拍不动鼠标 ✓")
         gain = load_gain(frame_shape)
         if not gain:
