@@ -393,6 +393,26 @@ AUTO_MAX_TRIES = 3
 _AUTO_TRIES = {}
 
 
+#: ⭐⭐⭐ **自动量的总开关 —— 默认【关】** ✓✓（2026-10-10 第三次现场之后定的 ✓）。
+#:   用户原话（**同一句报了三次**）："**A 机鼠标停在左上角不动了**" ✓
+#:   ⇒ 猜了两次都没到根 ✗ ⇒ 那就**先把这个会动鼠标的新功能关掉** ✓（它一关，
+#:     行为就回到"老样子"：没量过 ⇒ **说清 + 不点** ✓ 鼠标绝不会自己跑 ✓）
+#:   ⇒ 想开：把 `config/mouse_gain.json` 里的 `"auto_measure": true` 写上 ✓
+#:     （找不到这个键 / 读不出来 ⇒ **当关** ✓ 安全的一侧做默认 ✓）。
+#:   ⚠ 开着它才可能动鼠标 ✓；关着的时候 `auto_measure_async` **一个字节都不发** ✗。
+AUTO_MEASURE_DEFAULT = False
+
+
+def auto_measure_enabled():
+    """自动量开着吗 ⇒ 读 `config/mouse_gain.json` 的 `"auto_measure"` ✓（缺省 / 读不出来 ⇒ **关** ✓）。"""
+    import json
+    try:
+        d = json.loads(GAIN_PATH.read_text(encoding="utf-8"))
+        return bool(d.get("auto_measure", AUTO_MEASURE_DEFAULT))
+    except Exception:                            # noqa: BLE001 —— 读不出来 ⇒ 当关 ✓
+        return AUTO_MEASURE_DEFAULT
+
+
 def auto_measure_async(frame_shape):
     """⭐ **后台**量一次 ✓（**实时回路绝不许阻塞** ✗）⇒ `(是否已起, 人话)` ✓。
 
@@ -411,6 +431,15 @@ def auto_measure_async(frame_shape):
     key = gain_frame_key(frame_shape)
     if not key:
         return False, "拿不到画面尺寸"
+    if not auto_measure_enabled():
+        # ⭐⭐⭐ **默认关** ✓（见 `AUTO_MEASURE_DEFAULT` ✓）—— 关着就**一个字节都不发** ✗
+        #   用户 2026-10-10 同一句报了三次 ⇒ 先把"会动鼠标"的新功能退出去 ✓
+        #   （退出去之后：没量过 ⇒ 老样子「说清 + 不点」✓ 鼠标绝不会自己跑 ✓）。
+        return False, ("自动量鼠标标定**当前是关的** ✓（怕再出现「A 机鼠标卡在左上角」✓）"
+                       "⇒ 这个尺寸**手工量一次**："
+                       "`python -X utf8 -m tools.mouse_aim_calib --source stream` ✓"
+                       "（要开自动量：在 `config/mouse_gain.json` 里加一行 "
+                       "`\"auto_measure\": true` ✓）")
     if _AUTO_BUSY:
         return False, "正在**后台自动量**标定 ✓ ⇒ 这一拍不动鼠标 ✓（量完下一拍就能点 ✓）"
     _t, _why = _AUTO_FAIL.get(key, (0.0, ""))

@@ -19930,6 +19930,42 @@ def t_auto_measure_async_no_block():
             check(_ok is False, "忙着量标定的时候还敢动鼠标 ✗：%r" % (_why,))
         check(_cmds == [],
               "忙着量标定的时候**发了指令** ✗（量到一半插进来 ⇒ 白量 + 点歪 ✓）：%r" % (_cmds,))
+
+        # ---- ⑤ ⭐⭐⭐ **总开关默认必须是【关】**（2026-10-10 ✓ 同一句症状报了三次之后定的 ✓）----
+        import json
+        import tempfile
+        from pathlib import Path
+        _tmp = Path(tempfile.mkdtemp()) / "gain.json"
+        _o2 = (ma.GAIN_PATH, ma._AUTO_BUSY)
+        try:
+            ma.GAIN_PATH = _tmp
+            ma._AUTO_BUSY = False
+            check(ma.auto_measure_enabled() is False,
+                  "文件都没有 ⇒ 自动量必须是**关**的（安全的一侧做默认 ✓）")
+            _ok, _why = ma.auto_measure_async((540, 960, 3))
+            check(_ok is False and ma._AUTO_BUSY is False,
+                  "**关着的时候**还起了量 ✗ ⇒ 它会在后台动鼠标（用户三次报的就是这个 ✓）：%r"
+                  % (_why,))
+            check("关" in _why and "mouse_aim_calib" in _why,
+                  "关着时要说清「手工量一次」+ 怎么开 ✓：%r" % (_why,))
+            # 文件里显式写 true ⇒ 这才允许起
+            _tmp.write_text(json.dumps({"auto_measure": True, "gain_x": 1.0, "gain_y": 1.0}),
+                            encoding="utf-8")
+            check(ma.auto_measure_enabled() is True, "写了 true 却还判成关 ✗")
+            _o3 = ma.auto_measure
+            ma.auto_measure = lambda *_a, **_k: (False, "替身：不在用例里真动鼠标")
+            try:
+                _ok2, _why2 = ma.auto_measure_async((540, 960, 3))
+                check(_ok2 is True, "开了 true 却不起量 ✗：%r" % (_why2,))
+                for _ in range(100):                 # 等那条后台线程收干净（最多 1 秒 ✓）
+                    if not ma._AUTO_BUSY:
+                        break
+                    time.sleep(0.01)
+                check(not ma._AUTO_BUSY, "后台那条线程跑完了却没收掉忙标记 ✗")
+            finally:
+                ma.auto_measure = _o3
+        finally:
+            ma.GAIN_PATH, ma._AUTO_BUSY = _o2
     finally:
         ma.dinput, ma._AUTO_BUSY = _o
 
