@@ -690,7 +690,16 @@ def bridge(conn, link):
                 #   还会污染 `DONE/ERR` 回执计数 ✓）⇒ 由 relay 自己答 ✓（见 `CURSOR_QUERY` ✓）。
                 data = data.replace(CURSOR_QUERY, b"")
                 try:
-                    conn.sendall((cursor_reply_text() + "\n").encode("ascii"))
+                    # ⚠⚠⚠ **必须和别的写者共用 `_SEND_LOCK`** ✗✗ —— 2026-10-10 现场：
+                    #   我这里原来直接 `conn.sendall` ✗ ⇒ 和 `ser_to_tcp`（固件回执 ✓）/
+                    #   `trace`（日志回传 ✓）**同时写同一条 TLS** ⇒ **写出坏记录 ⇒ 整条链烂掉**
+                    #   ✓ ⇒ 表现正是用户报的「**A 机鼠标停在左上角不动了**」✗
+                    #   （最后一条指令是"撞角归零"⇒ 光标就停在那儿 ✓ 之后一个字节都过不去 ✓）。
+                    #   ⇒ 规矩就写在 `_SEND_LOCK` 的注释里 ✓（"所有对客户端的 sendall 共用这把锁"✓）
+                    #   ⚠ 这条回包**不走 `_push_to_client` 队列** ✗（队列满了会**丢最旧** ✓
+                    #     而 B 正等着这一条 ✓ 被丢了就是"光标问不到"✓）⇒ 直接发 ✓、只在锁里 ✓。
+                    with _SEND_LOCK:
+                        conn.sendall((cursor_reply_text() + "\n").encode("ascii"))
                 except Exception:                # noqa: BLE001 —— 回不了就当没问过 ✓
                     pass
                 if not data:

@@ -19737,6 +19737,14 @@ def t_cursor_protocol_both_sides():
     check("parse_cursor_line" in inspect.getsource(kc.KbdClient._drain),
           "读线程没挑 `CUR` 回包 ⇒ `cursor()` 永远超时 ✓")
 
+    # ---- ⑤ ⚠⚠ **回包必须在 `_SEND_LOCK` 里**（2026-10-10 现场："A 机鼠标停在左上角不动了"✗）----
+    #   relay 自己的注释写着：回程有**两个写者**（固件回执 + 日志回传 ✓）⇒ 不共用锁就会
+    #   **写出坏 TLS 记录 ⇒ 整条链烂掉** ✓ —— 我第一版正是漏了它 ✗（直接 `conn.sendall` ✓）。
+    _send_seg = _bs[_bs.find("CURSOR_QUERY in data"):_bs.find("link.write(data)")]
+    check("with _SEND_LOCK:" in _send_seg,
+          "回 `CUR …` 没在 `_SEND_LOCK` 里 ✗ ⇒ 和回程那两个写者撞同一条 TLS ⇒ "
+          "**写出坏记录、整条链烂掉**（用户现场：A 机光标卡在左上角 ✓）")
+
 
 def t_auto_measure_selfcalib():
     """⭐⭐⭐ 帧尺寸没量过 ⇒ **自己量一次**（用户 2026-10-10："**两边一起**" ✓）。
@@ -19826,6 +19834,75 @@ def t_auto_measure_selfcalib():
               "1:1 时该是 2.0（一单位走 2 屏幕像素 ✓）：%r" % (_g5,))
     finally:
         (ma.GAIN_PATH, ma.dinput, ma._AUTO_LAST, ma.corner_zero) = _o
+
+
+def t_auto_measure_async_no_block():
+    """⭐⭐⭐ 自动量**绝不许卡住实时回路**（2026-10-10 ✓ 用户："**A 机鼠标停在左上角不动了**"✗）。
+
+    两处都是我引入的 ✗（这一条把它们钉死 ✓）：
+      ① A 机 relay 里我直接 `conn.sendall` ✓ **绕过了 `_SEND_LOCK`** ✗ ⇒ 和 `ser_to_tcp`
+         （固件回执 ✓）/ `trace`（日志回传 ✓）同时写同一条 **TLS** ⇒ **写出坏记录 ⇒
+         整条链烂掉** ✓（relay 的注释就写着这一条 ✓）⇒ 最后一条指令是"撞角归零" ⇒
+         光标停在那儿不动 ✓ —— 用户看到的就是这个 ✓（那条锁的钉在
+         `t_cursor_protocol_both_sides` ⑤ ✓）；
+      ② `auto_measure` 要**等两次 relay 回包**（各最多 0.8 秒 ✓）✗ 而它跑在**实时回路**
+         那条线程里 ✓ —— 本仓库硬规矩：「实时回路**不许 sleep / 不许阻塞**」✗
+         （睡一下就是丢帧 / 指令积压 ✓ 同 `click_ratio` 的说明 ✓）。
+
+    钉三件：
+      ① 三个鼠标出口（点 / 瞄 / 滚）走的是 **`auto_measure_async`** ✓，
+         **不许**在回路上直接调阻塞版的 `auto_measure` ✗（源码级 ✓）；
+      ② `auto_measure_async` 起的必须是**线程** ✓ + 同一时刻只有一条 ✓（`_AUTO_LOCK` ✓）；
+      ③ **量的时候**（`_AUTO_BUSY` ✓）三个出口**一个字都不发** ✗（两步插在一起就白量 ✓）。
+    """
+    import inspect
+
+    import decision.mouse_aim as ma
+
+    # ---- ①③ 源码级 ----
+    for _fn in (ma.click_ratio, ma.aim_to, ma.scroll):
+        _src = inspect.getsource(_fn)
+        check("auto_measure_async" in _src,
+              "`%s` 没走后台量 ✗ ⇒ 要是在回路上直接等 relay 回包就是**卡住实时回路** ✓"
+              "（用户 2026-10-10 现场 ✓）" % _fn.__name__)
+        check("_AUTO_BUSY" in _src,
+              "`%s` 没查「正在后台量」✗ ⇒ 会跟量那个动作插在一起（量出来的数是错的 ✓）"
+              % _fn.__name__)
+    _asrc = inspect.getsource(ma.auto_measure_async)
+    check("threading.Thread(" in _asrc and "_AUTO_LOCK" in _asrc,
+          "`auto_measure_async` 没起线程 / 没串行锁 ⇒ 还是卡回路（或两条量打架 ✓）")
+    check("_AUTO_BUSY = True" in _asrc and "_AUTO_BUSY = False" in _asrc,
+          "`auto_measure_async` 没把忙标记立起来 / 收干净 ✗")
+
+    # ---- ② 行为级：忙着的时候**一个字节都不发** ----
+    _cmds = []
+
+    class _Fake:
+        @staticmethod
+        def mouse_available():
+            return True
+
+        @staticmethod
+        def mouse_move(dx, dy):
+            _cmds.append((dx, dy))
+
+        @staticmethod
+        def cursor_probe():
+            return (0, 0, 0, 0, 1920, 1080, (1920, 1080))
+
+    _o = (ma.dinput, ma._AUTO_BUSY)
+    try:
+        ma.dinput = _Fake
+        ma._AUTO_BUSY = True
+        for _call in (lambda: ma.click_ratio((540, 960, 3), 0.5, 0.5),
+                      lambda: ma.aim_to((540, 960, 3), 0.5, 0.5),
+                      lambda: ma.scroll(0, 1, (540, 960, 3), 0.5, 0.5)):
+            _ok, _why = _call()
+            check(_ok is False, "忙着量标定的时候还敢动鼠标 ✗：%r" % (_why,))
+        check(_cmds == [],
+              "忙着量标定的时候**发了指令** ✗（量到一半插进来 ⇒ 白量 + 点歪 ✓）：%r" % (_cmds,))
+    finally:
+        ma.dinput, ma._AUTO_BUSY = _o
 
 
 CHECKS = [
@@ -20164,6 +20241,9 @@ CHECKS = [
     ("⭐⭐⭐ 帧尺寸没量过 ⇒ **自己量一次**（撞角→读光标→走一步→再读→按尺寸存；看不见光标/折算比"
      "算不出 ⇒ 不写不猜）",
      t_auto_measure_selfcalib),
+    ("⭐⭐⭐ 自动量绝不许卡住实时回路（后台线程 + 忙时谁都不许动鼠标）"
+     "—— 用户 2026-10-10「A 机鼠标停在左上角不动了」的复盘",
+     t_auto_measure_async_no_block),
     ("⭐⭐ 下跳被打断 ⇒ 回来**重头开始**（2026-10-08 用户：进 attack 要切断、打完从"
      "「当前 foothold 是否可下跳」重判）：回入口 · 重新挑 fh · 那一拍不按键 · 短打断不算",
      t_drop_restart_after_attack),

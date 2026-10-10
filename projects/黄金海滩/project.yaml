@@ -121,7 +121,7 @@ decision:
   - 2500
   atk_target_count: 1
   mob_atk_cd_ms: 2000
-  input_device: local
+  input_device: remote
   attack_cd: 800
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 400

@@ -43,6 +43,7 @@
 两个读者读的是**同一个文件、同一套单位**（"px/单位" ✓）。
 """
 
+import threading
 import time
 from pathlib import Path
 
@@ -341,6 +342,45 @@ def auto_measure(frame_shape, force=False):
                   % (gx, gy, dx_px / float(AUTO_STEP), dy_px / float(AUTO_STEP), sx, key))
 
 
+#: 自动量**正在后台跑**吗 ✓（跑的时候**谁都不许再动鼠标** ✗ —— 两步插在一起就白量了 ✓）。
+_AUTO_BUSY = False
+#: 自动量的串行锁（同一时刻只允许一条量 ✓）。
+_AUTO_LOCK = threading.Lock()
+
+
+def auto_measure_async(frame_shape):
+    """⭐ **后台**量一次 ✓（**实时回路绝不许阻塞** ✗）⇒ `(是否已起, 人话)` ✓。
+
+    ⚠⚠ 为什么必须有它（2026-10-10 ✓ 现场："**A 机鼠标停在左上角不动了**" ✓ 查出来的
+      第二处 ✗ 也是我引入的）：量一次要**读两次光标** ✓，远端那两次是**等 relay 回包** ✓
+      （`KbdClient.cursor` 各等最多 0.8 秒 ✓）⇒ 直接在**实时回路**那条线程里做 ⇒
+      它被卡住一两秒 ✗ —— 而本仓库的硬规矩是「**实时回路不许 sleep / 不许阻塞**」✗
+      （见 `click_ratio` 的说明 ✓：睡一下就是丢帧 / 积压 ✓）。
+      ⇒ 挪到后台 ✓；代价是**这一拍点不了** ✓（返回 False 并说清"正在量"✓）
+      ⇒ 量完存下 ✓ ⇒ **下一拍**（重连状态机本来就会重试 ✓）就正常点了 ✓。
+    """
+    global _AUTO_BUSY
+    if not gain_frame_key(frame_shape):
+        return False, "拿不到画面尺寸"
+    if _AUTO_BUSY:
+        return False, "正在**后台自动量**标定 ✓ ⇒ 这一拍不动鼠标 ✓（量完下一拍就能点 ✓）"
+    _AUTO_BUSY = True
+
+    def _run():
+        global _AUTO_BUSY
+        try:
+            with _AUTO_LOCK:
+                auto_measure(frame_shape, force=True)
+        except Exception:                        # noqa: BLE001 —— 后台线程不许把谁炸了 ✗
+            pass
+        finally:
+            _AUTO_BUSY = False
+
+    threading.Thread(target=_run, daemon=True, name="mouse-auto-measure").start()
+    return True, ("正在**后台**自动量这个尺寸的鼠标标定 ✓（这一拍先不动鼠标 ✓"
+                  "量完下一拍就能点 ✓）")
+
+
 def gain_warn(frame_w=None):
     """**这一帧要不要提醒"标定不是在这路画面上量的"** ⇒ 人话；不用提醒 ⇒ "" ✓。
 
@@ -539,12 +579,18 @@ def scroll(up=0, down=0, frame_shape=None, xr=None, yr=None, origin=None):
     moved = ""
     if frame_shape is not None and xr is not None and yr is not None:
         h, w = int(frame_shape[0]), int(frame_shape[1])
+        if _AUTO_BUSY:
+            # ⚠ 后台正在量标定 ⇒ **连光标都不许挪** ✗（见 `_AUTO_BUSY` ✓）
+            return False, ("正在**后台自动量**鼠标标定 ✓ ⇒ 这一拍先不动 ✓"
+                           "（量完下一拍就能点 ✓）")
         gain = load_gain(frame_shape)     # ⚠ 按**帧尺寸**取那一份 ✓
         if not gain:
-            # ⭐⭐ 同上：这个尺寸没量过 ⇒ **先自己量一次** ✓（见 `auto_measure` ✓）
-            _am_ok, _am_why = auto_measure(frame_shape)
+            # ⭐⭐ 同上：这个尺寸没量过 ⇒ **起后台线程自己量** ✓（见 `auto_measure_async` ✓）
+            _am_ok, _am_why = auto_measure_async(frame_shape)
             if _am_ok:
-                gain = load_gain(frame_shape)
+                return False, (_am_why
+                               or "正在**后台自动量**标定 ✓ ⇒ 这一拍不动鼠标 ✓")
+            gain = load_gain(frame_shape)
         if not gain:
             # 量不了 ⇒ **连光标都不挪** ✗（歪着滚 = 在别的地方滚 ✓）
             _blk, _blk_why = gain_mismatch_block(frame_shape)
@@ -623,16 +669,24 @@ def aim_to(frame_shape, xr, yr, gain=None, origin=None):
     global _AIM_TGT, _AIM_TGT_AT
     if frame_shape is None or len(frame_shape) < 2:
         return False, "拿不到画面尺寸"
+    if _AUTO_BUSY:
+        # ⚠⚠ 后台正在量标定（那条线程在动鼠标 ✓）⇒ 这里**一个字都不许发** ✗
+        #   （两步插在一起 ⇒ 量出来的数是错的 ✓ 而且点也点不准 ✓）
+        return False, ("正在**后台自动量**鼠标标定 ✓ ⇒ 这一拍先不动鼠标 ✓"
+                       "（量完下一拍就能点 ✓）")
     h, w = int(frame_shape[0]), int(frame_shape[1])
     if gain is None:
         gain = load_gain(frame_shape)     # ⚠ 按**帧尺寸**取那一份 ✓（见 `load_gain` ✓）
     if not gain:
-        # ⭐⭐ **这个尺寸没量过 ⇒ 先自己量一次** ✓（用户 2026-10-10："**不能自动吗？**"✓
-        #   见 `auto_measure` ✓）：**能量就量**（看得见光标 ✓ 折算比是真数 ✓）⇒ 量完接着点 ✓；
-        #   **量不了**（看不见光标 / 折算比算不出来 ✓）⇒ 才回落到"说清 + 不点" ✓。
-        _am_ok, _am_why = auto_measure(frame_shape)
-        if _am_ok:
-            gain = load_gain(frame_shape)
+        # ⭐⭐ **这个尺寸没量过 ⇒ 起一条后台线程自己量** ✓（用户 2026-10-10："**不能自动吗？**"✓
+        #   见 `auto_measure_async` ✓）：⚠ **绝不在实时回路上等** ✗（等一次最多 1.6 秒 ✗
+        #   ⇒ 那条线程被卡住 = 丢帧 / 指令积压 ✓ 本仓库硬规矩 ✓）
+        #   ⇒ 这一拍先不动鼠标、**下一拍量好了就接着点** ✓（状态机本来就会重试 ✓）；
+        #   只有"**起不来**"（冷却中 / 看不见光标 ✓）才回落到"说清 + 不点" ✓。
+        _am_ok, _am_why = auto_measure_async(frame_shape)
+        if _am_ok or _AUTO_BUSY:
+            return False, (_am_why or "正在**后台自动量**标定 ✓ ⇒ 这一拍不动鼠标 ✓")
+        gain = load_gain(frame_shape)
         if not gain:
             _blk, _blk_why = gain_mismatch_block(frame_shape)
             return False, ((_blk_why or "鼠标没标定（缺 config/mouse_gain.json）")
@@ -709,16 +763,24 @@ def click_ratio(frame_shape, xr, yr, gain=None, origin=None):
     """
     if frame_shape is None or len(frame_shape) < 2:
         return False, "拿不到画面尺寸"
+    if _AUTO_BUSY:
+        # ⚠⚠ 后台正在量标定（那条线程在动鼠标 ✓）⇒ 这里**一个字都不许发** ✗
+        #   （两步插在一起 ⇒ 量出来的数是错的 ✓ 而且点也点不准 ✓）
+        return False, ("正在**后台自动量**鼠标标定 ✓ ⇒ 这一拍先不动鼠标 ✓"
+                       "（量完下一拍就能点 ✓）")
     h, w = int(frame_shape[0]), int(frame_shape[1])
     if gain is None:
         gain = load_gain(frame_shape)     # ⚠ 按**帧尺寸**取那一份 ✓（见 `load_gain` ✓）
     if not gain:
-        # ⭐⭐ **这个尺寸没量过 ⇒ 先自己量一次** ✓（用户 2026-10-10："**不能自动吗？**"✓
-        #   见 `auto_measure` ✓）：**能量就量**（看得见光标 ✓ 折算比是真数 ✓）⇒ 量完接着点 ✓；
-        #   **量不了**（看不见光标 / 折算比算不出来 ✓）⇒ 才回落到"说清 + 不点" ✓。
-        _am_ok, _am_why = auto_measure(frame_shape)
-        if _am_ok:
-            gain = load_gain(frame_shape)
+        # ⭐⭐ **这个尺寸没量过 ⇒ 起一条后台线程自己量** ✓（用户 2026-10-10："**不能自动吗？**"✓
+        #   见 `auto_measure_async` ✓）：⚠ **绝不在实时回路上等** ✗（等一次最多 1.6 秒 ✗
+        #   ⇒ 那条线程被卡住 = 丢帧 / 指令积压 ✓ 本仓库硬规矩 ✓）
+        #   ⇒ 这一拍先不动鼠标、**下一拍量好了就接着点** ✓（状态机本来就会重试 ✓）；
+        #   只有"**起不来**"（冷却中 / 看不见光标 ✓）才回落到"说清 + 不点" ✓。
+        _am_ok, _am_why = auto_measure_async(frame_shape)
+        if _am_ok or _AUTO_BUSY:
+            return False, (_am_why or "正在**后台自动量**标定 ✓ ⇒ 这一拍不动鼠标 ✓")
+        gain = load_gain(frame_shape)
         if not gain:
             _blk, _blk_why = gain_mismatch_block(frame_shape)
             return False, ((_blk_why or "鼠标没标定（缺 config/mouse_gain.json）")
