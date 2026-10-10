@@ -19731,9 +19731,12 @@ def t_cursor_protocol_both_sides():
 
     # ---- ④⑤ 客户端这半边 ----
     _cs = inspect.getsource(kc.KbdClient.cursor)
-    check('send("CURSOR?")' in _cs and "_cur_ev.wait" in _cs,
+    check('b"CURSOR?\\n"' in _cs and "_cur_ev.wait" in _cs,
           "`KbdClient.cursor` 没按「**单独发一条 + 等回包事件**」实现 ✗"
           "（拼在别的指令里 relay 就得拆半行 ✓ 容易拆歪 ✓）")
+    check("self.send(" not in _cs,
+          "`cursor()` 走了 `send()` ✗ ⇒ 会 `_pending += 1` ⇒ 而这条**永远等不到固件回执** ✓"
+          "⇒ `silence_for()` 到点就误报「链路卡死」✓（2026-10-10 顺手查出来的第三处 ✓）")
     check("parse_cursor_line" in inspect.getsource(kc.KbdClient._drain),
           "读线程没挑 `CUR` 回包 ⇒ `cursor()` 永远超时 ✓")
 
@@ -19832,6 +19835,18 @@ def t_auto_measure_selfcalib():
         _g5 = ma.load_gain((1080, 1920, 3))
         check(_g5 and abs(_g5[0] - 2.0) < 1e-6,
               "1:1 时该是 2.0（一单位走 2 屏幕像素 ✓）：%r" % (_g5,))
+
+        # ---- ⑥ 量完要**放回撞角之前那儿**（不然它就停在左上角 ✓ 用户 2026-10-10 正是看到这个 ✓）----
+        _Fake.pos = [500, 400]           # 撞角之前光标在 (500,400)（**屏幕像素** ✓）
+        _cmds.clear()
+        _ok6, _why6 = ma.auto_measure((1080, 1920, 3), force=True)
+        check(_ok6, "又一次自动量失败了：%s" % (_why6,))
+        check(_Fake.pos == [500, 400],
+              "量完**没把光标放回原处** ⇒ 它就停在左上角（用户看到的正是这个 ✓）：%r"
+              % (_Fake.pos,))
+        check(any(c == (250, 200) for c in _cmds),
+              "送回的位移没**除以屏幕增益**（500/2=250、400/2=200 ✓ ⇒ 直接拿像素当单位会跑过头 ✓）："
+              "%r" % (_cmds,))
     finally:
         (ma.GAIN_PATH, ma.dinput, ma._AUTO_LAST, ma.corner_zero) = _o
 
@@ -19873,6 +19888,20 @@ def t_auto_measure_async_no_block():
           "`auto_measure_async` 没起线程 / 没串行锁 ⇒ 还是卡回路（或两条量打架 ✓）")
     check("_AUTO_BUSY = True" in _asrc and "_AUTO_BUSY = False" in _asrc,
           "`auto_measure_async` 没把忙标记立起来 / 收干净 ✗")
+
+    # ---- ④ ⚠⚠⚠ **失败不许当没发生**（2026-10-10 ✓ 用户**报两次**才查出来的那一处 ✗）----
+    #   第一版调的是 `auto_measure(…, force=True)` ✗ —— force **跳过冷却** ⇒ 量不成时
+    #   **每拍都起一条新的量** ⇒ 每 ~100ms 撞角一次 ⇒ **光标被反复撞到左上角 = 看着卡住不动** ✓
+    check("force=True" in _asrc,
+          "后台那条线程拿不到既有的量结果 ✓（它本来就该 force 进去 ✓ 但**冷却必须在外面管** ✗）")
+    check("_AUTO_FAIL" in _asrc and "AUTO_MAX_TRIES" in _asrc,
+          "失败了**没记住** ✗ ⇒ 每一拍都会再起一条（= 每 100ms 撞一次角 ⇒ "
+          "用户看到的「A 机鼠标停在左上角不动了」✓）")
+    _src_all = inspect.getsource(ma)
+    check("_AUTO_FAIL[key] = " in _src_all and "AUTO_RETRY_S" in _asrc,
+          "失败既没记时间也没冷却 ✗ ⇒ 会一直重试 ✓")
+    check("手工量一次" in _asrc,
+          "试满次数后没说「请手工量一次」✗ ⇒ 人只觉得鼠标乱撞、不知道该干嘛 ✓")
 
     # ---- ② 行为级：忙着的时候**一个字节都不发** ----
     _cmds = []

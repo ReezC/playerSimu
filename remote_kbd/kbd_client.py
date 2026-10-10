@@ -217,8 +217,22 @@ class KbdClient:
         """
         self._cur_box = None
         self._cur_ev.clear()
-        if not self.send("CURSOR?"):
-            return None
+        # ⚠⚠ **这一条不许走 `send()`** ✗（2026-10-10 ✓ 顺手查出来的第三处）：
+        #   `send()` 会 `_pending += 1`（"发出去还没等到固件回执的条数"✓）⇒ 而
+        #   `CURSOR?` **不给固件**（relay 自己答的 ✓ 永远等不到 `DONE` ✓）
+        #   ⇒ 它会**一直挂在 `_pending` 里** ⇒ `silence_for()` 到点就报
+        #   「发指令后 N 秒没收到固件回执（链路卡死）」✗ ⇒ 界面误报死链、甚至触发重连 ✓。
+        #   ⇒ 这里**自己发**：只记 `sent` / `last_send_at`（诊断用 ✓），**不记 `_pending`** ✓。
+        with self._lock:
+            try:
+                self._sock.sendall(b"CURSOR?\n")
+                self.sent += 1
+                self.last_send_at = time.monotonic()
+                self.ok = True
+            except Exception as e:               # noqa: BLE001 —— 发不出去就当问不到 ✓
+                self.ok = False
+                self.last_err = "%s: %s" % (type(e).__name__, e)
+                return None
         if not self._cur_ev.wait(float(timeout)):
             return None
         return self._cur_box

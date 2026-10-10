@@ -264,6 +264,29 @@ AUTO_RETRY_S = 60.0
 _AUTO_LAST = {}
 
 
+def _restore_cursor(pre, p0, gx_screen=None, gy_screen=None):
+    """量完**把光标放回撞角之前那儿** ✓（放不了就算了 ✓ 它是"体贴"不是"正确性" ✓）。
+
+    ⚠⚠ 为什么必须有（2026-10-10 ✓ 用户**两次**报"**A 机鼠标停在左上角不动了**"✗）：
+      量一次必然要"撞角归零"✓ —— 量完若**后面那一拍没接着点**（重连已经放弃 / 这一拍被
+      别的门挡了 ✓）⇒ 光标就**留在左上角** ✓ ⇒ 人看到的就是"鼠标卡在左上角"✓。
+      ⇒ 现在量完主动把它送回原处 ✓（`pre − p0` 两个读数都是现成的 ✓ 不用再问一次 ✓）。
+    ⚠⚠ **位移要换成"指令单位"** ✗：`pre − p0` 是**屏幕像素** ✓ 而 `mouse_move` 要的是
+      **单位** ✓ ⇒ 必须除以刚量到的**屏幕增益**（`gx_screen/gy_screen` ✓）——
+      ⚠ 我第一版直接拿像素当单位发 ✗（1:1 那条路看不出来 ✓ 有加速的机器上就会跑过头 ✓）。
+    ⚠ 没量到增益（撞角后就看不见光标了 ✓）⇒ **放弃送回** ✓（宁可不送，也别乱送 ✗）。
+    """
+    if not pre or not p0 or not gx_screen or not gy_screen:
+        return
+    try:
+        ux = int(round((int(pre[0]) - int(p0[0])) / float(gx_screen)))
+        uy = int(round((int(pre[1]) - int(p0[1])) / float(gy_screen)))
+        if ux or uy:
+            dinput.mouse_move(ux, uy)
+    except Exception:                            # noqa: BLE001 —— 放不回去只是不体贴 ✓
+        pass
+
+
 def _probe_cursor():
     """读一次"光标在哪 + 屏幕信息" ⇒ 见 `decision/input.cursor_probe` ✓（本地读 / 远端问 ✓）。"""
     f = getattr(dinput, "cursor_probe", None)
@@ -296,7 +319,8 @@ def auto_measure(frame_shape, force=False):
     _AUTO_LAST[key] = _now
     if not dinput.mouse_available():
         return False, "鼠标通道不可用 ⇒ 自动量不了（本地 SendInput 模式没有硬件鼠标 ✓）"
-    if _probe_cursor() is None:
+    pre = _probe_cursor()
+    if pre is None:
         return False, ("**看不见光标** ⇒ 自动量不了 ✗（鼠标在被控机上 ⇒ 要 A 机的 relay "
                        "回 `CURSOR?` ✓ 见 `remote_kbd/relay.py`；relay 是旧版就更新它 ✓）"
                        "⇒ 这个尺寸手工量一次 ✓")
@@ -304,13 +328,21 @@ def auto_measure(frame_shape, force=False):
     corner_zero()                                # ① 到已知原点（那台机器的虚拟屏左上角 ✓）
     p0 = _probe_cursor()
     if p0 is None:
+        _restore_cursor(pre, None)               # ⚠ 撞角了就得负责放回去 ✗
         return False, "撞角之后读不到光标 ⇒ 自动量不了 ✗"
     dinput.mouse_move(AUTO_STEP, AUTO_STEP)      # ② 走一步（两个轴一起走，一次量两轴 ✓）
     p1 = _probe_cursor()
-    dinput.mouse_move(-AUTO_STEP, -AUTO_STEP)    # ⚠ 挪回去（别把光标留在别处 ✓）
+    dinput.mouse_move(-AUTO_STEP, -AUTO_STEP)    # ⚠ 先挪回撞角处（别把光标留在别处 ✓）
+    dx_px = dy_px = None
+    if p1 is not None:
+        dx_px, dy_px = int(p1[0]) - int(p0[0]), int(p1[1]) - int(p0[1])
+    # ⚠⚠ 再**放回撞角之前那儿** ✓（见 `_restore_cursor` ✓ —— 要除以刚量到的**屏幕**增益 ✓
+    #   ⇒ 所以先把它算出来再送 ✓；量不到 ⇒ 它自己会放弃 ✓）
+    _restore_cursor(pre, p0,
+                    (dx_px / float(AUTO_STEP)) if dx_px else None,
+                    (dy_px / float(AUTO_STEP)) if dy_px else None)
     if p1 is None:
         return False, "走完那一步读不到光标 ⇒ 自动量不了 ✗"
-    dx_px, dy_px = int(p1[0]) - int(p0[0]), int(p1[1]) - int(p0[1])
     if dx_px <= 0 or dy_px <= 0:
         return False, ("走 %d 单位之后光标没动（Δ=%d,%d）⇒ 这一步量不可信 ✗"
                        "（检查 A 机的指针速度 / 加速 ✓）" % (AUTO_STEP, dx_px, dy_px))
@@ -346,6 +378,19 @@ def auto_measure(frame_shape, force=False):
 _AUTO_BUSY = False
 #: 自动量的串行锁（同一时刻只允许一条量 ✓）。
 _AUTO_LOCK = threading.Lock()
+#: ⭐⭐ 失败记忆：帧尺寸键 → `(时刻, 人话)` ⇒ **冷却期内不再重试** ✓（见 `AUTO_RETRY_S` ✓）。
+#: ⚠⚠⚠ 为什么它才是治"**A 机鼠标停在左上角不动了**"的那一刀（2026-10-10 ✓ 用户**报了两次**
+#:   才查清 ✗ 这是我引入的第三处 ✗）：第一版 `auto_measure_async` 里调的是
+#:   `auto_measure(…, force=True)` ✗ —— **`force` 会跳过冷却** ✗ ⇒ 只要这个尺寸一直量不成
+#:   （量出来被判"不像话" / 看不见光标 / 折算比算不出 ✓）⇒ **每一拍都起一条新的后台量** ✗
+#:   ⇒ 每 ~100 毫秒"撞角归零"一次 ⇒ **光标被反复撞到左上角 ⇒ 看上去就是卡在那儿一动不动** ✓✓
+#:   （现场现象一字不差 ✓）。
+#: ⇒ 现在：**失败了就记住** ✓（冷却 `AUTO_RETRY_S` ✓ + 最多试 `AUTO_MAX_TRIES` 次 ✓
+#:   ⇒ 试完就认了、让人手工量一次 ✓ 绝不再折腾机器 ✓）。
+_AUTO_FAIL = {}
+#: 同一个尺寸**最多自动试几次** ✓（试完就认 ✓）。
+AUTO_MAX_TRIES = 3
+_AUTO_TRIES = {}
 
 
 def auto_measure_async(frame_shape):
@@ -358,21 +403,39 @@ def auto_measure_async(frame_shape):
       （见 `click_ratio` 的说明 ✓：睡一下就是丢帧 / 积压 ✓）。
       ⇒ 挪到后台 ✓；代价是**这一拍点不了** ✓（返回 False 并说清"正在量"✓）
       ⇒ 量完存下 ✓ ⇒ **下一拍**（重连状态机本来就会重试 ✓）就正常点了 ✓。
+
+    ⚠⚠⚠ **失败不许当没发生** ✗（那是"每拍都撞一次角"的根 ✓ 见 `_AUTO_FAIL` ✓）：
+      记下失败 + 冷却 + 最多 `AUTO_MAX_TRIES` 次 ✓ ⇒ 试完就**明说"请手工量一次"** ✓。
     """
     global _AUTO_BUSY
-    if not gain_frame_key(frame_shape):
+    key = gain_frame_key(frame_shape)
+    if not key:
         return False, "拿不到画面尺寸"
     if _AUTO_BUSY:
         return False, "正在**后台自动量**标定 ✓ ⇒ 这一拍不动鼠标 ✓（量完下一拍就能点 ✓）"
+    _t, _why = _AUTO_FAIL.get(key, (0.0, ""))
+    if _why:
+        _n = _AUTO_TRIES.get(key, 0)
+        if _n >= AUTO_MAX_TRIES:
+            return False, ("自动量**已经试过 %d 次都没成**（%s）⇒ 不再自动试了 ✓"
+                           "这个尺寸**手工量一次** ✓"
+                           "（`python -X utf8 -m tools.mouse_aim_calib --source stream` ✓）"
+                           % (_n, _why))
+        if (time.monotonic() - _t) < AUTO_RETRY_S:
+            return False, ("刚自动量过没成（%s）⇒ **%.0f 秒内不再试** ✓（免得一直挪鼠标 ✓）"
+                           % (_why, AUTO_RETRY_S))
     _AUTO_BUSY = True
+    _AUTO_TRIES[key] = _AUTO_TRIES.get(key, 0) + 1
 
     def _run():
         global _AUTO_BUSY
         try:
             with _AUTO_LOCK:
-                auto_measure(frame_shape, force=True)
-        except Exception:                        # noqa: BLE001 —— 后台线程不许把谁炸了 ✗
-            pass
+                _ok, _w = auto_measure(frame_shape, force=True)
+            if not _ok:
+                _AUTO_FAIL[key] = (time.monotonic(), str(_w)[:120])
+        except Exception as e:                   # noqa: BLE001 —— 后台线程不许把谁炸了 ✗
+            _AUTO_FAIL[key] = (time.monotonic(), "%s: %s" % (type(e).__name__, e))
         finally:
             _AUTO_BUSY = False
 
