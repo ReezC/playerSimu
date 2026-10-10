@@ -19979,6 +19979,53 @@ def t_auto_measure_async_no_block():
         ma.dinput, ma._AUTO_BUSY, ma._AUTO_BUSY_AT = _o
 
 
+def t_mouse_path_check_tool():
+    """⭐⭐ 「鼠标为什么没被操控」要有**一条能自己说的命令**（用户 2026-10-10 ✓ 同一句报了几次 ✓）。
+
+    为什么要有它：那句"**A 机的鼠标没有被操控**"背后至少有**三种完全不同**的原因 ——
+      ① **这个帧尺寸没量过** ⇒ 新代码「**故意不点**」✓（保护 ✓ 不是坏 ✓）；
+      ② 指令**到不了 A**（relay / 串口 / ProMicro ✓）；
+      ③ 忙标记卡住 ⇒ 三个鼠标出口全被挡 ✓。
+    而三者的**修法完全不同** ✗ ⇒ 只靠人描述分不出来 ✓ ⇒ 做成
+    `tools/mouse_path_check.py` ✓：**默认只读、不动鼠标** ✓，按顺序把三件事都说清 ✓。
+
+    钉三件：
+      ① 工具在（`-m tools.mouse_path_check` ✓ 能跑 ✓）；
+      ② **默认不动鼠标** ✗ —— 只有显式 `--move` 才走位 ✓（源码级 ✓）；
+      ③ 它必须把「①没量过 ⇒ 故意不点」这条**最容易误判成"坏了"**的原因排在第一条 ✓
+         并**给出量它的命令** ✓。
+    """
+    import inspect
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    _f = Path(__file__).resolve().parent / "mouse_path_check.py"
+    check(_f.exists(), "少了 `tools/mouse_path_check.py` ⇒ 「鼠标没被操控」又只能靠猜 ✗")
+    _src = _f.read_text(encoding="utf-8")
+    check('"--move"' in _src and "_try_move()" in _src,
+          "工具没有 `--move` 开关 ⇒ 一跑就动鼠标 ✗（默认必须只读 ✓）")
+    check("if a.move:" in _src,
+          "`_try_move()` 没挂在 `--move` 后面 ✗ ⇒ 默认跑一次就会动鼠标 ✓")
+    check("故意不点" in _src and "mouse_aim_calib --source" in _src,
+          "工具没把「这个尺寸没量过 ⇒ 故意不点」说清 + 给出量它的命令 ✗"
+          "（那是最容易被当成「坏了」的一条 ✓）")
+    _r = subprocess.run([sys.executable, "-X", "utf8", "-m", "tools.mouse_path_check",
+                         "--help"], capture_output=True, text=True, cwd=str(_f.parent.parent))
+    check(_r.returncode == 0 and "--move" in (_r.stdout or ""),
+          "工具跑不起来（`--help` 都不行）：%r / %r" % (_r.returncode, (_r.stderr or "")[:160]))
+    # ⚠ 顺手：`_AUTO_BUSY` 的"自愈"（见 `AUTO_BUSY_MAX_S`）—— 忙标记卡住不许永久锁鼠标 ✓
+    from decision import mouse_aim as ma
+    check(hasattr(ma, "_auto_busy") and hasattr(ma, "AUTO_BUSY_MAX_S"),
+          "忙标记没有超时自愈 ✗ ⇒ 一旦卡住 ⇒ **鼠标永久没被操控**（用户看到的就是这个 ✓）")
+    _o = (ma._AUTO_BUSY, ma._AUTO_BUSY_AT)
+    try:
+        ma._AUTO_BUSY, ma._AUTO_BUSY_AT = True, time.monotonic() - 9999.0
+        check(ma._auto_busy() is False, "忙标记放了很久还算「在忙」✗ ⇒ 鼠标会被永久锁死 ✓")
+    finally:
+        ma._AUTO_BUSY, ma._AUTO_BUSY_AT = _o
+
+
 CHECKS = [
     ("⭐⭐⭐ 「攻击目标数量」：0 = 不启用 / -1 = 不限制 / N = 同时最多 N 只在 CD"
      "（用户 2026-10-06 第二轮）",
@@ -20318,6 +20365,8 @@ CHECKS = [
     ("⭐⭐⭐ 自动量绝不许卡住实时回路（后台线程 + 忙时谁都不许动鼠标）"
      "—— 用户 2026-10-10「A 机鼠标停在左上角不动了」的复盘",
      t_auto_measure_async_no_block),
+    ("⭐⭐ 「鼠标为什么没被操控」要有**一条能自己说的命令**（默认只读 ✓）；忙标记不许永久锁鼠标",
+     t_mouse_path_check_tool),
     ("⭐⭐ 下跳被打断 ⇒ 回来**重头开始**（2026-10-08 用户：进 attack 要切断、打完从"
      "「当前 foothold 是否可下跳」重判）：回入口 · 重新挑 fh · 那一拍不按键 · 短打断不算",
      t_drop_restart_after_attack),
