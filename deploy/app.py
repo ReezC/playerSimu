@@ -665,59 +665,111 @@ class ServiceCard(QFrame):
     # ---------------- 跟随窗口（用户 2026-10-17 ✓「像本地一样自动适应窗口尺寸」✓）----------------
 
     def _follow_push_window(self):
-        """「跟随窗口」：**列出窗口让你挑**（用户 2026-10-17 ✓ 原话：
-        「**跟随窗口 按钮点击后没有任何展示，用户根本不知道现在取的是哪个窗口，
-        并且这个状态永久持续**」✗）。
+        """「跟随窗口」：**列窗口让人挑**（用户 2026-10-17 ✓ 两次报：
+        「按钮点击后没有任何展示，用户根本不知道现在取的是哪个窗口，并且这个状态永久持续」
+        ＋「**点跟随窗口按钮 没有任何反应**」✗）。
 
-        以前是"把鼠标移到窗口上停住 6 秒"——那是**看不见的状态** ✗（只在状态栏一行字、
-        倒计时还不跳 ✓ 人会以为卡住了 ✓）。现在：
-          · 弹**选窗口对话框**：列出当前可见的顶层窗口（标题 + **客户区**尺寸 ✓
-            按面积从大到小 ✓ **部署台自己排掉** ✓）；
-          · 选完**立刻**在卡片那行显示「跟随「标题」WxH」✓ ＋ 运行日志一条 ✓
-            （这就是"现在取的是哪个窗口"✓）；
-          · **没有"进行中"状态了** ✗ ⇒ 不存在"永久持续"✓（关了对话框就是没选 ✓）。
+        ⚠ 为什么会"没反应"（本条的关键 ✓）：
+          · 上一版用 `QInputDialog.getItem(self, …)`（parent = **卡片** ✓）——
+            实机上弹窗容易**落在主窗口后面 / 屏幕外** ⇒ 看着就是"点了没反应"✓；
+          · 而且整个方法**没有兜底** ✗ ⇒ 真抛异常（pywin32 抽风 / DPI 异常 ✓）时
+            traceback 只进控制台 ✓ `pythonw` 下连控制台都没有 ✓ ⇒ **同样静默** ✓
+            （这正是用户两次都只能看到"没反应"的原因 ✓）。
+        ⇒ 现在三条纪律 ✓：
+          ① **自建 `QDialog`**，parent = **主窗口** ＋ `Qt.ApplicationModal` ＋
+             显式**居中到主窗口** ＋ `raise_()/activateWindow()` ✓
+             —— 它一定出现在**看得见的地方** ✓；
+          ② **任何异常都弹 `QMessageBox.critical`** 说清（类型 + 消息 ✓）＋ 写运行日志 ✓
+             ⇒ **不可能再"点了没反应"** ✓；
+          ③ **列表本身就是答案**：标题 + 客户区尺寸 ✓ 面积从大到小 ✓ 部署台自己排掉 ✓
+             当前跟随的那个默认选中 ✓ 双击即选 ✓。
         """
-        from PyQt5.QtWidgets import QInputDialog
+        import os as _os
+
+        try:
+            self.log("push", "选窗口：正在列出窗口…")
+            self._follow_pick_dialog(_os.getpid())
+        except Exception as e:                   # noqa: BLE001 —— **绝不静默** ✗
+            import traceback as _tb
+            self.log("push", "选窗口失败：%s: %s" % (type(e).__name__, e))
+            self.log("push", _tb.format_exc()[:600])
+            QMessageBox.critical(
+                self.window() or self, "选窗口失败",
+                "打不开窗口列表：%s: %s\n\n（这条也写进了运行日志 ✓）"
+                % (type(e).__name__, e))
+
+    def _follow_pick_dialog(self, my_pid):
+        """真正弹窗那一段（单独一个方法 ⇒ 外面的 `try` 才兜得住 ✓）。"""
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtWidgets import (QDialog, QListWidget, QListWidgetItem)
 
         from core import wincap
 
-        _w = self.window()
-        if hasattr(_w, "statusBar"):
-            _w.statusBar().clearMessage()       # 清掉老版本那条"还剩 6 秒"的残留 ✓
-        try:
-            wins = wincap.list_windows(min_w=200, min_h=150)
-        except Exception as e:                   # noqa: BLE001
-            self.log("push", "列窗口失败：%s: %s" % (type(e).__name__, e))
-            return
-        import os as _os
-        wins = [w for w in wins if _win_pid(w.get("hwnd")) != _os.getpid()]
+        wins = [w for w in wincap.list_windows(min_w=200, min_h=150)
+                if _win_pid(w.get("hwnd")) != my_pid]
         if not wins:
             QMessageBox.information(
-                self, "没找到窗口",
-                "当前没有可跟随的窗口 —— 先把游戏开起来（窗口别最小化），再点一次。")
+                self.window() or self, "没找到窗口",
+                "现在没有可跟随的窗口 —— 先把游戏开起来（别最小化），再点一次。")
             return
 
-        labels = ["%s    %d×%d" % (str(w.get("title") or "")[:48],
-                                   int(w["size"][0]), int(w["size"][1]))
-                  for w in wins]
-        cur = 0
+        win = self.window() or self
+        dlg = QDialog(win)
+        dlg.setWindowTitle("跟随哪个窗口")
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.resize(560, 420)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(8)
+        _tip = QLabel("选一个窗口：推流只抓它的**客户区**（不含标题栏）。\n"
+                      "之后它挪了 / 改了大小 / 游戏重启都会自动跟上。")
+        _tip.setText(_tip.text().replace("**", ""))
+        lay.addWidget(_tip)
+
+        lst = QListWidget(dlg)
+        cur_row = 0
         _fol = (self.cfg.get("push") or {}).get("region_win") or []
-        if _fol:
-            for i, w in enumerate(wins):
-                if int(w["hwnd"]) == int(_fol[0]):
-                    cur = i
-                    break
-        text, ok = QInputDialog.getItem(
-            self, "跟随哪个窗口",
-            "选一个窗口：推流只抓它的客户区（不含标题栏）。\n"
-            "之后它挪了 / 改了大小 / 游戏重启都会自动跟上。",
-            labels, cur, False)
-        if not ok or not text:
+        for i, w in enumerate(wins):
+            item = QListWidgetItem("%s    %d×%d"
+                                   % (str(w.get("title") or "")[:60],
+                                      int(w["size"][0]), int(w["size"][1])))
+            item.setData(Qt.UserRole, i)
+            lst.addItem(item)
+            if _fol and int(w["hwnd"]) == int(_fol[0]):
+                cur_row = i
+        lst.setCurrentRow(cur_row)
+        lay.addWidget(lst, 1)
+
+        rowb = QHBoxLayout()
+        rowb.addStretch(1)
+        b_cancel = _fit_btn("取消")
+        b_ok = _fit_btn("跟随这个", "把选中的窗口记下来：之后它挪了/改了大小/重启都会自动跟上 ✓")
+        rowb.addWidget(b_cancel)
+        rowb.addWidget(b_ok)
+        lay.addLayout(rowb)
+
+        picked = {"row": -1}
+
+        def _ok(_=None):
+            it = lst.currentItem()
+            picked["row"] = int(it.data(Qt.UserRole)) if it is not None else -1
+            dlg.accept()
+
+        b_ok.clicked.connect(_ok)
+        b_cancel.clicked.connect(dlg.reject)
+        lst.itemDoubleClicked.connect(lambda _it: _ok())
+
+        # ⭐ 居中到主窗口（防止落在屏幕外 / 被主窗口盖住 ⇒ 看着像没反应 ✗）
+        _g = win.frameGeometry()
+        dlg.move(max(0, _g.center().x() - dlg.width() // 2),
+                 max(0, _g.center().y() - dlg.height() // 2))
+        dlg.raise_()
+        dlg.activateWindow()
+        if dlg.exec_() != QDialog.Accepted:
             return
-        try:
-            self._apply_push_window(wins[labels.index(text)])
-        except (ValueError, IndexError):
+        if not (0 <= picked["row"] < len(wins)):
             return
+        self._apply_push_window(wins[picked["row"]])
 
     def _apply_push_window(self, w):
         """认下这个窗口 ⇒ 存 `region_win` + `region_rel` ＋ 立刻生效（重启推流）。"""
@@ -905,6 +957,53 @@ class ServiceCard(QFrame):
             else:
                 out[spec["keys"][0]] = val
         return out
+
+    def log(self, key, text):
+        """卡片打日志 ⇒ **转给主窗口**（卡片自己没有日志面板 ✓）。
+
+        ⚠⚠ 用户 2026-10-17 报「**点跟随窗口按钮 没有任何反应**」✗ —— 真正的病根在这儿：
+          卡片里到处是 `self.log(...)` ✗（生成证书 / 框选区域 / 选窗口 ✓），可
+          `ServiceCard` **根本没有 `log`** ✗ ⇒ `AttributeError` 在 Qt 槽里被吞掉 ✓
+          ⇒ 界面上**一点反应都没有** ✓（`pythonw` 下连 traceback 都看不到 ✓）。
+          这是**一类**问题，不是一处 ✓：凡是"点了没反应"的按钮，先查它有没有
+          `self.xxx` 在卡片上不存在 ✓。
+        做法：`self.window()` 拿到主窗口（`DeployWindow.log` ✓）转过去 ✓；
+          拿不到就**静默丢弃**（日志永远不该让功能崩 ✗）。
+        """
+        win = self.window()
+        fn = getattr(win, "log", None)
+        if callable(fn):
+            try:
+                fn(key, text)
+            except Exception:                  # noqa: BLE001 —— 日志不许拖垮功能 ✓
+                pass
+
+    def start_service(self, key):
+        """卡片请求**主窗口**启服务（卡片自己没有进程表 ✓ 同 `log` 那条说明 ✓）。
+
+        ⚠⚠ 和 `log` 是**同一类坑**（用户 2026-10-17「点了没反应」✓）：
+          卡片里写 `self.start_service(...)` / `self.stop_service(...)`（框完区域要重启 ✓、
+          跟随窗口发现窗口动了要重启 ✓、小地图框完要重启 ✓），
+          而这两个方法**只在主窗口**上有 ✗ ⇒ `AttributeError` 被 Qt 槽吞掉 ✓
+          ⇒ 表现就是"改了没生效 / 跟随时窗口动了也不动"✓（比报错更糟 ✓）。
+        """
+        win = self.window()
+        fn = getattr(win, "start_service", None)
+        if callable(fn):
+            try:
+                fn(key)
+            except Exception:                  # noqa: BLE001 —— 界面动作不许炸 ✓
+                pass
+
+    def stop_service(self, key):
+        """卡片请求**主窗口**停服务（同 `start_service` ✓）。"""
+        win = self.window()
+        fn = getattr(win, "stop_service", None)
+        if callable(fn):
+            try:
+                fn(key)
+            except Exception:                  # noqa: BLE001
+                pass
 
     def refresh_displays(self):
         """把**只读那几行**按现在的实际情况重读一遍（B 机随时可能告诉本机换图 ✓）。

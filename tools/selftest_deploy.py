@@ -1003,8 +1003,17 @@ def t_push_follow_window():
     check("_ensure_push_watch" in app,
           "⑤ 跟随的「眼睛」该只装一次 ✓")
     # ⭐ 2026-10-17 用户报「按钮点了没展示 / 状态永久持续」⇒ 改成**选窗口对话框** ✓
-    check("QInputDialog.getItem" in app and "wincap.list_windows" in app,
-          "⑤ 「跟随窗口」该**列出窗口让人选** ✗（蹲鼠标 6 秒是看不见的状态 ✓）")
+    # ⭐ 2026-10-17 第二次报「点了没有任何反应」⇒ 必须**自建模态对话框**（parent = 主窗口 ✓
+    #   居中 ✓ ApplicationModal ✓）＋ **异常必须弹框**（绝不静默 ✗）
+    check("QDialog(win)" in app and "Qt.ApplicationModal" in app,
+          "⑤ 选窗口要用**自建模态对话框**、parent 是主窗口 ＋ 居中 ✗（否则可能落在窗口后面 ✓）")
+    check("QMessageBox.critical" in app and "选窗口失败" in app,
+          "⑤ 选窗口出异常必须**弹框说清** ✗（静默 = 用户只看到「没反应」✓）")
+    # ⚠ 判据只看**真实导入** ✗ —— 注释里为了说明"别再回到 QInputDialog"会提到它 ✓
+    check("wincap.list_windows" in app
+          and "from PyQt5.QtWidgets import QInputDialog" not in app
+          and "_follow_pick_dialog" in app,
+          "⑤ 窗口列表走 `wincap.list_windows` ＋ 自建对话框 ✓（QInputDialog 易落在窗口后面 ✗）")
     check("FOLLOW_PICK_SEC" not in app and "停住不动" not in app,
           "⑤ 不许再有「把鼠标移过去停住 N 秒」那套 ✗（状态会永久挂着 ✓）")
     check("_win_pid" in app,
@@ -1122,6 +1131,72 @@ def t_screen_single_source():
           "⑥ `probe_gen` 不许再读 `probe.out_scale` ✗（那是老口径 ✓）")
 
 
+def t_card_log_wiring():
+    """⭐⭐⭐⭐ **卡片的 `self.log(...)` 必须真的能落到主窗口**（用户 2026-10-17 ✓ 两次报
+    「按钮点击后没有任何展示 / 状态永久持续」＋「**点跟随窗口按钮 没有任何反应**」✗）。
+
+    ⚠ 真病根（这条是本次最有价值的发现 ✓）：
+      `ServiceCard` 里到处写 `self.log("push", …)`（选窗口 / 框区域 / 生成证书 ✓），
+      可卡片**根本没有 `log`** ✗ ⇒ `AttributeError` 在 Qt 槽里被**吞掉** ✓
+      ⇒ 界面上**一点反应都没有** ✓（`pythonw` 下连 traceback 都看不到 ✓）。
+      于是：
+        · v1（蹲鼠标版）：状态栏那行先画出来了、**计时器却没启动** ⇒ 那行字**永久挂着** ✓
+          = 用户说的"**这个状态永久持续**"✓；
+        · v2（列表版）：`self.log` 在最前面 ⇒ **什么都没发生** ✓ =
+          "**点跟随窗口按钮 没有任何反应**"✓。
+    判据（三条 ✓）：
+      ① `ServiceCard` 有 `log(self, key, text)` 且**转给 `self.window()`** ✓；
+      ② 功能上真能转过去（构造窗口 ⇒ 卡片 `log()` ⇒ 主窗口日志面板里真有这行 ✓）；
+      ③ 主窗口确实有 `log(self, key, text)` ✓（不然转接到空处 ✓ 一样静默 ✗）。
+    """
+    from PyQt5.QtWidgets import QApplication
+
+    from deploy import app as dapp
+
+    _qa = QApplication.instance() or QApplication([])
+    src = (Path(__file__).resolve().parent.parent / "deploy" / "app.py").read_text(
+        encoding="utf-8")
+    check("def log(self, key, text):" in src,
+          "① `ServiceCard` 必须有 `log(self, key, text)` ✗ —— 没有它 ⇒ 卡片里所有\n"
+          "   `self.log(...)` 都是 AttributeError ⇒ 按钮点了**毫无反应** ✓（用户现场 ✓）")
+    check('fn = getattr(win, "log", None)' in src,
+          "① 卡片的 `log` 必须**转给 `self.window()`**（卡片没有日志面板 ✗）")
+    # ⚠⚠ 同一类坑的第二处：卡片里也调 `start_service` / `stop_service`（框完要重启 ✓）
+    #   而它们只在主窗口 ⇒ 一样 AttributeError ⇒ "改了没生效 / 窗口动了也不动"✓
+    _card = src[src.index("class ServiceCard"):src.index("class ScreenCard")]
+    for _m in ("def start_service(self, key)", "def stop_service(self, key)"):
+        check(_m in _card,
+              "① `ServiceCard` 缺 `%s` ✗ —— 卡片里调用它 ⇒ AttributeError 被吞 ⇒ "
+              "「改了没生效」✓（和 `log` 同一类 ✓）" % _m)
+    check("def log(self, key, text):" in src[src.index("class DeployWindow"):],
+          "③ 主窗口 `DeployWindow` 必须有 `log(self, key, text)` ✗（转接到空处一样静默 ✓）")
+
+    w = dapp.DeployWindow()
+    try:
+        card = w.cards["push"]
+        got = []
+        _orig = w.log_pane.append
+
+        def _spy(k, t):
+            got.append((k, t))
+            _orig(k, t)
+
+        w.log_pane.append = _spy          # ⚠ 面板没有 `toPlainText` ✗ ⇒ 直接盯 `append` ✓
+        card.log("push", "自检探针：这一行必须出现在日志面板里")
+        check(any("自检探针" in str(t) for _k, t in got),
+              "② 卡片 `log()` 没落到主窗口日志面板 ✗（`log_pane.append` 没被调用 ✓）")
+        check(all(k == "push" for k, _t in got),
+              "② 转发要保留**卡片类别**（push/kbd/…）✗ 否则日志分不出是谁说的 ✓：%r"
+              % (got,))
+    finally:
+        try:
+            w.log_pane.append = _orig
+        except Exception:                  # noqa: BLE001
+            pass
+        w.close()
+        w.deleteLater()
+
+
 TESTS = (
     ("服务表（标题/参数/命令行）完整", t_service_table),
     ("小地图推流的命令行（按「当前是哪张图」传 --map-id）", t_mmap_cmd),
@@ -1147,6 +1222,8 @@ TESTS = (
     ("⭐⭐⭐ 探针位置可在部署台配（写回 link.yaml ＋ 变了才重启）", t_probe_geometry_ui),
     ("⭐⭐⭐ 推流区域可在部署台框（ffmpeg 只抓那一块 ＋ 尺寸写回 link.yaml）", t_push_region_button),
     ("⭐⭐⭐⭐ 推流区域能「跟随窗口」（相对比例 ＋ 窗口动了自动重启）", t_push_follow_window),
+    ("⭐⭐⭐⭐ 屏幕/DPI 唯一来源（输出缩放现算、不落盘、部署台顶上配）", t_screen_single_source),
+    ("⭐⭐⭐⭐ 卡片的 self.log 必须落到主窗口（否则按钮点了毫无反应）", t_card_log_wiring),
 )
 
 
