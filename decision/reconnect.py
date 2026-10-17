@@ -41,9 +41,39 @@
 
 import time
 
+import numpy as np
+
 from core import behavior
 from decision import mouse_aim
 from perception import ui_state
+
+#: ⭐⭐⭐ **黑屏判据**（用户 2026-10-17 ✓ 两句话合一：原话「**选人界面按Enter黑屏后就应该停止
+#:   按Enter 不然进游戏打开对话框所有的指令都变成了打字**」✓ ＋ 追加口径「**必须拿黑屏作为
+#:   判定条件，没黑屏还是走以前的超时重试**」✓）：加载 / 切图那一瞬**整幅接近纯黑** ✓。
+#:   ⚠ 判法用「**绝大多数像素都暗**」✗ 而不是「平均亮度低」✗：
+#:     平均会被一条进度条 / 一个 logo 拉起来 ✓；「绝大多数都暗」对那一小片亮东西**免疫** ✓。
+#:   ⚠ 阈值 40（0~255 尺度 ✓ 单通道值）留了余量：真·黑屏实测是**个位数** ✓；而正常画面
+#:     （哪怕夜景 ✓）绝大部分像素都远在 40 以上 ✓ ⇒ 不会把正常画面误判成黑屏 ✗
+#:     （误判的后果很重：**该按回车时不按** ⇒ 一整轮重连卡死 ✗）。
+BLACK_MAX = 40.0        # 「暗」的上限（0~255 ✓）
+BLACK_FRAC = 0.98       # 要多"整幅"才算黑屏（98% 的像素都暗 ✓）
+
+
+def is_black(frame):
+    """整幅画面是不是**黑屏**（进游戏 / 加载 ✓）—— 是 ⇒ `True`；帧坏 / 空 ⇒ `False`。
+
+    ⚠ 「判不出来」一律返回 `False` ✗（= 照旧走超时重试 ✓）—— 宁可多按一次回车，
+      也别因为读帧出问题把**该按的那一下**吞掉（那会让一整轮重连卡死 ✗）。
+    """
+    if frame is None:
+        return False
+    try:
+        a = np.asarray(frame)
+        if a.size == 0:
+            return False
+        return float((a < BLACK_MAX).mean()) >= BLACK_FRAC
+    except Exception:                            # noqa: BLE001 —— 判不出来 = 不是黑屏 ✓
+        return False
 
 # 界面 -> (动作, 说明)。动作只有三种：
 #     "enter"  按一次回车
@@ -207,6 +237,18 @@ class Reconnector:
         self.s = settings
         self.active = False        # 是否在重连流程里
         self.ui = None             # 最近一次判到的界面
+        #: ⭐⭐⭐ **「选角 ⇒ 按 Enter」这份待办**（用户 2026-10-12 ✓ 原话："现在就上"✓）：
+        #:   只要**这一轮里判到过**「选择角色」（`UI_CHAR_SELECT` ✓），就必须**补按一次 Enter** ✓
+        #:   —— 哪怕后面某一帧又判成 `combat`（选角立绘把那一下匹配骗了 ✓）也**不许**当成
+        #:   "人已经回来了"收工 ✗（真机 `behavior.log` 23:37 正是"13.544 判到 char_select ⇒
+        #:   13.751 却写「已回到游戏」"✗ ⇒ **"选角 ⇒ 按 Enter 进游戏"那一步永远走不到** ✓）。
+        #:   ⚠ 只补**一次**：按下 Enter 那一刻清掉 ✓（之后照原逻辑重试 / 超时放弃 ✓ 不会无限按 ✗）。
+        self._char_pending = False
+        #: ⭐ **这一轮已经按过 Enter 了吗**（配合 `ui_hint` ✓ ✓）—— 按过之后，**哪怕广播那份界面
+        #:   还挂着 `char_select`（它自己的限流+留住 ✓）也不再重新立待办** ✗：不然会出现
+        #:   "已经进游戏了、状态机又去按一次 Enter"（游戏里 Enter 会开聊天 ✗ 那正是要避免的 ✓）。
+        #:   一轮结束（`_finish` / `_give_up` / `_reset` / 重新接手）时清零 ✓。
+        self._char_entered = False
         self.note = ""             # 给界面显示的状态文字
         self._lost_since = None    # 玩家框开始丢失的时刻
         self._probe_at = 0.0       # 上次探界面的时刻
@@ -234,19 +276,44 @@ class Reconnector:
         self._doubled = False
         #: ⭐⭐ 「先滚再点」用（第 21~60 个频道 ✓ 见 `CHANNEL_TOTAL` 那段 ✓）：
         #: `_scroll_pending` = 滚完之后要点的那个坐标（`(x, y, 人话)` ✓ 没有 = 不用滚 ✓）；
-        #: `_scroll_at` = 发出滚动动作那一拍的时刻 ✓（到点再出点击 ✓ 同双击那套 ✓）。
+        #: `_scroll_at` = 发出滚动动作那一拍的时刻 ✓（到点再出点击 ✓ 同双击那套 ✓）；
+        #: `_scroll_left` = **还要再发几格**（⚠ **一格一拍** ✗ 一次发一串会被客户端当成一下 ✓
+        #:   2026-10-11 现场：设 29 ⇒ 实际进 21 ✓）。
         self._scroll_pending = None
         self._scroll_at = 0.0
+        self._scroll_left = 0
 
     # ---------------- 唯一入口 ----------------
 
-    def update(self, frame, player_found, now):
+    def update(self, frame, player_found, now, ui_hint=None, in_game=False):
         """每帧调一次。frame 是当前画面（BGR），player_found 是玩家框有没有。
+
+        ⭐ `ui_hint`（可选 ✓ 2026-10-12 加 ✓）：调用方（实时线程 ✓）**那一帧的"画面状态"
+          广播**（`self._screen_state` ✓ —— 它同样走 `ui_state.detect` ✓，还带那套"限流 +
+          留住接管"✓）。
+          **只拿它立"选角 ⇒ 还欠一次 Enter"那份待办** ✓（见 `_char_pending` ✓）——
+          ⚠ **不改判定口径** ✗：界面判定仍是本方法自己的 `ui_state.detect(frame)` ✓
+          （两处各判各的 ✓ 这一条只是"别让一次误判把 Enter 那一步整个吞掉"✓）。
+          ⚠ 只认**这一轮还没按过** Enter 的时候（`_char_entered` ✓）⇒ 不会"进了游戏还被
+          广播那份旧状态带着再按一次"✗。
 
         返回要执行的动作 dict 或 None（见类文档）。
         """
         s = self.s
         self._now = now
+        # ⭐⭐⭐ **画面状态广播说是选角 ⇒ 立「还欠一次 Enter」的待办**（用户 2026-10-12 ✓
+        #   原话："现在就上"✓ —— "判到选角就必须走一遍按 Enter"✓ 里的"判到"，两个来源都算 ✓）。
+        #   ⚠⚠ 必须放在 **`player_found` 那段的早退之前** ✗✗：不然"本方法还没接手
+        #     （`active` 还是假 ✓）+ 广播说选角"这一路会被早退直接吃掉 ✗ ⇒ 实得 `None`、
+        #     连"已回到游戏"都不写、Enter 更不会按 ✓（用例 ⑥ 就是钉这个的 ✓）。
+        #   ⚠ 只在这一轮**还没按过** Enter 时才立（`_char_entered` ✓ 一轮一清 ✓）——
+        #     否则"已经进游戏了、广播那份旧状态还挂着选角"会被带着再按一次 ✗（开聊天 ✗）。
+        if (str(ui_hint or "") == ui_state.UI_CHAR_SELECT
+                and not self._char_entered and not self._char_pending):
+            self._char_pending = True
+            self._idle_logged = None
+            self._say("画面状态说是%s ⇒ 走一遍「按 Enter 进游戏」（本方法这一帧没认出来也算 ✓）"
+                      % ui_state.UI_NAMES.get(ui_hint, ui_hint))
         # ⭐ **「停自动」与「自动重连」解耦**（2026-09-30 用户要求 ✓ 原话："刚刚
         #   判定到断线了，在断线的时候停止自动吧"）—— 原来这个早退把两件事连坐
         #   ✗（`reconnect_enabled` 默认 False ⇒ 断线了自动还在瞎跑 ✗）：现在
@@ -260,12 +327,76 @@ class Reconnector:
         #   —— 结果无害，但白跑一轮、状态栏还闪两下 ✓）。
         #   ⇒ 口径：**只有"当前不是断线系界面"时，"玩家框出现"才算回到游戏** ✓
         #     （判不出界面 / 判成别的 ⇒ 算回到游戏 ✓ 与老行为一致 ✓）。
-        #   ⚠ `self._probe_at = 0.0` = **催下一拍立刻重探界面** ✓：判据要用**刚判的**界面 ✓，
-        #     不是几百毫秒前那份旧结果 ✗（回来时少等一拍 ✓）。
+        #   ⚠⚠ **判据要用"这一帧刚判的"界面** ✗ 不许用旧那份（见下 ✓）。
         if player_found:
             self._lost_since = None
-            self._probe_at = 0.0
-            if self.ui not in FAKE_PLAYER_UIS:
+            # ⭐⭐⭐ **就地重探一次**（2026-10-12 ✓ 用户报的现场："断线重连到选人时候怎么不按
+            #   Enter 了？？"✓）—— 原来这里只写 `self._probe_at = 0.0`（**催下一拍**再探 ✗），
+            #   可**本拍**立刻就要拿 `self.ui` 去判"回没回到游戏"✗ ⇒ 用的是**上一次探测**
+            #   那份旧结果（最多 `PROBE_INTERVAL` = 1 秒前 ✓）。
+            #   真机日志（`behavior.log` 2026-10-12 23:37）：
+            #     13.544 判到 `char_select`（广播那份 ✓）
+            #     13.751 重连却写「**已回到游戏**」✗ ⇒ `finish` ⇒ **收工** ✓
+            #   ⇒ 那一刻 `self.ui` 还是点频道时的 `channel_panel` ✗ ⇒ 不在 `FAKE_PLAYER_UIS`
+            #     里 ⇒ 角色立绘被当成"玩家框"那一下直接判成"人回来了"✗ ⇒ **"选角 ⇒ 按 Enter"
+            #     那一步永远走不到** ✓（用户看到的就是"不按 Enter 了"✓）。
+            #   ⚠ 只在**真会在意的岔口**重探（正卡在流程里 + 手上那份不在 `FAKE_PLAYER_UIS` ✓）：
+            #     不然人在游戏里时"玩家框"每帧都在 ⇒ 每帧重探（~4ms ✗）白烧 ✓。
+            if self.active and self.ui not in FAKE_PLAYER_UIS:
+                self._probe_at = now
+                try:
+                    self.ui = ui_state.detect(frame)
+                except Exception:                        # noqa: BLE001 —— 探测坏了别把重连弄停 ✗
+                    self.ui = None
+            else:
+                self._probe_at = 0.0
+            # ⭐⭐⭐ **人已经在游戏里了 ⇒ 取消那份「还欠一次 Enter」的待办** ✗
+            #   （用户 2026-10-17 ✓ 原话：「**进了游戏之后 小地图、世界状态都有了 还是按了回车**」✗）
+            #   现场（`behavior.log` 02:47 ✓）：
+            #     · 黑屏那几拍**被我那道闸拦住了** ✓（那条闸是对的 ✓
+            #       `.622~.998 进游戏：画面已黑屏 ⇒ 这一拍不动手` ✓）；
+            #     · 可**黑屏一过**画面已经是游戏世界（`screen_state st=combat` ✓ 小地图/世界状态都在 ✓
+            #       见 `.282` ✓ —— 而且用户当时看屏幕也是"都有了"✓）；
+            #     · 而 `_char_pending` **还挂着** ✗ ⇒ 这一拍重探**判不出界面**（= `None` ✓，
+            #       那正是"在游戏里"的正常结果 ✓）也收不了工 ✗ ⇒ 再等
+            #       `reconnect_step_timeout_ms` ⇒ **超时重试把回车按进游戏里** ✗✗
+            #       （`.136 进游戏：按 enter` ✓ ⇒ ⇒ 开聊天框 ⇒ 之后所有指令变打字 ✓ = 用户报的 ✓）。
+            #   ⚠ 判据用**这一帧刚重探的** `self.ui` ✗ 不许用旧的（见上面那段 ✓ ——
+            #     2026-10-12 那次就是拿了旧结果 ✗）：
+            #     · **还在选角**（`detect` 认得出 `char_select` ✓）⇒ **不清** ✓ ⇒ 待办照旧
+            #       ⇒ 下面那一步照常按一次回车 ✓（该按的那一下**不许丢** ✓ 2026-10-12 的教训 ✓）；
+            #     · **认不出 / 认成别的**（= 游戏世界 ✓）⇒ 人已经在游戏里 ⇒ **清掉待办** ✓
+            #       ⇒ 下面按"不是断线系界面 + 没有待办"**照常收工**（`_finish` ✓）⇒ **不按回车** ✓。
+            #   ⚠ 取舍（与 2026-10-12 那次方向相反 ✓ 都写清免得来回改 ✗）：
+            #     认不出界面时**宁可当作"已经在游戏里"** ✓ —— 因为两个代价不对等：
+            #     按进游戏里 = **开聊天框 ⇒ 之后所有指令全变打字** ✗✗（不可逆、还看不出来 ✓）；
+            #     误收工 = 多等一会儿/多看一轮 ✓（`finish` 之后玩家框一丢还会再来一轮 ✓）。
+            # ⚠⚠⚠ **2026-10-17 修正：判据换成"调用方给的那个 `in_game`"** ✗
+            #   ⛔ 我第一版拿「这一帧认不出界面」当判据 —— **那条太宽，把用例 ⑥ 弄坏了** ✗✗
+            #     （⑥ = 2026-10-07 那条：**广播说「选择角色」、本帧认不出 ⇒ 该补按一次 Enter** ✓
+            #       —— 可"认不出界面"在**选角屏**上也会发生 ✓ ⇒ 拿它当"已经在游戏里" ✗
+            #       ⇒ 那一下该按的会被吞掉 ✗ = 2026-10-12 用户抱怨过的「怎么不按 Enter 了」✓）。
+            #   ⇒ 判据必须是**只有真在游戏里才成立**的信号 ✓ ⇒ 由**调用方**（实时线程 ✓ 它手上
+            #     有小地图/世界状态 ✓）明确传进来 ✓（用户 2026-10-17 原话就是
+            #     「**进了游戏之后 小地图、世界状态都有了 还是按了回车**」✓ —— 判据正是这两个 ✓）。
+            #   ⚠ 下面那段长注释里凡写「用 `self.ui` 判」的地方**一律作废** ✗，以这里为准 ✓。
+            #   ⚠⚠ 判据要用**两个来源**（本帧 `self.ui` ✓ ＋ 广播 `ui_hint` ✓），
+            #     而且**两个都不再说"选角"**才算"已经在游戏里" ✓：
+            #       · 本帧判不出（`None` ✓）在**选角屏**上也会发生 ✗ ⇒ 单独用它 ⇒
+            #         把"该补按的那一下"吞掉 ✗（= 用例 ⑥ 钉的那条 ✓）；
+            #       · 广播（`_screen_state` ✓）在真进游戏后会**改口**（现场是 `combat` ✓
+            #         见 `behavior.log` 02:47:36.282 ✓）⇒ 两个来源同时指"不再是选角" ✓
+            #         ⇒ 那才是"人已经在游戏世界里"✓。
+            #     ⚠ 也接受调用方**明确**给的 `in_game`（更强的信号 ✓ 现在没人传 ✓ 留个钩子 ✓）。
+            if self._char_pending and (in_game or (
+                    self.ui != ui_state.UI_CHAR_SELECT
+                    and str(ui_hint or "") != ui_state.UI_CHAR_SELECT)):
+                self._char_pending = False
+                self._say("已经在游戏世界里了（小地图/世界状态都在 ✓）⇒ **取消「还欠一次回车」**"
+                          "（再按就是开聊天框 ⇒ 之后指令全变打字 ✗）")
+            # ⭐⭐ **只要这一轮判到过选角 ⇒ 不许"提前收工"** ✗（用户 2026-10-12 ✓：
+            #   见 `_char_pending` 的说明 ✓）—— "按 Enter 进游戏"那一步由下面照常走完 ✓。
+            if self.ui not in FAKE_PLAYER_UIS and not self._char_pending:
                 self.ui = None
                 if self.active:
                     return self._finish(now)
@@ -298,6 +429,24 @@ class Reconnector:
             self._probe_at = now
             self.ui = ui_state.detect(frame)
         ui = self.ui
+        # ⭐⭐⭐ **「选角 ⇒ 按 Enter」立成待办**（用户 2026-10-12 ✓ 见 `__init__` 里那段说明 ✓）：
+        #   判到选角 ⇒ 这一轮**必须走一遍那一步** ✓；之后某一帧就算又判成别的（立绘把匹配骗了 ✗）
+        #   也照选角走 ✓ ⇒ 下面 `STEPS[UI_CHAR_SELECT]` = 按 Enter ✓ 一处出口 ✓。
+        if ui == ui_state.UI_CHAR_SELECT:
+            if not self._char_pending:
+                self._char_pending = True
+                self._idle_logged = None                  # 换了个说法 ⇒ 下一轮"没出手原因"重记 ✓
+        elif self._char_pending and ui in RECONNECT_UIS:
+            # 待办还挂着（还没按过 Enter ✓）却判成了**另一个已知界面**（登录 / 频道 / 排队 ✓）
+            #   ⇒ 那是"真的走过去了"✓ ⇒ **待办作废** ✓
+            #   （⚠ 不作废就会赖在选角上、把别的界面当没看见 ✗ —— `t_reconnect_fake_player_box`
+            #     的 ② 段正是拿这个钉着的：那条口径是"别的断线系照旧收工"✓ 别推翻它 ✗）。
+            self._char_pending = False
+        elif self._char_pending and ui not in RECONNECT_UIS:
+            # 待办还挂着、而这一帧**认不出界面 / 判成了非断线系**（多半被选角立绘骗了 ✗）
+            #   ⇒ **按选角算** ✓（这就是"强制走一遍按 Enter"✓ 用户 2026-10-12："现在就上"✓）。
+            #   ⚠ 只在"待办还挂着 + 认不出"时这么干 ✗：按完 Enter 待办就销 ✓ ⇒ 该收工收工 ✓。
+            ui = ui_state.UI_CHAR_SELECT
 
         if ui not in RECONNECT_UIS:
             if self.active:
@@ -319,6 +468,11 @@ class Reconnector:
             self._tries = 0
             self._last_fail = ""
             self._declined = ""
+            # ⚠ 「选角还欠一次 Enter」那份待办**不在这儿清** ✗：这一轮可能是被"广播说选角"
+            #   （`ui_hint` ✓）**刚立起来**的 ✓ —— 清掉就等于把它丢了 ✗（用例 ⑥ 钉着 ✓）。
+            #   它由 `_finish` / `_give_up` / `_reset` 在**一轮结束时**销 ✓（那才是对的时机 ✓）；
+            #   `_char_entered` 倒是本轮该从零算 ✓。
+            self._char_entered = False
             self._scene_at = now
             # ⚠⚠ 记下"接手这一刻自动到底是什么状态"（2026-10-09 修 ✗）：原来**硬写 True** ——
             #   可"自动本来就是关的"那一路（掉线把自动停了 ✓ 见 `HARD_DISCONNECT_UIS` 那段 ✓）
@@ -342,6 +496,33 @@ class Reconnector:
 
         act, desc = STEPS[ui]
 
+        # ⭐⭐⭐ **黑屏 ⇒ 这一拍什么动作都不做**（尤其是**不按回车** ✗）——
+        #   用户 2026-10-17 ✓ 两句话合一：原话「**选人界面按Enter黑屏后就应该停止按Enter
+        #   不然进游戏打开对话框所有的指令都变成了打字**」✓ ＋ 追加口径「**必须拿黑屏作为
+        #   判定条件，没黑屏还是走以前的超时重试**」✓。
+        #   ⛔⛔ **摆在这儿是有血的教训的** ✗：这条闸原来是摆在**下面**「界面没变」那一段里 ✗ ⇒
+        #     只盖住了"超时重试"那一条出口 ✓，**漏掉上面这条**「`ui != self._scene` ⇒
+        #     立刻出手」✗✗ —— 现场日志（2026-10-17 01:45:02）：
+        #       .482 `进游戏：等界面变化…` → .517 `进游戏：按 enter`（**只隔 35ms** ✗）
+        #     ⇒ 那一下**只可能**走上面那条出口 ⇒ **人已经在进游戏的黑屏里，还是按了回车** ✗
+        #     ⇒ 进游戏后 Enter 开聊天框 ⇒ 之后所有指令变打字 ✓ = 用户报的 ✓。
+        #   ⇒ **一处闸，两条出口都盖住** ✓（摆在 `act, desc` 之后、`ui != self._scene` 之前 ✓）。
+        #   ⚠ 判据**只认"画面本身是黑的"** ✗（`is_black` ✓），**不认广播那份界面** ——
+        #     广播会滞后 ✓ 黑屏那几拍它还可能挂着 `char_select` ✗，那正是最危险的窗口 ✓。
+        #   ⚠⚠ 黑屏期间**把 `_scene_at` 往前推** ✓、**不吃 `_tries`** ✗、**也不改 `_scene`** ✓：
+        #     · 推 `_scene_at` ⇒ 加载那几秒不算"这一步超时"✓（否则画面一回来就立刻重按 /
+        #       甚至直接判 `_give_up` ✗ —— 那是误伤：加载不是我们的动作失败 ✓）；
+        #     · 不改 `_scene` ⇒ 画面一回来仍按"界面变了"走一趟 ✓（该按的那一下**不会丢** ✓）。
+        #   ⚠ 只管**会动手**的动作（`act != "wait"` ✓）：`wait`（排队 ✓）照旧往下走 ✓
+        #     —— 排队那支要**计时放弃** ✓，黑屏时把它一起冻住会让"排队超时"永远不触发 ✗。
+        #   ⚠ "黑屏 ⇒ 什么都不做"而不是"只不按回车" ✓：黑屏/加载画面上**没有任何**
+        #     "按了有用"的东西 ✓（既不是登录界面也不是选角 ✓）⇒ 一律不动手最不容易出错 ✓。
+        if act != "wait" and is_black(frame):
+            self._scene_at = now
+            self._say("%s：画面已黑屏（正在进游戏 / 加载 ✓）⇒ **这一拍不动手**"
+                      "（按回车就是开聊天框 ⇒ 之后指令全变打字 ✗），等画面回来…" % desc)
+            return None
+
         # 界面变了 = 上一步生效了 → 立刻做这一步
         if ui != self._scene:
             self._scene = ui
@@ -350,23 +531,72 @@ class Reconnector:
             self._click_at = 0.0            # 换界面 ⇒ 双击那一轮作废 ✓
             self._doubled = False
             self._scroll_pending = None     # 换界面 ⇒ "先滚再点"那一轮也作废 ✓
+            self._scroll_left = 0           # ⚠ 连同"还欠几格"一起作废 ✓（别欠到下一个界面 ✓）
+            self._homed = False             # 换界面 ⇒ "撞角单独一拍"那轮也作废 ✓
+                                            #   （新界面第一下必须重新归零 ✓ —— 光标位置
+                                            #    在上一个界面被点过、已经不可信了 ✓）
             return self._do(act, desc, now)
 
-        # ⭐⭐ **「先滚再点」的第二拍**（第 21~60 个频道 ✓ 见 `CHANNEL_TOTAL` 那段 ✓）：
-        #   滚动动作上面已经发了（`_do` ✓），滚完**隔一会儿**再点 ✓ —— ⚠ 一样**不在实时回路里
-        #   睡** ✗（交给这一拍 ✓ 同双击那套 ✓）。
+        # ⭐⭐ **「先滚再点」的后续拍**（第 21~60 个频道 ✓ 见 `CHANNEL_TOTAL` 那段 ✓）：
+        #   ⚠⚠ **一次只发 1 格、发完这一格等 `SCROLL_SETTLE` 再发下一格** ✗✗
+        #     （2026-10-11 现场：设 29 ⇒ 实际进了 **21** ✓ = 客户端只吃下 **1 行** ✗）：
+        #     客户端把**一串滚轮爆发当成一下** ✗（同 2026-10-10 那条注释记的同一族毛病 ✓
+        #     —— 那回"先发 20 格回顶"被当成一下 ⇒ 列表没动 ⇒ 点了频道 2 ✓）。
+        #     ⇒ 滚几行就分几拍发 ✓（每拍 1 格 ✓），全滚完再点 ✓。
+        #   ⚠ 一样**不在实时回路里睡** ✗（交给这一拍 ✓ 同双击那套 ✓）。
         #   ⚠ 点完照旧要**双击**（频道面板 ✓）⇒ 这里顺手把双击那一轮起个头 ✓（第二次由上面补 ✓）。
         if (self._scroll_pending is not None and self._scroll_at
                 and now - self._scroll_at >= SCROLL_SETTLE):
             xr, yr, name = self._scroll_pending
+            if int(getattr(self, "_scroll_left", 0) or 0) > 0:
+                self._scroll_at = now                         # 这一格已发 ⇒ 重新计时 ✓
+                self._scroll_left -= 1
+                self._declined = ""
+                self._say("%s：继续往下滚（**一格一拍** ✓ 还剩 %d 格）…"
+                          % (desc, self._scroll_left))
+                return {"act": "scroll", "up": 0, "down": 1, "x": xr, "y": yr, "desc": desc}
             self._scroll_pending = None
             if self.ui in DOUBLE_CLICK_UIS:
                 self._click_at = now
                 self._doubled = False
             self._declined = ""
+            # ⭐⭐⭐ **滚完必须重新归零**（用户 2026-10-17 ✓「**地铁二号线 无法选中频道**」✗）：
+            #   `mouse_aim.scroll` 是**带坐标**发的 ✓（滚轮只作用在光标底下的控件上 ✓）⇒
+            #   那一步**把光标挪到列表上了** ✗ ⇒ 之前那个"角"不再可信 ✗ ⇒ 若这一拍直接出
+            #   click（撞角 + 绝对走位**同一拍** ✗）⇒ 起点不是角 ⇒ 点歪 ✓
+            #   （relay 日志实证：`MOVE -4000 -4000` 与 `MOVE 2625 1805` 同一毫秒 ✓）。
+            #   ⚠ **不要**再进 `_do()` ✗ —— 那会重新判"要不要滚"（`_click_target` 还会说
+            #     要滚 ✓）⇒ **死循环** ✗（现场真栽过一轮 ✓）。这里直接出"归零"或"点击" ✓。
+            # ⚠⚠ **`_homed` 不许在这里复位** ✗（2026-10-17 ✓ 用户原话：
+            #   「**鼠标在屏幕上乱飞 然后停在左上角不动**」✗ = 我上一版造出来的**死循环** ✓）：
+            #   这一段**每次"待办到点"都会进来** ✓ ⇒ 若在这里 `_homed = False`
+            #   ⇒ 下一趟又判"没归过零" ⇒ **又撞角** ✓ ⇒ 永远在撞角 ✓
+            #   （relay trace 实证：每 0.38 秒一条 `MOVE -4000 -4000`、**没有走位** ✗）
+            #   ⇒ 光标被反复按在左上角 ✓✓。归零**一次就够** ✓ ⇒ 判据里必须带 `not _homed` ✓。
+            if (mouse_aim.cursor_visible() is False
+                    and not getattr(self, "_homed", False)):
+                # 收流（看不见光标 ✓）⇒ 让**下一拍**只归零，再下一拍才点 ✓
+                self._homed = True
+                self._click_at = 0.0          # ⚠ 双击的账作废（见 `_do` 里那段说明 ✓）
+                self._doubled = False
+                self._scroll_pending = (xr, yr, name)   # ← 归零完再回这块出点击 ✓
+                self._scroll_at = now
+                self._scroll_left = 0
+                self._declined = ""
+                self._say("%s：滚动到位 —— 先把光标**归零到屏幕角**"
+                          "（滚轮把光标挪到列表上了 ✓ 角不再可信 ✗ 下一拍再点 ✓）" % desc)
+                return {"act": "home", "desc": desc}
+            if self.ui in DOUBLE_CLICK_UIS:
+                self._click_at = now
+                self._doubled = False
+            self._declined = ""
             self._say("%s：滚动到位 —— 点%s（画面比例 %.3f, %.3f）" % (desc, name, xr, yr))
+            # ⚠ **归零只管这一下**（消费掉 ✓）：下一轮（失败了要重点 ✓）必须**重新归零** ✗
+            #   —— 那时光标已经跑到上一个目标上了 ✓ 角不再可信 ✓。
+            self._homed = False
             return {"act": "click", "x": xr, "y": yr, "desc": desc,
-                    "double": self.ui in DOUBLE_CLICK_UIS}
+                    "double": self.ui in DOUBLE_CLICK_UIS,
+                    "homed": True}
 
         # ⭐⭐ **「频道格要双击」的第二下**（2026-10-07 ✓ 真机验出来：单击只是"选中" ✗）：
         #   第一下由 `_do` 发（撞角归零 + 走位 + 左键 ✓）；**隔一小会儿**再补一条**光左键** ✓
@@ -380,6 +610,14 @@ class Reconnector:
             self._declined = ""
             self._say("%s：补第二下（这个界面要双击 ✓）" % desc)
             return {"act": "click2", "desc": desc}
+
+        # ⚠⚠ **（2026-10-17 复盘 · 记一笔 ✗）黑屏那道闸原来摆在这里 ⇒ 漏了上面那条出口** ✗：
+        #   它只盖住下面这段"超时重试" ✓，**没盖住上面**「`ui != self._scene` ⇒ 立刻出手」✗
+        #   ⇒ 实测（01:45:02）：`.482 等界面变化…` → `.517 按 enter`（**35ms** ✗）
+        #     = 从上面那条出口出去的 ⇒ 黑屏里照按不误 ✗ ⇒ 进游戏后 Enter 开聊天 ✓。
+        #   ⇒ 已**上移到 `act, desc = STEPS[ui]` 之后、`ui != self._scene` 之前** ✓
+        #     （**一处闸、两条出口都盖住** ✓ 详见那边的说明 ✓）。
+        #   ⇒ **下面这段一个字没改**：没黑屏时该重试就重试 ✓（用户点名要保的老行为 ✓）。
 
         # 界面没变：等超时再重试
         if act == "wait":
@@ -415,6 +653,11 @@ class Reconnector:
         if act == "enter":
             self._tries += 1
             self._declined = ""
+            # ⭐⭐ 「选角 ⇒ 按 Enter」这份待办**按下就销**（用户 2026-10-12 ✓ 见 `__init__` 那段 ✓）
+            #   —— 销掉之后：界面真变成游戏 ⇒ 该收工收工 ✓；还停在选角 ⇒ 照原逻辑重试/超时放弃 ✓
+            #   （**不会**无限按 ✗ 也不会一直赖着不结束 ✓）。
+            self._char_pending = False
+            self._char_entered = True    # ⭐ 这一轮按过了 ⇒ 广播那份旧状态别再立待办 ✓
             key = s.keymap.get("enter") or "enter"
             self._say("%s：按 %s" % (desc, key))
             return {"act": "tap", "key": key, "desc": desc}
@@ -433,6 +676,37 @@ class Reconnector:
                           % (desc, why, max(0.0, now - self._scene_at)))
                 return None
             xr, yr, name, scroll = tgt
+            # ⭐⭐⭐ **撞角必须单独占一拍**（用户 2026-10-17 ✓ 原话：
+            #   「**地铁二号线 无法选中频道**」✗）。
+            #   ⛔ 病根：收流那条路读不到光标 ⇒ `click_ratio` 只能"撞角 + 绝对走位" ✓，
+            #     而它把两条**同一拍**发出去 ✗ —— 撞角 `-4000,-4000` 固件要分块发完
+            #     （~34 块/轴 ✓）⇒ 走位紧跟着排上去 ⇒ **起点不是角** ⇒ 点歪 ✓
+            #     （`remote_kbd/A_relay_trace.log` 实证：两条 `MOVE` 同一毫秒 ✓）。
+            #   ⇒ 照 `scroll` 那条"**一格一拍**"的现成规矩 ✓：这一拍**只归零**
+            #     （`act="home"` ✓）、**不点、也不算一次尝试** ✗（`_tries` 动都不动 ✓
+            #     —— 411 那回就是栽在"白吃重试"上 ✓）；下一拍 `_homed` 已真 ⇒ 正常点 ✓。
+            #   ⚠ **只在"看不见那只光标"时才需要**（收流 relay ✓）：本地看得见 ⇒
+            #     `click_ratio` 走"**只发差量**"✓ ⇒ 根本不用撞角 ✗ ⇒ 也就不必分拍 ✓
+            #     （本地那条路的行为**一个字不变** ✓ —— 既有用例钉着"第一拍就是 click"✓）。
+            if (not getattr(self, "_homed", False)
+                    and mouse_aim.cursor_visible() is False):
+                #   ⚠ 只认**确定**看不见（`is False` ✓）—— "说不准"（`None` ✓）⇒ 保持老行为 ✗
+                self._homed = True
+                # ⚠⚠ **双击的账必须作废** ✗（2026-10-17 ✓ 现场「**鼠标停在左上角不动**」✗）：
+                #   归零这一拍**没点** ⇒ 可 `_click_at` 还留着 ✓ ⇒ 下一拍会走"**补第二下**"
+                #   （只发左键、**不走位** ✓ 它假设"光标没动"✗）⇒ **在角落里点** ✓
+                #   ⇒ 三次失败 ⇒ 重连放弃 ⇒ 光标就留在角上 ✓✓（日志实证 22.949 ✓）。
+                self._click_at = 0.0
+                self._doubled = False
+                # ⭐ 归零完**下一拍立刻走位+点** ✓ —— 借 `scroll` 那套"待办 + 节拍"
+                #   （`_scroll_pending` ✓ 收尾那块就是"走位+点"✓ 它认 `_homed` ✓ 不再归零 ✓）。
+                self._scroll_pending = (xr, yr, name)
+                self._scroll_at = now
+                self._scroll_left = 0
+                self._declined = ""
+                self._say("%s：先把光标**归零到屏幕角**（撞角那串要走完 ✓ 这一拍**不点** ✗，"
+                          "下一拍再点 ✓）" % desc)
+                return {"act": "home", "desc": desc}
             self._tries += 1
             self._declined = ""
             # ⭐⭐ 第 21~60 个频道**不在第一页**里 ⇒ 只往下滚需要的那几行（见 `CHANNEL_TOTAL`
@@ -440,8 +714,14 @@ class Reconnector:
             if scroll:
                 self._scroll_pending = (xr, yr, name)
                 self._scroll_at = now
-                self._say("%s：先把光标放到列表上，再往下滚 %d 行（目标落到最下面一行 ✓），"
-                          "然后点%s" % (desc, scroll[1], name))
+                # ⚠⚠ **记下"还剩几格要滚"**，**每次只发 1 格** ✗✗（2026-10-11 现场：设 29 ⇒
+                #   实际进 21 ✓ = 一次发 3 格时客户端只吃下 1 行 ✓ —— 它把一串爆发当成一下 ✓，
+                #   同 2026-10-10 那条"先发 20 格回顶 ⇒ 列表没动"✓ 同一族 ✓）。
+                #   剩下的由 `update()` 下一拍接着发 ✓（每格隔 `SCROLL_SETTLE` ✓ 不睡 ✗）。
+                self._scroll_left = max(0, int(scroll[1]) - 1)
+                self._say("%s：先把光标放到列表上，再往下滚 %d 行（目标落到最下面一行 ✓；"
+                          "**一格一拍** ✓ 防客户端吞串 ✓），然后点%s"
+                          % (desc, scroll[1], name))
                 # ⚠⚠ **坐标必须一起带上**（2026-10-09 真机修的 ✗ 用户："我选的 22 频道，
                 #   怎么断线重连去 2 了？"）：滚轮**只作用在光标底下那个控件**上 ✗ ——
                 #   不带坐标 ⇒ 光标还停在上一步"点服务器"的位置（画面上方 ✗ 不在列表里）
@@ -451,7 +731,9 @@ class Reconnector:
                 # ⚠⚠ **`up` 恒为 0** ✗（2026-10-10 ✓ 用户："选频道**没有滚轮操作**"）：
                 #   上一版先发 20 格"回到顶" ✗ ⇒ 客户端把这一串爆发当成一下 ⇒ **列表没动** ✗
                 #   ⇒ 点第一行 ⇒ 频道 2（现场 ✓）。一次只发"人也会那么滚"的那 1 格 ✓。
-                return {"act": "scroll", "up": scroll[0], "down": scroll[1],
+                # ⚠⚠ **这一拍只发 1 格** ✗（余下的 `_scroll_left` 格由 `update()` 逐拍发 ✓
+                #   —— 见上面那段：一次发一串会被客户端当成一下 ✓ 现场 29→21 ✓）。
+                return {"act": "scroll", "up": 0, "down": 1,
                         "x": xr, "y": yr, "desc": desc}
             # ⭐ 这一步要不要**双击**（`DOUBLE_CLICK_UIS` ✓）：要 ⇒ 记下这一拍的时刻，
             #   下一拍 `update()` 到点会补第二下（`click2` ✓ 见那边 ✓）。
@@ -462,7 +744,10 @@ class Reconnector:
                       % (desc, name, xr, yr,
                          "（这个界面要双击 ✓）" if self.ui in DOUBLE_CLICK_UIS else ""))
             return {"act": "click", "x": xr, "y": yr, "desc": desc,
-                    "double": self.ui in DOUBLE_CLICK_UIS}
+                    "double": self.ui in DOUBLE_CLICK_UIS,
+                    # ⭐ 能走到这里说明**归零那一拍已经过了**（见上面那段 ✓）⇒ 让
+                    #   `click_ratio` **别再撞角** ✗（撞角与走位必须分拍 ✓ 2026-10-17 ✓）。
+                    "homed": True}
         # "wait"：界面没变时上面已经处理，这里只是「刚切到排队界面」
         self._say("排队中…")
         return None
@@ -555,6 +840,8 @@ class Reconnector:
         self._tries = 0
         self._last_fail = ""
         self._declined = ""
+        self._char_pending = False       # ⭐ 收工 ⇒ 那份"选角还欠一次 Enter"的待办一起销 ✓
+        self._char_entered = False       # ⭐ 连同"这一轮按过没"一起清 ✓（下一轮重新算 ✓）
         if was:
             # ⭐⭐ **只"请求"恢复自动，不直接开**（用户 2026-10-07 ✓ 三选一里选了"体检"）：
             #   真正开自动前要过 `player_panel._precheck_problems` 那份体检（**同一份判据** ✓）。
@@ -578,6 +865,8 @@ class Reconnector:
         self._scene = None
         self._last_fail, fail = "", self._last_fail
         self._declined = ""
+        self._char_pending = False       # ⭐ 放弃了 ⇒ 那份待办一起销 ✓（别带进下一轮 ✓）
+        self._char_entered = False
         self.s.enabled = False
         if fail:
             # 把"动作本身为什么没成"一起说出来：只说"重试 3 次"，
@@ -595,6 +884,8 @@ class Reconnector:
         self.ui = None
         self._last_fail = ""
         self._declined = ""
+        self._char_pending = False       # ⭐ 整轮清空 ⇒ 那份"选角待办"也一起清 ✓
+        self._char_entered = False
 
     def _idle(self, why):
         """**这一步为什么没出手** —— 只在变化时进 `behavior.log`（诊断 ✓ 不打扰界面 ✓）。

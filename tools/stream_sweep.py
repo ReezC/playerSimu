@@ -37,7 +37,8 @@ import cv2                                                      # noqa: E402
 import numpy as np                                              # noqa: E402
 
 from link import PyAVSource                                     # noqa: E402
-from tools import probe_codec, push_presets as pp, sweep_link    # noqa: E402
+from core import probe_codec    # ⭐ 下沉 core（分层：上层不许 import tools ✓）
+from core import push_presets as pp, sweep_link    # noqa: E402
 from core.config import ROOT, get                              # noqa: E402
 
 #: 每段等流等多久（A 机换参数会重启 ffmpeg，UDP 流会断一下）

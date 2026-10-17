@@ -62,6 +62,12 @@ SPIN_MAX = 12.0
 #: 匹配分低于这个值时，「保存」会先问一句。0.55 = locate 内部那条 min_score
 SCORE_WARN = 0.55
 
+#: ⭐ 两次**整体重搜**之间至少隔这么久（秒 ✓ 用户 2026-10-13 ✓ 见 `_locate_now` ✓）：
+#: 邻近尺度搜索（5 个候选）在**当前尺度 ±10%** 里找 ✗ ⇒ 第一次用 / 手上的尺度本来就是
+#: 错的时，它只会回 `None` ✗ ⇒ 那时必须退回**整体搜索**（全范围）才能纠回来 ✓。
+#: 但整体搜索在大面板上要几秒 ✗ ⇒ 跟丢时不能每拍都来一次（观感就是"卡死"✗）⇒ 隔这么久一次 ✓。
+FULL_SEARCH_GAP_S = 2.0
+
 #: 邻域比现在**高出多少**才算"附近还有更贴的一档"（见 `_refresh_judge` ✓）。
 #: 0.02 是"比采样噪声大、又不至于把 0.002 的抖动当指路"那个量级 ✓。
 NEAR_MARGIN = 0.02
@@ -1143,8 +1149,26 @@ class MinimapCalibDialog(QDialog):
         scales = self._near_scales()
 
         t0 = time.perf_counter()
+        _full = False
         if scales is not None:
             loc = mm.locate_fit(self._frame, self.canvas, scales=scales)
+            # ⭐⭐ **跟丢 ⇒ 整体重搜一次**（用户 2026-10-13 ✓ 用例 `t_dialog_auto_fit`：
+            #   "邻近尺度跟踪能对上，**跟丢了要能整体重搜一次**"✓）
+            #   为什么非补不可：`_near_scales` 只给**当前尺度 ±10%** 的 5 个候选 ✗ ⇒
+            #     第一次用（或手上那个尺度本来就是错的 ✓）它直接回 `None` ✗ ⇒ 原来这里
+            #     只写一句"没对上"就 `return` 了 ✗ ⇒ **错尺度一辈子纠不回来** ✗
+            #     （真机现象：自动定位量出来的是 1.000，e 该 ≈2 的底图 ✗）。
+            #   判据两条都算跟丢：① 邻近搜索没结果（`None` ✓）；② 找着了但分数低于
+            #     `SCORE_WARN`（≈对了但不放心 ✓）。
+            #   ⚠ 只有 **fit** 这么干（crop 那条 `locate_crop` 自己搜倍数 ✓ 且每个候选都便宜 ✓）；
+            #   ⚠ **节流**：整体搜索在大面板上要几秒 ✗ ⇒ 距上次整体搜索不足
+            #     `FULL_SEARCH_GAP_S` 就这一拍先算了（否则跟丢时每拍卡一下 = 观感"卡死"✗）。
+            if ((loc is None or float(loc.get("score") or 0.0) < SCORE_WARN)
+                    and self.mode == mm.MODE_FIT
+                    and (now - float(getattr(self, "_full_at", 0.0))) >= FULL_SEARCH_GAP_S):
+                self._full_at = now
+                _full = True
+                loc = mm.locate(self._frame, self.canvas, self.mode)
         elif self.mode == mm.MODE_CROP:
             # ⭐ crop 两条路都**拿手上这套几何当种子**（用户 2026-09-29："我已经手工对得
             #   很好了"✓ —— 手工那份离答案最近，从它开始量又准又省 ✓）：
@@ -1162,6 +1186,8 @@ class MinimapCalibDialog(QDialog):
                 loc = mm.locate_crop(self._frame, self.canvas, seed=cur)
         else:
             loc = mm.locate(self._frame, self.canvas, self.mode)
+            _full = True                   # 本来就是整体搜（`scales` 给不出来 ✓）
+            self._full_at = now
         dt = time.perf_counter() - t0
         self._locate_cost = float(dt)      # 给自动模式的自适应节流用
 
@@ -1206,8 +1232,11 @@ class MinimapCalibDialog(QDialog):
         self._sync_overlay()
         # 顺带报一下这次定位花了多久：这一路以后要接进实时线程，耗时是硬指标
         #（B 机关键路径本来就没余量，见 docs/寻路设计.md §5 的性能一节）。
-        self._say("定位成功%s　匹配分 %.3f　%.0f ms%s"
-                  % ("（只改位移，缩放没动）" if self.ck_no_scale.isChecked() else "",
+        # ⚠ `_full`：这一下走的是**整体重搜**（邻近尺度那条跟丢了 ✓ 见上面那段）——
+        #   明说出来，人看到"这次慢"就知道为什么（不然只会以为卡了 ✓）。
+        self._say("定位成功%s%s　匹配分 %.3f　%.0f ms%s"
+                  % ("（整体重搜：邻近尺度跟丢了）" if _full else "",
+                     "（只改位移，缩放没动）" if self.ck_no_scale.isChecked() else "",
                      self.score, dt * 1000, move),
                   bad=(self.score < SCORE_WARN or dt > 0.25))
 

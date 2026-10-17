@@ -12,7 +12,7 @@ import sys
 import tkinter as tk
 
 from core.config import get
-from tools.probe_codec import encode_bits, now_ms
+from core.probe_codec import encode_bits, now_ms
 
 
 def main() -> int:

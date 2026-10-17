@@ -69,6 +69,16 @@ CORNER_STEP = 4000
 #:   老形状（只有平铺 ✓ 没有 `by_frame`）仍读得出 ✓ ⇒ 当"就只有那一份"✓ 不报错 ✓。
 GAIN_V2 = 2
 
+#: 找"这个尺寸的那一份"时允许的**相对差**（2026-10-11 ✓ 现场定案）。
+#: ⚠⚠ 为什么必须有它：本机窗口那条量出来是 **1918×1079** ✓，而后来画面是 **1920×1080** ✗
+#:   —— **同一路画面、差两个像素** ✓，可我第一版要求**精确相等** ✗ ⇒ 判成"没量过"
+#:   ⇒ **一个字节都不点** ⇒ 用户看到的正是「**本地的断线重连不选频道了**」✓
+#:   （日志原话：`⛔ 先不点：这个画面尺寸（1920×1080）还没有量过鼠标` ✓）。
+#: ⇒ 改成"**最接近的那一份 + 两轴都在这个比例内**"✓：
+#:     1920 vs 1918 = **0.1%** ⇒ 命中 ✓；1366 vs 1920 = **28%** ⇒ **不命中** ✓（正确 ✓）。
+#: ⚠ **绝不许"随便就近取一个"** ✗ —— 那是拿别的来源的几何来用，正是本仓库明令禁止的猜 ✓。
+GAIN_SIZE_TOL = 0.02
+
 
 def gain_frame_key(frame_shape):
     """帧尺寸 → 那一份标定的键 `"1366x768"` ✓（`frame_shape` = `(h, w, …)` ✓）。"""
@@ -136,7 +146,36 @@ def load_gain(frame_shape=None):
     key = gain_frame_key(frame_shape)
     if not key:
         return None
-    return _ok_entry(by.get(key) or {})
+    if key in by:
+        return _ok_entry(by[key])
+    # ⚠ 精确相等找不到 ⇒ 找**最接近**的那一份（**两轴都要**落在 `GAIN_SIZE_TOL` 内 ✓）
+    #   见 `GAIN_SIZE_TOL` 那段：1918×1079 ↔ 1920×1080 是**同一路画面** ✓ 该命中 ✓；
+    #   1366×768 ↔ 1920×1080 差 28% ⇒ **不许命中** ✗（那会拿收流的几何去点本机 ✓）。
+    try:
+        h, w = int(frame_shape[0]), int(frame_shape[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    best, best_d = None, None
+    for e in by.values():
+        g = _ok_entry(e)
+        if not g:
+            continue
+        try:
+            ew, eh = int(e.get("ref_w") or 0), int(e.get("ref_h") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ew <= 0 or eh <= 0:
+            continue
+        dw = abs(ew - w) / float(w)
+        dh = abs(eh - h) / float(h)
+        if dw > GAIN_SIZE_TOL or dh > GAIN_SIZE_TOL:
+            continue
+        _d = dw + dh
+        if best_d is None or _d < best_d:
+            best, best_d = g, _d
+    return best
 
 
 def gain_sizes():
@@ -325,13 +364,50 @@ def auto_measure(frame_shape, force=False):
                        "回 `CURSOR?` ✓ 见 `remote_kbd/relay.py`；relay 是旧版就更新它 ✓）"
                        "⇒ 这个尺寸手工量一次 ✓")
     h, w = int(frame_shape[0]), int(frame_shape[1])
+
+    def _wait_cursor(pred, timeout=0.8):
+        """等"读到的位置**满足 `pred`**" ✓ ⇒ 返回那一次读数 ✓（到点还没有 ⇒ 返回最后一次 ✓ 照实报 ✓）。
+
+        ⚠⚠⚠ **为什么判据不能是"两次读数相同 / 和上一次不同"** ✗✗（2026-10-15 ✓ 这里连栽两版 ✓）：
+          慢 relay 的形态是"**读到的永远是几拍之前的位置**" ✓ ⇒
+            · 判"**和上一次不同**" ⇒ 会**立刻返回那个旧位置** ✗（现场 `Δ=0` ✓）；
+            · 判"**两次读数相同**" ⇒ **照样立刻返回** ✗✗ —— 因为在这个形态下**连续两次读数本来
+              就相同** ✓（都在读同一条旧尾巴 ✓）⇒ 它给了个"看着很稳"的**假基准** ✓
+              （**比不判更糟** ✗ —— 这一版就是被 `t_mouse_aim_measure_settle` 那根桩当场逮住的 ✓
+              报的正是 `Δ=-900,-700`：基准还是撞角之前那个点 ✓）。
+          ⇒ 判据只能是"**这一拍该在的那个点**" ✓：
+            · 撞角之后 ⇒ 该在**虚拟屏左上角**（`(vx, vy)` ✓ 字段序见 `cursor_reply_text` ✓）；
+            · 走一步之后 ⇒ 该**离开**那个点 ✓（走多少**正是要量的** ⇒ 不预设 ✓ 只要求"变了" ✓）。
+        ⚠ 到点还没满足 ⇒ 返回最后一次读数 ✓（让调用方**照实**按"没动 / 不可信"报 ✓ ——
+          宁可不写盘，也不给自己一个假数 ✗ 同 `save_gain` 的口径 ✓）。
+        ⚠ 它**只许**在 `auto_measure` 里（也就只在**后台线程**里 ✓ 见 `auto_measure_async` /
+          「立即量一次」的 `_ForceMeasure` ✓）：实时回路那条路上**一个都不许睡** ✗
+          —— `selftest_decision` 里那条源码钉把这条口径钉着 ✓（本意：睡 = 卡住整条实时回路 ✓）。
+        """
+        _last, _t0 = None, time.monotonic()
+        while True:
+            _last = _probe_cursor()
+            if _last is not None and pred(_last):
+                return _last
+            if (time.monotonic() - _t0) >= timeout:
+                return _last
+            time.sleep(0.05)
+
+    # 撞角的目标 = **虚拟屏左上角** ✓（`pre` 的字段序：`x y vx vy vw vh [cap]` ✓
+    #   见 `cursor_reply_text` ✓）；老格式只有三个数 ⇒ 退化成 (0, 0) 那台机器的原点 ✓
+    try:
+        _vx, _vy = int(pre[2]), int(pre[3])
+    except (TypeError, ValueError, IndexError):
+        _vx, _vy = 0, 0
     corner_zero()                                # ① 到已知原点（那台机器的虚拟屏左上角 ✓）
-    p0 = _probe_cursor()
+    # ⭐ **等它真的到角上**再当基准 ✓（撞角是大位移 ✓ 慢 relay 下要过几拍才读得到 ✓）
+    p0 = _wait_cursor(lambda _p: abs(int(_p[0]) - _vx) <= 4 and abs(int(_p[1]) - _vy) <= 4)
     if p0 is None:
         _restore_cursor(pre, None)               # ⚠ 撞角了就得负责放回去 ✗
         return False, "撞角之后读不到光标 ⇒ 自动量不了 ✗"
     dinput.mouse_move(AUTO_STEP, AUTO_STEP)      # ② 走一步（两个轴一起走，一次量两轴 ✓）
-    p1 = _probe_cursor()
+    # ⭐ **等它离开那个点**（走多少正是要量的 ⇒ 不预设 ✓ 只要"变了" ✓ 见 `_wait_cursor` 那段 ✓）
+    p1 = _wait_cursor(lambda _p: (int(_p[0]), int(_p[1])) != (int(p0[0]), int(p0[1])))
     dinput.mouse_move(-AUTO_STEP, -AUTO_STEP)    # ⚠ 先挪回撞角处（别把光标留在别处 ✓）
     dx_px = dy_px = None
     if p1 is not None:
@@ -372,6 +448,97 @@ def auto_measure(frame_shape, force=False):
     return True, ("自动量好了：一单位走 **%.4f / %.4f 帧像素**"
                   "（屏幕基准 %.4f / %.4f × 折算 %.4f ✓）⇒ 已按帧尺寸 %s 存下 ✓"
                   % (gx, gy, dx_px / float(AUTO_STEP), dy_px / float(AUTO_STEP), sx, key))
+
+
+#: ⭐⭐ 「**实时回路正收到的那个帧**」的尺寸（`(h, w)` ✓）—— 由实时回路每拍更新 ✓。
+#: ⚠⚠ 为什么必须有它（2026-10-15 现场 ✓）：设置里那个按钮原来只问"**设置对话框所属那一台
+#:   工作台**的 `live_panel._last_stats["size"]`" ✗ ⇒ 现场连着两次留痕都是 `size=[0, 0]`
+#:   （`remote_measure_click` ✓）⇒ 一个字节都没发 ✗ ⇒ 用户看到的就是"**点了没反应**" ✓。
+#:   而**开两个工作台**时，设置对话框属于哪一台、预览跑在哪一台，本来就可能**不是同一台** ✗
+#:   ⇒ 那条路不可靠 ✓ ⇒ 让**真正在收帧的那条回路**把尺寸报上来 ✓（与工作台实例无关 ✓）。
+_LAST_FRAME_SHAPE = None
+
+
+def note_frame_shape(frame_shape):
+    """实时回路每拍调一下 ✓：记下"我正在收的那个帧"的尺寸 ✓（`(h, w)` 口径 ✓）。
+
+    ⚠ 只在拿到**有效**尺寸时覆盖 ✗（没有帧的那几拍不许把上一次的抹成 `None` ✗ ——
+      否则按钮会在"刚好那一拍没帧"时误报"拿不到画面尺寸" ✓）。
+    """
+    global _LAST_FRAME_SHAPE
+    try:
+        if frame_shape is not None and len(frame_shape) >= 2:
+            _h, _w = int(frame_shape[0]), int(frame_shape[1])
+            if _w > 0 and _h > 0:
+                _LAST_FRAME_SHAPE = (_h, _w)
+    except (TypeError, ValueError, IndexError):
+        pass
+
+
+def last_frame_shape():
+    """`(h, w)` = 实时回路**最近**一帧的尺寸；**从没有过帧 ⇒ `None`** ✓（界面据它说清 ✓）。"""
+    return _LAST_FRAME_SHAPE
+
+
+def gain_record(frame_shape=None):
+    """这一尺寸的**整份记录**（含探针真数 ✓）⇒ dict / None ✓（用户 2026-10-15 要的"看得见"✓）。
+
+    ⚠ 为什么必须补它 ✗（本轮踩的坑 ✓）：`load_gain` 只回 `(gx, gy)` ✓ ⇒ 界面只知道
+      "**量过没有**"，**看不见"折算比是多少 / relay 报的屏幕与抓取区域是多少"** ✗ ——
+      而这次"重量了也没用"恰恰就出在这一步（`probe.scale` / `probe.cap` ✓）⇒
+      那三个数必须**能一眼看到** ✓（`calib_status` 现在就把它们写进状态行 ✓）。
+    """
+    flat, by = _read_gain_file()
+    if frame_shape is None:
+        return flat or None
+    key = gain_frame_key(frame_shape)
+    if key and key in by:
+        return by[key]
+    return None
+
+
+def _log_probe(ok, frame_shape, why, source=None):
+    """把一次测量的**真数**写进 `behavior.log` ✓（**成功失败都写** ✓ —— 失败那次尤其重要 ✗）。
+
+    ⚠⚠ 为什么非要有它（2026-10-15 现场 ✓）：标定失败原来只写在**设置对话框那行小字**里 ✗
+      ⇒ 关掉设置就没了 ⇒ 事后只能靠"连 A 机 relay 问一遍"（还被工作台占着连不上 ✗）或
+      "反推文件改动时间"来猜 ✓ —— 这次整整绕了两轮 ✗ ⇒ 记下来：**帧尺寸 / relay 报的屏幕 /
+      抓取区域 / 折算比 / 量出来的增益 / 人话原因** ✓。
+    ⚠ 它自己炸了**绝不许**影响测量 ✗（留痕是附带的 ✓ 不是主流程 ✓）。
+    """
+    try:
+        from core import behavior
+        _r = gain_record(frame_shape) or {}
+        _pr = dict(_r.get("probe") or {})
+        _w, _h = 0, 0
+        try:
+            _h, _w = int(frame_shape[0]), int(frame_shape[1])
+        except Exception:                            # noqa: BLE001
+            pass
+        behavior.event("mouse_gain_probe", ok=bool(ok), frame=[_w, _h],
+                       source=source or _pr.get("frame_source") or _pr.get("source"),
+                       screen=_pr.get("screen"), cap=_pr.get("cap"),
+                       scale=_pr.get("scale"), gain=[_r.get("gain_x"), _r.get("gain_y")],
+                       why=str(why)[:180])
+    except Exception:                                # noqa: BLE001
+        pass
+
+
+_raw_auto_measure = auto_measure
+
+
+def auto_measure(frame_shape, force=False, source=None):     # noqa: F811
+    """同 `_raw_auto_measure` ✓，外面包一层**留痕** ✓（成功失败都记 ✓ 见 `_log_probe` ✓）。
+
+    ⚠ 为什么不直接在原函数体里加日志 ✗：它有十来处 `return False, …`（每处一句人话 ✓）
+      ⇒ 逐个加等于把那份说明撕成十几段 ✓；**在出口包一层**只动一处 ✓，而且**所有调用方**
+      （`auto_measure_async` 那条自动路 ✓、设置里「立即量一次」那个按钮 ✓）自动全带上 ✓。
+    ⚠ 参数与老的一字不差 ✓（多的 `source` 只喂给日志 ✓ —— 调用方知道"这一帧是哪一路"
+      就传 ✓ 不知道就不传 ✓ 绝不影响测量本身 ✓）。
+    """
+    ok, why = _raw_auto_measure(frame_shape, force=force)
+    _log_probe(ok, frame_shape, why, source=source)
+    return ok, why
 
 
 #: 自动量**正在后台跑**吗 ✓（跑的时候**谁都不许再动鼠标** ✗ —— 两步插在一起就白量了 ✓）。
@@ -429,6 +596,80 @@ def auto_measure_enabled():
         return bool(d.get("auto_measure", AUTO_MEASURE_DEFAULT))
     except Exception:                            # noqa: BLE001 —— 读不出来 ⇒ 当关 ✓
         return AUTO_MEASURE_DEFAULT
+
+
+def set_auto_measure(on):
+    """**写**「自动量」这个开关 ⇒ `(ok, 人话)` ✓（用户 2026-10-15：「设置 → 链路 → 远程操控」要一个勾选框 ✓）。
+
+    ⚠⚠ 为什么必须由**这里**写、不许界面自己 `json.dump` ✗：这个键和标定**同住一个文件** ✓
+      （`config/mouse_gain.json` ✓ 见 `_read_gain_file` 的文件形状那段 ✓）⇒ 界面整写会把
+      `by_frame` 里那几份**抹掉** ✗ —— 那是"一种尺寸量一次"攒下来的 ✓（`load_gain` 的说明里
+      写着为什么按尺寸存 ✓）抹了就得**每种尺寸重量一次** ✓。
+    ⇒ 这里**只改这一个键** ✓，读得出来的部分**一个字都不丢** ✓（文件不在 / 坏了 ⇒ 从空开始 ✓）。
+    """
+    import json
+    try:
+        try:
+            d = json.loads(GAIN_PATH.read_text(encoding="utf-8"))
+            if not isinstance(d, dict):
+                d = {}
+        except Exception:                        # noqa: BLE001 —— 没有 / 坏了 ⇒ 从空开始 ✓
+            d = {}
+        d["auto_measure"] = bool(on)
+        GAIN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        GAIN_PATH.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:                       # noqa: BLE001 —— 写盘失败 ⇒ 说清 ✓
+        return False, "写不进 `%s`：%s" % (GAIN_PATH.name, e)
+    return True, ("已**开启**自动量 ✓（这个尺寸没量过时它会自己量一次 ⇒ **会动鼠标** ✓）"
+                  if on else "已**关闭**自动量 ✓（没量过的尺寸 ⇒ 只提示、绝不自己动鼠标 ✓）")
+
+
+def calib_status():
+    """给「远程操控」那一组用的一行状态 ⇒ **人话**（用户 2026-10-15 ✓）。
+
+    ⚠ 只报**文件里有什么** ✓、不猜"现在收到的是多大" ✗ —— 那是实时回路的账 ✓（判据见
+      `gain_mismatch`：它问的就是"**这个尺寸量过没有**"✓），界面这一侧拿不到帧 ✓。
+    """
+    _sizes = gain_sizes()
+    if not _sizes:
+        return "还没有量过任何画面尺寸 ⇒ 鼠标**不会点**（点服务器 / 点频道 / 测谎瞄准都靠它 ✗）"
+    _lines = ["已量过的画面尺寸：%s　｜　自动量：%s" % (
+        " / ".join(sorted(_sizes)), "开" if auto_measure_enabled() else "关")]
+    # ⚠⚠ **折算比必须看得见**（2026-10-15 ✓ 这一条是拿一次真事故换来的 ✗）：`load_gain` 只回
+    #   两个增益 ✗ ⇒ 界面看不见"它是拿**什么几何**算出来的" ✗ —— 而"重量了也没用"这次恰恰就是
+    #   **relay 报的抓取区域不对** ✓（`scale` = 这一帧 ÷ 抓取区域 ✓）⇒ 每个尺寸给一行：
+    #   **来源 / 折算比 / relay 报的屏幕 / 抓取区域** ✓。
+    #   ⭐ 自证判据：`scale` 不等于"这一帧 ÷ **你 A 机的真实屏幕**"⇒ 一眼就是 relay 那边报错了 ✓
+    #     （例：帧 1366×768 / A 机 1920×1080 ⇒ 对的折算比是 **0.7115**；写 0.8 ⇒ 它以为屏幕是
+    #      1707×960 ✗ ⇒ 点击会**按比例**落在 80% 处 ✗ —— 这正是用户看到的现象 ✓）。
+    _flat, _by = _read_gain_file()
+    for _k in sorted(_by):
+        _e = _by[_k] or {}
+        _pr = dict(_e.get("probe") or {})
+        _bits = [str(_k)]
+        _src = _pr.get("frame_source") or _pr.get("source")
+        if _src:
+            _bits.append(str(_src))
+        _sc = _pr.get("scale")
+        try:
+            if _sc:
+                _bits.append("折算 %s" % "/".join("%.4f" % float(v) for v in _sc))
+        except (TypeError, ValueError):
+            pass
+        _cap = _pr.get("cap")
+        try:
+            if _cap:
+                _bits.append("抓取区域 %dx%d" % (int(_cap[0]), int(_cap[1])))
+        except (TypeError, ValueError, IndexError):
+            pass
+        _scr = _pr.get("screen")
+        try:
+            if _scr:
+                _bits.append("relay 报的屏幕 %dx%d" % (int(_scr[0]), int(_scr[1])))
+        except (TypeError, ValueError, IndexError):
+            pass
+        _lines.append("　· " + "　".join(_bits))
+    return "\n".join(_lines)
 
 
 def auto_measure_async(frame_shape):
@@ -571,18 +812,154 @@ def _virtual_origin():
         return 0, 0
 
 
-def to_screen(px, py, origin=None):
-    """**画面像素** → **屏幕像素**（`origin` = 这一帧在屏幕上的左上角 ✓）。
+#: `frame_rect` 的**离谱门**：抓取区域/帧尺寸 的比例必须在这个范围里 ✓
+#: （本机实测 1.4054 ✓ 收流整屏那种可能到 3.7 ✓；超出这个范围 ⇒ 记的东西多半是错的 ✓
+#:  ⇒ 当没量过 ✓ 宁可退回老行为，也别按一条离谱记录去点 ✗）。
+RECT_SANITY = 4.0
+
+
+def frame_rect(frame_shape=None):
+    """这一帧对应的**抓取区域** ⇒ `(ox, oy, cw, ch)`（**屏幕像素** ✓）；没量过 ⇒ `None` ✓。
+
+    ⚠⚠ **为什么非要它**（2026-10-17 ✓ 用户现场两句话：
+      「**选频道界面鼠标操作完全歪了**」✗ ＋「**刚跑了标定 还是没用**」✗）：
+      · `to_screen()` 老版本**只加原点、不折算比例** ✗，而帧是**推流**来的、被缩过 ✗ ——
+        本机实测：抓取区域 **1920×1080** ✓ 而帧是 **1366×768** ✓ ⇒ 比例 **k = 1.4054** ✗
+        ⇒ 目标点整体偏 k 倍 ✓；再叠上桌面 **5120×1440** ✓ / 虚拟原点 **(−2560, 0)** ✓ 的
+        原点折返 ✓ ⇒ 现场算出 **4317** 单位（正确值约 **700** ✓）⇒ 差 6 倍 = "完全歪了" ✓。
+      · ⚠ 标定工具**拒绝猜**这个折算比是对的 ✓（当时报的是"这一帧跟那台机器的屏幕不是
+        1:1（5120x1440）✗、relay 也没报**抓取区域** ✗ ⇒ 算不出来 ✓（**不猜** ✓）"✓）
+        ⇒ 只能**实测** ✓（`tools/mouse_aim_rect.py` ✓）。
+    ⚠ **没量到 ⇒ `None`** ⇒ `to_screen` / `screen_gain` **一字退回老行为** ✓
+      ⇒ 这套东西**加了也不会把现在能用的场景弄坏** ✓（没量过就与今天一样 ✓）。
+    ⚠ 校验（宁缺毋滥 ✓）：四个数得是数、`cw/ch` 为正 ✓、比例落在 `RECT_SANITY` 内 ✓。
+    """
+    if frame_shape is None:
+        return None                      # 手上没帧 ⇒ 不折算 ✓（宁可不动 ✓）
+    try:
+        fh, fw = int(frame_shape[0]), int(frame_shape[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if fw <= 0 or fh <= 0:
+        return None
+    _flat, by = _read_gain_file()
+    key = gain_frame_key(frame_shape)
+    e = by.get(key) if key else None
+    if not isinstance(e, dict):
+        # 精确找不到 ⇒ 找**最接近**那份（与 `load_gain` 同一条规矩 ✓ 2% 以内 ✓）
+        best, best_d = None, None
+        for cand in by.values():
+            if not isinstance(cand, dict):
+                continue
+            try:
+                ew, eh = int(cand.get("ref_w") or 0), int(cand.get("ref_h") or 0)
+            except (TypeError, ValueError):
+                continue
+            if ew <= 0 or eh <= 0:
+                continue
+            dw = abs(ew - fw) / float(fw)
+            dh = abs(eh - fh) / float(fh)
+            if dw > GAIN_SIZE_TOL or dh > GAIN_SIZE_TOL:
+                continue
+            if best_d is None or dw + dh < best_d:
+                best, best_d = cand, dw + dh
+        e = best
+    if not isinstance(e, dict):
+        return None
+    try:
+        ox, oy, cw, ch = (int(round(float(v))) for v in e.get("frame_rect"))
+    except (TypeError, ValueError):
+        return None
+    if cw <= 0 or ch <= 0:
+        return None
+    kx, ky = cw / float(fw), ch / float(fh)
+    if not (1.0 / RECT_SANITY <= kx <= RECT_SANITY
+            and 1.0 / RECT_SANITY <= ky <= RECT_SANITY):
+        return None                      # 差得离谱 ⇒ 当没量过 ✓（按它点就是飞 ✓）
+    return ox, oy, cw, ch
+
+
+def roi_px(roi, frame_shape, xr, yr):
+    """比例（**相对"我们看到的这块画面"**）⇒ **整帧**像素 ✓（部署台框选游戏区域用 ✓）。
+
+    ⭐⭐⭐ 为什么要有它（用户 2026-10-17 ✓ 原话：
+      「**现在我需要部署台也能像本地流程一样能够自由选择游戏窗口区域**
+       注意**断线重连、自动测谎的鼠标适配**」✓）：
+      · 部署台（B 机）自己**不抓屏** ✗，吃的是 A 机推来的整帧 ✓；
+      · 框了"游戏窗口区域"之后，我们看到的画面就是**整帧里的一块** ✓；
+      · 而断线重连 / 自动测谎给的比例是**相对它看到的那块**算的 ✓
+        ⇒ 直接拿它去乘**整帧**尺寸就会**整体偏移一块**（点歪 ✓ 而且偏得很有规律 ✓）。
+    ⇒ 口径：`整帧像素 = roi 原点 + 比例 × 这块的尺寸` ✓（**一块实现**，两处调用共用 ✓）。
+    ⚠ 比例越界**不夹取**、直接失败（同 `target_px` ✓ —— 写错了就该停下报 ✗）。
+    """
+    px, why = target_px(frame_shape[1], frame_shape[0], xr, yr)
+    if px is None:
+        return None, why
+    try:
+        x, y, w, h = (float(v) for v in roi)
+    except (TypeError, ValueError, IndexError):
+        return None, "框选区域不是四个数（%r）" % (roi,)
+    if w <= 0 or h <= 0:
+        return None, "框选区域无效（宽高该 > 0：%r）" % (roi,)
+    return (x + px[0], y + px[1]), ""
+
+
+def to_screen(px, py, origin=None, frame_shape=None):
+    """**画面像素** → **屏幕像素**。
 
     ⚠⚠ 为什么必须有这一步（2026-10-10 ✓ 用户原话：**"我可能会把游戏窗口随意拖动，并且
       游戏窗口可能会被拖到副显示屏"** ✓）：帧是**从你框选那块区域裁出来的** ✗ ⇒ 帧里的
       `(0, 0)` 是**那块区域的左上角** ✓、不是屏幕原点 ✗。窗口拖到副屏（x<0 ✓）时，
       "帧像素"与"屏幕像素"差的正是这个 `origin` ✓ —— 不补上 ⇒ 点击落点整体偏一整块区域 ✗
       （老版本在副屏上则是**根本够不着** ✓ 见 `counts_for` 的说明 ✓）。
-    `origin` 不给 ⇒ 当 `(0, 0)`（帧就在主屏原点 ⇒ 与老行为一字不差 ✓）。
+
+    ⚠⚠ **两件事，缺一不可**（2026-10-17 ✓ 现场"鼠标完全歪了"就是漏了第二件 ✗）：
+      ① 加**原点**（那块区域的左上角在屏幕哪 ✓ —— 老版本就有 ✓）；
+      ② 乘**比例**（抓取区域尺寸 / 帧尺寸 ✓ —— 老版本**没有** ✗）：
+         ⚠ 帧是**推流**来的、被缩过 ✗（本机 1920×1080 的区域 → 1366×768 的帧 ✓
+         ⇒ 帧里的 497px 其实是屏幕上的 **698px** ✓）⇒ 只加原点不加比例 ⇒
+         落点整体偏 **k 倍** ✓（正是"完全歪了"✓）。
+      ② 的比例与①的原点**一起**来自 `frame_rect()` ✓（**量过才有** ✓）⇒
+      没量过 ⇒ ①②都不做 ✓（= 老行为**一字不变** ✓）。
+    `origin` 给了 ⇒ **按调用方给的**（老行为：只加、不折算 ✓）。
     """
-    ox, oy = (0, 0) if not origin else (int(origin[0]), int(origin[1]))
-    return float(px) + ox, float(py) + oy
+    if origin:
+        return float(px) + int(origin[0]), float(py) + int(origin[1])
+    r = frame_rect(frame_shape) if frame_shape is not None else None
+    if not r:
+        return float(px), float(py)
+    try:
+        fh, fw = int(frame_shape[0]), int(frame_shape[1])
+    except (TypeError, ValueError, IndexError):
+        return float(px), float(py)
+    return (float(px) * r[2] / float(fw) + r[0],
+            float(py) * r[3] / float(fh) + r[1])
+
+
+def screen_gain(gain, frame_shape=None):
+    """「**帧像素** / 指令单位」的 gain ⇒ 折成「**屏幕像素** / 指令单位」✓（`counts_for` 要的正是后者 ✓）。
+
+    ⚠⚠ **这就是现场那条"尺度被算了两遍"的病根**（2026-10-17 ✗）：
+      `to_screen()` 已经把帧像素折成屏幕像素 ✓，而 `counts_for()` 又拿**帧像素口径**的 gain
+      除了第二遍 ✗（`load_gain` 的注释写"帧像素"✗、`counts_for` 的 docstring 写"屏幕像素"✓
+      ⇒ **同一个文件里两处口径打架** ✗）⇒ 于是**多乘了一个 k** ✓。
+      ⭐ 折算过来是**自洽**的 ✓：`0.7115 × 1.4054 = 1.0` ✓ —— 正好等于标定探针量到的
+      「**1 单位走 1 个屏幕像素**」✓✓（`probe.step=300 / screen_px=[300,300]` ✓）
+      ⇒ 这也反过来印证 ①（比例 k）该乘上 ✓。
+    ⚠ 没量过 `frame_rect` ⇒ **原样返回** ✓（老行为一字不变 ✓）。
+    """
+    try:
+        gx, gy = float(gain[0]), float(gain[1])
+    except (TypeError, ValueError, IndexError):
+        return gain
+    r = frame_rect(frame_shape) if frame_shape is not None else None
+    if not r:
+        return (gx, gy)
+    try:
+        fh, fw = int(frame_shape[0]), int(frame_shape[1])
+    except (TypeError, ValueError, IndexError):
+        return (gx, gy)
+    return (gx * r[2] / float(fw), gy * r[3] / float(fh))
 
 
 def counts_for(px, py, gain_x, gain_y):
@@ -649,6 +1026,88 @@ def corner_zero():
     dinput.mouse_move(-CORNER_STEP, -CORNER_STEP)
 
 
+#: 撞角「到位」的容差（像素 ✓）—— 实测撞角落点**是精确的** `(−2560, 0)` ✓，
+#: 留几像素只为吸收 OS 的取整 ✓；**不许放大** ✗（放大了就把"没归零"当"归零了"✓）。
+CORNER_TOL = 8
+
+
+def _cursor_pos():
+    """**系统光标现在在哪** ⇒ `(x, y)`；读不到 ⇒ `None` ✓（瞬时 ✓ **绝不 sleep** ✗）。
+
+    ⚠⚠ 为什么要读它（用户 2026-10-17 ✓ 现场：断线重连卡在"点服务器"上 ✗、
+      说"**鼠标都不在游戏窗口内 一直在屏幕最右边**"✗）：
+      `click_ratio` 原来是「`corner_zero()` → `mouse_move(dx, dy)` → `click`」**一口气发完** ✗
+      —— 设计前提是"固件按行顺序执行、所以按钮按下时光标已经在目标上 ✓"（见它的 docstring ✓）。
+      ⚠ 但那条前提**漏了一件事**：撞角那一步是 `−4000,−4000` ✓，而固件对 `MOVE` 是
+      **分块发送**的（`mouseMoveChunked`，每块 ≤120 ✓ 见本文件 L57-58 ✓）
+      ⇒ 那是 **~34 块/轴** 的一串报文 ✓；紧接着就发 `mouse_move(3072, 203)` ✗
+      ⇒ 只要撞角那串**还没发完/被后来的行顶掉** ✗，"角"就不是角 ✗
+      ⇒ `+3072` 从错误的位置算起 ⇒ 落点整体偏 ✗，最典型就是被**屏幕右缘夹住** ✓
+      （`0 + 3072 > 2559` ⇒ 停在 **2559** ✓ = 用户看到的"屏幕最右边"✓✓ 数字正好对上 ✓）。
+      ⚠ 旁证：我**空着串口**实测时是"撞角 + `sleep 0.5`"⇒ 落点精确 ✓；差别就在这 ✗。
+    ⚠ 读光标是**瞬时**的 ✓（`GetCursorPos` 系统调用 ✓）⇒ 不违反"实时回路不许 sleep"那条硬规矩 ✓
+      （那条钉子见 `selftest_decision` ✓）。
+    """
+    try:
+        import win32api
+        return tuple(int(v) for v in win32api.GetCursorPos())
+    except Exception:                           # noqa: BLE001 —— 读不到就照老路走 ✓
+        return None
+
+
+def _sync_aim_cur(frame_shape, gain_pair, origin):
+    """把**瞄准的「当前位置」基准**同步成**真光标** ⇒ 同步到了返回 `True` ✓（瞬时 ✓ **不 sleep** ✗）。
+
+    ⭐⭐⭐ 为什么非有它不可（用户 2026-10-17 ✓ 原话：
+      「**鳄鱼潭项目1 自动测谎：鼠标没有指着准心，而是在屏幕很靠右的地方动**」✗）：
+      `aim_tick` 在"位置不可信"时的老写法是「`corner_zero()` ＋ **立刻**当光标已在原点
+      `(0,0)`」✗ —— 而撞角是 `−4000,−4000`、固件对 `MOVE` 是**分块发**的（~34 块/轴 ✓
+      见本文件头 L57-58 ✓）⇒ **16ms 后**那一拍就已经按 `(0,0)` 算差量了 ✗
+      ⇒ 撞角那串还没走完 / 被打断 ⇒ **基准整体偏** ✗ ⇒ **瞄准整体偏** ✓
+      —— 症状就是「没指着准心、在很靠右的地方动」✓。
+      （⚠ 与 `click_ratio` 411/412 那两轮是**同一类病** ✓ 同一个修法 ✓。）
+    ⚠ 只在"**要指挥的就是这只光标**"时才算数 —— 这层由 `_own_cursor()` 判掉 ✓
+      （网络 relay ⇒ 返回 `None` ⇒ 这里**什么都不做** ⇒ 老行为一字不变 ✓）。
+    """
+    cur = _own_cursor()
+    if cur is None:
+        return False
+    try:
+        gx, gy = screen_gain(tuple(gain_pair), frame_shape)
+        vx, vy = _virtual_origin()
+        global _AIM_CUR, _AIM_AT
+        _AIM_CUR = (int(round((cur[0] - vx) / gx)),
+                    int(round((cur[1] - vy) / gy)))
+        _AIM_AT = time.monotonic()
+        return True
+    except Exception:                        # noqa: BLE001 —— 同步不了就照老路 ✓
+        return False
+
+
+def _own_cursor():
+    """**我们要指挥的那只光标**现在在哪 ⇒ `(x, y)`；问不到 / 不是这只 ⇒ `None` ✓（瞬时 ✓）。
+
+    ⚠⚠ 为什么不能直接用 `_cursor_pos()`（2026-10-17 第二轮 ✓）：它读的是**本机**光标 ✓，
+      只有"鼠标确实动在**本机**"时它才是**要指挥的那只** ✓：
+        · **本地串口 ProMicro**（`SerialKbd` ✓）/ 本机 SendInput ⇒ 是 ✓
+          （`SerialKbd` **没有** `cursor()` 方法 ✓ ⇒ 这里就能认出来 ✓）；
+        · **网络 relay**（`KbdClient` ✓）⇒ 鼠标动在**被控机** ✗ ⇒ 本机读到的是**另一只** ✗
+          ⇒ 拿它算差量会**点飞** ✗ ⇒ 返回 `None`，让调用方退回"撞角 + 绝对走位" ✓。
+      ⚠ 与 `decision/input.cursor_probe()` 的分工：那条**能问 A 机**（relay 也对 ✓）
+        但要走一次网络 ✗ ⇒ 只适合**后台线程** ✓；**实时回路线程**上只能读本机的
+        （瞬时 ✓ 不阻塞 ✓ 不违反"不许 sleep"那条硬规矩 ✓）。
+      ⚠ 判据用 `hasattr(_remote, "cursor")`（= relay 那个客户端 ✓ `input.cursor_probe`
+        也是这么分工的 ✓）—— **别**拿类型名去猜 ✗。
+    """
+    try:
+        _r = getattr(dinput, "_remote", None)
+        if _r is not None and hasattr(_r, "cursor"):
+            return None                      # relay：本机读到的不是要指挥的那只 ✗
+        return _cursor_pos()
+    except Exception:                        # noqa: BLE001
+        return None
+
+
 def repeat_click():
     """**再点一下**（不重新走位 ✓ —— 给「双击」的第二下用 ✓）。返回 `(ok, why)`。
 
@@ -713,8 +1172,9 @@ def scroll(up=0, down=0, frame_shape=None, xr=None, yr=None, origin=None):
         if px is None:
             return False, why
         # ⚠ 先把**帧像素**折成**屏幕像素**（帧是裁出来的 ⇒ 差一个 `origin` ✓ 见 `to_screen` ✓）
-        _sx, _sy = to_screen(px[0], px[1], origin)
-        d, why = counts_for(_sx, _sy, gain[0], gain[1])
+        _sx, _sy = to_screen(px[0], px[1], origin, frame_shape)   # ①原点 ②比例（见它说明 ✓）
+        _g = screen_gain(gain, frame_shape)                       # 帧像素口径 → 屏幕像素口径 ✓
+        d, why = counts_for(_sx, _sy, _g[0], _g[1])
         if d is None:
             return False, why
         corner_zero()                    # ① 到已知绝对原点
@@ -767,7 +1227,8 @@ def aim_reset():
     _AIM_TGT, _AIM_TGT_AT = None, 0.0
 
 
-def aim_to(frame_shape, xr, yr, gain=None, origin=None):
+def aim_to(frame_shape, xr, yr, gain=None, origin=None,
+           roi=None, full_shape=None):
     """**设一个瞄准目标**（**不直接动鼠标** ✓）—— 换算仍是老那一处（`target_px` / `counts_for` ✓）。
 
     为什么是"设目标"而不是"一次发到位"（2026-10-09 现场 ✓ 用户原话："鼠标还是一顿一顿跳动的，
@@ -786,36 +1247,31 @@ def aim_to(frame_shape, xr, yr, gain=None, origin=None):
         #   （两步插在一起 ⇒ 量出来的数是错的 ✓ 而且点也点不准 ✓）
         return False, ("正在**后台自动量**鼠标标定 ✓ ⇒ 这一拍先不动鼠标 ✓"
                        "（量完下一拍就能点 ✓）")
-    h, w = int(frame_shape[0]), int(frame_shape[1])
+    _fs = full_shape if (full_shape is not None and len(full_shape) >= 2) else frame_shape
+    h, w = int(_fs[0]), int(_fs[1])
     if gain is None:
-        gain = load_gain(frame_shape)     # ⚠ 按**帧尺寸**取那一份 ✓（见 `load_gain` ✓）
-    if not gain:
-        # ⭐⭐ **这个尺寸没量过 ⇒ 起一条后台线程自己量** ✓（用户 2026-10-10："**不能自动吗？**"✓
-        #   见 `auto_measure_async` ✓）：⚠ **绝不在实时回路上等** ✗（等一次最多 1.6 秒 ✗
-        #   ⇒ 那条线程被卡住 = 丢帧 / 指令积压 ✓ 本仓库硬规矩 ✓）
-        #   ⇒ 这一拍先不动鼠标、**下一拍量好了就接着点** ✓（状态机本来就会重试 ✓）；
-        #   只有"**起不来**"（冷却中 / 看不见光标 ✓）才回落到"说清 + 不点" ✓。
-        _am_ok, _am_why = auto_measure_async(frame_shape)
-        if _am_ok or _auto_busy():
-            return False, (_am_why or "正在**后台自动量**标定 ✓ ⇒ 这一拍不动鼠标 ✓")
-        gain = load_gain(frame_shape)
+        gain, _gwhy = _gain_or_why(_fs)
         if not gain:
-            _blk, _blk_why = gain_mismatch_block(frame_shape)
-            return False, ((_blk_why or "鼠标没标定（缺 config/mouse_gain.json）")
-                           + (("\n　（自动量这次没成：%s）" % _am_why) if _am_why else ""))
+            return False, _gwhy
     gx, gy = gain
-    px, why = target_px(w, h, xr, yr)
+    px, why = (roi_px(roi, frame_shape, xr, yr) if roi else target_px(w, h, xr, yr))
     if px is None:
         return False, why
     # ⚠ 先把**帧像素**折成**屏幕像素**（见 `to_screen` ✓ —— 副屏/挪过的窗口全靠这一步 ✓）
-    _sx, _sy = to_screen(px[0], px[1], origin)
-    d, why = counts_for(_sx, _sy, gx, gy)
+    _sx, _sy = to_screen(px[0], px[1], origin, _fs)   # ①原点 ②比例（见它说明 ✓）
+    _gx, _gy = screen_gain((gx, gy), _fs)             # 帧像素口径 → 屏幕像素口径 ✓
+    d, why = counts_for(_sx, _sy, _gx, _gy)
     if d is None:
         return False, why
     if not dinput.mouse_available():
         return False, "鼠标通道不可用（本地 SendInput 模式没有硬件鼠标）"
     _AIM_TGT = d
     _AIM_TGT_AT = time.monotonic()
+    # ⭐⭐⭐ **顺手把基准同步成真光标**（本地 ✓ 瞬时 ✓ 不 sleep ✗ —— 见 `_sync_aim_cur` 那段 ✓）：
+    #   ⛔ 老口径是"等 `aim_tick` 自己撞角建原点"，而那一步**假设撞角瞬间到位** ✗
+    #     ⇒ 瞄准整体偏 ✓（用户 2026-10-17：「**没指着准心、在很靠右的地方动**」✗）。
+    #   ⚠ 它自己会判"这是不是要指挥的那只光标"（relay ⇒ 不动 ✓），失败也不影响下面 ✓。
+    _sync_aim_cur(_fs, (_gx, _gy), origin)
     _gw = gain_warn(w)
     return True, ("瞄准目标 (%.0f, %.0f) 像素 ⇒ 指令 %r%s"
                   % (px[0], px[1], d, ("　" + _gw) if _gw else ""))
@@ -859,8 +1315,93 @@ def aim_tick(tick_ms=16.0, settle_ms=120.0, now=None):
 #   一次发到位、下一拍才更新 ⇒ 光标还是"跳" ✓ ⇒ 被 `aim_to` + `aim_tick`（高频插值）取代 ✓。
 
 
-def click_ratio(frame_shape, xr, yr, gain=None, origin=None):
+def cursor_visible():
+    """**这只要指挥的光标看不看得见** ⇒ `True` / `False` / **`None`（说不准）** ✓
+    （瞬时 ✓ 不走网络 ✓ **不 sleep** ✗）。
+
+    ⚠ 干嘛用（用户 2026-10-17 ✓「**地铁二号线 无法选中频道**」✗）：
+      · **看得见**（本地 ✓）⇒ `click_ratio` 走"**只发差量**"✓ ⇒ **根本不用撞角** ✗
+        ⇒ 也不需要"撞角单独一拍"那道手续 ✓；
+      · **看不见**（收流 relay ✓）⇒ 只能"撞角 + 绝对走位"✓ ⇒ **必须分两拍** ✓
+        （否则撞角那串没走完就走位 ⇒ 点歪 ✓ 见 `corner_only` ✓）。
+      ⚠ 这里**不**问 A 机 ✗（`KbdClient.cursor` 是**网络往返** ✓ 实时回路不许等 ✓）——
+        relay 就是"看不见" ✓，这正是那一步要分拍的判据 ✓。
+
+    ⚠⚠ **三态**（`True` 看得见 / `False` **确定**看不见 / `None` 说不准）：
+      只有**确定看不见**（relay ✓）才值得多加"只归零"那一拍 ✓；
+      **说不准**（读光标那一步本身失败 ✓ 比如没装 pywin32 的机器 ✓）⇒ **保持老行为** ✗
+      —— 宁可不动，也不要因为"读不到"就给别人多插一拍 ✓（那会让**本地**那条路
+      平白多一次撞角 + 多等一拍 ✓，还会把既有用例全逼红 ✓ 现场真栽过 ✓）。
+    """
+    try:
+        _r = getattr(dinput, "_remote", None)
+        if _r is not None and hasattr(_r, "cursor"):
+            return False                     # 网络 relay：鼠标动在被控机 ⇒ 本机这只不是它 ✓
+        return True if _cursor_pos() is not None else None
+    except Exception:                        # noqa: BLE001 —— 说不准 ✓ 别改行为 ✗
+        return None
+
+
+def corner_only(frame_shape=None):
+    """只**撞角归零**、不点 ⇒ `(ok, why)`（给"撞角和走位必须**分拍**"那条用 ✓ 见下 ✓）。
+
+    ⚠⚠ 为什么要它（用户 2026-10-17 ✓ 原话：「**地铁二号线 无法选中频道**」✗）：
+      **收流（relay）**那条路**读不到光标** ✗ ⇒ `click_ratio` 只能"撞角 + 绝对走位" ✓，
+      而老写法是**同一拍**把两条一起发出去 ✗ —— `remote_kbd/A_relay_trace.log` 实证：
+      ```
+      10:18:15.022  tcp->serial MOVE -4000 -4000|   ← 撞角（固件要分 ~34 块/轴 才走完 ✗）
+      10:18:15.022  tcp->serial MOVE 2625 1805|     ← 走位**同一毫秒**就排上去 ✗
+      10:18:15.023  tcp->serial SCROLL -1|
+      ```
+      ⇒ **起点根本不是角** ✗ ⇒ 落点整体偏 ⇒ 频道格点不中 ⇒「无法选中频道」✓。
+    ⇒ 正解（同 `reconnect` 里滚轮那条"**一格一拍**"✓）：**这一拍只撞角** ✓、
+      **下一拍再走位 + 点** ✓（`click_ratio(..., homed=True)` ✓ 跳到"不撞角"那支 ✓）。
+    ⚠ 守卫与 `click_ratio` **同一套** ✓（自动量标定在忙 ⇒ 一个字都不发 ✗；没标定 ⇒ 不点 ✗）。
+    """
+    if _auto_busy():
+        return False, ("正在**后台自动量**鼠标标定 ✓ ⇒ 这一拍先不动鼠标 ✓")
+    if frame_shape is not None and not load_gain(frame_shape):
+        _am_ok, _am_why = auto_measure_async(frame_shape)
+        if _am_ok or _auto_busy():
+            return False, (_am_why or "正在**后台自动量**标定 ✓ ⇒ 这一拍不动鼠标 ✓")
+        return False, "鼠标没标定（缺 config/mouse_gain.json）⇒ 先不撞角"
+    if not dinput.mouse_available():
+        return False, "鼠标通道不可用（本地 SendInput 模式没有硬件鼠标）"
+    corner_zero()
+    return True, "撞角归零（这一拍**只归零** ✓ 下一拍再走位 + 点 ✓ 撞角那串要走完 ✓）"
+
+
+def _gain_or_why(frame_shape):
+    """取**这个整帧尺寸**的标定；没有就按老规矩走「后台自动量」那条路 ✓。
+
+    ⭐⭐⭐ 为什么收成一处（2026-10-17 ✓ 用户要求「**如果功能有耦合，优化代码结构**」✓）：
+      `aim_to`（瞄准）与 `click_ratio`（撞角+走位+点）原来**各自抄了一份**这段兜底 ✗
+      ⇒ 改一处漏一处 ⇒ 上一轮接 `roi` 时就漏了瞄准那一路 ✓（光标停在偏一块的地方再点 ✓）。
+    ⭐ 返回 `(gain, why)`：`why` 非空 = **这一拍别动鼠标** ✓（原因人话 ✓ 直接
+      `return False, why` ✓）；`gain` 非空 = 可以往下算 ✓。
+    ⚠ **绝不在实时回路上等** ✗（`auto_measure_async` 是后台线程 ✓ 等一次最多 1.6 秒 ✗
+      ⇒ 那条线程被卡住 = 丢帧 / 指令积压 ✓ 本仓库硬规矩 ✓）。
+    """
+    gain = load_gain(frame_shape)         # ⚠ 按**整帧尺寸**取那一份 ✓（见 `load_gain` ✓）
+    if gain:
+        return gain, ""
+    _am_ok, _am_why = auto_measure_async(frame_shape)
+    if _am_ok or _auto_busy():
+        return None, (_am_why or "正在**后台自动量**标定 ✓ ⇒ 这一拍不动鼠标 ✓")
+    gain = load_gain(frame_shape)
+    if gain:
+        return gain, ""
+    _blk, _blk_why = gain_mismatch_block(frame_shape)
+    return None, ((_blk_why or "鼠标没标定（缺 config/mouse_gain.json）")
+                  + (("\n　（自动量这次没成：%s）" % _am_why) if _am_why else ""))
+
+
+def click_ratio(frame_shape, xr, yr, gain=None, origin=None, homed=False,
+                roi=None, full_shape=None):
     """**撞角归零 → 走位 → 左键点击**（这一层的唯一出口）。
+
+    `homed=True`：**上一拍已经撞过角**（`corner_only()` ✓）⇒ 这一拍**不再撞角** ✗、
+    直接走位 + 点 ✓（撞角与走位必须**分拍**，见 `corner_only` 的说明 ✓）。
 
     `frame_shape`：`frame.shape`（只要前两维 ✓）。
     `gain`：不给就现读 `config/mouse_gain.json`（`(gx, gy)` 或 None ✓）。
@@ -880,36 +1421,59 @@ def click_ratio(frame_shape, xr, yr, gain=None, origin=None):
         #   （两步插在一起 ⇒ 量出来的数是错的 ✓ 而且点也点不准 ✓）
         return False, ("正在**后台自动量**鼠标标定 ✓ ⇒ 这一拍先不动鼠标 ✓"
                        "（量完下一拍就能点 ✓）")
-    h, w = int(frame_shape[0]), int(frame_shape[1])
+    _fs = full_shape if (full_shape is not None and len(full_shape) >= 2) else frame_shape
+    h, w = int(_fs[0]), int(_fs[1])
     if gain is None:
-        gain = load_gain(frame_shape)     # ⚠ 按**帧尺寸**取那一份 ✓（见 `load_gain` ✓）
-    if not gain:
-        # ⭐⭐ **这个尺寸没量过 ⇒ 起一条后台线程自己量** ✓（用户 2026-10-10："**不能自动吗？**"✓
-        #   见 `auto_measure_async` ✓）：⚠ **绝不在实时回路上等** ✗（等一次最多 1.6 秒 ✗
-        #   ⇒ 那条线程被卡住 = 丢帧 / 指令积压 ✓ 本仓库硬规矩 ✓）
-        #   ⇒ 这一拍先不动鼠标、**下一拍量好了就接着点** ✓（状态机本来就会重试 ✓）；
-        #   只有"**起不来**"（冷却中 / 看不见光标 ✓）才回落到"说清 + 不点" ✓。
-        _am_ok, _am_why = auto_measure_async(frame_shape)
-        if _am_ok or _auto_busy():
-            return False, (_am_why or "正在**后台自动量**标定 ✓ ⇒ 这一拍不动鼠标 ✓")
-        gain = load_gain(frame_shape)
+        gain, _gwhy = _gain_or_why(_fs)
         if not gain:
-            _blk, _blk_why = gain_mismatch_block(frame_shape)
-            return False, ((_blk_why or "鼠标没标定（缺 config/mouse_gain.json）")
-                           + (("\n　（自动量这次没成：%s）" % _am_why) if _am_why else ""))
+            return False, _gwhy
     gx, gy = gain
-    px, why = target_px(w, h, xr, yr)
+    px, why = (roi_px(roi, frame_shape, xr, yr) if roi else target_px(w, h, xr, yr))
     if px is None:
         return False, why
     # ⚠ 先把**帧像素**折成**屏幕像素**（见 `to_screen` ✓ —— 副屏/挪过的窗口全靠这一步 ✓）
-    _sx, _sy = to_screen(px[0], px[1], origin)
-    d, why = counts_for(_sx, _sy, gx, gy)
+    _sx, _sy = to_screen(px[0], px[1], origin, _fs)   # ①原点 ②比例（见它说明 ✓）
+    _gx, _gy = screen_gain((gx, gy), _fs)             # 帧像素口径 → 屏幕像素口径 ✓
+    d, why = counts_for(_sx, _sy, _gx, _gy)
     if d is None:
         return False, why
     if not dinput.mouse_available():
         return False, "鼠标通道不可用（本地 SendInput 模式没有硬件鼠标）"
     dx, dy = d
-    corner_zero()                       # ① 到已知绝对原点
+    _vx, _vy = _virtual_origin()
+    # ⭐⭐⭐ **光标位置拿得到 ⇒ 只发"差量"，根本不用撞角**（2026-10-17 第二轮 ✓）
+    #   ⛔ 为什么把 411 那版（"先只归零、下一拍再走位"✗）**撤掉**：它**吃重试次数** ✗ ——
+    #     "点服务器"那一步每发一次动作、等满 `reconnect_step_timeout_ms` 才算一次 ✓
+    #     ⇒ "只归零"那一拍等于**白吃一次** ✗ ⇒ 3 次用光 ⇒ **重连放弃** ✓
+    #     ⇒ 光标被留在角上 ✓✓ = 用户 2026-10-17 现场原话
+    #     「**现在鼠标停在屏幕左上角一动不动**」✗（一字不差 ✓ 而这也正是本文件
+    #     L567-588 记着的那个老症状 ✓ 别再犯第三次 ✗）。
+    #   ⭐ 正解：**拿绝对读到的光标当基准** ✓（本地读本机 `GetCursorPos` ✓ **瞬时** ✓
+    #     **绝不 sleep** ✗）⇒ 差量通常很小 ⇒ 既不会被"撞角那串还没发完"咬 ✓
+    #     也不吃重试 ✓ 更不会把光标留在角上 ✓。
+    #   ⚠ 只在"**要指挥的就是这只光标**"时才能这么算 ✓（见 `_own_cursor` ✓）——
+    #     网络 relay 时本机读到的是**另一台**的 ✗ ⇒ 用它算差量会点飞 ✗ ⇒ 那种情况退回老路 ✓。
+    _cur = _own_cursor()
+    if _cur is not None:
+        _ddx = int(round(dx - (_cur[0] - _vx) / _gx))
+        _ddy = int(round(dy - (_cur[1] - _vy) / _gy))
+        if _ddx or _ddy:
+            dinput.mouse_move(_ddx, _ddy)   # ① 从**现在的位置**走差量（小步 ✓）
+        dinput.mouse_click("left")          # ② 点
+        return True, ("按现在光标 (%d, %d) 走差量 (%d, %d) 指令单位 → 左键点击"
+                      "（画面 (%.0f, %.0f) 像素 ⇒ 屏幕 (%.0f, %.0f)）%s"
+                      % (_cur[0], _cur[1], _ddx, _ddy, px[0], px[1], _sx, _sy,
+                         ("　" + _w) if (_w := gain_warn(w)) else ""))
+    # ⚠ 拿不到"我们要指挥的那只光标"（网络 relay ✓ / 极少数读不到 ✓）⇒ **一字退回老路** ✓
+    #   （撞角 + 从虚拟原点走绝对量 ✓；老路那个"撞角那串还没发完就走位"的毛病照旧留着 ✗ ——
+    #    但它**不会**把重连的重试次数吃光 ✓ 也不会把光标留在角上 ✓，比 411 那版安全 ✓）
+    if not homed:
+        # ⭐⭐⭐ 撞角**只在"这一拍还没归过零"时发**（用户 2026-10-17 ✓ 原话：
+        #   「**地铁二号线 无法选中频道**」✗）—— 撞角那串固件要分块发完（~34 块/轴 ✗），
+        #   同一拍接着走位 ⇒ **起点不是角** ⇒ 落点整体偏 ⇒ 频道格点不中 ✓
+        #   （`remote_kbd/A_relay_trace.log` 实证：两条 `MOVE` 同一毫秒 ✓）。
+        #   `homed=True` = 上一拍已经 `corner_only()` 归过了 ✓ ⇒ 这一拍直接走位 ✓。
+        corner_zero()                   # ① 到已知绝对原点
     dinput.mouse_move(dx, dy)           # ② 走到目标（x 用 gx、y 用 gy ✓）
     dinput.mouse_click("left")          # ③ 点
     # ⭐ **口径提醒**（2026-10-10 ✓）：标定那一帧的尺寸跟现在这帧差得多 ⇒

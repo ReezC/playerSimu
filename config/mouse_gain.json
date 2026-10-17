@@ -1,6 +1,6 @@
 {
-  "gain_x": 1.0,
-  "gain_y": 1.0,
+  "gain_x": 0.284583,
+  "gain_y": 0.284444,
   "probe": {
     "units": [
       60,
@@ -21,6 +21,56 @@
     "verify_rel": 0.0,
     "source": "live-cursorpos"
   },
-  "ref_w": 1918,
-  "ref_h": 1079
+  "ref_w": 1366,
+  "ref_h": 768,
+  "v": 2,
+  "auto_measure": true,
+  "by_frame": {
+    "1918x1079": {
+      "gain_x": 1.0,
+      "gain_y": 1.0,
+      "probe": {
+        "units": [
+          60,
+          120,
+          800
+        ],
+        "measured_px": [
+          60.0,
+          120.0,
+          800.0
+        ],
+        "n": [
+          3,
+          3,
+          3
+        ],
+        "linear_rel": 0.0,
+        "verify_rel": 0.0,
+        "source": "live-cursorpos"
+      },
+      "ref_w": 1918,
+      "ref_h": 1079
+    },
+    "1366x768": {
+      "gain_x": 1.0,
+      "gain_y": 1.0,
+      "probe": {
+        "units": [
+          60,
+          120,
+          800
+        ],
+        "measured_px": [
+          60.0,
+          120.0,
+          800.0
+        ],
+        "source": "fixed-2026-10-17-from-1918x1079-probe",
+        "note": "原值 0.284583 无探针（source=auto）⇒ 与探针实测 1 px/单位 差 3.51 倍 ⇒ 本地/收流点击都走 3.5 倍距离（用户 2026-10-17：「点了没反应」「无法选中频道」）。此处按同机 1918x1079 那条的探针改正 ✓。"
+      },
+      "ref_w": 1366,
+      "ref_h": 768
+    }
+  }
 }

@@ -179,3 +179,16 @@ def stop():
 
 def active():
     return _listener is not None
+
+
+def held():
+    """**本机手动通道此刻正按着**的键名集合（只读副本 ✓）。
+
+    为什么要公开它（2026-10-13 ✓ 用户原话："**关闭自动情况下，开启手动输入按住的键会被
+    断掉**，什么情况？"✓）：固件侧按住的键是个**集合**（见模块文档 ✓）⇒ 谁发 RELEASE 谁就
+    真把那个键松开 ✗ ⇒ 决策层那几处"收摊"（停自动 / 重置通道 / 定期 RELEASEALL ✓）动手
+    之前**必须先问一句"这个键是不是人家手正按着的"** ✓ 才能躲开它 ✓
+    （定期那条早就这么干了 ✓ 见 `decision/agent.py` 的 `_periodic_reset` ✓）。
+    """
+    with _lock:
+        return set(_pressed)

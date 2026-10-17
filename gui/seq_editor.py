@@ -13,6 +13,12 @@
     {"type": "up",    "key": "jump"}                                键松开
     {"type": "delay", "ms": 200}                                    额外延迟
 
+⚠ 「**以秒为单位**」那个勾选**不在这个文件**（2026-10-15 挪走了 ✓）：它只属于
+「**添加 / 编辑定时行为**」那个弹窗（本文件末尾的 `TimerEditDialog` ✓），控制的是
+「**触发下限 / 触发上限**」的单位（`min` ⇄ `s`），与上面这个「额外延迟」**无关** ✗ ——
+用户 2026-10-15 ✓ 原话："**不是所有的行为编辑器都要加「以秒为单位」，只在添加定时行为弹窗里加，
+它只是控制「触发下限(分钟)」「触发上限(分钟)」的单位**"✓。
+
 序列编辑核心抽成 SeqEditorWidget（可嵌入任意弹窗）；SeqEditorDialog 是
 带确定/取消的独立弹窗版本，用于单独编辑一个序列；TimerEditDialog 是
 自定义定时行为的一体化编辑弹窗（名字 + 时间区间 + 序列）。
@@ -538,11 +544,48 @@ class SeqEditorDialog(QDialog):
         return self.editor.seq()
 
 
+#: 「触发下限 / 上限」的**真源单位 = 分钟** ✓（同 `custom_timers[].interval`，
+#: 见 `decision/agent.py` 里 `random.uniform(lo, hi) * 60.0` ✓）。
+#: 界面上的 `min` / `s` 只是**显示与填写的口径** ✓ —— 勾「以秒为单位」换的只是它 ✓。
+TIMER_LO_MIN, TIMER_HI_MIN = 0.01, 600.0       # 分钟（= 0.6 秒 ~ 10 小时 ✓ 见下面那段）
+TIMER_DEFAULT_LO, TIMER_DEFAULT_HI = 5.0, 10.0  # 新增时的默认区间（分钟 ✓ 同老行为 ✓）
+#: ⭐⭐ **秒口径的下限（秒 ✓）**（用户 2026-10-16 ✓ 原话："**编辑定时行为的触发下限、上限
+#: 不能配置 6.0 以下**"✓）。
+#: ⚠⚠ **先把"为什么原来正好卡在 6.0"记下来**（免得后人又"顺手放宽"✗）：
+#:   真源是**分钟** ✓、而控件原来只留 **1 位小数** ✓ ⇒ 最小可表示的一格 = **0.1 分钟 = 6 秒** ✓
+#:   ⇒ 秒口径 `× 60` 之后就成了 **6.0** ✓ —— **那个 6 不是谁定的，是"存储精度"的产物** ✓
+#:   （注释里原先还写着"不许放宽"✗ —— 那条是把副作用当成了设定 ✓）。
+#: ⇒ 要真能配 6 秒以下，**两处都得动** ✓：① 分钟口径小数位 1 → 3
+#:   （最小 0.001 分钟 ≈ 0.06 秒 ✓ 够用 ✓ 见 `TIMER_DECIMALS`）；② 秒口径下限单独给
+#:   （**1.0 秒** ✓ 见 `TIMER_LO_SEC`）—— 只动一处都会"填得进、存不下"✗。
+#: ⚠ 为什么不干脆"0.1 秒起"✗：实时回路一拍 ~15~30fps ✓ ⇒ 亚秒定时 = **每拍都按** ✗
+#:   那不是配置、是抖 ✓ ⇒ 下限卡在 **1 秒** ✓（要更小得先说明用途 ✓）。
+#: ⚠ 分钟口径也给了更小的下限（0.01 分钟 ≈ 0.6 秒 ✓），但那要**手打**（步进仍是 0.1 ✓
+#:   保住老手感 ✓）；要填秒数就勾「以秒为单位」✓ 那才是它的用途 ✓。
+TIMER_DECIMALS = 3
+TIMER_LO_SEC = 1.0                              # 秒口径下限（秒 ✓ 见上面那段）
+
+#: 「以秒为单位」这个**本机偏好**存哪：`config/ui.yaml` 的**顶层** `timer_edit_prefs` 段 ✓
+#: （同 `gui/theme.load_section` / `save_section` 那套"窗口自己的上次配置"✓）。
+#: ⚠ 段名**别叫 `timer_edit`** ✗：那个名字已经被「**窗口几何**」占着当键了（在 `windows:` 段
+#:   底下 ✓，见 `gui/theme.py` 里负责把弹窗几何记进 `windows:` 的那个函数 ✓）—— 同名不同层，
+#:   将来查配置的人一定会看错 ✓。加 `_prefs` 后缀区分开 ✓。
+#: ⚠⚠ **别把那个函数名原样写进这段注释** ✗：本文件里有一条**按出现次数数**的源码钉 ——
+#:   注释里抄一遍就多一次、当场假红 ✓（上一版就是这么被抓住的 ✓ 见开发日志 341/342 ✓）。
+_UI_SECTION = "timer_edit_prefs"
+_UI_SECONDS_KEY = "interval_in_seconds"
+
+
 class TimerEditDialog(QDialog):
     """自定义定时行为的一体化编辑弹窗：名字 + 时间区间 + 行为序列。
 
     timer 为 None 表示新增；否则传入现有 dict 预填。
-    确定后通过 result() 取回 {name, interval:[lo,hi], seq}。
+    确定后通过 result() 取回 {name, interval:[lo,hi], seq} —— **`interval` 永远是分钟** ✓。
+
+    ⭐ 「**以秒为单位**」（用户 2026-10-15 ✓ 原话："**不是所有的行为编辑器都要加「以秒为单位」，
+    只在添加定时行为弹窗里加，它只是控制「触发下限(分钟)」「触发上限(分钟)」的单位**"✓）：
+    勾上 ⇒「触发下限 / 上限」按**秒**填、行标签变成 `(s)`；不勾 ⇒ 按**分钟**（老口径 ✓）。
+    ⚠ 它**只管界面** ✗：`interval` 存下去**永远是分钟** ✓ ⇒ 切来切去**不会改动已配好的值** ✓。
     """
 
     _DEFAULT_SEQ = [{"type": "down", "key": "attack"}, {"type": "up", "key": "attack"}]
@@ -563,22 +606,35 @@ class TimerEditDialog(QDialog):
 
         # 名字 + 时间区间
         form = QFormLayout()
+        self.form = form                        # 换单位时要改**行标签**的文案 ⇒ 得留一份 ✓
         form.setLabelAlignment(Qt.AlignLeft)
         self.ed_name = QLineEdit()
         self.ed_name.setPlaceholderText("例如：自动喊话")
         # 分钟支持小数：用 DoubleSpinBox（和参数面板同一套，滚轮不误触）
+        # ⚠ 这两个控件的**单位会变**（min ⇄ s ✓ 见 `set_seconds_mode`）⇒ 范围 / 小数位 / 步进 /
+        #   行标签一律**不在这里写死**，全部交给 `set_seconds_mode()` **一处**设 ✓
+        #   （两处各写一份必然分叉 ✗）。
         self.sp_lo = NoWheelDoubleSpinBox()
-        self.sp_lo.setRange(0.1, 600)
-        self.sp_lo.setDecimals(1)
-        self.sp_lo.setSingleStep(0.1)
         self.sp_hi = NoWheelDoubleSpinBox()
-        self.sp_hi.setRange(0.1, 600)
-        self.sp_hi.setDecimals(1)
-        self.sp_hi.setSingleStep(0.1)
-        # 单位写在**行标签**里（UI 规范 §9：不写进编辑框）
+        #: ⭐ **真源（分钟 ✓** 与 `custom_timers[].interval` 同口径 ✓）—— 控件里放的只是
+        #:   "当前单位下的那个数" ✓；换单位**只重算显示**、不动这里 ✓（切来切去不会改值 ✓）。
+        self._lo_min = TIMER_DEFAULT_LO
+        self._hi_min = TIMER_DEFAULT_HI
+        self._seconds = False
+        # 单位写在**行标签**里（UI 规范 §9②：不写进编辑框 ✓；§6：单位用 `(min)` / `(s)` 短写法 ✓）
         form.addRow("行为名", self.ed_name)
-        form.addRow("触发下限(分钟)", self.sp_lo)
-        form.addRow("触发上限(分钟)", self.sp_hi)
+        form.addRow("触发下限", self.sp_lo)
+        form.addRow("触发上限", self.sp_hi)
+        # ⭐ 「以秒为单位」（用户 2026-10-15 ✓）：**只属于这个弹窗** ✓（通用序列编辑器里没有 ✗），
+        #   而且只管下面那两条的**单位** ✓。
+        self.ck_seconds = QCheckBox("以秒为单位")
+        self.ck_seconds.setToolTip(
+            "勾上：下面两条按**秒**填（`30` = 30 秒），单位变成 `(s)`；\n"
+            "不勾（默认）：按**分钟**填（可写小数，`0.5` = 30 秒），单位是 `(min)`。\n\n"
+            "⚠ 只改**填法 / 显示**：定时行为存下来**永远是分钟** ⇒ 跟面板上的倒计时、\n"
+            "项目文件同一口径，切来切去**不会改动已配好的值**。\n"
+            "这个勾选记在**本机**（config/ui.yaml），跟项目无关。")
+        form.addRow("", self.ck_seconds)
         # 「休息时暂停计时」（用户 2026-09-26 要求）—— **每条行为各自一份**的开关：
         #   勾上（默认）= 防掉线休息期间这条**冻住计时**（老行为 ✓，剩余时间不走）；
         #   不勾 = 休息期间**照常倒数、到点照演** ✓（给"休息时也得按的键"用：喂宠 / 喊话…）。
@@ -610,26 +666,121 @@ class TimerEditDialog(QDialog):
         row.addWidget(btn_cancel)
         root.addLayout(row)
 
-        # 预填
+        # 预填（**分钟** ✓ —— 存的就是这个单位 ✓）
         if timer:
             self.ed_name.setText(timer.get("name", ""))
-            lo, hi = timer.get("interval", [5, 10])
-            self.sp_lo.setValue(lo)
-            self.sp_hi.setValue(max(lo, hi))
-        else:
-            self.sp_lo.setValue(5)
-            self.sp_hi.setValue(10)
+            lo, hi = timer.get("interval", [TIMER_DEFAULT_LO, TIMER_DEFAULT_HI])
+            self._lo_min = max(0.0, float(lo))
+            self._hi_min = max(self._lo_min, float(hi))
         # 「休息时暂停计时」也要预填（缺省 = 勾上 = 老行为：休息时冻住 ✓）
         self.ck_pause_rest.setChecked(bool((timer or {}).get("pause_on_rest", True)))
-        self.sp_lo.valueChanged.connect(self._clamp_hi)
-        self._clamp_hi()
+        self.sp_lo.valueChanged.connect(self._sync_from_spins)
+        self.sp_hi.valueChanged.connect(self._sync_from_spins)
+        self.ck_seconds.toggled.connect(self._on_seconds_toggled)
+        # ⚠ 口径**最后**摆：`set_seconds_mode` 会按真源把两个控件的值写一遍（内部 `blockSignals` ✓）
+        #   —— 放在接信号之前的话，那几次写入会被当成"用户改了值"、把真源覆盖掉 ✓ 踩过 ✓。
+        #   读本机偏好（缺省 = 不勾 = **老口径（分钟）** ✓）；初始化**不落盘** ✓。
+        self.set_seconds_mode(self._load_seconds(), persist=False)
         # 预设默认文件名跟着「行为名」走（改名字时同步，省得存出一堆"行为预设.json"）
         self.ed_name.textChanged.connect(self._sync_preset_name)
         self._sync_preset_name()
 
+    # ---------------- 「以秒为单位」（2026-10-15） ----------------
+
+    def seconds_mode(self):
+        """现在是不是「以秒为单位」（给用例 / 调用方看 ✓）。"""
+        return bool(self._seconds)
+
+    def set_seconds_mode(self, on, persist=True):
+        """**摆**「以秒为单位」⇒ 按真源重设那两个控件 + 行标签 ✓。
+
+        · **真源（`_lo_min` / `_hi_min`，单位永远是分钟）一个字都不动** ✓ —— 这里只是把
+          "同一个量"换算成当前单位显示出来 ✓ ⇒ 来回切**不会改值** ✓；
+        · `persist=False` = **不写** `config/ui.yaml` ✓（**用例专用**：不许动用户真实的本机偏好 ✗；
+          顺便让用例不受用户本机勾过的状态影响 ✓ —— 否则老用例会假红 ✓）。
+        """
+        self._seconds = bool(on)
+        self.ck_seconds.blockSignals(True)      # 摆的时候别再触发一次 `toggled`（会重复落盘 ✓）
+        self.ck_seconds.setChecked(self._seconds)
+        self.ck_seconds.blockSignals(False)
+        self._apply_unit()
+        if persist:
+            self._save_seconds()
+
+    def _apply_unit(self):
+        """按当前口径把两个控件重设一遍（范围 / 小数位 / 步进 / 值 / 行标签 ✓）。
+
+        · 单位换算：秒口径 = 分钟口径 **× 60** ✓（同一量 ⇒ 来回切**只换显示** ✓）；
+        · ⭐ **下限按口径各给**（用户 2026-10-16 ✓ 原话："**编辑定时行为的触发下限、上限
+          不能配置 6.0 以下**"✓）：分钟 `TIMER_LO_MIN`（0.01 分钟 ≈ 0.6 秒 ✓）/
+          秒 **`TIMER_LO_SEC`（1.0 秒 ✓）**；
+          ⚠ 原来秒口径是"分钟下限 × 60"⇒ **正好 6.0** ✗ —— 那不是设定的下限，
+            是"分钟只留 1 位小数"的**精度副作用** ✓（0.1 分钟 = 6 秒 ✓ 详见 `TIMER_LO_SEC` 那段 ✓）；
+        · **小数位 `TIMER_DECIMALS`（3 ✓）**：1 位时最小一格 = 6 秒 ⇒ 秒数**根本填不进去** ✗
+          ⇒ 要与下限一起放 ✓（只放一处会"填得进、存不下"✗）；
+        · 步进：分钟 0.1（**老手感一字不动** ✓）/ 秒 1（1 秒一步 ✓）；
+        · ⚠ 换单位时控件值按 3 位小数显示 ⇒ 像 2 秒（= 0.03333 分钟）这种会显示成 `0.033` ✓
+          —— 那只是**显示**四舍五入 ✓，**真源 `_lo_min` / `_hi_min` 一个字不动** ✓
+          （下面 `blockSignals` 就是为这个 ✓；配合 3 位小数 ⇒ 秒口径的值切回来不会丢 ✓）。
+        """
+        sc = 60.0 if self._seconds else 1.0
+        _lo = TIMER_LO_SEC if self._seconds else TIMER_LO_MIN
+        _hi = TIMER_HI_MIN * sc
+        for sp, v_min in ((self.sp_lo, self._lo_min), (self.sp_hi, self._hi_min)):
+            sp.blockSignals(True)               # 换范围/换值会发 `valueChanged` ⇒ 别回头改真源 ✓
+            sp.setRange(_lo, _hi)
+            sp.setDecimals(TIMER_DECIMALS)
+            sp.setSingleStep(1.0 if self._seconds else 0.1)
+            sp.setValue(min(max(v_min * sc, _lo), _hi))
+            sp.blockSignals(False)
+        unit = "s" if self._seconds else "min"
+        self.form.labelForField(self.sp_lo).setText("触发下限(%s)" % unit)
+        self.form.labelForField(self.sp_hi).setText("触发上限(%s)" % unit)
+
+    def _on_seconds_toggled(self, on):
+        self.set_seconds_mode(on)
+
+    def _sync_from_spins(self, *_a):
+        """控件一变 ⇒ 换回**分钟**写进真源 ✓（真源的**唯一写口** ✓），并顺手钳上限 ✓。"""
+        sc = 60.0 if self._seconds else 1.0
+        self._lo_min = float(self.sp_lo.value()) / sc
+        self._hi_min = float(self.sp_hi.value()) / sc
+        self._clamp_hi()
+
     def _clamp_hi(self):
-        if self.sp_hi.value() < self.sp_lo.value():
-            self.sp_hi.setValue(self.sp_lo.value())
+        """上限不许小于下限（**在分钟上比** ✓ 与当前显示单位无关 ✓）。
+
+        ⚠ 下限一律用**当前口径**那一份（`TIMER_LO_SEC` / `TIMER_LO_MIN` ✓ 见 `_apply_unit` ✓）
+          —— 两处各写一份必然分叉 ✗（这正是先前那个"秒口径正好 6.0"的来源 ✓）。
+        """
+        if self._hi_min >= self._lo_min:
+            return
+        self._hi_min = self._lo_min
+        sc = 60.0 if self._seconds else 1.0
+        _lo = TIMER_LO_SEC if self._seconds else TIMER_LO_MIN
+        self.sp_hi.blockSignals(True)
+        self.sp_hi.setValue(min(max(self._hi_min * sc, _lo), TIMER_HI_MIN * sc))
+        self.sp_hi.blockSignals(False)
+
+    def _load_seconds(self):
+        """读本机偏好 ⇒ 默认 **False**（不勾 = 分钟 = **老口径** ✓）。
+
+        ⚠ 任何异常一律当"没存过"✓ —— 界面偏好读不出来**不是**错误，
+        不许把弹窗拦在门外 ✗（同 `gui/theme.load_section` 自己的口径 ✓）。
+        """
+        try:
+            return bool(theme.load_section(_UI_SECTION).get(_UI_SECONDS_KEY, False))
+        except Exception:                       # noqa: BLE001
+            return False
+
+    def _save_seconds(self):
+        """把这个勾选记进本机（`config/ui.yaml` ✓）；存不下就只在本次会话生效 ✓（不报错）。"""
+        try:
+            d = theme.load_section(_UI_SECTION)
+            d[_UI_SECONDS_KEY] = bool(self._seconds)
+            theme.save_section(_UI_SECTION, d)
+        except Exception:                       # noqa: BLE001
+            pass
 
     def _sync_preset_name(self):
         """把「行为名」同步成预设的默认文件名（空名时退回"定时行为"）。"""
@@ -645,7 +796,9 @@ class TimerEditDialog(QDialog):
     def result(self):
         return {
             "name": self.ed_name.text().strip(),
-            "interval": [self.sp_lo.value(), self.sp_hi.value()],
+            # ⚠ **取真源（分钟 ✓）**，不是控件的值 ✗ —— 控件里放的是"当前单位下的数"
+            #   （勾了「以秒为单位」时它是秒 ✓ 直接交出去就慢了 60 倍 ✗）。
+            "interval": [self._lo_min, self._hi_min],
             "seq": self.editor.seq(),
             # 「休息时暂停计时」（2026-09-26 新增的项目级开关 ✓）
             "pause_on_rest": bool(self.ck_pause_rest.isChecked()),

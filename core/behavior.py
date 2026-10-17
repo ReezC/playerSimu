@@ -38,6 +38,23 @@
     | `route_phase` | 任何任务的 `phase` 变了（align→climb、climb→done…）| `ladder` / `prev` / `to` / `note` |
     | `route_diag` | 爬绳的**斜跳**起跳 / 结束 | `ladder` / `what`（起跳 / 结束·吸上绳 / 结束·没吸上）/ `note` |
     | `route_retry` | 一次尝试**失败重来** | `ladder` / `attempt` / `note` |
+    | `facing_mismatch` | **朝向的判据（Agent 意图）与真实（世界坐标位移）不一致** | `intent` / `real` |
+    | `keys_tapped_dirs` | **清键/重置通道前补按了一遍方向键 ←/→/↓**（刷新游戏侧卡住的方向键 ✓；**不含 ↑** ✓）| `n` / `why` |
+    | `link_reset_applied` | 「重置指令通道」在决策线程里的那一步做完了（清键 + 重挂上下文 ✓）| `why` / `keys` |
+
+    ⭐ 2026-10-11 起**跟踪那两条链**也各留一份现场（治"框疯狂闪烁 / 传送后被抢框 /
+    飞过去锁别人"✓ 用户当天四句现场 ✓）—— 都**只在真发生的时候写** ✓（平时一条不打 ✓ 不刷屏 ✓）：
+
+    | 事件 | 什么时候 | 关键字段 |
+    |---|---|---|
+    | `mob_flick` | 一条怪轨迹**活得短、又没确认过**就没了（= 闪一下 ✓）| `id` / `age` / `conf` / `peak` / `missed` / `ms` |
+    | `player_teleport` | 黄点世界坐标**相邻两帧**跳 ≥400px ⇒ 判成传送 / 换图 ✓ | `world` / `old` / `dw` |
+    | `player_teleport_gap` | 位移够大、但**两次读数不相邻** ⇒ 只改预测 **不武装** ✓ | `gap_ms` / `dw` |
+    | `player_teleport_giveup` | 连着几拍「武装了却谁也不认」⇒ 认账失败、**解锁重锁** ✓ | `n` |
+    | `player_quarantine` | 要换框 ⇒ **先隔离**（同一个新候选连着赢才认 ✓）| `old` / `new` / `n` / `move` |
+    | `player_ambiguous` | 最优与次优**差不多近** ⇒ 谁都不换 ✓ | `old` / `new` / `best_d` / `second_d` |
+    | `player_relock` | 认账换锁 ✓ | `old` / `new` / `move` / `cam_resid` |
+    | `player_low_maintain` | **低分档**给已有轨迹续命（两个前提都满足 ✓）| `new` / `wd` |
 
     2026-09-28 起**范围扩到全部「行为 / 状态」**（用户："任务下达、战斗、寻路、角色状态等等
     打点应该在 behavior.log；perf.log 只管 GUI / 推流收流 / 性能"）—— 原来"借"在 `perf.log`

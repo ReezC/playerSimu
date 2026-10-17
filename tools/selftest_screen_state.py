@@ -348,6 +348,11 @@ def t_screen_beat_bridge():
         with mock.patch.object(ui_state, "detect", lambda f: "login_err"), \
              mock.patch.object(screen_state, "capture_frame",
                                lambda f, st: caps.append(st)):
+            # ⚠ 2026-10-15（阶段 1）：`_screen_beat` 拆成**两个口**了 ⇒ 替身也得能调到它们 ✗
+            #   （`SimpleNamespace` 上没有 ⇒ `self._screen_every_tick(...)` 当场 AttributeError ✓
+            #    实测踩到 ✓）—— 同下面"类属性也得搬过来"那个手法：从类上取下来绑给替身 ✓。
+            th._screen_every_tick = _lt.LiveThread._screen_every_tick.__get__(th)
+            th._screen_on_transition = _lt.LiveThread._screen_on_transition.__get__(th)
             _lt.LiveThread._screen_beat(th, frame)
         check(th._screen_state == "login_err",
               "ui_state 判出断线界面却没进状态 ✗：%r" % th._screen_state)
@@ -398,6 +403,163 @@ def t_lie_game_threshold_widened():
           "显式 `threshold=0.0` 时应当给出最像的那块（显式门限的语义被改了 ✗）：%r" % st)
 
 
+def t_stream_region_mouse_fit():
+    """⭐⭐⭐ **部署台框「游戏窗口区域」= 裁帧 + 鼠标折回整帧**（用户 2026-10-17 ✓ 原话：
+    「**现在我需要部署台也能像本地流程一样能够自由选择游戏窗口区域**
+     注意**断线重连、自动测谎的鼠标适配**」✓）。
+
+    口径：
+      · 部署台不抓屏 ⇒ 吃 A 机**整帧** ✗ ⇒ 框出来的那块要**按比例**存（换分辨率不用重框 ✓）；
+      · 裁帧在**唯一那一处**（`_stage_frame_ready` ✓）⇒ 下游全看到游戏区域 ✓；
+      · 鼠标：状态机给的比例是**相对"看到的那块"** ⇒ 必须 `整帧像素 = roi 原点 + 比例 × 这块尺寸`
+        （`mouse_aim.roi_px` ✓ 一处实现 ✓）；标定/屏幕折算仍按**整帧**（标定表是整帧量的 ✓）。
+    判据（四组 ✓）：
+      ① `roi_px` 换算 / 越界报错 / 坏 roi 给 None；② `aim_to` + `click_ratio` **两处**都接；
+      ③ 实时线程：比例→像素框、尺寸变了跟着变、`_mouse_roi` 只在收流时给值；
+      ④ 界面：按钮 + `select_region_on_image`（在**预览**上框）+ 参数按项目存。
+    """
+    from pathlib import Path
+
+    from decision import mouse_aim as ma
+    from gui import live_thread as lt
+
+    root = Path(__file__).resolve().parent.parent
+
+    # ---- ① 换算 ----
+    px, _w = ma.roi_px((200, 300, 100, 50), (50, 100, 3), 0.5, 0.5)
+    check(px == (250.0, 325.0),
+          "① (0.5, 0.5) 在 roi(200,300,100,50) 里该折成整帧 (250, 325) ✗：%r" % (px,))
+    px0, _ = ma.roi_px((200, 300, 100, 50), (50, 100, 3), 0.0, 0.0)
+    check(px0 == (200.0, 300.0), "① 比例 0,0 该正好落在 roi 原点 ✗：%r" % (px0,))
+    bad, why = ma.roi_px((200, 300, 100, 50), (50, 100, 3), 1.5, 0.5)
+    check(bad is None and why, "① 比例越界必须**报错不夹取** ✗（点歪比不点危险 ✓）")
+    check(ma.roi_px((0, 0, 0, 10), (50, 100, 3), 0.5, 0.5)[0] is None,
+          "① 坏 roi（宽 0）该给 None ✓（宁可不动 ✗）")
+
+    # ---- ② 两处换算都接上 ----
+    src = (root / "decision" / "mouse_aim.py").read_text(encoding="utf-8")
+    check(src.count("roi_px(roi, frame_shape, xr, yr)") >= 2,
+          "② `aim_to` **和** `click_ratio` 都要走 roi 折算 ✗ —— 只改点击 ⇒ 光标先停在偏一块的地方"
+          "再点 ✓（测谎/重连更歪 ✗）")
+    check(src.count("_fs = full_shape") >= 2,
+          "② 两处都该拿**整帧**做标定/屏幕折算的基准 ✗ —— 用裁后的尺寸会找不到标定 ⇒ "
+          "每拍\"正在后台量\" ⇒ 点不出去 ✓")
+
+    # ---- ③ 实时线程 ----
+    lt_src = (root / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    check("def set_stream_rect" in lt_src and "def _mouse_roi" in lt_src,
+          "② 实时线程该有 `set_stream_rect` / `_mouse_roi`（框完要能**立即生效** ✓）")
+    check(lt_src.count("self._mouse_roi()") >= 3,
+          "② 测谎点击 / 测谎走位 / 断线重连点击 **三处**都要折回整帧 ✗（漏一处就那一处点歪 ✓）")
+    check('getattr(self, "_source", "")' in lt_src and "_stream_roi_now" in lt_src,
+          "② 收流帧该在 `_stage_frame_ready` 按框裁 ✗（不裁 ⇒ 小地图/辨认还对着整帧 ✓）；"
+          "且读来源要 `getattr` 兜底（自检替身没有这个字段 ✓）")
+
+    o = lt.LiveThread.__new__(lt.LiveThread)
+    o._p = {"stream_rect_rel": [0.25, 0.5, 0.5, 0.25]}
+    roi = o._stream_roi_now((400, 800))
+    check(roi == (200, 200, 400, 100), "③ 比例该折成像素框 ✗：%r" % (roi,))
+    o._p["stream_rect_rel"] = [0.25, 0.5, 0.5, 0.25]
+    check(o._stream_roi_now((800, 1600)) == (400, 400, 800, 200),
+          "③ 画面变大 ⇒ 框跟着放大（**不用重框** ✓）")
+    o._p["stream_rect_rel"] = None
+    check(o._stream_roi_now((400, 800)) is None, "③ 没框选 ⇒ 整帧不裁 ✓（老行为 ✓）")
+    o._p["stream_rect_rel"] = [0.25, 0.5, 0.5, 0.25]
+
+    o._source, o._stream_roi, o._stream_full = "stream", (200, 200, 400, 100), (400, 800)
+    check(o._mouse_roi() == ((200, 200, 400, 100), (400, 800)),
+          "③ 鼠标要同时拿到 roi 与**整帧**尺寸 ✗：%r" % (o._mouse_roi(),))
+    o._source = "window"
+    check(o._mouse_roi() == (None, None),
+          "③ 本地窗口来源不该走这套（它抓屏时就只抓窗口那块 ✓ 再折一次就偏 ✗）")
+
+    # ---- ④ 界面 ----
+    ui = (root / "gui" / "live_panel.py").read_text(encoding="utf-8")
+    check("btn_pick_stream" in ui and "_pick_stream_rect" in ui,
+          "④ 实时页该有「框选游戏区域」按钮 ✗（部署台要能自己框 ✓）")
+    check("select_region_on_image" in ui,
+          "④ 部署台必须在**实时预览画面**上框 ✗（在屏幕上框 = 框的是 B 机桌面 ✓）")
+    check('"stream_rect_rel"' in ui,
+          "④ `stream_rect_rel` 没进参数/按项目清单 ⇒ 重启就丢 ✗")
+
+
+def t_lie_window_30s():
+    """⭐⭐⭐ **测谎触发后录屏最多 30 秒** ⇒ 到点停录 + 停相关逻辑 + **判定成功/失败**
+    （用户 2026-10-17 ✓ 原话：「**测谎触发后录屏最多30秒，超过后需要停止相关逻辑，
+    然后判定是测谎成功还是失败**」✓）。
+
+    口径（`gui/live_thread.py` ✓）：
+      · 起点 = **触发**（`lie_warn` 开的那一场 ✓ `_lie_sess_t0` ✓）；
+      · 到点（`LIE_REC_WINDOW_S`）⇒ ① 停录 ✓ ② 场次作废（`_lie_sess_t0`/`_lie_warn_at`
+        清掉 ⇒ **留住接管**自动放回 Agent ✓）③ 判定 ✓；
+      · **成功那一路不等满 30 秒** ✓（`lie_success` 一认出来就当场判成功 ✓）。
+    判据（四条 ✓）：
+      ① 常量必须是 **30.0** ✓；② 没见成功弹窗 ⇒ 判 **失败** + 停录一次 + 场次清干净 +
+        留 `lie_verdict ok=False` ✓；③ 见过成功弹窗 ⇒ 判 **成功** ✓；
+      ④ 源码钉：窗口判据必须在 `_screen_beat` 的**早退之前** ✗（放到后面就只在"状态变了"
+        那一拍才评估 —— GAP / 待停那两条踩过三次同一个坑 ✓）。
+    """
+    from pathlib import Path
+
+    from gui import live_thread as lt
+
+    check(float(lt.LIE_REC_WINDOW_S) == 30.0,
+          "① 窗口必须是 **30 秒**（用户原话「最多30秒」✓）：%r" % (lt.LIE_REC_WINDOW_S,))
+
+    def _mk():
+        o = lt.LiveThread.__new__(lt.LiveThread)
+        o._lie_sess_t0 = 100.0
+        o._lie_warn_at = 100.0
+        o._lie_seen_game = True
+        o._lie_rec_top_game = 0.9
+        o._lie_rec_stop_at = 111.0
+        o._lie_rec_last_lie = 105.0
+        o._lie_rec = object()               # 假装正在录 ✓
+        o._lie_rec_pending = 0.0
+        o._lie_rec_saw_success = False
+        o._screen_state = "lie_game"
+        _calls = []
+        o._lie_rec_stop = lambda why="": _calls.append(why)
+        _ev = []
+        o.vt_status = type("S", (), {"emit": staticmethod(lambda t: _ev.append(t))})()
+        return o, _calls, _ev
+
+    # ---- ② 没见到成功弹窗 ⇒ 失败 ----
+    o, calls, _ev = _mk()
+    _bev = []
+    _old = lt.behavior.event
+    lt.behavior.event = lambda name, **kw: _bev.append((name, kw))
+    try:
+        o._lie_window_over(30.0)
+    finally:
+        lt.behavior.event = _old
+    check(len(calls) == 1, "② 到点必须**停录一次** ✗：%r" % (calls,))
+    check(o._lie_last_verdict == "fail",
+          "② 没见到成功弹窗 ⇒ 该判**失败** ✗：%r" % (o._lie_last_verdict,))
+    check(o._lie_sess_t0 == 0.0 and o._lie_warn_at == 0.0 and o._lie_rec_stop_at == 0.0,
+          "② 「停止相关逻辑」= 场次必须清干净 ✗（否则留住接管不放 ⇒ Agent 一直被冻 ✓）："
+          "%r/%r/%r" % (o._lie_sess_t0, o._lie_warn_at, o._lie_rec_stop_at))
+    check(any(n == "lie_verdict" and kw.get("ok") is False for n, kw in _bev),
+          "② 该在 `behavior.log` 留一条 `lie_verdict ok=False` ✓：%r" % (_bev,))
+
+    # ---- ③ 见过成功弹窗 ⇒ 成功 ----
+    o2, _c2, _e2 = _mk()
+    o2._lie_rec_saw_success = True
+    o2._lie_window_over(12.5)
+    check(o2._lie_last_verdict == "success",
+          "③ 见过成功弹窗 ⇒ 该判**成功** ✗：%r" % (o2._lie_last_verdict,))
+
+    # ---- ④ 源码钉：位置与"成功不等满" ----
+    src = (Path(__file__).resolve().parent.parent
+           / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    _call = src.index("self._lie_window_over(_now_t")
+    check(_call < src.index("return st != self._screen_state", _call),
+          "④ 窗口判据必须在 `_screen_beat` 的**早退之前** ✗（放后面 ⇒ 画面卡住不动时"
+          "永远没人评估 ✓ = GAP / 待停踩过三次的那个坑 ✓）")
+    check("self._lie_verdict(True" in src,
+          "④ `lie_success` 那一路必须**当场判成功** ✗（不等满 30 秒 ✓）")
+
+
 def t_lie_needs_warn():
     """⭐⭐⭐⭐⭐ **A ＋ C：测谎状态的两道门** ✗✗（用户 2026-10-08 ✓ 两条都是他选的 ✓）。
 
@@ -443,8 +605,24 @@ def t_lie_needs_warn():
         #   ⚠ 这个替身**绕过 `__init__`** ⇒ 类属性也得搬过来 ✗（`_screen_beat` 里会读它们 ✓：
         #     `LIE_REC_GAP_S` / `LIE_REC_HOLD_S` ✓ —— 不搬 ⇒ 走到那条兜底时 `AttributeError` ✗，
         #     实测踩到 ✓）。
-        for _k in ("LIE_REC_HOLD_S", "LIE_REC_GAP_S"):
+        #   ⚠ 2026-10-17（测谎 30 秒窗口 ✓）：`LIE_REC_WINDOW_S` 也**必须搬** ✗
+        #     （`_screen_every_tick` 里那句窗口判据会读它 ✓ 不搬就 `AttributeError` ✓）。
+        for _k in ("LIE_REC_HOLD_S", "LIE_REC_GAP_S", "LIE_REC_WINDOW_S"):
             setattr(th, _k, getattr(_lt.LiveThread, _k))
+        # ⚠ 2026-10-15（阶段 1）：`_screen_beat` 拆成**两个口** ⇒ 替身也得能调到它们 ✗
+        #   （`self._screen_every_tick(...)` / `self._screen_on_transition(...)` ✓ ——
+        #    不搬 ⇒ 走到那儿就是 `AttributeError` ✓ 同上面"类属性也得搬过来"一个道理 ✓）。
+        th._screen_every_tick = _lt.LiveThread._screen_every_tick.__get__(th)
+        th._screen_on_transition = _lt.LiveThread._screen_on_transition.__get__(th)
+        #   ⚠ 2026-10-17（测谎 **30 秒窗口** ✓ —— 用户：「测谎触发后录屏最多30秒，
+        #     超过后需要停止相关逻辑，然后判定是测谎成功还是失败」✓）：
+        #     窗口那条判据会调 `_lie_window_over` ✓，它再调 `_lie_verdict`
+        #     （`_lie_rec_stop` 上面已换成替身 ✓）⇒ 这两个也得绑 ✗，否则一过 30 秒就
+        #     `AttributeError` ✓；`vt_status` / `_lie_last_verdict` 是判定出口要用的 ✓。
+        th._lie_window_over = _lt.LiveThread._lie_window_over.__get__(th)
+        th._lie_verdict = _lt.LiveThread._lie_verdict.__get__(th)
+        th.vt_status = type("S", (), {"emit": staticmethod(lambda t: None)})()
+        th._lie_last_verdict = ""
         return th, calls
 
     def _beat(th, st, score):
@@ -479,47 +657,41 @@ def t_lie_needs_warn():
         check(th._screen_state == "lie_game" and calls["start"] == ["lie"],
               "③ **同一场里的 lie_game ⇒ 认**（实测 %r ／ 起录还是 %d 次 ✓〔该 1 ✓〕）"
               % (th._screen_state, len(calls["start"])))
-        # ④ **C**：离开 `lie_*` 不急着停；到 90 秒才收 ＋ 关掉这一场
+        # ④ **测谎 30 秒窗口**（用户 2026-10-17 ✓ 取代了旧的 C（90 秒软规则）✓）：
+        #    离开 `lie_*` 不急着停；**触发后 30 秒**到点才收 ＋ 把这一场关掉 ＋ 判**失败** ✓
         _NOW[0] = 1010.0
         _beat(th, "combat", 0.55)
         check(not calls["stop"],
-              "④ **刚离开 lie_* 不急着停**（还没见到成功弹窗 ⇒ 照旧一路录 ✓）")
-        _NOW[0] = 1002.0 + _lt.LIE_REC_SOFT_S + 1.0
+              "④ **刚离开 lie_* 不急着停**（还没到 30 秒 ⇒ 照旧一路录 ✓）")
+        _NOW[0] = 1002.0 + _lt.LIE_REC_WINDOW_S + 1.0
         _beat(th, "combat", 0.55)
-        check(len(calls["stop"]) == 1 and "贴着门槛" in calls["stop"][0]
-              and not th._lie_warn_at,
-              "④ **C：到 %g 秒收工 ＋ 把这一场关掉**（实测 stop=%r ／ `_lie_warn_at`=%r ✓）"
-              % (_lt.LIE_REC_SOFT_S, calls["stop"], th._lie_warn_at))
+        check(len(calls["stop"]) == 1 and "窗口" in calls["stop"][0]
+              and not th._lie_warn_at and not th._lie_sess_t0,
+              "④ **窗口到点：收工 ＋ 把这一场关掉**（实测 stop=%r ／ warn=%r ／ t0=%r ✓）"
+              % (calls["stop"], th._lie_warn_at, th._lie_sess_t0))
+        check(th._lie_last_verdict == "fail",
+              "④ 到点还没见到成功弹窗 ⇒ 该判**失败** ✗：%r" % (th._lie_last_verdict,))
         # ⑤ 关场之后再来的 `lie_game` ⇒ 又被 A 拦（不来回切 ✓）
         _NOW[0] += 5.0
         _beat(th, "lie_game", 0.82)
         check(th._screen_state == "combat" and len(calls["start"]) == 1,
               "⑤ **关场之后再来的 lie_game 不认**（实测 %r ✓ ／ 起录仍 %d 次 ✓）"
               % (th._screen_state, len(calls["start"])))
-        # ⑥ **反例**：这场分数够高（0.88 ≥ 0.85 ✓）⇒ C **不许**收（收了就是把真场面掐掉 ✗）
-        #   ⚠⚠ **沿途必须喂一拍 `lie_game`** ✗（2026-10-10 修 ✗ 这条原来写漏了 ✓）：
-        #      C 的门槛（`LIE_REC_SOFT_S` = 90 秒 ✓）**比 GAP 兜底（`LIE_REC_GAP_S` = 60 秒 ✓）
-        #      长** ⇒ 中间一次 `lie_*` 都不喂的话，**先触发的是 GAP** ✗ —— 那是**另一条规则**
-        #      （"整场失败 / 界面卡住 ⇒ 不能无限录" ✓ 见它自己的用例 ⑧ ✓），不是 C ✗。
-        #      原来这条一口气跳到 91 秒 ⇒ 拿到的 `stop` 是 GAP 的 ✓ ⇒ 期望写错了（实测 stop=
-        #      `['长时间没再见到测谎（60 秒）⇒ 收工']` ✗）。
-        #      ⚠ 而且**只喂 `lie_*` 不算数** ✗：`_lie_rec_last_lie` 只在**状态变化**那一拍更新
-        #        （它排在 `_screen_beat` 的早退**之后** ✓）⇒ 中间那拍必须是一次**真变化**
-        #        （`combat → lie_game` ✓ 现场小游戏期间"偶尔匹得上几拍"就是这个样子 ✓）。
+        # ⑥ **新口径（用户 2026-10-17 ✓）**：分数再高，**30 秒窗口一到也收工** ✗
+        #   —— 30 秒是**硬上限** ✓（老版本这里钉的是"C（`LIE_REC_SOFT_S` = 90 秒）遇上
+        #      高分数不收工"✓ —— 那条**已被 30 秒窗口取代** ✓：窗口先到 ⇒ C 根本轮不上 ✓）。
         th2, calls2 = _mk()
         _NOW[0] = 2000.0
         _beat(th2, "lie_warn", 0.86)
         _NOW[0] = 2002.0
         _beat(th2, "lie_game", 0.88)
-        _NOW[0] = 2004.0
-        _beat(th2, "combat", 0.5)                # 中间几拍匹不上（**常态** ✓）
-        _NOW[0] = 2000.0 + _lt.LIE_REC_SOFT_S / 2.0
-        _beat(th2, "lie_game", 0.88)             # ← 又匹上了（把 GAP 按住 ✓ 分数依旧够高 ✓）
-        _NOW[0] = 2000.0 + _lt.LIE_REC_SOFT_S + 1.0
+        _NOW[0] = 2000.0 + _lt.LIE_REC_WINDOW_S + 1.0
         _beat(th2, "combat", 0.5)
-        check(not calls2["stop"],
-              "⑥ **分数够高（0.88 ≥ %.2f）⇒ C 不收工**（实测 stop=%r ✓ —— ⚠ 收了就是掐真场面 ✗）"
-              % (_lt.LIE_REC_STRONG, calls2["stop"]))
+        check(len(calls2["stop"]) == 1 and "窗口" in calls2["stop"][0],
+              "⑥ **分数 0.88 也照收**：30 秒窗口是**硬上限**（实测 stop=%r ✗ —— "
+              "不收就是无限录 ✓ 用户 2026-10-17「最多30秒」✓）" % (calls2["stop"],))
+        check(th2._lie_last_verdict == "fail",
+              "⑥ 没见过成功弹窗 ⇒ 到点判**失败** ✗：%r" % (th2._lie_last_verdict,))
         # ⑦ `lie_warn` 早过 60 秒 ⇒ 后面的 `lie_game` 照样不认
         th3, calls3 = _mk()
         _NOW[0] = 3000.0
@@ -530,25 +702,28 @@ def t_lie_needs_warn():
         check(th3._screen_state == "combat",
               "⑦ **warn 早过 %g 秒 ⇒ lie_game 不认**（实测 %r ✓）"
               % (_lt.LIE_SESSION_MAX_S, th3._screen_state))
-        # ⑧ ⭐ **GAP 兜底**（既有规则 ✓ **本轮才补上它的用例** ✗）：整场失败 / 界面卡住 ⇒
-        #    `LIE_REC_GAP_S` 秒没再见到**任何** `lie_*` 就收工 ✓（不许无限录 ✗）。
-        #    ⚠ 它必须**远大于**中间小游戏那一截（现场实测 **18 秒**没有任何 `lie_*` ✓
-        #      这就是它取 60 的原因 ✓）—— 与 C（90 秒、看**分数贴不贴门槛** ✓）是**两条**规则 ✓：
-        #      这条只看"还见不见得到 `lie_*`" ✓。
+        # ⑧ ⭐ **30 秒窗口 vs GAP 兜底**（用户 2026-10-17 ✓ 口径变了）：
+        #    窗口（30 秒）现在**排在 GAP（60 秒）前面** ✓ ⇒ 到点先被窗口收掉，
+        #    GAP **不许再补一刀** ✓（顺序一错就会出现"一趟两条 stop"✗ —— 实测真出现过 ✓）。
+        #    ⚠ GAP（60 秒）/ C（90 秒）**保留但不再触发**（窗口更早 ✓）——
+        #      它们现在是"窗口被关掉 / 手工调参时"的兜底 ✓。
         th4, calls4 = _mk()
         _NOW[0] = 4000.0
         _beat(th4, "lie_warn", 0.86)
         _NOW[0] = 4002.0
         _beat(th4, "combat", 0.55)
         check(not calls4["stop"],
-              "⑧ 刚离开 `lie_*` 不该停（宽限还没到 ✓）")
+              "⑧ 刚离开 `lie_*` 不该停（30 秒还没到 ✓）")
         _gap = float(_lt.LiveThread.LIE_REC_GAP_S)     # ⚠ **类属性** ✗（不是模块级 ✓）
-        _NOW[0] = 4002.0 + _gap + 1.0
+        _NOW[0] = 4000.0 + _lt.LIE_REC_WINDOW_S + 1.0  # ← 先到的是**窗口** ✓
         _beat(th4, "combat", 0.55)
-        check(len(calls4["stop"]) == 1 and "长时间" in calls4["stop"][0],
-              "⑧ **`LIE_REC_GAP_S` = %g 秒没再见到任何 `lie_*` ⇒ 收工**"
-              "（实测 stop=%r ✗ —— 不收就会无限录 ✗）"
-              % (_gap, calls4["stop"]))
+        check(len(calls4["stop"]) == 1 and "窗口" in calls4["stop"][0],
+              "⑧ **30 秒窗口先到 ⇒ 由窗口收工**（实测 stop=%r ✗）" % (calls4["stop"],))
+        _NOW[0] = 4000.0 + _gap + 5.0                  # 再往后走，GAP 时刻也过了
+        _beat(th4, "combat", 0.55)
+        check(len(calls4["stop"]) == 1,
+              "⑧ **GAP 不许再补一刀**（一趟只许停一次 ✗ —— 实测 stop=%r ✓ "
+              "顺序一错就是两条 ✓）" % (calls4["stop"],))
     finally:
         behavior.configure(old_en, log=old_log)
     txt = logf.read_text(encoding="utf-8") if logf.exists() else ""
@@ -603,6 +778,10 @@ TESTS = [
     ("断线桥接（行为级）：ui_state 判出 login_err ⇒ 状态切换 + 报警 + 存帧 + 打点",
      t_screen_beat_bridge),
     ("测谎两道门（A 必须先见 warn ＋ C 贴门槛 90 秒收工）", t_lie_needs_warn),
+    ("⭐⭐⭐ 测谎窗口最多 30 秒：到点停录 + 停相关逻辑 + 判成功/失败（用户 2026-10-17）",
+     t_lie_window_30s),
+    ("⭐⭐⭐ 部署台框「游戏窗口区域」+ 鼠标折回整帧（重连/测谎三处都接）",
+     t_stream_region_mouse_fit),
     ("⭐⭐⭐⭐ 「`lie_game` 单独放宽门限」（用户 2026-10-10）：真录像实测 0.783~0.785 低于基础"
      "门限 ⇒ 小游戏认不出来 ⇒ Agent 在测谎里还在按移动/跳跃；放宽 + 保留 A 规则才是完整口径",
      t_lie_game_threshold_widened),

@@ -110,18 +110,86 @@ def save_yolo_labels(txt_path, boxes, w, h):
     os.replace(tmp, p)                        # 原子替换（半截文件不会出现 ✓）
 
 
-def make_data_yaml(root, names, subset=None):
+def _write_lines(p, lines):
+    """一行一个的**清单**文件（`train.txt` / `val.txt` ✓）—— **原子写** ✓（同 `save_yolo_labels`）。
+
+    ⚠⚠ **2026-10-17 补（`selftest_yolo_wb` 逮到的 ✓）**：`_make_yaml` 里 2026-10-16 加
+      train/val 拆分时**调用了它、却没定义** ✗ ⇒ 点「生成 data.yaml」当场
+      `NameError: name '_write_lines' is not defined` ✗ 崩（整条"拆分"白做 ✓
+      用户拿到的还是老行为，而且是以崩的形式 ✓）。
+    ⚠ 用**同一套**原子写法（`.tmp` + `os.replace` ✓）—— 半截清单会让 ultralytics 读到一半 ✗
+      （那正是上面那条注释的由来 ✓）。
+    ⚠ **空清单也照写**（写空文件 ✓）：路径必须存在 —— 否则 ultralytics 报的是"文件不存在"✗，
+      而不是"清单是空的"✓ 两种病分不开 ✓。
+    """
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    lines = list(lines)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def _frame_group(line):
+    """`./images/cycle_00001_0000001_000.012605s.bmp` ⇒ `cycle_00001`（**会话组** ✓）。
+
+    文件名头两段 = 录制会话 + ……：同组 = **同一段录屏** ✓（几乎逐帧连续 ✓）。
+    """
+    stem = Path(line.strip()).stem
+    parts = stem.split("_")
+    return "%s_%s" % (parts[0], parts[1]) if len(parts) >= 2 else stem
+
+
+def split_frames_train_val(lines, val_ratio=0.15, seed=20261016):
+    """把选帧清单**按会话整组**劈成 `(train, val)` —— **同一段录屏绝不跨集** ✗。
+
+    ⚠⚠ 为什么不能"按图随机劈" ✗（这是比 train==val 更隐蔽的那个坑）：
+      同一段录屏的相邻帧**几乎一模一样**（间隔 ~0.005 s ✓）⇒ 随机劈会把"训练帧的
+      隔壁邻居"放进 val ⇒ 模型只是**认出了那段录屏** ⇒ **指标虚高** ✗
+      （与 `train/val 同指一个文件` 是同一个病的两种形态 ✓ 见 `make_data_yaml` ✓）。
+    ⇒ 所以**整组**进 train 或整组进 val ✓（组 = 文件名头两段 ✓ 见 `_frame_group` ✓）。
+
+    返回 `(train_lines, val_lines)`；⚠ 只有 **1 个会话**时**拆不开** ⇒ 原样返回两份
+      （val 等于 train ✓ **调用方必须吭声** ✗ 见 `_make_yaml` ✓）。
+    """
+    import random                              # 局部 import（本文件其余处不用它 ✓）
+    groups = {}
+    for ln in lines:
+        groups.setdefault(_frame_group(ln), []).append(ln)
+    if len(groups) < 2:
+        return list(lines), list(lines)
+    keys = sorted(groups)
+    random.Random(seed).shuffle(keys)          # 固定种子 ⇒ 同样的清单拆出同样的结果 ✓
+    n_val = min(max(1, int(round(len(keys) * val_ratio))), len(keys) - 1)
+    val_keys = set(keys[:n_val])
+    tr = [ln for k in keys if k not in val_keys for ln in groups[k]]
+    va = [ln for k in keys if k in val_keys for ln in groups[k]]
+    return tr, va
+
+
+def make_data_yaml(root, names, subset=None, val_subset=None):
     """数据集根 + 类别名 ⇒ `data.yaml` 文本（YOLO 标准结构：images/ labels/ ✓）。
 
     ⭐ `subset`（2026-09-30 加 ✓）：**选帧清单**文件名（如 `"train_frames.txt"`，
     每行一条相对 `path` 的图片路径 ✓）—— 给了它 train/val 就**只吃清单里那几帧** ✓
     （用户要的「分数据集」步骤：指定哪些帧参与训练 ✓）；不给 = 老行为
     （train/val 都吃整个 images 目录 ✓）。
+
+    ⭐⭐⭐ `val_subset`（**2026-10-16 加 ✓ —— 修掉一个"指标永远虚高"的坑** ✗）：
+      · 以前本函数**只收一个 `subset`** ⇒ `train:` 与 `val:` 被写成**同一个文件** ✗
+        ⇒ **验证集就是训练集** ⇒ `results.csv` 里那句「召回 **0.996** / mAP50 0.995」
+        是**背下来的** ✓、不是泛化 ✗ —— 这正是用户 2026-10-16 报
+        「**怪类漏检严重**」时"验证集几乎不漏、现场却漏"的原因 ✓
+        （现场那份 `datasets/yolo/data.yaml` 实测就是 `train==val` ✓）；
+      · 现在：`subset` 管 train ✓、`val_subset` 管 val ✓；`val_subset=None`
+        ⇒ **val 落回 train**（= 老行为 ✓，**只有在"拆不开"时才该走到那儿** ✗
+        且调用方必须**吭声** ✗ 见 `_make_yaml` ✓）。
     """
     names_lines = "\n".join("  %d: %s" % (i, n) for i, n in enumerate(names))
     tv = subset if subset else "images"
+    vv = val_subset if val_subset else tv
     return ("path: %s\ntrain: %s\nval: %s\n\nnames:\n%s\n"
-            % (Path(root).resolve().as_posix(), tv, tv, names_lines))
+            % (Path(root).resolve().as_posix(), tv, vv, names_lines))
 
 
 def propose_boxes(img):
@@ -1324,6 +1392,7 @@ class _TrainTab(QWidget):
             QMessageBox.warning(self, "yolo工作台", "先在「标注」页填图片目录 ✓")
             return
         subset = None
+        val_subset = None          # ⭐ 2026-10-16：val 单独指清单（见下面拆分那段 ✓）
         stems = self._current_selection()
         if stems:
             imgs = scan_images(self._img_dir_getter() or "")
@@ -1337,9 +1406,31 @@ class _TrainTab(QWidget):
                      for p in imgs if p.stem in want]
             (root / "train_frames.txt").write_text(
                 "\n".join(lines) + "\n", encoding="utf-8")
-            subset = "train_frames.txt"       # train/val 都指向清单 ✓
             self.log.appendPlainText("选帧：%d / %d 张参与（清单 %s）"
                             % (len(lines), len(imgs), root / "train_frames.txt"))
+            # ⭐⭐⭐ **拆 train / val**（2026-10-16 修 ✓ 用户报"**怪类漏检严重**"时查出来的 ✗）：
+            #   · 以前这里是 `subset = "train_frames.txt"` ✗ 而 `make_data_yaml` 把
+            #     **train 与 val 都写成它** ✗ ⇒ **验证集 = 训练集** ⇒ `results.csv` 里那句
+            #     「召回 0.996」是**背下来的** ✓ 不是泛化 ✗ ⇒ 换骨干/调参**全看不出真假** ✗；
+            #   · 现在：**按会话整组劈** ✓（同一段录屏不许跨集 ✗ 见 `split_frames_train_val` ✓）
+            #     ⇒ 写出 `train.txt` / `val.txt` 两份 ✓，`data.yaml` 分指 ✓。
+            #   · ⚠ 只有**一段会话**时**真的拆不开** ⇒ 保持老行为，但**必须吭声** ✗
+            #     （宁可让用户知道"这次指标会虚高"，也不能让他拿着假数去调参 ✓）。
+            tr, va = split_frames_train_val(lines)
+            _write_lines(root / "train.txt", tr)
+            _write_lines(root / "val.txt", va)
+            if len(tr) == len(va):
+                subset = "train_frames.txt"        # 拆不开 ⇒ 老行为（val 落回 train ✓）
+                self.log.appendPlainText(
+                    "⚠⚠ 拆不出验证集：清单里只有 **1 段会话** ✗ ⇒ train 与 val 仍是同一份\n"
+                    "   ⇒ **这次的 mAP / 召回会虚高** ✗（换骨干、调参都看不出真假 ✓）\n"
+                    "   怎么修：多录几段**不同场景/不同地图**的对局再选帧，至少 2 段 ✓")
+            else:
+                subset = "train.txt"
+                val_subset = "val.txt"
+                self.log.appendPlainText(
+                    "已拆 train/val（**按会话整组** ✓ 同段录屏不跨集 ✓）："
+                    "train %d 张 / val %d 张" % (len(tr), len(va)))
             # ⚠ **YOLO 找标签靠目录名**：ultralytics 把图片路径里的 `images` 段替换成
             #   `labels`（img2label_paths ✓）—— 图片目录不叫 `images` ⇒ 标签永远配不上
             #   ⇒ **全部当背景图**（训练照跑但啥也学不到 ✗）。提醒一句，别让用户白训。
@@ -1349,7 +1440,7 @@ class _TrainTab(QWidget):
                     "images/labels 目录名配对找标签，配不上会全当背景图 ✗。\n"
                     "  建议把图片放进 <数据集根>/images/、标签放 <数据集根>/labels/ "
                     "再训练。" % Path(self._img_dir_getter()).name)
-        text = make_data_yaml(root, self._names_getter(), subset)
+        text = make_data_yaml(root, self._names_getter(), subset, val_subset)
         (root / "data.yaml").write_text(text, encoding="utf-8")
         self.log.appendPlainText("已生成 %s\n%s" % (root / "data.yaml", "-" * 40))
         self.log.appendPlainText(text)

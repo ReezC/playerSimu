@@ -1041,7 +1041,199 @@ def t_auto_hotkey_three_layers():
           "关闭时没卸键盘钩子 ✗ ⇒ 它一直挂在**系统钩子链**上（关掉工作台还拖慢按键 ✓）")
 
 
+def t_hotkey_elevation_hint():
+    """⭐⭐⭐ 「游戏聚焦时 F11 没反应」要说清是**权限（UIPI）**（用户 2026-10-11 ✓ 原话：
+    "**本地实时聚焦游戏窗口时按 F11 无法暂停自动**" ✓）。
+
+    现场实测（就在这台机器上 ✓）：
+      · `Maplestory_Classic.exe` **提权 = True** ✓、「冒险岛怀旧服」/「launcher3.0」也是 ✓；
+      · 工作台 `pythonw.exe` **提权 = False** ✗；
+      · ⇒ **低级键盘钩子 / `RegisterHotKey` 都收不到"发给更高权限窗口"的按键** ✗（UIPI ✓）
+        ⇒ 游戏一聚焦，F11 **传不到我们这儿** ✓；
+      · ⚠ 而工作台自己聚焦时**能用** ✓ —— 那走的是**窗口内快捷键**那条降级路 ✓
+        ⇒ 症状正是"只在游戏里没反应" ✓。
+
+    钉三件：
+      ① `elevation_hint()` 拿得到、且**说得清治法**（提权启动 / 去掉游戏的提权 ✓）；
+      ② 它在"我们没提权 + 有提权窗口"时才说话（不该天天啰嗦 ✓）；
+      ③ **接上了**：`main_window._register_auto_hotkey` 里真的把它 `log` 出来 ✓
+        （光有函数没接上 = 没有 ✓ 本仓库的老规矩 ✓）。
+    """
+    import inspect
+
+    from decision import hotkey as hk
+    from gui.main_window import MainWindow
+
+    _hint = hk.elevation_hint()
+    check(isinstance(_hint, str), "`elevation_hint()` 该返回字符串 ✓")
+    if hk.self_elevated() is False:
+        # 本机是"我们没提权"⇒ 只要机器上有提权窗口，就该有话可说 ✓（没提权窗口 ⇒ 空串也对 ✓）
+        if hk.elevated_visible_titles():
+            check("管理员" in _hint and ("以管理员身份启动" in _hint
+                                        or "以管理员身份运行" in _hint),
+                  "有提权窗口时该说清治法（工作台提权启动 / 去掉它们的提权 ✓）：%r" % (_hint,))
+    _mw = inspect.getsource(MainWindow._register_auto_hotkey)
+    check("elevation_hint" in _mw,
+          "`_register_auto_hotkey` 没把权限提示说出来 ✗ ⇒ 人只会以为「热键坏了」、一遍遍重启 ✓")
+    check("_note_hotkey_fallback" in _mw,
+          "权限那条没留痕（`hotkey_fallback` ✓）⇒ 事后复盘看不到 ✓")
+
+
+def t_remote_group_measure_click():
+    """⭐⭐⭐ 「设置 → 链路 → 远程操控」那一组：**点下去必须看得见、而且真的去重量**
+    （用户 2026-10-15 现场报「**我点击立即量一次没有任何反应**」✗ ⇒ 这条钉防的就是它 ✓）。
+
+    ⚠⚠ **"没反应"的根子**（别修回去 ✗）：当前画面尺寸**早就标定过**（`load_gain` 有值 ✓）
+      ⇒ 旧写法走的是"自动量"那条路 ⇒ 它只回一句"这个尺寸已经有标定 ⇒ 不用量" ✓
+      ⇒ **鼠标一动不动** ✗ ⇒ 在用户眼里就是"点了没反应" ✓。
+      ⇒ "人明确按了按钮"这条路**必须**用 `auto_measure(…, force=True)` **强制重量** ✓
+        （`force` 本来就只给"人明确要求"用 ✓ **自动那条路永远不许带** ✗）。
+
+    钉五件（前三件正是本次踩到的形态 ✓）：
+      ① **已标定过也要真去量** ⇒ 必须走到 `force=True` ✗（不许回一句"不用量"就完事 ✓）；
+      ② 点下去**当场可见**：按钮**置灰 + 文字变「量中…」** ✓（只改一行小字**不算** ✓
+         —— 那正是用户看到的"没反应" ✓）；
+      ③ 量完**按钮恢复** + 状态行写结果 ✓（后台线程不许碰控件 ⇒ 结果只能走信号 ✓）；
+      ④ **没勾「自动量」**（= 没同意动鼠标）⇒ **明说原因** ✓ 不许静默 ✗；
+      ⑤ 后端那句**只改一个键**也一并钉住 ✓：写开关**不许抹掉 `by_frame`** ✗
+         （那几份标定是"一种尺寸量一次"攒下来的 ⇒ 抹了就得**每种尺寸重量一次** ✓）。
+    """
+    import json
+    import pathlib
+    import tempfile
+    import types
+    from unittest import mock
+
+    from PyQt5.QtWidgets import QApplication, QWidget
+
+    # ⚠ 本套件那个模块级 `app` 在这里**取不到**（实测 `NameError: name 'app' is not defined` ✗）
+    #   ⇒ 自己拿一次 ✓（套件的规矩：**全程只许一个 `QApplication`** ⇒ 只能 `instance()` ✓
+    #   重建第二个会崩 ✗ 见文件头那段说明 ✓）
+    app = QApplication.instance() or QApplication([])
+
+    from decision import mouse_aim as ma
+    from gui.settings_dialog import SettingsDialog
+
+    # ---- ⑤ 后端：写「自动量」开关**只改这一个键** ----
+    _tmp = pathlib.Path(tempfile.mkdtemp(prefix="psimu_am_")) / "mouse_gain.json"
+    with mock.patch.object(ma, "GAIN_PATH", _tmp):
+        _ok, _why = ma.set_auto_measure(True)        # 文件还不存在 ⇒ 也要能写 ✓
+        check(_ok and ma.auto_measure_enabled() is True,
+              "⑤ 文件不存在时写「自动量」开关失败 / 读不回来：%s" % _why)
+        _tmp.write_text(json.dumps(
+            {"auto_measure": True,
+             "by_frame": {"1366x768": {"gain_x": 0.8, "gain_y": 0.8},
+                          "1918x1079": {"gain_x": 1.0, "gain_y": 1.0}}},
+            ensure_ascii=False), encoding="utf-8")
+        _ok, _why = ma.set_auto_measure(False)
+        _d = json.loads(_tmp.read_text(encoding="utf-8"))
+        check(_ok and _d["auto_measure"] is False, "⑤ 关掉开关没写进去：%s" % _why)
+        check(set(_d.get("by_frame") or {}) == {"1366x768", "1918x1079"},
+              "⑤ 写「自动量」开关把 `by_frame` 里的标定**抹掉了** ✗✗（那份是「一种尺寸量一次」"
+              "攒下来的 ⇒ 抹了就得每种尺寸重量一次 ✓）—— 实得 %r"
+              % (sorted(_d.get("by_frame") or {}),))
+        _st = ma.calib_status()
+        check("1366x768" in _st and "1918x1079" in _st,
+              "⑤ 状态行没报出**已量过哪些尺寸** ✗（「没量过」和「量过哪些」是两件事 ✗）：%r" % _st)
+
+    # ---- ①②③④ 界面：真点一下那个按钮 ----
+    _tmp2 = pathlib.Path(tempfile.mkdtemp(prefix="psimu_am2_")) / "mouse_gain.json"
+    mw = QWidget()
+    # ⚠ 假主窗口：只提供"实时回路正收到多大的帧"那一个口 ✓（按钮就是从这儿取尺寸的 ✓）
+    mw.live_panel = types.SimpleNamespace(_last_stats={"size": (1366, 768)})
+    calls = []
+
+    def _fake_measure(shp, force=False):
+        calls.append((shp, force))
+        return True, "（假）重量完成 ✓"
+
+    def _fake_async(shp):
+        # ⚠⚠ **这条也必须钉住**（是安全 ✓ 不是多余 ✗）：万一实现**走错了路**（又回到旧写法 ⇒
+        #   已标定的尺寸照样走"自动量"那条 ✓ —— 正是本次这个 bug ✓），真的 `auto_measure_async`
+        #   会**真去动鼠标** ✗ ⇒ 那就成了"钉子自己先动手"✓ 比不钉更糟 ✗。
+        calls.append(("async", shp))
+        return True, "（假）已起后台量"
+
+    with mock.patch.object(ma, "GAIN_PATH", _tmp2), \
+         mock.patch.object(ma, "load_gain", lambda shp: {"gain_x": 1.0, "gain_y": 1.0}), \
+         mock.patch.object(ma, "auto_measure_async", _fake_async), \
+         mock.patch.object(ma, "auto_measure", _fake_measure):
+        dlg = SettingsDialog(mw)
+        box = dlg.remote_box
+
+        # ④ 没勾「自动量」⇒ 明说，且**一个字节都不发** ✓
+        box.auto.setChecked(False)
+        box.btn.click()
+        check(not calls,
+              "④ 没勾「自动量」（= 没同意动鼠标）却真去量了 ✗：%r" % (calls,))
+        check("没勾" in box.status.text() and "动鼠标" in box.status.text(),
+              "④ 没勾时**静默**了 ✗（用户分不清「按钮坏了」还是「没同意动鼠标」✓）：%r"
+              % (box.status.text(),))
+
+        # ①②③ 已勾 + **已标定过** ⇒ 必须 force 重量，且点下去当场可见 ✓
+        box.auto.setChecked(True)
+        box.btn.click()
+        check(box.btn.isEnabled() is False and "量中" in box.btn.text(),
+              "② 点下去**当场没有可见反馈**（按钮该置灰 + 文字变「量中…」✓ —— 只改一行小字"
+              "正是用户看到的「没反应」✗）：enabled=%r text=%r"
+              % (box.btn.isEnabled(), box.btn.text()))
+        for _ in range(150):                # 后台线程 + 信号（让事件循环转起来 ✓）
+            # ⚠⚠ 这里必须 `getattr` 兜一下 ✗ —— **走错路时**（实现回到旧写法 ⇒ 压根没起
+            #   `_start_force` ⇒ 没有 `_task`）会当场 `AttributeError: 'RemoteControlBox'
+            #   object has no attribute '_task'` ✓ ⇒ 那是"**红了、但红错地方**"✗
+            #   （反向验证实测踩到 ✓）：它把真正该报的 ①（没走 force 重量）**盖住了** ✗
+            #   ⇒ 看到红也读不出原因 ✓ 那这条钉就白钉了 ✓。
+            _task = getattr(box, "_task", None)
+            if _task is not None:
+                _task.wait(20)              # ⚠ 用 `QThread.wait` ⇒ 不必 import time ✓
+            app.processEvents()
+            if box.btn.isEnabled():
+                break
+        check(calls and calls[-1] == ((768, 1366), True),
+              "① **已标定过的尺寸也要真去量**（该走 `auto_measure(…, force=True)` ✓ 形状 (h,w) ✓）"
+              " —— 实得 %r（只回一句「不用量」就是用户报的「没反应」✗）" % (calls,))
+        check(box.btn.isEnabled() and box.btn.text() == "立即量一次",
+              "③ 量完按钮没恢复：enabled=%r text=%r" % (box.btn.isEnabled(), box.btn.text()))
+        check(len(box.status.text()) > 4 and "（假）" in box.status.text(),
+              "③ 量完没把**结果**写回状态行 ✗：%r" % (box.status.text(),))
+
+    # ⑥ ⭐⭐⭐ **「问错了那一台工作台」也不许哑**（2026-10-15 现场真凶 ✓）：`_last_stats` 是
+    #   "**设置对话框所属那一台工作台**"的账 ✗ —— 用户**开着两个工作台**时，预览完全可能跑在
+    #   **另一台**上 ✓ ⇒ 现场三条点击留痕全是 `size=[0, 0]` ✗ ⇒ 一个字节都没发 ⇒ 用户看到的
+    #   就是"**点了没反应**" ✓（三轮才抓到 ✓）。
+    #   ⇒ 必须回落到"**实时回路自己报上来的那一帧**"（`mouse_aim.note_frame_shape` ✓：
+    #     谁在收帧谁就报 ✓ 与"哪台的设置对话框"无关 ✓）。
+    with mock.patch.object(ma, "GAIN_PATH", _tmp2), \
+         mock.patch.object(ma, "load_gain", lambda shp: {"gain_x": 1.0, "gain_y": 1.0}), \
+         mock.patch.object(ma, "auto_measure", _fake_measure), \
+         mock.patch("core.behavior.event", lambda name, **kw: None):
+        ma.note_frame_shape((768, 1366))          # 实时回路报上来的那一帧 ✓
+        calls.clear()
+        mw2 = QWidget()
+        mw2.live_panel = types.SimpleNamespace(_last_stats={})    # ⚠ 空统计 = 现场形态 ✓
+        dlg2 = SettingsDialog(mw2)
+        dlg2.remote_box.auto.setChecked(True)
+        dlg2.remote_box.btn.click()
+        for _ in range(150):                      # 后台线程 + 信号（同上面 ①②③ 那一段 ✓）
+            _t2 = getattr(dlg2.remote_box, "_task", None)
+            if _t2 is not None:
+                _t2.wait(20)
+            app.processEvents()
+            if dlg2.remote_box.btn.isEnabled():
+                break
+        check(calls and calls[-1] == ((768, 1366), True),
+              "⑥ 设置对话框**问错工作台**（`_last_stats` 空的 ✓ 现场就是这个形态 ✓）时没有回落到"
+              "「实时回路报上来的那一帧」⇒ **一个字节都不发** ✗ —— 那正是用户说的\"点了没反应\"✓"
+              "（兜底见 `mouse_aim.last_frame_shape` ✓）：实得 %r" % (calls,))
+
+
 TESTS = (
+    ("⭐⭐⭐ 「设置 → 链路 → 远程操控」的「立即量一次」：**点下去必须看得见、且真的去重量**"
+     "（已标定过也要 force 重量 · 没勾就明说 · 写开关不抹标定；用户 2026-10-15",
+     t_remote_group_measure_click),
+    ("⭐⭐⭐ 「游戏聚焦时 F11 没反应」= 权限（UIPI）：别人提权、我们没提 ⇒ 收不到；"
+     "要自己说出来（用户 2026-10-11）",
+     t_hotkey_elevation_hint),
     ("⭐⭐⭐ 「开关自动」热键三层：注册制 → 键盘钩子 → 窗口内快捷键（用户 2026-10-10"
      "「我需要 F11 全局生效」）；钩子不吞键 · 装在模块级 · 关闭必卸",
      t_auto_hotkey_three_layers),

@@ -14,7 +14,7 @@ import numpy as np
 
 from link import PyAVSource
 from core.config import ROOT, get
-from tools.probe_codec import resolve_delay_ms
+from core.probe_codec import resolve_delay_ms
 
 
 def locate_probe(gray, cell, gap, bits, y_search=60, x_search=600):

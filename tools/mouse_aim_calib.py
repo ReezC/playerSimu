@@ -334,6 +334,12 @@ def calib_live_by_cursorpos(a, out_path):
     #   不能自动吗？**" ✓ ⇒ 每条约来源**只量一次** ✓，以后在窗口/收流之间来回切会
     #   **自动挑对应尺寸那份** ✓（`decision/mouse_aim.load_gain(frame_shape)` ✓）。
     #   ⚠ 原来这里是**整个文件覆盖** ✗ ⇒ 量一种尺寸就把另一种顶掉 ✓ ⇒ 于是每次都得重量 ✓。
+    # ⚠⚠ **`--dry-run` 必须在这儿生效**（2026-10-17 现场发现 ✗）：这条本地路原来**根本不看**它 ✗
+    #   ⇒ 带了 `--dry-run` 也照写盘 ✓（那就不叫 dry-run 了 ✗）—— 已补 ✓。
+    if getattr(a, "dry_run", False):
+        print("（--dry-run ⇒ **不写** %s ✓ —— 上面那几行就是真量到的 ✓）" % out_path)
+        kbd.close()
+        return 0
     import decision.mouse_aim as _ma
     _ma.save_gain(gain_x, gain_x, frame_shape=(ref_h, ref_w),
                   extra={"probe": {"units": [STEP_SMALL, STEP_BIG, STEP_VERIFY],

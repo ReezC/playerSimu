@@ -53,11 +53,11 @@ import cv2
 import numpy as np
 
 from link import FileSource, PyAVSource
-from tools import probe_codec
+from core import probe_codec
 from core.config import get
 # 判据与工作台**共用一份实现**（`probe_codec.Verdict`）：两边各写一份必然漂移，
 # 而漂移的那一份会让"工具说 OK、工作台说不对"这种最难查的分歧出现。
-from tools.probe_codec import Verdict                   # noqa: F401
+from core.probe_codec import Verdict                   # noqa: F401
 
 #: 时钟偏移的重读间隔（秒）—— 两台机器的 NTP 各漂各的，实测 ~45ms/小时
 OFFSET_REFRESH = 5.0

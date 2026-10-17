@@ -80,11 +80,20 @@ def t_locate_accounting_is_single_entry():
     `locate_ms` 的样本数会翻倍、中位数会被"没算的 0ms"污染 ⇒ 以后没人信它 ✗。
     """
     lt = _src("gui/live_thread.py").replace("\r\n", "\n")
-    check(lt.count('perf.ms("locate_ms"') == 1,
-          "`locate_ms` 有 %d 处记账（应该只有 `_locate_latest` 一处 ✗）"
-          % lt.count('perf.ms("locate_ms"'))
-    check(lt.count('perf.count("mmap_ok" if loc.get("ok")') == 1,
-          "`mmap_ok/miss` 记了不止一处（样本会翻倍 ✗）")
+    # ⚠⚠ **只数真代码行**（2026-10-11 修 ✗）：原来直接 `lt.count('perf.ms("locate_ms"')`
+    #   ⇒ 被**注释**骗过 ✓ —— `live_thread` 里有一句注释写着"这段必须在
+    #   `perf.ms("locate_ms", …)` 之前"（讲"接管期间不定位"那段 ✓），于是**计数变成 2** ✗
+    #   判据当场变红、而代码一处没多 ✓。⇒ 与本仓库那条老教训同源（**文本判据按行、注释不算** ✓
+    #   见 SKILL 311/312 ✓）。
+    _code = [ln for ln in lt.splitlines() if not ln.strip().startswith("#")]
+    _ms = [ln for ln in _code if 'perf.ms("locate_ms"' in ln]
+    check(len(_ms) == 1,
+          "`locate_ms` 有 %d 处记账（应该只有 `_locate_latest` 一处 ✗）：%r"
+          % (len(_ms), [x.strip()[:70] for x in _ms]))
+    _ok = [ln for ln in _code if 'perf.count("mmap_ok" if loc.get("ok")' in ln]
+    check(len(_ok) == 1,
+          "`mmap_ok/miss` 记了不止一处（样本会翻倍 ✗）：%r"
+          % ([x.strip()[:70] for x in _ok],))
 
 
 def t_loc_slot_take_reports_age_and_drop():

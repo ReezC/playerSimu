@@ -27,7 +27,7 @@ import numpy as np
 
 from link import PyAVSource
 from core.config import get
-from tools.probe_codec import decode_ms, resolve_delay_ms
+from core.probe_codec import decode_ms, resolve_delay_ms
 
 
 def find_model(explicit=None):

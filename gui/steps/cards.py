@@ -1099,6 +1099,11 @@ class LabelCard(StepCard):
         self._yolo_player = {}       # 权重路径 -> 所属项目玩家角色
         # 选帧弹窗的结果：{"mob": [帧名…] / None, "player": …}，None = 不筛（全选）
         self._only = {}
+        #: ⭐⭐ **只在这个矩形里标**（`"x,y,w,h"` 或 None ✓）—— 用户 2026-10-11 的「区域自动标注」
+        #:   用它（质检台里框选一块 ⇒ 弹窗 ⇒ 点按钮只标那一块 ✓ 见 `gui/region_label_dialog.py` ✓）。
+        #:   ⚠ 默认 `None` ⇒ **整幅画面都算** ✓ ⇒ 老流程（本页那四个按钮）**一字不变** ✗。
+        #:   口径见 `perception/region.py`（四条链共用同一套判定 ✓）。
+        self._region = None
 
         # 通用「运行」按钮隐藏 —— 活交给**四段各自那两个按钮**（`模板匹配标注{类}` /
         # `YOLO标注{类}` ✓ 用户 2026-10-05 ✓ 原话："模板匹配标注{类名}→按钮、YOLO标注{类名}→按钮"）。
@@ -1147,6 +1152,21 @@ class LabelCard(StepCard):
         dv = QVBoxLayout(self.drop_box)
         dv.setContentsMargins(0, 2, 0, 0)
         dv.setSpacing(4)
+
+        # ⭐⭐ **摆放顺序统一成「参数组 → 背包窗格 → 添加/移出选中/已选 → 动作按钮」**
+        #   （用户 2026-10-11 ✓ 原话："标准掉落物、标注宠物**参数**挪到**掉落物参数组 /
+        #   宠物参数组上方**（模块划分统一）" ＋ "**添加、移出选中、已选** 挪到**对象选择
+        #   背包窗格下面**" ✓）⇒ 四块（玩家/怪物/掉落物/宠物）现在是**同一套顺序** ✓。
+        #   ⚠ 只挪"摆放"这几行 ✗ —— 控件**创建**还在原处（`grid_drop` / 参数字段 / 按钮 ✓）：
+        #     布局顺序只由 `add*` 决定 ✓，动创建顺序只会平白多出风险 ✓。
+        #   ⚠ 参数组的**小标题行**（`_section` ✓）跟玩家/怪物保持同一种写法 ✓ 见那里 ✓。
+        #   ⭐ 省事但可靠的做法：**先把表单摆到最上面** ✓、字段**稍后再往里加**
+        #     （`field()` 建完控件就 `addRow` ✓ ⇒ 加进去的顺序 = 视觉顺序 ✓）
+        #     ⇒ 控件**创建**一行都不用挪 ✗ 见上面那条 ✓。
+        _tform = QFormLayout()
+        _tform.setContentsMargins(0, 0, 0, 0)
+        _tform.setSpacing(4)
+        dv.addLayout(_tform)
 
         # ⭐⭐ **提示挂在标题上**（用户 2026-10-04 ✓ 第 3 条：改成"指着字段标题时弹出。
         #   例如「要标注的掉落物」"）—— 原来这段说明挂在**窗格控件自己**身上 ✗ ⇒ 鼠标指到
@@ -1198,9 +1218,17 @@ class LabelCard(StepCard):
         #     / 提示挂标题 / UI 规范那几条**全都自动吃到** ✓（手搓就得一样样补 ✗）。
         #   ⚠ 放在 `drop_box` **里面** ⇒ 没勾「标注掉落物」时它跟着一起藏 ✓（用户说的正是
         #     "勾选…后需要有这个参数" ✓）。
-        _tform = QFormLayout()
-        _tform.setContentsMargins(0, 0, 0, 0)
-        _tform.setSpacing(4)
+        # ⚠ `_tform` 的**创建 + 摆位**已经挪到本段最上面了 ✓（见那段说明 ✓）——
+        #   这里只管往里加字段 ✓（加进去的顺序 = 视觉顺序 ✓）。
+        # ⭐ 参数组的**小标题行**（与玩家/怪物同一种写法 ✓ 见 `_section` ✓）
+        _tform.addRow("", self._section("掉落物", "掉落物（class 2）单独一套阈值与尺度 ✓"))
+        # ⭐⭐⭐ **框到可见部分（掉落物这一格）**（用户 2026-10-16 ✓「每类各自一格」✓ +
+        #   「**注意区域自动标注与模型训练里一致**」✓）：⚠ 区域弹窗**搬的就是这张卡片的原件** ✓
+        #   ⇒ 这一格在训练页与区域弹窗里**是同一格** ✓（不会有两份 ✗）。
+        #   口径见 `_visible_params` ✓（默认开 ✓ 老键 `visible` 兜底 ✓）。
+        self.field(_tform, "drop_visible", "框到可见部分", "bool", True,
+                   tip="只框**实际露出来**的那部分（被别的怪/地形/UI 挡掉的像素不算）\n"
+                       "⚠ 只管**掉落物**这一类 ✓（别的类在它们各自那一格 ✓）")
         self.field(_tform, "drop_thresh", "匹配阈值", "float", 0.90,
                    minimum=0.0, maximum=1.0, step=0.01, decimals=2,
                    tip="**这一块自己的匹配阈值**（掉落物模板匹配用 ✓）。\n\n"
@@ -1248,7 +1276,8 @@ class LabelCard(StepCard):
                        "  `1` 能检出、`2` 是 0 框 ✗）；\n"
                        "· 真的嫌慢再往上调 ✓，但要盯着检出率 ✓；\n"
                        "· 调它只影响**掉落物这一块** ✓。")
-        dv.addLayout(_tform)
+        # ⚠ **不许再 `dv.addLayout(_tform)`** ✗ —— 同一个布局再 add 一次只会把它**挪到这儿**
+        #   （Qt 的语义 ✓）⇒ 参数又跑到窗格下面去了 ✓。它已经在最上面了 ✓。
 
         drow = QHBoxLayout()
         drow.setSpacing(6)
@@ -1297,6 +1326,14 @@ class LabelCard(StepCard):
         pv.setContentsMargins(0, 2, 0, 0)
         pv.setSpacing(4)
 
+        # ⭐⭐ 摆放顺序同掉落物那块（**参数组 → 背包窗格 → 添加/移出选中/已选 → 动作按钮** ✓
+        #   用户 2026-10-11 ✓ 见 `drop_box` 上面那段说明 ✓）：表单**先摆最上面** ✓、
+        #   字段**稍后再往里加** ✓ ⇒ 控件创建一行都不用挪 ✗。
+        _pform = QFormLayout()
+        _pform.setContentsMargins(0, 0, 0, 0)
+        _pform.setSpacing(4)
+        pv.addLayout(_pform)
+
         plbl = title_label(
             "要标注的宠物",
             tip="**这个字段是干嘛的**：下面格子里列出「这次要标的宠物」——\n"
@@ -1316,9 +1353,15 @@ class LabelCard(StepCard):
         self.grid_pet.activated_id.connect(lambda _i: self._pick_entry_frames("pet"))      # 同掉落物那块（见上面那段说明 ✓）
         pv.addWidget(self.grid_pet)
 
-        _pform = QFormLayout()
-        _pform.setContentsMargins(0, 0, 0, 0)
-        _pform.setSpacing(4)
+        # ⚠ `_pform` 的**创建 + 摆位**已经挪到本段最上面了 ✓（见那段说明 ✓）——
+        #   这里只管往里加字段 ✓。
+        # ⭐ 参数组的**小标题行**（与玩家/怪物同一种写法 ✓）
+        _pform.addRow("", self._section("宠物", "宠物（class 5）单独一套阈值与尺度 ✓"))
+        # ⭐⭐⭐ **框到可见部分（宠物这一格）**（用户 2026-10-16 ✓「每类各自一格」✓）
+        #   ⚠ 与训练页/区域弹窗**同一份**（区域弹窗搬的就是这张卡片的原件 ✓ 不抄两份 ✗）
+        self.field(_pform, "pet_visible", "框到可见部分", "bool", True,
+                   tip="只框**实际露出来**的那部分（被别的怪/地形/UI 挡掉的像素不算）\n"
+                       "⚠ 只管**宠物**这一类 ✓（别的类在它们各自那一格 ✓）")
         self.field(_pform, "pet_thresh", "匹配阈值", "float", 0.90,
                    minimum=0.0, maximum=1.0, step=0.01, decimals=2,
                    tip="**这一块自己的匹配阈值**（宠物组合外观做模板匹配时用 ✓）。\n\n"
@@ -1361,10 +1404,12 @@ class LabelCard(StepCard):
                        "  几十像素，缩一半就糊 ⇒ **一个都匹配不上** ✓（用户实测：同 8 帧，\n"
                        "  `1` 能检出、`2` 是 0 框 ✗）；\n"
                        "· 调它只影响**宠物这一块** ✓。")
-        pv.addLayout(_pform)
+        # ⚠ **不许再 `pv.addLayout(_pform)`** ✗ —— 同一个布局再 add 一次 = 把它**挪到这儿**
+        #   （Qt 的语义 ✓）⇒ 参数又跑到窗格下面去了 ✓。它已经在段首了 ✓。
 
         prow = QHBoxLayout()
         prow.setSpacing(6)
+
         self.btn_pet_add = QPushButton("添加…")
         self.btn_pet_add.setToolTip("打开「选择要标注的宠物」：**先挑宠物、再挑它戴的装备**，"
                                     "看着组合预览确认 ✓")
@@ -1612,6 +1657,13 @@ class LabelCard(StepCard):
         v = QVBoxLayout(box)
         v.setContentsMargins(0, 6, 0, 0)
         v.setSpacing(4)
+        # ⭐⭐ 摆放顺序统一成「**参数组 → 背包窗格 → 添加/移出选中/已选 → 动作按钮**」✓
+        #   （用户 2026-10-11 ✓ 原话见 `drop_box` 上面那段 ✓）—— 这里是"参数组先摆位、
+        #   字段稍后往里加"那个省事做法 ✓（控件创建一行都不用挪 ✗）。
+        _plform = QFormLayout()
+        _plform.setSpacing(4)
+        _plform.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        v.addLayout(_plform)
         v.addWidget(title_label(
             "标注玩家",
             tip="「标注玩家」这一段：选一个角色，用他那套外观模板在画面里找自己（class 0）✓。\n"
@@ -1633,15 +1685,21 @@ class LabelCard(StepCard):
         #   （`QFormLayout` 直接挂进段的竖排布局 ✓）。
         #   ⚠⚠ **键一个字都没改** ✗ —— `load_from_project` / `sync` / `make_task` / 四套用例
         #   全按 key 认 ✓；这一趟是**纯版式** ✓ 值、默认值、tip 全部原样 ✓。
-        _plform = QFormLayout()
-        _plform.setSpacing(4)
-        _plform.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        # ⚠ `_plform` 的**创建 + 摆位**已经挪到本段最上面了 ✓（见那段说明 ✓）——
+        #   这里只管往里加字段 ✓。
         _plform.addRow("", self._section("玩家", "玩家（class 0）单独一套阈值与尺度 ✓"))
         # 玩家 scale 由 ③ 标定尺度自动测，这里只读展示，不让手填
         self.lbl_player_scale = QLabel("—（先跑 ③ 标定）")
         self.lbl_player_scale.setStyleSheet("color:#5f6368;")
         _plform.addRow("玩家 scale", self.lbl_player_scale)
 
+        # ⭐⭐⭐ **框到可见部分（玩家这一格）**（用户 2026-10-16 ✓「每类各自一格」✓ +
+        #   「**注意区域自动标注与模型训练里一致**」✓）：⚠ 区域弹窗**搬的就是这张卡片的
+        #   原件** ✓ ⇒ 训练页与区域弹窗里**是同一格** ✓（不许抄出两份 ✗）。
+        #   口径见 `_visible_params` ✓（默认开 ✓ 老键 `visible` 兜底 ✓）。
+        self.field(_plform, "player_visible", "框到可见部分", "bool", True,
+                   tip="只框**实际露出来**的那部分（被别的怪/地形/UI 挡掉的像素不算）\n"
+                       "⚠ 只管**玩家**这一类 ✓（别的类在它们各自那一格 ✓）")
         self.field(_plform, "player_thresh", "玩家阈值", "float", 0.78,
                    minimum=0.0, maximum=1.0, decimals=2, step=0.01,
                    tip="只有「标注玩家」（class 0）这一条走它 —— 怪物 / 掉落物 / 宠物\n"
@@ -1697,7 +1755,7 @@ class LabelCard(StepCard):
         #      再下面就是按钮「模板匹配标注」、「YOLO标注」"）----
         #   勾选 ⇒ 卡片**最下面**出现那一块（列表 + 两个按钮 ✓ 见 `__init__` 里 `drop_box` ✓）。
         #   ⚠ 类别号用类别表里的 **class 2 = drop**（`perception/classes.py` ✓ 早就在表里 ✓）。
-        v.addLayout(_plform)
+        # ⚠ **不许再 `v.addLayout(_plform)`** ✗（同上：那会把它挪到这儿 ⇒ 参数跑到窗格下面 ✓）
         # ⭐⭐ **双击某个角色 ⇒ 选模板帧**（用户 2026-10-05 ✓「四块窗格各接一行双击选模板帧」）——
         #   与掉落物 / 宠物那两块**同一行** ✓（`IconGrid.activated_id` = 双击或回车都会发 ✓）。
         #   存进 `label.frames_sel` 的键是 `player:<角色id>` ✓ —— 与管线那把钥匙**完全一致** ✓
@@ -1747,6 +1805,13 @@ class LabelCard(StepCard):
         v = QVBoxLayout(box)
         v.setContentsMargins(0, 6, 0, 0)
         v.setSpacing(4)
+        # ⭐⭐ 摆放顺序统一成「**参数组 → 背包窗格 → 添加/移出选中/已选 → 动作按钮**」✓
+        #   （用户 2026-10-11 ✓ 见 `drop_box` 上面那段 ✓）：表单**先摆最上面** ✓、
+        #   字段**稍后再往里加** ✓（`field()` 建完就 `addRow` ⇒ 加的顺序 = 视觉顺序 ✓）。
+        _mform = QFormLayout()
+        _mform.setSpacing(4)
+        _mform.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        v.addLayout(_mform)
         v.addWidget(title_label(
             "标注怪物",
             tip="「标注怪物」这一段：挑这张图要识别的怪，用它们的精灵做模板匹配（class 1）✓。\n"
@@ -1766,9 +1831,8 @@ class LabelCard(StepCard):
         #   （`QFormLayout` 直接挂进段的竖排布局 ✓）。
         #   ⚠⚠ **键一个字都没改** ✗ —— `load_from_project` / `sync` / `make_task` / 四套用例
         #   全按 key 认 ✓；这一趟是**纯版式** ✓ 值、默认值、tip 全部原样 ✓。
-        _mform = QFormLayout()
-        _mform.setSpacing(4)
-        _mform.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        # ⚠ `_mform` 的**创建 + 摆位**已经挪到本段最上面了 ✓（见那段说明 ✓）——
+        #   这里只管往里加字段 ✓。
         _mform.addRow("", self._section(
             "模板匹配参数", "「标注怪物 / 标注玩家 / 掉落物-模板匹配」用的匹配参数 ✓"))
         self.field(_mform, "thresh", "匹配阈值", "float", 0.90,
@@ -1818,7 +1882,20 @@ class LabelCard(StepCard):
         #   `tools/detect_mobs._visible_box` ✓）—— **默认关** ✓（这是改**标注语义** ✗：
         #   框住整只（含被挡部分）是 COCO/YOLO 的通行约定 ✓ 老行为不算错 ✓；开了之后
         #   **同一帧的框会变小** ⇒ 要重跑这一趟标注 ✓）。
-        self.field(_mform, "visible", "框到可见部分", "bool", False,
+        # ⭐⭐⭐ **默认改成「开」**（用户 2026-10-16 ✓ 原话：「**所有的类别都需要「框到可见部分」
+        #   勾选，且默认勾选**」✓）：原来是**默认关** ✗（见下一条注释的由来 ✓）。
+        #   ⚠ 这是**改标注语义**的默认值 ✓（框会从"模板尺寸"缩到"真正露出来的那部分" ✓
+        #   见 `perception/visible_box.py` ✓）—— 用户**明确要求**默认开 ✓，故改 ✓。
+        #   ⚠ 老项目文件里**没有这个键** ⇒ 走这里的默认值 ✓ ⇒ 也变成开 ✓
+        #   （正是用户要的"**默认勾选**"✓；要关掉在界面上取消勾选即可 ✓）。
+        # ⭐⭐⭐ **每类各自一格**（用户 2026-10-16 ✓ 原话：「**每类各自一格**」✓）：
+        #   这一格从**共享键 `visible`** 改成**本类的 `mob_visible`** ✓ ——
+        #   它在**怪物区**里 ✓（`_build_mob_section` ✓）⇒ 勾/取消**只管怪物** ✓。
+        #   ⚠ 以前它是"**一格管四类**"✗，而且它就在**这一区**里 ✓ ⇒ 掉/宠/玩三块
+        #     看着像"根本没有这个功能"✗ —— 正是用户报的那件事 ✓（现已补全另三格 ✓）。
+        #   ⚠ 老项目文件里只有老键 `visible` ⇒ 由 `_visible_params` / 回填两处兜底 ✓
+        #     （当时显式关了的仍关 ✓ 不会被默认值偷偷翻回去 ✗）。
+        self.field(_mform, "mob_visible", "框到可见部分", "bool", True,
                    tip="**只框看得见的那部分**（被别的怪/地形/UI 挡掉的像素不进框 ✓）。\n"
                        "  · ⭐ 关（默认）：框 = **完整贴图尺寸** —— 这是 COCO/YOLO 的通行约定 ✓\n"
                        "    （人手工标注也这么标 ✓），老行为一字不变 ✓；\n"
@@ -1845,7 +1922,7 @@ class LabelCard(StepCard):
                        "框任一边小于 6 像素就当没缩 ✓ —— 都是为了「别把没被挡的框啃小」✗。")
 
         # ---- 玩家标注参数（模板匹配，class 0）----
-        v.addLayout(_mform)
+        # ⚠ **不许再 `v.addLayout(_mform)`** ✗（同上：那会把它挪到这儿 ⇒ 参数跑到窗格下面 ✓）
         # ⭐⭐ 同上（怪物那块）：双击 ⇒ 选模板帧 ✓ 键 = `mob:<怪id>` ✓
         #   （`detect_mobs.py:655` 那句 `split(":", 1)[1]` **就是**剥这个前缀 ✓）。
         self.grid_mob.activated_id.connect(
@@ -2457,7 +2534,16 @@ class LabelCard(StepCard):
         self.set_value("player_max_peaks", sec.get("player_max_peaks", 1))
         self.set_value("player_downscale", sec.get("player_downscale", 1))
         # ⭐⭐ **框到可见部分**（用户 2026-10-05 ✓）：四段**共用一份** ✓（默认关 ✓ 老项目一字不变 ✓）
-        self.set_value("visible", sec.get("visible", False))
+        # ⭐⭐⭐ **每类各自一格 ⇒ 回填要铺四个键**（用户 2026-10-16 ✓ 原话：「**每类各自一格**」✓
+        #   + 「**注意区域自动标注与模型训练里一致**」✓ —— 区域弹窗搬的就是这张卡片的原件 ✓
+        #   所以这一处回填**两边同时生效** ✓ 不会有两份 ✗）：
+        #   ⚠ **读的顺序与 `_visible_params` 必须一字不差** ✗（本类键 → 老键 `visible` → True ✓）
+        #     —— 界面按 A 显示、下发却按 B 走 ⇒ 那种"两个真相"最坑 ✓（勾着却是关的 ✗）。
+        #   ⚠ 老项目文件里**只有老键 `visible`** ✓ ⇒ 四类都先吃它 ✓（当时显式关了的仍关 ✓
+        #     不会被新默认值偷偷翻回去 ✗）；改过某一类之后 ⇒ 该类读自己的键 ✓。
+        _v_legacy = sec.get("visible", True)
+        for _vt in ("mob", "player", "drop", "pet"):
+            self.set_value("%s_visible" % _vt, sec.get("%s_visible" % _vt, _v_legacy))
         self.set_value("visible_keep", sec.get("visible_keep", 0.2))
         # ⭐ 掉落物列表（用户 2026-10-04 ✓）：开关走 `set_value`（自动 ✓），列表手工灌 ✓
         #   ⚠ 归一化用 `wzexport.norm_drops`（老配置可能只存了 id ✓ 一处口径 ✓）
@@ -2678,7 +2764,7 @@ class LabelCard(StepCard):
                 return float(v)              # ③ 为这一类**专门**标定的那个 ✓
         return float(p.get("scale") or 1.12)     # 1.12 = 怪物那条一直用的兜底 ✓ 别改 ✗
 
-    def _visible_params(self, sec):
+    def _visible_params(self, sec, target=None):
         """⭐ **框到可见部分**那两个参数（用户 2026-10-05 ✓ 实现见 `perception/visible_box.py` ✓）。
 
         ⚠ **一处口径** ✓：怪物 / 掉落物 / 宠物 **/** 玩家**四段都从这儿取 ✓ —— 免得哪个 cfg
@@ -2690,7 +2776,25 @@ class LabelCard(StepCard):
         ⚠ `visible_tol` **不在界面里**（内核支持、界面没开这一格 ✗ 用户没要 ⇒ 别自作主张加 ✗）
           ⇒ 它恒走实现那边那个常量 ✓。
         """
-        return {"visible": bool(sec.get("visible", False)),
+        # ⭐⭐ **默认「开」**（用户 2026-10-16 ✓ 见 `_mform` 里那条注释 ✓）：
+        #   老项目文件里没这个键 ⇒ 这里兜底 ⇒ 也走"框到可见部分" ✓（= 用户要的默认勾选 ✓）；
+        #   ⚠ 与界面那格的默认值**必须是同一个** ✗（两处不一致 ⇒ 界面显示勾着、下发却是关的 ✓
+        #     那种"两个真相"最坑 ✓）。
+        # ⭐⭐⭐ **每类各自一格**（用户 2026-10-16 ✓ 原话：「**每类各自一格**」✓ +
+        #   「**注意区域自动标注与模型训练里一致**」✓）：`target` 给了就按**本类自己的键**
+        #   读（`mob_visible` / `player_visible` / `drop_visible` / `pet_visible` ✓）。
+        #   ⚠ **读的顺序**（三档 ✓ 缺一档就会踩老项目 ✗）：
+        #     ① 本类键 ✓（新写法 ✓）；② **老的共享键 `visible`** ✓ —— 老项目文件里有它 ✓
+        #     ⇒ 那份显式选择**照旧生效** ✓（当时关了就一直关 ✓ 不许被默认值偷偷翻回去 ✗）；
+        #     ③ 都没有 ⇒ **True** ✓（用户要的"**默认勾选**"✓）。
+        #   ⚠ `visible_keep`（最小保留比例 ✓）**仍是共享一格** ✓ —— 用户这次只要
+        #     "每类一个**勾选**" ✓，多拆一个只会让人多调一处 ✗（要拆说一声 ✓ 一行的事 ✓）。
+        key = ("%s_visible" % target) if target else "visible"
+        if key in sec:
+            on = bool(sec.get(key))
+        else:
+            on = bool(sec.get("visible", True))
+        return {"visible": on,
                 "visible_keep": float(sec.get("visible_keep", 0.2))}
 
     def make_task(self, p):
@@ -2727,9 +2831,13 @@ class LabelCard(StepCard):
                 #     `drop_thresh` 的）取到的就是**原来那个数** ✓ 行为一字不变 ✓；
                 #     其余几个参数（min_distinct / per_mob / max_peaks / downscale）仍与怪物
                 #     同一份 ✓ —— 这次只把**阈值**拆出来（用户点名要的就是它 ✓）。
-                "thresh": sec.get("drop_thresh", sec.get("thresh", 0.90)),
-                # ⭐⭐ 框到可见部分（用户 2026-10-05 ✓ 一处口径见 `_visible_params` ✓）
-                **self._visible_params(sec),
+                # ⭐⭐⭐ **框到可见部分：按本类自己的键**（用户 2026-10-16 「每类各自一格」✓）
+        #   ⇒ 「掉落物」那一格只管掉落物 ✓（老键 `visible` 仍作兜底 ✓ 见 `_visible_params` ✓）
+        #   ⚠ 顺序要求：本类的 `field(...)` 必须先写进 sec（见掉落物那段表单 ✓）。
+        "thresh": sec.get("drop_thresh", sec.get("thresh", 0.90)),
+        # ⭐⭐ 框到可见部分（用户 2026-10-05 ✓ 一处口径见 `_visible_params` ✓；
+        #   ⭐ 2026-10-16 ⇒ **按本类自己的键** ✓ 用户「每类各自一格」✓）
+        **self._visible_params(sec, "drop"),
                 # ⭐ 2026-10-05：这三项也**各存一份**了（用户："4类按照统一的格式整理"✓）——
                 #   ⚠ 兜底链 `drop_*` → 总的那个 → 常量 ✓ ⇒ **老项目一字不变** ✓。
                 "min_distinct": sec.get("drop_min_distinct", sec.get("min_distinct", 0.06)),
@@ -2749,6 +2857,8 @@ class LabelCard(StepCard):
                 "imgsz": p.sec("train").get("imgsz", 960),
                 "device": p.sec("train").get("device", "0"),
                 "only": self._only.get("drop") or [],
+                # ⭐⭐ **只标框选区域**（用户 2026-10-11 ✓ 见 `self._region` ✓；None = 整幅 ✓）
+                "region": self._region,
             }
 
         # ⭐⭐ 宠物（class 5；用户 2026-10-04 ✓ 方案 C）—— 与掉落物那条**并列**：
@@ -2779,8 +2889,9 @@ class LabelCard(StepCard):
                 # ⭐ 匹配阈值：这一块自己的优先 ✓（兜底链 `pet_thresh` → 总的 `thresh` → 0.90 ✓
                 #   老项目取到的就是原来那个数 ✓ 行为一字不变 ✓）
                 "thresh": sec.get("pet_thresh", sec.get("thresh", 0.90)),
-                # ⭐⭐ 框到可见部分（用户 2026-10-05 ✓ 一处口径见 `_visible_params` ✓）
-                **self._visible_params(sec),
+                # ⭐⭐ 框到可见部分（用户 2026-10-05 ✓ 一处口径见 `_visible_params` ✓；
+                #   ⭐ 2026-10-16 ⇒ **按本类自己的键** ✓ 用户「每类各自一格」✓）
+                **self._visible_params(sec, "pet"),
                 # ⭐ 2026-10-05：这三项各存一份 ✓（兜底链 `pet_*` → 总的 → 常量 ✓ 老项目不变 ✓）
                 "min_distinct": sec.get("pet_min_distinct", sec.get("min_distinct", 0.06)),
                 "per_mob": sec.get("pet_per_mob", sec.get("per_mob", 20)),
@@ -2797,6 +2908,8 @@ class LabelCard(StepCard):
                 "imgsz": p.sec("train").get("imgsz", 960),
                 "device": p.sec("train").get("device", "0"),
                 "only": self._only.get("pet") or [],
+                # ⭐⭐ **只标框选区域**（用户 2026-10-11 ✓ 同掉落物 ✓；None = 整幅 ✓）
+                "region": self._region,
             }
 
         # 「YOLO 标注」单独跑：只做模型这一遍（往 labels_auto 追加框），
@@ -2819,6 +2932,8 @@ class LabelCard(StepCard):
                 "imgsz": p.sec("train").get("imgsz", 960),
                 "device": p.sec("train").get("device", "0"),
                 "only": self._only.get(target) or [],
+                # ⭐⭐ **只标框选区域**（用户 2026-10-11 ✓ 同掉落物/宠物 ✓；None = 整幅 ✓）
+                "region": self._region,
             }
 
         if self._label_target == "player":
@@ -2837,7 +2952,8 @@ class LabelCard(StepCard):
                     #   `PlayerLocator` 连能力都没有 ✓ 2026-10-06 三段一起补 ✓）。
                     #   ⚠ **与怪物/宠物/掉落共用同一份实现**（`perception/visible_box.py` ✓）
                     #   和**同一个设置值**（`_visible_params` 一处口径 ✓）。
-                    **self._visible_params(sec),
+                    #   ⭐ 2026-10-16 ⇒ **本类自己的键** ✓（用户「每类各自一格」✓）：玩家那格只管玩家 ✓
+                    **self._visible_params(sec, "player"),
                     # ⭐ 2026-10-05：玩家这一段自己的另外 4 个（用户："缺功能的就补功能" ✓）——
                     #   能力先在 `perception/player_locator.py` 里补出来的 ✓
                     #   ⚠ 默认值**故意与怪物不同**（区分度 0 ✓ 最大模板帧 0 = 不截 ✓
@@ -2873,6 +2989,9 @@ class LabelCard(StepCard):
                 }
             # 选帧：只处理勾中的帧（[] = 全选不筛）
             params["detect"]["only"] = self._only.get("player") or []
+            # ⭐⭐ **只标框选区域**（用户 2026-10-11 ✓）：`detect` 整块会被原样转给
+            #   `detect_player.run_detect_player` ✓（它按 `region` 丢区域外的框 ✓ 见那边 ✓）
+            params["detect"]["region"] = self._region
             return run_detect_player_augmented, params
 
         from tools.yolo_augment import run_detect_mob_augmented
@@ -2883,8 +3002,9 @@ class LabelCard(StepCard):
                 "frames": str(p.frames),
                 "out": str(p.dir_of("labels_auto")),
                 "vis_dir": str(p.vis),
-                # ⭐⭐ 框到可见部分（用户 2026-10-05 ✓ 一处口径见 `_visible_params` ✓）
-                **self._visible_params(sec),
+                # ⭐⭐ 框到可见部分（用户 2026-10-05 ✓ 一处口径见 `_visible_params` ✓；
+                #   ⭐ 2026-10-16 ⇒ **按本类自己的键** ✓ 用户「每类各自一格」✓）
+                **self._visible_params(sec, "mob"),
                 "scale": self._sprite_scale(p),      # = `p.get("scale") or 1.12`（一处口径 ✓）
                 "mob_scales": p.get("mob_scales") or {},
                 "downscale": sec.get("downscale", 1),
@@ -2902,6 +3022,9 @@ class LabelCard(StepCard):
         }
         # 选帧：只处理勾中的帧（[] = 全选不筛）
         params["detect"]["only"] = self._only.get("mob") or []
+        # ⭐⭐ **只标框选区域**（用户 2026-10-11 ✓）：`detect` 整块会被原样转给
+        #   `detect_mobs.run_detect` ✓（它本来就能"只在区域里**搜**"✓ 见那边 ✓）
+        params["detect"]["region"] = self._region
         return run_detect_mob_augmented, params
 
 

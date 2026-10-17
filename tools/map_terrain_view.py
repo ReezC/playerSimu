@@ -45,7 +45,31 @@ def hex_bgr(h):
         return (170, 170, 170)
 
 
+# ⭐⭐⭐ **全局"不许画字"开关**（用户 2026-10-17 ✓ 原话：「**怎么还这么多字，不是让你去掉吗？**」✗）：
+#   · 这一屏的字**不是** Qt 文本图元 ✗，而是本模块用 `cv2.putText` **画进图片像素**里的
+#     （图例五行 + 集合名 / 地名 / 段号 / 门名 ✓）⇒ `gui/canvas.set_text_visible` **管不到**
+#     它们 ✗（那个是按 Qt 图元类型处理的 ✓ —— 我上一轮就是漏了这一批 ✓）。
+#   · 所以开关放在**唯一画字的地方** `_label()` ✓ —— **一处关、全都关** ✓
+#     （去追每一个调用点必然漏 ✗，漏一个就还是"字没去干净"✓）。
+#   ⚠ **默认 False（照旧画字 ✓）** —— 命令行 `python -m tools.map_terrain_view`、
+#     以及别的页面的画法**一个字不变** ✓；只由 `gui/route_panel` 初始化时关掉 ✓。
+_LABEL_OFF = False
+
+
+def set_labels(on):
+    """画字开关（传 `False` ⇒ 这张图上**一个字都不画** ✓）。用户 2026-10-17 ✓ 见上面那段 ✓。"""
+    global _LABEL_OFF
+    _LABEL_OFF = not bool(on)
+
+
+def labels_on():
+    """当前开关（`True` = 照旧画字 ✓）——给自检与排查用 ✓。"""
+    return not _LABEL_OFF
+
+
 def _label(vis, text, org, color, scale=0.9):
+    if _LABEL_OFF:
+        return                          # ⭐ 一个像素都不画（连描边一起省 ✓）
     cv2.putText(vis, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 4)
     cv2.putText(vis, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2)
 

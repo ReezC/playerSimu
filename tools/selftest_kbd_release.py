@@ -56,6 +56,59 @@ def t_stop_automation_releases_keys():
           "停自动的分支里出现了 `_reassert_ctx` ⇒ 松完又按回去 ✗（那等于没停）")
 
 
+def t_release_keeps_manual_held():
+    """⭐⭐⭐ **收摊不许把「手动输入正按着的键」一起松掉**（用户 2026-10-13 ✓ 原话：
+    "**关闭自动情况下，开启手动输入按住的键会被断掉**，什么情况？"✓）。
+
+    病根：固件侧按住的键是个**集合**（见 `decision/manual_input.py` 模块文档 ✓）⇒
+    `RELEASEALL` 是"**把那张表整张清空**"✗ ⇒ 手动通道转发过去、人手此刻正按着的键一起没 ✗。
+    而 `_release_keys_now()` 正是**停自动**那一拍调的（见上面那条用例 ✓）⇒ 少这道闸就是
+    "一关自动，人手的键就断" ✓；面板那条 `_force_release_all` 同理（它也会被
+    "本来就没开自动"的 `_toggle_auto()` 调到 ✓）。
+
+    钉三处（缺一处就复发 ✓）：
+      ① `agent._release_keys_now`：**先问** `manual_input.held()` ✓，有手动键时走**逐键**
+         那条路 —— `if _man:` 必须排在 `release_all_remote()` **之前** ✗；
+      ② `player_panel._force_release_all`：同样先问 ✓（`if not _man:` 才敢发 RELEASEALL ✓），
+         并且逐键兜底那一遍要把手动正按着的键**排除**（`) - _man` ✓）；
+      ③ `player_panel._toggle_auto`：只在**真从开着 → 关掉**的下降沿收摊 ✓
+         （原来是"只要不是开着的就收"✗ ⇒ 自动本来就关着时再调一次也会清键 ✓）。
+    """
+    ag_src = (ROOT / "decision" / "agent.py").read_text(encoding="utf-8")
+    _i = ag_src.find("def _release_keys_now(self):")
+    check(_i >= 0, "找不到 `_release_keys_now` ✗")
+    # ⚠ 切到**下一个方法**为止 ✓（别用"往后 N 个字符"那种魔法数字 ✗ —— 说明文一写长就滑出去，
+    #   第一版 4200 就是这么红的 ✓：`if _man:` 根本没进窗口 ⇒ 用例假红 ✓）。
+    _seg = ag_src[_i:]
+    _seg = _seg[: _seg.index("\n    def ", 1)]
+    # ⚠⚠ **必须先去 docstring 再比顺序** ✗ —— 那段说明文里**故意写着** `release_all_remote()`
+    #   （"本地后端上它是空操作"✓）⇒ 不剥掉的话 `index()` 会先撞到说明文 ⇒ 顺序判据**假红** ✓
+    #   （第一版就是这么红的 ✓ 同 `t_pad_delta_from_tracker` ⑧ 那条注记 ✓）。
+    _code = _seg.split('"""', 2)[2] if _seg.count('"""') >= 2 else _seg
+    check("manual_input.held()" in _seg,
+          "松键那条路没问「手动输入正按着哪些键」✗ ⇒ 一关自动就把人手的键一起松了"
+          "（用户 2026-10-13 ✓）")
+    check("if _man:" in _code
+          and _code.index("if _man:") < _code.index("release_all_remote()"),
+          "有手动键时**没有先走逐键那条路**（`if _man:` 必须排在 `RELEASEALL` 之前 ✗）"
+          "⇒ `RELEASEALL` 一视同仁、把人手的键也清了 ✗")
+
+    pp_src = (ROOT / "gui" / "player_panel.py").read_text(encoding="utf-8")
+    _j = pp_src.find("def _force_release_all(self):")
+    check(_j >= 0, "找不到 `_force_release_all` ✗")
+    _pseg = pp_src[_j:]                          # 同上：切到下一个方法为止 ✓
+    _pseg = _pseg[: _pseg.index("\n    def ", 1)]
+    _pcode = _pseg.split('"""', 2)[2] if _pseg.count('"""') >= 2 else _pseg
+    check("manual_input.held()" in _pseg, "面板那条强杀没问「手动输入正按着哪些键」✗")
+    check("if not _man:" in _pcode
+          and _pcode.index("if not _man:") < _pcode.index("release_all_remote()"),
+          "面板那条在手动输入开着时**照发 `RELEASEALL`** ✗（固件整张表清空 ⇒ 人手的键断 ✓）")
+    check(") - _man" in _pseg,
+          "面板逐键兜底没把手动正按着的键**排除** ✗（那一遍照样会把它松开 ✓）")
+    check("if not on and _was_on:" in pp_src,
+          "`_toggle_auto` 又变成「只要不是开着的就收摊」✗ ⇒ 自动本来就关着时再调一次也清键 ✓")
+
+
 def t_release_keys_covers_both_backends():
     """松键那唯一一处写法必须**同时认两种后端**（2026-09-26 现场踩过 ✗）。
 
@@ -767,6 +820,8 @@ def t_pad_sender_off_gui_thread():
 
 TESTS = (
     ("停自动要真的松干净（下降沿 + 不许把键按回去）", t_stop_automation_releases_keys),
+    ("⭐⭐⭐ 收摊不许把「手动输入正按着的键」一起松掉（用户 2026-10-13）",
+     t_release_keeps_manual_held),
     ("松键那条唯一写法同时认两种后端", t_release_keys_covers_both_backends),
     ("限流（背压）已整个撤掉、别悄悄加回来", t_backpressure_is_gone),
     ("⭐ 鼠标链打点：`mouse_send` / `move_gap_ms` / `move_px`（先量后改 ✓）",

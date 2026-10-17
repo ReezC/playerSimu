@@ -673,7 +673,377 @@ def t_op_modes_and_band_select():
 
 
 
+def t_region_auto_label_mode():
+    """⭐⭐⭐ 「区域自动标注」操作模式：框一块 ⇒ **弹窗**（用户 2026-10-11 ✓ 原话：
+    "给质检台新增「区域自动标注」操作模式，在该模式，框选一个区域后出现弹窗…"）。
+
+    钉五件：
+      ① 下拉里真有这一项（`MODE_REGION` ✓）且默认不是它 ✗（默认仍是标注模式 ✓ 老行为不变 ✓）；
+      ② 画布那一侧：**只有这个模式**松手才发 `region_picked` ✓，而且**不建框、不动选中** ✗；
+      ③ 面板那一侧：框完真的去开弹窗 ✓，**参数对**（当前帧 + 那个矩形 ✓）；
+      ④ 框太小 / 没项目 / 没帧 ⇒ **不开弹窗**，只把人话写在状态行 ✓（别弹个没用的窗 ✗）；
+      ⑤ ~~模态（`exec_`）~~ ⇒ ⭐⭐⭐ **2026-10-16 口径变更**（用户原话："**区域自动标注 弹窗
+         打开时需要能交互主窗口**"✓）：改判"**非模态 + 目标帧跟着当前帧走**"✓ ——
+         原来那条风险（"背后切帧 ⇒ 以为标的是新那一帧"✗）**换了挡法**：让弹窗标的永远等于
+         你正看着的那一帧（`set_target` + `_load_current` 里那次推送 ✓）⇒ 风险从根上不成立 ✓。
+    """
+    import inspect
+
+    from gui.canvas import MODE_LABEL, MODE_REGION, ImageCanvas
+    from gui.review import ReviewPanel
+
+    _root = Path(__file__).resolve().parents[1]
+    _src = (_root / "gui" / "review.py").read_text(encoding="utf-8")
+    _csrc = (_root / "gui" / "canvas.py").read_text(encoding="utf-8")
+
+    # ---- ①② 源码级：模式存在 / 画布只在它下面发信号 / 不建框 ----
+    check("MODE_REGION" in _src and "区域自动标注" in _src,
+          "质检台下拉里没有「区域自动标注」这一项 ✗（用户 2026-10-11 点名要它 ✓）")
+    check("region_picked" in _csrc and "MODE_REGION" in _csrc,
+          "画布没有「区域自动标注」模式 / 没有 `region_picked` 信号 ✗")
+    _branch = _csrc.split("if self._region_band:", 1)[-1].split("if band:", 1)[0]
+    check("region_picked.emit" in _branch,
+          "那个模式松手后**没把矩形交出去** ✗ ⇒ 弹窗打不开 ✓")
+    # ⚠ 只看**真调用**（`self.xxx.emit` / `self._select_in_rect(` ✓）—— 那段注释里就写着
+    #   "不建框、不发 boxes_changed" ✓，拿**字符串**去查会把自己的注释当违规 ✗（踩过一次 ✓）。
+    check("boxes_changed.emit" not in _branch and "_select_in_rect(" not in _branch,
+          "区域框选**改动了标注**（建框 / 选中）✗ —— 它只该「圈一块地方」✓")
+    _mw = inspect.getsource(ReviewPanel._on_region_picked)
+    # ⭐⭐⭐ **口径变更（2026-10-16 ✓ 用户原话："区域自动标注 弹窗打开时需要能交互主窗口"✓）**：
+    #   本条原样是与它**相反**的一条 —— `check("exec_()" in _mw, "弹窗不是模态的 ✗ ⇒
+    #   背后还能切帧 ⇒ 人会以为标的是新那一帧 ✓")` ✓（当年靠**模态**挡那个风险 ✓）。
+    #   ⚠ 现在**不是把风险当不存在** ✗，而是**换挡法** ✓：**目标帧跟着当前帧走** ✓
+    #   ⇒ "以为标的是新那一帧"从根上不成立 ✓（弹窗上还常显「目标帧：xxx」✓ 看得见才敢按 ✓）。
+    #   ⇒ 判据随之从"必须 `exec_`" 改成"**必须非模态，且那条链在**"✓。
+    check("exec_()" not in _mw and "setModal(False)" in _mw,
+          "弹窗还是模态的 ✗ ⇒ 主窗口点不动 ✓（用户 2026-10-16 要求能交互 ✓）")
+    check("set_target" in _mw and "set_target" in _src,
+          "目标帧没跟着当前帧走 ✗ ⇒ 换了帧再按按钮会以为标的是新帧 ✓"
+          "（这条替代了原来「靠模态挡住」那条 ✓）")
+    check("_region_dlg" in _mw and "_on_region_closed" in _mw,
+          "非模态的结果没人收 / 会开出第二个窗 ✗（要存引用 + 从信号收结果 ✓）")
+
+    # ---- ③④ 行为级：框完开弹窗，参数对；太小/没帧 ⇒ 只写状态 ----
+    import gui.region_label_dialog as _rld
+    from PyQt5.QtCore import QRectF
+
+    app = QApplication.instance() or QApplication([])
+    panel = ReviewPanel()
+    panel.resize(640, 480)
+    panel.show()
+    app.processEvents()
+
+    _opened = []
+
+    class _Sig:
+        """假信号（够 `connect` 用 ✓）——非模态之后结果是从信号收的 ✓。"""
+
+        def connect(self, *_a, **_k):
+            return None
+
+    class _FakeDlg:
+        def __init__(self, parent, project, stem, region, *a, **k):
+            _opened.append((stem, region))
+            self.stem = stem
+            self._done_once = False
+            self.finished = _Sig()          # ⭐ 非模态：面板会连它 ✓（见 `_on_region_closed` ✓）
+            # ⭐ **跑完一趟就报**那条（用户 2026-10-16 ✓ "显示完成但没看到框"✓）——
+            #   质检台靠它**每跑完一次就重载** ✓ 见 `review._on_region_labeled` ✓。
+            self.labeled = _Sig()
+            self.modal_calls = []
+            self.targets = []
+
+        # ---- 非模态所需的那几个接口（用户 2026-10-16 ✓ 见 `_on_region_picked` ✓）----
+        def setModal(self, on):             # noqa: N802 —— 照 Qt 的驼峰 ✓
+            self.modal_calls.append(bool(on))
+
+        def setWindowModality(self, _m):    # noqa: N802
+            return None
+
+        def show(self):
+            return None
+
+        def isVisible(self):                # noqa: N802
+            return False                    # 当"已经关掉"⇒ 后面几次调用各开各的 ✓
+
+        def set_target(self, stem):
+            self.targets.append(stem)
+
+        def raise_(self):
+            return None
+
+        def activateWindow(self):           # noqa: N802
+            return None
+
+        def exec_(self):
+            return 0
+
+    # ⚠ `_on_region_picked` 里是**调用时**才 `from gui.region_label_dialog import …` ✓
+    #   ⇒ 把**那个模块上的名字**换掉就能拦住它 ✓（不用碰 import 语句 ✓）
+    _o_dlg = _rld.RegionLabelDialog
+    try:
+        _rld.RegionLabelDialog = _FakeDlg
+        # 面板里塞一份"假的当前帧"，模拟已经打开项目、选好帧 ✓
+        panel.project = object()
+        panel.items = [("frame_00042", 3, False)]
+        panel.index = 0
+        panel._on_region_picked(QRectF(10, 20, 300, 200))
+        check(_opened == [("frame_00042", "10,20,300,200")],
+              "框完没按「当前帧 + 那个矩形」开弹窗 ✗：%r" % (_opened,))
+        # ⭐⭐ **非模态**（用户 2026-10-16 ✓ 口径变更 ✓）：面板必须**关掉模态**再 `show` ✓
+        #   —— 只 `show()` 不 `setModal(False)` 在某些风格下照样挡主窗口 ✗（两件一起做才稳 ✓）。
+        _d0 = panel._region_dlg
+        check(getattr(_d0, "modal_calls", None) == [False],
+              "没把弹窗设成非模态 ✗ ⇒ 主窗口点不动 ✓（用户的第 1 条 ✓）")
+        # ⭐ **换帧 ⇒ 目标帧跟着走** ✓（这就是替代"靠模态挡住"的那条链 ✓）
+        #   ⚠ 走**源码级**判据（同本文件惯例 ✓）：行为级要真跑 `_load_current` ⇒
+        #     得造一个够用的 `project`（`frames` / `dir_of` / `labelio.*` 一串 ✓）——
+        #     那会把本条用例变成"测双份" ✗，不值 ✓（推送那一句就在这个方法里 ✓）。
+        check("set_target" in inspect.getsource(ReviewPanel._load_current),
+              "换帧时没把新帧名推给弹窗 ✗ ⇒ 人会以为标的是新那一帧 ✓（原来的风险又来了 ✗）")
+        _opened.clear()
+        panel._on_region_picked(QRectF(10, 20, 1, 1))          # 太小
+        check(not _opened, "框太小也弹窗 ✗ —— 该只写一句人话 ✓")
+        check("太小" in panel.lbl_status.text(),
+              "框太小时状态行没说清 ✗：%r" % panel.lbl_status.text())
+        panel.items = []
+        panel._on_region_picked(QRectF(10, 20, 300, 200))      # 没帧
+        check(not _opened, "没选帧也弹窗 ✗")
+        check("先打开项目" in panel.lbl_status.text(),
+              "没帧时该说「先打开项目、选一帧」✗：%r" % panel.lbl_status.text())
+    finally:
+        _rld.RegionLabelDialog = _o_dlg
+        panel.close()
+
+    # ---- 列表面板里的那一项：默认仍得是标注模式 ✓ ----
+    _p2 = ReviewPanel()
+    check(_p2.cmb_mode.currentData() == MODE_LABEL,
+          "默认模式变了 ✗（该仍是标注模式 ✓ 老习惯不能改 ✓）")
+    _i = _p2.cmb_mode.findData(MODE_REGION)
+    check(_i >= 0, "下拉里找不到 MODE_REGION ✗")
+    _p2.cmb_mode.setCurrentIndex(_i)
+    check(_p2.canvas.mode == MODE_REGION, "选了这一项，画布模式没跟上 ✗")
+    check("青框" in _p2.lbl_status.text() or "框" in _p2.lbl_status.text(),
+          "切到这个模式后状态行该说「拖一个框」✗：%r" % _p2.lbl_status.text())
+    _p2.close()
+
+
+def t_region_dialog_limits_scope():
+    """⭐⭐⭐ 弹窗必须**只标当前帧 + 只标框选区域**（用户 2026-10-11 ✓ "点击各个标注按钮，
+    **只会在当前帧框选的区域内**进行自动标注"）。
+
+    钉五件：
+      ① 四块**真的是卡片原件**搬进来的（`parent()` 是弹窗里那一节 ✓）—— "直接照抄"就该是
+         **同一份控件** ✗ 不是抄一份代码 ✓（抄一份必然越用越歪 ✓）；
+      ② YOLO 权重下拉也是**原件**（选中的模型卡片自己读得到 ✓ 一处口径 ✓）；
+      ③ 勾选项 ⇒ 那一节显隐（`isHidden()` 翻 ✓）；
+      ④ 卡片被改成"**就这一帧**"（`_pick_frames` 覆盖 ✓ 不弹选帧窗 ✓）；
+      ⑤ ⚠⚠ **走真入口跑时** `only=[当前帧]` + `region=那个矩形` **四个目标全都要对** ✗
+         —— 这是这一屏的全部意义 ✓（少一个 ⇒ 那个按钮偷偷标了整份画面 ✓）。
+    """
+    from PyQt5.QtWidgets import QApplication
+
+    import gui.region_label_dialog as RLD
+    from gui.project import last_opened
+    from gui.region_label_dialog import TARGETS
+
+    app = QApplication.instance() or QApplication([])
+    proj = last_opened()
+    check(proj is not None, "这台机器上没有最近打开过的项目 ⇒ 这条用例没法验真数据 ✗")
+
+    _spec = "10,20,300,200"
+    dlg = RLD.RegionLabelDialog(None, proj, "frame_00001", _spec)
+    try:
+        # ---- ①② 原件搬进来了 ----
+        for key, label, attr in TARGETS:
+            box = getattr(dlg.card, attr, None)
+            check(box is not None, "卡片里没有 `%s` ✗（弹窗没得搬 ✓）" % attr)
+            check(box.parent() is dlg.sections[attr],
+                  "「%s」那块**不是卡片原件**（没搬进弹窗 ✓）✗ ⇒ 参数会越抄越歪 ✓" % label)
+        check(dlg.card.cmb_yolo.parent() is dlg,
+              "YOLO 权重下拉没搬进弹窗 ✗ ⇒ 弹窗里选的模型卡片读不到 ✓（两处口径 ✗）")
+
+        # ---- ③ 勾选 ⇒ 显隐 ----
+        _sec = dlg.sections["drop_box"]
+        check(_sec.isHidden(),
+              "一开始该收着 ✓（用户：「勾选项被勾选时，在该勾选项下面显示出详细的配置内容」✓）")
+        dlg.checks["drop"].setChecked(True)
+        check(not _sec.isHidden(), "勾上了却没收起来/没展开 ✗")
+        dlg.checks["drop"].setChecked(False)
+        check(_sec.isHidden(), "取消勾选后该收回去 ✗")
+
+        # ---- ④ 只这一帧（不弹选帧窗 ✓）----
+        check(dlg.card._pick_frames("drop") == (True, ["frame_00001"]),
+              "卡片没被改成「就这一帧」✗ ⇒ 点按钮会弹选帧窗（用户要的是当前帧 ✓）")
+        check(dlg.card._region == _spec or dlg.card._region == RLD.region_mod.to_spec(_spec),
+              "卡片没被设成「只标这块区域」✗：%r" % (dlg.card._region,))
+
+        # ---- ⑤ 走真入口：四个目标都要 only + region ----
+        _seen = {}
+
+        class _FakeTask:
+            def __init__(self, fn, params, parent=None):
+                _seen["fn"], _seen["params"] = fn, params
+
+                class _S:
+                    def connect(self, *_a, **_k):
+                        pass
+
+                self.sig_log = self.sig_progress = self.sig_done = _S()
+                self.finished = _S()
+
+            def start(self):
+                _seen["started"] = True
+
+            def cancel(self):
+                pass
+
+        _o_task, _o_save = RLD.TaskThread, proj.save
+        try:
+            RLD.TaskThread = _FakeTask
+            proj.save = lambda: None                     # ⚠ 用例不许改真项目 ✓
+            for _t in ("drop", "pet", "mob", "player"):
+                dlg.task = None                          # 上一轮的替身没收尾（那条闸是对的 ✓）
+                dlg.card._label_target = _t
+                dlg.card._drop_mode = dlg.card._pet_mode = "template"
+                _seen.clear()
+                dlg._on_run(dlg.card)
+                _p = _seen.get("params") or {}
+                _p = _p.get("detect") or _p
+                check(_seen.get("started") is True,
+                      "「%s」那条没起成任务 ✗（`_on_run` 该把它跑起来 ✓）" % _t)
+                check(_p.get("only") == ["frame_00001"],
+                      "「%s」的任务**没被钉成「只当前帧」** ✗ ⇒ 会重标整份画面 ✓：%r"
+                      % (_t, _p.get("only")))
+                check(_p.get("region"),
+                      "「%s」的任务里**没有 region** ✗ ⇒ 那个按钮会标全图 ✓：%r"
+                      % (_t, _p.get("region")))
+        finally:
+            RLD.TaskThread, proj.save = _o_task, _o_save
+    finally:
+        dlg.close()
+
+
+def t_region_forwarded_in_chains():
+    """⭐⭐⭐ 「区域」必须**真的传到标注内核**（用户 2026-10-11 ✓ "只会在当前帧框选的区域内
+    进行自动标注"）。
+
+    为什么单钉这一条：弹窗那一条只验到"任务参数里有 `region`" ✓ —— 而**中间那几层**
+    （`label_drops` / `label_pets` / `yolo_augment` / `detect_player` ✓）要是**没往下转**，
+    表现就是"弹窗里框了区域、结果还是标了整幅画面" ✗✗ —— 那比没有这个功能**更坏** ✓
+    （人会以为已经限定了 ✓）。所以每一层都钉：
+      · `label_drops` / `label_pets`：两处都要转（模板匹配那条 + YOLO 那条 ✓）；
+      · `yolo_augment`：从 params 里读出来 + **按中心点筛掉区域外的预测** ✓；
+      · `detect_player`：cfg 里带上 + `work()` 里筛 ✓；
+      · 内核 `perceive/region.py`：纯函数的四种形态 ✓（空 ⇒ **一律算"在区域内"** ✓ = 老行为 ✓）。
+    """
+    _root = Path(__file__).resolve().parents[1]
+
+    def _src(p):
+        return (_root / p).read_text(encoding="utf-8")
+
+    # ---- ① 两条 label_*：模板匹配 + YOLO 都要转 ----
+    for _f, _n in (("tools/label_drops.py", 2), ("tools/label_pets.py", 2)):
+        _t = _src(_f)
+        _cnt = _t.count('"region": params.get("region")')
+        check(_cnt >= _n,
+              "%s 里只转了 %d 处 region ✗（该 ≥ %d：模板匹配那条 + YOLO 那条 ✓）"
+              "⇒ 有一类按钮会**偷偷标整幅画面** ✓" % (_f, _cnt, _n))
+
+    # ---- ② yolo_augment：读 + 筛 ----
+    _y = _src("tools/yolo_augment.py")
+    check("region = region_mod.parse(params.get" in _y,
+          "`yolo_augment` 没从 params 里读 region ✗ ⇒ YOLO 那几类照样标全图 ✓")
+    check("region_mod.center_inside(" in _y,
+          "`yolo_augment` 没**筛**区域外的预测 ✗（判据要跟别的链同一套 ✓ 见 `region.py` ✓）")
+    check("boxes_outside" in _y,
+          "被区域筛掉的框数没报出来 ✗ ⇒ 「框 0 个」时分不清是模型没检出还是全在框外 ✓")
+
+    # ---- ③ detect_player：cfg 里带 + work 里筛 ----
+    _d = _src("tools/detect_player.py")
+    check('"region": params.get("region"),' in _d,
+          "`detect_player` 的参数里没带 region ✗ ⇒ 玩家那条照样标全图 ✓")
+    check("region_mod.center_inside(cfg.get(\"region\")" in _d,
+          "`detect_player.work()` 没按区域筛玩家框 ✗")
+
+    # ---- ④ 内核纯函数（一处口径 ✓）----
+    from perception import region as R
+
+    check(R.to_spec((10, 20, 300, 200)) == "10,20,300,200", "`to_spec` 元组形态不对 ✓")
+    check(R.to_spec(None) == "" and R.to_spec((0, 0, 0, 0)) == "",
+          "空框该给空串 ✓（面板靠它判「太小」✓）")
+    check(R.parse("10,20,300,200") == (10, 20, 300, 200), "`parse` 字符串形态不对 ✓")
+    check(R.parse("") is None and R.parse("坏") is None and R.parse("1,2,3") is None,
+          "坏输入该给 None ✓（不许抛 ✗）")
+    check(R.center_inside("", 99999, 99999) is True,
+          "**没框区域时**该一律算「在区域内」✗（那才是老行为 ✓ 一个字节都不改 ✓）")
+    check(R.center_inside("0,0,100,100", 50, 50) is True
+          and R.center_inside("0,0,100,100", 150, 50) is False,
+          "中心点判据不对 ✓（区域外的必须 False ✓）")
+    # 归一化框：第 0 条中心 = (500,500)、第 1 条 = (50,50) ✓
+    _rows = [(1, 0.5, 0.5, 0.1, 0.1), (0, 0.05, 0.05, 0.1, 0.1)]
+    # ⇒ 只框住 (400,400)-(700,700) 那块 ⇒ 只有第 0 条在区域内 ✓
+    check(R.filter_norm("400,400,300,300", _rows, 1000, 1000) == [_rows[0]],
+          "`filter_norm` 没把区域外的归一化框筛掉 ✗（YOLO/玩家那两条要用它 ✓）")
+    check(R.filter_norm("", _rows, 1000, 1000) == _rows,
+          "没区域时 `filter_norm` 改了内容 ✗（老行为必须一字不变 ✓）")
+
+
+def t_region_merge_keeps_outside_boxes():
+    """⭐⭐⭐ **区域模式只许改区域内**：区域外的旧框必须留住（2026-10-16 事故 ✓ 用户原话：
+    「**并不是只标注我框选的区域，而是把整帧其他的标注框全删掉了**」✓）。
+
+    钉**两条链**（同一处病、两套写法 ✓）：
+      · `detect_mobs.merge_class_lines` —— 怪物 / 掉落物 / 宠物 三条链共用 ✓；
+      · `detect_player.keep_old_player_lines` —— 玩家 ✓
+        （⚠ 它**有意整帧重写 class 0** ✓ ⇒ "区域内不保留、区域外保留" ✓ 与那边不是一个语义 ✗ 别混 ✓）。
+    """
+    from tools.detect_mobs import merge_class_lines
+    from tools.detect_player import keep_old_player_lines
+
+    IN = "1 0.100000 0.100000 0.050000 0.050000"        # 中心 (20,20) ⇒ 区域里 ✓
+    OUT = "1 0.800000 0.800000 0.050000 0.050000"       # 中心 (160,160) ⇒ 区域外 ✓
+    NEW = "1 0.200000 0.200000 0.050000 0.050000"
+    other = "0 0.500000 0.500000 0.050000 0.050000"     # 别的类 ✓
+    REG = "0,0,100,100"
+
+    lines, _p = merge_class_lines("\n".join([IN, OUT, other]), [NEW], 1, REG, 200, 200)
+    check(OUT in lines, "区域外的**本类**旧框被删了 ✗（= 2026-10-16 那次事故原样复发 ✓）")
+    check(NEW in lines, "这一趟的新框没写进去 ✗")
+    check(IN not in lines, "区域内的本类旧框没被替掉 ✗（那就不叫「只重标这一块」✓）")
+    check(other in lines, "别的类的框被动了 ✗")
+
+    lines2, _p2 = merge_class_lines("\n".join([IN, OUT]), [NEW], 1, None, 200, 200)
+    check(OUT not in lines2 and IN not in lines2,
+          "**没框区域**时不再是整帧重写 ✗（那是改尺度 / 阈值重标的语义 ✓ 不许变 ✓）")
+
+    lines3, prot = merge_class_lines("\n".join([IN, OUT]), [], 1, REG, 200, 200)
+    check(IN in lines3 and OUT in lines3 and prot == 1,
+          "区域内 0 检出的**保命**没了 ✗（用户 2026-10-05 那个老坑 ✓）")
+
+    pl_in = "0 0.100000 0.100000 0.050000 0.050000"
+    pl_out = "0 0.800000 0.800000 0.050000 0.050000"
+    mob = "1 0.500000 0.500000 0.050000 0.050000"
+    k = keep_old_player_lines("\n".join([pl_in, pl_out, mob]), REG, 200, 200)
+    check(pl_out in k, "区域外的**玩家**旧框被删了 ✗（玩家那条是同一处病 ✓）")
+    check(pl_in not in k, "区域内的玩家旧框没被替掉 ✗（玩家那条**有意**整帧重写 class 0 ✓）")
+    check(mob in k, "玩家那条把怪物框一起清了 ✗")
+
+    k2 = keep_old_player_lines("\n".join([pl_in, pl_out, mob]), None, 200, 200)
+    check(pl_in not in k2 and pl_out not in k2 and mob in k2,
+          "没框区域时玩家那条不再是「整帧重写 class 0」✗（那是**有意**的语义 ✓ 不许变 ✓）")
+
+
 TESTS = (
+    ("⭐⭐⭐ 区域模式只许改区域内：**区域外的旧框必须留住**（怪物/掉落/宠物/玩家 四条链 ✓）",
+     t_region_merge_keeps_outside_boxes),
+    ("⭐⭐⭐ 「区域自动标注」模式：框一块 ⇒ 弹窗（模态）；太小/没帧 ⇒ 只写状态、不弹窗"
+     "（用户 2026-10-11）",
+     t_region_auto_label_mode),
+    ("⭐⭐⭐ 区域弹窗：四块是**卡片原件** + 只标当前帧 + 只标框选区域（四个目标全都要对）",
+     t_region_dialog_limits_scope),
+    ("⭐⭐⭐ 区域**真的传到标注内核**：四条链各自转发/筛选 + 内核纯函数（空区域 = 老行为）",
+     t_region_forwarded_in_chains),
     ("⭐⭐ 数据集：「标过但空」的帧能当负样本收（`min_boxes=0`）—— 空文件给 `[]`、"
      "没文件给 `None`（用户 2026-09-28：frame_00381 画面没东西，有益无害就加）",
      t_dataset_empty_frame_is_negative),

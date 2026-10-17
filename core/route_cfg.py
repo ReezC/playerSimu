@@ -26,6 +26,7 @@ from core import mapdata
 PARAM_KEYS = (
     "climb_align_gap_ms",       # 对齐绳梯移动延迟(ms)
     "climb_align_near_px",      # 开始对齐绳梯x的距离(px)
+    "climb_align_first",        # 对齐上绳梯（关 ⇒ 只准斜跳 ✓ 用户 2026-10-17）
     "climb_retry_delay_s",      # 攀爬失败：重试延时(s)
     "climb_retry_delay_inc_s",  # 攀爬失败：每次重试递增(s)
     "move_retry_ms",            # 移动操作尝试间隔(ms)

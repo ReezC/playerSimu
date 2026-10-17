@@ -4,28 +4,34 @@ mobs:
 - '2130100'
 - '2230102'
 - '3230300'
-- '3230301'
-scale: 1.12
+scale: 1.406
 mob_scales: {}
-scale_at: {}
+scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
 calib:
   min_scale: 0.4
   max_scale: 2.4
   step: 0.1
   sample: 5
 bars: {}
-mmap_crop: null
+mmap_crop:
+- 6
+- 72
+- 178
+- 103
 decision:
-  attack_dist: 80.0
-  min_attack_dist: 0
+  attack_dist: 600.0
+  min_attack_dist: 80
   attack_up_dist: 40
-  attack_down_dist: 22
+  attack_down_dist: 20
   chase_jump_enabled: true
   chase_jump_min: -10
   chase_jump_max: 5
   chase_jump_dash_ms: 100
   mouse_speed: 1.1999999999999995
-  evade_type: jump
+  evade_type: back
   jump_interval: 0
   jump_random_prob: 0.1
   back_jump_seq:
@@ -69,10 +75,11 @@ decision:
     feed_pet: pagedown
     shop: null
     enter: enter
+    pickup: space
   target_cd:
   - 1000
   - 2500
-  input_device: remote
+  input_device: local
   attack_cd: 300
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 500
@@ -82,20 +89,10 @@ decision:
   player_box_min_area_pct: 0.0
   player_box_area_base_s: 1.0
   player_box_area_tol_pct: 0.0
-  hp_bar:
-  - 0.341142
-  - 0.973958
-  - 0.120791
-  - 0.018229
+  hp_bar: null
   mp_bar: null
   probe_calib: {}
-  hp_color:
-  - - 0
-    - 0
-    - 138
-  - - 76
-    - 79
-    - 255
+  hp_color: null
   mp_color: null
   hp_threshold: 39
   mp_threshold: 7
@@ -103,11 +100,11 @@ decision:
   mob_sets_ttl_s: 3.0
   auto_hp_pot: true
   auto_mp_pot: false
-  strategy: patrol
-  vision_top: -1
-  vision_bottom: -1
-  vision_left: -1
-  vision_right: -1
+  strategy: sweep
+  vision_top: 200
+  vision_bottom: 200
+  vision_left: 600
+  vision_right: 600
   vision_center: false
   vision_off_x: 0
   vision_off_y: 0
@@ -115,8 +112,8 @@ decision:
   big_mob_ratio: 1.5
   big_mob_range_px: 600.0
   sweep_turn_cd: 500
-  back_range: 150
-  sweep_edge_turn_px: 60
+  back_range: 600
+  sweep_edge_turn_px: 600
   route_goto_set: 底层
   align_tol_px: 12
   align_hold_ms: 1000
@@ -231,24 +228,109 @@ decision:
     隐身术: a
     普攻: f
     表情_无语: f6
+  attack_fan_deg: 10.0
+  walk_stall_jump: true
+  chase_jump_edge_guard_enabled: true
+  chase_jump_edge_guard_px: 150
+  station_turn_interval_ms: 1000
+  atk_target_count: -1
+  mob_atk_cd_ms: 0
+  auto_pickup: false
+  sweep_turn_cd_enabled: true
+  sweep_edge_turn_enabled: true
+  station_pickup_enabled: false
+  station_pickup_min_s: 0.0
+  station_pickup_max_s: 0.0
+  station_pickup_spots: []
+  multi_spots: []
+  reconnect_server_x: 0.3635
+  reconnect_server_y: 0.2074
+  reconnect_channel_x: 0.4104
+  reconnect_channel_y: 0.5093
+  reconnect_channel: 1
+  jump_attack_enabled: true
+  jump_attack_height: 80.0
+  fall_speed_px_s: 600.0
+  vision_detect_only: true
+  multi_leave_wait_enabled: false
+  multi_leave_delay_s: 0.0
 notes: ''
 capture:
-  source: window
-  file: ''
+  source: file
+  file: D:/Media/record/mxd/2026-10-11 00-18-50.mp4
   url: udp://0.0.0.0:5000
   fps: 5.0
-  stride: 6
+  stride: 45
   seconds: 120.0
   dedup: 0.06
   limit: 0
   clean: true
 label:
-  thresh: 0.9
+  thresh: 0.3
   min_distinct: 0.06
   per_mob: 20
-  max_peaks: 3
+  max_peaks: -1
   downscale: 1
   region: null
+  player_thresh: 0.4
+  player_min_distinct: 0.0
+  player_per_mob: 0
+  player_max_peaks: 1
+  player_downscale: 1
+  drop_min_distinct: 0.06
+  drop_per_mob: 20
+  drop_max_peaks: -1
+  pet_min_distinct: 0.06
+  pet_per_mob: 20
+  pet_max_peaks: -1
+  label_drops_on: true
+  drop_thresh: 0.3
+  drop_downscale: 1
+  label_pets_on: true
+  pet_thresh: 0.3
+  pet_downscale: 1
+  pets:
+  - pet: '5000042'
+    name: 花蘑菇仔
+    equips:
+    - 01802054
+  drops:
+  - id: 09000000
+    name: ''
+  - id: 09000001
+    name: ''
+  - id: 09000002
+    name: ''
+  - id: 09000003
+    name: ''
+  - id: '04000020'
+    name: 野猪尖牙
+  - id: '04000215'
+    name: 斧头
+  - id: 04000018
+    name: 木块
+  frames_sel:
+    pet:5000042__01802054:
+    - hungry_0
+    - hungry_1
+    - hungry_2
+    - hungry_3
+    - hungry_4
+    - hungry_5
+    - hungry_6
+    - hungry_7
+    - jump_0
+    - move_0
+    - move_1
+    - move_2
+    - move_3
+    - move_4
+    - move_5
+    - stand1_0
+    - stand1_1
+    - stand1_2
+    - stand1_3
+    - stand1_4
 dataset:
   val_ratio: 0.2
   min_boxes: 1
@@ -260,10 +342,51 @@ train:
   batch: 8
   device: '0'
   patience: 40
-player_id: 数值策划
+  resume: false
+live:
+  weights: ''
+  capture_source: window
+  rect:
+  - 320
+  - 191
+  - 1920
+  - 1080
+  rect_rel:
+  - 0.00052
+  - 0.027878
+  - 0.998959
+  - 0.971223
+  rect_win:
+  - 201822
+  - 冒险岛怀旧服
+  url: udp://0.0.0.0:5000
+  conf_mob: 0.15
+  conf_player: 0.75
+  imgsz: 640
+  device: '0'
+  capture_fps: 60
+  draw: true
+  half: true
+  show_fps: 50
+  window_capture: wgc
+player_id: 珠缨
 mob_names:
 - 黑斧木妖
 - 野猪
 - 幼魔精灵
-- 幼魔精灵2
 mobs_cleared: false
+player_scale: 1.406
+drop_scale: 1.406
+pet_scale: 1.406
+player_scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
+drop_scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
+pet_scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual

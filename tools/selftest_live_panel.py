@@ -450,6 +450,74 @@ def t_vision_box_updates_every_frame():
           "`_vision_box_for` 没了（它是纯整数运算，不该被别的东西换掉 ✗）")
 
 
+def t_det_vision_only_crop():
+    """⭐⭐⭐ 「**只检测视野框**」（用户 2026-10-15 ✓ 原话："我们是否可以只让YOLO检测视野框
+    剪裁的画面？这样能省不少性能"✓）。
+
+    这条钉的是一件**哑巴亏**：剪裁之后模型给回来的框是"**剪裁块自己的坐标系**"（原点在块左上角）
+    ✗ —— 偏移忘了加回去，界面上"看着能跑"、但**所有框整体偏一块** ✗（画框 / 追踪 / 掉落拾取
+    全错，而且**不报任何错** ✓ 最难查的就是这一种）。
+
+    钉五件：
+      ① **关**（默认）⇒ 喂**原图** + 零偏移（**老行为一字不变** ✓）；
+      ② **开** ⇒ 喂的是剪裁块（形状 = 框的高 × 宽 ✓ 且是**视图、没白拷内存** ✓）
+         + 偏移 = 框左上角 `(left, top)` ✓；
+      ③ **退化框**（宽或高 ≤ 0）⇒ **退回原图** ✓ —— `vision_*` 是用户可填的，
+         `left == right` 真会出现 ✓；空数组喂进 ultralytics 会崩在很深的地方、
+         报错还看不出跟这个设置有关 ✗；
+      ④ 偏移**加回坐标** ⇒ 与"全图检测"的坐标一致 ✓；
+      ⑤ **源码**：偏移只在"刚从 GPU 拿回来"那**一处**加 ✓、且主回路那次 `predict` 喂的
+         确实是剪裁块 ✓（开关白勾 / 加两处都会红 ✓）。
+    """
+    from gui import live_thread as lt
+
+    vis = np.zeros((300, 400, 3), np.uint8)
+    vis[100:140, 120:200, 0] = 200          # 在视野框里点一块 ⇒ 好认出"喂的是哪一块" ✓
+
+    # ① 关（默认）⇒ 原图 + 零偏移
+    _src, _off = lt._det_crop_for(vis, (100, 50, 350, 250), False)
+    check(_src is vis and _off == (0, 0),
+          "关着的时候必须喂**原图**、偏移 (0,0)（老行为一字不变 ✗）：%r" % (_off,))
+
+    # ② 开 ⇒ 剪裁块（形状 / 内容 / 是视图）+ 偏移
+    _src, _off = lt._det_crop_for(vis, (100, 50, 350, 250), True)
+    check(_src.shape[:2] == (200, 250),
+          "剪出来的不是「框的高 × 宽」= (200, 250)：%r" % (_src.shape,))
+    check(_off == (100, 50), "偏移不等于框左上角 (100, 50)：%r" % (_off,))
+    check(bool(np.all(_src[50:90, 20:100, 0] == 200)),
+          "剪出来的**不是框里那一块**（内容对不上 ⇒ 剪错位置了 ✗）")
+    check(not _src.flags.owndata,
+          "剪裁块**拷了内存**（`vis[top:bottom, left:right]` 该是**视图** —— "
+          "每帧白拷 ~1MB 没必要 ✗）")
+
+    # ③ 退化框 / 没框 ⇒ 退回原图（**不许**把空图喂给模型 ✗）
+    for _bad in ((100, 50, 100, 250), (100, 50, 350, 50), (100, 50, 90, 40)):
+        _s2, _o2 = lt._det_crop_for(vis, _bad, True)
+        check(_s2 is vis and _o2 == (0, 0),
+              "退化框 %r 没退回原图（把空图喂进模型会崩在很深的地方 ✗）：%r"
+              % (_bad, _o2))
+    _s3, _o3 = lt._det_crop_for(vis, None, True)
+    check(_s3 is vis and _o3 == (0, 0), "框是 None 时没退回原图 ✗")
+
+    # ④ 偏移加回坐标 ⇒ 与「全图检测」等价（下游拿到的必须是**全画面坐标** ✓）
+    _xyxy = np.array([[10.0, 10.0, 50.0, 40.0]])          # 模型在**剪裁块**里给的框
+    _back = lt._det_off_xyxy(_xyxy, _off)
+    check(_back[0].tolist() == [110.0, 60.0, 150.0, 90.0],
+          "偏移加回之后不是全画面坐标（画框 / 追踪 / 掉落拾取会整体偏一块 ✗）：%r"
+          % (_back[0].tolist(),))
+    check(lt._det_off_xyxy(_xyxy, (0, 0)) is _xyxy,
+          "零偏移时不该动那个数组（没剪裁那条路每帧都白算一遍 ✗）")
+
+    # ⑤ 源码：加偏移**只有一处**、主回路喂的**是剪裁块**
+    src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    code = [l for l in src.splitlines() if not l.strip().startswith("#")]
+    check(sum(1 for l in code if "xyxy = _det_off_xyxy(xyxy, _det_off)" in l) == 1,
+          "「把偏移加回 `xyxy`」那一句不在了、或不止一处 ⇒ 剪裁开着时框会整体位移 ✗")
+    check(sum(1 for l in code if "res = model.predict(_det_src," in l) == 1,
+          "主回路那一次推理喂的**不是**剪裁块（`_det_src`）⇒ 开关白勾 ✗")
+    check("def _det_crop_for" in src, "`_det_crop_for` 没了（剪裁那一步没了 ✗）")
+
+
 def t_vis_color_alpha_and_toggles():
     """「外观 → 辅助线与标记」那一组的新行为（用户 2026-09-27 一次提的三条）。
 
@@ -536,12 +604,33 @@ def t_vis_color_alpha_and_toggles():
           "（图上两者是并排的）")
     check("from_d=max_ad + jlo" in lsrc,
           "「追击起跳框」没按区间画（该是 [最大 + min, 最大 + max] ✓）")
+    # ⭐⭐ 2026-10-12：绿框的**上边**要抬到「跳跃攻击的高度」（用户原话："追击起跳框的判定距离
+    #   需要**向上延伸到跳跃攻击的高度**"✓）—— 上边**只有一处**算：`agent.chase_jump_ceiling`
+    #   （判据 `agent._in_chase_jump_box` 用的**同一条上边** ✓）⇒ live_thread 里**不许**自己
+    #   加一个高度 / 自己抄一份 ✗（各算一套 ⇒ 画的和判的迟早对不上 ✓）。
+    check("chase_jump_ceiling" in lsrc,
+          "「追击起跳框」没跟上边那条口径（`agent.chase_jump_ceiling` ✗）—— 画出来的绿框会停在"
+          "攻击框上边，而判据（`_in_chase_jump_box`）已经抬到跳跃高度 ⇒ **画的和判的对不上** ✓")
+    check("_in_chase_jump_range" not in lsrc,
+          "live_thread 里还留着老那句「它的判定仍是水平距离（`_in_chase_jump_range`）」✗ ——"
+          "2026-10-12 起判定已经是 `_in_chase_jump_box`（含上边那条高度 ✓）⇒ 那句话现在是错的 ✓")
     check("_chase_jump_color" in lsrc and "_on_chase" in lsrc,
           "「追击起跳框」没用设置里的颜色/开关 ⇒ 又写死回 live_thread 了 ✗")
     check("(0, 200, 0)" not in lsrc,
           "live_thread 里还有写死的那个绿（追击起跳的颜色该只在 `gui/theme.py` 一处 ✗）")
-    check("jump_attack_color" not in lsrc,
-          "「跳跃攻击范围框」被画出来了 —— 它的逻辑还没做、尺寸都没定义 ⇒ 不该画 ✗")
+    # ⭐⭐ 「**跳跃攻击范围框**」**2026-10-12 起真的会画了**（用户那天定了：攻击范围框上边
+    #   再往上「跳跃高度」那一条**白框** ✓ 见 `decision/agent.py::jump_attack_box_poly` ✓）
+    #   ⇒ 老钉子（"逻辑还没做 ⇒ **不该画**"✗）**作废** ✓，改成钉新的两件：
+    #     ① 颜色 / 显示开关走设置（不再写死在 live_thread ✓）；
+    #     ② 形状与"成不成立"**只有一处**（`jump_attack_box_poly` / `jump_attack_active` ✓）
+    #        ⇒ live_thread 里**不许**自己算高度 / 四条边 ✗（各算一套 ⇒ 框和判据迟早对不上 ✓）。
+    check("_jump_attack_color" in lsrc and "_on_jump_attack" in lsrc
+          and "jump_attack_color" in lsrc,
+          "「跳跃攻击范围框」没用设置里的颜色/开关 ⇒ 又写死回 live_thread 了 ✗"
+          "（用户 2026-10-12 ✓ 见 `gui/theme.py` 的 `jump_attack_color` / `jump_attack_on` ✓）")
+    check("jump_attack_box_poly" in lsrc and "jump_attack_active" in lsrc,
+          "「跳跃攻击范围框」没走 `agent.jump_attack_box_poly` / `jump_attack_active` ✗ ——"
+          "形状与「成不成立」必须一处算 ✓（自己算一遍 ⇒ 画出来的框和判据迟早对不上 ✓）")
 
     check("QColorDialog.ShowAlphaChannel" in src
           and "QColorDialog.DontUseNativeDialog" in src,
@@ -664,7 +753,7 @@ def t_probe_box_overlay():
     import cv2 as _cv2
     import numpy as _np
 
-    from tools import probe_codec as pc
+    from core import probe_codec as pc
     from tools.selftest_probe_tune import synth as _synth
 
     app, lp, p, made, orig = _panel()
@@ -725,7 +814,7 @@ def t_probe_mono_gate():
 
     import cv2 as _cv2
 
-    from tools import probe_codec as pc
+    from core import probe_codec as pc
     from tools.selftest_probe_tune import synth as _synth
 
     app, lp, p, made, orig = _panel()
@@ -773,31 +862,49 @@ def t_probe_mono_gate():
         geo_ok = {"x": 20.0, "y": 20.0, "cell": 16.0, "gap": 2.0}
         geo_drift = dict(geo_ok, gap=1.5)          # 采样式偏 0.5px/块（实测那类偏差）
         bits = 40
-        now = pc.now_ms()
+        # ⚠⚠ **把"现在几点"钉死**（2026-10-13 ✓ 查这条用例为什么**偶尔红**）——
+        #   ① 这里用 `pc.now_ms()` 合成码带 ✓，而判据里那道"解出的时刻要接近此刻"
+        #      （`ts_plausible` ✓ 它内部**直接读真时钟** ✓）也在跑 ✓；
+        #   ② 「偏 0.5px/块」（gap 2.0 → 1.5 ✓ 40 块累计偏 20px ≈ **一个方块节距** ✓）
+        #      解出来**恰好是真值的 1/2**（读串了一格 ✓ —— 实测 2026-10-13：真值 1221635
+        #      ⇒ 解出 610817 ✓），而步长**照旧单调**（16~17ms ✓）⇒ 单调性那道闸
+        #      **抓不到它** ✗（"大跳"一次都没有 ✓ 也一次没"倒退" ✓）；
+        #   ③ ⇒ 唯一能抓它的是那道 ±10 分钟窗口 ✗ ⇒ **能不能抓住全看当时几点** ✗：
+        #      「真值 / 2」落在真时刻 ±10 分钟内 ⇔ 本地时间在 **00:20 之前 / 23:40 之后**
+        #      ⇒ 那段时间跑就**误放行** ⇒ 用例红 ✓（2026-10-13 00:2x 就是这么红的 ✓；
+        #      同一台机器 2026-10-12 23:xx 跑是绿的 ✓）。
+        #   ⇒ 钉一个固定时刻（**正午** ✓）：「真值 / 2」离它 6 小时 ⇒ 谁也蒙不过 ✓
+        #     这样一来，这条用例只验"判据对不对"，不再跟墙上的钟绑定 ✓。
+        _real_now_ms = pc.now_ms
+        pc.now_ms = lambda: 43_200_000            # 12:00:00.000（当天偏移毫秒 ✓）
+        try:
+            now = pc.now_ms()
 
-        def _frames(n=8):
-            """按**正确**几何画 8 帧码带（时间戳每帧 +33ms）→ BGR 帧列表。"""
-            out = []
-            for k in range(n):
-                g = _synth(geo_ok, now - 200 + int(k * 33), bits)
-                out.append(_cv2.cvtColor(g, _cv2.COLOR_GRAY2BGR))
-            return out
+            def _frames(n=8):
+                """按**正确**几何画 8 帧码带（时间戳每帧 +33ms）→ BGR 帧列表。"""
+                out = []
+                for k in range(n):
+                    g = _synth(geo_ok, now - 200 + int(k * 33), bits)
+                    out.append(_cv2.cvtColor(g, _cv2.COLOR_GRAY2BGR))
+                return out
 
-        for sample_geo, want_ok, tag in ((geo_ok, True, "采样几何正确"),
-                                         (geo_drift, False, "采样偏 0.5px/块")):
-            seq = _frames()
-            it = iter(seq)
-            with mock.patch.object(p, "current_frame",
-                                   lambda: next(it, seq[-1])):
-                ok, why = p._verify_geo_live(sample_geo, bits, seconds=1.0, want=6)
-            check(ok == want_ok,
-                  "%s 时判据结论不对（ok=%s）：%s" % (tag, ok, why))
+            for sample_geo, want_ok, tag in ((geo_ok, True, "采样几何正确"),
+                                             (geo_drift, False, "采样偏 0.5px/块")):
+                seq = _frames()
+                it = iter(seq)
+                with mock.patch.object(p, "current_frame",
+                                       lambda: next(it, seq[-1])):
+                    ok, why = p._verify_geo_live(sample_geo, bits, seconds=1.0, want=6)
+                check(ok == want_ok,
+                      "%s 时判据结论不对（ok=%s）：%s" % (tag, ok, why))
 
-        # ④ 帧太少时**不拦**（预览刚起就框选，不能因此存不下标定）
-        one = iter(_frames(1))
-        with mock.patch.object(p, "current_frame", lambda: next(one, None)):
-            ok4, why4 = p._verify_geo_live(geo_ok, bits, seconds=0.05, want=6)
-        check(ok4, "帧不够时把保存拦了（预览刚起就框不了）：%s" % why4)
+            # ④ 帧太少时**不拦**（预览刚起就框选，不能因此存不下标定）
+            one = iter(_frames(1))
+            with mock.patch.object(p, "current_frame", lambda: next(one, None)):
+                ok4, why4 = p._verify_geo_live(geo_ok, bits, seconds=0.05, want=6)
+            check(ok4, "帧不够时把保存拦了（预览刚起就框不了）：%s" % why4)
+        finally:
+            pc.now_ms = _real_now_ms
     finally:
         lp._bgr_to_pixmap = orig
         p.close()
@@ -1544,8 +1651,16 @@ def t_engine_imgsz_alignment():
     _win = src[max(0, src.index("_probe_img") - 500):src.index("_probe_img")]
     check('endswith(".engine")' in _win,
           "预演没被 `endswith(\".engine\")` 守卫住 ⇒ `.pt` 那条路也白多跑一次推理 ✗")
-    check(src.index("_engine_imgsz_from_error(_e)") < src.index("res = model.predict(vis"),
+    # ⚠ **锚点 2026-10-15 改过**（原来钉的是字面串 `res = model.predict(vis` ✗）：
+    #   「只检测视野框」那次改动把主循环喂的对象从 `vis` 换成了 `_det_src`
+    #   （可能被剪裁 ✓ 见 `t_det_vision_only_crop` ✓）⇒ 老锚点当场 `substring not found` ✗。
+    #   ⚠ 这条钉要的**是"预演/对齐发生在主循环那次推理之前"**（不是"喂的一定是 `vis`"✓）⇒
+    #   锚点改成 `res = model.predict(` —— 它在这个文件里**仍然唯一** ✓（预演那次是
+    #   `model.predict(_probe_img, …`、不赋给 `res` ✓）：
+    check(src.index("_engine_imgsz_from_error(_e)") < src.index("res = model.predict("),
           "对齐写在**主循环那次推理之后** ✗ ⇒ 报错照样把线程收掉 ✓")
+    check(src.count("res = model.predict(") == 1,
+          "主循环那次推理不止一处了（`res = model.predict(` 该只有一处 ✗）⇒ 上面那条比较失去意义")
     check("if _eng is None:" in src
           and "raise" in src.split("if _eng is None:")[1][:220],
           "认不出尺寸时没 `raise` ⇒ 别的问题会被悄悄吞掉 ✗")
@@ -1935,6 +2050,55 @@ def t_live_params_follow_project():
     check("盖在它上面的别的窗口不会进画面" in _wg,
           "`wgc_capture` 没把「**单窗口采集** ⇒ 盖在它上面的窗口不进画面」写清楚 ✗ "
           "（那正是「选错抓屏方式 ⇒ 断线重连判不出界面」的根源 ✓）")
+
+
+def t_project_save_keeps_deletions():
+    """⭐⭐⭐ **删掉的键必须真的落盘**（用户 2026-10-17 ✓ 原话：
+    「**重新开gui后，之前删掉的自定义按键还会出现**」✗）。
+
+    ⛔ 病根（`gui/project.py` `_merge_disk` ✓）：多实例落盘走"**只盖本窗口改过的那几处**"
+      （`_leaf_diff` ✓）—— 可它**只认改值 / 加键、不认删键** ✗（docstring 里还写着
+      "实际也没人这么用" ✗）⇒ 被删的键**不在 `mine` 里** ⇒ 写回去的是**磁盘那份**
+      （还带着它 ✓）⇒ **删除永远落不了盘** ✓ ⇒ 重启（从文件读回）又出现 ✓ = 现场 ✓。
+      ⚠ 打穿那个假设的正是「自定义按键」面板（`_remove_custom_key` 干的就是 `pop` ✓）。
+    判据（三条 ✓）：
+      ① 删一个子键 ⇒ `save()` 之后**文件里就没有它** ✓（重启不会复活 ✓）；
+      ② **没动过的兄弟键还在** ✓（不许多抹 ✗）；
+      ③ **另一个窗口刚写进来的改动要留住** ✓（多实例那条规矩不许回归 ✗）。
+    """
+    import tempfile
+    from pathlib import Path
+
+    from gui.project import Project
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "proj"
+        p = Project.create(root, name="t", map_id="1")
+        p.set("decision", {"custom_keys": {"甲": "f1", "乙": "f2"},
+                           "其它": {"留着": 1}})
+        p.save()
+        # ① 删掉「乙」（= 面板的 `pop` ✓）
+        p.set("decision", {"custom_keys": {"甲": "f1"}, "其它": {"留着": 1}})
+        p.save()
+        back = Project.open(root).get("decision") or {}
+        check("乙" not in (back.get("custom_keys") or {}),
+              "删掉的键**又回来了** ✗（这就是「重新开 gui 后还出现」✓）：%r"
+              % (back.get("custom_keys"),))
+        check((back.get("custom_keys") or {}).get("甲") == "f1"
+              and (back.get("其它") or {}).get("留着") == 1,
+              "没动过的键被弄丢了 ✗：%r" % (back,))
+        # ③ 多实例：另一个窗口新增的键必须留住
+        p2 = Project.open(root)
+        _d2 = dict(p2.get("decision") or {})
+        _d2["custom_keys"] = {"甲": "f1", "丙": "f3"}       # 别的窗口加了一个 ✓
+        p2.set("decision", _d2)
+        p2.save()
+        p.set("decision", {"custom_keys": {"甲": "f1"}, "其它": {"留着": 1}})
+        p.save()
+        _ck = ((Project.open(root).get("decision") or {}).get("custom_keys") or {})
+        check("乙" not in _ck, "第二次保存又把删掉的键带回来了 ✗：%r" % (_ck,))
+        check(_ck.get("丙") == "f3",
+              "另一个窗口新增的键被我盖掉了 ✗（多实例那条规矩不许回归 ✓）：%r" % (_ck,))
 
 
 def t_missing_weights_msg():
@@ -2487,7 +2651,10 @@ def t_pot_zero_means_dead():
           "HP/MP 没都走 `_pot_accept`（唯一采信出口 ✗）：%d 处" % src.count("_pot_accept("))
     check("if ratio > 0.0:   # 0% = 丢失/抖动，保持上次值" not in src,
           "旧的 `if ratio > 0.0:` 分支还在（真的 0% 仍会被丢 ✗）")
-    check("ws.player.dead = bool(_pot_vals[0] <= 0.0)" in src,
+    # ⚠ 2026-10-13 阶段 1 编排收口：这段从 `_run` 主循环抽进了 `_read_hpmp()` 方法，
+    #   参数名 `_pot_vals` → `pot_vals`（方法内简洁名）⇒ 锚点跟着变 ✓。语义不变：仍是
+    #   "血条空了写进 `ws.player.dead`（死亡检测的数据源）"。
+    check("ws.player.dead = bool(pot_vals[0] <= 0.0)" in src,
           "没把「血条空了」写进 `ws.player.dead`（死亡检测就没数据源 ✗）")
 
 
@@ -2738,7 +2905,9 @@ def t_drop_touch():
 
     # ④ 源码钉
     src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
-    check("drop_touch(player_box or _last_player[0]," in src,
+    # ⚠ 2026-10-13 阶段 1 编排收口：这段从 `_run` 主循环抽进了 `_decide_frame_on_infer()`，
+    #   参数名 `_last_player` → `last_player` ⇒ 锚点跟着变 ✓。语义不变：仍在感知层算「接没接触」。
+    check("drop_touch(player_box or last_player[0]," in src,
           "感知层没把「接没接触」算出来 / 没按玩家框那张算（决策那边就没得读 ✗）")
     check(src.count("ws.player.touching_drop =") == 1,
           "`touching_drop` 该**只有一处**写口（每帧覆盖写 ✓ 别留上一帧的 True ✗）：%d 处"
@@ -2824,8 +2993,13 @@ def t_out_cd_dashed_attack_box():
     check(src.count("dashed=_") == 1 and "dashed=_out_cd_dash" in src,
           "`dashed=` 不止喂给「攻击范围框」一处（用户点名的是**它** ✗）：%d 处"
           % src.count("dashed=_"))
-    check("def _draw_box(ad, color, on, from_d=0.0, width=2, dashed=False):" in src,
-          "`_draw_box` 没有 `dashed` 这个口子（那虚线就得另写一条画框的路 ⇒ 形状会分叉 ✗）")
+    # ⚠ 2026-10-12：签名多了 `up` / `down`（「追击起跳框」要用它把上边抬到跳跃攻击的高度 ✓
+    #   见 `t_chase_jump_box_height` / `agent.chase_jump_ceiling` ✓）⇒ 这条钉改成"**有**
+    #   `dashed` 这个口子"（**不钉整串签名** ✗ —— 那样每加一个口径就得改一次钉子 ✓）。
+    check("def _draw_box(ad, color, on, from_d=0.0, width=2, dashed=False," in src
+          and "up=None, down=None):" in src,
+          "`_draw_box` 没有 `dashed` / `up` 这些口子（那虚线、「抬上边」就得各写一条画框的"
+          "路 ⇒ 形状迟早分叉 ✗）")
     check("cv2.rectangle(t, p0, p1, c, width)" in src and "_draw_poly_dashed(" in src,
           "实线那条路被弄丢了 / 虚线没接上（两者必须都留着 ✓）")
 
@@ -2938,8 +3112,17 @@ def t_class_box_switches():
 
             # ---- ④⑤ 源码钉：决策那条链不动、每一类各吃自己的勾 ----
             src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
-            check("ws.mobs = mob_tracker.update(mob_dets)" in src,
-                  "怪那条链不吃 `mob_dets` 了 —— 画框那份（只给显示 ✓）可能混进了决策 ✗")
+            # ⚠ 2026-10-11 起多一个**低分档** `mob_low`（只给怪续命 ✓ 见 `split_dets` ✓）——
+            #   钉的写法跟着改 ✓ **但这条的要害没变**：怪那条链**只吃 `split_dets` 那一路** ✓
+            #   画框那份（`_cls_dets` ✓ 只给显示 ✓）**一个都不许进来** ✗。
+            check("ws.mobs = tuple(mob_tracker.update(mob_dets, mob_low" in src,
+                  "怪那条链不吃 `mob_dets`（+ 低分档 `mob_low`）了 —— 画框那份"
+                  "（只给显示 ✓）可能混进了决策 ✗")
+            # ⭐⭐ 2026-10-13：语义没变，但调用**多了 `player_world=`**（用户的「角色相对系」✓
+            #   见 `MobTracker._shift_anchor` ✓）—— 钉的还是"**只吃 `mob_dets`/`mob_low`**"✓。
+            check("player_world=_pw" in src,
+                  "没把**角色的世界坐标**递给 tracker ✗（用户 2026-10-13："
+                  "「根据角色的世界坐标去算相对位移、相对速度」✓ 少了它 ⇒ 相机一动同一只怪换 id ✗）")
             check("mob_tracker.update(_cls_dets)" not in src
                   and "PlayerTracker(_cls_dets" not in src,
                   "**画框那份**被喂给 tracker 了（= 掉落/宠物进决策 ✗ 用户 2026-10-04 明确否掉）")
@@ -3155,6 +3338,13 @@ def t_vt_aim_is_smooth():
     """
     import decision.mouse_aim as ma
 
+    # ⚠ 2026-10-17：`aim_to` 现在会**用真光标同步基准**（本地 ✓ 见 `_sync_aim_cur` ✓）——
+    #   而这一条钉的是**兜底那条**（读不到光标 / 网络 relay ✓）⇒ 在这里把它钉成
+    #   「读不到」✓，强制走「第一发撞角建原点」✓ 原断言一个字不用改 ✓；
+    #   「读得到那只手」由 `selftest_decision.t_aim_cur_synced_to_real_cursor` 专门钉 ✓。
+    _old_own = ma._own_cursor
+    ma._own_cursor = lambda: None
+
     moves = []
 
     class _Fake:
@@ -3206,6 +3396,7 @@ def t_vt_aim_is_smooth():
     finally:
         ma.dinput, ma.load_gain, ma.AIM_TGT_TTL_S = old_d, old_gain, old_ttl
         ma.gain_mismatch_block = _old_chk
+        ma._own_cursor = _old_own
         _wc.virtual_screen = _old_vs
         ma.aim_reset()
 
@@ -3633,12 +3824,26 @@ def t_lie_rec_stops_after_success():
         t._screen_beat(None)
         check(stopped, "⭐ 「太久没再见到测谎 ⇒ 收工」也没在状态不变的那一拍生效 ✗")
 
-        # ③ 源码级：两条必须在早退之前
+        # ③ 源码级：两条必须在「状态没变就短路」之前，而且必须在**同一个口（每拍口）里**
         src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
-        _i_ret = src.find("if st == self._screen_state:\n            return")
-        _i_stop = src.find('self._lie_rec_stop("离开测谎（已稳定')
-        check(_i_ret > 0 and _i_stop > 0 and _i_stop < _i_ret,
-              "两条按时间的收工判据又被放到早退后面了 ✗（只有状态再变一次才会被评估 ✓）")
+        # ⚠ 2026-10-15（阶段 1）：这一拍拆成了两个口 ⇒ 锚点跟着改 ✓ 口径一字不变 ✓：
+        #   · 短路从 `if st == self._screen_state: return` 变成 `return st != self._screen_state` ✓
+        #     （它现在待在**每拍口** `_screen_every_tick` 里 ✓）；
+        #   · 于是"在短路之前"这句话必须连**同一方法**一起判 ✗ —— 只判"文件里的先后"
+        #     是不够的（很可能一条在每拍口、另一条挪进了过渡口 ✗ 那正是踩过三次的坑 ✓）。
+        _i_beat = src.find("def _screen_every_tick(self, raw, st, det):")
+        _i_next = src.find("\n    def _screen_on_transition(self, raw, st, det):", _i_beat)
+        _i_ret = src.find("return st != self._screen_state", _i_beat)
+        _i_stop = src.find('self._lie_rec_stop("离开测谎（已稳定', _i_beat)
+        _i_gap = src.find("长时间没再见到测谎", _i_beat)
+        check(_i_beat > 0 and _i_next > _i_beat,
+              "`_screen_every_tick` / `_screen_on_transition` 这两个口找不到了 ✗"
+              "（结构变了 ⇒ 这条钉子要跟着改 ✓ 但**别把两半粘回一个函数** ✗）")
+        check(_i_stop > 0 and _i_ret > 0 and _i_stop < _i_ret < _i_next,
+              "「待停到点就收工」那条**不在每拍口里、或排在短路之后** ✗"
+              "（那就只有「状态又变一次」才被评估 ✓ 用户 2026-10-10 报的正是这个 ✗）")
+        check(_i_gap > 0 and _i_gap < _i_ret,
+              "GAP 兜底（太久没再见到测谎 ⇒ 收工）也必须在短路之前、且在每拍口里 ✗")
     finally:
         ss.check_frame, us.detect, ss.capture_frame = _o_cf, _o_ui, _o_cap
 
@@ -3891,6 +4096,167 @@ def t_convert_only_when_wanted():
           "不传判据时行为被改了（老路应当**每帧都转换** ✓）：skipped=%d ✗" % s2.skipped_convert)
 
 
+def t_frame_ctx_discipline():
+    """⭐⭐⭐ **一帧的上下文（`runtime.pipeline.FrameCtx`）三条纪律**（用户 2026-10-15 选的口径 B ✓）。
+
+    `_run` 1651 行的根子是「一帧的东西散在循环体里」✗ —— 盒子是来收它的 ✓。但盒子自己
+    有两三种**典型坏法**，全是「能跑、不报错、事后极难查」✗ ⇒ 先把纪律钉死，再往里搬：
+
+      ① **字段写死**（`__slots__` ✓）：写一个没声明的字段必须**当场报错** ✗ —— 不然它退化成
+         「谁都能塞的袋子」= 换了个名字的全局变量 ✓（那比现在更难查 ✓）；
+      ② **一帧一个**（**不复用** ✓）：两个盒子互不干扰 ✓（复用省的那点分配，跟「上一帧的怪框
+         漏进这一帧」这种静默 bug 比不值 ✓）；
+      ③ **跨帧的东西一律不进** ✗：帧计数 / 上一帧时刻 / 采样窗口 / 配置 / `*_ref` 那种回填
+         小列表 ⇒ 留在线程上 ✓（判据一句话：**「下一帧还会用吗？」** ✓）。
+    """
+    from runtime.pipeline import FrameCtx
+
+    _fields = ("f", "vis", "raw", "t_take", "t_pipe", "ws")
+
+    # ① 声明的字段：默认 None ✓（不是空串 / 空列表那种**会骗人**的默认值 ✗）、能读能写 ✓
+    c = FrameCtx()
+    for _k in _fields:
+        check(getattr(c, _k) is None,
+              "`FrameCtx.%s` 的默认值不是 None ⇒ 阶段分不清「还没填」和「填了个空」✗：%r"
+              % (_k, getattr(c, _k)))
+    c.t_take, c.ws = 12.5, object()
+    check(c.t_take == 12.5 and c.ws is not None, "填进去的值读不出来 ✗")
+
+    # ① 高墙：没声明的字段 ⇒ 当场炸（**这条是重点** ✓ 它挡的正是"退化成袋子" ✓）
+    try:
+        c.not_declared = 1
+        check(False,
+              "给 `FrameCtx` 写一个**没声明的字段**居然成功了 ✗ ⇒ 它退化成「谁都能往里塞」"
+              "的袋子（= 换名字的全局变量）⇒ 静默、事后极难查 ✓")
+    except AttributeError:
+        pass
+    check(not hasattr(c, "__dict__"),
+          "`FrameCtx` 实例居然有 `__dict__`（`__slots__` 失效）⇒ 又能塞没声明的字段 ✗")
+
+    # ② 一帧一个：互不干扰
+    _a, _b = FrameCtx(), FrameCtx()
+    _a.vis = "A"
+    check(_b.vis is None, "两个盒子串了（写 A 影响到了 B）⇒ 复用了同一个盒子 ✗：%r" % (_b.vis,))
+
+    # ③ 结构钉子：字段清单本身就是"什么属于这一帧"的口径 ✓
+    check(FrameCtx.__slots__ == _fields,
+          "`FrameCtx` 的字段清单变了（2026-10-15 起 = %r）—— 加字段是**正常**的 ✓ 但要盯两件："
+          "① 加进来的必须**只属于这一帧** ✗（帧计数 / 上一帧时刻 / 采样窗口 / 配置 / `*_ref`"
+          "那类回填小列表 ⇒ 留在线程上 ✓ 判据：「下一帧还会用吗？」✓）；② 顺手把这条钉子的"
+          "清单和 `FrameCtx` 的文档一起改 ✓" % (FrameCtx.__slots__,))
+
+    # ④ ⚠⚠ 「**抽出来的阶段方法要真能跑**」—— 这条是拿一次**现场事故**换来的（2026-10-15 ✓
+    #   用户当场截图：「失败：NameError: name 'perf' is not defined」✗）。
+    #   根因：`perf`（还有 `behavior` / `mmap` / `WorldState` …）在这个文件里**一直是局部导入** ✗
+    #   ⇒ 把它写进**新方法**时，那个方法**必须自己再 import 一次** ✓
+    #   （漏了 ⇒ 一开预览当场炸 ✗ 而**自检全绿** ✗ —— 没人真调过那个新方法 ✓）。
+    #   ⚠ 这条**刻意不靠 pyflakes** ✗：本机 `python -m pyflakes` 直接报 `No module named
+    #     pyflakes` ⇒ 那条静态检查钉一直在**静默跳过** ✓（今天这个错它本来能抓 ✓）
+    #     ⇒ 这里改成**真调一次**：只要方法里少任何一句它自己的 import / 少任何一句口径，
+    #     这一句就会当场抛 `NameError` 或断言失败 ✓。
+    import types as _types
+
+    from core import perf as _cperf
+    from runtime.pipeline import HeavyGate as _HG
+
+    from gui import live_thread as _lt
+
+    #   ⚠ 替身还得摆 `_infer`（`_heavy_gate` 要问它"现在跑不跑重活" ✓ —— 第一版漏了 ⇒
+    #     报的是 `'SimpleNamespace' object has no attribute '_infer'` ✗ 而不是我们要验的那个错 ✗
+    #     所以这条钉**自己也要反向验证**才敢信 ✓）
+    _th = _types.SimpleNamespace(_gate=_HG(),
+                                 _infer=_types.SimpleNamespace(is_set=lambda: True))
+    _th._gate.fps_limit = 0.0                     # 0 = 不限制 ⇒ 这一拍必放行 ✓
+    # ⚠ 替身绕过 `__init__` ⇒ `_stage_frame_ready` 里 `self._heavy_gate(...)` 得先绑上 ✓
+    #   （同 `selftest_screen_state` 里那几个替身的手法 ✓）
+    _th._heavy_gate = _lt.LiveThread._heavy_gate.__get__(_th)
+    _hits, _old_fa = [], _cperf.frame_arrived
+    _cperf.frame_arrived = lambda t: _hits.append(t)
+    try:
+        _c2 = _types.SimpleNamespace(f=_types.SimpleNamespace(image="VIS"), t_take=1.0,
+                                     t_pipe=None, vis=None, ws=None, raw=None)
+        _ok2 = _lt.LiveThread._stage_frame_ready(_th, _c2, None, None)
+    finally:
+        _cperf.frame_arrived = _old_fa
+    check(_ok2 is True and _c2.vis == "VIS" and len(_hits) == 1,
+          "`_stage_frame_ready` **真调一遍**没过（0=不限制 ⇒ 该放行 ✓、画面该入盒 ✓、"
+          "`perf.frame_arrived` 该被调一次 ✓）—— 实得 ok=%r vis=%r hits=%d ✗"
+          % (_ok2, _c2.vis, len(_hits)))
+
+
+def t_heavy_gate_unit():
+    """⭐⭐ 重活闸的**本体**当纯逻辑跑（`runtime.pipeline.HeavyGate` ✓ 2026-10-15 阶段 1 ✓）。
+
+    上面那条钉的是"**接线还在不在**"（源码锚点 ✓），这条钉的是"**本体算得对不对**" ✓
+    —— 搬家最怕的就是"搬的过程中顺手改了一点东西" ✗，那种改动**开游戏也很难看出来** ✗
+    （限速错了只表现为"节奏怪怪的"✓）。四条：
+
+      ① `0` = **不限制** ⇒ 永远放行、且**一次都不喂**时间拍（老行为一字不变 ✓ 默认必须是 0 ✓）；
+      ② 到点前**跳过**、到点后**放行**、放行后时刻前移（第二拍又开始跳 ✓ 节奏对 ✓）；
+      ③ ⚠⚠ 跳过的拍**必须喂时间拍**（`tick_timing` ✓）—— 漏了就是"限了速 ⇒ 攻击节奏漂移"✗；
+         **只在跳过时**喂 ✓（放行那一拍多喂一次也错 ✗ 会双倍喂 ⇒ 节奏偏快 ✗）；
+      ④ 不在推理（`active=False`）⇒ **不拦**、也**不喂**（那条路另有主人 ✓）；
+      ⑤ 时间拍抛异常**不许炸回路**（`try/except` 兜住 ⇒ 仍返回"跳过"✓）；
+      ⑥ 打点齐全（`timing_ms` / `timing_calls` / `skip_heavy` ✓ ⇒ 事后看得出闸在干活 ✓）。
+
+    ⚠ 全程**不碰真 `perf`**：把它两个口换成记录器 ✓（不然会写进现场 `perf.log` ✗）。
+    """
+    from runtime import pipeline as _pl
+    from runtime.pipeline import HeavyGate
+
+    class _A:
+        def __init__(self, boom=False):
+            self.calls = 0
+            self.boom = boom
+
+        def tick_timing(self, ws):
+            self.calls += 1
+            if self.boom:
+                raise RuntimeError("时间拍炸了")
+
+    _seen = []
+    _old_ms, _old_cnt = _pl.perf.ms, _pl.perf.count
+    _pl.perf.ms = lambda name, *a: _seen.append(("ms", name))
+    _pl.perf.count = lambda name, *a: _seen.append(("cnt", name))
+    try:
+        g, a = HeavyGate(), _A()
+        # ① 0 = 不限制
+        check(g.fps_limit == 0.0, "默认档位不是 0（不限制）✗：%r" % (g.fps_limit,))
+        check(g.skip_now(1000.0, True, a, None) is False
+              and g.skip_now(1000.001, True, a, None) is False,
+              "`0` = 不限制时**不该跳过**任何一拍 ✗（老行为一字不变 ✓）")
+        check(a.calls == 0 and _seen == [],
+              "不限制那一路**喂了时间拍 / 打了点** ✗（它该像闸不存在一样 ✓）：%r" % (_seen,))
+
+        # ②③ 到点前跳、到点后放行；跳过的那拍喂时间拍、放行的不喂
+        g.fps_limit = 30.0                      # 每 1/30 s 放行一拍
+        _t = 5000.0
+        check(g.skip_now(_t, True, a, None) is False,
+              "第一拍就该放行（从没跑过 ⇒ 必放行 ✗）—— 否则开局要先白等一个周期 ✓")
+        check(g.skip_now(_t + 0.005, True, a, None) is True, "没到点却没跳过 ✗")
+        check(g.skip_now(_t + 1.0 / 30.0, True, a, None) is False, "到点了却不放行 ✗")
+        check(a.calls == 1,
+              "⚠⚠ 跳过的那一拍**没喂时间拍**（或多喂了）⇒ 输出CD/delay/跳间隔会漂 ✗："
+              "tick_timing 调了 %d 次（该 1 次：只有跳过那拍喂 ✓）" % a.calls)
+        check([n for k, n in _seen if n == "skip_heavy"] == ["skip_heavy"],
+              "跳过的那一拍没计 `skip_heavy`（事后看不出闸在干活 ✗）：%r" % (_seen,))
+        check([n for k, n in _seen if k == "ms"] == ["timing_ms"],
+              "喂时间拍没打 `timing_ms`（口径变了 ✗）：%r" % (_seen,))
+
+        # ④ 不在推理 ⇒ 不拦也不喂
+        _n = a.calls
+        check(g.skip_now(_t + 1.0 / 30.0 + 0.001, False, a, None) is False,
+              "没在推理时闸还拦（那时候没有重活可跳 ✗）")
+        check(a.calls == _n, "没在推理时还喂了时间拍（那条路另有主人 ✗）")
+
+        # ⑤ 时间拍炸了 ⇒ 不许炸回路（仍按"跳过"处理 ✓）
+        b = _A(boom=True)
+        check(g.skip_now(_t + 1.0 / 30.0 + 0.002, True, b, None) is True,
+              "时间拍抛异常时没兜住 ⇒ 整个实时回路会被一个打点炸掉 ✗")
+    finally:
+        _pl.perf.ms, _pl.perf.count = _old_ms, _old_cnt
+
+
 def t_heavy_gate_when_machine_busy():
     """⭐⭐ **重载保命闸**：每秒最多跑多少拍「推理＋追踪＋决策＋画框」（用户 2026-10-10 ✓
     原话："**我就是想在挂游戏+浏览器+音乐+steam+玩大型游戏的时候，实时还能流畅跑**"✓）。
@@ -3911,221 +4277,50 @@ def t_heavy_gate_when_machine_busy():
          攻击节奏变慢/延迟漂移"✗（很难查 ✓）；
       ④ `0` = **不限制** ⇒ 这一整段等于不存在 ✓（**老行为一字不变** ✓ 默认值必须是 0 ✓）。
     """
+    # ⭐ 2026-10-15 阶段 1「编排收口」：闸的**实现**搬进了 `runtime/pipeline.py::HeavyGate` ✓
+    #   ⇒ 这条改成**两个文件各查各的那一半** ✓（判据口径一字不改 ✓）：
+    #     · `gui/live_thread.py` 该留：配置热读 / 初值 / 档位委托口 / 主循环那一下 `continue` ✓；
+    #     · `runtime/pipeline.py` 该留：判据本体（到点没有 + 跳过必喂时间拍 + 计数 + 回信号 ✓）。
+    #   ⚠ 关键的一条是"**本体不许留副本**" ✗：判据在两边各写一份 ⇒ 迟早分叉 ⇒
+    #     到时候"到底限没限速"说不清 ✓（那正是排查性能时最怕的 ✓）。
     src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    pipe = (ROOT / "runtime" / "pipeline.py").read_text(encoding="utf-8")
     check('_live.get("pipe_fps"' in src and "self._pipe_fps = max(0.0" in src,
           "重活闸没从 live 配置热读 `pipe_fps`（现场调不了 ✗）")
-    check("if self._pipe_fps > 0.0 and self._infer.is_set():" in src,
-          "闸没装在**重活之前**（跑完再丢 = 白跑 ✗）")
-    _i_gate = src.find("if self._pipe_fps > 0.0 and self._infer.is_set():")
-    _i_cnt = src.find('perf.count("skip_heavy")')
+    check("if self._pipe_fps > 0.0 and self._infer.is_set():" not in src,
+          "闸的**本体**又出现在 `gui/live_thread.py` 里了（该只在 `runtime/pipeline.py` ✓）"
+          "—— 两边各一份判据 = 迟早分叉 ✗")
+    check("if self.fps_limit <= 0.0 or not active:" in pipe,
+          "闸没装在**重活之前**（跑完再丢 = 白跑 ✗）：`runtime/pipeline.py` 里找不到那道判据 ✓")
+    _i_gate = pipe.find("if self.fps_limit <= 0.0 or not active:")
+    _i_cnt = pipe.find('perf.count("skip_heavy")')
     check(_i_gate >= 0 and _i_cnt > _i_gate,
           "跳过的那一帧没计数（`skip_heavy` ✓ ⇒ 事后看不出闸有没有在干活 ✗）")
-    _mid = src[_i_gate:_i_cnt]
+    _mid = pipe[_i_gate:_i_cnt]
     check("agent.tick_timing(ws)" in _mid,
           "⚠⚠ 跳过的帧**没喂时间拍**（`agent.tick_timing`）⇒ 输出CD/delay/跳间隔会跟着变慢 ✗"
           "（那条序列走本机绝对时钟 ✓ 跳拍本可以完全不影响它 ✓）")
-    check("continue" in src[_i_cnt:_i_cnt + 260],
-          "跳过的帧没**跳过重活**（该 `continue` 去取下一帧 ✗）—— 那就成了「跑完再丢」白跑 ✗")
-    check("self._pipe_fps = 0.0\n" in src and "self._heavy_at = 0.0" in src,
+    # ⚠ 2026-10-13 阶段 1：闸抽成 `_heavy_gate()` 方法后，跳过的语义 = 方法 `return True`
+    #   + 主循环 `continue` ⇒ 锚点跟着变 ✓（原"`skip_heavy` 后 260 字符内找 `continue`"作废 ✗）。
+    check("return True" in pipe[_i_cnt:_i_cnt + 200],
+          "跳过的帧没**返回跳过信号**（该 `return True` 让主循环去取下一帧 ✗）—— 那就成了「跑完再丢」白跑 ✗")
+    check("if not self._stage_frame_ready(ctx, agent, ws):\n                    continue" in src,
+          "主循环没按**阶段**的返回值 `continue` ✗（2026-10-15 阶段 1：闸搬进了 "
+          "`_stage_frame_ready` ✓ 主循环只认它的返回值 ✓）")
+    check("if self._heavy_gate(agent, ws):\n            return False" in src,
+          "阶段里没按闸的返回值 `return False` ✗（口径：闸说跳过 ⇒ 这一拍就到这儿 ✓）")
+    # ⭐ 2026-10-15 阶段 1：「这一帧到手之后」那一段搬进了 `_stage_frame_ready` ✓ ⇒ 顺手钉住
+    #   三个**时间戳/盒子**（⚠ 这三个是"搬家时最容易用错、而且**开游戏也看不出来**"的那一类 ✓
+    #   —— 我把 `t_pipe` 换成 `t_take` 试过一次，**61/61 全绿** ✗ 实测抓到的缺口 ✓）：
+    check("ctx.t_pipe = time.perf_counter()" in src,
+          "「收到这一帧 → 决策完」的起点**不是现在** ✗（拿 `t_take` 顶替 ⇒ 槽等待被算进 "
+          "`pipe_ms` / `out_key_ms` ⇒ 全线偏大，还看不出来 ✓）")
+    check("ctx = FrameCtx(f=f, t_take=_t_take)" in src,
+          "主循环没给这一帧建盒子 ✗（口径 B：阶段之间只认 `FrameCtx` ✓ 一帧一个 ✓）")
+    check("_t_take = time.perf_counter()" in src,
+          "取帧那一刻 `_t_take` 没了 ✗（`slot_wait_ms` 全靠它算 ✓ 见那段注释 ✓）")
+    check("self._pipe_fps = 0.0\n" in src,
           "默认不是「不限制」（0）⇒ 老行为被改了 ✗")
-
-
-def t_arrow_can_show_facing():
-    """⭐⭐ **x 箭头 = 玩家「真实」朝向**（用户 2026-10-10 ✓ 原话："**我想让坐标箭头代表玩家的
-    真实朝向（需要尽量高效）**"✓）。
-
-    ⚠⚠ **两轮都在这里翻车** ✗ ⇒ 这条用例要把两次的病一次钉住：
-      · 第一次：把"**意图**那份"（`action["facing"]` ✓ = `CombatAgent.facing` ✓ **「攻击范围框」
-        用的就是它** ✓）当成了真实的 ✗（用户当场纠正 ✓）；
-      · 第二次：改读 `ws.player.facing` ✓ —— 可那个字段**唯一的写者**（`perception/player_state.py`
-        里靠 `@L` **镜像模板**那条链 ✓）**根本没接进实时回路** ✗ ⇒ 全场恒默认 `+1` ⇒
-        **箭头永久朝右** ✗（用户 2026-10-10 现场报的 ✓ —— 典型的"读了一个**没有写者**的字段"✗，
-        正是 `docs/架构-AI三层.md` 里 R1 要防的事 ✓）。
-      · 第三次：改用"**猜外观**"（玩家框左右亮度差 + 走目标定 ✓）⇒ 用户实测"**并不灵敏**"✗
-        ⇒ 当天撤掉 ✓（三条硬伤见 `live_thread._face_beat` 的撤销留痕 ✓）。
-      ⇒ 现来源 = `live_thread.move_face_dir` ✓：**角色「世界坐标」x 的真实位移**
-        （`Player.world_x` ✓ 小地图那份 ✓ **与相机无关** ✓ —— 用户 2026-10-10 纠正过：
-        "**应该用世界状态坐标的位移算，因为画面里相机镜头是会移动的**"✓）；
-        连几拍**同向**且净位移够 ✓ 成本 **0** ✓ 不裁图、不标定、不用模板 ✓；
-        ⚠ 只有**角色在走**时才有读数 ✓ 停下 / 抖动 / 这一拍没定位 ⇒ **不画** ✓（不猜 ✓）。
-
-    钉六件：
-      ① 开关**关着** ⇒ 恒 `+1`（世界 x 正方向 ✓ ⇒ 老观感一字不变 ✓）；
-      ② `face_ok=True` ⇒ 用估出来的方向（`-1` / `+1` ✓）；
-      ③ ⚠⚠ **没有可信读数 ⇒ 返回 `0` ＝ 这根箭头不画**（**绝不假装朝右** ✗ —— 那就是"永久
-         朝右"那条病 ✓）；只有"**上一拍有过**"时才保持上一拍（短时丢读数 ⇒ 不乱跳 ✓）；
-      ④ **判据纯函数真跑**（`move_face_dir` ✓）：连几拍同向 + 净位移够 ⇒ `±1` ✓；
-         **站着不动 / 来回抖 / 净位移太小 / 样本不够 / 坏值 ⇒ 一律 `0`** ✓（不猜 ✓）；
-      ⑤ **状态机真跑**（`_face_beat` ✓ 拿 `__new__` 替身直接调 ✓）：世界坐标连着走 ⇒ 判对 ✓；
-         ⚠⚠ **`world_held=True`（沿用上一帧）/ 没定位 / `world_x=None` ⇒ 必须清历史 + 不画** ✗
-         （沿用值→真值那一下**跳变**会被当成"在走"⇒ 给错方向 ✓）；开关关着 ⇒ 不攒样本 ✓；
-      ⑤ 接线（源码级）：主回路调 `_face_beat` ✓、画那段走 `arrow_real_face_dir(` ✓ 且取
-         **`self._face_dir/_face_ok`** ✓（**不许**回头读 `ws.player.facing` ✗ 那是本轮那个
-         "没有写者的字段" ✓）、**「攻击范围框」照旧读 `action["facing"]`** ✓（两条链分开 ✓）；
-      ⑥ 配置：`vis:` 有这个键、**默认 `False`** ✓、**不在 `_VIS_ON_KEYS`** ✗（那批是
-         "缺省 ⇒ True"✗ 会偷改所有人观感 ✗）；**存得进读得回**（坏值回 `False` ✓ 且**还原** ✓）。
-    """
-    from gui import live_thread as LT
-    from gui import theme
-
-    # ①②③ 三件判据（⚠ 第三条是"**0 = 不画**"✓ —— 本轮的病就是在这儿）
-    check(LT.arrow_real_face_dir(-1, True, 0, False) == 1,
-          "开关关着 ⇒ 必须恒 +1（世界 x 正方向 = 老观感 ✓）：%r"
-          % (LT.arrow_real_face_dir(-1, True, 0, False),))
-    check(LT.arrow_real_face_dir(-1, True, 0, True) == -1,
-          "有可信读数 + 估出朝左 ⇒ 箭头朝左（-1）：%r"
-          % (LT.arrow_real_face_dir(-1, True, 0, True),))
-    check(LT.arrow_real_face_dir(1, True, -1, True) == 1,
-          "有可信读数 + 估出朝右 ⇒ 箭头朝右（+1）：%r"
-          % (LT.arrow_real_face_dir(1, True, -1, True),))
-    check(LT.arrow_real_face_dir(1, False, 0, True) == 0,
-          "⚠⚠ **没有可信读数又没上一拍 ⇒ 必须返回 0（= 不画）** ✗ —— "
-          "**绝不假装朝右** ✓（用户 2026-10-10 报的「箭头永久朝右」就是这么来的 ✓）：%r"
-          % (LT.arrow_real_face_dir(1, False, 0, True),))
-    check(LT.arrow_real_face_dir(1, False, -1, True) == -1,
-          "短时丢读数（之前朝左）⇒ 保持上一拍（不乱跳 ✓）：%r"
-          % (LT.arrow_real_face_dir(1, False, -1, True),))
-
-    # ④ 判据纯函数**真跑**（`move_face_dir`：一连串**世界坐标** x → 方向 ✓）
-    check(LT.move_face_dir([100.0, 104.0, 108.0, 112.0]) == 1,
-          "连几拍**同向往右** + 净位移够 ⇒ 该判 +1：%r"
-          % (LT.move_face_dir([100.0, 104.0, 108.0, 112.0]),))
-    check(LT.move_face_dir([112.0, 108.0, 104.0, 100.0]) == -1,
-          "连几拍**同向往左** ⇒ 该判 -1：%r"
-          % (LT.move_face_dir([112.0, 108.0, 104.0, 100.0]),))
-    check(LT.move_face_dir([100.0, 100.0, 100.0, 100.0]) == 0,
-          "**站着不动** ⇒ 判不出（0 ✓ 不猜 ✓）：%r"
-          % (LT.move_face_dir([100.0, 100.0, 100.0, 100.0]),))
-    check(LT.move_face_dir([100.0, 105.0, 99.0, 104.0]) == 0,
-          "**来回抖 / 反向** ⇒ 判不出（0 ✓ 不猜 ✓）：%r"
-          % (LT.move_face_dir([100.0, 105.0, 99.0, 104.0]),))
-    check(LT.move_face_dir([100.0, 108.0, 102.0, 110.0]) == 0,
-          "⚠ **抖动但净位移够**（+8 / −6 / +8 ⇒ 净 10px ≥ 门槛）⇒ **仍必须判不出** ✓"
-          "（「连几拍同向」要的是**单调**：中间夹一个反向就不算 ✓ —— "
-          "只看净位移是最骗人的写法 ✗）：%r"
-          % (LT.move_face_dir([100.0, 108.0, 102.0, 110.0]),))
-    check(LT.move_face_dir([100.0, 101.0, 102.0, 103.0]) == 0,
-          "**净位移太小**（3px < 门槛 6px）⇒ 判不出（0 ✓ 站着微抖不算 ✓）：%r"
-          % (LT.move_face_dir([100.0, 101.0, 102.0, 103.0]),))
-    check(LT.move_face_dir([100.0, 101.0]) == 0,
-          "**样本不够**（<3 拍）⇒ 判不出（0 ✓）：%r" % (LT.move_face_dir([100.0, 101.0]),))
-    check(LT.move_face_dir(None) == 0 and LT.move_face_dir(["x", "y", "z"]) == 0,
-          "喂进来的东西不对 ⇒ 判不出（0 ✓ 且**绝不抛** ✓）")
-
-    # ⑤ **状态机真跑**（`_face_beat` 只碰三个字段 ⇒ 能拿 `__new__` 替身直接调 ✓）
-    #    ⚠⚠ 这一层专钉**"读的是世界坐标、且只用新鲜读数"**（用户 2026-10-10 纠正 ✓：
-    #      "**应该用世界状态坐标的位移算，因为画面里相机镜头是会移动的**"✓）
-    class _Pl:                            # 冒充 `ws.player`（只要两个字段 ✓）
-        def __init__(self, wx, held=False):
-            self.world_x, self.world_held = wx, held
-
-    def _stub(on=True):
-        _t = LT.LiveThread.__new__(LT.LiveThread)
-        _t._arrow_real_face_on = bool(on)
-        _t._face_hist, _t._face_dir, _t._face_ok = [], 0, False
-        return _t
-
-    _t1 = _stub()
-    for _wx in (100.0, 104.0, 108.0, 112.0):
-        _t1._face_beat(_Pl(_wx))
-    check(_t1._face_dir == 1 and _t1._face_ok,
-          "世界坐标连着往右 ⇒ 该判 +1（实测 %r / ok=%r）" % (_t1._face_dir, _t1._face_ok))
-    _t2 = _stub()
-    for _wx in (112.0, 108.0, 104.0, 100.0):
-        _t2._face_beat(_Pl(_wx))
-    check(_t2._face_dir == -1, "世界坐标连着往左 ⇒ 该判 -1（实测 %r）" % (_t2._face_dir,))
-    # ⚠ `world_held=True`（这一拍没认出黄点、坐标是**沿用上一帧**的 ✓）⇒ 不许当读数 ✗
-    _t3 = _stub()
-    for _wx in (100.0, 104.0, 108.0):
-        _t3._face_beat(_Pl(_wx))
-    _t3._face_beat(_Pl(140.0, held=True))
-    check(not _t3._face_ok and _t3._face_hist == [],
-          "`world_held=True`（沿用上一帧）⇒ 该**清历史 + 不给读数** ✗"
-          "（不然「沿用值 → 真值」那一下跳变会被当成在走 ✓）：ok=%r / hist=%r"
-          % (_t3._face_ok, _t3._face_hist))
-    # ⚠ 这一拍没定位（`player=None` / `world_x=None`）⇒ 同上
-    for _mk, _why in ((lambda: None, "player=None（没定位 / 被闸拦 ✓）"),
-                      (lambda: _Pl(None), "world_x=None（没算出世界坐标 ✓）")):
-        _t4 = _stub()
-        for _wx in (100.0, 104.0, 108.0):
-            _t4._face_beat(_Pl(_wx))
-        _t4._face_beat(_mk())
-        check(not _t4._face_ok and _t4._face_hist == [],
-              "%s ⇒ 该清历史 + 不给读数 ✗（实测 ok=%r / hist=%r）"
-              % (_why, _t4._face_ok, _t4._face_hist))
-    _t5 = _stub(on=False)
-    for _wx in (100.0, 104.0, 108.0, 112.0):
-        _t5._face_beat(_Pl(_wx))
-    check(not _t5._face_ok and _t5._face_hist == [],
-          "开关关着 ⇒ 一个样本都不攒（老行为 + 零成本 ✓）")
-
-    # ⑤ 接线（源码级）
-    _lt = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
-    check("def _face_beat(" in _lt, "`_face_beat` 没了（真实朝向没有计算处 ✗）")
-    # ⚠⚠ **按"行"判，不按子串判** ✗ —— 本仓库注释密度极高：把调用**注释掉**之后
-    #   `"self._face_beat(vis, player_box)" in 源码` 仍然成立 ⇒ 判据被注释骗 ✗
-    #   （2026-10-10 实测踩到 ✓ 用**反向验证**才发现 ✓）。
-    _calls = [ln.strip() for ln in _lt.splitlines()
-              if ln.strip().startswith("self._face_beat(")]
-    check(bool(_calls),
-          "主回路没**真的**调 `_face_beat`（估计器白写 / `_face_ok` 恒 False ⇒ 箭头永远不画 ✗）")
-    _i_arrow = _lt.find("_fdir = arrow_real_face_dir(")
-    check(_i_arrow > 0, "画箭头那段没走 `arrow_real_face_dir(`（勾了不生效 ✗）")
-    _win = _lt[_i_arrow - 600:_i_arrow + 600]
-    # ⚠ 同样按行判（只在**真代码**里找，注释不算 ✓）
-    _code = [ln for ln in _win.splitlines() if not ln.strip().startswith("#")]
-    check(any('getattr(self, "_face_ok", False)' in ln for ln in _code)
-          and any("_face_dir" in ln for ln in _code),
-          "画箭头那段取的不是 `self._face_dir/_face_ok`（估计器的结果 ✗）")
-    check("player.facing" not in _win,
-          "⚠ 又回头去读 `ws.player.facing` 了 ✗ —— 那个字段在**实时回路里没有写者** ✓"
-          "（用户报的「永久朝右」就是这么来的 ✓）")
-    check('facing = action.get("facing", 1)' in _lt,
-          "⚠ 「攻击范围框」那份必须**照旧**取 `action[\"facing\"]`（Agent 的意图 ✓）——"
-          "被这次改动顺手改掉 = 另一条链断了 ✗")
-    # ⚠⚠ 必须读**世界坐标**（用户 2026-10-10 纠正 ✓："**应该用世界状态坐标的位移算，
-    #    因为画面里相机镜头是会移动的**"✓），而且**不许**出现画面 x ✗
-    check('getattr(player, "world_x", None)' in _lt and "world_held" in _lt,
-          "`_face_beat` 没读**世界坐标**（`world_x` / `world_held` ✗）—— "
-          "画面 x 会被相机带走 ✓（人没走镜头一动也像在走 ✓）")
-    _i_fb = _lt.find("def _face_beat(")
-    check(_i_fb > 0, "`_face_beat` 没了（真实朝向没有计算处 ✗）")
-    _fb_body = _lt[_i_fb:_lt.find("    def _locate_latest", _i_fb)]
-    _fb_code = [ln for ln in _fb_body.splitlines() if not ln.strip().startswith("#")]
-    check(not any("pb[0]" in ln or "player_box[" in ln for ln in _fb_code),
-          "⚠ `_face_beat` 里又出现**画面**坐标（`pb[0]` ✗）—— 相机一动就假了 ✓")
-    # ⚠ 调用点必须在**写世界坐标之后**（`mm.apply_to_player` ✓）—— 否则用的是上一拍的值 ✓
-    _i_apply = _lt.find("mm.apply_to_player(ws.player, _loc)")
-    _i_call = _lt.find("self._face_beat(ws.player if _loc is not None else None)")
-    check(0 < _i_apply < _i_call,
-          "`_face_beat` 的调用点排在 `apply_to_player` **之前** ⇒ 读的是**上一拍**的世界坐标 ✗")
-
-    # ⑤ 配置：默认关 + 不混进「缺省 ⇒ True」那个名单 + 存读回
-    check(theme.VIS_DEFAULTS.get("player_arrow_real_face") is False,
-          "`player_arrow_real_face` 默认不是 False（= 老观感被改了 ✗）：%r"
-          % (theme.VIS_DEFAULTS.get("player_arrow_real_face"),))
-    check("player_arrow_real_face" not in theme._VIS_ON_KEYS,
-          "它被塞进了 `_VIS_ON_KEYS` ✗ —— 那批的读回是「缺省 / 写坏 ⇒ **True**」"
-          "⇒ 会让**所有人**的箭头默认改成「真实朝向」（偷改观感 ✗）")
-    _bak = theme.load_vis().get("player_arrow_real_face")
-    try:
-        theme.save_vis({"player_arrow_real_face": True})
-        _got = theme.load_vis().get("player_arrow_real_face")
-        theme.save_vis({"player_arrow_real_face": "yes"})     # 坏值
-        _bad2 = theme.load_vis().get("player_arrow_real_face")
-    finally:
-        theme.save_vis({"player_arrow_real_face": bool(_bak)})
-    check(_got is True,
-          "勾上存了却读不回来（`load_vis` 漏了这道 ⇒ 表现是「改了没用」✗）：%r" % (_got,))
-    check(_bad2 is False,
-          "坏值该回默认 False（「坏值当没存过」✓）：%r" % (_bad2,))
-
-    # ⑥ 接线（界面侧）
-    check('_vis_cfg.get("player_arrow_real_face", False)' in _lt,
-          "画的时候没读这个键（勾了不生效 ✗）")
-    _sd = (ROOT / "gui" / "settings_dialog.py").read_text(encoding="utf-8")
-    check("ck_arrow_real_face" in _sd and 'vis_cfg["player_arrow_real_face"]' in _sd,
-          "设置界面没把这个开关存下去（勾了保存不了 ✗）")
 
 
 def t_precheck_source_per_map():
@@ -4213,11 +4408,104 @@ def t_precheck_source_per_map():
               % (_f, _bad))
 
 
+def t_mob_id_label_optional():
+    """⭐⭐ **怪框角标 `#id conf/peak`**（用户 2026-10-11 ✓ 原话："**同个怪物的检出框疯狂
+    闪烁**"✓）。
+
+    为什么要有它：两种"闪"的成因**完全不同** ✗ —— ① 同一个 id 一直在（置信度忽高忽低 ✓）
+    = **检测不稳** ✓；② **每帧 id 都换** ✓ = 认领 / 新建那一步有问题 ✓
+    ⇒ 不把 id 打出来**只能靠猜** ✓（沿用"坏了要看得见"那条 ✔ 见 SKILL 315 ✓）。
+
+    钉五件：
+      ① 默认**关** ✓（老观感一字不变 ✓）；
+      ② ⚠⚠ **不在 `_VIS_ON_KEYS`** ✗（那批的语义是"缺省 / 写坏 ⇒ **True（画）**"✓
+         ⇒ 塞进去会让**所有人**的框上都多一串数字 ✗）；
+      ③ **存得进读得回**（坏值回 `False` ✓ 用完无论如何还原 ✓）；
+      ④ 画的时候真读了这个键 ✓、格式里真有 **id / 两个置信度**（`%.2f/%.2f` ✓）；
+      ⑤ 关着时**一字不变**（还是老的 `"%s %.2f" % (_m_label, m.conf)` ✓）。
+    """
+    from gui import theme
+
+    # ⚠ 2026-10-11 起是**两个键**（怪 `mob_show_id` / 玩家 `player_show_id` ✓
+    #   用户："怪物框上面…" 之后接着问"玩家的检出框是否用了类似算法"⇒ 给玩家也补上 ✓）
+    for _k in ("mob_show_id", "player_show_id"):
+        check(theme.VIS_DEFAULTS.get(_k) is False,
+              "`%s` 默认不是 False（= 偷改观感 ✗）：%r"
+              % (_k, theme.VIS_DEFAULTS.get(_k)))
+        check(_k not in theme._VIS_ON_KEYS,
+              "`%s` 被塞进 `_VIS_ON_KEYS` ✗（那批是「缺省 ⇒ True」⇒ 所有人的框上都多字 ✗）"
+              % _k)
+        _bak = theme.load_vis().get(_k)
+        try:
+            theme.save_vis({_k: True})
+            _got = theme.load_vis().get(_k)
+            theme.save_vis({_k: "yes"})                 # 坏值
+            _bad = theme.load_vis().get(_k)
+        finally:
+            theme.save_vis({_k: bool(_bak)})
+        check(_got is True, "`%s` 勾上存了却读不回来（改了没用 ✗）：%r" % (_k, _got))
+        check(_bad is False, "`%s` 坏值该回 `False`（老观感 ✓）：%r" % (_k, _bad))
+
+    _lt = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    for _k in ("mob_show_id", "player_show_id"):
+        check('_vis_cfg.get("%s", False)' % _k in _lt,
+              "画角标那段没读 `%s`（勾了不生效 ✗）" % _k)
+    check("%.2f/%.2f" in _lt and "peak_conf" in _lt,
+          "怪角标里没有「这一拍 / 峰值」两个置信度（那就分不清是哪种闪 ✗）")
+    check('"%s %.2f" % (_m_label, m.conf)' in _lt,
+          "关着时的老文案被改掉了（老观感该一字不变 ✗）")
+    # ⚠⚠ **幽灵标记必须在最前面** ✗（2026-10-11 用户当场问："为什么…后面一个带*"✗
+    #   —— 那时它贴在第二个置信度后面、看着像在修饰它 ✓）⇒ 钉住这个排版约定 ✓
+    check('_mtxt = "%s#%s %s %.2f/%.2f"' in _lt,
+          "怪角标的幽灵标记没放在**最前面**（又会被读成「第二个数带星号」✗）")
+    check("last_missed" in _lt and "last_low" in _lt,
+          "玩家角标没读「外推 / 低分续命」那两个只读镜像（看不出来这拍可不可信 ✗）")
+
+
+def t_track_events_wired():
+    """⭐⭐ **"闪 / 抢框"的现场要真写进 `behavior.log`**（用户 2026-10-11 ✓）。
+
+    用户原话："**同个怪物的检出框疯狂闪烁**"✓ / "**角色使用传送点后被其他玩家抢检出框**"✓
+    —— 这两件事以前**只能靠肉眼看画面** ✗（判不出是"同一个 id 在闪"还是"每帧换 id" ✓，
+    也看不出"到底是谁抢走了框"✓）⇒ 现在两条链各留一份现场 ✓：
+      · `MobTracker.drain_flick()` → `mob_flick`（id / 存活拍数 / peak / 漏检 ✓）；
+      · `PlayerTracker.drain_events()` → `player_<what>`（旧框→新框 / 竞争者 / 残差 / ΔW ✓）。
+
+    钉四件（**两半**：真能取到 ✓ ＋ 真接线了 ✓ —— 只钉一半都会"永远什么都不写"✗）：
+      ① 两个 `drain_*` 在真对象上存在且**取走即清空** ✓；
+      ② 实时回路真调了它们 ✓（源码钉）；
+      ③ 真往 `behavior.log` 写了（源码钉：事件名 `mob_flick` / `player_` 前缀 ✓）；
+      ④ 那条打点**不许**把回路带崩（整个块包在 `try/except` 里 ✓ 源码钉）。
+    """
+    import perception.tracker as trk
+
+    t = trk.MobTracker()
+    check(hasattr(t, "drain_flick") and t.drain_flick() == [],
+          "`MobTracker` 没有 `drain_flick()`（那现场就永远写不出去 ✗）")
+    p = trk.PlayerTracker()
+    check(hasattr(p, "drain_events") and p.drain_events() == [],
+          "`PlayerTracker` 没有 `drain_events()`（抢框现场写不出去 ✗）")
+
+    src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    for key in ("mob_tracker.drain_flick()", "player_tracker.drain_events()"):
+        check(key in src, "实时回路没调 `%s`（有现场也没人取 ⇒ 等于没做 ✗）" % key)
+    check('"mob_flick"' in src, "没往 behavior.log 写 `mob_flick`（那这条记事本就没内容 ✗）")
+    check('"player_" + str(' in src, "没写 `player_*` 事件（换锁/隔离/传送都没留痕 ✗）")
+    # ④ 打点块必须被 try/except 包住（`event()` 出事不许把实时回路带崩 ✗）
+    _i = src.find("mob_tracker.drain_flick()")
+    _blk = src[max(0, _i - 600):_i + 900]
+    check("except Exception" in _blk, "打点那块没包 `except`（读日志的代码不许拖垮回路 ✗）")
+
+
 TESTS = (
-    ("⭐⭐⭐ 「x 箭头 = 玩家真实朝向」（用户 2026-10-10「现在箭头永久朝右」）：判据 = **世界坐标** x"
-     " 的真实位移（小地图那份 · **与相机无关** · 连几拍同向 + 净位移够 · 成本 0）· 沿用值/没定位"
-     "**清历史不画** · 判不出**不画**（不许假装朝右）· 与「攻击范围框」（意图那份）**分开** · 默认关",
-     t_arrow_can_show_facing),
+    ("⭐⭐ 怪框角标 `#id conf/peak`（用户 2026-10-11）：默认关 · 不混进「缺省⇒True」名单 · "
+     "存得进读得回 · 关着时老文案一字不变（用来分清「同一个 id 在闪」还是「每帧换 id」）",
+     t_mob_id_label_optional),
+    ("⭐⭐ 「闪 / 抢框」的现场真写进 behavior.log（两半都钉：取得到 + 真接线 + 包了 except）",
+     t_track_events_wired),
+    ("⭐⭐ 怪 / 玩家框角标（`#12 …` / `#我 …`，外推 `*`、低分 `~` **都在最前面**）："
+     "默认关 · 不混进「缺省⇒True」名单 · 存得进读得回",
+     t_mob_id_label_optional),
     ("⭐⭐⭐⭐⭐ 「地形图的玩家圈只用唯一那一份世界坐标」（用户 2026-10-10）：不许再用「差分自己"
      "挑的点」当玩家（会锁到墙的红点上 · 与信息栏两个数）· 换算只走地形 · 换图/没跑/没定上位不画",
      t_live_map_marker_is_authoritative),
@@ -4231,6 +4519,13 @@ TESTS = (
      "也不许把操作权还回去（留住接管）· 全程接管到成功弹窗 · 测谎完自动还权 · "
      "没 warn 的 lie_game / warn 误判都不许冻住 Agent",
      t_lie_takeover_holds_through_minigame),
+    ("⭐⭐⭐ 「一帧的上下文」`FrameCtx` 三条纪律（口径 B 立盒子 ✓ 用户 2026-10-15）：字段写死"
+     "（没声明的字段当场报错 ✗ 挡「退化成谁都能塞的袋子」）· 一帧一个（不复用 ⇒ 上一帧的值漏不进来）"
+     "· 跨帧的东西一律不进（帧计数/采样窗口/配置留下来 ✓ 判据「下一帧还会用吗？」）",
+     t_frame_ctx_discipline),
+    ("⭐⭐ 「重载保命闸」的**本体**（`runtime.pipeline.HeavyGate`）：0=不限制 · 到点前跳/到点后放 · "
+     "跳过必喂时间拍且只喂那一次 · 没推理不拦不喂 · 时间拍炸了不炸回路 · 打点齐全",
+     t_heavy_gate_unit),
     ("⭐⭐ 「重载保命闸」：每秒最多跑 N 拍重活（用户 2026-10-10「挂游戏+浏览器+音乐+steam+大型游戏"
      "也要流畅」）—— 到点才跑 · 跳过的帧只喂时间拍（CD/delay 精度不受影响）· 默认 0 = 不限制",
      t_heavy_gate_when_machine_busy),
@@ -4274,6 +4569,8 @@ TESTS = (
     ("不可见时一帧都不画，但帧仍是最新的", t_hidden_skips_draw),
     ("视野框（虚线）：每帧现算，不许再套「每 N 秒算一次」的节流", 
      t_vision_box_updates_every_frame),
+    ("只检测视野框：关=原图 / 开=剪裁块+偏移 / 退化框退回原图 / 偏移只加一处（用户 2026-10-15）",
+     t_det_vision_only_crop),
     ("辅助线与标记：颜色支持透明度（#AARRGGBB）+ 每项一个开关 + 四个「框」项"
      "（含追击起跳框）+ 三个框并排的画法", t_vis_color_alpha_and_toggles),
     ("current_frame() 必须是原生帧：显示帧（框线/视野虚线）不许进那条路",
@@ -4310,6 +4607,8 @@ TESTS = (
      t_export_done_takes_over),
     ("⭐⭐ 权重路径失效时要说清「怎么办」（别只甩一行 does not exist）",
      t_missing_weights_msg),
+    ("⭐⭐⭐ 删掉的键要真的落盘（「重开 gui 后删掉的自定义按键又出现」的真根）",
+     t_project_save_keeps_deletions),
     ("⭐⭐ 每帧一条 ultralytics 弃用告警要静音（stdout.log 被写成 406MB ✗，但别的告警不许吞）",
      t_half_warn_not_spamming),
     ("⭐⭐ 一键导出该尺寸引擎（从 .engine 推同名 .pt / 名字带尺寸 / 后台线程 / 有反馈）",
@@ -4322,6 +4621,85 @@ TESTS = (
 )
 
 
+
+
+def t_infer_conf_feeds_low_band():
+    """⭐⭐⭐⭐ **推理门槛必须低到「低分档」那一层**（用户 2026-10-13 ✓ 原话："**检出框疯狂闪烁，
+    防抖时间不生效**"✓）。
+
+    病根（一处对不上的口径 ✓ 害了整整两轮排查 ✗）：`LiveThread._run` 里推理用的门槛原来是
+      `min(conf_mob, conf_player)`（= 0.25 ✓）✗，而 `split_dets` 的**低分档**门槛是
+      `conf_mob × MOB_LOW_CONF_RATIO`（0.25 × 0.5 = **0.125** ✓）⇒ **模型 0.25 以下直接丢掉** ✗
+      ⇒ 低分档**永远收不到框** ✗ ⇒ BYTE 那条「低分只续命」的链**从来没生效过** ✓
+      ⇒ 框一掉到阈值以下就只能靠**防抖幽灵**撑着（`debounce_ms` ✓）⇒ 撑完就死、
+      再出现就是新 id ✓ = 用户看到的"疯狂闪烁 ＋ 防抖时间不生效" ✓✓。
+    ⚠ 上面那两行注释本来就写着"保证两类的**低分框**都进结果" ✗ —— 实现漏了那个比例 ✓。
+
+    钉两件（源码级 ✓ 真跑一次推理不现实 ✗）：
+      ① 门槛取**两档里更低的那个**（`* MOB_LOW_CONF_RATIO` / `* PLAYER_LOW_CONF_RATIO` ✓）；
+      ② 分档那份口径（`split_dets` ✓）**照旧**：它只负责分档 ✓ 判据不写第二遍 ✓。
+    """
+    _p = Path(__file__).resolve().parents[1] / "gui" / "live_thread.py"
+    src = _p.read_text(encoding="utf-8")
+    check("conf = min(conf_mob * MOB_LOW_CONF_RATIO" in src,
+          "推理门槛又退回 `min(conf_mob, conf_player)` 了 ✗ —— 那会让**低分档永远空** ⇒ "
+          "「防抖时间」对「擦着阈值」的怪彻底不生效 ✓（用户 2026-10-13 的现场 ✓）")
+    check("PLAYER_LOW_CONF_RATIO)" in src or "PLAYER_LOW_CONF_RATIO)" in src.replace(" ", ""),
+          "玩家那一档的门槛没跟着降 ✗ —— 玩家低分框同样喂不进 tracker ✓")
+    # ⚠⚠⚠ **两处都要**（2026-10-13 实测踩到 ✓ 这一条比上面那条还值钱 ✗）：
+    #   `_run` 开头那处只算"建会话时"的；主循环里还有一格**热重载**
+    #   （读 `config/live.yaml` 重算 `conf` ✓）⇒ 只改一处的话，**1 秒内就被盖回去** ✗
+    #   （现场表现 = 改完看不出任何变化 ✓ 与"防抖时间不生效"同源 ✓）
+    #   ⇒ 判据 = 两处都带比例 + **旧的 `min(conf_mob, conf_player)` 一处都不许剩** ✓。
+    check(src.count("min(conf_mob * MOB_LOW_CONF_RATIO") == 2,
+          "带「低分档比例」的推理门槛该有**两处**（建会话 + 热重载 ✓），实得 %d 处 ✗ —— "
+          "少一处 ⇒ 那一处会把口径盖回去 ✓（用户 2026-10-13 现场 ✓）"
+          % (src.count("min(conf_mob * MOB_LOW_CONF_RATIO"),))
+    check("conf = min(conf_mob, conf_player)" not in src,
+          "还留着旧的 `conf = min(conf_mob, conf_player)` ✗ —— 它会让低分档永远空 ✓")
+
+
+def t_max_det_minus_one_is_unlimited():
+    """⭐⭐ **怪框上限 `-1` = 不限**（用户 2026-10-17 ✓ 原话：「**怪框上限可以做成默认 -1
+    无限吗？**」✓）。
+
+    钉四件（缺一件这功能就不成立 ✓）：
+      ① 界面那格的**下限必须是 -1** ✗ —— 不然用户**填不进 -1**（会被夹回 10 ⇒ 填了没效果 ✓）；
+      ② 引擎里 **两处读数都要把 -1 翻译成大上限** ✗ —— 只翻译一处 ⇒ 另一处（热重载 ✓）
+         会把**负数原样**塞给 Ultralytics ⇒ **当场报错** ✓；
+      ③ **缺键的兜底是 -1** ✓（这就是用户要的「默认不限」✓）；
+      ④ 那格的 **tooltip 必须写明「-1 = 不限」** ✓（不然没人知道能填负数 ✓）。
+    """
+    import io
+    import os
+
+    # ⚠ `_panel()` 返回的是**元组** ✓ `(app, lp, p, made, orig)`（实测上报
+    #   `'tuple' object has no attribute ...' ✓ 就是这个坑 ✓）⇒ 解包取那个面板 `p` ✓。
+    _app, _lp, p, _made, _orig = _panel()
+    _lp._bgr_to_pixmap = _orig       # 本用例用不到那支探针 ⇒ 立刻还原 ✓（别漏给后面的用例 ✓）
+    check(p.sp_max_det.minimum() == -1,
+          "怪框上限的下限不是 -1 ✗ ⇒ 用户**填不进 -1**（界面上会被夹回 10 ⇒ 填了没效果 ✓）")
+    check("-1" in p.sp_max_det.toolTip() and "不限" in p.sp_max_det.toolTip(),
+          "怪框上限的 tooltip 没写明「-1 = 不限」✗ ⇒ 没人知道能填负数 ✓")
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    lt = io.open(os.path.join(root, "gui", "live_thread.py"), encoding="utf-8").read()
+    check(lt.count("if max_det < 0") == 2,
+          "`-1` 的翻译不是**两处** ✗（实测 %d 处）⇒ 热重载那处会把负数塞给模型"
+          " ⇒ 当场报错 ✓" % lt.count("if max_det < 0"))
+    check(lt.count('max_det", -1') == 1,
+          "建会话那处的兜底不是 -1 ✗ ⇒ 「默认不限」没生效 ✓"
+          "（⚠ 老项目文件里写了数的照旧生效 ✓ 这条只管缺键 ✓）")
+    check(lt.count("res = model.predict") == 1,
+          "推理口变成不止一处了 ✗（这条链上只许有一个 —— 见那边的源码钉 ✓）")
+
+
+TESTS = TESTS + (
+    ("⭐⭐ 怪框上限 `-1` = 不限（界面下限 / 两处翻译 / 缺键兜底 / tooltip 都要对）",
+     t_max_det_minus_one_is_unlimited),
+    ("⭐⭐⭐⭐ 推理门槛必须低到「低分档」那一层（否则防抖 / 续命整条链是死的）",
+     t_infer_conf_feeds_low_band),
+)
 
 
 def main() -> int:

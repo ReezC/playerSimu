@@ -394,6 +394,51 @@ def panel_mismatch(calib, panel, canvas_wh, tol=PANEL_TOL):
            (float(pw) / rw) if rw else 0.0))
 
 
+def crop_rel_of(crop, shape):
+    """**帧内像素** crop `[x, y, w, h]` ⇒ **比例** `[nx, ny, nw, nh]`（相对**这一帧** ✓）。
+
+    ⭐⭐⭐ 为什么要有一份比例（用户 2026-10-17 ✓ 原话：
+      「**为什么我移动本地游戏窗口后，小地图要重新框选？它不是相对游戏画面的坐标偏移
+      记录的吗？？**」✗）：
+      · `mmap_crop` 本来就是**相对帧**的 ✓（不是屏幕坐标 ✓）—— 但它是**像素** ✗
+        ⇒ 只要**帧的尺寸**变了（窗口最大化 / 拖到缩放比例不同的显示器 / 换来源 ✓），
+        它就错位或越界 ✗ ⇒ 只能重框 ✓；
+      · 而"帧"本身是跟着窗口走的 ✓（`rect_rel` + `rect_win` ✓ 见 `core/wincap` ✓）
+        ⇒ 那么**框也应该跟着比例走** ✓ —— 和 `rect_rel` 完全同一个道理 ✓。
+    ⚠ 纯函数、无副作用 ✓；`shape` 用 `(H, W)` 或 `(H, W, C)` 都行 ✓
+      （内部只取前两位 ✓）；w/h ≤ 0 或 shape 不可用 ⇒ `None` ✓（不猜 ✗）。
+    """
+    try:
+        x, y, w, h = (float(v) for v in crop)
+        H, W = float(shape[0]), float(shape[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if W <= 0 or H <= 0 or w <= 0 or h <= 0:
+        return None
+    return [round(x / W, 6), round(y / H, 6), round(w / W, 6), round(h / H, 6)]
+
+
+def crop_from_rel(rel, shape):
+    """**比例** ⇒ 当前这帧的像素 crop `(x, y, w, h)` ✓（`crop_rel_of` 的逆 ✓）。
+
+    ⚠ 折算完**必须还在画面里** ✓：越界就夹回边界 ✓ —— 宁可裁小一点，也不要越界后
+      "整块取不到 ⇒ 定位全停" ✗（`_mmap_panel_from_frame` 那边越界会直接返回 None ✓）。
+    ⚠ 算不出来 ⇒ `None` ✓（调用方退回绝对 `mmap_crop` ✓ 老行为一字不变 ✓）。
+    """
+    try:
+        nx, ny, nw, nh = (float(v) for v in rel)
+        H, W = int(shape[0]), int(shape[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if W <= 0 or H <= 0 or nw <= 0 or nh <= 0:
+        return None
+    x = max(0, min(W - 1, int(round(nx * W))))
+    y = max(0, min(H - 1, int(round(ny * H))))
+    w = max(1, min(W - x, int(round(nw * W))))
+    h = max(1, min(H - y, int(round(nh * H))))
+    return (x, y, w, h)
+
+
 def offset_of(calib):
     """从**标定字典**里读「坐标系偏移」→ `(x, y)`（没有 / 坏了给 `(0, 0)`）。
 
@@ -481,6 +526,105 @@ TRUST_SCORE = 0.8
 #: "这块面板和底图对上了没有" ✓）。它比 `TRUST_SCORE` 低一档：0.55 是"低于它连试都
 #: 不用试"，0.8 才是"这份几何可信" ✓。
 LOCATE_MIN_SCORE = 0.55
+
+#: ⭐⭐ **「自动补标定」的闸**（用户 2026-10-11 ✓ 原话："**为什么要我补标定？标定的数据不是
+#:   都存好了？**"✓）：同一张图 + 同一条来源最多自动试这么多次、每次至少隔这么久 ✓
+#:   —— `locate_fit` 一次几十 ms ✓，面板坏掉/被挡住时不该每拍都白试 ✗。
+AUTOFIT_MAX_TRIES = 3
+AUTOFIT_COOLDOWN_S = 5.0
+
+#: `(map_id, src)` → `{"tries", "at", "why", "score"}`；**只活在本进程** ✓
+#: （重启就重来 —— 它只用来"别在坏面板上死磕" ✓ 不是要记账给谁看 ✓）。
+_AUTOFIT_STATE = {}
+
+
+def autofit_reset(map_id=None, src=None):
+    """清掉自动补标定的尝试计数（用例隔离用 ✓；`map_id/src` 都不给 ⇒ 全清 ✓）。"""
+    if map_id is None and src is None:
+        _AUTOFIT_STATE.clear()
+        return
+    _AUTOFIT_STATE.pop((str(map_id or ""), str(src or "")), None)
+
+
+def any_mode_of(map_id):
+    """这张图**任何一条来源**记过的显示方式（`fit` / `crop`）；一条都没有 → `None` ✓。
+
+    ⚠⚠ **为什么"自动补标定"必须先问它** ✗：显示方式（全局 / 局部）是**人工选的** ——
+      模块头那段写着"**不按匹配分自动挑**"✓（两种画法在不同图上确实不一样，分数高低
+      说明不了该用哪种 ✓）。⇒ 自动这条路**只许沿用**已选过的那个 ✓，**不许**自己挑 ✗。
+    """
+    try:
+        for cal in (mapdata.load_calibs(map_id) or {}).values():
+            m = (cal or {}).get("mode")
+            if m in (MODE_FIT, MODE_CROP):
+                return m
+    except Exception:                                # noqa: BLE001 —— 读不出来当没有 ✓
+        return None
+    return None
+
+
+def try_autofit(panel, canvas, map_id, src, min_score=LOCATE_MIN_SCORE, seed=None):
+    """给「**这张图 + 这条来源**」自动补一份标定 —— 成功 ⇒ **已经写盘** ✓。
+
+    用户 2026-10-11 ✓ 原话："**为什么要我补标定？标定的数据不是都存好了？**"✓
+      —— 存好的那份是**另一条来源**的 ✗：标定记的是「面板像素 ↔ 底图像素」的换算 ✓，
+      而两条来源的面板**几何完全不同**（实测同一张图：独立推流 1164×585、从实时画面
+      240×79 ✓ 差 5.6 倍 ✓，`panel_mismatch` 会直接判"对不上"✓）⇒ **不能互换** ✓。
+      而"自动量一遍"这条路**是通的** ✓（实测黄金海滩：`locate_fit` 一次就给
+      `score 0.9388 / scale 5.625` ✓ 与手工那份基本一致 ✓）⇒ 缺哪条就补哪条 ✓。
+
+    返回 `{"ok", "why", "score", "tries", "already"?}`（**绝不抛** ✓ 异常一律变成 `ok=False` ✓）。
+    ⚠ 调用方应**先**确认这条来源还没有几何 ✓（这里**不覆盖**已有的 ✗ —— 有的话直接回
+      `already=True`，也不消耗尝试次数 ✓）。
+    ⚠ **只沿用**已选过的显示方式 ✓（见 `any_mode_of` ✓）；一条都没有 ⇒ 拒绝并说清原因 ✓。
+    """
+    key = (str(map_id or ""), str(src or ""))
+    try:
+        if has_geometry(mapdata.load_calib(map_id, src) or {}):
+            return {"ok": True, "already": True, "tries": 0, "score": None,
+                    "why": "这条来源已经有标定了 ✓（不用补）"}
+    except Exception:                                # noqa: BLE001
+        pass
+    st = _AUTOFIT_STATE.setdefault(key, {"tries": 0, "at": 0.0, "why": "", "score": None})
+    now = time.monotonic()
+    if st["tries"] >= AUTOFIT_MAX_TRIES:
+        return {"ok": False, "tries": st["tries"], "score": st.get("score"),
+                "why": "已经自动试过 %d 次都量不出来 ⇒ 得人工标一次（或换来源）" % st["tries"]}
+    if st["tries"] and (now - float(st["at"])) < AUTOFIT_COOLDOWN_S:
+        return {"ok": False, "tries": st["tries"], "score": st.get("score"),
+                "why": st["why"] or "刚试过，等一会儿再试"}
+    st["tries"] += 1
+    st["at"] = now
+    try:
+        mode = any_mode_of(map_id)
+        if not mode:
+            st["why"] = ("这张图还没选过「显示方式」（全局 / 局部）⇒ 自动**不敢替你挑** ✗"
+                         "（那两种画法得分说明不了该用哪种 ✓）")
+            return {"ok": False, "tries": st["tries"], "why": st["why"], "score": None}
+        if panel is None or canvas is None or getattr(canvas, "size", 0) == 0:
+            st["why"] = "没有面板画面 / 这张图还没有底图"
+            return {"ok": False, "tries": st["tries"], "why": st["why"], "score": None}
+        if mode == MODE_CROP:
+            got = locate_crop(panel, canvas, min_score=min_score, seed=seed)
+        else:
+            got = locate_fit(panel, canvas, min_score=min_score)
+        if not got:
+            st["why"] = ("自动量了一次：这块面板和底图对不上（低于 %.2f）⇒ 得人工标一次"
+                         % float(min_score))
+            return {"ok": False, "tries": st["tries"], "why": st["why"], "score": None}
+        cal = dict(got)
+        cal.update({"mode": mode, "ref": "canvas",
+                    "panel": [int(panel.shape[1]), int(panel.shape[0])],
+                    "src": "auto", "picked_by": "auto",
+                    "note": "自动补标定（未人工确认 ✓ 用户 2026-10-11）"})
+        mapdata.save_calib(map_id, cal, src=src)
+        st["why"] = ""
+        st["score"] = float(cal.get("score") or 0.0)
+        return {"ok": True, "tries": st["tries"], "score": st["score"],
+                "why": "自动补标定成功（分 %.3f）" % st["score"]}
+    except Exception as e:                           # noqa: BLE001 —— 自动这条路出事绝不许炸回路 ✗
+        st["why"] = "自动补标定出错：%s: %s" % (type(e).__name__, e)
+        return {"ok": False, "tries": st["tries"], "why": st["why"], "score": None}
 
 #: `locate_crop` 的模板（缩回底图尺度之后）**最多取底图的多少**（0~1，按边长）。
 #: **为什么要有这个上限**：面板比底图宽时（crop 的常态 —— 实测 105040303 = 502×408 的
@@ -2448,10 +2592,105 @@ DOT_GHOST_MAX_SHIFT = 8.0        # 幽灵外推的总位移上限（面板像素
 #:   `BGR(108,255,255)` ✓ 见 `DOT_CORE_*` ✓，动它风险大于收益 ✗ —— 这条记在这儿，
 #:   免得下一个人又去改颜色 ✗）。
 DOT_PLAYER_SIDE_REL = 0.032       # 玩家点短边 ≈ 面板宽 × 3.2%（实测 ✓ 判据见上）
+# ⭐⭐⭐ **2026-10-11 实测推翻了一条假设** ✗（用户现场："**队友橙色点上方有个很小的黄点标记，
+#   经常认错**"✗；量测脚本 `tools/mmap_dot_like_probe.py` + `data/dot_probe/*.png` ✓）：
+#     面板宽 1164 那块真点 **26×24 = 2.15%** ⇒ like **只有 0.25** ✗（期望边长算成 37px ✗）；
+#     而同一帧别的黄块（大概率是 portals ✓）28×21 / 27×21 也是 0.20~0.28 ⇒ **同档** ✗✗；
+#     另外两块：536 宽 ⇒ 20×16（3.36% ✓ like 0.61）；78 宽 ⇒ 6×6（7.7% ✓ like 0.80）。
+#   ⇒ 结论：**"短边 = 面板宽 × 3.2%"这条跨来源不成立** ✗（点的大小不随面板线性缩放 ✓）
+#      ⇒ 拿它当"期望尺寸"时，真点会被判成"偏小" ⇒ 跟杂块同档 ⇒ 胜负全交给距离
+#      ⇒ **又回到"谁近谁赢"** ✓（老病灶 ✓）。
+#   ⇒ 正确做法：**期望尺寸自标定**（`exp_side` ✓ 见 `find_player_dot` ✓）—— 拿"**最近锁定住的
+#      那个点**"的短边中位数当尺子 ✓（锁定的那个默认就是真点 ✓）。上面这个比例**只当首帧兜底** ✓。
+#   ⚠ 别再去调那个 0.032 了 ✗（它治不了跨来源 ✓，只会让别的来源变坏 ✓）。
+#: 自标定尺子的样本数下限（少于它 ⇒ 退回比例兜底 ✓ 不猜 ✗）。
+DOT_EXP_MIN_SAMPLES = 5
+#: 自标定窗口（最近多少个**锁定成功**的点 ✓；中位数抗单帧异常 ✓）。
+DOT_EXP_HISTORY = 15
+#: ⭐ 滞后分**只保护"像个玩家点"的候选**（`DOT_LIKE_MIN` ✓ 2026-10-11 缺口①）：
+#: 原来只要"离上一拍近"就 +`DOT_LOCK_MARGIN` ✗ ⇒ 锁在一个**形状完全不像**的东西上（队友那个
+#: 小标记 ✓）以后，它**永远拿这份保护** ⇒ 真点出现也难挤下去 ✓。
+#: 取值照量测：真点最低 **0.20**（1164 那块 ✓）⇒ 取 **0.15**（留一点余量 ✓ 又能挡住"几个像素的
+#: 杂点 / 细长条"那一档 ✓ —— 它们在 `dot_player_like` 里本来就只有 0 或 ~0.01 ✓）。
+DOT_LIKE_MIN = 0.15
+#: ⭐ **"可达半径"**（`DOT_REACH_REL` ✓ 2026-10-11 缺口③）：候选离上一拍超过 `它 × 期望边长`
+#: ⇒ **一律垫底**（不再是线性扣分 ✗）✓。
+#: 为什么必须改：旧口径线性罚最高 **0.7** ✗ 而实测 `like` 之间的差距常在 **0.05~0.2** ✓
+#: ⇒ 实际上是"**谁近谁赢**" ✓（那正是乱飘 / 锁错的来源 ✓）。
+#: 改后：**半径内按 `like` 排**（距离只占很小权重 `DOT_DIST_W` ✓）⇒ "像不像"才是主判据 ✓。
+DOT_REACH_REL = 3.0
+#: 半径内的距离权重（很小 ✓ 只用来打破"两个都像"的平局 ✓）。
+DOT_DIST_W = 0.10
+#: ⚠ **硬尺寸闸**（相对面板宽 ✓ 2026-10-11 ✓）：短边小于"面板宽 × 它"的块**不算候选** ✓。
+#: 取值照量测（14 个真样本复核过 ✓）：最"小"的真点是 78 宽面板上的 **6×6 = 7.7%** ✓、
+#: 960 宽那块 **16×16 = 1.67%** ✓ ⇒ 门槛取 **0.8%**（真点的 1/2 以下 ✓）**再夹到 ≥3px** ✓
+#: ⇒ 1164 那块的门槛是 9.3px ✓ ⇒ 队友那个几像素的小标记**直接出局** ✓ 而 16/20/24/26 全过 ✓。
+#: ⚠ 零回归兜底：**筛空 ⇒ 原样返回**（绝不把本来找得到的点弄丢 ✗ 见 `_dot_candidates` ✓）。
+DOT_PLAYER_SIDE_HARD_REL = 0.008
+
+#: ⭐⭐⭐ **绝对下限**（短边像素 ✓ 2026-10-11 第二轮 ✓ —— 用户原话："**还在锁小黄点
+#: 拿大小判定一下不行吗？**"✓）。
+#: ⚠⚠ 为什么非有它不可（**现场量出来的** ✓ 不是猜 ✗）：那道相对闸有一条"**筛空就原样返回**"
+#:   的零回归兜底 ✓，而它**把"连像都不像"的碎块也一起放行了** ✗✗ —— 拿用户那块真面板
+#:   （`data/dot_probe/now_panel.png` ✓ 1164 宽 ✓）实测：
+#:     · 黄族**被淹**（命中 25774 px ⇒ 颜色层判死 ✓ 见 `_is_flood` ✓）；
+#:     · 于是退到**青族** ✓，而青族那一片里**只有一个**候选：**(628,350) 的 3×5**（= 0.34% ✗）
+#:       —— 均值 4px < 门槛 9.3px ⇒ 该被挡 ✓ 可它**就是唯一那个** ⇒ 兜底原样放行 ✗
+#:       ⇒ `find_player_dot` 报 `ok=True` 锁住它 ✓（真点在 **(1135,480)** ✓ 离 523px ✗）✓
+#:       ⇒ 这就是"**还在锁小黄点**" ✓（换任何尺子都一样 ✓ 实测 ✓ —— 因为尺子压根没参与 ✓）。
+#:   ⇒ 修法：把"**绝对**不可能"和"**相对**可疑"拆开 ✓：
+#:     · **绝对**（短边 < 它）⇒ **没有兜底** ✗ —— 6 个真来源量下来，真点**核心块**最小是
+#:       536 宽面板上的 **8×12**（短边 8 ✓）、黄色层最小 **16×16** ✓ ⇒ 取 **4px**
+#:       （= 真点最小短边的**一半** ✓ 与相对闸"取真点比例的一半"**同一口径** ✓）✓
+#:       ⇒ 这时**如实报"认不出"** ✓ 比报一个假坐标强得多 ✓
+#:       （模块自己的信条 ✓：假坐标会让 Agent 一路怼墙 ✓ 见 `force_reacquire` 那段现场 ✓）。
+#:     · **相对**（短边 < 面板宽 × `DOT_PLAYER_SIDE_HARD_REL`）⇒ **保留兜底** ✓
+#:       （小面板 / 换分辨率的容错 ✓ 那条兜底正是为 78 宽那块 **6×6** 留的 ✓）。
+#:   ⚠⚠ **为什么是 4 而不是 6**（我第一版写 6，当场被 5 条既有用例按住 ✓ 如实记）：
+#:     "无素材时 5×5 的青色方块也算玩家"是**故意**钉着的（真·青色标记、测试替身都靠它 ✓）
+#:     ⇒ 绝对下限只该拦"**连替身都不如**"的那一档 ✓ —— 用户现场那块是 **3×5**（短边 3 ✓）
+#:     ⇒ 4px 照样拦得住 ✓✓（两边都不伤 ✓）。
+#: ⚠ 记着：这条**只看尺寸**（"拿大小判定" ✓），它治不了"**同样大小**的地图图标"✗ ——
+#:   那一档要靠核心色（`DOT_CORE_*` ✓ 已经在用 ✓ 见 `_local_result_trustworthy` ✓）
+#:   与"底图相减"（那条治的就是"地图上的假黄色图标不许赢过真点" ✓ 见它用例 ✓）。
+DOT_SIDE_HARD_ABS = 4.0
+#: ⛔⛔ **上面那个 4px 是死值 ⇒ 会卡死小面板** ✗（2026-10-13 现场复盘 ✓ 用户报：
+#:   "**石人寺院III 项目，提示「世界坐标：实时在跑，但这一拍还没定上位」就会发呆**"✗
+#:   "**严重问题**"✓）。证据链（都可复现 ✓）：
+#:     · 那张图 `106010106` 的标定里记着 **live 源的面板 = 129×71** ✓（`mmap_crop` 也是
+#:       [5,71,129,71] ✓），画布 **127×61** ✓ —— **小面板** ✓；
+#:     · 这游戏的小地图标记是**固定像素大小**的 ✓（本文件上面量过并写着：
+#:       "**点的大小不随面板线性缩放**"✗）⇒ 129 宽那块面板上真点只有 **3~5px** ✓；
+#:     · 死值 4px（**短边、且没有兜底** ✗）= 我 2026-10-11 定的 ⇒ **正好把真点挡死** ✗
+#:       ⇒ `find_player_dot` 报认不出 ⇒ 没有世界坐标 ⇒ `LAST_POS.world_x=None` ⇒
+#:       界面那行显示"这一拍还没定上位" ⇒ Agent「未定位玩家」⇒ **发呆** ✓✓（现象逐条吻合 ✓）。
+#:   ⇒ 现在改成**跟着面板尺寸走**（一行算式 ✓ 三个数都有量测支撑 ✓）：
+#:       `下限 = max(2px, min(6px, 0.4% × 面板宽))`
+#:     · **1164 宽** ⇒ 4.66px ✓（2026-10-11 那块 3×5 的碎块**照样挡得住** ✓ 那天的修法不倒退 ✓）；
+#:     · **129 宽** ⇒ 2px ✓（真点 3px **过得去** ✓✓ 本轮的 bug 修掉 ✓）；
+#:     · **4656 宽**（推流原始像素）⇒ 6px（夹住 ✓ 真点 84px 离得远 ✓ 不误伤 ✓）。
+#:   ⚠ 2px 那一头是"**连 1~2px 的噪声都不认**"的意思 ✓（真点最小 3px ✓ 有量测 ✓）。
+DOT_SIDE_HARD_ABS_MIN = 2.0
+DOT_SIDE_HARD_ABS_REL = 0.004
+DOT_SIDE_HARD_ABS_MAX = 6.0
 #: 换锁要赢这么多分（0~1 尺度 ✓）：太小 = 来回跳 ✗，太大 = 传送时换不过去 ✗。
 DOT_LOCK_MARGIN = 0.12
 #: 报出去的位置做一阶低通：**1 = 不过滤** ✓；取 0.6 = 抹抖但不拖泥带水 ✓。
 DOT_SMOOTH_ALPHA = 0.6
+
+#: ⭐⭐⭐ **「定位保底」**（2026-10-13 ✓ 用户原话："**做保底：定位后，不准找不到，
+#:   丢了就用上次EMA平滑的**"✓；同一次现场："**石人寺院III 项目，提示「世界坐标：实时在跑，
+#:   但这一拍还没定上位」就会发呆**"✗ "**严重问题**"✓）。
+#: 口径（一句）：**只要这张图上定过一次位** ⇒ 之后认不出黄点时**不再报"找不到"** ✓，
+#:   输出"**最后一次定位的 EMA 平滑值**" ✓，并如实标上 `held=True`（沿用的 ✓）、
+#:   `stale=True`（是保底值 ✓）、`stale_s`（多少秒前那次真定位 ✓）—— 标志齐全 ⇒
+#:   "要新鲜观测"的消费方自己看标志 ✓，不要的照用 ✓（**绝不假装它是这一拍量出来的** ✗）。
+#: 为什么必须做（现场链条）：小面板（129×71 ✓）上黄点本来就难认 ✓ ⇒ 认不出 ⇒ `world_x=None`
+#:   ⇒ 界面那行写"这一拍还没定上位" ⇒ Agent `_player_located` 判"未定位玩家" ⇒ **发呆** ✓
+#:   （整条自动等于停了 ✗ —— 用户要的就是"别停" ✓）。
+#: ⚠ **前提是"定位后"** ✓：从没定过位（刚开 / 没标定 / 刚换图 ✓）⇒ 照旧如实说找不到 ✓（不猜 ✗）。
+#: ⚠ 换图（`PlayerLocator.load`）**清掉** ✓：上一张图的位置在另一张图上毫无意义 ✗。
+PLAYER_FB_EMA_ALPHA = 0.4
 
 #: 上面这四个可以**从 config/live.yaml 覆盖**（界面在「路线识别 → 小地图定位」里调）。
 #: 键名 → 默认值：改键名要一起改 `track_params()` 和界面那排输入框。
@@ -2583,8 +2822,16 @@ def dot_side_max(panel_w):
     return max(6, int(panel_w) // DOT_SIDE_MAX_DIV)
 
 
-def dot_player_like(c, panel_w):
+def dot_player_like(c, panel_w, exp_side=None):
     """这个候选块**像不像「玩家那个点」** ⇒ 0~1 分（越大越像 ✓）；坏形状 ⇒ 0 ✓。
+
+    ⭐⭐ `exp_side` = **自标定的"期望边长"**（2026-10-11 ✓ 现场量出来的 ✓ 见
+      `DOT_PLAYER_SIDE_REL` 上面那张表 ✓）：拿"最近锁定住的那些点"的短边中位数当尺子 ✓
+      ⇒ **跨来源也成立** ✓（比例兜底只在首帧用 ✗）。
+      ⚠ 为什么这条非加不可：1164 宽那片面板上，真点 26×24 ⇒ 比例口径把期望算成 37px ✗
+      ⇒ like 只剩 **0.25** ⇒ 跟同帧别的黄块（portals ✓ 0.20~0.28）**同档** ✗
+      ⇒ 挑点退化成"谁近谁赢" ✓（用户报的"经常认错"就是它 ✓）。
+      自标定之后：真点 ≈ 1.0 ✓、队友那个几像素的小标记 ≈ 0 ✓ ⇒ 分得干干净净 ✓。
 
     ⭐ 2026-10-10 加（用户三条抱怨见 `DOT_PLAYER_SIDE_REL` 上面那段 ✓）。三个因子相乘，
     任一项离谱就把总分拉低 ✓：
@@ -2609,7 +2856,15 @@ def dot_player_like(c, panel_w):
         return 0.0
     if w <= 0.0 or h <= 0.0:
         return 0.0
-    exp = max(4.0, float(DOT_PLAYER_SIDE_REL) * max(1.0, float(panel_w)))
+    # ⭐ 期望边长：**自标定优先**（`exp_side` ✓ 见函数头那段 ✓），没有才退回比例兜底 ✓
+    try:
+        _es = float(exp_side) if exp_side is not None else 0.0
+    except (TypeError, ValueError):
+        _es = 0.0
+    if _es >= 2.0:
+        exp = _es
+    else:
+        exp = max(4.0, float(DOT_PLAYER_SIDE_REL) * max(1.0, float(panel_w)))
     side = 0.5 * (w + h)
     d = abs(float(np.log(max(1e-6, side / exp))))
     # ⚠⚠ **两侧不对称**（2026-10-10 ✓ 现场定的）：真玩家点比预期**大**是常事
@@ -2628,7 +2883,7 @@ def dot_player_like(c, panel_w):
     return float(size * min(1.0, fill / 0.85) * sq)
 
 
-def _dot_candidates(m, panel_w):
+def _dot_candidates(m, panel_w, exp_side=None):
     """掩码 → (像「点」的连通块列表, 成片像素数)。
 
     每项：{x, y（重心）, w, h, area, fill}。**不做「选一个」** —— 多候选时该选谁
@@ -2665,8 +2920,38 @@ def _dot_candidates(m, panel_w):
     #   ⚠ **算分不写进候选字典** ✗（`all` 是要给界面/诊断看的 ✓ 加字段会牵动一堆比较 ✓）：
     #     排序时现算（候选通常个位数 ✓ 便宜 ✓）。
     _pw = float(panel_w)
-    out.sort(key=lambda c: (-dot_player_like(c, _pw), -c["area"], -c["fill"]))
-    return out, dense
+    out.sort(key=lambda c: (-dot_player_like(c, _pw, exp_side), -c["area"], -c["fill"]))
+    # ⭐⭐ **硬尺寸闸**（2026-10-11 ✓ 见 `DOT_PLAYER_SIDE_HARD_REL` 那段量测 ✓）：
+    #   短边小于"面板宽 × 0.8%（并夹到 ≥3px）"的块 ⇒ **不是候选** ✗ —— 队友头上那个
+    #   几像素的小黄标记**就死在这一条** ✓（它以前只是"分低" ✓ 还一直排在候选表里等着被锁 ✓）。
+    #   ⚠⚠ **零回归**（老规矩 ✓）：这一道要是把候选**筛空**了 ⇒ **整段作废、按老的来** ✓
+    #     —— 绝不允许它把"本来认得出"的那一拍弄丢 ✗（宁可多留几个候选 ✓ 不许一个都不剩 ✓）。
+    # ⭐⭐⭐ 2026-10-11 第二轮改：**两道分开**（用户："**还在锁小黄点 拿大小判定一下不行吗？**"✓）
+    #   ① **绝对下限** `DOT_SIDE_HARD_ABS`（短边 6px ✓）⇒ **没有兜底** ✗ ——
+    #      几像素的碎块**绝不可能是玩家点** ✓（6 个真来源量下来真点最小短边 8px ✓ 见那里 ✓）
+    #      ⇒ 这时**如实报"认不出"** ✓ 比锁一个假点强得多 ✓；
+    #   ② **相对下限**（面板宽 × `DOT_PLAYER_SIDE_HARD_REL` ✓）⇒ **保留"筛空就退回"的兜底** ✓
+    #      —— 老兜底的本意是"别因为换分辨率把点弄丢"✓，那说的是**这一层** ✓ 不是"什么都放行" ✗。
+    #   ⚠ 口径同时**改对**：一律用**短边**（`min(w,h)` ✓ —— 与常量的说明一致 ✓）：
+    #     老写法用的是 `0.5*(w+h)`（**长短边平均** ✗）⇒ 一条 63×27 的长条能靠平均分混过去 ✗。
+    #   ⚠⚠ 现场铁证（`data/dot_probe/now_panel.png` ✓ 1164 宽 ✓）：青族里只有一个 **3×5**
+    #     的碎块（真点在 (1135,480) ✓）⇒ 老写法：均值 4 < 9.3 ⇒ 被挡 ⇒ **但它是唯一那个** ⇒
+    #     兜底原样放行 ✗ ⇒ `ok=True` 锁住它（离真点 523px ✗）⇒ 就是用户看到的"**还在锁**" ✓。
+    try:
+        # ⚠ **跟着面板尺寸走**（2026-10-13 ✓ 见上面 `DOT_SIDE_HARD_ABS_MIN` 那段现场 ✓）：
+        #   死值会卡死小面板（129 宽那块真点只有 3px ✓ 被 4px 挡死 ⇒ 一直"没定上位"⇒ 发呆 ✗）。
+        _abs = max(float(DOT_SIDE_HARD_ABS_MIN),
+                   min(float(DOT_SIDE_HARD_ABS_MAX),
+                       float(DOT_SIDE_HARD_ABS_REL) * _pw))
+    except (TypeError, ValueError):
+        _abs = float(DOT_SIDE_HARD_ABS_MIN)
+    try:
+        _rel = max(_abs, float(DOT_PLAYER_SIDE_HARD_REL) * _pw)
+    except (TypeError, ValueError):
+        _rel = _abs
+    _ok = [c for c in out if min(float(c["w"]), float(c["h"])) >= _abs]
+    _big = [c for c in _ok if min(float(c["w"]), float(c["h"])) >= _rel]
+    return (_big or _ok), dense
 
 
 def roi_around(center, shape, pad):
@@ -2777,19 +3062,22 @@ DIFF_FLOOR_WARN = 30.0
 #: ⚠ 归一化 ⇒ 没有绝对含义 ⇒ **必须配合上面那条 `DIFF_FLOOR_WARN` 的对比度闸**一起用 ✓
 #:   （不然整幅噪声也会被归一放大成"亮点"✗）。
 DOT_DIFF_THR = 128
-#: ⭐ **差分层"有没有东西"的最低绝对对比度**（灰阶；用户 2026-10-06 ✓）：
-#: `raw_peak − floor ≥ 它` 才算"**比背景明显**" ✓。
+#: ⭐ **差分层"有没有东西"的最低对比度**（灰阶；用户 2026-10-06 ✓）：
+#: `peak ≥ 它`（**`peak` = 局部对比度** ✓ 2026-10-12 口径 ✓）才算"**比周围明显**" ✓。
 #: ⚠ **不是** `DIFF_FLOOR_WARN`(30) —— 那 30 是"整幅不同源"的提示线 ✓（现在**只提示、不拦** ✓
 #:   见 `dot_candidates_diff` 里那段 ✓）；当**门槛**它会挡住好东西 ✗：界面那张黑底差分图是
 #:   **归一化**过的（峰值 ⇒ 255 ✓）⇒ 看着很跳 ✓，可**绝对**对比度常常不到 30 ✗
 #:   （实测图 `110040000`：拆掉闸①后仍被这条挡住 ⇒ 一直落回颜色层 ✓）。
-#: 8 = "**确实比背景亮了一截**"（纯噪声的差只有 0~3 灰阶 ✓ ⇒ 仍然 `ok=False` ✓）。
+#: ⚠⚠ **2026-10-12 起不再是 `raw_peak − floor`** ✗：差分改成**逐块局部背景**之后，`peak`
+#:   本身就是"比周围多出来多少"✓ ⇒ 直接比 ✓（老的 `峰值 − 整幅中位` 是两个量纲混着算 ✗
+#:   见 `dot_candidates_diff` 闸②那段 ✓）。
+#: 8 = "**确实比周围亮了一截**"（纯噪声的残差只有 0~3 灰阶 ✓ ⇒ 仍然 `ok=False` ✓）。
 #: 真正把关的是另外三条：`DOT_DIFF_THR`(128 ✓)、`_dot_candidates`(尺寸/方形度 ✓)、
 #: `_is_flood`(被淹 ✓) —— 用例 `t_dot_diff_layer` ③ 守着"带噪声、没亮点 ⇒ 不给候选" ✓。
 DOT_DIFF_MIN_CONTRAST = 8
 
 
-def dot_candidates_diff(panel, calib, terrain, ref_w=None, roi=None):
+def dot_candidates_diff(panel, calib, terrain, ref_w=None, roi=None, exp_side=None):
     """⭐ **差分层**的候选（用户 2026-10-06「下一步」✓）→ `(cands, dense, info)`。
 
     为什么要有它（只补**色族救不回来**的那种情况 ✓）：色族那两层（`color` / `basemap`）
@@ -2797,12 +3085,12 @@ def dot_candidates_diff(panel, calib, terrain, ref_w=None, roi=None):
     这一层**不看颜色** ✓ —— 面板 **减** 底图那一块（`diff_panel_vs_canvas` ✓，**一处实现** ✓）
     ⇒ 差出来的就是"**底图上没有的东西**"（玩家点 / 实时元素 ✓）。
 
-    ⚠⚠ **两道闸（缺一不可）**：
-      · **对比度**：`raw_peak − floor < DIFF_FLOOR_WARN` ⇒ 这图上没有比背景明显的东西
+    ⚠⚠ **两道闸**（2026-10-12 起口径见下 ✓）：
+      · **对比度**：`peak < DOT_DIFF_MIN_CONTRAST` ⇒ 这图上没有"**比周围明显**"的块
         ⇒ **不给候选** ✓（否则归一化会把噪声放大成"亮点"✗）；
-      · **不同源**：`floor ≥ DIFF_FLOOR_WARN` ⇒ **不给候选** ✓（整幅都在差 ⇒ 差分在这儿
-        不是"看内容"，是"看两张图不一样"✗ —— 界面那边同一根线会染橙色并说清 ✓）。
-    判据都是**现成的那条线**、不新造数 ✓。
+      · **不同源**：`floor ≥ DIFF_FLOOR_WARN` ⇒ **只留一句提示、不拦** ✗（用户 2026-10-06 ✓
+        "黑底 + 黄/红/橙点的地图很适合拿来识别坐标"✓；2026-10-12 起差分还改成**逐块局部
+        背景** ✓ ⇒ 均匀/成片的偏色在归一化那步就没了 ✓ 真正把关的是**局部残差**✓）。
 
     ⚠ 它**只是候选生成器** ✗：真假由下游定 —— 尺寸/方形度/跨帧跟踪（`PlayerDotTracker` ✓）、
       以及"离上一帧最近" ✓。**别在这儿选一个当结论** ✗（同 `_dot_candidates` 的取舍 ✓）。
@@ -2814,7 +3102,9 @@ def dot_candidates_diff(panel, calib, terrain, ref_w=None, roi=None):
         return [], 0, dict(di, ok=False,
                            why="差分算不出来（%s）" % (di.get("why") or "?"))
     floor = float(di.get("floor") or 0.0)
-    peak = float(di.get("raw_peak") or 0.0)
+    # ⚠ **`peak` 取的是"局部对比度"**（`di["peak"]` ✓ = 比周围多出来多少 ✓）——
+    #   **不是** `raw_peak`（整幅最大 ✗ 见下面闸②那段说明 ✓）。
+    peak = float(di.get("peak") or 0.0)
     # ⭐⭐ **"不同源"不再一票否决**（用户 2026-10-06 ✓ 原话："**黑底 + 黄/红/橙点 的地图很适合
     #   拿来识别坐标**"✓）—— 原来这一条一响就**整层拒掉** ✗（理由："整幅都在差 ⇒ 差分不是
     #   在'看内容'"✓）；可我们要的是"**多出来的那个亮团**" ✓ —— **整幅底色偏**（底图素材与
@@ -2823,24 +3113,34 @@ def dot_candidates_diff(panel, calib, terrain, ref_w=None, roi=None):
     #   ⇒ 降级成**一句提示**（进 `info` / 日志 ✓，人看得到"这张图整幅偏"✓，但**不拦** ✗）；
     #     真正把关的是下面那条**对比度**闸 ✓ 与"被淹"（`_is_flood` ✓）——
     #     极端情形（整幅噪声）会表现成 **候选一大片** ⇒ 被淹那条自然会挡 ✓（不靠这一条 ✓）。
+    #   ⭐ 2026-10-12 起**"整幅偏"连提示都不用那么重了** ✓：差分已经改成**逐块局部背景**
+    #     （见 `DIFF_LOCAL_PX` ✓）⇒ 均匀/成片的亮度差在归一化那一步就没了 ✓ —— 所以那句
+    #     提示改成拿 **`res_med`（局部归一之后的残差中位）** 来说话 ✓（真不同源时才拦得上话 ✓）。
     why_flat = ""
-    if floor >= DIFF_FLOOR_WARN:
-        why_flat = ("整幅偏（背景档 %g ≥ %g：底图与游戏小地图不同源）—— "
-                    "但「亮团比背景明显」仍采信" % (floor, DIFF_FLOOR_WARN))
-    # ⭐⭐ **闸②（对比度）也从"绝对 30"降下来**（用户 2026-10-06 ✓ 同上："黑底 + 黄/红/橙点的
-    #   地图很适合拿来识别坐标"✓）。为什么原来那 30 会挡住好东西 ✗：界面那张黑底图**归一化**
-    #   过（"峰值 ⇒ 255"✓ 见 `diff_panel_vs_canvas` 的 `vis` 说明 ✓）⇒ 看着**很跳** ✓，
-    #   可**绝对**对比度（`raw_peak − floor`）往往**不到 30** ✗（实测这张图：闸①拆掉后
-    #   仍被这一条挡住 ⇒ 一直落回颜色层 ✓）。
-    #   ⇒ 门槛降到 **`DOT_DIFF_MIN_CONTRAST`(8)** ✓：只挡"**几乎没差别**"（纯噪声：差分
-    #     全 0 或 ±两三灰阶 ✓ ⇒ 仍是 `ok=False` ✓ 不动那条纪律 ✓）；
-    #     真正把关交给**已有的三条** ✓：`DOT_DIFF_THR`(128，归一后峰值一半 ✓)、
-    #     `_dot_candidates`（尺寸/方形度 ✓）、`_is_flood`（成片一大片 ⇒ 被淹 ✓）。
+    _res_med = float(di.get("res_med") or 0.0)
+    if _res_med >= DIFF_FLOOR_WARN:
+        why_flat = ("连局部归一后残差还有 %g ≥ %g（底图与游戏小地图**真的**不同源）—— "
+                    "但「亮团比周围明显」仍采信" % (_res_med, DIFF_FLOOR_WARN))
+    elif floor >= DIFF_FLOOR_WARN:
+        why_flat = ("整幅偏 %g 灰阶（底图与游戏小地图底色/透明不同）—— **已按局部背景扣掉** ✓"
+                    "（残差只剩 %g）" % (floor, _res_med))
+    # ⭐⭐ **闸②（对比度）**：门槛是 `DOT_DIFF_MIN_CONTRAST`(8) ✓。
+    #   为什么原来那 30 会挡住好东西 ✗：界面那张黑底图**归一化**过（"峰值 ⇒ 255"✓ 见
+    #   `diff_panel_vs_canvas` 的 `vis` 说明 ✓）⇒ 看着**很跳** ✓，可**绝对**对比度
+    #   （`raw_peak − floor`）往往**不到 30** ✗（实测图 `110040000`：闸①拆掉后仍被挡住 ✓）。
+    #   ⚠⚠ **2026-10-12 起 `peak` 已经是「局部对比度」**（差分减的是逐块局部背景 ✓ 见
+    #     `DIFF_LOCAL_PX` ✓）⇒ 直接拿 `peak` 比 ✓ —— 老写法 `peak − floor`（局部峰值 −
+    #     **整幅**中位 ✗）在换口径之后是**两个量纲混着算** ✗（整幅偏 60 的那张图上，一个
+    #     只比周围亮 10 的假亮块会算出 10 − 60 < 0 ✗ 反而"过不了"；而真点也说不清 ✓）。
+    #   于是：**门槛语义变成"比周围亮了多少"** ✓（正是这个量该管的事 ✓）——
+    #   纯噪声（差分全 0 或 ±两三灰阶 ✓）⇒ `peak` 也就两三 ⇒ 仍然 `ok=False` ✓ 不动纪律 ✓。
+    #   真正把关的另外三条照旧 ✓：`DOT_DIFF_THR`(128，归一后 ✓)、`_dot_candidates`（尺寸/方形度 ✓）、
+    #   `_is_flood`（成片一大片 ⇒ 被淹 ✓）。
     #   ⚠ 用例 `t_dot_diff_layer` ③（**带噪声、没有亮点 ⇒ 不许给候选** ✓）就是这条的守门员 ✓。
-    if peak - floor < DOT_DIFF_MIN_CONTRAST:
+    if peak < DOT_DIFF_MIN_CONTRAST:
         return [], 0, dict(di, ok=False,
-                           why="没有比背景明显的块（最亮才比背景高 %g 灰阶 < %g%s）"
-                               % (peak - floor, DOT_DIFF_MIN_CONTRAST,
+                           why="没有比周围明显突出的块（最突出的才比周围高 %g 灰阶 < %g%s）"
+                               % (peak, DOT_DIFF_MIN_CONTRAST,
                                   "；且" + why_flat if why_flat else ""))
     # ⭐⭐ **别再来一次 `vis.max(axis=2)`**（用户 2026-10-06 ✓ 帧率现场：`_amax` 占 **9.4%** ✗）：
     #   `vis` 是 `cvtColor(gv, GRAY2BGR)` 出来的 ✓ ⇒ **三个通道完全相等** ⇒ `max` 等于
@@ -2875,7 +3175,7 @@ def dot_candidates_diff(panel, calib, terrain, ref_w=None, roi=None):
             m = (m & (_aw > 0).astype(np.uint8)).astype(np.uint8)
         except Exception:                   # noqa: BLE001 —— 算不出来就当没有 alpha ✓
             pass
-    cands, dense = _dot_candidates(m, ref_w or panel.shape[1])
+    cands, dense = _dot_candidates(m, ref_w or panel.shape[1], exp_side)
     return cands, dense, dict(di, ok=True, flat=why_flat)
 
 
@@ -2984,7 +3284,7 @@ def _prefer_on_foothold(cands, calib, terrain, panel):
 
 
 def find_player_dot(panel, calib=None, terrain=None, roi=None, near=None,
-                    ref_w=None):
+                    ref_w=None, exp_side=None):
     """面板里找玩家标记 → 结论 dict（**认不出也是结论，不要硬凑**）。
 
     搜索顺序 = **黄族 → 青族**（⚠ **每族先「底图相减层」、再「颜色层」** —— 用户 2026-10-06：
@@ -3083,7 +3383,8 @@ def find_player_dot(panel, calib=None, terrain=None, roi=None, near=None,
             and getattr(terrain, "canvas", None) is not None:
         _diff_first_tried = True
         _dc, _dd, _di = dot_candidates_diff(panel, calib, terrain,
-                                            ref_w=ref_w, roi=used_roi)
+                                            ref_w=ref_w, roi=used_roi,
+                                            exp_side=exp_side)
         # ⭐⭐⭐ **把"最亮那一点落在谁身上"那个候选排到最前**（用户 2026-10-06 ✓ 现场实锤 ✓）——
         #   用户原话："**为什么还要担心被沙吞掉？从黑色背景里找黄点应该都没有沙了**"✓
         #   —— 完全对 ✓：差分图（面板 − 底图）**已经是黑底 + 亮团** ✓，沙被减掉了 ✓。
@@ -3157,7 +3458,7 @@ def find_player_dot(panel, calib=None, terrain=None, roi=None, near=None,
             # `ref_w`：**给裁剪图用**。像点的边长上限是按面板宽度定的，而局部
             # 搜索传进来的是一小块（37×37）—— 按那块的宽度算，上限只剩 6px，
             # 28×24 的玩家点会被尺寸筛选直接挡掉（实测就是这么"局部搜索没生效"的）。
-            cands, dense = _dot_candidates(m, ref_w or panel.shape[1])
+            cands, dense = _dot_candidates(m, ref_w or panel.shape[1], exp_side)
             # ⭐⭐ **再剔一道"落在底图自己的标记色上"的假候选**（用户 2026-10-06 ✓ 见
             #   `_drop_on_canvas_marks` 里那段实测：颜色层 15 个候选**全坐在底图黄色上** ✗）。
             #   ⚠⚠ **这一道对"跟踪态"同样生效** ✓ —— 跟踪态走的是小范围局部搜 ✓，上面那条
@@ -3216,7 +3517,8 @@ def find_player_dot(panel, calib=None, terrain=None, roi=None, near=None,
             and terrain is not None \
             and getattr(terrain, "canvas", None) is not None:
         dcands, ddense, dinfo = dot_candidates_diff(panel, calib, terrain,
-                                                    ref_w=ref_w, roi=used_roi)
+                                                    ref_w=ref_w, roi=used_roi,
+                                                    exp_side=exp_side)
         dflood = _is_flood(len(dcands), ddense, area_search)
         if dcands and (not dflood or near is not None):
             hit = {"family": "diff", "layer": "diff", "mask_px": 0,
@@ -3282,22 +3584,62 @@ def find_player_dot(panel, calib=None, terrain=None, roi=None, near=None,
     #     队友头上那个**小黄标记**只要离得近，就能把**大黄点**（真玩家标记）顶掉 ✓；
     #     两块分数接近时还会**来回翻** ⇒ 读数乱飘 ✓（这就是"乱飘"的来源 ✓）。
     _pw = float(ref_w or panel.shape[1])
-    _exp = max(4.0, float(DOT_PLAYER_SIDE_REL) * _pw)
+    # ⭐⭐ 期望边长：**自标定优先**（`exp_side` ✓ 见 `DOT_PLAYER_SIDE_REL` 那张量测表 ✓）
+    try:
+        _es = float(exp_side) if exp_side is not None else 0.0
+    except (TypeError, ValueError):
+        _es = 0.0
+    _exp = _es if _es >= 2.0 else max(4.0, float(DOT_PLAYER_SIDE_REL) * _pw)
     if near is not None:
         def _score(t):
-            """像不像玩家点（越大越好 ✓）− 距离惩罚；**还贴着上一拍那个点**再加滞后分 ✓。"""
-            _like = dot_player_like(t, _pw)
+            """像不像玩家点（越大越好 ✓）− **很小的**距离权重；还贴着上一拍那个点 ⇒ 再加滞后分 ✓。
+
+            ⚠⚠ 2026-10-11 两处改动（见 `DOT_REACH_REL` / `DOT_LIKE_MIN` 的说明 ✓）：
+              · **距离从"线性重罚"改成"闸 + 很小的权重"** ✗：旧口径罚分最高 0.7，而实测
+                `like` 之间的差距常在 0.05~0.2 ⇒ 实际上是"谁近谁赢" ✗（乱飘 / 锁错的来源 ✓）；
+              · **滞后分要"像个玩家点"才给** ✗：原来只要离上一拍近就 +0.12 ⇒ 锁在一个
+                形状完全不像的东西上以后，它**永远拿这份保护** ✓。
+            """
+            _like = dot_player_like(t, _pw, exp_side)
             _dist = ((t["x"] - near[0]) ** 2 + (t["y"] - near[1]) ** 2) ** 0.5
-            # 距离惩罚按"预期点尺寸"归一 ⇒ 面板大、点大时允许的偏移也大 ✓
-            _s = _like - 0.35 * min(2.0, _dist / max(2.0, 3.0 * _exp))
-            if _dist <= max(_exp, 3.0):
-                _s += DOT_LOCK_MARGIN        # ⭐ 还是"现在锁着的那个" ⇒ 滞后 ✓ 不轻易换 ✓
+            _reach = max(6.0, float(DOT_REACH_REL) * _exp)
+            if _dist > _reach:
+                _s = _like - 0.7            # 超出"可达半径" ⇒ **一律垫底** ✓（人走不了那么远 ✓）
+            else:
+                _s = _like - float(DOT_DIST_W) * (_dist / _reach)
+            if _dist <= max(_exp, 3.0) and _like >= DOT_LIKE_MIN:
+                _s += DOT_LOCK_MARGIN        # ⭐ 还是"现在锁着的那个" **且它像个点** ⇒ 滞后 ✓
             return _s
         c = max(cands, key=_score)
     else:
         # 没有上一帧（首帧 / 重捕后）⇒ 取"**最像玩家点**"的那个 ✓
         #   （`_dot_candidates` 已按它排过序 ✓；差分层那份在这里现算一遍 ⇒ 口径一处 ✓）
-        c = max(cands, key=lambda t: (dot_player_like(t, _pw), t.get("area") or 0))
+        c = max(cands, key=lambda t: (dot_player_like(t, _pw, exp_side),
+                                      t.get("area") or 0))
+    # ⭐⭐⭐⭐ **出口再验一次颜色**（用户 2026-10-17 ✓ 原话：「**实测黄点识别十分不准会把红点、
+    #   地图背景完全跟黄点不像的认成黄点**」✗）
+    #   ⛔ 病根：**差分层 / 底图层不看颜色** ✓（它们认的是"底图上没有的东西" / "和底图对不上" ✓）
+    #      ⇒ 红点、绿点、队友标记、甚至一块背景，只要"和底图不一样"就都能当候选 ✗；
+    #      而上面那道 `_blob_looks_core` 是**整批筛**（`if _core_ok: cands = _core_ok` ✓）——
+    #      **一个都没过时它就不筛** ✗ ⇒ 红点原样过关 ✓（正是用户看到的那件事 ✓）。
+    #   ⇒ 现在：**只要结论来自"不看颜色的层"**（`diff` / `basemap` ✓），最后选中的这个点
+    #     **必须自己过得了"玩家点核心色"** ✓，过不了就**如实说认不出** ✓
+    #     （本文件的老规矩：宁可认不出，也别给假的 ✓ —— 假坐标会被 `segment_of` 拿去择路 ✓）。
+    #   ⚠ 零回归：颜色层（`yellow` 族 ✓）**不拦** ✗ —— 它就是按黄色卡出来的 ✓；
+    #     核心色层（`core` ✓）本来就过了核心色 ✓；真点（BGR≈(108,255,255) ✓）照旧过 ✓；
+    #     合成用例里那些**黄色**测试点也照旧过 ✓（不是黄色的小方块会**当场变红** ✓ 见用例 ✓）。
+    if hit.get("layer") in ("diff", "basemap") or hit.get("family") in ("diff", "core"):
+        try:
+            _ok_y = _blob_looks_core(panel, dot_mask(panel, "yellow"), c)
+        except Exception:                      # noqa: BLE001 —— 算不出就**不拦** ✓（零回归 ✓）
+            _ok_y = True
+        if not _ok_y:
+            return dict(base, ok=False, flood=True, reason=(
+                "候选 (%.0f,%.0f) 块 %dx%d **颜色不像玩家标记**（%s 不看颜色 ⇒ 可能是红点/"
+                "背景 ✓）⇒ 宁可不认 ✓"
+                % (c["x"], c["y"], int(c["w"]), int(c["h"]),
+                   "差分层" if hit.get("layer") == "diff" else
+                   ("底图层" if hit.get("layer") == "basemap" else "核心色层"))))
     cx, cy = int(round(c["x"])), int(round(c["y"]))
     patch = panel[max(0, cy - 3):cy + 4, max(0, cx - 3):cx + 4]
     # 颜色取**这个族判据命中的那些像素**的中位 —— 直接取补丁中位会被周围压暗，
@@ -3427,6 +3769,16 @@ class PlayerDotTracker:
         self._shifted = 0.0        # 幽灵外推累计走了多远
         self._last_seen = 0.0
         self._last = None          # 上一次成功的完整结论（补位时原样复用）
+        #: ⭐⭐ **自标定的"期望边长"尺子**（2026-10-11 ✓ 见 `DOT_PLAYER_SIDE_REL` 那张量测表 ✓）：
+        #:   窗口里放"**最近锁定成功**那些点的短边"，取**中位数**当尺子 ✓。
+        #:   为什么必须自标定：那条"短边 = 面板宽 × 3.2%"**跨来源不成立** ✗（1164 宽那块真点
+        #:   只有 **2.15%** ⇒ 真点被判成"偏小" ⇒ like 掉到 **0.25** ⇒ 跟杂块同档 ⇒ 谁近谁赢 ✗
+        #:   —— 用户报的"经常认错"就是它 ✓）。
+        #:   ⚠ 样本不够（`DOT_EXP_MIN_SAMPLES` ✓）⇒ 退回比例兜底 ✓（不猜 ✓ 老行为 ✓）；
+        #:   ⚠ 用**中位数**（抗单帧怪块 ✓）；⚠ 硬尺寸闸已经把"几像素的东西"挡在候选外 ✓
+        #:     ⇒ 尺子学不到那种尺寸 ✓（不会被锁错的那个带跑偏 ✓）。
+        self._exp_hist = []
+        self._exp_side = None
 
     def force_reacquire(self, why=""):
         """⭐ **丢掉"锁定的那个点"，下一拍做全画面重捕**（用户 2026-10-06 ✓ 原话："**那就是位置
@@ -3477,7 +3829,25 @@ class PlayerDotTracker:
 
         if self.x is not None:
             d = ((r["x"] - self.x) ** 2 + (r["y"] - self.y) ** 2) ** 0.5
+            # ⭐⭐⭐ **真传送 vs 噪声**（用户 2026-10-17 ✓「根本没有防抖…超远 2 个地方跳变认黄点」✗
+            #   ＋ 老用例「跳变丢弃后要能重捕，人真传过去就永远追不上了」✓ 两条都要满足 ✓）：
+            #   · **同一个远处候选连着两拍** ⇒ 那是**真传送** ✓ ⇒ 接受（否则人传过去永远追不上 ✗）；
+            #   · **两个远点交替**（A→B→A→B）⇒ `_jump_rej` 每拍都被"回到原点"那拍清掉 ✓
+            #     ⇒ 永远凑不成"连着两拍" ✓ ⇒ **一直拒绝** ✓（这才是用户要的防抖 ✓）。
+            #   ⚠ 这就是"不许清锁位"之外的另一半 ✓：只留位置还不够，还得让真传送有出路 ✓。
+            _same_jump = False
             if self.max_jump > 0 and d > self.max_jump:
+                _jtol = max(6.0, float(self.max_jump) * 0.5)
+                _rp = self.__dict__.get("_jump_rej")
+                if (_rp is not None
+                        and abs(r["x"] - _rp[0]) <= _jtol
+                        and abs(r["y"] - _rp[1]) <= _jtol):
+                    _same_jump = True
+                    self._jump_n = 0
+                    self._jump_rej = None
+                else:
+                    self._jump_rej = (r["x"], r["y"])
+            if self.max_jump > 0 and d > self.max_jump and not _same_jump:
                 # ⭐⭐ **先数一数"连着被丢了几次"**（用户 2026-10-06 ✓ 见 `DOT_JUMP_GIVEUP_N`
                 #   上面那段现场 ✓）：**跳过阈值这么多次 ⇒ 承认旧锁已失效** ✓，不再丢，
                 #   **往下走**（= 直接接受这个新候选 ✓，等价于"承认这是传送"✓）。
@@ -3495,14 +3865,24 @@ class PlayerDotTracker:
                     self._jump_n = int(self.__dict__.get("_jump_n", 0)) + 1
                 self._jump_last = _now_j
                 if self._jump_n < DOT_JUMP_GIVEUP_N:
-                    self.x = self.y = None
+                    # ⛔⛔ **不许把锁清掉** ✗（2026-10-17 ✓ 用户原话：
+                    #   「**根本就没有防抖（路线识别页签→跳变上限）**，会再超远的 2 个地方跳变
+                    #   认黄点**」✗）。病根就是这个 `self.x = self.y = None`：
+                    #   清掉之后下一拍 `self.x is None` ⇒ **跳变判据整段不执行** ✗
+                    #   （它挂在 `if self.x is not None:` 里面 ✓）⇒ 下一拍"全画面搜"直接
+                    #   **无条件接受**远处那个候选 ✓ ⇒ 再下一拍又跳回来 ✓ ⇒
+                    #   在两个远点之间**来回认**（画面上就是"跳变上限根本没生效"✓
+                    #   —— 其实它每拍都在丢，只是丢完立刻又无条件接了一个 ✓）。
+                    #   ⇒ 现在：**位置留着** ✓（`_search` 仍以它为 `near` 附近搜 ✓），
+                    #     只把"这一拍没有可信读数"如实报出去 ✓；连续 `DOT_JUMP_GIVEUP_N`
+                    #     次仍不过来 ⇒ 下面那条 `force_reacquire`（整幅重捕 ✓ 传送照旧认 ✓）。
                     self.hits = 0
                     self.missed = 0
                     self._last = None
                     return dict(r, ok=False, hits=0, confirmed=False, held=False,
                                 missed=0, reason=(
                                     "候选位置跳变 %.0f px（阈值 %.0f）—— 当噪声丢弃，"
-                                    "下一拍重捕（第 %d 次）"
+                                    "**锁仍留在原位**、下一拍继续在附近找（第 %d 次）"
                                     % (d, self.max_jump, self._jump_n)))
                 # ⭐⭐⭐ 到这儿 = 连着 `DOT_JUMP_GIVEUP_N` 次都"跳变" ⇒ **旧锁是假的** ✓
                 #   ⇒ **丢掉它、要求下一拍"全画面重捕"** ✓（`force_reacquire` ✓）——
@@ -3519,6 +3899,9 @@ class PlayerDotTracker:
                             reason=("连续 %d 次「候选位置跳变」⇒ 承认旧锁已失效 ⇒ "
                                     "**丢掉锁定、下一拍全画面重捕** ✓" % DOT_JUMP_GIVEUP_N))
 
+        # ⚠ 接受了一个"**贴着锁**"的候选 ⇒ 把"上一个被拒的远点"忘掉 ✓
+        #   （否则 A→B→A→B 交替时，第二次 B 会被当成"连着两拍"⇒ 误判成真传送 ✗）
+        self._jump_rej = None
         # 速度：够算"漏检期间大概往哪边走"就行，平滑一下免得被单拍抖动带偏
         if self.x is not None:
             self._vx = 0.5 * self._vx + 0.5 * (r["x"] - self.x)
@@ -3551,6 +3934,18 @@ class PlayerDotTracker:
         self._shifted = 0.0
         self._last_seen = now
         self._last = dict(r)
+        # ⭐⭐ **喂一把尺子**（2026-10-11 ✓ 见 `_exp_hist` 那段 ✓）：只有**真检出**才算
+        #   （幽灵是外推的 ✗ 拿它量尺寸会把尺子带歪 ✓）；中位数 ⇒ 抗单帧怪块 ✓。
+        try:
+            _side = 0.5 * (float(r.get("w") or 0.0) + float(r.get("h") or 0.0))
+            if _side >= 2.0:
+                self._exp_hist.append(_side)
+                if len(self._exp_hist) > DOT_EXP_HISTORY:
+                    del self._exp_hist[:-DOT_EXP_HISTORY]
+                if len(self._exp_hist) >= DOT_EXP_MIN_SAMPLES:
+                    self._exp_side = float(np.median(self._exp_hist))
+        except (TypeError, ValueError):
+            pass
         return dict(r, hits=self.hits, held=False, missed=0,
                     confirmed=self.hits >= DOT_CONFIRM_FRAMES)
 
@@ -3601,7 +3996,8 @@ class PlayerDotTracker:
                 # 这一小块里没有 / 找到的不像玩家点 ⇒ 退回全画面 ✓
                 # （可能真换了地方 / 标定变了 / **旧锁本身就是个假点** ✓）
         self.last_roi = roi
-        return find_player_dot(panel, calib, terrain, roi=roi)
+        return find_player_dot(panel, calib, terrain, roi=roi,
+                               exp_side=self._exp_side)
 
     def _drift(self):
         """漏检时按（衰减的）速度往前推一点，总位移有上限（同 MobTracker._drift）。"""
@@ -3653,6 +4049,11 @@ class PlayerLocator:
         #: 挂在 locator 上（**有状态**：跨帧记"上一拍滚了多少"给附近找定余量 ✓），
         #: 与 locator 同寿命；`load()`（换图）时清掉 ✓。
         self._view_track = CropViewTracker()
+        #: ⭐⭐ **定位保底**（2026-10-13 ✓ 见 `PLAYER_FB_EMA_ALPHA` 那段 ✓）：
+        #: `None` = **这张图上还没定过位** ⇒ 认不出时照旧如实说找不到 ✓（不猜 ✓）；
+        #: 定过之后就变成一份 `{world_x, world_y, segment_id, foothold_id, at}` ✓
+        #: （`at` = **上一次真定位**的时刻 ✓ 算"沿用多少秒"用 ✓ 喂 EMA 只喂真检出 ✓）。
+        self._fb = None
         self._new_tracker()
         self.load(map_id)
 
@@ -3687,6 +4088,9 @@ class PlayerLocator:
         # 换图 → 位置不连续，别拿上一张图的点去跟踪（跳变判据会乱丢）。
         # ⚠ 重建时把界面调的跟踪参数带上（见 self.track）。
         self._new_tracker()
+        # ⭐ **保底也跟着换图清掉**（2026-10-13 ✓）：上一张图的世界坐标在另一张图上
+        #   毫无意义 ✗ ⇒ 清掉之后新图上"没定过位"照旧如实说找不到 ✓（不猜 ✓）。
+        self._fb = None
         self._calib_cache = {}
         # 换图 ⇒ "现在显示的是底图哪一块"整个换了一套（底图都不一样）⇒ 忘掉跟过的位置 ✓
         self._view_track.reset()
@@ -3852,20 +4256,38 @@ class PlayerLocator:
             out["panel_mismatch"] = True
             out["note"] = _pm_why
             out["short"] = "标定对不上这块面板 ⇒ 已拒用（请重标定）"
-            return out
+            return self._fallback(out, "标定与面板对不上")
         if not r["ok"]:
+            # ⭐⭐ **认不出黄点 ⇒ 走保底**（2026-10-13 ✓ 用户："定位后，不准找不到"✓）：
+            #   这就是"石人寺院III 发呆"那条链的**出口** ✓（原来这里直接 return ⇒
+            #   `world_x=None` ⇒ 界面说"没定上位" ⇒ Agent 判未定位 ⇒ 发呆 ✓）。
+            #   ⚠ 原因**照旧写进 note** ✓（保底没生效时它就是那句"认不出"✓；生效时保底会
+            #     把它拼进自己的句子 ✓）—— 我第一版把这行**覆盖掉**了 ✗，用例当场抓住 ✓。
             out["note"] = r["reason"]
-            return out
+            return self._fallback(out, r["reason"])
         if terrain is None:
             out["note"] = "没有这张图的地形/底图（先「生成地形图」）"
             out["short"] = "没有地形数据"
-            return out
+            return self._fallback(out, "没有这张图的地形/底图")
         if not has_geometry(calib or {}):
+            # ⭐⭐ **先在"这条来源"上自动补一次**（用户 2026-10-11 ✓ 原话："**为什么要我补标定？
+            #   标定的数据不是都存好了？**"✓）：标定是**按来源分开存**的 ✓（同一张图两条来源的
+            #   面板实测差 5.6 倍 ⇒ 不能互换 ✗），而"自动量一遍"这条路是通的 ✓
+            #   （`locate_fit` 实测 0.9388 ✓）⇒ 缺哪条补哪条 ✓，**不用人动手** ✓。
+            _af = try_autofit(panel, getattr(terrain, "canvas", None), self.map_id, src,
+                              seed=calib)
+            self.autofit = _af                     # 给界面/日志看（"自动试过/补上了" ✓）
+            if _af.get("ok") and not _af.get("already"):
+                self.forget_calib()                # 缓存里那份是"没有" ⇒ 立刻重读 ✓
+                calib = self.calib_for(src)
+        if not has_geometry(calib or {}):
+            _af_why = str((getattr(self, "autofit", None) or {}).get("why") or "")
             out["note"] = ("还没量过这张图的「面板 → 底图」换算"
-                           "（来源「%s」下点「标定…」）"
-                           % SRC_LABEL.get(src, src))
+                           "（来源「%s」下点「标定…」）%s"
+                           % (SRC_LABEL.get(src, src),
+                              ("；自动补标定：" + _af_why) if _af_why else ""))
             out["short"] = "还没标定"
-            return out
+            return self._fallback(out, "这条来源还没标定")
 
         # ⚠ **取黄点的下沿（脚底），不是重心**（2026-09-27 改，见 `dot_feet`）：
         #   双点标定采样时填的就是下沿 ⇒ 两边不同口径的话，站回同一个地方读数却
@@ -3887,7 +4309,7 @@ class PlayerLocator:
             out["note"] = ("算出来在底图范围外 (%.0f, %.0f) —— 标定或底图不对？"
                            % (wx, wy))
             out["short"] = "算到图外了"
-            return out
+            return self._fallback(out, "算到图外了")
         seg = terrain.segment_of(wx, wy, xtol=_xt)
         out["segment_id"] = seg.index if seg is not None else None
         # 脚下**那条** foothold 的 id（字符串，和 zones 文件里的写法一致）。
@@ -3920,6 +4342,56 @@ class PlayerLocator:
             out["note"] = (out["note"] + "；" if out["note"] else "") + _crop_note
             if not out["short"]:
                 out["short"] = "局部小地图没跟住"
+        # ⭐⭐ **真定位 ⇒ 喂保底一把**（2026-10-13 ✓ 见 `PLAYER_FB_EMA_ALPHA` ✓）：
+        #   ⚠ **只喂真检出**（`held` 那几拍不喂 ✗）—— 否则保底值会被它自己的旧值反复平均
+        #     ⇒ 越拖越钝 ✓（"沿用值当观测"是这一层的经典自欺 ✓）。
+        if not out["held"]:
+            self._remember_pos(float(wx), float(wy), out)
+        return out
+
+    def _remember_pos(self, wx, wy, out):
+        """把这一拍的**真定位**喂给保底（EMA ✓ + 带上段号/foothold ✓）。
+
+        EMA 只在"已经有上一份"时才平均 ✓（首帧直接落值 ✓ 不带偏 ✓）。
+        ⚠ 段号 / foothold 取**这一拍**的（它们本来就是"够用就行"的粗粒度 ✓：人是走过去的，
+          不会瞬移 ✓ 而**坐标**才是要紧的那个 ✓）。
+        """
+        a = float(PLAYER_FB_EMA_ALPHA)
+        if self._fb is not None and self._fb.get("world_x") is not None:
+            wx = a * wx + (1.0 - a) * float(self._fb["world_x"])
+            wy = a * wy + (1.0 - a) * float(self._fb["world_y"])
+        self._fb = {"world_x": wx, "world_y": wy,
+                    "segment_id": out.get("segment_id"),
+                    "foothold_id": out.get("foothold_id"),
+                    "at": time.monotonic()}
+
+    def _fallback(self, out, why=""):
+        """**认不出黄点时的保底**：用"最后一次定位的 EMA 值"顶上（用户 2026-10-13 ✓）。
+
+        用户原话："**做保底：定位后，不准找不到，丢了就用上次EMA平滑的**"✓
+        （配套现场：小面板上认不出黄点 ⇒ 界面"这一拍还没定上位" ⇒ Agent 未定位 ⇒ **发呆**✗）。
+
+        ⚠ **从没定过位**（`self._fb is None` = 刚开 / 没标定 / 刚换图 ✓）⇒ **原样返回** ✓
+          —— 照旧如实说"找不到" ✓（保底的前提就是"**定位后**" ✓ 不猜 ✗）。
+        ⚠ 填的字段与真定位**一模一样**（`world_x/world_y/segment_id/foothold_id` ✓）⇒
+          下游（`apply_to_player` / `LAST_POS` / 决策层 ✓）**一个字都不用改** ✓；
+          多出来的只有如实标志：`held=True`（沿用 ✓）`stale=True`（保底值 ✓）
+          `stale_s`（多少秒前那次真定位 ✓）+ 说得清的 `note/short` ✓。
+        ⚠ `ok=True` 是**故意**的 ✓：口径同跟踪器自己的"幽灵帧"（`PlayerDotTracker` 沿用上一帧
+          也报 `ok=True` + `held=True` ✓ 见那边 ✓）—— "有可用位置"与"这一拍量出来的"是两件事 ✓。
+        """
+        fb = self._fb
+        if not fb:
+            return out
+        _age = max(0.0, time.monotonic() - float(fb.get("at") or 0.0))
+        out.update(ok=True, held=True, stale=True, stale_s=round(_age, 1),
+                   world_x=fb.get("world_x"), world_y=fb.get("world_y"),
+                   segment_id=fb.get("segment_id"),
+                   foothold_id=fb.get("foothold_id"))
+        out["note"] = ("认不出黄点 ⇒ 用上次定位的 EMA 保底（%.1f 秒前那次真定位；原因：%s）"
+                       % (_age, str(why or out.get("note") or "—")[:80]))
+        # 画面那行越短越好（见 `note/short` 的说明 ✓）：给一句带秒数的 ✓
+        out["short"] = "沿用上次定位(%.0fs)" % _age
         return out
 
 
@@ -4049,8 +4521,28 @@ def overlay_draw_rects(loc, panel_wh, canvas_wh):
 #: 不乘一下整幅就是灰蒙蒙一片、看不出哪儿不一样 ✓。
 DIFF_GAIN = 4.0
 
+#: ⭐⭐⭐ **「局部背景」的窗口边长**（奇数；像素；用户 2026-10-12 ✓）——
+#:   差分**先减掉"这一圈的平均"再放大**（而不是减整幅那一个中位数 ✓）。
+#: ⚠⚠ **为什么非改不可**（2026-10-12 现场：石人寺院Ⅳ 差分"处理很差"✓ 实测过）：
+#:   · 底图（`datasets/map/*.png`）是**不透明黑底**的小地图素材 ✓；
+#:   · 而游戏里那张小地图**半透明**（背后的游戏画面透出来 ✓）——
+#:     实测背景区（底图纯黑处）:面板灰度**中位 53 / 标准差 39.5 / 95% 位 182** ✗
+#:     ⇒ 同一个"背景"，两边差 60 灰阶，而且**随背后画面起伏** ✗；
+#:   · 原来减的是**整幅一个中位**（`floor` ✓）⇒ 只能消掉"均匀"的那一部分 ✓，
+#:     起伏（云影/地形透出来 ✓）与"地形边缘被放大 5.6 倍后对不上"✗ 全都留着
+#:     ⇒ 差分图到处碎白点、真正的玩家点被淹 ⇒ 用户看到的"处理很差"✓。
+#:   ⇒ 改成**逐块**：每个像素减掉**它周围 `k×k` 的均值**（`cv2.blur` ✓ O(1)）——
+#:     实测（2026-10-12 现场那帧）：残差中位 **67 → 5.1 灰阶**、地形区 95% 位
+#:     **86 → 46** ✓✓（背景档 `floor` **照旧如实报** ✓ 界面上那行还得让人看见
+#:     "这张图整幅有多偏"✓）。
+#: ⚠ 窗口**不能太大**（越大越接近老的"整幅口径"⇒ 大片亮度差又回来了）也**不能太小**
+#:   （逼近点本身的尺寸 ⇒ 会把点自己当成背景扣掉 ✗）：21 ≈ 面板里那个点（~8~12px ✓）
+#:   的两三倍 ✓。**换算不了绝对尺寸**（面板有大有小 ✓ 见 `frame_overlay_rects` 那段
+#:   "A 机推流带 zoom"✓）⇒ 取固定值，且带一条开关（`local=0` = 老口径 ✓ 零回归 ✓）。
+DIFF_LOCAL_PX = 21
 
-def diff_panel_vs_canvas(panel, canvas, calib, gain=None, color=False):
+
+def diff_panel_vs_canvas(panel, canvas, calib, gain=None, color=False, local=None):
     """面板图 **减** 底图上它盖住的那一块 ⇒ 差分图 `(vis, info)`（用户 2026-10-06 ✓）。
 
     ⭐ 「像素差分地图」那一路（路线识别 → 地形图 → **显示类型**）**唯一的算法**：
@@ -4058,21 +4550,30 @@ def diff_panel_vs_canvas(panel, canvas, calib, gain=None, color=False):
     "本该长得一样" ✓ ⇒ 差出来的就是**底图上没有的东西** —— 最典型的就是**玩家点**
     （黄点）以及其它实时元素 ✓（这正是用户 2026-10-06 问"是不是颜色相减"时想看的 ✓）。
 
-    ⚠⚠ **先减掉"背景那一档"再放大**（`floor` = 整幅差的中位）✗ 不许直接放大：
-      底图是**解码出来的地形画布**、和游戏里那张小地图**不一定同源**（底色 / 线条都
-      可能不一样 ✗）⇒ 直接放大常常整幅糊成白的、什么也看不出来 ✓；减掉中位之后，
-      "**比别人多差了那么一截**"的那一小块才会跳出来 ✓（那才是要看的东西 ✓）。
-      ⚠ 反过来也要如实：`floor` 很大 = **这张图上两者本来就不同源** ⇒ 差分在这里只
-        当"辅助看看"，别拿它当判据 ✓（`info` 里把数字都摆出来 ✓）。
+    ⚠⚠ **先减掉"背景"再放大** ✗ 不许直接放大：底图与游戏里那张小地图**常常不同源**
+      （底色 / 透明度 / 线条都不一样 ✗）⇒ 直接放大整幅糊成白的、什么也看不出来 ✓；
+      减掉背景之后，"**比周围多差了那么一截**"的那一小块才会跳出来 ✓（那才是要看的 ✓）。
+
+    ⭐⭐⭐ **背景是"逐块"的**（用户 2026-10-12 ✓ 现场：石人寺院Ⅳ 差分"处理很差"✓）：
+      · 老口径减的是**整幅一个中位**（`floor` ✓）⇒ 只能消掉**均匀**那一部分 ✗；
+      · 实测现场那一帧：游戏里的小地图**半透明**（背景透出画面 ⇒ 底图纯黑处、面板
+        灰度**中位 53 / 标准差 39.5**✗）、地形又是"放大 5.6 倍 + 抗锯齿"渲染 ⇒
+        整幅到处碎白点、真玩家点被淹 ✓；
+      · 现在减的是**每个像素周围 `k×k` 的均值**（`DIFF_LOCAL_PX` ✓ `cv2.blur` ✓）⇒
+        实测残差中位 **67 → 5.1 灰阶**、地形区 95% 位 **86 → 46** ✓✓。
+      ⚠ `floor`（整幅中位）**照旧如实报** ✓ —— 界面上那行还要让人看见"这张图整幅有多偏"
+        ✓；判"是不是真不同源"改用 `res_med`（**局部归一之后**的残差中位 ✓）。
+      ⚠ `local=0`（或负）⇒ **老口径**（减整幅中位 ✓ 零回归 ✓；用例/取证工具要复现老图时用 ✓）。
 
     ⚠ 它**只是"看"的**：不参与定位、不写盘、不缓存 ✓（真要拿它去找黄点，那是下一步 ✓）。
 
     返回 `(vis, info)`：
-      · `vis` = 与 `panel` **同尺寸**的 3 通道 BGR（= `clip((原始差 − floor) × gain)` ✓）；
+      · `vis` = 与 `panel` **同尺寸**的 3 通道 BGR（= `clip((原始差 − 局部背景) × gain)` ✓）；
         算不出来 ⇒ `None`（**不给假图** ✗）；
-      · `info` = `{ok, why, gain, floor, peak, at, raw_mean, raw_peak, rect}` ——
-        `at` = "多差得最厉害"那个点的**面板像素** `(x, y)` ✓；`rect` = 底图上盖住的
-        那一块 `(x0, y0, x1, y1)` ✓（调用方可以直接报给人看 ✓）。
+      · `info` = `{ok, why, color, gain, local, floor, res_med, peak, at, raw_mean,
+        raw_peak, rect, gray}` ——
+        `at` = "**比周围多差得最厉害**"那个点的**面板像素** `(x, y)` ✓；`rect` = 底图上
+        盖住的那一块 `(x0, y0, x1, y1)` ✓（调用方可以直接报给人看 ✓）。
     """
     if panel is None or canvas is None:
         return None, {"ok": False, "why": "没有面板图或底图"}
@@ -4114,14 +4615,28 @@ def diff_panel_vs_canvas(panel, canvas, calib, gain=None, color=False):
     #   对 uint8 与 float32 完全同值** ✓（差值是整数 ✓ `clip`/`*gain` 在同一个表达式里做 ✓）
     #   ⇒ 去掉那次转换、并把两个 `clip` 合成一遍 ✓ —— **算出来的数一个都没变** ✓。
     g = d.max(axis=2)                        # 逐像素取"差得最多的那个通道" ✓（uint8 ✓）
-    floor = float(np.median(g))
-    gv = np.clip((g.astype(np.float32) - floor)
-                 * float(gain if gain is not None else DIFF_GAIN),
+    floor = float(np.median(g))              # 整幅背景档（**照旧如实报** ✓ 界面那行用它 ✓）
+    # ⭐⭐⭐ **减掉的是「局部背景」**（用户 2026-10-12 ✓ 见 `DIFF_LOCAL_PX` 的说明 ✓）：
+    #   每个像素减掉**它周围 `k×k` 的均值** ⇒ 整片/成片的亮度差（半透明小地图、底色偏 ✓）
+    #   一次性消掉 ✓，只留"**比周围多出来的那一截**"（点 / 实时元素 ✓）。
+    #   `cv2.blur` 是 O(1) 的箱式均值 ✓（只多一个浮点数组 ⇒ 与老写法同量级 ✓）。
+    #   ⚠ `local=0/负` ⇒ **老口径**（`base` = 整幅一个常数 ⇒ 与老写法逐像素同值 ✓ 零回归 ✓）。
+    gf = g.astype(np.float32)
+    _k = int(DIFF_LOCAL_PX if local is None else local)
+    if _k >= 3:
+        _k = _k + 1 if (_k % 2 == 0) else _k         # 奇数窗口 ✓（居中 ✓）
+        base = cv2.blur(gf, (_k, _k))
+    else:
+        _k = 0
+        base = np.float32(floor)
+    res = gf - base                          # ⭐ "比周围多差了这么多"（正 = 更多 ✓）
+    gv = np.clip(res * float(gain if gain is not None else DIFF_GAIN),
                  0.0, 255.0).astype(np.uint8)
-    # ⭐ `at` / `peak` **直接从 `g` 取**（老写法专门为它建了一个 2.7 MB 的 `extra` ✗）：
-    #   `clip(g − floor, 0, None)` 是**单调**的 ⇒ `argmax` 的位置与 `argmax(g)` **完全一致** ✓；
-    #   `peak = max(0, g[at] − floor)` ✓（全幅都一样时两边的 argmax 都取第一个 ✓ 同值 ✓）。
-    #   ⇒ 再省一次整幅浮点分配与遍历 ✓，**返回的两个数一个字没变** ✓。
+    # ⭐ `at` / `peak` 取的是**残差** `res`（不是 `g` ✗）—— 老写法里 `base` 是整幅常数 ⇒
+    #   `argmax(g)` 与 `argmax(res)` 同一个点 ✓（`clip` 单调 ✓）；现在 `base` **逐像素不同**
+    #   ⇒ 必须直接在 `res` 上取 ✓（不然会挑到"整幅最偏"的那一片、而不是"比周围最突出"的点 ✗）。
+    #   ⚠ 全幅一样时 `argmax` 取第一个 ✓（同老口径 ✓）。
+    #   `peak = max(0, res[at])` = "比周围多出来的那一截" ✓（**不乘 gain** ✓ 与老口径同量纲 ✓）。
     vis = cv2.cvtColor(gv, cv2.COLOR_GRAY2BGR)
     # ⭐⭐ `color=True` ⇒ **把点的颜色显示出来**（用户 2026-10-06 ✓ 原话："像素差分地图能把点的
     #   颜色显示出来而不是纯白吗？"✓）：只把"**差得够亮**"的那些像素（`gv ≥ DOT_DIFF_THR` ✓
@@ -4133,11 +4648,15 @@ def diff_panel_vs_canvas(panel, canvas, calib, gain=None, color=False):
         _m = gv >= DOT_DIFF_THR
         vis = np.zeros_like(vis)
         vis[_m] = _bgr(panel)[_m]
-    ay, ax = np.unravel_index(int(g.argmax()), g.shape)
+    ay, ax = np.unravel_index(int(res.argmax()), res.shape)
     return vis, {"ok": True, "why": "", "color": bool(color),
                  "gain": float(gain if gain is not None else DIFF_GAIN),
+                 "local": int(_k),
                  "floor": round(floor, 1),
-                 "peak": round(max(0.0, float(g[ay, ax]) - floor), 1),
+                 #: ⭐ "局部归一**之后**还剩多少" —— **判"真不同源"用这一个** ✓
+                 #:   （`floor` 只管"整幅偏多少"：偏得再多，只要**均匀**，局部一减就没了 ✓）。
+                 "res_med": round(float(np.median(np.abs(res))), 1),
+                 "peak": round(max(0.0, float(res[ay, ax])), 1),
                  "at": (int(ax), int(ay)),
                  "raw_mean": round(float(g.mean()), 1),
                  "raw_peak": round(float(g.max()), 1),

@@ -27,7 +27,7 @@
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (QCheckBox, QColorDialog, QDialog,
-                             QDialogButtonBox, QFormLayout, QFrame, QGroupBox,
+                             QDialogButtonBox, QFormLayout, QGroupBox,
                              QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                              QPushButton, QScrollArea, QTabWidget, QVBoxLayout,
                              QWidget)
@@ -42,6 +42,10 @@ from perception import minimap as mm
 # （详见 docs/UI规范.md：滚轮不许改参数）
 from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSlider,
                          NoWheelSpinBox, scroll_page, title_label)
+#: ⭐ 「远程操控」那一组（**鼠标标定** ✓ 用户 2026-10-15 ✓）住在**它自己那个文件**里 ✓ ——
+#:   ⚠ 写进本文件会把这一份（本来就 1400 多行 ✓）顶过 1500 行 ⇒ `selftest_arch` **E-②**
+#:   （不许再冒巨型运行期文件 ✓）当场红 ✓ ⇒ 见 `_page_link` 里那段"为什么拆"✓。
+from gui.remote_group import RemoteControlBox
 from core.config import load_link, load_live, update_link, update_live
 
 #: 页签名（顺序 = 显示顺序）。测试和文档都按这份来。
@@ -442,9 +446,14 @@ class SettingsDialog(QDialog):
                 "最小攻击距离 = 0（默认）时**没有盲区** ⇒ 这个框不画 ✓。",
                 on_key="min_attack_on", w_key="min_attack_width")
         add_row(vf2, "跳跃攻击范围框", "jump_attack_color",
-                "**占位项**（用户 2026-09-27 记的一笔）：等跳跃物理做好后，它表示\n"
-                "「怪框落在这个范围内 ⇒ 按跳就能把它带进攻击范围框 ⇒ 触发 attack」。\n"
-                "⚠ 逻辑还没实现 ⇒ 现在画面上**不会**出现这个框（先把颜色定下来 ✓）。",
+                "「**跳跃攻击范围**」（用户 2026-10-12 ✓ 已经真的会画了）：\n"
+                "攻击范围框**上边**再往上「跳跃高度」的那一条带子 ✓\n"
+                "（开关/高度在 决策参数 → 战斗参数 → 攻击 →「跳跃攻击」✓）。\n\n"
+                "它**碰到怪**时和攻击范围碰到怪走一样的逻辑（进 attack ✓ 背后的怪照旧转身 ✓），\n"
+                "只是进了 attack 之后要**先按跳**，并且**等怪进「攻击范围框」再输出** ✓\n"
+                "（前方的怪直接跳；后方的怪等转够「最小切换朝向时间」再跳 ✓；\n"
+                "一次跳没够着会隔一下补跳 ✓ 不会每拍乱跳 ✓）。\n"
+                "⚠ 没勾「跳跃攻击」/ 高度配 0 / 「向上攻击距离」是不限(-1) ⇒ 框不成立 ⇒ 不画 ✓。",
                 on_key="jump_attack_on", w_key="jump_attack_width")
         add_row(vf2, "追击起跳框", "chase_jump_color",
                 "「**追击起跳**」的起跳区间（决策参数 → 战斗参数 → 攻击 → 追击起跳）：\n"
@@ -499,28 +508,51 @@ class SettingsDialog(QDialog):
         vf2.addWidget(QLabel("箭头尖大小(%)（占线长）"), _tr, 0)
         vf2.addWidget(self.sp_arrow_tip, _tr, 2)
 
-        # ⭐⭐ **x 箭头 = 玩家真实朝向**（用户 2026-10-10 ✓ 原话："**我想让坐标箭头代表玩家的
-        #   真实朝向（需要尽量高效）**"✓）—— 与上面三格**同一组**（数值列**同一条竖线** ✓
-        #   守着"网格对齐 + 参数名显示完整"那条要求 ✓）。
-        #   ⚠ 它是**改语义**的开关（不是"画不画"✗）⇒ 默认**不勾** ✓（老观感一字不变 ✓）。
-        self.ck_arrow_real_face = QCheckBox("x 箭头 = 真实朝向")
-        self.ck_arrow_real_face.setChecked(bool(
-            self._vis.get("player_arrow_real_face", False)))
-        self.ck_arrow_real_face.setToolTip(
-            "勾上 ⇒ 那根 **x 箭头**不再画「世界 x 正方向」，而是按**角色真实朝向**朝左 / 朝右。\n"
-            "判据：**角色「世界坐标」x 的真实位移**（小地图那份，**与相机无关**）——\n"
-            "连几拍**同向**且净位移够才算（抖动 / 来回走不猜），成本 **0**（它本来每拍就有）。\n\n"
-            "⚠ 为什么不用画面坐标：镜头会动 —— 人没走、镜头一动也「看起来在走」，\n"
-            "  而镜头跟着人走时画面又几乎不动 ⇒ 画面 x 判这个不准。\n\n"
-            "⚠ **只有角色在走的时候才画**：停下 / 抖动 / 这一拍没定位 ⇒ **这根箭头不画**。\n"
-            "  （诊断工具也要诚实 —— 宁缺勿错，绝不拿默认值凑一个方向出来。）\n\n"
-            "⚠⚠ 它和**「攻击范围框」不是同一份**：那个框按 **Agent 的方向键 / 意图**走\n"
-            "（站桩时它跟的是「怪在哪一侧」）—— **两个不一致的时候正是要看的东西**。\n\n"
-            "⚠ 不勾（默认）= 老口径：x 箭头 = 世界 x 正方向（对着调「脚底偏移」用）。\n"
-            "⚠ 勾着时 x 箭头就**不再能**验世界正方向了（y 箭头照旧 ✓ 脚底偏移仍可对着它调）。")
-        _fr = _grid_rows[0]
+
+        # ⭐⭐ **怪框角标 `#id conf/peak`**（用户 2026-10-11 ✓ 原话："**同个怪物的检出框
+        #   疯狂闪烁**"✓）—— 与上面那几格**同一组**（数值列**同一条竖线** ✓）。
+        #   用途只有一个：**分清两种闪** ✓（同一个 id 在闪 = 检测不稳 ✓；
+        #   每帧换 id = 认领/新建那一步有问题 ✓）—— 这两种以前**只能靠猜** ✗。
+        #   ⚠ **默认不勾** ✓（老观感一字不变 ✓）；⚠⚠ **不进**「缺省 ⇒ 勾」那批
+        #     （`_VIS_ON_KEYS` ✗）⇒ 读回是"缺省 / 坏值 ⇒ False" ✓（见 `theme.load_vis` ✓）。
+        self.ck_mob_id = QCheckBox("怪框显示 id/置信度")
+        self.ck_mob_id.setChecked(bool(self._vis.get("mob_show_id", False)))
+        self.ck_mob_id.setToolTip(
+            "勾上 ⇒ 怪框上方多一串 `#12 mob .82/.91`：\n"
+            "  · `#12`   = **追踪 id**（跨帧稳定；它每帧都换说明认领/新建那一步有问题）；\n"
+            "  · `.82`   = 这一拍的检测置信度；\n"
+            "  · `.91`   = **历史最高**置信度（防抖闸看的就是它）；\n"
+            "  · 尾巴 `*` = 这拍是**幽灵框**（没检出、靠防抖保留，位置是外推的）。\n\n"
+            "⚠ 默认不勾（老观感一字不变）。勾选**当场生效**（实时预览每秒重读配置）。\n"
+            "⚠ 它**只管画**：不影响追踪与决策一个字。")
+        # ⭐ 勾选即写盘（同上面那批"检测框颜色"的勾 ✓ 口径一致 ✓）
+        self.ck_mob_id.stateChanged.connect(
+            lambda _st: theme.save_vis(
+                {"mob_show_id": bool(self.ck_mob_id.isChecked())}))
+        _mr = _grid_rows[0]
         _grid_rows[0] += 1
-        vf2.addWidget(self.ck_arrow_real_face, _fr, 2)
+        vf2.addWidget(self.ck_mob_id, _mr, 2)
+
+        # ⭐⭐ **玩家框角标**（用户 2026-10-11 ✓ 与怪框那个**同一组、同一条竖线** ✓）
+        #   用途：一眼看出"我"那个蓝框是**实测**还是**外推**的 ✓ —— 它稳不稳直接决定
+        #   攻击框画在哪一侧、以及"可信相机"要不要采纳 ✓。
+        self.ck_player_id = QCheckBox("玩家框显示 id/置信度")
+        self.ck_player_id.setChecked(bool(self._vis.get("player_show_id", False)))
+        self.ck_player_id.setToolTip(
+            "勾上 ⇒ 玩家蓝框上方写成 `#我 玩家 0.88` ✓。两个**前缀**标记：\n"
+            "  · `*` = 这一拍**没检测到**，位置是**外推**的（按你按着的方向键推出来的）；\n"
+            "  · `~` = 这一拍是**低分档续命**来的（必须「已锁定 + 小地图黄点对得上」才准用）。\n"
+            "两者都没有 = 这一拍是真检出 ✓。\n\n"
+            "⚠ 为什么值得看：玩家框一旦认错人/抖，**可信相机**会跟着错 ⇒ 所有"
+            "「画面 → 世界」的换算整体平移（怪的世界坐标、脚下的集合全跟着偏）。\n"
+            "⚠ 默认不勾（老观感一字不变）。勾选**当场生效**（实时预览每秒重读配置）。\n"
+            "⚠ 它**只管画**：不影响追踪与决策一个字。")
+        self.ck_player_id.stateChanged.connect(
+            lambda _st: theme.save_vis(
+                {"player_show_id": bool(self.ck_player_id.isChecked())}))
+        _pr = _grid_rows[0]
+        _grid_rows[0] += 1
+        vf2.addWidget(self.ck_player_id, _pr, 2)
 
         # ---- ⑤ foothold 集合编辑器（只管它那个窗口，和实时预览无关 ⇒ 单独一组）----
         grp = QGroupBox("foothold 集合编辑器 · 线宽(px)")
@@ -828,6 +860,10 @@ class SettingsDialog(QDialog):
             "⚠ 与「寻路超时时间」是**两道独立的闸**：这道更专（只掐追击），通常设得更短；\n"
             "   两个用的是**同一把钟**（这一段任务的起点）⇒ 不会互相错位 ✓。")
         _tf.addRow("追怪寻路.duration(s)", self.sp_chase_max)
+        # ⚠ 2026-10-13：「**锁定怪物丢框防抖时间(ms)**」这一格连同它的功能**整套删了** ✓
+        #   （用户原话："**移除「锁定怪物丢框防抖时间」的配置与功能（这是重复功能）**"✓）——
+        #   它等于"只对锁定那只、把防抖时间换个数"✓，与主界面「目标参数」里那两条重复 ✓
+        #   ⇒ 现在只有一条链：**防抖置信度 + 防抖时间** ✓。
         form.addRow("", _task_grp)
 
         # ① 坐标对齐误差范围
@@ -1068,9 +1104,25 @@ class SettingsDialog(QDialog):
             if _i:
                 lay.addSpacing(2)
             lay.addWidget(box)
+        # ⭐⭐ **新组「远程操控」（用户 2026-10-15 ✓）**：鼠标标定。
+        #   ⚠⚠ 2026-10-15 当天**又挪了一次**：它原来就写在这里 ✗ ⇒ 把这一份（本来 1400 多行 ✓）
+        #     顶过 **1500 行** ⇒ `selftest_arch` 的 **E-②**（不许再冒巨型运行期文件 ✓）当场红 ✓。
+        #     那条钉明说的两条出路是「拆成两件事」/「连为什么一起写进 `GIANT_BASELINE`」✓ ⇒
+        #     这里选**拆** ✓：这一组**一个字节都不写 `link.yaml`** ✗（它写 `config/mouse_gain.json` ✓）
+        #     ⇒ 它本来就不属于那一页的数据驱动表格 ✓ ⇒ 落成 `gui/remote_group.py::RemoteControlBox` ✓。
+        #   ⚠ 顺带把 `QCheckBox` 之类**从本文件的导入里用不上了**（那一段搬走了 ✓）。
+        self.remote_box = RemoteControlBox(getattr(self, "parent", lambda: None)())
+        lay.addSpacing(2)
+        lay.addWidget(self.remote_box)
         self._sync_link_page()
         lay.addStretch(1)
         return page
+
+    # ⚠ 2026-10-15：原来这儿还有 `_sync_remote_group` / `_on_remote_auto` / `_on_remote_measure`
+    #   三个方法 ✗ ⇒ 连同那一组一起搬去了 `gui/remote_group.py` ✓（原因见 `_page_link` 里那段：
+    #   它们把这一份顶过 1500 行 ⇒ E-② 红 ✓；而且它们**不写 `link.yaml`** ⇒ 本来就不属于这一页 ✓）。
+    #   顺带一句：那三个方法里都是**函数内 import** ✗ ⇒ 也一起消失了 ✓（`check_ui` 那条既有红
+    #   是另一处 `gui/live_panel.py` 的 ✓ 也已修 ✓）。
 
     def _sync_link_page(self):
         """把 `link.yaml` 的**当前值**灌到控件上（建页时 + 每次露头都调 ✓）。"""
@@ -1383,7 +1435,6 @@ class SettingsDialog(QDialog):
         # ⭐⭐ **x 箭头 = 玩家真实朝向**（用户 2026-10-10 ✓ 见 `theme.VIS_DEFAULTS` 那段说明 ✓）——
         #   ⚠ 它是**改语义**的开关 ✗（不是"画不画"✓）⇒ 不放进下面那个 `_vis_on` 循环 ✗
         #   （那批的读回语义是"缺省 ⇒ True"✗ 会把所有人的箭头默认改掉 ✗）。
-        vis_cfg["player_arrow_real_face"] = bool(self.ck_arrow_real_face.isChecked())
         # 每项的**显示开关**（用户 2026-09-27："辅助线与标记组里每项参数前加开关"）：
         # 和颜色存在同一段（`config/ui.yaml` 的 `vis:` ✓），`theme.load_vis` 一并读回 ✓
         vis_cfg.update({k: bool(ck.isChecked()) for k, ck in self._vis_on.items()})

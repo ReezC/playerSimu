@@ -1,4 +1,4 @@
-"""玩家状态读取：位置 + 朝向（模板匹配）+ HP/MP（UI 条颜色占比）。
+"""玩家状态读取：位置（模板匹配）+ HP/MP（UI 条颜色占比）。
 
 玩家定位走模板匹配（不走 YOLO 训练），复用 perception/player_locator.py。
 HP/MP 读屏幕 UI 条：在条区域里数「条颜色」像素占比，不用 OCR。
@@ -43,9 +43,9 @@ class PlayerStateReader:
         self._full_done = False                 # 全图兜底只做一次
         self._miss_frames = 0
 
-    def set_position(self, x, y, facing=1):
+    def set_position(self, x, y):
         """手动指定玩家位置（GUI 用户调整后调用），之后从这里开始追踪。"""
-        self._last = (float(x), float(y), int(facing))
+        self._last = (float(x), float(y))
 
     def read(self, bgr):
         """从一帧 BGR 读取玩家状态，返回 Player。"""
@@ -69,13 +69,11 @@ class PlayerStateReader:
             if r:
                 cx, cy, tw, th, score, name = r
                 # 朝向：模板名带 @L 后缀 = 镜像模板 = 朝左
-                facing = -1 if name.endswith("@L") else 1
-                self._last = (cx, cy, facing)
             else:
                 self._last = None
 
         if self._last is not None:
-            player.x, player.y, player.facing = self._last
+            player.x, player.y = self._last
             player.found = True
 
         hp = self._read_bar(bgr, self.ui.get("hp"))
@@ -90,7 +88,7 @@ class PlayerStateReader:
         """三级搜索：动态 ROI → 中央兜底 → 全图（只一次）。"""
         # 1) 动态 ROI：上一帧位置附近
         if self._last is not None:
-            cx, cy, _f = self._last
+            cx, cy = self._last
             m = self.roi_margin
             sx = max(0, int(cx - m))
             sy = max(0, int(cy - m))

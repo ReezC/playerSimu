@@ -19,18 +19,24 @@ class Mob:
     y: float           # 框中心 y
     w: float           # 框宽
     h: float           # 框高
-    conf: float        # 检测置信度
+    conf: float        # 检测置信度（这一拍）
+    #: ⭐ **历史最高**置信度（2026-10-11 新增 ✓）：这条轨迹**曾经**看到过的最好一版 ✓。
+    #: 用途两个：① 界面角标 `#id conf/peak`（用户要看清"是同一个 id 在闪、还是每帧换 id"✓）；
+    #: ② 防抖的判据本来就是它（`MobTracker.update` 的幽灵分支 ✓ 一个事实一个写者 ✓
+    #:    ⇒ 只有 `MobTracker` 写 ✓ 决策层只读 ✗）。
+    peak_conf: float = 0.0
     vx: float = 0.0    # 屏幕速度（px/帧，追踪得到）
     vy: float = 0.0
     age: int = 0       # 连续被追踪到的帧数
     missed: int = 0                  # 连续漏检帧数（>0 = 防抖保留的幽灵框）
+    # ⚠ 2026-10-13：「`lock_ghost`」那个字段**删了** ✓ —— 「锁定怪物丢框防抖时间」整套移除
+    #   （用户："这是重复功能"✓）⇒ 幽灵框现在只有**一条链**（`debounce_conf` / `debounce_ms` ✓）。
 
 
 @dataclass
 class Player:
     x: float = 0.0
     y: float = 0.0
-    facing: int = 1         # -1 朝左 / +1 朝右
     hp: float = 1.0         # 0~1，读不到时保持 1.0
     mp: float = 1.0         # 0~1
     state: str = "idle"     # idle / move / attack / hit（先留 idle，后续补）
@@ -74,7 +80,7 @@ class Player:
     #: 脚下这条 foothold 属于**哪些命名集合**（`core.zones.set_of` 的结果）。
     #: ⚠ 以前**没有任何地方写它** ⇒ `ClimbJob._arrived` 的"脚下已是目标集合"判据
     #: 永不触发，只能靠几何兜底（寻路到了也判不出来）。
-    here_sets: list = field(default_factory=list)
+    here_sets: tuple = field(default_factory=tuple)
     #: 现在**贴在哪根绳上**（`core.zones.ladder_ids` 的那套编号，如 "L1"）；不在绳上 = None。
     #: ⚠ 同样以前没人写 ⇒ "从绳上掉下来"每 2 秒误判一次 ⇒ 任务不停失败重试。
     ladder_id: str | None = None
@@ -126,6 +132,23 @@ class Player:
     cam_x: float | None = None
     cam_y: float | None = None
 
+    #: ⭐⭐ **快照冻结**（2026-10-13 阶段 1「冻结」✓）：喂 Agent 前调 `_freeze()`，之后任何
+    #:   字段赋值都抛异常 ——「快照构造完不可变、写者唯一」由**类型**（`__setattr__`）硬保证 ✓。
+    #:   ⚠ 为什么不用 `@dataclass(frozen=True)`：那会**构造完就锁死** ✗ —— 快照是"逐步凑"
+    #:   出来的（先建空 Player、再按阶段填 x / here_sets / … ✓）构造期必须能写 ✗；
+    #:   测试 fixture 也靠"构造后赋值"造数据 ✗ ⇒ 改成**显式 `_freeze()`**：凑完、喂 Agent 前锁 ✓。
+    _frozen: bool = field(default=False, init=False, repr=False)
+
+    def _freeze(self):
+        """凑完快照后锁死（喂 Agent 前调 ✓）。之后写字段抛 `AttributeError` ✓。"""
+        object.__setattr__(self, "_frozen", True)
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_frozen", False):
+            raise AttributeError(
+                "WorldState 快照已冻结，不许再写字段 %r（写者唯一由类型保证 ✓）" % name)
+        object.__setattr__(self, name, value)
+
 
 @dataclass
 class WorldState:
@@ -133,7 +156,7 @@ class WorldState:
     ts: float = 0.0
     width: int = 0         # 画面宽（「基于画面中心」的视野计算用）
     height: int = 0        # 画面高
-    mobs: list = field(default_factory=list)
+    mobs: tuple = field(default_factory=tuple)
     player: Player = field(default_factory=Player)
     #: **界面状态**（感知层在原生帧上做弹窗模板匹配的结论 ✓，M1「测谎报警」）：
     #: "combat" / "lie_warn"（测谎预警弹窗）/ "lie_game"（测谎小游戏）/ "lie_success"。
@@ -143,6 +166,20 @@ class WorldState:
     #: 用途：上绳对齐的"保持窗口" = 设置里的保持时间 + 它（见 `agent._climb_tick`）——
     #: 定位读数本来就是"过去某一刻"的位置，延迟越大越不能拿单帧当真。
     e2e_ms: float = 0.0
+
+    #: ⭐⭐ **快照冻结**（2026-10-13 ✓）：同 `Player._frozen` 那套 —— 喂 Agent 前 `_freeze()`，
+    #:   `_freeze` 会**递归锁死 player** ✓（这样 `ws.player.x = …` 也会崩 ✓）。
+    _frozen: bool = field(default=False, init=False, repr=False)
+
+    def _freeze(self):
+        self.player._freeze()
+        object.__setattr__(self, "_frozen", True)
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_frozen", False):
+            raise AttributeError(
+                "WorldState 快照已冻结，不许再写字段 %r（写者唯一由类型保证 ✓）" % name)
+        object.__setattr__(self, name, value)
 
 
 # ---------------------------------------------------------------- 运行期镜像

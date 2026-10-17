@@ -309,7 +309,52 @@ def rect_from_rel(rel, geom=None):
             int(round(nw * gw)), int(round(nh * gh)))
 
 
-def binding_rect(rel, win, fallback_rect):
+def window_by_title(title, exclude=None):
+    """按**窗口标题**找一个还活着的顶层窗口 ⇒ `hwnd` / `None` ✓。
+
+    ⭐⭐⭐ 为什么要它（用户 2026-10-17 ✓ 原话：「**为什么我移动本地游戏窗口后，小地图要
+      重新框选？**」✗）：框选时记的 `rect_win = [hwnd, 标题]` ✓ 里**标题一直都在**，
+      可代码只用了 hwnd ✗ ⇒ **游戏一重启（hwnd 变了）就绑不上** ✗ ⇒ 退回\"你框的那块
+      绝对屏幕区域\" ⇒ 窗口挪过 / 改过大小就整块对不上 ⇒ 用户只能重框 ✓✓。
+    ⚠ 匹配顺序：**完全同名** 优先 ✓，其次**标题包含**（大小写不敏感 ✓）—— 只认**可见**
+      且**非最小化**的窗口 ✓（最小化那个 `window_geom` 本来也会给出\"问不到\"✓）。
+    ⚠ 找不到 / 出任何异常 ⇒ `None` ✓（调用方照旧退回绝对区域 ✓ 绝不猜 ✗）。
+    """
+    t = str(title or "").strip()
+    if not t:
+        return None
+    try:
+        import win32gui
+
+        exact, partial = [], []
+        low = t.lower()
+
+        def _cb(h, _):
+            try:
+                if not win32gui.IsWindowVisible(h) or win32gui.IsIconic(h):
+                    return True
+                name = str(win32gui.GetWindowText(h) or "").strip()
+                if not name or (exclude and int(h) == int(exclude)):
+                    return True
+                if name == t:
+                    exact.append((h, name))
+                elif low in name.lower():
+                    partial.append((h, name))
+            except Exception:                      # noqa: BLE001 —— 单个窗口问不到就跳过 ✓
+                pass
+            return True
+
+        win32gui.EnumWindows(_cb, None)
+        cands = exact or partial
+        if not cands:
+            return None
+        # ⚠ 有多个同名 ⇒ 取**第一个**（枚举顺序 = Z 序 ✓ 通常最上面那个就是它 ✓）
+        return int(cands[0][0])
+    except Exception:                              # noqa: BLE001
+        return None
+
+
+def binding_rect(rel, win, fallback_rect, title=None):
     """「框选区域」这一拍**该抓哪块屏** ⇒ `(rect, why)` —— `why` = 一句**短**人话（没退路 ⇒ ""）。
 
     · `rel` = 框选那一刻记的**相对那个窗口**的比例 ✓（见 `rel_from_rect` ✓）；
@@ -335,6 +380,17 @@ def binding_rect(rel, win, fallback_rect):
         return tuple(fallback_rect), ""
     g = window_geom(h)
     if g is None:
+        # ⭐⭐⭐ **句柄失效（游戏重启 / 窗口重建）⇒ 先按标题重新找回来** ✗
+        #   （用户 2026-10-17 ✓：「**为什么我移动本地游戏窗口后，小地图要重新框选？**」✗）
+        #   ⛔ 老行为是**直接退回你框的那块绝对屏幕区域** ✗ —— 窗口挪过/改过大小就整块
+        #     对不上 ⇒ 面板裁错 ⇒ 只能重框 ✓（`rect_win` 里明明存着标题，却没人用 ✗）。
+        h2 = window_by_title(title, exclude=h) if title else None
+        if h2:
+            g2 = window_geom(h2)
+            if g2 is not None:
+                return tuple(rect_from_rel(rel, g2)), (
+                    "原窗口句柄失效（游戏重启过？）⇒ **已按标题「%s」重新绑上** ✓"
+                    "（不用重框 ✓）" % (str(title or "")[:28],))
         return tuple(fallback_rect), (
             "框绑定的那个窗口现在**问不到**（关了 / 最小化 / 句柄失效）"
             "⇒ 已按**你框的那块固定区域**抓（想跟着窗口走 ⇒ 重框一次 ✓）")

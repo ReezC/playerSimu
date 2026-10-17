@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tools import sweep_link                                       # noqa: E402
+from core import sweep_link                                       # noqa: E402
 
 
 def check(cond, msg):
@@ -291,7 +291,7 @@ def t_auto_flow_end_to_end():
     import threading
     import unittest.mock as mock
 
-    from tools import push_presets as pp
+    from core import push_presets as pp
     from tools.stream_sweep import finish_and_report, iter_segments
 
     port = _free_port()

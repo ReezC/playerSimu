@@ -1,0 +1,22 @@
+{
+  "when": "2026-10-11 18:09:28",
+  "build": "2026-10-10b",
+  "frames_dir": "E:\\MyPrograms\\playerSimu\\projects\\野猪的领土\\frames",
+  "out": "E:\\MyPrograms\\playerSimu\\projects\\野猪的领土\\labels_auto",
+  "weights": "E:\\MyPrograms\\playerSimu\\projects\\黄金海滩\\models\\detect_v3.pt",
+  "mode": "drop",
+  "frames": 1,
+  "boxes_added": 0,
+  "frames_merged": 0,
+  "skipped": 0,
+  "skipped_names": [],
+  "first_inputs": [
+    "frame_00000.png"
+  ],
+  "first_returned": [
+    "image0.jpg"
+  ],
+  "order_mapped": 1,
+  "seconds": 7.2,
+  "canceled": false
+}

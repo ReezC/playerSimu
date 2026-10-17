@@ -11,7 +11,12 @@
 
 判据的层级（`PKGS` 里的数越小越底层）：
 
-    core(0) < link/remote_kbd/perception(1) < decision(2) < gui/deploy(3) < tools(4)
+    core(0) < link/remote_kbd/perception(1) < decision/runtime(2) < gui/deploy(3) < tools(4)
+
+⚠ `runtime`（2026-10-15 阶段 1「编排收口」新建 ✓）与 `decision` **同层**：它**编排**
+  `perception`(1) + `decision`(2)，自己被 `gui`(3) 调用 ✓。另有一条更严的钉子单独管它
+  （**不许 import `gui` / `tools`** ✓ 见 `tools/selftest_arch.py` ✓）—— 因为它是"调度"，
+  一旦沾上 Qt / 屏幕 / Ultralytics 就再也拆不出来了 ✗。
 
 ⚠ 扫描范围**必须**跳开 `.venv` / `site-packages`（2026-10-10 修：原来用 `"venv" not in
   p.parts` 这种**精确相等**比较 ⇒ `.venv` 全漏进来 ✗ ⇒ 1951 行输出里绝大多数是
@@ -50,7 +55,29 @@ def skip(p):
 
 def py_files():
     """要被扫的 `.py`（跳过上面那些目录 ✓）。"""
-    return [p for p in sorted(ROOT.rglob("*.py")) if not skip(p)]
+    # ⚠⚠ **不许用 `ROOT.rglob("*.py")` + 事后 `skip()` 过滤** ✗（2026-10-15 实测踩到 ✓）：
+    #   `rglob` 会**先一头钻进 `.venv`** ✗ —— 而这里是**目录联接**（junction ✓）⇒ Windows 当场
+    #   `OSError: [WinError 448] 无法遍历该路径，因为它包含不受信任的装入点` ✗ ⇒ `scan()` 整个
+    #   抛出去 ⇒ **E-①（分层/环）与 E-②（巨型文件）两条判据一起红** ✗✗。
+    #   ⚠ 这种红最坏：它**看着像**"分层更差了 / 又冒巨型文件了"✗，其实**两条判据一个字都没判** ✓
+    #     —— 判据被中断 ≠ 判据通过（本仓库的"判据空转"家族又一员 ✓）。
+    #   ⚠ `skip()` 是**事后过滤**：文件/目录**已经被遍历过了** ✗ ⇒ 拦不住遍历本身 ✓
+    #     （所以 E-①/E-② 之前一直挂着这两条红 ✓ —— 不是环境天生如此，是这里该改 ✓）。
+    #   ⇒ `os.walk(topdown=True)` + **就地改 `dirs[:]`**（只有就地改才真的不进去 ✓）；
+    #     再挂 `onerror` 兜住别的读不了的目录 ✓（一个坏目录不该中断整次扫描 ✓）。
+    import os
+    out = []
+    for base, dirs, names in os.walk(str(ROOT), topdown=True, onerror=lambda e: None):
+        b = Path(base)
+        # ⚠ 片段匹配（同 `SKIP_PARTS` 的口径 ✓ 见 `skip()` 那段为什么用片段 ✗）
+        dirs[:] = [d for d in dirs
+                   if not any(frag in d.lower() for frag in SKIP_PARTS)]
+        for n in names:
+            if n.endswith(".py"):
+                p = b / n
+                if not skip(p):
+                    out.append(p)
+    return sorted(out)
 
 
 def mod_of(path):

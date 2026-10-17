@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 
 from core.config import get, record_dir
-from tools.probe_codec import encode_bits, now_ms
+from core.probe_codec import encode_bits, now_ms
 
 
 def main() -> int:

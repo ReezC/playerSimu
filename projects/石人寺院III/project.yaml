@@ -1,9 +1,9 @@
 name: 石人寺院III
-map_id: '106010105'
+map_id: '106010106'
 mobs:
 - '2220100'
 - '3000004'
-- '5130102'
+- '5150000'
 scale: 1.406
 mob_scales: {}
 scale_at:
@@ -21,7 +21,7 @@ bars:
   - 0.973958
   - 0.120791
   - 0.019531
-  hp_color: &id001
+  hp_color:
   - - 0
     - 0
     - 135
@@ -31,21 +31,21 @@ bars:
 mmap_crop:
 - 5
 - 71
-- 117
-- 81
+- 129
+- 71
 decision:
-  attack_dist: 80.0
+  attack_dist: 70.0
   min_attack_dist: 0
   attack_up_dist: 30
-  attack_down_dist: 20
+  attack_down_dist: 30
   chase_jump_enabled: true
   chase_jump_min: -10
   chase_jump_max: 5
-  chase_jump_dash_ms: 50
-  chase_jump_edge_guard_enabled: true
-  chase_jump_edge_guard_px: 150
-  station_turn_interval_ms: 1000
-  mouse_speed: 1.1999999999999995
+  chase_jump_dash_ms: 1000
+  chase_jump_edge_guard_enabled: false
+  chase_jump_edge_guard_px: 100
+  station_turn_interval_ms: 600
+  mouse_speed: 1.2000000000000002
   evade_type: jump
   jump_interval: 0
   jump_random_prob: 0.1
@@ -90,14 +90,15 @@ decision:
     feed_pet: pagedown
     shop: null
     enter: enter
+    pickup: space
   target_cd:
   - 1000
   - 2500
   input_device: remote
-  attack_cd: 300
+  attack_cd: 1000
   attack_lock_debounce_ms: 1000
-  min_turn_hold_ms: 600
-  turn_output_delay_ms: 300
+  min_turn_hold_ms: 400
+  turn_output_delay_ms: 200
   player_track_jump: 200
   player_foot_offset_px: -25
   player_box_min_area_pct: 0.0
@@ -110,49 +111,49 @@ decision:
   - 0.019531
   mp_bar: null
   probe_calib: {}
-  hp_color: *id001
-  mp_color:
-  - - 143
-    - 78
+  hp_color:
+  - - 0
     - 0
-  - - 255
-    - 198
-    - 77
+    - 135
+  - - 79
+    - 82
+    - 255
+  mp_color: null
   hp_threshold: 39
   mp_threshold: 7
   pot_cd: 1000
   mob_sets_ttl_s: 3.0
   auto_hp_pot: true
   auto_mp_pot: false
-  strategy: patrol
-  vision_top: -1
-  vision_bottom: -1
-  vision_left: -1
-  vision_right: -1
+  strategy: multi
+  vision_top: 200
+  vision_bottom: 100
+  vision_left: 300
+  vision_right: 300
   vision_center: false
   vision_off_x: 0
   vision_off_y: 0
   big_mob_enabled: true
   big_mob_ratio: 1.5
-  big_mob_range_px: 600.0
+  big_mob_range_px: 5000
   sweep_turn_cd: 500
   back_range: 150
   sweep_edge_turn_px: 100
-  route_goto_set: 二楼
+  route_goto_set: 右3
   align_tol_px: 12
   align_hold_ms: 1000
-  climb_align_gap_ms: 200
-  climb_align_near_px: 1
-  climb_retry_delay_s: 1.0
-  climb_retry_delay_inc_s: 1.0
+  climb_align_gap_ms: 180
+  climb_align_near_px: 20
+  climb_retry_delay_s: 0.0
+  climb_retry_delay_inc_s: 0.0
   goto_timeout_s: 15
   chase_goto_max_s: 5.0
   goto_timeout_key: 表情_无语
   disable_chase_pathfinding: false
-  jump_start_px: 80
-  move_retry_ms: 350
-  debounce_conf: 0.5
-  debounce_ms: 2000
+  jump_start_px: 100
+  move_retry_ms: 3000
+  debounce_conf: 0.2
+  debounce_ms: 1500
   custom_timers:
   - name: 自动喂宠
     seq:
@@ -164,11 +165,24 @@ decision:
     - 8.0
     - 12.0
     pause_on_rest: false
+    paused: true
+    paused_left: 241.06137963104993
+  - name: 自动拾取
+    seq:
+    - type: down
+      key: 拾取
+    - type: up
+      key: 拾取
+    interval:
+    - 0.1
+    - 0.2
+    paused: true
+    paused_left: 5.35204582685401
   facing_timeout_min: 0.0
   player_lost_timeout_min: 3.0
-  resetall_interval: 30
-  anti_afk_enabled: true
-  anti_afk_type: hidden_rest
+  resetall_interval: 20
+  anti_afk_enabled: false
+  anti_afk_type: spot_rest
   anti_afk_min: 25.0
   anti_afk_max: 30.0
   anti_afk_enter_seq:
@@ -227,9 +241,15 @@ decision:
     key: 普攻
   anti_afk_rest_min: 4.5
   anti_afk_rest_max: 5.5
-  anti_afk_spot_set: ''
-  anti_afk_spot_seq: []
-  anti_afk_spot_after: ''
+  anti_afk_spot_set: '4'
+  anti_afk_spot_seq:
+  - type: delay
+    ms: 4000
+  - type: down
+    key: 椅子
+  - type: up
+    key: 椅子
+  anti_afk_spot_after: '5'
   anti_afk_spot_loop: false
   anti_afk_spot_loop_items: []
   anti_afk_spot_loop_min: 30.0
@@ -237,9 +257,9 @@ decision:
   anti_afk_spot_loop_hold: false
   anti_afk_retry_on_interrupt: true
   anti_afk_retry_sec: 10.0
-  reconnect_enabled: false
-  reconnect_probe_after_lost_sec: 0.0
-  reconnect_step_timeout_ms: 3000
+  reconnect_enabled: true
+  reconnect_probe_after_lost_sec: 3.0
+  reconnect_step_timeout_ms: 5000
   reconnect_queue_timeout_ms: 180000
   reconnect_max_retry: 3
   reconnect_resume_auto: true
@@ -249,13 +269,67 @@ decision:
     隐身术: a
     普攻: f
     表情_无语: f6
+    拾取: space
+    椅子: x
+  attack_fan_deg: 0.0
+  walk_stall_jump: true
+  atk_target_count: 0
+  mob_atk_cd_ms: 2000
+  auto_pickup: true
+  sweep_turn_cd_enabled: true
+  sweep_edge_turn_enabled: true
+  station_pickup_enabled: true
+  station_pickup_min_s: 0.0
+  station_pickup_max_s: 0.0
+  station_pickup_spots: []
+  multi_spots:
+  - kind: set
+    name: 左2
+  - kind: set
+    name: 左1
+  - fid: '53'
+    kind: foothold
+    ratio: 100.0
+  - fid: '46'
+    kind: foothold
+    ratio: 100.0
+  - fid: '68'
+    kind: foothold
+    ratio: 100.0
+  - kind: set
+    name: 右2
+  - fid: '110'
+    kind: foothold
+    ratio: 100.0
+  - fid: '80'
+    kind: foothold
+    ratio: 100.0
+  - kind: set
+    name: 右1
+  - fid: '24'
+    kind: foothold
+    ratio: 100.0
+  - fid: '19'
+    kind: foothold
+    ratio: 100.0
+  multi_leave_wait_enabled: true
+  multi_leave_delay_s: 0.5
+  reconnect_server_x: 0.3635
+  reconnect_server_y: 0.2074
+  reconnect_channel_x: 0.4104
+  reconnect_channel_y: 0.5093
+  reconnect_channel: 18
+  jump_attack_enabled: false
+  jump_attack_height: 90.0
+  fall_speed_px_s: 115.0
+  lock_mob_ghost_ms: 1000
 notes: ''
 capture:
   source: file
-  file: D:/Media/record/mxd/石人寺院III误判素材.mp4
+  file: D:/Media/record/mxd/石人 寺院IV右.mp4
   url: udp://0.0.0.0:5000
   fps: 5.0
-  stride: 30
+  stride: 45
   seconds: 120.0
   dedup: 0.01
   limit: 300
@@ -264,31 +338,89 @@ label:
   thresh: 0.2
   min_distinct: 0.06
   per_mob: 20
-  max_peaks: 3
+  max_peaks: -1
   downscale: 1
   region: null
   player_thresh: 0.7
+  player_min_distinct: 0.0
+  player_per_mob: 0
+  player_max_peaks: 1
+  player_downscale: 1
+  drop_min_distinct: 0.06
+  drop_per_mob: 20
+  drop_max_peaks: 3
+  pet_min_distinct: 0.06
+  pet_per_mob: 20
+  pet_max_peaks: 3
+  label_drops_on: true
+  drop_thresh: 0.2
+  drop_downscale: 1
+  label_pets_on: true
+  pet_thresh: 0.2
+  pet_downscale: 1
+  pets:
+  - pet: '5000020'
+    name: 小白雪人
+    equips: []
+  - pet: '5000042'
+    name: 花蘑菇仔
+    equips:
+    - 01802054
+  drops:
+  - id: 09000000
+    name: ''
+  - id: 09000001
+    name: ''
+  - id: 09000002
+    name: ''
+  - id: 09000003
+    name: ''
+  - id: 04000009
+    name: 蓝蘑菇盖
+  - id: '04000177'
+    name: 混种石块
 dataset:
   val_ratio: 0.2
   min_boxes: 0
   quality: 92
 train:
-  model: E:\MyPrograms\playerSimu\projects\寺院通道2\models\detect_v5.pt
-  epochs: 200
-  imgsz: 1280
+  model: E:\MyPrograms\playerSimu\projects\石人寺院III\models\detect_v4.pt
+  epochs: 120
+  imgsz: 960
   batch: 8
   device: '0'
   patience: 40
   resume: false
+live:
+  weights: E:\MyPrograms\playerSimu\projects\石人寺院III\models\detect_v6_960.engine
+  capture_source: stream
+  rect:
+  - 1184
+  - 617
+  - 1366
+  - 768
+  rect_rel: null
+  rect_win: null
+  url: udp://0.0.0.0:5000
+  conf_mob: 0.25
+  conf_player: 0.75
+  imgsz: 960
+  device: '0'
+  capture_fps: 60
+  draw: true
+  half: true
+  show_fps: 50
+  window_capture: wgc
 player_id: 数值策划
 verify: {}
 iterate: {}
 mob_names:
 - 蓝蘑菇
 - 蝴蝶精
-- 黑石头人
+- 混种石头人
 player_scale: 1.406
 player_scale_at:
   width: 1920
   height: 1080
   confidence: manual
+mobs_cleared: false

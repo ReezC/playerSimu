@@ -133,6 +133,10 @@ def run_label_drops(params, ctx=None):
             "imgsz": int(params.get("imgsz", 960) or 960),
             "device": str(params.get("device", "0")),
             "only": only,
+            # ⭐⭐ **只在框选区域内标注**（用户 2026-10-11 ✓ "点击各个标注按钮，只会在当前帧
+            #   框选的**区域内**进行自动标注"✓）—— 口径见 `perception/region.py` ✓；
+            #   ⚠ 不传 / 空 ⇒ 整幅画面 ✓（= 老行为一字不变 ✓）。
+            "region": params.get("region"),
         }, ctx)
 
     from tools.detect_mobs import run_detect
@@ -184,4 +188,7 @@ def run_label_drops(params, ctx=None):
         #   `"mob"` 记，掉落物跑过的帧就会被当成**怪物标过了** ✗（选帧弹窗的"只选未处理"全乱 ✓）。
         "target": "drop",
         "only": only,
+        # ⭐⭐ **只在框选区域内标注**（用户 2026-10-11 ✓ 见上面 YOLO 那条的说明 ✓）——
+        #   `run_detect` 本来就支持它 ✓（在区域内**搜**、检出坐标再**偏移回去** ✓）。
+        "region": params.get("region"),
     }, ctx)

@@ -139,6 +139,13 @@ def _deep_merge(base: dict, over: dict) -> dict:
 #: 「这个键原来不存在」的哨兵（`_leaf_diff` / 冲突记账用 ✓ 与"值是 None"分开 ✓）。
 _MISSING = object()
 
+#: ⭐⭐⭐ 「**这个键被本窗口删掉了**」的哨兵（用户 2026-10-17 ✓ 原话：
+#: 「**重新开gui后，之前删掉的自定义按键还会出现**」✗）。
+#: 为什么非要有它：落盘走"只盖本窗口改过的那几处"（`_leaf_diff` ✓）⇒ 而**删键**
+#: 在老口径里**根本表达不出来** ✗ ⇒ 写回去的是磁盘上那份（还带着它 ✓）⇒ 删除永远
+#: 落不了盘 ✓（见 `_leaf_diff` / `_merge_disk` 里那两段说明 ✓）。
+_DELETED = object()
+
 
 def _leaf_diff(base, now, prefix=()):
     """`now` 相对 `base` **改过 / 新增了哪些"叶子"** ⇒ `{路径元组: 值}`（递归进 dict ✓）。
@@ -147,8 +154,12 @@ def _leaf_diff(base, now, prefix=()):
     落盘**不能整份覆盖** ✗ —— 另一个窗口刚写进去的会被抹掉 ✗ ⇒ 只把"**本窗口改过的
     那几处**"盖回磁盘 ✓（见 `Project.save` / `Project._merge_disk` ✓）。
 
-    ⚠ 只认"**改值 / 加键**"，**不认删键** ✗（这类配置里"少一个键"没有语义、实际也没人这么用 ✓）：
-      要"清掉"某样东西就把值写成空（`{}` / `""` / `0` ✓ 那是改值 ⇒ 照样盖得上 ✓）。
+    ⚠⚠ **也认"删键"**（`_DELETED` ✓ 用户 2026-10-17 ✓ 原话：「**重新开gui后，之前删掉
+      的自定义按键还会出现**」✗）：老口径只认"改值 / 加键" ✗，注释里还写着"少一个键没有
+      语义、**实际也没人这么用**" ✗ —— 而「自定义按键」面板干的正是 `pop` 删键 ✗
+      （`player_panel._remove_custom_key` ✓）⇒ 那一删**永远落不了盘** ✓（写回去的是磁盘
+      上那份 ✓）⇒ 重启后又冒出来 ✓✓。**那个假设已经被现场打穿了** ✗ 别再写回去 ✓。
+    ⚠ 其余照旧：要"清掉内容"也可以把值写成空（`{}` / `""` / `0` ✓ 那是改值 ⇒ 照样盖得上 ✓）。
     """
     out = {}
     if not isinstance(now, dict):
@@ -163,6 +174,13 @@ def _leaf_diff(base, now, prefix=()):
                 out.update(_leaf_diff({}, v, p))      # 原来不是 dict ⇒ 整棵都算我改的 ✓
         elif b is _MISSING or b != v:
             out[p] = copy.deepcopy(v)
+    # ⭐⭐⭐ **删键也要报出来**（老口径漏的就是这一段 ✗ 见上面那段说明 ✓）：
+    #   只在**最上面那一层**记一次 `_DELETED` ✓（整棵子树被删 ⇒ 一条就够 ✓
+    #   不必逐个叶子报 ✓）；`_MISSING` 那套（"原来没有"）不参与 ✗。
+    if isinstance(base, dict):
+        for k in base:
+            if k not in now:
+                out[prefix + (k,)] = _DELETED
     return out
 
 
@@ -176,6 +194,22 @@ def _set_leaf(doc, path, val):
             cur[k] = nxt
         cur = nxt
     cur[path[-1]] = copy.deepcopy(val)
+
+
+def _del_leaf(doc, path):
+    """按路径把那一格**删掉**（中间不存在就什么都不做 ✓）—— `_DELETED` 的执行端 ✓。
+
+    `_leaf_diff` 的"删键"只在**最上面那一层**记一条 ✓ ⇒ 这里删的就是那一格（连同它
+    底下的整棵子树 ✓ 那正是"这个键被删了"的语义 ✓）。
+    ⚠ 中间路径碰到**不是 dict** 的 ⇒ 说明那一层也被换掉了 ⇒ 直接收工 ✓（不猜 ✗）。
+    """
+    cur = doc
+    for k in path[:-1]:
+        nxt = cur.get(k)
+        if not isinstance(nxt, dict):
+            return
+        cur = nxt
+    cur.pop(path[-1], None)
 
 
 class Project:
@@ -240,7 +274,13 @@ class Project:
         conflicts = ["/".join(str(x) for x in p) for p, v in mine.items()
                      if p in theirs and theirs[p] != v]
         for p, v in mine.items():
-            _set_leaf(fresh, p, v)               # ⭐ 只盖我那几处 ⇒ 别人的改动留住 ✓
+            if v is _DELETED:
+                # ⭐⭐⭐ **删键**也要真的删（用户 2026-10-17 ✓：「重新开 gui 后，之前删掉的
+                #   自定义按键还会出现」✗）—— 老口径里删键**根本表达不出来** ✗
+                #   ⇒ 磁盘那份原封不动 ⇒ 删除永远落不了盘 ✓（见 `_leaf_diff` 那段说明 ✓）。
+                _del_leaf(fresh, p)
+            else:
+                _set_leaf(fresh, p, v)           # ⭐ 只盖我那几处 ⇒ 别人的改动留住 ✓
         return fresh, conflicts
 
     def save(self):

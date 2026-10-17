@@ -45,7 +45,7 @@ mmap_crop:
 - 208
 - 105
 decision:
-  attack_dist: 80.0
+  attack_dist: 70.0
   min_attack_dist: 0
   attack_up_dist: 30
   attack_down_dist: 20
@@ -90,18 +90,6 @@ decision:
     type: down
   - key: attack
     type: up
-  - ms: 50
-    type: delay
-  - key: attack
-    type: down
-  - key: attack
-    type: up
-  - key: attack
-    prob: 15
-    then:
-    - key: attack
-      type: up
-    type: down
   keymap:
     auto: f11
     left: left
@@ -119,7 +107,7 @@ decision:
   target_cd:
   - 1000
   - 2500
-  atk_target_count: 1
+  atk_target_count: 0
   mob_atk_cd_ms: 2000
   input_device: remote
   attack_cd: 800
@@ -166,8 +154,8 @@ decision:
   strategy: patrol
   vision_top: 100
   vision_bottom: 100
-  vision_left: 400
-  vision_right: 400
+  vision_left: 350
+  vision_right: 353
   vision_center: false
   vision_off_x: 0
   vision_off_y: 0
@@ -210,16 +198,16 @@ decision:
   - fid: '39'
     kind: foothold
     ratio: 100.0
-  - fid: '6'
+  - fid: '5'
     kind: foothold
     ratio: 100.0
-  - fid: '4'
+  - fid: '38'
     kind: foothold
     ratio: 100.0
-  - fid: '116'
+  - fid: '26'
     kind: foothold
     ratio: 100.0
-  - fid: '105'
+  - fid: '53'
     kind: foothold
     ratio: 100.0
   route_goto_set: '4'
@@ -350,7 +338,7 @@ decision:
   reconnect_server_y: 0.2074
   reconnect_channel_x: 0.4104
   reconnect_channel_y: 0.5093
-  reconnect_channel: 22
+  reconnect_channel: 29
   custom_keys:
     攻击药水: grave
     回避药水: '5'
@@ -361,6 +349,11 @@ decision:
     椅子: x
   sweep_turn_cd_enabled: true
   sweep_edge_turn_enabled: true
+  multi_leave_wait_enabled: true
+  multi_leave_delay_s: 1.0
+  jump_attack_enabled: false
+  jump_attack_height: 0.0
+  fall_speed_px_s: 600.0
 notes: ''
 capture:
   source: file
@@ -487,7 +480,7 @@ live:
   - 1366
   - 768
   url: udp://0.0.0.0:5000
-  conf_mob: 0.25
+  conf_mob: 0.35
   conf_player: 0.75
   imgsz: 960
   device: '0'

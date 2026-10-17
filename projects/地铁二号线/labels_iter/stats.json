@@ -1,0 +1,13 @@
+{
+  "frames": 158,
+  "boxes": 662,
+  "from_model": 155,
+  "boxes_from_model": 662,
+  "protected": 0,
+  "kept_orig": 0,
+  "boxes_kept": 0,
+  "cleared": 3,
+  "median_boxes": 3.0,
+  "conf_thr": 0.15,
+  "weights": "E:\\MyPrograms\\playerSimu\\projects\\地铁二号线\\models\\detect_v2.pt"
+}

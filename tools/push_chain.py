@@ -35,7 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deploy import config as dcfg, services                      # noqa: E402
-from tools import push_presets as pp                             # noqa: E402
+from core import push_presets as pp                             # noqa: E402
 
 #: 每条候选跑多久。3 秒够 ffmpeg 走到"稳态"或"立刻死"，再长就是浪费。
 SECONDS = 3.0

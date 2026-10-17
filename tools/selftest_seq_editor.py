@@ -243,6 +243,134 @@ def t_load_replaces_and_bad_keeps():
          QMessageBox.question) = old
 
 
+def t_timer_dialog_seconds_unit():
+    """⭐⭐ 「**添加 / 编辑定时行为**」弹窗里的「以秒为单位」勾选项（用户 2026-10-15 ✓ 原话：
+    "**不是所有的行为编辑器都要加「以秒为单位」，只在添加定时行为弹窗里加，它只是控制
+    「触发下限(分钟)」「触发上限(分钟)」的单位**"✓）。
+
+    口径：勾上 ⇒ 那两条按**秒**填、行标签变 `(s)`；不勾 ⇒ 按**分钟**（老口径 ✓ `(min)`）。
+
+    ⚠⚠ **为什么必须钉**：它**只该换界面** —— `result()["interval"]` **永远是分钟** ✓
+      （`custom_timers[].interval` 就这么存 ✓ 见 `decision/agent.py` 里
+      `random.uniform(lo, hi) * 60.0` ✓）。换算错了（少乘 / 多除 60）就是"**定时行为差 60 倍**"
+      ✗ —— 而界面上一点都看不出来 ✗（那种坑比报错难查一百倍 ✓）。
+
+    钉六件：
+      ① 不勾（老口径）⇒ 行标签 `(min)` ✓、控件里就是**分钟原值** ✓、`interval` 原样 ✓；
+      ② 勾上 ⇒ 行标签 `(s)` ✓、控件里 = 分钟×60 ✓、而 `interval` **一个字没变** ✓（只换显示 ✓）；
+      ③ 秒口径下填 `30` ⇒ `interval` 落成 **`0.5`（分钟 ✓）**；
+      ④ 切回分钟 ⇒ 显示 `0.5`（**同一个量** ✓ 来回切不丢值 ✓）；
+      ⑤ ⭐ **下限能配到 6 秒以下**（用户 2026-10-16 ✓ 原话："触发下限、上限不能配置 6.0 以下"✓）：
+         秒口径 `1 ~ 36000` ✓、分钟口径 `0.01 ~ 600` ✓、小数 3 位 ✓
+         （原来卡在 6.0 是"分钟只留 1 位小数"的**精度副作用** ✓ 不是设定 ✓
+          见 `gui/seq_editor.py::TIMER_LO_SEC` 那段 ✓）；
+      ⑥ 勾选**记在本机**（`config/ui.yaml` ✓）⇒ 下一个弹窗沿用 ✓（行标签也已是 `(s)` ✓）。
+      ⚠ 全程**不许碰用户真实的 `config/ui.yaml`**：两个存取口换成内存版 ✓（见下 ✓）。
+    """
+    from PyQt5.QtWidgets import QApplication
+
+    from gui import seq_editor as se
+
+    app = QApplication.instance() or QApplication([])            # noqa: F841
+    # ⚠ 把本机偏好的**读/写口**换成内存版：第 ⑥ 件要验"存下来了" ⇒ 不换就写进用户真实文件了 ✗
+    mem = {}
+    old_load, old_save = se.theme.load_section, se.theme.save_section
+    se.theme.load_section = lambda name: dict(mem.get(name) or {})
+    se.theme.save_section = lambda name, data: mem.__setitem__(name, dict(data or {}))
+    try:
+        def _labels(dlg):
+            return (dlg.form.labelForField(dlg.sp_lo).text(),
+                    dlg.form.labelForField(dlg.sp_hi).text())
+
+        d = se.TimerEditDialog({"name": "自动喊话", "interval": [5, 10], "seq": []})
+        try:
+            # ① 老口径：分钟
+            d.set_seconds_mode(False, persist=False)
+            check(_labels(d) == ("触发下限(min)", "触发上限(min)"),
+                  "不勾时行标签不是 (min)：%r %r" % _labels(d))
+            check((d.sp_lo.value(), d.sp_hi.value()) == (5.0, 10.0),
+                  "不勾时控件里该是分钟原值：[5, 10] 才对：%r"
+                  % ((d.sp_lo.value(), d.sp_hi.value()),))
+            check(d.result()["interval"] == [5.0, 10.0],
+                  "不勾时 interval 不是 [5, 10]（分钟 ✓）：%r" % (d.result()["interval"],))
+
+            # ② 切到秒：**只换显示**（值一个字不动）
+            d.set_seconds_mode(True, persist=False)
+            check(_labels(d) == ("触发下限(s)", "触发上限(s)"),
+                  "勾上时行标签不是 (s)：%r %r" % _labels(d))
+            check((d.sp_lo.value(), d.sp_hi.value()) == (300.0, 600.0),
+                  "勾上后控件里该是秒（5 分钟 = 300 秒）：%r"
+                  % ((d.sp_lo.value(), d.sp_hi.value()),))
+            check(d.result()["interval"] == [5.0, 10.0],
+                  "切口径把 **interval 改了**（只该换显示 ✗）：%r" % (d.result()["interval"],))
+
+            # ③ 秒口径下填 30 秒 ⇒ interval = 0.5 分钟 ✓
+            d.sp_lo.setValue(30.0)
+            check(d.result()["interval"][0] == 0.5,
+                  "秒口径下填 30 秒没落成 0.5 分钟（换算错了 = 定时差 60 倍 ✗）：%r"
+                  % (d.result()["interval"],))
+
+            # ④ 切回分钟 ⇒ 显示 0.5（同一个量 ✓ 不丢 ✓）
+            d.set_seconds_mode(False, persist=False)
+            check(abs(d.sp_lo.value() - 0.5) < 1e-9,
+                  "切回分钟后显示的不是 0.5 分钟（值丢了 / 换错方向 ✗）：%r" % d.sp_lo.value())
+            check(d.result()["interval"][0] == 0.5, "切回分钟后 interval 变了 ✗")
+
+            # ⑤ **下限不再卡在 6.0**（用户 2026-10-16 ✓ 原话："**编辑定时行为的触发下限、上限
+            #   不能配置 6.0 以下**"✓）。
+            #   ⚠ 原来那条写的是"可配域等价 …… **不许顺手放宽** ✗" —— 那是把**存储精度的
+            #     副作用**当成了设定（分钟只留 1 位小数 ⇒ 一格 6 秒 ✓ 见 `TIMER_LO_SEC` 那段 ✓）；
+            #     用户要的就是更小 ⇒ 口径**有理由地改**：秒下限 `TIMER_LO_SEC`（1 秒 ✓）、
+            #     分钟下限 0.01 ✓、小数 3 位 ✓。
+            d.set_seconds_mode(True, persist=False)
+            check((d.sp_lo.minimum(), d.sp_lo.maximum()) == (se.TIMER_LO_SEC, 36000.0),
+                  "秒口径的范围不是 %.4g ~ 36000（下限还卡在 6.0 的话，用户就配不出 6 秒以下 ✗ "
+                  "见 `seq_editor.TIMER_LO_SEC` ✓）：%r"
+                  % (se.TIMER_LO_SEC, (d.sp_lo.minimum(), d.sp_lo.maximum())))
+            check(d.sp_lo.decimals() == se.TIMER_DECIMALS,
+                  "秒口径小数位不是 %d（1 位 ⇒ 最小一格仍是 6 秒 ✗）：%r"
+                  % (se.TIMER_DECIMALS, d.sp_lo.decimals()))
+            # ⭐ **钉的正是用户那句诉求本身**：秒口径填 2 秒 ⇒ 真源落成 2/60 分钟 ✓
+            d.sp_lo.setValue(2.0)
+            d.sp_hi.setValue(3.0)
+            check(abs(d.result()["interval"][0] - 2.0 / 60.0) < 1e-9,
+                  "秒口径填 2 秒没落成 2/60 分钟（填得进、存不下 ✗）：%r"
+                  % (d.result()["interval"],))
+            check(abs(d.result()["interval"][1] - 3.0 / 60.0) < 1e-9,
+                  "秒口径填 3 秒没落成 3/60 分钟：%r" % (d.result()["interval"],))
+            d.set_seconds_mode(False, persist=False)
+            check(d.sp_lo.minimum() == se.TIMER_LO_MIN and d.sp_lo.decimals() == se.TIMER_DECIMALS,
+                  "分钟口径的下限 / 小数位没跟着放（0.01 / 3 位 ✓ 见 `TIMER_LO_MIN` ✓）：%r / %r"
+                  % (d.sp_lo.minimum(), d.sp_lo.decimals()))
+            check(d.sp_lo.maximum() == 600.0,
+                  "分钟口径的**上限**被改了（600 分钟 = 10 小时该一字不动 ✓）：%r"
+                  % d.sp_lo.maximum())
+            # ⭐ 切回分钟**不丢值**（2 秒 ⇒ 0.0333 分钟 ✓ 小数 3 位装得下 ✓ —— 这正是"两处一起动"
+            #   的原因：只动秒口径的话，切回来就会被显示精度吃掉 ✓）
+            check(abs(d.result()["interval"][0] - 2.0 / 60.0) < 1e-9,
+                  "切回分钟之后值变了（换单位丢值 ✗ 见 `_apply_unit` 里那句「真源一个字不动」✓）：%r"
+                  % (d.result()["interval"],))
+
+            # ⑥ 勾选记在本机 ⇒ 下一个弹窗沿用（且行标签就是 (s) ✓）
+            d.set_seconds_mode(True)          # persist 默认 True ⇒ 写进（内存版）本机偏好 ✓
+            check(mem.get(se._UI_SECTION, {}).get(se._UI_SECONDS_KEY) is True,
+                  "「以秒为单位」没存进本机偏好：%r" % (mem,))
+            d2 = se.TimerEditDialog({"name": "x", "interval": [30, 60], "seq": []})
+            try:
+                check(d2.seconds_mode(), "新弹窗没沿用上次勾的「以秒为单位」✗")
+                check(_labels(d2) == ("触发下限(s)", "触发上限(s)"),
+                      "沿用了口径但行标签还是 min：%r %r" % _labels(d2))
+                check((d2.sp_lo.value(), d2.sp_hi.value()) == (1800.0, 3600.0),
+                      "沿用了秒口径但控件里不是秒（30 分钟 = 1800 秒）：%r"
+                      % ((d2.sp_lo.value(), d2.sp_hi.value()),))
+            finally:
+                d2.deleteLater()
+        finally:
+            d.deleteLater()
+    finally:
+        se.theme.load_section, se.theme.save_section = old_load, old_save
+
+
 # ⚠ 这里原来是 `TESTS = (...)` 的**表头**，已经挪到文件末尾（`main()` 之前）——
 #    因为 `TESTS` 的每一项在**模块导入时**就要求值 ⇒ 它引用的用例函数必须**先定义** ✓。
 #    （我把它放到函数前面过一次 ⇒ 当场 `undefined name` ✗。）
@@ -327,6 +455,9 @@ TESTS = (
      t_seq_editor_add_down_pairs_up),
     ("编辑器：双击元素按类型进编辑（delay⇒毫秒、键⇒改键；取消不动）",
      t_seq_editor_double_click_edits_by_type),
+    ("定时行为弹窗：「以秒为单位」勾选（只换触发下限/上限的单位 min⇄s；interval 永远是分钟；"
+     "可配域等价；记在本机）",
+     t_timer_dialog_seconds_unit),
     ("预设：存 → 读 → 一致（含 then 嵌套 / prob / 中文键名，文件人能读）",
      t_roundtrip_nested),
     ("预设：空序列 + 归一化（prob=100 / 空 then 不写出来）+ 不动入参",

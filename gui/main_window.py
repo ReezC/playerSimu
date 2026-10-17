@@ -1300,6 +1300,18 @@ class MainWindow(QMainWindow):
             return
         # ---- 第 3 层：窗口内快捷键 ----
         self._hotkey_how = "window"
+        # ⚠⚠⭐ 第三层落地之后**再补一句"权限"的提示**（2026-10-11 ✓ 用户："本地实时聚焦游戏
+        #   窗口时按 F11 无法暂停自动"✓ 现场定案）：**别人提权、我们没提** ⇒ 低级钩子与
+        #   `RegisterHotKey` **都收不到发给更高权限窗口的按键** ✗（UIPI ✓）
+        #   ⇒ 游戏一聚焦就没反应 ✓（工作台自己聚焦时能收 ✓ —— 走的是窗口内快捷键 ✓）。
+        #   这一条**必须说出来** ✗：不然人会以为"热键坏了"，然后一遍遍重启 ✓。
+        try:
+            _hint = _hotkey.elevation_hint()
+            if _hint:
+                self.log(_hint, "warn")
+                self._note_hotkey_fallback("elevated", key_name, _hint)
+        except Exception:                        # noqa: BLE001 —— 只是提示，别把启动弄崩 ✓
+            pass
         if self._auto_shortcut is None:
             self._auto_shortcut = QShortcut(QKeySequence(key_name), self)
             # ⚠ 显式写出来（§10）：这里**故意**用 WindowShortcut（默认值）—— 降级语义就是

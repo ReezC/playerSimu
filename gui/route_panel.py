@@ -489,7 +489,10 @@ class RoutePanel(QWidget):
         grp_guard = QGroupBox("攀爬参数")
         gv = QVBoxLayout(grp_guard)
         gv.setSpacing(6)
-        # 第一行：**对齐绳梯移动延迟(ms)**（用户 2026-09-27 加的参数）——
+        # 第一行：**对齐上绳梯**开关（用户 2026-10-17 ✓ 新增）——
+        #   它是这一组的"总开关"：关掉 ⇒ 上绳只用**斜跳** ✗（不再"对齐到容差内 ⇒ 站住 ⇒ 跳"）
+        gv.addLayout(self._build_align_first_row())
+        # 第二行：**对齐绳梯移动延迟(ms)**（用户 2026-09-27 加的参数）——
         # 它管的是流程里**最早**的一步（对齐绳的 x），所以排在最前 ✓
         row_gap = QHBoxLayout()
         row_gap.setSpacing(6)
@@ -499,7 +502,9 @@ class RoutePanel(QWidget):
         self.sp_align_gap.setSingleStep(10)
         self.sp_align_gap.setMinimumWidth(90)
         self.sp_align_gap.setValue(int(getattr(settings, "climb_align_gap_ms", 180) or 0))
-        self.sp_align_gap.setToolTip(
+        # ⚠ 提示语**存一份**（`_tip_align_gap` ✓）：`_sync_align_first` 在关闭
+        #   「对齐上绳梯」时要往这句后面追加"不可配置"那条说明 ✓（不存就得重抄一遍 ✗）
+        self._tip_align_gap = (
             "**对齐绳梯的 x** 时，两次按下方向键之间至少要隔这么久（毫秒）。\n\n"
             "为什么要它：按住方向键在游戏里就是「一直走」，快到绳那儿必然冲过头、\n"
             "然后往回走 ⇒ 表现是「在绳两边来回抖」。所以进了「开始对齐绳梯x的距离」\n"
@@ -508,6 +513,7 @@ class RoutePanel(QWidget):
             "调大 = 走得更碎、更不易过冲（代价：贴到绳上更慢）。\n\n"
             "⚠ 比那个距离**远**时仍然是**一口气按住走**（那本来就只有「一次按下」）；\n"
             "   它约束的是「松开过之后再按」的那一下 ✓。")
+        self.sp_align_gap.setToolTip(self._tip_align_gap)
         self.sp_align_gap.valueChanged.connect(self._on_align_gap)
         row_gap.addWidget(self.sp_align_gap)
         row_gap.addStretch(1)
@@ -955,7 +961,18 @@ class RoutePanel(QWidget):
         # 「地形图里叠实时小地图」那条的节拍（用户 2026-09-29 第 ⑦ 条 ✓）：单开一个定时器，
         # 因为它跟"画面上那层叠图"（`mmap_draw`）是**两件事** —— 那个关着也该能用这个 ✓。
         self._live_map_timer = QTimer(self)
-        self._live_map_timer.setInterval(250)   # 同上：4 次/秒够看 ✓
+        # ⭐⭐⭐ **刷新率提上去**（用户 2026-10-16 ✓ 原话："**提高视图的刷新率，与主视区的
+        #   实时相同的收流逻辑**"✓）：
+        #   · 以前 **250ms（4 次/秒）** ✗ —— 眼睛能看出"一格一格跳" ✓；
+        #   · 现在 **40ms（≈25 次/秒）** ✓ —— 与主视区实时那一档（约 30fps ✓ 见
+        #     `live_panel` 的绘制合并说明 ✓）**同一个量级** ✓；
+        #   · ⚠ 光提频不够 ✗：这一拍里原来有**重活**（每拍 `mapdata.load` 读盘 + 建画布 ✗）
+        #     ⇒ 提到 25fps 会把主线程吃满 ✗ ⇒ 同一个改动里把那步改成**换图才读** ✓
+        #     见 `_live_map_tick` 里那段缓存 ✓；
+        #   · ⚠ 「从实时画面」那种来源仍然是**拉**（`current_frame()` ✓ 取最新一帧 ✓）——
+        #     它拿到的就是主视区**同一份原生帧** ✓（`raw_frame_ready` 那条口径 ✓
+        #     见 `live_thread` 的 `current_frame` 说明 ✓）⇒ 收流同源 ✓、节拍靠本定时器 ✓。
+        self._live_map_timer.setInterval(40)    # ≈25 次/秒（原来 250ms = 4 次/秒 ✗）
         self._live_map_timer.timeout.connect(safe_slot(self._live_map_tick))
         #: 那一层的**透明度**（% ；用户 2026-09-29 追加："需要加个参数'透明度'"✓）。
         #: 落在 `config/live.yaml`（本机外观偏好，和 `mmap_draw` 同一处 ✓）。
@@ -1030,12 +1047,14 @@ class RoutePanel(QWidget):
             "随时跟着滚动 ✓。滚轮放大到那一带：面板里的地形和底图处处重合就是对的；"
             "整块偏、或者越走越偏，就是标定或「显示区跟踪」的问题 ✓。\n"
             "  像素差分地图 —— 面板 减 底图上它盖住的那一块，专门看「底图上没有的东西」"
-            "（玩家点 / 其它实时元素 ✓）。差分先减掉整幅的背景档再放大，"
-            "所以整幅都偏一点时也不至于糊成一片 ✓。\n"
+            "（玩家点 / 其它实时元素 ✓）。差分**先减掉每个像素周围的局部背景**再放大"
+            "（用户 2026-10-12 ✓）⇒ 整幅底色偏、游戏小地图半透明这些都不影响 ✓，"
+            "只留「比周围多出来的那一截」✓。\n"
             "  仅地形图 —— 不叠，只看底图 ✓。\n\n"
             "⚠ 差分只是「看」的：不参与定位、不写盘 ✓。\n"
-            "⚠ 底图是解码出来的地形画布、和游戏里那张小地图不一定同源 ⇒ "
-            "差分的背景档偏大就说明这张图上它只能当辅助（右边那行会把数字报出来 ✓）。\n\n"
+            "⚠ 底图是解码出来的地形画布、和游戏里那张小地图不一定同源 ⇒ 右边那行会报两个数：\n"
+            "   **背景档**（整幅差的中位）= 这张图整幅有多偏（已被局部背景扣掉 ✓ 不影响观感 ✓）；\n"
+            "   **局部残差** = 扣完之后还剩多少 ⇒ 它大才是「真的不同源、只能当辅助」（会染橙色 ✓）。\n\n"
             "⚠ 面板从哪来跟「小地图来源」走：收流用 A 机那一口（画质好），"
             "从实时画面则按本项目的框选区域裁。")
         # ⚠ `setCurrentIndex` **必须在 `connect` 之前**（同老勾选框那条理由 ✓）：
@@ -1149,6 +1168,45 @@ class RoutePanel(QWidget):
 
         # 只读看图画布：和质检台同一套交互（滚轮缩放 / 中键平移 / 双击适应）
         self.canvas = ImageCanvas()
+        # ⭐⭐⭐ **地形图上一个字都不要**（用户 2026-10-16 ✓ 原话："**路线识别页签→地形图
+        #   里的字全部去掉**"✓）—— 这一页是"看地形 + 看实时小地图叠图"的 ✓，框上的类名、
+        #   标记旁边那行字都是**干扰** ✗ ⇒ 整页关掉文字 ✓。
+        #   ⚠ 只改**可见性** ✗：框、坐标、编辑能力全都照旧 ✓（`set_text_visible(True)`
+        #     就能恢复 ✓）；⚠ 开关是**持久**的 ⇒ 换图 / 重画地形图（`load()` 重建框 ✓）
+        #     也一样不显示 ✓（见 `canvas.add_box` 里那道守卫 ✓）。
+        self.canvas.set_text_visible(False)
+        # ⭐⭐⭐ **底图上那些字也去掉**（用户 2026-10-17 ✓ 原话：「**怎么还这么多字，不是让你
+        #   去掉吗？**」✗）—— ⚠ 这一批**不是** Qt 图元 ✗：它们是
+        #   `tools/map_terrain_view.py` 用 `cv2.putText` **画进图片像素**里的
+        #   （图例五行「red: walls / cyan: ladderRope (14) / 1 px = …」+ 集合名 / 地名 /
+        #    段号「10 / 12 / 13」/ 门名「花田 / 小车站 / Outlook」✓）⇒ 上面那个画布
+        #   「文字总开关」**管不到**它们 ✗（那是按 `QGraphicsSimpleTextItem` 处理的 ✓ ——
+        #   我上一轮就漏了这一批 ✓）。
+        #   ⇒ 开关落在**唯一画字处** `_label()` ✓（一处关、全都关 ✓ 见那边说明 ✓），
+        #     而且是**进程内**生效 ✓（本页 `from tools.map_terrain_view import render` ✓）。
+        #   ⚠ 关的是**本进程**的画字 ✓（命令行跑那个脚本照旧有字 ✓ 行为不变 ✓）。
+        try:
+            from tools.map_terrain_view import set_labels
+            set_labels(False)
+        except Exception:                # noqa: BLE001 —— 关不动不该让整页起不来 ✓
+            pass
+        # ⭐⭐⭐ **这一页那些"说明性"标签也去掉**（用户 2026-10-17 ✓ 原话：「**怎么还这么多字，
+        #   不是让你去掉吗？**」✗ —— 上一轮我只关了两批"画在图上的字"✗，**面板自己的标签**
+        #   还留着 ✓ 所以截图里仍然一堆字 ✓）：
+        #   · 隐掉的全是**纯说明**（看也好、不看也罢那种 ✓）：
+        #     `lbl_map_img`（"集合图 xxx_zones.png 1235×395 像素（地形编辑器的结果：…）"✓）、
+        #     `lbl_mmap_hint`（图例那行 "red: walls / cyan: ladderRope (14) / 1 px = …"✓）、
+        #     `lbl_mmap_draw`（画出处那一行 ✓）；
+        #   · ⚠ **`lbl_live_map` 不在这儿隐** ✗ —— 它兼着"**为什么没画出来**"的唯一出口
+        #     （取不到面板 / 还没标定 / 还没底图 ✓）⇒ 正常时**它自己会写空** ✓（见
+        #     `_refresh_live_map` 里那段 ✓）、出问题才说话 ✓；
+        #   · ⚠ **控件**（显示类型 / 透明度 / 生成地形图 / 定位那几行 ✓）**一律留着** ✓ ——
+        #     那是操作入口 ✓ 去掉就没法用了 ✗。
+        for _w in (getattr(self, "lbl_map_img", None),
+                   getattr(self, "lbl_mmap_hint", None),
+                   getattr(self, "lbl_mmap_draw", None)):
+            if _w is not None:
+                _w.setVisible(False)
         # 只设**下限**（用户可以靠分隔条把它压到这么小 ✓ —— 用户 2026-09-27 嫌它占地方；
         # 原来 320 太"霸道" ✗，140 够看清缩略图，要看细节滚轮放大就行 ✓）。
         self.canvas.setMinimumHeight(140)
@@ -1474,8 +1532,11 @@ class RoutePanel(QWidget):
                 sec = ag.resetall_left() if ag is not None else None
             except Exception:                       # noqa: BLE001
                 sec = None
+            # ⭐ 「没开自动 ⇒ 定时清键停」写进文案（用户 2026-10-15 ✓）：那种"None"不是
+            #   "还没排到"，是**压根不计时** ✓ —— 两者都写"未排期"会让人以为它随时会清一次 ✗。
+            _on = bool(getattr(getattr(ag, "settings", None), "enabled", True))
             out.append("定时清键%s" % ("　剩余 %s" % _mmss(sec) if sec is not None
-                                     else "　未排期"))
+                                     else ("　关自动时不计时" if not _on else "　未排期")))
         return out
 
     def _fight_line(self):
@@ -1505,6 +1566,75 @@ class RoutePanel(QWidget):
         except (TypeError, ValueError):
             return ""
         return "战斗时长　「%s」剩余 %s / %s" % (name, _mmss(left), _mmss(cap))
+
+    @staticmethod
+    def _facing_text(v):
+        """朝向的显示口径：`+1` / `-1` / **`—`**（拿不到 ⇒ 如实说"没有" ✓ 绝不编一个方向 ✗）。
+
+        用户 2026-10-11 ✓ 原话："**我在哪里能可视化看到你的朝向判据呢？**"✓ —— 界面上要有
+        一个能读的**数** ✓，而不是只让人从"框画在哪一侧"去反推 ✓。
+        """
+        try:
+            _v = int(v or 0)
+        except (TypeError, ValueError):
+            return "—"
+        return "+1" if _v > 0 else ("-1" if _v < 0 else "—")
+
+    def _face_line_text(self):
+        """⭐ **朝向那一行**：只报**判据**（`CombatAgent.facing` = `action["facing"]` ✓）
+
+        「**攻击范围框**」画在哪一侧用的就是它 ✓（走路跟方向键 ✓ 站桩时贴「怪在哪一侧」✓）。
+
+        ⚠⚠ 2026-10-13（用户："**把真实视觉朝向的判定逻辑和显示都移除**"✓）：原来这行是
+          「判据 ｜ **真实**」**两份并排**（用户 2026-10-11 "我在哪里能可视化看到你的
+          朝向判据呢？"✓）—— 「真实」那半来自 `LiveThread._face_beat`（世界坐标位移
+          推出来的 ✓）⇒ **连同判定一起撤了** ✗ ⇒ 这行只剩判据 ✓。
+        ⚠ 拿不到实时线程 / agent（老环境 / 替身 / 没开始）⇒ **返回空串** ✓
+          ⇒ 这一行**一个字都不画** ✓（不画「朝向 ?」这种废行 ✗ —— 同决策行那条口径 ✓）。
+        ⚠ 只**读**、不写 ✗（判据那份的写者只有 `set_facing` ✓ R1 ✓）。
+        """
+        try:
+            _th = getattr(getattr(self, "live_panel", None), "thread", None)
+            if _th is None:
+                # ⚠⚠ **没有实时线程 ⇒ 这一行不画** ✗（2026-10-11 实测踩到）：自检里
+                #   `decision.agent.CURRENT` 会**残留**着上一个用例建的 agent ✓ ⇒ 只按
+                #   「有 agent」判的话，每个建过 RoutePanel 的用例都会多出一行、把
+                #   「画面那几行：当前任务 + 计时任务逐行」那条逼红 ✓。
+                #   ⇒ 与其它读数**同一条口径**：读数来自**实时回路** ✓ 它没跑就没有 ✓。
+                return ""
+            _ag = self._live_agent()
+            _int = getattr(_ag, "facing", None) if _ag is not None else None
+            return "朝向　判据 %s" % self._facing_text(_int)
+        except Exception:                       # noqa: BLE001 —— 少一行读数别把界面带崩 ✗
+            return ""
+    def _calib_line_text(self):
+        """⭐ **小地图标定那一行**：把「自动补标定」的结果说出来 ✓（有事才出现 ✓）。
+
+        用户 2026-10-11 ✓ 连着两问："黄金海滩又找不到黄点了" → "**为什么要我补标定？**"✓
+          —— 结论是"**标定按来源分开存**"（同一张图两条来源的面板差 5.6 倍 ✗ 不能互换 ✓），
+          而"自动量一遍"这条路是通的 ⇒ 缺哪条自动补哪条 ✓（`minimap.try_autofit` ✓）。
+        ⚠ 它原来的去向只有 `perf.log` 段头 / `behavior.log` ✗ ⇒ **得翻日志才知道**卡在哪 ✗
+          ⇒ 这里给它一个常驻的可见去处 ✓（就在小地图下面那几行 ✓ 人本来就盯着那儿 ✓）。
+        三种说法（都取自 `PlayerLocator.autofit` ✓ **一处写** ✓）：
+          · 补上了 ⇒ `标定　已自动补（分 0.94）` ✓；
+          · 试过但不够 ⇒ `标定　自动试过：…`（人就知道得手动标一次 ✓）；
+          · 正常 / 还没试过 ⇒ **不画这一行** ✓（平时画面上不多一行 ✓）。
+        """
+        try:
+            _th = getattr(getattr(self, "live_panel", None), "thread", None)
+            _loc = getattr(_th, "_locator", None) if _th is not None else None
+            _af = getattr(_loc, "autofit", None)
+            if not isinstance(_af, dict):
+                return ""
+            _why = str(_af.get("why") or "")
+            if not _why:
+                return ""
+            _sc = _af.get("score")
+            if _af.get("ok") and _sc is not None:
+                return "标定　已自动补（分 %.2f）" % float(_sc)
+            return "⚠ 标定　自动试过：%s" % _why[:60]
+        except Exception:                       # noqa: BLE001
+            return ""
 
     def _osd_lines(self, first):
         """画面那几行（小地图框下方，从上到下）：世界坐标 → **当前任务** → （队列）→
@@ -1557,6 +1687,12 @@ class RoutePanel(QWidget):
                     _dec += " → foothold#%s" % _ifid
         except Exception:                     # noqa: BLE001 —— 老环境/替身 ⇒ 不画 ✓
             _dec = ""
+        # ⭐⭐ **朝向那一行**（用户 2026-10-11 ✓ 原话："**我在哪里能可视化看到你的朝向判据呢？**"✓）
+        #   —— 两份并排：**判据**（Agent 的意图 = 攻击范围框画在哪侧 ✓）｜**真实**（世界坐标
+        #   位移推出来的 ✓）。⚠ 两份**故意分开** ✗：不一致时正是要看的东西 ✓（见 `_face_line_text` ✓）。
+        _face_line = self._face_line_text()
+        # ⭐ **小地图标定那一行**（只有"自动补过 / 试过"时才出现 ✓ 见 `_calib_line_text` ✓）
+        _calib_line = self._calib_line_text()
         # ⭐⭐ **角色死了吗**（用户 2026-10-05 ✓ 原话："角色死了之后画面中心会出现这个弹窗
         #   （原地复活），并且 HP 是 0%？…我们能否检查出角色死了？"）——
         #   判据与"停手 + 留痕"全在 `agent._death_beat` ✓（血条连续几拍读出空 ✓）；
@@ -1609,6 +1745,12 @@ class RoutePanel(QWidget):
         lines = [first]                       # str ⇒ 保持黑底白字（读数是排查用的）
         if _dec:
             lines.append(_dec)                # 决策状态：与世界坐标同款式 ✓（见上）
+        # ⭐ 朝向（判据 vs 真实 ✓）与**小地图标定**（有事才出现 ✓）：同样与世界坐标**同款式**
+        #   （普通 str ⇒ 黑底白字 ✓ 它们是**读数** ⇒ 不归「定时任务」那个开关管 ✓ 见上 ✓）。
+        if _face_line:
+            lines.append(_face_line)
+        if _calib_line:
+            lines.append(_calib_line)
         # ⭐⭐ 角色死亡那行（构造在**上面** ✓ `_head`）—— 放「当前任务」**之前**：
         #   那一行这时还写着"战斗"，得先说清"为什么不打了" ✓（红字 + 大字 ✓）。
         lines += _head
@@ -3267,6 +3409,18 @@ class RoutePanel(QWidget):
                 # 有坐标、但**很久没更新** ⇒ 实时多半已经停了（`LAST_POS` 从来不清 ✓）
                 r = dict(r, ok=False,
                          short="位置状态已经 %.0f 秒没更新（实时可能停了）" % _age)
+            else:
+                # ⭐⭐ **坐标有效 ⇒ 这一行就说「有」** ✗（2026-10-11 修 ✓）：
+                #   上面那个 `r["ok"]` 来自**面板自己那份 locator**（"这块面板上认没认出黄点" ✓）
+                #   —— 它**不再是这一行的判据** ✗：用户 2026-10-10 已定案"**坐标只认唯一那一份**"
+                #   ✓，而面板那份 locator 只剩两件活：**显示区跟踪**（`view` ✓ 叠图画在哪儿用 ✓）
+                #   与**黄点诊断**（tooltip 那行 ✓）。
+                #   ⚠ 不改的话会**自相矛盾**：tooltip 写着"（唯一那份：实时回路的位置状态 ✓）"、
+                #     这行却拒绝显示它 ✗ —— 2026-10-11 实测就是这样 ✓（复现：面板是黑的/还没认出
+                #     黄点，但实时那份坐标明明有效 ⇒ 界面显示"（鼠标放上去看详情）"、详情里却说
+                #     "唯一那份"✓）。它顺手把 `t_world_reads_new_calib` / `t_world_label_text`
+                #     两条用例逼红了 ✓（那两条正是按"面板自己认黄点"写的 ✓ 见它们的说明 ✓）。
+                r = dict(r, ok=True, short="")
         elif _lp:
             # 收到过、但**是另一张图**的（换图之后实时还在按旧图算 ⇒ 别拿它当这一张的坐标 ✗）
             r = dict(r, ok=False, world_x=None, world_y=None,
@@ -3604,7 +3758,16 @@ class RoutePanel(QWidget):
             self.canvas.set_live_patch(None)
             self.lbl_live_map.setText("先选地图 + 打开项目")
             return
-        t = mapdata.load(mid, with_canvas=True)
+        # ⭐⭐ **底图只在"换图"时读一次**（用户 2026-10-16 ✓ 见定时器那段 ✓）：
+        #   以前**每一拍**都 `mapdata.load` ✗（读 png + 建画布图元 + 装蒙版 ✓）
+        #   ⇒ 那才是刷新率上不去的真正原因 ✗（4 次/秒时就已在白跑 ✓，
+        #     提到 25 次/秒会直接把主线程吃满 ✗）。
+        #   ⚠ 缓存键是**地图 id** ✓：换图必然重读 ✓（换图还走 `_load_map` 那条 ✓，
+        #     两条路读的是同一份 ✓ 不会打架 ✓）。
+        if getattr(self, "_live_map_cached_id", None) != mid:
+            self._live_map_cached_t = mapdata.load(mid, with_canvas=True)
+            self._live_map_cached_id = mid
+        t = self._live_map_cached_t
         if t is None or t.canvas is None:
             self.canvas.set_live_patch(None)
             self.lbl_live_map.setText("这张图还没有底图 —— 先点「生成地形图」")
@@ -3667,9 +3830,14 @@ class RoutePanel(QWidget):
                 diff_warn = True
             else:
                 wx, wy = mm.panel_to_world(di["at"][0], di["at"][1], cal, t)
-                diff_txt = ("　差分 ×%g：背景档 %g 灰阶（整幅均值 %g · 最大 %g）· "
-                            "最突出 %g 在面板 (%d, %d) ⇒ 世界 (%d, %d)"
+                # ⭐ 「差分 ×4：背景档 60 灰阶（**局部残差 5.1**）· 最突出 245 在面板 (x,y)…」
+                #   —— `floor` 照旧报（"这张图整幅偏多少"✓），**多报一个局部残差**（用户
+                #   2026-10-12 ✓）：差分改成逐块局部背景之后，"整幅偏"已经不影响观感 ✓
+                #   见 `perception.minimap.DIFF_LOCAL_PX` ✓。
+                diff_txt = ("　差分 ×%g：背景档 %g 灰阶（整幅均值 %g · 最大 %g · "
+                            "**局部残差 %g**）· 最突出 %g 在面板 (%d, %d) ⇒ 世界 (%d, %d)"
                             % (di["gain"], di["floor"], di["raw_mean"], di["raw_peak"],
+                               float(di.get("res_med") or 0.0),
                                di["peak"], di["at"][0], di["at"][1],
                                round(wx), round(wy)))
                 show = vis
@@ -3713,9 +3881,19 @@ class RoutePanel(QWidget):
                         % (_dpt[0], _dpt[1],
                            "" if _dwx is None else
                            "，按标定算出来是 (%d, %d)" % (round(_dwx), round(_dwy)))
-                if di["floor"] >= DIFF_FLOOR_WARN:
-                    diff_txt += "（背景档偏大 ⇒ 这张图上底图与游戏小地图不同源，只能当辅助看）"
+                # ⭐⭐ **判"该不该提醒"改用「局部残差」**（用户 2026-10-12 ✓ 见 `DIFF_LOCAL_PX` ✓）：
+                #   · **局部归一之后**还剩一大截 ⇒ 这两张图**真的**不同源 ⇒ 照旧提醒 ✓；
+                #   · 只是"整幅偏"（底色/半透明不同 ✓ 现场 石人寺院Ⅳ 就是这种 ✗）⇒
+                #     **一句说明、不是警告** ✓ —— 差分已经把它扣掉了、照样能用 ✓
+                #     （老口径在这儿会染橙 + 说"只能当辅助看"✗，而画面明明干净 ✓ ⇒ 人白跑 ✓）。
+                _rm = float(di.get("res_med") or 0.0)
+                if _rm >= DIFF_FLOOR_WARN:
+                    diff_txt += ("（**局部归一之后**残差还有 %g 灰阶 ⇒ 这两张图真的不同源，"
+                                 "差分只能当辅助看）" % _rm)
                     diff_warn = True
+                elif float(di["floor"]) >= DIFF_FLOOR_WARN:
+                    diff_txt += ("（整幅偏 %g 灰阶 —— 底图与小地图的底色/透明不同，"
+                                 "**已按局部背景扣掉** ✓ 差分照常可用）" % di["floor"])
         # ⭐⭐⭐⭐⭐ **玩家那个圈 = 唯一那一份世界坐标**（用户 2026-10-10 ✓ 原话："**地形图都锁到
         #   红点上去了，报的坐标也与信息栏不一致，这个不应该自己走独立逻辑，它就应该根据
         #   最终信息栏读到的玩家世界坐标来绘制**"✓）。
@@ -3768,12 +3946,32 @@ class RoutePanel(QWidget):
         if n_mark:
             diff_txt += "　· 已在地形图上**圈出 %d 个点**（黄圈 = 差分找到的那个 ✓）" % n_mark
         warn = how.startswith("⚠") or diff_warn
-        self.lbl_live_map.setText(
-            "面板 %d×%d 摆在地图 (%d, %d) 起、%.2f×（%s）%s%s"
-            % (wp, hp, round(ox), round(oy), kx, how,
-               "" if cal.get("mode") == mm.MODE_CROP
-               else "　（全局小地图：整张底图都在面板里、不滚动 ✓）",
-               diff_txt))
+        # ⭐⭐⭐ **正常时一个字都不写**（用户 2026-10-17 ✓ 原话：「**怎么还这么多字，不是让你
+        #   去掉吗？**」✗ —— 截图里那行「面板 1050×339 摆在地图 (-4,-2) 起、1.18×（照标定）
+        #   …　已在地形图上圈出 1 个点」就是这儿写的 ✓）：
+        #   · ⚠ **只有出问题才说**（`warn` = `how` 以 ⚠ 开头 / 差分没取到 ✓）—— 这一页
+        #     就这**一个出口**能讲"为什么没画出来"✗（取不到面板 / 没标定 / 没底图 ✓ 都走它 ✓）
+        #     ⇒ 连它一起抹掉 ⇒ 出问题时就彻底哑了 ✗ 那是帮倒忙 ✓；
+        #   · 其余情况 `setText("")` ✓（标签留着、**不占眼** ✓ 出问题时能立刻说话 ✓）。
+        if warn:
+            self.lbl_live_map.setText(
+                "面板 %d×%d 摆在地图 (%d, %d) 起、%.2f×（%s）%s%s"
+                % (wp, hp, round(ox), round(oy), kx, how,
+                   "" if cal.get("mode") == mm.MODE_CROP
+                   else "　（全局小地图：整张底图都在面板里、不滚动 ✓）",
+                   diff_txt))
+        else:
+            # ⭐⭐ **字不占眼了，但那句话不丢** ✗ —— 同一段文案**挪进 tooltip** ✓
+            #   （鼠标悬停就能看 ✓；⚠ 出问题时它照样会自己说话 ✓ 见上面那支 ✓）：
+            #   这样「这一页别有字」✓ 与「出问题/要排查时看得见」✓ 两个要求都保住 ✓
+            #   （也让既有的那几条"状态行要说清…"钉子改成读 tooltip 即可 ✓ 判据不放宽 ✓）。
+            self.lbl_live_map.setText("")
+            self.lbl_live_map.setToolTip(
+                "面板 %d×%d 摆在地图 (%d, %d) 起、%.2f×（%s）%s%s"
+                % (wp, hp, round(ox), round(oy), kx, how,
+                   "" if cal.get("mode") == mm.MODE_CROP
+                   else "　（全局小地图：整张底图都在面板里、不滚动 ✓）",
+                   diff_txt))
         self.lbl_live_map.setStyleSheet("color: %s;" % ("#b06000" if warn else "#80868b"))
 
     def _calib_panel_wh(self, cal=None):
@@ -4038,6 +4236,50 @@ class RoutePanel(QWidget):
         mapdata.save_calib(mid, cal, src_kind)
         self._refresh_mmap()        # 里面会顺带按新方式重算叠图（fit/crop 画法不同）
 
+    def _build_align_first_row(self):
+        """「**对齐上绳梯**」那个勾选框（用户 2026-10-17 ✓ 新增的攀爬参数 ✓）。
+
+        语义（原话）：「**攀爬参数增加开关"对齐上绳梯"，关闭后只能斜跳上绳，
+        "对齐绳梯移动延迟"不可配置，需要角色需要走出"开始对齐绳梯x的距离"后再进行斜跳**」✓
+        · 勾上（默认）= 老行为：对齐到「坐标对齐误差范围」内 ⇒ 站住 ⇒ 按跳 ✓；
+        · 取消 = **只准斜跳** ✗ ⇒ 角色先走出「开始对齐绳梯x的距离」进斜跳窗口再跳 ✓；
+        · 取消时「对齐绳梯移动延迟」**置灰不可配** ✓（`_sync_align_first` ✓）。
+        """
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.chk_align_first = QCheckBox("对齐上绳梯")
+        self.chk_align_first.setChecked(
+            bool(getattr(settings, "climb_align_first", True)))
+        self.chk_align_first.setToolTip(
+            "勾上（默认）= 先横向把 x 对齐到绳上，再站住一下、按跳上去（老行为 ✓）。\n\n"
+            "取消 = **只准斜跳上绳**：角色会先走出「开始对齐绳梯x的距离」，\n"
+            "进了斜跳区间（那个距离 ~ 斜跳起手距离）再斜跳上去。\n\n"
+            "⚠ 取消后「对齐绳梯移动延迟(ms)」**不可配置**（那一项只对点按微调有意义 ✓）。")
+        # ⚠ **先 `setChecked` 再 `connect`** ✗ —— 反过来的话，构造时那一下
+        #   `setChecked(True)` 就会触发 `_on_align_first` ⇒ `_sync_align_first`
+        #   ⇒ 而 `sp_align_gap` **还没建出来** ✗ ⇒ 构造期 AttributeError ✓（真踩过 ✓）。
+        self.chk_align_first.toggled.connect(self._on_align_first)
+        row.addWidget(self.chk_align_first)
+        row.addStretch(1)
+        return row
+
+    def _sync_align_first(self):
+        """按「对齐上绳梯」的状态，决定「对齐绳梯移动延迟」能不能配（用户 2026-10-17 ✓）。"""
+        on = bool(self.chk_align_first.isChecked())
+        _sp = getattr(self, "sp_align_gap", None)
+        if _sp is None:
+            return          # 构造期还没建出来 ⇒ 什么都不做（别炸 ✗ 见 `_build_align_first_row` ✓）
+        _sp.setEnabled(on)
+        self.sp_align_gap.setToolTip(
+            self._tip_align_gap + ("" if on else
+                                   "\n\n⚠ 「对齐上绳梯」已关闭 ⇒ 只走斜跳，这一项**不可配置** ✓"))
+
+    def _on_align_first(self, on):
+        """切换「对齐上绳梯」⇒ 写进配置（决策参数、跟着项目存 ✓）并联动置灰 ✓。"""
+        settings.climb_align_first = bool(on)
+        settings.save()
+        self._sync_align_first()
+
     def _on_align_gap(self, v):
         """改了「对齐绳梯移动延迟(ms)」⇒ 写进配置（同样是决策参数、跟着项目存）。"""
         settings.climb_align_gap_ms = int(v)
@@ -4106,6 +4348,13 @@ class RoutePanel(QWidget):
         self.sp_align_near.setValue(
             int(getattr(settings, "climb_align_near_px", 20) or 20))
         self.sp_align_near.blockSignals(False)
+        # 「对齐上绳梯」也是决策参数（按项目存 ✓）⇒ 换项目重读一遍；
+        # 同样 `blockSignals` 别把刚读出来的值又写回去 ✗（以前踩过的坑 ✓）。
+        self.chk_align_first.blockSignals(True)
+        self.chk_align_first.setChecked(
+            bool(getattr(settings, "climb_align_first", True)))
+        self.chk_align_first.blockSignals(False)
+        self._sync_align_first()        # 关掉 ⇒ 「对齐绳梯移动延迟」置灰 ✓
         self.sp_retry.blockSignals(True)
         self.sp_retry.setValue(float(getattr(settings, "climb_retry_delay_s", 1.0)))
         self.sp_retry.blockSignals(False)

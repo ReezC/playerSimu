@@ -240,14 +240,39 @@ def load_templates(root, mob_ids, max_per_mob=0, min_side=20, min_alpha=200,
     return out
 
 
-def clean_stale_outputs(out_dir, vis_dir, keep_n):
-    """清掉帧号 >= keep_n 的残留标注/可视化，返回删除个数。
+def clean_stale_outputs(out_dir, vis_dir, keep_n, keep_stems=None):
+    """清掉**帧号对不上现有帧**的残留标注/可视化，返回删除个数。
 
     重新采集后帧数往往变少（如 500→109），labels_auto/vis 里会留下旧
     采集的 txt/jpg。它们不会被本次运行覆盖（帧号对不上），却会被质检台
     当成有效帧显示 —— 旧尺度的零框残留会造成「运行中翻帧全是空框」的
     假象，也会混进数据集构建。
+
+    ⚠⚠⚠ **2026-10-16 修（用户报「区域自动标注影响了其他帧」✗ —— 事故级 ✓）**：
+      · 老判据是 `int(num) > keep_n`（`keep_n` = **帧数** ✓）✗ —— 它只在
+        「**帧号连续、从 1 开始**」时才等价于"这一帧不存在" ✗。而帧号**是稀疏的**
+        （重新采集 / 删帧后留洞 ✓；实测有项目 **280 帧、帧号却到 451** ✓）⇒
+        那句会**把"存在帧"的标注当成残留删掉** ✗✗ —— 表现就是
+        **每跑一次标注（哪怕只标一帧 ✓）就删掉一批别人的标注** ✗ = 真丢数据 ✓
+        （鳄鱼潭1 实测：缺的 `frame_00359`~`frame_00451` 全是"帧号 > 280" ✓ 吻合 ✓）。
+      · 现在：**给了 `keep_stems`（现有帧的名字集合 ✓）就按"帧号在不在集合里"判** ✓
+        —— 这才是本函数注释一开始想表达的意思 ✓（"帧号对不上" ✓ 而不是"比总数大" ✗）；
+        ⚠ 只在**没给 `keep_stems`** 时才退回老判据 ✓（向后兼容 ✓ 但调用方**必须**给 ✗）。
     """
+    keep_nums = None
+    if keep_stems is not None:
+        keep_nums = set()
+        for _s in keep_stems:
+            _m = re.search(r"(\d+)$", str(_s))
+            if _m:
+                keep_nums.add(int(_m.group(1)))
+
+    def _keep(num_text):
+        v = int(num_text)
+        if keep_nums is not None:
+            return v in keep_nums            # ⭐ 新判据："这一帧还在吗" ✓
+        return v <= keep_n                   # 老判据（仅向后兼容 ✓）
+
     n = 0
     for d in (out_dir, vis_dir):
         if not d:
@@ -263,13 +288,58 @@ def clean_stale_outputs(out_dir, vis_dir, keep_n):
             #   把 `frame_00002.txt` 删了 ✓）。后果是每跑一趟就丢最后一帧里**别的类的框**
             #   （它会被 `work` 重建成"只有本类" ✓）—— 本轮就是被用例抓出来的 ✓
             #   （`t_second_run_protects_and_reports` 的 class-0 框凭空消失 ✓）。
-            if m and int(m.group(1)) > keep_n:
+            if m and not _keep(m.group(1)):
                 try:
                     os.remove(str(f))
                     n += 1
                 except OSError:
                     pass
     return n
+
+
+def merge_class_lines(existing, new_lines, cls, region, fw, fh):
+    """把「本类新框」与「已有各类框」合成这一帧**最终要写**的行 ⇒ `(lines, protected)` ✓。
+
+    ⚠⚠⚠ **2026-10-16 修的事故（用户原话："并不是只标注我框选的区域，而是把整帧其他的
+      标注框全删掉了"✗ —— 真丢数据 ✓）**：
+      · 老语义是「**覆盖本类旧框**」✓，它写的是**整帧**口径 ✗ —— 对"改尺度/改阈值重标一遍"
+        是对的 ✓（新旧混一起更坏 ✓）；但**区域模式**（用户只框了一块 ✓）下它是**错的** ✗：
+        那一趟只**搜了框选那块** ⇒ 新框只有区域内那些 ✓ ⇒ 而"覆盖整帧本类旧框"会把
+        **区域外那些本类旧框一并丢掉** ✗✗ = 用户看到的那一幕 ✓。
+      · 现在按区域**分开算** ✓：**区域内的**本类旧框参与"覆盖/保命"✓；**区域外的**一律
+        归到"保留"那一边 ✓（与别的类同等对待 ✓）⇒ 区域模式变成"**只重标这一块**"✓
+        （正是"区域自动标注"该有的语义 ✓）。
+      · 判据用**同一套**：`perception.region.center_inside` ✓ —— **中心点在不在区域内** ✓
+        （与四条链共用一处口径 ✓ 不然四个按钮四种边界行为 ✓）。**归一化坐标乘回画面
+        像素**再比 ✓（`fw/fh` = 那一帧的宽高 ✓）。
+      · ⚠ **没给区域**（`region=None` / 坏）⇒ **一个字都不改** ✓（= 老行为 ✓ 零回归 ✓）。
+      · ⚠ 解析不出来的旧行 ⇒ **宁可留着** ✗（不猜、不删 ✓）。
+    """
+    keep = [ln for ln in existing.splitlines()
+            if ln.split() and ln.split()[0] != str(cls)]
+    old_mine = [ln for ln in existing.splitlines()
+                if ln.split() and ln.split()[0] == str(cls)]
+
+    if region and old_mine:
+        from perception import region as region_mod
+        mine_in, mine_out = [], []
+        for ln in old_mine:
+            p = ln.split()
+            try:
+                cx, cy = float(p[1]) * float(fw), float(p[2]) * float(fh)
+            except (IndexError, ValueError, TypeError):
+                # ⚠ 读不懂的行 ⇒ 放进**保留**那一桶 ✓（2026-10-16 ✓ 桩测第 ⑨ 条逮到 ✓）：
+                #   放 `mine_in` 就等于"会被这次重标覆盖掉" ✗ —— 那是**删** ✗（不猜不删 ✓）。
+                mine_out.append(ln)
+                continue
+            (mine_in if region_mod.center_inside(region, cx, cy)
+             else mine_out).append(ln)
+        old_mine = mine_in
+        keep = keep + mine_out                 # ⭐ 区域外的本类旧框 ⇒ **保留** ✓
+
+    if not new_lines and old_mine:
+        return keep + old_mine, 1              # 本类 0 检出 ⇒ 保命（同老行为 ✓）
+    return keep + new_lines, 0
 
 
 # ══════════════════════════════════════════════════════════════
@@ -560,23 +630,15 @@ def work(fp_str):
         _cls, (x + w / 2) / W, (y + h / 2) / H, w / W, h / H)
         for _, x, y, w, h, _ in kept]
     # 覆盖**本类**的旧框、保留别的类（例如标怪物时不动玩家框 ✓）—— 改尺度重标时不留旧框 ✓
+    # ⚠⚠⚠ **这一段的语义已搬进 `merge_class_lines`** ✗（2026-10-16 事故 ✓ 用户原话：
+    #   "**并不是只标注我框选的区域，而是把整帧其他的标注框全删掉了**"✓）：
+    #   老写法在这里**整帧覆盖本类旧框** ✗ ⇒ 区域模式（只搜了一块 ✓）会把**区域外的本类旧框
+    #   一起丢掉** ✗✗（真丢数据 ✓）。现在按区域分开算 ✓（区域内参与覆盖 ✓ 区域外保留 ✓），
+    #   而且顺手把"0 检出保命"（用户 2026-10-05 那个坑 ✓）也一并留在助手那一处 ✓ ——
+    #   **一处口径、可单测** ✓（见 `tools/selftest_*.py` 的用法 ✓）。
     existing = out_path.read_text(encoding="utf-8") if out_path.exists() else ""
-    keep = [ln for ln in existing.splitlines()
-            if ln.split() and ln.split()[0] != str(_cls)]
-    old_mine = [ln for ln in existing.splitlines()
-                if ln.split() and ln.split()[0] == str(_cls)]
-    # ⭐⭐ **这一帧本类一个都没检出、而它原来有本类的框 ⇒ 保留旧框**（用户 2026-10-05 ✓）。
-    #   起因是个真坑（用户现场："模板匹配怪物一波之后往后每次提示 检出 0 框"✓）：原来这里
-    #   **无条件覆盖**本类旧框 ✗ ⇒ 那一波标出来的框被**悄悄清空** ✓（实测那个项目：113 帧有怪框、
-    #   **59 帧只剩玩家/宠物框**、14 帧全空 ✓ 形状吻合 ✓）。
-    #   ⚠ **只在"这一帧本类 0 检出"时才保命** ✗：检出非空时**照旧覆盖** ✓ —— 那才是"重标一遍"
-    #     的正常语义（改了尺度/阈值就该整帧换新的 ✓ 新旧混一起更坏 ✓）。
-    protected = 0
-    if not new_lines and old_mine:
-        lines = keep + old_mine
-        protected = 1
-    else:
-        lines = keep + new_lines
+    lines, protected = merge_class_lines(existing, new_lines, _cls,
+                                         cfg.get("region"), W, H)
     out_path.write_text(("\n".join(lines) + "\n") if lines else "\n",
                         encoding="utf-8")
 
@@ -786,11 +848,24 @@ def run_detect(params, ctx=None):
     vis = bool(params.get("vis", True))
     vis_dir = params.get("vis_dir") or str(out.parent / "vis_map")
 
-    # 上次采集可能帧数更多，先清掉帧号超界的旧标注/可视化，防止旧尺度的
+    # 上次采集可能帧数更多，先清掉**帧号已不存在**的旧标注/可视化，防止旧尺度的
     # 零框残留混进本次结果（质检台显示和数据集构建都会被污染）
-    removed = clean_stale_outputs(str(out), vis_dir, n_all)
-    if removed:
-        ctx.log("清理上次残留 %d 个文件（帧号超出已有的 %d 帧）" % (removed, n_all))
+    #
+    # ⚠⚠⚠ **2026-10-16 修（事故级 ✓ 用户："区域自动标注…实测影响了其他帧"✗）**：
+    #   · 这里原来**无条件**执行 ✗ —— 哪怕这一趟是「**只标这一帧**」（`only` 非空 ✓）
+    #     也照清 ✓；而老判据是"帧号 > 帧数"✗ ⇒ 帧号稀疏的项目**每跑一次就删一批
+    #     别人的标注** ✗✗（见 `clean_stale_outputs` 那段说明 ✓）。
+    #   · 现在两件事一起改 ✓：
+    #     ① **`only` 非空 ⇒ 根本不清** ✗（用户要的是"只标这几帧"✓ ⇒
+    #        就不许顺手动别的帧的文件 ✗ —— 这条是**语义**上的护栏 ✓ 最要紧 ✓）；
+    #     ② 真要清 ⇒ 判据按"**帧号在不在现有帧集合里**"✓（把 `frames` 交过去 ✓）。
+    if only:
+        ctx.log("只跑选中的 %d 帧 ⇒ **跳过全局清理**（不动其他帧的文件 ✓）" % len(frames))
+    else:
+        removed = clean_stale_outputs(str(out), vis_dir, n_all,
+                                      keep_stems=[f.stem for f in frames])
+        if removed:
+            ctx.log("清理上次残留 %d 个文件（帧号已不在现有帧集合里）" % removed)
 
     mob_scales = params.get("mob_scales") or {}
     if not isinstance(mob_scales, dict):

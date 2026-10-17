@@ -30,6 +30,7 @@ CLASS_PLAYER = 0
 #: ⭐ 掉落物（用户 2026-10-04 ✓）：**照 `perception/classes.py` 导入**（别在本地另立一份 ✗ ——
 #:   上面那两个是历史遗留的本地副本 ✓ 新的一律从类别表拿 ✓）。
 from perception.classes import CLASS_DROP, CLASS_PET               # noqa: E402
+from perception import region as region_mod                         # ⭐ 框选区域一处口径 ✓
 #: 每个 mode 只合并**这一类**，`summary` 里用哪个中文名 —— **一处口径** ✓
 #: （加一类只改这张表 ✓ 别在下面各处再写 `if mode == ...` ✗）。
 MODE_CLASS = {"mob": CLASS_MOB, "player": CLASS_PLAYER, "drop": CLASS_DROP,
@@ -304,6 +305,15 @@ def run_yolo_augment(params, ctx=None):
     out = Path(params["out"])
     out.mkdir(parents=True, exist_ok=True)
 
+    # ⭐⭐ **只在框选区域内标注**（用户 2026-10-11 ✓ 原话："点击各个标注按钮，只会在当前帧
+    #   框选的**区域内**进行自动标注"✓）：YOLO 这条跟模板匹配那条**不一样** ✗ ——
+    #   那边 `detect_mobs.run_detect` 本来就能"只在区域里**搜**"✓；这里是**整幅推理完再筛** ✓
+    #   （推理本身不挑地方 ✓）⇒ 判据用同一处口径：**中心点在不在区域里** ✓ 见 `perception/region.py` ✓。
+    #   ⚠ 不传 / 空 ⇒ 不筛 ✓（= 老行为一字不变 ✓）。
+    region = region_mod.parse(params.get("region"))
+    if region:
+        ctx.log("YOLO：%s" % region_mod.note(region))
+
     # ⭐⭐ **输出名一律走"画面目录里的帧名"**（2026-10-09 ✓ 见 `_stem_of` 的说明）：
     #   对不上的图**跳过**，跑完汇总报出来 —— 绝不把标注写到"没人认的名字"上 ✗。
     frame_map = {f.resolve(): f.stem for f in frames}
@@ -386,6 +396,9 @@ def run_yolo_augment(params, ctx=None):
     t0 = time.perf_counter()
     n_merged = 0      # 有多少帧补了框
     n_boxes = 0       # 共补了多少框
+    #: ⭐ 被**区域**丢掉的框数（用户 2026-10-11 ✓ 只在框选区域内标 ✓ 见上面 `region` 那段 ✓）
+    #:   ⚠ 要**报出来** ✗ —— 不然"框到 0 个"时分不清是"模型没检出"还是"全被区域筛掉了"✓
+    n_outside = 0
     n = len(frames)
 
     stream = model.predict(
@@ -430,10 +443,19 @@ def run_yolo_augment(params, ctx=None):
         if boxes is not None and len(boxes):
             cls = boxes.cls.cpu().numpy()
             xywhn = boxes.xywhn.cpu().numpy()
+            # ⚠ 归一化 → 像素要**这一帧的尺寸**（`orig_shape` 才是真的 ✓ 见上面 `r.path` 那段 ✓）
+            _os = getattr(r, "orig_shape", None) or ()
+            _fh, _fw = (int(_os[0]), int(_os[1])) if len(_os) >= 2 else (0, 0)
             for c, (cx, cy, w, h) in zip(cls, xywhn):
-                if int(c) in allowed:
-                    preds.append((int(c), float(cx), float(cy),
-                                  float(w), float(h)))
+                if int(c) not in allowed:
+                    continue
+                # ⭐⭐ **区域外的预测一律丢掉** ✓（同一处判据 ✓ 见 `perception/region.py` ✓）
+                if region and not region_mod.center_inside(
+                        region, float(cx) * _fw, float(cy) * _fh):
+                    n_outside += 1
+                    continue
+                preds.append((int(c), float(cx), float(cy),
+                              float(w), float(h)))
 
         added = 0
         for pc, pcx, pcy, pw, ph in preds:
@@ -481,9 +503,15 @@ def run_yolo_augment(params, ctx=None):
             % (n, n_boxes, n_merged,
                "／跳过 %d 张" % len(skipped) if skipped else ""))
     ctx.log("  用时 %.1fs" % dt)
+    if n_outside:
+        # ⭐ 被区域筛掉的要**单独报** ✓ —— 不然"0 个框"分不清是"模型没检出"还是"全在框外"✓
+        ctx.log("  ⭐ 另有 %d 个预测框**落在框选区域外**，已按「只标框选区域」丢掉 ✓"
+                "（%s）" % (n_outside, region_mod.note(region)))
     if n_boxes == 0:
-        ctx.log("  一个框都没补 —— 模型对这些画面不适应，或画面里本就没有目标"
-                "（⚠ 已有框若**和预测框重叠**则按「只补不覆盖」不补 ✓）", "warn")
+        _why = ("预测框全在**框选区域外** ✓（换个框，或把框拉大点 ✓）" if n_outside
+                else "模型对这些画面不适应，或画面里本就没有目标")
+        ctx.log("  一个框都没补 —— %s"
+                "（⚠ 已有框若**和预测框重叠**则按「只补不覆盖」不补 ✓）" % _why, "warn")
     # ⭐⭐ 落盘一份"这趟干了什么"（见 `_write_last_run` ✓）：日志只在界面里，过一会儿查不了 ✗
     if _write_last_run(out, {
             "when": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -515,9 +543,13 @@ def run_yolo_augment(params, ctx=None):
         "mode": mode,
         "seconds": dt,
         "weights": str(weights),
-        "summary": "补充 %d 框 / %d 帧（%s）%s"
+        # ⭐ 被框选区域筛掉的框数（用户 2026-10-11 ✓ 见 `n_outside` ✓ —— 摘要里也要能看见 ✓）
+        "boxes_outside": n_outside,
+        "region": region_mod.note(region),
+        "summary": "补充 %d 框 / %d 帧（%s）%s%s"
                    % (n_boxes, n_merged, MODE_ZH.get(mode, "怪物"),
-                      "，跳过 %d 张对不上的" % len(skipped) if skipped else ""),
+                      "，跳过 %d 张对不上的" % len(skipped) if skipped else "",
+                      "，区域外丢掉 %d" % n_outside if n_outside else ""),
     }
 
 

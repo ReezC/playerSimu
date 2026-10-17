@@ -1,0 +1,524 @@
+name: 地铁二号线
+map_id: '103000201'
+mobs:
+- '2130103'
+- '3230101'
+- '4230102'
+scale: 1.406
+mob_scales: {}
+scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
+calib:
+  min_scale: 0.4
+  max_scale: 2.4
+  step: 0.1
+  sample: 5
+bars: {}
+mmap_crop:
+- 5
+- 71
+- 249
+- 80
+decision:
+  attack_dist: 180.0
+  min_attack_dist: 0
+  attack_up_dist: 78
+  attack_down_dist: 120
+  attack_fan_deg: 0.0
+  jump_attack_enabled: false
+  jump_attack_height: 50.0
+  fall_speed_px_s: 600.0
+  walk_stall_jump: true
+  chase_jump_enabled: true
+  chase_jump_min: -15
+  chase_jump_max: 10
+  chase_jump_dash_ms: 200
+  chase_jump_edge_guard_enabled: false
+  chase_jump_edge_guard_px: 100
+  station_turn_interval_ms: 600
+  mouse_speed: 1.2000000000000002
+  evade_type: jump
+  jump_interval: 0
+  jump_random_prob: 0.1
+  back_jump_seq:
+  - type: down
+    key: back
+  - type: delay
+    ms: 800
+  - type: down
+    key: jump
+  - type: delay
+    ms: 20
+  - type: up
+    key: back
+  - type: up
+    key: jump
+  - type: down
+    key: forward
+  - type: delay
+    ms: 150
+  - type: down
+    key: attack
+  - type: up
+    key: attack
+  - type: up
+    key: forward
+  output_seq:
+  - key: 圣光
+    prob: 33
+    then:
+    - key: 圣光
+      type: up
+    type: down
+  - key: attack
+    type: down
+  - key: attack
+    type: up
+  - ms: 600
+    type: delay
+  keymap:
+    auto: f11
+    left: left
+    right: right
+    up: up
+    down: down
+    attack: shift
+    jump: space
+    pickup: alt
+    hp_pot: g
+    mp_pot: null
+    feed_pet: pagedown
+    shop: null
+    enter: enter
+  target_cd:
+  - 1000
+  - 2500
+  atk_target_count: 0
+  mob_atk_cd_ms: 2000
+  input_device: remote
+  attack_cd: 0
+  attack_lock_debounce_ms: 1000
+  min_turn_hold_ms: 400
+  turn_output_delay_ms: 0
+  auto_pickup: true
+  player_track_jump: 200
+  player_foot_offset_px: -25
+  player_box_min_area_pct: 0.0
+  player_box_area_base_s: 1.0
+  player_box_area_tol_pct: 0.0
+  hp_bar: null
+  mp_bar: null
+  hp_color: null
+  mp_color: null
+  hp_threshold: 39
+  mp_threshold: 7
+  pot_cd: 1000
+  mob_sets_ttl_s: 3.0
+  auto_hp_pot: false
+  auto_mp_pot: false
+  strategy: multi
+  vision_top: 300
+  vision_bottom: 200
+  vision_left: 350
+  vision_right: 353
+  vision_center: false
+  vision_off_x: 0
+  vision_off_y: 0
+  big_mob_enabled: true
+  big_mob_ratio: 1.5
+  big_mob_range_px: 598
+  sweep_turn_cd: 500
+  back_range: 150
+  sweep_edge_turn_px: 100
+  sweep_turn_cd_enabled: true
+  sweep_edge_turn_enabled: true
+  station_pickup_enabled: true
+  station_pickup_min_s: 0.0
+  station_pickup_max_s: 0.0
+  station_pickup_spots: []
+  multi_spots:
+  - fid: '245'
+    kind: foothold
+    ratio: 100.0
+  - fid: '225'
+    kind: foothold
+    ratio: 100.0
+  - fid: '89'
+    kind: foothold
+    ratio: 100.0
+  - fid: '48'
+    kind: foothold
+    ratio: 100.0
+  - fid: '38'
+    kind: foothold
+    ratio: 100.0
+  - fid: '70'
+    kind: foothold
+    ratio: 100.0
+  - fid: '97'
+    kind: foothold
+    ratio: 100.0
+  - fid: '252'
+    kind: foothold
+    ratio: 100.0
+  - fid: '62'
+    kind: foothold
+    ratio: 100.0
+  - fid: '30'
+    kind: foothold
+    ratio: 100.0
+  - fid: '3'
+    kind: foothold
+    ratio: 100.0
+  - fid: '5'
+    kind: foothold
+    ratio: 100.0
+  - fid: '25'
+    kind: foothold
+    ratio: 100.0
+  - fid: '223'
+    kind: foothold
+    ratio: 100.0
+  - fid: '167'
+    kind: foothold
+    ratio: 100.0
+  - fid: '189'
+    kind: foothold
+    ratio: 100.0
+  - fid: '115'
+    kind: foothold
+    ratio: 100.0
+  - fid: '93'
+    kind: foothold
+    ratio: 100.0
+  - fid: '47'
+    kind: foothold
+    ratio: 100.0
+  - fid: '39'
+    kind: foothold
+    ratio: 100.0
+  - fid: '63'
+    kind: foothold
+    ratio: 100.0
+  - fid: '23'
+    kind: foothold
+    ratio: 100.0
+  multi_leave_wait_enabled: false
+  multi_leave_delay_s: 1.0
+  route_goto_set: '4'
+  align_tol_px: 12
+  align_hold_ms: 1000
+  climb_align_gap_ms: 180
+  climb_align_near_px: 1
+  climb_retry_delay_s: 0.0
+  climb_retry_delay_inc_s: 1.0
+  goto_timeout_s: 15.0
+  chase_goto_max_s: 5.0
+  goto_timeout_key: 表情_无语
+  disable_chase_pathfinding: true
+  jump_start_px: 80
+  move_retry_ms: 3000
+  debounce_conf: 0.3
+  debounce_ms: 2000
+  custom_timers:
+  - name: 自动喂宠
+    seq:
+    - type: down
+      key: feed_pet
+    - type: up
+      key: feed_pet
+    interval:
+    - 8.0
+    - 12.0
+    pause_on_rest: false
+    paused: true
+    paused_left: 241.06137963104993
+  - name: 自动拾取
+    seq:
+    - type: down
+      key: 拾取
+    - type: up
+      key: 拾取
+    interval:
+    - 0.1
+    - 0.2
+    paused: true
+    paused_left: 5.35204582685401
+  - name: 随机瞬移
+    seq:
+    - type: down
+      key: 瞬移
+    - type: up
+      key: 瞬移
+    interval:
+    - 0.016666666666666666
+    - 0.05
+  - name: 自动开花
+    seq:
+    - type: down
+      key: 开花
+    - type: up
+      key: 开花
+    interval:
+    - 120.0
+    - 120.0
+    paused: true
+    paused_left: 4722.203000000009
+  facing_timeout_min: 0.0
+  player_lost_timeout_min: 3.0
+  resetall_interval: 50
+  anti_afk_enabled: false
+  anti_afk_type: spot_rest
+  anti_afk_min: 25.0
+  anti_afk_max: 30.0
+  anti_afk_enter_seq:
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  - type: delay
+    ms: 1000
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  - type: delay
+    ms: 1000
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  - type: delay
+    ms: 160000
+  - type: down
+    key: 普攻
+  - type: up
+    key: 普攻
+  - type: delay
+    ms: 1000
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  anti_afk_exit_seq:
+  - type: down
+    key: 普攻
+  - type: up
+    key: 普攻
+  - type: delay
+    ms: 1000
+  - type: down
+    key: 普攻
+  - type: up
+    key: 普攻
+  - type: delay
+    ms: 1000
+  - type: down
+    key: 普攻
+  - type: up
+    key: 普攻
+  anti_afk_rest_min: 4.5
+  anti_afk_rest_max: 5.5
+  anti_afk_spot_set: '4'
+  anti_afk_spot_seq:
+  - type: delay
+    ms: 4000
+  - type: down
+    key: 椅子
+  - type: up
+    key: 椅子
+  anti_afk_spot_after: '5'
+  anti_afk_spot_loop: false
+  anti_afk_spot_loop_items: []
+  anti_afk_spot_loop_min: 30.0
+  anti_afk_spot_loop_max: 60.0
+  anti_afk_spot_loop_hold: false
+  anti_afk_retry_on_interrupt: true
+  anti_afk_retry_sec: 10.0
+  reconnect_enabled: true
+  reconnect_probe_after_lost_sec: 3.0
+  reconnect_step_timeout_ms: 5000
+  reconnect_queue_timeout_ms: 180000
+  reconnect_max_retry: 3
+  reconnect_resume_auto: true
+  reconnect_server_x: 0.3635
+  reconnect_server_y: 0.2074
+  reconnect_channel_x: 0.4104
+  reconnect_channel_y: 0.5093
+  reconnect_channel: 47
+  custom_keys:
+    攻击药水: grave
+    回避药水: '5'
+    隐身术: a
+    普攻: f
+    表情_无语: f6
+    拾取: space
+    椅子: x
+    custom1: ctrl
+    光箭: shift
+    custom2: z
+    瞬移: z
+    custom3: pageup
+    开花: pageup
+    输出: shift
+    治疗: shift
+    圣光: ctrl
+  probe_calib:
+    x_ratio: 0.06588579795021962
+    y_ratio: 0.024739583333333332
+    cell_ratio: 0.00951683748169839
+    gap_ratio: 0.002374816983894583
+    bits: 40
+    frame:
+    - 1366
+    - 768
+    solved_at: '2026-10-15 22:52:58'
+  vision_detect_only: false
+notes: ''
+capture:
+  source: file
+  file: D:/Media/record/mxd/地铁二号线.mp4
+  url: udp://0.0.0.0:5000
+  fps: 5.0
+  stride: 60
+  seconds: 120.0
+  dedup: 0.01
+  limit: 0
+  clean: true
+label:
+  thresh: 0.3
+  min_distinct: 0.06
+  per_mob: 20
+  max_peaks: -1
+  downscale: 1
+  region: null
+  player_thresh: 0.4
+  player_min_distinct: 0.0
+  player_per_mob: 0
+  player_max_peaks: 1
+  player_downscale: 1
+  drop_min_distinct: 0.06
+  drop_per_mob: 20
+  drop_max_peaks: -1
+  pet_min_distinct: 0.06
+  pet_per_mob: 20
+  pet_max_peaks: 3
+  label_drops_on: true
+  drop_thresh: 0.8
+  drop_downscale: 1
+  label_pets_on: true
+  pet_thresh: 0.9
+  pet_downscale: 1
+  pets:
+  - pet: '5000020'
+    name: 小白雪人
+    equips:
+    - 01802026
+  drops:
+  - id: 09000000
+    name: ''
+  - id: 09000001
+    name: ''
+  - id: 09000002
+    name: ''
+  - id: 09000003
+    name: ''
+  - id: '04000036'
+    name: 奇妙的药
+  - id: '04000034'
+    name: 蛇皮
+  - id: '04000035'
+    name: 桌布
+  frames_sel:
+    player:吱吱姐:
+    - 吱吱姐-alert-0
+    - 吱吱姐-alert-1
+    - 吱吱姐-alert-2
+    - 吱吱姐-alert-3
+    - 吱吱姐-jump-0
+    - 吱吱姐-ladder-0
+    - 吱吱姐-ladder-1
+    - 吱吱姐-prone-0
+    - 吱吱姐-proneStab-0
+    - 吱吱姐-proneStab-1
+    - 吱吱姐-rope-0
+    - 吱吱姐-rope-1
+    - 吱吱姐-stand1-0
+    - 吱吱姐-stand1-1
+    - 吱吱姐-stand1-2
+    - 吱吱姐-stand1-3
+    - 吱吱姐-walk1-0
+    - 吱吱姐-walk1-1
+    - 吱吱姐-walk1-2
+    - 吱吱姐-walk1-3
+    - 吱吱姐-walk2-0
+dataset:
+  val_ratio: 0.2
+  min_boxes: 1
+  quality: 92
+train:
+  model: yolo26s.pt
+  epochs: 180
+  imgsz: 960
+  batch: 8
+  device: '0'
+  patience: 40
+  resume: false
+live:
+  weights: E:\MyPrograms\playerSimu\projects\地铁二号线\models\detect_v3_960.engine
+  capture_source: stream
+  rect:
+  - 1184
+  - 617
+  - 1366
+  - 768
+  rect_rel: null
+  rect_win: null
+  url: udp://0.0.0.0:5000
+  conf_mob: 0.15
+  conf_player: 0.75
+  imgsz: 960
+  device: '0'
+  capture_fps: 60
+  draw: true
+  half: true
+  show_fps: 50
+  window_capture: wgc
+  iou_mob: 0.8
+  max_det: -1
+  agnostic_nms: false
+mob_names:
+- 青蛇
+- 小幽灵
+- 大幽灵
+mobs_cleared: false
+player_scale: 1.406
+drop_scale: 1.406
+pet_scale: 1.406
+player_scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
+drop_scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
+pet_scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
+player_id: 吱吱姐
+iterate:
+  conf: 0.15
+  keep_empty: true
+  limit: 0

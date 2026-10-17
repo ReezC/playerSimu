@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from deploy import config as dcfg, services                      # noqa: E402
-from tools import push_presets as pp, sweep_link                 # noqa: E402
+from core import push_presets as pp, sweep_link                 # noqa: E402
 
 #: 发完报告后等 B 机回结论最多多久（B 机还有最后一段要量完 + 合并出表）
 RESULT_WAIT_S = 300.0

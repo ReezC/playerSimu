@@ -23,8 +23,11 @@ import numpy as np
 from decision.agent import settings
 from gui import theme
 from gui.live_thread import LiveThread
+#: ⚠ `last_sound_note` 原来是**函数内 import** ✗ ⇒ `check_ui` 一直在报那一条（2026-10-15 挪上来 ✓
+#:   `docs/UI规范.md` 的规矩：导入一律在模块顶部 ✓ —— 而且 `gui.widgets` 本来就**已经在这里**导入了 ✓
+#:   （同文件那处局部导入纯属多余 ✗）。
 from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox,
-                         play_sound)
+                         last_sound_note, play_sound)
 from core.config import ROOT, get, load_live, update_live
 
 #: ⭐⭐ **预览重绘的最低间隔**（毫秒 ✓ 用户 2026-10-06 ✓ 见 `_render` 的说明 ✓）：
@@ -56,7 +59,15 @@ RENDER_MIN_MS = 20.0
 #:     （同 `rec_*` / `perf_log` 那条口径 ✓）。⚠ 留在这儿会出真事：控件一旦不存在，
 #:     这份"按项目取的值"会写成 `vt_on=False` ⇒ **每存一次参数就把开关自己关掉** ✗。
 PROJ_LIVE_KEYS = ("capture_source", "rect", "rect_rel", "rect_win",
+                  # ⭐ 部署台「游戏窗口区域」（比例 ✓ 2026-10-17 ✓）—— 与 `rect_rel`
+                  #   同族：**按项目存** ✓（不同项目构图不一样 ✓）
+                  "stream_rect_rel",
                   "url", "conf_mob", "conf_player", "imgsz",
+                  # ⭐⭐⭐ **推理侧那三个"漏检旋钮"**（用户 2026-10-16 ✓ 见控件那段说明 ✓）：
+                  #   `iou_mob`（NMS 去重门槛 ✓）/ `max_det`（一帧框上限 ✓）/
+                  #   `agnostic_nms`（类别互不压制 ✓）—— 都是"**按项目**该不一样"的参数 ✓
+                  #   （怪密度、怪大小本来就随地图变 ✓），故进这份清单 ✓。
+                  "iou_mob", "max_det", "agnostic_nms",
                   "device", "capture_fps", "draw", "half", "show_fps",
                   # ⭐ 「本地窗口的抓屏方式」（`wgc` / `bitblt` ✓ 用户 2026-10-09 加 ✓）：
                   #   它决定"有没有那圈 Win11 系统采集边框" ✓（见 `cmb_wcap` 的 tooltip ✓）
@@ -374,6 +385,10 @@ class LivePanel(QWidget):
         #: 换分辨率 / 改窗口大小都不用重框** ✓；老项目只有 `rect` ⇒ 照旧用绝对坐标 ✓。
         self._rect_rel = None   # [nx, ny, nw, nh]（相对那个窗口 ✓）
         self._rect_win = None   # [hwnd, 标题]（框选那一刻记一次 ✓）
+        #: ⭐ **部署台「游戏窗口区域」**（比例 `[nx, ny, nw, nh]`，相对 A 机推来的整帧 ✓）
+        #:   —— 用户 2026-10-17 ✓：「**现在我需要部署台也能像本地流程一样能够自由选择
+        #:   游戏窗口区域**」✓；`None` = 整帧（老行为 ✓ 不裁 ✗）。
+        self._stream_rect_rel = None
         # 绘制合并（见 _on_frame）：只保留最新一帧，渲染慢时丢中间帧而不是排队
         self._pending = None
         self._render_pending = False
@@ -464,6 +479,24 @@ class LivePanel(QWidget):
         self.btn_pick_win.clicked.connect(self._pick_rect_auto)
         bar.addWidget(self.btn_pick_win)
 
+        # ⭐⭐⭐ **部署台「游戏窗口区域」**（用户 2026-10-17 ✓ 原话：「**现在我需要部署台也能
+        #   像本地流程一样能够自由选择游戏窗口区域**」✓）
+        #   本地流程是\"抓屏时只抓窗口那块\"✓；部署台吃的是 A 机**整帧** ✗ ⇒ 在**预览画面**上
+        #   框一块，按**比例**存（换分辨率不用重框 ✓），运行期只裁这一块 ✓
+        #   ⇒ 辨认 / 小地图 / 测谎 / 断线重连 看到的都跟本地一样 ✓
+        #   ⚠ 鼠标比例会**自动折回整帧** ✓（见 `LiveThread._mouse_roi` ✓ 与
+        #     `mouse_aim.roi_px` ✓ —— 不然点服务器/点频道会整块偏 ✗）。
+        self.btn_pick_stream = QPushButton("框选游戏区域")
+        self.btn_pick_stream.setToolTip(
+            "**部署台 / 收流用**：在实时预览画面上拖出一块「游戏窗口区域」。\n\n"
+            "• 存的是**比例** ⇒ A 机换分辨率 / 改推流尺寸都**不用重框** ✓\n"
+            "• 只在「来源 = 推流」时生效；本地窗口来源本来只抓窗口那块 ✓\n"
+            "• 框完之后：辨认、小地图、测谎、断线重连都只看这一块 ✓\n"
+            "• **断线重连 / 测谎的鼠标点击会自动折回整帧坐标** ✓（不用另外调）\n\n"
+            "⚠ 想恢复整帧 ⇒ 重新框一次**铺满整个画面**即可。")
+        self.btn_pick_stream.clicked.connect(self._pick_stream_rect)
+        bar.addWidget(self.btn_pick_stream)
+
         self.lbl_rect = QLabel("（未选）")
         self.lbl_rect.setStyleSheet("color:#80868b;")
         bar.addWidget(self.lbl_rect, 1)
@@ -516,6 +549,67 @@ class LivePanel(QWidget):
         self.sp_conf_mob.setValue(float(_live.get("conf_mob", 0.30)))
         self.sp_conf_mob.valueChanged.connect(self._save_live_params)
         row.addWidget(self.sp_conf_mob)
+
+        # ⭐⭐⭐ **NMS / 上限 三个旋钮**（用户 2026-10-16 ✓ 原话："**`iou=0.85`、`max_det=300→600`
+        #   怎么试？**"✓ + "把**值得调试的所有参数**都暴露出来给我配，通俗写好 tips"✓）。
+        #   病根：现场那次推理调用**没传**这三个 ⇒ 吃 Ultralytics 默认（`iou=0.7` / `max_det=300` ✓）
+        #   ⇒ **挨得近/重叠的怪会被 NMS 吞掉** ✓ —— 表现成"怪明明在，框就是没有" ✗
+        #   （即用户报的"**怪物类漏检严重**"✓ 而标注是完美的 ✓ 所以不是标注的事 ✓）。
+        #   ⚠ 这三个**热读**（同 `conf_mob` 那一族 ✓ 见 `live_thread` 里那段热读 ✓）⇒
+        #     **改完当场生效、不用重启实时** ✓（不像 `weights` 要重开 ✓）。
+        row.addWidget(QLabel("怪框重叠"))
+        self.sp_iou_mob = NoWheelDoubleSpinBox()
+        self.sp_iou_mob.setRange(0.30, 0.95)
+        self.sp_iou_mob.setDecimals(2)
+        self.sp_iou_mob.setSingleStep(0.05)
+        self.sp_iou_mob.setValue(float(_live.get("iou_mob", 0.70)))
+        self.sp_iou_mob.setToolTip(
+            "两个怪框重叠超过这个比例时，只保留分数高的那个（NMS 的去重门槛）。\n\n"
+            "  · 0.70 = 默认（旧行为）；\n"
+            "  · **调大（0.80~0.90）= 挨得近、叠在一起的怪不容易被误当成重复而丢掉**\n"
+            "    ⇒ 漏检变少，代价是偶尔多出半个框（真怪叠着时本来也分不清 ✅）；\n"
+            "  · 调小（0.5）⇒ 框更干净，但密集怪会真的少几个。\n\n"
+            "一句话：**怪多、爱扎堆 ⇒ 往 0.85 试**。")
+        self.sp_iou_mob.valueChanged.connect(self._save_live_params)
+        row.addWidget(self.sp_iou_mob)
+
+        row.addWidget(QLabel("怪框上限"))
+        # ⭐⭐⭐ **默认 -1 = 不限**（用户 2026-10-17 ✓ 原话：「**怪框上限可以做成默认 -1
+        #   无限吗？**」✓）：
+        #   · `-1` 在引擎那边被翻译成一个"实操上等于不限"的大上限 ✓
+        #     （见 `gui/live_thread.py` 读 `max_det` 那两处 ✓）；
+        #   · ⚠ **下限必须从 10 放到 -1** ✗ —— 不然这格连自己都填不进 `-1` ✓
+        #     （界面上会当场被夹回 10 ⇒ 用户填了没效果 ✗）；
+        #   ⚠ **缺键才落 -1** ✓：老项目 / `live.yaml` 里**显式写了数**的照旧生效 ✓
+        #     （比如现值 600 ✓ —— 想不限就把它改成 -1 ✓）。
+        self.sp_max_det = NoWheelSpinBox()
+        self.sp_max_det.setRange(-1, 2000)
+        self.sp_max_det.setSingleStep(50)
+        self.sp_max_det.setValue(int(_live.get("max_det", -1)))
+        self.sp_max_det.setToolTip(
+            "一帧最多留多少个框（超出就丢掉）。\n\n"
+            "  · **-1 = 不限**（默认 ✓）—— 不给上限，一帧有多少留多少 ✅\n"
+            "    （内部会翻译成一个够大的数 ✓，所以填负数不会报错 ✓；调它没有额外代价 ✓）；\n"
+            "  · 300 = Ultralytics 的框架默认（老项目文件里写着 300/600 的会照旧用它 ✓\n"
+            "    —— 想不限就**把这一格改成 -1** ✓，改完当场生效 ✓）；\n"
+            "  · 画面怪多（尤其小怪、或者整屏都在打）时，**小上限**（如 300）可能被\n"
+            "    **排在前面的框吃满** ⇒ 后面的怪直接消失 ⇒ 临时调 **600** 也能缓解；\n"
+            "  · 调很大没有额外代价（只是内存里多几个框 ✅）。\n\n"
+            "一句话：**想彻底排除「上限把怪挤掉」这种可能，就填 -1**。")
+        self.sp_max_det.valueChanged.connect(self._save_live_params)
+        row.addWidget(self.sp_max_det)
+
+        self.ck_agnostic = QCheckBox("类别互不压制")
+        self.ck_agnostic.setChecked(bool(_live.get("agnostic_nms", False)))
+        self.ck_agnostic.setToolTip(
+            "不同类型（怪 / 玩家 / 掉落）的框重叠时，要不要**互相压制**。\n\n"
+            "  · **关（默认）**：各类型各算各的 —— 怪框不会因为和玩家框重叠就被删 ✅；\n"
+            "  · **开**：所有类型放一起做去重 ⇒ 重叠的不同类型只留一个 **✗ 通常更糟**\n"
+            "    （会把'怪站在玩家身上'那种真情景吃掉）；\n\n"
+            "只有一种类别（本项目 `nc=1`）时开不开都一样 ✅。\n"
+            "一句话：**别开，除非你在排查'不同类互相吃掉'**。")
+        self.ck_agnostic.stateChanged.connect(self._save_live_params)
+        row.addWidget(self.ck_agnostic)
 
         row.addWidget(QLabel("玩家conf"))
         self.sp_conf_player = NoWheelDoubleSpinBox()
@@ -794,7 +888,7 @@ class LivePanel(QWidget):
 
         来源有三种，**项目标定优先**（标定跟项目走，见 pick_calib 的说明）。
         """
-        from tools import probe_codec
+        from core import probe_codec
         bits = int(get("probe", "bits", 40))
         cal, src = probe_codec.pick_calib(settings.probe_calib)
         if cal:
@@ -823,7 +917,7 @@ class LivePanel(QWidget):
         **与实时回路、框选、命令行工具同一个来源**（项目标定 → 全局 → link.yaml）：
         屏幕上画的框必须就是真正采样的那几个点，否则人看到的和机器采的会悄悄错开。
         """
-        from tools import probe_codec
+        from core import probe_codec
 
         bits = int(get("probe", "bits", 40))
         cal, src = probe_codec.pick_calib(settings.probe_calib)
@@ -866,7 +960,7 @@ class LivePanel(QWidget):
         """
         import cv2
 
-        from tools import probe_codec
+        from core import probe_codec
 
         h, w = bgr.shape[:2]
         geo = self._probe_geo_px((h, w))
@@ -928,7 +1022,7 @@ class LivePanel(QWidget):
         from PyQt5.QtWidgets import QApplication
 
         import cv2
-        from tools import probe_codec as pc
+        from core import probe_codec as pc
 
         # 步长上限的参考周期**故意放宽到 ≥66ms**（≈15fps）：这里收的是**显示帧**，
         # 显示层掉一帧就是两倍步长（实测见过 195ms 的一跳）——那不等于错位。
@@ -974,7 +1068,7 @@ class LivePanel(QWidget):
         而界面上一切正常。
         """
         from gui.region_selector import select_region_on_image
-        from tools import probe_codec
+        from core import probe_codec
 
         frame = self.current_frame()
         if frame is None:
@@ -1093,6 +1187,51 @@ class LivePanel(QWidget):
     _auto_timer = None
     _auto_seen = None
     _auto_left = 0
+
+    def _pick_stream_rect(self):
+        """在**实时预览那一帧**上框出「游戏窗口区域」（部署台 ✓ 2026-10-17 用户要求 ✓）。
+
+        与本地窗口那条的区别（别混 ✗）：
+          · 本地 = 在**屏幕上**框（`select_region` ✓）+ 绑窗口（跟着窗口走 ✓）；
+          · 部署台 = 在**A 机推来的画面**上框（`select_region_on_image` ✓）⇒ 只能存
+            **整帧里的比例** ✓（A 机的窗口在哪儿，B 机看不见 ✓）。
+        ⚠ 没画面就**说清怎么办**（"先点开始"✓），别静默返回 ✗。
+        """
+        from gui.region_selector import select_region_on_image
+        img = None
+        try:
+            img = self.panel.current_frame() if self.panel is not None else None
+        except Exception:                                # noqa: BLE001
+            img = None
+        if img is None:
+            QMessageBox.information(
+                self, "还没有画面",
+                "先点上面的「开始」让实时画面跑起来（来源 = 推流），\n"
+                "看到画面之后再回来框「游戏窗口区域」✓")
+            return
+        rect = select_region_on_image(img, self)
+        if rect is None:
+            return
+        H, W = img.shape[:2]
+        if W <= 0 or H <= 0:
+            return
+        rel = [round(float(rect[0]) / W, 6), round(float(rect[1]) / H, 6),
+               round(float(rect[2]) / W, 6), round(float(rect[3]) / H, 6)]
+        self._stream_rect_rel = rel
+        self._save_project_params()          # 按项目存（`_live_params` 里带了它 ✓）
+        # ⭐ **立即生效**：已经跑着的那条线程直接改参数 ✓（不用重启预览 ✓）
+        th = getattr(self, "thread", None)
+        try:
+            if th is not None and hasattr(th, "set_stream_rect"):
+                th.set_stream_rect(rel)
+        except Exception as e:                           # noqa: BLE001
+            print("⚠ 游戏区域没送到实时线程（%s: %s）" % (type(e).__name__, e))
+        QMessageBox.information(
+            self, "已记下游戏区域",
+            "框选已保存（比例 %s）✓\n\n"
+            "· 马上生效（正在跑的预览也会切过去）\n"
+            "· 换分辨率 / 改推流尺寸**不用重框** ✓\n"
+            "· 想恢复整帧 ⇒ 重新框一次铺满画面即可" % (rel,))
 
     def _bind_rect_window(self, rect, hwnd=None, title=""):
         """记下「这块区域**相对哪个窗口**」+ 是谁 ✓（2026-10-10 ✓ 手框与自动框共用一处 ✓）。
@@ -1256,6 +1395,10 @@ class LivePanel(QWidget):
                          if self._rect_win else None),
             "url": self.ed_url.text().strip(),
             "conf_mob": float(self.sp_conf_mob.value()),
+            # ⭐ 漏检三旋钮（用户 2026-10-16 ✓）—— 与 `conf_mob` 同族、**按项目**存 ✓
+            "iou_mob": float(self.sp_iou_mob.value()),
+            "max_det": int(self.sp_max_det.value()),
+            "agnostic_nms": bool(self.ck_agnostic.isChecked()),
             "conf_player": float(self.sp_conf_player.value()),
             "imgsz": int(self.sp_imgsz.value()),
             "device": self.ed_device.text().strip() or "0",
@@ -1266,6 +1409,10 @@ class LivePanel(QWidget):
             # 「本地窗口」的抓屏方式（`wgc` / `bitblt` ✓；控件只在窗口来源时可见 ✓，
             #  但**任何来源下都照原样存** ⇒ 切回收流也不会把它写丢 ✓）
             "window_capture": str(self.cmb_wcap.currentData() or "wgc"),
+            # ⭐ **部署台的「游戏窗口区域」**（比例，相对 A 机推来的整帧 ✓ 2026-10-17）：
+            #   与 `rect_rel` 同族 —— 换分辨率 / 改推流尺寸都**不用重框** ✓
+            "stream_rect_rel": ([float(v) for v in self._stream_rect_rel]
+                                if self._stream_rect_rel else None),
         }
 
     def _save_project_params(self):
@@ -1328,6 +1475,10 @@ class LivePanel(QWidget):
                 w.blockSignals(False)
 
         _spin(self.sp_conf_mob, "conf_mob", float)
+        # ⭐ 漏检三旋钮（用户 2026-10-16 ✓ 见控件那段 ✓）：回填只在"项目里真有这个键"时才动 ✓
+        _spin(self.sp_iou_mob, "iou_mob", float)
+        _spin(self.sp_max_det, "max_det", int)
+        _chk(self.ck_agnostic, "agnostic_nms")
         _spin(self.sp_conf_player, "conf_player", float)
         _spin(self.sp_imgsz, "imgsz", int)
         _spin(self.sp_capfps, "capture_fps", int)
@@ -1374,6 +1525,13 @@ class LivePanel(QWidget):
             self._rect_win = [int(rw[0]), str(rw[1])] if rw else None
         except Exception:                           # noqa: BLE001
             self._rect_rel, self._rect_win = None, None
+        # ⭐ **部署台「游戏窗口区域」**（比例 ✓ 2026-10-17）：老项目没有这个键 ⇒ 留 None
+        #   ⇒ **整帧**（老行为 ✓ 绝不让一个缺键把画面裁没 ✗）。
+        try:
+            sr = v.get("stream_rect_rel")
+            self._stream_rect_rel = [float(x) for x in sr] if sr else None
+        except Exception:                           # noqa: BLE001
+            self._stream_rect_rel = None
         self._refresh_rect_label()
 
     def bind(self, project):
@@ -1632,6 +1790,10 @@ class LivePanel(QWidget):
         common = {
             "weights": w,
             "conf_mob": self.sp_conf_mob.value(),
+            # ⭐ 漏检三旋钮（用户 2026-10-16 ✓）：随这套参数一起给线程 ✓（工具/命令行也读得到 ✓）
+            "iou_mob": self.sp_iou_mob.value(),
+            "max_det": int(self.sp_max_det.value()),
+            "agnostic_nms": bool(self.ck_agnostic.isChecked()),
             "conf_player": self.sp_conf_player.value(),
             "imgsz": self.sp_imgsz.value(),
             "device": self.ed_device.text().strip() or "0",
@@ -1677,6 +1839,9 @@ class LivePanel(QWidget):
             self.thread = LiveThread({
                 **common,
                 "source": "stream",
+                # ⭐ 部署台「游戏窗口区域」（比例 ✓）：线程按它裁帧 + 把鼠标比例折回整帧 ✓
+                "stream_rect_rel": ([float(v) for v in self._stream_rect_rel]
+                                    if self._stream_rect_rel else None),
                 "url": url,
                 "format": get("stream", "format", None),
                 "probe": self.ck_probe.isChecked(),
@@ -2134,7 +2299,8 @@ class LivePanel(QWidget):
             #   `alarm` 事件（带"实际怎么响的"`how` ✓ 见 `widgets.last_sound_note` ✓）。
             try:
                 from core import behavior
-                from gui.widgets import last_sound_note
+                # ⚠ 2026-10-15：`last_sound_note` 已挪到**模块顶部** ✓（原来这儿一句局部导入 ⇒
+                #   `check_ui` 每次都在报"导入写进了函数体" ✗ 见文件头那行注释 ✓）
                 _n = last_sound_note()
                 behavior.event("alarm", st=_scr, prev=_prev,
                                how=str(_n.get("how") or ""),

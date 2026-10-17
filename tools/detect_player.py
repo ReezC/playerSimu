@@ -31,7 +31,46 @@ import cv2
 from core.context import ConsoleContext, TaskContext, cancelable
 from core.imgio import imread, imwrite
 # ⭐⭐ 「框到可见部分」的两个默认值（与怪物/宠物/掉落**同一份** ✓ 见 `perception/visible_box.py` ✓）
+from perception import region as region_mod         # ⭐ 框选区域的一处口径 ✓（见 `region.py` ✓）
 from perception.visible_box import VISIBLE_KEEP, VISIBLE_TOL
+
+
+def keep_old_player_lines(existing, region, w, h, cls=None):
+    """玩家链写盘前该保留的旧行 ⇒「别的类」+「**区域外**的旧玩家框」✓（2026-10-17 事故修 ✓）。
+
+    ⚠ 与 `detect_mobs.merge_class_lines` **同一套判据** ✓（`perception.region.center_inside`
+      ✓ **中心点**在不在区域里 ✓ 归一化坐标乘回画面像素 ✓），但**语义不同** ✗：
+        · 那边：**区域内**的本类旧框参与"覆盖 / 0 检出保命"✓；
+        · 这边：**区域内**的旧玩家框**一律不保留** ✓ —— 玩家那条**有意整帧重写 class 0** ✓
+          （重新采集后旧框位置是错的 ✗ 见 `work` 里那段注释的由来 ✓），"保命"反而会留下
+          **位置错的框** ✗ ⇒ 不能照搬那边的保命分支 ✓。
+    ⚠ **没给区域** ⇒ 返回"只剩别的类" ✓（= 老行为：整帧重写 class 0 ✓ **零回归** ✓）。
+    ⚠ 读不懂的行 ⇒ **留着** ✓（不猜不删 ✓ 与 `merge_class_lines` 同口径 ✓）。
+    """
+    # ⚠ 默认值**不能写成 `cls=CLASS_PLAYER`** ✗（2026-10-17 实测踩到 ✓）：默认参数是在
+    #   **函数定义时**求值的 ✗，而本助手插在文件**靠前**（常量在后面才定义 ✓）⇒
+    #   导入这个模块就 `NameError: name 'CLASS_PLAYER' is not defined` ✗✗
+    #   ⇒ 一律改成"**调用时**再取"✓（`cls=None` 哨兵 ✓）。
+    cls = CLASS_PLAYER if cls is None else cls
+    keep = []
+    for ln in (existing or "").splitlines():
+        p = ln.split()
+        if not p:
+            continue
+        if p[0] != str(cls):
+            keep.append(ln)                 # 别的类（怪物 / 掉落 / 宠物）：原样保留 ✓
+            continue
+        if not region:
+            continue                        # 无区域 ⇒ 整帧重写（老行为 ✓）
+        try:
+            cx, cy = float(p[1]) * w, float(p[2]) * h
+        except (IndexError, ValueError, TypeError):
+            keep.append(ln)                 # 读不懂 ⇒ 留着（不猜不删 ✓）
+            continue
+        if region_mod.center_inside(region, cx, cy):
+            continue                        # 区域内 ⇒ 交给这一趟的新结果 ✓
+        keep.append(ln)                     # ⭐ 区域外 ⇒ **保留** ✓（事故就在这儿 ✗）
+    return keep
 # 可视化框颜色跟「设置 → 可视化」走（gui.theme 不 import PyQt5，子进程可用）
 from gui.theme import class_color
 
@@ -85,14 +124,35 @@ def work(fp_str):
     # 残留的 class 0 框位置是错的，若按「已有 class 0 就跳过」会整批跳过，
     # 造成「命中 0 帧」的假象。怪物框（class 1）原样保留。
     existing = out.read_text(encoding="utf-8") if out.exists() else ""
-    keep = [ln for ln in existing.splitlines()
-            if ln.split() and ln.split()[0] != str(CLASS_PLAYER)]
+    # ⚠⚠⚠ **2026-10-17 修（与 `detect_mobs` 同一种病 ✗ 用户原话：「**并不是只标注我框选的
+    #   区域，而是把整帧其他的标注框全删掉了**」✓）**：
+    #   老写法 `keep` 把**所有** class 0 行都剔掉 ✗ ⇒ **区域模式**（这一趟只搜了框选那块 ✓）
+    #   下会把**区域外的玩家框一并丢掉** ✗✗ = 真丢数据 ✓。
+    #   ⇒ 现在按区域**分两桶** ✓（判据与 `detect_mobs.merge_class_lines` **同一套** ✓
+    #     `perception.region.center_inside` ✓ 中心点 ✓ 归一化乘回像素 ✓）：
+    #       · **区域内**的旧玩家框 ⇒ 照旧**不保留** ✓（这一趟的新结果会替掉它 ✓
+    #         = "只重标这一块"该有的语义 ✓）；
+    #       · **区域外**的旧玩家框 ⇒ **保留** ✓（与怪物框同等对待 ✓ 本次修的就是它 ✓）。
+    #   ⚠ **没框选**（`region` 为空 ✓）⇒ **一字不改** ✓ —— 仍是"整帧重写 class 0"✓
+    #     （那是**有意**的语义 ✓ 见上面那段注释的由来：重新采集后旧 class 0 位置是错的 ✓）。
+    #   ⚠ 读不懂的行 ⇒ **留着** ✓（不猜不删 ✓ 与 `merge_class_lines` 同口径 ✓）。
+    _reg = cfg.get("region")
+    keep = keep_old_player_lines(existing, _reg, w, h)
 
     score = None
     if r is not None:
         cx, cy, bw, bh, score, _name = r
-        keep.append("%d %.6f %.6f %.6f %.6f" % (
-            CLASS_PLAYER, cx / w, cy / h, bw / w, bh / h))
+        # ⭐⭐ **只标框选区域内的**（用户 2026-10-11 ✓ 见 `perception/region.py` ✓）——
+        #   判据是"**中心点在不在区域里**"✓（跨边界的框只要主要在区域内就算 ✓ 见那边说明 ✓）。
+        #   ⚠ 没框选（`region` 为空 ✓）⇒ 一律 True ✓ ⇒ **老行为一字不变** ✓。
+        if not region_mod.center_inside(cfg.get("region"), cx, cy):
+            # ⇒ 下面既不加框、也不画可视化 ✓；⭐ `score` 也清掉 ✗ —— 它是"命中帧数"的账 ✓
+            #   被区域丢掉的框**不算命中** ✓（否则摘要会报"命中 30 帧"而框一个没有 ✓）
+            r = None
+            score = None
+        else:
+            keep.append("%d %.6f %.6f %.6f %.6f" % (
+                CLASS_PLAYER, cx / w, cy / h, bw / w, bh / h))
 
     out.write_text(("\n".join(keep) + "\n") if keep else "\n", encoding="utf-8")
 
@@ -186,16 +246,32 @@ def run_detect_player(params, ctx=None):
         #   ⚠ **默认关** ✗（改的是**标注语义**、不是修 bug ✓ ⇒ 老项目 / 老调用方一字不变 ✓）；
         #     要开就按项目显式开（设置里那个勾 ✓）；开了之后同一帧的框会变小 ⇒ 要重跑标注 ✓。
         #   ⚠ 实现是 `perception/visible_box.py`（与怪物/宠物/掉落**共用那一份** ✓）。
+        # ⭐⭐ **只在框选区域内标注**（用户 2026-10-11 ✓ 原话："点击各个标注按钮，只会在
+        #   当前帧框选的**区域内**进行自动标注"✓）—— 口径见 `perception/region.py` ✓。
+        #   ⚠ 不传 / 空 ⇒ `None` ⇒ **整幅画面都算** ✓（= 老行为一字不变 ✓）。
+        "region": params.get("region"),
         "visible": bool(params.get("visible", False)),
         "visible_tol": float(params.get("visible_tol", VISIBLE_TOL)),
         "visible_keep": float(params.get("visible_keep", VISIBLE_KEEP)),
     }
 
-    # 重新采集后帧数变少时，清掉帧号超界的旧标注/可视化（同 detect_mobs）
+    # 重新采集后帧数变少时，清掉**帧号已不存在**的旧标注/可视化（同 detect_mobs）
+    #
+    # ⚠⚠⚠ **2026-10-16 修（事故级 ✓ 与 `detect_mobs` 同一处病 ✓）**：
+    #   · 原来**无条件**执行 ✗（"只标这一帧"也照清 ✗）+ 老判据是"帧号 > 帧数"✗
+    #     ⇒ **帧号稀疏**的项目每跑一次就删掉一批别人的标注 ✗✗
+    #     （用户原话："**区域自动标注…实测影响了其他帧**"✓ 详见
+    #      `tools/detect_mobs.py::clean_stale_outputs` 那段说明 ✓）；
+    #   · 现在：**`only` 非空 ⇒ 根本不清** ✗（只标几帧就不许动别的帧 ✓）；
+    #     真要清 ⇒ 判据换成"**帧号在不在现有帧集合里**"✓。
     from tools.detect_mobs import clean_stale_outputs
-    removed = clean_stale_outputs(str(out), cfg["vis_dir"], n_all)
-    if removed:
-        ctx.log("清理上次残留 %d 个文件（帧号超出已有的 %d 帧）" % (removed, n_all))
+    if only:
+        ctx.log("只跑选中的 %d 帧 ⇒ **跳过全局清理**（不动其他帧的文件 ✓）" % len(frames))
+    else:
+        removed = clean_stale_outputs(str(out), cfg["vis_dir"], n_all,
+                                      keep_stems=[f.stem for f in frames])
+        if removed:
+            ctx.log("清理上次残留 %d 个文件（帧号已不在现有帧集合里）" % removed)
 
     # 主进程先验一次模板能不能加载，避免开了几十个进程才发现模板空
     ctx.progress(0, 0, "加载玩家模板…")

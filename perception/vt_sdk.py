@@ -39,6 +39,46 @@ DEFAULT_SDK_DIR = Path(__file__).resolve().parent.parent / "visual_tracking_sdk_
 #: 换一个数就会出现"SDK 说成功、我们找不到按钮"（或反过来）那种互相打脸 ✗。
 CONFIRM_MATCH_THR = 0.86
 
+#: ⭐⭐⭐ **瞄准平滑强度**（0 ~ 100 ✓；`None` ⇒ 用 SDK 自己的默认 = 5 ✓）。
+#:   **0 = 准心在哪、鼠标就设在哪**（用户 2026-10-16 ✓ 原话："**怎么会有 2x 追速这种说法？
+#:   最快应该是 100% → 准心在哪就把鼠标位置设置在哪**"✓）。
+#:   · SDK 的 `AimTrajectorySmoother`（`liescd/trajectory.py` ✓）在 `strength == 0` 时
+#:     **原样返回测量点** ✓（原文 "**exact bypass**" ✓）⇒ 没有任何平滑滞后、没有任何追速上限 ✓；
+#:   · ⚠⚠ 那些 `catch_up_ratio = 2.0 - 0.45*strength` / `max_speed`（地板 40 px/s ✓）/
+#:     `max_acceleration`（地板 600 px/s² ✓）**只在 `strength > 0` 时才走** ✓
+#:     ⇒ 它们是"**打磨档里的追速上限**"（最多约"目标速度的 2 倍"✓）—— **不是**"最快档" ✗
+#:     （我 2026-10-16 先说错了一次 ✓ 记在这儿，免得后人再绕 ✓）；
+#:   · 想恢复"拟人打磨" ⇒ 调成 5（SDK 默认 ✓）或 1~100 ✓ —— ⚠ 那是**抖动 / 平滑**的取舍 ✓
+#:     （越大越平滑、越跟不上 ✓）。
+#:   ⚠⚠ **绝不改 SDK 目录里的文件** ✗（本文件顶部那条纪律 ✓：它是校验过的交付包，
+#:     `verify_package.py` 逐文件 sha256 比对 ✓）⇒ 只能**从我们这侧调它的公开属性** ✓
+#:     （`sess.smoother.set_strength()` ✓ 见 `vision_sdk/session.py:72` ✓）。
+#:   ⚠⚠⚠ **必须在每次 `reset()` 之后再设一次** ✗：SDK 的 `Session.reset()`（`session.py:64-72`）
+#:     **每次都重建** `AimTrajectorySmoother()` ✓ ⇒ 只设一次会在"开一轮新任务"时失效 ✓
+#:     （所以下面那个 `_apply_aim_smooth()` 被**两处**调用：建会话后 ✓ + 每次 reset 后 ✓）。
+AIM_SMOOTH_STRENGTH = 0
+
+
+def apply_aim_smooth(vt, sess=None):
+    """把"**这一刻该用的**瞄准平滑强度"设到会话上（**唯一一处实现** ✓ 三处调用 ✓）。
+
+    · `vt` = 桥自己（`VtLieSdk` ✓）；强度取 `vt._smooth` ✓ —— **缺省落回模块常量**
+      `AIM_SMOOTH_STRENGTH`（0 = 直跟 ✓）；`_smooth = None` ⇒ 用 SDK 默认（5 ✓）。
+    · `sess` 只在**建会话那一拍**传（那时 `vt._sess` 还没挂上 ✓ 见 `_load_worker` ✓）。
+    · ⚠⚠ **每轮 `reset()` 之后必须再叫一次** ✗：SDK 的 `Session.reset()` 会**重建**
+      `AimTrajectorySmoother`（`session.py:64-72` ✓）⇒ 不补这一下，强度就退回 SDK 默认 5 ✗。
+    """
+    s = sess if sess is not None else getattr(vt, "_sess", None)
+    if s is None:
+        return
+    v = getattr(vt, "_smooth", AIM_SMOOTH_STRENGTH)
+    if v is None:
+        return
+    try:
+        s.smoother.set_strength(v)
+    except Exception:                     # noqa: BLE001 —— 老版本 SDK 没这个属性 ⇒ 不致命 ✓
+        pass
+
 
 def frame_rect_of(obs):
     """把 SDK 的目标框（**追踪图坐标**）换算到**喂进去那张图**的坐标 ⇒ `(x0,y0,x1,y1)`。
@@ -137,6 +177,20 @@ class VtLieSdk:
             sess = Session(confidence=self.confidence, region=self.region,
                            success_detection=self.success_detection,
                            max_duration_s=self.max_duration_s)
+            # ⭐⭐⭐ **瞄准平滑强度 = 0 ⇒ 准心在哪、鼠标就设在哪**（用户 2026-10-16 ✓ 原话：
+            #   "**怎么会有 2x 追速这种说法？最快应该是 100% → 准心在哪就把鼠标位置设置在哪**"✓）。
+            #   · SDK 的 `AimTrajectorySmoother`（`liescd/trajectory.py` ✓）在 `strength == 0` 时
+            #     **原样返回测量点** ✓（原文"exact bypass"✓）⇒ 这就是"100% 直跟" ✓；
+            #   · ⚠⚠ 下面那些 `catch_up_ratio = 2.0 - 0.45*strength` / `max_speed` /
+            #     `max_acceleration` **只在 `strength > 0` 时才走** ✓ ⇒ 它们是"**打磨档**里的
+            #     追速上限"（最多约"目标速度的 2 倍"、地板 40 px/s、起步 600 px/s² ✓），
+            #     **不是**"最快档" ✗（我 2026-10-16 先说错了一次 ✓ 记在这儿免得后人再绕 ✓）；
+            #   · 设 0 之后：**没有任何平滑滞后、没有任何追速上限** ✓ = 用户要的最快 ✓；
+            #   · 想恢复"拟人打磨" ⇒ 把 `AIM_SMOOTH_STRENGTH` 调回 5（SDK 默认 ✓）或 1~100 ✓
+            #     —— ⚠ 那是**抖动/平滑**的取舍 ✓（越大越平滑、越跟不上 ✓）。
+            #   · ⚠ 不动 SDK 源码 ✓：SDK 升级不会被覆盖 ✓（只调它的公开属性 ✓
+            #     `sess.smoother.set_strength()` ✓ 见 `session.py:72` ✓）。
+            apply_aim_smooth(self, sess)      # ⭐ 此刻该用的强度（缺省 = 0 = 准心在哪、鼠标就设在哪 ✓）
             sess.prepare()                    # 阻塞加载 YOLO 权重（实测 ~11s ✓）
             with self._lock:
                 self._sess, self._obs_cls = sess, Observation
@@ -162,6 +216,10 @@ class VtLieSdk:
         """
         if self._sess is not None:
             self._sess.reset(roi=roi)
+            # ⚠⚠ **必须重设一次**：SDK 的 `reset()` 会**重建** `AimTrajectorySmoother`
+            #   （`session.py:64-72` ✓）⇒ 不补这一句，我们刚设的"直跟"就会在**每一轮新任务**
+            #   开始时被悄悄退回 SDK 默认（5 = 打磨档 ✓）✗ ⇒ 见 `AIM_SMOOTH_STRENGTH` 那段 ✓。
+            apply_aim_smooth(self)
             self.shapec = None
             self._last_ts = None
             self.last_phase = "-"

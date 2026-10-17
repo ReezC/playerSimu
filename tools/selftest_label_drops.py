@@ -725,8 +725,16 @@ def t_worker_dispatch():
               "`run_detect` 没有 `cls` 参数（掉落物就没法写 class 2 ✗）")
         check('cfg.get("cls", CLASS_MOB)' in dm_src and '"cls": cls,' in dm_src,
               "`cls` 没顺着 `cfg` 进到**子进程**里（写出去的还是 class 1 ✗）")
-        check('if ln.split() and ln.split()[0] != str(_cls)' in dm_src,
-              "覆盖旧框时没按 `_cls` 过滤 ⇒ 标掉落物会把**怪物框**一起清掉 ✗")
+        # ⭐⭐ **2026-10-16 位置变更（口径不变 ✓）**：这段原来**内联在 `work` 里** ✗ ——
+        #   为了修用户当天报的事故（「**并不是只标注我框选的区域，而是把整帧其他的标注框
+        #   全删掉了**」✓）已抽成 **`merge_class_lines`** ✓（区域模式只覆盖**区域内**那部分 ✓）。
+        #   ⇒ 判据跟着改成"**助手按类别过滤** + **`work` 走助手**"✓ ——
+        #   它保护的那件事（**标掉落物不许把怪物框一起清掉** ✓）**一字不变** ✗ 没有放宽 ✓。
+        check('ln.split()[0] != str(cls)' in dm_src and "def merge_class_lines(" in dm_src,
+              "覆盖旧框时没按类别过滤 ⇒ 标掉落物会把**怪物框**一起清掉 ✗")
+        check("merge_class_lines(" in dm_src and 'cfg.get("region")' in dm_src,
+              "写盘那步没走 `merge_class_lines`（或没把区域交过去）"
+              " ⇒ **区域模式会把区域外的本类框一起删掉** ✗（2026-10-16 事故 ✓）")
     finally:
         lib.restore()
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1947,10 +1955,19 @@ def t_label_card_fields_all_have_tips():
     c = LabelCard()
     try:
         _keys = list((c.widgets or {}).keys())
-        check(len(_keys) == 24,
-              "卡片 4 的字段数变了（用例里写死 24 = 四类各 5 个参数 + 2 个勾选框 + "
-              "「框到可见部分」那两个（四段共用 ✓ 用户 2026-10-05 ✓）"
-              "⇒ 加/删字段时这里要跟着改 ✓）：%d 个 %r" % (len(_keys), _keys))
+        # ⭐⭐⭐ **2026-10-16 口径变更：24 → 27**（用户原话「**每类各自一格**」✓ +
+        #   「**注意区域自动标注与模型训练里一致**」✓）：
+        #   · 原来「框到可见部分」是**四段共用一格**（键 `visible` ✓）+ 共享的 `visible_keep`
+        #     ⇒ 24 = 四类各 5 个参数 + 2 个勾选框 + 那两格 ✓；
+        #   · 现在**每类各一格** ✗ ⇒ 键改成 `mob_visible` / `player_visible` /
+        #     `drop_visible` / `pet_visible` ✓（+3 格 ✓；`visible_keep` 仍是共享一格 ✓）
+        #     ⇒ **27** ✓。
+        #   ⚠ 判据本身没放宽 ✓（照样是"字段数不许悄悄变"✓）—— 只是**知道**了这次该是 27 ✓。
+        check(len(_keys) == 27,
+              "卡片 4 的字段数变了（用例里写死 27 = 四类各 5 个参数 + 2 个勾选框 + "
+              "「框到可见部分」**每类一格**（2026-10-16 ✓ 原来是四段共用一格 ✗）+ "
+              "共享的 `visible_keep` ✓ ⇒ 加/删字段时这里要跟着改 ✓）：%d 个 %r"
+              % (len(_keys), _keys))
         _forms = c.findChildren(QFormLayout)
         miss, short = [], []
         for key in _FILLED:

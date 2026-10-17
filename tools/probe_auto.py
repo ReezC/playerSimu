@@ -13,7 +13,7 @@ import numpy as np
 
 from link import PyAVSource
 from core.config import get
-from tools.probe_codec import (DEFAULT_BITS, bits_to_ms, decode_ms, now_ms,
+from core.probe_codec import (DEFAULT_BITS, bits_to_ms, decode_ms, now_ms,
                                ts_plausible)
 
 

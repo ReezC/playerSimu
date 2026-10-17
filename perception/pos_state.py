@@ -142,11 +142,16 @@ class PosSnapshot:
 
     def fmt(self):
         """一句话（日志/界面 ✓）：三态要看得出来（`判不了` / `否` / 绳号 ✓）。"""
-        return ("集合=%s　绳梯=%s　到顶=%s　到底=%s　脚下y=%s　只看位置=%s　平台x=%s"
+        return ("集合=%s　绳梯=%s　到顶=%s　到底=%s　脚下y=%s　只看位置=%s　"
+                "坐标符合=%s　平台x=%s"
                 % (("、".join(self.here_sets) or "—"), self.ladder_id or "不在绳上",
                    self._tri(self.at_ladder_top), self._tri(self.at_ladder_bottom),
                    ("%.0f" % self.ground_y) if self.ground_y is not None else "—",
                    self.on_rope_pos or "—",
+                   # ⭐⭐⭐ 2026-10-13（用户："**位置状态需要更新当前坐标是否符合在「绳梯上」**"✓）：
+                   #   `on_rope_align`（用户 2026-10-06 定的那份 ✓ 见它那段说明 ✓）本来**算了
+                   #   却没进这行** ✗ ⇒ 补上 ✓ 三态可读（是 / 否 都在 ✓ 与上面那几格同一口径 ✓）。
+                   "是" if self.on_rope_align else "否",
                    ("%.0f~%.0f" % self.here_span) if self.here_span else "—"))
 
     @staticmethod
@@ -178,6 +183,10 @@ class PositionStateMachine:
         self.here_span = None
         self.ladder_id = None
         self.on_rope_pos = None
+        # ⭐ 2026-10-13（用户："位置状态需要更新当前坐标是否符合在「绳梯上」"✓）：
+        #   **没定位那几拍也要清** ✓ —— 与上面两格同一条纪律（`绝不留旧值骗执行器` ✓
+        #   见 `update` 那段说明 ✓）⇒ 免得"上一拍的'是'"被当成本拍的读数 ✓。
+        self.on_rope_align = False
         self.on_rope_align = False
         self.at_ladder_top = None
         self.at_ladder_bottom = None

@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tools import push_presets as pp                     # noqa: E402
+from core import push_presets as pp                     # noqa: E402
 
 
 def check(cond, msg):

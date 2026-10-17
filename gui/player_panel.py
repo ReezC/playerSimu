@@ -1123,8 +1123,9 @@ class PlayerPanel(QWidget):
         self.btn_reset_link = QPushButton("重置指令通道")
         self.btn_reset_link.setToolTip(
             "按键卡住（角色自己一直走 / 一直攻击）或按键发不出去时点这里。\n"
-            "⓪ 先把 ←/→/↑/↓ 四个方向键**各点按一遍**（按下→松开）：补发这一下能把\n"
+            "⓪ 先把 ←/→/↓ 三个方向键**各点按一遍**（按下→松开）：补发这一下能把\n"
             "   游戏侧「卡住的方向键」刷成松开（光靠 RELEASEALL 只清得了固件侧 ✗）；\n"
+            "   ⛔ 不按 ↑：它在这游戏里是**抓绳 / 上梯** ⇒ 按了反而把角色挂到绳上 ✗\n"
             "① 重连远程通道 —— 连接断开时 relay 会直接往固件写一条 RELEASEALL，\n"
             "   把卡住的键一次松开（这条路不依赖我们的网络还通不通）；\n"
             "② 再补发一轮 RELEASEALL + 所有映射键的 RELEASE；\n"
@@ -1257,6 +1258,15 @@ class PlayerPanel(QWidget):
         self.sp_attack_lock_db.valueChanged.connect(self._on_attack_lock_db)
         top_form.addRow("输出后锁定防抖(ms)", self.sp_attack_lock_db)
 
+        # ⚠⚠ **这里不许再加「防抖置信度 / 防抖保留」两格** ✗（2026-10-16 记）：
+        #   · 我（AI）今天**误以为界面上没有**这两项 ✗ ⇒ 在这儿加了一份 ⇒ 与
+        #     **同文件 L1907 / L1925 早有的那一对**（`sp_debounce_conf` 0~1 两位小数 ✓ /
+        #     `sp_debounce_ms` ✓）**重名** ✗，而且 `_on_debounce` 也变成**两份**
+        #     ⇒ **后定义的那份（L4475 附近）赢** ✗ ⇒ 我这份根本不执行 ✓（桩测当场露馅：
+        #     写进去的是 `30.0` 而不是 `0.30` ✓）。⇒ 现已**整块撤回** ✓。
+        #   · 教训：**"界面上有没有"要先按名字搜一遍**（`sp_debounce_conf` / `_on_debounce` ✓），
+        #     别只按"关键词像不像"扫一遍就下结论 ✗ —— 我今天犯的就是这个 ✗。
+
         # 玩家追踪阈值（像素）：新玩家框离预测位置超此距离就不认（防跟错）。
         self.sp_track_jump = self._spin(0, 2000, 150, 0)
         self.sp_track_jump.setToolTip(
@@ -1304,6 +1314,25 @@ class PlayerPanel(QWidget):
         self.ck_vision_center.setToolTip("勾选：以画面屏幕中心为视野中心；\n不勾：以角色位置为中心。")
         self.ck_vision_center.stateChanged.connect(self._on_vision)
         vg.addWidget(self.ck_vision_center)
+
+        # ⭐⭐ 「只检测视野框」（用户 2026-10-15 ✓ 原话："我们是否可以只让YOLO检测视野框剪裁的
+        #   画面？这样能省不少性能"✓）—— ⚠ 它是**检测链路**的开关（不是决策参数 ✓），
+        #   但能不能开取决于**这个项目的视野框多大** ⇒ 跟 `vision_*` 一起、跟着项目存 ✓。
+        self.ck_vision_detect = QCheckBox("只检测视野框")
+        self.ck_vision_detect.setToolTip(
+            "勾上：只把**视野框**那一块画面剪出来喂 YOLO（框坐标会自动加回偏移，\n"
+            "追踪 / 决策 / 画框 / 掉落拾取拿到的仍是全画面坐标）。\n"
+            "不勾（默认）：检测走**整帧** —— 老行为。\n\n"
+            "⚠⚠ **会改变行为**：视野框外的怪**彻底不再被检出**（老行为是「照样检出、只是\n"
+            "不参与决策」）⇒ 依赖「画面上的怪」的逻辑会跟着变，例如多点巡逻那条\n"
+            "「视野内无怪若干秒才去下一点」。\n\n"
+            "⚠ **不省推理时间**：模型的输入尺寸由「实时」页的 imgsz 定死 —— 喂整帧和喂剪裁块，\n"
+            "网络里跑的都是同一个 imgsz。真正的收益是**同一份算力换更高分辨率**（视野框只占\n"
+            "整帧一小块 ⇒ 怪在模型眼里更大更清楚）⇒ 小的 / 远的怪更容易检出；\n"
+            "想**省时间**得把 imgsz 一起调小（权重是 960 训的，调小可能掉检出，要试）。\n\n"
+            "⚠ 四个方向都是 -1（不限制）时视野框 = 整帧 ⇒ 勾不勾一样。")
+        self.ck_vision_detect.stateChanged.connect(self._on_vision)
+        vg.addWidget(self.ck_vision_detect)
 
         self.sp_vision_top = self._spin(-1, 2000, 200, 0)
         self.sp_vision_bottom = self._spin(-1, 2000, 200, 0)
@@ -1367,6 +1396,50 @@ class PlayerPanel(QWidget):
             "（主循环一帧只推进一步序列，帧率低时序列耗时会按帧向上取整）")
         self.sp_attack_cd.valueChanged.connect(self._on_attack_cd)
         bf.addRow("输出行为CD(ms)", self.sp_attack_cd)
+
+        # ⭐⭐⭐ 「**跳跃高度(px)**」（用户 2026-10-13 ✓ 原话："**将「跳跃高度」挪到「下落速度」
+        #   上面，并且不依赖勾选「跳跃攻击」**"✓）—— 从「攻击」子组挪到这儿、**紧挨着下落速度** ✓：
+        #   这两个本来就是一件事的两半（跳上去 → 落回来 = 高度 ÷ 下落速度 ✓）。
+        #   ⚠⚠ **不再跟「跳跃攻击」勾选框联动** ✗（2026-10-13 用户点名 ✓）：它已经不只给那条白框用 ——
+        #     2026-10-13 起它还定「**跳跃CD**」（滞空时间 = 本值 ÷ 下落速度 ✓ 见 `decision/agent.py`
+        #     的 `jump_air_ms` ✓）⇒ **不勾「跳跃攻击」也必须能配** ✓（那才是这次要改的 ✓）。
+        self.sp_jump_height = self._spin(0, 2000, 0, 0)
+        self.sp_jump_height.setToolTip(
+            "**跳跃高度**（像素）：角色一跳能上去多高（按游戏里实测填）。\n\n"
+            "用途一：「**跳跃攻击**」那条白框 = 攻击范围框**上边**再往上这么高 ✓\n"
+            "  （只在勾了左边「跳跃攻击」且本值 > 0 时才成立 ✓）—— 所以它**不再**跟着那个勾选框置灰 ✓，\n"
+            "  没勾的时候这一格照样能配 ✓。\n"
+            "用途二（2026-10-13 ✓）：和「下落速度」一起定「**跳跃CD**」——\n"
+            "  跳上去再落回来要多久 = **本值 ÷ 下落速度**（秒）✓ ⇒ 这段时间里**一律不发跳**\n"
+            "  （人还在空中，按了也白按 ✓）；**连续两段寻路都要跳**时，第二段会**等 CD 过去**再开始 ✓。\n\n"
+            "· **0** = 没配 ⇒ 白框不存在（等同没勾 ✓）、跳跃CD 也不成立（照旧随时能发跳 ✓ 老行为 ✓）。")
+        self.sp_jump_height.valueChanged.connect(self._on_jump_attack_height)
+        bf.addRow("跳跃高度(px)", self.sp_jump_height)
+
+        # ⭐⭐ 「**下落速度(px/s)**」（用户 2026-10-12 ✓ 原话："在「输出行为CD(ms)」参数下加参数
+        #   「下落速度(px/s)」，**压住的时间按「跳跃高度」/这个值算**"✓）——
+        #   ⭐ 2026-10-13 起它**不只给「跳跃攻击」用了** ✓：它和上面的「跳跃高度」一起定
+        #     「**跳跃CD**」（滞空时间 = 高度 ÷ 本值 ✓ 用户原话："因为跳→落地是需要时间的
+        #     （跳跃高度 / 下落速度），所以所有的跳都要记录跳跃CD"✓）⇒ 不再依赖勾选框 ✓。
+        #   给「跳跃攻击」那一条的用途仍是：按完跳之后"压住输出"的**最长时间** = 同一个比值 ✓。
+        #   ⚠ `0` = 白框那条**不设上限** ✓（一直压到怪进攻击框为止 ✓）；跳跃CD 那条**不成立** ✓。
+        self.sp_fall_speed = self._spin(0, 5000, 600, 0, 10)
+        self.sp_fall_speed.setToolTip(
+            "**下落速度**（像素/秒）：跳上去之后往下落多快（按游戏里实测填）。\n\n"
+            "① 和上面的「**跳跃高度**」一起定「**跳跃CD**」（2026-10-13 ✓）：\n"
+            "　　滞空时间 = **跳跃高度 ÷ 本值**（秒）⇒ 这段时间里一律不发跳 ✓；\n"
+            "　　连续两段寻路都要跳时，第二段会**等 CD 过去**再开始 ✓。\n"
+            "② 给「**跳跃攻击**」用：按完跳之后输出会被**压住**（= 这一轮先不打），\n"
+            "　　压住的**最长时间**也是 **「跳跃高度」÷ 本值**（秒）✓。\n"
+            "（例：跳跃高度 100px、下落速度 600px/s ⇒ 0.17 秒）。\n\n"
+            "压住那段时间里只要**怪进了「攻击范围框」**（= 跳上去把它带进框了 ✓）就立刻照常输出 ✓；\n"
+            "· 超过这个时间还是没够着（跳矮了 / 怪在墙后够不着）⇒ **不再干等**，\n"
+            "  照旧输出 ✓（＝ 防「一直跳、一直不打」的兜底 ✓）。\n\n"
+            "**填 0**：白框那条 = 不设上限（一直压到怪进框为止 ✓）；跳跃CD 那条 = **不成立**\n"
+            "（照旧随时能发跳 ✓ 老行为 ✓）。\n"
+            "⚠ 调法：按实测的跳跃高度/滞空时间估一个值就行（偏大 = 等得久一点/跳CD 更长、偏小 = 早点照旧打）✓")
+        self.sp_fall_speed.valueChanged.connect(self._on_fall_speed)
+        bf.addRow("下落速度(px/s)", self.sp_fall_speed)
 
         # ---- 子组「**攻击**」（用户 2026-09-27 要求）----
         # 放进来的东西（他点名的那两批）：**攻击范围那四个距离** + **追击起跳**的全部参数 ✓。
@@ -1444,15 +1517,36 @@ class PlayerPanel(QWidget):
         self.sp_attack_fan.valueChanged.connect(self._on_attack_fan)
         af.addRow("扇形角度(°)", self.sp_attack_fan)
 
-        # 「**跳跃攻击范围**」（用户 2026-09-27 记的一笔，**本次不实现**）：等跳跃物理做好后，
-        # 它表示"怪框落在这个范围内 ⇒ 按跳就能把它带进攻击范围框 ⇒ 触发 attack" ✓。
-        # 所以这里**故意不放参数框**（没有物理逻辑可依据 ✗），但设置里已经有它的
-        # **显示颜色 + 开关**（「外观 → 辅助线与标记 → 跳跃攻击范围框」✓）。
-        lbl_jump_box = QLabel("「跳跃攻击范围」：等跳跃物理做好后再加参数，"
-                              "现在设置里只有它的显示颜色")
-        lbl_jump_box.setWordWrap(True)
-        lbl_jump_box.setStyleSheet("color: #5f6368;")
-        af.addRow("", lbl_jump_box)
+        # ⭐⭐⭐ **「跳跃攻击」**（用户 2026-10-12 ✓ 原话："在决策参数→战斗参数→攻击组
+        #   「**向下攻击距离**」参数下面增加新配置「跳跃攻击」→勾选项；勾选后，可配置参数
+        #   「跳跃高度」→px，当配置>0时，沿着攻击范围框（最小攻击距离到最大攻击距离的
+        #   矩形或梯形）**上面的边向上扩展出一个白色框**，作为跳跃攻击范围"✓）。
+        #   · **勾选框**：不勾 ⇒ 整条不生效（高度框**置灰** ✓ 配了也不算 ✓ 老行为 ✓）；
+        #   · **跳跃高度(px)**：> 0 才真有那条白框（勾了填 0 = 没开 ✓）。
+        #   ⚠ 判定与绘制**同一处**：`agent._in_jump_attack_box` / `jump_attack_box_poly` ✓；
+        #     白框的颜色/线宽/开关在「外观 → 辅助线与标记 → 跳跃攻击范围框」✓（本来就是白 ✓）。
+        self.ck_jump_attack = QCheckBox("启用")
+        self.ck_jump_attack.setChecked(bool(getattr(settings, "jump_attack_enabled", False)))
+        self.ck_jump_attack.setToolTip(
+            "**跳跃攻击范围**：在攻击范围框**上边**再往上「跳跃高度」那一条**白框**。\n\n"
+            "· **白色框碰到怪** ⇒ 和攻击范围框碰到怪走**一样的**逻辑（进 attack ✓，\n"
+            "  背后的怪照旧触发转身 ✓）；\n"
+            "· 进了 attack 之后：**前方的怪先按跳** ✓；**后方的怪**要等转向做完、\n"
+            "  并过完「最小切换朝向时间」**才按跳** ✓；\n"
+            "· 按跳之后**要等它进「攻击范围框」才输出** ✓（＝ 跳上去把它带进框里再打 ✓\n"
+            "  用户 2026-10-12 原话：「在攻击范围框碰到怪后再输出」✓）；\n"
+            "· 一次跳没够着（怪还在头上）⇒ 隔一下**再补跳一下** ✓（不会每拍乱跳 ✓）；\n"
+            "· 压住**最多**压多久 = **「跳跃高度」÷「战斗参数 → 下落速度(px/s)」**（秒 ✓）\n"
+            "  —— 超过它还没进框就不等了、照旧输出 ✓（那格填 0 = 不设上限 ✓）。\n\n"
+            "**不勾**（默认）：整条不生效 ✓ ⇒ 行为与以前一模一样 ✓（老项目/老模板也是这个 ✓）。\n"
+            "⚠ 「向上攻击距离」是 **-1（不限）** 时这条**不成立** ✓ —— 那种情况下攻击范围框\n"
+            "  **上边没有具体位置**，谈不上「往上扩展」✗（把向上攻击距离设成具体值再用 ✓）。\n\n"
+            "白框的颜色/线宽/显示开关：设置 → 外观 → 辅助线与标记 →「跳跃攻击范围框」✓")
+        self.ck_jump_attack.toggled.connect(self._on_jump_attack_toggle)
+        af.addRow("跳跃攻击", self.ck_jump_attack)
+
+        # ⚠ 「跳跃高度(px)」**已挪到上面「战斗参数」组**（紧挨「下落速度(px/s)」✓ 用户 2026-10-13
+        #   点名 ✓）、并且**不再跟这个勾选框联动** ✗（它还管「跳跃CD」✓ 见那一格的说明 ✓）。
 
         # ⭐⭐ **「走不动按跳」**（用户 2026-10-06 ✓ 原话："现在走路走不动会跳一下，能做成开关
         #   放到战斗参数里吗「走不动按跳」，放在「追击起跳」上面"）—— 就摆在**追击起跳上面** ✓。
@@ -1553,7 +1647,10 @@ class PlayerPanel(QWidget):
             "min/max 都是相对最大攻击距离的偏移：\n"
             "  0 ~ 50  → 纯外侧（还差一点够不着时跳）\n"
             "  -30 ~ 0 → 纯内侧（已进范围但偏远时跳）\n"
-            "  -30 ~ 50 → 跨攻击距离两侧")
+            "  -30 ~ 50 → 跨攻击距离两侧\n"
+            "⚠ 高度（2026-10-12 ✓）：这个框的**上边** = 攻击框上边 + 「跳跃攻击」的「跳跃高度」\n"
+            "  （只在勾了「跳跃攻击」且高度 > 0 时才抬 ✓）⇒ 比攻击框高、但没高过跳跃高度的怪\n"
+            "  才算「跳一下够得着」；站在上面那层平台的怪不算 ✓（下边仍照「向下攻击距离」✓）。")
         self.ck_chase_jump.stateChanged.connect(self._on_chase_jump)
         self.sp_chase_jump_min = self._spin(-2000, 2000, 0, 0)
         self.sp_chase_jump_min.setToolTip("起跳区间下限：相对最大攻击距离的偏移（可为负）。")
@@ -1784,7 +1881,16 @@ class PlayerPanel(QWidget):
         self.sp_debounce_conf.setToolTip(
             "置信度高于此值的怪，框短暂消失会保留位置，防漏检。\n"
             "保留期间框会按消失前的速度继续走一小段（逐渐收住），\n"
-            "不会粘在原地 —— 移动中的怪也跟得上。")
+            "不会粘在原地 —— 移动中的怪也跟得上。\n"
+            "\n"
+            "⚠⚠ 它只管「**消失之后还留多久**」——**不决定「这一拍显不显示」** ✗。\n"
+            "「显示」由**确认闸**管（新轨迹要**连续 2 拍且活满 60ms** 才画出来，\n"
+            "单帧假框一个都不出）⇒ 所以「框在闪」多半**不是**这一格能修的 ✓。\n"
+            "\n"
+            "想看清是**哪一种闪**：设置 → 界面 → 辅助线与标记 →\n"
+            "勾上「怪框显示 id/置信度」⇒ 框上会写 `#id 这一拍/历史最高`：\n"
+            "  · **每帧 id 都在换** ⇒ 认领 / 新建那一步有问题（看 `mob_flick` 打点）；\n"
+            "  · **同一个 id 在闪** ⇒ 检测不稳（该动阈值 / 增益）。")
         self.sp_debounce_conf.valueChanged.connect(self._on_debounce)
         tf.addRow("防抖置信度", self.sp_debounce_conf)
 
@@ -1794,7 +1900,10 @@ class PlayerPanel(QWidget):
             "这段时间里框按消失前的速度继续走、每帧收一点，所以是「滑过去」\n"
             "而不是「跳一下」；到期就不再输出。\n"
             "调大的代价：角色可能朝一个已经消失的框走过去（性能面板的\n"
-            "chase_ghost 就是这个占比）。")
+            "chase_ghost 就是这个占比）。\n"
+            "\n"
+            "⚠ 同样只管「**消失后还留多久**」✗ —— 它**不决定**这一拍画不画 ✓\n"
+            "（见上面「防抖置信度」那条的说明：显示由确认闸管 ✓）。")
         self.sp_debounce_ms.valueChanged.connect(self._on_debounce)
         tf.addRow("防抖时间(ms)", self.sp_debounce_ms)
 
@@ -2109,7 +2218,9 @@ class PlayerPanel(QWidget):
             "选**多个地点**当巡逻点位（集合 / 单条 foothold / 绳梯 / 传送门 ✓）。\n\n"
             "· **顺序 = 依次走的顺序**（同弹窗里列出的顺序 ✓）；\n"
             "· 启用后角色**依次循环**走过去（走完最后一个 ⇒ 回到第一个 ✓）；\n"
-            "· ⭐ **到了就直接去下一个**（不在那儿停留等条件 ✓）；\n"
+            "· ⭐ 到了之后**走不走**看下面那行「**视野内无怪才去下一点**」（用户 2026-10-11 ✓）：\n"
+            "　　不勾 = 到了**立刻**去下一个 ✓；勾上 = **视野内有怪就就近追着打**（灰框不算 ✓）、\n"
+            "　　**连续没怪够 N 秒**才去下一个 ✓；\n"
             "· 路上 / 到点时攻击范围内有怪 ⇒ **照打**（那是既有机制 ✓），打完接着走 ✓；\n"
             "· ⚠ **至少选 2 个**才能启用这个策略（只选 1 个 = 站着不动 ✓）。")
         sf.addRow("点位", self.btn_multi_spots)
@@ -2118,6 +2229,55 @@ class PlayerPanel(QWidget):
         self.lbl_multi_spots.setWordWrap(True)
         sf.addRow("", self.lbl_multi_spots)
         _r_ms2 = sf.labelForField(self.lbl_multi_spots)
+        # ⭐⭐ 「**视野内无怪几秒才去下一点**」（用户 2026-10-11 ✓ 两轮合起来的口径：
+        #   第一轮加参数 ✓ 第二轮："给该参数前面加上**勾选框**，**不勾选不启用**，
+        #   且**不能配置秒数**；勾选的时候，如果视野内有怪，会走 **chase** 逻辑，
+        #   连续 x 秒无怪才下一点（**灰框不算有怪**）"✓）：
+        #   · **不勾**（默认 ✓）⇒ 这条功能整个不启用 ✗ ⇒ 秒数**不读** ⇒ 老行为（到了立刻走 ✓）；
+        #   · **勾上** ⇒ 视野内**有怪**就走 **chase** 追它打 ✓（灰框不算 ✓）、
+        #     **连续无怪满 N 秒**才去下一个 ✓。
+        self.ck_multi_delay = QCheckBox("启用")
+        self.ck_multi_delay.toggled.connect(self._on_multi_delay_toggle)
+        self.ck_multi_delay.setToolTip(
+            "**勾上**：到点位后先看**「视野」内有没有够得着的怪** ✓\n"
+            "　· 有怪 ⇒ **就近追过去打**（走追击逻辑 ✓ 找最近的那只 ✓\n"
+            "　　⚠ 画面上那种**灰框**不算有怪 ✓ —— 灰框 = 已经打过、正在等「目标被攻击CD」的怪 ✓）；\n"
+            "　· **连续没怪满 N 秒** ⇒ 才去下一个点位 ✓。\n"
+            "**不勾**（默认）：这条功能不启用 ✓ ⇒ 到了点位**立刻去下一个**（老行为 ✓），\n"
+            "　　右边的秒数框会**置灰**（配了也不算 ✓）。\n\n"
+            "⚠ 「视野」= 上面那一组 上/下/左/右（px）✓ —— **范围外的怪不算「有怪」** ✗\n"
+            "（想让它在更远处也去追，就把那组调大 ✓）。\n"
+            "⚠⚠ **得走寻路才能到的怪也不算「有怪」** ✓（2026-10-12 加的：怪在别的 foothold\n"
+            "集合、又没够得着 ⇒ **不算有怪** ⇒ 巡逻照走 ✓ 不会为了它拐出去/干等 ✓；\n"
+            "「够得着」= 同一个 foothold 集合，或攻击框伸过去够得到它 ✓\n"
+            "—— 伸手最远伸到**你脚下这块平台的端点**为止 ✓）。")
+        self.sp_multi_delay = self._spin(0.0, 3600, 0.0, 1, 0.5)
+        self.sp_multi_delay.valueChanged.connect(self._on_multi_delay)
+        self.sp_multi_delay.setToolTip(
+            "**视野内连续没怪够这么多秒**才去下一个点位 ✓（只在左边勾选后有效 ✓）\n\n"
+            "· 「**视野内**」= 上面「**视野**」那一组参数圈出来的范围 ✓\n"
+            "  （⚠ **超出那个范围的怪不算「有怪」** ✗ ⇒ 人会在点位等着 ✓\n"
+            "  ⇒ 想让它管到更远的怪，就把「视野」的 上/下/左/右 调大 ✓）；\n"
+            "· **灰框不算有怪** ✓（灰框 = 已经打过、正在等「目标被攻击CD」的那些怪）；\n"
+            "· 有怪 ⇒ **就近追过去打**（找最近的一个 ✓ 与平地巡逻同一套挑法 ✓）\n"
+            "  ⇒ 计时清零；怪没了才从头数 ✓；\n"
+            "· ⚠ 攻击范围内的怪照旧由 attack 优先接管 ✓（这条只管「该不该走」✓）。\n\n"
+            "⚠⚠ **要寻路才能到的怪不算「有怪」** ✓（2026-10-12 ✓）—— 怪在别的 foothold 集合、\n"
+            "又没够得着时，**不会**让你追出去、也**不会**卡住计时 ✓ ⇒ 巡逻照走 ✓。\n"
+            "「够得着」= ① **同一个 foothold 集合**（那就在我这块平台上 ✓），或\n"
+            "② 攻击框伸过去够得到它 ✓ —— 伸展最远到**我脚下这块平台的端点**为止 ✓。\n"
+            "⇒ 以前那句「怪看得到但过不去 ⇒ 会一直追着/等着」**已经不成立了** ✓；\n"
+            "　真要让它去别层打，就**把「视野」调大**是没用的 ✗ —— 得**把点位选到那一层** ✓。")
+        _md_row = QWidget()
+        _md_lay = QHBoxLayout(_md_row)
+        _md_lay.setContentsMargins(0, 0, 0, 0)
+        _md_lay.setSpacing(6)
+        _md_lay.addWidget(self.ck_multi_delay)
+        _md_lay.addWidget(self.sp_multi_delay)
+        _md_lay.addWidget(QLabel("秒"))
+        _md_lay.addStretch(1)
+        sf.addRow("视野内无怪才去下一点", _md_row)
+        _r_md = sf.labelForField(_md_row)
 
         #: 「平台站桩」那几行的 `(控件, 左边那格标签)` —— 显隐**一处收口** ✓
         #: （`QFormLayout` 里"标题"和"控件"是**两样东西** ⇒ 必须成对显隐 ✗ 只藏一个会留半行 ✓）
@@ -2127,9 +2287,13 @@ class PlayerPanel(QWidget):
                               (_pk, _r_time),
                               (self.btn_pickup_spots, _r_ps),
                               (self.lbl_pickup_spots, _r_ps2)]
-        #: 「多点巡逻」那两行 —— 同上，成对显隐 ✓（只在**选中**「多点巡逻」时出现 ✓）
+        #: 「多点巡逻」那几行 —— 同上，成对显隐 ✓（只在**选中**「多点巡逻」时出现 ✓）
+        #: ⚠ 新控件要**加进来** ✗（不加 ⇒ 它在别的策略下也亮着 ✓ 见 `_apply_strategy` ✓）
+        #: ⚠ 这里加的是**整行**（`_md_row` ✓ 勾选框 + 秒数框都在它里面 ✓）——
+        #:   只加 `sp_multi_delay` 的话，那一行的**勾选框会留在原地亮着** ✗。
         self._multi_rows = [(self.btn_multi_spots, _r_ms),
-                            (self.lbl_multi_spots, _r_ms2)]
+                            (self.lbl_multi_spots, _r_ms2),
+                            (_md_row, _r_md)]
         #: 「地区选择」弹窗的工厂（`fn(parent, multi, init) -> [地点] | None` ✓
         #:   —— 由主窗口从路线识别面板推过来 ✓ 见 `set_element_picker_factory` ✓）
         self._element_factory = None
@@ -2693,8 +2857,16 @@ class PlayerPanel(QWidget):
             self.btn_auto.blockSignals(False)
             self._refresh_auto_ui()
             return
+        # ⭐⭐⭐ **2026-10-13：只有"真从开着 → 关掉"这一下才收摊**（用户原话："**关闭自动
+        #   情况下，开启手动输入按住的键会被断掉**，什么情况？"✓）
+        #   原来这里不看"刚才是开着的吗" ✗ —— 程序自己也会调 `_toggle_auto()`（F11 那条
+        #   `toggle_auto()` / 断线停止那几条 ✓）⇒ 自动**本来就关着**时再调一次，也会
+        #   `_force_release_all()` ✗ ⇒ 手动输入正按着的键跟着被清掉 ✓。
+        #   ⇒ 只认**下降沿** ✓（与 agent 那条 `_release_keys_now` 的下降沿同一口径 ✓）；
+        #     `_force_release_all` 那边另有一道"跳过人手按着的键"✓ —— 两道各管一半 ✓。
+        _was_on = bool(settings.enabled)
         settings.enabled = on
-        if not on:
+        if not on and _was_on:
             self._force_release_all()   # 关闭自动立即释放所有按键，防卡键
         self._refresh_auto_ui()
 
@@ -2830,13 +3002,14 @@ class PlayerPanel(QWidget):
         #   刷干净；随后 RELEASEALL / 重连再清固件侧，两边就都不留卡键 ✓。
         #   ⚠ 通道死了这几下会静默失败（`_send_remote` 吞掉、不抛 ✗）⇒ 无副作用，
         #   后面的重连照走 ✓。
-        for _name in ("left", "right", "up", "down"):
-            _k = (settings.keymap or {}).get(_name)
-            if _k:
-                try:
-                    dinput.tap(_k)
-                except Exception:                       # noqa: BLE001
-                    pass
+        # ⚠ 段实现**只有一处** ✓（`decision/input.tap_directions` ✓）—— 2026-10-11 收口：
+        #   定时清键 / 通道自愈走的是**同一个函数** ✓（用户当天正是问"这两处有没有先按一遍"✓）。
+        #   ⚠ 这里**不加** `only_hardware` ✓：手动按钮是人明确点的 ⇒ 本地(仅测试)也照发 ✓
+        #     （只有**自动**那两条会跳过 ✗ 见 `tap_directions` 的说明 ✓）。
+        try:
+            dinput.tap_directions(settings.keymap)
+        except Exception:                           # noqa: BLE001
+            pass
         h = dinput.link_health()
         backend = h.get("backend")
         reconnected = False
@@ -2871,11 +3044,28 @@ class PlayerPanel(QWidget):
         映射键；对未按下的键发 RELEASE 无害（固件/SendInput 都忽略）。
         """
         from decision import input as dinput
-        # 远程模式：发一条 RELEASEALL 让固件清空所有按键，比逐键 RELEASE 可靠，
-        # 能救回「RELEASE 丢失导致卡键」的情况
-        dinput.release_all_remote()
-        # 逐键兜底（本地 SendInput + 远程补充）
-        keys = set(settings.keymap.values()) | set(settings.custom_keys.values())
+        # ⭐⭐⭐ **2026-10-13：手动输入开着 ⇒ 不许发 RELEASEALL、不许动人手正按着的键**
+        #   （用户原话："**关闭自动情况下，开启手动输入按住的键会被断掉**，什么情况？"✓）
+        #   为什么：`RELEASEALL` 让固件**整张表清空** ✗ ⇒ 手动通道正转发着的人手按键一起没 ✗
+        #   （`manual_input` 模块文档："固件侧按住的键是个集合……谁先发 RELEASE 谁就真松开"✓）。
+        #   ⇒ 这时**退化成逐键 RELEASE**，并且**跳过** `manual_input.held()` 里的那些 ✓。
+        #   ⚠ 所以"防卡键"在手动输入开着时只能靠逐键（漏一个就漏一个 ✓）—— 这是**故意的**权衡 ✓：
+        #     宁可少救一个卡键，也不许把人家正在按的键松掉 ✗（人就在键盘前 ✓ 自己松一下就行 ✓）。
+        _man = set()
+        try:
+            from decision import manual_input
+            if manual_input.active():
+                _man = manual_input.held()
+        except Exception:                       # noqa: BLE001 —— 问不到就当没有手动输入 ✓
+            _man = set()
+        if not _man:
+            # 远程模式：发一条 RELEASEALL 让固件清空所有按键，比逐键 RELEASE 可靠，
+            # 能救回「RELEASE 丢失导致卡键」的情况
+            # ⚠ 只有**没有手动输入**时才敢用它 ✓（它不分是谁按的 ✗）
+            dinput.release_all_remote()
+        # 逐键兜底（本地 SendInput + 远程补充）—— 手动正按着的那些**跳过** ✓
+        keys = (set(settings.keymap.values())
+                | set(settings.custom_keys.values())) - _man
         for key in keys:
             if key:
                 try:
@@ -3126,6 +3316,28 @@ class PlayerPanel(QWidget):
         `attack_box_poly` ✓）。⚠ **0 = 老行为一字不差** ✓（老项目文件里没有这个键 ⇒ 兜底 0 ✓）。
         """
         settings.attack_fan_deg = float(self.sp_attack_fan.value())
+        settings.save()
+
+    def _on_jump_attack_toggle(self, _on=None):
+        """「跳跃攻击」勾选框写回设置（        用户 2026-10-12 ✓）。
+
+        ⚠ 和别的决策参数一样**按项目存** ✓（`jump_attack_enabled` 在 `DecisionSettings.
+          to_dict` / `from_dict` 里 ✓ ⇒ 跟着 `project.yaml` 的 `decision:` 段走 ✓）。
+        ⚠⚠ **它不再决定「跳跃高度」那一栏能不能配** ✗（2026-10-13 用户点名：那一格要
+          "**不依赖勾选「跳跃攻击」**"✓）—— 因为「跳跃高度」现在还管「**跳跃CD**」✓
+          （滞空时间 = 高度 ÷ 下落速度 ✓）⇒ 不勾这条白框也必须能配 ✓。
+        """
+        settings.jump_attack_enabled = bool(self.ck_jump_attack.isChecked())
+        settings.save()
+
+
+    def _on_jump_attack_height(self, _val=None):
+        """「跳跃高度(px)」写回设置（用户 2026-10-12 ✓ 见 `__init__` 那段原话 ✓）。
+
+        ⚠ `0` 是**合法且默认**的 ✓（勾了但填 0 = 那条白框不存在 ✓）⇒ 不许把它当"没填"✗。
+        ⚠ 判据那边读的就是 `jump_attack_height > 0` ✓（`agent.jump_attack_active` 一处 ✓）。
+        """
+        settings.jump_attack_height = float(self.sp_jump_height.value())
         settings.save()
 
     def _on_walk_hop(self, _val=None):
@@ -3515,9 +3727,24 @@ class PlayerPanel(QWidget):
         settings.attack_cd = int(val)
         settings.save()
 
+    def _on_fall_speed(self, val):
+        """「下落速度(px/s)」写回设置（用户 2026-10-12 ✓）。
+
+        它**只给「跳跃攻击」那条用** ✓：压住输出的上限 = 「跳跃高度」÷ 本值（秒 ✓
+        见 `decision/agent.py::_jump_attack_hold_cap` 一处口径 ✓）。
+        ⚠ `0` 是**合法值**（= 不设上限 ✓ 一直压到怪进攻击框 ✓）⇒ 不许把它当"没填"✗。
+        ⚠ 和别的决策参数一样**按项目存** ✓（`fall_speed_px_s` 在 `to_dict` / `from_dict` 里 ✓）。
+        """
+        settings.fall_speed_px_s = float(val)
+        settings.save()
+
     def _on_attack_lock_db(self, val):
         settings.attack_lock_debounce_ms = int(val)
         settings.save()
+
+    # ⚠⚠ **这里不许再加 `_on_debounce`** ✗（2026-10-16 记）：本文件**早就有一份**
+    #   （见后面那处 ✓）⇒ 我再加一份只会让**后定义的那个赢** ✗、我这份永远不执行 ✓
+    #   （桩测当场露馅：写进去的是 `30.0` 而非 `0.30` ✓）。⇒ 已整块撤回 ✓。
 
     def _on_track_jump(self, val):
         settings.player_track_jump = int(val)
@@ -3775,6 +4002,29 @@ class PlayerPanel(QWidget):
         self.sp_vt_aim_ms.valueChanged.connect(self._on_vt_changed)
         f.addRow("鼠标跟随间隔(ms)", self.sp_vt_aim_ms)
 
+        # ⭐⭐⭐ **瞄准平滑强度**（用户 2026-10-16 ✓ 原话："**自动测谎鼠标跟随目标准心的速度太慢了**"✓
+        #   + "**最快应该是 100% → 准心在哪就把鼠标位置设置在哪**"✓）：
+        #   · `0`（默认）= **最快**：准心在哪、鼠标就设在哪（SDK 里 `strength == 0` 是
+        #     "**exact bypass**"✓ 原样返回测量点 ⇒ 无平滑滞后、**无追速上限** ✓）；
+        #   · `1 ~ 100` = 打磨（**越大越平滑、越跟不上** ✓ —— 那是抖动/平滑的取舍 ✓）；
+        #     SDK 自己那份默认是 **5** ✓（想回到"出厂打磨档"就填 5 ✓）。
+        #   ⚠⚠ 别把它和"**跟随间隔(ms)**"混了 ✗：那个改的是**喂帧/插值节奏** ✓，
+        #     这个改的是**每拍走多少** ✓ —— 用户 2026-10-16 明确："**速度跟频率无关**"✓。
+        #   ⚠ 落 `config/live.yaml`（本机偏好 ✓ 见类头那段 ✓ 不进项目文件 ✗）；
+        #     实时线程**热读** ⇒ 改完最多 1 秒生效 ✓（见 `live_thread` 里那段热读 ✓）。
+        self.sp_vt_smooth = NoWheelSpinBox()
+        self.sp_vt_smooth.setRange(0, 100)
+        self.sp_vt_smooth.setSingleStep(1)
+        self.sp_vt_smooth.setValue(int(_lv.get("vt_smooth", 0)))
+        self.sp_vt_smooth.setToolTip(
+            "瞄准点平滑强度（0 ~ 100）：\n"
+            "  · 0（默认）= 最快 —— 准心在哪、鼠标就设在哪（不加平滑、不限追速）；\n"
+            "  · 1~100 = 越大人味越足（越平滑），但越跟不上快目标；\n"
+            "  · 5 = SDK 自带的默认打磨档（想恢复旧手感就填它）；\n"
+            "存 config/live.yaml（本机偏好），实时线程 1 秒内热读生效。")
+        self.sp_vt_smooth.valueChanged.connect(self._on_vt_changed)
+        f.addRow("瞄准平滑强度(0=直跟)", self.sp_vt_smooth)
+
         self.sp_vt_conf = NoWheelDoubleSpinBox()
         self.sp_vt_conf.setRange(0.05, 0.90)
         self.sp_vt_conf.setDecimals(2)
@@ -3853,7 +4103,9 @@ class PlayerPanel(QWidget):
                         vt_conf=float(self.sp_vt_conf.value()),
                         vt_region=str(self.cmb_vt_region.currentData() or "CN"),
                         vt_cool_s=float(self.sp_vt_cool.value()),
-                        vt_aim_ms=int(self.sp_vt_aim_ms.value()))
+                        vt_aim_ms=int(self.sp_vt_aim_ms.value()),
+                        # ⭐ **瞄准平滑强度**（0 = 直跟 ✓ 用户 2026-10-16 ✓ 见 `_build_vt_group` ✓）
+                        vt_smooth=int(self.sp_vt_smooth.value()))
         except Exception as e:                # noqa: BLE001 —— 存不上不该炸面板 ✓
             print("⚠ 自动测谎参数没存进 live.yaml（%s: %s）" % (type(e).__name__, e))
 
@@ -4258,10 +4510,28 @@ class PlayerPanel(QWidget):
         elif is_multi:
             _n = len([x for x in (getattr(settings, "multi_spots", None) or [])
                       if isinstance(x, dict) and x])
+            # ⭐⭐ 到了之后走不走，取决于「视野内无怪才去下一点」那**一行**（勾选框 + 秒数 ✓
+            #   用户 2026-10-11 ✓ 第二轮）—— 说明行必须**跟着它们变** ✗（写死就成假话了 ✓）。
+            _on = bool(getattr(settings, "multi_leave_wait_enabled", False))
+            _d = max(0.0, float(getattr(settings, "multi_leave_delay_s", 0.0) or 0.0))
+            if not _on:
+                _leave = "**到了就直接去下一个**（那行没勾 ✓）"
+            elif _d <= 0:
+                _leave = "到了**立刻**去下一个（勾了但秒数是 0 ✓）"
+            else:
+                _leave = ("到了**先不走**：**视野内有怪就就近追着打**（灰框不算 ✓）、"
+                          "**连续没怪 %.1f 秒**才去下一个" % _d)
             self.lbl_strategy_note.setText(
-                "多点巡逻：在 %d 个点位之间**依次循环**走 —— **到了就直接去下一个**；"
+                "多点巡逻：在 %d 个点位之间**依次循环**走 —— %s；"
                 "路上/到点遇怪照打（攻击范围内有怪优先 attack ✓）。%s"
-                % (_n, "" if _n >= 2 else "　⚠ 少于 2 个点位 ⇒ **不能启用**（先「选择点位…」）"))
+                % (_n, _leave,
+                   "" if _n >= 2 else "　⚠ 少于 2 个点位 ⇒ **不能启用**（先「选择点位…」）"))
+            # ⚠ 那个勾选框**一关** ⇒ 秒数框必须**置灰**（用户原话："不勾选**不能配置秒数**"✓）
+        # ⚠⚠ 这一句**故意放在 if/elif 之外** ✗：秒数框的灰不灰只由**勾选框**决定 ✓，
+        #   跟"下拉现在选的是不是 multi"无关 ✓ —— 放进去的话，切走再切回来 / 回填之后
+        #   它就停在**旧的灰状态**上 ✗（用例里栽过一次："勾上了还是灰的"✓）。
+        if getattr(self, "sp_multi_delay", None) is not None:
+            self.sp_multi_delay.setEnabled(bool(self.ck_multi_delay.isChecked()))
         else:
             self.lbl_strategy_note.setText(
                 "以角色脚底为基准：上阈值往上、下阈值往下，范围外的怪不追踪")
@@ -4364,12 +4634,60 @@ class PlayerPanel(QWidget):
             lbl.setStyleSheet("color: #c5221f;")
             return
         txt = " → ".join(zones_mod.element_label(x) for x in spots)
+        # ⭐ 摘要里带上"到了之后走不走"（用户 2026-10-11 ✓）—— 这一句是**唯一**能一眼
+        #   看到"现在配的是立刻走还是等够 N 秒"的地方 ✓（值本身在下面那一行里 ✓）。
+        #   ⚠ **必须把"有没有勾"算进来** ✗：没勾时那个秒数是**不生效**的 ✓ ——
+        #     摘要里照着秒数写"等 N 秒才走"就是在骗人 ✓（用户第二轮特意强调"不勾选不启用"✓）。
+        _on = bool(getattr(settings, "multi_leave_wait_enabled", False))
+        _d = max(0.0, float(getattr(settings, "multi_leave_delay_s", 0.0) or 0.0))
+        if not _on:
+            _how = "（**没勾**「视野内无怪才去下一点」⇒ 到了**立刻**去下一个 ✓"
+        elif _d <= 0:
+            _how = "（勾了但秒数是 0 ⇒ 等于**立刻**去下一个 ✓ 建议填个 3 秒 ✓"
+        else:
+            _how = ("（勾了 ⇒ **视野内有怪就就近追着打**（灰框不算 ✓）、"
+                    "**连续没怪 %.1f 秒**才走 ✓" % _d)
         if len(spots) < 2:
             lbl.setText("%s　⚠ 只有 1 个 ⇒ **不能启用**（再选一个 ✓）" % txt)
             lbl.setStyleSheet("color: #c5221f;")
         else:
-            lbl.setText("%s　（共 %d 个，走完回到第一个 ⇒ 循环 ✓）" % (txt, len(spots)))
+            lbl.setText("%s　（共 %d 个，走完回到第一个 ⇒ 循环 ✓）%s"
+                        % (txt, len(spots), _how))
             lbl.setStyleSheet("color: #80868b;")
+
+    def _on_multi_delay_toggle(self, on):
+        """「视野内无怪才去下一点」**那个勾选框** ⇒ 写回 + 置灰秒数框（用户 2026-10-11 ✓）。
+
+        ⚠ 勾上时若秒数还是 `0` ⇒ **自动填 3 秒** ✗✗（这是**故意**的 ✓ 想清楚再改）：
+          `0` 的语义是"无怪 0 秒 ⇒ 立刻走"（= 老行为 ✓）⇒ 人**勾上**就是想"等一会儿" ✓
+          结果什么都不变 ⇒ 会以为功能坏了 ✓。填 3 秒能**立刻看出差别** ✓，
+          而且他随后改成自己想要的值也只是一步 ✓（tooltip / 摘要里都写着实际值 ✓）。
+        """
+        settings.multi_leave_wait_enabled = bool(on)
+        if on and float(self.sp_multi_delay.value() or 0.0) <= 0.0:
+            settings.multi_leave_delay_s = 3.0
+            self.sp_multi_delay.blockSignals(True)
+            self.sp_multi_delay.setValue(3.0)
+            self.sp_multi_delay.blockSignals(False)
+        settings.save()
+        self._refresh_strategy_ui()          # 一处收口：置灰 + 说明行 + 摘要都跟着变 ✓
+
+    def _on_multi_delay(self, _val=None):
+        """「**视野内无怪N秒才去下一点**」的**秒数** ⇒ 写回 + 刷摘要（用户 2026-10-11 ✓）。
+
+        ⚠ `0` 是**合法**的 ✓（= 无怪就立刻走 ✓ 老行为 ✓）⇒ 这里**不许**把它当"没填"处理 ✗
+          （同 `_on_pickup_time` 那条"最大值 <= 0 = 整组不生效"是**另一码事** ✓）。
+        ⚠ 秒数框在**没勾**时是置灰的 ⇒ 正常收不到这个信号 ✓（收到也无害：值照存 ✓ 反正不读 ✓）。
+        """
+        try:
+            _v = float(self.sp_multi_delay.value())
+        except (TypeError, ValueError):
+            _v = 0.0
+        settings.multi_leave_delay_s = max(0.0, _v)
+        settings.save()
+        # ⚠ 走**一处收口** ✗：说明行那句"到了直接走 / 等够 N 秒"必须跟着这个值变 ✓
+        #   （写死在说明里就成了假话 ✓ 见 `_refresh_strategy_ui` 里 `_leave` 那段 ✓）
+        self._refresh_strategy_ui()
 
     def _on_pickup_spots_pick(self):
         """「选择掉落地区」⇒ 开「地区选择」弹窗（**多选** ✓）⇒ 写回 + 刷摘要 ✓。"""
@@ -4421,6 +4739,8 @@ class PlayerPanel(QWidget):
         settings.vision_center = bool(self.ck_vision_center.isChecked())
         settings.vision_off_x = int(self.sp_vision_off_x.value())
         settings.vision_off_y = int(self.sp_vision_off_y.value())
+        # ⭐ 「只检测视野框」（用户 2026-10-15 ✓）—— 走同一个口（`stateChanged` 也接的这里 ✓）
+        settings.vision_detect_only = bool(self.ck_vision_detect.isChecked())
         settings.save()
         self._refresh_vision_labels()
 
@@ -5121,6 +5441,28 @@ class PlayerPanel(QWidget):
             float(getattr(settings, "attack_fan_deg", 0.0) or 0.0))
         self.sp_attack_fan.blockSignals(False)
 
+        # ⭐⭐ 「**跳跃攻击**」勾选框 +「**跳跃高度(px)**」（用户 2026-10-12 ✓）：
+        #   ⚠ `getattr` 兜底 False / 0.0 —— 老配置 / 半初始化的 settings 里可能还没这两个字段 ✓
+        #   （= 整条不生效 = 老行为一字不变 ✓）。
+        #   ⚠ 勾选框要 `blockSignals`：不然 `setChecked` 会触发 `_on_jump_attack_toggle`
+        #     ⇒ 反手往盘上写一次（打开面板就写盘 ✗ 本项目的一条老纪律 ✓）。
+        _ja_on = bool(getattr(settings, "jump_attack_enabled", False))
+        self.ck_jump_attack.blockSignals(True)
+        self.ck_jump_attack.setChecked(_ja_on)
+        self.ck_jump_attack.blockSignals(False)
+        self.sp_jump_height.blockSignals(True)
+        self.sp_jump_height.setValue(
+            int(round(float(getattr(settings, "jump_attack_height", 0.0) or 0.0))))
+        self.sp_jump_height.blockSignals(False)
+        # ⚠ 不置灰（2026-10-13 用户："**不依赖勾选「跳跃攻击」**"✓）—— 它还管「跳跃CD」✓
+
+        # ⭐ 「下落速度(px/s)」（用户 2026-10-12 ✓ 压住上限 = 高度 / 它 ✓）：老配置没这一格
+        #   ⇒ `getattr` 兜底 600 ✓（只在开了「跳跃攻击」时才起作用 ✓ 不影响老项目 ✓）。
+        self.sp_fall_speed.blockSignals(True)
+        self.sp_fall_speed.setValue(
+            int(round(float(getattr(settings, "fall_speed_px_s", 600.0) or 0.0))))
+        self.sp_fall_speed.blockSignals(False)
+
         # ⭐ 「走不动按跳」（用户 2026-10-06 ✓）：老项目没这个键 ⇒ 显示 **True**（= 现在行为 ✓）
         self.ck_walk_hop.setChecked(bool(getattr(settings, "walk_stall_jump", True)))
         # ⭐ 「自动拾取」（用户 2026-10-06 ✓）：老项目没这个键 ⇒ 显示 **False**（= 关着 ✓
@@ -5190,6 +5532,10 @@ class PlayerPanel(QWidget):
         self.sp_attack_lock_db.setValue(settings.attack_lock_debounce_ms)
         self.sp_attack_lock_db.blockSignals(False)
 
+        # ⚠⚠ **「防抖置信度 / 防抖保留」的回填也不许加在这儿** ✗（2026-10-16 记）：
+        #   那两格的控件与回填**本来就是同一批做好的** ✓（同文件 L1907 / L1925 一带 ✓）
+        #   ⇒ 我再补一份只会**重复** ✗（已整块撤回 ✓）。
+
         self.sp_track_jump.blockSignals(True)
         self.sp_track_jump.setValue(settings.player_track_jump)
         self.sp_track_jump.blockSignals(False)
@@ -5237,6 +5583,11 @@ class PlayerPanel(QWidget):
         self.ck_vision_center.blockSignals(True)
         self.ck_vision_center.setChecked(settings.vision_center)
         self.ck_vision_center.blockSignals(False)
+
+        # ⭐ 「只检测视野框」（用户 2026-10-15 ✓）；⚠ `getattr` 兜底：老项目对象可能还没这个字段 ✓
+        self.ck_vision_detect.blockSignals(True)
+        self.ck_vision_detect.setChecked(bool(getattr(settings, "vision_detect_only", False)))
+        self.ck_vision_detect.blockSignals(False)
 
         self.sp_vision_top.blockSignals(True)
         self.sp_vision_top.setValue(settings.vision_top)
@@ -5315,6 +5666,17 @@ class PlayerPanel(QWidget):
         self.sp_pickup_max.blockSignals(True)
         self.sp_pickup_max.setValue(float(getattr(settings, "station_pickup_max_s", 0.0) or 0.0))
         self.sp_pickup_max.blockSignals(False)
+        # ⭐ 「视野内无怪才去下一点」（用户 2026-10-11 ✓）：勾选框 + 秒数两格一起回填 ✓
+        #   老配置 / 老模板都没有 ⇒ **不勾 + 0** ✓（= 老行为 ✓ 到了立刻走 ✓）。
+        #   ⚠ 秒数框的**灰不灰**由 `_refresh_strategy_ui()` 统一摆 ✓（它在下面就被调 ✓）。
+        self.ck_multi_delay.blockSignals(True)
+        self.ck_multi_delay.setChecked(
+            bool(getattr(settings, "multi_leave_wait_enabled", False)))
+        self.ck_multi_delay.blockSignals(False)
+        self.sp_multi_delay.blockSignals(True)
+        self.sp_multi_delay.setValue(
+            float(getattr(settings, "multi_leave_delay_s", 0.0) or 0.0))
+        self.sp_multi_delay.blockSignals(False)
 
         self._refresh_strategy_ui()
 

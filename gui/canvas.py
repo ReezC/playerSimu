@@ -30,9 +30,16 @@ MIN_SIZE = 8       # 框的最小边长
 #: 按钮改成"操作模式"下拉 ✓ 默认标注模式 ✓ 快捷键 Q/W ✓）：
 MODE_LABEL = "label"    # 拉出一个**新框**（老行为 ✓ 默认 ✓）
 MODE_SELECT = "select"  # 只拉一个**黑虚线**框来**选中**里面的框（**不建框** ✓ 批量删误检用 ✓）
+#: ⭐⭐ **区域自动标注**（用户 2026-10-11 ✓ 原话："给质检台新增「区域自动标注」操作模式，
+#:   在该模式，框选一个区域后出现弹窗…"✓）：拉一个框 ⇒ **只把那个矩形交出去**
+#:   （`region_picked` ✓）⇒ 面板弹窗 ✓；⚠ **不建框、也不动选中** ✗（它跟 `MODE_SELECT`
+#:   的区别就在这里 ✓）。
+MODE_REGION = "region"
 #: 框选范围的颜色 —— 用户指定"**黑色虚线**"✓（标注模式那个是新框预览，所以按类别上色 ✓，
 #: 两种模式一眼能分出来 ✓）
 SELECT_BAND_COLOR = "#000000"
+#: 「区域自动标注」那根橡皮筋的颜色（**青色实线** ✓ —— 跟选择模式的**黑虚线**一眼分得开 ✓）
+REGION_BAND_COLOR = "#00bcd4"
 
 # 类别名/颜色都来自 perception/classes.py（唯一定义处）—— 类别清单只在那里维护
 CLASS_NAMES = ZH_NAMES
@@ -303,6 +310,11 @@ class ImageCanvas(ZoomPanView):
     #: ⚠ **选中不算修改**：不许借此发 `boxes_changed` ✗（那会把"只看了一遍"的帧标成
     #:   人工改过 ✓ 见 `_select_in_rect` ✓）。
     selection_changed = pyqtSignal(int)
+    #: ⭐⭐ **区域自动标注**：框完松手把那个矩形交出去 ⇒ `QRectF`（**画面像素** ✓ 与标注链
+    #:   的 `region="x,y,w,h"` 同一套坐标 ✓ 见 `tools/detect_mobs.run_detect` ✓）。
+    #:   ⚠ 为什么不复用 `selection_changed`（它只发**数量** ✗）：那个信号一处口径是
+    #:     "选中了几个框" ✓，往里塞矩形会把两件事搅在一起 ✓ ⇒ 单独一个信号 ✓。
+    region_picked = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -333,6 +345,8 @@ class ImageCanvas(ZoomPanView):
         self.mode = MODE_LABEL
         self._select_band = False   # 手上这个橡皮筋是"框选"还是"建框"（按下时定 ✓）
         self._band_add = False      # 框选时按住了 Ctrl（= 加选，别清旧的 ✓）
+        #: ⭐ 手上这根橡皮筋是**「区域自动标注」**拉的那种（松手只把矩形交出去 ✓ 见 `MODE_REGION` ✓）
+        self._region_band = False
         self._apply_mode_cursor()
         #: ⭐ 「实时小地图」那一层（`set_live_patch` ✓）—— 只在**路线识别 → 地形图**
         #: 用得上：把 A 机实时小地图面板**按标定摆到地形图上**，方便放大看对齐 ✓。
@@ -393,7 +407,9 @@ class ImageCanvas(ZoomPanView):
         🚫 传别的值一律当 `MODE_LABEL`（老行为 ✓）—— 宁可回到最熟的那个，也别进一个
         "什么都不做"的僵尸模式 ✗。
         """
-        self.mode = MODE_SELECT if str(mode) == MODE_SELECT else MODE_LABEL
+        self.mode = (MODE_SELECT if str(mode) == MODE_SELECT
+                     else MODE_REGION if str(mode) == MODE_REGION
+                     else MODE_LABEL)
         self._apply_mode_cursor()
         return self.mode
 
@@ -457,6 +473,7 @@ class ImageCanvas(ZoomPanView):
         self._draw_start = None
         self._select_band = False     # 换帧时手上那根橡皮筋一律作废 ✓（别把上一帧的框选带过来 ✗）
         self._band_add = False
+        self._region_band = False     # ⚠ 区域那根同理（换帧了就别再把旧矩形交出去 ✗）
 
         self.pix_item = self.scene_.addPixmap(pixmap)
         self.pix_item.setPos(0, 0)
@@ -627,7 +644,9 @@ class ImageCanvas(ZoomPanView):
                 self._tag_helper(ln)
                 self.scene_.addItem(ln)
                 self._mark_items.append(ln)
-            if label:
+            if label and bool(getattr(self, "_text_on", True)):
+                # ⭐ 文字总开关关着 ⇒ **新画的那行字也不显示** ✓（用户 2026-10-16 ✓
+                #   见 `set_text_visible` ✓）—— 只在"创建时"守一道，就不用每拍重扫场景 ✓
                 txt = QGraphicsSimpleTextItem(label)
                 txt.setBrush(QBrush(color))
                 txt.setZValue(13)
@@ -636,12 +655,50 @@ class ImageCanvas(ZoomPanView):
                 self.scene_.addItem(txt)
                 self._mark_items.append(txt)
 
+    # ---------------- ⭐ 文字总开关（用户 2026-10-16）----------------
+
+    def set_text_visible(self, on):
+        """把画布上**所有文字**统一显 / 隐（用户 2026-10-16 ✓ 原话："**路线识别页签→地形图
+        里的字全部去掉**"✓）。
+
+        ⚠ 为什么要做成"总开关"而不是逐个删 ✗：画布上的字来自**好几处**
+          （框上的类名 `BBoxItem.label` ✓、标记层那行字 ✓、以及将来会加的 ✓），
+          逐个去找必然会漏 ✗；这里统一按**图元类型**处理 ✓（`QGraphicsSimpleTextItem` ✓
+          —— 全仓库画字用的就是它 ✓ 见 `element_picker` / `foothold_picker` / `zone_editor` ✓）。
+        ⚠ **递归**：框上那个名字是**框的子图元** ✗ ⇒ 只看顶层项会漏掉它 ✓（`childItems()` ✓）。
+        ⚠ 本开关**只改可见性** ✗：图元还在、坐标还在、编辑照旧 ✓
+          —— 想恢复调 `set_text_visible(True)` 即可 ✓（不丢任何数据 ✓）。
+        """
+        self._text_on = bool(on)
+        self._apply_text_visible()
+
+    def _apply_text_visible(self):
+        """按 `self._text_on` 把所有文字图元显 / 隐一遍（⚠ 默认开 ✓ 老页面一字不变 ✓）。"""
+        on = bool(getattr(self, "_text_on", True))
+        scene = getattr(self, "scene_", None)
+        if scene is None:
+            return
+
+        def walk(it):
+            if isinstance(it, QGraphicsSimpleTextItem):
+                it.setVisible(on)
+            for ch in it.childItems():
+                walk(ch)
+
+        for it in scene.items():
+            walk(it)
+
     # ---------------- 框操作 ----------------
 
     def add_box(self, x, y, w, h, cls=1, manual=False, colors=None):
         it = BBoxItem(x, y, w, h, cls, manual, colors or self._colors,
                       self.class_names)
         it.setEnabled(self.editable)
+        # ⭐ 文字总开关关着 ⇒ 框上那个类名**也不显示** ✓（用户 2026-10-16 ✓ 见
+        #   `set_text_visible` ✓）—— `load()` 重建框时同样吃这条 ✓（开关是**持久**的 ✓
+        #   所以**不必**每次 load 后再补一刀 ✓）。
+        if not bool(getattr(self, "_text_on", True)):
+            it.label.setVisible(False)
         it.on_changed = self._on_item_changed   # 框挪/缩 ⇒ 蒙版洞跟手 + 照常发信号 ✓
         it.on_press = self.before_change.emit   # 拖动前记录撤销快照
         it.on_select = self._on_box_pressed     # 选择模式：按下一框就换成只选它 ✓
@@ -733,7 +790,14 @@ class ImageCanvas(ZoomPanView):
                 self._draw_start = self.mapToScene(e.pos())
                 self._rubber = QGraphicsRectItem()
                 self._rubber.setZValue(20)
-                if self.mode == MODE_SELECT:
+                if self.mode == MODE_REGION:
+                    # ⭐⭐ **区域自动标注**（用户 2026-10-11 ✓）：拉一个**青色实线**框，
+                    #   松手**只把矩形交出去** ✓（不建框 ✗ 不动选中 ✗ 见 `MODE_REGION` ✓）。
+                    self._region_band = True
+                    self._select_band = False
+                    self._draw_cls = None
+                    self._rubber.setPen(QPen(QColor(REGION_BAND_COLOR), 2, Qt.SolidLine))
+                elif self.mode == MODE_SELECT:
                     # ⭐ **选择模式**（用户 2026-10-04 ✓ 第 3 条）：只拉一个**黑色虚线**框，
                     #   松手**选中被框住的框**、**不建框** ✓（批量删误检用 ✓）。
                     #   ⚠ 不按 Ctrl ⇒ 先把旧的选中清掉（"框一次 = 选这一批" ✓）；
@@ -776,6 +840,16 @@ class ImageCanvas(ZoomPanView):
             self.scene_.removeItem(self._rubber)
             self._rubber = None
             self._draw_start = None
+
+            if self._region_band:
+                # ⭐⭐ **区域自动标注**（用户 2026-10-11 ✓）：松手**只把矩形交出去** ✓
+                #   —— 不建框 ✗、不动选中 ✗、也不发 `boxes_changed` ✗（"框一下"不算改标注 ✓）。
+                self._region_band = False
+                if r.width() >= MIN_SIZE and r.height() >= MIN_SIZE:
+                    self.region_picked.emit(r.normalized())
+                self._draw_cls = None
+                e.accept()
+                return
 
             if band:
                 # ⭐ 选择模式：松手只**选中**（不建框 ✓）—— 太小的一下当"点空白" ⇒ 只清选择 ✓

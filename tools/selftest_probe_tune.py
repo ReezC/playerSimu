@@ -23,7 +23,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tools import probe_codec                     # noqa: E402
+from core import probe_codec                     # noqa: E402
 from tools.probe_tune import (Verdict, apply_key, decode_with,  # noqa: E402
                               initial_geo, nudge_key, project_calib,
                               sample_cells, should_save)
@@ -98,7 +98,7 @@ def t_picker_prefers_framed_geometry():
     这里造一张**周期 18.3** 的合成码带，框选矩形给对、hint 故意给错的旧值：
     选出来的必须是框选那一份，且**采样模糊 0 块**。
     """
-    from tools import probe_codec as pc
+    from core import probe_codec as pc
 
     cell_true, gap_true = 17.0, 1.3            # 周期 18.3
     bits = 40
@@ -421,7 +421,7 @@ def t_verdict_is_shared_with_workbench():
     两边各写一份必然漂移，而漂移出来的现象是最难查的那类：工具说"几何 OK"、
     工作台说"几何可疑"（或反过来），于是没人敢信任何一边的数。
     """
-    from tools import probe_codec as pc
+    from core import probe_codec as pc
     from tools import probe_tune as pt
     check(pt.Verdict is pc.Verdict, "probe_tune 的 Verdict 不是 probe_codec 那一份")
     src = (Path(__file__).resolve().parent.parent / "gui" / "live_thread.py"

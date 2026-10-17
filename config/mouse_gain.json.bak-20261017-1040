@@ -1,0 +1,82 @@
+{
+  "gain_x": 0.284583,
+  "gain_y": 0.284444,
+  "probe": {
+    "units": [
+      60,
+      120,
+      800
+    ],
+    "measured_px": [
+      60.0,
+      120.0,
+      800.0
+    ],
+    "n": [
+      3,
+      3,
+      3
+    ],
+    "linear_rel": 0.0,
+    "verify_rel": 0.0,
+    "source": "live-cursorpos"
+  },
+  "ref_w": 1366,
+  "ref_h": 768,
+  "v": 2,
+  "auto_measure": true,
+  "by_frame": {
+    "1918x1079": {
+      "gain_x": 1.0,
+      "gain_y": 1.0,
+      "probe": {
+        "units": [
+          60,
+          120,
+          800
+        ],
+        "measured_px": [
+          60.0,
+          120.0,
+          800.0
+        ],
+        "n": [
+          3,
+          3,
+          3
+        ],
+        "linear_rel": 0.0,
+        "verify_rel": 0.0,
+        "source": "live-cursorpos"
+      },
+      "ref_w": 1918,
+      "ref_h": 1079
+    },
+    "1366x768": {
+      "gain_x": 0.284583,
+      "gain_y": 0.284444,
+      "probe": {
+        "source": "auto",
+        "step": 300,
+        "screen_px": [
+          120,
+          120
+        ],
+        "scale": [
+          0.711458,
+          0.711111
+        ],
+        "screen": [
+          1920,
+          1080
+        ],
+        "cap": [
+          1920,
+          1080
+        ]
+      },
+      "ref_w": 1366,
+      "ref_h": 768
+    }
+  }
+}

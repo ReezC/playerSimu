@@ -1,10 +1,8 @@
 name: 森林迷宫III
-map_id: '105040306'
+map_id: '105040304'
 mobs:
-- '3210800'
-- '3230100'
+- '5130101'
 - '5130102'
-- '5150000'
 scale: 1.406
 mob_scales: {}
 scale_at:
@@ -22,7 +20,7 @@ bars:
   - 0.973958
   - 0.120791
   - 0.019531
-  hp_color: &id001
+  hp_color:
   - - 0
     - 0
     - 135
@@ -34,7 +32,7 @@ bars:
   - 0.973958
   - 0.120791
   - 0.019531
-  mp_color: &id002
+  mp_color:
   - - 143
     - 78
     - 0
@@ -44,8 +42,8 @@ bars:
 mmap_crop:
 - 5
 - 71
-- 129
-- 142
+- 110
+- 114
 decision:
   attack_dist: 80.0
   min_attack_dist: 0
@@ -104,6 +102,7 @@ decision:
     feed_pet: pagedown
     shop: null
     enter: enter
+    pickup: space
   target_cd:
   - 1000
   - 2500
@@ -137,8 +136,20 @@ decision:
     - 1366
     - 768
     solved_at: '2026-10-03 00:30:33'
-  hp_color: *id001
-  mp_color: *id002
+  hp_color:
+  - - 0
+    - 0
+    - 135
+  - - 79
+    - 82
+    - 255
+  mp_color:
+  - - 143
+    - 78
+    - 0
+  - - 255
+    - 198
+    - 77
   hp_threshold: 39
   mp_threshold: 7
   pot_cd: 1000
@@ -148,8 +159,8 @@ decision:
   strategy: patrol
   vision_top: 150
   vision_bottom: 150
-  vision_left: -1
-  vision_right: -1
+  vision_left: 400
+  vision_right: 400
   vision_center: false
   vision_off_x: 0
   vision_off_y: 0
@@ -169,7 +180,7 @@ decision:
   goto_timeout_s: 15.0
   chase_goto_max_s: 5.0
   goto_timeout_key: 表情_无语
-  disable_chase_pathfinding: false
+  disable_chase_pathfinding: true
   jump_start_px: 80
   move_retry_ms: 350
   debounce_conf: 0.3
@@ -217,7 +228,7 @@ decision:
   facing_timeout_min: 0.0
   player_lost_timeout_min: 3.0
   resetall_interval: 30
-  anti_afk_enabled: true
+  anti_afk_enabled: false
   anti_afk_type: hidden_rest
   anti_afk_min: 25.0
   anti_afk_max: 30.0
@@ -281,7 +292,7 @@ decision:
   anti_afk_spot_loop_hold: false
   anti_afk_retry_on_interrupt: true
   anti_afk_retry_sec: 10.0
-  reconnect_enabled: false
+  reconnect_enabled: true
   reconnect_probe_after_lost_sec: 0.0
   reconnect_step_timeout_ms: 3000
   reconnect_queue_timeout_ms: 180000
@@ -293,6 +304,28 @@ decision:
     隐身术: a
     普攻: f
     表情_无语: f6
+  jump_attack_enabled: false
+  jump_attack_height: 0.0
+  fall_speed_px_s: 600.0
+  walk_stall_jump: true
+  atk_target_count: -1
+  mob_atk_cd_ms: 0
+  auto_pickup: false
+  sweep_turn_cd_enabled: true
+  sweep_edge_turn_enabled: true
+  station_pickup_enabled: false
+  station_pickup_min_s: 0.0
+  station_pickup_max_s: 0.0
+  station_pickup_spots: []
+  multi_spots: []
+  multi_leave_wait_enabled: false
+  multi_leave_delay_s: 0.0
+  reconnect_server_x: 0.3635
+  reconnect_server_y: 0.2074
+  reconnect_channel_x: 0.4104
+  reconnect_channel_y: 0.5093
+  reconnect_channel: 16
+  vision_detect_only: false
 notes: ''
 capture:
   source: file
@@ -357,15 +390,33 @@ dataset:
   min_boxes: 1
   quality: 92
 train:
-  model: E:\MyPrograms\playerSimu\projects\森林迷宫III\models\detect_v6.pt
+  model: yolo26n.pt
   epochs: 120
-  imgsz: 1280
+  imgsz: 960
   batch: 8
   device: '0'
   patience: 40
   resume: false
 live:
   weights: ''
+  capture_source: stream
+  rect:
+  - 1184
+  - 617
+  - 1366
+  - 768
+  rect_rel: null
+  rect_win: null
+  url: udp://0.0.0.0:5000
+  conf_mob: 0.15
+  conf_player: 0.75
+  imgsz: 960
+  device: '0'
+  capture_fps: 60
+  draw: true
+  half: true
+  show_fps: 50
+  window_capture: wgc
 player_id: 数值策划
 verify:
   source: E:/MyPrograms/playerSimu/projects/森林迷宫III/测试集
@@ -377,10 +428,8 @@ iterate:
   keep_empty: true
   limit: 0
 mob_names:
-- 猴子
-- 风独眼兽
+- 石头人
 - 黑石头人
-- 混种石头人
 player_scale: 1.406
 player_scale_at:
   width: 1920

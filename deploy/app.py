@@ -92,7 +92,7 @@ try:
                                  QWidget)
 
     from deploy import selfcheck, services
-    from tools import push_presets as pp
+    from core import push_presets as pp
     from deploy.runner import Proc
     from deploy.settings_dialog import DeploySettingsDialog
     from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,

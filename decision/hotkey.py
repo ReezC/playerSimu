@@ -147,6 +147,106 @@ def install_hook(vk, on_fire):
     return True, ""
 
 
+def _pid_elevated(pid):
+    """那个进程是不是**提权**（管理员）跑的 ⇒ `True` / `False` / `None`（问不到 ✓）。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32, adv = ctypes.windll.kernel32, ctypes.windll.advapi32
+        h = k32.OpenProcess(0x1000, False, int(pid))       # QUERY_LIMITED_INFORMATION
+        if not h:
+            return None
+        try:
+            tok = wintypes.HANDLE()
+            if not adv.OpenProcessToken(h, 0x0008, ctypes.byref(tok)):   # TOKEN_QUERY
+                return None
+            try:
+                val, n = wintypes.DWORD(), wintypes.DWORD()
+                if not adv.GetTokenInformation(tok, 20, ctypes.byref(val),
+                                               ctypes.sizeof(val), ctypes.byref(n)):
+                    return None                                 # 20 = TokenElevation
+                return bool(val.value)
+            finally:
+                k32.CloseHandle(tok)
+        finally:
+            k32.CloseHandle(h)
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+def self_elevated():
+    """**我们自己**是不是提权跑的 ✓（`None` = 问不到 ✓）。"""
+    try:
+        import ctypes
+        return _pid_elevated(ctypes.windll.kernel32.GetCurrentProcessId())
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+def elevated_visible_titles(limit=3):
+    """现在**看得见**的顶层窗口里，属于**提权**进程的那几个标题 ✓（取不到就跳过 ✓）。
+
+    ⚠ 只看**看得见**的（游戏/播放器等 ✓）—— 系统里本来就有几个常驻的提权窗口，
+      全列出来会把提示冲淡 ✓。
+    """
+    out = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        titles = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HWND, wintypes.LPARAM)
+        def _cb(hwnd, _lp):
+            try:
+                if not u.IsWindowVisible(hwnd):
+                    return 1
+                n = u.GetWindowTextLengthW(hwnd)
+                if n <= 0:
+                    return 1
+                buf = ctypes.create_unicode_buffer(n + 1)
+                u.GetWindowTextW(hwnd, buf, n + 1)
+                pid = wintypes.DWORD()
+                u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                titles.append((pid.value, buf.value))
+            except Exception:                            # noqa: BLE001
+                pass
+            return 1
+
+        u.EnumWindows(_cb, 0)
+        for pid, t in titles:
+            if pid and _pid_elevated(pid) is True:
+                out.append(t.strip()[:40])
+            if len(out) >= limit:
+                break
+    except Exception:                                    # noqa: BLE001
+        return []
+    return out
+
+
+def elevation_hint():
+    """⇒ 一句**给人看**的话（不用提醒 ⇒ `""` ✓）：**别人提权、我们没提** ⇒ 热键收不到 ✓。
+
+    ⚠⚠⚠ 为什么必须有它（2026-10-11 ✓ 用户："**本地实时聚焦游戏窗口时按 F11 无法暂停自动**"✓）：
+      · **低级键盘钩子 / `RegisterHotKey` 都收不到"发给更高权限窗口"的按键** ✗（UIPI ✓）；
+      · 现场实测：`Maplestory_Classic.exe` **提权 = True** ✓，而工作台 `pythonw.exe`
+        **提权 = False** ✗ ⇒ **游戏一聚焦，我们什么都收不到** ✓
+        （⚠ 这正是"工作台自己聚焦时能用、切到游戏就没反应"的成因 ✓ —— 前者走的是
+          **窗口内快捷键**那条降级路 ✓）。
+      ⇒ 治法只有两条（都得人来决定 ✓）：**工作台也用管理员身份启动** ✓，或
+        **把游戏改回不提权启动** ✓（游戏快捷方式 → 属性 → 取消"以管理员身份运行"✓）。
+    """
+    if self_elevated() is not False:
+        return ""                                        # 我们本来就是提权 / 问不到 ⇒ 不啰嗦 ✓
+    _names = elevated_visible_titles()
+    if not _names:
+        return ""
+    return ("⚠ 现在这些窗口是**以管理员身份**跑的：%s ⇒ 我们的全局热键 `F11` 在它们聚焦时"
+            "**收不到** ✗（Windows 的 UIPI：低权限收不到发给高权限窗口的按键 ✓）。"
+            "治法：**用管理员身份启动本工作台** ✓，或把它们的「以管理员身份运行」去掉 ✓"
+            % "、".join("「%s」" % n for n in _names))
+
+
 def remove_hook():
     """卸掉键盘钩子（**窗口关闭时必须调** ✓ 不然它会一直挂在系统钩子链上 ✓）。"""
     global _hook_proc, _hook_handle, _hook_vk, _hook_cb
