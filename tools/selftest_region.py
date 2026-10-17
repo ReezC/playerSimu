@@ -266,6 +266,113 @@ def t_b_side_entry():
 
 # ---------------------------------------------------------------- 规范
 
+def t_grab_follows_cursor_screen():
+    """⭐⭐⭐⭐ **抓屏必须跟着光标那块屏走，origin 必须是那块屏的原点**（用户 2026-10-17 ✓
+    原话：「**远程选区又坏了 / 怎么每次都坏？**」✗）。
+
+    ⚠ 真病根（不是偶发 ✓ 是**每次都错** ✓）：
+      · 老 `grab_primary_pixmap` 写死 `primaryScreen()` ✗ 且 origin 写死 `(0, 0)` ✗；
+      · 多显示器时主屏未必是游戏那块（本机实测：主屏 `(0,0)`、副屏 `(-2560,0)` ✓）；
+      · ⇒ 在副屏上框：显示的是**主屏画面** ✓、返回的 x 还少了 2560 ✓
+        ⇒ 存进 `deploy.json` 的推流区域 / 小地图区域**整体偏到屏幕外** ✓
+        ⇒ 下游现象就是"推流黑屏 / 底图对不上 / 黄点认不出" ✓ 用户眼里"选区坏了"✓。
+    判据（四条 ✓）：
+      ① 默认抓屏**跟光标**（源码里有 `screenAt` ✓）；
+      ② **origin == 那块屏 `geometry().topLeft()`**（行为：换屏 ⇒ origin 跟着变 ✓）；
+      ③ 抓到的是那块屏的**逻辑尺寸**（DPI 已归一 ✓ 窗口不会超出屏幕 ✓）；
+      ④ **全黑要说清楚**（抛错 + 文案里给原因 ✓ 不再"点了没反应"✓）。
+    """
+    from PyQt5.QtGui import QGuiApplication
+
+    src = (ROOT / "gui" / "region_picker.py").read_text(encoding="utf-8")
+    seg = src[src.index("def grab_screen_pixmap"):]
+    seg = seg[:seg.index("\ndef ", 10)]
+    check("screenAt" in src and "geometry().topLeft()" in seg,
+          "① 默认抓屏必须**跟光标所在屏**、origin 用该屏 `geometry().topLeft()` ✗ "
+          "—— 写死主屏 / 写死 (0,0) ⇒ 副屏上框出来的区域每次全错 ✓（用户现场就是这个 ✓）")
+    check("_looks_black" in seg and "raise RuntimeError" in seg,
+          "④ 抓到**全黑**必须抛错说清（远程断开 / 锁屏 / 休眠）✗ —— 不能让人对着黑图框 ✓")
+
+    app()
+    from PyQt5.QtCore import QRect
+
+    class _FakeScreen:
+        """假屏：**不真抓屏**（自检跑在 offscreen 平台 ✓ 真屏抓不到 ✗），
+        但把"origin / DPI 归一"这两件事原样走一遍 ✓。"""
+
+        def __init__(self, rect, pix):
+            self._rect, self._pix = rect, pix
+
+        def name(self):
+            return "FAKE"
+
+        def geometry(self):
+            return self._rect
+
+        def grabWindow(self, _wid=0):
+            return self._pix
+
+    def _shot(w, h, dpr=1.0, color="#808080"):
+        p = QPixmap(int(w * dpr), int(h * dpr))
+        p.fill(QColor(color))
+        if dpr != 1.0:
+            p.setDevicePixelRatio(dpr)
+        return p
+
+    _orig = rp._pick_screen
+    try:
+        # ⭐ 副屏（原点 -2560）—— 现场就是这块屏上的游戏框不准 ✓
+        _scr = _FakeScreen(QRect(-2560, 0, 1600, 900), _shot(1600, 900))
+        rp._pick_screen = lambda: _scr
+        _pix, _origin = rp.grab_screen_pixmap()
+        check(_origin == (-2560, 0),
+              "② 副屏 origin 该是 (-2560, 0)，实测 %r ✗ —— 写死 (0,0) 时每个坐标少 2560 ✓"
+              % (_origin,))
+        check((_pix.width(), _pix.height()) == (1600, 900),
+              "③ 抓到的该是那块屏的逻辑尺寸 1600x900，实测 %dx%d"
+              % (_pix.width(), _pix.height()))
+
+        # DPI 缩放 2.0：抓回来是设备像素 3200x1800 ⇒ 必须缩回 1600x900 ✓
+        _hidpi = _FakeScreen(QRect(0, 0, 1600, 900), _shot(1600, 900, dpr=2.0))
+        rp._pick_screen = lambda: _hidpi
+        _pix2, _origin2 = rp.grab_screen_pixmap()
+        check((_pix2.width(), _pix2.height()) == (1600, 900),
+              "③ DPI=2.0 的设备像素图必须缩回逻辑尺寸（实测 %dx%d ✗ ⇒ 选区窗会超出屏幕 ✓）"
+              % (_pix2.width(), _pix2.height()))
+        check(abs(float(rp.last_scale) - 2.0) < 1e-6,
+              "③ `last_scale` 该记下 2.0（排查推流偏移要用 ✓）：%r" % (rp.last_scale,))
+
+        # ⑤ **每次抓屏都要落一份诊断**（用户 2026-10-17：A 机单屏、现象只有"每次都坏"，
+        #    光靠猜分不出"缩放 / 黑图 / 窗口盖住" ✓ ⇒ 让它自己写参数 ✓）
+        _diag = ROOT / "data" / "debug" / "region_grab.txt"
+        check(_diag.exists(),
+              "⑤ 抓屏没落诊断文件 `data/debug/region_grab.txt` ✗"
+              "（A 机排查「每次都坏」就靠它 ✓）")
+        _txt = _diag.read_text(encoding="utf-8")
+        for _k in ("ok =", "detail =", "last_scale =", "geometry =",
+                   "screens =", "platform =", "high_dpi_scaling ="):
+            check(_k in _txt, "⑤ 诊断里缺 `%s` ✗（这几项就是分病因用的 ✓）：%r" % (_k, _txt))
+        check("dpr=2.000" in _txt,
+              "⑤ 诊断里要写清这一次的 dpr（缩放那条病根全靠它 ✓）：%r" % (_txt,))
+
+        # 全黑 ⇒ 必须抛错（调用方会弹「框选失败」✓ 不再静默 ✓）
+        _dark = _FakeScreen(QRect(0, 0, 800, 600), _shot(800, 600, color="#000000"))
+        rp._pick_screen = lambda: _dark
+        try:
+            rp.grab_screen_pixmap()
+            _raised = False
+        except RuntimeError as e:
+            _raised = "全黑" in str(e)
+        check(_raised, "④ 抓到全黑必须抛 RuntimeError 说清（远程断开 / 锁屏 / 休眠）✗")
+    finally:
+        rp._pick_screen = _orig
+
+    _dim = QPixmap(320, 240)
+    _dim.fill(QColor("#101010"))
+    check(rp._looks_black(_dim) is False,
+          "④ 深色画面（亮度 16）不许误报成黑屏 ✗（游戏夜景会被判死 ✓）")
+
+
 def t_single_implementation():
     """只有一份实现；它只依赖 PyQt5；各处都委派过来（UI 规范 §8）。"""
     src = (ROOT / "gui" / "region_picker.py").read_text(encoding="utf-8")
@@ -335,6 +442,8 @@ TESTS = (
     ("模态框：正常 / 误点 / Esc", t_modal_small_and_esc),
     ("抓屏前藏起调用方窗口", t_hide_owner),
     ("B 机入口（实时画面上框）", t_b_side_entry),
+    ("⭐⭐⭐⭐ 抓屏跟光标那块屏 + origin 正确 + DPI 归一 + 全黑要报（选区\"每次都坏\"·用户 2026-10-17）",
+     t_grab_follows_cursor_screen),
     ("唯一实现 + 规范写死", t_single_implementation),
     ("没有 numpy 也能 import（模拟 A 机）", t_import_without_numpy),
 )

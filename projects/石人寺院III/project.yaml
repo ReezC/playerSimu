@@ -110,7 +110,16 @@ decision:
   - 0.120791
   - 0.019531
   mp_bar: null
-  probe_calib: {}
+  probe_calib:
+    x_ratio: 0.029282576866764276
+    y_ratio: 0.018229166666666668
+    cell_ratio: 0.010248901903367497
+    gap_ratio: 0.0020893118594436312
+    bits: 40
+    frame:
+    - 1366
+    - 768
+    solved_at: '2026-10-17 13:45:15'
   hp_color:
   - - 0
     - 0
@@ -152,8 +161,6 @@ decision:
   disable_chase_pathfinding: false
   jump_start_px: 100
   move_retry_ms: 3000
-  debounce_conf: 0.2
-  debounce_ms: 1500
   custom_timers:
   - name: 自动喂宠
     seq:
@@ -322,7 +329,8 @@ decision:
   jump_attack_enabled: false
   jump_attack_height: 90.0
   fall_speed_px_s: 115.0
-  lock_mob_ghost_ms: 1000
+  vision_detect_only: false
+  track_buffer_ms: 1000
 notes: ''
 capture:
   source: file
@@ -384,7 +392,7 @@ dataset:
   min_boxes: 0
   quality: 92
 train:
-  model: E:\MyPrograms\playerSimu\projects\石人寺院III\models\detect_v4.pt
+  model: yolo26s.pt
   epochs: 120
   imgsz: 960
   batch: 8
@@ -392,7 +400,7 @@ train:
   patience: 40
   resume: false
 live:
-  weights: E:\MyPrograms\playerSimu\projects\石人寺院III\models\detect_v6_960.engine
+  weights: E:\MyPrograms\playerSimu\projects\石人寺院III\models\detect_v8_960.engine
   capture_source: stream
   rect:
   - 1184
@@ -411,6 +419,10 @@ live:
   half: true
   show_fps: 50
   window_capture: wgc
+  iou_mob: 0.85
+  max_det: -1
+  agnostic_nms: false
+  stream_rect_rel: null
 player_id: 数值策划
 verify: {}
 iterate: {}

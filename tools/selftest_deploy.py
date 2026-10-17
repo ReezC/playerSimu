@@ -340,10 +340,31 @@ def t_ask_region_modal():
     ⚠ 尺寸是 `QRect` 的**含两端**约定：从 (100,40) 拖到 (300,190) 覆盖的是
     201x151 个像素（x=100..300 全含），正好等于抓屏时 grabWindow 抓到的范围。
     """
-    from PyQt5.QtCore import QEvent, QPointF, Qt, QTimer
-    from PyQt5.QtGui import QMouseEvent
+    from PyQt5.QtCore import QEvent, QPointF, QRect, Qt, QTimer
+    from PyQt5.QtGui import QColor, QMouseEvent, QPixmap
     from PyQt5.QtWidgets import QApplication, QDialog, QMainWindow
     from tools.minimap_push import ask_region
+
+    # ⚠ 本用例跑在 **offscreen** 平台 ⇒ 真抓屏拿到的是空图/黑图 ⇒
+    #   `region_picker.grab_screen_pixmap` 会按"远程断开 / 锁屏"**抛错** ✓（那是新增的
+    #   正确行为 ✓ 见 `selftest_region` 那条）。这里只钉"**已有事件循环里能跑完**"，
+    #   抓屏本身不归它管 ⇒ 塞一块**假屏**（原点 0,0、白底 1600×900）✓ 别弱化断言 ✗。
+    import gui.region_picker as _rp
+
+    class _FakeScreen:
+        def name(self):
+            return "FAKE"
+
+        def geometry(self):
+            return QRect(0, 0, 1600, 900)
+
+        def grabWindow(self, _wid=0):
+            _p = QPixmap(1600, 900)
+            _p.fill(QColor("#808080"))
+            return _p
+
+    _orig_pick = _rp._pick_screen
+    _rp._pick_screen = lambda: _FakeScreen()
 
     app = QApplication.instance() or QApplication([])
     win = QMainWindow()
@@ -422,6 +443,7 @@ def t_ask_region_modal():
         check(run_drag(50, 60, 150, 160, None) == (50, 60, 101, 101),
               "没有 owner 时框选结果不对")
     finally:
+        _rp._pick_screen = _orig_pick      # 假屏用完就还回去 ✓（别污染后面的用例 ✓）
         win.close()
 
 

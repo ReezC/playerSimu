@@ -5582,7 +5582,7 @@ def t_target_params_group():
 
     p, app = build_panel()
     S = ppm.settings
-    keep = (list(S.target_cd), float(S.debounce_conf), int(S.debounce_ms),
+    keep = (list(S.target_cd), int(getattr(S, "track_buffer_ms", 1000)),
             int(getattr(S, "mob_atk_cd_ms", 0)),
             int(getattr(S, "atk_target_count", -1)))
     _sv = patch.object(S, "save", lambda *a, **k: None)     # 写回照跑，但不落盘 ✓
@@ -5599,8 +5599,8 @@ def t_target_params_group():
         check(g_tgt.mapTo(p, QPoint(0, 0)).y() > g_battle.mapTo(p, QPoint(0, 0)).y(),
               "「目标参数」没在「战斗参数」**下面**（用户原话：「挪出到**下面**」✗）")
 
-        _moved = (("目标切换CD", p.sp_cd_min), ("防抖置信度", p.sp_debounce_conf),
-                  ("防抖时间(ms)", p.sp_debounce_ms),
+        # ⚠ 2026-10-17：「防抖置信度 / 防抖时间」两格**已删** ✗ ⇒ 换成「失联帧长(ms)」✓
+        _moved = (("目标切换CD", p.sp_cd_min), ("失联帧长(ms)", p.sp_track_buffer),
                   ("目标被攻击CD(ms)", p.sp_mob_atk_cd),
                   ("攻击目标数量", p.sp_atk_target_count))
         for _name, _w in _moved:
@@ -5679,10 +5679,10 @@ def t_target_params_group():
         check("_sync_from_settings()" in _src,
               "`__init__` 里没调 `_sync_from_settings`（那 ⑤ 这条回填在真机上就没人走到 ✗）")
     finally:
-        S.target_cd, S.debounce_conf, S.debounce_ms = (
-            keep[0], keep[1], keep[2])
-        S.mob_atk_cd_ms = keep[3]
-        S.atk_target_count = keep[4]
+        S.target_cd = keep[0]
+        S.track_buffer_ms = keep[1]
+        S.mob_atk_cd_ms = keep[2]
+        S.atk_target_count = keep[3]
         _sv.stop()
         p.close()
         p.deleteLater()
@@ -15709,6 +15709,65 @@ def t_mouse_aim_frame_rect():
     finally:
         ma.GAIN_PATH = old
 
+    # ---- ⑤ **"只折一边"必须不许再出现**（用户 2026-10-17 ✓ 实机反证：
+    #        「**偏右下，差一整块（越过了目标）**」✗）----
+    #   教训：`to_screen` 折了目标像素、`screen_gain` 却没折增益（它只在有 `frame_rect`
+    #   时才折 ✓）⇒ 送的**指令数多出 k 倍** ⇒ 光标越过目标 ✓。
+    #   ⚠ 要折就**两边同时折**（目标 ×k 且 增益 ×k，落点不变 ✓）；只折一边 ⇒ 偏 k 倍 ✓。
+    check(not hasattr(ma, "cfg_frame_scale"),
+          "⑤ 别再加「按配置折目标像素」那一套 ✗ —— 它只折一边 ⇒ 实测**偏右下越过** ✓")
+    check(ma.to_screen(497.0, 159.0, (0, 0), (768, 1366, 3)) == (497.0, 159.0),
+          "⑤ 没实测 `frame_rect` 时目标像素**不许**折（两边都不折才是自洽的 ✓）")
+    _d, _ = ma.counts_for(*ma.to_screen(497.0, 159.0, (0, 0), (768, 1366, 3)),
+                          *ma.screen_gain((1.0, 1.0), (768, 1366, 3)))
+    check(_d == (497, 159),
+          "⑤ 目标不折 + 增益不折 ⇒ 指令数必须还是 (497, 159)（一边折一边不折就翻车 ✓）：%r"
+          % (_d,))
+
+
+def t_window_probe_aim():
+    """⭐⭐⭐ **点之前先问 A 机"游戏窗口在哪"**（用户 2026-10-17 ✓ 原话：
+    「**A 机游戏窗口是会移动的，你保证你的方案能适配吗？**」✓）。
+
+    ⚠ 为什么必须有这一条（我上一版的错 ✓）：点击比例是**相对画面**算的 ✓，
+      而画面 = A 机抓的那块 ⇒ 要落成**屏幕坐标**必须知道"那块在屏幕的哪儿"✓。
+      老实现把它当 `(0, 0)` ✗ ⇒ **窗口一挪就整块偏** ✓（"会移动"正是这条 ✗）。
+
+    判据（五条）：
+      ① 协议往返：`WIN x y w h` 能解回四 个数（`parse_window_line` ✓）；
+      ② 拿不到时是 `WIN -`（A 机说不准 ⇒ B 机**必须**退回老路，不许猜 ✗）；
+      ③ 宽高非正 / 行不对 ⇒ 一律 `None`（宁可不点 ✓ 别按错的坐标点 ✗）；
+      ④ 三处调用都要问：断线重连点击 / 测谎「确定」/ 测谎瞄准 ✓（少一处就歪一块 ✓）；
+      ⑤ `input.window_probe()` 在本地后端要**安静地返回 None** ✓（不炸 ✓）。
+    """
+    from remote_kbd import kbd_client as kc
+
+    check(kc.parse_window_line(b"WIN 100 200 1366 768") == (100, 200, 1366, 768),
+          "① `WIN x y w h` 该解成四个数：%r"
+          % (kc.parse_window_line(b"WIN 100 200 1366 768"),))
+    check(kc.parse_window_line(b"WIN -") is None,
+          "② `WIN -`（A 机说不准）必须解成 None ⇒ 调用方退回老路 ✓")
+    check(kc.parse_window_line(b"WIN 10 20 0 768") is None
+          and kc.parse_window_line(b"WIN 10 20 1366") is None
+          and kc.parse_window_line(b"CUR 1 2 0 0 1920 1080") is None,
+          "③ 宽高非正 / 字段不够 / 不是 WIN 行 ⇒ 一律 None ✓（按错的坐标点比不点糟 ✓）")
+
+    _root = Path(__file__).resolve().parent.parent
+    _relay = (_root / "remote_kbd" / "relay.py").read_text(encoding="utf-8")
+    check("WINDOW_QUERY" in _relay and "window_reply_text()" in _relay
+          and "if WINDOW_QUERY in data:" in _relay,
+          "④ A 机 relay 必须自己答 `WINDOW?`（和 `CURSOR?` 同一套 ✓ 不写串口 ✗）")
+    check("_client_rect" in _relay and "ClientToScreen" in _relay,
+          "④ 报的必须是窗口**客户区**的屏幕坐标（`GetClientRect`+`ClientToScreen` ✓）")
+    _lt = (_root / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    check(_lt.count("self._aim_geo(") >= 3 and "self._mouse_win()" in _lt,
+          "④ 断线重连点击 / 测谎「确定」/ 测谎瞄准**三处**都要走 `_aim_geo`（问窗口在哪 ✗）"
+          "—— 实测 %d 处 ✓" % (_lt.count("self._aim_geo("),))
+
+    from decision import input as _di
+    check(_di.window_probe() is None,
+          "⑤ 没有 relay（本地后端）时 `window_probe()` 该安静返回 None ✓ 不许抛 ✗")
+
 
 def t_mouse_aim_math():
     """鼠标**绝对定位**那一层（`decision/mouse_aim.py` ✓ 2026-10-06 加）：换算 + 发指令顺序。
@@ -22540,130 +22599,66 @@ def t_jump_cd():
           "`JumpJob` 该标 `NEEDS_JUMP = True` ✓、基类 `False` ✓")
 
 
-def t_debounce_ghost_rules():
-    """⭐⭐⭐ 「防抖置信度 + 防抖时间」的口径与修复（用户 2026-10-13 ✓ 原话："**移除「锁定怪物
-    丢框防抖时间」的配置与功能（这是重复功能）**，并检查「防抖置信度」+「防抖时间」的逻辑
-    为何不生效（现在依旧有框一闪一闪的问题）。期望**只要曾经怪物到过该置信度阈值**，那么其框
-    消失会被保留「防抖时间」（除非是被输出行为的清框逻辑清掉的），且**检出框再次出现时重新
-    计时重置**"✓）。
+def t_track_buffer_setting():
+    """⭐⭐⭐ **「防抖置信度 / 防抖时间」删干净 + 「失联帧长(ms)」接上**（用户 2026-10-17 ✓ 原话：
+    「**去掉现在的怪物检测框防抖置信度和防抖时间的配置和逻辑，现在完全不对**。接 ByteTrack，
+    **新参数『失联帧长』（track_buffer）代替以前的『防抖时间』，默认 1000ms**」✓）。
 
-    **现场证据**（`behavior.log` 2026-10-13 01:39~01:40 ✓ 共 **429** 条 `mob_flick`）：
-        检出一闪就没了（没通过确认闸）  age=1  conf=0.306  id=7768  missed=57  ms=2547.0  peak=0.306
-        … 全部落在 conf/peak **0.30~0.46**（正是项目里「防抖置信度」0.3 上下 ✓）
-    病根：那些怪**过不了「确认闸」**（2 拍 + 60ms ✗）⇒ 被当"闪一下"删掉 ✗ ⇒ **连"丢框保留
-    防抖时间"那一步都走不到** ✗（输出那支先看 `confirmed` ✗）⇒ 用户看到的"**防抖不生效 +
-    框一闪一闪**"就是它 ✓。
+    为什么删（记一笔，别再回去 ✗）：那两格把「这一拍显不显示」和「消失后还留多久」
+    混成一对旋钮 ⇒ 调"时间"救不了"闪" ✓；而"留多久"又要求"曾经到过某个置信度"
+    ⇒ 置信度在阈值上下跳的目标**两头不靠** ✓（现场：同一个怪的框一闪一闪、甚至整拍消失 ✓）。
 
-    钉六件：
-      ① **那套重复功能删干净**（`lock_mob_ghost_ms` / `locked_id` / `lock_ghost_ms` /
-         `Mob.lock_ghost` / 设置弹窗那一格 ✓ —— 运行时 + `to_dict` + 老项目键被忽略 ✓）；
-      ② 「曾经到过阈值」= **两个档位都算**（`any_conf` ✓）：低分档喂进来的高值也算 ✓，
-         而 `peak_conf`（界面角标用 ✓）**仍只认高分档** ✓；
-      ③ 到过阈值 ⇒ **直接算数**（确认闸短路 ✓）：conf 0.35（< 检出阈值那档）也立刻出框 ✓；
-      ④ 丢框 ⇒ 保留「防抖时间」；**再被检出 ⇒ 重新计时**（`missed` 归零 + `last_seen` 刷新 ✓）；
-      ⑤ **超过**防抖时间 ⇒ 不再输出 ✓；
-      ⑥ 决策层：输出行为的清框（`_reap_ghost_mobs` ✓）**照旧清**（用户点名的例外 ✓）；
-         而"锁定的那只还在（幽灵框）"⇒ 照旧**不许换目标** ✓（与那条被删的窗口无关 ✓）。
+    钉五件：
+      ① `DecisionSettings` **不再有** `debounce_conf` / `debounce_ms` ✗；
+      ② `to_dict()` 有 `track_buffer_ms`、**没有**那两个老键 ✓（否则下次又存回去 ✓）；
+      ③ 老项目里那两个键 ⇒ `from_dict` **直接忽略** ✓（不报错、也不产生属性 ✓ 同 `walk_mode`）；
+      ④ `MobTracker()` 默认就是 **1000ms**，灌进去能生效 ✓（设置→追踪器这一段是通的 ✓）；
+      ⑤ 换内核之后的语义还在：幽灵框**带 `missed>0`**、超期消失 ✓
+         （决策层 `_reap_ghost_mobs` 那条"主动清框"照旧 ✓ 用户点名的例外 ✓）。
     """
     from pathlib import Path
 
-    from perception.tracker import MobTracker
-    from perception.world_state import Mob
-
-    # ---- ① 「锁定怪物丢框防抖」删干净了吗（运行时 + 存读 + 界面 ✓）----
-    check(not hasattr(MobTracker(), "lock_ghost_ms")
-          and not hasattr(MobTracker(), "locked_id"),
-          "`MobTracker` 里还留着「锁定怪专用窗口」那两个字段 ✗（用户点名删掉这套重复功能 ✓）")
-    check("lock_ghost" not in getattr(Mob, "__dataclass_fields__", {}),
-          "`Mob` 上还留着 `lock_ghost` 字段 ✗（没人再读它了 ⇒ 该删 ✓）")
     from decision.agent import DecisionSettings
-    check(not hasattr(DecisionSettings(), "lock_mob_ghost_ms"),
-          "`DecisionSettings` 里还留着 `lock_mob_ghost_ms` ✗")
-    check("lock_mob_ghost_ms" not in DecisionSettings().to_dict(),
-          "`to_dict` 还在写那个键 ✗ ⇒ 又被存进项目文件（下次还得再删一遍 ✓）")
-    _s_old = DecisionSettings()
-    _s_old.from_dict({"lock_mob_ghost_ms": 1234, "debounce_ms": 300})
-    check(not hasattr(_s_old, "lock_mob_ghost_ms")
-          and int(getattr(_s_old, "debounce_ms", 0)) == 300,
-          "老项目文件里那个键没被**忽略** ✗（该像 `walk_mode` 那样直接不读 ✓）")
-    _root = Path(__file__).resolve().parents[1]
-    check("sp_lock_ghost" not in (_root / "gui" / "settings_dialog.py").read_text(
-        encoding="utf-8"),
-        "设置弹窗里还留着那一格 `sp_lock_ghost` ✗（用户点名移除这个配置 ✓）")
+    from perception.tracker import MobTracker
 
-    # ---- ② 低分档也抬 `any_conf`；`peak_conf` 仍只认高分档 ----
-    tr2 = MobTracker()
-    tr2.debounce_conf = 0.9          # 故意设得比"高分档喂的值"还高 ⇒ 只有低分档能救它 ✓
-    tr2.debounce_ms = 1000.0
-    for _ in range(3):
-        tr2.update([(100.0, 100.0, 140.0, 140.0, 0.5)], [])
-    check(len(tr2._tracks) == 1, "用例前提不成立：没建出轨迹：%r" % (tr2._tracks,))
-    _ac0 = float(tr2._tracks[0]["any_conf"])
-    tr2.update([], [(100.0, 100.0, 140.0, 140.0, 0.95)])       # 低分档喂一个 0.95
-    check(float(tr2._tracks[0]["any_conf"]) == 0.95 and _ac0 == 0.5,
-          "低分档没抬 `any_conf` ✗ ⇒ 「**曾经**到过阈值」那半条永远不成立 ✓：%r"
-          % (tr2._tracks[0]["any_conf"],))
-    check(float(tr2._tracks[0]["peak_conf"]) == 0.5,
-          "`peak_conf`（界面角标「它到底多确信」✓）被低分档抬了 ✗ —— 它该只认高分档 ✓")
+    S = DecisionSettings()
+    check(not hasattr(S, "debounce_conf") and not hasattr(S, "debounce_ms"),
+          "① `DecisionSettings` 里还留着「防抖置信度 / 防抖时间」✗（用户点名删掉这套 ✓）")
+    _d = S.to_dict()
+    check("debounce_conf" not in _d and "debounce_ms" not in _d,
+          "② `to_dict` 还在写老键 ✗ ⇒ 下次存盘又写回项目文件 ✓")
+    check(int(_d.get("track_buffer_ms", -1)) == 1000,
+          "② `to_dict` 必须写 `track_buffer_ms`（默认 1000 ✓）：%r"
+          % (_d.get("track_buffer_ms"),))
 
-    # ---- ③④⑤ tracker 层：到过阈值 ⇒ 立刻算数；丢框保留；再检出重新计时；过期不留 ----
+    _old = DecisionSettings()
+    _old.from_dict({"debounce_conf": 0.8, "debounce_ms": 300, "track_buffer_ms": 1500})
+    check(not hasattr(_old, "debounce_conf"),
+          "③ 老项目里的 `debounce_conf` 没被忽略 ✗（该像 `walk_mode` 那样直接不读 ✓）")
+    check(int(_old.track_buffer_ms) == 1500,
+          "③ 新键没读进来（该 1500 ✓）：%r" % (_old.track_buffer_ms,))
+
     tr = MobTracker()
-    tr.debounce_conf = 0.3
-    tr.debounce_ms = 1000.0
-    _out = tr.update([(100.0, 100.0, 140.0, 140.0, 0.35)], [])
-    check(len(_out) == 1 and int(getattr(_out[0], "missed", 1)) == 0,
-          "conf 0.35（≥ 防抖置信度 0.3）的怪该**直接算数**并出框 ✓（老口径要 2 拍 + 60ms ✗）：%r"
-          % ([m.id for m in _out],))
-    _tid = tr._tracks[0]["id"]
-    _seen = tr._tracks[0]["last_seen"]
-    _out2 = tr.update([], [])
-    check([m.id for m in _out2] == [_tid] and int(_out2[0].missed) > 0,
-          "刚丢一拍就没了 ✗（「到过阈值 ⇒ 保留防抖时间」没生效 ✓）：%r"
-          % ([m.id for m in _out2],))
-    tr._tracks[0]["last_seen"] = _seen - 0.5             # 拨到 0.5s 前（< 1000ms ✓）
-    check([m.id for m in tr.update([], [])] == [_tid],
-          "0.5s（还在「防抖时间」内）就不留了 ✗")
-    # ④ 再被检出 ⇒ **重新计时**（missed 归零 + last_seen 刷新 ✓ —— 用户点名要重置 ✓）
-    _back = tr.update([(100.0, 100.0, 140.0, 140.0, 0.35)], [])
-    check(len(_back) == 1 and int(_back[0].missed) == 0,
-          "再出现时没被当成「它回来了」（missed 该归零 ✗）：%r" % ([m.id for m in _back],))
-    _seen2 = tr._tracks[0]["last_seen"]
-    check(_seen2 > _seen - 1.0,
-          "再出现没有刷新 `last_seen` ✗ ⇒ 计时**没重置** ✓")
-    tr._tracks[0]["last_seen"] = _seen2 - 0.5
-    check([m.id for m in tr.update([], [])] == [_tid],
-          "重置之后 0.5s 就又不留了 ✗ ⇒ 说明计时没真正重置 ✓")
-    # ⑤ 超过「防抖时间」⇒ 不再输出（⚠ 轨迹本身也在 keep_ms 后被清 ⇒ 这条放最后 ✓）
-    tr._tracks[0]["last_seen"] = _seen2 - 2.0            # 拨到 2s 前（> 1000ms ✓）
-    check(tr.update([], []) == [],
-          "超过「防抖时间」还在输出它 ✗（那就是「永远不消失」了 ✓）")
+    check(abs(float(tr.track_buffer_ms) - 1000.0) < 1e-6,
+          "④ 追踪器默认失联帧长该是 **1000ms**（用户定稿 ✓）：%r" % (tr.track_buffer_ms,))
+    tr.track_buffer_ms = 250.0
+    check(abs(float(tr.bt.track_buffer_ms) - 250.0) < 1e-6,
+          "④ 灌进 `track_buffer_ms` 没传到 ByteTrack 内核 ✗（那设置就是假的 ✓）")
 
-    # ---- ⑥ 决策层：输出行为的清框照旧清；锁定那只还在 ⇒ 不换目标 ----
-    s = fresh_settings(attack_dist=40.0)
-    s.enabled = True
-    h = Harness(s)
-    with h._patched():
-        a = h.agent
-        ws = h.ws(with_mob=False)
-        ws.player.x = ws.player.world_x = 500.0
-        ws.player.y = 500.0
-        _g = Mob(id=7, x=520.0, y=500.0, w=40.0, h=40.0, conf=0.9)
-        _g.missed = 3                                    # 幽灵框 ✓
-        _plain = Mob(id=8, x=530.0, y=500.0, w=40.0, h=40.0, conf=0.9)
-        _plain.missed = 3
-        a._kill_mobs.clear()
-        a._reap_ghost_mobs(_g, [_g, _plain], ws)
-        check(7 in a._kill_mobs and 8 in a._kill_mobs,
-              "输出行为没把范围内的幽灵框清掉 ✗（用户点名的例外：「除了是被输出行为的"
-              "清框逻辑清掉的」✓）：%r" % (sorted(a._kill_mobs),))
-        a._target_id = 7
-        a._target_until = 0.0
-        _tgt, _ = a._locked_target([_g, _plain], ws, 1000.0)
-        check(getattr(_tgt, "id", None) == 7,
-              "锁定的那只**还在**（幽灵框 ✓）却换了目标 ✗（那条「锁着不换」是 id 命中带来的 ✓）：%r"
-              % (getattr(_tgt, "id", None),))
+    # ⑤ 语义：确认后漏一拍 ⇒ 幽灵（missed>0）；缓冲过了 ⇒ 消失 ✓
+    _d0 = (480.0, 280.0, 520.0, 320.0, 0.9)
+    for _ in range(3):
+        tr.update([_d0])
+    _out = tr.update([])
+    check(len(_out) == 1 and int(_out[0].missed) > 0,
+          "⑤ 确认过的轨迹漏一拍该是**幽灵框**（`missed>0`，决策层靠它防空放技能 ✓）：%r"
+          % ([(m.id, m.missed) for m in _out],))
 
-
+    _agent_src = (Path(__file__).resolve().parent.parent / "decision" / "agent.py").read_text(
+        encoding="utf-8")
+    check("_reap_ghost_mobs" in _agent_src,
+          "⑤ 决策层「输出行为主动清框」（`_reap_ghost_mobs`）不许跟着一起删 ✗"
+          "（用户 2026-10-13 点名的例外 ✓）")
 
 
 def t_output_seq_finishes_after_leaving_attack():
@@ -22872,6 +22867,104 @@ def t_mouse_aim_measure_settle():
               "（归一后 = %r）" % (_key, ma.gain_frame_key(_key)))
 
 
+def t_climb_align_stall_hop():
+    """⭐⭐⭐⭐ **对齐绳梯「走不动」也要跳一下**（用户 2026-10-17 ✓ 原话：
+    「鳄鱼潭1项目**永久卡在 L13 绳梯**了，**也没有触发走不动跳一下**」✗）。
+
+    ⚠ 现场（`behavior.log` 13:06:17~13:06:21 连刷）：`climb_dx v=82.0` **一直是 82**、
+      `climb_phase v=0.0`（对齐相）、`climb_on_ladder v=0` ⇒ 人卡在离绳 82px 处不动，
+      最后 `battle_state frm=climb to=idle`（超时判失败 ⇒ 路线再排一遍 ⇒ 用户眼里"永久卡住"✓）。
+      病根：`stall_jump`（走不动按跳）**只灌给 `WalkJob`** ✗ —— 对齐绳梯这一段是
+      `ClimbJob` 自己"按住方向走" ⇒ 走不动只会**干等到超时** ✓（用户要的就是这段也跳 ✓）。
+    判据（四条 ✓）：
+      ① 卡住（px 不变、离绳 82px）⇒ 会**朝绳 + 跳**（`jump=True` ＋ `move` 朝绳 ✓）；
+      ② **有刹车**：一轮最多 3 次 ✓（不是每拍跳成筛子 ✓）；
+      ③ **不许被当成"上绳的跳"** ✗：`_jumped_once` 必须仍为 False、阶段仍在 align
+        （否则 2×卡住判定时长后误判「按跳之后 y 没上升」⇒ 任务失败 ✓ 第一版实测就这样 ✓）；
+      ④ 人一旦**走近了**⇒ 不再跳 ✓；设置里关掉 ⇒ 一次都不跳 ✓。
+    """
+    import decision.route as route
+
+    def _run(px_seq, stall_jump=True):
+        job = route.ClimbJob("L13", 210.0, 0.0, -500.0, 1, stall_s=1.0, jump_start_px=0)
+        job.stall_jump = stall_jump
+        now, hops = 0.0, []
+        for px in px_seq:
+            now += 0.1
+            out = job.update(now, px=px, py=-427.0, ladder_id=None)
+            if out.get("jump"):
+                hops.append((round(now, 1), out.get("move"), out.get("dir")))
+        return job, hops
+
+    job, hops = _run([128.0] * 70)
+    check(bool(hops),
+          "① 离绳 82px 一直不动 ⇒ 必须**跳一下** ✗（现场就是这样一直干等到超时 ✓）")
+    check(all(h[1] for h in hops),
+          "① 跳的时候要**朝绳方向按住** ✗（只跳不走＝原地蹦 ✓）：%r" % (hops,))
+    check(len(hops) <= 3,
+          "② 刹车：一轮最多 3 次 ✗（实测 %d 次 ⇒ 会跳成筛子 ✓）" % len(hops))
+    check(job._jumped_once is False and str(job.phase).lower() == "align",
+          "③ 「走不动的跳」**不是上绳的跳** ✗ —— 把 `_jumped_once` 置上 ⇒ 2×卡住判定时长后"
+          "误判「按跳之后 y 没上升」⇒ 任务失败 ✓（实测 phase=%r）" % (job.phase,))
+
+    _j2, hops2 = _run([128.0] * 25 + [160.0 + i for i in range(30)])
+    check(not [h for h in hops2 if h[0] > 2.5],
+          "④ 人走近了就不该再跳 ✗（会一直小跳 ✓）：%r" % (hops2,))
+    _j3, hops3 = _run([128.0] * 70, stall_jump=False)
+    check(not hops3,
+          "④ 关掉「走不动按跳」⇒ 一次都不许跳 ✗：%r" % (hops3,))
+
+
+def t_mmap_cfg_pushed_without_tab():
+    """⭐⭐⭐⭐ **小地图设置不许"只有切到路线识别页签"才生效**（用户 2026-10-17 ✓ 原话：
+    「**为什么非要切到路线识别页签黄点才能被认出来？**」✗）。
+
+    ⚠ 真病根：`RoutePanel._push_mmap()`（把 `map_id` / `src` / **`crop`** / `track`
+      推给实时线程 ✓）原来只挂在**四处手动动作**上 —— `showEvent → _refresh_mmap` ✓、
+      `_on_manual_map_change` / `_pick_mmap_crop` / `_on_mmap_track` ✓。
+      ⇒ **启动 / 换项目 / 换图**之后，实时线程手里只有 `map_id`（`main_window` 单独推 ✓），
+      **裁哪一块（crop）是空的** ⇒ 裁不出小地图 ⇒ **黄点认不出来** ✓
+      ⇒ 人必须先切一次「路线识别」页签（`showEvent` 触发那条推 ✓）才好 ✓。
+      （这与 `main_window` 里给"叠图"补过一次的是**同一个病**✓ 见那边注释 ✓）
+    判据（三条 ✓）：
+      ① `_apply_route_cfg()`（项目载入 / 换图都走它 ✓）**必须**结尾推一次；
+      ② `main_window` 接上 `live_panel` 之后**必须**补推一次（面板建时它还不存在 ✓）；
+      ③ **功能**：`_push_mmap()` 真把四样一起推过去（`map_id/src/crop/track` ✓
+         —— 少推 `crop` 就裁不出面板 ✓）。
+    """
+    from PyQt5.QtWidgets import QApplication
+
+    import gui.route_panel as rp
+
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "gui" / "route_panel.py").read_text(encoding="utf-8")
+    seg = src[src.index("    def _apply_route_cfg"):]
+    seg = seg[:seg.index("\n    def ", 10)]
+    check("self._push_mmap()" in seg,
+          "① `_apply_route_cfg` 灌完配置必须 `self._push_mmap()` ✗ —— 不推 ⇒ 实时线程"
+          "拿不到 `crop` ⇒ 黄点认不出来，必须先切页签 ✓（用户现场就是这样 ✓）")
+
+    mw = (root / "gui" / "main_window.py").read_text(encoding="utf-8")
+    i = mw.index("self.route_panel.live_panel = self.live_panel")
+    check("_push_mmap()" in mw[i:i + 1600],
+          "② `main_window` 接上 `live_panel` 之后要补推一次 `_push_mmap()` ✗"
+          "（面板构造时 `live_panel` 还不存在 ⇒ 那次是空转 ✓）")
+
+    app = QApplication.instance() or QApplication([])      # noqa: F841 —— 建控件要它 ✓
+    got = {}
+
+    class _LP:
+        def set_mmap(self, **kw):
+            got.update(kw)
+
+    p = rp.RoutePanel()
+    p.live_panel = _LP()
+    p._push_mmap()
+    check({"map_id", "src", "crop", "track"} <= set(got),
+          "③ `_push_mmap()` 必须把 `map_id / src / crop / track` **四样一起**推过去 ✗"
+          "（少 `crop` 就裁不出小地图 ✓）：%r" % (sorted(got),))
+
+
 CHECKS = [
     ("⭐⭐⭐ 「攻击目标数量」：0 = 不启用 / -1 = 不限制 / N = 同时最多 N 只在 CD"
      "（用户 2026-10-06 第二轮）",
@@ -22941,9 +23034,8 @@ CHECKS = [
      t_jump_attack),
     ("⭐⭐⭐ 「跳跃CD」：跳跃高度/下落速度 · CD 内不许按跳 · 连跳时第 2 段推迟（用户 2026-10-13）",
      t_jump_cd),
-    ("⭐⭐⭐ 「防抖置信度+防抖时间」（用户 2026-10-12）：锁定那只按**自己的窗口**留框 "
-     "· 窗口内**不换目标**、**不清它的框** · 0 = 沿用全局防抖（老行为）",
-     t_debounce_ghost_rules),
+    ("⭐⭐⭐ 「防抖置信度/防抖时间」删干净 + 「失联帧长(ms)=1000」接上 ByteTrack（用户 2026-10-17）",
+     t_track_buffer_setting),
     ("⭐⭐ 寻路时限：只有「追击」签注吃「寻路超时时间」（其它任务无限）、"
      "attack 重下不刷新它的钟、走完一段接下一段才刷新（用户 2026-09-29）",
      t_chase_clock_attack_vs_segment),
@@ -23201,6 +23293,8 @@ CHECKS = [
      "没标定/越界就一个字节都不发", t_mouse_aim_math),
     ("抓取区域：帧↔屏幕的对应（to_screen 的比例 + gain 口径 ✓）",
      t_mouse_aim_frame_rect),
+    ("⭐⭐⭐ 点之前先问 A 机「游戏窗口在哪」（窗口会移动 ✓ 2026-10-17）",
+     t_window_probe_aim),
     ("⭐ 人已经在游戏里 ⇒ 不许再按回车（认不出界面 + 有玩家框 = 游戏世界 ✓）",
      t_reconnect_in_game_no_enter),
     ("⭐ 「走不动时跳一下」的记账要跨重算保住 ＋ 定时清键要开「允许上绳梯」",
@@ -23443,6 +23537,10 @@ CHECKS = [
     ("⭐⭐⭐ **进了 attack、输出行为就必须走完**（用户 2026-10-13：「只要触发了 attack 就一定"
      "要把输出行为配置的逻辑全走完」）—— 状态抖走也跑完 · 排好期还没开跑的丢掉",
      t_output_seq_finishes_after_leaving_attack),
+    ("⭐⭐⭐⭐ 对齐绳梯「走不动」也要跳一下（卡在 L13 绳梯却不跳 · 用户 2026-10-17）",
+     t_climb_align_stall_hop),
+    ("⭐⭐⭐⭐ 小地图设置不许「切到路线识别页签才生效」（crop/src/track 要主动推给实时线程）",
+     t_mmap_cfg_pushed_without_tab),
 ]
 
 

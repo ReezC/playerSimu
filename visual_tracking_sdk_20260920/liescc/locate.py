@@ -298,8 +298,14 @@ def _pair_anchor_matches(
     footer_matches: list[AnchorMatch],
     frame_shape: tuple[int, ...],
     reject_counts: dict[str, int] | None = None,
+    relaxed: bool = False,
 ) -> list[LieWindowCandidate]:
-    """Pair title/footer anchors with tolerant scale, edge and layout gates."""
+    """Pair title/footer anchors with tolerant scale, edge and layout gates.
+
+    `relaxed=True`：**只放宽"配对几何"那两道闸**（尺度差 / 左右边 —— 不同渲染、
+      推流拉伸、窗口缩放都可能让它们差一截 ✓），**保留**尺寸 / 越界 / 居中 /
+      纵向间距四道 ✓（那几道才是"这是不是一个居中弹窗"的真判据 ✓）。
+    """
     frame_height, frame_width = frame_shape[:2]
     candidates: list[LieWindowCandidate] = []
 
@@ -311,7 +317,7 @@ def _pair_anchor_matches(
         for footer in footer_matches:
             mean_scale = max(1e-6, (title.scale + footer.scale) / 2.0)
             relative_scale_error = abs(title.scale - footer.scale) / mean_scale
-            if relative_scale_error > ANCHOR_SCALE_TOLERANCE:
+            if (not relaxed) and relative_scale_error > ANCHOR_SCALE_TOLERANCE:
                 rejected("SCALE_MISMATCH")
                 continue
 
@@ -319,10 +325,21 @@ def _pair_anchor_matches(
             edge_tolerance = max(8.0, expected_width * ANCHOR_EDGE_TOLERANCE_FRAC)
             title_right = title.x + title.width
             footer_right = footer.x + footer.width
-            if abs(title.x - footer.x) > edge_tolerance:
+            if (not relaxed) and abs(title.x - footer.x) > edge_tolerance:
                 rejected("LEFT_EDGE_MISMATCH")
                 continue
-            if abs(title_right - footer_right) > edge_tolerance:
+            # ⚠⚠ **右边容差必须宽容"尺度差"这一段**（2026-10-17 现场 ✓）：
+            #   两个锚点各自匹配出来的尺度**本来就不一样**（上面允许差 8% ✓）——
+            #   尺度不同 ⇒ 匹配框**宽度**不同 ⇒ 右边天然差一截 ✗
+            #   ⇒ 只按"固定百分比"判右边，等于把已经放行的尺度差又拒掉一次 ✓
+            #   实测（`data/recordings/lie_20261017_125205.mp4` 第 2 秒）：
+            #     title scale 0.512 / footer scale 0.537（差 4.8% ✓ 放行）
+            #     ⇒ 宽度 696 vs 730 ⇒ 右边差 **50px**，而容差只有 36px ⇒ **误拒** ✗
+            #     ⇒ 表现为"模板明明匹上了（0.95 / 0.82），却 LOCATING 18 秒超时、
+            #       一枪不放、只有警报" ✓（用户 2026-10-17 现场 ✓）
+            #   口径：固定容差 ＋ **尺度差导致的宽度差**（expected_width × 相对尺度误差 ✓）
+            right_tolerance = edge_tolerance + expected_width * relative_scale_error
+            if (not relaxed) and abs(title_right - footer_right) > right_tolerance:
                 rejected("RIGHT_EDGE_MISMATCH")
                 continue
 
@@ -330,6 +347,7 @@ def _pair_anchor_matches(
             expected_height = TEMPLATE_HEIGHT * mean_scale
             vertical_tolerance = max(
                 10.0, expected_height * ANCHOR_VERTICAL_TOLERANCE_FRAC
+                * (2.5 if relaxed else 1.0)     # 放宽那一路：纵向也松一档（尺度差会把它们拉偏 ✓）
             )
             if abs(footer.y - expected_footer_y) > vertical_tolerance:
                 rejected("LAYOUT_MISMATCH")
@@ -436,6 +454,16 @@ def locate_by_dual_anchor_diagnostic(
     )
     reason = "MATCHED"
     if not paired:
+        # ⭐⭐ **兜底：两个锚点都匹上了，只是"配对几何"对不上**（用户 2026-10-17 ✓
+        #   远程测谎：A 机推流过来的画面被拉伸 / 缩放，同一个弹窗的标题与页脚
+        #   尺度会差到 8% 以上 ⇒ 严格那一路永远配不上 ⇒ LOCATING 超时、没有检测框 ✓）。
+        #   锚点**各自都匹上了**是强证据（阈值 0.7+ ✓）⇒ 放宽"尺度 / 左右边"两道闸
+        #   再来一次；**尺寸 / 越界 / 居中 / 纵向间距**四道照旧 ✓（不放开"是不是居中弹窗"）
+        paired = _pair_anchor_matches(
+            titles, footers, frame_bgr.shape, relaxed=True
+        )
+        reason = "MATCHED_RELAXED"
+    if not paired and reason == "MATCHED_RELAXED":
         reason = (
             max(reject_counts, key=reject_counts.get)
             if reject_counts

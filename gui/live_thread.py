@@ -1457,6 +1457,69 @@ class LiveThread(QThread):
             return tuple(roi), (int(full[0]), int(full[1]))
         return None, None
 
+    def _mouse_win(self, max_age=1.0):
+        """A 机**画面那一块**在屏幕上的位置 ⇒ `((x, y), (h, w))`；问不到 ⇒ `(None, None)` ✓。
+
+        ⭐⭐⭐ 为什么要有它（用户 2026-10-17 ✓ 原话：
+          「**A 机游戏窗口是会移动的，你保证你的方案能适配吗？**」✓）：
+          · 点击比例是**相对画面**算的 ✓，而画面 = A 机抓的那块（跟随窗口时就是游戏窗口 ✓）；
+          · 要落成**屏幕坐标**就必须知道那块在屏幕的哪儿 ✓ —— 老实现当它是 `(0, 0)` ✗
+            ⇒ **窗口一挪，点击就整块偏** ✓；
+          · 现在每 `max_age` 秒问一次 A 机（relay 的 `WINDOW?` ✓ 见 `remote_kbd/relay.py` ✓），
+            窗口挪了 / 缩放 / 重启 ⇒ 下一拍就是新值 ✓ **不用改配置** ✓。
+        ⚠ 问不到（旧 relay / 没开跟随窗口 / 本地后端）⇒ `(None, None)` ⇒ 调用方退回老路 ✓
+          不会更糟 ✓。
+        """
+        import time as _t
+        now = _t.monotonic()
+        if now - float(getattr(self, "_mwin_at", 0.0) or 0.0) < float(max_age):
+            return getattr(self, "_mwin_box", (None, None))
+        box = (None, None)
+        try:
+            from decision import input as _di     # ⚠ 局部导入（本文件对 decision 的惯例 ✓）
+            r = _di.window_probe()
+            if r:
+                x, y, w, h = (int(v) for v in r)
+                if w > 0 and h > 0:
+                    box = ((x, y), (h, w))       # ⚠ 形状是 (h, w) ✓ 同 `frame.shape[:2]`
+        except Exception:                        # noqa: BLE001 —— 问不到就退回老路 ✓
+            box = (None, None)
+        self._mwin_at = now
+        self._mwin_box = box
+        return box
+
+    def _aim_geo(self, frame, origin=None):
+        """点击 / 瞄准的定位参数 ⇒ `(origin, roi, full_shape, gain)` ✓（一处算清 ✓）。
+
+        ⭐ **窗口会移动**（用户 2026-10-17 ✓）⇒ 问得到窗口就按**窗口**落点：
+           屏幕坐标 = 窗口原点 + 比例 × 窗口尺寸 ✓
+        ⚠⚠ 但**增益必须按"帧"查** ✗（`load_gain(frame.shape)` ✓）：
+           窗口尺寸（比如 1600×900）在 `by_frame` 里查不到 ⇒ 会落到配置文件**根上的旧值**
+           （`0.2846` ✗ 比真值小 3.5 倍）⇒ 指令数多 3.5 倍 ⇒ **点飞** ✓（实测过这条 ✓）。
+           查不到帧口径的增益 ⇒ **干脆不用窗口那条** ✓（退回老路，宁可不折也别飞 ✓）。
+        问不到窗口（旧 relay / 本地后端 / 没开跟随窗口）⇒ 原样返回调用方给的 `origin` ✓
+          一字不变 ✓。
+        """
+        from decision import mouse_aim as _ma    # ⚠ 局部导入（本文件惯例 ✓）
+        roi, full = self._mouse_roi()
+        worg, wshape = self._mouse_win()
+        if wshape:
+            gain = _ma.load_gain(frame.shape)
+            if gain:
+                # ⭐ 窗口**变了**就留一笔（窗口挪一下只写一行 ✓ 不是每拍都写 ✗）——
+                #   现场"又点歪"时，先看这行就知道是不是它挪了 ✓ 不用再猜 ✓
+                if getattr(self, "_mwin_last", None) != (worg, wshape):
+                    self._mwin_last = (worg, wshape)
+                    try:
+                        from core import behavior
+                        behavior.event("aim_win", x=worg[0], y=worg[1],
+                                       w=wshape[1], h=wshape[0], frame=str(frame.shape[:2]))
+                    except Exception:            # noqa: BLE001 —— 留痕坏了不许影响点击 ✗
+                        pass
+                return worg, None, wshape, gain
+        return origin, roi, full, None
+
+
     def set_mmap(self, map_id=None, src=None, crop=None, track=None):
         """更新小地图定位要的东西（**运行中也改得动**：切项目/换来源/重框/改容差）。
 
@@ -2581,8 +2644,9 @@ class LiveThread(QThread):
         ws.player.touching_drop = drop_touch(player_box or last_player[0],
                                              drop_boxes)
         # 同步防抖参数（每帧读 settings，改了即时生效）
-        mob_tracker.debounce_conf = settings.debounce_conf
-        mob_tracker.debounce_ms = settings.debounce_ms
+        # ⭐ 2026-10-17：怪追踪**只有一个参数** —— 「失联帧长(ms)」
+        #   （ByteTrack 的 `track_buffer` ✓ 用户定稿 ✓ 老的防抖置信度/防抖时间已删 ✗）
+        mob_tracker.track_buffer_ms = settings.track_buffer_ms
         # ⚠ 2026-10-13：「锁定怪物丢框防抖时间」那两行灌参**删了** ✓
         #   （用户："移除…（这是重复功能）"✓）⇒ tracker 只吃上面那两条防抖参数 ✓。
         # 用 MobTracker 追踪，得到跨帧稳定的 id（目标锁定 CD 靠它匹配）
@@ -3794,10 +3858,11 @@ class LiveThread(QThread):
         #   "我可能会把游戏窗口随意拖动，并且游戏窗口可能会被拖到副显示屏" ✓）。
         # ⭐ **部署台框了游戏区域 ⇒ 比例要折回整帧**（用户 2026-10-17 ✓「自动测谎的鼠标适配」✓）：
         #   比例是相对**我们看到的这块**算的 ✓ ⇒ 直接乘整帧尺寸会**整体偏一块** ✗
-        _mroi, _mfull = self._mouse_roi()
+        # ⭐ A 机游戏窗口会移动（用户 2026-10-17 ✓）⇒ 问得到就**按窗口**落点 ✓
+        _vorg, _mroi, _mfull, _gain = self._aim_geo(frame, (origin_x, origin_y))
         ok, why = mouse_aim.click_ratio(
             frame.shape, pt[0] / max(1, _w), pt[1] / max(1, _h),
-            origin=(origin_x, origin_y), roi=_mroi, full_shape=_mfull)
+            gain=_gain, origin=_vorg, roi=_mroi, full_shape=_mfull,)
         behavior.event("vt_confirm_click", ok=bool(ok), why=str(why)[:80],
                        x=round(pt[0]), y=round(pt[1]))
         self.vt_status.emit("测谎：成功 ⇒ 已点「确定」%s"
@@ -3852,11 +3917,13 @@ class LiveThread(QThread):
         #   **16ms 一拍**的线程（`mouse_aim.aim_tick` ✓ 同跟踪包生产端的 8ms 插值定时器 ✓）。
         # ⭐ 走位同样要折回整帧（用户 2026-10-17 ✓「自动测谎的鼠标适配」✓）—— 只改点击
         #   不改瞄准 ⇒ 光标会停在**偏一块**的位置，然后从那儿点 ✓（更歪 ✗）。
-        _mroi, _mfull = self._mouse_roi()
+        # ⭐ 瞄准也按窗口落点（同点击 ✓ 否则先停偏一块、再从那儿点 ✓ 更歪 ✗）
+        _aorg, _mroi, _mfull, _gain = self._aim_geo(frame, (origin_x, origin_y))
         ok, why = mouse_aim.aim_to(frame.shape,
                                    float(obs.aim_frame[0]) / max(1, _w),
                                    float(obs.aim_frame[1]) / max(1, _h),
-                                   origin=(origin_x, origin_y),   # ⚠ 帧原点 ✓ 同上 ✓
+                                   gain=_gain,
+                                   origin=_aorg,                # ⚠ 帧原点 ✓ 同上 ✓
                                    roi=_mroi, full_shape=_mfull)
         if ok:
             # ⭐ **第一次设上目标要留痕**（现场问过"到底发了没" ✓）：走位的每一拍由线程计数 ✓。
@@ -4507,7 +4574,7 @@ class LiveThread(QThread):
         #   门槛是 `conf_mob × MOB_LOW_CONF_RATIO`（0.25 × 0.5 = **0.125** ✓）、玩家那条
         #   `conf_player × PLAYER_LOW_CONF_RATIO`（0.375 ✓）⇒ **模型 0.25 以下直接丢掉了** ✗
         #   ⇒ 那两个低分档**永远收不到框** ✗ ⇒ BYTE 那条「低分只续命」的链**从来没生效过** ✓
-        #   ⇒ 框一掉到阈值以下，轨迹就**只能靠防抖幽灵撑着**（`debounce_ms` ✓）⇒ 撑完就死、
+        #   ⇒ 框一掉到阈值以下，轨迹就**只能靠失联缓冲撑着**（`track_buffer_ms` ✓ 2026-10-17 ✓）⇒ 撑完就死、
         #     再出现就是新 id ✓ = 用户看到的"疯狂闪烁"＋"防抖时间不生效" ✓✓。
         #   ⚠ 上面那两行注释本来就写着"保证两类的**低分框**都进结果"✗ —— 实现漏了那个比例 ✓
         #     （这就是那句注释与代码对不上的地方 ✓）。
@@ -5917,8 +5984,14 @@ class LiveThread(QThread):
                         #   「注意**断线重连**、自动测谎的鼠标适配」✓）—— 状态机给的比例是
                         #   相对**我们看到的这块**（框了游戏区域之后 ✓）⇒ 不折就整块偏 ✓
                         #   （\"点服务器/点频道\"那种格点尤其致命 ✗ 差一格就点到别的频道 ✓）。
-                        _mroi, _mfull = self._mouse_roi()
+                        # ⭐⭐⭐ **A 机游戏窗口会移动**（用户 2026-10-17 ✓「你保证你的方案
+                        #   能适配吗？」✓）⇒ `_aim_geo` 会先问窗口在哪：
+                        #     屏幕坐标 = 窗口原点 + 比例 × 窗口尺寸 ✓
+                        #   ⇒ 窗口挪/缩放/重启、换分辨率**全自动跟上** ✓
+                        #     （问不到 ⇒ 退回 `origin_ref`/`origin_x` 那条老路 ✓ 不会更糟 ✓）
+                        _org, _mroi, _mfull, _gain = self._aim_geo(vis, _org)
                         _ok, _why = mouse_aim.click_ratio(vis.shape, _act["x"], _act["y"],
+                                                          gain=_gain,
                                                           origin=_org,
                                                           roi=_mroi, full_shape=_mfull,
                                                           # ⭐ 上一拍已经**只归零**过（`act="home"`

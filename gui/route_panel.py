@@ -2478,6 +2478,18 @@ class RoutePanel(QWidget):
                     pass
                 sp.blockSignals(False)
             self._mmap_track = dict(trk)
+        # ⭐⭐⭐⭐ **灌完就推给实时线程**（用户 2026-10-17 ✓ 原话：
+        #   「**为什么非要切到路线识别页签黄点才能被认出来？**」✗）
+        #   ⛔ 原来这里**不推** ✗ —— 只有 `_refresh_mmap()`（由 `showEvent` 触发 ✓）、
+        #     `_on_manual_map_change`（手动选图 ✓）、`_pick_mmap_crop`（手动框 ✓）、
+        #     `_on_mmap_track`（拖容差 ✓）四处会推 ⇒ **启动/换项目/换图之后**，
+        #     实时线程手里只有 `mmap_map_id`（`main_window` 单独推的那一件 ✓），
+        #     **裁哪一块（crop）/ 哪来的面板（src）/ 黄点容差（track）全是空的** ✓
+        #     ⇒ 实时线程裁不出小地图 ⇒ 黄点认不出来 ⇒ 人必须先切到「路线识别」页签
+        #       `showEvent → _refresh_mmap → _push_mmap` 才生效 ✓（用户看到的正是这个 ✓）。
+        #   ⚠ 这正是 `main_window` 里给「叠图」补过一次的那个坑（见那边注释 ✓）——
+        #     同一个病、另一条线 ✓。
+        self._push_mmap()
         self._refresh_crop_status()
         return n
 

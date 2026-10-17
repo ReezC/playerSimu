@@ -92,6 +92,9 @@ AFFECTS = {
     "perception/tracker.py": ("selftest_tracker",),
     "perception/anchor_track.py": ("selftest_anchor_track",),
     "perception/": ("selftest_minimap",),
+    # ⚠ 测谎 SDK 是**外挂目录**（`visual_tracking_sdk_20260920/liescc` ✓）——
+    #   改它就跑 `selftest_vt_sdk` ✓（2026-10-17 在这儿改过双锚点配对的右边容差 ✓）
+    "visual_tracking_sdk_20260920/": ("selftest_vt_sdk",),
     # ---- 界面 ----
     "gui/live_thread.py": ("selftest_screen_state", "selftest_live_panel"),
     "gui/live_panel.py": ("selftest_live_panel", "selftest_screen_state"),

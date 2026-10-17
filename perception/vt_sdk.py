@@ -129,6 +129,13 @@ class VtLieSdk:
         self.load_ms = 0.0
         self.frames = 0                     # 喂进去多少帧（诊断用 ✓）
         self.last_phase = "-"
+        #: 「**LOCATING 卡住**」的诊断落盘（用户 2026-10-17 ✓ 远程测谎：只有警报、
+        #:   没有检测框、A 机鼠标一动不动 ✗）—— 光看 `vt_phase=ENDED why=timeout` 判不出
+        #:   是"模板没匹上"还是"配对被拒"✓ ⇒ 卡住 **3 秒**后把**帧 + 诊断**存到
+        #:   `data/debug/vt_locate_*.jpg/.txt`（每 10 秒最多一份 ✓ 不刷盘 ✓）。
+        #:   ⚠ 只诊断、不改行为 ✗（这一步绝不能影响实时回路 ✓）。
+        self._loc_since = None
+        self._loc_dump_at = 0.0
         self.last_aim_screen = None
         self.last_roi = None
         self.shapec = None                  # 上一拍的 (shape, origin)：一变就 reset ✓（见模块头 ✓）
@@ -266,7 +273,58 @@ class VtLieSdk:
         self.last_phase = str(getattr(obs, "phase", "-"))
         self.last_aim_screen = getattr(obs, "aim_screen", None)
         self.last_roi = getattr(obs, "roi", None)
+        self._maybe_dump_locate(frame_bgr)      # 卡在 LOCATING ⇒ 留证据（见那边 ✓）
         return obs
+
+    #: LOCATING 卡多久开始落盘（秒）—— 正常锁定是 1~2 秒 ✓ 3 秒还没锁就是"卡住了"✓
+    DUMP_AFTER_S = 3.0
+    #: 落盘最小间隔（秒）—— 别刷盘（一次 imwrite + 一次模板匹配 ✓ 几十毫秒 ✓）
+    DUMP_EVERY_S = 10.0
+
+    def _maybe_dump_locate(self, frame_bgr):
+        """`LOCATING` 卡住 ⇒ 把**当前帧 ＋ 双锚点诊断**存到 `data/debug/` ✓（只诊断 ✗）。
+
+        ⭐ 为什么值得写（用户 2026-10-17 ✓）：现场只有
+          `vt_phase phase=LOCATING` ⇒ 73~120 秒后 `ENDED why=timeout` ✓，
+          而 `screen_state` 明明认出了 `lie_warn` / `lie_game` ✓ ⇒ **画面里有弹窗** ✓，
+          但 SDK 锁不上 ⇒ 检测框没有、鼠标不动 ✓。
+          光凭超时这一条**分不清**：模板没匹上？尺度对不上？配对被拒？越界？居中不对？
+          ⇒ 落一份帧 + `LocateDiagnostics`（含 `reject_counts` ✓）就能一次说清 ✓。
+        """
+        import time as _t
+        if str(self.last_phase) != "LOCATING":
+            self._loc_since = None
+            return
+        now = _t.monotonic()
+        if self._loc_since is None:
+            self._loc_since = now
+        if (now - float(self._loc_since)) < float(self.DUMP_AFTER_S):
+            return
+        if (now - float(self._loc_dump_at or 0.0)) < float(self.DUMP_EVERY_S):
+            return
+        self._loc_dump_at = now
+        try:
+            from pathlib import Path
+
+            from core import imgio
+            d = Path("data") / "debug"
+            d.mkdir(parents=True, exist_ok=True)
+            stamp = _t.strftime("%Y%m%d_%H%M%S", _t.localtime())
+            jpg = d / ("vt_locate_%s.jpg" % stamp)
+            imgio.imwrite(str(jpg), frame_bgr)
+            lines = ["frame.shape = %r" % (getattr(frame_bgr, "shape", None),)]
+            try:
+                from liescc import locate as L
+                cand, diag = L.locate_by_dual_anchor_diagnostic(frame_bgr)
+                lines.append("candidate = %r" % (cand,))
+                lines.append("diag = %r" % (diag,))
+            except Exception as e:                 # noqa: BLE001 —— 诊断失败不影响实时 ✓
+                lines.append("locate 诊断失败：%s: %s" % (type(e).__name__, e))
+            jpg.with_suffix(".txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            from core import behavior
+            behavior.event("vt_locate_dump", file=jpg.name)
+        except Exception:                          # noqa: BLE001
+            pass
 
     # ---------------- 「成功后点确定」用的确认按钮定位 ----------------
 

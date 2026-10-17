@@ -127,15 +127,15 @@ decision:
   - 0.120791
   - 0.019531
   probe_calib:
-    x_ratio: 0.0739385065885798
-    y_ratio: 0.02734375
-    cell_ratio: 0.01171303074670571
-    gap_ratio: 0.0016471449487554905
+    x_ratio: 0.029282576866764276
+    y_ratio: 0.018229166666666668
+    cell_ratio: 0.010248901903367497
+    gap_ratio: 0.0020893118594436312
     bits: 40
     frame:
     - 1366
     - 768
-    solved_at: '2026-10-03 00:30:33'
+    solved_at: '2026-10-17 13:07:30'
   hp_color:
   - - 0
     - 0
@@ -417,6 +417,10 @@ live:
   half: true
   show_fps: 50
   window_capture: wgc
+  iou_mob: 0.85
+  max_det: -1
+  agnostic_nms: false
+  stream_rect_rel: null
 player_id: 数值策划
 verify:
   source: E:/MyPrograms/playerSimu/projects/森林迷宫III/测试集

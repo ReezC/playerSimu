@@ -121,6 +121,36 @@ def parse_cursor_line(line):
     return (x, y, v[0], v[1], v[2], v[3], cap)
 
 
+def parse_window_line(line):
+    """relay 回的 `WIN x y w h` 一行 ⇒ `(x, y, w, h)`；不像 / 失败 ⇒ `None` ✓。
+
+    为什么要有它（用户 2026-10-17 ✓「**A 机游戏窗口是会移动的**」✓）：
+      B 机的点击比例是**相对画面**算的 ✓，而画面 = A 机抓的那块屏幕 ✓
+      ⇒ 要落成**屏幕坐标**必须知道那块在屏幕的哪儿 ✓（就是这四 个数 ✓）。
+    ⚠ 单独一个纯函数是为了**能直接测** ✓（同 `parse_cursor_line` ✓）。
+    """
+    try:
+        s = (line.decode("ascii", "replace") if isinstance(line, (bytes, bytearray))
+             else str(line)).strip()
+    except Exception:                            # noqa: BLE001
+        return None
+    parts = s.split()
+    if len(parts) < 2 or parts[0] != "WIN":
+        return None
+    if parts[1] == "-":                          # A 机也说不准（没跟随窗口 / 没框过 ✓）
+        return None
+    try:
+        nums = [int(v) for v in parts[1:5]]
+    except (TypeError, ValueError):
+        return None
+    if len(nums) < 4:
+        return None
+    x, y, w, h = nums
+    if w <= 0 or h <= 0:
+        return None
+    return (x, y, w, h)
+
+
 class KbdClient:
     def __init__(self, host, port, cafile, timeout=5.0):
         ctx = ssl.create_default_context(cafile=cafile)
@@ -164,6 +194,10 @@ class KbdClient:
         #:   `CURSOR_QUERY` ✓），也不许混进 `DONE/ERR` 计数 ✗（它俩都不含 ✓ 天然分开 ✓）。
         self._cur_ev = threading.Event()
         self._cur_box = None
+        #: ⭐ 「问 A 机**游戏窗口**在哪」的回包（`WIN …` ✓ 2026-10-17 ✓
+        #:   用户原话：「**A 机游戏窗口是会移动的**」✓ —— 点击比例要靠它落到屏幕坐标 ✓）。
+        self._win_ev = threading.Event()
+        self._win_box = None
         # 后台读线程：relay 会把固件的 DONE 应答回传，这里持续读走丢弃，
         # 否则回传缓冲被 DONE 塞满后，relay/固件/控制机整条链路会连锁卡死
         # （表现为：按键发不出、推理丢帧暴增、RELEASE 丢失导致卡键）。
@@ -236,6 +270,29 @@ class KbdClient:
         if not self._cur_ev.wait(float(timeout)):
             return None
         return self._cur_box
+
+    def window(self, timeout=0.8):
+        """问 **A 机游戏窗口**在屏幕哪 ⇒ `(x, y, w, h)`；问不到 ⇒ `None` ✓。
+
+        ⚠ 走 `WINDOW?`（relay 自己答 ✓ 不碰串口 ✓ 见 `remote_kbd/relay.py` ✓）。
+        ⚠ 同 `cursor()`：**单独发**这一条 ✗（别拼包 ✓）、收发用**事件**等（不 sleep ✓）、
+          **不记 `_pending`** ✗（它不是固件回执 ✓ 记了会误报"链路卡死"✓）。
+        """
+        self._win_box = None
+        self._win_ev.clear()
+        with self._lock:
+            try:
+                self._sock.sendall(b"WINDOW?\n")
+                self.sent += 1
+                self.last_send_at = time.monotonic()
+                self.ok = True
+            except Exception as e:               # noqa: BLE001 —— 发不出去就当问不到 ✓
+                self.ok = False
+                self.last_err = "%s: %s" % (type(e).__name__, e)
+                return None
+        if not self._win_ev.wait(float(timeout)):
+            return None
+        return self._win_box
 
     def silent_for(self):
         """多久没收到固件回执了（秒）。0 = 正常（或无从判断）。
@@ -382,6 +439,12 @@ class KbdClient:
                         if _ln.lstrip().startswith(b"CUR "):
                             self._cur_box = parse_cursor_line(_ln)
                             self._cur_ev.set()
+                # ⭐⭐ 「问 A 机游戏窗口在哪」的回包（`WIN …` ✓ 同样 relay 自己答 ✓）
+                if b"WIN " in data:
+                    for _ln in data.split(b"\n"):
+                        if _ln.lstrip().startswith(b"WIN "):
+                            self._win_box = parse_window_line(_ln)
+                            self._win_ev.set()
                 n = data.count(b"DONE") + data.count(b"ERR")
                 if n:
                     self.replies += n

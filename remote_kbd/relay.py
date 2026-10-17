@@ -554,6 +554,108 @@ def _cursor_pos():
     return (int(pt.x), int(pt.y)) if ok else None
 
 
+#: 「问 A 机**游戏窗口**在哪」—— 同样由 relay 自己答 ✓（用户 2026-10-17 ✓ 原话：
+#:   「**A 机游戏窗口是会移动的，你保证你的方案能适配吗？**」✓）
+#: ⚠ B 机的点击比例是**相对画面**算的 ✓，而画面 = A 机抓的那块屏幕 ✓
+#:   ⇒ 要把比例落到**屏幕坐标**，必须知道"那块在屏幕的哪儿" ✓ = 这四 个数 ✓
+#:   ⇒ 窗口一挪，这里跟着变 ⇒ B 机下一拍问到的就是新值 ✓ **不用改任何配置** ✓。
+WINDOW_QUERY = b"WINDOW?"
+
+
+def _deploy_push():
+    """A 机自己的 `config/deploy.json [push]` ⇒ dict（读不到 ⇒ `{}` ✓ 不抛 ✓）。"""
+    try:
+        import json
+        from pathlib import Path
+        p = Path(__file__).resolve().parent.parent / "config" / "deploy.json"
+        return (json.loads(p.read_text(encoding="utf-8")).get("push") or {})
+    except Exception:                            # noqa: BLE001 —— 读不到就当没有 ✓
+        return {}
+
+
+def _client_rect(hwnd):
+    """某个窗口的**客户区**在屏幕上的矩形 ⇒ `(x, y, w, h)`；窗口没了 ⇒ `None` ✓。"""
+    import ctypes
+    from ctypes import wintypes
+    try:
+        u = ctypes.windll.user32
+        hwnd = int(hwnd or 0)
+        if not hwnd or not u.IsWindow(hwnd):
+            return None
+        r = wintypes.RECT()
+        if not u.GetClientRect(hwnd, ctypes.byref(r)):
+            return None
+        w, h = int(r.right - r.left), int(r.bottom - r.top)
+        if w <= 0 or h <= 0:
+            return None
+        pt = wintypes.POINT(0, 0)
+        if not u.ClientToScreen(hwnd, ctypes.byref(pt)):
+            return None
+        return (int(pt.x), int(pt.y), w, h)
+    except Exception:                            # noqa: BLE001
+        return None
+
+
+def _window_rect():
+    """A 机**画面那一块**在屏幕上的矩形 ⇒ `(x, y, w, h)`；说不准 ⇒ `None` ✓（**不猜** ✗）。
+
+    口径（**读 A 机自己的 `config/deploy.json`** ✓ 同 `_capture_region_size` ✓）：
+      · `push.region_win = [hwnd, title]`（部署台「跟随窗口」✓ ⇒ 画面 **= 那个窗口** ✓）
+        ⇒ 取它的**客户区** ✓（hwnd 失效就按标题重找 ✓ 游戏重启后照样跟得上 ✓）；
+      · 否则 `push.rect = [x,y,w,h]`（手框的固定区域 ✓）⇒ 它就是画面那块 ✓；
+      · 再否则 `push.region_x/y/w/h`（部署台算出来的"当前那块"✓ 跟随窗口时 = 窗口位置 ✓）；
+      · 都没有 ⇒ `None` ✓（B 机退回老路 ✓ 不会更糟 ✓）。
+    """
+    push = _deploy_push()
+    win = push.get("region_win")
+    if isinstance(win, (list, tuple)) and win:
+        try:
+            rect = _client_rect(win[0])
+        except Exception:                        # noqa: BLE001
+            rect = None
+        if rect is None and len(win) > 1 and win[1]:
+            try:
+                import ctypes
+                hwnd = int(ctypes.windll.user32.FindWindowW(None, str(win[1])))
+                rect = _client_rect(hwnd) if hwnd else None
+            except Exception:                    # noqa: BLE001
+                rect = None
+        if rect is not None:
+            return rect
+        # 跟随窗口但窗口暂时没了（最小化 / 重启中）⇒ 往下退回它记着的绝对坐标 ✓
+    r = push.get("rect")
+    if isinstance(r, (list, tuple)) and len(r) == 4:
+        try:
+            x, y, w, h = (int(v) for v in r)
+            if w > 0 and h > 0:
+                return (x, y, w, h)
+        except (TypeError, ValueError):
+            pass
+    try:
+        x, y = int(push.get("region_x") or 0), int(push.get("region_y") or 0)
+        w, h = int(push.get("region_w") or 0), int(push.get("region_h") or 0)
+        if w > 0 and h > 0:
+            return (x, y, w, h)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def window_reply_text():
+    """一行回给 B 机：`WIN x y w h`（拿不到 ⇒ `WIN -` ✓）。
+
+    ⚠ 格式与 `CUR …` 同一套（纯 ASCII 一行 ✓ 见 `cursor_reply_text` ✓）——
+      千万别塞中文 / 空格以外的分隔符 ✗（B 机按 `split()` 解 ✓）。
+    """
+    try:
+        r = _window_rect()
+    except Exception:                            # noqa: BLE001
+        r = None
+    if not r:
+        return "WIN -"
+    return "WIN %d %d %d %d" % (r[0], r[1], r[2], r[3])
+
+
 def _capture_region_size():
     """推流**抓的是哪块屏** ⇒ `(w, h)`；说不准 ⇒ `None` ✓（**不许猜** ✗ 见下面说明 ✓）。
 
@@ -704,6 +806,17 @@ def bridge(conn, link):
                     pass
                 if not data:
                     continue                      # 就这一条 ⇒ 不用再写串口 ✓
+            if WINDOW_QUERY in data:
+                # ⭐ 「问游戏窗口在哪」—— 同 `CURSOR?`：**不写串口** ✗、由 relay 自己答 ✓。
+                #   ⚠ 同样必须共用 `_SEND_LOCK`（见上面那段血的教训 ✓）。
+                data = data.replace(WINDOW_QUERY, b"")
+                try:
+                    with _SEND_LOCK:
+                        conn.sendall((window_reply_text() + "\n").encode("ascii"))
+                except Exception:                # noqa: BLE001
+                    pass
+                if not data:
+                    continue
             trace("tcp->serial %s"
                   % data.decode("ascii", "replace").replace("\n", "|")[:60])
             # ⭐ **写串口耗时**（`KbdStats` 要它）：这就是"下游堵没堵"的直接证据 ✓

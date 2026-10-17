@@ -569,7 +569,11 @@ class ServiceCard(QFrame):
             rect = ask_region(owner=self)
         except Exception as e:
             # 抓屏失败（没有可用屏幕 / 远程会话）也要说清楚，别静默什么都不发生
-            QMessageBox.warning(self, "框选失败", "%s: %s" % (type(e).__name__, e))
+            QMessageBox.warning(
+                self, "框选失败",
+                "%s: %s\n\n这一次的抓屏参数已存到\n  data/debug/region_grab.txt\n"
+                "（屏幕 / 缩放 / 是否黑图都写在那儿 ⇒ 下次\"又坏了\"不用猜 ✓）"
+                % (type(e).__name__, e))
             return
         if not rect:
             return
@@ -621,7 +625,11 @@ class ServiceCard(QFrame):
         try:
             rect = ask_region(owner=self)
         except Exception as e:                     # noqa: BLE001 —— 抓屏失败也要说清
-            QMessageBox.warning(self, "框选失败", "%s: %s" % (type(e).__name__, e))
+            QMessageBox.warning(
+                self, "框选失败",
+                "%s: %s\n\n这一次的抓屏参数已存到\n  data/debug/region_grab.txt\n"
+                "（屏幕 / 缩放 / 是否黑图都写在那儿 ⇒ 下次「又坏了」不用猜 ✓）"
+                % (type(e).__name__, e))
             return
         if not rect:
             return

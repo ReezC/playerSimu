@@ -722,12 +722,17 @@ class DecisionSettings:
         # 为什么：上绳失败常常是"这次就是歪了"，越往后越该多稳一会儿再重来 ✓。0 = 不累加（老行为）。
         # 算法**只有一处**（`retry_delay_s` ✓，便于自检 ✓）。
         self.climb_retry_delay_inc_s = 1.0
-        self.debounce_conf = 0.5    # 防抖置信度：高于它的怪框消失后保留位置
-        self.debounce_ms = 300      # 防抖时间（毫秒）：保留消失前位置的时长
-        # ⚠ 2026-10-13：「**锁定怪物丢框防抖时间(ms)**」`lock_mob_ghost_ms` **整套删了** ✓
-        #   （用户原话："**移除「锁定怪物丢框防抖时间」的配置与功能（这是重复功能）**"✓）——
-        #   它本来就是"只对锁定那只、把防抖时间换个数"✓，与上面那两条重复 ✓。
-        #   ⇒ 幽灵框只剩**一条链**：`debounce_conf` + `debounce_ms` ✓（判据在 `MobTracker` ✓）。
+        # ⭐⭐⭐⭐⭐ 2026-10-17 **「防抖置信度 / 防抖时间」整套删掉** ✓（用户原话：
+        #   「**去掉现在的怪物检测框防抖置信度和防抖时间的配置和逻辑，现在完全不对**」✗）：
+        #   它们把「这一拍**显不显示**」和「消失后**还留多久**」混成一对旋钮 ⇒
+        #   调"时间"救不了"闪"✓；而"留多久"又要求"曾经到过那个置信度" ⇒ 置信度在阈值
+        #   上下跳的目标**两头不靠** ✓（现场：同一个怪的框一闪一闪、甚至整拍消失 ✓）。
+        #   ⇒ 现在交给 **ByteTrack**（`perception/bytetrack.py` ✓）：两阶段关联（高分/低分）＋
+        #     卡尔曼 **8 维匀速**平滑 ＋ 确认闸（连续 2~3 帧）✓ —— 时间参数只剩下面**一个** ↓
+        #: ⭐ **失联帧长**（毫秒 ✓ 用户 2026-10-17 定的**新参数** ✓ 默认 **1000ms** ✓）：
+        #: 轨迹丢掉检测后还能活多久（换帧数 = 毫秒 × fps ✓ 见 `ByteTracker._buffer_frames` ✓）。
+        #: 它就占原来「防抖时间」的位置 ✓ —— 但判据换成 ByteTrack 那一套 ✓ 不再混"显示" ✓。
+        self.track_buffer_ms = 1000
         # ⚠ 「自动喂宠」整块**已移除**（用户 2026-09-26：他会用**自定义定时行为**自己实现 ✓）。
         #    按键那一层（`keymap["feed_pet"]` / 行为编辑器里的「喂宠」）**必须保留** ✓ ——
         #    那正是他实现它要用的东西，别顺手一起删掉 ✗。
@@ -981,10 +986,9 @@ class DecisionSettings:
                 #   `datasets/map/<id>.battle.json`（`core.battle` ✓，由路线识别面板读写、
                 #   换图时灌进 `settings.battle_zones` ✓）。老项目文件里可能还留着这两个键 ⇒
                 #   `from_dict` 直接忽略；旧配置的**迁移**在 `route_panel` 那次"换图"里显式做 ✓。
-                "debounce_conf": self.debounce_conf,
-                # ⚠ 「锁定怪物丢框防抖时间(ms)」这个键**已移除**（2026-10-13 ✓ 用户点名删 ✓）
-                #   —— 老项目文件里可能还留着它 ⇒ `from_dict` **直接忽略** ✓（别写回去 ✗）。
-                "debounce_ms": self.debounce_ms,
+                # ⭐ 「失联帧长(ms)」（2026-10-17 ✓ 取代 `debounce_conf` / `debounce_ms` ✓）：
+                #   老项目文件里那两个键**不读、也不再写回** ✓（同 `walk_mode` 的处置 ✓）。
+                "track_buffer_ms": self.track_buffer_ms,
                 # ⚠ 「自动喂宠」的三个键已移除（2026-09-26）—— 老项目文件里可能还留着，
                 #    `from_dict` **直接忽略**它们 ✓（已经不是参数了，别再写回去 ✗）。
                 "custom_timers": self.custom_timers,
@@ -1292,11 +1296,10 @@ class DecisionSettings:
         self.battle_zone_sets = []
         # ⚠ 老配置里可能还留着 `walk_mode` 键 —— **直接忽略**（用户 2026-09-26 删掉了它：
         # 走只有"朝集合中点"一种走法）⇒ 不读、也不再写回（见 `to_dict`）。
-        self.debounce_conf = float(data.get("debounce_conf", 0.5))
-        # ⚠ 「锁定怪物丢框防抖时间(ms)」**已移除**（2026-10-13 ✓ 用户点名删 ✓）：
-        #   老项目 / 老模板里可能还留着那个键 ⇒ **直接忽略** ✓（不读、也不再写回 ✓
-        #   同上面 `walk_mode` 的处置 ✓）。
-        self.debounce_ms = int(data.get("debounce_ms", 300))
+        # ⭐ **失联帧长(ms)**（ByteTrack 的 `track_buffer` ✓ 用户 2026-10-17 ✓ 默认 1000ms ✓）。
+        #   ⚠ 老的 `debounce_conf` / `debounce_ms` **直接忽略** ✓（那一套已删 ✗ 不读、
+        #   也不再写回 ✓ 同 `walk_mode` 的处置 ✓）。
+        self.track_buffer_ms = int(data.get("track_buffer_ms", 1000))
         # ⚠ 老项目文件里可能还留着 `auto_feed_pet` / `feed_interval_min|max`
         #    （「自动喂宠」2026-09-26 已整块移除）—— **直接忽略** ✓，不读、也不再写回 ✓。
         #    想喂宠就用「自定义定时行为」配一条（按键那层的「喂宠」键还在 ✓）。
@@ -3790,7 +3793,10 @@ class CombatAgent:
         # ⭐⭐ **「走不动按跳」开关灌进走任务**（用户 2026-10-06 ✓ 见 `DecisionSettings.walk_stall_jump`）——
         #   **只有这一处**：命令前往 / 追怪 / 用例…… 所有走任务都要过 `start_climb` ✓
         #   ⇒ 不用在每个 `WalkJob(...)` 调用点各传一遍 ✗（那种迟早漏一处 ⇒ "开了没生效" ✓）。
-        #   ⚠ 只认走任务 ✓（爬 / 下跳 / 跳 没有这一项，别给它们塞个没用的属性 ✗）。
+        #   ⚠ 判据是 `hasattr` ✓ 所以**谁有这个属性谁就吃到**：现在有两处 ——
+        #     `WalkJob`（走路 ✓）与 `ClimbJob`（**对齐绳梯那一段走不动** ✓ 用户 2026-10-17
+        #     现场「卡在 L13 绳梯、也没触发走不动跳一下」✗ 见 `route.ClimbJob._align_stall_hop` ✓）；
+        #     下跳 / 跳过门**没有**这一项（别给它们塞个没用的属性 ✗）。
         #   ⚠⚠ **判据用 `hasattr`，不许写 `isinstance(job, route.WalkJob)`** ✗ ——
         #     `agent.py` 里**没有** `route` 这个模块名（route 是**反过来** import agent 的这边 ✗）
         #     ⇒ 那么写会 `NameError: name 'route' is not defined`，而且**只有走到 start_climb

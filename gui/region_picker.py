@@ -279,16 +279,172 @@ def select_on_pixmap(pix, origin=(0, 0), parent=None, zoom=ZOOM_DEFAULT):
     return sel.result_rect() if sel.exec_() == QDialog.Accepted else None
 
 
-def grab_primary_pixmap():
-    """抓主屏 → (QPixmap, 屏幕原点)。
+#: 「抓屏是黑的」判据：亮度 < `BLACK_LIGHTNESS` 的采样点占比 ≥ 它 ⇒ 当作没抓到画面。
+#: ⚠ 只判**全黑**（985‰ 以上）✗ —— 游戏夜景本来就暗，判宽了会误报 ✓
+BLACK_RATIO = 0.985
+BLACK_LIGHTNESS = 8
 
-    默认抓屏方式只依赖 PyQt5 —— A 机部署台那边就够用（那里没装 numpy/opencv）。
-    B 机想用能跨显示器的抓屏（core.wincap），通过 `grab=` 传进来即可。
+#: 上一次抓屏的 **DPI 缩放比**（`devicePixelRatio` ✓ 归一化前 ✓）。
+#: 排查用：`dpr > 1` 说明那台机器开着 High DPI 缩放（`deploy/app.py` 里
+#: `AA_EnableHighDpiScaling` ✓）—— 框选坐标已按**逻辑像素**归一 ✓，
+#: 若推流区域仍旧整体偏移 dpr 倍，就是下游（`gdigrab` / 区域换算）按物理像素理解 ✓。
+last_scale = 1.0
+
+
+def _pick_screen():
+    """**哪块屏**该抓：光标所在屏 → 主屏 → 第一块屏（全没有 ⇒ None）。
+
+    ⚠⚠ **改这一条的真实理由，别记错 ✗**（2026-10-17 用户当场纠正过 ✓）：
+      · 用户报「**远程选区又坏了 / 怎么每次都坏？**」✓；
+      · 我先按**开发机**（双屏：主屏 `(0,0)`、副屏 `(-2560,0)`）推断"多屏 +
+        origin 写死 `(0,0)`" ⇒ 用户立刻回：「**A 机只有 1 块屏幕啊**」✗
+        —— 对，**多屏不是 A 机的病因**（A 机是单屏游戏机 ✓）；
+      · 单屏下 `primaryScreen()` 与光标屏是同一块、`origin` 也确实是 `(0,0)`
+        ⇒ 这两条**在 A 机上无害但也无用** ✓ 留着是因为"多屏用户"迟早会有 ✓
+        （多屏时它确实是**必错**的 ✓ 不是猜 ✓）。
+    ⇒ A 机"每次都坏"的真正嫌疑是另外两条（都在 `grab_screen_pixmap` 里 ✓）：
+      ① **缩放 ≠ 100%**：部署台开着 `AA_EnableHighDpiScaling` ✓ ⇒ `grabWindow`
+         给**设备像素** ⇒ 框选窗按设备像素设几何 ⇒ **窗口比屏幕大**、
+         只能看到左上角一块、存下来的区域整体放大 dpr 倍 ✓（单屏一样坏 ✓）；
+      ② **抓到黑图**：远程桌面断开 / 控屏软件画面没出来 / 锁屏 / 显示器休眠 ✓
+         ⇒ 以前**一声不吭**（人对着黑图框 ⇒ 存进去的区域毫无意义 ✓）
+         ⇒ 现在抛错说清 ＋ 落盘诊断（`_dump_grab_diag` ✓）。
     """
-    from PyQt5.QtGui import QGuiApplication
-    scr = QGuiApplication.primaryScreen()
-    pix = scr.grabWindow(0) if scr is not None else QPixmap()
-    return pix, (0, 0)
+    from PyQt5.QtGui import QCursor, QGuiApplication
+    scr = None
+    try:
+        scr = QGuiApplication.screenAt(QCursor.pos())
+    except Exception:                       # noqa: BLE001 —— 老 Qt / 无光标时退回主屏 ✓
+        scr = None
+    if scr is None:
+        scr = QGuiApplication.primaryScreen()
+    if scr is None:
+        screens = QGuiApplication.screens()
+        scr = screens[0] if screens else None
+    return scr
+
+
+def _looks_black(pix):
+    """这张图是不是**基本全黑**（远程桌面断开 / 锁屏 / 显示器休眠 ⇒ 抓屏给黑图 ✓）。
+
+    只采样 40×25 个点（`pixelColor` 一千次 ✓ 便宜 ✓）—— 目的不是精确判断，
+    而是**别让人对着黑图框** ✓（那样框出来存进 deploy.json 的区域毫无意义 ✓）。
+    """
+    if pix is None or pix.isNull() or pix.width() < 2 or pix.height() < 2:
+        return True
+    img = pix.toImage()
+    w, h = img.width(), img.height()
+    step_x, step_y = max(1, w // 40), max(1, h // 25)
+    total = dark = 0
+    for x in range(0, w, step_x):
+        for y in range(0, h, step_y):
+            total += 1
+            if img.pixelColor(x, y).lightness() < BLACK_LIGHTNESS:
+                dark += 1
+    return bool(total) and (dark / float(total)) >= BLACK_RATIO
+
+
+def _dump_grab_diag(ok, detail=""):
+    """把**这一次抓屏的真参数**落到 `data/debug/region_grab.txt`（**覆盖式 ✓ 纯文本 ✓**）。
+
+    ⚠ 为什么非有不可（用户 2026-10-17 ✓）：现象只有一句「**选区每次都坏**」✓，
+      而病因至少三种（**缩放 ≠ 100%** / **抓到黑图** / **窗口盖住** ✓），
+      光靠猜分不出来 ✓（我第一轮按多屏猜，用户当场纠正「**A 机只有 1 块屏幕**」✗）。
+      让机器自己把 `dpr / 抓屏尺寸 / 屏几何 / 光标 / 平台名 / 是否 High DPI` 写下来
+      ⇒ 下次"还坏"，看这一个文件就知道是哪一条 ✓ 不用再问"你那台是什么缩放"✓。
+    ⚠ A 机没有 numpy / opencv ✓ 这里只用 pathlib + PyQt5 ✓。
+    """
+    try:
+        import time as _t
+        from pathlib import Path as _P
+
+        from PyQt5.QtCore import Qt as _Qt
+        from PyQt5.QtGui import QCursor, QGuiApplication
+
+        d = _P("data") / "debug"
+        d.mkdir(parents=True, exist_ok=True)
+        scr = _pick_screen()
+        geo = scr.geometry() if scr is not None else None
+        cur = QCursor.pos()
+        lines = [
+            "time = %s" % _t.strftime("%Y-%m-%d %H:%M:%S"),
+            "ok = %s" % ("True" if ok else "False"),
+            "detail = %s" % str(detail)[:400],
+            "platform = %s" % QApplication.platformName(),
+            "high_dpi_scaling = %s"
+            % QApplication.testAttribute(_Qt.AA_EnableHighDpiScaling),
+            "screens = %d" % len(QGuiApplication.screens()),
+            "screen_used = %s" % (scr.name() if scr is not None else None),
+            # ⚠ 这里必须先转字符串 ✗ —— 直接 `% ((x, y, w, h))` 会被当成**多个参数**
+            #   ⇒ `TypeError: not all arguments converted` ⇒ 整条诊断被 except 吞掉 ✓
+            #   （第一版就是这样：文件根本没生成 ✓ 实测踩到 ✓）
+            "geometry = %s"
+            % (None if geo is None
+               else "(%d,%d %dx%d)" % (geo.x(), geo.y(), geo.width(), geo.height())),
+            "last_scale = %.3f" % float(last_scale),
+            "cursor = (%d, %d)" % (cur.x(), cur.y()),
+        ]
+        (d / "region_grab.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:                          # noqa: BLE001 —— 诊断绝不拖垮框选 ✗
+        pass
+
+
+def grab_screen_pixmap():
+    """抓**一块屏** → (QPixmap, 屏幕原点)。
+
+    四条口径（都是"每次都坏"那几条教训 ✓ 用户 2026-10-17 ✓）：
+      ① **跟光标走**（`_pick_screen` ✓）—— 不再写死主屏 ✗；
+      ② **origin = 那块屏的 `geometry().topLeft()`** ✓ —— 老实现写死 `(0, 0)` ✗，
+         副屏在左边时原点是 `-2560` ✓（`LoupeSelector` 靠它把图像坐标换算成屏幕坐标 ✓）；
+      ③ **DPI 归一**：`grabWindow` 在 125%/150% 缩放下返回**设备像素**
+         （2560×1440 的屏幕给 3840×2160 ✓）⇒ 不归一的话框选窗会**超出屏幕**、
+         存下来的区域也整体放大 1.5 倍 ✓ ⇒ 这里缩回**逻辑像素**并置 `dpr=1` ✓；
+      ④ **全黑就说清楚**（`_looks_black` ✓）—— 抛 `RuntimeError`，调用方已有
+         `QMessageBox.warning("框选失败", …)` ✓ 不会再"点了没反应 / 框了没生效" ✓。
+    ⚠⚠ **A 机是单屏**（用户 2026-10-17 当场纠正 ✓）⇒ ①② 对它无害也无用 ✓，
+      A 机"每次都坏"的主力是 **③ 缩放** 与 **④ 黑图** ✓ —— 别再把病因记错 ✗。
+    ⚠ 成功和失败**都**落一份诊断（`_dump_grab_diag` ✓）—— 下次"还坏"不用猜 ✓。
+    ⚠ 只依赖 PyQt5 ✓（A 机部署台没有 numpy/opencv ✓ 别在这里 import 它们 ✗）。
+    B 机那条跨屏的路走 `region_selector._grab_virtual_screen`（wincap ✓ 与本函数无关 ✓）。
+    """
+    from PyQt5.QtCore import Qt
+
+    scr = _pick_screen()
+    if scr is None:
+        _dump_grab_diag(False, "没有可用的屏幕")
+        raise RuntimeError("没有可用的屏幕（远程桌面断开 / 显示器没接？）")
+    geo = scr.geometry()
+    pix = scr.grabWindow(0)
+    if pix is None or pix.isNull():
+        _dump_grab_diag(False, "grabWindow 返回空图（screen=%s）" % (scr.name(),))
+        raise RuntimeError("抓屏失败（屏幕 %s 抓不到画面：远程桌面断开 / 锁屏 / 显示器休眠？）"
+                           % (scr.name(),))
+    dpr = float(pix.devicePixelRatio() or 1.0)
+    global last_scale
+    last_scale = dpr
+    if dpr > 1.0001:
+        pix = pix.scaled(max(1, int(round(pix.width() / dpr))),
+                         max(1, int(round(pix.height() / dpr))),
+                         Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        pix.setDevicePixelRatio(1.0)
+    if _looks_black(pix):
+        _dump_grab_diag(False, "抓屏全黑（screen=%s）" % (scr.name(),))
+        raise RuntimeError(
+            "抓屏是**全黑**的（屏幕 %s）—— 多半是：\\n"
+            "  · 远程桌面断开 / 锁屏 / 显示器休眠（A 机画面根本没输出）；\\n"
+            "  · 或者游戏窗口被最小化 / 藏到了另一块屏。\\n"
+            "把 A 机画面亮出来再框一次 ✓（真是黑屏场景就忽略这条提示）。"
+            % (scr.name(),))
+    _dump_grab_diag(
+        True,
+        "screen=%s geometry=%r dpr=%.3f 归一后=%dx%d（该屏逻辑 %dx%d）"
+        % (scr.name(), (geo.x(), geo.y(), geo.width(), geo.height()),
+           float(last_scale), pix.width(), pix.height(), geo.width(), geo.height()))
+    return pix, (int(geo.x()), int(geo.y()))
+
+
+#: 兼容旧名字（老调用方 / 老自检按这个名字取 ✓ 行为已升级为"光标所在屏" ✓）
+grab_primary_pixmap = grab_screen_pixmap
 
 
 def select_screen_region(parent=None, zoom=ZOOM_DEFAULT, hide_owner=True, grab=None):
@@ -298,7 +454,9 @@ def select_screen_region(parent=None, zoom=ZOOM_DEFAULT, hide_owner=True, grab=N
     盖着调用方自己的界面，人对着自己的窗口框游戏里的东西（部署台那条路上
     实测踩过）。窗口在 finally 里 show() 回来，中途取消也不会把界面弄丢。
 
-    grab 返回值是 (QPixmap, origin)：默认 `grab_primary_pixmap`（Qt 抓主屏）。
+    grab 返回值是 (QPixmap, origin)：默认 `grab_screen_pixmap`
+    （**抓光标所在那块屏** ✓ 带正确 origin 与 DPI 归一 ✓ 2026-10-17 ✓ ——
+     老默认是"只抓主屏 + origin 写死 (0,0)"✗，多显示器下每次都错 ✓）。
     """
     if grab is None:
         grab = grab_primary_pixmap

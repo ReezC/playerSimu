@@ -1,51 +1,37 @@
-"""怪物跨帧追踪：给检测框稳定的 id。
+"""怪物跨帧追踪：给检测框稳定的 id（**2026-10-17 换内核**）。
 
-决策层要「盯住同一只怪」——单帧检测框没有 id，某帧漏检就会换目标。
+⭐⭐⭐ 用户 2026-10-17 原话（一字不改）：
+  「**去掉现在的怪物检测框防抖置信度和防抖时间的配置和逻辑，现在完全不对**。
+   接 ByteTrack，新参数『**失联帧长**』（track_buffer）代替以前的『防抖时间』，默认 1000ms。
+   稳定 ID 后，再用卡尔曼/EMA 平滑输出框坐标做轻量平滑，对 `(cx, cy, w, h)` 建 **8 维状态**，
+   **匀速模型**够用：观测 = YOLO 框；预测 = 上一帧速度外推；更新 = 观测值融合。
+   按 `track_id` 维护每个目标的：**最近 N 帧位置、平均置信、存活时间**；
+   新出现的**低分框先挂 buffer，连续 2~3 帧稳定再认**。」
 
-**实现：运动补偿 + 同体合并 + 平滑/幽灵 + 确认闸 + 全局最优分配**：
-    前几条是自己踩出来的（见下）；2026-10-11 又借了 `visual_tracking_sdk_20260920` 的
-    **OC-SORT 纪律**（确认 / 低分维持身份 / 全局分配 ✓ 见 `docs/开发日志-4.md` 那一天 ✓）。
-    ⚠ **不用卡尔曼** ✗（那是"视频里目标会匀速滑行"的假设 ✓；这里是游戏，怪会急停/瞬移 ✓
-    「运动补偿 + 认领半径」更贴合 ✓），但**认领那一步改成全局最优** ✓（原因见第 4 条 ✓）。
-    每条规则都冲着**实测踩过的现象**去的，出了问题好定位：
+⚠ **旧实现为什么"完全不对"**（别再走回去 ✗）：把「**这一拍显不显示**」和
+  「**消失后还留多久**」两件事塞进同一对旋钮（`debounce_conf` / `debounce_ms`）⇒
+  调"时间"救不了"闪烁"✓；而"留多久"又要"曾经到过 `debounce_conf`" ⇒ 置信度在阈值
+  上下跳的目标**两头不靠** ✓（现场：同一只怪的框一闪一闪、甚至整拍消失 ✓）。
 
-    1) **运动补偿匹配**（只比 IoU 不够）
-       相邻两帧 IoU 会随移动掉得很快：同尺寸的框横移 d（框宽 w）时
-       IoU ≈ (w-d)/(w+d) —— 移动超过约 0.54w 就跌破 0.3。怪在走、框又小的时候
-       这就是常态 → 同一个怪**每帧新起一条轨迹**，屏幕上是"移动轨迹上排着一串框"。
-       所以先按速度**预测**它这一帧该在哪，再用「IoU 达标」或「离预测位置够近
-       （和框尺寸挂钩）」两种方式认领。YOLO 把框判大判小（只框到半个身子）
-       中心却没怎么动 —— 这类也靠距离那条兜住。
+**现在两层，职责分开**：
+  · `perception/bytetrack.py::ByteTracker` —— ByteTrack 内核：两阶段关联（高分 / 低分）✔
+    卡尔曼 **8 维匀速**平滑 ✔ **失联帧长**缓冲 ✔ 确认闸 ✔ 每轨记账（历史/平均置信/存活）✔
+  · `perception/tracker.py::MobTracker` —— 只做业务适配：相机（角色）位移补偿 ✓、
+    `Track → Mob` 转换 ✓、保持对外接口（`update` / `kill` / `drain_flick` / `diag`）✓
 
-    2) **同体合并**（幽灵框 + 新轨迹是同一只怪）
-       上一条漏了的时候：防抖留下的幽灵框停在旧位置，新起的轨迹在新位置，
-       两者**同时**输出 → 看起来又是一串框。合并时保留**活得久的那个 id**
-       （决策层的目标锁定 CD 靠 id 稳定），位置取更新鲜的那条。
+对外接口（**一个字没改** ✓）：
+  `update(detections, low_detections=(), player_world=None) -> [Mob]`；
+  `Mob.missed > 0` = 「失联缓冲期内的幽灵框」（决策层靠它防空放技能 ✓）；
+  `Mob.peak_conf` = 这条轨迹历史最高置信度（界面角标 `#id conf/peak` ✓）。
 
-    3) **位置/尺寸平滑 + 幽灵外推**（"框在抖"与"框粘在原地"）
-       检测本身有噪声，直接输出框会一直晃；防抖期间冻结在旧位置，移动目标
-       又会和框越差越远（决策层朝空位置走 / 空放技能）。所以：位置按"移动快
-       就不平滑、几乎不动就重平滑"的自适应系数走，尺寸恒定平滑；漏检期间按
-       衰减的速度继续走一小段（有总位移上限）。
-
-    4) **确认才输出 / 低分只维持身份 / 全局最优认领**（2026-10-11 ✓ 用户原话："**防抖置信度+
-       防抖时间的配置 基本无效，同个怪物的检出框疯狂闪烁**"✓ ⇒ 照 `visual_tracking_sdk_20260920`
-       的 OC-SORT 纪律补的三条 ✓ 每条都有它治的现象，见 `update` 的说明 ✓）：
-       · 新轨迹**要确认**（连续 2 拍 **且** 活满 60ms ✓）才输出 ⇒ 单帧假框不再"闪一下" ✓；
-       · `conf_mob` 以下的框**只能续已有轨迹、不能新建身份**（借 BYTE ✓）⇒ 置信度在阈值
-         上下跳的那几拍不再"整拍查无此怪" ✓（原来幽灵规则也救不了它 ✓）；
-       · 认领改成**全局最优**（`perception/assign.py` ✓）⇒ 两条轨迹不再"先到先挑"✓
-         （贪心偶尔会把两条轨迹的对像互换 ⇒ id 跳一下 ⇒ 看着就是闪 ✓）。
-    ⚠⚠ 那两个**界面旋钮**（`debounce_conf` / `debounce_ms`）只管"**消失后还留多久**"✗
-      —— 它们**不决定"这一拍显不显示"** ✓（显示由上面的**确认闸**管 ✓ 别再把两者混起来 ✗）。
-
-对外接口：`update(detections, low_detections=()) -> [Mob]`、`kill(id)`；
-`Mob.missed > 0` 仍然表示「幽灵框（这一帧没检测到，靠防抖留着）」—— 决策层就靠它防空放技能。
-`Mob.peak_conf`（2026-10-11 新增 ✓）是这条轨迹**历史最高**置信度，给界面角标看"它到底多确信"✓。
+⚠ 下面这一大段模块常量是**旧内核**留下的读数口径：现在只有 `CAM_MAX_STEP`
+  （相机位移离谱线 ✓）、`MOB_LOW_CONF_RATIO`（`split_dets` 分档 ✓）还在用；
+  其余（确认闸 / GMC / 补桥 / 跳变隔离）**已被 ByteTrack 的两阶段关联 + 匀速外推替换** ✓
+  —— 留着是为了不让历史用例/工具 import 报错 ✗ 新代码**别再用它们** ✗。
 """
 import time
 
-from perception.assign import BIG as _ASSIGN_BIG, hungarian as _assign_pairs
+from perception.bytetrack import CONFIRM_FRAMES, TRACK_BUFFER_MS, ByteTracker
 from perception.world_state import Mob
 
 #: ⭐⭐ 确认闸（2026-10-11 ✓ 治"框疯狂闪烁"✓ 借 OC-SORT 的 `lock_confirmations` 思路 ✓）：
@@ -140,129 +126,76 @@ def _iou(a, b):
 
 
 class MobTracker:
-    """贪心匹配的怪追踪器（带运动补偿 / 同体合并 / 平滑，见模块文档）。
+    """怪物追踪器（**2026-10-17 换内核**：`perception.bytetrack` ✓ 见模块文档）。
 
-    update(detections) 返回本帧的 Mob 列表；
-    detections 形如 [(x1, y1, x2, y2, conf), ...]（YOLO 输出的 xyxy + 置信度）。
-
-    下面这些参数都是"手感"参数，**先固定在内部**：调歪了比不调更糟，
-    真要开给界面也得先把每一条的现象描述清楚（就像 debounce_* 那两条）。
+    ⚠ 对外契约**一个字没改**：
+      · `update(detections, low_detections=(), player_world=None) -> [Mob]`；
+      · `kill(mob_id)` / `drain_flick()` / `diag`；
+      · `Mob.missed > 0` 仍是「失联缓冲期内的幽灵框」✓（只是"缓冲多久"换了名字：
+        **失联帧长** `track_buffer_ms` ✓ 用户 2026-10-17 ✓ 默认 1000ms）。
     """
 
-    def __init__(self, min_iou=0.3, max_age=15, gate_ratio=0.9, merge_iou=0.5,
-                 smooth=0.55, size_smooth=0.5, vel_smooth=0.6,
-                 ghost_decay=0.75, ghost_max_shift=0.6):
-        self.min_iou = min_iou      # IoU 匹配阈值（达到就直接认领）
-        self.max_age = max_age      # 保留兼容：清理现在按**时间**算（见 update 第 4 步）
-        # 认领半径 = gate_ratio × 框的长边（兜住"移动快 / 框判小"导致的 IoU 崩掉）
-        self.gate_ratio = gate_ratio
-        self.merge_iou = merge_iou  # 两条轨迹 IoU 超过它 = 同一只怪（合并）
-        self.smooth = smooth        # 位置平滑上限（移动快时自动降下来，见 _gain）
-        self.size_smooth = size_smooth  # 尺寸平滑（恒定，怪的大小不会突变）
-        self.vel_smooth = vel_smooth    # 速度平滑（预测用，抖动的速度预测不准）
-        self.ghost_decay = ghost_decay  # 幽灵框每帧速度衰减
-        self.ghost_max_shift = ghost_max_shift  # 幽灵总位移上限（× 框长边）
-
-        #: 防抖置信度：这只怪**曾经达到过**它 ⇒ 消失后按「防抖时间」残留（幽灵框 ✓）。
-        #: ⭐ 2026-10-01 起判据是**历史最高置信度**（`peak_conf`），不是最后一次 ✓。
-        #: ⚠⚠ 2026-10-13：「**锁定怪物丢框防抖时间**」那套（`locked_id` / `lock_ghost_ms` /
-        #:   `Mob.lock_ghost`）**整套删掉了** ✓（用户原话："移除「锁定怪物丢框防抖时间」的配置与
-        #:   功能（**这是重复功能**）"✓—— 它本来就是"只对锁定那只、把防抖时间换个数"✓
-        #:   与这一格重复 ✓）⇒ 现在**一条链**：见下 `debounce_*` ✓。
-        #: ⭐⭐⭐ **相机锚 + 这一帧的相机位移**（用户 2026-10-13 ✓ 见 `_shift_cam` ✓）：
-        #:   `cam` = 上一次吃的可信相机（`世界 = 画面 + 相机` ✓ 由调用方灌 ✓ 见 `update` ✓）；
-        #:   `cam_dx/dy` = 这一帧挪了多少（打点 / 排查用 ✓）。
+    def __init__(self, track_buffer_ms=None, confirm_frames=None,
+                 cam_max_step=CAM_MAX_STEP):
+        self.bt = ByteTracker(
+            track_buffer_ms=(TRACK_BUFFER_MS if track_buffer_ms is None
+                             else float(track_buffer_ms)),
+            confirm_frames=(CONFIRM_FRAMES if confirm_frames is None
+                            else int(confirm_frames)),
+        )
+        #: 相机位移的"离谱线"（超过它 = 传送 / 换图 ⇒ 这一帧不挪、只重锚 ✓ 见 `_shift_anchor` ✓）
+        self.cam_max_step = float(cam_max_step)
+        #: 上一次吃的可信锚（角色世界坐标）与这一帧挪了多少（打点用 ✓）
         self.cam = None
         self.cam_dx = self.cam_dy = 0.0
-        self.debounce_conf = 0.0
-        self.debounce_ms = 0.0      # 防抖时间（毫秒）
-        self._tracks = []       # 每条是 dict，字段见 _new_track
-        self._next_id = 1
-        #: ⭐⭐⭐⭐ GMC 兜底（见 `GMC_MIN_TRACKS` ✓ 用户 2026-10-13 ✓）：
-        #: `gmc` = 上一次算出的"**画面整体平移**"（`None` = 样本不够 / 还没算过 ⇒ 那几拍照旧
-        #: 不挪 ✓ 宁缺勿错 ✓）；`_gmc_samples` = **这一帧**收集到的原始位移样本（`_absorb` 写、
-        #: `update` 末尾结算并清 ✓ 一个事实一个写者 ✓）；`_frame_no` 只在 `update` 里 +1 ✓
-        #: —— 用来判"这只怪**上一帧也见过**"（只有连续两帧都见到，它的位移才是"这一帧"的 ✓）。
+        #: ⚠ 兼容字段（旧 GMC 兜底已被"匀速模型外推"接替 ✓ 别再读写它 ✗）
         self.gmc = None
-        self._gmc_samples = []
-        self._frame_no = 0
-        #: ⭐⭐ **这一拍的账**（2026-10-11 ✓ 给 `behavior.log` 用 ✓ 见 `drain_diag`）：
-        #:   新建 / 认领 / 低分续命 / 幽灵 / **没确认就没了（= 闪一下 ✓）** 各几条。
-        #:   ⚠ 它是**读数**：只在 `update` 里重置并累加 ✓ 别处不许写 ✗（R1 一个事实一个写者 ✓）。
+        #: 这一帧的读数（给 `behavior.log` 用 ✓ 口径仍是老的六个名字 ✓）
         self.diag = {"created": 0, "matched": 0, "ghost": 0, "low": 0,
-                     "dropped_young": 0, "unconfirmed": 0}
-        #: 「闪一下」的现场（最多留 `FLICK_KEEP` 条 ✓）—— 由 `drain_flick()` 取走打点 ✓。
-        #: ⚠ 为什么要有它：用户报的"**同个怪物的检出框疯狂闪烁**"有两种完全不同的成因
-        #:   （① 同一个 id 闪 = 检测不稳 ✓；② **每帧换 id** = 认领/新建有问题 ✓）✗
-        #:   ⇒ 不把 id 与存活拍数打出来，**只能靠猜** ✓（沿用 SKILL 315 那条：
-        #:     只在日志里 = 等于没有 ✓ 但至少要有 ✓）。
-        self.flick = []
+                     "dropped_young": 0, "unconfirmed": 0,
+                     "tracks": 0, "buffer": 0}
 
-    # ---------------- 轨迹 ----------------
+    # ---------------- 只读快照（兼容旧自检 / 打点 ✓） ----------------
+    @property
+    def _tracks(self):
+        """轨迹的**只读快照**（老代码/老用例按 `t["id"] / t["x1"]` 读 ✓ 2026-10-17）。
 
-    @staticmethod
-    def _new_track(tid, x1, y1, x2, y2, conf, now):
-        return {
-            "id": tid, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-            "conf": conf,
-            #: ⭐ **历史最高置信度**（用户 2026-10-01 ✓）：**界面角标**用"它到底多确信"
-            #:   （只认**高分档** ✓ 见 `_absorb` ✓）。
-            "peak_conf": conf,
-            #: ⭐⭐⭐ **两个档位都算的最高置信度** → **防抖判据读它**（用户 2026-10-13 ✓
-            #:   原话："只要曾经怪物到过该置信度阈值…"✓）；与 `peak_conf` 分开的原因见 `_absorb` ✓。
-            "any_conf": conf,
-            "missed": 0, "age": 1, "vx": 0.0, "vy": 0.0,
-            "shifted": 0.0,          # 幽灵外推累计走了多远（到上限就不走了）
-            "last_seen": now,
-            #: ⭐ **确认闸的两个依据**（2026-10-11 ✓ 见 `CONFIRM_HITS` / `CONFIRM_MS` ✓）：
-            #: 出生时刻（算"活满 60ms 没有"✓）与"确认过了吗"（**只涨不落** ✓
-            #: —— 一条轨迹一旦确认过就不再回退 ✓ 否则它会因为偶尔漏拍而重新"闪" ✓）。
-            "born": now, "confirmed": False,
-            #: ⭐ 2026-10-13 三样（用户"全部做完"✓ 各自见常量）：
-            #:  · `det` / `seen_frame` —— 上一次**原始检测中心**与那一拍的帧号 ⇒ GMC 采样用
-            #:    （只有"上一帧也见过"的配对才算 ✓ 见 `_absorb` ✓）；
-            #:  · `_q_box` / `_q_n` —— 同 ID 跳变隔离的计数（见 `update` 第 1 步 ✓）。
-            "det": None, "seen_frame": -1,
-            "_q_box": None, "_q_n": 0,
-        }
+        ⚠ 现在真正的轨迹是 `self.bt.tracks`（`Track` 对象 ✓）——
+          这里只是给"按字典读"的老代码一个兼容视图 ✓ **别再往里写** ✗。
+        """
+        out = []
+        for t in self.bt.tracks:
+            cx, cy, w, h = t.box
+            vx, vy = t.velocity()
+            out.append({"id": int(t.tid),
+                        "x1": cx - w / 2.0, "y1": cy - h / 2.0,
+                        "x2": cx + w / 2.0, "y2": cy + h / 2.0,
+                        "conf": float(t.conf), "peak_conf": float(t.peak_conf),
+                        "vx": vx, "vy": vy,
+                        "age": int(t.age), "missed": int(t.missed),
+                        "confirmed": bool(t.confirmed)})
+        return out
 
-    @staticmethod
-    def _center(t):
-        return ((t["x1"] + t["x2"]) / 2.0, (t["y1"] + t["y2"]) / 2.0)
+    # ---------------- 「失联帧长」的入口 ----------------
+    @property
+    def track_buffer_ms(self):
+        """**失联帧长**（毫秒 ✓ 用户 2026-10-17 定的新参数 ✓ 默认 1000ms）。"""
+        return self.bt.track_buffer_ms
 
-    @staticmethod
-    def _size(t):
-        return (t["x2"] - t["x1"], t["y2"] - t["y1"])
+    @track_buffer_ms.setter
+    def track_buffer_ms(self, value):
+        self.bt.track_buffer_ms = float(value)
 
+    # ---------------- 相机 / 角色位移补偿 ----------------
     def _shift_anchor(self, player_world):
-        """**把已有轨迹整体挪进"角色的相对系"**（用户 2026-10-13 ✓ 原话："**不应该**去算相机的
-        位移，而是应该**根据角色的世界坐标**去算**相对位移、相对速度**"✓）。
+        """**把已有轨迹整体挪进"这一帧的画面系"**（角色世界坐标变了 ⇒ 画面整体平移 ✓）。
 
-        ⚠⚠ **为什么是"角色的世界坐标"而不是"相机的位移"**（用户 2026-10-13 ✓ 追问）：
-          「同一只怪」这件事的本质是"**怪相对角色的位移/速度**" ✓ —— 角色自己的世界坐标一变
-          （走过去 / 被推 / 相机跟不动 ✓），怪在**画面**上的位置也会跟着变 ✗；而相机那份估算
-          会被冻结 / 拒收（`camera()` 的 `cam_resid` 闸 ✓）⇒ 拿它当锚不稳 ✗。
-          ⇒ 锚 = **角色的世界坐标** ✓（由调用方给：`画面 + 相机` ✓ 与全仓的
-          `world = screen + cam` 同一口径 ✓ 见 `PlayerTracker._cam_of` ✓）；
-          这一帧把它与上一帧比 ⇒ 得到**角色的世界位移** ✓ ⇒ 把老轨迹**反着挪**回去 ✗
-          ⇒ 之后 `_score` 比的才是"**怪自己**相对角色动了多少" ✓（`vx/vy` 也顺带成了
-          **相对速度** ✓ —— 它由连续两帧的**相对位置**算出 ✓）。
-        ⚠ 下面这个函数名/字段名保留了 `cam_*` 的历史叫法（`cam_dx/cam_dy` = 这一帧挪了多少 ✓）
-          —— 它算的就是"画面该反向挪多少" ✓ 与角色世界位移**逐字相等** ✓（世界 = 画面 + 相机 ✓）。
-
-        ⚠⚠ **为什么非有不可**：怪框是**画面坐标** ✓，而"世界 = 画面 + 相机"（见
-          `PlayerTracker.camera()` ✓）⇒ 角色一走 / 相机一滚，**同一只怪在画面上就平移** ✓
-          （世界没动、画面动了 ✓）。而 `_score` 那道闸只有 `max(10, 0.9 × 框长边)`——
-          一只 40px 的怪 ≈ 36px ✗ ⇒ 相机每帧滚十几像素、两拍就顶破 ✗ ⇒ **认领失败 ⇒ 同一个怪
-          换一个新 id** ✓✓（正是用户看到的那两条现象：**框立刻消失 + 再出现是新 id** ✓）。
-          ⇒ 认领之前先把轨迹按**相机位移**反着挪一次（`画面 = 世界 − 相机` ✓ 见 `_cam_of` ✓），
-          这样两边都在"这一帧的画面系"里，`_score` 比的才是**怪自己**的运动 ✓。
-
-        ⚠ 相机拿不到（`None` ✓ 没定位 / 刚起 / 小地图没读出黄点 ✓）⇒ **这一帧不挪**（= 老行为 ✓
-          宁缺勿错 ✓）；⚠ 位移大得离谱（传送 / 换图 ✓ 超过 `CAM_MAX_STEP`）⇒ **不挪、只重锚** ✓
-          （硬挪会把一堆轨迹甩到错地方 ✗）。
-        ⚠ 挪的是**位置**；`vx/vy`（画面速度 ✓）**不动** ✗ —— 它本来就含相机速度，用来自我外推
-          下一帧的画面位置**正是对的** ✓（`_score` 的预测项直接用 ✓）。
+        口径与旧版一致（见 `docs/开发日志-4.md` 2026-10-13 那条）：
+          · 锚 = **角色的世界坐标**（`世界 = 画面 + 相机` ✓ 由调用方给）；
+          · 这一帧与上一帧的差 = 角色的世界位移 ⇒ 轨迹**反着挪**回去 ✓；
+          · 拿不到锚 ⇒ **不挪**（宁缺勿错 ✓）；位移超过 `cam_max_step` ⇒ 当成传送 / 换图，
+            **只重锚、不挪** ✓（硬挪会把一屏轨迹甩到错地方 ✗）。
+        ⚠ 这里**只挪位置、不动速度** ✓ —— 速度是目标自己的 ✓（Kalman 里那条状态 ✓）。
         """
         self.cam_dx = self.cam_dy = 0.0
         try:
@@ -270,589 +203,69 @@ class MobTracker:
         except TypeError:
             ok = False
         if not ok:
-            self.cam = None                  # 拿不到 ⇒ 忘掉旧锚（别拿发霉的值硬挪 ✗）
-            # ⭐⭐⭐⭐ **GMC 兜底**（用户 2026-10-13 ✓ 见 `GMC_MIN_TRACKS` ✓）：
-            #   外部锚（小地图黄点世界坐标）拿不到的那几拍，用**上一次算出的"画面整体平移"
-            #   （多数派运动 ✓）**顶上 ✓ —— 原来这里**直接 `return`**（这一帧**完全不挪**）✗
-            #   ⇒ 认领闸（`0.9 × 框长边` ≈ 36px）被相机滚动顶破 ⇒ **框消失 + 换新 id** ✗✓
-            #   （现场那批 `age=1 / missed≈80` 的"闪一下"就是它 ✓）。
-            #   ⚠ 样本不够 / 还没算过 ⇒ 还是**不挪** ✓（宁缺勿错 ✓ 老行为 ✓）。
-            _g = getattr(self, "gmc", None)
-            if _g is None:
-                return
-            dcx, dcy = float(_g[0]), float(_g[1])
-            if (abs(dcx) > CAM_MAX_STEP or abs(dcy) > CAM_MAX_STEP
-                    or (not dcx and not dcy)):
-                return                   # 离谱（传送 / 换图 ✓）⇒ 不挪、只重锚 ✓
-            for t in self._tracks:
-                t["x1"] -= dcx
-                t["x2"] -= dcx
-                t["y1"] -= dcy
-                t["y2"] -= dcy
-            self.cam_dx, self.cam_dy = dcx, dcy
-            # ⚠ 先记成一次性标记 ✓（这一拍 `diag` 还没重置 ✓ 见 `update` 里那段说明 ✓）
-            self._gmc_used = True
+            self.cam = None
             return
         cx, cy = float(player_world[0]), float(player_world[1])
         if self.cam is None:
-            self.cam = (cx, cy)              # 第一帧：只记锚 ✓（没有"上一帧"可比 ✓）
+            self.cam = (cx, cy)          # 第一帧只记锚 ✓
             return
         dcx, dcy = cx - self.cam[0], cy - self.cam[1]
         self.cam = (cx, cy)
-        if abs(dcx) > CAM_MAX_STEP or abs(dcy) > CAM_MAX_STEP:
-            return                           # 传送 / 换图 ⇒ 重锚、这一帧不挪 ✓
+        if abs(dcx) > self.cam_max_step or abs(dcy) > self.cam_max_step:
+            return                       # 传送 / 换图 ⇒ 重锚、这一帧不挪 ✓
         if not dcx and not dcy:
             return
-        for t in self._tracks:
-            t["x1"] -= dcx
-            t["x2"] -= dcx
-            t["y1"] -= dcy
-            t["y2"] -= dcy
+        self.bt.shift(-dcx, -dcy)
         self.cam_dx, self.cam_dy = dcx, dcy
 
-    def _gmc_estimate(self):
-        """这一帧的「**画面整体平移**」估计 —— `None` = 样本不够（宁缺勿错 ✓）。
-
-        样本是"同一只怪这一帧与上一帧的**原始画面位移**"（`_absorb` 里收集 ✓ 见那边 ✓），
-        这里只做两件事（口径见 `GMC_MIN_TRACKS` ✓ 借 SDK 的 `_majority_motion` ✓）：
-          · **中位数**（多数派 ✓）：大多数怪自己没怎么动 ⇒ 中位数 ≈ 相机滚动 ✓；
-          · **再剔一次离群**（在跑的 / 被打飞的那只 ✓）后重新取中位数，剔完还得够数 ✓。
-        ⚠ 只用**高分档**的配对（低分档是"擦着阈值"的框 ✓ 位置噪声更大 ✗ 见 `_absorb` ✓）。
-        """
-        smp = self._gmc_samples
-        self._gmc_samples = []
-        if len(smp) < GMC_MIN_TRACKS:
-            # 这一拍没得算（配对太少 / 全在漏帧 ✓）⇒ **沿用上一次并衰减** ✓（见 `GMC_HOLD_RATIO` ✓）
-            g = getattr(self, "gmc", None)
-            if g is None:
-                return None
-            nx = float(g[0]) * GMC_HOLD_RATIO
-            ny = float(g[1]) * GMC_HOLD_RATIO
-            if abs(nx) < 0.5 and abs(ny) < 0.5:
-                return None
-            return (nx, ny)
-
-        def _med(vals):
-            s = sorted(vals)
-            return s[len(s) // 2]
-
-        mx, my = _med([v[0] for v in smp]), _med([v[1] for v in smp])
-        inl = [v for v in smp
-               if abs(v[0] - mx) <= GMC_INLIER_PX and abs(v[1] - my) <= GMC_INLIER_PX]
-        if len(inl) < GMC_MIN_TRACKS:
-            return None
-        return (_med([v[0] for v in inl]), _med([v[1] for v in inl]))
-
-    def _gate(self, t, relax=1.0):
-        """认领半径：和框的尺寸挂钩（`relax` = 给"补桥"那一趟放宽的倍数 ✓ 见 `MATCH_RELAX` ✓）。
-
-        为什么不用固定像素：小框（远处的怪）动几像素 IoU 就崩，大框能跑远点 ——
-        阈值跟着框走，各种距离下才是同一套手感。
-        ⚠ `relax` **只给补桥那一趟**用（`update` 1c ✓）：正常那一趟永远 1.0 ✓
-          —— 别在这儿写死放大 ✗（那等于把"两只贴着的怪"直接放到一起比 ✓ 更容易换错 ✓）。
-        """
-        w, h = self._size(t)
-        return max(10.0, self.gate_ratio * max(w, h)) * float(relax)
-
-    def _score(self, t, d, relax=1.0):
-        """这个检测框能不能认成这条轨迹：能认返回 >0，不能返回 -1。
-
-        分数只用来**排序**，不参与别处计算：IoU 达标的（score = IoU）永远排在
-        「只满足距离」的前面 —— 有真正重叠的框时，距离近不该抢走它。
-
-        ⚠ `relax`（默认 `1.0` = 老口径 ✓）只放宽**认领半径**那一条 ✗，**不放宽 IoU 档** ✓
-          —— 补桥那一趟（`MATCH_RELAX` ✓）要的是"漏了几拍之后还认得回来" ✓，
-          不是"允许随便配" ✓。
-        """
-        iou = _iou((t["x1"], t["y1"], t["x2"], t["y2"]), d[:4])
-        if iou >= self.min_iou:
-            base = iou
-        else:
-            cx, cy = self._center(t)
-            pcx, pcy = cx + t["vx"], cy + t["vy"]   # 预测位置（位置 + 速度外推）
-            dx = (d[0] + d[2]) / 2.0 - pcx
-            dy = (d[1] + d[3]) / 2.0 - pcy
-            dist = (dx * dx + dy * dy) ** 0.5
-            gate = self._gate(t, relax)
-            if dist > gate:
-                return -1.0
-            # 距离越近分数越高，但乘 0.99 压在 min_iou 之下（排序上永远次于 IoU 达标）
-            base = self.min_iou * 0.99 * (1.0 - dist / gate)
-        # ⚠ 年龄偏好**必须小到不会翻过 `min_iou`**（`1e-5 × 最多 50 拍` = 5e-4 ✓
-        #   而"只满足距离"那一档最高 0.297 ✓ ⇒ 加完仍 < 0.3 ✓ 那条不变量还在 ✓）
-        return base * self._dir_factor(t, d) + 1e-5 * min(int(t.get("age", 1) or 1), 50)
-
-    def _dir_factor(self, t, d):
-        """候选相对**上一拍中心**的位移方向，与这条轨迹速度方向的一致度：`[1-W, 1]` ✓。
-
-        借 OC-SORT 的 ORU（`_vendor/ocsort/association.py:251-284` ✓ 把"方向差"加进代价 ✓）：
-        怪在往右走时，右边那个候选比左边那个更"顺" ✓ —— 只在两个候选本来就接近时起作用 ✓
-        （权重 `MOTION_DIR_WEIGHT = 0.15` 很小 ✓ 不该推翻明确的 IoU / 距离判据 ✗）。
-        ⚠ 没有速度（刚认领 / 静止 ✓）⇒ 恒 `1.0`（完全不参与 ✓ 老行为 ✓ 不许抛 ✗）。
-        """
-        sx, sy = float(t.get("vx", 0.0) or 0.0), float(t.get("vy", 0.0) or 0.0)
-        speed = (sx * sx + sy * sy) ** 0.5
-        if speed <= 1e-6:
-            return 1.0
-        try:
-            cx, cy = self._center(t)
-            ux = (d[0] + d[2]) / 2.0 - cx
-            uy = (d[1] + d[3]) / 2.0 - cy
-        except (TypeError, IndexError, ValueError):
-            return 1.0
-        nu = (ux * ux + uy * uy) ** 0.5
-        if nu <= 1e-6:
-            return 1.0
-        cos = (ux * sx + uy * sy) / (nu * speed)
-        cos = max(-1.0, min(1.0, cos))
-        return 1.0 - MOTION_DIR_WEIGHT * (1.0 - cos) / 2.0
-
-    # ---------------- 每帧 ----------------
-
+    # ---------------- 主循环 ----------------
     def update(self, detections, low_detections=(), player_world=None):
-        """这一帧：认领 → 低分续命 → 漂移 → 新建 → 合并 → 清理 → **只输出确认过的** ✓。
-
-        ⭐⭐ 2026-10-11 三条（用户原话："**防抖置信度+防抖时间的配置 基本无效，同个怪物的
-        检出框疯狂闪烁**"✓ ⇒ 照 `visual_tracking_sdk_20260920` 的 OC-SORT 纪律补 ✓）：
-          ① **全局最优认领**（`_assign` ✓）：原来是"按轨迹顺序贪心、老轨迹先挑"✗ ——
-             贪心会"先到先挑"⇒ 两条轨迹偶尔**互换对像** ⇒ id 跳一下 ⇒ 看着就是闪 ✓；
-          ② **新轨迹要确认才输出**（`_confirmed` ✓）：原来新轨迹**当拍就输出**✗ ⇒
-             单帧假框 = 闪一下 ✓（时间地板见 `CONFIRM_MS` 的说明 ✓）；
-          ③ **低分框只续命、不新建身份**（`low_detections` ✓ BYTE ✓）：怪框 conf 在
-             `conf_mob` 上下跳的那几拍，原来**整拍查无此怪**✗ ⇒ 幽灵规则也救不了
-             （它要求"曾经达到过 防抖置信度"✓）⇒ 现在由低分框把轨迹续住 ✓。
-
-        ⚠⚠ **两个旋钮的边界**（回应用户那句"配置基本无效"✓）：`debounce_conf` /
-          `debounce_ms` 只管"**消失后还留多久**"✗，**不决定"这一拍显不显示"** ✓
-          —— 显不显示由**确认闸**说了算 ✓。想"更不容易闪"该调的是"看见"那一侧，
-          不是"消失"那一侧 ✓（这两件事以前被混在一起了 ✓）。
-        """
-        now = time.monotonic()
-        self._frame_no = int(getattr(self, "_frame_no", 0) or 0) + 1
-        low_detections = list(low_detections or ())
-        # ⭐⭐⭐ **先按"角色的世界位移"把轨迹挪进这一帧的相对系**（用户 2026-10-13 ✓
-        #   见 `_shift_anchor` ✓："**不应该**去算相机的位移，而是应该**根据角色的世界坐标**
-        #   去算**相对位移、相对速度**"✓）
-        #   ⚠ 必须在**认领之前** ✗ —— 挪晚了 `_score` 比的还是"两个不同系"的位置 ✓。
+        """这一帧：位移补偿 → ByteTrack（关联 / 卡尔曼融合 / 失联缓冲）→ `[Mob]` ✓。"""
         self._shift_anchor(player_world)
-        used = [False] * len(detections)
-        self.diag = {"created": 0, "matched": 0, "ghost": 0, "low": 0,
-                     "dropped_young": 0, "unconfirmed": 0,
-                     # ⭐ 2026-10-13 三条（用户"全部做完"✓）：GMC 兜底用上了 / 补桥救回一条 id /
-                     #   跳变隔离拦下一拍（见各自常量 ✓）—— 都是**读数**，给 behavior.log 看 ✓。
-                     "gmc": 0, "bridge": 0, "quarantine": 0}
-        # ⚠⚠ 「这一拍用了 GMC 兜底吗」必须在**上面那次移位里就记下来** ✓ —— 移位发生在
-        #   `used`/`diag` **之前** ✗ ⇒ 记进 `diag` 会被下面这行**当场抹掉** ✓（本轮用例
-        #   实测：`diag.gmc` 恒 0 ✓ 而其实挪了 ✓）⇒ 用这个一次性标记，`_shift_anchor` 里置上、
-        #   这里搬到 `diag` ✓（一处写一处搬 ✓ 不新造第二份状态 ✓）。
-        if getattr(self, "_gmc_used", False):
-            self.diag["gmc"] += 1
-            self._gmc_used = False
-
-        # 0) 先记账：这一拍谁都没认领到（认领成功的会被 `_absorb` 归零 ✓）
-        for t in self._tracks:
-            t["missed"] += 1
-
-        # 1) 认领（**全局最优** ✓）：代价 = `1 - 分数`，配不上的行留空 ✓
-        #    ⭐⭐⭐ 2026-10-13 起：这里多了**同 ID 跳变隔离**（用户"全部做完"✓ 见
-        #      `MOB_QUARANTINE_*` ✓ 借 SDK `branch_tracker.py:106-116` ✓）——
-        #      治"**id 没变、但框跳到了另一个更连续的位置**"（两只贴着的怪整体换身 ✓）：
-        #      这一拍**先别认**（让它按 coast 走 ✓），要**连着 3 拍都指向同一处**才认 ✓。
-        #      ⚠ 真·快速移动（掉平台 / 被击退 ✓）3 拍后照样认下 ✓ —— 不拦"真的在动" ✗；
-        #      ⚠ 万一那 3 拍里检测自己新建了一条 ✓ 还有 `_dedupe` 兜（同体合并保留老 id ✓）。
-        for ti, di in self._assign(self._tracks, detections):
-            t = self._tracks[ti]
-            d = detections[di]
-            _ocx = (t["x1"] + t["x2"]) / 2.0
-            _ocy = (t["y1"] + t["y2"]) / 2.0
-            _ncx = (d[0] + d[2]) / 2.0
-            _ncy = (d[1] + d[3]) / 2.0
-            _mv = ((_ncx - _ocx) ** 2 + (_ncy - _ocy) ** 2) ** 0.5
-            # ⚠ 判据是**相对**的（认领半径 × `MOB_QUARANTINE_JUMP_RATIO` ✓ 见常量说明：
-            #   绝对像素在这儿是死代码 ✗ —— 认领闸本身就只有 0.9×框长边 ✓）
-            _jump_lim = max(10.0, MOB_QUARANTINE_JUMP_RATIO * self._gate(t))
-            if _mv > _jump_lim:
-                _qb = t.get("_q_box")
-                if (_qb is not None
-                        and ((_ncx - _qb[0]) ** 2
-                             + (_ncy - _qb[1]) ** 2) ** 0.5 <= MOB_QUARANTINE_HOLD_PX):
-                    t["_q_n"] = int(t.get("_q_n", 0) or 0) + 1
-                else:
-                    t["_q_n"] = 1
-                t["_q_box"] = (_ncx, _ncy)
-                if int(t["_q_n"]) < MOB_QUARANTINE_FRAMES:
-                    self.diag["quarantine"] += 1
-                    continue                  # ⛔ 这一拍不认 ⇒ 它按 coast 走 ✓（下一拍再判 ✓）
-            else:
-                t["_q_n"], t["_q_box"] = 0, None
-            used[di] = True
-            self._absorb(t, d, now)
-            self.diag["matched"] += 1
-
-        # 1b) **低分框**只喂给"这一拍还没被正常框认领"的轨迹 ✓（⛔ 不能新建身份 ✗ = BYTE ✓）
-        if low_detections:
-            left = [i for i, t in enumerate(self._tracks) if t["missed"] > 0]
-            if left:
-                for k, dj in self._assign([self._tracks[i] for i in left],
-                                          low_detections):
-                    self._absorb(self._tracks[left[k]], low_detections[dj],
-                                 now, low=True)
-                    self.diag["low"] += 1
-
-        # 1c) ⭐⭐⭐ **跨漏帧重关联（"补桥"）**（用户 2026-10-13 ✓ 见 `MATCH_RELAX` ✓）：
-        #   这一拍还没配上的**已确认**轨迹，拿**剩下的正常框**再配一次（放宽 `MATCH_RELAX` 倍 ✓）
-        #   —— 目的只有一个：**同一个 id 回来** ✓。不补这一刀时，"漏两拍又出现"必然换新 id ✗
-        #   （现场 `age=1 / missed≈80` 那批：一次都没配上 ⇒ 只能新起一条 ✓ 用户看到的就是"闪"✓）。
-        #   ⚠ 只给**确认过**的轨迹（`confirmed` ✓）：没确认过的本来就不该有身份 ✗（防噪声复活 ✓）；
-        #   ⚠ 必须排在 1b（低分续命）之后 ✗ —— 低分框是"续命"用的 ✓ 不该抢这一趟的正经框 ✓。
-        _free = [i for i, _d in enumerate(detections) if not used[i]]
-        #   ⚠⚠ **正在跳变隔离里的不计入** ✗（本轮实测踩到 ✓ 记下来）：隔离那一拍会把配对
-        #     `continue` 掉 ✗，而这一趟补桥用的是**放宽后的闸**（`MATCH_RELAX` ✓）⇒ 它立刻
-        #     又把同一对配了回来 ⇒ **隔离形同虚设** ✓（用例当场红 ✓）⇒ 必须在这里排掉 ✓。
-        _lost = [t for t in self._tracks
-                 if t["missed"] > 0 and t["confirmed"] and int(t.get("_q_n", 0) or 0) == 0]
-        if _free and _lost:
-            for k, dj in self._assign(_lost, [detections[i] for i in _free],
-                                      relax=MATCH_RELAX):
-                t = _lost[k]
-                di = _free[dj]
-                used[di] = True
-                self._absorb(t, detections[di], now)
-                self.diag["bridge"] += 1
-
-        # 2) 还没认领到的 ⇒ 幽灵外推（同老行为 ✓ 只是挪到"低分续命"之后 ✓
-        #    —— 低分框已经认下它的，就不该再被推走 ✓）
-        for t in self._tracks:
-            if t["missed"] > 0:
-                self._drift(t)
-
-        # 3) 没被认领的**正常**框 → 新轨迹（⚠ **低分框永远不新建** ✗ = 第 ③ 条 ✓）
-        for i, d in enumerate(detections):
-            if not used[i]:
-                x1, y1, x2, y2, cf = d
-                _nt = self._new_track(self._next_id, x1, y1, x2, y2, cf, now)
-                # ⭐⭐⭐ **到过「防抖置信度」⇒ 出生那一刻就算数**（用户 2026-10-13 ✓ 原话：
-                #   "只要曾经怪物到过该置信度阈值…"✓）—— 见 `_confirmed` 里那条短路 ✓。
-                #   ⚠ 必须在**这儿**也判一次 ✗：不判的话这条新轨迹要等下一拍 `_absorb` 才确认
-                #     ⇒ "只被看见一帧"的怪**一个框都不出** ✗（真机日志里 429 条 `mob_flick`
-                #     全是这一档 ✓）⇒ 用户看到的"框一闪一闪"里那一半就是它 ✓。
-                if self._confirmed(_nt, now):
-                    _nt["confirmed"] = True
-                self._tracks.append(_nt)
-                self._next_id += 1
-                self.diag["created"] += 1
-
-        # 4) 同体合并：把"其实是同一只怪"的多条并成一条（一串框的元凶）
-        self._dedupe()
-
-        # 5) 清理长期漏检的轨迹。
-        # 用时间戳（和防抖同单位）：漏检时间超过「防抖时间 + 500ms 缓冲」才清理。
-        # 不能用 max_age 帧数 —— 帧数 × fps 随帧率变，高帧率时防抖还没到期
-        # 轨迹就被清掉了（防抖 1000ms ≈ 27 帧，但 max_age=15 帧 ≈ 0.5s 就清理）。
-        # ⭐ 顺手记"**闪一下**"：活得短、又从没确认过 ⇒ 记一条现场（给日志/界面 ✓ 见 `flick`）
-        # ⚠ 2026-10-13：「锁定怪物丢框防抖」删了 ⇒ 保留窗口就**只有一个**（防抖时间 ✓）
-        #   （原来要取 `max(debounce_ms, lock_ghost_ms)` ✗ 见版本历史 ✓）。
-        keep_ms = self.debounce_ms + 500.0
-        keep = []
-        for t in self._tracks:
-            if (now - t["last_seen"]) * 1000.0 <= keep_ms:
-                keep.append(t)
-            elif not t["confirmed"]:
-                self.diag["dropped_young"] += 1
-                self._note_flick(t, now)
-        self._tracks = keep
-
-        # 6) 输出：**确认过的** + 防抖期内的幽灵。
-        #    合并之后每条轨迹最多出一个框 —— id 也不会重复。
-        out = []
-        for t in self._tracks:
-            if not t["confirmed"]:
-                # 还没攒够"我看见它了" ⇒ **一个字都不输出** ✓（这就是治闪的那道闸 ✓）
-                self.diag["unconfirmed"] += 1
-                continue
-            if t["missed"] == 0:
-                out.append(self._to_mob(t))
-                continue
-            _gap_ms = (now - t["last_seen"]) * 1000.0
-            # ⚠ 2026-10-13：「锁定怪物丢框防抖」那条分支（`locked_id` / `lock_ghost_ms` /
-            #   `lock_ghost` ✓）**删了** ✓ —— 与下面这条重复 ✓（用户："这是重复功能"✓）。
-            # ⭐ 防抖判据 = 「**曾经达到过**」+「**窗口内**」（用户 2026-10-01 ✓ 2026-10-13 修订 ✓）：
-            #   · 「曾经达到过」看 `any_conf` ✓（**两个档位都算** ✓ 见 `_absorb` ✓ ——
-            #     2026-10-13 前是 `peak_conf`（只算高分档 ✗）⇒ 配得比检出阈值低的
-            #     「防抖置信度」**永远不生效** ⇒ 框一闪一闪 ✓ 现场就是它 ✓）；
-            #   · 「窗口内」看 `missed`/`last_seen` ✓ ⇒ 检出框**再次出现**时 `_absorb` 会把
-            #     `missed` 归零、`last_seen` 刷新 ⇒ **重新计时** ✓（用户要的"再出现就重置"✓）；
-            #   · **只在输出行为把它清掉时例外** ✓（`_reap_ghost_mobs` → `tracker.kill()` ✓
-            #     那是"主动清框"✓ 不是防抖该管的 ✓ 用户也点名保留这个例外 ✓）。
-            if (t["any_conf"] >= self.debounce_conf
-                    and _gap_ms <= self.debounce_ms):
-                self.diag["ghost"] += 1
-                out.append(self._to_mob(t))
-        # ⭐⭐⭐⭐ **结算这一帧的 GMC**（见 `_gmc_estimate` ✓ 放到最后是因为样本由 `_absorb` 收集 ✓
-        #   —— 结算出来的这一份**下一帧**才用得上 ✓ 与 SDK 的用法一致 ✓）。
-        self.gmc = self._gmc_estimate()
-        return out
-
-    # ---------------- 认领 / 确认 / 记账 ----------------
-
-    def _assign(self, tracks, dets, relax=1.0):
-        """`tracks` × `dets` 的**全局最优**配对 → `[(轨迹下标, 检测框下标), ...]` ✓。
-
-        代价 = `1 - _score`（分数越高代价越小 ✓）；`_score <= 0` = 配不上 ⇒ 禁止 ✓。
-        ⚠ 空表 / 全禁止 ⇒ 返回空（这一拍谁都没配上 ✓ 不许抛 ✗）。
-        ⚠⚠ **规模闸**（`ASSIGN_TOP_K` ✓）：每条轨迹只留自己分数最高的 K 个框 ✓
-          —— 全矩阵是 O(n²) 的（30 只怪时实测 **7.4 ms** ✗ 那是每帧的预算里不能忍的 ✓）
-          ⇒ 留 K 个之后 30×6 是 **0.5 ms** 量级 ✓。这一步在"真配对必在前 K 名"时**不损失最优性** ✓
-          （分数是排序用的 ✓ 只满足距离那一档本来就被压在下面 ✓），极端情况才与全矩阵不同 ✓。
-        """
-        if not tracks or not dets:
-            return []
-        # 每条轨迹 → [(分数, 检测框下标), ...]（按分数降序 ✓ 只留前 K 个 ✓）
-        picks = []
-        for t in tracks:
-            row = []
-            for i, d in enumerate(dets):
-                s = self._score(t, d, relax)
-                if s > 0.0:
-                    row.append((s, i))
-            row.sort(key=lambda x: -x[0])
-            picks.append(row[:ASSIGN_TOP_K])
-        cols = sorted({i for row in picks for _s, i in row})
-        if not cols:
-            return []
-        col_of = {i: k for k, i in enumerate(cols)}
-        cost = []
-        for row in picks:
-            full = [0.0] * len(cols)
-            for k in range(len(cols)):
-                full[k] = _ASSIGN_BIG                    # 没进前 K 的 = 禁止 ✓
-            for s, i in row:
-                full[col_of[i]] = max(0.0, 1.0 - s)
-            cost.append(full)
-        return [(ti, cols[di]) for ti, di in _assign_pairs(cost)]
-
-    def _confirmed(self, t, now):
-        """这条轨迹够不够"我看见它了"：**连续 N 拍 且 活满 M 毫秒**（两个都要 ✓）。
-
-        两个数缺一个都能被绕过（见 `CONFIRM_MS` 那段 ✓）；`confirmed` 一旦置上就**不再回退** ✓
-        —— 否则一条老轨迹偶尔漏拍会被打回"没确认"，画面又闪起来 ✓。
-
-        ⭐⭐⭐ **2026-10-13 加一条短路**（用户原话："**只要曾经怪物到过该置信度阈值**，那么其框
-        消失会被保留「防抖时间」（除非是被输出行为的清框逻辑清掉的），且检出框重新出现时重新
-        计时重置"✓）：**历史最高置信度（两个档位都算 ✓ `any_conf`）≥「防抖置信度」⇒ 直接算数** ✓。
-
-        ⚠⚠ **为什么必须加**（真机 `behavior.log` 2026-10-13 01:39 一大片 ✓，共 429 条
-          `mob_flick`，全是 `age=1/2`、`conf`/`peak` 落在 **0.30~0.46** ✓）：
-          那些"置信度刚好在检出阈值附近晃"的怪**永远过不了 2 拍 + 60ms** ✗ ⇒ 被当成"闪一下"
-          删掉 ✗ ⇒ **它的框一闪就没** ✓，而且**连"丢框保留防抖时间"那一步都走不到** ✗
-          （输出那支先看 `confirmed` ✗ 见 `update` ✓）⇒ 用户看到的"**防抖不生效 + 框一闪一闪**"
-          正是这一条 ✓✓。
-        ⚠ **低于**这个阈值的（真·噪声 ✓）**照旧走确认闸**（2 拍 + 60ms ✓）⇒ "单帧假框一个都不出"
-          那条没丢 ✓ —— 于是两个旋钮的语义终于一致了：
-          「防抖置信度」= **这个档位以上我就认它**（一帧也算 ✓）；
-          更低的那批 = 要**连续两拍且活满 60ms** 才认 ✓。
-        ⚠ 配 **0 / 负** = **这条短路不启用** ✓（照旧走确认闸 ✓ —— `MobTracker()` 的默认就是 0.0 ✓，
-          用例/离线工具都靠它保持老行为 ✓；真实项目里配的是 0.3~0.6 ✓ 短路生效 ✓）。
-        ⚠ 现在得是**实例方法**（要读 `self.debounce_conf` ✓）—— 调用点本来就是 `self._confirmed(...)`
-          ✓，没有别的静态调用 ✗。
-        """
-        _dc = float(self.debounce_conf or 0.0)
-        if _dc > 0.0 and float(t.get("any_conf") or 0.0) >= _dc:
-            return True
-        if int(t.get("age", 1) or 1) < CONFIRM_HITS:
-            return False
-        return (float(now) - float(t.get("born", now) or now)) * 1000.0 >= CONFIRM_MS
-
-    def _note_flick(self, t, now):
-        """记一条"闪一下"的现场（**有上限** ✓ 别把内存吃光 ✗）。"""
-        try:
-            self.flick.append({
-                "id": int(t.get("id") or 0),
-                "age": int(t.get("age") or 0),
-                "conf": round(float(t.get("conf") or 0.0), 3),
-                "peak": round(float(t.get("peak_conf") or 0.0), 3),
-                "missed": int(t.get("missed") or 0),
-                "ms": round((float(now) - float(t.get("born", now) or now)) * 1000.0, 1),
-            })
-            if len(self.flick) > FLICK_KEEP:
-                del self.flick[:-FLICK_KEEP]
-        except Exception:                       # noqa: BLE001 —— 记账不许拖垮跟踪 ✗
-            pass
-
-    def drain_flick(self):
-        """取走累计的"闪一下"现场（并清空 ✓）—— 给 `behavior.log` 用 ✓。"""
-        out, self.flick = self.flick, []
-        return out
-
-    def _gain(self, t, cx, cy):
-        """位置平滑系数：几乎不动的目标重平滑（去抖），走得快的轻平滑（不拖沓）。
-
-        不加这条的话只能二选一：要么框一直抖（噪声直接输出），要么移动时框
-        永远慢半拍（固定重平滑）。判据用**这一帧的实测位移**和框尺寸的比值。
-        """
-        pcx, pcy = self._center(t)
-        moved = ((cx - pcx) ** 2 + (cy - pcy) ** 2) ** 0.5
-        w, h = self._size(t)
-        ref = max(8.0, 0.5 * max(w, h))
-        return self.smooth * max(0.0, 1.0 - moved / ref)
-
-    def _absorb(self, t, d, now, low=False):
-        """把这一帧的检测并进轨迹：平滑中心/尺寸、更新速度。
-
-        用「中心 + 尺寸」而不是四条边分别平滑：这样**位置**和**大小**能各用一个
-        系数 —— 移动的目标位置要紧跟（不然框拖在后面），而框大小不该跟着 YOLO
-        一帧大一帧小（那正是"框在抖"的来源）。
-
-        `low=True` = 这是**低分档**的框（借 BYTE ✓ 只用来续命 ✓）：位置/速度照常更新 ✓，
-        但它**不抬 `peak_conf`** ✗（见下面那段 ✓）。
-        """
-        x1, y1, x2, y2, cf = d
-        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-        # ⭐⭐⭐ **GMC 采样**（见 `GMC_MIN_TRACKS` ✓ 用户 2026-10-13 ✓）：只有"**上一帧也见过
-        #   它**"的这一对才有意义 ✓ —— 隔了几帧的差里混着那段走路的累积 ✗（与玩家那条链的
-        #   `TELEPORT_MAX_GAP_MS` 同一个道理 ✓）。⚠ 只用**高分档**（`low=False` ✓）：低分档是
-        #   "擦着阈值"的框 ✓ 位置噪声更大 ✗。
-        _f = int(getattr(self, "_frame_no", 0) or 0)
-        _pd = t.get("det")
-        if (not low and _pd is not None
-                and int(t.get("seen_frame", -1)) == _f - 1):
-            self._gmc_samples.append((cx - _pd[0], cy - _pd[1]))
-        t["det"] = (cx, cy)
-        t["seen_frame"] = _f
-        ocx, ocy = self._center(t)
-        ow, oh = self._size(t)
-
-        a = self._gain(t, cx, cy)
-        b = self.size_smooth
-        mcx = a * ocx + (1 - a) * cx
-        mcy = a * ocy + (1 - a) * cy
-        mw = b * ow + (1 - b) * (x2 - x1)
-        mh = b * oh + (1 - b) * (y2 - y1)
-        t["x1"], t["y1"] = mcx - mw / 2.0, mcy - mh / 2.0
-        t["x2"], t["y2"] = mcx + mw / 2.0, mcy + mh / 2.0
-
-        v = self.vel_smooth
-        t["vx"] = v * t["vx"] + (1 - v) * (cx - ocx)
-        t["vy"] = v * t["vy"] + (1 - v) * (cy - ocy)
-
-        t["conf"] = cf
-        # ⭐ 历史最高置信度只涨不落（**界面角标**用：它到底多确信 ✓ 见 `peak_conf`）
-        # ⚠⚠ **低分档不参与**（`low=True` ✗ 2026-10-11）：它按定义就是"低于 `conf_mob`"
-        #   的框 ✓ ⇒ 让它抬高 `peak_conf` 会把"其实没真正看清过"记成看清过 ✓
-        if not low and cf > t["peak_conf"]:
-            t["peak_conf"] = cf
-        # ⭐⭐⭐ **`any_conf`：两个档位都算** —— **防抖判据读的是它** ✓（用户 2026-10-13 ✓
-        #   原话："**只要曾经怪物到过该置信度阈值**，那么其框消失会被保留「防抖时间」
-        #   （除非是被输出行为的清框逻辑清掉的），且检出框再次出现时重新计时重置"✓）。
-        #   ⚠⚠ **为什么非跟 `peak_conf` 分开不可**（2026-10-13 现场："框一闪一闪"✓）：
-        #     「防抖置信度」常被配得**低于**检出阈值（本项目 0.3 < `conf_mob` ✓）——
-        #     那种怪**只会走低分档**（`low=True` ✓，用来"续命"✓）⇒ 老判据（只看 `peak_conf`）
-        #     **永远不成立** ✗ ⇒ 它一丢框就立刻消失 ⇒ **就是闪** ✗✓（这条是病根 ✓）。
-        #   ⚠ `peak_conf` 保持原义（只认高分档 ✓）⇒ 界面角标/曲线观感不变 ✓。
-        if cf > t["any_conf"]:
-            t["any_conf"] = cf
-        t["missed"] = 0
-        t["age"] += 1
-        # ⭐ **确认闸**（见 `_confirmed`）：攒够就**永久**置上 ✓（只涨不落 ✓）
-        #   ⚠ 必须在 `age += 1` **之后**判（这一拍也算"看见了一次" ✓）
-        if not t["confirmed"] and self._confirmed(t, now):
-            t["confirmed"] = True
-        t["shifted"] = 0.0
-        t["last_seen"] = now
-
-    def _drift(self, t):
-        """漏检一帧：幽灵框按（衰减的）速度继续走一小段。
-
-        为什么不让它冻在原地：怪在走的时候，冻住的框和实际位置越差越远
-        （决策层会朝空位置走 / 空放技能）；为什么不让它一直走：防抖结束前
-        速度必须收住，否则框会飘到地图另一头去。所以衰减 + 总位移上限。
-        """
-        w, h = self._size(t)
-        cap = self.ghost_max_shift * max(w, h)
-        if t["shifted"] >= cap:
-            return
-        dx, dy = t["vx"], t["vy"]
-        t["x1"] += dx
-        t["x2"] += dx
-        t["y1"] += dy
-        t["y2"] += dy
-        t["shifted"] += (dx * dx + dy * dy) ** 0.5
-        t["vx"] *= self.ghost_decay
-        t["vy"] *= self.ghost_decay
-
-    # ---------------- 同体合并 ----------------
-
-    def _same_body(self, a, b):
-        """两条轨迹是不是同一只怪。
-
-        **保守**：只在两种情况下判"是同一只"——
-          · 框重叠得厉害（IoU 达标）→ 一帧里 YOLO 对同一个怪吐了两个框；
-          · 一条是幽灵框、另一条是本帧新检测到的，且新框离幽灵的预测位置
-            在认领半径内 → 就是"上一条没认领成功"的那个漏网之鱼。
-        两条**都是本帧检测到**的、只是离得近，不合并 —— 那可能是两只真挨着
-        站着的怪，吞掉一只比多一个框更糟。
-        """
-        if _iou((a["x1"], a["y1"], a["x2"], a["y2"]),
-                (b["x1"], b["y1"], b["x2"], b["y2"])) >= self.merge_iou:
-            return True
-        fresh, ghost = (a, b) if a["missed"] == 0 else (b, a)
-        if fresh["missed"] != 0 or ghost["missed"] == 0:
-            return False                    # 两条要么都活、要么都幽灵 → 不合并
-        cx, cy = self._center(ghost)
-        gx, gy = cx + ghost["vx"], cy + ghost["vy"]
-        fx = (fresh["x1"] + fresh["x2"]) / 2.0
-        fy = (fresh["y1"] + fresh["y2"]) / 2.0
-        d = ((fx - gx) ** 2 + (fy - gy) ** 2) ** 0.5
-        return d <= self._gate(ghost)
-
-    def _dedupe(self):
-        """把同体的多条轨迹合成一条：**活得久的当主体**（id 更"熟"）。"""
-        keep = []
-        for t in sorted(self._tracks, key=lambda x: -x["age"]):
-            host = next((k for k in keep if self._same_body(k, t)), None)
-            if host is None:
-                keep.append(t)
-            else:
-                self._merge_into(host, t)
-        self._tracks = keep
+        res = self.bt.update(detections, low_detections)
+        d = res["diag"]
+        # 老名字照旧给（日志/界面按它们看读数 ✓ 新名字括号里 ✓）
+        self.diag = {
+            "created": d["created"],            # 新建轨迹数
+            "matched": d["matched"],            # 高分档认领数
+            "ghost": d["lost"],                 # 失联缓冲内的幽灵框数
+            "low": d["low"],                    # 低分档续命数
+            "dropped_young": d["removed"],      # 这一帧被移除的轨迹数
+            "unconfirmed": d["flick"],          # 没攒够确认帧就没了（= 闪一下 ✓）
+            "tracks": d["tracks"],              # 这一帧输出的轨迹数
+            "buffer": d["buffer"],              # 失联帧长换算出来的**帧数**（读数 ✓）
+        }
+        return [self._to_mob(t) for t in res["tracks"]]
 
     @staticmethod
-    def _merge_into(host, t):
-        """把 t 并进 host：id/age 用 host 的，位置/状态用**更新鲜**的那条。"""
-        if t["last_seen"] < host["last_seen"]:
-            return                          # host 本来就更新，没什么可并的
-        for k in ("x1", "y1", "x2", "y2", "vx", "vy", "missed", "shifted",
-                  "last_seen", "det", "seen_frame", "_q_n", "_q_box"):
-            host[k] = t.get(k, host.get(k))
-        host["conf"] = max(host["conf"], t["conf"])
-        host["peak_conf"] = max(host["peak_conf"], t["peak_conf"])
-        # ⭐ `any_conf`（防抖判据读它 ✓ 见 `_absorb`）合并时也要取最大 ✓，否则
-        #   "两条并一条"之后那条的"曾经到过阈值"可能被丢掉 ⇒ 又闪 ✓（2026-10-13 ✓）。
-        host["any_conf"] = max(float(host.get("any_conf") or 0.0),
-                              float(t.get("any_conf") or 0.0))
-
-    # ---------------- 输出 ----------------
-
-    def _to_mob(self, t):
+    def _to_mob(t):
+        cx, cy, w, h = t.box
+        vx, vy = t.velocity()
         return Mob(
-            id=t["id"],
-            x=(t["x1"] + t["x2"]) / 2.0,
-            y=(t["y1"] + t["y2"]) / 2.0,
-            w=t["x2"] - t["x1"],
-            h=t["y2"] - t["y1"],
-            conf=t["conf"],
-            # ⭐ 历史最高置信度（2026-10-11 ✓ 界面角标 `#id conf/peak` 用它 ✓
-            #   也是"这条轨迹到底有没有被看清过"的读数 ✓）
-            peak_conf=t["peak_conf"],
-            vx=t["vx"],
-            vy=t["vy"],
-            age=t["age"],
-            missed=t["missed"],
+            id=int(t.tid),
+            x=cx,
+            y=cy,
+            w=w,
+            h=h,
+            conf=float(t.conf),
+            #: 历史最高置信度（界面角标 `#id conf/peak` ✓ 2026-10-11 ✓）
+            peak_conf=float(t.peak_conf),
+            vx=vx,
+            vy=vy,
+            #: 存活帧数（出生到现在 ✓ 与"存活时间" `alive_ms` 同源 ✓）
+            age=int(t.age),
+            #: >0 = 这一帧没检测到、靠**失联帧长**留着的幽灵框 ✓
+            missed=int(t.missed),
         )
 
+    # ---------------- 外部操作 ----------------
     def kill(self, mob_id):
-        """立即消除某个轨迹（防抖幽灵框被攻击时调用，避免持续空放技能）。"""
-        self._tracks = [t for t in self._tracks if t["id"] != mob_id]
+        """立即抹掉某条轨迹（幽灵框被攻击时调 ✓ 避免持续空放技能 ✓）。"""
+        self.bt.remove(mob_id)
+
+    def drain_flick(self):
+        """取走"没攒够确认帧就没了"的现场（给 `behavior.log` ✓ 见 `ByteTracker._note_flick` ✓）。"""
+        return self.bt.drain_flick()
 
 
 #: ⭐⭐⭐ 步 2 的四个常量（2026-10-11 ✓ 用户原话："**角色使用传送点后被其他玩家抢检出框**"✓）

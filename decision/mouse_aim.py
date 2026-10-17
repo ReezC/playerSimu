@@ -921,19 +921,37 @@ def to_screen(px, py, origin=None, frame_shape=None):
          落点整体偏 **k 倍** ✓（正是"完全歪了"✓）。
       ② 的比例与①的原点**一起**来自 `frame_rect()` ✓（**量过才有** ✓）⇒
       没量过 ⇒ ①②都不做 ✓（= 老行为**一字不变** ✓）。
-    `origin` 给了 ⇒ **按调用方给的**（老行为：只加、不折算 ✓）。
+    `origin` 给了、而**没量过** `frame_rect` ⇒ 按调用方给的（老行为：只加、不折算 ✓）；
+    量过 `frame_rect` ⇒ **一律折算**（它才是真值 ✓ 见下面那条教训 ✗）。
+
+    ⚠⚠ **2026-10-17 现场（断线重连「选区/点服务器」那一步鼠标点歪 ✗）**：
+      原来 `if origin: return 只加原点` **排在折算之前** ✗ —— 而断线重连 / 自动测谎
+      **每次都传 origin**（`live_thread` 那条 `_org` 恒有值 ✓ `(0, 0)` 也算有 ✓）
+      ⇒ **永远走不到折算那一段** ✗ ⇒ 推流缩放（1366×768 帧 ← 1920×1080 区域，k=1.4054）
+      被整个忽略 ✓；而 `screen_gain()` **是折算的** ✓ ⇒ 分子没乘 k、分母乘了 k
+      ⇒ 落点整体**短 k 倍**（朝左上偏）✓ = 用户说的「**断线重连选区阶段鼠标点歪了**」✓
+      而且**每次都歪、歪得一模一样** ✓（不是偶发 ✗）。
+      ⇒ 口径改成：**量过就以 `frame_rect` 为准**（它同时给了真原点与真比例 ✓），
+        `origin` 只在"没量过"时兜底 ✓。
     """
+    r = frame_rect(frame_shape) if frame_shape is not None else None
+    if r:
+        try:
+            fh, fw = int(frame_shape[0]), int(frame_shape[1])
+        except (TypeError, ValueError, IndexError):
+            return float(px), float(py)
+        return (float(px) * r[2] / float(fw) + r[0],
+                float(py) * r[3] / float(fh) + r[1])
+    # ⛔ **"没实测就按 link.yaml 折 k"那一版已撤回**（2026-10-17 ✓ 实机反证）：
+    #   它只折了**分子**（目标像素）没折**分母**（`screen_gain` 的增益 ✓ 那支只在有
+    #   `frame_rect` 时才折算 ✓）⇒ 送的指令数多出 k 倍 ⇒ 光标**偏右下越过目标** ✓
+    #   （用户原话：「**偏右下，差一整块（越过了目标）**」✗）。
+    #   ⇒ 回到"要么两边都折、要么都不折" ✓ 现在这条路上两边都**不折**：
+    #     目标不折（497）＋ 增益不折（1.0）⇒ 落点与改之前**一模一样** ✓
+    #     —— 真正的偏差是**增益本身**（实测约 1.15 px/单位 ✓ 见 `mouse_tap_probe`）。
     if origin:
         return float(px) + int(origin[0]), float(py) + int(origin[1])
-    r = frame_rect(frame_shape) if frame_shape is not None else None
-    if not r:
-        return float(px), float(py)
-    try:
-        fh, fw = int(frame_shape[0]), int(frame_shape[1])
-    except (TypeError, ValueError, IndexError):
-        return float(px), float(py)
-    return (float(px) * r[2] / float(fw) + r[0],
-            float(py) * r[3] / float(fh) + r[1])
+    return float(px), float(py)
 
 
 def screen_gain(gain, frame_shape=None):
@@ -1258,7 +1276,7 @@ def aim_to(frame_shape, xr, yr, gain=None, origin=None,
     if px is None:
         return False, why
     # ⚠ 先把**帧像素**折成**屏幕像素**（见 `to_screen` ✓ —— 副屏/挪过的窗口全靠这一步 ✓）
-    _sx, _sy = to_screen(px[0], px[1], origin, _fs)   # ①原点 ②比例（见它说明 ✓）
+    _sx, _sy = to_screen(px[0], px[1], origin, _fs)
     _gx, _gy = screen_gain((gx, gy), _fs)             # 帧像素口径 → 屏幕像素口径 ✓
     d, why = counts_for(_sx, _sy, _gx, _gy)
     if d is None:
@@ -1432,7 +1450,9 @@ def click_ratio(frame_shape, xr, yr, gain=None, origin=None, homed=False,
     if px is None:
         return False, why
     # ⚠ 先把**帧像素**折成**屏幕像素**（见 `to_screen` ✓ —— 副屏/挪过的窗口全靠这一步 ✓）
-    _sx, _sy = to_screen(px[0], px[1], origin, _fs)   # ①原点 ②比例（见它说明 ✓）
+    # ⛔ 「没实测就按 link.yaml 折 k」那一版**已撤回**（只折一边 ⇒ 偏右下越过 ✓
+    #   见 `to_screen` 里那段说明 ✓）
+    _sx, _sy = to_screen(px[0], px[1], origin, _fs)
     _gx, _gy = screen_gain((gx, gy), _fs)             # 帧像素口径 → 屏幕像素口径 ✓
     d, why = counts_for(_sx, _sy, _gx, _gy)
     if d is None:

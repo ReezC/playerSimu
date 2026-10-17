@@ -254,8 +254,74 @@ def t_live_integration_yields_under_lag():
           "—— 用户要的是「降速但仍能跑」✓")
 
 
+def t_pair_right_edge_tolerates_scale_gap():
+    """⭐⭐⭐⭐ **双锚点的"右边对齐"要宽容两个锚点自身的尺度差**（用户 2026-10-17 ✓
+    现场：「A 机的自动测谎**没有任何反应了 只有警报**」✗）。
+
+    ⚠ 真病根（`behavior.log` 现场 ✓）：12:53:49 `vt_phase LOCATING` ⇒ 12:54:07
+      `ENDED why=timeout` —— **18 秒没锁定** ⇒ 不瞄、不点，只剩警报 ✓。
+      查录像（`data/recordings/lie_20261017_125205.mp4` 第 2 秒）：
+      模板**匹上了**（title 0.952 / footer 0.816），却被**配对闸**拒掉 ✓：
+        · title scale 0.512 / footer 0.537 ⇒ 相对差 **4.8%**（容差 8% ✓ 放行）；
+        · 宽度因此 696 vs 730 ⇒ **右边差 50px**，而右边容差只有 `expected_width × 5% = 36px` ✗；
+        · ⇒ `RIGHT_EDGE_MISMATCH` ⇒ `paired_candidates=0` ⇒ LOCATING 永不锁定 ✓。
+      一句话：**尺度容差放行的差值，右边闸又用绝对值拒了一次** ✗（自相矛盾 ✓）。
+    ⇒ 修法：右边容差 = 固定容差 ＋ `expected_width × 相对尺度误差`（尺度差天然带来的宽度差 ✓）。
+    判据（三条 ✓）：
+      ① 现场那对数**必须配对成功**，外框 = (302, 88, 762, 595) ✓；
+      ② **负控**：标题跑到很左边（左边差 218px）仍必须被拒 ✗（闸不能形同虚设 ✓）；
+      ③ 有录像就再跑一次真素材（第 2 秒）⇒ `locate_by_dual_anchor` 必须非空 ✓
+        （录像不入库 ⇒ 没有就跳过 ✓）。
+    """
+    t = locate.AnchorMatch(x=302.0, y=88.0, width=696.0, height=30.0,
+                           scale=0.512, score=0.952)
+    f = locate.AnchorMatch(x=318.0, y=618.0, width=730.0, height=62.0,
+                           scale=0.537, score=0.816)
+    got = locate._pair_anchor_matches([t], [f], (768, 1366))
+    check(len(got) == 1,
+          "① 现场那对锚点该配对成功 ✗（title 0.512/footer 0.537 ⇒ 右边差 50px，"
+          "尺度差 4.8%% 已被放行 ⇒ 右边闸不该再按绝对 5%% 拒 ✓）：%r" % (got,))
+    if got:
+        check(got[0].outer_rect == (302, 88, 762, 595),
+              "① 外框该按 footer 中心 + 锚点间距算出来 ✓（实测 %r）"
+              % (got[0].outer_rect,))
+    t2 = locate.AnchorMatch(x=100.0, y=88.0, width=696.0, height=30.0,
+                            scale=0.512, score=0.95)
+    check(locate._pair_anchor_matches([t2], [f], (768, 1366)) == [],
+          "② 负控失败：标题在很左边（左边差 218px）也配上了 ✗ ⇒ 闸形同虚设 ✓")
+    # ---- ④ **兜底：尺度差太大时"放宽配对"必须还能锁定**（远程推流拉伸 ⇒ 用户 2026-10-17）----
+    t3 = locate.AnchorMatch(x=302.0, y=88.0, width=696.0, height=30.0,
+                            scale=0.512, score=0.95)
+    f3 = locate.AnchorMatch(x=318.0, y=618.0, width=730.0, height=62.0,
+                            scale=0.62, score=0.82)      # 与标题差 21% ✓
+    check(locate._pair_anchor_matches([t3], [f3], (768, 1366)) == [],
+          "④ 负控：尺度差 21% 在**严格**那一路就该被拒 ✓")
+    _rel = locate._pair_anchor_matches([t3], [f3], (768, 1366), relaxed=True)
+    check(len(_rel) == 1 and _rel[0].outer_rect == (302, 88, 762, 595),
+          "④ 两个锚点都匹上了、只是尺度差大 ⇒ **放宽配对**必须锁定 ✗"
+          "（远程推流拉伸时这就是\"没有检测框\"的原因 ✓）：%r" % (_rel,))
+    # 放宽**不等于放开一切**：越界 / 太小的仍然要拒 ✓
+    t4 = locate.AnchorMatch(x=-400.0, y=-300.0, width=696.0, height=30.0,
+                           scale=0.512, score=0.95)
+    check(locate._pair_anchor_matches([t4], [f3], (768, 1366), relaxed=True) == [],
+          "④ 放宽那一路也必须挡住**越界/太小**的候选 ✗（不然满屏乱锁 ✓）")
+
+    vp = _ROOT / "data" / "recordings" / "lie_20261017_125205.mp4"
+    if vp.exists():
+        cap = cv2.VideoCapture(str(vp))
+        cap.set(cv2.CAP_PROP_POS_MSEC, 2000)
+        ok, frame = cap.read()
+        cap.release()
+        if ok:
+            cand = locate.locate_by_dual_anchor(frame)
+            check(cand is not None,
+                  "③ 真录像第 2 秒该定位到测谎弹窗 ✗（否则现场就是\"只有警报\"✓）")
+
+
 def main():
     tests = [("① 模板几何：确认按钮比例量得出来", t_templates),
+             ("⭐⭐⭐⭐ 双锚点：尺度差 4.8% 时右边容差要放宽（否则 LOCATING 超时）",
+              t_pair_right_edge_tolerates_scale_gap),
              ("⭐⭐ 实时链路契约：独立线程 / 只留最新一帧 / **积压时让路**（2026-10-10）",
               t_live_integration_yields_under_lag),
              ("⑩ 框坐标换算：追踪图 → 喂进去那张图（手算对数 ✓）", t_frame_rect),

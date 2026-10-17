@@ -1875,37 +1875,30 @@ class PlayerPanel(QWidget):
         self.sp_mob_atk_cd.valueChanged.connect(self._on_mob_atk_cd)
         tf.addRow("目标被攻击CD(ms)", self.sp_mob_atk_cd)
 
-        # ③④ 防抖（怪框消失后保留位置）—— 同样从「战斗参数」搬来（键/默认值/提示全原样 ✓）
-        self.sp_debounce_conf = self._spin(0.0, 1.0, 0.5, 2)
-        self.sp_debounce_conf.setSingleStep(0.05)
-        self.sp_debounce_conf.setToolTip(
-            "置信度高于此值的怪，框短暂消失会保留位置，防漏检。\n"
-            "保留期间框会按消失前的速度继续走一小段（逐渐收住），\n"
-            "不会粘在原地 —— 移动中的怪也跟得上。\n"
+        # ⭐⭐⭐ **「失联帧长(ms)」**（用户 2026-10-17 ✓ 原话："去掉现在的怪物检测框
+        #   **防抖置信度**和**防抖时间**的配置和逻辑，现在完全不对；接 ByteTrack，
+        #   新参数『**失联帧长**』（track_buffer）代替以前的『防抖时间』，**默认 1000ms**"✓）
+        #   ⛔ 原来那两格（防抖置信度 / 防抖时间）**已删** ✗ —— 它们把"这一拍显不显示"
+        #     和"消失后还留多久"混成一对旋钮 ⇒ 调它救不了"框闪" ✓（见 `perception/bytetrack.py` 抬头 ✓）。
+        self.sp_track_buffer = self._spin(0, 10000, 1000, 0)
+        self.sp_track_buffer.setToolTip(
+            "**失联帧长**（ByteTrack 的 track_buffer）：怪框丢掉后，这条轨迹还活多久。\n"
+            "默认 1000ms。这段时间里框按「卡尔曼匀速模型」往前推（不是粘在原地），\n"
+            "所以移动中的怪也跟得上；到期就从画面和决策里消失。\n"
             "\n"
-            "⚠⚠ 它只管「**消失之后还留多久**」——**不决定「这一拍显不显示」** ✗。\n"
-            "「显示」由**确认闸**管（新轨迹要**连续 2 拍且活满 60ms** 才画出来，\n"
-            "单帧假框一个都不出）⇒ 所以「框在闪」多半**不是**这一格能修的 ✓。\n"
+            "· 调大 ⇒ 更不容易「框突然没了」，代价是角色可能朝一个已经消失的框走\n"
+            "  （性能面板的 chase_ghost 就是这个占比）；\n"
+            "· 调小 ⇒ 反应更快，但漏检那几拍会直接丢目标。\n"
+            "\n"
+            "⚠ 它**只管「消失后还活多久」** ✗ —— 新框什么时候**开始显示**由确认闸管\n"
+            "（连续 2~3 帧稳定才认，单帧假框一个都不出 ✓），这两件事现在**分开**了 ✓。\n"
             "\n"
             "想看清是**哪一种闪**：设置 → 界面 → 辅助线与标记 →\n"
             "勾上「怪框显示 id/置信度」⇒ 框上会写 `#id 这一拍/历史最高`：\n"
-            "  · **每帧 id 都在换** ⇒ 认领 / 新建那一步有问题（看 `mob_flick` 打点）；\n"
+            "  · **每帧 id 都在换** ⇒ 关联那一步有问题（看 `mob_flick` 打点）；\n"
             "  · **同一个 id 在闪** ⇒ 检测不稳（该动阈值 / 增益）。")
-        self.sp_debounce_conf.valueChanged.connect(self._on_debounce)
-        tf.addRow("防抖置信度", self.sp_debounce_conf)
-
-        self.sp_debounce_ms = self._spin(0, 10000, 300, 0)
-        self.sp_debounce_ms.setToolTip(
-            "怪框消失后保留位置的时长。\n"
-            "这段时间里框按消失前的速度继续走、每帧收一点，所以是「滑过去」\n"
-            "而不是「跳一下」；到期就不再输出。\n"
-            "调大的代价：角色可能朝一个已经消失的框走过去（性能面板的\n"
-            "chase_ghost 就是这个占比）。\n"
-            "\n"
-            "⚠ 同样只管「**消失后还留多久**」✗ —— 它**不决定**这一拍画不画 ✓\n"
-            "（见上面「防抖置信度」那条的说明：显示由确认闸管 ✓）。")
-        self.sp_debounce_ms.valueChanged.connect(self._on_debounce)
-        tf.addRow("防抖时间(ms)", self.sp_debounce_ms)
+        self.sp_track_buffer.valueChanged.connect(self._on_track_buffer)
+        tf.addRow("失联帧长(ms)", self.sp_track_buffer)
 
         # ⚠ 这一组的控件**不进 `self.widgets`**（那是 `steps.base` 那套卡片的登记表 ✗
         #   本面板的控件一律按成员名访问、回填走 `_sync_from_settings` ✓ 同上面 battle 里那批 ✓）。
@@ -4435,9 +4428,9 @@ class PlayerPanel(QWidget):
             self._previewing = False
             self._btn_preview.setText("试听")
 
-    def _on_debounce(self, _val=None):
-        settings.debounce_conf = float(self.sp_debounce_conf.value())
-        settings.debounce_ms = int(self.sp_debounce_ms.value())
+    def _on_track_buffer(self, _val=None):
+        """「失联帧长(ms)」⇒ ByteTrack 的 `track_buffer`（用户 2026-10-17 ✓ 默认 1000ms ✓）。"""
+        settings.track_buffer_ms = int(self.sp_track_buffer.value())
         settings.save()
 
     def _on_big_mob(self, _val=None):
@@ -5628,13 +5621,9 @@ class PlayerPanel(QWidget):
             _ck.blockSignals(False)
         self._sync_sweep_switches()
 
-        self.sp_debounce_conf.blockSignals(True)
-        self.sp_debounce_conf.setValue(settings.debounce_conf)
-        self.sp_debounce_conf.blockSignals(False)
-
-        self.sp_debounce_ms.blockSignals(True)
-        self.sp_debounce_ms.setValue(settings.debounce_ms)
-        self.sp_debounce_ms.blockSignals(False)
+        self.sp_track_buffer.blockSignals(True)
+        self.sp_track_buffer.setValue(int(getattr(settings, "track_buffer_ms", 1000)))
+        self.sp_track_buffer.blockSignals(False)
 
         self.sp_big_mob_ratio.blockSignals(True)
         self.sp_big_mob_ratio.setValue(getattr(settings, "big_mob_ratio", 1.5))

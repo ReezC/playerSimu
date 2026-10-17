@@ -107,6 +107,11 @@ def ask_region(owner=None, wait=0.0):
         time.sleep(wait)
 
     from gui.region_picker import select_screen_region
+    # ⚠ **不许在这里吞异常** ✗（2026-10-17 用户：「选区每次都坏」✓）——
+    #   吞掉就变成"点了没反应"✓，而部署台那条路正是靠这个异常弹
+    #   `QMessageBox.warning("框选失败", …)` 把**原因**说给人听 ✓
+    #   （没屏 / 全黑 / 远程断开 ✓ 见 `gui.region_picker.grab_screen_pixmap` ✓）。
+    #   命令行那条路由 `main()` 自己 try 一下翻译成人话 ✓（见那边 ✓）。
     return select_screen_region(parent=owner, hide_owner=True)
 
 
@@ -399,7 +404,15 @@ def main() -> int:
     if args.pick:
         # 命令行框选：等 5 秒（要切回游戏窗口）—— 部署台那条路不用等，
         # 它会把窗口自己藏起来（见 ask_region）。
-        r = ask_region(wait=5.0)
+        # ⚠ 抓屏失败会**抛错**（没屏 / 全黑 / 远程断开 ✓ 见 `grab_screen_pixmap` ✓）
+        #   ⇒ 命令行这条路把它翻译成一句人话（部署台那条路自己弹窗 ✓ 不归这里 ✓）。
+        try:
+            r = ask_region(wait=5.0)
+        except Exception as e:                 # noqa: BLE001
+            print("  ✗ 框选不可用：%s: %s" % (type(e).__name__, e))
+            print("    （黑屏多半是远程桌面断开 / 锁屏 / 显示器休眠；"
+                  "这次的抓屏参数在 data/debug/region_grab.txt）")
+            return 1
         if not r:
             print("没框选（取消，或框得太小）")
             return 1

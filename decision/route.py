@@ -580,6 +580,25 @@ class ClimbJob(_PausableJob):
         #:   ⚠ 全项目只有两个读者：`walking_to_ladder()`（✅ 就是它要回答的）与"斜跳飞行中"那支 ✓
         #:     —— **别在别处再算一遍距离** ✗（约定 10：一条口径一处实现 ✓）。
         self._last_dx = None
+        #: ⭐⭐⭐⭐ **对齐相「走不动 ⇒ 跳一下」**（用户 2026-10-17 ✓ 原话：
+        #:   「**鳄鱼潭1项目永久卡在 L13 绳梯了，也没有触发走不动跳一下**」✗）——
+        #:   现场日志（`behavior.log` 13:06:17~13:06:21）：`climb_dx v=82.0` **一直是 82**、
+        #:   `climb_phase v=0.0`（对齐相）、`climb_on_ladder v=0` ⇒ **人卡在离绳 82px 处
+        #:   一动不动** ✓，最后 `battle_state frm=climb to=idle`（超时判失败 ✓）⇒ 路线再来一遍
+        #:   ⇒ 用户看到的就是"**永久卡住**"✓。
+        #:   ⚠ 为什么以前没人管：`stall_jump`（「走不动按跳」）**只灌给 `WalkJob`** ✗
+        #:     （见 `agent.start_climb` ✓）；而对齐绳梯这一段是 `ClimbJob` 自己在"按住方向走"✓
+        #:     ⇒ 走不动就只会**干等到超时** ✓（用户要的就是这一段也跳 ✓）。
+        #: `stall_jump` 由 `agent.start_climb` 统一灌（`hasattr` 判据 ✓ 设置里那个开关 ✓）。
+        self.stall_jump = True
+        #: `_align_best` / `_align_best_at` = 对齐相"离绳多远"的**最好成绩**与时刻
+        #:（`_stalled_since` 那套架子的输入 ✓ 与"爬不动 / 走不动"同一个判据 ✓）。
+        self._align_best = None
+        self._align_best_at = None
+        #: 这一轮已经**为对齐跳过几次**（跳也是有代价的：每跳一次要等落回 ✓）——
+        #: ⚠ 必须有上限 ✗（日志 302 那条教训："自动重试必须自带刹车"✓）：
+        #: 上限到了就**不再跳**、老老实实按住方向等超时（至少不会跳成筛子 ✓）。
+        self._align_hops = 0
         #: 「**按过跳了**」（`_out` 里 `jump=True` 的拍都会置上 ✓，**一次就够、永不清** ✓）——
         #: "从按下跳到攀爬成功期间不许进 attack"（用户 2026-09-27 ✓）要用它，见 `holds_player` ✓。
         self._jumped_once = False
@@ -1233,6 +1252,45 @@ class ClimbJob(_PausableJob):
             return 0
         return 1 if dx > 0 else -1
 
+    #: 对齐相"走不动"最多**跳几次**（跳一次要等落回，跳多了就是原地蹦 ✓）
+    ALIGN_STALL_HOPS = 3
+
+    def _align_stall_hop(self, now, dx, sign):
+        """对齐相**走不动 ⇒ 跳一下**（用户 2026-10-17 ✓ 原话：
+        「鳄鱼潭1项目永久卡在 L13 绳梯了，**也没有触发走不动跳一下**」✗）。
+
+        规则（四条 ✓）：
+          · **只在"按住方向走"这一段生效** ✓ —— 斜跳窗口里本来就会跳（那条在前面 ✓），
+            这里管的是 `|dx| > 起跳距离`（离绳太远、只能走过去 ✓）；
+          · 判据用**现成那套** `_stalled_since`（与"爬不动 / 走不动"同一把尺 ✓
+            `STALL_GAIN_PX` = 8 世界像素 ✓ 不新造数 ✗）；
+          · 跳的时候**朝绳方向按住 + 按跳**（`_out(sign, True)` ✓ 竖直方向由 `_out` 按老规则给 ↑ ✓）；
+          · ⚠ **刹车**：一轮最多 `ALIGN_STALL_HOPS`(=3) 次 ✓；每次跳完**重新起锚** ✓
+            （下一跳要再等一个「卡住判定时长」⇒ 不会每拍跳成筛子 ✓）。
+        返回 `_out(...)` 或 `None`（`None` = 这一拍不跳、照常走 ✓）。
+        """
+        if not bool(getattr(self, "stall_jump", True)):
+            return None
+        if int(getattr(self, "_align_hops", 0)) >= int(self.ALIGN_STALL_HOPS):
+            return None
+        best, best_at, stalled = self._stalled_since(
+            now, abs(float(dx)), self._align_best, self._align_best_at,
+            self.stall_s, lambda v, b: v < (float(b) - STALL_GAIN_PX))
+        self._align_best, self._align_best_at = best, best_at
+        if not stalled:
+            return None
+        self._align_hops += 1
+        self._align_best = abs(float(dx))      # 跳完重新起锚 ✓
+        self._align_best_at = float(now)
+        self._press_dir = sign                  # 记账与"按住方向"一致 ✓
+        self._press_at = now
+        self.note = ("对齐走不动：离绳 %.0f px，%.1fs 没靠近（平台边缘 / 小台阶？）"
+                     "⇒ **跳一下**（第 %d/%d 次，「走不动按跳」✓）"
+                     % (dx, self.stall_s, self._align_hops, self.ALIGN_STALL_HOPS))
+        # ⚠ `hop=True` ＋ `vert=0` ✗：这是**平台上的小跳**（朝绳 ← + 跳 ✓ 不按 ↑ ✓），
+        #   不是"按住 ↑ 上绳"的跳 ✓ 见 `_out` 里 `hop` 那段 ✓
+        return self._out(sign, True, vert=0, hop=True)
+
     def _align_step(self, now, px, py, _on_ladder):
         """① 对齐相：斜跳 / 横向对齐 / 按跳（`None` = 对齐好了，落到下一段 ✓）。"""
         # ⭐ **这一拍离绳多远 —— 唯一记账**（`_last_dx` ✓，用户 2026-10-02）：
@@ -1388,6 +1446,14 @@ class ClimbJob(_PausableJob):
                 #   一进这个区间 ↑ 就按住 ✗，"从任务下达一直被按住"里有它一份 ✓）；
                 #   已经按过跳 / 人已在绳段里 ⇒ 由那条规则照旧按住 ✓（例外见 `_out` ✓）。
                 return self._out(sign, False)   # 只朝绳走（**不按跳**；↑ 由规则决定 ✓）
+            # ⭐⭐⭐ **走不动 ⇒ 跳一下**（用户 2026-10-17 ✓ 见 `_align_stall_hop` ✓）：
+            #   ⚠ 位置很讲究 ✓ —— 必须在**斜跳窗口之后**：窗口内本来就是"朝绳走 + 跳"✓
+            #     放前面会抢掉斜跳（`selftest_decision` 的「斜跳上绳」那条当场红 ✓）。
+            #   这里管的是「|dx| > 起跳距离」那一段（离绳还远、只能走过去 ✓）——
+            #   现场就卡在这儿：`climb_dx v=82.0` 一直不变 ✓
+            _hop = self._align_stall_hop(now, dx, sign)
+            if _hop is not None:
+                return _hop
             # 「**对齐绳梯移动延迟(ms)**」（用户 2026-09-27 加的参数）：对齐 x 时
             # **两次按下方向键之间至少要隔这么久**。怎么算"一次按下"：**同方向的连续
             # 按住算一次**（`_press_dir` 记着现在按着哪边）—— 所以远距离那种"一口气
@@ -1765,6 +1831,10 @@ class ClimbJob(_PausableJob):
         #（留着上一轮的时刻，重来第一拍就会被自己的间隔挡住 ✗）。
         self._press_dir = 0
         self._press_at = None
+        # ⭐ 对齐"走不动跳一下"的账也要清 ✓（否则上一轮跳完 3 次刹车了 ⇒ 这一轮一次都不跳 ✗）
+        self._align_best = None
+        self._align_best_at = None
+        self._align_hops = 0
         # "这一轮按过跳了没"与"是不是回来重来那一轮"同理要清（新的一轮从 ① 开始 ✓）；
         # "点按到一半"（`_dir_tap_at`）也一样：留着会让新的一轮一上来就"松/按"接着上次跑 ✗
         self._jump_tried = False
@@ -2045,8 +2115,19 @@ class ClimbJob(_PausableJob):
         self.note = why
         return self._out(0, False)
 
-    def _out(self, move, jump, hold_dir=False, reassert=False, vert=None, replan=False):
-        """`hold_dir`：**不按跳也要按住方向键** —— 下跳要求"先按住 ↓，再按跳"。
+    def _out(self, move, jump, hold_dir=False, reassert=False, vert=None, replan=False,
+             hop=False):
+        """`hop`：**"走不动"那种跳**（不是上绳的跳 ✓ 用户 2026-10-17 ✓）。
+
+        ⚠ 为什么必须跟"上绳的跳"分开 ✗：`jump=True` 会
+          · 置 `_jumped_once`（**永不清** ✓ "按下跳到爬上去之前不许进 attack"要它 ✓）
+          · 并把 `_no_rise_since` 的钟**启动**（`update` 里 ✓）⇒ 2×stall_s 后判
+            "**按跳之后 y 没上升**" ⇒ 任务失败 ✓
+          而"对齐走不动 ⇒ 跳一下"是**在平台上一路小跳**（本来就不该上升 ✓）
+          ⇒ 若共用 `jump=True`，跳完必被误判成"上绳失败"✓（第一版实测就是这样 ✓）。
+        ⇒ `hop=True` ⇒ 发跳键，但 **不置 `_jumped_once`、不启"y 没上升"的钟** ✓。
+
+        `hold_dir`：**不按跳也要按住方向键** —— 下跳要求"先按住 ↓，再按跳"。
 
         （爬绳用不到它：那边只有"按住跳 + ↑/↓"一步。）
 
@@ -2090,7 +2171,7 @@ class ClimbJob(_PausableJob):
         # ⚠ 「**按过跳了**」—— 只要真按过一次就**一直记着**（`retry()` / 被打断重走都**不清** ✓）：
         #   "从按下跳到攀爬成功期间都不许进 attack"（用户 2026-09-27 ✓）要它 ✓，
         #   见 `holds_player` ✓。
-        if jump:
+        if jump and not hop:
             self._jumped_once = True
             # ⚠ 「按跳后 y 一直没上升」那个计时锚（`_no_rise_since` ✓ 见它那段说明）**不在这儿起**
             #   ✗ —— 起在 `update` 里（那里有**执行器自己的钟** `now` ✓）：`_out` 手里没有 `now`，
@@ -2102,7 +2183,9 @@ class ClimbJob(_PausableJob):
         #   循环"）：· **按了跳** ⇒ 这一轮结束（下一轮必须重新发方向键 ✓）；
         #             · **发了水平方向** ⇒ 这一轮满足 ✓（`_align_step` 那道闸就靠它 ✓）。
         #   ⚠ 判的是**水平** `move`（竖直那个 `d` 不算 —— ↑ 全程按着，不然永远算"发过" ✗）。
-        if jump:
+        # ⚠ `hop`（走不动那种跳）**不算"这一轮按过跳"** ✗ —— 它不是上绳的跳 ✓
+        #   （否则跳一下就把"对齐发过方向键"的账清掉 ⇒ 下一拍又拦 ✓ 见 `_align_step` ✓）
+        if jump and not hop:
             self._align_pressed = False
         elif move:
             self._align_pressed = True

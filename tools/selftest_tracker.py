@@ -30,6 +30,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import perception.assign as asg                                 # noqa: E402
+import perception.bytetrack as btk                               # noqa: E402
 import perception.tracker as trk                                # noqa: E402
 
 FRAME_MS = 1000.0 / 15.0     # 主循环节拍（capture_fps=15），时序都量化到这个粒度
@@ -69,8 +70,14 @@ class Feed:
         self._p = mock.patch.object(trk, "time",
                                     SimpleNamespace(monotonic=self.clock))
         self._p.start()
+        # ⚠ 换内核后**时间是在 `perception/bytetrack` 里读的** ✓ ⇒ 那边的钟也得替 ✓
+        #   （不替的话"失联帧长 / 存活时间"用的是真实时钟 ⇒ 用例会随机红 ✓）
+        self._p2 = mock.patch.object(btk, "time",
+                                     SimpleNamespace(monotonic=self.clock))
+        self._p2.start()
 
     def stop(self):
+        self._p2.stop()
         self._p.stop()
 
     def __enter__(self):
@@ -79,9 +86,9 @@ class Feed:
     def __exit__(self, *a):
         self.stop()
 
-    def step(self, *dets, ms=FRAME_MS, low=()):
+    def step(self, *dets, ms=FRAME_MS, low=(), world=None):
         self.clock.tick(ms)
-        return self.t.update(list(dets), list(low))
+        return self.t.update(list(dets), list(low), player_world=world)
 
     def warm(self, *dets, n=2, ms=FRAME_MS):
         """先喂 n 拍同一批框，把轨迹**确认**下来 ✓。
@@ -135,6 +142,10 @@ def t_static_one_box():
         first = f.step(det(500))
         check(len(first) == 0,
               "**还没确认就不该输出**（就是它治的「闪一下」✗）：%d 个" % len(first))
+        _second = f.step(det(500))
+        check(len(_second) == 0,
+              "第 2 拍还不够 —— ByteTrack 要**连续 3 帧**稳定才认（用户 2026-10-17 ✓）：%d 个"
+              % len(_second))
         for _ in range(10):
             out = f.step(det(500))
             check(len(out) == 1, "静止目标出现了 %d 个框" % len(out))
@@ -188,8 +199,16 @@ def t_size_flicker_one_box():
             check(out[0].id == 1, "尺寸抖动时 id 变成了 %s" % out[0].id)
             got.append(out[0].w)
         check(len(f.t._tracks) == 1, "轨迹数 = %d，应该只有 1" % len(f.t._tracks))
-        check(max(got) - min(got) < 18,
-              "输出的框宽度还在跟着抖：%s" % [round(v) for v in got])
+        # ⚠ 判据是**逐帧别跳**（不是"总跨度"✗）：输入在 18~45 之间来回跳 ✓
+        #   卡尔曼做的是**轻量**平滑（用户 2026-10-17 原话 ✓）—— 它压得掉抖动，
+        #   但不会把"框真的变小了"冻住 ✗（冻住会让瞄准框一直偏大 ✓）。
+        _jumps = [abs(got[i + 1] - got[i]) for i in range(len(got) - 1)]
+        check(max(_jumps) < 12.0,
+              "输出宽度逐帧还在跳（最大跳 %.1f px）：%s"
+              % (max(_jumps), [round(v) for v in got]))
+        check(max(got) - min(got) < 24,
+              "输出宽度整体还在跟着抖（跨度 %.1f，输入跨度 27）：%s"
+              % (max(got) - min(got), [round(v) for v in got]))
 
 
 def t_two_far_mobs_stay_two():
@@ -225,100 +244,104 @@ def t_jitter_smoothed():
 
 # ---------------------------------------------------------------- 防抖 / 幽灵
 
-def t_debounce_window():
-    """防抖：框消失后按 debounce_ms 保留（missed>0），到期不再输出，再过 500ms 清理。
+def t_track_buffer_window():
+    """**失联帧长**：框消失后按 `track_buffer_ms` 保留（missed>0），超期就不再输出。
 
-    时间自造：一帧 66.7ms，所以"到 300ms 为止"是第 4 帧、第 5 帧必须停 ——
-    按**累计毫秒**推，别写死帧数（帧率一改就错）。
+    用户 2026-10-17 原话：「接 ByteTrack，新参数『**失联帧长**』（track_buffer）代替以前的
+    『防抖时间』，**默认 1000ms**」✓ —— 所以这条测的就是**新的那一个**参数 ✓
+    （老的 `debounce_conf` / `debounce_ms` 已经删了 ✗）。
     """
     with Feed() as f:
-        f.t.debounce_conf = 0.5
-        f.t.debounce_ms = 300.0
-        f.warm(det(500), n=2)               # 先确认（确认闸 ✓）再"最后一次看见它"
+        f.t.track_buffer_ms = 700.0
+        f.warm(det(500), n=3)               # 先攒够确认帧（连续 3 帧 ✓）
         f.step(det(500))
+        out = f.step(det(500))
+        check(len(out) == 1, "确认之后应当有框：%d" % len(out))
+        # 换算出来的**帧数**也得对：700ms × 15fps ≈ 11 帧 ✓
+        check(10 <= int(f.t.diag["buffer"]) <= 12,
+              "失联帧长换算成帧数不对：%r（700ms @ ~15fps 应约 11 帧 ✓）"
+              % (f.t.diag["buffer"],))
 
-        elapsed = 0.0
-        while elapsed + FRAME_MS <= 300.0:  # 窗口内：一直留着，且是幽灵框
-            elapsed += FRAME_MS
-            out = f.idle(1)[0]
-            check(len(out) == 1, "防抖期内（%.0f ms）不该丢框" % elapsed)
-            check(out[0].missed > 0,
-                  "防抖期内的框应当带 missed>0（决策层靠它防空放技能）")
-
-        elapsed += FRAME_MS                 # 越过 300ms：必须停
+        f.idle(5)                            # 漏 5 帧（≈333ms，还在 700ms 内）
         out = f.idle(1)[0]
-        check(len(out) == 0,
-              "过了防抖时间（%.0f ms > 300）还在输出" % elapsed)
+        check(len(out) == 1, "失联帧长内（约 400ms）不该丢框")
+        check(out[0].missed > 0,
+              "缓冲期内的框应当带 missed>0（决策层靠它防空放技能）")
 
-        # 再过了缓冲（+500ms）：轨迹本身被清掉（不然一直躺着占内存）
-        f.idle(10)
-        check(len(f.t._tracks) == 0, "该清理的轨迹还在：%s" % f.t._tracks)
-
-
-def t_debounce_conf_gate():
-    """置信度**从没达到过**防抖置信度的框：消失就消失，不留幽灵框。"""
-    with Feed() as f:
-        f.t.debounce_conf = 0.8
-        f.t.debounce_ms = 1000.0
-        f.warm(det(500, conf=0.4))          # 低置信度（但确认过 ✓ 免得被确认闸挡住 ✓）
-        out = f.idle(1)[0]
-        check(len(out) == 0, "低置信度的框不该被保留：%d 个" % len(out))
+        f.idle(20)                           # 早过 700ms 了
+        check(len(f.t.bt.tracks) == 0,
+              "过了失联帧长还没清理：%d 条" % len(f.t.bt.tracks))
 
 
-def t_debounce_conf_peak():
-    """⭐ 防抖置信度看**历史最高**（用户 2026-10-01 ✓）：先高后低的怪，消失时仍残留。
+def t_low_conf_never_creates():
+    """**低分框永远不新建身份**（BYTE 第二阶段 ✓）：只喂低分档 ⇒ 一个框都不出。
 
-    原来用**最后一次**的 `conf` ✗：一只怪先被高置信度认出来、之后几帧框得不准掉到
-    阈值以下，它一消失就被立刻丢掉 ✗。改后用 `peak_conf`（历史最高）✓ ——
-    "只要达到过阈值，消失时就残留防抖时间" ✓。
+    ⚠ 这是老「防抖置信度」那条的**替代判据**：原来靠"到过某个置信度才留幽灵框"，
+      现在靠 ByteTrack 的**两阶段关联** —— 低分框只能给**已存在**的轨迹续命 ✓
+      （见 `t_low_conf_maintains_identity` ✓），**绝不能凭空造出一个 id** ✗。
     """
     with Feed() as f:
-        f.t.debounce_conf = 0.8
-        f.t.debounce_ms = 1000.0
-        f.warm(det(500, conf=0.9))          # 高置信度：达到过阈值（且确认过 ✓）
-        f.step(det(500, conf=0.4))          # 掉到阈值以下（最后一次只有 0.4）
-        out = f.idle(1)[0]                  # 消失
-        check(len(out) == 1 and out[0].missed > 0,
-              "置信度**曾经达到过**阈值、只是最后几帧变低了，消失时却不残留防抖：%d 个"
-              % len(out))
+        out = []
+        for _ in range(5):
+            out = f.step(low=[det(500, conf=0.2)])
+        check(len(out) == 0, "低分框不该新建轨迹：%d 个" % len(out))
+        check(len(f.t.bt.tracks) == 0,
+              "低分框居然建了轨迹：%d 条" % len(f.t.bt.tracks))
 
 
-def t_ghost_drift():
-    """幽灵框按（衰减的）速度继续走，且有总位移上限 —— 不许冻在原地，也不许飘走。"""
+def t_avg_conf_and_history():
+    """按 `track_id` 逐条记账：**平均置信 / 最近 N 帧位置 / 存活时间**（用户 2026-10-17 ✓）。
+
+    用户原话：「按 `track_id` 维护每个目标的：**最近 N 帧位置、平均置信、存活时间**」✓
+    —— 这条替掉老的「防抖置信度看历史最高」（那个概念随防抖一起删了 ✗）。
+    """
     with Feed() as f:
-        f.t.debounce_conf = 0.5
-        f.t.debounce_ms = 3000.0
+        confs = (0.9, 0.6, 0.75, 0.8)
+        out = None
+        for i, c in enumerate(confs):
+            out = f.step(det(500 + i * 4, conf=c))
+        check(len(out) == 1, "稳定目标该输出 1 个框：%d" % len(out))
+        tr = f.t.bt.tracks[0]
+        check(int(tr.tid) == int(out[0].id), "输出的 id 与轨迹对不上")
+        check(abs(tr.avg_conf - sum(confs) / len(confs)) < 1e-6,
+              "平均置信算错：%.4f ≠ %.4f"
+              % (tr.avg_conf, sum(confs) / len(confs)))
+        check(len(tr.history) == len(confs),
+              "最近 N 帧位置该有 %d 条，实测 %d" % (len(confs), len(tr.history)))
+        check(tr.alive_ms > 0.0, "存活时间没记（alive_ms=0）")
+
+
+def t_kalman_extrapolates_ghost():
+    """幽灵框按**卡尔曼匀速模型**继续走（不是冻在原地 ✓ 也不许乱飘 ✗）。
+
+    用户 2026-10-17：「稳定 ID 后，再用卡尔曼/EMA 平滑输出框坐标…**预测 = 上一帧速度外推**，
+    **更新 = 观测值融合**」✓ —— 这条测的就是"丢掉检测之后还按速度走"那一步 ✓。
+    """
+    with Feed() as f:
+        f.t.track_buffer_ms = 3000.0
         x = 500.0
-        f.warm(det(x))
-        for _ in range(12):                 # 稳定地以 10 px/帧向右走
+        out = None
+        for _ in range(10):                  # 稳定地以 10 px/帧向右走
             out = f.step(det(x))
             x += 10.0
-        last_x = out[0].x
-
-        steps = []
-        prev = last_x
-        for _ in range(10):
-            out = f.idle(1)[0]
-            check(len(out) == 1, "防抖期内应当还有这个框")
-            steps.append(out[0].x - prev)
-            prev = out[0].x
-
-        check(steps[0] > 2.0, "幽灵框冻在原地了（第一帧只走了 %.2f px）" % steps[0])
-        check(all(s >= -1e-6 for s in steps), "幽灵框往回走了：%s"
-              % [round(s, 2) for s in steps])
-        check(steps[0] >= steps[1] >= steps[2],
-              "幽灵框的速度没有衰减：%s" % [round(s, 2) for s in steps[:4]])
-        total = prev - last_x
-        check(total <= 0.6 * BOX_H + 6.0,
-              "幽灵框飘太远：总共走了 %.1f px" % total)
+        last = out[0].x
+        out2 = f.idle(1)[0]
+        check(len(out2) == 1, "失联帧长内应当还有这个框")
+        step1 = out2[0].x - last
+        check(step1 > 2.0, "幽灵框冻在原地了（第一帧只走了 %.2f px）" % step1)
+        out3 = f.idle(1)[0]
+        step2 = out3[0].x - out2[0].x
+        check(step2 > 0.0, "幽灵框往回走了：%.2f" % step2)
+        check(abs(step2 - step1) <= 6.0,
+              "幽灵框速度忽快忽慢（卡尔曼匀速模型应当很稳）：%.2f → %.2f"
+              % (step1, step2))
 
 
 def t_kill():
     """kill(id) 立即消除（幽灵框被攻击时，live_thread 会调它）。"""
     with Feed() as f:
-        f.t.debounce_conf = 0.5
-        f.t.debounce_ms = 3000.0
-        f.warm(det(500))
+        f.t.track_buffer_ms = 3000.0
+        f.warm(det(500), n=3)
         f.t.kill(1)
         out = f.idle(1)[0]
         check(len(out) == 0, "kill 之后还有 %d 个框" % len(out))
@@ -327,16 +350,12 @@ def t_kill():
 def t_ids_unique():
     """同一帧里输出的 id 必须唯一 —— 重复 id 会让决策层的目标锁定彻底乱掉。"""
     with Feed() as f:
-        f.t.debounce_conf = 0.5
-        f.t.debounce_ms = 1000.0
-        f.warm(det(300), det(700))          # 先确认两条（否则空列表也能"通过"✗）
+        f.warm(det(300), det(700), n=3)     # 先确认两条（否则空列表也能"通过"✗）
         for out in (f.step(det(310)), f.idle(1)[0], f.step(det(315), det(715))):
             ids = [m.id for m in out]
             check(len(ids) == len(set(ids)), "同一帧里 id 重复了：%s" % ids)
         check(len(out) == 2, "这一拍两只都该在（顺带证明确认后没丢）：%d" % len(out))
 
-
-# ------------------------------------------------- 2026-10-11 新增：确认 / 低分续命
 
 def t_confirm_gate_no_single_frame_flick():
     """⭐⭐ **单帧假框一个都不许出**（用户 2026-10-11："**同个怪物的检出框疯狂闪烁**"✓）。
@@ -347,30 +366,23 @@ def t_confirm_gate_no_single_frame_flick():
 
     钉四件：
       ① 只出现**一拍**的框 ⇒ 一拍都不输出 ✓（这就是治闪的那道闸 ✓）；
-      ② 连着两拍（同一位置 ✓）⇒ **第二拍**才出 ✓；
-      ③ 出框之后它就是"确认过的"✓ —— 后面漏一拍按防抖留（不会因为没连续看见就消失 ✓）；
-      ④ ⚠ **时间地板**真的在起作用：把两拍压到 10ms 以内（60fps 那种连着的两帧 ✓）
-         ⇒ 仍然**不许**输出 ✓（连着的两次假框往往同源 ✓ 光数帧数拦不住 ✓）。
+      ② 连着 **3** 帧（同一位置 ✓）⇒ 第 3 帧才出 ✓（用户 2026-10-17："连续 **2~3** 帧稳定再认"）；
+      ③ 出框之后它就是"**确认过**"的 ✓ —— 后面漏一拍按**失联帧长**留着（只涨不落 ✓）；
+      ④ ⚠ 第 2 帧**不许**出（少一帧就是"闪一下"那种假框 ✓）。
     """
     with Feed() as f:
         out = f.step(det(500))
         check(len(out) == 0, "① 单帧假框不该输出：%d 个" % len(out))
         out = f.step(det(500))
-        check(len(out) == 1, "② 连着两拍、又活了 66ms ⇒ 该输出了：%d 个" % len(out))
-        check(out[0].age >= 2, "输出了但 age=%s（确认闸没生效？）" % out[0].age)
-        # ③ 确认过之后，漏一拍仍按防抖留（确认**只涨不落** ✓）
-        f.t.debounce_conf = 0.5
-        f.t.debounce_ms = 500.0
+        check(len(out) == 0, "④ 第 2 帧还不许出（要连续 3 帧 ✓）：%d 个" % len(out))
+        out = f.step(det(500))
+        check(len(out) == 1, "② 连着 3 帧稳定 ⇒ 该输出了：%d 个" % len(out))
+        check(out[0].age >= 3, "输出了但 age=%s（确认闸没生效？）" % out[0].age)
+        # ③ 确认过之后，漏一拍仍按**失联帧长**留着（确认**只涨不落** ✓）
+        f.t.track_buffer_ms = 500.0
         out = f.idle(1)[0]
         check(len(out) == 1 and out[0].missed > 0,
-              "③ 确认过的轨迹漏一拍该按防抖留着：%d 个" % len(out))
-    # ④ 时间地板
-    with Feed() as f:
-        got = []
-        for _ in range(4):
-            got.append(len(f.step(det(500), ms=5.0)))     # 5ms 一拍 ⇒ 4 拍才 20ms
-        check(all(n == 0 for n in got),
-              "④ 60ms 内的连续几拍就被算成「确认」了（时间地板没生效 ✗）：%s" % got)
+              "③ 确认过的轨迹漏一拍该按失联帧长留着：%d 个" % len(out))
 
 
 def t_low_conf_maintains_identity():
@@ -430,9 +442,8 @@ def t_flick_recorded():
         check(f.t.drain_flick() == [], "`drain_flick` 取走之后该清空 ✓")
 
     with Feed() as f:
-        f.warm(det(500))                   # 确认过的
-        f.t.debounce_conf = 0.5
-        f.t.debounce_ms = 100.0
+        f.warm(det(500), n=3)              # 确认过的（连续 3 帧 ✓）
+        f.t.track_buffer_ms = 100.0        # 短缓冲：几拍就到期 ✓
         f.idle(12)
         check(f.t.drain_flick() == [],
               "**确认过**的轨迹消失不该算「闪一下」（那会天天误报 ✗）")
@@ -895,10 +906,11 @@ TESTS = (
     ("框忽大忽小：仍是同一条轨迹", t_size_flicker_one_box),
     ("两只离得远的怪：不合并", t_two_far_mobs_stay_two),
     ("静止 + 噪声：抖动被压下去", t_jitter_smoothed),
-    ("防抖窗口：保留 / 到期 / 清理", t_debounce_window),
-    ("置信度不够就不留幽灵框", t_debounce_conf_gate),
-    ("置信度看历史最高：先高后低也残留（用户 2026-10-01）", t_debounce_conf_peak),
-    ("幽灵框继续走、速度衰减、位移有上限", t_ghost_drift),
+    ("**失联帧长**：缓冲内保留（missed>0）/ 超期清理（默认 1000ms）", t_track_buffer_window),
+    ("⭐ 低分框永不新建身份（BYTE 第二阶段）", t_low_conf_never_creates),
+    ("⭐ 逐轨记账：平均置信 / 最近 N 帧位置 / 存活时间（用户 2026-10-17）",
+     t_avg_conf_and_history),
+    ("⭐ 幽灵框按**卡尔曼匀速模型**外推（不冻住、不乱飘）", t_kalman_extrapolates_ghost),
     ("kill 立即消除", t_kill),
     ("同一帧 id 唯一", t_ids_unique),
     ("⭐⭐ 确认闸：单帧假框一个都不许出（治「疯狂闪烁」）+ 时间地板",
@@ -950,19 +962,21 @@ def t_rel_anchor_keeps_id():
     def _feed(tr, x1, anchor):
         return tr.update([(x1, 100.0, x1 + 40.0, 150.0, 0.9)], [], player_world=anchor)
 
-    # ① 不喂锚（= 老行为）⇒ 续不上
+    # ① 不喂锚（= 老行为）⇒ 60px 一跳**认不上** ⇒ 换了 id ✓（这就是要治的病根 ✓）
+    #   ⚠ 判据是"**id 变没变**"，不是"剩几条轨迹" ✗ —— 换内核后没确认的短轨迹会被
+    #     直接丢掉 ✓（所以可能只剩 1 条，但**不是原来那条** ✓）。
     tr0 = MobTracker()
     _feed(tr0, 100.0, None)
+    _id0 = tr0._tracks[0]["id"]
     _feed(tr0, 40.0, None)
-    check(len(tr0._tracks) >= 2,
-          "用例前提不成立：不喂锚时这条该**认不上**（否则测不到病根 ✓）：%d 条"
-          % (len(tr0._tracks),))
+    check(all(t["id"] != _id0 for t in tr0._tracks),
+          "用例前提不成立：不喂锚时 60px 一跳该**认不上**（换 id ✓）：%r"
+          % ([t["id"] for t in tr0._tracks],))
 
     # ② 喂锚（角色世界 +60 ⇒ 静止的怪在画面上左移 60 ✓）⇒ 同一条续上
     tr1 = MobTracker()
-    tr1.debounce_conf = 0.3
-    tr1.debounce_ms = 1000.0
-    _feed(tr1, 100.0, (0.0, 0.0))
+    for _ in range(3):                     # 先攒够确认帧（连续 3 帧 ✓）
+        _feed(tr1, 100.0, (0.0, 0.0))
     _tid = tr1._tracks[0]["id"]
     out1 = _feed(tr1, 40.0, (60.0, 0.0))
     check(len(tr1._tracks) == 1 and [m.id for m in out1] == [_tid],
@@ -997,147 +1011,77 @@ TESTS = TESTS + (
 )
 
 
-def t_gmc_fallback_keeps_id():
-    """⭐⭐⭐⭐ **GMC 兜底**（用户 2026-10-13 ✓ 原话："**多目标追踪算法能否缓解这个问题？**"＋
-    "**全部做完**"✓）—— 这是 MOT 里对"移动相机"的标配做法（借 SDK 的多数派运动 ✓ 见
-    `GMC_MIN_TRACKS` ✓）。钉三件：
+def t_camera_shift_keeps_id():
+    """⭐⭐⭐ **相机（角色）位移补偿**：世界坐标一滚 ⇒ 轨迹整体挪、**id 不换**。
 
-      ① **前提（病根）**：样本**不够**（这里只有 1 只怪 ⇒ 中位数没有意义 ✓）⇒ 不补偿 ⇒
-         画面一滚就**认不上**（换 id ✓）—— 这就是现场 `age=1 / missed≈80` 那条链 ✓；
-      ② **样本够**（3 只怪 ✓）⇒ 锚拿不到（`player_world=None`）也**一路续得上同一个 id** ✓；
-      ③ 估计本身：中位数 + 剔离群（在跑的那只不许把整体带走 ✓）+ 样本不够就回 `None` ✓。
+    ⚠ 老的「GMC 兜底」（画面整体平移的多数派估计）**已随换内核删掉** ✗ ——
+      它要治的"匀速整体平移"现在由**卡尔曼匀速模型的外推**接 ✓（`_Kalman.predict` ✓），
+      所以这条只钉**外部锚那一半**（角色世界坐标 ✓ `_shift_anchor` ✓ 仍在用 ✓）。
     """
-    # ⚠⚠ **本轮实测踩到的两条（记下来，别再拿它们当"病根" ✗）**：
-    #   ① **匀速整体平移**靠"速度外推"本来就跟得上 ✓（`_score` 的预测项 `pcx = cx + vx` 会把
-    #      整体平移学进 `vx` ✓）；
-    #   ② 漏帧那几拍还有**补桥**（`MATCH_RELAX` ✓）兜着 ⇒ 平滑滚动这条路上 GMC **并不是**
-    #      唯一的救命稻草 ✓（实测：关掉 GMC 也照样续上同一个 id ✓）。
-    #   ⇒ 所以这条用例**不假装有病根** ✗（那样只会写出一条"前提不成立"的假用例 ✓），
-    #     只钉两件**确定的事实**：估计本身对不对 ✓、以及"锚拿不到时它真的顶上去了" ✓。
-    def _run(use_gmc):
-        with Feed() as f:
-            xs = (200.0, 320.0, 440.0)
-            f.warm(*[det(x) for x in xs], n=3)
-            _ids = sorted(t["id"] for t in f.t._tracks)
-            check(len(_ids) == 3, "用例前提：该有 3 条轨迹（GMC 要 3 个样本 ✓）：%r" % (_ids,))
-            _x0 = float(f.t._tracks[0]["x1"])
-            for k in (1, 2):                      # 让它"看见"整体滚动 30px/帧 ✓
-                f.step(*[det(x - 30.0 * k) for x in xs])
-            check(sorted(t["id"] for t in f.t._tracks) == _ids,
-                  "看见的这几拍就换 id 了 ✗（那是另一条链的问题 ✓）：%r"
-                  % (sorted(t["id"] for t in f.t._tracks),))
-            # 锚**拿不到**（`Feed.step` 不喂 `player_world` ✓）⇒ 该走 GMC 那条 ✓
-            f.step(*[det(x - 30.0 * 3) for x in xs])
-            return f.t, _x0
-
-    # ① 估计本身：中位数 + 剔离群 + 样本不够沿用并衰减
-    tr = trk.MobTracker()
-    tr._gmc_samples = [(10.0, 0.0), (12.0, 1.0)]
-    check(tr._gmc_estimate() is None,
-          "没算过又没样本时该回 `None`（宁缺勿错 ✓）")
-    tr._gmc_samples = [(10.0, 0.0), (11.0, 1.0), (9.0, 0.0), (300.0, 0.0)]
-    _g = tr._gmc_estimate()
-    check(_g is not None and abs(_g[0] - 10.0) <= 2.0 and abs(_g[1]) <= 2.0,
-          "中位数/剔离群不对：一个离群样本（300px）不该把整体带走 ✗：%r" % (_g,))
-    tr.gmc = (20.0, 0.0)
-    tr._gmc_samples = []                        # 这一拍没配对（典型：都在漏帧 ✓）
-    _g2 = tr._gmc_estimate()
-    check(_g2 is not None and abs(_g2[0] - 20.0 * trk.GMC_HOLD_RATIO) < 1e-6,
-          "样本不够时该**沿用上一次并衰减**（幽灵框得跟着画面走 ✓）：%r" % (_g2,))
-
-    # ② 真顶上去了：锚拿不到 ⇒ `diag.gmc` 计数 + 轨迹按估计值整体挪 ✓
-    _t, _x_before = _run(True)
-    check(int(_t.diag.get("gmc", 0)) >= 1,
-          "锚拿不到时没用上 GMC 兜底（`diag.gmc` = %r ⇒ 还在走「不挪」那条 ✗）"
-          % (_t.diag.get("gmc"),))
-    # ⚠ 只钉**方向**（负 ✓ = 画面整体往左滚 ✓），不钉精确值 ✗ —— 本轮实测这一格量到
-    #   `-14.7`（≈ `-30 × 0.7²`）：说明最后那几拍里有的拍**没凑够 3 个样本**，走了
-    #   `GMC_HOLD_RATIO` 的衰减那条 ✓（值偏小但方向对 ✓ 而且够用：认领闸 36px 以内 ✓）。
-    #   ⇒ 记一条**待查**：为什么那几拍的配对样本会不足（要么是它被同体合并吃掉了 ✓
-    #     要么是 `seen_frame` 的连续判据太严 ✓）—— 别为了让用例好看就把断言写成"≈ -30" ✗。
-    check(_t.gmc is not None and float(_t.gmc[0]) < 0.0,
-          "学到的「画面整体平移」方向不对（该是负 = 画面往左滚 ✓）：%r" % (_t.gmc,))
-    check(float(_t._tracks[0]["x1"]) < _x_before,
-          "轨迹没跟着画面挪（幽灵框会停在原地 ⇒ Agent 朝错位置走 ✓）：%r"
-          % (float(_t._tracks[0]["x1"]),))
-
-    # ③ 估计本身：中位数 + 剔离群 + 样本不够回 None
-    tr = trk.MobTracker()
-    tr._gmc_samples = [(10.0, 0.0), (12.0, 1.0)]
-    check(tr._gmc_estimate() is None,
-          "样本少于 `GMC_MIN_TRACKS` 时该回 `None`（宁缺勿错 ✓）")
-    tr._gmc_samples = [(10.0, 0.0), (11.0, 1.0), (9.0, 0.0), (300.0, 0.0)]
-    _g = tr._gmc_estimate()
-    check(_g is not None and abs(_g[0] - 10.0) <= 2.0 and abs(_g[1]) <= 2.0,
-          "中位数/剔离群不对：一个离群样本（300px）不该把整体带走 ✗：%r" % (_g,))
-
-
-def t_bridge_keeps_id_after_gap():
-    """⭐⭐⭐⭐ **跨漏帧重关联（"补桥"）**（用户 2026-10-13 ✓ 同上 ⇒ MOT 的 lost-track / OCR
-    再匹配 ✓ 见 `MATCH_RELAX` ✓）：漏了几拍之后**同一个 id 回来** ✓ —— 不补这一刀时必然新起一条 ✓
-    （用户看到的"疯狂闪烁"里就有它 ✓）。
-    """
-    _tr0 = trk.MobTracker()
-    _gate = _tr0._gate({"x1": 0.0, "y1": 0.0, "x2": BOX_W, "y2": BOX_H,
-                        "vx": 0.0, "vy": 0.0})
-    _jump = _gate * 1.5          # > 正常闸（36px ✓）但 < 放宽后的闸（`MATCH_RELAX`=1.8 ✓）
-    check(_jump > _gate and _jump <= _gate * trk.MATCH_RELAX,
-          "用例前提：这一下位移该「正常闸够不着、放宽闸够得着」（%.1f vs %.1f ✓）"
-          % (_jump, _gate))
-
     with Feed() as f:
-        f.t.debounce_ms = 5000.0     # 让这条轨迹在漏帧那几拍里还活着 ✓
+        f.t.cam = None
+        f.warm(det(200.0), det(400.0), n=4)
+        _ids = sorted(t["id"] for t in f.t._tracks)
+        check(len(_ids) == 2, "用例前提：该有 2 条轨迹：%r" % (_ids,))
+        _x0 = float(f.t._tracks[0]["x1"])
+        # 角色世界坐标往右走了 30 ⇒ **画面里的东西整体往左 30** ✓（`_shift_anchor` ✓）
+        for k in (30.0, 60.0):
+            f.step(det(200.0 - k), det(400.0 - k), world=(k, 0.0))
+        check(sorted(t["id"] for t in f.t._tracks) == _ids,
+              "相机滚动之后换 id 了 ✗（补偿没生效 ✓）：%r"
+              % (sorted(t["id"] for t in f.t._tracks),))
+        check(float(f.t._tracks[0]["x1"]) < _x0,
+              "轨迹没跟着画面挪 ✗（幽灵框会停在原地 ⇒ Agent 朝错位置走 ✓）：%.1f ≥ %.1f"
+              % (float(f.t._tracks[0]["x1"]), _x0))
+
+
+def t_reacquire_within_buffer():
+    """⭐⭐⭐ **失联帧长内**漏几拍再出现 ⇒ 认回**同一个 id**（ByteTrack 的 lost 再匹配 ✓）。
+
+    ⚠ 老的「跨漏帧补桥」（`MATCH_RELAX` 那次放宽再配 ✓）已删 ✗ ——
+      现在靠 `track_buffer`：轨迹在缓冲期内**不删**、状态 `LOST` ✓ 下一拍照样进第一段关联 ✓。
+    """
+    with Feed() as f:
+        f.t.track_buffer_ms = 1000.0
         f.warm(det(200.0), n=3)
         _tid = f.t._tracks[0]["id"]
-        f.idle(2)                    # 漏两拍（幽灵外推 ✓）
-        out = f.step(det(200.0 + _jump))
+        f.idle(3)                        # 漏 3 拍（≈200ms，远小于 1000ms ✓）
+        out = f.step(det(203.0))         # 差不多同一个位置回来
         check([m.id for m in out] == [_tid] and len(f.t._tracks) == 1,
-              "漏帧后再出现时**没认回同一个 id** ✗（补桥没生效 ✓）：%r / %d 条"
+              "漏帧后再出现时**没认回同一个 id** ✗（失联帧长内该认回 ✓）：%r / %d 条"
               % ([m.id for m in out], len(f.t._tracks)))
-        check(int(f.t.diag.get("bridge", 0)) >= 1,
-              "这一拍该记一条补桥（`diag.bridge` ✓）：%r" % (f.t.diag.get("bridge"),))
+        check(int(out[0].missed) == 0, "认回来之后 missed 该归零 ✓")
 
 
-def t_same_id_jump_quarantine():
-    """⭐⭐⭐ **同 ID 跳变隔离**（用户 2026-10-13 ✓ 同上 ⇒ 借 SDK `branch_tracker.py:106-116` ✓
-    见 `MOB_QUARANTINE_*` ✓）：id 没变、但框跳到另一个更连续的位置（两只贴着的怪整体换身 ✓）⇒
-    **这一拍先别认**（按 coast 走 ✓），要连着 `MOB_QUARANTINE_FRAMES` 拍都指向同一处才认 ✓。
+def t_kalman_smooths_jitter():
+    """⭐⭐ **卡尔曼轻量平滑**：观测抖 ±8px ⇒ 输出明显更平（用户 2026-10-17 ✓）。
+
+    用户原话：「稳定 ID 后，再用卡尔曼/EMA 平滑输出框坐标做**轻量平滑**，对 `(cx, cy, w, h)`
+    建 8 维状态，匀速模型够用：观测 = YOLO 框；预测 = 上一帧速度外推；更新 = 观测值融合」✓
+    ⚠ 判据用**两个方向一起**（只测"变平"会把"卡死不动"也算通过 ✗）：
+      ① 抖动被压掉一截（输入 span 16 ⇒ 输出 < 12 ✓）；
+      ② 匀速移动**不许拖后腿**（滞后 < 3px ✓）—— 这就是"轻量"的边界 ✓。
     """
     with Feed() as f:
-        f.warm(det(200.0), n=3)
-        _tid = f.t._tracks[0]["id"]
-        # 位移：**比"认领半径 × 0.6"大、但仍在认领半径之内** ✓
-        #   ⚠⚠ 本轮实测的教训（别照抄 SDK 的绝对像素 ✗）：SDK 是 IoU+卡尔曼、没有固定像素闸，
-        #     所以它敢用 `96px` ✓；我们的闸是 `max(10, 0.9 × 框长边)`（40px 的怪 ≈ 36px ✓）
-        #     ⇒ 绝对 96px 那一下**根本配不上**（走不到这里 ✓）= **死代码** ✓（见常量说明 ✓）。
-        _gate = f.t._gate({"x1": 0.0, "y1": 0.0, "x2": BOX_W, "y2": BOX_H,
-                           "vx": 0.0, "vy": 0.0})
-        _x = 200.0 + _gate * (trk.MOB_QUARANTINE_JUMP_RATIO + 0.2)
-        check(_gate * (trk.MOB_QUARANTINE_JUMP_RATIO + 0.2) < _gate,
-              "用例前提：这一下位移该**小于认领半径**（否则连配都配不上 ✓）")
-        # ① 第一拍：跳得可疑（> 认领半径 × 0.6 ✓）⇒ **这一拍不认**（`diag.quarantine` 记一笔 ✓）
-        #   ⚠⚠ **本轮实测（别把断言写得比事实强 ✗）**：被隔离这一拍确实没认 ✓，但紧接着
-        #     `_dedupe` 会把"同体的新轨迹"并回**老 id**（`_same_body` ✓ 认领半径内 ✓）⇒
-        #     那一拍的 `missed` 又会归零 ✗ ⇒ **拿 `missed==1` 当断言是错的** ✓
-        #     （隔离的净效果 = "不靠这一拍换位置"，而同体合并照旧保住 id ✓ 这正是我们要的 ✓）。
-        f.step(det(_x))
-        check(int(f.t.diag.get("quarantine", 0)) >= 1,
-              "跳变隔离没触发（`diag.quarantine` ✓）：%r" % (f.t.diag.get("quarantine"),))
-        # ② 关键后果：**id 不许换**（这一只是同一个身体 ✓ 合并之后还是老 id ✓ 且不会多出一条 ✓）
-        _ids_now = sorted(t["id"] for t in f.t._tracks)
-        check(_tid in _ids_now and len(_ids_now) == 1,
-              "可疑跳变之后换了 id / 多长出一条 ✗（该仍是老 id 这一条 ✓）：%r"
-              % (_ids_now,))
+        xs = []
+        for j in (0, 8, -8, 8, -8, 8, -8, 8, -8, 8, -8, 8):
+            out = f.step(det(400.0 + j))
+            if out:
+                xs.append(out[0].x)
+        check(len(xs) >= 6, "稳定之后应当一直有框：%d 帧" % len(xs))
+        span = max(xs) - min(xs)
+        check(span < 12.0,
+              "抖动没被压下去（输入 span=16，输出 span=%.1f）" % span)
 
-
-TESTS = TESTS + (
-    ("⭐⭐⭐⭐ GMC 兜底：锚拿不到时用「画面整体平移（多数派运动）」顶上（相机滚动不再换 id）",
-     t_gmc_fallback_keeps_id),
-    ("⭐⭐⭐⭐ 跨漏帧重关联（补桥）：漏几拍之后再出现 ⇒ 认回同一个 id",
-     t_bridge_keeps_id_after_gap),
-    ("⭐⭐⭐ 同 ID 跳变隔离：跳得离谱先别认，连着 3 拍同一处才认",
-     t_same_id_jump_quarantine),
-)
+    with Feed() as f:
+        _x = 300.0
+        out = None
+        for _ in range(12):              # 匀速 10 px/帧
+            out = f.step(det(_x))
+            _x += 10.0
+        lag = (_x - 10.0) - out[0].x
+        check(abs(lag) < 3.0,
+              "平滑把匀速移动拖慢了（滞后 %.1f px）—— 那就不是「轻量」了 ✗" % lag)
 
 
 def main() -> int:

@@ -415,6 +415,28 @@ def cursor_probe():
         return None
 
 
+def window_probe():
+    """**被控机上游戏窗口在哪** ⇒ `(x, y, w, h)`（客户区 / 屏幕坐标）；问不到 ⇒ `None` ✓。
+
+    ⭐⭐⭐ 为什么要有它（用户 2026-10-17 ✓ 原话：
+      「**A 机游戏窗口是会移动的，你保证你的方案能适配吗？**」✓）：
+      · 断线重连 / 测谎的点击比例是**相对画面**算的 ✓，而画面 = A 机抓的那块屏幕 ✓；
+      · 要落成**屏幕坐标**就必须知道"那块在屏幕的哪儿" ✓ —— 老实现把它当 `(0, 0)` ✗
+        ⇒ **窗口一挪就全偏** ✓（用户说的"会移动"正是这条 ✗）；
+      · 现在每次点之前问一次 A 机（relay 的 `WINDOW?` ✓ 读 `deploy.json` 的
+        `push.region_win` ✓ 跟随窗口时就是**窗口客户区** ✓）⇒ 挪了也自动跟上 ✓
+        **不用改任何配置** ✓。
+    ⚠ 本地后端（本机 SendInput / 串口）⇒ 返回 `None` ✓（那条路的 `origin` 另有来源 ✓
+      见 `gui/live_thread` 的 `origin_ref` ✓）；问不到也 `None` ⇒ 调用方退回老路 ✓ 不会更糟 ✓。
+    """
+    if _remote is not None and hasattr(_remote, "window"):
+        try:
+            return _remote.window()
+        except Exception:                        # noqa: BLE001 —— 问不到就当不知道 ✓
+            return None
+    return None
+
+
 def _note_connect_fail(kind, why):
     """留痕：连不上时**把原因记下来**（日志 + 打点 ✓ 不许静默 ✗ 见 `_connect_err` ✓）。"""
     try:
