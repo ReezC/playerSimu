@@ -573,7 +573,7 @@ class ServiceCard(QFrame):
             return
         if not rect:
             return
-        zoom = int(self.cfg.get("mmap", {}).get("zoom") or 3)
+        zoom = int(self.config().get("mmap", {}).get("zoom") or 3)
         try:
             path = mmap_regions.save(mid, rect[0], rect[1], rect[2], rect[3],
                                      zoom=zoom, note="部署台「框选…」")
@@ -585,7 +585,7 @@ class ServiceCard(QFrame):
             return
         self.refresh_mmap_rows()
         _restarted = False
-        proc = self.procs.get("mmap")
+        proc = self.procs_map().get("mmap")
         if proc is not None and proc.running():
             self.stop_service("mmap")
             QTimer.singleShot(600, lambda: self.start_service("mmap"))
@@ -633,13 +633,13 @@ class ServiceCard(QFrame):
                 "框到的是 %d×%d —— 这么小推出去什么都看不清，先框大一点 ✓\n"
                 "（想回到整屏就点旁边的「整屏」。）" % (w, h))
             return
-        py = self.cfg["push"]
+        py = self.config().setdefault("push", {})     # ⚠ 本段 ≠ 整份 ✓ 见 `config()`
         py.update({"region_x": max(0, x), "region_y": max(0, y),
                    "region_w": w, "region_h": h,
                    "width": w, "height": h,        # 1:1，最省 ✓
                    # ⚠ 手框 = **固定区域** ⇒ 必须把"跟随窗口"关掉 ✗（不然两个口径打架 ✓）
                    "region_win": None, "region_rel": None})
-        dcfg.save(self.cfg)
+        dcfg.save(self.config())   # ⚠ 必须存**整份** ✗（存本段会把 deploy.json 写残 ✓）
         ok, msg = dcfg.sync_push_size_to_link(w, h)
         # 「分辨率」那格要跟着变 ✓（卡片自刷 ✓ 不必重建整个界面 ✗）
         self.refresh_displays()
@@ -650,13 +650,13 @@ class ServiceCard(QFrame):
 
     def _clear_push_region(self):
         """「整屏」：清掉区域 ⇒ 回到抓整个桌面（老行为 ✓ 用户 2026-10-17）。"""
-        py = self.cfg["push"]
+        py = self.config().setdefault("push", {})
         if not int(py.get("region_w") or 0) and not int(py.get("region_h") or 0):
             self.log("push", "现在就是整屏 ✓ 不用改")
             return
         py.update({"region_x": 0, "region_y": 0, "region_w": 0, "region_h": 0,
                    "region_win": None, "region_rel": None})
-        dcfg.save(self.cfg)
+        dcfg.save(self.config())
         self.refresh_displays()
         self.refresh_cmd()
         self.log("push", "已改回**整屏**（抓整个桌面 ✓）")
@@ -743,7 +743,7 @@ class ServiceCard(QFrame):
 
         lst = QListWidget(dlg)
         cur_row = 0
-        _fol = (self.cfg.get("push") or {}).get("region_win") or []
+        _fol = (self.config().get("push") or {}).get("region_win") or []
         for i, w in enumerate(wins):
             item = QListWidgetItem("%s    %d×%d"
                                    % (str(w.get("title") or "")[:60],
@@ -803,13 +803,13 @@ class ServiceCard(QFrame):
         rel = wincap.rel_from_rect(rect, geom) if geom else None
         if not rel:
             self.log("push", "⚠ 窗口几何问不到 ⇒ 只记这次的绝对坐标（不跟随）")
-        py = self.cfg["push"]
+        py = self.config().setdefault("push", {})   # ⚠ **现场那个 KeyError: 'push'** ✓
         py.update({"region_win": [int(w["hwnd"]), str(w["title"])],
                    "region_rel": rel,
                    "region_x": rect[0], "region_y": rect[1],
                    "region_w": ww, "region_h": hh,
                    "width": ww, "height": hh})
-        dcfg.save(self.cfg)
+        dcfg.save(self.config())
         ok, msg = dcfg.sync_push_size_to_link(ww, hh)
         # ⚠ 卡片没有 `_rebuild_cards`（那是主窗口的 ✓）⇒ 卡片自己刷新那两处就够 ✓
         self.refresh_displays()
@@ -821,7 +821,7 @@ class ServiceCard(QFrame):
 
     def _push_follow_rect(self):
         """跟随模式下**此刻**该抓的那块（屏幕坐标）；不跟随 / 问不到 ⇒ `None` ✓。"""
-        py = self.cfg.get("push") or {}
+        py = self.config().get("push") or {}
         if not py.get("region_win") or not py.get("region_rel"):
             return None
         from core import wincap
@@ -848,12 +848,12 @@ class ServiceCard(QFrame):
         ⚠ **连续两次一样才动** ✗：拖窗口时每 700ms 都在变 ⇒ 不这样会连着重启 ✓
           （推流一断，B 机的延迟统计也跟着断档 ✓）。
         """
-        py = self.cfg.get("push") or {}
+        py = self.config().get("push") or {}
         if not py.get("region_win"):
             return
         # ⚠ `procs` 是**主窗口**构造完卡片之后注入的 ✓ ⇒ 计时器第一拍可能比它早（700ms ✓）
         #   所以这里必须兜底 ✗（否则刚打开部署台就 `AttributeError` ✓）
-        proc = (getattr(self, "procs", None) or {}).get("push")
+        proc = self.procs_map().get("push")
         if proc is None or not proc.running():
             return
         r = self._push_follow_rect()
@@ -888,7 +888,7 @@ class ServiceCard(QFrame):
           ⇒ 改了不重启 ⇒ 画面上"什么也没发生" ✓（用户只会以为按钮没生效 ✓）。
         ⚠ 没在跑时**别**乱起服务 ✗（人可能故意停着 ✓）。
         """
-        proc = (getattr(self, "procs", None) or {}).get(key)
+        proc = self.procs_map().get(key)
         if proc is not None and proc.running():
             self.log(key, "%s ⇒ 重启「%s」" % (why or "参数变了",
                                               services.TITLE.get(key, key)))
@@ -907,7 +907,7 @@ class ServiceCard(QFrame):
         from tools import mmap_regions
         mid, box, zoom = services.mmap_region_now()
         if mid and box is not None:
-            want = int(self.cfg.get("mmap", {}).get("zoom") or 3)
+            want = int(self.config().get("mmap", {}).get("zoom") or 3)
             if want != int(zoom or 3):
                 try:
                     mmap_regions.save(mid, box[0], box[1], box[2], box[3], zoom=want,
@@ -972,6 +972,20 @@ class ServiceCard(QFrame):
             else:
                 out[spec["keys"][0]] = val
         return out
+
+    def config(self):
+        """**整份配置** `{"clock": …, "push": …}` ✓（本卡片的 `self.cfg` 只是**本段** ✗）。
+
+        ⚠⚠ 用户 2026-10-17 现场：点「跟随窗口」⇒ 选完 ⇒ `KeyError: 'push'` ✗ ——
+          `ServiceCard.__init__(key, cfg)` 收到的是 `cfg[key]`（本段 ✓ 见 `_rebuild_cards` ✓），
+          所以卡片里写 `self.cfg["push"]` 必然 KeyError ✓（只有这张卡正好是 push 时才碰巧对 ✓）。
+        ⇒ 要**别的段** / 要**整体保存** ⇒ 一律走这里 ✓（问主窗口要 ✓）。
+        """
+        return getattr(self.window(), "cfg", None) or {}
+
+    def procs_map(self):
+        """主窗口的进程表 `{key: Popen}` ✓（卡片上没有它 ✗ 同上一条 ✓）。"""
+        return getattr(self.window(), "procs", None) or {}
 
     def log(self, key, text):
         """卡片打日志 ⇒ **转给主窗口**（卡片自己没有日志面板 ✓）。

@@ -1295,6 +1295,68 @@ def t_wincap_without_pywin32():
           "%s" % stdout[-300:])
 
 
+def t_card_uses_whole_config():
+    """⭐⭐⭐⭐ **卡片必须从主窗口拿"整份配置"**（用户 2026-10-17 ✓ 现场：点「跟随窗口」⇒
+    选完 ⇒ `KeyError: 'push'` ✗）。
+
+    ⚠ 病根：`ServiceCard.__init__(key, cfg)` 收到的是 **`cfg[key]`（本段）** ✓，
+      可卡片里到处按**整份**用：`self.cfg["push"]` ✗ / `self.cfg.get("push")` ✗ /
+      `self.procs` ✗ / `dcfg.save(self.cfg)` ✗（最后这个最狠：只存本段 ⇒ **deploy.json 被写残** ✓）。
+      同批受害者：`_push_follow_rect` / `_push_watch_tick` 恒拿不到配置
+      ⇒ **跟随永远不生效** ✓（且一声不响 ✓）。
+    ⇒ 修法：卡片加 `config()` / `procs_map()` 两个访问器（问 `self.window()` ✓），
+      凡"别的段 / 整体保存 / 进程表"一律走它们 ✓。
+    判据（三条 ✓）：
+      ① 源码：卡片里不许再有 `self.cfg["push"]` / `dcfg.save(self.cfg)` / `self.procs.get(`；
+      ② **功能**：构造部署台 ⇒ 对**真实窗口**调 `_apply_push_window` ⇒
+         `cfg["push"]["region_win"]` 真写上 ✓、`_push_follow_rect()` 能算出矩形 ✓；
+      ③ **保存必须是整份配置**（≥5 段 ✓ 只存 push 一段就是写残 ✓）。
+    """
+    from PyQt5.QtWidgets import QApplication
+
+    import core.wincap as wc
+    import deploy.config as dcfg
+    from deploy import app as dapp
+
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "deploy" / "app.py").read_text(encoding="utf-8")
+    card = src[src.index("class ServiceCard"):src.index("class ScreenCard")]
+    # ⚠ 判据用**代码形态**（`py = self.cfg["push"]` ✓）—— 注释/说明里为了讲清楚会提到
+    #   `self.cfg["push"]` ✓ 拿它当判据会假红 ✓（这一轮就撞了一次 ✓）
+    for bad in ('py = self.cfg["push"]', "dcfg.save(self.cfg)", "self.procs.get("):
+        check(bad not in card,
+              "① 卡片里不许出现 `%s` ✗ —— `self.cfg` 只是**本段** ✓"
+              "（当整份用就 KeyError / 把 deploy.json 写残 ✓）" % bad)
+    check("def config(self):" in card and "def procs_map(self):" in card,
+          "① 卡片必须有 `config()` / `procs_map()` 访问器 ✗")
+
+    _qa = QApplication.instance() or QApplication([])
+    wins = wc.list_windows()
+    check(bool(wins), "② 这台机器上要能看到至少一个窗口（自检环境 ✓）")
+    if not wins:
+        return
+
+    saved = {}
+    _save, _sync = dcfg.save, dcfg.sync_push_size_to_link
+    dcfg.save = lambda cfg: (saved.update(cfg), True)[1]
+    dcfg.sync_push_size_to_link = lambda w, h: (True, "ok")
+    w = dapp.DeployWindow()
+    try:
+        card_obj = w.cards["push"]
+        card_obj._apply_push_window(wins[0])
+        check(bool((w.cfg.get("push") or {}).get("region_win")),
+              "② `_apply_push_window` 没把 `region_win` 写进配置 ✗（现场就是这里 KeyError ✓）")
+        check(card_obj._push_follow_rect() is not None,
+              "② `_push_follow_rect()` 拿不到矩形 ✗ ⇒ **跟随永远不生效**（`_watch_tick` 会直接 return ✓）")
+        check(len(saved) >= 5,
+              "③ 保存的必须是**整份配置**（≥5 段）✗ —— 只存 push 一段会把 deploy.json 写残 ✓：%r"
+              % (sorted(saved),))
+    finally:
+        dcfg.save, dcfg.sync_push_size_to_link = _save, _sync
+        w.close()
+        w.deleteLater()
+
+
 TESTS = (
     ("服务表（标题/参数/命令行）完整", t_service_table),
     ("小地图推流的命令行（按「当前是哪张图」传 --map-id）", t_mmap_cmd),
@@ -1324,6 +1386,7 @@ TESTS = (
     ("⭐⭐⭐⭐ 卡片的 self.log 必须落到主窗口（否则按钮点了毫无反应）", t_card_log_wiring),
     ("⭐⭐⭐⭐ 部署台不依赖 opencv（没有 cv2 也能列窗口）", t_deploy_needs_no_cv2),
     ("⭐⭐⭐⭐ 没有 pywin32 也要能列窗口（ctypes 兜底 ＋ 几何）", t_wincap_without_pywin32),
+    ("⭐⭐⭐⭐ 卡片必须从主窗口拿整份配置（否则 KeyError: push / 写残 deploy.json）", t_card_uses_whole_config),
 )
 
 
