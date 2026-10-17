@@ -4364,16 +4364,25 @@ def t_climb_job():
     _tt = 0.0
     o = None
     _hopped = False
+    _hop_out = None
     for _ in range(120):
         _tt += 0.1
         o = job.update(_tt, px=100.0)
         if o["jump"] and not o["failed"]:
             _hopped = True                 # 走过一次"单点跳"✓
+            if _hop_out is None:
+                _hop_out = o
         if o["failed"]:
             break
     check(_hopped,
           "走不动之后没先「单点跳一下」（该先跳、跳过小台阶，跳过还走不动才失败）：%r"
           % (o["note"],))
+    # ⭐⭐ **跳的时候必须带着方向键**（用户 2026-10-17 ✓ 现场反证：
+    #   「**走不动跳一下 没有搭配方向键**」✗ —— 原地蹦过不去小台阶 ✓）
+    #   目标在右边（x=900 > 100）⇒ 这一跳的 `move` 必须是 **+1**（朝目标那一侧 ✓）；
+    #   ⛔ 老写法 `move=0`（只跳不挪）就是用户看到的"原地跳一下、还是过不去" ✓。
+    check(_hop_out is not None and int(_hop_out["move"]) == 1,
+          "走不动那一下跳**没带方向键**（该按住目标那一侧再跳 ✗）：%r" % (_hop_out,))
     check(o["failed"] and "走不动" in o["note"] and "100" in o["note"],
           "走不动却没判失败 / 没写清卡在哪：%r" % o["note"])
     check("跳了一下" in o["note"],
@@ -15768,6 +15777,123 @@ def t_window_probe_aim():
     check(_di.window_probe() is None,
           "⑤ 没有 relay（本地后端）时 `window_probe()` 该安静返回 None ✓ 不许抛 ✗")
 
+    # ---- ⑥ **实时回路不许等网络 / 不许每帧读盘**（用户 2026-10-17 ✓ 原话：
+    #        「**自动测谎特别卡 鼠标跟丢了**」✗）----
+    #  ⚠ 病根：`_mouse_win()` 当场问 relay（往返 + 0.8s 超时 ✗），而 `_aim_geo` **每帧**调它
+    #    ⇒ 每秒一次阻塞 ⇒ `_AIM_TGT` 过期（0.25s）⇒ `aim_tick` 停手 ⇒ **鼠标冻住** ✓。
+    #  ⇒ 定死：`_mouse_win` **只读缓存**、问网络只在后台 `_mwin_loop` 里 ✓；
+    #    增益文件按"文件状态"缓存 ✓（改了立刻生效 ✓ 平时纯内存 ✓）。
+    _ltsrc = (_root / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    _seg = _ltsrc[_ltsrc.index("def _mouse_win"):]
+    _seg = _seg[:_seg.index("\n    def ", 10)]
+    check("window_probe" not in _seg,
+          "⑥ `_mouse_win()` 里**不许**问网络 ✗（它每帧都被调 ⇒ 一卡就「鼠标跟丢」✓）："
+          "问网络那段只能在 `_mwin_loop` 里 ✓")
+    check("window_probe" in _ltsrc[_ltsrc.index("def _mwin_loop"):][:900],
+          "⑥ 后台线程 `_mwin_loop` 里才问 `window_probe` ✓")
+
+    from decision import mouse_aim as ma
+    import json as _json
+    import os as _os
+    import tempfile
+    _old_path, _old_cache = ma.GAIN_PATH, dict(ma._GAIN_CACHE)
+    try:
+        _fd, _tmp = tempfile.mkstemp(suffix=".json")
+        _os.close(_fd)
+        with open(_tmp, "w", encoding="utf-8") as _f:
+            _json.dump({"by_frame": {"1366x768": {"gain_x": 1.0, "gain_y": 1.0}}}, _f)
+        ma.GAIN_PATH = Path(_tmp)
+        ma._GAIN_CACHE["key"] = None
+        check(ma.load_gain((768, 1366, 3)) == (1.0, 1.0),
+              "⑥ 增益缓存第一次该读到 1.0 ✓")
+        check(ma._GAIN_CACHE["key"] is not None,
+              "⑥ 增益文件读完要**记下文件状态**（否则每帧都在读盘 ✗）")
+        with open(_tmp, "w", encoding="utf-8") as _f:
+            _json.dump({"by_frame": {"1366x768": {"gain_x": 2.0, "gain_y": 2.0}}}, _f)
+        _os.utime(_tmp, (1e9, 1e9))          # 显式把 mtime 挪开（文件系统精度可能不够 ✓）
+        check(ma.load_gain((768, 1366, 3)) == (2.0, 2.0),
+              "⑥ 文件改了必须**立刻生效**（缓存按 mtime+大小失效 ✓ 别按时间过期 ✗）")
+    finally:
+        ma.GAIN_PATH = _old_path
+        ma._GAIN_CACHE.update(_old_cache)
+        try:
+            _os.remove(_tmp)
+        except Exception:                    # noqa: BLE001
+            pass
+
+    # ---- ⑦ **瞄准从"当前位置"走，不许先跳左上角**（用户 2026-10-17 ✓ 原话：
+    #        「**自动测谎时为什么鼠标要先到左上角再移过去 不能从当前位置**」✓）----
+    #   固件只有相对移动 ⇒ 要走到绝对某点必须先知道"现在在哪"✓；
+    #   收流看不见 A 机光标 ⇒ 以前只能撞角建原点 ✗；
+    #   relay 能答 `CURSOR?` ⇒ 后台采（`_cur_loop` ✓）+ 起算用它 ✓ ⇒ 不用撞角 ✓。
+    #   ⚠ 三重判据缺一不用（宁可不点，也不能按错位置点 ✗）：
+    #     ① 有采样 ✓；② 采样**比上次移动更新** ✓；③ 采样不超 `CUR_HINT_FRESH_S` ✓。
+    import time as _t2
+    from decision import input as _di3
+    _sav = {}
+    for _n in ("mouse_available", "mouse_move"):
+        _sav[_n] = getattr(_di3, _n)
+    _sav_own = ma._own_cursor
+    _sav_corner, _sav_gain, _sav_rect = ma.corner_zero, ma.load_gain, ma.frame_rect
+    _sav_hint = (ma._CUR_SCREEN, ma._CUR_SCREEN_AT, ma._CUR_HINT, ma._CUR_HINT_AT,
+                 ma._AIM_CUR, ma._AIM_AT, ma._AIM_TGT)
+    try:
+        _di3.mouse_available = lambda: True
+        _di3.mouse_move = lambda dx, dy: None
+        ma._own_cursor = lambda: None          # 收流：本机读不到那只光标 ✓
+        ma.load_gain = lambda *a, **k: (1.0, 1.0)
+        ma.frame_rect = lambda *a, **k: None
+
+        def _run_aim(_prep):
+            """→ 这一拍有没有撞角 ✓（`_calls` 里有没有 "home"）。"""
+            _calls = []
+            ma.corner_zero = lambda: _calls.append("home")
+            ma.aim_reset()
+            ma.set_cursor_screen(0, 0, 0, 0, now=0.0)
+            ma._CUR_SCREEN, ma._CUR_SCREEN_AT = None, 0.0   # 先清掉，别让 aim_to 刷新
+            ma.aim_to((768, 1366, 3), 0.5, 0.5, origin=(0, 0))
+            _prep()
+            ma.aim_tick()
+            return "home" in _calls
+
+    # ① 有新鲜采样（且比上次移动新）⇒ **不撞角** ✓
+        def _fresh():
+            ma._CUR_HINT = (600, 300)
+            ma._CUR_HINT_AT = _t2.monotonic()
+            ma._AIM_CUR = None
+            ma._AIM_AT = 0.0                   # 从没动过 ⇒ 采样一定"更新" ✓
+
+        check(not _run_aim(_fresh),
+              "⑦ 有新鲜光标采样时**不许撞角** ✗（用户要的就是「从当前位置移过去」✓）")
+
+        # ② 采样太旧 ⇒ **必须**退回撞角（这期间可能有人碰过鼠标 ✓）
+        def _stale():
+            ma._CUR_HINT = (600, 300)
+            ma._CUR_HINT_AT = _t2.monotonic() - (ma.CUR_HINT_FRESH_S + 0.5)
+            ma._AIM_CUR = None
+            ma._AIM_AT = 0.0
+
+        check(_run_aim(_stale),
+              "⑦ 采样过期（> CUR_HINT_FRESH_S）必须退回撞角 ✓（按旧位置点比多跳一下糟 ✓）")
+
+        # ③ 采样比"我们上次移动"更旧 ⇒ **不许**用（否则会拿旧位置当现在 ⇒ 往回跳 ✓）
+        def _older():
+            _now = _t2.monotonic()
+            ma._CUR_HINT = (600, 300)
+            ma._CUR_HINT_AT = _now - 0.10
+            ma._AIM_CUR = None
+            ma._AIM_AT = _now - 0.02           # 上次移动比采样新 ✓
+
+        check(_run_aim(_older),
+              "⑦ 采样比上次移动更旧时不许用（会往回跳 ✓）⇒ 该撞角")
+    finally:
+        for _n, _v in _sav.items():
+            setattr(_di3, _n, _v)
+        ma._own_cursor = _sav_own
+        ma.corner_zero, ma.load_gain, ma.frame_rect = _sav_corner, _sav_gain, _sav_rect
+        (ma._CUR_SCREEN, ma._CUR_SCREEN_AT, ma._CUR_HINT, ma._CUR_HINT_AT,
+         ma._AIM_CUR, ma._AIM_AT, ma._AIM_TGT) = _sav_hint
+
 
 def t_mouse_aim_math():
     """鼠标**绝对定位**那一层（`decision/mouse_aim.py` ✓ 2026-10-06 加）：换算 + 发指令顺序。
@@ -16197,6 +16323,52 @@ def t_reconnect_channel_num():
             check(abs(float(_o["y"]) - (base_y + ((_n - 1) // 4) * CHANNEL_GRID_DY)) < 1e-9,
                   "⑦′ 第 %d 个的落点该在原位（第 %d 行 ✓）：%r"
                   % (_n, (_n - 1) // 4 + 1, _o))
+
+        # ---- ⑧ **收流（看不见光标）＋ 要滚**：顺序必须是 先滚 → 再归零 → 再点 ----
+        #   用户 2026-10-17 现场 ✓ 原话：「**我配的 43 频道，但是进了 19 频道**」✗
+        #   ⚠ 病根：`_do()` 里"归零单独一拍"那一支**排在 `if scroll:` 前面** ✗
+        #     ⇒ 它把 `_scroll_left` **抹成 0** ⇒ 归零后直接"滚动到位 ⇒ 点" ⇒ **一格没滚**
+        #     ⇒ 点第一页同一格 ⇒ 43 变 **19**（43 与 19 同列、同为屏上第 5 行 ✓ 一个数不差 ✓）。
+        _orig_vis = mouse_aim.cursor_visible
+        mouse_aim.cursor_visible = lambda: False        # 收流那条：确定看不见 ✓
+        try:
+            s8 = fresh_settings(reconnect_enabled=True, reconnect_probe_after_lost_sec=0.0)
+            s8.enabled = True
+            s8.reconnect_channel = 43
+            cur["ui"] = ui_state.UI_CHANNEL_PANEL
+            r8 = Reconnector(s8)
+            _acts, _t8 = [], 100.0
+            _o8 = r8.update(frame, True, _t8)
+            if _o8:
+                _acts.append(_o8)
+            for _ in range(40):
+                if _o8 and _o8.get("act") == "click":
+                    break
+                _t8 += SCROLL_SETTLE + 0.01
+                _o8 = r8.update(frame, False, _t8)
+                if _o8:
+                    _acts.append(_o8)
+            _kinds = [a.get("act") for a in _acts]
+            check("click" in _kinds, "⑧ 43 号最后没点出去：%r" % (_kinds,))
+            _i_click = _kinds.index("click")
+            _scrolls = [i for i, k in enumerate(_kinds) if k == "scroll"]
+            check(len(_scrolls) == 6,
+                  "⑧ 43 号该滚 **6 格**（43 ⇒ 第 11 行，一页 5 行 ✓）；实际 %d 格 —— 不滚就会点到"
+                  "第一页同一格 = **频道 19**（用户 2026-10-17 现场 ✓）：%r"
+                  % (len(_scrolls), _kinds))
+            _i_home = _kinds.index("home") if "home" in _kinds else -1
+            check(_i_home > max(_scrolls) and _i_home > -1,
+                  "⑧ 归零必须排在**滚完之后**（滚轮会把光标挪到列表上 ⇒ 先归零等于白归零 ✗）：%r"
+                  % (_kinds,))
+            check(_i_click > _i_home,
+                  "⑧ 点击必须排在**归零之后**（撞角那串要走完，否则起点不是角 ⇒ 点歪 ✗）：%r"
+                  % (_kinds,))
+            _c = _acts[_i_click]
+            check(abs(float(_c["x"]) - (base_x + 2 * CHANNEL_GRID_DX)) < 1e-9
+                  and abs(float(_c["y"]) - (base_y + 4 * CHANNEL_GRID_DY)) < 1e-9,
+                  "⑧ 43 号该落到屏上**第 5 行第 3 列**：%r" % (_c,))
+        finally:
+            mouse_aim.cursor_visible = _orig_vis
 
         # ⑤ 服务器那一步不受影响
         s5 = fresh_settings(reconnect_enabled=True, reconnect_probe_after_lost_sec=0.0)
@@ -21317,12 +21489,21 @@ def t_cursor_protocol_both_sides():
           "**负坐标**（副屏 / 多屏 ✓）该照原样读出来 ✓")
 
     # ---- ③ 源码级：不许写串口 + 必须在写之前挑 ----
+    # ⚠ 2026-10-17：这段查询处理被抽成 `_answer_queries` 了（多实例的"只读客户端"
+    #   也要用同一份逻辑 ✓ 见 `bridge_observer`）⇒ 断言跟着**钉到新家** ✓，
+    #   并且必须钉住"`bridge` 真的调了它"✗（只钉函数存在 = 没人调也能绿 ✗）。
     _bs = inspect.getsource(rl.bridge)
-    check("CURSOR_QUERY" in _bs and "replace(CURSOR_QUERY" in _bs,
-          "`bridge` 没把 `CURSOR?` 挑出来 ⇒ 会被当指令写进串口 ✗（固件回 ERR ✓ 还污染回执计数 ✓）")
-    _i_q, _i_w = _bs.find("CURSOR_QUERY in data"), _bs.find("link.write(data)")
+    _aq = inspect.getsource(rl._answer_queries)
+    check("CURSOR_QUERY" in _aq and "replace(CURSOR_QUERY" in _aq,
+          "`_answer_queries` 没把 `CURSOR?` 挑出来 ⇒ 会被当指令写进串口 ✗"
+          "（固件回 ERR ✓ 还污染回执计数 ✓）")
+    check("_answer_queries(conn, data)" in _bs,
+          "`bridge` 没调用 `_answer_queries` ⇒ 查询会漏进串口 ✗（抽出去了没人调 = 等于删了）")
+    _i_q, _i_w = _bs.find("_answer_queries(conn, data)"), _bs.find("link.write(data)")
     check(0 <= _i_q < _i_w, "挑 `CURSOR?` 那一步没在 `link.write` **之前** ✗")
-    check("cursor_reply_text" in _bs, "挑出来了却没回话 ⇒ B 机永远等不到 ✓")
+    check("cursor_reply_text" in _aq, "挑出来了却没回话 ⇒ B 机永远等不到 ✓")
+    check("WINDOW_QUERY" in _aq,
+          "`WINDOW?` 也要在同一个地方挑（两处逻辑分叉 ⇒ 迟早只修一边 ✗）")
 
     # ---- ④⑤ 客户端这半边 ----
     _cs = inspect.getsource(kc.KbdClient.cursor)
@@ -21338,10 +21519,15 @@ def t_cursor_protocol_both_sides():
     # ---- ⑤ ⚠⚠ **回包必须在 `_SEND_LOCK` 里**（2026-10-10 现场："A 机鼠标停在左上角不动了"✗）----
     #   relay 自己的注释写着：回程有**两个写者**（固件回执 + 日志回传 ✓）⇒ 不共用锁就会
     #   **写出坏 TLS 记录 ⇒ 整条链烂掉** ✓ —— 我第一版正是漏了它 ✗（直接 `conn.sendall` ✓）。
-    _send_seg = _bs[_bs.find("CURSOR_QUERY in data"):_bs.find("link.write(data)")]
+    #   ⚠ 2026-10-17：这段搬到 `_answer_queries` 了（"只读客户端"也要共用 ✓）⇒
+    #     锁的判据跟着搬 ✓（**钉行为不钉位置** ✓ 但必须钉住"锁还在"✗）。
+    _send_seg = _aq
     check("with _SEND_LOCK:" in _send_seg,
           "回 `CUR …` 没在 `_SEND_LOCK` 里 ✗ ⇒ 和回程那两个写者撞同一条 TLS ⇒ "
           "**写出坏记录、整条链烂掉**（用户现场：A 机光标卡在左上角 ✓）")
+    #   ⚠ 只读客户端那条路**同样**要锁 ✓（它也会往同一条 TLS 写 `ERR busy` ✓）
+    check("_SEND_LOCK" in inspect.getsource(rl.bridge_observer),
+          "只读客户端回 `ERR busy` 绕过了 `_SEND_LOCK` ✗（同一个坏记录病 ✓）")
 
 
 def t_auto_measure_selfcalib():

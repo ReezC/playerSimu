@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboB
                              QVBoxLayout, QWidget)
 
 from core import behavior           # 重连回来"没恢复自动"要落一条日志（`reconnect_resume` ✓）
+from core import instance as inst_mod   # 多实例：输入设备按实例记（见 `_on_input_device` ✓）
 from core import zones as zones_mod
 # ⭐ 「自动测谎（视觉追踪）」组的参数落 `config/live.yaml`（本机偏好 ✓ 2026-10-09）
 from core.config import load_live, update_live
@@ -5103,6 +5104,17 @@ class PlayerPanel(QWidget):
     def _on_input_device(self, _idx=None):
         dev = self.cmb_device.currentData()
         settings.input_device = dev
+        # ⚠⚠ **具名实例：设备选择归本实例**（用户 2026-10-17 ✓「多实例」）：
+        #   `input_device` 是**项目级**的一份 ✓ ⇒ 两个实例打开**同一个项目**时，
+        #   一个切「远程」另一个跟着变 ✗（一个连 A 机、一个要用本机发送 ⇒ 互相打架 ✓）。
+        #   ⇒ 具名实例额外写进 `config/live_<实例>.yaml` 的 `input_device` ✓，
+        #     启动时以它为准（见 `bind()` 那段 ✓）⇒ 同一个项目也能各用各的设备 ✓。
+        #   ⚠ 项目里那份**照旧写**（老行为不变 ✓）：单实例用户一个字都不用改 ✓。
+        if inst_mod.slug():
+            try:
+                update_live(input_device=str(dev))
+            except Exception:              # noqa: BLE001 —— 写不进实例配置也别拦住切换 ✓
+                pass
         settings.save()
         self._apply_input_device(dev)
 
@@ -5740,7 +5752,17 @@ class PlayerPanel(QWidget):
         # HP/MP 条：先显示全局值；打开项目后由 bind() 用项目里存的覆盖
         self._sync_bar_ui()
 
+        # ⭐ 具名实例：**设备以本实例那份为准**（见 `_on_input_device` 的说明 ✓）——
+        #   项目里那份可能是**另一个实例**刚写进去的 ✗（两个实例共用一个项目时✓）。
         dev = settings.input_device
+        if inst_mod.slug():
+            try:
+                _ov = str(load_live().get("input_device") or "")
+                if _ov in ("local", "remote", "serial"):
+                    dev = _ov
+                    settings.input_device = _ov
+            except Exception:                  # noqa: BLE001 —— 读不出来就用项目里那份 ✓
+                pass
         self.cmb_device.blockSignals(True)
         idx = self.cmb_device.findData(dev)
         if idx >= 0:

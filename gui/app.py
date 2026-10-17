@@ -59,10 +59,13 @@ from gui.widgets import install_wheel_guard       # noqa: E402
 
 # 项目根加入 sys.path，这样从任意工作目录启动都能 import tools / link / core
 ROOT = Path(__file__).resolve().parent.parent
+# ⭐ 实例身份（用户 2026-10-17 ✓「多实例」）—— 见 `core/instance.py`：
+#   具名实例的崩溃日志是 `crash_<名字>.log` ✓ 两个实例的崩溃不会挤在一个文件里 ✓
+from core import instance as _instance      # noqa: E402
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-CRASH_LOG = ROOT / "crash.log"
+CRASH_LOG = _instance.crash_path()
 
 
 def _ensure_std_streams():
@@ -94,6 +97,23 @@ def _ensure_std_streams():
             except Exception:
                 continue
         setattr(sys, name, f)
+
+
+def _strip_instance_args(argv):
+    """把 `--instance X` / `--instance=X` 从 argv 里摘掉（见 `main()` 里那段说明 ✓）。"""
+    out, i = [], 0
+    argv = list(argv or [])
+    while i < len(argv):
+        a = argv[i]
+        if a == "--instance" and i + 1 < len(argv):
+            i += 2
+            continue
+        if isinstance(a, str) and a.startswith("--instance="):
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out
 
 
 def _install_crash_handlers():
@@ -222,6 +242,10 @@ def main():
     except Exception:                       # noqa: BLE001 —— 设不动就算了，别影响启动 ✓
         pass
 
+    # ⚠ `--instance b` 必须在 Qt 之前**摘掉** ✗：Qt 不认识这个选项，
+    #   留在 argv 里会被当成未知参数处理（不同平台表现不同 ✓ 没必要赌 ✓）。
+    #   实例名已经从 argv 读过了（`core/instance.py` 解析一次就记住 ✓）。
+    sys.argv = _strip_instance_args(sys.argv)
     app = QApplication(sys.argv)
     # 和窗口标题用同一个名字（定义在 gui/main_window.py，那边要拼上项目名）
     from gui.main_window import APP_NAME

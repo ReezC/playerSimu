@@ -70,6 +70,19 @@ def stop_all_clients():
             pass
 
 
+# ⭐ 注册成**解释器退出前**的动作（2026-10-17 ✓ 实测量到过这个崩 ✓）：
+#   自检套件（`selftest_main_window` 等）建了面板就会惰性起收流线程 ✓，而它们
+#   **不走 `player_panel.shutdown`** ✗ ⇒ 解释器直接拆 socket/缓冲 ⇒
+#   `0xC0000005`（access violation）✓ —— 表现是"**16/16 全过，进程却非 0 退出**"✓
+#   （现场排查时很容易被当成"套件挂了" ✗）。
+#   ⇒ 出口统一收一遍 ✓ 生产路径（关窗）多收一次也无害（幂等 ✓）。
+try:
+    import atexit as _atexit
+    _atexit.register(stop_all_clients)
+except Exception:                               # noqa: BLE001
+    pass
+
+
 class MiniMapClient:
     """收 A 机推来的小地图帧；只保留最新一帧（旧的直接丢）。"""
 
@@ -85,6 +98,8 @@ class MiniMapClient:
         self._times = deque(maxlen=40)
         self._stop = threading.Event()
         self._th = None
+        #: 当前那条 TCP（`stop()` 要能**从外面掐断它** ✓ 否则 `recv` 卡到超时才退出 ✗）
+        self._sock = None
         self.n_recv = 0
         self.n_drop = 0             # 没被取走就被下一帧覆盖的次数
         self.err = ""
@@ -101,7 +116,24 @@ class MiniMapClient:
         return self
 
     def stop(self):
+        """停掉收流线程 —— **要真的等它退出**（用户 2026-10-17 ✓ 排查到的崩溃 ✓）。
+
+        ⚠⚠ 老写法只 `_stop.set()` + `join(2)` ✗：线程正卡在 `recv` 里（超时 5s ✓）⇒
+          join 等不到 ⇒ 解释器开始拆 numpy/socket 缓冲 ⇒ **`0xC0000005`（access violation）**
+          ✓ ⇒ 现场就是"跑完全部用例、进程却非 0 退出"✓（很容易被当成"套件挂了" ✗）。
+        ⇒ 现在先把**那条 TCP 掐断**（`shutdown` ✓ 让阻塞的 `recv` 立刻返回 ✓）再 join ✓。
+        """
         self._stop.set()
+        s = self._sock
+        if s is not None:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except Exception:                   # noqa: BLE001 —— 已经断了 / 还没连上 ✓
+                pass
+            try:
+                s.close()
+            except Exception:                   # noqa: BLE001
+                pass
         if self._th is not None:
             self._th.join(timeout=2)
         _CLIENTS.discard(self)
@@ -113,6 +145,9 @@ class MiniMapClient:
                 with socket.create_connection((self.host, self.port),
                                               timeout=self.timeout) as s:
                     s.settimeout(self.timeout)
+                    # ⭐ 让 `stop()` 能从**外面**掐断这条连接（否则它要等 recv 超时 ✗
+                    #   见 `stop()` 的说明：解释器退出时那一下就是 access violation ✓）
+                    self._sock = s
                     self.connected = True
                     self.err = ""
                     while not self._stop.is_set():
@@ -1349,6 +1384,17 @@ def locate(frame, canvas, mode):
     return None
 
 
+#: 「显示区起点」的**死区**（底图像素）：匹配出来的 `view` 变化小于它 ⇒ **保持上一拍** ✓
+#: 用户 2026-10-17 ✓ 原话：「**推流过来的小地图在疯狂抖动**」✗ ——
+#: 那层「地形底图」叠图只盖在小地图那块 ✓，位置来自 `CropViewTracker` 每拍的模板匹配 ✓；
+#: 面板其实**没动**时匹配也会在相邻像素间来回跳（±1 底图像素 ✓）⇒
+#:   叠图每帧挪一下 × 放大倍数（那块面板常常把 58 个底图像素铺成 251 个画面像素 ✓ 4 倍多）
+#:   ⇒ 看起来就是**每帧抖 4 个像素** ✓ = 用户说的"疯狂抖动" ✓。
+#: ⇒ 变化小于 `VIEW_DEADBAND` 就**不跟**（保持上一拍），真滚动自然会超过它、立刻跟上 ✓
+#:   （**不是限速** ✗：一超过就整段跟到位 ✓ 所以快速滚动一点延迟都没有 ✓）。
+VIEW_DEADBAND = 1.5
+
+
 class CropViewTracker:
     """crop（局部小地图）**运行时跟踪**「现在显示的是底图哪一块」→ `view`（底图像素）。
 
@@ -1417,6 +1463,8 @@ class CropViewTracker:
         #: 底图灰度缓存（每拍转一次纯属浪费；底图对象在一次会话里不变 ✓）
         self._cg = None
         self._cg_key = None
+        #: ⭐ 死区（底图像素 ✓）：`view` 的小变化**不跟**（防叠图每帧抖 ✓ 见 `VIEW_DEADBAND`）
+        self.deadband = float(VIEW_DEADBAND)
 
     def reset(self, view=None):
         """换图 / 重标定：忘掉跟过的位置（给了 `view` 就以它当起点 ✓）。"""
@@ -1704,6 +1752,17 @@ class CropViewTracker:
             if not ax_on:
                 nvx = float(seeds[0][0])
         prev = self.view
+        # ⭐⭐ **死区**：面板其实没动时，模板匹配也会在相邻像素间来回跳（±1 底图像素 ✓）
+        #   ⇒ `view` 每拍变一点 ⇒ 叠图每帧挪一下 ⇒ 用户说的「**疯狂抖动**」✗（2026-10-17 ✓）。
+        #   ⇒ 变化小于 `self.deadband` ⇒ **保持上一拍**（不写新值）✓：
+        #      · 真滚动每拍都超过 deadband ⇒ **一点延迟都没有** ✓（不是限速 ✗）；
+        #      · 慢滚（每拍不到 1.5 底图像素）⇒ 攒够再跟一步 ✓ 肉眼是"一格一格走"，
+        #        而不再是每帧抖 1 像素 × 放大倍数 ✓；
+        #      · 第一拍 `prev is None` ⇒ 照常写 ✓（必须有值 ✓）。
+        if prev is not None and self.deadband > 0.0:
+            if (abs(float(nvx) - float(prev[0])) < self.deadband
+                    and abs(float(nvy) - float(prev[1])) < self.deadband):
+                nvx, nvy = float(prev[0]), float(prev[1])
         self.view = (nvx, nvy)
         self.tracked = True
         self.score = float(score)

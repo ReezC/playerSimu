@@ -137,6 +137,22 @@ def install_hook(vk, on_fire):
         # ⚠⚠ **必须原样传下去** ✗（不吞键 ✓ 见上面说明 ✓）
         return _user32.CallNextHookEx(None, int(ncode), int(wparam), int(lparam))
 
+    # ⚠⚠ **多实例要提前打招呼**（用户 2026-10-17 ✓「多实例」）：
+    #   `RegisterHotKey` 是**独占**的 ✓（只有一个实例拿得到 ✓），可钩子这条路**不独占** ✗
+    #   ⇒ 同机两个工作台都走钩子时，按一下 F11 **两边一起切** ✓
+    #   （一个控远程、一个控本机 ⇒ 两个客户端同时开始/停止自动 ✓ 这不是"看着乱"✗）。
+    #   ⇒ 这里只做**如实记账**（不擅自关掉功能 ✗：多数人只开一个 ✓ 关掉反而是坏的 ✓）；
+    #     要彻底避开 ⇒ 给两个实例配**不同的热键**（热键是项目级 ✓ 两个项目各配一个 ✓）。
+    try:
+        from core import instance as _inst
+        if _inst.slug():
+            from core import behavior as _bh
+            _bh.event("hotkey", "多实例：全局热键不独占", ok=True,
+                      inst=_inst.label(),
+                      why="两个实例都会收到同一个键；请给两边配不同热键")
+    except Exception:                        # noqa: BLE001 —— 记账不许影响装钩子 ✓
+        pass
+
     _hook_proc = _HOOKPROC(_proc)                # ⚠ 留模块级 ✓（回收 = 崩 ✓）
     h = _user32.SetWindowsHookExW(WH_KEYBOARD_LL, _hook_proc, None, 0)
     if not h:

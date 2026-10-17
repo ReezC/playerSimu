@@ -57,6 +57,8 @@ MATCH_IOU_LOW = 0.5       # 第二阶段：还没配上的轨迹 × **低分框*
 MATCH_IOU_UNCONF = 0.3
 #: 取消置位 / 移除时，"闪一下"记几条（与 `MobTracker.FLICK_KEEP` 同口径 ✓）。
 FLICK_KEEP = 32
+#: 「刚丢的确认轨迹」现场留多少条（同 `FLICK_KEEP` 的上限思路 ✓ 防无限涨 ✗）
+LOST_KEEP = 300
 
 
 def iou_xyxy(a, b):
@@ -281,6 +283,8 @@ class ByteTracker:
         self._last_ts = None
         self.diag = {}
         self.flick = []
+        #: 「**认过的轨迹刚丢失**」的现场（`missed` 0→1 ✓）—— 给 `mob_lost` 打点用 ✓
+        self.lost_ev = []
 
     # ---------------- 关联 ----------------
     @staticmethod
@@ -314,6 +318,27 @@ class ByteTracker:
 
     def _buffer_frames(self):
         return max(1, int(round(self.track_buffer_ms / 1000.0 * float(self.fps))))
+
+    def _note_lost(self, t):
+        """记一条「**认过的轨迹刚丢失**」（`missed` 0→1 的那一帧 ✓ 只记一次 ✓）。"""
+        try:
+            self.lost_ev.append({
+                "id": int(t.tid),
+                "cx": round(float(t.box[0]), 1), "cy": round(float(t.box[1]), 1),
+                "w": round(float(t.box[2]), 1), "h": round(float(t.box[3]), 1),
+                "conf": round(float(t.conf), 3),
+                "peak": round(float(t.peak_conf), 3),
+                "age": int(t.age),
+            })
+            if len(self.lost_ev) > LOST_KEEP:
+                del self.lost_ev[:-LOST_KEEP]
+        except Exception:                      # noqa: BLE001 —— 记账不许拖垮跟踪 ✗
+            pass
+
+    def drain_lost(self):
+        """取走「刚丢的确认轨迹」现场（取完就清 ✓ 同 `drain_flick` ✓）。"""
+        out, self.lost_ev = self.lost_ev, []
+        return out
 
     def _note_flick(self, t):
         try:
@@ -415,6 +440,13 @@ class ByteTracker:
             #   `confirmed` 就是 False 了 ⇒ 会把**确认过的老轨迹**也记成"闪一下" ✓
             #   （实测现场：`mob_flick` 天天误报 ✓）
             _was_confirmed = bool(t.confirmed)
+            # ⭐ **"确认过的轨迹刚丢"记一条现场**（用户 2026-10-17 ✓ 原话：
+            #   「**离玩家远的时候怪物检出框较稳定 离得近时开始频繁丢失**」✗）：
+            #   光看"丢了"分不出病因（**被玩家/特效挡住** ✗ vs **近身目标太大超出训练分布** ✗
+            #   vs **血条/名字压在身上** ✗）⇒ 得把**丢的时候那些框在哪、多大、多少分**留下 ✓
+            #   （`live_thread` 会再补"和玩家框的重叠 / 距离"✓ 见那边的 `mob_lost` ✓）。
+            if _was_confirmed and t.missed == 1:
+                self._note_lost(t)
             if _was_confirmed and t.missed <= buf:
                 keep.append(t)
                 diag["lost"] += 1

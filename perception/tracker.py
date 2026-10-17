@@ -267,6 +267,16 @@ class MobTracker:
         """取走"没攒够确认帧就没了"的现场（给 `behavior.log` ✓ 见 `ByteTracker._note_flick` ✓）。"""
         return self.bt.drain_flick()
 
+    def drain_lost(self):
+        """取走「**认过的轨迹刚丢失**」的现场（给 `mob_lost` 打点 ✓ 见 `ByteTracker._note_lost` ✓）。
+
+        用户 2026-10-17 ✓ 原话：「**离玩家远的时候怪物检出框较稳定 离得近时开始频繁丢失**」✗
+        —— 只有"丢了"这三个字分不出病因 ✓（被玩家挡住 / 近身框太大超出训练分布 /
+        血条名字压在身上 ✓）⇒ 得把**丢的那一刻框在哪、多大、多少分**留下来 ✓，
+        由 `gui/live_thread` 补上"和玩家框的重叠 / 距离"✓
+        """
+        return self.bt.drain_lost()
+
 
 #: ⭐⭐⭐ 步 2 的四个常量（2026-10-11 ✓ 用户原话："**角色使用传送点后被其他玩家抢检出框**"✓）
 #: —— 全借 `visual_tracking_sdk_20260920` 的 `ASSOCIATION_*` 那一组

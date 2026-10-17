@@ -169,6 +169,12 @@ class KbdClient:
         self.ok = True           # 最近一次发送成功了吗（链路健康度）
         self.fails = 0           # 累计失败次数（排查用）
         self.last_err = ""
+        #: ⭐ relay 给的角色（`control` / `readonly` / `""`=老 relay 不说 ✓）。
+        #:   ⚠ 同机多实例时**只有第一个连上的是控制端** ✓（见 `remote_kbd/relay.py`）——
+        #:   只读端发指令会被 `ERR busy` 挡掉 ✓，但光看 `ERR` 分不清"固件不认"还是
+        #:   "控制位被占"✗ ⇒ relay 在握手后先发一条 `ROLE …` ✓ 这里记下来 ✓
+        #:   ⇒ `decision/input.link_health()` 才能如实说"本实例只读"✓
+        self.role = ""
         # 回执计数：固件对每条指令都会回 DONE/ERR。靠它判断「TCP 发得出去、
         # 但固件根本没在处理」这种更隐蔽的卡死（relay 卡在串口写上时就是这样，
         # 发送不报错、命令却全都石沉大海）。
@@ -445,6 +451,15 @@ class KbdClient:
                         if _ln.lstrip().startswith(b"WIN "):
                             self._win_box = parse_window_line(_ln)
                             self._win_ev.set()
+                # ⭐ relay 的**角色公告**（`ROLE control` / `ROLE readonly` ✓ 见 relay）——
+                #   ⚠ 必须在 `DONE/ERR` 计数**之前**挑走 ✗（老 relay 不发这条 ⇒ 收不到就是 ""✓）
+                if b"ROLE " in data:
+                    for _ln in data.split(b"\n"):
+                        if _ln.lstrip().startswith(b"ROLE "):
+                            try:
+                                self.role = _ln.split()[1].decode("ascii", "replace").lower()
+                            except Exception:      # noqa: BLE001
+                                pass
                 n = data.count(b"DONE") + data.count(b"ERR")
                 if n:
                     self.replies += n

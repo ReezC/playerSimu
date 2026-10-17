@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (QFileDialog, QHBoxLayout, QInputDialog,
                              QSizePolicy, QSplitter, QTabWidget,
                              QToolBar, QVBoxLayout, QWidget)
 
+from core import instance
 from gui import theme
 from gui.export_dialog import ExportDialog
 from gui.live_panel import LivePanel
@@ -671,6 +672,13 @@ class MainWindow(QMainWindow):
         没有项目时保持基础标题（别留个空的「-playerSimu…」）。
         """
         base = APP_NAME
+        # ⭐ **具名实例把名字挂标题上**（用户 2026-10-17 ✓「多实例」）：
+        #   两个窗口并排时，任务栏/Alt+Tab 里「playerSimu 数据集工作台」长得一模一样 ✗
+        #   ⇒ 分不清哪个控远程、哪个控本地 ⇒ 点错窗口就操作错机器 ✓（这比"不好看"严重得多 ✓）。
+        #   空实例 ⇒ 标题**一字不变** ✓（老行为 ✓）。
+        _inst = instance.label() if instance.slug() else ""
+        if _inst:
+            base = "【%s】%s" % (_inst, base)
         name = self.project.root.name if self.project is not None else ""
         self.setWindowTitle("%s-%s" % (name, base) if name else base)
 

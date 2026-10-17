@@ -3,9 +3,19 @@ from typing import Any
 
 import yaml
 
+from core import instance
+from core.fsutil import write_text_atomic
+
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = ROOT / "config" / "link.yaml"
-LIVE_CONFIG = ROOT / "config" / "live.yaml"   # 实时预览参数（独立文件，避免重写 link.yaml 丢注释）
+# ⭐⭐ **按实例分文件**（用户 2026-10-17 ✓「我们一定要能支持多实例工作」）：
+#   空实例 ⇒ `config/live.yaml`（**与今天一字不差** ✓ 单实例用户感觉不到 ✓）；
+#   具名实例 ⇒ `config/live_<名字>.yaml`（第一次用时从默认那份复制 ✓ 见 `core/instance.py`）——
+#   ⚠ 这一条就是"两个实例抢同一份配置"的根治：一个要收流（`url` / `capture_source: stream`）、
+#     一个要抓本地窗口（`capture_source: window`），**同一份文件里存不下两个答案** ✗
+#     ⇒ 后写的那个把前一个改掉 ⇒ 现象是"另一个工作台莫名其妙变成黑屏/来源错了" ✓。
+#   ⚠ `LINK_CONFIG` **故意不分实例** ✓（A/B 机 IP、A 机分辨率是机器事实 ✓ 见 instance.py 说明）
+LIVE_CONFIG = instance.live_path()            # 实时预览参数（独立文件，避免重写 link.yaml 丢注释）
 LINK_CONFIG = ROOT / "config" / "link.yaml"   # 链路配置（注释密集 ⇒ 只许**逐行**改，见 update_link ✓）
 
 _cache: dict[str, Any] | None = None
@@ -42,9 +52,14 @@ def load_live() -> dict[str, Any]:
 
 
 def save_live(cfg: dict[str, Any]):
-    """写实时预览参数到 config/live.yaml（**整文件覆盖**）。"""
-    with open(LIVE_CONFIG, "w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+    """写实时预览参数到 config/live.yaml（**整文件覆盖**，但**原子** ✓）。
+
+    ⚠ 原子很重要（用户 2026-10-17 ✓「多实例」）：两个实例同时写 / 或一个实例正在写时
+      另一个在读 ⇒ 老的"截断再写"会让对方读到**半截 yaml** ⇒ 解析失败 ⇒ 配置看起来
+      "莫名其妙回默认值"✓ ⇒ 走 `core/fsutil.write_text_atomic` ✓。
+    """
+    text = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)
+    write_text_atomic(LIVE_CONFIG, text)
 
 
 def update_live(**kw) -> dict[str, Any]:
@@ -186,6 +201,9 @@ def update_link(path: str | Path | None = None, **kw) -> dict[str, Any]:
 
 
 def record_dir() -> Path:
-    d = ROOT / get("paths", "record_dir", "data/recordings")
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    """录像目录 —— **按实例分子目录** ✓（具名实例 ⇒ `data/recordings/<名字>/`）。
+
+    ⚠ 两个实例往同一个目录写本身不会坏（文件名已经带毫秒 + 独占 ✓ 见
+      `gui/live_thread._rec_path` ✓），但**分开**更好查 ✓：出问题先看是哪个实例录的 ✓。
+    """
+    return instance.record_dir(ROOT / get("paths", "record_dir", "data/recordings"))

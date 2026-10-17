@@ -523,6 +523,8 @@ class Zones:
         self.sets = {}
         self.edges = []
         self.points = []
+        #: 上次见到盘上那份时的 `st_mtime_ns`（多实例冲突记账用 ✓ 见 `save` ✓）
+        self._disk_mtime = None
 
     # ---------------- 集合 ----------------
 
@@ -742,11 +744,46 @@ class Zones:
                 "edges": self.edges, "points": self.points}
 
     def save(self, path=None):
+        """整份落盘（**原子替换** ✓，且**改的人不是你就是别人 ⇒ 要记账**）。
+
+        ⭐⭐ 为什么要管"别人改过"（用户 2026-10-17 ✓「我们一定要能支持多实例工作」）：
+          集合 / 边 / 点是**按地图**存的（`datasets/map/<id>.zones.json` ✓ 不分项目）
+          ⇒ 两个实例打开**同一张图**时都在写这一份 ✗。
+        ⚠⚠ **不做"和盘上合并"** ✗（2026-10-17 试过、当天回退 ✓ 理由要记住）：
+          合并会让"**故意删掉的集合复活**"（对方那份还留着 ✓），
+          更要命的是**它破坏了"保存=这份内容"的语义** —— 本仓库有调用方
+          明确靠"整份覆盖"来换内容（合成用例、换图/导入 ✓）
+          ⇒ 真红过一次（`t_goto_hands_over_whole_path`：换一份含跳的边，
+            旧的走边被合并保留 ⇒ 最短路又选回走边 ⇒ 整条用例红 ✓）。
+        ⭐ 现在的做法：**整份覆盖 + 原子替换 + 冲突记账** ——
+          · `_disk_mtime` 记"我上次见到它时它是什么样"（`load()` 时记 ✓）；
+          · 保存时发现**盘上已经变过**（mtime 不同）⇒ 说明**另一个实例刚写过** ✓
+            ⇒ 仍按内存这份写（语义不变 ✓），但记一条 `zones_conflict` ✓
+            ⇒ 现场"我那几条集合怎么没了"能查到是哪一次、哪张图 ✓（而不是无声无息 ✗）。
+        ⚠ 原子替换（别让对方读到半截 JSON ✓ 见 `core/fsutil` ✓）。
+        """
         p = Path(path) if path else zones_path(self.map_id)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
-                     encoding="utf-8")
-        return p
+        try:
+            _m = p.stat().st_mtime_ns if p.exists() else None
+        except Exception:                      # noqa: BLE001
+            _m = None
+        _seen = getattr(self, "_disk_mtime", None)
+        if _m is not None and _seen is not None and _m != _seen:
+            try:
+                from core import behavior
+                behavior.event("zones_conflict", "这张图的集合被别的实例改过（本次保存覆盖了它）",
+                               ok=False, map=self.map_id, path=str(p))
+            except Exception:                  # noqa: BLE001 —— 记账不许拦住保存 ✓
+                pass
+        from core.fsutil import write_text_atomic
+        out = write_text_atomic(
+            p, json.dumps(self.to_dict(), ensure_ascii=False, indent=2))
+        try:
+            self._disk_mtime = p.stat().st_mtime_ns
+        except Exception:                      # noqa: BLE001
+            self._disk_mtime = None
+        return out
 
     @classmethod
     def from_dict(cls, d):
@@ -766,9 +803,15 @@ def load(map_id):
     if not p.exists():
         return Zones(map_id)
     try:
-        return Zones.from_dict(json.loads(p.read_text(encoding="utf-8")))
+        z = Zones.from_dict(json.loads(p.read_text(encoding="utf-8")))
     except Exception as e:                    # noqa: BLE001
         raise ValueError("集合文件读不出来：%s（%s）" % (p, e))
+    # ⭐ 记住"我见到它时的样子" ⇒ 保存时才知道**中间被别的实例改过** ✓（见 `save` ✓）
+    try:
+        z._disk_mtime = p.stat().st_mtime_ns
+    except Exception:                        # noqa: BLE001
+        z._disk_mtime = None
+    return z
 
 
 # ══════════════════════════════════════════

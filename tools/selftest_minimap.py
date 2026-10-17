@@ -474,6 +474,54 @@ def t_fit_roundtrip():
     check(loc["score"] > 0.9, "匹配分只有 %.3f，合成帧应当接近 1" % loc["score"])
 
 
+def t_crop_view_deadband():
+    """⭐⭐ **叠图不许每帧抖**（用户 2026-10-17 ✓ 原话：**「推流过来的小地图在疯狂抖动」**✗）。
+
+    ⚠ 抖的是什么（先分清，别再改错地方 ✗）：
+      · **A 机推流那一路**（5003）实测是稳的（帧间位移 0.01 px、灰度差 <1 ✓）；
+      · 抖的是**叠在预览上的那层地形底图** —— 它恰好只盖在小地图那块 ✓，
+        位置来自 `CropViewTracker` **每拍**的模板匹配 ✓；
+      · 面板其实没动时，匹配也会在相邻**底图像素**间来回跳 ±1 ✓
+        ⇒ 叠图每帧挪 1 × 放大倍数（那块面板常把 58 个底图像素铺成 251 个画面像素 ✓ 4 倍多）
+        ⇒ 看着就是"每帧抖 4 个像素"✓。
+
+    判据三条（死区的两个方向都要钉，缺一半就会"要么还抖、要么不跟" ✗）：
+      ① 同一张面板连跑多拍 ⇒ `view` **一点不变**；
+      ② **1 个底图像素的抖动** ⇒ 被压住（还是不动）；
+      ③ **真滚动 6 个底图像素** ⇒ 必须跟上（死区**不是**限速 ✗）。
+    """
+    mid, canvas = pick_map()
+    if mid is None:
+        print("      （没有可用的底图，跳过）")
+        return
+    ch, cw = canvas.shape[:2]
+    x = min(40, max(0, cw - 70))
+    y = min(40, max(0, ch - 110))
+    w, h = min(60, cw - x - 5), min(100, ch - y - 5)
+    if w < 20 or h < 20:
+        print("      （底图太小，跳过）")
+        return
+    panel = synth_crop_panel(canvas, x, y, w, h)
+    cal = mm.locate_crop(panel, canvas)
+    check(cal is not None, "crop 定位没对上（合成帧应当必中）")
+    tr = mm.CropViewTracker()
+    a = tr.update(panel, canvas, cal)
+    check(a["ok"], "第一拍该跟住（不然下面三条都无从谈起）：%r" % (a.get("why"),))
+    v0 = tuple(a["view"])
+    for _ in range(5):
+        b = tr.update(panel, canvas, cal)
+    check(b["ok"] and tuple(b["view"]) == v0,
+          "同一张面板连跑 5 拍 `view` 却在动（叠图就是这么抖起来的 ✗）：%r ⇒ %r"
+          % (v0, tuple(b["view"])))
+    d = tr.update(synth_crop_panel(canvas, x + 1, y, w, h), canvas, cal)
+    check(d["ok"] and tuple(d["view"]) == v0,
+          "**1 个底图像素**的抖动没被死区压住（每帧抖 1px × 放大倍数 ✗）：%r"
+          % (tuple(d["view"]),))
+    e = tr.update(synth_crop_panel(canvas, x + 6, y, w, h), canvas, cal)
+    check(e["ok"] and tuple(e["view"]) != v0,
+          "真滚了 **6 个底图像素**却没跟上（死区被做成延迟了 ✗）：%r" % (tuple(e["view"]),))
+
+
 def t_crop_roundtrip():
     """crop：合成 (x, y) 起的一块 → locate_crop 的 view 与 panel_to_canvas 要对上。
 
@@ -773,7 +821,7 @@ def t_dialog_auto_fit():
     dlg = MinimapCalibDialog(mid, mode=mm.MODE_FIT, client=stub)
     try:
         dlg.ck_auto.setChecked(True)
-        # 第一次：当前 scale 还是个瞎猜的值 → 邻近尺度搜不到 → 应当退回整体搜索
+        # 第一次：先让第一帧落地（摆几何 ✓ 和"人打开标定窗"的时序一致 ✓）
         dlg._on_tick()
         check(abs(dlg.scale - 2.0) < 0.26,
               "自动定位（首次，需整体重搜）量出的缩放 %.3f 不对" % dlg.scale)
@@ -781,13 +829,24 @@ def t_dialog_auto_fit():
               "自动定位量出的偏移 %s 不对" % (dlg.offset,))
         check("ms" in dlg.lbl_say.text(),
               "定位结果里没报耗时：%r" % dlg.lbl_say.text())
-        # ⭐⭐ 2026-10-13：这一下必须走的是**整体重搜**那条路（邻近尺度 ±10% 找不到 ⇒
-        #   退回全范围 ✓）—— 钉"路"而不只是钉数值 ✗：只钉数值的话，哪天有人把回退删掉、
-        #   改成"猜一个 2.0"，这条用例照样绿 ✗（真机现象：手上的尺度错的 ⇒ 邻近搜索回
-        #   `None` ⇒ 原来只写一句"没对上"就 return ⇒ **错尺度一辈子纠不回来** ✗）。
+        # ⭐⭐ 2026-10-13：**尺度和真值对不上时**必须走**整体重搜**那条路（邻近尺度 ±10%
+        #   找不到 ⇒ 退回全范围 ✓）—— 钉"路"而不只是钉数值 ✗：只钉数值的话，哪天有人把
+        #   回退删掉、改成"猜一个 2.0"，这条用例照样绿 ✗（真机现象：手上的尺度错的 ⇒
+        #   邻近搜索回 `None` ⇒ 原来只写一句"没对上"就 return ⇒ **错尺度一辈子纠不回来** ✗）。
+        # ⚠⚠ **必须显式把尺度弄成错的**（2026-10-17 修 ✓）：第一帧的 `_apply_frame` 会把
+        #   `scale` 摆成"刚好嵌进面板"的 guess（`min(w/cw, h/ch)` ✓）；而这个用例的面板
+        #   正是**整图 ×2**（pad=0）⇒ guess 恰好就是真值 2.0 ✗ ⇒ "邻近搜不到"的前提**不成立**
+        #   ⇒ 用例会假红（实测：`定位成功 匹配分 1.000`，一个字都不提整体重搜 ✓）。
+        #   ⇒ 改成**显式给一个错尺度**（1.0）再触发一次 ⇒ 这才是真正要钉的那条路 ✓。
+        dlg.scale = 1.0
+        dlg._last_locate = 0.0          # 假装过了节流窗口
+        stub.frame = panel.copy()       # 新对象 ⇒ 真走一次 set_frame（`_geom_ready` 已 True ✓）
+        dlg._on_tick()
         check("整体重搜" in dlg.lbl_say.text(),
-              "第一次定位没走「整体重搜」（邻近尺度跟丢时必须退回全范围 ✓）：%r"
+              "尺度是错的时候没走「整体重搜」（邻近尺度跟丢时必须退回全范围 ✓）：%r"
               % dlg.lbl_say.text())
+        check(abs(dlg.scale - 2.0) < 0.26,
+              "整体重搜没把错尺度纠回来（%.3f）：那就永远卡在错尺度上 ✗" % dlg.scale)
 
         # 第二次：换一帧（新对象），尺度已经对了 → 走邻近尺度那条路
         stub.frame = panel.copy()
@@ -9324,6 +9383,9 @@ def t_osd_facing_and_calib_lines():
 TESTS = (
     ("⭐⭐ 缺哪条来源的标定就自动补哪条（用户 2026-10-11「为什么要我补标定」）：沿用已选方式 ·"
      "只补这一条不碰别的 · 没选过方式就拒绝 · 对不上不落盘", t_autofit_fills_missing_source),
+    ("⭐⭐ 叠图不许每帧抖（用户 2026-10-17「推流过来的小地图在疯狂抖动」）："
+     "同一张面板 view 不许动 · 1px 抖动被死区压住 · 真滚动 6px 必须跟上",
+     t_crop_view_deadband),
     ("定位细化：非整数倍 scale + 亚像素偏移也量得出",
      t_locate_fit_refined),
     ("标定核对：差多少 + 反向换算（一处实现）",

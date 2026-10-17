@@ -712,6 +712,79 @@ def cursor_reply_text():
         return "CUR -"
 
 
+def _answer_queries(conn, data):
+    """把 `CURSOR?` / `WINDOW?` 就地答掉 ⇒ 返回**剩下**要写串口的那部分 ✓。
+
+    ⚠ 这两个查询**不写串口** ✗（固件不认识它 ✓ 写进去只会换回 ERR 并污染 `DONE/ERR`
+      计数 ✓）；由 relay 自己答 ✓。
+    ⚠⚠ **必须和别的写者共用 `_SEND_LOCK`**（2026-10-10 现场：直接 `sendall` 和
+      `ser_to_tcp`/`trace` 同时写同一条 TLS ⇒ 写出坏记录 ⇒ 整条链烂掉 ✓
+      ⇒ 现象是"**A 机鼠标停在左上角不动了**"✗）。
+    """
+    if CURSOR_QUERY in data:
+        data = data.replace(CURSOR_QUERY, b"")
+        try:
+            with _SEND_LOCK:
+                conn.sendall((cursor_reply_text() + "\n").encode("ascii"))
+        except Exception:                    # noqa: BLE001 —— 回不了就当没问过 ✓
+            pass
+    if WINDOW_QUERY in data:
+        data = data.replace(WINDOW_QUERY, b"")
+        try:
+            with _SEND_LOCK:
+                conn.sendall((window_reply_text() + "\n").encode("ascii"))
+        except Exception:                    # noqa: BLE001
+            pass
+    return data
+
+
+def bridge_observer(conn):
+    """**只读客户端**：答 `CURSOR?` / `WINDOW?`，其余指令一律 `ERR busy`（不碰串口 ✓）。
+
+    ⭐⭐⭐ 为什么要有它（用户 2026-10-17 ✓「我们一定要能支持多实例工作」）：
+      relay 原来 `listen(1)` + 一次只服务一个连接 ✗ ⇒ **同机开两个工作台**时，
+      第二个连上来只能躺在 backlog 里 ✓；更糟的是**握手没有超时** ⇒
+      一个连上不做握手的客户端能把 relay **钉死**（`docs/断线重连设计.md` 记过这条 ✓）
+      ⇒ 连人工排查都连不进去 ✗。
+      ⇒ 现在：**控制位只有一个**（两个客户端同时发 `MOVE` 只会把光标扯来扯去 ✗），
+        先到的当控制端 ✓，后到的是**只读**：能问光标/窗口（定位、排查要用 ✓），
+        想发指令就回 `ERR busy` ✓ —— **不再互相踢、也不会把 relay 钉死** ✓。
+    """
+    try:
+        conn.settimeout(5.0)
+        _set_nodelay(conn)
+    except Exception:                        # noqa: BLE001
+        pass
+    while True:
+        try:
+            ready, _, _ = select.select([conn], [], [], 5.0)
+        except Exception:                    # noqa: BLE001
+            break
+        if not ready:
+            continue
+        try:
+            data = conn.recv(4096)
+        except socket.timeout:
+            continue
+        except Exception:                    # noqa: BLE001
+            break
+        if not data:
+            break
+        rest = _answer_queries(conn, data)
+        rest = rest.replace(b"\r", b"").strip()
+        if not rest:
+            continue
+        try:
+            with _SEND_LOCK:
+                conn.sendall(b"ERR busy\n")
+        except Exception:                    # noqa: BLE001
+            break
+    try:
+        conn.close()
+    except Exception:                        # noqa: BLE001
+        pass
+
+
 def bridge(conn, link):
     """双向桥：TCP -> 串口，串口 -> TCP。
 
@@ -787,36 +860,12 @@ def bridge(conn, link):
                 continue
             if not data:
                 break
-            if CURSOR_QUERY in data:
-                # ⭐⭐ 「问光标在哪」**不写串口** ✗ —— 固件不认识它 ✓（写进去只会换回 ERR ✓
-                #   还会污染 `DONE/ERR` 回执计数 ✓）⇒ 由 relay 自己答 ✓（见 `CURSOR_QUERY` ✓）。
-                data = data.replace(CURSOR_QUERY, b"")
-                try:
-                    # ⚠⚠⚠ **必须和别的写者共用 `_SEND_LOCK`** ✗✗ —— 2026-10-10 现场：
-                    #   我这里原来直接 `conn.sendall` ✗ ⇒ 和 `ser_to_tcp`（固件回执 ✓）/
-                    #   `trace`（日志回传 ✓）**同时写同一条 TLS** ⇒ **写出坏记录 ⇒ 整条链烂掉**
-                    #   ✓ ⇒ 表现正是用户报的「**A 机鼠标停在左上角不动了**」✗
-                    #   （最后一条指令是"撞角归零"⇒ 光标就停在那儿 ✓ 之后一个字节都过不去 ✓）。
-                    #   ⇒ 规矩就写在 `_SEND_LOCK` 的注释里 ✓（"所有对客户端的 sendall 共用这把锁"✓）
-                    #   ⚠ 这条回包**不走 `_push_to_client` 队列** ✗（队列满了会**丢最旧** ✓
-                    #     而 B 正等着这一条 ✓ 被丢了就是"光标问不到"✓）⇒ 直接发 ✓、只在锁里 ✓。
-                    with _SEND_LOCK:
-                        conn.sendall((cursor_reply_text() + "\n").encode("ascii"))
-                except Exception:                # noqa: BLE001 —— 回不了就当没问过 ✓
-                    pass
-                if not data:
-                    continue                      # 就这一条 ⇒ 不用再写串口 ✓
-            if WINDOW_QUERY in data:
-                # ⭐ 「问游戏窗口在哪」—— 同 `CURSOR?`：**不写串口** ✗、由 relay 自己答 ✓。
-                #   ⚠ 同样必须共用 `_SEND_LOCK`（见上面那段血的教训 ✓）。
-                data = data.replace(WINDOW_QUERY, b"")
-                try:
-                    with _SEND_LOCK:
-                        conn.sendall((window_reply_text() + "\n").encode("ascii"))
-                except Exception:                # noqa: BLE001
-                    pass
-                if not data:
-                    continue
+            # ⭐ 两个"问一下"的查询（`CURSOR?` / `WINDOW?`）**就地答掉** ✓
+            #   —— 与"只读客户端"共用**一处实现** ✓（见 `_answer_queries` ✓）
+            #   ⚠ 别在这儿再写一遍 `conn.sendall` ✗（会绕开 `_SEND_LOCK` ⇒ 坏记录 ✓）。
+            data = _answer_queries(conn, data)
+            if not data:
+                continue                      # 就这一条 ⇒ 不用再写串口 ✓
             trace("tcp->serial %s"
                   % data.decode("ascii", "replace").replace("\n", "|")[:60])
             # ⭐ **写串口耗时**（`KbdStats` 要它）：这就是"下游堵没堵"的直接证据 ✓
@@ -923,26 +972,64 @@ def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("0.0.0.0", args.port))
-    server.listen(1)
+    # ⭐⭐⭐ **多客户端**（用户 2026-10-17 ✓「我们一定要能支持多实例工作」）：
+    #   老写法 `listen(1)` + 一次只服务一个 ✗ ⇒ 同机第二个工作台只能躺在 backlog 里 ✓；
+    #   而且**握手在主循环里同步做、没有超时** ✗ ⇒ 一个连上不做握手的客户端就能把 relay
+    #   **钉死**（`docs/断线重连设计.md` 记过这条 ✓）⇒ 连人工排查都连不进去 ✓。
+    #   现在的规矩：**控制位只有一个**（两路 `MOVE` 同时发只会把光标扯来扯去 ✗），
+    #   先到的当控制端 ✓，后到的是**只读**（能问光标/窗口 ✓ 发指令回 `ERR busy` ✓）。
+    server.listen(8)
     print(f"[relay] listening on :{args.port}")
+
+    _ctl_lock = threading.Lock()
+    _ctl = {"conn": None}          # 控制端（None = 空位 ✓）
+
+    def _serve(conn, addr):
+        tls = None
+        try:
+            try:
+                conn.settimeout(5.0)       # ⚠ 握手也要有超时（否则能被钉死 ✗ 见上面那段）
+                tls = ctx.wrap_socket(conn, server_side=True)
+            except Exception as e:
+                # 握手阶段对端就走了：多数是 B 侧「重连」的中间态（撤掉了刚建的连接，
+                # 或两个重连撞在一起）—— 偶发一条不用管。
+                # **持续刷屏**才是问题（B 侧在反复重连、一次都没成）⇒ 查证书/端口。
+                print(f"[relay] 客户端在 TLS 握手阶段断开（{e}）"
+                      f" —— 偶发可忽略；一直刷就是 B 侧连不上")
+                return
+            with _ctl_lock:
+                mine = _ctl["conn"] is None
+                if mine:
+                    _ctl["conn"] = tls
+            # ⭐ 先告诉对端"你是哪种角色"（B 侧据此**如实说**"控制位被占了"，而不是
+            #   让它以为连上了、一顿发指令却全被丢掉 ✗）。
+            try:
+                with _SEND_LOCK:
+                    tls.sendall(b"ROLE control\n" if mine else b"ROLE readonly\n")
+            except Exception:                  # noqa: BLE001 —— 报不出角色不影响后续 ✓
+                pass
+            if not mine:
+                print(f"[relay] client {addr[0]} connected（只读：控制位已被占用）")
+                bridge_observer(tls)
+                print(f"[relay] client {addr[0]} （只读）断开")
+                return
+            print(f"[relay] client {addr[0]} connected（控制端）")
+            trace("client %s connected" % addr[0])
+            try:
+                bridge(tls, link)
+            finally:
+                with _ctl_lock:
+                    _ctl["conn"] = None
+                print("[relay] client disconnected（控制端）")
+        finally:
+            try:
+                conn.close()
+            except Exception:                  # noqa: BLE001
+                pass
 
     while True:
         conn, addr = server.accept()
-        try:
-            tls = ctx.wrap_socket(conn, server_side=True)
-        except Exception as e:
-            # 握手阶段对端就走了：多数情况是 B 侧「重连」的中间态（它撤掉了刚建的
-            # 连接，或两个重连撞在一起）—— 偶发一条不用管，relay 会继续等下一个。
-            # **持续刷屏**才是问题（B 侧在反复重连、一次都没成），那时要查：
-            # 证书/端口、以及 B 侧那行状态栏写的原因。
-            print(f"[relay] 客户端在 TLS 握手阶段断开（{e}）"
-                  f" —— 偶发可忽略；一直刷就是 B 侧连不上")
-            conn.close()
-            continue
-        print(f"[relay] client {addr[0]} connected")
-        trace("client %s connected" % addr[0])
-        bridge(tls, link)
-        print("[relay] client disconnected")
+        threading.Thread(target=_serve, args=(conn, addr), daemon=True).start()
 
 
 if __name__ == "__main__":

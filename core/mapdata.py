@@ -700,8 +700,10 @@ def save_calib(map_id, calib, src=None, zoom=None):
         srcs.pop("", None)              # 老格式那份已经由这次保存的来源接管了
         srcs[src] = body
         out = {"v": CALIB_V2, "sources": srcs}
-    p.write_text(_json.dumps(out, ensure_ascii=False, indent=2),
-                 encoding="utf-8")
+    # ⚠ **原子写**（用户 2026-10-17 ✓「多实例」）：两个实例（或崩溃重启的自己）同时
+    #   碰这份标定时，老写法"截断再写"会让对方读到半截 JSON ⇒ 标定"丢了" ✓
+    from core.fsutil import write_text_atomic
+    write_text_atomic(p, _json.dumps(out, ensure_ascii=False, indent=2))
     return p
 
 

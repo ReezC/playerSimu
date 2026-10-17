@@ -92,8 +92,15 @@
 import time
 from pathlib import Path
 
+from core import instance
+
 ROOT = Path(__file__).resolve().parent.parent
-LOG = ROOT / "behavior.log"
+# ⭐⭐ **按实例分文件**（用户 2026-10-17 ✓「多实例」）：
+#   两个实例写同一个 `behavior.log` 不只"看着乱" ✗ —— `_trim()` 是
+#   "读尾巴 → 写 .trim → 原子替换整个文件" ✓ ⇒ 一个实例 trim 的那一刻，
+#   另一个**刚 append 的行会被吞掉** ✓（现场排查时"那几行怎么没了"就是这么来的 ✓）。
+#   具名实例 ⇒ `behavior_<名字>.log` ✓ 空实例 ⇒ `behavior.log`（老行为 ✓）。
+LOG = instance.behavior_path()
 
 # ⚠ **别调小**（教训同 `perf.MAX_BYTES`）：2026-09-28 起「行为 / 状态」打点**全在这里**
 # （含每秒几条的 `sample`）⇒ 窗口太短的话，"出事那一段"会被裁掉、永远查不到 ✗。

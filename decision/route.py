@@ -3281,6 +3281,10 @@ class WalkJob(_PausableJob):
         #:     打断回来也不该接着跳（keys 已经清空，重新走就行 ✓）。
         self._hopped = False
         self._hop_at = None
+        #: ⭐⭐⭐ 跳这一下**朝哪边按方向键**（-1/0/+1 ✓ 用户 2026-10-17 现场：
+        #:   「**走不动跳一下 没有搭配方向键**」✗ —— 原地蹦根本过不去 ✓
+        #:   小台阶/小坎要**带着方向跳**才上得去 ✓ 见 `_hop_or_fail` ✓）
+        self._hop_dir = 0
         #: ⭐⭐ 「**走不动按跳**」（用户 2026-10-06 ✓ 见 `DecisionSettings.walk_stall_jump`）：
         #:   **关** ⇒ 走不动**直接判失败**（= 加这个单点跳之前的老行为 ✓）。
         #:   ⚠ 由 `agent.start_climb` **一处**灌进来（所有走任务都过那儿 ✓ 见那边的说明 ✓）。
@@ -3326,8 +3330,16 @@ class WalkJob(_PausableJob):
         # 跳键是**点按**（按 `TAP_ON_S` ≈ 30ms 就松，和「跳下绳梯」同一份节奏，不新造时长 ✓）。
         if self._hop_at is not None:
             if (now - self._hop_at) < TAP_ON_S:
-                self.note = "跳一下：跳过小台阶（走不动了，先跳一下试试）"
-                return self._result(0, jump=True)   # 只跳、不横挪（跳起来挪会挪歪 ✓）
+                # ⭐⭐ **跳的时候要带着方向键**（用户 2026-10-17 ✓ 现场反证：
+                #   「**走不动跳一下 没有搭配方向键**」✗ —— 原地蹦过不去小台阶 ✓）：
+                #   老写法 `_result(0, jump=True)` 只发跳键 ⇒ 人原地弹一下、位移为 0
+                #   ⇒ 30ms 后接着走还是被同一级台阶挡住 ✓ ⇒ 一轮跳完照样判失败 ✓。
+                #   现在跟 `_hop_dir`（跳之前朝目标那一边 ✓）一起发 ✓ ——
+                #   跳完那一拍就回到正常走，方向键仍然是同一边（连续，不会回摆 ✓）。
+                _hd = int(getattr(self, "_hop_dir", 0))
+                self.note = ("跳一下：按住%s + 跳（走不动了，跳过小台阶 ✓）"
+                             % ("←" if _hd < 0 else ("→" if _hd > 0 else "（原地）")))
+                return self._result(_hd, jump=True)
             self._hop_at = None                      # 跳完了 ⇒ 下面接着走
         # ---- 「仅向左 / 仅向右」（逐边配的 `dir`，2026-09-27 起真的生效）----
         # 只按那一个方向键、**不看集合中点**：这种边说的是"朝那个方向一直走，直到踏上
@@ -3347,7 +3359,8 @@ class WalkJob(_PausableJob):
                     "走不动了：这条边是「仅向%s」，x 卡在 %.0f、%.0fs 没再%s"
                     " —— 可能被墙/台阶挡住，或者这条边配的方向反了（目标「%s」在另一头？）"
                     % ("左" if sign < 0 else "右", float(px), self.stall_s,
-                       "变小" if sign < 0 else "变大", self.dst_set))
+                       "变小" if sign < 0 else "变大", self.dst_set),
+                    move=sign)
             self.note = "走过去：这条边是「仅向%s」⇒ 只按 %s（走到「%s」上才算到；现在 x=%.0f）" % (
                 "左" if sign < 0 else "右", "←" if sign < 0 else "→",
                 self.dst_set, float(px))
@@ -3378,7 +3391,8 @@ class WalkJob(_PausableJob):
                 now,
                 "走不动了：卡在 x=%.0f（目标在%s，还差 %.0f px）"
                 "—— 可能被墙/台阶挡住，或者这条边的落点/方向写错了"
-                % (float(px), tgt_txt, d))
+                % (float(px), tgt_txt, d),
+                move=(1 if dx > 0 else -1))
         if d <= self.tol_px:
             self.note = "走到落点附近了（差 %.0f px）—— 站住，等判到达" % d
             return self._out(0)
@@ -3404,6 +3418,7 @@ class WalkJob(_PausableJob):
         # ⚠ 单点跳也重新武装：新的一轮允许再"走不动 → 跳一下"一次 ✓
         self._hopped = False
         self._hop_at = None
+        self._hop_dir = 0
         # ⚠ 不写分母（同 `ClimbJob.retry`：没有"最多试几次"了 ✓）
         self.note = "第 %d 次尝试：重新走过去「%s」" % (self.attempt, self.dst_set)
         return self._out(0)
@@ -3422,6 +3437,7 @@ class WalkJob(_PausableJob):
         """
         self._hopped = False
         self._hop_at = None
+        self._hop_dir = 0
         self._best_d = None
         self._best_at = None
 
@@ -3453,14 +3469,18 @@ class WalkJob(_PausableJob):
         self.note = why
         return self._out(0)
 
-    def _hop_or_fail(self, now, why):
-        """走不动了：**先单点跳一下**（跳过小台阶/小障碍），跳过还走不动才判失败。
+    def _hop_or_fail(self, now, why, move=0):
+        """走不动了：**朝目标按住方向 + 跳一下**（跳过小台阶/小坎），跳完还走不动才判失败。
 
         用户 2026-09-28 要求："walk 执行器判定走不动了之后，发个单点跳键"。
+        用户 2026-10-17 ✓ 现场更正："**走不动跳一下 没有搭配方向键**" ✗ ——
+          ⛔ 老写法 `move=0`（"只跳、不横挪，跳起来挪会挪歪"）**在小台阶上根本过不去** ✓：
+            原地弹一下、位移为 0 ⇒ 30ms 后接着走还是被同一级挡住 ⇒ 一轮跳完照样失败 ✓。
+          ⭐ 现在：`move` = **跳之前朝目标那一边**（±1 ✓ 由调用方给：两条走路分支各自
+            知道自己按的是哪边 ✓，不在这里重算 ✗）⇒ 带着方向跳，才上得去台阶 ✓；
+            跳完那一拍立刻回到正常走，方向还是同一边 ⇒ **不会回摆** ✓。
         · 一轮只跳一次（`_hopped` ✓）：跳完清掉 stall 锚点重新计时，再走不动才 `_fail`
           （被真墙挡住时不会无限跳 ✗）；
-        · 跳的那一下**只跳、不横挪**（`move=0`）—— 跳起来横着挪会挪歪，和上绳"跳失败后
-          站住等 y 稳定"同一个道理 ✓；
         · 跳键是**点按**（按 `TAP_ON_S` ≈ 30ms 就松，见 `update` 里那段"跳进行中"），
           不新造时长常数 ✓。
         """
@@ -3471,11 +3491,14 @@ class WalkJob(_PausableJob):
         if not self._hopped:
             self._hopped = True
             self._hop_at = now
+            self._hop_dir = int(1 if float(move) > 0 else (-1 if float(move) < 0 else 0))
             self._best_d = None            # 跳之前那段"没动"不算数，跳完重新计时 ✓
             self._best_at = None
-            self.note = "%s ⇒ 先单点跳一下，跳过小台阶" % why
-            return self._result(0, jump=True)
-        return self._fail("%s（跳了一下还是没过去）" % why)
+            self.note = ("%s ⇒ **按住%s + 跳一下**，跳过小台阶"
+                         % (why, "←" if self._hop_dir < 0
+                            else ("→" if self._hop_dir > 0 else "（原地）")))
+            return self._result(self._hop_dir, jump=True)
+        return self._fail("%s（带着方向跳了一下还是没过去）" % why)
 
     def _out(self, move):
         """走不按跳、也不按上下（`dir` 恒 0）—— 回值走 `_PausableJob._result` 的统一形状 ✓。"""

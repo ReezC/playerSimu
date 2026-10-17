@@ -1,0 +1,60 @@
+conf_mob: 0.22
+conf_player: 0.75
+imgsz: 960
+device: '0'
+capture_fps: 60
+draw: true
+perf_log: true
+perf_keepalive: true
+mmap_src: stream
+mmap_crop:
+- 6
+- 72
+- 134
+- 109
+mmap_draw: true
+mmap_hold_ms: 200
+mmap_ghost_shift: 7
+mmap_roi_pad: 18
+mmap_max_jump: 40
+mmap_world_offset:
+- 7
+- 33
+live_map_alpha: 100
+show_fps: 50
+half: true
+rec_disc: false
+draw_async: true
+live_map_view: live
+capture_source: stream
+rect:
+- 15
+- 44
+- 1366
+- 768
+url: udp://0.0.0.0:5000
+vt_on: true
+rec_lie: true
+window_capture: wgc
+rect_rel:
+- 0.000731
+- 0.03875
+- 0.998538
+- 0.96
+rect_win:
+- 2361700
+- 冒险岛怀旧服
+vt_click: true
+vt_aim: true
+vt_draw: true
+vt_conf: 0.22
+vt_region: CN
+vt_cool_s: 3.0
+vt_aim_ms: 15
+vt_max_fps: 10
+pipe_fps: 30
+vt_smooth: 0
+iou_mob: 0.85
+max_det: -1
+agnostic_nms: false
+stream_rect_rel: null

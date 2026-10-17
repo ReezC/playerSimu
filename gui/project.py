@@ -25,6 +25,8 @@ from pathlib import Path
 
 import yaml
 
+from core import instance
+
 SUBDIRS = (
     "frames", "calib",
     "labels_auto", "labels", "labels_backup", "labels_iter",
@@ -299,9 +301,15 @@ class Project:
         self.data, self._conflicts = self._merge_disk()
         self._loaded = copy.deepcopy(self.data)  # ⭐ 基准跟着走（下次 diff 从这儿算 ✓）
         self.root.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(self.data, f, allow_unicode=True,
-                           sort_keys=False, default_flow_style=False)
+        # ⚠ **原子写**（用户 2026-10-17 ✓「多实例」）：上面那套读-改-写只解决"别抹掉对方"✓，
+        #   但"截断再写"这一下，另一个实例正好在**读**（它也要 merge ✓）就会读到半截 yaml ✗
+        #   ⇒ 解析失败 ⇒ 它按"空文件"合并 ⇒ **把这里刚写的东西全抹掉** ✓
+        #   （现场表现：改完参数过一会儿又变回去 ✓ 很难联想到是对方那一拍读空了 ✓）。
+        from core.fsutil import write_text_atomic
+        write_text_atomic(
+            self.path,
+            yaml.safe_dump(self.data, allow_unicode=True,
+                           sort_keys=False, default_flow_style=False))
 
     # ---------------- 取值 ----------------
 
@@ -382,17 +390,22 @@ def sanitize(name: str) -> str:
 #
 # 存在仓库 config/ 下，不存在项目里：这是**界面自己的**状态，与项目内容无关；
 # 放进项目里会跟着项目一起被拷到别的机器，语义就乱了。
-SESSION_FILE = Path(__file__).resolve().parent.parent / "config" / "session.json"
+# ⭐⭐ **按实例分文件**（用户 2026-10-17 ✓「多实例」）：
+#   两个实例共用一份 `session.json` ⇒ 谁最后关窗谁把 `last_project` 改掉 ✗
+#   ⇒ 另一个下次启动"莫名其妙打开了别人的项目" ✓（现场就是这么被带偏的 ✓）。
+#   具名实例 ⇒ `config/session_<名字>.json` ✓ 空实例 ⇒ `session.json`（老行为 ✓）。
+SESSION_FILE = instance.session_path()
 
 
 def remember_open(root):
     """记下「最近打开的项目」—— 打开 / 新建项目成功后调用。"""
     try:
         SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SESSION_FILE.write_text(
+        from core.fsutil import write_text_atomic      # ⚠ 原子写（多实例 ✓ 见 project.save）
+        write_text_atomic(
+            SESSION_FILE,
             json.dumps({"last_project": str(Path(root).resolve())},
-                       ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8")
+                       ensure_ascii=False, indent=2) + "\n")
     except Exception:
         pass      # 记不住只会退化成「没有最近项目」，不该影响打开项目本身
 

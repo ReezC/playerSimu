@@ -91,9 +91,26 @@ def gain_frame_key(frame_shape):
     return "%dx%d" % (w, h)
 
 
+#: 增益文件的小缓存：`((mtime_ns, size), (flat, by))` ✓ —— **实时回路每帧都在查它** ✗
+#: ⚠⚠ 为什么必须缓存（用户 2026-10-17 ✓ 原话：「**自动测谎特别卡 鼠标跟丢了**」✗）：
+#:   瞄准那条路**每帧**都要问一次增益（`_aim_geo` → `load_gain` ✓），而一帧里
+#:   `load_gain` / `frame_rect` / `screen_gain` 会各读一遍 ⇒ 每秒上百次
+#:   **读盘 + JSON 解析** ✗（每条 0.1~0.3ms ✓ 叠起来就是可感的卡顿 ✓）。
+#:   ⇒ 按"文件改没改"（mtime + 大小 ✓）缓存 ✓ ⇒ 平时纯内存 ✓ 改了立刻生效 ✓
+#:   （不按时间过期 ✗ —— 那样标定刚写完还得等一会儿才生效 ✓ 更容易误判"标定没用"✗）
+_GAIN_CACHE = {"key": None, "val": ({}, {})}
+
+
 def _read_gain_file():
-    """⇒ `(平铺那份, {尺寸键: 记录})`（读不出来 ⇒ `({}, {})` ✓）。"""
+    """⇒ `(平铺那份, {尺寸键: 记录})`（读不出来 ⇒ `({}, {})` ✓）。**按文件状态缓存** ✓。"""
     import json
+    try:
+        st = GAIN_PATH.stat()
+        key = (int(st.st_mtime_ns), int(st.st_size))
+    except Exception:                            # noqa: BLE001 —— 没有文件 ⇒ 就是"没标定过" ✓
+        return {}, {}
+    if _GAIN_CACHE["key"] == key:
+        return _GAIN_CACHE["val"]
     try:
         d = json.loads(GAIN_PATH.read_text(encoding="utf-8"))
     except Exception:                            # noqa: BLE001 —— 坏文件当"没标定过" ✓
@@ -109,6 +126,8 @@ def _read_gain_file():
             by["%dx%d" % (int(flat["ref_w"]), int(flat["ref_h"]))] = flat
         except (TypeError, ValueError):
             pass
+    _GAIN_CACHE["key"] = key
+    _GAIN_CACHE["val"] = (flat, by)
     return flat, by
 
 
@@ -1089,7 +1108,17 @@ def _sync_aim_cur(frame_shape, gain_pair, origin):
     """
     cur = _own_cursor()
     if cur is None:
-        return False
+       # ⭐ **收流（relay）那条**：本机读不到那只光标 ✓ ⇒ 用后台采到的**真光标位置**
+       #   （`_CUR_SCREEN` ✓ 见 `set_cursor_screen` ✓）折成指令空间备着 ✓
+       #   ⇒ `aim_tick` 起算时就不必先撞角 ✓（用户 2026-10-17 ✓
+       #   「**自动测谎时为什么鼠标要先到左上角再移过去 不能从当前位置**」✓）。
+       #   ⚠ 只是**备好**，用不用由 `aim_tick` 判（采样要比上次移动更新 ✓）。
+       try:
+           _gx, _gy = screen_gain(tuple(gain_pair), frame_shape)
+           _refresh_cur_hint(_gx, _gy)
+       except Exception:                    # noqa: BLE001 —— 算不出来就当没有 ✓
+           pass
+       return False
     try:
         gx, gy = screen_gain(tuple(gain_pair), frame_shape)
         vx, vy = _virtual_origin()
@@ -1234,6 +1263,40 @@ _AIM_TGT_AT = 0.0
 #: 目标多久没刷新 ⇒ **不再追**（人/那一轮已经不需要了 ✓ 同 SDK"点不新鲜就不补发"的精神 ✓）。
 AIM_TGT_TTL_S = 0.25
 
+#: ⭐⭐ **后台采到的「A 机光标现在在哪」**（屏幕像素 + 它自报的虚拟屏原点 ✓）与采集时刻 ✓。
+#: 用户 2026-10-17 ✓ 原话：「**自动测谎时为什么鼠标要先到左上角再移过去 不能从当前位置**」✓
+#: ⚠ 为什么以前必须撞角：固件只有**相对移动** ⇒ 要走到"绝对某点"就先得有个已知起点 ✓，
+#:   而收流那条路**看不见 A 机光标**（`cursor_visible()` 恒 False ✓）⇒ 只能撞角建原点 ✗。
+#: ⇒ 现在 relay 能答 `CURSOR?`（`decision/input.cursor_probe` ✓）——
+#:   **后台线程**每秒问几次（见 `gui/live_thread._cur_loop` ✓）⇒ 起算点直接用**真光标位置** ✓
+#:   ⇒ 瞄准**不再先跳左上角** ✓（用户要的"从当前位置移过去"✓）。
+_CUR_SCREEN = None          # (sx, sy, vx, vy)
+_CUR_SCREEN_AT = 0.0
+#: 指令空间的同一件事（`aim_to` 拿得到增益时算好 ✓ 见 `_refresh_cur_hint` ✓）
+_CUR_HINT = None            # (cx, cy)
+_CUR_HINT_AT = 0.0
+#: 采样比这更旧 ⇒ **不信**（这期间可能有人碰过鼠标 / 我们自己动过 ✓）
+CUR_HINT_FRESH_S = 0.45
+
+
+def set_cursor_screen(sx, sy, vx=0, vy=0, now=None):
+    """后台线程喂进来：**A 机光标此刻在屏幕哪儿**（像素 ✓ 不阻塞 ✓ 纯赋值 ✓）。"""
+    global _CUR_SCREEN, _CUR_SCREEN_AT
+    _CUR_SCREEN = (float(sx), float(sy), int(vx), int(vy))
+    _CUR_SCREEN_AT = time.monotonic() if now is None else float(now)
+
+
+def _refresh_cur_hint(gx, gy):
+    """把采样折成**指令空间**（`_AIM_CUR` 的单位 ✓）备用 —— 由 `aim_to` 顺手调 ✓。"""
+    global _CUR_HINT, _CUR_HINT_AT
+    if _CUR_SCREEN is None:
+        _CUR_HINT, _CUR_HINT_AT = None, 0.0
+        return
+    sx, sy, vx, vy = _CUR_SCREEN
+    _CUR_HINT = (int(round((sx - vx) / (float(gx) or 1.0))),
+                 int(round((sy - vy) / (float(gy) or 1.0))))
+    _CUR_HINT_AT = _CUR_SCREEN_AT        # ⚠ 记**采样时刻** ✗ 不是"现在"（否则等于假新鲜 ✓）
+
 
 def aim_reset():
     """忘掉"目标 + 我知道光标在哪" ⇒ 下一拍瞄准会**先撞角归零一次**（见 `aim_tick` ✓）。
@@ -1311,8 +1374,22 @@ def aim_tick(tick_ms=16.0, settle_ms=120.0, now=None):
     if not dinput.mouse_available():
         return False
     if (_AIM_CUR is None) or (now - _AIM_AT > AIM_FRESH_S):
-        corner_zero()                       # 建原点（只在位置不可信时做 ✓）
-        _AIM_CUR = (0, 0)
+        # ⭐⭐ **能用真光标起算就用它**（用户 2026-10-17 ✓「为什么鼠标要先到左上角再移过去
+        #    不能从当前位置」✓）——判据三重，缺一不用：
+        #    ① 有采样 ✓；② 采样**比我们上一次动鼠标更新** ✓（`_CUR_HINT_AT >= _AIM_AT`，
+        #       这样不会"用旧位置当现在"⇒ 不会往回跳 ✓）；
+        #    ③ 采样不超过 `CUR_HINT_FRESH_S` ✓（这期间可能有人碰过鼠标 ✓）。
+        #    ⇒ 起算点 = 光标**现在**在哪 ⇒ 直接朝目标走 ✓ **不再跳左上角** ✓；
+        #    有一条不满足 ⇒ 老老实实撞角（宁可多跳一下，不能按错位置点 ✗）。
+        _hint_ok = (_CUR_HINT is not None
+                    and _CUR_HINT_AT >= _AIM_AT
+                    and (now - _CUR_HINT_AT) <= CUR_HINT_FRESH_S)
+        if _hint_ok:
+            _AIM_CUR = _CUR_HINT
+            _AIM_AT = now                   # ⚠ "我现在知道它在哪" ⇒ 下一步别再重复 seed ✓
+        else:
+            corner_zero()                   # 建原点（只在位置不可信时做 ✓）
+            _AIM_CUR = (0, 0)
     dx = _AIM_TGT[0] - _AIM_CUR[0]
     dy = _AIM_TGT[1] - _AIM_CUR[1]
     if dx == 0 and dy == 0:

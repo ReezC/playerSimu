@@ -561,6 +561,15 @@ def link_health():
                 "ok": not _blocked, "err": _connect_err, "fails": 0, "silent": 0.0}
     kind = _cfg[0] if _cfg else "remote"
     send_ok = bool(getattr(_remote, "ok", True))
+    # ⭐⭐ **同机多实例：relay 只让第一个连上的人控制**（用户 2026-10-17 ✓「多实例」）
+    #   ⇒ 后连上的那个是**只读**（能问光标/窗口 ✓ 发指令一律 `ERR busy` ✓）。
+    #   ⚠ 光看 `ERR` 分不清"固件不认这条"还是"控制位被别人占了" ✗
+    #     ⇒ relay 握手后先发 `ROLE readonly` ✓（`kbd_client.role` ✓）这里如实说 ✓
+    #     ⇒ 上层（agent 自检 / 状态栏）能立刻看到真原因 ✓ 而不是"卡住不动"✓。
+    _role = str(getattr(_remote, "role", "") or "")
+    _readonly = (_role == "readonly")
+    if _readonly:
+        send_ok = False               # ⚠ 只读 ⇒ 一律当"发不出去"（上层别继续对着它发 ✓）
     silent = 0.0
     try:
         silent = float(_remote.silent_for())
@@ -570,11 +579,18 @@ def link_health():
     err = str(getattr(_remote, "last_err", ""))
     if not quiet_ok and not err:
         err = "发指令后 %.0f 秒没收到固件回执（链路卡死）" % silent
+    if _readonly:
+        # ⚠ 这句**必须写在这之后**（✗ 否则会被上面那句 `err = last_err` 冲掉 ✓）
+        err = ("控制位被另一个工作台实例占用（本实例只读）——"
+               "同一台机器只能有一个实例控它：把其中一个实例的输入设备改成「本机」，"
+               "或让它连另一台机器")
     return {"backend": kind,
             "ok": send_ok and quiet_ok,
             "err": err,
             "fails": int(getattr(_remote, "fails", 0)),
-            "silent": silent}
+            "silent": silent,
+            #: `control` / `readonly` / `""`（老 relay 不说 ✓ 当控制端用 ✓）
+            "role": _role}
 
 
 def reconnect_remote():

@@ -1457,36 +1457,80 @@ class LiveThread(QThread):
             return tuple(roi), (int(full[0]), int(full[1]))
         return None, None
 
-    def _mouse_win(self, max_age=1.0):
-        """A 机**画面那一块**在屏幕上的位置 ⇒ `((x, y), (h, w))`；问不到 ⇒ `(None, None)` ✓。
+    def _mouse_win(self):
+        """A 机**画面那一块**在屏幕上的位置 ⇒ `((x, y), (h, w))`；还没问到 ⇒ `(None, None)` ✓。
 
         ⭐⭐⭐ 为什么要有它（用户 2026-10-17 ✓ 原话：
           「**A 机游戏窗口是会移动的，你保证你的方案能适配吗？**」✓）：
           · 点击比例是**相对画面**算的 ✓，而画面 = A 机抓的那块（跟随窗口时就是游戏窗口 ✓）；
           · 要落成**屏幕坐标**就必须知道那块在屏幕的哪儿 ✓ —— 老实现当它是 `(0, 0)` ✗
             ⇒ **窗口一挪，点击就整块偏** ✓；
-          · 现在每 `max_age` 秒问一次 A 机（relay 的 `WINDOW?` ✓ 见 `remote_kbd/relay.py` ✓），
-            窗口挪了 / 缩放 / 重启 ⇒ 下一拍就是新值 ✓ **不用改配置** ✓。
-        ⚠ 问不到（旧 relay / 没开跟随窗口 / 本地后端）⇒ `(None, None)` ⇒ 调用方退回老路 ✓
-          不会更糟 ✓。
+          · 窗口挪了 / 缩放 / 重启 ⇒ 后台线程下一拍就拿到新值 ✓ **不用改配置** ✓。
+
+        ⚠⚠⚠ **这里绝对不许问网络** ✗✗（2026-10-17 现场 ✓ 用户原话：
+          「**自动测谎特别卡 鼠标跟丢了**」✗）：
+          上一版是**当场问** relay（`WINDOW?` 往返 ✓ 超时 0.8s ✗）—— 而它被
+          `_aim_geo` **每帧**调用 ✓ ⇒ 每秒一次**阻塞往返**，那条连接还正被 60Hz 的
+          `MOVE` 占着 ⇒ 一卡就是上百毫秒 ⇒ `_AIM_TGT` 过期（0.25s ✓）⇒ `aim_tick`
+          **停手** ⇒ 鼠标冻住 = 用户说的"**跟丢**" ✓。
+          ⇒ 改成**后台线程每秒问一次** ✓、这里**只读内存缓存**（零阻塞 ✓）。
+          同本仓库那条硬规矩：**实时回路不许等网络** ✗。
         """
-        import time as _t
-        now = _t.monotonic()
-        if now - float(getattr(self, "_mwin_at", 0.0) or 0.0) < float(max_age):
-            return getattr(self, "_mwin_box", (None, None))
-        box = (None, None)
-        try:
-            from decision import input as _di     # ⚠ 局部导入（本文件对 decision 的惯例 ✓）
-            r = _di.window_probe()
-            if r:
-                x, y, w, h = (int(v) for v in r)
-                if w > 0 and h > 0:
-                    box = ((x, y), (h, w))       # ⚠ 形状是 (h, w) ✓ 同 `frame.shape[:2]`
-        except Exception:                        # noqa: BLE001 —— 问不到就退回老路 ✓
-            box = (None, None)
-        self._mwin_at = now
-        self._mwin_box = box
-        return box
+        if getattr(self, "_mwin_thr", None) is None:
+            _t = threading.Thread(target=self._mwin_loop, name="mwin", daemon=True)
+            self._mwin_thr = _t
+            _t.start()
+        return getattr(self, "_mwin_box", (None, None))
+
+    def _mwin_loop(self, every=1.0):
+        """后台问 A 机"游戏窗口在哪"（`WINDOW?` ✓ 每秒一次 ✓）。
+
+        ⚠ 问不到 ⇒ **留着上一次的值** ✓（relay 抖一下不该把定位打回 `(0,0)` ✗
+          —— 那一下正好在点，就是点到别处 ✓）。
+        ⚠ 用 `self._stop.wait()` 睡（可被 `stop()` 立刻打断 ✓ 不是死等 ✗）。
+        """
+        while not self._stop.is_set():
+            try:
+                from decision import input as _di
+                r = _di.window_probe()
+                if r:
+                    x, y, w, h = (int(v) for v in r)
+                    if w > 0 and h > 0:
+                        self._mwin_box = ((x, y), (h, w))    # ⚠ 形状 (h, w) ✓ 同 frame.shape
+            except Exception:                    # noqa: BLE001 —— 问不到就留旧值 ✓
+                pass
+            self._stop.wait(float(every))
+
+    def _cur_loop_start(self):
+        """把"采 A 机光标位置"的后台线程拉起来（**幂等** ✓ 调几次都只起一个 ✓）。"""
+        if getattr(self, "_cur_thr", None) is None:
+            _t = threading.Thread(target=self._cur_loop, name="cur", daemon=True)
+            self._cur_thr = _t
+            _t.start()
+
+    def _cur_loop(self, every=0.2):
+        """后台：每 `every` 秒问一次 **A 机光标现在在哪** ⇒ `mouse_aim.set_cursor_screen` ✓。
+
+        用户 2026-10-17 ✓ 原话：「**自动测谎时为什么鼠标要先到左上角再移过去 不能从当前位置**」✓
+          · 固件只有**相对移动** ⇒ 要走到绝对某点，先得知道"现在在哪"✓；
+          · 收流那条路**看不见** A 机光标 ⇒ 以前只能撞角建原点 ✗（就是那个"先跳左上角"✓）；
+          · relay 本来就能答 `CURSOR?` ⇒ **后台问**（每秒 5 次 ✓）⇒ 起算点 = 真光标 ✓
+            ⇒ 瞄准直接从当前位置走过去 ✓。
+        ⚠ **只许后台问** ✗：`cursor_probe()` 是网络往返 ✓ 放实时回路里就是
+          「自动测谎特别卡 鼠标跟丢了」那次的病 ✓（见 `_mouse_win` 的说明 ✓）。
+        ⚠ 问不到 ⇒ **什么都不做**（别清零 ✗ —— 清零等于把"已知"打回"不知道"
+          ⇒ 下一拍又要跳左上角 ✓）。
+        """
+        while not self._stop.is_set():
+            try:
+                from decision import input as _di
+                from decision import mouse_aim as _ma
+                p = _di.cursor_probe()
+                if p:
+                    _ma.set_cursor_screen(p[0], p[1], p[2], p[3])
+            except Exception:                    # noqa: BLE001 —— 问不到就不更新 ✓
+                pass
+            self._stop.wait(float(every))
 
     def _aim_geo(self, frame, origin=None):
         """点击 / 瞄准的定位参数 ⇒ `(origin, roi, full_shape, gain)` ✓（一处算清 ✓）。
@@ -2702,6 +2746,35 @@ class LiveThread(QThread):
             for _fl in mob_tracker.drain_flick():
                 _bh_tr.event("mob_flick",
                              "检出一闪就没了（没通过确认闸）", **_fl)
+            # ⭐⭐ **「认过的怪怎么会丢」也要留现场**（用户 2026-10-17 ✓ 原话：
+            #   「**离玩家远的时候怪物检出框较稳定 离得近时开始频繁丢失**」✗）：
+            #   把"丢的那一帧"里能分辨病因的三个量一起写下来 ✓：
+            #     · `ov`   = 这只怪的框和**玩家框**的重叠面积 ÷ 怪框面积 ✓
+            #                （>0.5 ⇒ 基本被角色挡住了 ⇒ 是**遮挡**✓ 不是模型不行 ✓）；
+            #     · `dist` = 怪框中心到玩家框中心的距离（画面像素 ✓）；
+            #     · `w/h/conf` = 丢的时候它多大、多少分 ✓（近身目标大 + 分数低 ⇒ 训练分布外 ✓）。
+            #   ⚠ 只在**确认过的轨迹刚丢**那一拍写一行 ✓（不会刷屏 ✗）。
+            for _lv in mob_tracker.drain_lost():
+                _ov = _dist = -1.0
+                if player_box:
+                    try:
+                        _pcx, _pcy = float(player_box[0]), float(player_box[1])
+                        _pw = float(player_box[4]) if len(player_box) > 4 else 0.0
+                        _ph = float(player_box[5]) if len(player_box) > 5 else 0.0
+                        _mx, _my = float(_lv["cx"]), float(_lv["cy"])
+                        _mw, _mh = float(_lv["w"]), float(_lv["h"])
+                        _dist = round(((_mx - _pcx) ** 2 + (_my - _pcy) ** 2) ** 0.5, 1)
+                        _ix = (min(_mx + _mw / 2, _pcx + _pw / 2)
+                               - max(_mx - _mw / 2, _pcx - _pw / 2))
+                        _iy = (min(_my + _mh / 2, _pcy + _ph / 2)
+                               - max(_my - _mh / 2, _pcy - _ph / 2))
+                        _ov = round(max(0.0, _ix) * max(0.0, _iy)
+                                    / max(1.0, _mw * _mh), 3)
+                    except Exception:        # noqa: BLE001 —— 算不出就留 -1 ✓
+                        pass
+                _bh_tr.event("mob_lost", "认过的怪丢了（看 ov/dist/尺寸分病因）",
+                             ov=_ov, dist=_dist, **{k2: v2 for k2, v2 in _lv.items()
+                                                   if k2 not in ("cx", "cy")})
             for _ev in player_tracker.drain_events():
                 _bh_tr.event("player_" + str(_ev.get("what") or "?"),
                              "玩家框：传送 / 隔离 / 换锁",
@@ -4331,10 +4404,72 @@ class LiveThread(QThread):
         self._lie_rec_err = ""
         return True
 
+    @staticmethod
+    def _rec_path(_d, kind):
+        """占一个**独占**的录像文件名 ⇒ `str` ✓（同一毫秒也绝不重名 ✓）。
+
+        ⭐⭐⭐ 为什么必须独占（用户 2026-10-17 ✓ 现场那份 `lie_20261017_162813.mp4`）：
+          · 老写法 `"%s_%Y%m%d_%H%M%S.mp4"` **只到秒** ✗；
+          · 同一秒里开两段录制（**两边同时触发测谎** / 一段刚停一段又起 ✓）
+            ⇒ 两个 `VideoWriter` 写**同一个路径** ✗ ⇒ 两路帧互相覆盖/交织 ✓
+            ⇒ 播放出来"前 2 秒是远程画面、后面上半截是另一路"✓（解码器还会报
+            `ac-tex damaged` / `first frame is no keyframe` ✓）；
+          · ⇒ ① 名字带**毫秒** ✓；② 用 `open(path, "xb")` **原子占位** ✓
+            —— 已存在就抛 `FileExistsError` ⇒ 换下一个后缀 ✓
+            （只靠毫秒不够 ✗：两路在同一毫秒起也是可能的 ✓）。
+        """
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        ms = int((time.time() % 1.0) * 1000)
+        stem = "%s_%s_%03d" % (kind, ts, ms)
+        for i in range(50):
+            p = str(_d / ("%s.mp4" % (stem if i == 0 else "%s_%d" % (stem, i))))
+            try:
+                with open(p, "xb"):          # 独占创建：占住名字 ✓ 绝不两路写一个 ✗
+                    pass
+            except FileExistsError:
+                continue
+            except OSError:
+                return p                     # 建不了（权限等）⇒ 交给 VideoWriter 去报 ✓
+            return p
+        raise RuntimeError("找不到可用的录像文件名（同一毫秒撞了 50 次）")
+
+    @staticmethod
+    def _rec_writer(path, fps, size):
+        """开录像容器 ⇒ `(writer, 编码名)`：**优先 H.264** ✓，不行才退回 `mp4v` ✓。
+
+        ⭐⭐⭐ 为什么必须换（用户 2026-10-17 ✓ 原话：**「最近一次测谎录屏全是花屏」**✗）：
+          · 老写法固定 `mp4v`（**MPEG-4 Part 2** ✓ 文件里四字码是 `FMP4`/`mp4v`）；
+          · **文件本身是好的** —— 我用 OpenCV 把那次录像 718 帧全解出来，画面清晰 ✓
+            （`lie_20261017_174814.mp4` ✓ 帧 0/400 都正常 ✓）；
+          · 但 **Windows 自带播放器（电影和电视 / 照片 / Media Player）大多不带
+            MPEG-4 Part 2 解码器** ⇒ 一放就是**绿块/马赛克/花屏** ✓ = 用户看到的 ✓。
+          · ⇒ 改成系统 **Media Foundation** 的 H.264 编码器
+            （`cv2.CAP_MSMF` + `H264` ✓ 实测写出来是 `avc1` ✓ 容器里查得到 ✓）——
+            **所有播放器都认** ✓，体积还更小 ✓。
+        ⚠ 退回链**必须有**（不然老机器/别的系统上就整段录不了 ✗）：
+          MSMF 打不开（没装编码器 / 非 Windows）⇒ 删掉半成品 ⇒ 照老样子写 `mp4v` ✓。
+        """
+        import cv2
+        try:
+            _w = cv2.VideoWriter(path, cv2.CAP_MSMF,
+                                 cv2.VideoWriter_fourcc(*"H264"), fps, size)
+            if _w.isOpened():
+                return _w, "h264"
+            try:
+                _w.release()
+            except Exception:                # noqa: BLE001
+                pass
+        except Exception:                    # noqa: BLE001 —— 没有 MSMF 后端 ⇒ 走退回 ✓
+            pass
+        try:
+            import os
+            os.remove(path)                  # 半成品留着会挡住下面这次 open ✗
+        except Exception:                    # noqa: BLE001
+            pass
+        return cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, size), "mp4v"
+
     def _lie_rec_open(self, raw):
         """按**首帧尺寸**开容器（失败就记原因、本段不再重试 ✓ 免得每帧刷错误 ✓）。"""
-        import cv2
-
         try:
             from core import config as _cfg
             _d = _cfg.record_dir()
@@ -4343,11 +4478,18 @@ class LiveThread(QThread):
             except Exception:
                 pass                                   # 目录建不出来 ⇒ 下面 open 会报 ✓
             # 文件名前缀 = 本段种类（`lie_*` = 测谎 ✓ / `disc_*` = 断线 ✓ 用户 2026-10-02 ✓）
-            _p = str(_d / ("%s_%s.mp4" % (self._rec_kind or "lie",
-                                          time.strftime("%Y%m%d_%H%M%S"))))
+            # ⚠⚠ **名字要独占**（用户 2026-10-17 现场 ✓ `lie_20261017_162813.mp4`：
+            #   前 2 秒是远程画面、往后**上半截是另一路画面** ✓，解码器还报了一堆
+            #   `ac-tex damaged` / `first frame is no keyframe` ✓）：
+            #   老写法只到**秒** ✗ ⇒ 同一秒里开两段录制（两边同时触发测谎 / 一段刚停又起）
+            #   ⇒ **两个 VideoWriter 写同一个文件** ✗ ⇒ 两路帧交织 ⇒ 播放时"半屏一路、
+            #   半屏马赛克"✓ = 用户看到的"两份画面混在一起"✓。
+            #   ⇒ 见 `_rec_path`（毫秒 + 原子占位 ✓）。
+            _p = self._rec_path(_d, self._rec_kind or "lie")
             _h, _w = int(raw.shape[0]), int(raw.shape[1])
-            _wr = cv2.VideoWriter(_p, cv2.VideoWriter_fourcc(*"mp4v"),
-                                  float(LIE_REC_FPS), (_w, _h))
+            # ⭐ **优先 H.264**（见 `_rec_writer` 的说明：`mp4v` 在 Windows 自带播放器里
+            #   就是"花屏"✓ 用户 2026-10-17 ✓）；打不开才退回老编码 ✓
+            _wr, _codec = self._rec_writer(_p, float(LIE_REC_FPS), (_w, _h))
             if not _wr.isOpened():
                 raise RuntimeError("VideoWriter 打不开（编解码或尺寸不被支持）")
         except Exception as e:                         # noqa: BLE001
@@ -4358,7 +4500,8 @@ class LiveThread(QThread):
         self._lie_rec = (_wr, _p)
         self._lie_rec_path = _p
         self._lie_rec_t0 = time.monotonic()
-        behavior.event("lie_rec", ok=True, path=_p, size=(_w, _h),
+        # ⚠ `codec` 也要写：下次"放不出来/花屏"时，看一眼就知道这份是 h264 还是 mp4v ✓
+        behavior.event("lie_rec", ok=True, path=_p, size=(_w, _h), codec=_codec,
                        fps=LIE_REC_FPS, st=self._screen_state)
         return True
 
@@ -4545,6 +4688,16 @@ class LiveThread(QThread):
 
     def _run(self):
         import cv2
+
+        # ⭐ 开机就把"问 A 机窗口在哪"那条**后台线程**拉起来 ✓（用户 2026-10-17 ✓）：
+        #   等到第一次要点击/瞄准才启动的话，那一刻缓存还是空的 ⇒ 退回老口径 ⇒
+        #   **第一次点会歪** ✗（窗口原点 33,31 没算进去 ✓）。这里先跑起来，
+        #   之后任何时候读 `_mwin_box` 都是现成的 ✓（实时回路零阻塞 ✓ 见 `_mouse_win`）。
+        self._mouse_win()
+        # ⭐⭐ 同一条道理：**瞄准要"从当前位置移过去"**（用户 2026-10-17 ✓ 原话：
+        #   「**自动测谎时为什么鼠标要先到左上角再移过去 不能从当前位置**」✓）⇒
+        #   后台先开始采"A 机光标现在在哪"，起算点就是真光标 ✓ 不再跳左上角 ✓。
+        self._cur_loop_start()
 
         url = self._p.get("url", "")
         # 怪物/玩家置信度分开配：推理时用两者的较小值（保证两类的低分框都
@@ -5009,6 +5162,22 @@ class LiveThread(QThread):
                     perf.count("convert_skip")      # 这帧没人要 ⇒ 没做转换 ✓（计一笔 ✓）
                 return _need
 
+            # ⭐⭐ **同机多实例：一个 UDP 端口只能归一个实例收**（用户 2026-10-17 ✓「多实例」）
+            #   ⚠ 不占的话，ffmpeg 带 `SO_REUSEADDR` 时**两边都能 bind** ⇒ 包只落到一个
+            #     ⇒ 另一个"连上了但帧率一半/花屏"✓（比直接失败更难查 ✗ —— 见 `core/instance.py`）
+            from core import instance as _inst
+            _uport = _inst.udp_port_of(url)
+            if _uport:
+                _ok, _who = _inst.claim_port(_uport)
+                if not _ok:
+                    self.stream_status.emit("no_stream")
+                    self.failed.emit(
+                        "UDP 端口 %d 已被另一个工作台实例占用（%s）——\n"
+                        "同一路推流**只能给一个实例收**：要么给这个实例换一路"
+                        "（A 机另推一个端口，改 config/live_<实例>.yaml 的 url），"
+                        "要么把它的「来源」改成**本地窗口**。"
+                        % (_uport, _who))
+                    return
             src = PyAVSource(url, decode_format="bgr24",
                              container_format=self._p.get("format"),
                              keep_check=_want_frame)

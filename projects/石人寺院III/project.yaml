@@ -1,9 +1,9 @@
 name: 石人寺院III
-map_id: '106010106'
+map_id: '106010105'
 mobs:
 - '2220100'
 - '3000004'
-- '5150000'
+- '5130102'
 scale: 1.406
 mob_scales: {}
 scale_at:
@@ -29,10 +29,10 @@ bars:
     - 82
     - 255
 mmap_crop:
-- 5
-- 71
-- 129
-- 71
+- 6
+- 72
+- 116
+- 79
 decision:
   attack_dist: 70.0
   min_attack_dist: 0
@@ -94,7 +94,7 @@ decision:
   target_cd:
   - 1000
   - 2500
-  input_device: remote
+  input_device: local
   attack_cd: 1000
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 400
@@ -134,7 +134,7 @@ decision:
   mob_sets_ttl_s: 3.0
   auto_hp_pot: true
   auto_mp_pot: false
-  strategy: multi
+  strategy: patrol
   vision_top: 200
   vision_bottom: 100
   vision_left: 300
@@ -152,14 +152,14 @@ decision:
   align_tol_px: 12
   align_hold_ms: 1000
   climb_align_gap_ms: 180
-  climb_align_near_px: 20
+  climb_align_near_px: 15
   climb_retry_delay_s: 0.0
   climb_retry_delay_inc_s: 0.0
   goto_timeout_s: 15
   chase_goto_max_s: 5.0
   goto_timeout_key: 表情_无语
   disable_chase_pathfinding: false
-  jump_start_px: 100
+  jump_start_px: 110
   move_retry_ms: 3000
   custom_timers:
   - name: 自动喂宠
@@ -325,12 +325,12 @@ decision:
   reconnect_server_y: 0.2074
   reconnect_channel_x: 0.4104
   reconnect_channel_y: 0.5093
-  reconnect_channel: 18
+  reconnect_channel: 43
   jump_attack_enabled: false
   jump_attack_height: 90.0
   fall_speed_px_s: 115.0
   vision_detect_only: false
-  track_buffer_ms: 1000
+  track_buffer_ms: 2000
 notes: ''
 capture:
   source: file
@@ -410,7 +410,7 @@ live:
   rect_rel: null
   rect_win: null
   url: udp://0.0.0.0:5000
-  conf_mob: 0.25
+  conf_mob: 0.15
   conf_player: 0.75
   imgsz: 960
   device: '0'
@@ -429,7 +429,7 @@ iterate: {}
 mob_names:
 - 蓝蘑菇
 - 蝴蝶精
-- 混种石头人
+- 黑石头人
 player_scale: 1.406
 player_scale_at:
   width: 1920

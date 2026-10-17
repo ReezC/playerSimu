@@ -4491,13 +4491,101 @@ def t_track_events_wired():
         check(key in src, "实时回路没调 `%s`（有现场也没人取 ⇒ 等于没做 ✗）" % key)
     check('"mob_flick"' in src, "没往 behavior.log 写 `mob_flick`（那这条记事本就没内容 ✗）")
     check('"player_" + str(' in src, "没写 `player_*` 事件（换锁/隔离/传送都没留痕 ✗）")
+    # ⭐ 「认过的怪刚丢」也要留现场（用户 2026-10-17 ✓「离得近时开始频繁丢失」✗）——
+    #   两半都钉：取得到 ✓ ＋ 真接线写进 behavior.log ✓（只钉一半 = 永远什么都不写 ✗）
+    check(hasattr(t, "drain_lost") and t.drain_lost() == [],
+          "`MobTracker` 没有 `drain_lost()`（丢框现场写不出去 ⇒ 分不清是不是被挡住 ✗）")
+    check("mob_tracker.drain_lost()" in src and '"mob_lost"' in src,
+          "实时回路没把「刚丢的确认轨迹」写进 `behavior.log`（`mob_lost` ✗）")
+    check("ov=_ov" in src and "dist=_dist" in src,
+          "`mob_lost` 没带「与玩家框的重叠 / 距离」（那就分不出是**遮挡**还是**模型漏检** ✗）")
     # ④ 打点块必须被 try/except 包住（`event()` 出事不许把实时回路带崩 ✗）
+    #   ⚠ 窗口别抠太紧 ✗ —— 这段还在长（2026-10-17 加了 `mob_lost` 那一截 ✓
+    #     900 字符就不够了 ⇒ 假红 ✓）。
     _i = src.find("mob_tracker.drain_flick()")
-    _blk = src[max(0, _i - 600):_i + 900]
+    _blk = src[max(0, _i - 600):_i + 2600]
     check("except Exception" in _blk, "打点那块没包 `except`（读日志的代码不许拖垮回路 ✗）")
 
 
+def t_lie_rec_codec_h264():
+    """⭐⭐⭐ **测谎录屏必须优先写 H.264**（用户 2026-10-17 ✓ 原话：
+    「**最近一次测谎录屏全是花屏**」✗）。
+
+    ⚠ 先说明"花屏"是哪来的（**不许再归错因** ✗）：
+      · 老写法固定 `mp4v`（MPEG-4 Part 2 ✓ 文件里四字码 `FMP4`/`mp4v`）；
+      · **文件本身是好的** —— 实测把 `lie_20261017_174814.mp4` 全部 718 帧解出来，
+        帧 0 / 400 都是清晰的游戏画面 ✓；
+      · 但 **Windows 自带播放器大多不带 MPEG-4 Part 2 解码器** ⇒ 一放就是花屏 ✓；
+      · ⇒ 换成系统 **Media Foundation 的 H.264**（`CAP_MSMF` + `H264` ⇒ 容器里是 `avc1` ✓），
+        所有播放器都认 ✓。
+    钉三件：
+      ① 源码里**先试 MSMF/H264**（顺序钉死：先 h264 再 mp4v ✓ 反了就白改 ✗）；
+      ② 真写一个小文件、真回读 ⇒ 帧数对得上（不是"开得起来就算" ✗）；
+      ③ 名字里必须有 `mp4v` 这条**退回链**（老机器没有 MF 编码器时不能整段录不了 ✗）。
+    """
+    from gui.live_thread import LiveThread
+
+    check(hasattr(LiveThread, "_rec_writer"),
+          "没有 `_rec_writer`（录屏编码还写死在 `mp4v` ⇒ Windows 自带播放器花屏 ✗）")
+    src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    _i_h = src.find("cv2.CAP_MSMF")
+    _i_m = src.find('"mp4v"', _i_h + 1)
+    check(_i_h > 0 and _i_m > _i_h,
+          "必须**先试** `CAP_MSMF`+`H264`、再退回 `mp4v`（顺序反了等于没改 ✗）")
+
+    # ⭐⭐ **录像文件名必须独占**（用户 2026-10-17 ✓ 现场 `lie_20261017_162813.mp4`：
+    #   前 2 秒远程画面、后面上半截是另一路 ✓ 解码器报 `ac-tex damaged` ✓）
+    #   —— 老名字只到**秒** ⇒ 同一秒开两段录制 ⇒ **两个 writer 写一个文件** ⇒ 画面交织 ✓。
+    #   判据：连着占两次名 ⇒ **必须不同**，且两个文件都真被建出来了 ✓（"xb" 独占 ✓）。
+    _rp_dir = ROOT / "data" / "debug"
+    _rp_dir.mkdir(parents=True, exist_ok=True)
+    _p1 = LiveThread._rec_path(_rp_dir, "_selftest_recname")
+    _p2 = LiveThread._rec_path(_rp_dir, "_selftest_recname")
+    try:
+        check(_p1 != _p2,
+              "同一秒连开两段录制会**撞同一个文件名** ⇒ 两路写一个文件 ⇒ 画面交织/花屏 ✗：%r"
+              % (_p1,))
+        check(Path(_p1).exists() and Path(_p2).exists(),
+              "占名后文件没真建出来（那就没占住 ⇒ 还是会撞 ✗）")
+    finally:
+        for _p in (_p1, _p2):
+            try:
+                Path(_p).unlink()
+            except Exception:                    # noqa: BLE001
+                pass
+
+    import numpy as np
+    import cv2
+    _d = ROOT / "data" / "debug"
+    _d.mkdir(parents=True, exist_ok=True)
+    _p = str(_d / "_selftest_rec_codec.mp4")
+    try:
+        _w, _codec = LiveThread._rec_writer(_p, 30.0, (320, 240))
+        check(_w.isOpened(), "录像容器打不开（%s）" % (_codec,))
+        for _i in range(12):
+            _w.write(np.full((240, 320, 3), 20 + _i * 10, np.uint8))
+        _w.release()
+        _cap = cv2.VideoCapture(_p)
+        _n = 0
+        while True:
+            _ok, _f = _cap.read()
+            if not _ok:
+                break
+            _n += 1
+        _cap.release()
+        check(_n == 12, "写进去 12 帧、回读只有 %d 帧（容器/编码不对 ✗）" % (_n,))
+        check(_codec in ("h264", "mp4v"), "编码名不认识：%r" % (_codec,))
+    finally:
+        try:
+            import os
+            os.remove(_p)
+        except Exception:                        # noqa: BLE001
+            pass
+
+
 TESTS = (
+    ("⭐⭐⭐ 测谎录屏优先写 H.264（用户 2026-10-17「录屏全是花屏」）：先 MSMF/H264 再退回 mp4v · "
+     "真写进去真回读 · 退回链不许删", t_lie_rec_codec_h264),
     ("⭐⭐ 怪框角标 `#id conf/peak`（用户 2026-10-11）：默认关 · 不混进「缺省⇒True」名单 · "
      "存得进读得回 · 关着时老文案一字不变（用来分清「同一个 id 在闪」还是「每帧换 id」）",
      t_mob_id_label_optional),
