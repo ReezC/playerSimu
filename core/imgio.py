@@ -11,12 +11,33 @@
 
 from pathlib import Path
 
-import cv2
-import numpy as np
+# ⚠ **可选依赖**（同 `core/wincap.py` 顶部那条说明 ✓）：A 机部署台
+#   （只列窗口 / 起 ffmpeg）**不需要 opencv** ✓ —— 这里顶层硬导入会让
+#   `import core.wincap` 连带把 `imgio` 一起拽进来 ⇒ `No module named 'cv2'` ✗
+#   （用户 2026-10-17 现场 ✓）。真读写图片时才要求它 ✓。
+try:
+    import cv2
+except ImportError:                        # noqa: BLE001
+    cv2 = None
+try:
+    import numpy as np
+except ImportError:                        # noqa: BLE001
+    np = None
 
 
-def imread(path, flags=cv2.IMREAD_COLOR):
-    """读图，支持中文路径。失败返回 None（和 cv2.imread 行为一致）。"""
+def _need_cv(where):
+    """读/写图片前确认 opencv 在；缺了就**说清怎么装** ✓（不许 AttributeError ✗）。"""
+    if cv2 is not None and np is not None:
+        return
+    raise RuntimeError("%s 需要 opencv-python + numpy（pip install opencv-python numpy）"
+                       % where)
+
+
+def imread(path, flags=None):
+    """读图（默认 `cv2.IMREAD_COLOR` ✓ —— 延迟取，因为 `cv2` 可能是 None ✓）。"""
+    _need_cv("imread")
+    if flags is None:
+        flags = cv2.IMREAD_COLOR       # 中文路径 ⇒ 走 imdecode（见文件头说明 ✓）
     try:
         data = Path(path).read_bytes()
     except OSError:
@@ -34,6 +55,7 @@ def imwrite(path, img, quality=None):
 
     quality 只在 jpg 时生效。
     """
+    _need_cv("imwrite")
     p = Path(path)
 
     params = []

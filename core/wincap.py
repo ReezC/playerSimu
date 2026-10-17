@@ -15,12 +15,45 @@
 import time
 from pathlib import Path
 
-import cv2
-import numpy as np
-from PIL import ImageGrab
+# ⚠⚠⚠ **这几个是"可选依赖"**（用户 2026-10-17 ✓ 现场：A 机部署台点「跟随窗口」报
+#   `ModuleNotFoundError: No module named 'cv2'` ✗）：
+#   · 部署台（A 机）只用**窗口枚举 / 几何**（`list_windows` / `window_geom` / `client_rect` ✓）
+#     —— 那几件事只靠 pywin32 ✓ **一行 cv2 都用不到** ✓；
+#   · 真正**抓屏**（`grab_rect*` / `run_capture`）才要 cv2 / numpy / PIL ✓。
+#   ⇒ 顶层 `import cv2` 会把"列一下窗口"也变成非要装 opencv ✗（A 机 requirements 里没有它 ✓）
+#   ⇒ 改成**可选导入** ✓，用到的地方自己检查（见 `_need_grab_deps` ✓）。
+#   ⛔ 别改回顶层硬导入 ✗ —— 那会让整套部署台在 A 机上起不来 ✓。
+try:
+    import cv2
+except ImportError:                        # noqa: BLE001 —— A 机正常情况 ✓
+    cv2 = None
+try:
+    import numpy as np
+except ImportError:                        # noqa: BLE001
+    np = None
+try:
+    from PIL import ImageGrab
+except ImportError:                        # noqa: BLE001
+    ImageGrab = None
 
 from core.context import TaskContext
-from core.imgio import imwrite
+
+
+def _need_grab_deps(where):
+    """抓屏前确认可选依赖在（**只在真抓的时候要** ✓ 见文件顶部说明 ✓）。
+
+    ⚠ 报错要**说清怎么办** ✗：A 机部署台不需要 opencv ✓；真要抓（本地流程）
+      就 `pip install opencv-python numpy pillow` ✓。
+    """
+    if cv2 is not None and np is not None and ImageGrab is not None:
+        return
+    _miss = [n for n, m in (("opencv-python", cv2), ("numpy", np),
+                            ("pillow", ImageGrab)) if m is None]
+    raise RuntimeError(
+        "%s 需要抓屏依赖（缺 %s）。\\n"
+        "· A 机部署台**只用窗口列表**，不需要它们 ✓（这条不该出现 ✓）；\\n"
+        "· 要抓屏就装：pip install opencv-python numpy pillow"
+        % (where, " / ".join(_miss)))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -100,6 +133,7 @@ def grab_rect_fast(rect):
     能到 48fps（1366x768 约 80fps）。坐标体系和 ImageGrab(all_screens=True)
     一致，都是虚拟屏幕坐标。
     """
+    _need_grab_deps("grab_rect_fast")
     import win32con
     import win32gui
     import win32ui
@@ -568,6 +602,7 @@ def grab_rect(rect, use_wgc=True, prefer_dxgi=True):
         raise ValueError("矩形无效: %s" % (rect,))
     _NOTE["how"], _NOTE["why"] = "", ""
 
+    _need_grab_deps("grab_rect")       # 可选依赖在这儿才要（见文件头说明 ✓）
     # 0) DXGI 桌面复制：最快，而且同样是"屏幕合成结果"（外接弹窗照样进画面 ✓）
     _dxgi_ok = False
     if prefer_dxgi:
@@ -676,6 +711,10 @@ def run_capture(params, ctx=None):
     old = list(out.glob(prefix + "_*.png"))
     if old:
         ctx.log("输出目录已有 %d 张同名文件，将被覆盖" % len(old), "warn")
+
+    # ⚠ `imwrite` **在这儿才导入** ✗ 别放回顶层：它要 cv2（见文件头"可选依赖"那条 ✓）
+    _need_grab_deps("run_capture")
+    from core.imgio import imwrite
 
     ctx.log("抓取区域 %d,%d  %d×%d" % (rect[0], rect[1], rect[2], rect[3]))
     ctx.log("频率 %.1f fps   时长 %s   去重 %s"

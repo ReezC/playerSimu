@@ -1197,6 +1197,51 @@ def t_card_log_wiring():
         w.deleteLater()
 
 
+def t_deploy_needs_no_cv2():
+    """⭐⭐⭐⭐ **部署台不许强依赖 opencv / numpy / pillow**（用户 2026-10-17 ✓ 现场：
+    点「跟随窗口」弹框 `ModuleNotFoundError: No module named 'cv2'` ✗）。
+
+    ⚠ 病根：`core/wincap.py` 顶层 `import cv2` / `numpy` / `PIL.ImageGrab` ✗ ——
+      而 A 机**部署台只用窗口枚举**（`list_windows` / `window_geom` ✓ 纯 pywin32 ✓），
+      它的 requirements 里**没有 opencv** ✓ ⇒ 连"列个窗口"都做不到 ✓
+      （`core/imgio.py` 同理被连带拽进来 ✓）。
+    ⇒ 修法：这三个改成**可选导入**（`try: import cv2 except ImportError: cv2 = None` ✓），
+      真抓屏时由 `_need_grab_deps()` / `_need_cv()` **说清缺什么、怎么装** ✓。
+    判据（两条 ✓）：
+      ① 源码里不许再出现**顶层硬导入**（`try:` 包着 ✓）；
+      ② **子进程实测**：把 cv2/numpy/PIL 打成 None 之后
+         `from core import wincap` 仍能成功、`list_windows()` 仍能返回列表 ✓。
+    """
+    import os
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "core" / "wincap.py").read_text(encoding="utf-8")
+    check("try:\n    import cv2" in src or "except ImportError" in src,
+          "① `core/wincap.py` 的 cv2 必须是**可选导入** ✗（A 机没装 opencv ✓）")
+    check("def _need_grab_deps" in src,
+          "① 抓屏前要有守卫函数（缺依赖时说清怎么装 ✓ 不许 AttributeError ✗）")
+    # ⚠ 搬到函数里的导入**必须真的还在** ✗（第一版把它删了 ⇒ `run_capture` 里
+    #   `imwrite(...)` 会 NameError ✓ 那种错只在"真要存图"时才炸 ✓ 最难查 ✓）
+    check("from core.imgio import imwrite" in src,
+          "① `run_capture` 里那句 `imwrite` 的导入不能丢 ✗（丢了存图时 NameError ✓）")
+
+    code = ("import sys\n"
+            "for m in ('cv2', 'numpy', 'PIL'):\n"
+            "    sys.modules[m] = None\n"
+            "from core import wincap\n"
+            "w = wincap.list_windows()\n"
+            "print('OK', len(w))\n")
+    out = subprocess.run([sys.executable, "-c", code], cwd=str(root),
+                         capture_output=True, text=True,
+                         env=dict(os.environ, PYTHONPATH=str(root)))
+    check(out.returncode == 0 and "OK" in out.stdout,
+          "② **没有 cv2 时 `core.wincap` 必须还能导入并列窗口** ✗（A 机部署台就是这样 ✓）\n"
+          "stdout: %s\nstderr: %s"
+          % (out.stdout[-300:], out.stderr[-400:]))
+
+
 TESTS = (
     ("服务表（标题/参数/命令行）完整", t_service_table),
     ("小地图推流的命令行（按「当前是哪张图」传 --map-id）", t_mmap_cmd),
@@ -1224,6 +1269,7 @@ TESTS = (
     ("⭐⭐⭐⭐ 推流区域能「跟随窗口」（相对比例 ＋ 窗口动了自动重启）", t_push_follow_window),
     ("⭐⭐⭐⭐ 屏幕/DPI 唯一来源（输出缩放现算、不落盘、部署台顶上配）", t_screen_single_source),
     ("⭐⭐⭐⭐ 卡片的 self.log 必须落到主窗口（否则按钮点了毫无反应）", t_card_log_wiring),
+    ("⭐⭐⭐⭐ 部署台不依赖 opencv（没有 cv2 也能列窗口）", t_deploy_needs_no_cv2),
 )
 
 
