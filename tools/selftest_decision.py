@@ -21410,12 +21410,21 @@ def t_auto_measure_async_no_block():
     # ---- ①③ 源码级 ----
     for _fn in (ma.click_ratio, ma.aim_to, ma.scroll):
         _src = inspect.getsource(_fn)
-        check("auto_measure_async" in _src,
+        # ⚠ 2026-10-17：兜底那段收进 **`_gain_or_why`** 了 ✓（用户要求「功能有耦合就优化
+        #   代码结构」✓ —— 原来 `aim_to` / `click_ratio` 各抄一份，改一处漏一处 ✓）
+        #   ⇒ 判据从"**这个函数里**必须出现 `auto_measure_async`"改成"**它必须走后台量那条路**" ✓
+        #   （出现 async 或走共用兜底都算 ✓；阻塞版 `auto_measure(` 仍然**一个字都不许有** ✗）。
+        check("auto_measure_async" in _src or "_gain_or_why(" in _src,
               "`%s` 没走后台量 ✗ ⇒ 要是在回路上直接等 relay 回包就是**卡住实时回路** ✓"
               "（用户 2026-10-10 现场 ✓）" % _fn.__name__)
         check("_auto_busy(" in _src,
               "`%s` 没查「正在后台量」✗ ⇒ 会跟量那个动作插在一起（量出来的数是错的 ✓）"
               "（⚠ 走 `_auto_busy()` ✓ —— 它带**超时自愈** ✓ 见那条 ✓）" % _fn.__name__)
+    # ⭐ 共用兜底自己**必须**走后台版 ✗（阻塞版一次最多 1.6 秒 ⇒ 实时回路被卡住 ✓）
+    _gsrc = inspect.getsource(ma._gain_or_why)
+    check("auto_measure_async" in _gsrc
+          and "auto_measure(" not in _gsrc.replace("auto_measure_async(", ""),
+          "`_gain_or_why` 必须走**后台版** `auto_measure_async` ✗ —— 阻塞版会把实时回路卡住 ✓")
     _asrc = inspect.getsource(ma.auto_measure_async)
     check("threading.Thread(" in _asrc and "_AUTO_LOCK" in _asrc,
           "`auto_measure_async` 没起线程 / 没串行锁 ⇒ 还是卡回路（或两条量打架 ✓）")
