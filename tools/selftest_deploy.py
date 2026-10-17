@@ -1242,6 +1242,59 @@ def t_deploy_needs_no_cv2():
           % (out.stdout[-300:], out.stderr[-400:]))
 
 
+def t_wincap_without_pywin32():
+    """⭐⭐⭐⭐ **A 机没装 pywin32 也要能列窗口**（用户 2026-10-17 ✓ 现场：开着十几个程序，
+    点「跟随窗口」却弹「**没找到窗口**」✗）。
+
+    ⚠ 病根：`core/wincap.list_windows` 的 `except: return []` ✓ —— 缺 pywin32 就**静默返回空** ✗
+      （`deploy/requirements.txt` 里**没有 pywin32** ✓ A 机必然踩 ✓）；
+      `window_geom` 也一样 ⇒ 就算选上了"跟随"，也只能记绝对坐标 ⇒ **跟不动** ✓。
+    ⇒ 修法：新增 `core/winenum`（**纯 ctypes** ✓ 一个包都不用装 ✓），两条都兜底 ✓。
+    判据（三条 ✓）：
+      ① 源码里两处都接了 `from core import winenum` ✓；
+      ② **子进程实测**：把 `win32gui/win32process/win32api/pywintypes` 全打成 `None`
+         ⇒ `wincap.list_windows()` 仍返回**非空** ✓；
+      ③ 同一条件下 `window_geom()` 能给出一块合理几何 ✓（跟随窗口靠它算相对比例 ✓）。
+    """
+    import os
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parent.parent
+    src = (root / "core" / "wincap.py").read_text(encoding="utf-8")
+    check(src.count("from core import winenum") >= 2,
+          "① `list_windows` 和 `window_geom` 都要接 ctypes 兜底 ✗（只接一处 ⇒ 另一半还静默 ✓）")
+
+    code = ("import sys\n"
+            "for m in ('win32gui', 'win32process', 'win32api', 'pywintypes'):\n"
+            "    sys.modules[m] = None\n"
+            "from core import wincap\n"
+            "print('AVAIL', wincap.available())\n"
+            "w = wincap.list_windows()\n"
+            "print('N', len(w))\n"
+            "print('GEOM', wincap.window_geom(w[0]['hwnd']) is not None if w else None)\n")
+    out = subprocess.run([sys.executable, "-c", code], cwd=str(root),
+                         capture_output=True, text=True,
+                         env=dict(os.environ, PYTHONPATH=str(root)))
+    stdout = out.stdout or ""
+    check(out.returncode == 0,
+          "② 没有 pywin32 时 `core.wincap` 必须还能导入 ✗：\n%s" % (out.stderr or "")[-400:])
+    n = 0
+    for line in stdout.splitlines():
+        if line.startswith("N "):
+            try:
+                n = int(line.split()[1])
+            except (IndexError, ValueError):
+                n = 0
+    check(n > 0,
+          "② 没有 pywin32 时 `list_windows()` 必须靠 ctypes **列得出窗口** ✗（实测 %d 个）\n"
+          "   ⚠ 这条要在这台**有窗口的**机器上跑 ✓ 全屏全最小化时会假红 ✓\n"
+          "%s" % (n, stdout[-300:]))
+    check("GEOM True" in stdout or n == 0,
+          "③ 没有 pywin32 时 `window_geom()` 也要有结果 ✗（否则「跟随窗口」只能记绝对坐标 ✓）\n"
+          "%s" % stdout[-300:])
+
+
 TESTS = (
     ("服务表（标题/参数/命令行）完整", t_service_table),
     ("小地图推流的命令行（按「当前是哪张图」传 --map-id）", t_mmap_cmd),
@@ -1270,6 +1323,7 @@ TESTS = (
     ("⭐⭐⭐⭐ 屏幕/DPI 唯一来源（输出缩放现算、不落盘、部署台顶上配）", t_screen_single_source),
     ("⭐⭐⭐⭐ 卡片的 self.log 必须落到主窗口（否则按钮点了毫无反应）", t_card_log_wiring),
     ("⭐⭐⭐⭐ 部署台不依赖 opencv（没有 cv2 也能列窗口）", t_deploy_needs_no_cv2),
+    ("⭐⭐⭐⭐ 没有 pywin32 也要能列窗口（ctypes 兜底 ＋ 几何）", t_wincap_without_pywin32),
 )
 
 

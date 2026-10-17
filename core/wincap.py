@@ -75,9 +75,16 @@ def list_windows(min_w=200, min_h=150):
     过滤掉太小的窗口（工具提示、浮动面板之类）。
     """
     try:
-        import win32gui
+        import win32gui  # noqa: F401
     except Exception:
-        return []
+        # ⚠ **不许 return []** ✗（用户 2026-10-17 现场：A 机没装 pywin32 ⇒ 「没找到窗口」
+        #   而机器明明开着十几个程序 ✓ 静默返回空 = 骗人 ✓）
+        #   `core/winenum` 是**纯 ctypes** 的同一套口径 ✓ 一个包都不用装 ✓
+        try:
+            from core import winenum
+            return winenum.list_windows(min_w, min_h)
+        except Exception:                  # noqa: BLE001 —— 真不行才空 ✓
+            return []
 
     out = []
 
@@ -297,7 +304,13 @@ def window_geom(hwnd):
     try:
         import ctypes
         from ctypes import wintypes
-        import win32gui
+        try:
+            import win32gui
+        except ImportError:
+            # ⚠ A 机没 pywin32 ⇒ 走 ctypes 兜底（**同一口径** ✓ 见 `core/winenum` ✓）
+            #   不兜的话 `window_geom` 给 None ⇒ "跟随窗口"只能记绝对坐标 ⇒ 跟不动 ✓
+            from core import winenum
+            return winenum.window_geom(hwnd)
         if not win32gui.IsWindow(hwnd):
             return None
         if win32gui.IsIconic(hwnd):                 # 已最小化 ⇒ 没有可用的屏幕几何 ✓

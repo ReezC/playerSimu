@@ -705,12 +705,27 @@ class ServiceCard(QFrame):
 
         from core import wincap
 
+        # ⚠ 排掉**桌面壳**（`Program Manager` 永远是最大的一块 ✓ 放第一行很容易误选 ✓
+        #   用户 2026-10-17 ✓ 见现场列表 ✓）+ 排掉**部署台自己** ✓
+        _shell = {"program manager", "windows 输入体验"}
         wins = [w for w in wincap.list_windows(min_w=200, min_h=150)
-                if _win_pid(w.get("hwnd")) != my_pid]
+                if _win_pid(w.get("hwnd")) != my_pid
+                and str(w.get("title") or "").strip().lower() not in _shell]
         if not wins:
+            # ⚠ 别只说"没有窗口" ✗（用户 2026-10-17 现场：开着十几个程序却报没找到 ✓
+            #   真原因是 A 机没装 pywin32 ✓ 见 `core/winenum` ✓）⇒ 把**排查信息**一起说 ✓
+            _diag = ("pywin32：%s ｜ 内置 ctypes：%s"
+                     % ("有" if wincap.available() else "**没有**",
+                        "可用" if _ctypes_enum_ok() else "不可用"))
             QMessageBox.information(
                 self.window() or self, "没找到窗口",
-                "现在没有可跟随的窗口 —— 先把游戏开起来（别最小化），再点一次。")
+                "一个窗口都没列出来（不是「你没开程序」）。\n\n"
+                "排查：%s\n\n"
+                "常见原因：\n"
+                "· 游戏窗口**最小化了**（最小化的窗口不列出来 ✓）\n"
+                "· 远程桌面以「最小化/断开」方式连着（那种会话里列不出本机窗口 ✓）\n"
+                "· 窗口标题是空的（有些启动器这样 ✓）\n\n"
+                "把窗口开出来、别最小化，再点一次。" % _diag)
             return
 
         win = self.window() or self
@@ -1073,14 +1088,29 @@ def _fit_btn(text, tip="", pad=26, min_w=44):
     return b
 
 
+def _ctypes_enum_ok():
+    """内置 ctypes 窗口枚举能不能用（给"没找到窗口"那个框做诊断 ✓ 不许静默 ✗）。"""
+    try:
+        from core import winenum
+        return bool(winenum.available())
+    except Exception:                      # noqa: BLE001
+        return False
+
+
 def _win_pid(hwnd):
     """窗口的进程 ID（拿不到给 0）—— 选窗口时把**部署台自己**排掉 ✓。"""
     try:
         import win32process
         _t, pid = win32process.GetWindowThreadProcessId(int(hwnd))
         return int(pid)
-    except Exception:                          # noqa: BLE001
-        return 0
+    except Exception:                      # noqa: BLE001 —— A 机可能没 pywin32 ✓
+        # ⚠ 兜底走 `core.winenum`（**纯 ctypes** ✓ 一个包都不用装 ✓）——
+        #   不然这里恒返回 0 ⇒ "排掉自己"失效（小问题）+ 说明 A 机上 pywin32 真的缺 ✓
+        try:
+            from core import winenum
+            return winenum.pid_of(hwnd)
+        except Exception:                  # noqa: BLE001
+            return 0
 
 
 def _push_region_text(cfg):
