@@ -58,14 +58,41 @@ PARAMS = {
              tip="0.0.0.0 = 所有网卡（推荐，换网络不用改）"),
     ],
     "probe": [
-        dict(key="out_scale", keys=("out_scale",), label="输出缩放", kind="float",
-             minimum=0.05, maximum=4.0, decimals=4, step=0.01, width=110,
-             tip="A 机屏幕 → 流画面的缩放比 = 流分辨率 ÷ A 机屏幕**逻辑**分辨率。\n"
-                 "probe_gen 用它把 link.yaml 里的「流画面坐标」换算成 A 机屏幕\n"
-                 "坐标去画，所以 A、B 共用同一份 link.yaml，A 机不用手工换算。\n\n"
-                 "例：A 机 2560x1440、Windows 缩放 150%（逻辑 1706x960），\n"
-                 "推流 1366x768 → 1366 ÷ 1706.67 ≈ 0.8004。\n"
-                 "改了分辨率或缩放比例就要重算这个值（改完 B 机 re-solve 一次）。"),
+        # ⭐⭐⭐ **探针放在哪（流画面坐标 ✓ 2026-10-17 用户要求：「延迟探针可以让 A 机自己在
+        #   部署台配置放在哪吗？」✓）** —— 以前只能手改 `config/link.yaml` 的 `probe.x/y` ✗，
+        #   改完还得自己重启探针窗口 ✓（它只在启动时读一次 ✓）。
+        #   现在：这里填（= B 机采样那套坐标 ✓）⇒ 存 `deploy.json` ＋ **写回 link.yaml**
+        #   （A、B 共用一份 ✓ B 才知道该在哪采样 ✓）＋ 探针在跑就**自动重启** ✓。
+        #   ⚠ 单位是**流画面像素**（B 机看到的 1366x768 那套 ✓），不是 A 机屏幕像素 ✗ ——
+        #     换算是 `probe_gen` 用「输出缩放」做 ✓（见下一项说明 ✓）。
+        dict(key="x", keys=("x",), label="画面 x", kind="int", minimum=0, maximum=8192,
+             width=100,
+             tip="探针码带**左边缘**在**流画面**里的 x（B 机看到的坐标 ✓，不是 A 机屏幕 ✗）。\n"
+                 "A 机屏幕坐标由「输出缩放」自动换算（见下一项）。\n\n"
+                 "⚠ 改完 B 机若已经「框选探针」标定过 ⇒ 要重框一次 ✗\n"
+                 "（人工标定存在 config/probe_calib.json，优先于 link.yaml）。"),
+        dict(key="y", keys=("y",), label="画面 y", kind="int", minimum=0, maximum=8192,
+             width=100,
+             tip="探针码带**上边缘**在**流画面**里的 y。\n"
+                 "默认 8 = 贴在画面顶部（不挡游戏内容 ✓）。"),
+        dict(key="cell", keys=("cell",), label="方块宽 cell", kind="float",
+             minimum=4.0, maximum=64.0, decimals=2, step=0.5, width=100,
+             tip="一个黑/白方块的宽度（流画面像素）。\n"
+                 "⚠ 必须 ≥ 16 才稳（太小 ⇒ 推流压缩后糊成一团 ⇒ 解码失败 ✓）；\n"
+                 "填大了整条码会变宽，但更容易解 ✓。改完 B 机要重框一次 ✗。"),
+        dict(key="gap", keys=("gap",), label="间隔 gap", kind="float",
+             minimum=0.0, maximum=16.0, decimals=2, step=0.25, width=100,
+             tip="方块之间的间隙（流画面像素）。一般 2 ~ 3。"),
+        dict(key="bits", keys=("bits",), label="码位数 bits", kind="int",
+             minimum=8, maximum=64, width=100,
+             tip="时间码用多少位（40 = 现有标定 ✓）。\n"
+                 "⚠ 改了就和 B 机现有的框选标定对不上 ⇒ 必须重框一次 ✗。\n"
+                 "不是越大越好：位数越多整条码越宽，越容易压到游戏 UI。"),
+        # ⚠⚠ **「输出缩放」这一格已删**（用户 2026-10-17 ✓ 原话：
+        #   「**把探针输出缩放参数移除**」✓）——
+        #   它现在是**派生值**：流分辨率宽 ÷ A 机逻辑分辨率宽 ✓
+        #   （`core/screen.out_scale` ✓ 读最上面那张「分辨率设置」卡片写的 `[screen]` ✓）。
+        #   ⛔ 别再把"派生值"做成输入框 ✗ —— 改分辨率时人一定会忘改它 ✓（老口径的病根 ✓）。
     ],
     "kbd": [
         dict(key="serial", keys=("serial",), label="串口号", kind="serial", width=150,
@@ -98,7 +125,23 @@ PARAMS = {
              tip="推流分辨率（= B 机看到的画面尺寸）。\n"
                  "与 link.yaml 的 stream.width/height 一致；改完 A 机的\n"
                  "「输出缩放」要跟着重算，B 机的探针坐标要 re-solve。\n"
-                 "越小延迟越低 —— 131 ms 那个成绩就是 1920x1080@144 测的。"),
+                 "越小延迟越低 —— 131 ms 那个成绩就是 1920x1080@144 测的。\n\n"
+                 "⚠ 框过「推流区域」之后，这一格会**自动跟着框的大小**改（1:1 最省）✓"),
+        # ⭐⭐⭐ **推流区域**（用户 2026-10-17 ✓ 原话：「**没有在部署台看到选择推流区域的
+        #   按钮**」✗）—— 之前这一卡只能选分辨率 ⇒ 抓的是**整个桌面** ✗：
+        #   游戏窗口四周的桌面、任务栏、别的窗口一起压进码带（白占码率 ✓ 也让 B 机
+        #   看到不相干的东西 ✓）。现在可以在 A 机屏幕上**框一块**，只推那一块 ✓。
+        #   ⚠ `keys=()`：四个数字由「框选…」直接写进 `deploy.json` 的 push 段 ✓
+        #     （不走控件取值 ⇒ `values()` 跳过它 ✓）。整屏 = 四个 0（老行为 ✓）。
+        dict(key="region", keys=(), label="推流区域", kind="push_region",
+             tip="只推**这一块**（不是整个桌面）。点「框选…」在 A 机屏幕上拖一个框：\n"
+                 "框多大就推多大 —— 输出分辨率会自动改成框的大小（1:1、最省算力 ✓）。\n\n"
+                 "为什么要它：整屏推流时，游戏窗口四周的桌面 / 任务栏 / 别的窗口也一起\n"
+                 "压进去了（白占码率，还让 B 机看到不相干的东西）。\n"
+                 "「整屏」= 清掉框，回到抓整个桌面（老行为 ✓）。\n\n"
+                 "⚠ 改完 B 机会按新尺寸收流 ⇒ 探针坐标要重新 re-solve / 重框一次 ✗；\n"
+                 "⚠ ddagrab 的 offset/video_size 要 ffmpeg ≥ 5.0（自检会看版本 ✓），\n"
+                 "   太老就改用「gdigrab」那条采集链（它也支持 offset ✓）。"),
         dict(key="fps", keys=("fps",), label="帧率", kind="combo_edit", cast=int,
              choices=("50", "60", "144"), width=110,
              tip="采集帧率。实测抓得越快端到端延迟越低：\n"
@@ -259,8 +302,22 @@ def build_cmd(key, cfg):
                 "--port", str(int(num(p.get("port"), 5001, int)))]
 
     if key == "probe":
-        return [python_exe(), "-m", "tools.probe_gen",
-                "--out-scale", "%g" % num(p.get("out_scale"), 0.8004)]
+        # ⭐ 位置/尺寸**显式带上**（用户 2026-10-17 ✓「A 机自己在部署台配置放在哪」✓）：
+        #   · 命令行里写出来 ⇒ 卡片底部那条命令就是"人话"，想手工排查直接复制 ✓；
+        #   · 值同时会**写回 link.yaml**（见 `config.sync_probe_to_link` ✓）⇒ B 机按同一份采样 ✓；
+        #   · ⚠ 传的是**流画面坐标** ✓ —— `probe_gen` 内部再用 `--out-scale` 换算成 A 机屏幕 ✓。
+        cmd = [python_exe(), "-m", "tools.probe_gen",
+               "--out-scale", "%g" % num(p.get("out_scale"), 0.8004)]
+        for _k, _cast in (("x", int), ("y", int), ("cell", float), ("gap", float)):
+            _v = p.get(_k)
+            if _v in (None, ""):
+                continue                      # 没填 ⇒ 交给 probe_gen 按 link.yaml 读 ✓
+            try:
+                _v = _cast(_v)
+            except (TypeError, ValueError):
+                continue
+            cmd += ["--" + _k, ("%d" % _v) if _cast is int else ("%g" % _v)]
+        return cmd
 
     if key == "kbd":
         return [python_exe(), "-m", "remote_kbd.relay",
@@ -324,10 +381,61 @@ def mmap_region_now():
 
 
 def _push_cmd(p, num):
-    """推流命令行。默认对齐 tools/a_push.ps1 实测的那套（端到端 ~131 ms）。"""
+    """推流命令行。默认对齐 tools/a_push.ps1 实测的那套（端到端 ~131 ms）。
+
+    ⭐ **推流区域**（用户 2026-10-17 ✓「没有在部署台看到选择推流区域的按钮」✗）：
+      · `region_w/h > 0` ⇒ 只抓那一块（`region_x/y` 为它左上角 ✓ **A 机屏幕逻辑坐标** ✓）；
+      · 抓完再按「分辨率」缩放 ⇒ 框的大小 == 输出尺寸时这一步是 **1:1**（最省 ✓）；
+      · 四个值都是 0 ⇒ 整屏（**老行为一字不变** ✓）。
+    ⚠ 尺寸**必须是偶数** ✗（yuv420p / h264 的色度是 2x2 下采样 ✓ 奇数会让编码器报
+      "width not divisible by 2" ✓）—— 界面上框完已经抹成偶数 ✓，这里再兜一层 ✓。
+    """
     ff = str(p.get("ffmpeg") or "ffmpeg").strip() or "ffmpeg"
     w = int(num(p.get("width"), 1366, int))
     h = int(num(p.get("height"), 768, int))
+    rx = int(num(p.get("region_x"), 0, int))
+    ry = int(num(p.get("region_y"), 0, int))
+    rw = int(num(p.get("region_w"), 0, int))
+    rh = int(num(p.get("region_h"), 0, int))
+
+    # ⭐⭐⭐⭐⭐ **跟随窗口**（用户 2026-10-17 ✓ 原话：「**就不能像本地一样自动适应窗口尺寸吗？**」✓）
+    #   本地那条是 `rect_rel` + `rect_win`（相对窗口的比例 ✓ 窗口挪了/换分辨率不用重框 ✓
+    #   见 `core/wincap` ✓）；部署台这边照抄同一套 ✓：
+    #     · `region_win` = `[hwnd, 标题]`、`region_rel` = `[nx, ny, nw, nh]`（**相对窗口外框** ✓）；
+    #     · 每次**拼命令**都按窗口**现在的**几何现算 ✓（`binding_rect` ✓ 句柄失效会按标题
+    #       重绑回来 ✓ 见 `core/wincap.window_by_title` ✓）；
+    #     · 跟随模式下 **输出尺寸 = 区域尺寸**（1:1 ✓ 窗口改大小也不用去调分辨率 ✓）。
+    #   ⚠ 算不出来（窗口关了 / 最小化）⇒ **退回记下的绝对区域** ✓（老行为 ✓ 绝不炸 ✗）。
+    #   ⚠ `ffmpeg` 的采集参数是**启动参数** ✗ ⇒ 窗口动了要**重启**才生效 ✓
+    #     （谁负责发现"动了"：部署台的 `_push_watch_tick` ✓）。
+    _follow = False
+    if p.get("region_win") and p.get("region_rel"):
+        try:
+            from core import wincap
+
+            _win = p.get("region_win") or []
+            _hwnd = int(_win[0])
+            _title = str(_win[1]) if len(_win) > 1 else ""
+            _r, _why = wincap.binding_rect(p.get("region_rel"), _hwnd,
+                                           (rx, ry, rw, rh), title=_title)
+            if _r and int(_r[2]) >= 2 and int(_r[3]) >= 2:
+                rx, ry = int(_r[0]), int(_r[1])
+                rw, rh = int(_r[2]), int(_r[3])
+                _follow = True         # ⚠ 输出尺寸在**偶数化之后**才赋值 ✗（见下面那段 ✓）
+        except Exception:              # noqa: BLE001 —— 问不到窗口就用绝对区域 ✓
+            pass
+
+    _region = rw >= 2 and rh >= 2
+    if _region:
+        rx, ry = max(0, rx), max(0, ry)
+        rw, rh = rw - (rw % 2), rh - (rh % 2)      # 偶数化 ✓
+        cap_w, cap_h = rw, rh
+        if _follow:
+            # 跟随 ⇒ 输出尺寸 == **偶数化之后**的区域 ✓（拿奇数去 scale 会编码报错 ✗
+            # 而这里正好 1:1 ⇒ `scale=W:H` 是空转 ✓）
+            w, h = rw, rh
+    else:
+        cap_w, cap_h = w, h                        # 整屏：老口径（抓完再缩到输出尺寸）
     fps = int(num(p.get("fps"), 50, int))
     gop = int(num(p.get("gop"), 60, int))
     br = str(p.get("bitrate") or "6M")
@@ -340,24 +448,37 @@ def _push_cmd(p, num):
     cmd = [ff, "-hide_banner", "-loglevel", "error", "-nostats"]
 
     if str(p.get("capture")) == "gdigrab":
-        # GDI 抓屏：分辨率/帧率直接写在这，后面不用再 scale
-        cmd += ["-f", "gdigrab", "-framerate", str(fps),
-                "-video_size", "%dx%d" % (w, h), "-i", "desktop"]
-    elif str(p.get("scale_mode") or "cpu") == "cuda":
-        # DXGI 硬采 + **GPU 缩放**：整屏那一帧留在显存里（hwmap 到 cuda），
-        # 只在显存里缩到输出尺寸，再把小图拷回内存。
-        # 省掉的是"整屏 BGRA ≈15MB/帧 拷回内存" —— 实测 CPU 那条链的天花板就是它
-        # （2026-09-25：18 条候选 speed 全贴 1.00、实际 fps 只有 ~73）。
-        cmd += ["-init_hw_device", "d3d11va=dx", "-init_hw_device", "cuda=cu",
-                "-filter_hw_device", "dx", "-filter_complex",
-                "ddagrab=framerate=%d,hwmap=derive_device=cuda,"
-                "scale_cuda=%d:%d,hwdownload,format=nv12" % (fps, w, h)]
+        # GDI 抓屏：区域 + 采集尺寸都写在这。
+        # ⚠ 框过区域时 `cap_*` = 框的大小 ⇒ 与输出尺寸 1:1，后面那次 scale 被跳过 ✓；
+        #   人手工把「分辨率」调成别的值时，补一个 `-vf scale` 保证输出还是那个尺寸 ✓。
+        cmd += ["-f", "gdigrab", "-framerate", str(fps)]
+        if _region:
+            cmd += ["-offset_x", str(rx), "-offset_y", str(ry)]
+        cmd += ["-video_size", "%dx%d" % (cap_w, cap_h), "-i", "desktop"]
+        if (cap_w, cap_h) != (w, h):
+            cmd += ["-vf", "scale=%d:%d" % (w, h)]
     else:
-        # DXGI 硬采（默认）：抓完 hwdownload 回内存，再 scale + 转像素格式
-        cmd += ["-init_hw_device", "d3d11va=dx", "-filter_hw_device", "dx",
-                "-filter_complex",
-                "ddagrab=framerate=%d,hwdownload,format=bgra,scale=%d:%d,format=nv12"
-                % (fps, w, h)]
+        # ⭐ ddagrab 的 `video_size` / `offset_x` / `offset_y` = **只抓屏幕上一块** ✓
+        #   （不写就是整屏 ⇒ 老行为一字不变 ✓）。两个缩放分支共用这一段的构造 ✓。
+        _dag = "ddagrab=framerate=%d" % fps
+        if _region:
+            _dag += (":video_size=%dx%d:offset_x=%d:offset_y=%d"
+                     % (cap_w, cap_h, rx, ry))
+        if str(p.get("scale_mode") or "cpu") == "cuda":
+            # DXGI 硬采 + **GPU 缩放**：抓到的帧留在显存里（hwmap 到 cuda），
+            # 只在显存里缩到输出尺寸，再把小图拷回内存。
+            # 省掉的是"整屏 BGRA ≈15MB/帧 拷回内存" —— 实测 CPU 那条链的天花板就是它
+            # （2026-09-25：18 条候选 speed 全贴 1.00、实际 fps 只有 ~73）。
+            cmd += ["-init_hw_device", "d3d11va=dx", "-init_hw_device", "cuda=cu",
+                    "-filter_hw_device", "dx", "-filter_complex",
+                    _dag + ",hwmap=derive_device=cuda,"
+                    "scale_cuda=%d:%d,hwdownload,format=nv12" % (w, h)]
+        else:
+            # DXGI 硬采（默认）：抓完 hwdownload 回内存，再 scale + 转像素格式
+            cmd += ["-init_hw_device", "d3d11va=dx", "-filter_hw_device", "dx",
+                    "-filter_complex",
+                    _dag + ",hwdownload,format=bgra,scale=%d:%d,format=nv12"
+                    % (w, h)]
 
     if p.get("passthrough"):
         cmd += ["-fps_mode", "passthrough"]
@@ -522,11 +643,19 @@ def missing_hint(key, cfg):
         return ""
 
     if key == "probe":
+        # ⚠ 2026-10-17：`out_scale` 改成**自计算**了 ✓ ⇒ 这里不再查它 ✗
+        #   （查它=又让它挡启动 ✓ 而人根本改不了它 ✓）；只查**真能填错**的几何 ✓。
         try:
-            s = float(p.get("out_scale"))
+            cell = float(p.get("cell"))
+            gap = float(p.get("gap"))
+            bits = int(float(p.get("bits")))
         except (TypeError, ValueError):
-            return "输出缩放填得不对，应该是个小数，例如 0.8004。"
-        if not (0.05 <= s <= 4.0):
-            return "输出缩放 %.3f 超出范围（0.05 ~ 4.0）。" % s
+            return "探针几何填得不对（cell / gap 要是数字，bits 要是整数）。"
+        if cell < 8:
+            return "方块宽 cell = %g 太小（必须 ≥ 16，太小解不出真值 ✓）。" % cell
+        if gap < 0:
+            return "间隔 gap 不能为负：%g" % gap
+        if not (8 <= bits <= 64):
+            return "码位数 bits = %d 超出范围（8 ~ 64）。" % bits
 
     return ""

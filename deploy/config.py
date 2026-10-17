@@ -29,7 +29,27 @@ DEFAULTS = {
         "port": 5001,
     },
     "probe": {
-        "out_scale": 0.8004,
+        # ⭐ **探针放在哪（流画面坐标 ✓ 2026-10-17 用户要求 ✓）** —— 以前只有 out_scale，
+        #   位置只能手改 `link.yaml` 的 `probe.x/y` ✗。现在这几个键在这里存（= 部署台界面）
+        #   ＋ 保存时**写回 link.yaml**（A、B 共用一份 ⇒ B 才知道该在哪采样 ✓）。
+        #   ⚠ 默认值与 `link.yaml` 的回落值一致（见 `probe_gen` 的 `get("probe", ...)` ✓）。
+        "x": 100,
+        "y": 8,
+        "cell": 16.0,
+        "gap": 2.0,
+        "bits": 40,
+        # ⚠ `out_scale` **已移除**（用户 2026-10-17 ✓「把探针输出缩放参数移除」✓）：
+        #   它现在是**派生值**（`screen_out_scale(cfg)` ✓ 由 `[screen]` + 推流宽算 ✓），
+        #   `apply_derived()` 临时塞进内存给命令行用 ✓ **不落盘** ✗
+        #   （落盘就会变成第二份真相 ⇒ 改分辨率忘改它 ⇒ 探针画错位置 ✓ 老口径的病根 ✓）。
+    },
+    # ⭐⭐⭐ **A 机屏幕 / DPI**（用户 2026-10-17 ✓ 部署台最上面那张「分辨率设置」卡片 ✓）
+    #   这三项是**唯一来源** ⇒ 所有派生值（逻辑分辨率 / 输出缩放）一律现算 ✓
+    #   （`core/screen.py` ✓ A、B 共用同一个算法 ✓）。
+    "screen": {
+        "width": 2560,       # A 机屏幕**物理**分辨率
+        "height": 1440,
+        "dpi_scale": 1.5,    # Windows 显示缩放：100%⇒1.0 / 125%⇒1.25 / 150%⇒1.5
     },
     "kbd": {
         "serial": "COM3",
@@ -51,6 +71,19 @@ DEFAULTS = {
         "low_latency": True,
         "passthrough": False,
         "pkt_size": 1316,
+        # ⭐ **推流区域**（用户 2026-10-17 ✓「没有在部署台看到选择推流区域的按钮」✗）：
+        #   四个 0 = 整屏（老行为 ✓ 不抓区域 ✗）；由卡片上的「框选…」写入 ✓
+        #   （A 机屏幕**逻辑坐标** ✓ = `ask_region` 抓屏那套坐标系 ✓）。
+        "region_x": 0,
+        "region_y": 0,
+        "region_w": 0,
+        "region_h": 0,
+        # ⭐ **跟随窗口**（用户 2026-10-17 ✓「就不能像本地一样自动适应窗口尺寸吗？」✓）：
+        #   `region_win = [hwnd, 标题]` + `region_rel = [nx, ny, nw, nh]`（**相对窗口外框** ✓
+        #   与本地 `rect_rel`/`rect_win` 同一套 ✓ 见 `core/wincap`）。
+        #   `None` = 不跟随（用上面那四个绝对坐标 ✓ 老行为 ✓）。
+        "region_win": None,
+        "region_rel": None,
     },
     "mmap": {            # 小地图推流（寻路定位用；不用寻路就别起这张卡片）
         "bind": "0.0.0.0",
@@ -133,7 +166,15 @@ def seed_from_link():
             cfg[section][key] = val
 
     put("clock", "port", clock.get("server_port"))
-    put("probe", "out_scale", probe.get("out_scale"))
+    # ⭐ **屏幕 / DPI**（2026-10-17 ✓）：首次运行按 `link.yaml [screen]` 填好 ✓
+    #   （`out_scale` 不再从 link.yaml 推 ✗ —— 它现在是派生值 ✓ 见 `apply_derived` ✓）
+    _sc = lk.get("screen") or {}
+    for _k in ("width", "height", "dpi_scale"):
+        put("screen", _k, _sc.get(_k))
+    # ⭐ 探针**位置/尺寸**也一并推过来（2026-10-17 ✓）：老部署台没有这几项 ⇒ 首次读完
+    #   就按 link.yaml 现值填好 ✓（省得人照着 yaml 手抄一遍 ✗）。
+    for _k in ("x", "y", "cell", "gap", "bits"):
+        put("probe", _k, probe.get(_k))
     put("kbd", "port", kbd.get("port"))
     put("kbd", "serial", kbd.get("serial"))
     put("kbd", "cert", kbd.get("cert"))
@@ -170,14 +211,147 @@ def read():
 
 
 def save(cfg):
-    """写配置。失败只返回 False，由调用方决定要不要提示（不抛异常）。"""
+    """写配置。失败只返回 False，由调用方决定要不要提示（不抛异常）。
+
+    ⚠ **派生值不落盘** ✗（用户 2026-10-17 ✓「一律走取这个配置的自计算」✓）：
+      `probe.out_scale` 是算出来的（`apply_derived` 只在内存里塞 ✓）——
+      写进 `deploy.json` 就会变成**第二份真相** ✓（改分辨率忘改它 ⇒ 探针画错位置 ✓
+      那正是老口径的病根 ✓）。
+    """
     try:
         PATH.parent.mkdir(parents=True, exist_ok=True)
-        PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
+        out = dict(cfg or {})
+        if "probe" in out:
+            _p = dict(out.get("probe") or {})
+            _p.pop("out_scale", None)          # 派生值 ⇒ 不进文件 ✓
+            out["probe"] = _p
+        PATH.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n",
                         encoding="utf-8")
         return True
     except Exception:
         return False
+
+
+def screen_out_scale(cfg):
+    """**输出缩放** = 推流宽 ÷ A 机逻辑分辨率宽 ✓（用户 2026-10-17 ✓）。
+
+    算法**只有一份**（`core/screen.out_scale` ✓）—— 这里只是把它接到
+    `cfg["screen"]` / `cfg["push"]["width"]` 上 ✓；B 机那份读 `link.yaml` 同一个模块 ✓。
+    """
+    from core import screen as _screen
+
+    sc = (cfg or {}).get("screen") or {}
+    push = (cfg or {}).get("push") or {}
+    try:
+        w = int(float(push.get("width") or 0))
+        # ⚠ 一律走 `core/screen.out_scale` ✗ **别在这儿自己除** ——
+        #   那会变成第二份算法 ✓（用户要的是"一处自计算"✓ 以后改口径只改那儿 ✓）。
+        return float(_screen.out_scale(w, sc.get("width"), sc.get("height"),
+                                       sc.get("dpi_scale")))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def apply_derived(cfg):
+    """把**派生值**刷进内存配置 ✓（现在只有 `probe.out_scale`）。
+
+    ⚠ **不落盘** ✗：`deploy.json` 里只存真相（`screen.*` / `push.width` ✓）——
+      派生值一落盘就成第二份真相 ✓（改分辨率忘改它 ⇒ 探针画错 ✓ 老口径的病根 ✓）。
+    """
+    if not cfg:
+        return cfg
+    cfg.setdefault("probe", {})["out_scale"] = screen_out_scale(cfg)
+    return cfg
+
+
+def sync_screen_to_link(cfg):
+    """把屏幕三项写回 `config/link.yaml` 的 `[screen]`（**A、B 共用** ✓）。
+
+    用户 2026-10-17 ✓：「需要用到的地方（包括 **B 机**如果需要这些数据的话）
+    一律走取这个配置的自计算」✓ ⇒ A 机在部署台填一次，写回共用配置，
+    B 机（探针采样 / 换算 / 设置界面显示）读同一份 + 用同一个算法 ✓。
+    ⚠ 派生值（`out_scale`）**不写回** ✗（谁要谁算 ✓ 一份真相 ✓）。
+    """
+    from core.config import update_link
+
+    sc = (cfg or {}).get("screen") or {}
+    kw = {}
+    for _k in ("width", "height", "dpi_scale"):
+        _v = sc.get(_k)
+        if _v in (None, ""):
+            continue
+        try:
+            kw["screen." + _k] = float(_v)
+        except (TypeError, ValueError):
+            return False, "「%s」不是数字：%r" % (_k, _v)
+    if not kw:
+        return False, "没有可写的屏幕参数"
+    try:
+        update_link(**kw)
+    except Exception as e:                # noqa: BLE001
+        return False, "%s: %s" % (type(e).__name__, e)
+    return True, ("屏幕参数已写回 config/link.yaml（%s）⇒ 输出缩放自动 = %.4f"
+                  % (" ".join("%s=%g" % (k.split(".", 1)[1], v) for k, v in kw.items()),
+                     screen_out_scale(cfg)))
+
+
+def sync_probe_to_link(probe):
+    """探针几何写回 `config/link.yaml` 的 `[probe]`（**A、B 共用一份** ✓）。
+
+    ⭐⭐⭐ 为什么必须写回（用户 2026-10-17 ✓ 原话：「**延迟探针可以让 A 机自己在部署台
+      配置放在哪吗？**」✓）：
+      · A 机（部署台）决定\"画在哪\" ✓；B 机是按 `link.yaml` 里**同一组数字采样** ✓
+        ⇒ 只改 `deploy.json`（A 机自己用）的话，B 机还在**老位置**采 ✗
+        ⇒ 整条码解不出来 ✓（表现为\"探针明明移动了、延迟却一直 100% 失败\"✓）。
+      · 走 `core.config.update_link` ✓ —— 它**逐行改值**，注释与排版一个字节都不动 ✓
+        （`link.yaml` 是注释密集的说明书 ✓ 整文件 dump 会把注释全冲掉 ✗ 见它自己的说明 ✓）。
+    返回 `(ok, msg)`；`ok=False` 时 `msg` 是原因（调用方打在运行日志里 ✓ 不许静默 ✗）。
+    """
+    from core.config import update_link
+
+    pr = probe or {}
+    kw = {}
+    for _k, _cast in (("x", int), ("y", int), ("cell", float), ("gap", float),
+                      ("bits", int)):
+        _v = pr.get(_k)
+        if _v in (None, ""):
+            continue                      # 没填 ⇒ 这一项不动（别把已有值抹掉 ✗）
+        try:
+            kw["probe." + _k] = _cast(_v)
+        except (TypeError, ValueError):
+            return False, "「%s」不是合法数字：%r" % (_k, _v)
+    if not kw:
+        return False, "没有可写的探针几何（x/y/cell/gap/bits 都是空的）"
+    try:
+        update_link(**kw)
+    except Exception as e:                # noqa: BLE001 —— 文件只读 / 格式坏了 ✓ 说清楚
+        return False, "%s: %s" % (type(e).__name__, e)
+    return True, ("探针几何已写回 config/link.yaml："
+                  + " ".join("%s=%s" % (k.split(".", 1)[1], v) for k, v in kw.items()))
+
+
+def sync_push_size_to_link(w, h):
+    """推流分辨率写回 `config/link.yaml` 的 `stream.width/height`（**B 机按它准备** ✓）。
+
+    ⭐ 为什么要写（用户 2026-10-17 ✓ 加了「框选推流区域」之后这件事变重要了 ✓）：
+      · 框了区域 ⇒ 输出尺寸**跟着框变** ✓；`link.yaml` 里那份要是还写着 1366×768，
+        B 机（和探针 re-solve）就按**老尺寸**算 ⇒ 画面比例 / 探针坐标全错 ✗；
+      · 走 `core.config.update_link` ✓（逐行改值，注释不动 ✓ 同 `sync_probe_to_link` ✓）。
+    返回 `(ok, msg)`；`ok=False` 时 `msg` 是原因（调用方打在运行日志里 ✓）。
+    """
+    from core.config import update_link
+
+    try:
+        _w, _h = int(w), int(h)
+    except (TypeError, ValueError):
+        return False, "尺寸不是数字：%r×%r" % (w, h)
+    if _w <= 0 or _h <= 0:
+        return False, "尺寸无效：%d×%d" % (_w, _h)
+    try:
+        update_link(**{"stream.width": _w, "stream.height": _h})
+    except Exception as e:                # noqa: BLE001
+        return False, "%s: %s" % (type(e).__name__, e)
+    return True, "已写回 config/link.yaml（stream %d×%d）" % (_w, _h)
 
 
 def link_expect():

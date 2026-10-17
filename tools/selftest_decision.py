@@ -14732,7 +14732,10 @@ def t_link_page_and_writer():
                  "屏幕时间码探针", "路径"):
         check(must in _groups, "⑤ 「链路」页缺分组「%s」（分类要明白 ✓）：%r" % (must, sorted(_groups)))
     _w = getattr(d, "_link_widgets", {})
-    for must in ("kbd.serial", "kbd.serial_local", "stream.width", "probe.out_scale",
+    # ⚠ 2026-10-17：`probe.out_scale` **已移除**（用户「把探针输出缩放参数移除」✓
+    #   ⇒ 它成了派生值、由 `core/screen` 现算 ✓ 不再是可填的格子 ✓）——
+    #   这里换成 `probe.bits`（探针页仍必有的那一格 ✓）。
+    for must in ("kbd.serial", "kbd.serial_local", "stream.width", "probe.bits",
                  "a_host", "paths.record_dir"):
         check(must in _w, "⑤ 「链路」页缺「%s」这一格 ✗" % must)
     # ⑤ 提示要挂在**字段标题**上（`docs/UI规范.md` §6 ✓）—— 非 bool 行挂标题 ✓、bool 行挂它自己 ✓

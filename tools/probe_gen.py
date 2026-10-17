@@ -46,7 +46,15 @@ def main() -> int:
     # 所以在屏幕上按 1/scale 放大绘制，缩放之后正好等于配置值，
     # B 机一行都不用改。
     # 优先用命令行，其次读配置 —— 分辨率是机器的固定属性，填一次就不该再记
-    s = args.out_scale if args.out_scale is not None else get("probe", "out_scale", 1.0)
+    # ⭐⭐ **输出缩放不再手填**（用户 2026-10-17 ✓「把探针输出缩放参数移除」✓）：
+    #   现在一律 **现算**：流宽 ÷ A 机**逻辑**分辨率（`core/screen.out_scale` ✓
+    #   它读 `link.yaml [screen]` 的 width/height/dpi_scale ✓ A、B 共用同一份 ✓）。
+    #   `--out-scale` 只留给排查用（命令行显式给了就尊重 ✓）；`probe.out_scale` 不再读 ✗。
+    if args.out_scale is not None:
+        s = float(args.out_scale)
+    else:
+        from core import screen as _screen
+        s = float(_screen.out_scale())
     if s and s > 0 and abs(s - 1.0) > 1e-6:
         print(f"[probe_gen] 输出缩放 {s}：配置({x},{y}) cell={cell} "
               f"-> 屏幕需画在 ({x / s:.1f},{y / s:.1f}) cell={cell / s:.2f}")

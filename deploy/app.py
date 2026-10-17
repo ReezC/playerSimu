@@ -306,6 +306,40 @@ class ServiceCard(QFrame):
             row_box.addWidget(btn)
             holder = QWidget()
             holder.setLayout(row_box)
+        elif spec["kind"] == "push_region":
+            # 「推流区域」：只读一行 ＋ 「框选…」（A 机屏幕上拖一块 ✓）＋「整屏」（清掉）
+            row_box = QHBoxLayout()
+            row_box.setSpacing(4)
+            row_box.addWidget(widget, 1)
+            # ⚠ 三个按钮都走 `_fit_btn` ✗ **不许** `setFixedWidth`（大字号会切字 ✓
+            #   用户 2026-10-17「按钮上写的什么 看不全」✓）
+            btn = _fit_btn("框选…",
+                           "在 **A 机屏幕**上拖一个框 ⇒ 只推这一块（不是整个桌面）。\n"
+                           "框之前部署台窗口会自动藏起来（不然框到自己 ✗）。\n\n"
+                           "框完：「分辨率」自动改成框的大小（1:1、最省算力 ✓）；\n"
+                           "推流正在跑的话会自动重启一次（不重启就还是老画面 ✓）。\n\n"
+                           "⚠ 尺寸会抹成偶数（h264/yuv420p 的要求 ✓）。")
+            btn.clicked.connect(lambda _c: self._pick_push_region())
+            row_box.addWidget(btn)
+            btn_win = _fit_btn(
+                "跟随窗口",
+                "和**本地流程同一个口径**（用户 2026-10-17 ✓「就不能像本地一样自动适应\n"
+                "窗口尺寸吗？」✓）：点一下，**从列表里选一个窗口** ——\n"
+                "它会记住窗口 + 相对窗口的比例（不是固定屏幕坐标 ✓）。\n\n"
+                "之后：窗口**挪了 / 改了大小 / 游戏重启** ⇒ 推流会自动跟上\n"
+                "（只重启 ffmpeg，不改别的服务）。\n\n"
+                "⚠ 游戏重启后按**标题**重新找窗口（`core/wincap.window_by_title` ✓）；\n"
+                "⚠ 窗口最小化时抓不到 ⇒ 会退回上一次的坐标（画面会静止，但不会崩 ✓）。")
+            btn_win.clicked.connect(lambda _c: self._follow_push_window())
+            row_box.addWidget(btn_win)
+            btn2 = _fit_btn("整屏", "清掉区域 ⇒ 回到抓**整个桌面**（老行为 ✓）。")
+            btn2.clicked.connect(lambda _c: self._clear_push_region())
+            row_box.addWidget(btn2)
+            holder = QWidget()
+            holder.setLayout(row_box)
+            # ⭐ 跟随窗口的"眼睛"也在这张卡上（700ms 一拍 ✓ 只装一次 ✓）——
+            #   卡片构造完就装 ✓（等主窗口去装的话，卡片自己拿不到 `procs` 之前用不了 ✓）
+            self._ensure_push_watch()
         elif spec["kind"] == "cert":
             # 证书这一格多一个「生成证书…」：A 机的原则是不敲命令，
             # 而"生成证书"有个只做一半就很坑的分支（见 _gen_cert）。
@@ -398,6 +432,15 @@ class ServiceCard(QFrame):
             w = QLabel(_mmap_display_text(kind))
             w.setToolTip(spec.get("tip", ""))
             return w, (lambda k=kind: _mmap_display_text(k))
+
+        if kind == "push_region":
+            # ⭐ **推流区域那一行**（用户 2026-10-17 ✓「没有在部署台看到选择推流区域的
+            #   按钮」✗）：只读一行 + 「框选…」/「整屏」（见 `_add_param` ✓）。
+            #   ⚠ 文字**现算**（getter 闭包拿着 `cfg` 那个 dict ✓ 框完原地改它 ⇒
+            #     `refresh_displays` 一句 `setText` 就更新 ✓ 不用重建卡片 ✓）。
+            w = QLabel(_push_region_text(cfg))
+            w.setToolTip(spec.get("tip", ""))
+            return w, (lambda: _push_region_text(cfg))
 
         if kind == "serial":
             w = NoWheelComboBox()
@@ -554,6 +597,239 @@ class ServiceCard(QFrame):
                "推流正在跑 ⇒ 已自动重启一次，下一帧就是新区域。"
                if _restarted else "推流没在跑 ⇒ 下次「启动」就用这块。"))
 
+    def _pick_push_region(self):
+        """「框选…」：在 **A 机屏幕**上拖一块 ⇒ **只推这一块**（用户 2026-10-17 ✓ 原话：
+        「**没有在部署台看到选择推流区域的按钮**」✗）。
+
+        口径（四条 ✓）：
+          · 抓屏走 `tools.minimap_push.ask_region`（**和命令行 `--pick` 同一份实现** ✓）：
+            它会把部署台窗口**先藏起来**再抓 ✓ —— 不藏的话框到的图里盖着部署台自己 ✗；
+          · 存的是**A 机屏幕逻辑坐标**（`deploy.json` 的 `push.region_*` ✓）⇒ 老 `deploy.json`
+            没有这四个键也照旧能开（`DEFAULTS` 补 0 = 整屏 ✓）；
+          · **输出分辨率跟着框走**（`width/height` = 框的大小 ✓）⇒ 1:1、不用缩放 ✓
+            并**写回 `link.yaml` 的 `stream.width/height`** ✓（B 机按它准备 ✓）；
+          · 框完**推流在跑就重启** ✓（`ffmpeg` 的采集区域是启动参数 ⇒ 不重启还是老画面 ✗）。
+        ⚠ 宽高**抹成偶数** ✗（h264 / yuv420p 的色度 2x2 下采样 ⇒ 奇数直接报
+          "width not divisible by 2" ✓）；框太小（< 32）**不接**（多半是手滑 ✓）。
+        """
+        try:
+            from tools.minimap_push import ask_region
+        except Exception as e:                     # noqa: BLE001
+            QMessageBox.warning(self, "框选不可用",
+                                "加载框选模块失败：%s: %s" % (type(e).__name__, e))
+            return
+        try:
+            rect = ask_region(owner=self)
+        except Exception as e:                     # noqa: BLE001 —— 抓屏失败也要说清
+            QMessageBox.warning(self, "框选失败", "%s: %s" % (type(e).__name__, e))
+            return
+        if not rect:
+            return
+        x, y, w, h = [int(v) for v in rect]
+        w, h = w - (w % 2), h - (h % 2)             # 偶数 ✓
+        if w < 32 or h < 32:
+            QMessageBox.warning(
+                self, "框太小",
+                "框到的是 %d×%d —— 这么小推出去什么都看不清，先框大一点 ✓\n"
+                "（想回到整屏就点旁边的「整屏」。）" % (w, h))
+            return
+        py = self.cfg["push"]
+        py.update({"region_x": max(0, x), "region_y": max(0, y),
+                   "region_w": w, "region_h": h,
+                   "width": w, "height": h,        # 1:1，最省 ✓
+                   # ⚠ 手框 = **固定区域** ⇒ 必须把"跟随窗口"关掉 ✗（不然两个口径打架 ✓）
+                   "region_win": None, "region_rel": None})
+        dcfg.save(self.cfg)
+        ok, msg = dcfg.sync_push_size_to_link(w, h)
+        # 「分辨率」那格要跟着变 ✓（卡片自刷 ✓ 不必重建整个界面 ✗）
+        self.refresh_displays()
+        self.refresh_cmd()
+        self.log("push", "推流区域 = (%d, %d) %d×%d ✓%s"
+                 % (x, y, w, h, ("　" + msg) if msg else ""))
+        self._restart_if_running("push", "区域变了")
+
+    def _clear_push_region(self):
+        """「整屏」：清掉区域 ⇒ 回到抓整个桌面（老行为 ✓ 用户 2026-10-17）。"""
+        py = self.cfg["push"]
+        if not int(py.get("region_w") or 0) and not int(py.get("region_h") or 0):
+            self.log("push", "现在就是整屏 ✓ 不用改")
+            return
+        py.update({"region_x": 0, "region_y": 0, "region_w": 0, "region_h": 0,
+                   "region_win": None, "region_rel": None})
+        dcfg.save(self.cfg)
+        self.refresh_displays()
+        self.refresh_cmd()
+        self.log("push", "已改回**整屏**（抓整个桌面 ✓）")
+        self._restart_if_running("push", "区域清了")
+
+    # ---------------- 跟随窗口（用户 2026-10-17 ✓「像本地一样自动适应窗口尺寸」✓）----------------
+
+    def _follow_push_window(self):
+        """「跟随窗口」：**列出窗口让你挑**（用户 2026-10-17 ✓ 原话：
+        「**跟随窗口 按钮点击后没有任何展示，用户根本不知道现在取的是哪个窗口，
+        并且这个状态永久持续**」✗）。
+
+        以前是"把鼠标移到窗口上停住 6 秒"——那是**看不见的状态** ✗（只在状态栏一行字、
+        倒计时还不跳 ✓ 人会以为卡住了 ✓）。现在：
+          · 弹**选窗口对话框**：列出当前可见的顶层窗口（标题 + **客户区**尺寸 ✓
+            按面积从大到小 ✓ **部署台自己排掉** ✓）；
+          · 选完**立刻**在卡片那行显示「跟随「标题」WxH」✓ ＋ 运行日志一条 ✓
+            （这就是"现在取的是哪个窗口"✓）；
+          · **没有"进行中"状态了** ✗ ⇒ 不存在"永久持续"✓（关了对话框就是没选 ✓）。
+        """
+        from PyQt5.QtWidgets import QInputDialog
+
+        from core import wincap
+
+        _w = self.window()
+        if hasattr(_w, "statusBar"):
+            _w.statusBar().clearMessage()       # 清掉老版本那条"还剩 6 秒"的残留 ✓
+        try:
+            wins = wincap.list_windows(min_w=200, min_h=150)
+        except Exception as e:                   # noqa: BLE001
+            self.log("push", "列窗口失败：%s: %s" % (type(e).__name__, e))
+            return
+        import os as _os
+        wins = [w for w in wins if _win_pid(w.get("hwnd")) != _os.getpid()]
+        if not wins:
+            QMessageBox.information(
+                self, "没找到窗口",
+                "当前没有可跟随的窗口 —— 先把游戏开起来（窗口别最小化），再点一次。")
+            return
+
+        labels = ["%s    %d×%d" % (str(w.get("title") or "")[:48],
+                                   int(w["size"][0]), int(w["size"][1]))
+                  for w in wins]
+        cur = 0
+        _fol = (self.cfg.get("push") or {}).get("region_win") or []
+        if _fol:
+            for i, w in enumerate(wins):
+                if int(w["hwnd"]) == int(_fol[0]):
+                    cur = i
+                    break
+        text, ok = QInputDialog.getItem(
+            self, "跟随哪个窗口",
+            "选一个窗口：推流只抓它的客户区（不含标题栏）。\n"
+            "之后它挪了 / 改了大小 / 游戏重启都会自动跟上。",
+            labels, cur, False)
+        if not ok or not text:
+            return
+        try:
+            self._apply_push_window(wins[labels.index(text)])
+        except (ValueError, IndexError):
+            return
+
+    def _apply_push_window(self, w):
+        """认下这个窗口 ⇒ 存 `region_win` + `region_rel` ＋ 立刻生效（重启推流）。"""
+        from core import wincap
+
+        rect = tuple(int(v) for v in w["rect"])
+        ww, hh = rect[2] - rect[2] % 2, rect[3] - rect[3] % 2     # 偶数 ✓
+        if ww < 32 or hh < 32:
+            self.log("push", "窗口太小（%dx%d）⇒ 不接" % (ww, hh))
+            return
+        geom = None
+        try:
+            geom = wincap.window_geom(int(w["hwnd"]))
+        except Exception:                      # noqa: BLE001
+            geom = None
+        rel = wincap.rel_from_rect(rect, geom) if geom else None
+        if not rel:
+            self.log("push", "⚠ 窗口几何问不到 ⇒ 只记这次的绝对坐标（不跟随）")
+        py = self.cfg["push"]
+        py.update({"region_win": [int(w["hwnd"]), str(w["title"])],
+                   "region_rel": rel,
+                   "region_x": rect[0], "region_y": rect[1],
+                   "region_w": ww, "region_h": hh,
+                   "width": ww, "height": hh})
+        dcfg.save(self.cfg)
+        ok, msg = dcfg.sync_push_size_to_link(ww, hh)
+        # ⚠ 卡片没有 `_rebuild_cards`（那是主窗口的 ✓）⇒ 卡片自己刷新那两处就够 ✓
+        self.refresh_displays()
+        self.refresh_cmd()
+        self.log("push", "跟随窗口「%s」⇒ 现在 %d×%d ✓%s"
+                 % (str(w["title"])[:20], ww, hh, ("　" + msg) if msg else ""))
+        self._push_rect_at_launch = (rect[0], rect[1], ww, hh)
+        self._restart_if_running("push", "改成跟随窗口")
+
+    def _push_follow_rect(self):
+        """跟随模式下**此刻**该抓的那块（屏幕坐标）；不跟随 / 问不到 ⇒ `None` ✓。"""
+        py = self.cfg.get("push") or {}
+        if not py.get("region_win") or not py.get("region_rel"):
+            return None
+        from core import wincap
+
+        _win = py.get("region_win") or []
+        try:
+            _hwnd = int(_win[0])
+            _title = str(_win[1]) if len(_win) > 1 else ""
+            _fb = (int(py.get("region_x") or 0), int(py.get("region_y") or 0),
+                   int(py.get("region_w") or 0), int(py.get("region_h") or 0))
+            _r, _why = wincap.binding_rect(py.get("region_rel"), _hwnd, _fb,
+                                           title=_title)
+        except Exception:                      # noqa: BLE001
+            return None
+        if not _r or int(_r[2]) < 2 or int(_r[3]) < 2:
+            return None
+        return tuple(int(v) for v in _r)
+
+    def _push_watch_tick(self):
+        """跟随窗口的**眼睛**：窗口挪了 / 改了大小 ⇒ 重启推流跟上 ✓。
+
+        ⭐ 为什么必须有个轮询（用户 2026-10-17 ✓）：`ffmpeg` 的采集区域是**启动参数** ✗
+          ⇒ 窗口动了不重启就"画面还是老位置"✓（人会以为跟随没生效 ✓）。
+        ⚠ **连续两次一样才动** ✗：拖窗口时每 700ms 都在变 ⇒ 不这样会连着重启 ✓
+          （推流一断，B 机的延迟统计也跟着断档 ✓）。
+        """
+        py = self.cfg.get("push") or {}
+        if not py.get("region_win"):
+            return
+        # ⚠ `procs` 是**主窗口**构造完卡片之后注入的 ✓ ⇒ 计时器第一拍可能比它早（700ms ✓）
+        #   所以这里必须兜底 ✗（否则刚打开部署台就 `AttributeError` ✓）
+        proc = (getattr(self, "procs", None) or {}).get("push")
+        if proc is None or not proc.running():
+            return
+        r = self._push_follow_rect()
+        if r is None:
+            return
+        want = (int(r[0]), int(r[1]), int(r[2]) - int(r[2]) % 2,
+                int(r[3]) - int(r[3]) % 2)
+        if want == getattr(self, "_push_rect_at_launch", None):
+            self._push_pending = None
+            return
+        if want != getattr(self, "_push_pending", None):
+            self._push_pending = want      # 还在动 ⇒ 等下一拍再确认 ✓
+            return
+        self._push_pending = None
+        self._push_rect_at_launch = want
+        self.log("push", "窗口变成 %d,%d %d×%d ⇒ 重启推流跟上 ✓" % want)
+        self._restart_if_running("push", "窗口变了")
+
+    def _ensure_push_watch(self):
+        """装一只 700ms 的眼睛（只装一次 ✓ 见 `_push_watch_tick` ✓）。"""
+        if getattr(self, "_push_watch", None) is not None:
+            return
+        self._push_watch = QTimer(self)
+        self._push_watch.setInterval(700)
+        self._push_watch.timeout.connect(self._push_watch_tick)
+        self._push_watch.start()
+
+    def _restart_if_running(self, key, why=""):
+        """该服务**正在跑**就重启一次（没跑 ⇒ 只记一句"下次启动生效" ✓）。
+
+        ⭐ 为什么必须有（用户 2026-10-17 ✓）：`ffmpeg` / `probe_gen` 的几何都是**启动参数** ✗
+          ⇒ 改了不重启 ⇒ 画面上"什么也没发生" ✓（用户只会以为按钮没生效 ✓）。
+        ⚠ 没在跑时**别**乱起服务 ✗（人可能故意停着 ✓）。
+        """
+        proc = (getattr(self, "procs", None) or {}).get(key)
+        if proc is not None and proc.running():
+            self.log(key, "%s ⇒ 重启「%s」" % (why or "参数变了",
+                                              services.TITLE.get(key, key)))
+            self.stop_service(key)
+            QTimer.singleShot(600, lambda k=key: self.start_service(k))
+        else:
+            self.log(key, "当前没在跑 ⇒ 下次启动用新参数")
+
     def _reload_current_map(self):
         """「重读」：再问一次"当前是哪张图"（B 机说了才变 ✓ 这里只是立刻重读一次）。
 
@@ -636,7 +912,7 @@ class ServiceCard(QFrame):
         ⚠ 只动只读行（`setText` ✓），**不重建卡片**：重建会把人的输入/焦点清掉 ✗。
         """
         for spec, w, getter in self._getters.values():
-            if spec.get("kind") in ("mmap_current", "mmap_region"):
+            if spec.get("kind") in ("mmap_current", "mmap_region", "push_region"):
                 w.setText(getter())
 
     def set_running(self, running, uptime=0.0):
@@ -677,6 +953,80 @@ def _parse_size(text):
         return int(float(a)), int(float(b))
     except Exception:
         return 1366, 768
+
+
+def _fit_btn(text, tip="", pad=26, min_w=44):
+    """按**当前字体**算宽度的按钮 ✓ —— **不许**用 `setFixedWidth` 切字 ✗。
+
+    ⭐⭐ 用户 2026-10-17 ✓ 原话：「**按钮上写的什么 看不全**」✗ ——
+      「跟随窗口」四个字被 `setFixedWidth(72)` 切掉了 ✓（部署台有**字号设置**，
+      固定像素宽度迟早会撞上 ✓；而且"看不全"比"按钮宽一点"糟得多 ✓）。
+    ⭐ 做法：`fontMetrics().horizontalAdvance(text)` ＋ 左右内边距 ⇒ 字号改了也够宽 ✓；
+      用 `setMinimumWidth` ✗ 不用 `setFixedWidth` —— 布局想再给就别拦着 ✓。
+    """
+    b = QPushButton(text)
+    b.setToolTip(tip or text)
+    try:
+        _w = int(b.fontMetrics().horizontalAdvance(text)) + int(pad)
+    except Exception:                          # noqa: BLE001 —— 算不出来就用下限 ✓
+        _w = 0
+    b.setMinimumWidth(max(int(min_w), _w))
+    return b
+
+
+def _win_pid(hwnd):
+    """窗口的进程 ID（拿不到给 0）—— 选窗口时把**部署台自己**排掉 ✓。"""
+    try:
+        import win32process
+        _t, pid = win32process.GetWindowThreadProcessId(int(hwnd))
+        return int(pid)
+    except Exception:                          # noqa: BLE001
+        return 0
+
+
+def _push_region_text(cfg):
+    """「推流区域」那一行的文字（**只有这一处** ✓ 与 `_mmap_display_text` 同一套路 ✓）。
+
+    四个 0 / 没填 ⇒ 「整屏」（老行为 ✓ 一眼看出"现在不是只推一块"✓）。
+    """
+    p = cfg or {}
+    try:
+        x = int(p.get("region_x") or 0)
+        y = int(p.get("region_y") or 0)
+        w = int(p.get("region_w") or 0)
+        h = int(p.get("region_h") or 0)
+    except (TypeError, ValueError):
+        x = y = w = h = 0
+    _win = p.get("region_win") or None
+    if _win:
+        _name = str(_win[1])[:12] if len(_win) > 1 else ""
+        # ⚠ 这一行**尽量短** ✗：它在卡片里跟三个按钮抢地方（用户 2026-10-17
+        #   「按钮上写的什么 看不全」✓）—— 全名放 tooltip 里（见 `_add_param` ✓）
+        # ⭐ 跟随时**说清是谁**（用户 2026-10-17 ✓「用户根本不知道现在取的是哪个窗口」✗）：
+        #   跟随中写「跟随「标题」WxH」✓；窗口失联（关了/最小化）写「⚠ 跟丢」✓
+        #   —— 两种都不是"看不出来在干嘛"✓
+        _lost = False
+        try:
+            from core import wincap as _wc
+            _fb = (x, y, w, h)
+            _r, _why = _wc.binding_rect(p.get("region_rel"), int(_win[0]), _fb,
+                                        title=str(_win[1]) if len(_win) > 1 else "")
+            if _r and int(_r[2]) >= 2 and int(_r[3]) >= 2:
+                # ⚠ `why` 里有「问不到」= 退了兜底（窗口关了/最小化）⇒ 要明说**跟丢** ✓
+                #   （`binding_rect` 的另一种 why 是"按标题重新绑上了"✓ 那是**跟住了** ✓ 不算丢 ✓）
+                if _why and "问不到" in str(_why):
+                    return "⚠ 跟丢「%s」（按上次位置抓）" % _name
+                return "跟随「%s」 %d×%d" % (_name, int(_r[2]), int(_r[3]))
+            _lost = True
+        except Exception:                      # noqa: BLE001 —— 算不出来也当"跟丢"✓
+            _lost = True
+        if _lost:
+            return "⚠ 跟丢「%s」（按上次位置抓）" % _name
+        return ("跟随「%s」 %d×%d" % (_name, w, h)) if (w >= 2 and h >= 2) \
+            else ("跟随「%s」" % _name)
+    if w >= 2 and h >= 2:
+        return "只推 (%d, %d) 起的 %d×%d" % (x, y, w, h)
+    return "整屏（没框区域）"
 
 
 def _mmap_display_text(kind):
@@ -729,6 +1079,138 @@ def _hms(sec):
 # ══════════════════════════════════════════════════════════════
 # 环境自检
 # ══════════════════════════════════════════════════════════════
+class ScreenCard(QFrame):
+    """「**分辨率设置**」卡片（用户 2026-10-17 ✓ 部署台**最上面**一张 ✓）。
+
+    只填**真相**：A 机**物理分辨率** + **DPI 缩放比例** ✓；
+    逻辑分辨率 / 输出缩放是**派生值** ⇒ **只读显示** ✗ 不许填 ✓
+    （用户原话：「需要用到的地方（包括 B 机如果需要这些数据的话）**一律走取这个配置的
+      自计算**」✓ —— 算法只有一份：`core/screen.py` ✓）。
+
+    ⚠ 这张卡**不是服务** ✗ ⇒ 没有启动/停止 ✓，也不进 `services.ORDER` ✓
+      （它是"参数卡"✓ 跟 5 张服务卡不是一个东西 ✓）。
+    """
+
+    changed = pyqtSignal()
+
+    def __init__(self, cfg, push_w=None, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg or {}
+        self._push_w = push_w              # 可调用 ⇒ 取当前推流宽（算输出缩放用 ✓）
+        self.setObjectName("Card")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        _t = QLabel("分辨率设置")
+        _t.setObjectName("CardTitle")
+        head.addWidget(_t)
+        _sub = QLabel("只填 A 机屏幕的真值；逻辑分辨率 / 输出缩放**自动算**")
+        _sub.setObjectName("CardSub")
+        head.addWidget(_sub)
+        head.addStretch(1)
+        root.addLayout(head)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(6)
+
+        self.sp_w = NoWheelSpinBox()
+        self.sp_w.setRange(320, 16384)
+        self.sp_w.setToolTip("A 机屏幕的**物理**宽度（显卡输出那个，不是 Windows 里的逻辑值 ✓）\n"
+                             "例：2560×1440 屏就把缩放设成 150%，这里填 2560 ✓")
+        self.sp_h = NoWheelSpinBox()
+        self.sp_h.setRange(240, 16384)
+
+        self.sp_dpi = NoWheelDoubleSpinBox()
+        self.sp_dpi.setDecimals(2)
+        self.sp_dpi.setRange(1.0, 4.0)
+        self.sp_dpi.setSingleStep(0.05)
+        self.sp_dpi.setToolTip(
+            "Windows「显示设置 → 缩放」那一栏：100% ⇒ 1.00 · 125% ⇒ 1.25 ·\n"
+            "150% ⇒ 1.50 · 175% ⇒ 1.75 · 200% ⇒ 2.00 ✓\n\n"
+            "**逻辑分辨率** = 物理 ÷ 这个数 ✓（探针按逻辑像素画 ✓）；\n"
+            "**输出缩放** = 流分辨率宽 ÷ 逻辑分辨率宽 ✓ —— 都由它自动算 ✓ 不用手填 ✗")
+
+        try:
+            self.sp_w.setValue(int(self.cfg.get("width") or 2560))
+            self.sp_h.setValue(int(self.cfg.get("height") or 1440))
+            self.sp_dpi.setValue(float(self.cfg.get("dpi_scale") or 1.0))
+        except (TypeError, ValueError):
+            self.sp_w.setValue(2560)
+            self.sp_h.setValue(1440)
+            self.sp_dpi.setValue(1.0)
+
+        form.addWidget(QLabel("物理分辨率"), 0, 0)
+        _wbox = QHBoxLayout()
+        _wbox.setSpacing(4)
+        _wbox.addWidget(self.sp_w)
+        _x = QLabel("×")
+        _wbox.addWidget(_x)
+        _wbox.addWidget(self.sp_h)
+        _wbox.addStretch(1)
+        _wh = QWidget()
+        _wh.setLayout(_wbox)
+        form.addWidget(_wh, 0, 1)
+
+        form.addWidget(QLabel("DPI 缩放"), 1, 0)
+        _dbox = QHBoxLayout()
+        _dbox.setSpacing(4)
+        _dbox.addWidget(self.sp_dpi)
+        _dbox.addStretch(1)
+        _dh = QWidget()
+        _dh.setLayout(_dbox)
+        form.addWidget(_dh, 1, 1)
+
+        form.addWidget(QLabel("自动算出"), 2, 0)
+        self.lbl_derived = QLabel("")
+        self.lbl_derived.setObjectName("CardSub")
+        form.addWidget(self.lbl_derived, 2, 1)
+        root.addLayout(form)
+        self.setMinimumWidth(520)
+
+        self.sp_w.valueChanged.connect(self.changed)
+        self.sp_h.valueChanged.connect(self.changed)
+        self.sp_dpi.valueChanged.connect(self.changed)
+        self.refresh_derived()
+
+    # ---------------- 取值 / 显示 ----------------
+
+    def values(self):
+        """卡片上的**真相**（三个数 ✓）—— 派生值不在这里 ✗。"""
+        return {"width": int(self.sp_w.value()),
+                "height": int(self.sp_h.value()),
+                "dpi_scale": round(float(self.sp_dpi.value()), 2)}
+
+    def refresh_derived(self):
+        """把**派生值**现算一遍显示出来（逻辑分辨率 / 输出缩放 ✓）。"""
+        from core import screen as _screen
+
+        v = self.values()
+        lw, lh = _screen.logical(v["width"], v["height"], v["dpi_scale"])
+        try:
+            sw, sh = _screen.stream_size()
+        except Exception:                     # noqa: BLE001
+            sw, sh = 1366, 768
+        if callable(self._push_w):
+            try:
+                sw = int(self._push_w() or sw)
+            except (TypeError, ValueError):
+                pass
+        # ⚠ 缩放**必须问 `core/screen`** ✗ 别用上面那个取整过的逻辑宽自己除 ✓
+        #   （1707 ⇒ 0.8002，老标定是 0.8004 ✓ 差这一点会让探针整体偏零点几像素 ✓）
+        sc = _screen.out_scale(sw, v["width"], v["height"], v["dpi_scale"])
+        self.lbl_derived.setText(
+            "逻辑 %d×%d · 流 %d×%d ⇒ **输出缩放 %.4f**" % (lw, lh, sw, sh, sc))
+        self.lbl_derived.setToolTip(
+            "逻辑分辨率 = 物理 ÷ DPI ✓（探针按逻辑像素画 ✓）\n"
+            "输出缩放 = 流分辨率宽 ÷ 逻辑分辨率宽 ✓\n\n"
+            "⚠ 这个数**不许手填**（用户 2026-10-17 ✓）—— 改了分辨率/DPI 它自动跟着变 ✓")
+
+
 class SelfCheckPane(QWidget):
     """右上角：ffmpeg / 串口 / B 机 / 证书 / 与 link.yaml 是否一致。"""
 
@@ -1384,21 +1866,95 @@ class DeployWindow(QMainWindow):
     # ---------------- 配置同步（每次改动都落盘）----------------
 
     def _on_param_changed(self):
+        if getattr(self, "screen_card", None) is not None:
+            # ⭐ **分辨率设置**是派生值的前提 ⇒ 先收它 ✓（推流宽改了 ⇒ 输出缩放也得跟着变 ✓）
+            self.cfg.setdefault("screen", {}).update(self.screen_card.values())
+            self.screen_card.refresh_derived()
         for key, card in self.cards.items():
             self.cfg[key].update(card.values())
+        # ⭐ 派生值只在**内存**里刷 ✓（`save` 会把它剔掉 ✗ 不进 `deploy.json` ✓）
+        dcfg.apply_derived(self.cfg)
         for card in self.cards.values():
             card.refresh_cmd()
         self._refresh_flow()
         self._save_timer.start()          # 300ms 合并：连点数字框不至于每次都写盘
 
     def _save_now(self):
+        if getattr(self, "screen_card", None) is not None:
+            self.cfg.setdefault("screen", {}).update(self.screen_card.values())
         for key, card in self.cards.items():
             self.cfg[key].update(card.values())
         self.cfg["window"] = {"w": self.width(), "h": self.height()}
         self.cfg["log"]["filter"] = self.log_pane.filter
+        dcfg.apply_derived(self.cfg)      # 派生值先进内存 ✓（`save` 会剔掉 ✗）
         ok = dcfg.save(self.cfg)
         self.lbl_saved.setText(
             ("已保存 → config/%s" % dcfg.PATH.name) if ok else "保存失败（只读？）")
+        # ⭐ 屏幕/DPI 变了 ⇒ 写回 link.yaml（B 机同一个算法 ✓）＋ 探针在跑就重启 ✓
+        self._sync_screen_params()
+        # ⭐ 探针几何变了 ⇒ 写回 link.yaml（B 机按同一份采样 ✓）＋ 在跑就重启（用户 2026-10-17）
+        self._sync_probe_geometry()
+
+    def _sync_screen_params(self):
+        """分辨率 / DPI 变了 ⇒ 写回 `link.yaml [screen]` ＋ 探针在跑就重启 ✓。
+
+        ⭐ 为什么探针要重启（用户 2026-10-17 ✓「把探针输出缩放参数移除」✓
+          「一律走取这个配置的自计算」✓）：`probe_gen` 的**输出缩放**是**启动参数** ✗，
+          由 `core/screen.out_scale()` 现算（流宽 ÷ 逻辑宽 ✓）⇒ 屏幕/DPI/推流宽一变，
+          不重启就还是按老缩放画 ✓（位置会整体偏 ✓）。
+        ⚠ 变了才做 ✗（`_screen_sig` 记账 ✓ 否则每次保存都重启探针 ✓ 码带闪一下 ✓）。
+        ⚠ 首次调用只记账 ✓（打开部署台不该动任何东西 ✗）。
+        """
+        sc = self.cfg.get("screen") or {}
+        push_w = (self.cfg.get("push") or {}).get("width")
+        sig = (sc.get("width"), sc.get("height"), sc.get("dpi_scale"), push_w)
+        if not hasattr(self, "_screen_sig"):
+            self._screen_sig = sig
+            return
+        if sig == self._screen_sig:
+            return
+        self._screen_sig = sig
+        ok, msg = dcfg.sync_screen_to_link(self.cfg)
+        self.log("probe", msg if ok else ("写回 link.yaml 失败：%s" % msg))
+        proc = (getattr(self, "procs", None) or {}).get("probe")
+        if proc is not None and proc.running():
+            self.log("probe", "屏幕/DPI/推流宽变了 ⇒ 重启探针（输出缩放是启动参数）")
+            self.stop_service("probe")
+            QTimer.singleShot(500, lambda: self.start_service("probe"))
+        else:
+            self.log("probe", "探针没在跑 ⇒ 下次启动用新的输出缩放")
+
+    def _sync_probe_geometry(self):
+        """探针位置/尺寸改动 ⇒ 写回 `link.yaml` ＋ **在跑就自动重启**（用户 2026-10-17 ✓）。
+
+        用户原话：「**延迟探针可以让 A 机自己在部署台配置放在哪吗？**」✓
+        三件事，少一件就是"改了没反应"✗：
+          ① **写回** `config/link.yaml [probe]` ✓ —— B 机是按同一份数字**采样**的 ✓
+             （只改 deploy.json ⇒ B 机还在老位置采 ⇒ 解码 100% 失败 ✓）；
+          ② `probe_gen` **只在启动时读一次**位置 ✗ ⇒ 正在跑就必须**重启** ✓
+             （与\"停一下再启\"完全等价 ✓ 部署台本来就这么干 ✓
+              见 `_pick_region` 里对小地图推流那段 ✓）；
+          ③ **变了才做** ✓（`_probe_sig` 记账 ✓ —— 否则每次保存都重启探针 ⇒ 码带闪一下、
+             B 机的延迟统计连续断档 ✗）。
+        ⚠ 首次调用（还没有 `_probe_sig`）只**记账**：启动时不该写文件、也不该重启任何服务 ✗。
+        """
+        pr = self.cfg.get("probe") or {}
+        sig = tuple(pr.get(k) for k in ("x", "y", "cell", "gap", "bits"))
+        if not hasattr(self, "_probe_sig"):
+            self._probe_sig = sig
+            return
+        if sig == self._probe_sig:
+            return
+        self._probe_sig = sig
+        ok, msg = dcfg.sync_probe_to_link(pr)
+        self.log("probe", msg if ok else ("写回 link.yaml 失败：%s" % msg))
+        proc = self.procs.get("probe")
+        if proc is not None and proc.running():
+            self.log("probe", "位置变了 ⇒ 重启探针窗口（它只在启动时读一次位置）")
+            self.stop_service("probe")
+            QTimer.singleShot(500, lambda: self.start_service("probe"))
+        else:
+            self.log("probe", "探针当前没在跑 ⇒ 下次启动会自动用新位置")
 
     def _sync_cards_from_cfg(self):
         """把配置回填到界面（启动时 / 「按 link.yaml 填」之后）。
@@ -1418,13 +1974,24 @@ class DeployWindow(QMainWindow):
             layout.removeWidget(card)
             card.setParent(None)
         self.cards = {}
+        # ⭐ **「分辨率设置」永远排第一**（用户 2026-10-17 ✓「在部署台最上面加卡片」✓）——
+        #   它提供 `[screen]`（物理分辨率 / DPI ✓）⇒ 探针的输出缩放、B 机换算全靠它现算 ✓
+        if getattr(self, "screen_card", None) is not None:
+            layout.removeWidget(self.screen_card)
+            self.screen_card.setParent(None)
+            self.screen_card = None
+        self.screen_card = ScreenCard(
+            self.cfg.setdefault("screen", {}),
+            push_w=lambda: (self.cfg.get("push") or {}).get("width"))
+        self.screen_card.changed.connect(self._on_param_changed)
+        layout.insertWidget(0, self.screen_card)
         for i, key in enumerate(services.ORDER):
             card = ServiceCard(key, self.cfg[key])
             card.changed.connect(self._on_param_changed)
             card.start_clicked.connect(self.start_service)
             card.stop_clicked.connect(self.stop_service)
             self.cards[key] = card
-            layout.insertWidget(i, card)
+            layout.insertWidget(i + 1, card)      # 0 是分辨率设置 ✓
         # **必须自己刷一次「将执行」**：卡片的标签只有 `_on_param_changed` 会填，
         # 而这里重建时信号是**刚连上**的 —— 构造期间那些 setValue 早就发完了，
         # 所以不刷就等于：刚打开部署台时五张卡的「将执行」全是空的（看着像没配好），
@@ -1513,6 +2080,9 @@ class DeployWindow(QMainWindow):
         if key == "push":
             self._check_host_before_push(cfg)
 
+        # ⭐ 派生值（探针输出缩放 ✓）由 `[screen]` + 推流宽现算 ⇒ 起服务前刷一遍 ✓
+        dcfg.apply_derived(self.cfg)
+        cfg = self.cfg[key]
         cmd = services.build_cmd(key, cfg)
         proc = Proc(key, cmd, cwd=dcfg.ROOT,
                     on_line=lambda t, k=key: self.sig_line.emit(k, t),
@@ -1523,6 +2093,11 @@ class DeployWindow(QMainWindow):
             return False
         self.procs[key] = proc
         self.log(key, "已启动  PID %d" % proc.pid())
+        if key == "push":
+            # ⭐ 记下"这一趟 ffmpeg 用的是哪块区域" ⇒ `_push_watch_tick` 跟它比 ✓
+            #   （不记的话第一拍就会误判成"窗口变了"→ 白重启一次 ✓）
+            self._push_rect_at_launch = self._push_follow_rect()
+            self._push_pending = None
         self._refresh_states()
         return True
 

@@ -770,6 +770,358 @@ def t_gen_cert_pair_loads():
 
 # ---------------------------------------------------------------- 跑
 
+def t_probe_geometry_ui():
+    """⭐⭐⭐ **延迟探针的位置/尺寸可以在部署台里配**（用户 2026-10-17 ✓ 原话：
+    「**延迟探针可以让 A 机自己在部署台配置放在哪吗？**」✓）。
+
+    口径（三件事，少一件就是"改了没反应"✗）：
+      ① `services.PARAMS["probe"]` 要有 **x / y / cell / gap / bits**（界面是参数表驱动的 ✓
+         加进表里界面就有了 ✓ 不用手写控件 ✓）；
+      ② `build_cmd("probe")` 要**显式带上** `--x --y --cell --gap`（卡片底部那条命令 = 真相 ✓）；
+      ③ 改了要**写回 `link.yaml`**（B 机按同一份数字采样 ✓）＋ `probe_gen` 只在启动时读一次
+         ⇒ 在跑就**自动重启**；且**没变不许重启** ✗（否则每次保存码带都闪、延迟统计断档 ✓）。
+    """
+    from pathlib import Path
+
+    from deploy import config as dcfg
+    from deploy import services
+
+    # ---- ① 参数表 ----
+    keys = [r["key"] for r in services.PARAMS["probe"]]
+    for _k in ("x", "y", "cell", "gap", "bits"):
+        check(_k in keys,
+              "① 参数表少了「%s」✗ ⇒ 界面上就**没有**这一格（界面是照 PARAMS 生成的 ✓）：%r"
+              % (_k, keys))
+
+    # ---- ② 命令行 ----
+    cmd = services.build_cmd("probe", {"out_scale": 0.8004, "x": 153, "y": 8,
+                                       "cell": 16, "gap": 2, "bits": 40})
+    for _k, _want in (("--x", "153"), ("--y", "8"), ("--cell", "16"), ("--gap", "2")):
+        check(_k in cmd and cmd[cmd.index(_k) + 1] == _want,
+              "② 命令行缺 %s %s ✗（界面上改了、命令却不带 ⇒ 探针不会动 ✓）：%r"
+              % (_k, _want, cmd))
+
+    # ---- ③ 写回 link.yaml ----
+    import core.config as ccfg
+
+    seen = {}
+    _old = ccfg.update_link
+
+    def _fake(**kw):
+        seen.update(kw)
+        return {}
+
+    ccfg.update_link = _fake
+    try:
+        ok, msg = dcfg.sync_probe_to_link({"x": 153, "y": 12, "cell": 18.5,
+                                           "gap": 2.5, "bits": 40})
+    finally:
+        ccfg.update_link = _old
+    check(ok, "③ 写回 link.yaml 该成功 ✗：%s" % (msg,))
+    check(seen.get("probe.x") == 153 and seen.get("probe.cell") == 18.5,
+          "③ 该按 `probe.x` / `probe.cell` 这种**点号键**写回（`update_link` 的规矩 ✓）：%r"
+          % (seen,))
+    check("link.yaml" in msg, "③ 回执该说清写到哪了（人不该猜 ✓）：%r" % (msg,))
+
+    # ---- ③ 变了才重启 ----
+    src = (Path(__file__).resolve().parent.parent / "deploy" / "app.py").read_text(
+        encoding="utf-8")
+    check("def _sync_probe_geometry" in src and "self._sync_probe_geometry()" in src,
+          "③ `_save_now` 里没接 `_sync_probe_geometry` ✗ ⇒ 改完位置不会生效 ✓")
+    check("if sig == self._probe_sig:" in src,
+          "③ 必须**变了才**写/重启 ✗（每次保存都重启 ⇒ 码带闪、B 机延迟统计断档 ✓）")
+    check("proc is not None and proc.running()" in src,
+          "③ 探针没在跑时**别**去重启 ✗（只记一句\"下次启动生效\"✓）")
+
+
+def t_push_region_button():
+    """⭐⭐⭐ **部署台能框「推流区域」**（用户 2026-10-17 ✓ 原话：
+    「**没有在部署台看到选择推流区域的按钮**」✗）。
+
+    背景：推流卡片以前只能选分辨率 ⇒ `ddagrab` 不带 `video_size/offset` ⇒ 抓**整个桌面** ✗
+    （四周桌面/任务栏一起压进码带 ✓）。
+    判据（五条 ✓）：
+      ① 参数表里有 `kind="push_region"` 那一行（界面是照它生成的 ✓）；
+      ② `DEFAULTS.push` 有 `region_x/y/w/h`（老 `deploy.json` 才能补出 0 = 整屏 ✓）；
+      ③ **整屏**时 ddagrab **不带** `video_size=`（老行为一字不变 ✓）；
+      ④ **框了区域** ⇒ ddagrab 带 `video_size=WxH:offset_x=X:offset_y=Y` ✓；
+         **奇数抹成偶数** ✗（h264 / yuv420p 要求 ✓）；`gdigrab` 那条带
+         `-offset_x/-offset_y -video_size` ✓ 且尺寸不等时补 `-vf scale` ✓；
+      ⑤ 界面接线：`push_region` 那一支 ＋「框选…」→ `_pick_push_region` ＋
+         分辨率写回 `link.yaml`（`sync_push_size_to_link` ✓）。
+    """
+    from pathlib import Path
+
+    from deploy import config as dcfg
+    from deploy import services
+
+    # ---- ① 参数表 ----
+    kinds = [r.get("kind") for r in services.PARAMS["push"]]
+    check("push_region" in kinds,
+          "① 推流卡片没有「推流区域」那一行 ✗ ⇒ 界面上就没按钮 ✓：%r" % (kinds,))
+
+    # ---- ② 默认值 ----
+    dflt = dcfg.DEFAULTS["push"]
+    for _k in ("region_x", "region_y", "region_w", "region_h"):
+        check(_k in dflt,
+              "② `DEFAULTS.push` 少了 %s ✗ ⇒ 老 deploy.json 打不开/存不下区域 ✓" % _k)
+    check(dflt["region_w"] == 0 and dflt["region_h"] == 0,
+          "② 默认必须是 **0 = 整屏**（老行为 ✓）：%r" % (dflt,))
+
+    # ---- ③④ 命令行 ----
+    base = {"host": "192.168.1.2", "port": 5000, "width": 1366, "height": 768,
+            "fps": 50, "gop": 60, "bitrate": "6M", "capture": "ddagrab",
+            "scale_mode": "cpu", "encoder": "h264_nvenc", "low_latency": True}
+
+    full = " ".join(services.build_cmd("push", dict(base)))
+    check("video_size=" not in full,
+          "③ 整屏时 ddagrab **不许**带 video_size（老行为 ✓）：%s" % full)
+    check("offset_x=" not in full,
+          "③ 整屏时 ddagrab **不许**带 offset ✗：%s" % full)
+
+    reg = " ".join(services.build_cmd(
+        "push", dict(base, region_x=100, region_y=50,
+                     region_w=1367, region_h=769)))
+    check("video_size=1366x768:offset_x=100:offset_y=50" in reg,
+          "④ 框了区域该带 `video_size=WxH:offset_x:X:offset_y:Y` ✗ 且**奇数抹成偶数** ✓：%s"
+          % reg)
+
+    gdi = " ".join(services.build_cmd(
+        "push", dict(base, capture="gdigrab",
+                     region_x=100, region_y=50, region_w=800, region_h=600)))
+    check("-offset_x 100" in gdi and "-offset_y 50" in gdi
+          and "-video_size 800x600" in gdi,
+          "④ gdigrab 那条也要只抓那一块 ✗：%s" % gdi)
+    check("-vf scale=1366:768" in gdi,
+          "④ 框的大小 ≠ 输出尺寸时该补 `-vf scale` ✗（否则 B 机收到的是 800x600 ✓）：%s"
+          % gdi)
+
+    # ---- ⑤ 界面接线 ----
+    root = Path(__file__).resolve().parent.parent
+    app = (root / "deploy" / "app.py").read_text(encoding="utf-8")
+    check('spec["kind"] == "push_region"' in app and "def _pick_push_region" in app,
+          "⑤ 界面缺「推流区域」那一支 / 框选处理 ✗（按钮点了没反应 ✓）")
+    check("sync_push_size_to_link" in app,
+          "⑤ 框完没把**输出尺寸**写回 link.yaml ✗（B 机与探针还按老尺寸算 ✓）")
+    seen = {}
+    import core.config as ccfg
+
+    _old = ccfg.update_link
+
+    def _fake(**kw):
+        seen.update(kw)
+        return {}
+
+    ccfg.update_link = _fake
+    try:
+        ok, msg = dcfg.sync_push_size_to_link(800, 600)
+    finally:
+        ccfg.update_link = _old
+    check(ok and seen.get("stream.width") == 800 and seen.get("stream.height") == 600,
+          "⑤ 写回该按 `stream.width/height` 这种点号键 ✓：ok=%r seen=%r msg=%r"
+          % (ok, seen, msg))
+
+
+def t_push_follow_window():
+    """⭐⭐⭐⭐ **推流区域能"跟随窗口"**（用户 2026-10-17 ✓ 原话：
+    「**就不能像本地一样自动适应窗口尺寸吗？**」✓）。
+
+    口径（和本地 `rect_rel` + `rect_win` 同一套 ✓）：
+      · 存 `region_win=[hwnd, 标题]` + `region_rel`（**相对窗口外框的比例** ✓）；
+      · 每次拼命令都按窗口**现在的**几何现算（`core.wincap.binding_rect` ✓
+        句柄失效会按标题重绑 ✓）；
+      · **输出尺寸 = 区域尺寸**（1:1 ⇒ `scale` 空转，窗口改大小也不用调分辨率 ✓）；
+      · 算不出来 ⇒ **退回绝对区域**（老行为 ✓ 绝不炸 ✗）。
+    判据（五条 ✓）：
+      ① 按 `hwnd + 标题` 去问（标题是"游戏重启后还能找回"的唯一线索 ✓）；
+      ② 命令里是**当前窗口**的 `video_size/offset`（奇数抹偶数 ✓）；
+      ③ 输出尺寸也跟着窗口（1:1 ✓）；
+      ④ `binding_rect` 给不出结果 ⇒ 用记下的绝对区域，**不带** offset ✗；
+      ⑤ 界面接线：跟随按钮 + 轮询眼睛 + **连续两次一样才重启**（拖窗口不连着重启 ✓）。
+    """
+    from pathlib import Path
+
+    import core.wincap as wc
+    from deploy import config as dcfg
+    from deploy import services
+
+    # ---- ④ 默认值：None = 不跟随 ----
+    dflt = dcfg.DEFAULTS["push"]
+    check("region_win" in dflt and "region_rel" in dflt and dflt["region_win"] is None,
+          "④ `DEFAULTS.push` 该有 `region_win/region_rel` 且默认 None（= 不跟随 ✓）：%r"
+          % ({k: dflt.get(k) for k in ("region_win", "region_rel")},))
+
+    base = {"host": "192.168.1.2", "port": 5000, "width": 1366, "height": 768,
+            "fps": 50, "gop": 60, "bitrate": "6M", "capture": "ddagrab",
+            "scale_mode": "cpu", "encoder": "h264_nvenc", "low_latency": True,
+            "region_win": [1234, "冒险岛"], "region_rel": [0.1, 0.2, 0.5, 0.4],
+            "region_x": 0, "region_y": 0, "region_w": 100, "region_h": 100}
+
+    seen = {}
+    _old = wc.binding_rect
+
+    def _fake(rel, hwnd, fallback, title=""):
+        seen.update({"rel": rel, "hwnd": hwnd, "fallback": fallback, "title": title})
+        return (300, 200, 1001, 601), ""          # 故意给奇数 ✓ 看抹偶数
+
+    wc.binding_rect = _fake
+    try:
+        cmd = " ".join(services.build_cmd("push", dict(base)))
+    finally:
+        wc.binding_rect = _old
+
+    check(seen.get("hwnd") == 1234 and seen.get("title") == "冒险岛",
+          "① 跟随窗口要按 **hwnd + 标题** 去问 ✗（标题是游戏重启后找回窗口的唯一线索 ✓）：%r"
+          % (seen,))
+    check(seen.get("rel") == [0.1, 0.2, 0.5, 0.4],
+          "① 相对比例要原样传下去 ✗：%r" % (seen.get("rel"),))
+    check("video_size=1000x600:offset_x=300:offset_y=200" in cmd,
+          "② 采集区域该用**当前窗口几何**（1001×601 ⇒ 抹成 1000×600 ✓）：%s" % cmd)
+    check("scale=1000:600" in cmd,
+          "③ 输出尺寸该跟着窗口（1:1 ⇒ 缩放空转 ✓）：%s" % cmd)
+
+    # ---- ④ 问不到窗口 ⇒ 退回绝对区域 ----
+    _old2 = wc.binding_rect
+    wc.binding_rect = lambda *a, **k: (None, "窗口没了")
+    try:
+        cmd2 = " ".join(services.build_cmd("push", dict(base)))
+    finally:
+        wc.binding_rect = _old2
+    check("video_size=100x100" in cmd2,
+          "④ 窗口问不到 ⇒ 用记下的绝对区域 ✓（跟随时绝不能把画面弄没 ✗）：%s" % cmd2)
+
+    # ---- ⑤ 界面接线 ----
+    app = (Path(__file__).resolve().parent.parent / "deploy" / "app.py").read_text(
+        encoding="utf-8")
+    check("跟随窗口" in app and "def _follow_push_window" in app,
+          "⑤ 推流卡片该有「跟随窗口」按钮 ✗")
+    check("wincap.list_windows" in app and "rel_from_rect" in app,
+          "⑤ 选窗口要**列出来让人挑**（`wincap.list_windows` ✓ 用户要知道选的是哪个 ✓）"
+          "＋ 存**相对比例**（`rel_from_rect` ✓ 和本地同一套 ✓）")
+    check("def _push_watch_tick" in app and "if want != getattr(self, \"_push_pending\", None)" in app,
+          "⑤ 该有轮询 + **连续两次一样才重启** ✗（拖窗口时连着重启 ⇒ 延迟统计断档 ✓）")
+    check("_ensure_push_watch" in app,
+          "⑤ 跟随的「眼睛」该只装一次 ✓")
+    # ⭐ 2026-10-17 用户报「按钮点了没展示 / 状态永久持续」⇒ 改成**选窗口对话框** ✓
+    check("QInputDialog.getItem" in app and "wincap.list_windows" in app,
+          "⑤ 「跟随窗口」该**列出窗口让人选** ✗（蹲鼠标 6 秒是看不见的状态 ✓）")
+    check("FOLLOW_PICK_SEC" not in app and "停住不动" not in app,
+          "⑤ 不许再有「把鼠标移过去停住 N 秒」那套 ✗（状态会永久挂着 ✓）")
+    check("_win_pid" in app,
+          "⑤ 选窗口要排掉**部署台自己** ✗")
+
+    # ---- ⑥ 按钮文字不许被切（用户 2026-10-17「按钮上写的什么 看不全」✗）----
+    #   病根：`setFixedWidth(72)` + 「跟随窗口」四个字 ⇒ **字号一调大就切字** ✓
+    #   （部署台有字号设置 ✓ 固定像素宽度迟早撞上 ✓）
+    from PyQt5.QtWidgets import QApplication
+
+    from deploy import app as dapp
+
+    _qa = QApplication.instance() or QApplication([])
+    _b = dapp._fit_btn("跟随窗口")
+    _need = _b.fontMetrics().horizontalAdvance("跟随窗口")
+    check(_b.minimumWidth() >= _need,
+          "⑥ 按钮最小宽度必须 **≥ 文字宽度** ✗（不然就是\"看不全\"✓）：%d < %d"
+          % (_b.minimumWidth(), _need))
+    check(_b.minimumWidth() > 72 or _need <= 46,
+          "⑥ 别再用魔法数字 72 —— 按字体算 ✓（现算需要 %d px）" % _need)
+    # ⚠ 从 **`_add_param` 里那一支**（`elif`）切 ✗ —— `_make_widget` 里还有一个
+    #   `if kind == "push_region"`（只造控件 ✓）⇒ 从那个切会把中间别的按钮全框进来 ✓
+    _i = app.index('elif spec["kind"] == "push_region":')
+    _row = app[_i:app.index('elif spec["kind"] == "cert":', _i)]
+    # ⚠ 判据只看**代码行** ✗ —— 注释里为了说明"不许 setFixedWidth"会提到它 ✓
+    _code = "\n".join(_ln for _ln in _row.splitlines()
+                      if not _ln.strip().startswith("#"))
+    check("_fit_btn(" in _code and "setFixedWidth" not in _code,
+          "⑥ 推流区域那三个按钮都要走 `_fit_btn`、**一句 `setFixedWidth` 都不许有** ✗")
+    # ⚠ 别判 `_fit_btn("文字"` ✗ —— 长文字那行会**换行**（`_fit_btn(\n "跟随窗口",` ✓）
+    check(_code.count("_fit_btn(") == 3,
+          "⑥ 三个按钮都该走 `_fit_btn` ✗（实测 %d 个）" % _code.count("_fit_btn("))
+    for _t in ("框选…", "跟随窗口", "整屏"):
+        check('"%s"' % _t in _code,
+              "⑥ 「%s」这个按钮不见了 ✗" % _t)
+
+
+def t_screen_single_source():
+    """⭐⭐⭐⭐ **屏幕/DPI 是唯一来源，输出缩放一律现算**（用户 2026-10-17 ✓ 原话：
+    「**把探针输出缩放参数移除**；在部署台最上面加卡片"分辨率设置"：填写 A 机的分辨率、
+    DPI 缩放比例，**需要用到的地方（包括 B 机如果需要这些数据的话）一律走取这个配置的
+    自计算**」✓）。
+
+    判据（六条 ✓）：
+      ① 探针卡上**没有**「输出缩放」这一格（派生值不许做成输入框 ✗）；
+      ② `core/screen` 的算法对得上老值：2560×1440 @150% + 流 1366 ⇒ **0.8004** ✓
+        （⚠ 逻辑宽**不能先取整** ✗ —— 1707 会算出 0.8002 ✓）；
+      ③ `deploy.config` 只是把 `[screen]` 接到 `core/screen`（**不许自己再除一遍** ✗）；
+      ④ `deploy.json` **不落盘**派生值 ✓；
+      ⑤ 部署台最上面那张卡：`ScreenCard` + `insertWidget(0, …)` + 保存时同步 link.yaml；
+      ⑥ `probe_gen` 不再读 `probe.out_scale` ✓（改成 `core.screen.out_scale()` ✓）。
+    """
+    from pathlib import Path
+
+    from core import screen as core_screen
+    from deploy import config as dcfg
+    from deploy import services
+
+    # ---- ① ----
+    keys = [r.get("key") for r in services.PARAMS["probe"]]
+    check("out_scale" not in keys,
+          "① 探针卡上**不许**再有「输出缩放」✗（它是派生值 ✓）：%r" % (keys,))
+
+    # ---- ② ----
+    sc = core_screen.out_scale(1366, 2560, 1440, 1.5)
+    check(abs(sc - 0.8004) < 5e-4,
+          "② 2560×1440 @150%% + 流 1366 ⇒ 该是 **0.8004** ✓（实测 %.4f）\n"
+          "   ⚠ 逻辑宽别先取整（1707 ⇒ 0.8002 ✗）" % sc)
+    check(core_screen.logical(2560, 1440, 1.5) == (1707, 960),
+          "② 逻辑分辨率该是 1707×960 ✓（给人和界面看的那份 ✓）：%r"
+          % (core_screen.logical(2560, 1440, 1.5),))
+    sc2 = core_screen.out_scale(1366, 1920, 1080, 1.0)
+    check(abs(sc2 - round(1366 / 1920.0, 4)) < 1e-9,
+          "② 换屏幕要跟着变（1920×1080 @100%% ⇒ %.4f）✗：%r" % (sc2, sc2))
+
+    # ---- ③ ----
+    cfg = {"screen": {"width": 2560, "height": 1440, "dpi_scale": 1.5},
+           "push": {"width": 1366}, "probe": {}}
+    got = dcfg.screen_out_scale(cfg)
+    check(abs(got - 0.8004) < 5e-4,
+          "③ `deploy.config.screen_out_scale` 该走 `core/screen`（实测 %.4f）✗" % got)
+    dcfg.apply_derived(cfg)
+    check(abs(float(cfg["probe"].get("out_scale", 0)) - 0.8004) < 5e-4,
+          "③ `apply_derived` 该把派生值塞进 `cfg['probe']['out_scale']` ✗：%r"
+          % (cfg["probe"],))
+    src_cfg = (Path(__file__).resolve().parent.parent / "deploy" / "config.py"
+               ).read_text(encoding="utf-8")
+    check('_p.pop("out_scale", None)' in src_cfg,
+          "④ `save()` 必须把派生值**剔掉** ✗（写进 deploy.json 就成第二份真相 ✓）")
+
+    # ---- ② B 机那份配置 ----
+    lk = dcfg.link_cfg()
+    scr = lk.get("screen") or {}
+    for _k in ("width", "height", "dpi_scale"):
+        check(_k in scr, "② `link.yaml [screen]` 缺 `%s` ✗（B 机也读这一份 ✓）" % _k)
+    check("out_scale" not in (lk.get("probe") or {}),
+          "② `link.yaml` 的 `probe.out_scale` 该删掉 ✓（派生值不许留两份真相 ✗）")
+
+    # ---- ⑤ 界面 ----
+    app = (Path(__file__).resolve().parent.parent / "deploy" / "app.py").read_text(
+        encoding="utf-8")
+    check("class ScreenCard" in app and "insertWidget(0, self.screen_card)" in app,
+          "⑤ 部署台最上面该有「分辨率设置」卡片 ✗（用户明说要放最上面 ✓）")
+    check("def _sync_screen_params" in app and "self._sync_screen_params()" in app,
+          "⑤ 屏幕/DPI 改了要写回 link.yaml ＋ 重启探针 ✗")
+    check("refresh_derived" in app,
+          "⑤ 卡片上该**只读显示**派生值（逻辑分辨率 / 输出缩放 ✓）")
+
+    # ---- ⑥ probe_gen ----
+    pg = (Path(__file__).resolve().parent.parent / "tools" / "probe_gen.py").read_text(
+        encoding="utf-8")
+    check("_screen.out_scale()" in pg,
+          "⑥ `probe_gen` 该现算输出缩放（`core.screen.out_scale()`）✗")
+    check('get("probe", "out_scale"' not in pg,
+          "⑥ `probe_gen` 不许再读 `probe.out_scale` ✗（那是老口径 ✓）")
+
+
 TESTS = (
     ("服务表（标题/参数/命令行）完整", t_service_table),
     ("小地图推流的命令行（按「当前是哪张图」传 --map-id）", t_mmap_cmd),
@@ -792,6 +1144,9 @@ TESTS = (
     ("证书入口显眼（工具栏「证书…」）", t_cert_entry_is_findable),
     ("采集链两种模式都拼得对（默认档不变）", t_push_scale_mode_builds_both_chains),
     ("自检里那一段没成时，why 要带上 ffmpeg 的报错", t_sweep_row_says_why),
+    ("⭐⭐⭐ 探针位置可在部署台配（写回 link.yaml ＋ 变了才重启）", t_probe_geometry_ui),
+    ("⭐⭐⭐ 推流区域可在部署台框（ffmpeg 只抓那一块 ＋ 尺寸写回 link.yaml）", t_push_region_button),
+    ("⭐⭐⭐⭐ 推流区域能「跟随窗口」（相对比例 ＋ 窗口动了自动重启）", t_push_follow_window),
 )
 
 
