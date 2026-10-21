@@ -631,7 +631,7 @@ def t_worker_dispatch():
 
     from core.context import TaskContext
     from core import wzexport
-    from perception.classes import CLASS_DROP
+    from perception.detect.classes import CLASS_DROP
     from tools import label_drops as LD
 
     ctx = TaskContext()
@@ -1515,9 +1515,9 @@ def t_visible_box_adapts():
               "收了之后**中心该往左移**（可见部分在左 ✓）：cx=%s" % l_cov[0][1])
 
         # ---- 下限 / 天花板 / 出界：直接调 `visible_box`（不用等检出 ✓ 那几种本来也检不到 ✓）----
-        # ⚠ 实现 2026-10-06 搬去 `perception/visible_box.py` 了（玩家那条内核也要用 ✓
+        # ⚠ 实现 2026-10-06 搬去 `perception/detect/visible_box.py` 了（玩家那条内核也要用 ✓
         #   而 `perception` 不能反向 import `tools` ✗）⇒ **这里跟着搬** ✓（判据一字不改 ✓）。
-        from perception.visible_box import visible_box as _visible_box
+        from perception.detect.visible_box import visible_box as _visible_box
 
         tpl_bgr = cv2.cvtColor(tex, cv2.COLOR_GRAY2BGR)
         tg = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -1544,7 +1544,7 @@ def t_visible_box_adapts():
               "峰值出界时该原样回全尺寸、且**不抛** ✓（这只是把框收小一点 ✓ 坏了就别收 ✓）")
 
         # 判据必须是**最大连通块**（见 `visible_box` ✓）——拿"全部相符像素"求包围盒会被零散几点撑满 ✗
-        # ⚠ 查的是**实现所在的文件**（`perception/visible_box.py` ✓ 2026-10-06 搬过去的 ✓）
+        # ⚠ 查的是**实现所在的文件**（`perception/detect/visible_box.py` ✓ 2026-10-06 搬过去的 ✓）
         import ast as _ast
         _tree = _ast.parse((ROOT / "perception" / "visible_box.py").read_text(encoding="utf-8"))
         _fv = next(n for n in _ast.walk(_tree)
@@ -1570,7 +1570,7 @@ def t_visible_box_player_segment():
 
       ① **真行为**：合成帧（精灵 + 盖掉右边 25% ✓）⇒ `visible=False` 给**完整尺寸** ✓；
          `visible=True` 给**收窄**的框且**中心左移** ✓；**没被盖**的帧开了也**一字不变** ✓
-         —— 判据是**同一份实现**（`perception/visible_box.py` ✓ 怪物那条靠
+         —— 判据是**同一份实现**（`perception/detect/visible_box.py` ✓ 怪物那条靠
          `t_visible_box_adapts` 钉 ✓ 两条走同一份 ✓）；
       ② **中间层真的转发**（`run_detect_player` 的 cfg ⇒ 构造 `PlayerLocator` 时那三个形参 ✓）：
          ⚠ 这条链上**两处**构造 locator（子进程 `init_worker` + 主进程那个预检 ✓）
@@ -1589,9 +1589,9 @@ def t_visible_box_player_segment():
 
     from core.context import TaskContext
     from core.imgio import imwrite
-    from perception.player_locator import PlayerLocator
+    from perception.world.player_locator import PlayerLocator
     from tools import detect_player as DP
-    from perception import player_locator as PL
+    from perception.world import player_locator as PL
 
     MID = "珠缨"
     N = 24
@@ -2281,7 +2281,7 @@ def t_player_locator_params():
     import numpy as np
 
     from core.imgio import imwrite
-    from perception.player_locator import PlayerLocator
+    from perception.world.player_locator import PlayerLocator
 
     tmp = Path(tempfile.mkdtemp(prefix="ploc_"))
     try:
@@ -2382,7 +2382,7 @@ def t_frames_sel_restricts_templates():
     from core.imgio import imwrite
     from gui.project import Project
     from gui.steps.cards import LabelCard
-    from perception.player_locator import PlayerLocator
+    from perception.world.player_locator import PlayerLocator
     from tools.detect_mobs import load_templates
 
     app = QApplication.instance() or QApplication([])
@@ -2477,7 +2477,7 @@ def t_class_params_five_each():
       ④ ⚠⚠ **老项目兜底**：掉落物 / 宠物那三项**没存过** ⇒ 用**总那个**（不是常量 ✗ 一字不变 ✓）；
       ⑤ ⚠⚠ **玩家那四项的默认故意与怪物不同**（区分度 **0** ✓ 最大模板帧 **0**=不截 ✓
          每模板峰数 **1** ✓ 降采样 **1** ✓）—— 因为对玩家，区分度是"可信度闸"，
-         给 0.06 会把绝大多数帧判存疑 ✗（见 `perception/player_locator.py` 里那段说明 ✓）。
+         给 0.06 会把绝大多数帧判存疑 ✗（见 `perception/world/player_locator.py` 里那段说明 ✓）。
     """
     import shutil
     import tempfile
@@ -2799,7 +2799,7 @@ def t_template_load_is_cancellable():
     钉三件：
       ① `detect_mobs.load_templates(..., should_stop=…)`：说停就**当场**停（不是读完了才看 ✗），
          返回的是**已经读到的**那部分 ✓；
-      ② 玩家那条是**另一套**加载器 ✓（`perception.player_locator.PlayerLocator` ✓）也同口径：
+      ② 玩家那条是**另一套**加载器 ✓（`perception.world.player_locator.PlayerLocator` ✓）也同口径：
          半路叫停 ⇒ `stopped=True` ✓ 且**不抛异常** ✗（用户点的是"取消"，不是"这里坏了" ✓）；
       ③ 源码钉：两个入口都接上（`should_stop=ctx.canceled` ✓）**并且紧接着**再查一次
          `ctx.canceled()` 才往下走 ✓（半份模板绝不许当完整的用 ✗）。
@@ -2811,7 +2811,7 @@ def t_template_load_is_cancellable():
     import numpy as np
 
     from core.imgio import imwrite
-    from perception.player_locator import PlayerLocator
+    from perception.world.player_locator import PlayerLocator
     from tools.detect_mobs import load_templates
 
     tmp = _P(tempfile.mkdtemp(prefix="tpl_cancel_"))

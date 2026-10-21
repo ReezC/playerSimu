@@ -261,6 +261,9 @@ def t_apply_is_read_only():
                 _seed_route_cfg=lambda: {"jump_start_px": 12,
                                          "climb_align_gap_ms": 180,
                                          "mmap_src": "live"},
+                # ⚠ `_apply_route_cfg` 末尾会 `self._push_mmap()` 推给实时线程（推送 ≠ 写盘 ✓）
+                #   ⇒ 假面板也得有这一格，不然测的是"缺方法"而不是"只读"✗（既有的假红 ✓）
+                _push_mmap=lambda: None,
                 _refresh_crop_status=lambda: None)
             n = RoutePanel._apply_route_cfg(fake, "999")
             # ⚠ 快照要在**恢复之前**取（第一版把断言写在 `finally` 后面 ⇒ 读到的是恢复后的
@@ -322,6 +325,9 @@ def t_panel_registers_every_key():
         "route_goto_set",                                     # 前往预览（运行时 ✓）
         "battle_zones",                                       # 已按图 ✓（<id>.battle.json）
         "align_tol_px",                                       # 控件在「设置 → 判定参数」✗ 不在这页
+        #: ⭐ 「空中判定(px)」（用户 2026-10-18 ✓）：控件同样在「设置 → 判定参数」页 ✓，
+        #:   本页只是**把它传给定位器**（`loc.update(..., air_gap_px=...)` ✓）⇒ 不属本页配置 ✗
+        "air_gap_px",
     }
     missing = sorted(k for k in keys
                      if k not in allow and k not in route_cfg.PARAM_KEYS
@@ -351,6 +357,73 @@ def t_wiring_is_in_place():
           "`mmap_crop` 被登记进 PARAM_KEYS 了（那三样归面板 ✗ 会被灌到 settings 上 ✗）")
 
 
+def t_climb_mid_jump_direction_by_mid_y():
+    """⭐⭐⭐⭐ 站在绳**中段**的层 + 配了「中途跳下」⇒ 方向由 `mid_y` 定（2026-10-18 用户 ✓）。
+
+    现场：天空 `3 →(爬 L1)→ 2` 那条边建不出任务 ⇒ `task_plan_fail` 每拍刷屏 ⇒
+    人在平台 3 一直发呆 ✗。根因 = `climb_direction` 的"起点不在绳端"那一支
+    **只认"终点贴绳端"**、把 `mid_dir`/`mid_y` 当没看见 ✗。
+
+    用户定稿（原话）："**去掉这个条件。只要我配了就执行**：不是向上爬还是向下都需要
+    先跳上绳梯，上了绳梯之后我配的中途跳下坐标会告诉你向上爬还是向下爬"✓
+
+    钉五条（内存假图，不依赖任何用户数据 ✓）：
+      ① `mid_y` 比起点层**高** ⇒ `+1`（往上爬）；
+      ② `mid_y` 比起点层**低** ⇒ `-1`（往下爬）；
+      ③ 没配中途跳下 ⇒ 终点不在绳端就是 `None`（**不许猜** ✗，老行为不变 ✓）；
+      ④ `mid_y` 跟起点层一样高 ⇒ 退一步看**目标层**在起点上/下；
+      ⑤ 绳压根不路过起点层 ⇒ 仍然 `None`（够不着就是够不着 ✓）。
+    """
+    from core import zones as zones_mod
+
+    data = {
+        "footholds": [
+            {"id": "1", "x1": "300", "y1": "-1200", "x2": "340", "y2": "-1200",
+             "layer": "1", "group": "1"},                       # 绳上端
+            {"id": "2", "x1": "300", "y1": "200", "x2": "340", "y2": "200",
+             "layer": "1", "group": "1"},                       # 绳下端
+            {"id": "3", "x1": "300", "y1": "-500", "x2": "340", "y2": "-500",
+             "layer": "1", "group": "1"},                       # 起点层（绳中段）
+            {"id": "4", "x1": "300", "y1": "-300", "x2": "340", "y2": "-300",
+             "layer": "1", "group": "1"},                       # 目标层（偏下）
+            {"id": "5", "x1": "300", "y1": "-800", "x2": "340", "y2": "-800",
+             "layer": "1", "group": "1"},                       # 目标层（偏上）
+            {"id": "6", "x1": "900", "y1": "-1500", "x2": "960", "y2": "-1500",
+             "layer": "1", "group": "1"},                       # 绳根本到不了（y 超出绳两端 ✓）
+        ],
+        "ladderRope": [{"x": "320", "y1": "-1200", "y2": "200", "l": "1", "uf": "1"}],
+    }
+    terrain = mapdata.Terrain("T", data)
+    z = zones_mod.Zones.from_dict({
+        "map_id": "T",
+        "zones": {"A": {"footholds": ["3"]},       # 绳中段（现场那个"3"✓）
+                 "B": {"footholds": ["4"]},        # 也在绳中段，偏下
+                 "C": {"footholds": ["5"]},        # 也在绳中段，偏上
+                 "FAR": {"footholds": ["6"]}},     # 绳不路过
+        "edges": [],
+    })
+    ladder = terrain.ladders[0]
+    cd = zones_mod.climb_direction
+
+    check(cd(terrain, z, ladder, "A", "B", mid_jump=True, mid_y=-800) == 1,
+          "`mid_y` 比起点层高（-800 vs -500）却不算\"往上爬\" ✗ ⇒ 现场会一直 `task_plan_fail`")
+    check(cd(terrain, z, ladder, "A", "B", mid_jump=True, mid_y=-200) == -1,
+          "`mid_y` 比起点层低（-200 vs -500）却不算\"往下爬\" ✗ ⇒ 下爬的中途跳永远不触发")
+    check(cd(terrain, z, ladder, "A", "B", mid_jump=False) is None,
+          "**没配**中途跳下也放行了 ⇒ 终点悬在绳中间、爬到绳头会冲过头 ✗")
+    check(cd(terrain, z, ladder, "A", "C", mid_jump=True, mid_y=-500) == 1,
+          "`mid_y` 跟起点层一样高时没退一步看目标层（C 在 -800 更高 ⇒ 该 +1）✗")
+    check(cd(terrain, z, ladder, "FAR", "B", mid_jump=True, mid_y=-800) is None,
+          "绳**不路过**起点层也给了方向 ⇒ 那是真够不着，不许猜 ✗")
+
+    # 执行器那一侧：下爬也要能进 `MID_JUMP`（原来写死 `self.dir > 0` ✗）
+    route_src = _src("decision/jobs/climb.py")   # 2026-10-18 拆包：执行器在 jobs/climb.py
+    seg = route_src.split("_mid_hit = False", 1)
+    check(len(seg) == 2, "`_mid_hit` 不见了 ⇒ 中途跳的触发判据被挪走了，语义无法确认 ✗")
+    check("self.dir > 0" in seg[1][:400] and "else (float(py) >= self.mid_y)" in seg[1][:400],
+          "往下爬（`dir < 0`）时中途跳仍不触发（判据只看 `py <= mid_y`）✗")
+
+
 TESTS = (
     ("按图存读：往返 + **两图互不影响** +「没配过」与「清空」分得开",
      t_roundtrip_and_two_maps_do_not_mix),
@@ -367,6 +440,8 @@ TESTS = (
      t_panel_registers_every_key),
     ("接线：切图/换项目两处都灌 + 三个写口都存 + 保存钩子一处带写回",
      t_wiring_is_in_place),
+    ("⭐⭐⭐⭐ 绳中段的层 + 配了中途跳 ⇒ 方向由 `mid_y` 定（治\"平台3 发呆不去2\"✓）",
+     t_climb_mid_jump_direction_by_mid_y),
 )
 
 

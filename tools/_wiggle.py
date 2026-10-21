@@ -26,7 +26,7 @@ def main():
     print("[1] %s" % why)
     if not ok:
         return 2
-    from decision import input as dinput
+    from execution import input as dinput
     print("[2] 开始来回扫 %d 秒 —— **请看 A 机的屏幕**：光标动不动？" % SECONDS)
     t0 = time.time()
     n = 0

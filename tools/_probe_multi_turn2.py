@@ -12,14 +12,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import decision.agent as ag          # noqa: E402
 
 ag.DecisionSettings.save = lambda self: None
-from decision import route            # noqa: E402
 import tools.selftest_decision as S   # noqa: E402
+from decision import jobs as jobmod
 
 STEP = 1.0 / 15.0
 
 
 def run(in_cd=True, ticks=16, mob_x=460.0, job_x=(300.0, 700.0), hold_ms=300,
         leave_after=None):
+    from decision import jobs as jobmod
     s = S.fresh_settings(attack_dist=120.0)
     s.attack_cd = 500
     s.min_turn_hold_ms = hold_ms
@@ -36,7 +37,7 @@ def run(in_cd=True, ticks=16, mob_x=460.0, job_x=(300.0, 700.0), hold_ms=300,
         a.set_facing(1)
         a._last_output = (h.clock.t if in_cd else h.clock.t - 10.0)
         # 摆一条**走位任务**（多点巡逻去下一个点位就是它 ✓）：往右走 ⇒ 和"朝背后怪转"相反 ✓
-        a.start_climb(route.WalkJob("乙平台", [(job_x[0], 510.0, job_x[1], -208.0, "1")]))
+        a.start_climb(jobmod.WalkJob("乙平台", [(job_x[0], 510.0, job_x[1], -208.0, "1")]))
         print("   （任务起跑：climb=%s）" % ("有" if a._climb is not None else "-"))
         for i in range(ticks):
             a.tick(h.ws())

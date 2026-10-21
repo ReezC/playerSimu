@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """鼠标**绝对定位标定**：量出「1 个鼠标指令单位 = 画面里走多少像素」⇒ 写
-`config/mouse_gain.json`（断线重连「点服务器 / 点频道」要用它，见 `decision/mouse_aim.py`）。
+`config/mouse_gain.json`（断线重连「点服务器 / 点频道」要用它，见 `execution/mouse_aim.py`）。
 
 **为什么必须标定**（`docs/断线重连设计.md` §6.1）：鼠标通道**只有相对位移**
 （固件是相对 HID 鼠标），绝对定位靠"撞到屏幕左上角（已知原点）→ 按比例走位"。
@@ -53,7 +53,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from core.config import get                       # noqa: E402
-from decision import input as dinput              # noqa: E402
+from execution import input as dinput              # noqa: E402
+from execution import remote as _remote_mod
 from tools.mouse_gain_calib import _cursor_delta  # noqa: E402 —— 量位移只有这一份实现
 
 OUT = ROOT / "config" / "mouse_gain.json"
@@ -159,7 +160,7 @@ def _connect_input():
     port = int(get("kbd", "port", 9000) or 9000)
     cert = get("kbd", "cert", "remote_kbd/certs/cert.pem")
     try:
-        dinput.use_network(host, port, cert)
+        _remote_mod.use_network(host, port, cert)
     except Exception as e:                      # noqa: BLE001
         return False, ("连不上被控机 %s:%d（%s: %s）—— 查「键盘中继」在不在跑 / "
                        "端口证书 / 能不能 ping 到" % (host, port, type(e).__name__, e))
@@ -332,7 +333,7 @@ def calib_live_by_cursorpos(a, out_path):
     # ⭐⭐ 写盘走 `mouse_aim.save_gain`（**按帧尺寸存 ✓ 别的尺寸那几份原样保留 ✓**）——
     #   用户 2026-10-10 原话："**这个过程不能每次都发现错然后跑命令吧 太麻烦了
     #   不能自动吗？**" ✓ ⇒ 每条约来源**只量一次** ✓，以后在窗口/收流之间来回切会
-    #   **自动挑对应尺寸那份** ✓（`decision/mouse_aim.load_gain(frame_shape)` ✓）。
+    #   **自动挑对应尺寸那份** ✓（`execution/mouse_aim.load_gain(frame_shape)` ✓）。
     #   ⚠ 原来这里是**整个文件覆盖** ✗ ⇒ 量一种尺寸就把另一种顶掉 ✓ ⇒ 于是每次都得重量 ✓。
     # ⚠⚠ **`--dry-run` 必须在这儿生效**（2026-10-17 现场发现 ✗）：这条本地路原来**根本不看**它 ✗
     #   ⇒ 带了 `--dry-run` 也照写盘 ✓（那就不叫 dry-run 了 ✗）—— 已补 ✓。
@@ -340,8 +341,9 @@ def calib_live_by_cursorpos(a, out_path):
         print("（--dry-run ⇒ **不写** %s ✓ —— 上面那几行就是真量到的 ✓）" % out_path)
         kbd.close()
         return 0
-    import decision.mouse_aim as _ma
-    _ma.save_gain(gain_x, gain_x, frame_shape=(ref_h, ref_w),
+    import execution.mouse_aim as _ma
+    import execution.aim_convert as _mc   # 2026-10-18：换算那半拆出去了 ✓
+    _mc.save_gain(gain_x, gain_x, frame_shape=(ref_h, ref_w),
                   extra={"probe": {"units": [STEP_SMALL, STEP_BIG, STEP_VERIFY],
                                    "measured_px": [round(g_s * STEP_SMALL, 2),
                                                    round(g_b * STEP_BIG, 2), px_v],
@@ -360,7 +362,7 @@ class _LiveSrc:
     """**本地窗口**那条路的"帧源"（与实时页**同一路画面** ✓ —— 这是那条禁忌的要求 ✓）。
 
     ⚠⚠ 为什么非要能选来源（2026-10-10 ✓ 用户："**操作不对，鼠标点歪了**" ✓ 定案）：
-      gain 的单位是「**帧像素** / 指令单位」✓（见 `decision/mouse_aim.counts_for` ✓）——
+      gain 的单位是「**帧像素** / 指令单位」✓（见 `execution/mouse_aim.counts_for` ✓）——
       帧被缩放 / 换了来源 ⇒ 物理像素与帧像素**差一个比例** ✗ ⇒ 混用就差这个比例 ✓。
       本文件开头那句警告说的就是这件事 ✓：**gain 必须在同一路画面上量** ✓。
       现场：标定是 10-07 在**收流**（1366 宽）上量的 ✗，而实时用的是**本地窗口**（1918 宽）✗
@@ -865,8 +867,9 @@ def main():
     #   用户 2026-10-10："**这个过程不能每次都发现错然后跑命令吧 太麻烦了 不能自动吗？**" ✓
     #   ⇒ 每条约来源**只量一次** ✓ 以后来回切**自动挑对应尺寸那份** ✓
     #   （原来这一行是**整个文件覆盖** ✗ ⇒ 量一种尺寸就把另一种顶掉 ⇒ 每次都得重量 ✓）。
-    import decision.mouse_aim as _ma
-    _ma.save_gain(gain_x, gain_x, frame_shape=(ref_h, ref_w),
+    import execution.mouse_aim as _ma
+    import execution.aim_convert as _mc   # 2026-10-18：换算那半拆出去了 ✓
+    _mc.save_gain(gain_x, gain_x, frame_shape=(ref_h, ref_w),
                   extra={"probe": {"units": [u_s, u_b, u_v],
                                    "measured_px": [small[0], big[0],
                                                    (None if verify is None

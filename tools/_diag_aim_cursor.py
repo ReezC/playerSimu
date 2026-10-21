@@ -55,7 +55,7 @@ def main():
         return 2
     src, url = _open_stream()
     print("[2/3] 已开流：%s" % url)
-    from decision import input as dinput
+    from execution import input as dinput
     # ⚠ 量之前把「屏幕时间码探针」那条带遮掉（它每帧都在变 ✗ 会把结论带偏 ✓
     #   与标定工具同一份几何 ✓ 见 `mouse_aim_calib.probe_band_rect` ✓）
     from tools.mouse_aim_calib import _blank, probe_band_rect

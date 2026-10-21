@@ -2,8 +2,8 @@
 """M2c 鼠标增益标定：发一条**已知位移**的鼠标指令 ⇒ 从画面里量光标实际走了多少 ⇒
 存 `config/mouse_gain.json`（`{"gain_x": px/单位, "gain_y": ..., "probe": {...}}` ✓）。
 
-为什么要标定：鼠标通道只有**相对移动**（`decision/input.py::mouse_move(dx,dy)` ✓），
-控制律（`perception/lie_controller.py`）要把"目标误差（游戏像素）"换算成"发多少指令"
+为什么要标定：鼠标通道只有**相对移动**（`execution/input.py::mouse_move(dx,dy)` ✓），
+控制律（`liedetect/lie_controller.py`）要把"目标误差（游戏像素）"换算成"发多少指令"
 —— 换算比例就是增益。标定错得离谱（>2×）时闭环要靠反馈慢慢纠，误差大、命中率掉 ✗。
 
 **怎么量**（不依赖游戏里画不画光标模板 ✓）：连拍两帧、中间发一条指令 ——
@@ -32,7 +32,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from decision import input as dinput  # noqa: E402
+from execution import input as dinput  # noqa: E402
 
 OUT = ROOT / "config" / "mouse_gain.json"
 

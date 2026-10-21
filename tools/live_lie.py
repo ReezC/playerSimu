@@ -176,7 +176,7 @@ class LiveLieEngine:
             if self.mode == "motion":
                 # ⚠ `MotionRunner` 与 `Runner` **同签名、同 6 元组** ✓（见它那段注释 ✓）
                 #   ⇒ 上面"渲染 / 点选 / 拖动"那一整套**一行都不用改** ✓。
-                from perception.lie_motion import MotionRunner
+                from liedetect.lie_motion import MotionRunner
                 self.runner = MotionRunner(dets=None, **self.mcfg)
             else:
                 self.runner = Runner(dets=None,

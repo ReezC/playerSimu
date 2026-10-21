@@ -19,7 +19,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from perception.lie_tracker import LieTracker  # noqa: E402
+from liedetect.lie_tracker import LieTracker  # noqa: E402
 
 
 def _LT(**kw):
@@ -260,7 +260,7 @@ def test_lie_tracker_synthetic():
           "复活驱动** ✓ —— 只可能是**预测滑行本来就贴得住** ✓ 用户 2026-10-02 ✓）" % (revived,))
     import pathlib as _p9
 
-    _src9 = (_p9.Path(__file__).resolve().parent.parent / "perception"
+    _src9 = (_p9.Path(__file__).resolve().parent.parent / "liedetect"
              / "lie_tracker.py").read_text(encoding="utf-8")
     check("            # if tbox is None and self.lost_n > _LOST_AFTER:" in _src9
           and "            #     self._try_recapture(dets, dt, ts, _mt)" in _src9,
@@ -277,7 +277,7 @@ def test_track_memory():
       ② 按**预测位置**重新出现 ⇒ **接回原轨迹**（继承速度 ✓ 而不是从零新建 ✗ 用户 ② ✓）；
       ③ 记忆**到期**（> `_TRK_MEM_S`）⇒ 才真的删（否则表会无限膨胀 ✗）。
     """
-    from perception import lie_tracker as LT
+    from liedetect import lie_tracker as LT
 
     tr = _LT()
     a = 20.0
@@ -336,7 +336,7 @@ def test_noise_not_win():
 
 def test_size_suspects():
     """⭐⭐ 「重叠 / 分离」怀疑链 + 判据④（用户 2026-09-30 四条口径 ✓ 原话见
-    `perception/lie_tracker.py` 的常量区注释）。
+    `liedetect/lie_tracker.py` 的常量区注释）。
 
       ① 框**突然变大** ⇒ 记 `merge` 怀疑（怀疑与假目标**部分重叠** ⇒ 中心不可信 ✗）；
       ② 框**突然变小** + **附近新出框** ⇒ 记 `split` 怀疑 + 给新框打 `must_check`
@@ -344,7 +344,7 @@ def test_size_suspects():
       ③ 框**突然变小** + **没有新框** ⇒ 记 `hidden` 怀疑（真目标"就在面积消失的地方" ✓）；
       ④ 以上**只是怀疑**（不裁决 ✗）—— 裁决 = "**不合群速度持续够久**"（`_DEV_HOLD_S` ✓）。
     """
-    from perception import lie_tracker as LT
+    from liedetect import lie_tracker as LT
 
     def _grow_or_shrink(ratio, extra=None, frames=8):
         """建一条稳定轨迹（100,100 处 20×20 匀速右移），最后一拍把面积乘 `ratio`
@@ -441,7 +441,7 @@ def test_report_rate_limit():
     """
     import math
 
-    from perception import lie_tracker as LT
+    from liedetect import lie_tracker as LT
 
     tr = _LT()
     tr._wh = (750, 500)
@@ -503,7 +503,7 @@ def test_area_and_group():
     #    ⚠⚠ 2026-10-01 口径升级 ✓：融合 = "**包围已上板假目标**的检出框面积 / **那块假目标的
     #      登记面积** ≥ 阈值"（用户原话 ✓）⇒ 判"并集块"必须**先有登记条目**（不再是"当拍检出
     #      中位" ✗ 那个逐帧抖 ⇒ 同一格框面积没变也会判融合 ✗✗）。
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
     _brick = (250.0, 250.0, 150.0, 150.0)              # 已上板假目标（面积 22500 ✓）
     # ⚠ `select_step_ratio=0` ⇒ **关掉「选框距离门」**（用户 2026-10-03 ✓）：本条测的是"选框
     #   优先级 / 三态判据" ✓ 不该被那道**新闸**干扰（新闸默认开 ✓ 它管的是"别挑太远的框" ✓
@@ -611,7 +611,7 @@ def test_sep_takeover():
     实测背景（`9月30日(1).mp4` 显示帧 22 ✓）：冻结值 `(65.3,137.0)`、实测 `(2.3,36.4)`
     ⇒ 硬切 ⇒ 白箭头 **33px → 8px** ✗；接管后第一拍 `(51.0,104.0)` ⇒ 箭头 ≈25px ✓。
     """
-    from perception import lie_tracker as LT
+    from liedetect import lie_tracker as LT
 
     tr = _LT()
     _N = max(1, int(LT._SEP_TAKE_N))
@@ -650,7 +650,7 @@ def test_box_is_registered_fake():
     `_box_is_registered_fake` 两条判据：① 框中心贴某在册假框中心（门内 ✓）；② 框面积**不比那假框
     大**（真并集一定比单块假框大 ✗）。用实测 `9月30日(1).mp4` 第 27/28 帧那组数 ✓。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
 
     def _tr(fake):
         t = _LT()
@@ -706,7 +706,7 @@ def test_box_identity():
     数值取用户点名的实测帧（`10月1日.mp4`）：帧 31 覆盖率 1.00 / 倍率 **1.55**（用户："此帧红框
     不该标" ✓）；帧 27 倍率 **1.87**、帧 39/40 倍率 **2.05**（并集 = 融合 ✓）。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
 
     def _tr(fake, white=None):
         t = _LT()
@@ -793,7 +793,7 @@ def test_merge_rule1_center_range_hits():
     帧 17 真实数字（`9月30日(1).mp4` ✓）：并集框 `208.7×165.9` 包住砖(528,340)（登记
     `160.6×134.4`、**锁尺寸中** ✓）比 **1.604** ≥ 阈值、圆心 (359.7,254.8) 在框里 ⇒ **标红** ✓。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
 
     def _tr():
         t = _LT()
@@ -886,8 +886,8 @@ def test_merge_succ_no_swap():
     定胜负 ✓）⇒ 抢位那格赢 ⇒ 融合框换对象、参照砖跟着换 ✗✗（用户点名 ✓）。
     本用例：**续任 ⇒ 只许用延续格** ✓；把 `_SWAP_OV` 抬到 0.9 ⇒ 续任不成立 ⇒ 才会换 ✓（钉住门槛 ✓）。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
-    import perception.lie_tracker as _LTim
+    from liedetect.lie_registry import Entry, ShapeRegistry
+    import liedetect.lie_tracker as _LTim
 
     def _mk():
         # ⚠⚠ **夹具用的阈值放宽到 0.90** ✗（2026-10-03 ✓ 从"面积比"换成 IoU 之后 ✓）：这些夹具的
@@ -972,7 +972,7 @@ def test_sep_vel_cap():
       ⑤ 群体速度判不出（没观测 ✓）⇒ 不夹 ✓。
     """
     import math
-    import perception.lie_tracker as _LTim
+    import liedetect.lie_tracker as _LTim
 
     def _mk(a=1.0):
         t = _LT(sep_vel_max_ratio=a)
@@ -1040,7 +1040,7 @@ def test_brick_edge_max():
     夹具：一块砖 `(250,300) 140×130` ⇒ 四条边 eL 180 ／ eR 320 ／ eT 235 ／ eB 365。
     边归属 = 「框这条边距**最近的某块砖**对应边 ≤ 噪声容差」✓（本用例容差 15 ✓）。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
 
     def _tr(edge_max):
         t = _LT(noise_tol=15.0, edge_max=edge_max)
@@ -1129,7 +1129,7 @@ def test_edge_own_one_brick():
         覆盖率 = 0.95 ⇒ **旧口径会把"左边"判给 B** ✗；新口径只看 A（覆盖率最大 ✓）⇒
         四条边距离都 = 10 > 7 ⇒ **全不归砖** ✓。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
 
     def _mk():
         t = _LT(noise_tol=7.0, edge_max=4)
@@ -1181,7 +1181,7 @@ def test_same_inner_brick():
       ② 对照：参照砖改成 B ⇒ 同一个框**照常当选**（`merged` ✓）⇒ 差别确实来自"同一性"这条 ✓；
       ③ 非保持期（`_merge_hold=False`）⇒ **放行**（新会话自由挑 ✓ 这条不拦 ✓）。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
 
     def _mk(hold_bid):
         t = _LT(noise_tol=25.0, merge_iou=0.9, sep_ratio=1.15,
@@ -1245,7 +1245,7 @@ def test_merge_edge_own():
     夹具：砖 (250,300) 140×130（eL180/eR320/eT235/eB365）、容差 2、内接半径 61.4、
     绿圈半径 56 ✓（与实测帧 27 同一把尺 ✓）。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
 
     def _tr(pos):
         t = _LT(noise_tol=2.0)
@@ -1319,7 +1319,7 @@ def test_unregistered_box_beats_merge():
     """⭐⭐ **选框优先级（用户 2026-10-02 ✓ 帧 22 原话："与上一帧预测的圆相交的位置有未登记的
     检出框，这种情况优先标红，融合优先级应该更低" ✓）**：绿圈压着的**未登记**检出框在场时，
     并集框让位 ✓ —— 红框 = 目标自己那格（`ok` ✓）不是并集 ✓。"""
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
     # ⚠ `select_step_ratio=0` ⇒ **关掉「选框距离门」**（用户 2026-10-03 ✓）：本条钉的是"未登记框
     #   优先于并集框" ✓ 两格都在门内时才有意义 ⇒ 显式关掉新闸（自己的用例见 `test_select_step_gate` ✓）。
     # ⚠⚠ 本用例要**真实的内砖门槛**（`brick_iou_sep = 0.5` ✗ 不能用宽口径 0.9）：那个"并集框"
@@ -1351,7 +1351,7 @@ def test_tbox_prefers_merge_over_fake():
     `(178,193 194×187)`（含 pos、不是假框 ✓）。老实现取"列表里第一个" = 假砖小框 ⇒ 判 `gone`
     ⇒ 红框凭空消失 ✗✗。修后应取并集大框（`merged`）✓。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
     tr = _LT()
     tr._typ_area = 19000.0
     tr._rad = 56.0
@@ -1444,7 +1444,7 @@ def test_split_now_flag_and_forecast():
          `_pos_prev`（未修正 ⇒ 实测帧 39 差 **73.7px** ✗）。行为已在真素材上逐帧验过 ✓：
          帧 39→40 位移 `(+7.7,−16.4)`、而 39 帧白箭头预测 `(+9.9,−13.8)` ✓ 不再反向 ✗。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
     t = _LT(noise_tol=15.0)
     _e = Entry((270.0, 285.0, 170.0, 140.0), ts=0.0)
     _e.on_board = True
@@ -1513,7 +1513,7 @@ def test_split_now_flag_and_forecast():
     check(not bool(getattr(t, "_merge_split", False)),
           "⑰ `_merge_split` 也不为真（那条是「上一拍融合、这一拍不是」✓ 与 `_split_now` 是两件事 ✗）")
     import pathlib as _pl
-    _src = (_pl.Path(__file__).resolve().parent.parent / "perception"
+    _src = (_pl.Path(__file__).resolve().parent.parent / "liedetect"
             / "lie_tracker.py").read_text(encoding="utf-8")
     check("if (self._split_now and not self._merge_first" in _src
           and "_rp7" in _src and "_report_prev" in _src,
@@ -1532,7 +1532,7 @@ def test_pick_log():
       ③ 半径还没学到（`_rad = 0`）⇒ 日志**退回"圆心在框内"那一档**说 ✓ 不写"垂距比 0.00 /
          半径 0.0"那种**看着像真值**的数 ✗（实测帧 4/5 就是这种 ✓）。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
 
     # ① 非融合红框：门内只有"与绿圈相交"的那格、门里没有登记砖 ⇒ `ok` ✓
     t = _LT(noise_tol=15.0)
@@ -1743,7 +1743,7 @@ def test_rel_vel_cap():
       ③ 实测收益（本轮 A/B 的回归依据 ✓）：`10月2日.mp4` 白箭头最大模长 **590 → 322 px/s** ✓、
         融合 **10 → 23 帧** ✓（巨步不再把 B 型闸的允许量放大 ⇒ 不再误拦 ✓）；另两段素材**零差异** ✓。
     """
-    import perception.lie_tracker as _LT3
+    import liedetect.lie_tracker as _LT3
     _lim = float(_LT3._REL_V_MAX)
     _t = _LT()
     _big = (3000.0, 4000.0)
@@ -1780,7 +1780,7 @@ def test_edge_tangent_when_too_small():
       · 归**砖**的边（右 / 下）**不设限** ✓（圆该探出就探出 ✓）。
     另附**对照**：框**装得下**时（高 ≥ 2r）两套算法**同解** ✓（相切点就是内接区边界 ✓）。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
     _orig_own = LieTracker._edge_ownership
     t = _LT(noise_tol=25.0)
     _e = Entry((429.2, 244.0, 154.0, 155.0), ts=0.0)
@@ -1827,7 +1827,7 @@ def test_edge_tangent_when_too_small():
 
 
 def test_kf4_unit():
-    """⭐⭐⭐ **卡尔曼模块本身的数学**（用户 2026-10-03 ✓ "做 KF影子模式" ✓ 内核见 `perception/kf.py` ✓）。
+    """⭐⭐⭐ **卡尔曼模块本身的数学**（用户 2026-10-03 ✓ "做 KF影子模式" ✓ 内核见 `core/kf.py` ✓）。
 
     钉四件：
       ① 未喂观测 ⇒ `pos` / `vel` 都是 `None` ✓（不猜 ✗）；
@@ -1836,7 +1836,7 @@ def test_kf4_unit():
       ④ `predict(0)`（dt ≤ 0 ✓）⇒ 状态不动、不崩 ✓（帧率/时间戳异常时同一取舍 ✓）。
     """
     import random
-    from perception.kf import KF4
+    from core.kf import KF4
 
     _k0 = KF4()
     check(_k0.pos is None and _k0.vel is None,
@@ -1856,7 +1856,7 @@ def test_kf4_unit():
     _mk = sum(_err_kf) / len(_err_kf)
     _mo = sum(_err_obs) / len(_err_obs)
     check(_k.vel is not None and abs(float(_k.vel[0]) - _vx) < 15.0,
-          "㉒ 匀速直线 ⇒ KF 学出速度 **%.1f** px/s（真值 %.0f px/s ✓ 见 `perception/kf.py` ✓）"
+          "㉒ 匀速直线 ⇒ KF 学出速度 **%.1f** px/s（真值 %.0f px/s ✓ 见 `core/kf.py` ✓）"
           % (float(_k.vel[0]), _vx))
     check(_mk < _mo,
           "㉒ ⭐ **平滑有效**：位置估计平均误差 **%.2f** px < 单次观测 **%.2f** px ✓（这就是影子的意义 ✓）"
@@ -1916,8 +1916,8 @@ def test_merge_iou_threshold():
     夹具 = 同心框 + 砖 ⇒ `IoU = 砖面积 / 框面积`（好算 ✓）：
       · **同格**：框 = 砖 140×130 ⇒ IoU **1.00**；· **不同格**：框 220×210 ⇒ IoU **≈0.39**。
     """
-    from perception import geom
-    from perception.lie_registry import Entry, ShapeRegistry
+    from core import geom
+    from liedetect.lie_registry import Entry, ShapeRegistry
 
     def _mk(iou):
         # ⚠⚠ **要钉的是"分离期那一档"**（= 规则① 实际用的那个阈值 ✓）：2026-10-03 参数分档后
@@ -1978,7 +1978,7 @@ def test_reg_first_frame_iou_gate():
       · **半径还没学到**（开局那几拍 ✓ `rad=0` ✓）⇒ 退化成"**圆心落在框内**"（比 IoU 更保守 ✓）；
       · **半径有了** ⇒ 按 **`IoU > 0.4`** 判 ✓（与新建门同一把尺 ✓）。
     """
-    from perception.lie_registry import ShapeRegistry
+    from liedetect.lie_registry import ShapeRegistry
 
     # ① `rad = 0`：盖住圆心的那格**不登记**；远处的同尺寸格**照登记**（尺寸门按③已放宽 ✓）
     rg = ShapeRegistry()
@@ -2016,7 +2016,7 @@ def test_geom_three_rulers():
     ⇒ 一句话：**"同一格"用 IoU** ✓；**"盖住多少"要用单向的覆盖率** ✓（换 IoU 会把"框本来就
     比砖大"当成不合规 ⇒ 真并集框全被误判 ✗）；**"小框叠大砖"要用较小面积** ✓（IoU 偏小拦不住 ✗）。
     """
-    from perception import geom
+    from core import geom
 
     _big = (300.0, 200.0, 200.0, 200.0)
     _small = (300.0, 200.0, 100.0, 100.0)
@@ -2047,8 +2047,8 @@ def test_iou_brick_leg():
       · `noise_tol=25`（默认量级）⇒ 像素腿自己就过 ⇒ 与 IoU 无关 ✓（两条**并列** ✓）。
     ⚠ **反向验证**：把 IoU 那条腿掐掉 ⇒ 第 ② 条会红 ✓。
     """
-    from perception import geom
-    from perception.lie_registry import Entry, ShapeRegistry
+    from core import geom
+    from liedetect.lie_registry import Entry, ShapeRegistry
 
     def _mk(iou_brick, ntol):
         t = _LT(noise_tol=ntol, iou_brick=iou_brick, sep_ratio=1.5)
@@ -2098,7 +2098,7 @@ def test_sep_retreat_simple():
       ② **首拍不判**（`_merge_hold=False` ⇒ 进门那拍 ✓）⇒ 照旧 `merged` ✓；
       ③ **拿不到落点 ⇒ 不判**（容差调 0 ⇒ `n=0` ⇒ `_merge_edge_own` 回 `None` ✓）⇒ 照旧 `merged` ✓。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
 
     def _mk(hold, ntol=45.0):
         t = _LT(noise_tol=ntol, merge_iou=0.9, allow_back_ratio=0.0)
@@ -2181,7 +2181,7 @@ def test_merge_first_nearest_corner():
       · 实测对照（`10月1日.mp4` 帧 39）：老口径落 **左下**（圆心在框心左下 ✓），屏蔽后落
         **左上**（真边 = 左+上 ⇒ 对角 ✓）✓ —— 与日志里的边归属一致 ✓。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
     t = _LT(noise_tol=15.0)             # ⚠ 用户配置的容差（不是默认 2 ✗）
     t.merge_iou = 0.9                          # ⚠ 夹具用宽阈值（同心框 IoU≈0.65 ⇒ 0.9 才进 ✓）
     _e = Entry((270.0, 285.0, 170.0, 140.0), ts=0.0)   # 摆一块砖 ⇒ 让 L/T 两条边归砖 ✓
@@ -2204,7 +2204,7 @@ def test_merge_first_nearest_corner():
           "⑯ ⭐ **生成那一拍也按边归属**（真边 = 右+下 ⇒ 对角 = **右下角** (331.0,316.1) ✓ "
           "实际 %s ✓ —— 用户 2026-10-03「都按边归属算」✓）" % (_c,))
     # ⭐ **开关能回退**：`_MERGE_FIRST_NEAREST = True` ⇒ 老口径「就近内接」（用户 2026-10-02 ✓）
-    import perception.lie_tracker as _LTN
+    import liedetect.lie_tracker as _LTN
     _nf = _LTN._MERGE_FIRST_NEAREST
     try:
         _LTN._MERGE_FIRST_NEAREST = True
@@ -2253,7 +2253,7 @@ def test_merge_log_payload():
     数字用 `9月30日(1).mp4` 帧 17 那组实测值 ✓（并集框 `208.7×165.9` 包住砖(528,340)、
     登记 `160.6×134.4`、比 **1.604** ≥ 阈值 1.4、圆心 (359.7,254.8) 在框里 ⇒ 规则① ✓）。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
     t = _LT(noise_tol=2.0)
     t._typ_area = 140.0 * 130.0
     t._rad = 56.0                              # 演示窗画的绿圈半径（规则②那把尺 ✓）
@@ -2327,7 +2327,7 @@ def test_split_log_payload():
     已缩到参照砖 `160.2×128.8 @ (219.6,155.1)` 的 ±15px 之内 ⇒ `_box_is_brick_det=True` ✓
     （就是那条"分离信号" ✓ 也是"换对象"那一拍的起因 ✓）。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
     t = _LT(noise_tol=15.0)
     t.pos = (218.7, 178.3)
     t._rad = 56.0
@@ -2441,8 +2441,8 @@ def test_sep_ratio_gate():
       ④ 进门那拍**重置**、保持期每拍**更新**（行为：跑两拍看 max/min 有没有跟着变 ✓）；
       ⑤ 分离日志里带上 max/min 与阈值（与融合日志同一格式 ✓）。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
-    import perception.lie_tracker as LT
+    from liedetect.lie_registry import Entry, ShapeRegistry
+    import liedetect.lie_tracker as LT
     check(abs(float(LT._SEP_RATIO) - 1.3) < 1e-9,
           "⑱ 「分离判定阈值」模块默认 = %.2f（界面初值同一处口径 ✓）" % float(LT._SEP_RATIO))
     t = _LT(sep_ratio=1.5)
@@ -2667,7 +2667,7 @@ def test_merge_fix_safe():
         t._tbox_rad = 60.0
         t.pos = (200.0, 200.0)
         t._vel_rel = (-100.0, 0.0)
-        from perception.lie_registry import Entry, ShapeRegistry
+        from liedetect.lie_registry import Entry, ShapeRegistry
         e = Entry((300.0, 200.0, 140.0, 130.0), ts=0.0)
         e.on_board = True
         rg = ShapeRegistry()
@@ -2712,7 +2712,7 @@ def test_merge_fix_safe():
     finally:
         LieTracker._merge_fix_safe = _orig6
 
-    import perception.lie_tracker as _LT2
+    import liedetect.lie_tracker as _LT2
     check(LieTracker(allow_back_ratio=-5.0).allow_back_ratio == 0.0,
           "⑤ 负数无意义 ⇒ 夹到 0 ✓；`None` ⇒ 模块默认 %.2f（**步数** ✓ B 型：本拍该走多远的倍数 ✓"
           " 不再是「×半径」✓）" % float(_LT2._ALLOW_BACK_RATIO))
@@ -2769,7 +2769,7 @@ def test_merge_fix_all_unsafe():
     （原话："**照着我的逻辑简化分离判定**" ✓）⇒ 现在替身成 False 时，**保持期内就判分离** ✓；
     只有**非保持期**（新会话 / 首拍）才不参与 ✓。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
     _orig = LieTracker._merge_fix_safe
 
     def _mk19(hold):
@@ -2814,7 +2814,7 @@ def test_board_overlap_param():
     防抖重叠率**』" ✓）：`_LT(board_overlap=…)` ⇒ **同一处口径**落到登记表
     （`ShapeRegistry.board_overlap` ✓）；`None` ⇒ 默认（`_BOARD_OVERLAP_DEF` = 0.5 ✓）；
     越界值夹进 `[0, 1]` ✓。判据本身在 `selftest_lie_registry` 里钉 ✓。"""
-    from perception.lie_registry import _BOARD_OVERLAP_DEF
+    from liedetect.lie_registry import _BOARD_OVERLAP_DEF
     check(abs(LieTracker()._reg.board_overlap - _BOARD_OVERLAP_DEF) < 1e-9,
           "不配 ⇒ 用登记表同一处默认值（实际 %.2f ｜ 期望 %.2f ✓ 用户定的 0.5 ✓）"
           % (LieTracker()._reg.board_overlap, _BOARD_OVERLAP_DEF))
@@ -2845,9 +2845,9 @@ def test_merge_fix_adopt():
     """
     import pathlib
 
-    from perception import lie_tracker as LT
+    from liedetect import lie_tracker as LT
 
-    _src = (pathlib.Path(__file__).resolve().parent.parent / "perception"
+    _src = (pathlib.Path(__file__).resolve().parent.parent / "liedetect"
             / "lie_tracker.py").read_text(encoding="utf-8")
     check("_adopted = self._adopt_merge_fix(out) is not None" in _src
           and 'self._pos_prev = out["pos"] if _adopted else _pos_int' in _src,
@@ -2899,7 +2899,7 @@ def test_merge_front_gate():
       `(320.3,194.2)` 选成融合框 ⇒ 融合框"一跳 120px、方向与白箭头相反 173.8°"✗、绿圈被
       夹进新格（跳 86.7px）✗；加闸后那一拍不再融合 ⇒ 红框消失、圆按预测走 ✓。
     """
-    from perception.lie_registry import Entry, ShapeRegistry
+    from liedetect.lie_registry import Entry, ShapeRegistry
 
     def _tr(pos, vr, rad=60.0):
         t = _LT()
@@ -2999,7 +2999,7 @@ def test_merge_front_gate():
     #   就不需要『融合框继承距离限制』了，**先屏蔽相关逻辑**" ✓ 见 `_INHERIT_DIST_ON` ✓）——
     #   屏蔽态下它**恒放行** ⇒ 下面这些"闸在筛候选"的断言会失真 ✗ ⇒ 开关拨到 `True` 跑完立刻
     #   拨回 ✓（两态都钉 ✓）。
-    import perception.lie_tracker as _LTim
+    import liedetect.lie_tracker as _LTim
     _on0 = _LTim._INHERIT_DIST_ON
     _LTim._INHERIT_DIST_ON = True
     # ⭐ 把**圆心挪到框外**（出框 20px = 0.333 半径）+ 阈值 0.0（一点也不许出框）⇒ 第一条闸挡下

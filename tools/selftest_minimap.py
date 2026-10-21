@@ -25,7 +25,9 @@ import cv2                                                  # noqa: E402
 import numpy as np                                          # noqa: E402
 
 from core import mapdata                                    # noqa: E402
+from perception import map_const
 from perception import minimap as mm                        # noqa: E402
+from perception import map_calib
 
 # --------------------------------------------------------------- 自检不许改用户文件
 # ⛔ `config/ui.yaml` 是**用户的**文件（窗口几何 / 字号 / 颜色）⇒ 自检**绝不许**写它 ✗
@@ -36,6 +38,10 @@ from perception import minimap as mm                        # noqa: E402
 import tempfile as _tempfile                                # noqa: E402
 
 from gui import theme as _theme                             # noqa: E402
+from perception import map_dot
+from perception import map_locator
+from perception import map_overlay
+from decision import jobs as jobmod
 
 _theme.CFG = Path(_tempfile.mkdtemp(prefix="psimu_ui_")) / "ui.yaml"
 
@@ -147,33 +153,33 @@ def t_calib_overlap_is_a_ruler():
         return
     scale, ox, oy = 1.5, 40, 40
     panel = synth_fit_panel(canvas, scale, ox, oy, pad=40)
-    cal = {"mode": mm.MODE_FIT, "scale": scale, "offset": [float(ox), float(oy)],
+    cal = {"mode": map_const.MODE_FIT, "scale": scale, "offset": [float(ox), float(oy)],
            "view": [0.0, 0.0], "score": 0.0, "src": "manual"}
 
-    ov = mm.calib_overlap(panel, canvas, cal)
+    ov = map_calib.calib_overlap(panel, canvas, cal)
     check(ov is not None, "重合率算不出来（面板/底图/几何都齐 ✓）")
     check(abs(ov["shift"][0]) <= 1 and abs(ov["shift"][1]) <= 1,
           "对的几何却被判成偏了 %s（尺子先得对自己准 ✓）" % (ov["shift"],))
-    check(ov["iou"] >= mm.OVERLAP_OK,
+    check(ov["iou"] >= map_const.OVERLAP_OK,
           "对的几何重合率只有 %.3f（< %.2f ⇒ 会误报「对不上」✗）：%r"
-          % (ov["iou"], mm.OVERLAP_OK, ov))
-    check("重合良好" in mm.overlap_verdict(ov),
-          "判词没说「重合良好」：%r" % (mm.overlap_verdict(ov),))
+          % (ov["iou"], map_const.OVERLAP_OK, ov))
+    check("重合良好" in map_calib.overlap_verdict(ov),
+          "判词没说「重合良好」：%r" % (map_calib.overlap_verdict(ov),))
     for d in (4, 8):
         bad = dict(cal, offset=[float(ox + d), float(oy)])
-        ov2 = mm.calib_overlap(panel, canvas, bad)
+        ov2 = map_calib.calib_overlap(panel, canvas, bad)
         check(ov2 is not None, "推偏 %d px 后算不出来" % d)
         check(abs(ov2["shift"][0] + d) <= 1,
               "推偏 %d px 没被报成 shift≈%d（报的是 %s）✗" % (d, -d, ov2["shift"]))
         check(ov2["iou0"] <= ov["iou0"] + 1e-9,
               "推偏之后 `iou0` 反而没降（那样它当不了尺子 ✗）：%.3f vs %.3f"
               % (ov2["iou0"], ov["iou0"]))
-        _v2 = mm.overlap_verdict(ov2)
+        _v2 = map_calib.overlap_verdict(ov2)
         check("挪" in _v2 or "对不太上" in _v2,
               "推偏 %d px 的判词却说没事（%r）✗" % (d, _v2))
-    check(mm.calib_overlap(None, canvas, cal) is None, "面板为 None 时该给 None ✓")
-    check(mm.calib_overlap(panel, None, cal) is None, "底图为 None 时该给 None ✓")
-    check(mm.calib_overlap(panel, canvas, {}) is None, "几何为空时该给 None ✓")
+    check(map_calib.calib_overlap(None, canvas, cal) is None, "面板为 None 时该给 None ✓")
+    check(map_calib.calib_overlap(panel, None, cal) is None, "底图为 None 时该给 None ✓")
+    check(map_calib.calib_overlap(panel, canvas, {}) is None, "几何为空时该给 None ✓")
 
 
 def t_check_calib_fail_says_numbers():
@@ -201,7 +207,7 @@ def t_check_calib_fail_says_numbers():
         return
     t = mapdata.load(mid, with_canvas=True)
     # 一份**有几何**、但与底图完全不像的面板（噪声 ✓）＋ 把门槛抬到 0.99 ⇒ 必然"量不出来" ✓
-    cal = {"mode": mm.MODE_FIT, "scale": 1.0, "offset": [0, 0], "view": [0, 0],
+    cal = {"mode": map_const.MODE_FIT, "scale": 1.0, "offset": [0, 0], "view": [0, 0],
            "score": 0.0, "src": "manual"}
     bad = np.random.RandomState(7).randint(0, 255, (60, 80, 3)).astype(np.uint8)
     r = mm.check_calib(bad, t, cal, min_score=0.99)
@@ -300,11 +306,11 @@ def t_calib_check_and_reverse():
           "量不出来时不该给个像模像样的结论：%r" % r2["verdict"])
 
     # ④ 正反换算互逆（fit / crop）
-    for cal in (good, {"mode": mm.MODE_CROP, "scale": 1.5, "scale_y": 1.5,
+    for cal in (good, {"mode": map_const.MODE_CROP, "scale": 1.5, "scale_y": 1.5,
                        "offset": [4, 4], "view": [20, 30]}):
         for (px, py) in ((0.0, 0.0), (12.5, 33.25)):
-            wx, wy = mm.panel_to_world(px, py, cal, t)
-            bx, by = mm.world_to_panel(wx, wy, cal, t)
+            wx, wy = map_calib.panel_to_world(px, py, cal, t)
+            bx, by = map_calib.world_to_panel(wx, wy, cal, t)
             check(abs(bx - px) < 1e-6 and abs(by - py) < 1e-6,
                   "正反换算不互逆（%s）：(%.2f, %.2f) → (%.4f, %.4f)"
                   % (cal["mode"], px, py, bx, by))
@@ -326,6 +332,7 @@ def t_route_panel_mmap_check():
       ⑤ 缺东西时说**人话**：没画面 / 没标定 / 没选地图各有各的话（不许静默 ✗）；
       ⑥ 算法只有一处：面板侧只**调用** `mm.check_calib`，自己不许再写一套匹配 ✗。
     """
+    from perception import map_dot
     import unittest.mock as mock
 
     from PyQt5.QtCore import QPoint
@@ -350,7 +357,7 @@ def t_route_panel_mmap_check():
     cal = mm.locate_fit(panel, canvas)                        # 这份标定"就是尺子"
     check(cal is not None, "合成面板定不出来，后面没法验")
     good = {k: cal[k] for k in ("mode", "scale", "offset", "view")}
-    cfg = {"mmap_src": mm.SRC_LIVE, "mmap_draw": True, "mmap_crop": None}
+    cfg = {"mmap_src": map_const.SRC_LIVE, "mmap_draw": True, "mmap_crop": None}
 
     class _Live:
         """假实时面板：核对要 `current_frame()`；`bind()` 里那条叠图刷新也要接得住。"""
@@ -550,7 +557,7 @@ def t_crop_roundtrip():
                                 and abs(loc["view"][1] - (y + inset)) <= 0.5),
           "view %s 应该在 [%d, %d] 的半个像素之内" % (loc["view"], x + inset, y + inset))
     # 真正要紧的是这一条：面板左上角换回底图坐标 = 当初裁剪的原点（±0.5 底图像素 ✓）
-    cx, cy = mm.panel_to_canvas(0, 0, loc)
+    cx, cy = map_calib.panel_to_canvas(0, 0, loc)
     check(abs(cx - x) <= 0.5 and abs(cy - y) <= 0.5,
           "panel_to_canvas 换回 (%s, %s)，应该是 (%d, %d)±0.5" % (cx, cy, x, y))
 
@@ -578,7 +585,7 @@ def t_crop_scale_not_faked():
         check(abs(loc["scale"] - 1.0) < 0.01,
               "(%dx%d)@(%d,%d) 是 1:1 裁块，scale 应当是 1.0，实际 %.4f"
               % (w, h, x, y, loc["scale"]))
-        got = mm.panel_to_canvas(0, 0, loc)
+        got = map_calib.panel_to_canvas(0, 0, loc)
         # ⚠ 亚像素（见 `t_crop_roundtrip` 那条说明）⇒ 容差半个底图像素 ✓
         check(abs(got[0] - x) <= 0.5 and abs(got[1] - y) <= 0.5,
               "(%dx%d)@(%d,%d) 换算回 (%s, %s)，应该是 (%d, %d)±0.5"
@@ -592,6 +599,7 @@ def t_magnified_crop_roundtrip():
     就差 9.7 倍。客户端把小地图放大后再切块是常态，只按 1:1 找**永远量不出来**
     （人和程序都失败，表现是「匹配分 0.7 上下、怎么调都不对」）。
     """
+    from perception import map_overlay
     mid, canvas = pick_map()
     if mid is None:
         print("      （没有可用的底图，跳过）")
@@ -613,13 +621,13 @@ def t_magnified_crop_roundtrip():
     check(abs(loc["scale"] - s_true) <= 1.0,
           "量出的放大倍数 %.2f 与真实的 %d 差太多" % (loc["scale"], s_true))
     inset = int(loc["offset"][0])
-    cx, cy = mm.panel_to_canvas(0, 0, loc)
+    cx, cy = map_calib.panel_to_canvas(0, 0, loc)
     check(abs(cx - ox / s_true) <= 1.5 and abs(cy - oy / s_true) <= 1.5,
           "面板左上角换回底图坐标 (%s, %s)，应该是 (%d, %d)"
           % (cx, cy, ox // s_true, oy // s_true))
     check(loc["score"] > 0.9, "合成帧的匹配分只有 %.3f" % loc["score"])
     # 面板覆盖的底图范围：应当是「裁的那一块」那么大
-    r_canvas, _r_over = mm.view_rects(loc, (pw, ph), (cw, ch))
+    r_canvas, _r_over = map_overlay.view_rects(loc, (pw, ph), (cw, ch))
     check(abs(r_canvas[2] - r_canvas[0] - pw / loc["scale"]) <= 2,
           "view_rects 算的底图覆盖宽度不对：%s" % (r_canvas,))
 
@@ -636,7 +644,7 @@ def t_wrong_mode_fails():
         print("      （底图太小，跳过）")
         return
     panel = synth_crop_panel(canvas, 9, 40, w, h)
-    loc = mm.locate(panel, canvas, mm.MODE_FIT)
+    loc = mm.locate(panel, canvas, map_const.MODE_FIT)
     check(loc is None, "拿一块局部当整图量，居然量出来了：%s" % (loc,))
 
 
@@ -671,6 +679,7 @@ def t_dialog_with_stub():
     ⚠ 2026-09-29 起**图上不能拖**了（用户第 ① 条）：改位置只有「x/y 轴偏移」两条拖动条
     与方向键（都是可复现的值 ✓）；「锁定 xy 缩放」与「不改缩放」两个勾也在别的用例里 ✓。
     """
+    from perception import map_dot
     mid, canvas = pick_map()
     if mid is None:
         print("      （没有可用的底图，跳过）")
@@ -688,7 +697,7 @@ def t_dialog_with_stub():
 
     # 1) 用 crop（局部小地图）的方式量
     stub = StubClient(panel)
-    dlg = MinimapCalibDialog(mid, mode=mm.MODE_CROP, client=stub)
+    dlg = MinimapCalibDialog(mid, mode=map_const.MODE_CROP, client=stub)
     try:
         check(stub.started is False, "外部传进来的收帧器不该被弹窗 start")
         dlg.ck_live.setChecked(True)
@@ -697,9 +706,9 @@ def t_dialog_with_stub():
         dlg._locate_now()
         check(dlg.score > 0.9, "弹窗自动定位的匹配分只有 %.3f" % dlg.score)
         cal = dlg.calib()
-        check(cal["mode"] == mm.MODE_CROP, "标定字典里的方式不对：%s" % cal["mode"])
+        check(cal["mode"] == map_const.MODE_CROP, "标定字典里的方式不对：%s" % cal["mode"])
         check(cal["scale"] == 1.0, "crop 的缩放应当固定 1.0，实际 %s" % cal["scale"])
-        cx, cy = mm.panel_to_canvas(0, 0, cal)
+        cx, cy = map_calib.panel_to_canvas(0, 0, cal)
         # ⚠ 亚像素（`_peak_subpix` + 按贴合分抠到 0.25 底图像素 ✓）⇒ 容差半个像素 ✓
         #   （放大 5 倍的面板上，1 个底图像素 = 5~10 个面板像素 ⇒ 这半像素是有意义的 ✓）
         check(abs(cx - x) <= 0.5 and abs(cy - y) <= 0.5,
@@ -773,7 +782,7 @@ def t_dialog_with_stub():
         return made
 
     with mock.patch.object(mm, "MiniMapClient", _fake_client):
-        dlg2 = MinimapCalibDialog(mid, mode=mm.MODE_CROP)
+        dlg2 = MinimapCalibDialog(mid, mode=map_const.MODE_CROP)
         try:
             check(made.started is True, "自己连那条路应当 start 收帧器")
         finally:
@@ -782,7 +791,7 @@ def t_dialog_with_stub():
 
     # 6) 没帧时的说法（A 机没推流时人看到的就是这句）
     empty = StubClient(None)
-    dlg3 = MinimapCalibDialog(mid, mode=mm.MODE_CROP, client=empty)
+    dlg3 = MinimapCalibDialog(mid, mode=map_const.MODE_CROP, client=empty)
     try:
         dlg3._on_tick()
         check("等帧" in dlg3.lbl_conn.text(),
@@ -818,7 +827,7 @@ def t_dialog_auto_fit():
     pad = 0
     panel = synth_fit_panel(canvas, 2.0, 0, 0, pad=pad)
     stub = StubClient(panel)
-    dlg = MinimapCalibDialog(mid, mode=mm.MODE_FIT, client=stub)
+    dlg = MinimapCalibDialog(mid, mode=map_const.MODE_FIT, client=stub)
     try:
         dlg.ck_auto.setChecked(True)
         # 第一次：先让第一帧落地（摆几何 ✓ 和"人打开标定窗"的时序一致 ✓）
@@ -840,6 +849,12 @@ def t_dialog_auto_fit():
         #   ⇒ 改成**显式给一个错尺度**（1.0）再触发一次 ⇒ 这才是真正要钉的那条路 ✓。
         dlg.scale = 1.0
         dlg._last_locate = 0.0          # 假装过了节流窗口
+        # ⚠⚠ 2026-10-18：**整体重搜还有一道 2 秒节流（`_full_at`）**，跟 `_last_locate` 不是
+        #   同一把闸 ✗。第一拍若已经花掉一次整体重搜（盘上有旧标定时就会：`pick_map()` 挑的
+        #   100040102 存着 `scale=1.0` ⇒ 邻近尺度必然搜不到 ⇒ 走整体），第二拍在毫秒内
+        #   再要重搜就被节流挡掉 ⇒ 用例**假红**（说"没走整体重搜"，其实是被节流了 ✓）。
+        #   ⇒ 这条钉的是"跟丢要能退回全范围"，不是节流阈值 ⇒ 两道闸都归零 ✓。
+        dlg._full_at = 0.0
         stub.frame = panel.copy()       # 新对象 ⇒ 真走一次 set_frame（`_geom_ready` 已 True ✓）
         dlg._on_tick()
         check("整体重搜" in dlg.lbl_say.text(),
@@ -869,24 +884,25 @@ def t_dot_feet_subpixel():
     就能让读数跳 **9** ✗✗（现场：L1 上 x=56，顺绳下来 x=47，正差一格）。
     锚点（下沿 = 重心 + (h-1)/2）本身不变，只是**保留小数** ✓。
     """
-    x, y = mm.dot_feet({"x": 61.4, "y": 91.0, "h": 6})
+    from perception import map_dot
+    x, y = map_dot.dot_feet({"x": 61.4, "y": 91.0, "h": 6})
     check(abs(x - 61.4) < 1e-9, "x 被取整了（一格 = 8.55 世界单位）：%r" % (x,))
     check(abs(y - 93.5) < 1e-9,
           "脚底锚点被取整了（h=6 的点占 88..93 行 ⇒ 91 + 2.5 = 93.5）：%r" % (y,))
     # 亚像素位移必须**如实体现**（差 0.4 面板像素 ≈ 3.4 世界单位，不许被量化成 8.55）
-    x2, _ = mm.dot_feet({"x": 61.8, "y": 91.0, "h": 6})
+    x2, _ = map_dot.dot_feet({"x": 61.8, "y": 91.0, "h": 6})
     check(abs((x2 - x) - 0.4) < 1e-9,
           "亚像素位移被量化掉了：%r → %r（该差 0.4）" % (x, x2))
     # 采样那一侧（界面是整数框）由调用方取整 —— 口径仍是同一个函数 ✓
-    check(abs(mm.dot_feet({"x": 61.0, "y": 91.0, "h": 6})[1] - 93.5) < 1e-9,
-          "整数输入时脚底锚点算错了：%s" % (mm.dot_feet({"x": 61.0, "y": 91.0, "h": 6}),))
+    check(abs(map_dot.dot_feet({"x": 61.0, "y": 91.0, "h": 6})[1] - 93.5) < 1e-9,
+          "整数输入时脚底锚点算错了：%s" % (map_dot.dot_feet({"x": 61.0, "y": 91.0, "h": 6}),))
     # 锚点是"下**边缘**"（不是"最后一行"）：h=6、重心 91 ⇒ 92.5..93.5 那一格的下边 = 93.5
     # —— 差值只有半个面板像素（≈4 世界单位），但它决定 y 读数是否还会跳一格 ✓
-    check(abs((mm.dot_feet({"x": 61.0, "y": 91.0, "h": 6})[1]
-               - mm.dot_feet({"x": 61.0, "y": 91.0, "h": 5})[1]) - 0.5) < 1e-9,
+    check(abs((map_dot.dot_feet({"x": 61.0, "y": 91.0, "h": 6})[1]
+               - map_dot.dot_feet({"x": 61.0, "y": 91.0, "h": 5})[1]) - 0.5) < 1e-9,
           "点高变化没算对（h 每多 1，下沿多半个像素）：%.3f / %.3f"
-          % (mm.dot_feet({"x": 61.0, "y": 91.0, "h": 6})[1],
-             mm.dot_feet({"x": 61.0, "y": 91.0, "h": 5})[1]))
+          % (map_dot.dot_feet({"x": 61.0, "y": 91.0, "h": 6})[1],
+             map_dot.dot_feet({"x": 61.0, "y": 91.0, "h": 5})[1]))
 
 
 def t_calib_dialog_two_axis():
@@ -921,14 +937,14 @@ def t_calib_dialog_two_axis():
 
     # 用户现场那份（105090600 / stream，双点标定刚存下的样子，原样照抄）
     s_x, s_y = 1.880076070446757, 1.8900600092321893
-    cal = {"mode": mm.MODE_FIT, "scale": s_x, "scale_y": s_y,
+    cal = {"mode": map_const.MODE_FIT, "scale": s_x, "scale_y": s_y,
            "offset": [-0.452, -2.602], "view": [0, 0], "src": "two_point",
            "ref": "canvas", "alpha": 35}
     panel = synth_fit_panel(canvas, 1.88, -1, -3, pad=0)
 
     with mock.patch.object(mapdata, "load_calib", lambda _m, src=None: dict(cal)):
-        dlg = MinimapCalibDialog(mid, mode=mm.MODE_FIT, client=StubClient(panel),
-                                 src=mm.SRC_STREAM)
+        dlg = MinimapCalibDialog(mid, mode=map_const.MODE_FIT, client=StubClient(panel),
+                                 src=map_const.SRC_STREAM)
         try:
             # ① 两轴都读进来
             check(abs(dlg.scale - s_x) < 1e-9 and abs(dlg.scale_y - s_y) < 1e-9,
@@ -945,7 +961,7 @@ def t_calib_dialog_two_axis():
                   % dlg.lbl_loaded.text())
             # ③ 没动过 ⇒ 原样：两轴都在、来源不降级、不多 `score`、数不舍
             c = dlg.calib()
-            check(abs(mm.scales_of(c)[1] - s_y) < 1e-9,
+            check(abs(map_calib.scales_of(c)[1] - s_y) < 1e-9,
                   "「打开看一眼」就会把 y 轴抹成 x（`scale_y` 没了）：%s" % c)
             check(c.get("src") == "two_point",
                   "没动过却把来源降级了：%s" % c.get("src"))
@@ -990,7 +1006,7 @@ def t_calib_dialog_two_axis():
                   "人改过缩放却没记成「人眼对齐」：%s" % c2.get("src"))
             check("score" in c2, "人改过之后该如实写上匹配分：%s" % c2)
             # 存起来的是 6 位小数（`calib()` 里 round）⇒ 比**两轴各自的值**
-            _s2x, _s2y = mm.scales_of(c2)
+            _s2x, _s2y = map_calib.scales_of(c2)
             check(abs(_s2x - dlg.scale) < 1e-5 and abs(_s2y - dlg.scale_y) < 1e-5,
                   "人动过之后两轴没照实写回：%s（界面是 %.6f / %.6f）"
                   % (c2, dlg.scale, dlg.scale_y))
@@ -1022,7 +1038,7 @@ def t_dialog_ui_feedback():
         print("      （底图太小，跳过）")
         return
     panel = synth_crop_panel(canvas, 9, 40, w, h)
-    dlg = MinimapCalibDialog(mid, mode=mm.MODE_CROP, client=StubClient(panel))
+    dlg = MinimapCalibDialog(mid, mode=map_const.MODE_CROP, client=StubClient(panel))
     try:
         check(not hasattr(dlg, "btn_grab"), "「抓一帧」按钮应当删掉（与暂停重复）")
 
@@ -1122,13 +1138,13 @@ def t_calib_open_says_why_blank():
     tmp = tmpdir / ("%s.mapcalib.json" % mid)
     try:
         with mock.patch.object(mapdata, "calib_path", lambda _mid: tmp):
-            mapdata.save_calib(mid, {"mode": mm.MODE_FIT, "scale": 1.88,
+            mapdata.save_calib(mid, {"mode": map_const.MODE_FIT, "scale": 1.88,
                                      "scale_y": 1.89, "offset": [-0.45, -1.6],
                                      "view": [0, 0], "src": "two_point",
-                                     "ref": "canvas", "alpha": 0}, mm.SRC_STREAM)
+                                     "ref": "canvas", "alpha": 0}, map_const.SRC_STREAM)
             # ① 透明度 0 ⇒ 状态行说"几何是存着的"、那行读数写"看不见"
-            dlg = MinimapCalibDialog(mid, mode=mm.MODE_FIT,
-                                     client=StubClient(panel), src=mm.SRC_STREAM)
+            dlg = MinimapCalibDialog(mid, mode=map_const.MODE_FIT,
+                                     client=StubClient(panel), src=map_const.SRC_STREAM)
             try:
                 check("0%" in dlg.lbl_say.text() and "存着" in dlg.lbl_say.text(),
                       "透明度 0%% 时没说清「几何是存着的、只是看不见」：%r"
@@ -1141,8 +1157,8 @@ def t_calib_open_says_why_blank():
             finally:
                 dlg._shutdown()
             # ② fit 的几何 + crop 方式打开 ⇒ 要说清"这是另一种方式量的"
-            dlg2 = MinimapCalibDialog(mid, mode=mm.MODE_CROP,
-                                      client=StubClient(panel), src=mm.SRC_STREAM)
+            dlg2 = MinimapCalibDialog(mid, mode=map_const.MODE_CROP,
+                                      client=StubClient(panel), src=map_const.SRC_STREAM)
             try:
                 check("方式" in dlg2.lbl_say.text() and "fit" in dlg2.lbl_say.text(),
                       "显示方式与文件不一致时没说：%r" % dlg2.lbl_say.text())
@@ -1194,20 +1210,20 @@ def t_calib_windows_share_store():
             ch, cw = canvas.shape[:2]
             cA, cB = (5.0, 4.0), (float(cw - 6), float(ch - 5))
             s_x, s_y, o_x, o_y = 1.88, 1.892, -0.452, -2.602
-            r = mm.solve_two_point(cA, (cA[0] * s_x + o_x, cA[1] * s_y + o_y),
+            r = map_calib.solve_two_point(cA, (cA[0] * s_x + o_x, cA[1] * s_y + o_y),
                                    cB, (cB[0] * s_x + o_x, cB[1] * s_y + o_y))
             check(r["ok"], "两点解没成：%s" % (r.get("why"),))
-            mapdata.save_calib(mid, mm.calib_from_two_point(
-                {"mode": mm.MODE_FIT, "alpha": 35, "ref": "canvas",
-                 "world_offset": [0, 0]}, r), mm.SRC_STREAM)
+            mapdata.save_calib(mid, map_calib.calib_from_two_point(
+                {"mode": map_const.MODE_FIT, "alpha": 35, "ref": "canvas",
+                 "world_offset": [0, 0]}, r), map_const.SRC_STREAM)
             check(tmp.exists(), "双点标定那条路没写文件：%s" % tmp)
             before = json.loads(tmp.read_text(encoding="utf-8"))
-            check(mm.SRC_STREAM in before.get("sources", {}),
+            check(map_const.SRC_STREAM in before.get("sources", {}),
                   "写进去的不是 sources.<来源>：%s" % before)
 
             # 「标定…」看得见**同一份**（这就是用户要的"一套数据"）
-            dlg = MinimapCalibDialog(mid, mode=mm.MODE_FIT,
-                                     client=StubClient(panel), src=mm.SRC_STREAM)
+            dlg = MinimapCalibDialog(mid, mode=map_const.MODE_FIT,
+                                     client=StubClient(panel), src=map_const.SRC_STREAM)
             try:
                 check(abs(dlg.scale - r["scale"]) < 1e-9
                       and abs(dlg.scale_y - r["scale_y"]) < 1e-9,
@@ -1220,8 +1236,8 @@ def t_calib_windows_share_store():
                                        return_value=QMessageBox.Yes):
                     dlg._on_save()
                 check(dlg.saved, "「标定…」没保存成功：%r" % dlg.lbl_say.text())
-                g0 = before["sources"][mm.SRC_STREAM]
-                g1 = json.loads(tmp.read_text(encoding="utf-8"))["sources"][mm.SRC_STREAM]
+                g0 = before["sources"][map_const.SRC_STREAM]
+                g1 = json.loads(tmp.read_text(encoding="utf-8"))["sources"][map_const.SRC_STREAM]
                 for _k in ("mode", "scale", "scale_y", "offset", "view", "src",
                            "alpha", "world_offset", "ref"):
                     check(g0.get(_k) == g1.get(_k),
@@ -1237,8 +1253,8 @@ def t_calib_windows_share_store():
                 check(dlg.saved, "改完没保存成功：%r" % dlg.lbl_say.text())
             finally:
                 dlg._shutdown()
-            dlg2 = MinimapCalibDialog(mid, mode=mm.MODE_FIT,
-                                      client=StubClient(panel), src=mm.SRC_STREAM)
+            dlg2 = MinimapCalibDialog(mid, mode=map_const.MODE_FIT,
+                                      client=StubClient(panel), src=map_const.SRC_STREAM)
             try:
                 check(abs(dlg2.scale - 1.5) < 1e-6,
                       "重开那扇没看到刚保存的缩放：%.4f" % dlg2.scale)
@@ -1248,14 +1264,14 @@ def t_calib_windows_share_store():
                 dlg2._shutdown()
 
             # ④ 存另一条来源**不动**本条
-            mapdata.save_calib(mid, {"mode": mm.MODE_FIT, "scale": 2.0,
+            mapdata.save_calib(mid, {"mode": map_const.MODE_FIT, "scale": 2.0,
                                      "offset": [1, 1], "view": [0, 0]},
-                               mm.SRC_LIVE)
+                               map_const.SRC_LIVE)
             d = json.loads(tmp.read_text(encoding="utf-8"))
-            check(mm.SRC_STREAM in d["sources"] and mm.SRC_LIVE in d["sources"],
+            check(map_const.SRC_STREAM in d["sources"] and map_const.SRC_LIVE in d["sources"],
                   "存另一条来源把原来的抹掉了：%s" % list(d["sources"]))
-            check(abs(d["sources"][mm.SRC_STREAM]["scale"] - 1.5) < 1e-6,
-                  "存另一条来源动了本条：%s" % d["sources"][mm.SRC_STREAM])
+            check(abs(d["sources"][map_const.SRC_STREAM]["scale"] - 1.5) < 1e-6,
+                  "存另一条来源动了本条：%s" % d["sources"][map_const.SRC_STREAM])
     finally:
         shutil.rmtree(str(tmpdir), ignore_errors=True)
 
@@ -1308,7 +1324,7 @@ def t_save_then_reopen():
             #    ⚠ 以前这里用 `_ov_item.setPos(...)` 假装"拖"—— 2026-09-29 起图上不能拖
             #    了（用户第 ① 条 ✓），必须走拖动条/数字框这条路 ✓。
             stub = StubClient(panel)
-            dlg = MinimapCalibDialog(mid, mode=mm.MODE_CROP, client=stub)
+            dlg = MinimapCalibDialog(mid, mode=map_const.MODE_CROP, client=stub)
             try:
                 check("还没标定过" in dlg.lbl_loaded.text(),
                       "第一次打开要写明「这张图还没标定过」（不然人分不清现在摆的"
@@ -1334,27 +1350,27 @@ def t_save_then_reopen():
             check(tmp.exists(), "保存后标定文件没生成：%s" % tmp)
 
             saved = mapdata.load_calib(mid) or {}
-            check(saved.get("mode") == mm.MODE_CROP,
+            check(saved.get("mode") == map_const.MODE_CROP,
                   "存下来的方式不对：%s" % saved.get("mode"))
             check(saved.get("offset") == [dlg.inset, dlg.inset],
                   "crop 的 offset 必须写成 inset（模板内缩量），实际 %s —— 写成别的"
                   "值会让程序算出来的世界坐标和人工对齐差 inset 个底图像素"
                   % (saved.get("offset"),))
-            got = mm.panel_to_canvas(0, 0, saved)
+            got = map_calib.panel_to_canvas(0, 0, saved)
             check(got == (x, y),
                   "存下去的换算和人工对齐不一致：面板左上 → 底图 (%s, %s)，"
                   "应该是 (%d, %d)" % (got[0], got[1], x, y))
 
             # ② 重开：几何要原样回来（不能被「粗略猜测」覆盖）
             stub2 = StubClient(panel)
-            dlg2 = MinimapCalibDialog(mid, mode=mm.MODE_CROP, client=stub2)
+            dlg2 = MinimapCalibDialog(mid, mode=map_const.MODE_CROP, client=stub2)
             try:
                 dlg2._on_tick()
                 check(list(dlg2.block) == list(saved["view"]),
                       "重开后 view 被改了：%s，存的 %s —— 手工对齐的结果必须保留"
                       % (dlg2.block, saved["view"]))
-                check(mm.panel_to_canvas(0, 0, dlg2.calib()) == (x, y),
-                      "重开后的换算又漂了：%s" % (mm.panel_to_canvas(0, 0,
+                check(map_calib.panel_to_canvas(0, 0, dlg2.calib()) == (x, y),
+                      "重开后的换算又漂了：%s" % (map_calib.panel_to_canvas(0, 0,
                                                                 dlg2.calib()),))
                 # 顶部那行必须**说清几何是从文件读回来的** —— 不然"还原成功"和
                 # "程序又猜了一个"在屏幕上一模一样，人只能猜（现场就是这么卡住的）
@@ -1381,7 +1397,7 @@ def t_save_then_reopen():
                 dlg2._shutdown()
 
             # ④ 关窗守卫：动过又没存 → 必须问一句；选「否」= 放弃并真的关掉
-            dlg3 = MinimapCalibDialog(mid, mode=mm.MODE_CROP,
+            dlg3 = MinimapCalibDialog(mid, mode=map_const.MODE_CROP,
                                       client=StubClient(panel))
             try:
                 dlg3._on_tick()
@@ -1410,7 +1426,7 @@ def t_save_then_reopen():
             # ⑤ 写文件失败必须**说出来**：这个槽外面包着 safe_slot，而它只是
             #    `traceback.print_exc()`；正常启动走 pythonw（没有控制台）——
             #    写失败会一点痕迹都没有：人点了保存、界面什么都没说，以为存上了。
-            dlg4 = MinimapCalibDialog(mid, mode=mm.MODE_CROP,
+            dlg4 = MinimapCalibDialog(mid, mode=map_const.MODE_CROP,
                                       client=StubClient(panel))
             try:
                 dlg4._on_tick()
@@ -1469,7 +1485,7 @@ def t_calib_save_drops_stale_scale_y():
                               ensure_ascii=False, indent=2), encoding="utf-8")
     try:
         with mock.patch.object(mapdata, "calib_path", lambda _m: tmp):
-            dlg = MinimapCalibDialog(mid, mode=mm.MODE_FIT, src="stream",
+            dlg = MinimapCalibDialog(mid, mode=map_const.MODE_FIT, src="stream",
                                      client=StubClient(None))
             try:
                 check(dlg._src_loaded == "two_point", "前提不成立：读入的该是双点标定")
@@ -1575,7 +1591,7 @@ def t_live_source_region():
 
     # 5) 标定弹窗直接吃这个来源（一行都不用改）：量出来的换算要和框选的位置一致
     stub = LiveFrameRegionClient(lp, [rx, ry, w, h])
-    dlg = MinimapCalibDialog(mid, mode=mm.MODE_CROP, client=stub)
+    dlg = MinimapCalibDialog(mid, mode=map_const.MODE_CROP, client=stub)
     try:
         dlg._on_tick()
         check(dlg._frame is not None, "弹窗没从实时画面拿到那块图")
@@ -1584,7 +1600,7 @@ def t_live_source_region():
         dlg._locate_now()
         check(dlg.score > 0.9,
               "从实时画面来的那块定位失败（匹配分 %.3f）" % dlg.score)
-        got = mm.panel_to_canvas(0, 0, dlg.calib())
+        got = map_calib.panel_to_canvas(0, 0, dlg.calib())
         # ⚠ 亚像素（见 `t_crop_roundtrip` 那条说明）⇒ 容差半个底图像素 ✓
         check(abs(got[0] - x) <= 0.5 and abs(got[1] - y) <= 0.5,
               "弹窗量出来的换算偏了：面板左上 → 底图 %s，应该是 (%d, %d)±0.5"
@@ -1934,6 +1950,7 @@ def t_two_point_solve():
       ⇒ 残差恒为 0，**不能**拿它当自查 ✗。真正的自查是"两轴一致性"（游戏等比缩放，
       `sx` 与 `sy` 本该几乎相等），残差只在**按等比再拟合一次**时才有意义。
     """
+    from perception import map_overlay
     mid, canvas = pick_map()
     if mid is None:
         print("      （没有可用的底图，跳过）")
@@ -1942,27 +1959,27 @@ def t_two_point_solve():
     cw, ch = canvas.shape[1], canvas.shape[0]
 
     # ① 老文件兼容：没有 `scale_y` ⇒ 两轴相同（这是新老两个方向都不炸的关键）
-    check(mm.scales_of({"scale": 1.874}) == (1.874, 1.874),
-          "老标定（只有 scale）读出来不是两轴相同：%s" % (mm.scales_of({"scale": 1.874}),))
-    check(mm.scales_of({"scale": 1.874, "scale_y": 1.9}) == (1.874, 1.9),
-          "两轴不同的标定读错了：%s" % (mm.scales_of({"scale": 1.874, "scale_y": 1.9}),))
-    check(mm.scales_of({"scale": "写坏了", "scale_y": "也坏了"}) == (1.0, 1.0),
-          "坏值没兜住：%s" % (mm.scales_of({"scale": "写坏了", "scale_y": "也坏了"}),))
-    check("scale_y" not in mm.with_scales({"scale": 2.0, "scale_y": 2.5}, 2.0, 2.0),
+    check(map_calib.scales_of({"scale": 1.874}) == (1.874, 1.874),
+          "老标定（只有 scale）读出来不是两轴相同：%s" % (map_calib.scales_of({"scale": 1.874}),))
+    check(map_calib.scales_of({"scale": 1.874, "scale_y": 1.9}) == (1.874, 1.9),
+          "两轴不同的标定读错了：%s" % (map_calib.scales_of({"scale": 1.874, "scale_y": 1.9}),))
+    check(map_calib.scales_of({"scale": "写坏了", "scale_y": "也坏了"}) == (1.0, 1.0),
+          "坏值没兜住：%s" % (map_calib.scales_of({"scale": "写坏了", "scale_y": "也坏了"}),))
+    check("scale_y" not in map_calib.with_scales({"scale": 2.0, "scale_y": 2.5}, 2.0, 2.0),
           "两轴相同时不该留 `scale_y`（老文件里就没这个键）")
-    check(mm.with_scales({}, 2.0, 2.5).get("scale_y") == 2.5,
-          "两轴不同时没把 y 轴存进去：%s" % (mm.with_scales({}, 2.0, 2.5),))
+    check(map_calib.with_scales({}, 2.0, 2.5).get("scale_y") == 2.5,
+          "两轴不同时没把 y 轴存进去：%s" % (map_calib.with_scales({}, 2.0, 2.5),))
 
     # ② 两轴各自的换算：造一块**非等比**面板，来回一趟必须对得上
     sx, sy, ox, oy = 1.874, 1.9, 6.0, 72.0
-    cal_xy = {"mode": mm.MODE_FIT, "scale": sx, "scale_y": sy, "offset": [ox, oy]}
+    cal_xy = {"mode": map_const.MODE_FIT, "scale": sx, "scale_y": sy, "offset": [ox, oy]}
     for c in ((0.0, 0.0), (10.0, 20.0), (cw - 1.0, ch - 1.0)):
         p = (c[0] * sx + ox, c[1] * sy + oy)
-        got = mm.panel_to_canvas(p[0], p[1], cal_xy)
+        got = map_calib.panel_to_canvas(p[0], p[1], cal_xy)
         check(abs(got[0] - c[0]) < 1e-6 and abs(got[1] - c[1]) < 1e-6,
               "两轴各自的换算来回不一致：底图 %s → 面板 %s → 底图 %s" % (c, p, got))
-    cal_1 = {"mode": mm.MODE_FIT, "scale": sx, "offset": [ox, oy]}      # 老文件（等比）
-    one = mm.panel_to_canvas(c[0] * sx + ox, c[1] * sx + oy, cal_1)
+    cal_1 = {"mode": map_const.MODE_FIT, "scale": sx, "offset": [ox, oy]}      # 老文件（等比）
+    one = map_calib.panel_to_canvas(c[0] * sx + ox, c[1] * sx + oy, cal_1)
     check(abs(one[1] - c[1]) < 1e-6,
           "老文件（只有 scale）的 y 轴没走同一个值：%s" % (one,))
 
@@ -1970,7 +1987,7 @@ def t_two_point_solve():
     cA, cB = (5.0, 4.0), (float(cw - 6), float(ch - 5))
     pA = (cA[0] * sx + ox, cA[1] * sy + oy)
     pB = (cB[0] * sx + ox, cB[1] * sy + oy)
-    r = mm.solve_two_point(cA, pA, cB, pB)
+    r = map_calib.solve_two_point(cA, pA, cB, pB)
     check(r["ok"], "两点解没成：%s" % (r.get("why"),))
     check(abs(r["scale"] - sx) < 1e-9 and abs(r["scale_y"] - sy) < 1e-9,
           "两轴缩放没复原：(%.4f, %.4f)，该 (%.4f, %.4f)"
@@ -1981,7 +1998,7 @@ def t_two_point_solve():
           "两轴差 1.39%% 却没报出来（这就是用户要的那个提示）：%s" % r["axis_gap_pct"])
 
     # ④ 等比时：两轴一致、等比拟合残差≈0（反过来证明"残差"这条路没坏）
-    r2 = mm.solve_two_point(cA, (cA[0] * 2.0 + 3, cA[1] * 2.0 + 4),
+    r2 = map_calib.solve_two_point(cA, (cA[0] * 2.0 + 3, cA[1] * 2.0 + 4),
                             cB, (cB[0] * 2.0 + 3, cB[1] * 2.0 + 4))
     check(r2["axis_gap_pct"] < 1e-9 and r2["resid_px"] < 1e-6,
           "等比的两点却报了不一致/残差：gap=%.6f%% resid=%.6f px"
@@ -1995,7 +2012,7 @@ def t_two_point_solve():
         (cA, pA, cB, (pA[0], pA[1]), "负"),          # 面板两点对调 ⇒ 缩放成负的
     )
     for d1, d2, d3, d4, tag in degen:
-        rd = mm.solve_two_point(d1, d2, d3, d4)
+        rd = map_calib.solve_two_point(d1, d2, d3, d4)
         check(not rd["ok"] and rd["why"],
               "退化输入（%s）没被拦住：%s" % (tag, rd))
         check(tag in rd["why"] or "负" in rd["why"],
@@ -2003,7 +2020,7 @@ def t_two_point_solve():
 
     # ⑥ 读点抖 ±1 像素：**两点取得越远越准**（这条钉住"为什么让你取最远的两点"）
     def _err(pt_c, pt_p):
-        rr = mm.solve_two_point((10.0, 10.0), (10.0 * sx + ox, 10.0 * sy + oy),
+        rr = map_calib.solve_two_point((10.0, 10.0), (10.0 * sx + ox, 10.0 * sy + oy),
                                 pt_c, pt_p)
         return abs(rr["scale"] - sx)
     near_c = (30.0, 25.0)
@@ -2017,23 +2034,23 @@ def t_two_point_solve():
     # ⑦ 折算（叠图画到实时画面）两轴都要折：y 轴不同 ⇒ 高度跟着变、宽度不动
     crop = (6, 72, cw, ch + 8)
     panel_wh = (int(round(cw * sx)), int(round(ch * sy)))
-    _s1, d_1 = mm.frame_overlay_rects(cal_1, crop, (cw, ch), calib_panel=panel_wh)
-    _s2, d_2 = mm.frame_overlay_rects(cal_xy, crop, (cw, ch), calib_panel=panel_wh)
+    _s1, d_1 = map_overlay.frame_overlay_rects(cal_1, crop, (cw, ch), calib_panel=panel_wh)
+    _s2, d_2 = map_overlay.frame_overlay_rects(cal_xy, crop, (cw, ch), calib_panel=panel_wh)
     check(d_2[2] == d_1[2] and d_2[3] > d_1[3],
           "折算没按两轴走：等比 %s / 非等比 %s（x 该一样、y 该更大）" % (d_1, d_2))
 
     # ⑧ 写回标定：两种显示方式都要能"解出来 → 存进去 → 换算回来"对得上
     #    （crop 的 `offset` 是那套约定里的 inset，`view` 才装截距 —— 写错就是整体平移
     #     几十世界像素，而看着"差不多对" ✗）
-    base_fit = {"mode": mm.MODE_FIT, "alpha": 35, "ref": "canvas", "score": 0.73,
+    base_fit = {"mode": map_const.MODE_FIT, "alpha": 35, "ref": "canvas", "score": 0.73,
                 "world_offset": [7, 28]}
-    for mode in (mm.MODE_FIT, mm.MODE_CROP):
+    for mode in (map_const.MODE_FIT, map_const.MODE_CROP):
         base = dict(base_fit, mode=mode)
-        saved = mm.calib_from_two_point(base, r, inset=4)
+        saved = map_calib.calib_from_two_point(base, r, inset=4)
         check(saved["src"] == "two_point" and "score" not in saved,
               "写回的标定没标成两点来的/还留着旧的匹配分：%s" % saved)
         check(abs(saved["scale"] - sx) < 1e-9
-              and abs(mm.scales_of(saved)[1] - sy) < 1e-9,
+              and abs(map_calib.scales_of(saved)[1] - sy) < 1e-9,
               "两轴缩放没写进去：%s" % saved)
         check(saved.get("alpha") == 35 and saved.get("ref") == "canvas",
               "写回时把别的东西弄丢了：%s" % saved)
@@ -2044,9 +2061,9 @@ def t_two_point_solve():
               "重新量几何时把老的「坐标系偏移」带过去了（凭空偏几十世界像素 ✗）：%s" % saved)
         # 解出来的几何 → 存进这套写法 → 用 panel_to_canvas 换算回来，必须还是那 4 个点
         for c, p in ((cA, pA), (cB, pB)):
-            got = mm.panel_to_canvas(p[0], p[1], saved)
+            got = map_calib.panel_to_canvas(p[0], p[1], saved)
             # crop 下 `view` 取整了 ⇒ 容差 1 底图像素（fit 下应当精确）
-            tol = 1e-6 if mode == mm.MODE_FIT else 1.0
+            tol = 1e-6 if mode == map_const.MODE_FIT else 1.0
             check(abs(got[0] - c[0]) <= tol and abs(got[1] - c[1]) <= tol,
                   "%s 写回后换算对不上：底图 %s → 面板 %s → 底图 %s（容差 %s）"
                   % (mode, c, p, got, tol))
@@ -2062,18 +2079,18 @@ def t_two_point_solve():
     off_true = (7.0, 28.0)                   # 现存标定里的 world_offset
     cc_dot = t.world_to_canvas(w[0] - off_true[0], w[1] - off_true[1])   # 黄点画在哪
     pp_dot = (cc_dot[0] * sx + ox, cc_dot[1] * sy + oy)
-    adv = mm.world_offset_advice([(pp_dot, w)], cal_xy, off_true, t)
+    adv = map_calib.world_offset_advice([(pp_dot, w)], cal_xy, off_true, t)
     check(adv["ok"], "偏移核对没成：%s" % (adv.get("why"),))
     check(adv["suggest"] == (7, 28),
           "按黄点采样反推的偏移不对：%s，该 (7, 28)" % (adv["suggest"],))
     check(adv["delta"] == (0, 0) and adv["spread"] < 1e-6,
           "和现存值一致时却报了差额/不一致：delta=%s spread=%.6f"
           % (adv["delta"], adv["spread"]))
-    adv2 = mm.world_offset_advice([(pp_dot, w)], cal_xy, (17, 5), t)
+    adv2 = map_calib.world_offset_advice([(pp_dot, w)], cal_xy, (17, 5), t)
     check(adv2["delta"] == (-10, 23),
           "和现存值不一致时没算出该改多少：delta=%s，该 (-10, 23)" % (adv2["delta"],))
     # 两次采样互相矛盾 ⇒ spread 要摆出来（**不设**阈值，数字说话）
-    adv3 = mm.world_offset_advice([(pp_dot, w), (pp_dot, (w[0] + 80, w[1]))],
+    adv3 = map_calib.world_offset_advice([(pp_dot, w), (pp_dot, (w[0] + 80, w[1]))],
                                   cal_xy, off_true, t)
     check(adv3["ok"] and abs(adv3["spread"] - 80.0) < 1e-6,
           "两次采样差 80 世界像素却没报 spread：%s" % (adv3.get("spread"),))
@@ -2081,11 +2098,11 @@ def t_two_point_solve():
     # 去算，结果必然 ≈ 0 —— 以后谁想"顺手用平台角量偏移"会在这儿看到为什么不行 ✓
     cc_lm = t.world_to_canvas(w[0], w[1])                # 地标在底图上的真位置
     pp_lm = (cc_lm[0] * sx + ox, cc_lm[1] * sy + oy)
-    adv4 = mm.world_offset_advice([(pp_lm, w)], cal_xy, off_true, t)
+    adv4 = map_calib.world_offset_advice([(pp_lm, w)], cal_xy, off_true, t)
     check(adv4["ok"] and adv4["suggest"] == (0, 0) and adv4["delta"] == (-7, -28),
           "用平台角算偏移本该恒得 (0,0)（它不含偏移信息）：%s" % (adv4["suggest"],))
     # 什么都没填 ⇒ 老实说"没可核对的"，不许编
-    adv5 = mm.world_offset_advice([(pp_dot, None)], cal_xy, off_true, t)
+    adv5 = map_calib.world_offset_advice([(pp_dot, None)], cal_xy, off_true, t)
     check(not adv5["ok"] and adv5["suggest"] is None,
           "没给世界坐标却编了个建议值：%s" % (adv5,))
 
@@ -2099,7 +2116,7 @@ def t_two_point_dialog():
       · 「实时」= 黄点的**下沿（脚底）**，按钮自动认，不用手描。
     这条钉的就是这些（核心算法本身由 `t_two_point_solve` 钉）：
       ① 界面对不对（两行四格 + 两个按钮 + 下拉默认世界坐标）；
-      ② **脚底口径**（`mm.dot_feet` = 外接矩形下沿，不是重心）—— 口径漂了整份标定会抬高
+      ② **脚底口径**（`map_dot.dot_feet` = 外接矩形下沿，不是重心）—— 口径漂了整份标定会抬高
          半个点，叠图和读数一起偏，最难查；且**采样与读数必须是同一个口径**（见
          `t_two_point_readout_roundtrip`）；
       ③ 认黄点填进**那一行**；认不出 ⇒ **不瞎填** + 说清原因；
@@ -2108,6 +2125,7 @@ def t_two_point_dialog():
       ⑥ 离线按「世界坐标」填 ⇒ 换算后解出来的几何与按像素一致，且结果里写明换算过。
     ⚠ 实时画面用假 client（不连网络）；底图/地形用真文件 ✓；配置与标定全 mock ✓。
     """
+    from perception import map_dot
     import unittest.mock as mock
 
     from PyQt5.QtCore import QPoint
@@ -2139,7 +2157,7 @@ def t_two_point_dialog():
             pass
 
     box = {}
-    cal_in = {"mode": mm.MODE_FIT, "scale": 1.0, "offset": [0, 0], "view": [0, 0],
+    cal_in = {"mode": map_const.MODE_FIT, "scale": 1.0, "offset": [0, 0], "view": [0, 0],
               "alpha": 22, "score": 0.4, "ref": "canvas", "world_offset": [7, 28]}
 
     def _save(_m, c, src=None):
@@ -2153,8 +2171,8 @@ def t_two_point_dialog():
     with mock.patch.object(mapdata, "load_calib", lambda _m, src=None: dict(cal_in)), \
          mock.patch.object(mapdata, "save_calib", _save):
         cli = _Cli(np.zeros((ch + 8, cw, 3), np.uint8))
-        dlg = TwoPointCalibDialog(mid, src=mm.SRC_STREAM, client=cli,
-                                  mode=mm.MODE_FIT)
+        dlg = TwoPointCalibDialog(mid, src=map_const.SRC_STREAM, client=cli,
+                                  mode=map_const.MODE_FIT)
         try:
             # ① 界面对了：两行四格 + 两行各一个按钮 + 下拉默认世界坐标
             check(all(k in dlg._sp for k in (("A", "off"), ("A", "live"),
@@ -2174,11 +2192,11 @@ def t_two_point_dialog():
             #    ⚠ 下沿是**亚像素**的"下边缘"（h=6 的点占 88..93 行 ⇒ 重心 91 + 2.5 =
             #      93.5）—— 取整那条口径 2026-09-27 已删（它让读数一格一格跳 8.55 世界
             #      单位，用户报"同一个位置差 9"就是这个）。采样框是整数，调用方取整 ✓。
-            check(mm.dot_feet({"x": 61.0, "y": 91.0, "h": 6}) == (61.0, 93.5),
+            check(map_dot.dot_feet({"x": 61.0, "y": 91.0, "h": 6}) == (61.0, 93.5),
                   "黄点脚底算错了：%s（该 (61.0, 93.5)）"
-                  % (mm.dot_feet({"x": 61.0, "y": 91.0, "h": 6}),))
+                  % (map_dot.dot_feet({"x": 61.0, "y": 91.0, "h": 6}),))
             _src2p = (ROOT / "gui" / "two_point_calib.py").read_text(encoding="utf-8")
-            check("def dot_feet" not in _src2p and "mm.dot_feet" in _src2p,
+            check("def dot_feet" not in _src2p and "map_dot.dot_feet" in _src2p,
                   "弹窗自己又写了一份 dot_feet —— 口径分叉（采样和读数各算一套）")
 
             # ③ 认黄点：填进**这一行**的实时两格（此时没"算一算"⇒ 用文件里那份标定）
@@ -2232,7 +2250,7 @@ def t_two_point_dialog():
             check(dlg._result and abs(dlg._result["scale_y"] - sx) < 0.05,
                   "解出来的 y 轴缩放偏太多：%s" % (dlg._result or {}).get("scale_y"))
             dlg._on_save()
-            check(dlg.saved and box.get("src") == mm.SRC_STREAM,
+            check(dlg.saved and box.get("src") == map_const.SRC_STREAM,
                   "没写进当前来源：%s" % (box.get("src"),))
             check(fired == [1],
                   "保存后没发 `saved_now` —— 非模态下外面就不知道「存过了」，"
@@ -2320,6 +2338,8 @@ def t_two_point_readout_roundtrip():
          这条用例得能抓住"口径又漂回重心"，不然它只是把代码复述一遍。
     ⚠ 实时画面用假 client（不连网络）；配置/标定全 mock；底图/地形用真文件 ✓。
     """
+    from perception import map_locator
+    from perception import map_dot
     import unittest.mock as mock
 
     from PyQt5.QtWidgets import QApplication
@@ -2370,7 +2390,7 @@ def t_two_point_readout_roundtrip():
             pass
 
     box = {}
-    cal_in = {"mode": mm.MODE_FIT, "scale": 1.0, "offset": [0, 0], "view": [0, 0],
+    cal_in = {"mode": map_const.MODE_FIT, "scale": 1.0, "offset": [0, 0], "view": [0, 0],
               "score": 1.0, "alpha": 55, "world_offset": [0, 0]}
 
     def _save(_m, c, src=None):
@@ -2384,8 +2404,8 @@ def t_two_point_readout_roundtrip():
 
     with mock.patch.object(mapdata, "load_calib", lambda _m, src=None: dict(cal_in)), \
          mock.patch.object(mapdata, "save_calib", _save):
-        dlg = TwoPointCalibDialog(mid, src=mm.SRC_STREAM, client=cli,
-                                  mode=mm.MODE_FIT)
+        dlg = TwoPointCalibDialog(mid, src=map_const.SRC_STREAM, client=cli,
+                                  mode=map_const.MODE_FIT)
         try:
             check(dlg._off_is_world(),
                   "离线口径默认该是世界坐标（编辑器悬停读得到的那套）")
@@ -2409,8 +2429,8 @@ def t_two_point_readout_roundtrip():
             dlg.close()
 
     # ② 站回 B：同一帧、同一个点 ⇒ 读数必须回到 B 的世界坐标
-    loc = mm.PlayerLocator(mid)
-    r = loc.update(panels["B"], src=mm.SRC_STREAM, calib=saved, terrain=t)
+    loc = map_locator.PlayerLocator(mid)
+    r = loc.update(panels["B"], src=map_const.SRC_STREAM, calib=saved, terrain=t)
     check(r["ok"], "站回 B 却定位失败：%s（黄点层：%s）" % (r["note"], r["dot"]))
     tol = t.px_per_world + 3          # 一个底图像素（黄点本身有 ±1 像素）+ 余量
     check(abs(r["world_x"] - wB[0]) <= tol and abs(r["world_y"] - wB[1]) <= tol,
@@ -2418,8 +2438,8 @@ def t_two_point_readout_roundtrip():
           % (r["world_x"], r["world_y"], wB[0], wB[1], tol))
 
     # ③ 反证：按**重心**换算就得差出 ≥ 1 个底图像素（谁把口径改回重心，这条当场红）
-    ox2, oy2 = mm.offset_of(saved)
-    cx2, cy2 = mm.panel_to_world(r["px"], r["py"], saved, t)
+    ox2, oy2 = map_calib.offset_of(saved)
+    cx2, cy2 = map_calib.panel_to_world(r["px"], r["py"], saved, t)
     d_canvas = ((cx2 + ox2 - r["world_x"]) ** 2
                 + (cy2 + oy2 - r["world_y"]) ** 2) ** 0.5
     check(d_canvas >= 1.0,
@@ -2493,7 +2513,7 @@ def t_world_reads_new_calib():
     # 那一份位置状态（`live_thread._fill_route_ctx` 写的形状 ✓）
     pos = {"at": time.monotonic(), "map_id": mid, "world_x": wx, "world_y": wy,
            "foothold_id": getattr(f0, "fid", None), "segment_id": None}
-    cfg = {"mmap_src": mm.SRC_LIVE, "mmap_crop": [0, 0, 16, 16], "mmap_draw": True}
+    cfg = {"mmap_src": map_const.SRC_LIVE, "mmap_crop": [0, 0, 16, 16], "mmap_draw": True}
     try:
         with mock.patch.object(rp, "load_live", lambda: dict(cfg)), \
              mock.patch.object(rp, "update_live", lambda **kw: cfg.update(kw)), \
@@ -2555,6 +2575,7 @@ def t_two_point_keeps_state():
          「认黄点」会一直说"还没收到画面"，而界面上没有任何迹象 ✗）；
       ③ 入口那段**不许**再出现"看不见就重建"（`not dlg.isVisible()`）—— 那正是丢数据的原因。
     """
+    from perception import map_dot
     import unittest.mock as mock
 
     from PyQt5.QtWidgets import QApplication
@@ -2586,8 +2607,8 @@ def t_two_point_keeps_state():
     with mock.patch.object(mapdata, "load_calib", lambda _m, src=None: {}), \
          mock.patch.object(mapdata, "save_calib", lambda *a, **kw: None):
         cli = _Cli()
-        dlg = TwoPointCalibDialog(mid, src=mm.SRC_STREAM, client=cli,
-                                  mode=mm.MODE_FIT)
+        dlg = TwoPointCalibDialog(mid, src=map_const.SRC_STREAM, client=cli,
+                                  mode=map_const.MODE_FIT)
         try:
             dlg._sp[("A", "off")][0].setValue(123)
             dlg._sp[("A", "off")][1].setValue(-45)
@@ -2627,7 +2648,7 @@ def t_two_point_keeps_state():
 
             dlg._own_client = True
             dlg._client_off = True
-            with mock.patch.object(mmmod, "MiniMapClient", _FakeClient):
+            with mock.patch.object(mm, "MiniMapClient", _FakeClient):
                 dlg.close()
                 dlg.show()
                 app.processEvents()
@@ -2678,8 +2699,8 @@ def t_two_point_dialog_nonmodal():
 
     mid, _canvas = pick_map()
     if mid is not None:
-        dlg = TwoPointCalibDialog(mid, src=mm.SRC_STREAM, client=_Cli(),
-                                  mode=mm.MODE_FIT)
+        dlg = TwoPointCalibDialog(mid, src=map_const.SRC_STREAM, client=_Cli(),
+                                  mode=map_const.MODE_FIT)
         try:
             check(not dlg.isModal(),
                   "双点标定窗是模态的 —— 开着它就没法操作工作台 ✗")
@@ -2709,15 +2730,16 @@ def t_overlay_on_live():
     合起来错的方式却很隐蔽：叠图偏一截（两边各写了一份公式）、或者叠图被
     烘进了帧数据（那时标定弹窗会**拿叠图和它自己匹配**，匹配分虚高）。
     """
+    from perception import map_overlay
     # ① 几何：和 panel_to_canvas **交叉验证**（不是把公式抄一遍）
     canvas_wh = (100, 50)
-    z = mm.overlay_zoom(canvas_wh[0])
-    crop = {"mode": mm.MODE_CROP, "scale": 2.0, "offset": [4, 4],
+    z = map_overlay.overlay_zoom(canvas_wh[0])
+    crop = {"mode": map_const.MODE_CROP, "scale": 2.0, "offset": [4, 4],
             "view": [10, 20]}
-    src, dst = mm.overlay_draw_rects(crop, (60, 40), canvas_wh)
+    src, dst = map_overlay.overlay_draw_rects(crop, (60, 40), canvas_wh)
     check(dst == (0, 0, 60, 40),
           "crop 的目标矩形应当是**整个面板**（画面就是底图的一块）：%s" % (dst,))
-    cx, cy = mm.panel_to_canvas(0, 0, crop)          # 面板左上 ↔ 底图哪儿
+    cx, cy = map_calib.panel_to_canvas(0, 0, crop)          # 面板左上 ↔ 底图哪儿
     check((src[0] / float(z), src[1] / float(z)) == (int(cx), int(cy)),
           "crop 的源矩形左上角（%s → 底图 %.2f, %.2f）和 panel_to_canvas 说的"
           "(%d, %d) 对不上 —— 两处公式漂了" % (src, src[0] / float(z),
@@ -2726,14 +2748,14 @@ def t_overlay_on_live():
           "crop 的源宽度不对：%s（面板 60px ÷ scale 2.0 × overlay_zoom %d）"
           % (src[2] - src[0], z))
 
-    fit = {"mode": mm.MODE_FIT, "scale": 0.5, "offset": [7, 9]}
-    src2, dst2 = mm.overlay_draw_rects(fit, (60, 40), canvas_wh)
+    fit = {"mode": map_const.MODE_FIT, "scale": 0.5, "offset": [7, 9]}
+    src2, dst2 = map_overlay.overlay_draw_rects(fit, (60, 40), canvas_wh)
     check(src2 is None, "fit 取的是**整张**叠加图（源矩形该是 None）：%s" % (src2,))
     check(dst2 == (7, 9, 50, 25),
           "fit 的目标矩形应当是 offset 起、底图×scale 大：%s" % (dst2,))
 
     # ② 画面坐标：面板在画面 (6,72) 处，目标矩形整体平移过去
-    _s3, d3 = mm.frame_overlay_rects(fit, (6, 72, 60, 40), canvas_wh)
+    _s3, d3 = map_overlay.frame_overlay_rects(fit, (6, 72, 60, 40), canvas_wh)
     check(d3 == (13, 81, 50, 25), "面板在画面里的偏移没加上：%s" % (d3,))
 
     # ③ 接线：叠图那一层在路线面板；**开关与浓淡在设置窗口**（2026-09-26 搬走 ✓）
@@ -2750,10 +2772,10 @@ def t_overlay_on_live():
           % mm.overlay_alpha_pct({"alpha": 0}))
     check(mm.overlay_alpha({"alpha": 0}) == 0.0,
           "0%% 换成 Qt 透明度时不是 0.0：%r" % mm.overlay_alpha({"alpha": 0}))
-    check(mm.overlay_alpha_pct({}) == mm.DEFAULT_ALPHA_PCT,
+    check(mm.overlay_alpha_pct({}) == map_const.DEFAULT_ALPHA_PCT,
           "没写 alpha 时的默认浓淡不对：%r" % mm.overlay_alpha_pct({}))
     check(mm.overlay_alpha_pct({"alpha": 120}) == 100
-          and mm.overlay_alpha_pct({"alpha": "写坏了"}) == mm.DEFAULT_ALPHA_PCT,
+          and mm.overlay_alpha_pct({"alpha": "写坏了"}) == map_const.DEFAULT_ALPHA_PCT,
           "越界/坏值没被兜住：%r" % mm.overlay_alpha_pct({"alpha": 120}))
     for f in (ROOT / "gui" / "route_panel.py", ROOT / "gui" / "minimap_calib.py",
               ROOT / "gui" / "settings_dialog.py"):
@@ -2776,7 +2798,7 @@ def t_overlay_on_live():
     # "路线面板说在这块平台、起点判定说不知道"这种最难查的分歧 ✗。
     for f, label in ((ROOT / "gui" / "live_thread.py", "实时线程"),
                      (ROOT / "gui" / "route_panel.py", "路线面板"),
-                     (ROOT / "perception" / "minimap.py", "定位器")):
+                     (ROOT / "perception" / "map_locator.py", "定位器")):
         check("fh_xtol" in f.read_text(encoding="utf-8"),
               "%s 里没接「脚下 foothold 的 x 容差」（fh_xtol）" % label)
     for f, label in ((ROOT / "gui" / "live_thread.py", "实时线程"),
@@ -2799,8 +2821,9 @@ def t_overlay_on_live():
     # 谁把那句"顺手改来源"写回来都算 ✗
     for _f, _label in ((ROOT / "gui" / "route_panel.py", "路线面板"),
                        (ROOT / "gui" / "settings_dialog.py", "设置窗")):
-        check("update_live(mmap_src=mm.SRC_LIVE, mmap_crop=" not in
-              _f.read_text(encoding="utf-8"),
+        _ftxt = _f.read_text(encoding="utf-8")
+        check("update_live(mmap_src=map_const.SRC_LIVE, mmap_crop=" not in _ftxt
+              and "update_live(mmap_src=mm.SRC_LIVE, mmap_crop=" not in _ftxt,
               "%s 里「框选小地图」又把来源改掉了 —— 它只该存位置" % _label)
 
     lpn = (ROOT / "gui" / "live_panel.py").read_text(encoding="utf-8")
@@ -2847,7 +2870,7 @@ def t_terrain_image_shows_zones():
     z = zones_mod.Zones(mid)
     f0 = next(f for f in t.footholds if not f.is_wall)
     z.add_set("甲平台", [str(f0.fid)])
-    col = hex_bgr(z.sets["甲平台"]["color"])
+    col = hex_bgr(z.zones["甲平台"]["color"])
 
     tmp = Path(tempfile.mkdtemp(prefix="zrender_"))
     try:
@@ -2901,6 +2924,7 @@ def t_goto_hands_over_whole_path():
     ⇒ 断言两段各造一个任务、**一次**交给 `start_route`、顺序对；
     再造一条含「跳」的 ⇒ 断言**整条不下发**、且提示里点出是第几步。
     """
+    from decision import jobs as jobmod
     import tempfile
     import time as _time
     import unittest.mock as mock
@@ -2908,7 +2932,6 @@ def t_goto_hands_over_whole_path():
     from PyQt5.QtWidgets import QApplication
     from core import zones as zones_mod
     from decision import agent as agent_mod
-    from decision import route as route_mod
     from decision.agent import settings as dsettings
     from gui.route_panel import RoutePanel
 
@@ -2938,6 +2961,7 @@ def t_goto_hands_over_whole_path():
 
         class _Fake:
             def start_route(self, jobs, why=""):
+                from decision import jobs as jobmod
                 got.append((list(jobs), why))
                 return True
 
@@ -2962,7 +2986,7 @@ def t_goto_hands_over_whole_path():
                 check(len(got) == 1 and len(got[0][0]) == 2,
                       "不是「一次交出整条」（该只调一次 start_route）：%r" % (got,))
                 jobs = got[0][0]
-                check(all(isinstance(j, route_mod.WalkJob) for j in jobs),
+                check(all(isinstance(j, jobmod.WalkJob) for j in jobs),
                       "造出来的不是走任务：%r" % (jobs,))
                 check(jobs[0].dst_set == "乙平台" and jobs[1].dst_set == "丙平台",
                       "两段顺序不对：%s / %s" % (jobs[0].dst_set, jobs[1].dst_set))
@@ -2997,7 +3021,7 @@ def t_goto_hands_over_whole_path():
                 p._fh_seen = (str(walk[0].fid), _time.monotonic())
                 p._on_goto()
                 check(got and len(got[0][0]) == 1
-                      and isinstance(got[0][0][0], route_mod.JumpJob),
+                      and isinstance(got[0][0][0], jobmod.JumpJob),
                       "「跳」边没被下发成 JumpJob（执行器 2026-09-27 已接）：%r" % (got,))
                 check("已命令" in p.lbl_goto.text(),
                       "「跳」边下发了命令却没说出来：%r" % p.lbl_goto.text())
@@ -3078,7 +3102,7 @@ def t_goto_commands_climb():
         if cl is None:
             print("      （这张图没有带绳号的「爬」边，跳过下半段）")
             return
-        fids = (zr.sets.get(cl["from"]) or {}).get("footholds") or []
+        fids = (zr.zones.get(cl["from"]) or {}).get("footholds") or []
         if not fids:
             print("      （那条爬边的起点集合里没有 foothold，跳过下半段）")
             return
@@ -3552,7 +3576,7 @@ def t_goto_picker_and_preview():
                   "预览框太小了（%.1f×%.1f）—— 平台那种扁的会变成一条发丝"
                   % (boxes[0][3], boxes[0][4]))
             from tools.map_terrain_view import image_xy
-            sp = zones_mod.set_span(t, z.sets["乙平台"]["footholds"])
+            sp = zones_mod.set_span(t, z.zones["乙平台"]["footholds"])
             ex0, ey0 = image_xy(t, sp[0], sp[2])
             ex1, ey1 = image_xy(t, sp[1], sp[3])
             # 比**中心**：扁平台的框会被补到最少 8px（中心不变），比左上角会差那 4px
@@ -3641,9 +3665,9 @@ def t_settings_overlay_takes_effect():
     p.live_panel = live
     p.project = _Proj(mid)
     # 假配置 + 假标定：真 live.yaml / 真标定文件**一个字节都不碰** ✓（自检不许改用户配置）
-    cfg = {"mmap_src": mm.SRC_LIVE, "mmap_draw": False,
+    cfg = {"mmap_src": map_const.SRC_LIVE, "mmap_draw": False,
            "mmap_crop": [0, 0, int(canvas.shape[1]), int(canvas.shape[0])]}
-    cal = {"mode": mm.MODE_FIT, "scale": 1.0, "offset": [0, 0], "view": [0, 0],
+    cal = {"mode": map_const.MODE_FIT, "scale": 1.0, "offset": [0, 0], "view": [0, 0],
            "score": 1.0, "alpha": 55}
     with mock.patch.object(rp, "load_live", lambda: dict(cfg)), \
          mock.patch.object(rp, "update_live", lambda **kw: cfg.update(kw)), \
@@ -3741,8 +3765,8 @@ def t_route_panel_mmap_crop():
     # 裁出来那块应当和底图对得上（匹配分 ≈ 1.0）✓
     panel = synth_fit_panel(canvas, 1.0, 0, 0, pad=0)
     crop = [0, 0, cw, ch]
-    cfg = {"mmap_src": mm.SRC_STREAM, "mmap_draw": True, "mmap_crop": None}
-    cal = {"mode": mm.MODE_FIT, "scale": 1.0, "offset": [0, 0], "view": [0, 0],
+    cfg = {"mmap_src": map_const.SRC_STREAM, "mmap_draw": True, "mmap_crop": None}
+    cal = {"mode": map_const.MODE_FIT, "scale": 1.0, "offset": [0, 0], "view": [0, 0],
            "score": 1.0, "alpha": 55}
     proj = _Proj(mid)                      # 本项目**还没框过**
 
@@ -3819,7 +3843,7 @@ def t_route_panel_mmap_crop():
             check(cfg.get("mmap_crop") is None,
                   "框选又去写 config/live.yaml 了（那正是「换项目就错」的来源 ✗）：%s"
                   % cfg.get("mmap_crop"))
-            check(cfg.get("mmap_src") == mm.SRC_STREAM,
+            check(cfg.get("mmap_src") == map_const.SRC_STREAM,
                   "框选顺手把**来源**改掉了 —— 它只该存位置：%s" % cfg.get("mmap_src"))
             note = p.lbl_crop_note.text()
             check("已框选" in note and "匹配分" in note, "没当场报匹配分：%r" % note)
@@ -3895,7 +3919,7 @@ def t_overlay_waits_first_frame():
     SU = 1.874                                   # 现场标定里的 scale
     panel_cal = (int(round(cw * SU)), int(round(ch * SU)))   # 标定当时那块收流面板
     crop = (6, 72, cw, ch + 8)                   # 现场 mmap_crop 的形状（折算只看宽）
-    cal = {"mode": mm.MODE_FIT, "scale": SU, "offset": [0, 0], "view": [0, 0],
+    cal = {"mode": map_const.MODE_FIT, "scale": SU, "offset": [0, 0], "view": [0, 0],
            "score": 0.7272, "alpha": 35}         # 现场那份（**没有 `panel` 字段**）
 
     app = QApplication.instance() or QApplication([])
@@ -3938,7 +3962,7 @@ def t_overlay_waits_first_frame():
     p = RoutePanel()
     p.live_panel = live
     p.project = _Proj(mid)
-    cfg = {"mmap_src": mm.SRC_STREAM, "mmap_draw": True, "mmap_crop": list(crop)}
+    cfg = {"mmap_src": map_const.SRC_STREAM, "mmap_draw": True, "mmap_crop": list(crop)}
     try:
         with mock.patch.object(rp, "load_live", lambda: dict(cfg)), \
              mock.patch.object(mapdata, "load_calib", lambda _m, src=None: dict(cal)):
@@ -3963,14 +3987,14 @@ def t_overlay_waits_first_frame():
                   "画上了但没折算到面板框：%s（该约 %dx%d）" % (r, cw, ch))
             check(r[2] < int(crop[2]) * 1.2, "叠图比面板框还大 —— 折算没生效：%s" % (r,))
             # ③ 来源=从实时画面：那块面板就是框出来的这一块 ⇒ 不许被这条拦住
-            cfg["mmap_src"] = mm.SRC_LIVE
+            cfg["mmap_src"] = map_const.SRC_LIVE
             cal["scale"] = 1.0
             live.ov = None
             p._refresh_overlay()
             check(live.ov is not None,
                   "来源=「从实时画面」时被「等收流第一帧」拦住了（它压根不用收流）")
             # ④ 标定**真**不对（现场踩过：A 机 zoom=3 的帧上拟合出 scale=5.63）⇒ 要说明白
-            cfg["mmap_src"] = mm.SRC_STREAM
+            cfg["mmap_src"] = map_const.SRC_STREAM
             cfg["mmap_crop"] = [6, 72, 60, 40]
             cal["scale"] = 5.63
             live.ov = None
@@ -4065,9 +4089,10 @@ def t_dot_yellow_found():
     颜色用**实测中心色 BGR(65,243,245)**，不是纯黄 (0,255,255) —— 压缩/抗锯齿
     会把纯黄渗成这个样子，按纯色卡阈值就找不到（这是实测踩到的）。
     """
+    from perception import map_dot
     p = _dot_panel()
     p[50:56, 40:46] = (65, 243, 245)
-    r = mm.find_player_dot(p)
+    r = map_dot.find_player_dot(p)
     check(r["ok"], "6×6 的亮黄点没找到：%s" % r["reason"])
     check(abs(r["x"] - 42.5) <= 1.5 and abs(r["y"] - 52.5) <= 1.5,
           "点找出来了但位置偏了：(%.1f, %.1f)，应约 (42.5, 52.5)"
@@ -4080,9 +4105,10 @@ def t_dot_yellow_found():
 
 def t_dot_cyan_fallback():
     """无素材时客户端画的是 5×5 **青色**方块 —— 那也是玩家，同样要认。"""
+    from perception import map_dot
     p = _dot_panel()
     p[30:35, 20:25] = (255, 255, 0)          # BGR：青
-    r = mm.find_player_dot(p)
+    r = map_dot.find_player_dot(p)
     check(r["ok"], "青色兜底点没找到：%s" % r["reason"])
     check(abs(r["x"] - 22.0) <= 1.5 and abs(r["y"] - 32.0) <= 1.5,
           "青色点位置偏了：(%.1f, %.1f)" % (r["x"], r["y"]))
@@ -4093,9 +4119,10 @@ def t_dot_reject_npc():
 
     认错的后果不是"少一帧"，而是"以为自己在别处"，寻路会朝错的方向走。
     """
+    from perception import map_dot
     p = _dot_panel()
     p[30:36, 20:26] = (243, 216, 132)        # BGR：npc 蓝
-    r = mm.find_player_dot(p)
+    r = map_dot.find_player_dot(p)
     check(not r["ok"], "把 NPC/portal 的蓝点认成玩家了：(%.1f, %.1f)"
           % (r["x"], r["y"]))
 
@@ -4107,13 +4134,14 @@ def t_dot_flood_says_unusable():
     2000~7000 像素 / 87~110 块。这时候给一个"最像的块"，下游会当成"我在哪块
     平台上" —— 比认不出糟得多。
     """
+    from perception import map_dot
     p = _dot_panel()
     rng = np.random.default_rng(3)
     for _ in range(60):                      # 撒一把 4×4 亮黄碎块
         x = int(rng.integers(5, 125))
         y = int(rng.integers(5, 100))
         p[y:y + 4, x:x + 4] = (60, 240, 245)
-    r = mm.find_player_dot(p)
+    r = map_dot.find_player_dot(p)
     check(r["flood"], "命中这么多亮黄块，却没报「颜色层不可用」")
     check(not r["ok"], "颜色层不可用还给了一个位置（%.1f, %.1f）—— 下游会当真"
           % (r["x"], r["y"]))
@@ -4127,6 +4155,7 @@ def t_dot_basemap_layer():
     排序是"越大越像"，底图那些（放大后更大的）块会排在玩家点前面 —— 于是位置
     是错的。底图相减把"底图上本来就黄的地方"减掉，只剩下玩家标记。
     """
+    from perception import map_dot
     class _T:                                # 只用到 .canvas，做个替身就够
         canvas = None
 
@@ -4140,17 +4169,17 @@ def t_dot_basemap_layer():
     panel = cv2.resize(canvas, (60 * scale, 44 * scale),
                        interpolation=cv2.INTER_NEAREST)
     panel[100:106, 140:146] = (65, 243, 245)     # 玩家点（底图里没有这块）
-    calib = {"mode": mm.MODE_FIT, "scale": float(scale), "offset": [0, 0],
+    calib = {"mode": map_const.MODE_FIT, "scale": float(scale), "offset": [0, 0],
              "score": 1.0}
     t = _T()
     t.canvas = canvas
 
-    r0 = mm.find_player_dot(panel)                # 不给底图 → 颜色层被淹
+    r0 = map_dot.find_player_dot(panel)                # 不给底图 → 颜色层被淹
     check(r0["flood"], "底图那堆黄块没把颜色层淹掉？mask=%s" % r0["mask_px"])
     check(not (r0["ok"] and abs(r0["x"] - 143) <= 2 and abs(r0["y"] - 103) <= 2),
           "颜色层直接给出了玩家点？那这一层就没必要了（%s）" % r0["reason"])
 
-    r = mm.find_player_dot(panel, calib=calib, terrain=t)
+    r = map_dot.find_player_dot(panel, calib=calib, terrain=t)
     check(r["ok"], "有底图相减还找不到玩家点：%s" % r["reason"])
     check(r["layer"] == "basemap",
           "没走底图相减层（layer=%s）—— 那就还是被底图黄块带偏了" % r["layer"])
@@ -4163,9 +4192,11 @@ def t_dot_hold_last_on_miss():
     """漏检时**沿用上一帧位置**（同怪物防抖的幽灵框），超过窗口才老实认不出。
 
     用户要的就是这个：认不出黄点就取上一帧 —— 否则读数一秒里闪好几次"认不出"，
-    而且寻路白丢一小段惯性。口径照 `perception/tracker.py` 的 `debounce_ms`。
+    而且寻路白丢一小段惯性。口径照 `perception/track/tracker.py` 的 `debounce_ms`。
     """
-    tr = mm.PlayerDotTracker(hold_ms=400)
+    from perception import map_locator
+    from perception import map_dot
+    tr = map_locator.PlayerDotTracker(hold_ms=400)
     p1 = _dot_panel()
     p1[50:56, 40:46] = (65, 243, 245)
     r1 = tr.update(p1, now=100.0)
@@ -4201,7 +4232,9 @@ def t_dot_roi_search_local():
     快：按**搜索区尺寸**量（收流那条来源的面板 753×612，全图掩码+连通域每拍
     要几毫秒，缩到 37×37 基本免费）。
     """
-    tr = mm.PlayerDotTracker()
+    from perception import map_locator
+    from perception import map_dot
+    tr = map_locator.PlayerDotTracker()
     p1 = _dot_panel()
     p1[50:56, 40:46] = (65, 243, 245)
     r1 = tr.update(p1, now=1.0)
@@ -4217,7 +4250,7 @@ def t_dot_roi_search_local():
             continue
         noisy[y:y + 4, x:x + 4] = (60, 240, 245)
     noisy[50:56, 44:50] = (65, 243, 245)
-    check(not mm.find_player_dot(noisy)["ok"],
+    check(not map_dot.find_player_dot(noisy)["ok"],
           "没有先验时该拒绝（满屏碎块 = 颜色层不可用），这条前提不对")
 
     r2 = tr.update(noisy, now=1.04)
@@ -4226,8 +4259,8 @@ def t_dot_roi_search_local():
           "跟到的位置不对：(%.1f, %.1f)，期望约 %s" % (r2["x"], r2["y"], dot))
     roi = tr.last_roi
     check(roi is not None, "没走局部搜索这条便宜路")
-    check(roi[2] - roi[0] <= 2 * mm.DOT_ROI_PAD + 2
-          and roi[3] - roi[1] <= 2 * mm.DOT_ROI_PAD + 2,
+    check(roi[2] - roi[0] <= 2 * map_dot.DOT_ROI_PAD + 2
+          and roi[3] - roi[1] <= 2 * map_dot.DOT_ROI_PAD + 2,
           "搜索区太大（%s）—— 那就没省下什么" % (roi,))
 
 
@@ -4242,15 +4275,16 @@ def t_dot_flood_scale_invariant():
     结论 —— 小面板上 400 像素 = 2.7%（放行），大面板上 400 像素 = 0.09%（等于
     没管）。表现是"换一条来源，同一张图的判据就变了"。
     """
+    from perception import map_dot
     # ① 干净：一个小面板 13 像素的点、一个大面板 411 像素的点，都不该算被淹
     small = _dot_panel()
     small[50:56, 40:46] = (65, 243, 245)
-    r = mm.find_player_dot(small)
+    r = map_dot.find_player_dot(small)
     check(r["ok"] and not r["flood"], "小面板上正常的点被判被淹：%s" % r["reason"])
 
     big = _dot_panel(w=753, h=612)
     big[380:404, 230:258] = (99, 255, 255)       # 28×24 = 411 像素（实测值）
-    r = mm.find_player_dot(big)
+    r = map_dot.find_player_dot(big)
     check(r["ok"] and not r["flood"],
           "大面板上 0.09%% 的点被判被淹（成片 %s）：%s" % (r["dense_px"], r["reason"]))
     check(r["candidates"] == 1, "大面板候选数不对：%d" % r["candidates"])
@@ -4263,7 +4297,7 @@ def t_dot_flood_scale_invariant():
     for i in range(9):
         x, y = 40 + (i % 3) * 60, 40 + (i // 3) * 60
         big2[y:y + 32, x:x + 32] = (60, 240, 245)
-    rs, rb = mm.find_player_dot(small2), mm.find_player_dot(big2)
+    rs, rb = map_dot.find_player_dot(small2), map_dot.find_player_dot(big2)
     check(rs["flood"], "小面板 2%% 的成片量没判被淹（成片 %s / 阈值应约 %d）"
           % (rs["dense_px"], int(0.01 * 134 * 109)))
     check(rb["flood"], "大面板 2%% 的成片量没判被淹（成片 %s）" % rb["dense_px"])
@@ -4277,7 +4311,9 @@ def t_dot_tracker_confirm_and_jump():
     单帧亮斑屏幕上到处都是，只有"连续两拍都在附近"才当玩家 —— 这是把误检
     挡在定位外面的最后一道。
     """
-    tr = mm.PlayerDotTracker()
+    from perception import map_locator
+    from perception import map_dot
+    tr = map_locator.PlayerDotTracker()
     p1 = _dot_panel()
     p1[50:56, 40:46] = (65, 243, 245)
     r1 = tr.update(p1)
@@ -4311,30 +4347,31 @@ def t_dot_player_like_and_lock():
         ⚠ 尺寸那项**两侧不对称**（比预期**小**的罚得重 ✓ —— 队友小标记就在那一侧 ✓）；
       · 挑点 = 那个分 − 距离惩罚；**还贴着上一拍那个点**再加一点滞后分 ✓（不轻易换 ✓）。
     """
+    from perception import map_dot
     pw = 240.0
     big = {"x": 100.0, "y": 50.0, "w": 8, "h": 8, "area": 64, "fill": 1.0}
     small = {"x": 106.0, "y": 50.0, "w": 3, "h": 3, "area": 9, "fill": 1.0}
     strip = {"x": 100.0, "y": 60.0, "w": 12, "h": 2, "area": 20, "fill": 0.83}
     hole = {"x": 100.0, "y": 70.0, "w": 10, "h": 10, "area": 20, "fill": 0.2}
-    sb = mm.dot_player_like(big, pw)
-    ss = mm.dot_player_like(small, pw)
+    sb = map_dot.dot_player_like(big, pw)
+    ss = map_dot.dot_player_like(small, pw)
     check(sb > 0.8, "真正的玩家点（8×8 @ 面板宽 240）分数该接近 1：%.2f" % sb)
     check(sb > ss + 0.5,
           "**小标记**没被压下去（大 %.2f vs 小 %.2f）⇒ 就会锁错点" % (sb, ss))
-    check(mm.dot_player_like(strip, pw) < 0.05, "细长条（描边 / 地形线）不该像玩家点")
-    check(mm.dot_player_like(hole, pw) == 0.0, "低密度的空块不该像玩家点")
+    check(map_dot.dot_player_like(strip, pw) < 0.05, "细长条（描边 / 地形线）不该像玩家点")
+    check(map_dot.dot_player_like(hole, pw) == 0.0, "低密度的空块不该像玩家点")
     # 尺寸口径**跟着面板宽度缩放**：同一相对尺寸、面板宽翻倍 ⇒ 分数该一致 ✓
     #   （⚠ 别拿"大点的面板上 8×8 vs 小面板上 3×3"比 ✗ —— 那两个在"预期尺寸"的两侧，
     #     而两侧的容差是**故意不对称**的 ✓ 见 `dot_player_like` 里那段 ✓）
     _big2 = dict(big, w=16, h=16, area=256)
-    check(abs(mm.dot_player_like(big, 240.0) - mm.dot_player_like(_big2, 480.0)) < 1e-9,
+    check(abs(map_dot.dot_player_like(big, 240.0) - map_dot.dot_player_like(_big2, 480.0)) < 1e-9,
           "尺寸判据没跟着**面板宽度**缩放（换分辨率 / 换窗口就废）")
 
     # 面板里同时有"大黄点"和**紧挨着**的小黄标记，而且**上一拍锁在小标记上** ⇒ 必须纠回来 ✓
     panel = _dot_panel(w=240, h=109)
     panel[46:54, 96:104] = (65, 243, 245)          # 大黄点 8×8 ⇒ 中心 (100, 50)
     panel[47:50, 106:109] = (65, 243, 245)         # 小标记 3×3 ⇒ 中心 (107.5, 48.5)
-    r = mm.find_player_dot(panel, near=(106.0, 48.0))
+    r = map_dot.find_player_dot(panel, near=(106.0, 48.0))
     check(r["ok"], "面板里两个黄点都没找到：%s" % r["reason"])
     check(abs(r["x"] - 100.0) < 2.5 and abs(r["y"] - 50.0) < 2.5,
           "锁在**小标记**上了（挑到 (%.1f, %.1f)）——「大黄点锁定错了」就是这个"
@@ -4355,6 +4392,8 @@ def t_dot_exp_side_selfcalib():
       ③ `PlayerDotTracker` 真会攒尺子（连喂几拍 ⇒ `_exp_side` = 中位数 ✓）；
       ④ ⛔ 样本不够 ⇒ `_exp_side` 仍是 `None`（**不猜** ✓ 退回兜底 ✓）。
     """
+    from perception import map_locator
+    from perception import map_dot
     pw = 1164.0
     # ⚠⚠ 数字**全部照 `data/dot_probe/fresh_panel.png` 量出来的**（w/h/area ✓）：
     #   真点 26×24 / 320 ✓、同帧别的黄块 21×28 / 325 ✓、以及"另一种黄块" 24×15 / 209 ✓。
@@ -4366,22 +4405,22 @@ def t_dot_exp_side_selfcalib():
     real = {"x": 100.0, "y": 100.0, "w": 24, "h": 26, "area": 320, "fill": 1.0}
     other = {"x": 300.0, "y": 100.0, "w": 21, "h": 28, "area": 325, "fill": 1.0}
     tiny = {"x": 150.0, "y": 100.0, "w": 5, "h": 5, "area": 25, "fill": 1.0}      # 队友那个小标记
-    _r0 = mm.dot_player_like(real, pw)
+    _r0 = map_dot.dot_player_like(real, pw)
     check(_r0 < 0.35,
           "① 用例前提：比例口径下真点分数**本来就低**（现场实测 0.25 档）：%.3f" % _r0)
-    _r1 = mm.dot_player_like(real, pw, 25.0)
-    _t1 = mm.dot_player_like(tiny, pw, 25.0)
+    _r1 = map_dot.dot_player_like(real, pw, 25.0)
+    _t1 = map_dot.dot_player_like(tiny, pw, 25.0)
     check(_r1 > 0.4, "① 自标定之后真点该回到「像」那一档（实测 0.56）：%.3f" % _r1)
     check(_r1 > _t1 + 0.4,
           "① 自标定之后真点该**远远**高于队友那个小标记（实测 %.3f vs %.3f）"
           % (_r1, _t1))
-    check(_r1 > mm.dot_player_like(other, pw, 25.0),
+    check(_r1 > map_dot.dot_player_like(other, pw, 25.0),
           "① 至少不该输给同尺寸那块（实测 0.56 vs 0.49 ✓ —— 差得不多是**已知**的 ✓"
           "那一档靠脚下平台/底图标记那两条判据分 ✓ 见本用例开头那段 ✓）")
-    check(abs(mm.dot_player_like(real, pw) - _r0) < 1e-12,
+    check(abs(map_dot.dot_player_like(real, pw) - _r0) < 1e-12,
           "② 不给 `exp_side` 时口径该**一字不变**（老行为 ✓ 零回归 ✓）")
     # ③ tracker 真会攒尺子（同一个 8×8 点喂 6 拍 ⇒ 中位数 8）
-    tr = mm.PlayerDotTracker()
+    tr = map_locator.PlayerDotTracker()
     for _ in range(6):
         p = _dot_panel(w=240, h=109)
         p[50:58, 100:108] = (65, 243, 245)          # 8×8 ⇒ 短边 8
@@ -4389,18 +4428,21 @@ def t_dot_exp_side_selfcalib():
     check(tr._exp_side is not None and abs(tr._exp_side - 8.0) < 0.6,
           "③ 锁定几拍之后尺子该出来（≈8）：%r" % (tr._exp_side,))
     # ④ 样本不够 ⇒ 不出尺子（不猜 ✓）
-    tr2 = mm.PlayerDotTracker()
+    tr2 = map_locator.PlayerDotTracker()
     p1 = _dot_panel(w=240, h=109)
     p1[50:58, 100:108] = (65, 243, 245)
     tr2.update(p1)
     check(tr2._exp_side is None,
           "④ 只喂一拍 ⇒ 尺子**不该**出来（不猜 ✓ 退回比例兜底 ✓）：%r" % (tr2._exp_side,))
     # ⑤ 接线（源码钉）：算了却**没喂**出去 ⇒ 自标定白做 ✓（半途而废是最常见的漏 ✓）
-    _mm = (Path(__file__).resolve().parents[1] / "perception" / "minimap.py"
-           ).read_text(encoding="utf-8")
-    check("exp_side=self._exp_side" in _mm,
+    #   ⚠ 2026-10-18 拆包：喂尺子的那一句在 `map_locator`（PlayerDotTracker），
+    #     吃尺子的那一步在 `map_dot`（find_player_dot）—— 两个文件各钉一半。
+    _per = Path(__file__).resolve().parents[1] / "perception"
+    _loc = (_per / "map_locator.py").read_text(encoding="utf-8")
+    _dot = (_per / "map_dot.py").read_text(encoding="utf-8")
+    check("exp_side=self._exp_side" in _loc,
           "⑤ 尺子算了却没喂给 `find_player_dot`（自标定白做 ✗）")
-    check("_dot_candidates(m, ref_w or panel.shape[1], exp_side)" in _mm,
+    check("_dot_candidates(m, ref_w or panel.shape[1], exp_side)" in _dot,
           "⑤ 候选表排序那一步没吃到自标定尺子（`_dot_candidates` 内部的排序会退回比例 ✗）")
 
 
@@ -4415,6 +4457,7 @@ def t_dot_lock_needs_like():
     用例：真点在**可达半径边缘**（≈1 倍半径 ✓ 且 like 中等 ✓）、一个**不像点**的小块**紧贴**上一拍
       ⇒ **必须挑真点** ✓ —— 旧口径在这一幕会锁小标记 ✗（真点被距离重罚到负分 ✓ 小标记 +0.12 反超 ✓）。
     """
+    from perception import map_dot
     # ⚠⚠ 场景是**算出来的边界**（不是随手摆的 ✓）：面板 240 宽 ⇒ 期望 7.68px、可达半径 23px ✓
     #   · **真点 5×5**（like ≈ 0.41 ✓）摆在离上一拍 **21.5px** 处（≈0.93 倍半径 ✓）；
     #   · 一个**不像点**的 3×3（like ≈ 0.013 ✓）**紧贴**上一拍 ✓。
@@ -4424,17 +4467,17 @@ def t_dot_lock_needs_like():
     p[46:51, 126:131] = (65, 243, 245)              # 真点 5×5 ⇒ 中心 (128.5, 48.5)
     p[47:50, 106:109] = (65, 243, 245)              # 小标记 3×3 ⇒ 中心 (107.5, 48.5)（不像点 ✓）
     # 把"上一拍"放在**小标记**上 ⇒ 旧口径会给它 +0.12 的滞后保护
-    r = mm.find_player_dot(p, near=(107.0, 48.0))
+    r = map_dot.find_player_dot(p, near=(107.0, 48.0))
     check(r["ok"], "没找到任何点：%s" % r["reason"])
     check(abs(r["x"] - 128.5) < 3.0 and abs(r["y"] - 48.5) < 3.0,
           "锁在**不像点**的小标记上了（挑到 (%.1f, %.1f)，期望真点 ≈(128.5, 48.5)）"
           "—— 滞后分不该给「不像点」的候选（门槛 DOT_LIKE_MIN=%.2f）：%r"
-          % (r["x"], r["y"], mm.DOT_LIKE_MIN, r))
+          % (r["x"], r["y"], map_dot.DOT_LIKE_MIN, r))
     # ⚠ 顺带钉住两条常量之间的关系（它们是"像不像"该主导"谁近"的保证 ✓）
-    check(mm.DOT_DIST_W < 0.35,
-          "距离权重又涨回去了（>0.35 ⇒ 又是「谁近谁赢」✗）：%r" % (mm.DOT_DIST_W,))
-    check(mm.DOT_LIKE_MIN > 0.0,
-          "滞后门槛被降到 0（= 又变成「只要近就给保护」✗）：%r" % (mm.DOT_LIKE_MIN,))
+    check(map_dot.DOT_DIST_W < 0.35,
+          "距离权重又涨回去了（>0.35 ⇒ 又是「谁近谁赢」✗）：%r" % (map_dot.DOT_DIST_W,))
+    check(map_dot.DOT_LIKE_MIN > 0.0,
+          "滞后门槛被降到 0（= 又变成「只要近就给保护」✗）：%r" % (map_dot.DOT_LIKE_MIN,))
 
 
 def t_dot_hard_size_gate():
@@ -4460,18 +4503,19 @@ def t_dot_hard_size_gate():
          （7 ≥ 绝对 6 ✓ 但 < 相对 20 ✓）⇒ **原样返回它** ✓（老兜底的本意只该管这一层 ✓）；
       ⑤ 源码级：`find_player_dot` 必须走这道闸（别有人在上面又"整段作废" ✗）。
     """
+    from perception import map_dot
     m = np.zeros((585, 1164), np.uint8)
     m[100:105, 100:105] = 1                        # 5×5（小标记档 ✓）
     m[110:115, 200:205] = 1                        # 3×5（用户现场那块 ✓）
     m[200:224, 200:226] = 1                        # 26×24（真点档 ✓）
-    cands, _dense = mm._dot_candidates(m, 1164)
+    cands, _dense = map_dot._dot_candidates(m, 1164)
     sizes = sorted((int(c["w"]), int(c["h"])) for c in cands)
     check((5, 5) not in sizes, "① 5×5 的小块该被硬尺寸闸挡掉：%r" % (sizes,))
     check((3, 5) not in sizes, "① 3×5（用户现场那块）该被挡掉：%r" % (sizes,))
     check(any(w >= 24 and h >= 22 for w, h in sizes), "② 真点不该被删：%r" % (sizes,))
     m2 = np.zeros((40, 1164), np.uint8)
     m2[10:13, 300:305] = 1                         # 只有一块 **3×5**（= 用户现场那种局面 ✓）
-    c2, _d2 = mm._dot_candidates(m2, 1164)
+    c2, _d2 = map_dot._dot_candidates(m2, 1164)
     check(len(c2) == 0,
           "③ 绝对下限（短边 4px）之下的碎块**不许**靠「筛空兜底」混进候选"
           "（要么认这些碎块、要么认不出 —— 用户现场就是被它锁住的 ✗）：%r" % (c2,))
@@ -4479,13 +4523,13 @@ def t_dot_hard_size_gate():
     #    ⇒ **原样返回它** ✓ —— 这条是**故意**钉的（"5×5 的青色方块也算玩家"另有用例 ✓）
     m2b = np.zeros((40, 1164), np.uint8)
     m2b[10:15, 300:305] = 1
-    c2b, _d2b = mm._dot_candidates(m2b, 1164)
+    c2b, _d2b = map_dot._dot_candidates(m2b, 1164)
     check(len(c2b) == 1,
           "④ 相对闸筛空时**必须原样返回**（老兜底的本意：小面板 / 换分辨率别把点弄丢 ✗）：%r"
           % (c2b,))
     m3 = np.zeros((40, 2000), np.uint8)            # 面板宽 2000 ⇒ 相对闸 16px
     m3[10:17, 300:307] = 1                         # 只有一块 7×7（≥ 绝对 4 ✓ < 相对 16 ✓）
-    c3, _d3 = mm._dot_candidates(m3, 2000)
+    c3, _d3 = map_dot._dot_candidates(m3, 2000)
     check(len(c3) == 1,
           "④ 同上（面板更宽 ⇒ 相对闸更严 ⇒ 一样只放宽到绝对下限那一档）：%r" % (c3,))
     # ⑤ ⭐⭐⭐ **小面板**（用户 2026-10-13 现场 ✓ 石人寺院III 的面板 = 129×71 ✓）：
@@ -4494,15 +4538,74 @@ def t_dot_hard_size_gate():
     #   而 1164 宽那块**照样是 4.66px** ✓（10-11 修的那块 3×5 碎块不倒退 ✓）。
     m5 = np.zeros((71, 129), np.uint8)
     m5[30:35, 60:63] = 1                            # 3×5（小面板上的真点档 ✓）
-    c5, _d5 = mm._dot_candidates(m5, 129)
+    c5, _d5 = map_dot._dot_candidates(m5, 129)
     check(len(c5) == 1,
           "⑤ 129×71 的小面板上，3×5 的真点被尺寸闸挡掉了 —— 那就是"
           "「石人寺院III 一直显示没定上位 ⇒ 发呆」的根因 ✗：%r" % (c5,))
     m6 = np.zeros((71, 129), np.uint8)
     m6[30:32, 60:62] = 1                            # 2×2（噪声档 ✓）
-    c6, _d6 = mm._dot_candidates(m6, 129)
+    c6, _d6 = map_dot._dot_candidates(m6, 129)
     check(len(c6) == 0,
           "⑤ 小面板也不能连 2×2 的噪声都认（下限 2px 那一头 ✓）：%r" % (c6,))
+
+
+def t_world_offset_is_decimal():
+    """⭐⭐ 「坐标系偏移」两个框**必须能填小数**（2026-10-18 用户："怎么不能设置小数？？"）。
+
+    `world_offset` 是**残差**（世界坐标一路插值下来的 ✓），现场常见 0.3~2.7 这种值；
+    老实现是 `QSpinBox`（整数）+ 保存时 `int(...)` ⇒ 0.5 被吞成 0 / 1 ✗ ⇒ 永远差半个像素、
+    怎么调都对不齐 ✗。这条钉四件（源码级 —— 建 RoutePanel 太重，且这本来就是"用哪个控件"的事 ✓）：
+    """
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "gui" / "route_panel.py").read_text(encoding="utf-8")
+    check("NoWheelDoubleSpinBox()" in src,
+          "「坐标系偏移」又变回整数框了 ⇒ 小数填不进去（用户 2026-10-18 报的就是它 ✗）")
+    check("sp.setDecimals(1)" in src, "偏移框没设小数位（`setDecimals(1)`）⇒ 还是只能填整数 ✗")
+    check("int(sp.value())" not in src,
+          "保存时又对偏移 `int(...)` 了 ⇒ 填进去的 0.5 会被吞成 0 ✗")
+    check("round(float(sp.value()), 2)" in src,
+          "偏移保存时没按小数存（应当 `round(float(...), 2)` ✓）")
+
+
+def t_dot_small_panel_6x7_dot():
+    """⭐⭐⭐ 小面板上的真点可以到 **6×7 / 实心度 0.40**（2026-10-18 天空项目现场 ✓）。
+
+    天空项目（200010302）走**远程收流**，部署台裁出来的面板只有 **97×122** ⇒ 真玩家点
+    就是 `w=6 h=7 area=17`（`fill = 17/42 = **0.40**`）。以前两道闸把它挡死：
+      · `dot_side_max(97) = max(6, 97//16) = **6**` ⇒ 高 7 的那块被当"太大"✗；
+      · `DOT_FILL_MIN = 0.45` ⇒ 0.40 被当"不够实"✗（6~9px 的点抗锯齿要吃掉四成 ✓）
+    ⇒ 整帧 `候选 0 个` ⇒ 一直报「认不出玩家标记」（用户现场 ✓）。
+    现在：边长上限保底 8 ✓、**小点**（最长边 ≤ 9）的实心度下限 × 0.72 ✓ —— 大面板一点没动 ✓。
+    """
+    from perception import map_dot
+    side_max = map_dot.dot_side_max(97)
+    check(side_max >= 7,
+          "97 宽的面板上边长上限只有 %d ⇒ 6×7 的真点会被当成「太大」扔掉 ✗" % side_max)
+
+    m = np.zeros((122, 97), np.uint8)
+    # 真点档：6×7 的框里 17 个像素（= 现场那块 ✓ 实心度 0.40）
+    for yy, xs in ((101, (49, 50, 51)), (102, (49, 51, 54)),
+                   (103, (49, 50, 51, 52)), (104, (51, 52)),
+                   (105, (50, 51)), (106, (51, 52)), (107, (51,))):
+        for xx in xs:
+            m[yy, xx] = 1
+    cands, _dense = map_dot._dot_candidates(m, 97)
+    check(len(cands) == 1,
+          "97×122 上的 6×7 真点没进候选（现场就是这一条把黄点判死的 ✗）：%r"
+          % ([("%dx%d" % (c["w"], c["h"])) for c in cands],))
+
+    # 小点才放宽：大点的实心度门槛**原样**
+    check(map_dot.dot_fill_min(6, 7) < float(map_dot.DOT_FILL_MIN),
+          "小点（6×7）的实心度下限没放宽 ⇒ 抗锯齿吃掉的四角还是会把真点挡掉 ✗")
+    check(abs(float(map_dot.dot_fill_min(20, 20)) - float(map_dot.DOT_FILL_MIN)) < 1e-9,
+          "大点的实心度下限被一起放宽了 ⇒ 碎块/描边会混进候选 ✗")
+
+    # 放宽也要有边：边长上限保底 8 ⇒ 9 以上照样挡掉
+    m2 = np.zeros((122, 200), np.uint8)
+    m2[20:29, 20:29] = 1                            # 9×9（比保底大 1）
+    c2, _d2 = map_dot._dot_candidates(m2, 200)
+    check(len(c2) == 0 or all(max(int(c["w"]), int(c["h"])) <= 12 for c in c2),
+          "边长上限被放得太松（9×9 也照单全收）：%r" % (c2,))
 
 
 def t_dot_tracker_smoothing():
@@ -4511,7 +4614,9 @@ def t_dot_tracker_smoothing():
 
     规矩（见 `DOT_SMOOTH_ALPHA` 那段 ✓）：只在"接着上一拍、且位移不大"时做一阶低通 ✓。
     """
-    tr = mm.PlayerDotTracker()
+    from perception import map_locator
+    from perception import map_dot
+    tr = map_locator.PlayerDotTracker()
     p1 = _dot_panel(w=240, h=109)
     p1[50:58, 100:108] = (65, 243, 245)            # 8×8 ⇒ 中心 (103.5, 53.5)
     r1 = tr.update(p1)
@@ -4556,13 +4661,14 @@ def t_dot_small_blob_says_unknown():
       ③ 对照：同一画面里再补一块 **26×24**（真点尺寸 ✓）⇒ **立刻认得出、且挑那块大的** ✓
          （防"一刀切"把正常帧也弄成认不出 ✗）。
     """
+    from perception import map_dot
     # ⚠ 面板尺寸要**和现场一致**（1164×585 ✓）：`_dot_candidates` 另有一条"**太大也不算**"
     #   的闸（`dot_side_max(面板宽)` ✓）⇒ 面板给窄了，26×24 那块会被当"太大" ✗ ⇒ 用例假红 ✓
     #   （我第一版写 400 宽，当场踩到 ✓）。
     img = np.zeros((585, 1164, 3), np.uint8)
     # 玩家点核心色（探针量到的 BGR (108,255,255) ✓ 见 `DOT_CORE_*` ✓）
     img[400:405, 800:803] = (108, 255, 255)        # 3×5 的碎块（= 现场那块 ✓）
-    r = mm.find_player_dot(img)
+    r = map_dot.find_player_dot(img)
     check(not r.get("ok"),
           "① 画面里只有一块 3×5 的碎块，却把它当玩家点报出来了"
           "（用户现场就是被这一条锁住的 ✗）：%r" % (r,))
@@ -4570,7 +4676,7 @@ def t_dot_small_blob_says_unknown():
           "② 认不出时得说一句为什么（别给个空结论 ✓）：%r" % (r,))
     img2 = img.copy()
     img2[200:224, 400:426] = (108, 255, 255)       # 26×24（真点档 ✓）
-    r2 = mm.find_player_dot(img2)
+    r2 = map_dot.find_player_dot(img2)
     check(r2.get("ok"),
           "③ 有真点尺寸的块时**必须认得出**（别一刀切成认不出 ✗）：%r" % (r2,))
     check(int(r2.get("w") or 0) >= 24 and int(r2.get("h") or 0) >= 22,
@@ -4595,7 +4701,8 @@ def t_player_pos_fallback():
       ⑤ **换图清掉**（`load()` ✓）：上一张图的位置在另一张图上没有意义 ✗；
       ⑥ 保底的 `held` 与"跟踪器幽灵帧"的 `held` **同一个意思** ✓（都报 `ok=True` ✓ 口径一致 ✓）。
     """
-    from perception.minimap import PlayerLocator
+    from perception import map_dot
+    from perception.map_locator import PlayerLocator
 
     loc = PlayerLocator(None)
     blank = np.zeros((71, 129, 3), np.uint8)          # 129×71（= 石人寺院III 那块面板 ✓）
@@ -4609,7 +4716,7 @@ def t_player_pos_fallback():
     check(abs(loc._fb["world_x"] - 1000.0) < 1e-9 and loc._fb["segment_id"] == 3,
           "② 第一把该**直接落值**（不该被不存在的旧值带偏）：%r" % (loc._fb,))
     loc._remember_pos(1100.0, 300.0, {"segment_id": 4, "foothold_id": "42"})
-    _a = float(mm.PLAYER_FB_EMA_ALPHA)
+    _a = float(map_dot.PLAYER_FB_EMA_ALPHA)
     check(abs(loc._fb["world_x"] - (_a * 1100.0 + (1 - _a) * 1000.0)) < 1e-6,
           "② 第二把该是 EMA(α=%.2f)：%r" % (_a, loc._fb["world_x"]))
     # ③④ 认不出黄点那一拍 ⇒ 保底顶上（真跑 update ✓ 空面板 = 一定认不出 ✓）
@@ -4716,6 +4823,8 @@ def t_world_pos_chain():
     底图像素上，算出来的世界坐标必须回到那个点（容差 = 1 个底图像素对应的
     世界距离 —— 黄点本身有好几个像素，取整必然差一点）。
     """
+    from perception import map_locator
+    from perception import map_dot
     mid, canvas = pick_map()
     t = mapdata.load(mid, with_canvas=True) if mid else None
     if t is None or not t.segments:
@@ -4732,10 +4841,10 @@ def t_world_pos_chain():
     ccx, ccy = t.world_to_canvas(wx, wy)
     panel, px, py = _panel_with_dot_at(canvas, ccx, ccy)
 
-    calib = {"mode": mm.MODE_FIT, "scale": 1.0, "offset": [0, 0],
+    calib = {"mode": map_const.MODE_FIT, "scale": 1.0, "offset": [0, 0],
              "view": [0, 0], "score": 1.0}
-    loc = mm.PlayerLocator(mid)
-    r = loc.update(panel, src=mm.SRC_LIVE, calib=calib, terrain=t)
+    loc = map_locator.PlayerLocator(mid)
+    r = loc.update(panel, src=map_const.SRC_LIVE, calib=calib, terrain=t)
     check(r["ok"], "整条链没跑通：%s（黄点层：%s）" % (r["note"], r["dot"]))
     tol = t.px_per_world + 2          # 一个底图像素 + 取整余量
     check(abs(r["world_x"] - wx) <= tol and abs(r["world_y"] - wy) <= tol,
@@ -4752,7 +4861,7 @@ def t_world_pos_chain():
     L = t.ladders[0]
     lx, ly = t.world_to_canvas(L.x, (min(L.y1, L.y2) + max(L.y1, L.y2)) / 2.0)
     panel_l, _, _ = _panel_with_dot_at(canvas, lx, ly)
-    rl = mm.PlayerLocator(mid).update(panel_l, src=mm.SRC_LIVE, calib=calib,
+    rl = map_locator.PlayerLocator(mid).update(panel_l, src=map_const.SRC_LIVE, calib=calib,
                                       terrain=t)
     check(rl["ok"], "站在绳上却定位失败：%s（黄点层：%s）" % (rl["note"], rl["dot"]))
     check(rl["ladder_id"] == lids[id(L)],
@@ -4764,8 +4873,8 @@ def t_world_pos_chain():
     # 认不出黄点（面板上什么都不画）→ **坐标必须是 None**，不是 0
     blank = panel.copy()
     blank[py - 4:py + 4, px - 4:px + 4] = (70, 55, 45)
-    loc2 = mm.PlayerLocator(mid)
-    r2 = loc2.update(blank, src=mm.SRC_LIVE, calib=calib, terrain=t)
+    loc2 = map_locator.PlayerLocator(mid)
+    r2 = loc2.update(blank, src=map_const.SRC_LIVE, calib=calib, terrain=t)
     check(not r2["ok"], "面板上没黄点却说定位成功")
     check(r2["world_x"] is None and r2["world_y"] is None,
           "定位失败时坐标应当是 None —— 0 是合法的世界坐标（地图西北角），"
@@ -4773,8 +4882,8 @@ def t_world_pos_chain():
     check(r2["note"], "定位失败没写原因 —— 界面上就只剩一个空读数")
 
     # 没标定 → 认出黄点也换不出坐标，但要说清是「没标定」
-    loc3 = mm.PlayerLocator(mid)
-    r3 = loc3.update(panel, src=mm.SRC_LIVE, calib={}, terrain=t)
+    loc3 = map_locator.PlayerLocator(mid)
+    r3 = loc3.update(panel, src=map_const.SRC_LIVE, calib={}, terrain=t)
     check(not r3["ok"] and "标定" in r3["note"],
           "没标定时该说「还没量过换算」：%s" % r3["note"])
 
@@ -4797,7 +4906,7 @@ def t_minimap_client_timeout_says_where():
     import cv2
     import numpy as np
 
-    from perception.minimap import MiniMapClient
+    from perception.map_client import MiniMapClient
 
     jpg = cv2.imencode(".jpg", np.zeros((8, 8, 3), np.uint8))[1].tobytes()
 
@@ -4854,7 +4963,7 @@ def t_apply_to_player():
     ⚠ 这条原来还钉着「别把地形段号写进**视觉平台编号**（`current_platform_id`）」——
     平台识别那套 2026-09-26 已整块移除（那个字段也跟着没了），所以只剩下面两组断言。
     """
-    from perception.world_state import Player
+    from perception.world.world_state import Player
     p = Player()
     mm.apply_to_player(p, {"world_x": 123.5, "world_y": -45.0, "segment_id": 3,
                            "note": "", "held": True})
@@ -4939,7 +5048,7 @@ def t_world_label_text():
     p.project = _Proj(mid)
     pos = {"at": time.monotonic(), "map_id": mid, "world_x": wx, "world_y": wy,
            "foothold_id": getattr(f0, "fid", None), "segment_id": None}
-    cfg = {"mmap_src": mm.SRC_LIVE, "mmap_crop": [0, 0, 16, 16], "mmap_draw": True}
+    cfg = {"mmap_src": map_const.SRC_LIVE, "mmap_crop": [0, 0, 16, 16], "mmap_draw": True}
     try:
         # 配置用**假的那一份**：`load_live` 读它、`update_live` 写它 ——
         # 真 live.yaml 一个字节都不碰（自检不许改用户配置 ✓）。
@@ -5021,7 +5130,7 @@ def t_live_thread_mmap_panel_copy():
     frame = np.full((panel.shape[0] + 40, panel.shape[1] + 40, 3), 30, np.uint8)
     frame[:panel.shape[0], :panel.shape[1]] = panel
 
-    th = LiveThread({"mmap_map_id": mid, "mmap_src": mm.SRC_LIVE,
+    th = LiveThread({"mmap_map_id": mid, "mmap_src": map_const.SRC_LIVE,
                      "mmap_crop": [0, 0, panel.shape[1], panel.shape[0]]})
     try:
         got = th._mmap_panel_from_frame(frame)
@@ -5050,7 +5159,7 @@ def t_live_thread_mmap_panel_copy():
         th._mmap_panel_cur = got          # = 主回路每拍存下来的那份（见 live_thread ✓）
         with mock.patch.object(mapdata, "load_calib",
                                lambda _m, src=None: dict(
-                                   mode=mm.MODE_FIT, scale=1.0, offset=[0, 0],
+                                   mode=map_const.MODE_FIT, scale=1.0, offset=[0, 0],
                                    view=[0, 0], score=1.0)):
             r = th._locate_latest()
         check(seen.get("panel") is got,
@@ -5190,7 +5299,7 @@ def t_screen_to_world():
     ③ 拿不到玩家世界坐标 ⇒ 返回 `None`（**不猜** ✓，不许拿 0 当坐标 ✗）。
     """
     from perception.minimap import screen_to_world
-    from perception.world_state import Player
+    from perception.world.world_state import Player
 
     p = Player(x=400.0, y=300.0, bottom=340.0, w=40.0, h=60.0,
                world_x=1000.0, world_y=-200.0)
@@ -5297,7 +5406,7 @@ def t_player_tracker_world_anchor():
     ② 外推被误导那一拍：老口径选"更贴外推位置"的 ✗、世界口径选"黄点对得上"的 ✓；
     ③ 不给 `world` ⇒ 完全老行为 ✓；④ 中途不给 ⇒ 退回老判据、**锁不丢** ✓。
     """
-    from perception.tracker import PlayerTracker
+    from perception.track.tracker import PlayerTracker
 
     def _two():
         """两套一样的追踪器：一帧静止 → 一帧 +40（让"速度外推"开始起作用 ✓）。"""
@@ -5364,7 +5473,7 @@ def t_track_rows_layout():
     try:
         with mock.patch.object(rp, "load_live",
                                lambda: {"mmap_draw": False,
-                                        "mmap_src": mm.SRC_LIVE,
+                                        "mmap_src": map_const.SRC_LIVE,
                                         "mmap_crop": [0, 0, 40, 40],
                                         "mmap_hold_ms": 500, "mmap_roi_pad": 18,
                                         "mmap_max_jump": 40,
@@ -5398,6 +5507,8 @@ def t_dot_track_params_are_config():
     "界面拨了没生效"或"回填时把配置又写了一遍"（UI规范 §4/§5）。所以：按**行为**验
     —— 真建面板、真拨一下输入框、看配置和 locator 有没有跟着动。
     """
+    from perception import map_locator
+    from perception import map_dot
     import unittest.mock as mock
 
     from PyQt5.QtWidgets import QApplication
@@ -5408,12 +5519,12 @@ def t_dot_track_params_are_config():
     check(app is not None, "建不起 QApplication")
 
     # 配置坏一个值（字符串）→ 其余照旧，坏的退回默认（不能炸）
-    trk = mm.track_params({"mmap_hold_ms": "写坏了", "mmap_roi_pad": 33})
-    check(trk["mmap_hold_ms"] == mm.DOT_HOLD_MS,
+    trk = map_dot.track_params({"mmap_hold_ms": "写坏了", "mmap_roi_pad": 33})
+    check(trk["mmap_hold_ms"] == map_dot.DOT_HOLD_MS,
           "配置写坏了没退回默认：%s" % trk["mmap_hold_ms"])
     check(trk["mmap_roi_pad"] == 33, "正常的值没读进来：%s" % trk["mmap_roi_pad"])
 
-    cfg = {"mmap_src": mm.SRC_LIVE, "mmap_crop": [0, 0, 40, 40],
+    cfg = {"mmap_src": map_const.SRC_LIVE, "mmap_crop": [0, 0, 40, 40],
            "mmap_draw": False, "mmap_hold_ms": 700, "mmap_roi_pad": 25}
     pushed = []
 
@@ -5432,7 +5543,7 @@ def t_dot_track_params_are_config():
     p = RoutePanel()
     p.live_panel = _LP()
     p.project = _Proj("")          # 没地图也算：这组参数与地图无关
-    p._locator = mm.PlayerLocator()
+    p._locator = map_locator.PlayerLocator()
     try:
         with mock.patch.object(rp, "load_live", lambda: dict(cfg)), \
              mock.patch.object(rp, "update_live",
@@ -5469,8 +5580,10 @@ def t_dot_track_params_survive_map_change():
     这是最容易漏的一处：换图会重建 tracker（位置不连续，别跨图跟踪），而参数就
     挂在 tracker 上 —— 不特意带上，"界面里调过一次、一换图又回默认"。
     """
+    from perception import map_locator
+    from perception import map_dot
     mid, _canvas = pick_map()
-    loc = mm.PlayerLocator()
+    loc = map_locator.PlayerLocator()
     loc.set_track(hold_ms=123, roi_pad=7, max_jump=9, ghost_max_shift=1.5)
     check(loc.tracker.hold_ms == 123 and loc.tracker.roi_pad == 7,
           "set_track 没生效")
@@ -5548,8 +5661,8 @@ def t_calib_buttons_are_alive():
     tmp = tmpdir / ("%s.mapcalib.json" % mid)
     try:
         with mock.patch.object(mapdata, "calib_path", lambda _mid: tmp):
-            dlg = MinimapCalibDialog(mid, mode=mm.MODE_CROP,
-                                     client=StubClient(panel), src=mm.SRC_LIVE)
+            dlg = MinimapCalibDialog(mid, mode=map_const.MODE_CROP,
+                                     client=StubClient(panel), src=map_const.SRC_LIVE)
             try:
                 dlg._on_tick()
                 dlg._ov_item.setPos(dlg.inset - (x + dlg.inset),
@@ -5558,8 +5671,8 @@ def t_calib_buttons_are_alive():
                                        return_value=QMessageBox.Yes):
                     dlg.btn_save.click()          # ← 用户点的是这里，不是 _on_save
                 check(dlg.saved, "「保存标定」按钮点了没反应（走真实信号就废了）")
-                saved = mapdata.load_calib(mid, mm.SRC_LIVE) or {}
-                check(mm.has_geometry(saved),
+                saved = mapdata.load_calib(mid, map_const.SRC_LIVE) or {}
+                check(map_calib.has_geometry(saved),
                       "按钮点了、也置了 saved，但文件里没有几何：%s" % saved)
             finally:
                 dlg._shutdown()
@@ -5587,19 +5700,19 @@ def t_calib_per_source():
     tmp = tmpdir / ("%s.mapcalib.json" % mid)
     try:
         with mock.patch.object(mapdata, "calib_path", lambda _mid: tmp):
-            live_c = {"mode": mm.MODE_CROP, "scale": 4.0, "offset": [4, 4],
+            live_c = {"mode": map_const.MODE_CROP, "scale": 4.0, "offset": [4, 4],
                       "view": [11, 22], "score": 0.9}
-            st_c = {"mode": mm.MODE_FIT, "scale": 1.0, "offset": [0, 0],
+            st_c = {"mode": map_const.MODE_FIT, "scale": 1.0, "offset": [0, 0],
                     "view": [0, 0], "score": 0.8}
-            mapdata.save_calib(mid, live_c, mm.SRC_LIVE)
-            mapdata.save_calib(mid, st_c, mm.SRC_STREAM)
+            mapdata.save_calib(mid, live_c, map_const.SRC_LIVE)
+            mapdata.save_calib(mid, st_c, map_const.SRC_STREAM)
 
-            check(mapdata.load_calib(mid, mm.SRC_LIVE)["scale"] == 4.0,
-                  "live 那份被覆盖了：%s" % mapdata.load_calib(mid, mm.SRC_LIVE))
-            check(mapdata.load_calib(mid, mm.SRC_STREAM)["scale"] == 1.0,
+            check(mapdata.load_calib(mid, map_const.SRC_LIVE)["scale"] == 4.0,
+                  "live 那份被覆盖了：%s" % mapdata.load_calib(mid, map_const.SRC_LIVE))
+            check(mapdata.load_calib(mid, map_const.SRC_STREAM)["scale"] == 1.0,
                   "stream 那份被覆盖了：%s"
-                  % mapdata.load_calib(mid, mm.SRC_STREAM))
-            check(set(mapdata.load_calibs(mid)) == {mm.SRC_LIVE, mm.SRC_STREAM},
+                  % mapdata.load_calib(mid, map_const.SRC_STREAM))
+            check(set(mapdata.load_calibs(mid)) == {map_const.SRC_LIVE, map_const.SRC_STREAM},
                   "两份没并存：%s" % sorted(mapdata.load_calibs(mid)))
             check(mapdata.load_calib(mid, "cyber") is None,
                   "没标过的来源应当给 None（不能拿别的来源顶上）")
@@ -5607,10 +5720,10 @@ def t_calib_per_source():
                   "两份都在时不该猜一份给调用方 —— 猜错就是错的几何")
 
             # 再存一次 live：不能碰到 stream
-            mapdata.save_calib(mid, dict(live_c, scale=5.0), mm.SRC_LIVE)
-            check(mapdata.load_calib(mid, mm.SRC_STREAM)["scale"] == 1.0,
+            mapdata.save_calib(mid, dict(live_c, scale=5.0), map_const.SRC_LIVE)
+            check(mapdata.load_calib(mid, map_const.SRC_STREAM)["scale"] == 1.0,
                   "存 live 把 stream 那份抹了：%s"
-                  % mapdata.load_calib(mid, mm.SRC_STREAM))
+                  % mapdata.load_calib(mid, map_const.SRC_STREAM))
     finally:
         shutil.rmtree(str(tmpdir), ignore_errors=True)
 
@@ -5635,12 +5748,12 @@ def t_calib_legacy_readable():
     tmp = tmpdir / ("%s.mapcalib.json" % mid)
     try:
         with mock.patch.object(mapdata, "calib_path", lambda _mid: tmp):
-            old = {"mode": mm.MODE_FIT, "scale": 2.0, "offset": [3, 4],
+            old = {"mode": map_const.MODE_FIT, "scale": 2.0, "offset": [3, 4],
                    "view": [0, 0], "score": 0.7, "src": "auto"}
             tmp.write_text(json.dumps(old), encoding="utf-8")
 
-            got = mapdata.load_calib(mid, mm.SRC_LIVE)
-            check(mm.has_geometry(got or {}),
+            got = mapdata.load_calib(mid, map_const.SRC_LIVE)
+            check(map_calib.has_geometry(got or {}),
                   "老格式的几何读不出来了 —— 升级会把已有标定作废")
             check((got or {}).get("legacy"),
                   "老格式没被标出来，界面就没法提醒「换过来源请重量」")
@@ -5648,11 +5761,11 @@ def t_calib_legacy_readable():
                   "不带来源时读不出老格式")
 
             # 保存一次 → 变成 v2、归到这条来源；另一条来源仍然算「没标过」
-            mapdata.save_calib(mid, dict(got, scale=2.5), mm.SRC_LIVE)
-            again = mapdata.load_calib(mid, mm.SRC_LIVE) or {}
+            mapdata.save_calib(mid, dict(got, scale=2.5), map_const.SRC_LIVE)
+            again = mapdata.load_calib(mid, map_const.SRC_LIVE) or {}
             check(again.get("scale") == 2.5, "保存后没更新：%s" % again)
             check(not again.get("legacy"), "legacy 只是读的时候的标记，不该写进文件")
-            check(mapdata.load_calib(mid, mm.SRC_STREAM) is None,
+            check(mapdata.load_calib(mid, map_const.SRC_STREAM) is None,
                   "老格式那份不该被另一条来源继承（几何只对一条成立）")
             check(json.loads(tmp.read_text(encoding="utf-8")).get("v") == 2,
                   "保存后文件没升级成 v2")
@@ -5696,10 +5809,10 @@ def t_calib_legacy_is_visible():
     try:
         with mock.patch.object(mapdata, "calib_path", lambda _mid: tmp):
             tmp.write_text(json.dumps(
-                {"mode": mm.MODE_FIT, "scale": 1.0, "offset": [0, 0],
+                {"mode": map_const.MODE_FIT, "scale": 1.0, "offset": [0, 0],
                  "view": [0, 0], "score": 0.7}), encoding="utf-8")
-            dlg = MinimapCalibDialog(mid, mode=mm.MODE_FIT,
-                                     client=StubClient(panel), src=mm.SRC_LIVE)
+            dlg = MinimapCalibDialog(mid, mode=map_const.MODE_FIT,
+                                     client=StubClient(panel), src=map_const.SRC_LIVE)
             try:
                 txt = dlg.lbl_loaded.text()
                 check("老格式" in txt,
@@ -5746,9 +5859,9 @@ def t_calib_dialog_saves_its_source():
         with mock.patch.object(mapdata, "calib_path", lambda _mid: tmp):
             first = True
             prev = {}
-            for src in (mm.SRC_LIVE, mm.SRC_STREAM):
+            for src in (map_const.SRC_LIVE, map_const.SRC_STREAM):
                 stub = StubClient(panel)
-                dlg = MinimapCalibDialog(mid, mode=mm.MODE_CROP, client=stub,
+                dlg = MinimapCalibDialog(mid, mode=map_const.MODE_CROP, client=stub,
                                          src=src)
                 try:
                     check(dlg.src == src, "弹窗没记住自己是哪条来源：%s" % dlg.src)
@@ -5762,11 +5875,11 @@ def t_calib_dialog_saves_its_source():
                 finally:
                     dlg._shutdown()
                 saved = mapdata.load_calib(mid, src) or {}
-                check(mm.has_geometry(saved),
+                check(map_calib.has_geometry(saved),
                       "（%s）存下来的几何读不出来：%s" % (src, saved))
                 # 另一条来源：第一轮应当**根本不存在**；第二轮应当**原样还在**
                 #（新一轮标定只该碰自己那条）
-                other = mm.SRC_STREAM if src == mm.SRC_LIVE else mm.SRC_LIVE
+                other = map_const.SRC_STREAM if src == map_const.SRC_LIVE else map_const.SRC_LIVE
                 og = mapdata.load_calib(mid, other)
                 if first:
                     check(og is None,
@@ -5778,7 +5891,7 @@ def t_calib_dialog_saves_its_source():
                 prev[src] = saved
                 first = False
             body = json.loads(tmp.read_text(encoding="utf-8"))
-            check(set(body.get("sources") or {}) == {mm.SRC_LIVE, mm.SRC_STREAM},
+            check(set(body.get("sources") or {}) == {map_const.SRC_LIVE, map_const.SRC_STREAM},
                   "两条来源没并存：%s" % sorted((body.get("sources") or {}).keys()))
     finally:
         shutil.rmtree(str(tmpdir), ignore_errors=True)
@@ -5789,8 +5902,8 @@ def t_route_panel_button():
     src = (ROOT / "gui" / "route_panel.py").read_text(encoding="utf-8")
     check("btn_mmap_calib" in src, "面板上没有标定按钮")
     check("MinimapCalibDialog(" in src, "标定按钮没接到弹窗")
-    check("python -m perception.minimap --map" in src,
-          "命令行那条等价做法应当留在 tooltip 里（排查用）")
+    check("python -m tools.mmap_diag --map" in src,
+          "命令行那条等价做法应当留在 tooltip 里（排查用；2026-10-18 已搬到 tools.mmap_diag ✓）")
 
 
 def t_route_resolver_start_from_player_sets():
@@ -5809,7 +5922,8 @@ def t_route_resolver_start_from_player_sets():
     # 用**假地形 + 假集合**：这条钉的是**接线**（`_fill_route_ctx` 要把 here_sets 留给
     # 解析器），喂一对最小的替身就够 —— 真地图 / 真集合那条路由 `t_goto_*` 那几条覆盖 ✓。
     class _Z:
-        sets = {"甲平台": {"footholds": ["1"]}, "乙平台": {"footholds": ["2"]}}
+        # ⚠ 真类是 `Zones.zones`（2026-10-18 从 `sets` 改名 ✓）—— 假件要跟上，否则 AttributeError
+        zones = {"甲平台": {"footholds": ["1"]}, "乙平台": {"footholds": ["2"]}}
         edges = []
 
         def set_of(self, fid):
@@ -5863,7 +5977,7 @@ def t_route_resolver_start_from_player_sets():
     #     `mid=105090600` ✓）⇒ 上一版把"换图检测"写在**"定位没输出"那条早退之后** ✗
     #     ⇒ **那条路根本走不到它** ⇒ `_player_here` 里留着**上一张图的集合名「小平台」** ✗✗
     #   ⇒ 择路拿它当**起点** ⇒ `core/zones.py` 报 `集合不存在：小平台`
-    #     （那句的判据是 `src if src not in zones.sets else dst` ✓ ⇒ 说明报的是 **src = 起点** ✓）
+    #     （那句的判据是 `src if src not in zones.zones else dst` ✓ ⇒ 说明报的是 **src = 起点** ✓）
     #   ⇒「右下 → 左上」**永远造不出路线** ⇒ `zone_goto_fail` 每 3 秒重试 ⇒ **卡死** ✗✗✗。
     #   ⇒ 钉两件：① **换图必须清**（机器那份 + `_player_here` + `_player_at`，**三样一起** ✗）；
     #            ② **检测必须在函数最前**（在"定位没输出"那条早退**之前** ✓ —— 顺序就是本 bug 的根 ✗）。
@@ -6013,7 +6127,7 @@ def t_climb_failed_needs_stuck():
     """
     from core import mapdata
     from core import zones as zones_mod
-    from perception import pos_state
+    from perception.world import pos_state
 
     pick = None
     for q in sorted(mapdata.map_dir().glob("*.png")):
@@ -6073,6 +6187,105 @@ def t_climb_failed_needs_stuck():
     check(not o2.climb_failed and o2.climb_stalled,
           "x 对齐了却判成抓空（那支该只「补按 ↑」）：failed=%s stalled=%s"
           % (o2.climb_failed, o2.climb_stalled))
+
+
+def t_climb_stall_window_matches_jobs():
+    """⭐⭐⭐⭐ 「爬不动」的窗口必须与执行器**同一个换算**（2026-10-21 用户现场：
+    「**天空项目 3→2 在 L1 上不按 ↑ 了**」✗）。
+
+    病因 —— 同一个设置（「移动操作尝试间隔」）**被两处各算了一遍**：
+
+    | 谁 | 算式 | 天空 `move_retry_ms=350` 算出来 |
+    |---|---|---|
+    | 执行器 `decision/jobs/base` | `stall_s_from_retry_ms()` **有 0.5 秒下限** ✓ | 0.50 秒 |
+    | 感知 `pos_state`（本文件钉的） | `move_retry_ms / 1000` **没有下限** ✗ | **0.35 秒** |
+
+    ⇒ 广播**先**报「爬不动」（`climb_stalled`）⇒ `ClimbJob` 走失败逻辑 ⇒ **松 ↑** ⇒ 人往下滑
+      ⇒ 重来 ⇒ 现场看到的就是"**在 L1 上不按 ↑**、掉回集合 3"✓
+    （旁证 `behavior.log` 01:41:23.040 / 01:41:24.188：连着两次
+      `route_phase … 爬不动了 … prev=climb to=failed`，而 `climb_y` 从 -1091 一路在往 -1212
+      爬 —— **判失败的时候人其实在上升** ✗）。
+
+    钉四件（真图真绳 + 真 `PositionStateMachine`）：
+      ① 慢爬（y 每 0.45 秒才被定位刷新一次、每次 15px）⇒ `330ms` 那档会误报，
+         **现在不许报**（窗口 ≥ 0.5 秒 ✓）；
+      ② 真停住超过下限 ⇒ **要报**（"补按 ↑"那条照旧有效，没被这刀削掉 ✓）；
+      ③ 换算就是执行器那一个函数（`core.timing.stall_s_from_retry_ms`，**同一处实现** ✓）；
+      ④ 源码钉：`pos_state` 里不许再出现自己除 1000 那种写法 ✗。
+    """
+    from core import mapdata
+    from core import zones as zones_mod
+    from core.timing import stall_s_from_retry_ms
+    from perception.world import pos_state
+
+    pick = None
+    for q in sorted(mapdata.map_dir().glob("*.png")):
+        if q.stem.endswith(("_overlay", "_zones")):
+            continue
+        try:
+            _t = mapdata.load(q.stem, with_canvas=False)
+        except Exception:                       # noqa: BLE001 —— 读不动的图跳过 ✓
+            continue
+        _ids = zones_mod.ladder_ids(_t) or {}
+        if not (getattr(_t, "ladders", None) and _ids):
+            continue
+        _L = _t.ladders[0]
+        _lid = _ids.get(id(_L))
+        if _lid:
+            pick = (_t, _L, _lid)
+            break
+    if pick is None:
+        print("      （没有带绳的图，跳过）")
+        return
+
+    # ③ 同一处实现（执行器那边再导出的也是它 ✓）
+    check(stall_s_from_retry_ms(350) == 0.5,
+          "「移动操作尝试间隔 350ms」该按 **0.5 秒下限**算（执行器就是这么算的 ✓）：%r"
+          % (stall_s_from_retry_ms(350),))
+    # ④ 源码钉：感知那侧不许再自己算一遍
+    _ps_src = (ROOT / "perception" / "world" / "pos_state.py").read_text(encoding="utf-8")
+    _code = [l for l in _ps_src.splitlines() if not l.strip().startswith("#")]
+    check(not any("move_retry_ms" in l and "/ 1000" in l for l in _code),
+          "`pos_state` 又把「移动操作尝试间隔」自己除 1000 了 ✗（窗口会短 0.15 秒 ⇒ "
+          "广播抢在执器前面报'爬不动' ⇒ 松 ↑ 掉下来 ✓ 2026-10-21 现场）")
+
+    _t, _L, _lid = pick
+    _ymid = (min(_L.y1, _L.y2) + max(_L.y1, _L.y2)) / 2.0
+
+    class _Z:
+        def set_of(self, fid):
+            return []
+
+    _kw = dict(terrain=_t, zones=_Z(), hold_vert=True,
+               align_tol_px=10, move_retry_ms=350)      # ← 天空项目就是这个值 ✓
+
+    def _loc(dy):
+        return {"world_x": float(_L.x), "world_y": _ymid + dy, "foothold_id": ""}
+
+    # ① 慢爬：y 每 0.45 秒才刷新一次（每次升 15px），中间那些帧 y 不变
+    m = pos_state.PositionStateMachine()
+    stalled_seen = []
+    _y = 0.0
+    #   ⚠ 中间那几拍（0.80 / 0.85）**必须有** —— 定位不是每帧都刷新 y，广播是在
+    #     "同一个 y 连着几拍没变"的**中间**判的；只喂刷新那几拍的话，旧代码也不会红 ✗
+    #     （实测：0.45 刷新、0.80 还是同一个 y ⇒ 旧窗口 0.35 秒正好到点 ⇒ 误报 ✓）。
+    _frames = [(0.00, 0.0), (0.05, 0.0), (0.45, -15.0), (0.50, -15.0),
+               (0.80, -15.0), (0.85, -15.0), (0.90, -30.0), (0.95, -30.0)]
+    for _dt, _dy in _frames:
+        o = m.update(100.0 + _dt, loc=_loc(_dy), **_kw)
+        stalled_seen.append((round(100.0 + _dt, 2), o.climb_stalled))
+    check(str(m.update(100.95, loc=_loc(-30.0), **_kw).ladder_id) == _lid,
+          "用例前提：这一拍该算「在绳上」（不然 `climb_stalled` 恒 False，测不到 ✓）")
+    check(not any(s for _t2, s in stalled_seen),
+          "**慢爬时误报「爬不动」**（y 每 0.45 秒才刷新一次、每次升 15px ⇒ 那是 30px/s 在往上爬 ✓）"
+          " ⇒ 执行器会松 ↑、人掉下来（用户 2026-10-21「3→2 在 L1 上不按 ↑ 了」✗）：%r"
+          % (stalled_seen,))
+
+    # ② 真停住（超过 0.5 秒下限）⇒ 必须报
+    o = m.update(101.6, loc=_loc(-30.0), **_kw)
+    check(o.climb_stalled,
+          "真停住超过「移动操作尝试间隔」下限却不报「爬不动」⇒ 卡在绳上没人补按 ↑ ✗：%s"
+          % (o.fmt(),))
 
 
 def t_foothold_below_prefers_nearer_within_xtol():
@@ -6341,7 +6554,7 @@ def t_queried_mob_boxes_marked():
     # ⚠ 2026-09-28：解析器改成**自己按（平滑后的）相机**算世界坐标（⛔ 不再走
     #   `screen_to_world` —— 那里用的是**未平滑**的 cam，会和怪那份打架 ✓）⇒
     #   假 player **必须带** `x / bottom / world_x / world_y`（少一个就早退 ⇒ `sets` 空
-    #   ⇒ 这条红 ✓ **踩过** ✓；原来这里是 `mock.patch.object(mm, "screen_to_world", …)` ✗
+    #   ⇒ 这条红 ✓ **踩过** ✓；原来这里是 `mock.patch.object(map_dot, "screen_to_world", …)` ✗
     #   现在不起作用了 ✓）。
     _ply = types.SimpleNamespace(x=100.0, y=200.0, bottom=260.0,
                                  world_x=10.0, world_y=20.0)
@@ -6473,12 +6686,12 @@ def t_pos_state_machine():
       ⑦ ⭐ **`ground_y`**（脚下那块面的 y ✓，在**玩家 x 处**取）：下爬"落到目标平台的面"的
          判据 ✓；脚下那块 id 不在地形里 ⇒ `None`（**不拿 0 骗人** ✗）；
       ⑧ ⭐ **`here_span`**（脚下集合横着占的 x 范围 ✓）：口径**由调用方给的 `span_of`** 决定
-         （= `route.set_span`，"集合里有哪些**非墙** foothold"只此一处 ✓）⇒ 机器**不自己再算** ✗；
+         （= `pathing.set_span`，"集合里有哪些**非墙** foothold"只此一处 ✓）⇒ 机器**不自己再算** ✗；
          没有解析器 / 没圈集合 ⇒ `None` ✓。
     """
     from gui import live_thread as lt
 
-    from perception import pos_state
+    from perception.world import pos_state
 
     class _L:
         def __init__(self, x, y1, y2):
@@ -6688,7 +6901,7 @@ def t_calib_arrows_move_overlay():
     ch, cw = canvas.shape[:2]
     w, h = min(60, cw - 10), min(100, ch - 10)
     panel = synth_crop_panel(canvas, 9, 40, w, h)
-    dlg = MinimapCalibDialog(mid, mode=mm.MODE_CROP, client=StubClient(panel))
+    dlg = MinimapCalibDialog(mid, mode=map_const.MODE_CROP, client=StubClient(panel))
     try:
         dlg.ck_live.setChecked(True)
         dlg._on_tick()
@@ -6813,6 +7026,114 @@ def _crop_setup():
     return mid, canvas, scale, (vx, vy), (pw, ph)
 
 
+def t_nearest_peak_picks_continuity():
+    """⭐⭐⭐ 平台等间距重复时，峰要挑**离先验最近**的那个（2026-10-18 真机实测 ✓）。
+
+    现场：人站着不动，`view_y` 却在 **18 / 48 / 77** 之间来回跳（正好差**一根平台**）——
+    因为响应图上每根平台一个峰、分数几乎一样（0.84~0.88），取全局最大就会跳 ✓。
+    ⇒ `_nearest_peak`：只在"接近最高分"的峰里挑，**离先验最近的赢**。
+    """
+    res = np.zeros((60, 20), np.float32)
+    for cy in (10, 30, 50):                     # 三根"平台"，等间距
+        res[cy - 1:cy + 2, 5:12] = 0.90
+    res[10, 8] = 0.92                           # 全局最大在最上面那根
+    got = mm._nearest_peak(res, 0.92, (8.0, 48.0), tie=0.03)
+    check(got is not None and abs(got[1] - 50.0) <= 1.5,
+          "先验在 48 附近，却挑了 %r（应当挑离先验最近的那根平台 ≈50）—— "
+          "这就是\"人没动但 view_y 在平台之间跳\"的根因 ✗" % (got,))
+    # 先验离上面那根更近时，就该挑上面那根（别把"就近"写死成"最下面" ✗）
+    got2 = mm._nearest_peak(res, 0.92, (8.0, 12.0), tie=0.03)
+    check(got2 is not None and abs(got2[1] - 10.0) <= 1.5,
+          "先验在 12 附近，却挑了 %r" % (got2,))
+
+
+def t_crop_flow_when_basemap_mismatch():
+    """⭐⭐⭐ 跨图匹配失败时，用**帧间位移**把 `view` 继续跟住（2026-10-18 用户选的「A」）。
+
+    现场（105040303）：`scroll="y"`，底图 **82×218**、面板 110×112 ⇒ 面板**每拍都在上下滚**；
+    而「面板 ↔ 底图」那条**每拍都失败**（现场 7997 次、最好分只有 0.24）⇒ `view` 永远停在
+    标定值 ⇒ 世界 y 不动 ⇒ 用户看到的就是「实时小地图没有上下移动」✗
+
+    这里钉四件：
+      ① 第一拍（没有上一帧可比）⇒ 照旧 `ok=False`（**不猜** ✓）；
+      ② 之后每拍面板滚 +2px ⇒ `ok=True`、`where="flow"`、`view_y` 每拍涨 2（缩放 1.0 ✓）；
+      ③ 这条路的 `trust` **必须** False（相对位移，误差会累计 ⇒ 界面该说"不太稳"✓）；
+      ④ 面板**不动**时 `view` 也不许飘（死区 ✓）。
+    """
+    rng = np.random.RandomState(7)
+    # "世界"纹理（比面板高）：面板 = 从上往下开窗 ⇒ 窗口下移 = 面板内容上滚 ✓
+    world = cv2.GaussianBlur(rng.randint(0, 255, (420, 110)).astype(np.uint8), (5, 5), 0)
+    # 底图**故意**与面板毫无关系 ⇒ 「面板 ↔ 底图」必失败，只剩帧间位移这条 ✓
+    # ⚠ 底图必须是**三通道**：`_gray()` 走的是 `COLOR_BGR2GRAY`，喂 2D 灰度会直接
+    #   `cv2.error: Bad number of channels`（写这条用例时踩的 ✓）
+    canvas = cv2.cvtColor(rng.randint(0, 255, (218, 82)).astype(np.uint8),
+                          cv2.COLOR_GRAY2BGR)
+    calib = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [0, 0],
+             "view": [0.0, 100.0], "score": 1.0, "scroll": map_const.SCROLL_Y}
+    vt = mm.CropViewTracker().reset([0.0, 100.0])
+
+    def _panel(off):
+        return cv2.cvtColor(world[off:off + 112, :], cv2.COLOR_GRAY2BGR)
+
+    r0 = vt.update(_panel(0), canvas, calib)
+    check(not r0["ok"],
+          "第一拍没有上一帧可比，却说自己跟住了（分 %.3f）—— 这条不许猜 ✗" % r0["score"])
+
+    vy = 100.0
+    for k in range(1, 6):
+        r = vt.update(_panel(2 * k), canvas, calib)
+        check(r["ok"], "第 %d 拍帧间位移没接住：%s" % (k, r.get("why")))
+        check(r.get("where") == "flow",
+              "第 %d 拍没走帧间位移（where=%r）" % (k, r.get("where")))
+        check(r.get("trust") is False,
+              "帧间位移的结论被标成「可信」—— 它是相对量、误差会累计 ✗")
+        vy += 2.0
+        check(abs(r["view"][1] - vy) <= 1.0,
+              "第 %d 拍 view_y=%.2f，应当 ≈%.2f（每拍滚 2 ✓）"
+              % (k, r["view"][1], vy))
+
+    still = vt.update(_panel(10), canvas, calib)
+    check(abs(still["view"][1] - vy) <= 1.0,
+          "面板不动时 view 还在飘：%.2f vs %.2f" % (still["view"][1], vy))
+
+
+def t_flow_brakes_when_no_anchor():
+    """⭐⭐⭐ 帧间位移**必须有刹车**：连续 N 拍没和底图对上就必须停手（不许无限漂）。
+
+    现场（2026-10-18）✓：推流框**框错**成一块米色墙面纹理，跨图匹配永远失败，而帧间位移
+    照样"跟得住"（墙也有纹理！）⇒ `view` 一拍拍往前爬 ⇒ **人明明在底层，位置却算到三楼**
+    （偏了 1127 世界像素 ✗ 用户报的）。
+    ⇒ 连续 `FLOW_MAX_ABS_MISS` 拍都没锚上 ⇒ **停止推进**并报出来（宁可不动 ✓）。
+    """
+    rng = np.random.RandomState(11)
+    world = cv2.GaussianBlur(rng.randint(0, 255, (420, 110)).astype(np.uint8), (5, 5), 0)
+    canvas = cv2.cvtColor(rng.randint(0, 255, (218, 82)).astype(np.uint8),
+                          cv2.COLOR_GRAY2BGR)
+    calib = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [0, 0],
+             "view": [0.0, 100.0], "score": 1.0, "scroll": map_const.SCROLL_Y}
+    vt = mm.CropViewTracker().reset([0.0, 100.0])
+    vt.FLOW_MAX_ABS_MISS = 5          # 免得真跑 30 拍（现场那个值 ✓ 这里只验机制）
+
+    def _panel_bgr(off):
+        # ⚠ 只转**一次**（灰度 → BGR）：转两次会 `Bad number of channels` ✗
+        return cv2.cvtColor(world[off:off + 112, :], cv2.COLOR_GRAY2BGR)
+
+    vt.update(_panel_bgr(0), canvas, calib)          # 第一拍：只记模板
+    for k in range(1, 5):                            # 第 2~5 拍：帧间位移照常接住
+        r = vt.update(_panel_bgr(2 * k), canvas, calib)
+        check(r["ok"] and r.get("where") == "flow",
+              "第 %d 拍帧间位移没接住：%s" % (k, r.get("why")))
+    frozen = vt.view
+    r = vt.update(_panel_bgr(10), canvas, calib)     # 第 6 拍：没锚的拍数超限
+    check(not r["ok"],
+          "连续 6 拍都没和底图对上，却还在说跟住了 —— 这就会一路漂到别的楼层 ✗")
+    check(("漂" in (r.get("why") or "")) or ("不再跟" in (r.get("why") or "")),
+          "刹车时报的原因没说清（%r）—— 得让人知道是"
+          "「一直没和底图对上、怕漂」而不是「面板被挡」" % (r.get("why"),))
+    check(vt.view == frozen,
+          "刹车之后 view 还在动：%s → %s（刹了就必须真停 ✓）" % (frozen, vt.view))
+
+
 def t_crop_view_track():
     """⭐ **局部小地图（crop）的运行时 view 跟踪**（用户 2026-09-29 任务 1 ✓）。
 
@@ -6838,7 +7159,7 @@ def t_crop_view_track():
         print("      （没有可用的底图，跳过）")
         return
     mid, canvas, S, (vx, vy), (pw, ph) = su
-    calib = {"mode": mm.MODE_CROP, "scale": S, "offset": [0, 0], "view": [vx, vy],
+    calib = {"mode": map_const.MODE_CROP, "scale": S, "offset": [0, 0], "view": [vx, vy],
              "score": 1.0}
     panel = _crop_panel(canvas, S, (vx, vy), pw, ph)
     vt = mm.CropViewTracker()
@@ -6898,7 +7219,9 @@ def t_crop_view_track():
     #    否则"像但不是"的地方会被认下来，而且之后每一拍都在那一带附近找 ⇒ 再也纠不回来 ✗
     #    （实测：拿**另一张图**的底图去匹配能到 0.555 ✓ 那条线挡不住它 ✗）
     import inspect as _ins
-    _src = _ins.getsource(mm.CropViewTracker.update)
+    # ⚠ 2026-10-18：`update` 变成了薄壳（只负责"记住这一帧给帧间位移用"✓），
+    #   真正干活的是 `_update` ⇒ 钉子要钉实现那一层（钉薄壳会一直是"没有这条" ✗）。
+    _src = _ins.getsource(mm.CropViewTracker._update)
     check("TRUST_SCORE" in _src and "tracked" in _src,
           "全图重找没有「已经在跟就抬门槛」那条（错一次就再也回不来 ✗）")
     #    行为上钉一遍：给一个"跟得住但换了张底图"的局面，门口那道闸必须拦住 ✓
@@ -6913,9 +7236,9 @@ def t_crop_view_track():
     if other is not None:
         vt3 = mm.CropViewTracker()
         vt3.update(_crop_panel(other, S, (-6.0, 20.0), pw, ph), other,
-                   {"mode": mm.MODE_CROP, "scale": S, "offset": [0, 0],
+                   {"mode": map_const.MODE_CROP, "scale": S, "offset": [0, 0],
                     "view": [-6.0, 20.0]})
-        rr = vt3.update(panel, other, {"mode": mm.MODE_CROP, "scale": S,
+        rr = vt3.update(panel, other, {"mode": map_const.MODE_CROP, "scale": S,
                                        "offset": [0, 0], "view": [-6.0, 20.0]})
         check(not rr["ok"],
               "换了底图还说跟住了（分 %.3f）—— 那一拍的世界坐标就整体错了 ✗"
@@ -6923,7 +7246,7 @@ def t_crop_view_track():
 
     # ⑤ 不是 crop ⇒ 一个字都不动
     vt2 = mm.CropViewTracker()
-    r4 = vt2.update(panel, canvas, {"mode": mm.MODE_FIT, "scale": S, "offset": [3, 4]})
+    r4 = vt2.update(panel, canvas, {"mode": map_const.MODE_FIT, "scale": S, "offset": [3, 4]})
     check(not r4["ok"] and r4["why"], "fit 的标定也去跟显示区了（%s）" % (r4,))
 
     # ⑤' ⭐ **全图重找的门槛**：直接钉规则 —— 真图场景凑不出"分数刚好落在两档中间"的
@@ -6934,7 +7257,8 @@ def t_crop_view_track():
     #         之后每拍都围着那一带找 ⇒ 再也纠不回来 ✗ —— 实测：另一张底图能到 0.555、
     #         面板被挡一半也有 0.6 上下 ✓）。
     def _stub(score):
-        def f(_region, _tpl, ox, oy, where):
+        # ⚠ 2026-10-18：真 `_match` 多了 `prior`（高峰里取离先验最近的那个）⇒ 假件要跟上
+        def f(_region, _tpl, ox, oy, where, prior=None):
             return float(score), float(ox), float(oy), where
         return f
 
@@ -6970,6 +7294,8 @@ def t_crop_view_locator_wiring():
     那个显示区是错的**（差 40 底图像素 ≈ 几百世界像素 ✗）⇒ 只有真的跟住了，读数才能回到
     那个世界点 ✓。
     """
+    from perception import map_locator
+    from perception import map_dot
     mid, canvas = pick_map()
     if mid is None:
         print("      （没有可用的底图，跳过）")
@@ -7001,10 +7327,10 @@ def t_crop_view_locator_wiring():
     panel[max(0, py - dot + 1):py + 1, max(0, px - dot // 2):px + dot // 2 + 1] = (65, 243, 245)
 
     # 标定里那个显示区**是错的**（差 40 底图像素）—— 跟住了就该纠正过来 ✓
-    bad = {"mode": mm.MODE_CROP, "scale": S, "offset": [0, 0],
+    bad = {"mode": map_const.MODE_CROP, "scale": S, "offset": [0, 0],
            "view": [vx - 40.0, vy], "score": 1.0}
-    loc = mm.PlayerLocator(mid)
-    r = loc.update(panel, src=mm.SRC_LIVE, calib=bad, terrain=t)
+    loc = map_locator.PlayerLocator(mid)
+    r = loc.update(panel, src=map_const.SRC_LIVE, calib=bad, terrain=t)
     check(r.get("view_ok") is True,
           "定位这一拍没跟住显示区（view_ok=%r why=%s）" % (r.get("view_ok"), r.get("view_why")))
     tol = 2.5 * t.px_per_world           # 2.5 个底图像素（跟的精度 + 黄点本身的尺寸）
@@ -7017,9 +7343,9 @@ def t_crop_view_locator_wiring():
           "出参里那个 view %s 不是跟出来的（%.1f）" % (r["view"], vx))
 
     # 对照：**fit** 的标定 ⇒ `view_ok` 必须是 None（"没这回事"，界面一个字都不加 ✓）
-    fit = {"mode": mm.MODE_FIT, "scale": S, "offset": [0, 0], "view": [0, 0]}
-    r2 = mm.PlayerLocator(mid).update(_crop_panel(canvas, 1.0, (0, 0), cw, ch),
-                                      src=mm.SRC_LIVE, calib=fit, terrain=t)
+    fit = {"mode": map_const.MODE_FIT, "scale": S, "offset": [0, 0], "view": [0, 0]}
+    r2 = map_locator.PlayerLocator(mid).update(_crop_panel(canvas, 1.0, (0, 0), cw, ch),
+                                      src=map_const.SRC_LIVE, calib=fit, terrain=t)
     check(r2.get("view_ok") is None,
           "fit 的标定却报了显示区跟踪状态（%r）—— fit 没这回事，别让人以为它在跟 ✗"
           % (r2.get("view_ok"),))
@@ -7046,6 +7372,7 @@ def t_live_minimap_on_terrain_map():
       ⑤ 没标定 / 没底图 / 取不到帧 ⇒ 那一层收起来 + 一行说清（不许静默 ✗）；
       ⑥ `hide()`（切走页签）⇒ 节拍停掉（没人看就不取帧 ✓）。
     """
+    from perception import map_overlay
     import inspect
 
     from PyQt5.QtGui import QPixmap
@@ -7074,20 +7401,20 @@ def t_live_minimap_on_terrain_map():
         return
     t = mapdata.load(mid, with_canvas=True)
     cw, ch = t.canvas.shape[1], t.canvas.shape[0]
-    z = float(mm.overlay_zoom(cw))
+    z = float(map_overlay.overlay_zoom(cw))
     w, h = 60, 80
     vx, vy = 8.0, 11.0
     panel = synth_crop_panel(canvas, int(vx), int(vy), w, h)
     # ⚠ `synth_crop_panel` = 原样切一块（面板 (0,0) 就是底图 (vx, vy)）⇒ `offset` 必须是
     #   [0, 0]：写 [4, 4] 的话这份标定和面板**差 4 个底图像素**（自己跟自己不一致 ✗），
     #   而 2026-09-29 起位置的来源多了"这一层自己跟出来的显示区"⇒ 那 4 px 会当场露出来 ✓
-    cal = {"mode": mm.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [vx, vy]}
+    cal = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [vx, vy]}
 
     p = RoutePanel()
     try:
         p.canvas.load(QPixmap(40, 40))       # 先"画一张地形图"（`_live_item` 这时才存在 ✓）
         p._map_id = lambda: mid
-        p._mmap_src = lambda: mm.SRC_STREAM
+        p._mmap_src = lambda: map_const.SRC_STREAM
         _called = []                         # 记"取帧时用的是哪条路"（阻塞/非阻塞 ✓）
 
         def _fetch(blocking=True):
@@ -7121,7 +7448,7 @@ def t_live_minimap_on_terrain_map():
             it = p.canvas._live_item
             check(it is not None and it.isVisible(),
                   "进了这一页、勾也是勾上的，那一层却没出现")
-            bx, by = mm.panel_to_canvas(0.0, 0.0, cal)
+            bx, by = map_calib.panel_to_canvas(0.0, 0.0, cal)
             # ⚠ 容差 1 个底图像素：位置现在来自"这一层自己跟出来的显示区"（跟它有
             #   ~0.5 底图像素的拟合分辨率 ✓），不再是标定那个数照抄 —— 那正是修的东西 ✓
             check(abs(it.pos().x() - bx * z) <= 1.0 * z
@@ -7206,6 +7533,7 @@ def t_dot_basemap_core_gate():
       ③ **零回归**：一个候选都不像核心色时 ⇒ **照用原候选**（不许把点弄丢 ✗）；
       ④ 源码级：`find_player_dot` 的 basemap 支**真的调了**这条闸 ✓（加了函数没接上 = 白做 ✗）。
     """
+    from perception import map_dot
     import inspect
     import types
 
@@ -7214,11 +7542,11 @@ def t_dot_basemap_core_gate():
     # ---- ① 口径 ----
     _true = np.zeros((8, 8, 3), np.uint8)
     _true[:, :] = (108, 255, 255)
-    check(mm.dot_core_mask(_true).all(),
+    check(map_dot.dot_core_mask(_true).all(),
           "量到的真色 (108,255,255) 过不了核心色闸 ⇒ 这个邻域配错了 ✗")
     _pale = np.zeros((8, 8, 3), np.uint8)
     _pale[:, :] = (210, 235, 250)          # "发白的黄"（B 高 ⇒ 不该算核心色 ✓）
-    check(not mm.dot_core_mask(_pale).any(),
+    check(not map_dot.dot_core_mask(_pale).any(),
           "B=210 的浅黄也算成了玩家点核心色（闸太松 ✗）")
 
     # ---- ②③ 直接钉这道闸**本身**（"拒假点 / 留真点" ✓）----
@@ -7231,7 +7559,7 @@ def t_dot_basemap_core_gate():
     #       "接上了没有"由下面 ④ 的源码级钉 ✓。
     #   "假点"色 = **真实面板上量到的洪水色** ✓（G=211 < 240 ⇒ 该被拒 ✓）
     _fake_bgr = (116, 211, 244)
-    check(mm.dot_color(np.full((6, 6, 3), _fake_bgr, np.uint8), "yellow").all(),
+    check(map_dot.dot_color(np.full((6, 6, 3), _fake_bgr, np.uint8), "yellow").all(),
           "用例前提不成立：量到的洪水色不在黄族里（判据动过？）：%r" % (_fake_bgr,))
     panel = np.full((60, 60, 3), (90, 90, 90), np.uint8)
     m = np.zeros((60, 60), np.uint8)
@@ -7241,16 +7569,16 @@ def t_dot_basemap_core_gate():
     m[40:60, 40:60] = 1
     _flood = {"x": 20.0, "y": 20.0, "w": 20, "h": 20, "area": 400}
     _true = {"x": 50.0, "y": 50.0, "w": 20, "h": 20, "area": 400}
-    check(mm._blob_looks_core(panel, m, _true) is True,
+    check(map_dot._blob_looks_core(panel, m, _true) is True,
           "真点（量到的 (108,255,255) ✓）被判成「不像玩家点」⇒ 闸把真点也拒了 ✗")
-    check(mm._blob_looks_core(panel, m, _flood) is False,
+    check(map_dot._blob_looks_core(panel, m, _flood) is False,
           "**洪水色**（量到的 (116,211,244) ✓）被判成「像玩家点」⇒ 这道闸拦不住假点 ✗"
           "（那就是第一版 180 那条线的问题：一点都拒不掉 ✓）")
     # ⚠ 零回归那条（"一个都没保住就退回原候选" ✓）是**行为**，在 `find_player_dot` 里 ✓
     #   ⇒ 用源码级把它和接线一起钉住 ✓（下面 ④）。
 
     # ④ 源码级：接上了没有 + 有没有留"零回归"的退路
-    _src = inspect.getsource(mm.find_player_dot)
+    _src = inspect.getsource(map_dot.find_player_dot)
     check("_blob_looks_core" in _src,
           "`find_player_dot` 的底图相减支没接上「像玩家点核心色」那道闸（加了函数没接 = 白做 ✗）")
     check("if _core:" in _src and "else:" in _src,
@@ -7274,11 +7602,13 @@ def t_dot_force_reacquire():
         执行在 `live_thread`（`force_reacquire` ✓）—— ⚠ 跟踪器**自己不许**判 ✗（它看不见按键：
         "人真站着不动"和"读数锁住"在它眼里一样 ✓）。
     """
+    from perception import map_locator
+    from perception import map_dot
     import inspect
 
     from perception import minimap as mm
 
-    tr = mm.PlayerDotTracker()
+    tr = map_locator.PlayerDotTracker()
     p1 = _dot_panel()
     p1[50:56, 40:46] = (65, 243, 245)               # 玩家点在这儿
     r1 = tr.update(p1, now=1.0)
@@ -7333,6 +7663,7 @@ def t_dot_basemap_layer_first():
       ② 结论来自 `basemap` 层 ✓；
       ③ **退路还在**：没有底图时颜色层照样兜底 ✓（换顺序 ≠ 把颜色那条路删掉 ✗）。
     """
+    from perception import map_dot
     import types
 
     from perception import minimap as mm
@@ -7342,10 +7673,10 @@ def t_dot_basemap_layer_first():
     vx, vy, w, h = 20, 30, 80, 60
     panel = np.ascontiguousarray(canvas[vy:vy + h, vx:vx + w].copy())
     panel[20:25, 30:35] = (65, 243, 245)        # ⭐ 真玩家点（5×5，底图上**没有** ✓）
-    cal = {"mode": mm.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [vx, vy]}
+    cal = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [vx, vy]}
     terrain = types.SimpleNamespace(canvas=canvas)
     roi = (0, 0, w, h)
-    r = mm.find_player_dot(panel, calib=cal, terrain=terrain, roi=roi)
+    r = map_dot.find_player_dot(panel, calib=cal, terrain=terrain, roi=roi)
     check(r["ok"], "两个黄块都在，却一个都没认出来：%s" % (r.get("reason"),))
     check(abs(float(r["x"]) - 32.0) <= 3 and abs(float(r["y"]) - 22.0) <= 3,
           "挑错了：该挑**底图上没有的那个真点**（面板 (32,22) ✓），却挑了地图元素 (%.1f,%.1f) "
@@ -7360,7 +7691,7 @@ def t_dot_basemap_layer_first():
     _clean = np.full((120, 160, 3), (90, 90, 90), np.uint8)
     _only = np.ascontiguousarray(_clean[vy:vy + h, vx:vx + w].copy())
     _only[20:25, 30:35] = (65, 243, 245)
-    r2 = mm.find_player_dot(_only, calib=cal, terrain=None, roi=roi)
+    r2 = map_dot.find_player_dot(_only, calib=cal, terrain=None, roi=roi)
     check(r2["ok"] and r2["layer"] == "color",
           "没有底图时颜色层没兜住（换顺序把老路弄丢了 ✗）：%r / %s"
           % (r2.get("layer"), r2.get("reason")))
@@ -7387,8 +7718,11 @@ def t_dot_diff_layer():
       ⑤ 那条线**一处实现**：`gui.route_panel.DIFF_FLOOR_WARN is mm.DIFF_FLOOR_WARN` ✓
          （界面那份原来是自己写的一个 30 ✗，现在 import 感知层那份 ✓）。
     """
+    from perception import map_locator
+    from perception import map_dot
     import types
 
+    from perception import map_calib
     from perception import minimap as mm
 
     # ---- ① 合成：亮灰点（不属黄/青）⇒ 只有差分层能看见 ----
@@ -7397,12 +7731,12 @@ def t_dot_diff_layer():
     vx, vy, w, h = 20, 30, 60, 50
     panel = np.ascontiguousarray(canvas[vy:vy + h, vx:vx + w].copy())
     panel[10:14, 20:24] = (200, 200, 200)        # ⭐ 灰白亮点：**不属黄/青族**（R≈G≈B ✓）
-    cal = {"mode": mm.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [vx, vy]}
+    cal = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [vx, vy]}
     terrain = types.SimpleNamespace(canvas=canvas)
     roi = (0, 0, w, h)
-    check(not mm.dot_mask(panel, None).any(),
+    check(not map_dot.dot_mask(panel, None).any(),
           "用例造错了：那个亮点被判据当成黄/青族了（②就没意义了 ✗）")
-    r = mm.find_player_dot(panel, calib=cal, terrain=terrain, roi=roi)
+    r = map_dot.find_player_dot(panel, calib=cal, terrain=terrain, roi=roi)
     # ⭐⭐⭐⭐ 2026-10-17 **口径变了**（用户原话：「**实测黄点识别十分不准会把红点、
     #   地图背景完全跟黄点不像的认成黄点**」✗）：
     #   差分层**不看颜色** ⇒ 它给的候选**必须自己过「玩家点核心色」复核** ✓，
@@ -7425,7 +7759,7 @@ def t_dot_diff_layer():
     #   ⚠ 这条用例从此钉的是：**整幅偏也要能采信，并且把"整幅偏"写出来** ✓
     #     （"不同源就不能用"那条老口径**作废** ✓ 别再按它改回去 ✗）。
     canvas2 = np.clip(canvas.astype(np.int16) + 40, 0, 255).astype(np.uint8)
-    r2 = mm.find_player_dot(panel, calib=cal,
+    r2 = map_dot.find_player_dot(panel, calib=cal,
                             terrain=types.SimpleNamespace(canvas=canvas2), roi=roi)
     #   ⚠⚠ **这里只钉"必须说清"** ✗ 不钉"必须采信"：整幅平移之后**能不能给出候选**
     #     还取决于尺寸/归一化那几条 ✓（合成图里就未必给 ✓）—— 拿它当"采信与否"的判据
@@ -7441,7 +7775,7 @@ def t_dot_diff_layer():
     _rng = np.random.RandomState(20261006)
     _noisy = np.clip(canvas[vy:vy + h, vx:vx + w].astype(np.int16)
                      + _rng.randint(-3, 4, (h, w, 3)), 0, 255).astype(np.uint8)
-    r3 = mm.find_player_dot(_noisy, calib=cal, terrain=terrain, roi=roi)
+    r3 = map_dot.find_player_dot(_noisy, calib=cal, terrain=terrain, roi=roi)
     check(not r3["ok"],
           "面板只有噪声（没有多出来的东西）却给了结论 ⇒ 归一化把噪声放大成「亮点」了 ✗"
           "（那道「没有比背景明显就不给候选」的闸没起作用）：%r" % (r3,))
@@ -7455,19 +7789,19 @@ def t_dot_diff_layer():
     import inspect
 
     from gui import route_panel as rp
-    _src = inspect.getsource(mm.find_player_dot)
+    _src = inspect.getsource(map_dot.find_player_dot)
     check("dot_candidates_diff(" in _src,
           "`find_player_dot` 里没接差分层（函数写了没接上 = 白写 ✗）")
-    check(rp.DIFF_FLOOR_WARN is mm.DIFF_FLOOR_WARN,
+    check(rp.DIFF_FLOOR_WARN is map_const.DIFF_FLOOR_WARN,
           "「背景档」那条线在界面里是**另写的一份**（两边迟早分叉 ✗）：%r / %r"
-          % (rp.DIFF_FLOOR_WARN, mm.DIFF_FLOOR_WARN))
+          % (rp.DIFF_FLOOR_WARN, map_const.DIFF_FLOOR_WARN))
 
     # ---- ⑥ **"哪里看得到"**也要钉住（用户 2026-10-06 追问：「差分层」字样哪里看 ✓）----
     #   ⚠ 起因（我上一轮说得太笼统 ✗）：那句长理由（`dot`）**只在定位失败时**才有人显示
     #     ⇒ **成功靠差分层兜住**这种情况**根本看不到** ✗ ⇒ 单独立一个短字段 + 写进日志 ✓。
     # ⚠⚠ **钉要钉"精确串"** ✗（第一版只查 `"dot_layer" in src` ⇒ 反向验证**没红** ✗：
     #   把键名改成 `dot_layer_x` 照样含这个子串 ⇒ 弱钉等于没钉 ✓ 这条教训与 SKILL 273 同源 ✓）。
-    _pl = inspect.getsource(mm.PlayerLocator)
+    _pl = inspect.getsource(map_locator.PlayerLocator)
     check('"dot_layer":' in _pl,
           "`PlayerLocator` 没把「哪一层认出的」立成一个短字段（要**精确**写成 "
           "`\"dot_layer\":` ✓）⇒ 成功时谁都看不到 ✗")
@@ -7498,10 +7832,11 @@ def t_diff_local_background():
       ④ `local=0` ⇒ **老口径一字不变**（要复现老图 / 老结论时用 ✓ 零回归 ✓）；
       ⑤ `at`/`peak` 取的是"**比周围**最突出"的那一点 ✓（`peak` 不再是"整幅最大 − 整幅中位" ✗）。
     """
+    from perception import map_overlay
     canvas = np.zeros((160, 200, 3), np.uint8)
     canvas[:] = (60, 70, 80)
     canvas[60:100, 20:60] = (150, 40, 40)                 # 一块地物
-    cal = {"mode": mm.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [30.0, 40.0]}
+    cal = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [30.0, 40.0]}
     panel = np.ascontiguousarray(canvas[40:90, 30:90].copy())      # 50×60
     h, w = panel.shape[:2]
     # ⭐ 「半透明小地图」那种形状：整片亮度**从左到右渐亮**（背后画面透出来 ✓）
@@ -7509,12 +7844,12 @@ def t_diff_local_background():
     grad = np.clip(panel.astype(np.float32) + _g[:, :, None], 0, 255).astype(np.uint8)
     grad[18:22, 10:14] = (255, 255, 255)                  # "玩家点"（底图上没有 ✓）
 
-    vis, di = mm.diff_panel_vs_canvas(grad, canvas, cal)
-    vis0, di0 = mm.diff_panel_vs_canvas(grad, canvas, cal, local=0)
+    vis, di = map_overlay.diff_panel_vs_canvas(grad, canvas, cal)
+    vis0, di0 = map_overlay.diff_panel_vs_canvas(grad, canvas, cal, local=0)
     check(vis is not None and di.get("ok"), "差分算不出来：%r" % (di,))
-    check(int(di.get("local") or 0) == mm.DIFF_LOCAL_PX,
+    check(int(di.get("local") or 0) == map_const.DIFF_LOCAL_PX,
           "默认没走「局部背景」那一条（local=%r，该是 %r ✓）：%r"
-          % (di.get("local"), mm.DIFF_LOCAL_PX, di))
+          % (di.get("local"), map_const.DIFF_LOCAL_PX, di))
     # ---- ① 平地处该是黑的（老口径整片亮 ✗）----
     _flat_new = int(vis[45, 45].max())
     _flat_old = int(vis0[45, 45].max())
@@ -7574,6 +7909,7 @@ def t_diff_map_view():
          切回「实时小地图」⇒ 摆的是**面板本身** ✓；
       ⑤ 「仅地形图」⇒ 收起来 + 节拍停 + 透明度灰掉 ✓；差分算不出来时**照旧摆面板**并说明 ✓。
     """
+    from perception import map_overlay
     from PyQt5.QtGui import QPixmap
     from PyQt5.QtWidgets import QApplication
 
@@ -7589,10 +7925,10 @@ def t_diff_map_view():
     canvas = np.zeros((160, 200, 3), np.uint8)
     canvas[:] = (60, 70, 80)
     canvas[60:100, 20:60] = (150, 40, 40)          # 一块地物（免得整幅一个色 ✓）
-    cal = {"mode": mm.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [30.0, 40.0]}
+    cal = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [30.0, 40.0]}
     panel = np.ascontiguousarray(canvas[40:90, 30:90].copy())   # h=50 w=60，原样切一块
     panel[18:22, 10:14] = (255, 255, 255)          # "玩家点"（底图上没有 ✓）
-    vis, di = mm.diff_panel_vs_canvas(panel, canvas, cal)
+    vis, di = map_overlay.diff_panel_vs_canvas(panel, canvas, cal)
     check(vis is not None and di.get("ok"),
           "差分算不出来（%r）—— 面板明明就是底图上切的一块 ✓" % (di,))
     check(vis.shape == panel.shape,
@@ -7608,13 +7944,13 @@ def t_diff_map_view():
           "`peak` 没把「多差出来的那一截」报出来：%r" % (di.get("peak"),))
     # ---- ② 整幅偏一点（= 底图与游戏小地图不同源的形状）----
     panel2 = np.clip(panel.astype(np.int16) + 25, 0, 255).astype(np.uint8)
-    vis2, di2 = mm.diff_panel_vs_canvas(panel2, canvas, cal)
+    vis2, di2 = map_overlay.diff_panel_vs_canvas(panel2, canvas, cal)
     check(di2.get("ok") and float(di2.get("floor") or 0) >= 20,
           "整幅偏 25 灰阶，背景档却没报出来（%r）" % (di2.get("floor"),))
     check(int(vis2[20, 12].max()) > 200,
           "减掉背景档之后亮点该照样突出（实得 %r）" % (vis2[20, 12].tolist(),))
     # ---- ③ 落在底图外面 ⇒ 如实说，不抛也不给假图 ----
-    vis3, di3 = mm.diff_panel_vs_canvas(panel, canvas,
+    vis3, di3 = map_overlay.diff_panel_vs_canvas(panel, canvas,
                                         dict(cal, view=[5000.0, 5000.0]))
     check(vis3 is None and not di3.get("ok"),
           "面板整个落在底图外面，却还是给了张差分图（会让人以为「有内容」✗）：%r"
@@ -7649,13 +7985,13 @@ def t_diff_map_view():
     _dy = int(min(max(_dy, 1), ph - 3))
     panel4 = crop.copy()
     panel4[_dy:_dy + 3, _dx:_dx + 3] = (255, 255, 255)
-    cal4 = {"mode": mm.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [vx, vy]}
+    cal4 = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [vx, vy]}
     p = RoutePanel()
     _real_calib = mapdata.load_calib
     try:
         p.canvas.load(QPixmap(40, 40))      # 先"画一张地形图"（`_live_item` 这时才存在 ✓）
         p._map_id = lambda: mid
-        p._mmap_src = lambda: mm.SRC_STREAM
+        p._mmap_src = lambda: map_const.SRC_STREAM
         p._mmap_panel_for_check = lambda blocking=True: (panel4, "")
         p._overlay_blocker = lambda: ""
         mapdata.load_calib = lambda m, src=None: dict(cal4)
@@ -7693,11 +8029,11 @@ def t_diff_map_view():
               "状态行没报「局部残差」（少了它，人只会看到吓人的背景档 ✗）：%r" % (_txt,))
         # ⭐⭐ **"把点的颜色显示出来，而不是纯白"**（用户 2026-10-06 ✓ 原话）：
         #   界面上那份差分该用**面板本来的颜色**画那块——直接拿纯函数核最省 ✓（绕开 Qt ✓）。
-        _cal_c = {"mode": mm.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [0, 0]}
+        _cal_c = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [0, 0]}
         _cv = np.full((40, 40, 3), (90, 90, 90), np.uint8)
         _pn = np.ascontiguousarray(_cv.copy())
         _pn[10:14, 10:14] = (0, 210, 240)          # 一个**黄点**（BGR：蓝低、绿红高 ✓）
-        _vx2, _i2 = mm.diff_panel_vs_canvas(_pn, _cv, _cal_c, color=True)
+        _vx2, _i2 = map_overlay.diff_panel_vs_canvas(_pn, _cv, _cal_c, color=True)
         check(_vx2 is not None and _i2.get("color") is True,
               "差分没进「彩色」档（用户要的是把点的颜色显示出来 ✓）：%r" % (_i2,))
         _hot2 = _vx2[11, 11].astype(int)
@@ -7753,6 +8089,7 @@ def t_live_map_alpha_and_follows():
          （`load()` 会重建那一层 —— 不重贴就悄悄回到不透明 ✗）；
       ⑤ **落盘**：松手 ⇒ 写进 `live.yaml` 的 `live_map_alpha` ✓（本机外观偏好 ✓）。
     """
+    from perception import map_overlay
     from PyQt5.QtGui import QPixmap
     from PyQt5.QtWidgets import QApplication
 
@@ -7766,10 +8103,10 @@ def t_live_map_alpha_and_follows():
         return
     t = mapdata.load(mid, with_canvas=True)
     ch, cw = t.canvas.shape[:2]
-    z = float(mm.overlay_zoom(cw))
+    z = float(map_overlay.overlay_zoom(cw))
     vx, vy = 6.0, 9.0
     pw, ph = max(30, min(cw - 12, 70)), max(30, min(ch - 12, 90))
-    cal = {"mode": mm.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [vx, vy]}
+    cal = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [vx, vy]}
     holder = {"vy": vy, "noise": False}
     p = RoutePanel()
     _real_calib = mapdata.load_calib
@@ -7778,7 +8115,7 @@ def t_live_map_alpha_and_follows():
     try:
         p.canvas.load(QPixmap(40, 40))
         p._map_id = lambda: mid
-        p._mmap_src = lambda: mm.SRC_STREAM
+        p._mmap_src = lambda: map_const.SRC_STREAM
 
         def _fetch(blocking=True):
             if holder["noise"]:
@@ -7885,7 +8222,8 @@ def t_live_map_alpha_and_follows():
         vt._step = (0.0, 0.0)               # 有历史 ⇒ 会走"附近找"那一路
         calls = []
 
-        def _fake_match(region, tpl, ox, oy, where):
+        def _fake_match(region, tpl, ox, oy, where, prior=None):
+            # ⚠ 2026-10-18：真 _match 多了 prior（高峰里取离先验最近的那个）⇒ 假件要跟上
             calls.append(where)
             if where == "near":
                 return 0.62, float(ox), float(oy), where       # "像，但不很像"
@@ -7914,14 +8252,14 @@ def t_scroll_axes_helpers():
     钉三件：① 老标定（**没有这个键**）⇒ 双轴 = 老行为一字不变 ✓；② 写错/写怪 ⇒ 双轴
     （**宁慢不猜**：猜成单轴会把不动的那根轴钉死 ⇒ 那才是真错 ✗）；③ 三个值都能认 ✓。
     """
-    check(mm.scroll_of({}) == mm.SCROLL_XY
-          and mm.scroll_of({"scroll": None}) == mm.SCROLL_XY,
+    check(mm.scroll_of({}) == map_const.SCROLL_XY
+          and mm.scroll_of({"scroll": None}) == map_const.SCROLL_XY,
           "没写滚动方向却不是双轴（老标定必须一字不变 ✓）")
-    check(mm.scroll_of({"scroll": "什么鬼"}) == mm.SCROLL_XY,
+    check(mm.scroll_of({"scroll": "什么鬼"}) == map_const.SCROLL_XY,
           "写了个不认识的值 ⇒ 该退回双轴（猜成单轴会把另一根轴钉死 ✗）")
-    check(mm.scroll_of({"scroll": "x"}) == mm.SCROLL_X
-          and mm.scroll_of({"scroll": "X"}) == mm.SCROLL_X
-          and mm.scroll_of({"scroll": "仅x"}) == mm.SCROLL_X,
+    check(mm.scroll_of({"scroll": "x"}) == map_const.SCROLL_X
+          and mm.scroll_of({"scroll": "X"}) == map_const.SCROLL_X
+          and mm.scroll_of({"scroll": "仅x"}) == map_const.SCROLL_X,
           "「仅 X」没认出来（大小写/中文写法都要认 ✓）")
     check(mm.scroll_axes({"scroll": "x"}) == (True, False)
           and mm.scroll_axes({"scroll": "y"}) == (False, True)
@@ -7929,8 +8267,8 @@ def t_scroll_axes_helpers():
           "`scroll_axes` 映射不对：%r / %r / %r"
           % (mm.scroll_axes({"scroll": "x"}), mm.scroll_axes({"scroll": "y"}),
              mm.scroll_axes({})))
-    keys = [k for k, _t in mm.SCROLL_LABEL]
-    check(keys == [mm.SCROLL_XY, mm.SCROLL_X, mm.SCROLL_Y],
+    keys = [k for k, _t in map_const.SCROLL_LABEL]
+    check(keys == [map_const.SCROLL_XY, map_const.SCROLL_X, map_const.SCROLL_Y],
           "界面下拉的选项不该是这几个：%r" % (keys,))
 
 
@@ -7956,13 +8294,13 @@ def t_crop_view_track_scroll_axis():
     ch, cw = t.canvas.shape[:2]
     w, h = max(40, min(cw - 10, 70)), max(40, min(ch - 10, 90))
     vx, vy = 4.0, 5.0
-    cal_x = {"mode": mm.MODE_CROP, "scale": 1.0, "offset": [0, 0],
-             "view": [vx, vy], "scroll": mm.SCROLL_X}
-    cal_xy = dict(cal_x, scroll=mm.SCROLL_XY)
+    cal_x = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [0, 0],
+             "view": [vx, vy], "scroll": map_const.SCROLL_X}
+    cal_xy = dict(cal_x, scroll=map_const.SCROLL_XY)
     regions = []
 
     def _spy(make_result):
-        def f(region, tpl, ox, oy, where):
+        def f(region, tpl, ox, oy, where, prior=None):
             regions.append((where, region.shape, tpl.shape))
             return make_result(region, tpl, ox, oy, where)
         return f
@@ -7977,9 +8315,13 @@ def t_crop_view_track_scroll_axis():
         vt_xy.update(p0, t.canvas, dict(cal_xy))
         fulls = [s for where, s, _tp in regions if where == "full"]
         # ⚠ 双轴时**也可能**先走"附近找"（有历史）⇒ 这里只要求"整图那次"存在时是整图 ✓
+        # ⚠⚠ 2026-10-18：底图现在会**补边**（局部小地图的面板常比底图宽 ✓ 见 `_pad_canvas`）
+        #   ⇒ 判据从"高 == 底图高"改成"高 == 底图高 + 上下补边"（**仍然整张都在** ✓）
         if fulls:
-            check(fulls[0][0] == ch,
-                  "双轴的全图找没把整张底图喂进去（高 %d，底图高 %d）" % (fulls[0][0], ch))
+            _m = max(12, int(round(max(p0.shape[1], p0.shape[0]) * 0.25)))
+            check(fulls[0][0] == ch + 2 * _m,
+                  "双轴的全图找没把整张底图喂进去（高 %d，应为 %d = 底图 %d + 补边 %d×2）"
+                  % (fulls[0][0], ch + 2 * _m, ch, _m))
         # ① 仅 X ⇒ 全图找是一条**横带**（高 ≈ 模板 + 余量）
         regions.clear()
         vt_x = mm.CropViewTracker()
@@ -8027,8 +8369,8 @@ def t_locate_crop_scroll_x():
     w, h = max(40, min(cw - 12, 70)), max(40, min(ch - 12, 90))
     vx, vy = 3.0, 4.0
     panel = _crop_panel(t.canvas, 1.0, (vx + 3.0, vy), w, h)   # 真值：x 偏 3、y 同
-    seed = {"mode": mm.MODE_CROP, "scale": 1.0, "offset": [0, 0],
-            "view": [vx, vy], "scroll": mm.SCROLL_X}
+    seed = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [0, 0],
+            "view": [vx, vy], "scroll": map_const.SCROLL_X}
     r = mm.locate_crop(panel, t.canvas, seed=seed)
     check(r is not None, "仅 X 的图上自动定位没量出来（拿种子也没救回来？）")
     check(abs(r["view"][1] - vy) < 1e-6,
@@ -8073,27 +8415,27 @@ def t_calib_dialog_scroll_combo():
         print("      （没有可用的底图，跳过）")
         return
     app = QApplication.instance() or QApplication([])       # noqa: F841
-    base = {"mode": mm.MODE_CROP, "scale": 1.0, "offset": [4, 4], "view": [3, 4]}
+    base = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [4, 4], "view": [3, 4]}
     with mock.patch.object(mapdata, "load_calib",
                            lambda _m, src=None: dict(base, scroll="y")):
-        d = MinimapCalibDialog(mid, mode=mm.MODE_CROP, client=StubClient(None))
+        d = MinimapCalibDialog(mid, mode=map_const.MODE_CROP, client=StubClient(None))
         try:
             check(d.cmb_scroll.count() == 3,
                   "「滚动方向」下拉该有三项，实际 %d" % d.cmb_scroll.count())
-            check(d.cmb_scroll.currentData() == mm.SCROLL_Y,
+            check(d.cmb_scroll.currentData() == map_const.SCROLL_Y,
                   "文件里写着「仅 Y」，下拉却选中 %r（一保存就被抹成双轴 ✗）"
                   % d.cmb_scroll.currentData())
-            check(d.calib().get("scroll") == mm.SCROLL_Y,
+            check(d.calib().get("scroll") == map_const.SCROLL_Y,
                   "载入的滚动方向没写回标定：%r" % (d.calib().get("scroll"),))
-            d.cmb_scroll.setCurrentIndex(d.cmb_scroll.findData(mm.SCROLL_X))
-            check(d.calib().get("scroll") == mm.SCROLL_X,
+            d.cmb_scroll.setCurrentIndex(d.cmb_scroll.findData(map_const.SCROLL_X))
+            check(d.calib().get("scroll") == map_const.SCROLL_X,
                   "选了「仅 X」却没写进标定：%r" % (d.calib().get("scroll"),))
         finally:
             d._shutdown()
     with mock.patch.object(mapdata, "load_calib", lambda _m, src=None: dict(base)):
-        d2 = MinimapCalibDialog(mid, mode=mm.MODE_CROP, client=StubClient(None))
+        d2 = MinimapCalibDialog(mid, mode=map_const.MODE_CROP, client=StubClient(None))
         try:
-            check(d2.cmb_scroll.currentData() == mm.SCROLL_XY,
+            check(d2.cmb_scroll.currentData() == map_const.SCROLL_XY,
                   "老标定（没这个键）该按「双轴」显示，实际 %r"
                   % d2.cmb_scroll.currentData())
             check("scroll" not in d2.calib(),
@@ -8139,7 +8481,7 @@ def t_calib_dialog_layout():
         return
     panel = synth_crop_panel(canvas, 5, 7, w, h)
     with mock.patch.object(theme, "save_window", lambda *a, **k: None):
-        dlg = MinimapCalibDialog(mid, mode=mm.MODE_CROP, client=StubClient(panel))
+        dlg = MinimapCalibDialog(mid, mode=map_const.MODE_CROP, client=StubClient(panel))
         try:
             dlg.resize(980, 760)
             dlg.show()
@@ -8199,7 +8541,7 @@ def t_align_score_local():
 
     病根：标定弹窗原来报的是 `locate` 那个"**整张面板**最像底图的哪儿"——crop（局部小地图）
     下面板只是底图的一小块 ⇒ 那个分跟你手上这套几何对不对**没关系** ✗（手工对齐更干脆：
-    没有分 ⇒ 每次保存都弹"匹配分偏低" ✗）。`mm.align_score` 改成只算**面板映到底图上的
+    没有分 ⇒ 每次保存都弹"匹配分偏低" ✗）。`map_overlay.align_score` 改成只算**面板映到底图上的
     那一块**（重叠区由这套几何自己定 ⇒ 不需要人再去框一块 ✓）。
 
     钉五件：
@@ -8209,6 +8551,7 @@ def t_align_score_local():
       ④ 面板框太大（有一半落在底图外）⇒ `overlap` 小、要说清（分再高也别全信 ✓）；
       ⑤ 没几何 / 没画面 ⇒ `ok=False` + 一句人话（不许给个假分 ✗）。
     """
+    from perception import map_overlay
     mid, canvas = pick_map()
     if mid is None:
         print("      （没有可用的底图，跳过）")
@@ -8221,16 +8564,16 @@ def t_align_score_local():
         return
     x, y = 6, 9
     panel = synth_crop_panel(canvas, x, y, w, h)          # 1:1 的"面板" ✓
-    good = {"mode": mm.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [x, y]}
+    good = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": [x, y]}
     # ① 对上了
-    r = mm.align_score(panel, t, good)
+    r = map_overlay.align_score(panel, t, good)
     check(r["ok"] and r["score"] >= 0.9,
           "几何摆对了，贴合分却只有 %r（%s）" % (r.get("score"), r.get("why")))
     check(r["overlap"] > 0.98,
           "面板整块都在底图里，重叠率应当 ≈100%%：%.2f" % r["overlap"])
     # ② 挪歪 20 个底图像素
     bad = dict(good, view=[x + 20, y])
-    r2 = mm.align_score(panel, t, bad)
+    r2 = map_overlay.align_score(panel, t, bad)
     check(r2["ok"] and r2["score"] < 0.5,
           "位移挪歪 20 个底图像素，贴合分还有 %r —— 它就不是「对齐了没有」的读数 ✗"
           % (r2.get("score"),))
@@ -8239,25 +8582,25 @@ def t_align_score_local():
           % (r["score"], r2["score"]))
     # ③ 缩放不对：把同一块地图按 1.3 倍画（面板大 1.3 倍、几何仍按 1.0）
     panel_zoom = _crop_panel(canvas, 1.3, (x, y), int(w * 1.3), int(h * 1.3))
-    r3 = mm.align_score(panel_zoom, t, good)
+    r3 = map_overlay.align_score(panel_zoom, t, good)
     check(r3["ok"] and r3["score"] < 0.5,
           "缩放差了 1.3 倍，贴合分还有 %r（尺度错也算对不上 ✗）" % (r3.get("score"),))
     # ④ 面板框太大 / 框到了底图外：把显示区起点摆到地图右下角 ⇒ 面板有一半在外面
     #    （`overlap` 要掉下来，别让人以为"分高就没事" ✓）
     edge = dict(good, view=[float(cw) - w / 2.0, float(ch) - h / 2.0])
-    r4 = mm.align_score(panel, t, edge)
+    r4 = map_overlay.align_score(panel, t, edge)
     check(r4["overlap"] < 0.7,
           "一半面板落到地图外了，重叠率却有 %.2f（这样分再高也不该全信 ✗）"
           % r4["overlap"])
     # ⑤ 没几何 / 没画面
-    r5 = mm.align_score(panel, t, {"mode": mm.MODE_CROP})
+    r5 = map_overlay.align_score(panel, t, {"mode": map_const.MODE_CROP})
     check(not r5["ok"] and r5["why"], "没几何却给了分：%s" % (r5,))
-    r6 = mm.align_score(None, t, good)
+    r6 = map_overlay.align_score(None, t, good)
     check(not r6["ok"] and r6["why"], "没画面却给了分：%s" % (r6,))
     # ⑥ 真底图跑一遍耗时（这条要能每拍算：判据那行是随几何变化现算的 ✓）
     t0 = time.perf_counter()
     for _ in range(5):
-        mm.align_score(panel, t, good)
+        map_overlay.align_score(panel, t, good)
     cost = (time.perf_counter() - t0) / 5.0
     check(cost < 0.05, "一次贴合分要 %.1f ms —— 太贵，判据那行会卡（要 ≤ 几十毫秒 ✓）"
           % (cost * 1000))
@@ -8292,10 +8635,10 @@ def t_calib_dialog_v2_items():
     panel = synth_crop_panel(canvas, x, y, w, h)
 
     # ② fit 的偏移单位是**面板像素**、crop 是**底图像素**（同一个控件、两种含义 ✗）
-    cal_fit = {"mode": mm.MODE_FIT, "scale": 1.0, "offset": [3.0, 4.0], "view": [0, 0]}
+    cal_fit = {"mode": map_const.MODE_FIT, "scale": 1.0, "offset": [3.0, 4.0], "view": [0, 0]}
     with mock.patch.object(mapdata, "load_calib", lambda _m, src=None: dict(cal_fit)):
-        d_fit = MinimapCalibDialog(mid, mode=mm.MODE_FIT,
-                                   client=StubClient(panel), src=mm.SRC_STREAM)
+        d_fit = MinimapCalibDialog(mid, mode=map_const.MODE_FIT,
+                                   client=StubClient(panel), src=map_const.SRC_STREAM)
         try:
             check(d_fit._off_unit() == "面板像素",
                   "fit 的偏移单位该写「面板像素」，实际 %r" % d_fit._off_unit())
@@ -8309,10 +8652,10 @@ def t_calib_dialog_v2_items():
             d_fit._shutdown()
 
     # ⑥ 「不改缩放」：先把缩放**故意改错**（真实是 1:1 ⇒ 会自动定位成 1.0）
-    cal_crop = {"mode": mm.MODE_CROP, "scale": 3.0, "offset": [4, 4], "view": [0, 0]}
+    cal_crop = {"mode": map_const.MODE_CROP, "scale": 3.0, "offset": [4, 4], "view": [0, 0]}
     with mock.patch.object(mapdata, "load_calib", lambda _m, src=None: dict(cal_crop)):
-        d = MinimapCalibDialog(mid, mode=mm.MODE_CROP,
-                               client=StubClient(panel), src=mm.SRC_STREAM)
+        d = MinimapCalibDialog(mid, mode=map_const.MODE_CROP,
+                               client=StubClient(panel), src=map_const.SRC_STREAM)
         try:
             # ② crop 的偏移单位必须写「底图像素」（写死成"面板像素" 就是错的 ✗）
             check(d._off_unit() == "底图像素",
@@ -8347,7 +8690,7 @@ def t_calib_dialog_v2_items():
             d._locate_now()
             check(abs(d.scale - 1.0) < 1e-9,
                   "「不改缩放」把缩放改成 %.4f 了" % d.scale)
-            got = mm.panel_to_canvas(0, 0, d.calib())
+            got = map_calib.panel_to_canvas(0, 0, d.calib())
             check(abs(got[0] - x) < 1.0 and abs(got[1] - y) < 1.0,
                   "「不改缩放」时位移没对齐过来：面板左上 → 底图 (%s, %s)，应 ≈ (%d, %d)"
                   "（缩放已经是对的 ⇒ 这条必须准）" % (got[0], got[1], x, y))
@@ -8377,12 +8720,13 @@ def t_crop_overlay_geometry_matches_box():
     钉法：造一份**自洽的真值** —— 标定是在"同一块地图、放大 3 倍"的另一块面板上做的
     （尺寸与缩放都 ×3），那么折算到框选那块之后，源矩形**必须还是那块地图** ✓。
     """
+    from perception import map_overlay
     mid, canvas = pick_map()
     if mid is None:
         print("      （没有可用的底图，跳过）")
         return
     cw, ch = canvas.shape[1], canvas.shape[0]
-    z_ov = mm.overlay_zoom(cw)          # 底图 → 叠加图 的放大倍数（源矩形按它算 ✓）
+    z_ov = map_overlay.overlay_zoom(cw)          # 底图 → 叠加图 的放大倍数（源矩形按它算 ✓）
     box = (5, 71, 109, 114)             # 框选小地图：一个真实的形状 ✓
     # 真值：框选那块面板显示的地图范围（底图像素）。数取自 105040303 的真实标定：
     # scale 5.624（在 A 机 zoom=3 那块面板上量的）、view=[-12,105]、offset=[4,4]
@@ -8390,9 +8734,9 @@ def t_crop_overlay_geometry_matches_box():
     s_stream, s_box = 5.624, 5.624 / 3.0
     x0, y0 = -12.711, 104.29
     # 标定（在**放大 3 倍**的那块面板上）：view = 底图坐标(面板 0 处) + inset/scale ✓
-    cal = {"mode": mm.MODE_CROP, "scale": s_stream, "offset": [4, 4],
+    cal = {"mode": map_const.MODE_CROP, "scale": s_stream, "offset": [4, 4],
            "view": [x0 + 4.0 / s_stream, y0 + 4.0 / s_stream]}
-    src, dst = mm.frame_overlay_rects(cal, box, (cw, ch),
+    src, dst = map_overlay.frame_overlay_rects(cal, box, (cw, ch),
                                       calib_panel=(int(box[2] * 3), int(box[3] * 3)))
     check(tuple(dst) == box,
           "叠图的落点不是框选那块（%s vs %s）—— crop 下它就该正好盖在框上 ✓" % (dst, box))
@@ -8409,9 +8753,9 @@ def t_crop_overlay_geometry_matches_box():
     # 对照：`fit`（整张底图缩进面板）折算之后，画上去的那块**正好铺满框选那块** ✓
     #   —— fit 的每条边都跟 zoom 无关：底图 × scale / z = 框宽（z = 底图×scale / 框宽 ✓）。
     #   ⚠ 这条**不是**"折算前后一样"（那是我一开始写错的：折算必然会按 1/z 缩 ✓）。
-    fit = {"mode": mm.MODE_FIT, "scale": 5.6, "offset": [3.5, 4.7], "view": [0, 0]}
+    fit = {"mode": map_const.MODE_FIT, "scale": 5.6, "offset": [3.5, 4.7], "view": [0, 0]}
     fw_fit, fh_fit = int(cw * 5.6), int(ch * 5.6)          # 标定那块面板 = 整张底图 × 5.6
-    _, dst_f = mm.frame_overlay_rects(fit, (5, 71, fw_fit // 3, fh_fit // 3),
+    _, dst_f = map_overlay.frame_overlay_rects(fit, (5, 71, fw_fit // 3, fh_fit // 3),
                                       (cw, ch), calib_panel=(fw_fit, fh_fit))
     check(abs(dst_f[2] - fw_fit // 3) <= 1 and abs(dst_f[3] - fh_fit // 3) <= 1,
           "fit 折算之后没铺满框选那块（画出来 %s，框是 %s）—— 折算只该按 1/z 缩 ✓"
@@ -8436,6 +8780,7 @@ def t_crop_overlay_follows_view():
          叠图会被摆到别的图上那个框的位置、甚至判成"还没框" ✗）；
       ④ 跟不住时（`view_ok` 假）**不许**拿旧显示区硬喂（那一拍用的就是标定里那份 ✓）。
     """
+    from perception import map_overlay
     import inspect
 
     from PyQt5.QtGui import QPixmap
@@ -8450,7 +8795,7 @@ def t_crop_overlay_follows_view():
         return
     t = mapdata.load(mid, with_canvas=True)
     crop = [6, 72, 60, 40]
-    cal = {"mode": mm.MODE_CROP, "scale": 2.0, "offset": [4, 4],
+    cal = {"mode": map_const.MODE_CROP, "scale": 2.0, "offset": [4, 4],
            "view": [-3.0, 12.0], "score": 0.9}
 
     class _FakePanel:
@@ -8479,21 +8824,21 @@ def t_crop_overlay_follows_view():
         p.live_panel = fake
         p._map_id = lambda: mid
         p._mmap_crop = lambda: list(crop)
-        p._mmap_src = lambda: mm.SRC_LIVE     # 走"从实时画面裁一块"那条（不碰网络 ✓）
+        p._mmap_src = lambda: map_const.SRC_LIVE     # 走"从实时画面裁一块"那条（不碰网络 ✓）
         p._mmap_draw_on = lambda: True
         p._overlay_blocker = lambda: ""
         p._calib_panel_wh = lambda *a: None
         p._overlay_pix = lambda m: QPixmap(4, 4)
         real_calib = mapdata.load_calib
         mapdata.load_calib = lambda m, src=None: dict(cal)
-        real_rects = mm.frame_overlay_rects
+        real_rects = map_overlay.frame_overlay_rects
 
         def fake_rects(loc, *a, **kw):
             seen.setdefault("views", []).append(
                 None if loc.get("view") is None else [float(v) for v in loc["view"]])
             return ((0, 0, 2, 2), (1, 1, 2, 2))
 
-        mm.frame_overlay_rects = fake_rects
+        map_overlay.frame_overlay_rects = fake_rects
         try:
             # ① 带 view ⇒ 必须把它传下去；不带 ⇒ 用标定里那份 ✓
             p._refresh_overlay(view=[7.0, -9.0])
@@ -8550,7 +8895,7 @@ def t_crop_overlay_follows_view():
                   "没跟住却还去改叠图（那一拍该照标定里那份画 ✓，不然叠图会跳到错位置 ✗）："
                   "%s" % (seen.get("views"),))
         finally:
-            mm.frame_overlay_rects = real_rects
+            map_overlay.frame_overlay_rects = real_rects
             mapdata.load_calib = real_calib
     finally:
         p.deleteLater()
@@ -8584,6 +8929,8 @@ def t_dot_rejects_red_and_debounces():
       ③ 两远点交替喂 ⇒ **一次都不许报在远处**、回原点照旧认（别锁死 ✓）；
       ④ 源码钉：跳变被拒**不许清锁位** ✗ ＋ 出口必须有**颜色复核** ✓。
     """
+    from perception import map_locator
+    from perception import map_dot
     from pathlib import Path
 
     import numpy as np
@@ -8600,18 +8947,18 @@ def t_dot_rejects_red_and_debounces():
     RED = (0, 0, 255)
 
     # ---- ① 红点 ⇒ 认不出 ----
-    r = mm.find_player_dot(_panel((150, 120, RED)))
+    r = map_dot.find_player_dot(_panel((150, 120, RED)))
     check(not r["ok"], "① **红点不许被认成黄点** ✗（用户原话「把红点认成黄点」）：%r"
                        % (r.get("reason"),))
 
     # ---- ② 黄点 ⇒ 照旧认得出 ----
-    r2 = mm.find_player_dot(_panel((150, 120, YEL)))
+    r2 = map_dot.find_player_dot(_panel((150, 120, YEL)))
     check(r2["ok"] and abs(r2["x"] - 153) <= 5 and abs(r2["y"] - 123) <= 5,
           "② **黄色标记必须照旧认得出**（零回归 ✓）：ok=%r xy=(%r,%r) / %r"
           % (r2["ok"], r2.get("x"), r2.get("y"), r2.get("reason")))
 
     # ---- ③ 跳变上限真的抖住 ----
-    tr = mm.PlayerDotTracker(max_jump=40.0, hold_ms=0)
+    tr = map_locator.PlayerDotTracker(max_jump=40.0, hold_ms=0)
     tr.update(_panel((40, 40, YEL)), now=0.0)
     b = tr.update(_panel((260, 190, YEL)), now=0.1)
     check(not b["ok"], "③ 远处那个候选必须被**跳变上限**丢掉 ✗：%r" % (b.get("reason"),))
@@ -8629,12 +8976,17 @@ def t_dot_rejects_red_and_debounces():
 
     # ---- ④ 源码钉 ----
     src = (Path(__file__).resolve().parent.parent
-           / "perception" / "minimap.py").read_text(encoding="utf-8")
-    _i = src.index("候选位置跳变")
-    check("self.x = self.y = None" not in src[_i - 2000:_i],
+           / "perception" / "map_locator.py").read_text(encoding="utf-8")
+    # ⚠ 先滤掉注释行再找：这段说明文字里**照着写了** `self.x = self.y = None`，
+    #   不滤会把解释当成代码、自己判自己红（2026-10-18 拆包时踩到）。
+    _code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
+    _i = _code.index("候选位置跳变")
+    check("self.x = self.y = None" not in _code[_i - 2000:_i],
           "④ 跳变被拒时**不许清空锁位** ✗（清了 ⇒ 下一拍全画面搜、无条件接受远点 "
           "⇒ 来回跳 ✓ = 用户说的「根本没有防抖」✓）")
-    check('hit.get("layer") in ("diff", "basemap")' in src,
+    _dot_src = (Path(__file__).resolve().parent.parent
+                / "perception" / "map_dot.py").read_text(encoding="utf-8")
+    check('hit.get("layer") in ("diff", "basemap")' in _dot_src,
           "④ 出口必须有**颜色复核** ✗（差分层 / 底图层不看颜色 ⇒ 红点、背景都会过关 ✓）")
 
 
@@ -8651,21 +9003,22 @@ def t_mmap_crop_follows_frame_size():
       ② 帧缩一半 ⇒ 框**等比缩小** ✓ 且**不越界** ✗（老行为是原样越界 ⇒ 逼重框 ✓）；
       ③ 尺寸无效 / 零宽高 ⇒ `None` ✓（调用方退回绝对框 ✓ 不猜 ✗）。
     """
+    from perception import map_calib
     from perception import minimap as mm
 
     crop = [6, 72, 240, 79]
-    rel = mm.crop_rel_of(crop, (768, 1366))
+    rel = map_calib.crop_rel_of(crop, (768, 1366))
     check(rel and all(0.0 <= v <= 1.0 for v in rel), "① 比例该落在 0~1：%r" % (rel,))
-    back = mm.crop_from_rel(rel, (768, 1366))
+    back = map_calib.crop_from_rel(rel, (768, 1366))
     check(back == tuple(crop), "① 同尺寸往返该还原成原框：%r → %r" % (crop, back))
-    small = mm.crop_from_rel(rel, (384, 683))
+    small = map_calib.crop_from_rel(rel, (384, 683))
     check(small and abs(small[0] - 3) <= 1 and abs(small[2] - 120) <= 2,
           "② 帧缩一半时框该**等比缩小** ✗（原样不动就会越界 ⇒ 又要重框 ✓）：%r" % (small,))
     check(small[0] + small[2] <= 683 and small[1] + small[3] <= 384,
           "② 折算后**不许越界**：%r" % (small,))
-    check(mm.crop_from_rel([0.1, 0.1, 1.5, 1.0], (0, 0)) is None,
+    check(map_calib.crop_from_rel([0.1, 0.1, 1.5, 1.0], (0, 0)) is None,
           "③ 画面尺寸无效该给 None ✓（调用方退回绝对框 ✓）")
-    check(mm.crop_rel_of([0, 0, 0, 0], (768, 1366)) is None, "③ 零宽高该给 None ✓")
+    check(map_calib.crop_rel_of([0, 0, 0, 0], (768, 1366)) is None, "③ 零宽高该给 None ✓")
 
 
 def t_win_rebind_by_title():
@@ -8713,7 +9066,7 @@ def t_camera_no_flip_on_alternating_worlds():
       ② 新的位置**稳定**出现 ⇒ 照旧认账 ✓（"真传送 / 换图不许永远冻着" ✓ ——
         这条由既有 `t_player_tracker_trusted_camera` ③ 钉着 ✓，这里再钉一遍 ✓）。
     """
-    from perception.tracker import PlayerTracker
+    from perception.track.tracker import PlayerTracker
 
     tr = PlayerTracker()
     # ⚠ **直接驱动 `_cam_step`**（本用例测的就是它 ✓）——走 `update` 会先过"要不要换框"
@@ -8756,7 +9109,7 @@ def t_player_tracker_trusted_camera():
       ④ 没给黄点 ⇒ 不动、也不报"对不上"（判不了 ≠ 不一致 ✓）；
       ⑤ 跟丢 ⇒ 解锁重锁时**相机重来**（旧那个属于上一段位置，沿用只会把它带偏 ✗）。
     """
-    from perception.tracker import PlayerTracker
+    from perception.track.tracker import PlayerTracker
 
     def _c(cx, bottom):
         return [(cx - 20.0, bottom - 60.0, cx + 20.0, bottom, 0.9)]
@@ -8845,7 +9198,7 @@ def t_player_tracker_input_aware():
       ④ 变向 ⇒ 从正速度**刹到负**（不会卡在 0 不动）；
       ⑤ 主循环卡一下（`dt` 很大）⇒ 预测**不许被推出去几百像素**（夹住 ✓）。
     """
-    from perception import tracker as _tk
+    from perception.track import tracker as _tk
 
     class _Clock:
         """只替**本模块**里那个 `time`（不动全局 ✓）—— 让它按固定步长往前走。"""
@@ -8963,7 +9316,7 @@ def t_screen_to_world_trusted_camera():
     ⚠ `cam_x/cam_y` 是 `None`（还没建立）时**必须退回老口径**（现算）—— 把它当 0 会让
     所有怪的世界坐标整体偏一个相机 ✗。
     """
-    from perception.world_state import Player
+    from perception.world.world_state import Player
     from perception.minimap import screen_to_world
 
     # 老口径：没有可信相机 ⇒ 现算（行为一字不变 ✓）
@@ -8997,13 +9350,16 @@ def t_trusted_camera_wiring():
     from gui import live_thread as lt
 
     src = inspect.getsource(lt)
-    check("player_tracker.camera()" in src and "ws.player.cam_x" in src,
+    # ⚠ 2026-10-20：`player_tracker.camera()` 已随「玩家定位」段搬进 `runtime/frame_locate.py`
+    #   ⇒ 那一半读新文件；`ws.player.cam_x` 那半仍在 `live_thread` ✓（两半一起判 ✓）
+    _loc_src = (ROOT / "runtime" / "frame_locate.py").read_text(encoding="utf-8")
+    check("player_tracker.camera()" in _loc_src and "ws.player.cam_x" in src,
           "`live_thread` 没把可信相机写进 WorldState（下游就拿不到 ✓）")
     check("getattr(player, \"cam_x\", None)" in src,
           "怪的集合解析器没读 `player.cam_x`（相机那条链就还是每拍现算 ✗）")
     check("crop_view_ok" in src and "crop_view_miss" in src,
           "crop 显示区跟没跟住没打点（现场排查要它 ✓）")
-    check("perf.count(\"cam_reject\")" in src,
+    check("perf.count(\"cam_reject\")" in (src + _loc_src),
           "「框与黄点对不上」没打点（`cam_reject` 涨不涨是判断'框锁错了'的第一手证据 ✓）")
 
 
@@ -9046,7 +9402,7 @@ def t_crop_locate_real_shape():
     gx, gy = np.meshgrid(xs, ys)
     panel = cv2.remap(canvas, gx, gy, cv2.INTER_LINEAR,
                       borderMode=cv2.BORDER_REPLICATE)
-    true = {"mode": mm.MODE_CROP, "scale": s_true, "offset": [4, 4],
+    true = {"mode": map_const.MODE_CROP, "scale": s_true, "offset": [4, 4],
             "view": [view[0], view[1]]}
     sc_true, _ov, _why = mm.overlap_pearson(panel, canvas, true)
     check(sc_true is not None and sc_true > 0.9,
@@ -9061,7 +9417,7 @@ def t_crop_locate_real_shape():
     check(abs(loc["scale"] - s_true) / s_true <= 0.006,
           "量出的放大倍数 %.3f 与真值 %.3f 差了 %.2f%%（>0.6%% ⇒ 没做连续缩放/细化 ✗）"
           % (loc["scale"], s_true, abs(loc["scale"] - s_true) / s_true * 100))
-    cx, cy = mm.panel_to_canvas(0, 0, loc)
+    cx, cy = map_calib.panel_to_canvas(0, 0, loc)
     check(abs(cx - view[0]) <= 1.0 and abs(cy - view[1]) <= 1.0,
           "面板左上量到 (%.2f, %.2f)，真值 (%.2f, %.2f) —— 差超过 1 底图像素 ✗"
           "（放大 5 倍的面板上，1 底图像素 = 5~10 个面板像素 ⇒ 这一格是有意义的 ✓"
@@ -9101,7 +9457,7 @@ def t_crop_locate_real_shape():
                          move_scale=False)
     check(got is not None and abs(got["calib"]["scale"] - s_true) < 1e-9,
           "「不改缩放」却动了缩放：%r" % (got and got["calib"]["scale"]))
-    gx0, gy0 = mm.panel_to_canvas(0, 0, got["calib"])
+    gx0, gy0 = map_calib.panel_to_canvas(0, 0, got["calib"])
     check(abs(gx0 - view[0]) <= 1.0 and abs(gy0 - view[1]) <= 1.0,
           "「不改缩放」没把位移搬回来：(%.2f, %.2f) 真值 (%.2f, %.2f) ✗"
           % (gx0, gy0, view[0], view[1]))
@@ -9113,7 +9469,7 @@ def t_crop_locate_real_shape():
     check(got2 is not None and abs(got2["calib"]["scale"] - s_true) < 1e-9,
           "「不改缩放」在要靠粗定救回来的时候动了缩放：%r ✗"
           % (got2 and got2["calib"]["scale"]))
-    gx1, gy1 = mm.panel_to_canvas(0, 0, got2["calib"])
+    gx1, gy1 = map_calib.panel_to_canvas(0, 0, got2["calib"])
     check(abs(gx1 - view[0]) <= 1.0 and abs(gy1 - view[1]) <= 1.0,
           "起点在底图外时没救回来：(%.2f, %.2f) 真值 (%.2f, %.2f) ✗"
           % (gx1, gy1, view[0], view[1]))
@@ -9127,6 +9483,7 @@ def t_align_score_near():
         不同源，不是你标歪了 ✓（这时把对的几何改坏才是真的亏 ✗）；
       · 「**附近 (x, y) 更贴**」= 有得可挪 ⇒ 那才是真没对齐 ✓。
     """
+    from perception import map_overlay
     mid, canvas = pick_map()
     if mid is None:
         print("      （没有可用的底图，跳过）")
@@ -9146,8 +9503,8 @@ def t_align_score_near():
     t.canvas = canvas
     # ⚠ `_crop_panel` 的约定：面板 (0,0) **正好**是底图 `view` 那个点（不带 inset ✓）
     #   ⇒ 这套几何里 `offset` 必须是 [0, 0]（写 [8, 8] 就凭空偏 4 个底图像素 ✗）
-    good = {"mode": mm.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": list(view)}
-    r = mm.align_score(panel, t, good, near=True)
+    good = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [0, 0], "view": list(view)}
+    r = map_overlay.align_score(panel, t, good, near=True)
     check(r["ok"] and r["score"] > 0.9,
           "这套几何本该是对齐的（分 %.3f）—— 用例自己的约定写错了？" % (r.get("score") or -1))
     check(r["ok"] and r["near"] is not None,
@@ -9157,7 +9514,7 @@ def t_align_score_near():
           % (r["score"], r["near"]["score"]))
     # 故意挪歪 4 个底图像素 ⇒ 邻域必须指回**真方向**（dx ≈ −4）且明显更高 ✓
     off = dict(good, view=[view[0] + 4.0, view[1]])
-    r2 = mm.align_score(panel, t, off, near=True)
+    r2 = map_overlay.align_score(panel, t, off, near=True)
     check(r2["ok"] and r2["near"] is not None,
           "挪歪了却没给邻域结论：%s" % (r2,))
     check(r2["near"]["score"] > r2["score"] + 0.02,
@@ -9171,7 +9528,7 @@ def t_align_score_near():
           "邻域报的分（%.3f）比**真对齐**那档（%.3f）还高 —— 那这个分就没意义了 ✗"
           % (r2["near"]["score"], r["score"]))
     # 关掉时一分钱不多花（老调用方不受影响 ✓）
-    check(mm.align_score(panel, t, good).get("near") is None,
+    check(map_overlay.align_score(panel, t, good).get("near") is None,
           "`near=False`（默认）却把邻域也算了一遍（白花 ✗）")
 
 
@@ -9192,7 +9549,7 @@ def t_calib_judge_relative():
     pw, ph = max(40, min(cw - 8, 120)), max(40, min(ch - 8, 160))
     view = (float(int(cw * 0.2)), float(int(ch * 0.2)))
     panel = _crop_panel(canvas, 1.0, view, pw, ph)
-    dlg = MinimapCalibDialog(mid, mode=mm.MODE_CROP, client=StubClient(panel))
+    dlg = MinimapCalibDialog(mid, mode=map_const.MODE_CROP, client=StubClient(panel))
     try:
         dlg.ck_live.setChecked(True)
         dlg._on_tick()
@@ -9264,7 +9621,7 @@ def t_autofit_fills_missing_source():
         # ① 缺 live ⇒ 自动补
         r = mm.try_autofit(panel, canvas, mid, "live")
         live = mapdata.load_calib(mid, "live")
-        check(bool(r.get("ok")) and live is not None and mm.has_geometry(live),
+        check(bool(r.get("ok")) and live is not None and map_calib.has_geometry(live),
               "缺 `live` 时该**自动补上并落盘**（实测 %r / calib=%r）" % (r, live))
         # ② stream 那份不许动
         _after = dict((mapdata.load_calibs(mid) or {}).get("stream") or {})
@@ -9380,7 +9737,600 @@ def t_osd_facing_and_calib_lines():
         _agent_mod.CURRENT = _bak
 
 
+def t_ladder_is_not_airborne():
+    """⭐⭐⭐ **在绳梯上不许被判成"空中"**（用户 2026-10-18："在绳梯上应该是不能被判属于空中的"✓）。
+
+    现场：人挂在绳上时，脚下那块平台**天然在很远的地方**（实测本图 L5 绳上 y=1502 处
+    离下面平台 **472px**，L1 更是 1900+）⇒ 先判"空中"就会把**正常攀爬**判成半空 ✗
+    ⇒ `airborne=True` 且 `foothold_id`/`segment_id` 被清空、小地图那行写"空中"而不是"绳梯 L5" ✗。
+
+    钉四条（源码级 —— 这是**判据顺序**的事，跑整条链要造地形+面板，不值当）：
+      ① `ladder_at` 必须排在"空中判定"**之前** ✓
+      ② 有绳（`_lad`）时**不进** `out["airborne"] = True` 那条 ✓
+      ③ 有绳时报「绳梯 Lx」并写明"不算空中" ✓
+      ④ `seg is None` 那条**不许**把「空中 / 绳梯」的说明覆盖成"脚下没有平台" ✓
+    """
+    src = (ROOT / "perception" / "map_locator.py").read_text(encoding="utf-8")
+    i_lad = src.find("terrain.ladder_at(wx, wy)")
+    i_air = src.find('out["airborne"] = True')
+    check(i_lad > 0 and i_air > 0, "定位器里找不到绳梯判定 / 空中判定那两处 ✗")
+    check(i_lad < i_air,
+          "绳梯判定排在了空中判定**后面** ⇒ 挂在绳上的人会先被记成 airborne=True ✗"
+          "（用户 2026-10-18 现场就是这么错的 ✓）")
+
+    # ⚠ 分支是 `if _lad: …（报绳梯、不置 airborne）else: out["airborne"] = True …`
+    #   ⇒ `if _lad:` 在赋值**之前**，窗口要**往前**取 ✓
+    seg = src[max(0, i_air - 900):i_air + 300]
+    check("if _lad:" in seg and "else:" in seg,
+          "空中判定没有按「在不在绳上」分叉 ⇒ 绳梯上照样会被判空中 ✗")
+    check("不算空中" in seg,
+          "绳梯那一支没把「不算空中」说清楚（人得知道这是正常攀爬、不是半空）✗")
+
+    i_pass = src.find('if out["airborne"] or _lad:')
+    i_none = src.find('elif seg is None:')
+    check(i_pass > 0 and i_none > i_pass,
+          "`seg is None` 那条会覆盖「空中 / 绳梯」的说明 ⇒ 绳梯上显示成「脚下没有平台」✗")
+
+    check("_lad = zones.ladder_ids(terrain).get(id(L))" in src,
+          "绳号不是用 `zones.ladder_ids` 取的 ⇒ 界面上的 L2 和编辑器里那根绳对不上 ✗")
+
+
+def t_air_gap_state():
+    """⭐⭐⭐⭐ 「空中态」（用户 2026-10-18 ✓ 原话：
+
+      「**离下方 foothold y 差距如果超过 200 不应该算到达！** 当前的逻辑会影响各类
+       寻路 / idle 计时的判定，**我还在半空中没到点就开始计时了**，这是不对的」）。
+
+    病：人在**半空**（跳过去还没落地）时，脚下读到的仍是**下面那块平台** ⇒ 位置状态
+      照旧给 `foothold_id` ⇒ `here_sets` 非空 ⇒ 到达 / idle 计时 / 战斗区归属**当场成立** ✗。
+
+    钉五条：高度差口径 · 没 foothold 给 None · **超过**阈值才算空中（等于阈值不算）·
+      定位器把空中落到 `airborne` 并清空 `foothold_id`/`segment_id` · 三处同口径 + 设置页那一格。
+    """
+    from perception import map_locator
+    from perception import map_dot
+    from core import mapdata as M
+    from perception import minimap as mm
+
+    f = M.Foothold({"id": "1", "x1": "100", "y1": "0", "x2": "200", "y2": "0",
+                    "layer": "1", "group": "1"})
+    check(map_locator.PlayerLocator.foothold_gap(f, 150, 0) == 0.0,
+          "人正站在平台面上（y 相同）却算出了高度差 ✗")
+    check(map_locator.PlayerLocator.foothold_gap(f, 150, -250) == 250.0,
+          "高度差口径不对（该是「平台面 y − 人 y」，世界 y 越小越靠上 ✗）")
+    check(map_locator.PlayerLocator.foothold_gap(None, 0, 0) is None,
+          "没有 foothold 还给出高度差 ⇒ 会拿假数判空中 ✗")
+
+    gap_air = map_locator.PlayerLocator.foothold_gap(f, 150, -201)
+    gap_ok = map_locator.PlayerLocator.foothold_gap(f, 150, -200)
+    check(gap_air > 200 and gap_ok <= 200,
+          "阈值语义不对：该是「**超过** 200 才算空中」，正好 200 仍算落地 ✓")
+
+    root = ROOT
+    src = (root / "perception" / "map_locator.py").read_text(encoding="utf-8")
+    check("_gap > _air_gap" in src,
+          "定位器里空中判定的方向写反了（该是「人比平台高**超过**阈值」⇒ 空中 ✓）")
+    check('out["airborne"] = True' in src
+          and 'out["foothold_id"] = None' in src
+          and 'out["segment_id"] = None' in src,
+          "判成空中时没把 `foothold_id` / `segment_id` 一起清空 ⇒ 下游仍会认为站在平台上 ✗")
+    check("air_gap_px" in (root / "gui" / "live_thread.py").read_text(encoding="utf-8"),
+          "实时线程没把「空中判定」传给定位器 ⇒ 这条参数等于没接 ✗")
+    check("air_gap_px" in (root / "gui" / "route_panel.py").read_text(encoding="utf-8"),
+          "路线面板没传「空中判定」⇒ 面板与实时线程口径分叉 ✗")
+    rp = (root / "gui" / "route_panel.py").read_text(encoding="utf-8")
+    check("fh：空中" in rp, "界面上没有「fh：空中」这个状态显示 ✗")
+    sd = (root / "gui" / "settings_dialog.py").read_text(encoding="utf-8")
+    check("sp_air_gap" in sd and "air_gap_px" in sd,
+          "「设置 → 判定参数」里没有「空中判定(px)」这一格（回填/写回缺一不可 ✗）")
+
+
+def t_live_mark_on_dot():
+    """⭐⭐⭐⭐ 地形图页签那个「玩家圈」必须画在**贴图上黄点所在的位置**
+    （用户 2026-10-20 ✓ 原话："**你并没有把它标在玩家身上；玩家是黄点，它就应该标在实时
+    小地图你认为黄点所在的位置上**"✗）。
+
+    病：那条圈一直按**世界坐标**换算到地形图上（`world_to_canvas`）⇒ 它和"贴图上那个黄点"
+      是**两套坐标**（一套走地形、一套走面板像素 ✓）⇒ 看着**没压在黄点上** ✗，而用户要看的
+      恰恰是"你认的那个点对不对"✓。
+
+    钉四条：
+      ① 有 `dot_px/dot_py` ⇒ 圈落在 `贴图原点 + 黄点 × 贴图比例` 上 ✓（与贴图**同一套映射**）；
+      ② 它**不等于**"按世界坐标换算"的那个位置 ✓（证明真的走了新那条，不是碰巧）；
+      ③ 没有黄点像素（不是局部小地图 / 这拍没认出）⇒ **退回世界坐标** ✓（不许不画 ✗）；
+      ④ 黄点像素落在面板外（认错 / 面板换了尺寸）⇒ 也退回世界坐标 ✓（别画到图外 ✗）。
+    """
+    from PyQt5.QtGui import QPixmap
+    from PyQt5.QtWidgets import QApplication
+
+    from gui import route_panel as rp
+    from gui.route_panel import RoutePanel
+
+    app = QApplication.instance() or QApplication([])       # noqa: F841
+    mid, _base = pick_map()
+    if mid is None:
+        print("      （没有可用的底图，跳过）")
+        return
+    t = mapdata.load(mid, with_canvas=True)
+    ch, cw = t.canvas.shape[:2]
+    pw, ph = max(20, min(cw - 6, 40)), max(20, min(ch - 6, 50))
+    vx, vy = 3.0, 5.0
+    panel = np.ascontiguousarray(t.canvas[int(vy):int(vy) + ph,
+                                         int(vx):int(vx) + pw])
+    cal = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [0, 0],
+           "view": [vx, vy]}
+
+    _real_calib = mapdata.load_calib
+    _real_update = rp.update_live
+    _real_last = None
+    try:
+        from decision import agent as _agent_mod
+        _real_last = getattr(_agent_mod, "LAST_POS", None)
+    except Exception:                       # noqa: BLE001
+        _agent_mod = None
+    try:
+        rp.update_live = lambda **kw: None                  # 别写用户的 live.yaml ✓
+        mapdata.load_calib = lambda m, src=None: dict(cal)
+        p = RoutePanel()
+        p.canvas.load(QPixmap(40, 40))                      # "地形图已经画出来了" ✓
+        p._map_id = lambda: mid
+        p._mmap_src = lambda: map_const.SRC_STREAM
+        p._mmap_panel_for_check = lambda blocking=True: (panel, "")
+        p._overlay_blocker = lambda: ""
+        p._live_view_track.update = lambda *a, **k: {"ok": False, "why": "用例：不跟"}
+        p.cmb_live_view.setCurrentIndex(p.cmb_live_view.findData("live"))
+
+        _z = float(map_overlay.overlay_zoom(cw))
+        ox, oy, kx, ky = p._live_map_rect(cal, (cw, ch))
+        check(abs(ox - vx * _z) < 1e-6 and abs(oy - vy * _z) < 1e-6,
+              "贴图原点不对（面板 (0,0) 该落到底图 (%.0f,%.0f)×%.0f 处）：%r"
+              % (vx, vy, _z, (ox, oy)))
+
+        # ① 有黄点像素 ⇒ 圈画在"贴图上黄点该在的地方"
+        dx, dy = 7.0, 11.0
+        _agent_mod.LAST_POS = {"map_id": mid, "world_x": float(vx) + 30.0,
+                               "world_y": float(vy) + 30.0,
+                               "dot_px": dx, "dot_py": dy, "held": False,
+                               "dot_layer": "color"}
+        p._live_map_tick()
+        m = (p._live_mark or [None])[0]
+        check(m is not None, "这一拍有黄点像素，却没把圈画出来 ✗")
+        if m is not None:
+            _ex, _ey = ox + dx * kx, oy + dy * ky
+            check(abs(float(m[0]) - _ex) < 1e-6 and abs(float(m[1]) - _ey) < 1e-6,
+                  "圈没画在**贴图上黄点所在的位置**（该 (%.1f,%.1f)，实得 (%.1f,%.1f)）"
+                  "⇒ 用户看到的就是「没标在玩家身上」✗"
+                  % (_ex, _ey, float(m[0]), float(m[1])))
+            check("黄点" in str(m[2]), "圈上没写清这是「黄点」（谁看得懂 ✗）：%r" % (m[2],))
+            # ② 不等于"按世界坐标换算"的那个位置 ✓
+            _cx, _cy = t.world_to_canvas(float(vx) + 30.0, float(vy) + 30.0)
+            check(abs(float(m[0]) - _cx * _z) > 2.0 or abs(float(m[1]) - _cy * _z) > 2.0,
+                  "圈的位置和「按世界坐标换算」一模一样 ⇒ 这条压根没走黄点像素 ✗")
+
+        # ③ 没有黄点像素 ⇒ 退回世界坐标
+        _agent_mod.LAST_POS = {"map_id": mid, "world_x": float(vx) + 2.0,
+                               "world_y": float(vy) + 3.0,
+                               "dot_px": None, "dot_py": None, "held": True}
+        p._live_map_tick()
+        m3 = (p._live_mark or [None])[0]
+        check(m3 is not None, "没有黄点像素时**什么都不画**了（该退回世界坐标 ✓）✗")
+        if m3 is not None:
+            _cx3, _cy3 = t.world_to_canvas(float(vx) + 2.0, float(vy) + 3.0)
+            check(abs(float(m3[0]) - _cx3 * _z) < 1e-6
+                  and abs(float(m3[1]) - _cy3 * _z) < 1e-6,
+                  "退回世界坐标那条不对：(%.1f,%.1f) vs 该 (%.1f,%.1f)"
+                  % (float(m3[0]), float(m3[1]), _cx3 * _z, _cy3 * _z))
+
+        # ④ 黄点像素落在面板外 ⇒ 也退回世界坐标（别画到图外 ✗）
+        _agent_mod.LAST_POS = {"map_id": mid, "world_x": float(vx) + 2.0,
+                               "world_y": float(vy) + 3.0,
+                               "dot_px": 999.0, "dot_py": 999.0, "held": False}
+        p._live_map_tick()
+        m4 = (p._live_mark or [None])[0]
+        check(m4 is not None, "黄点像素离谱时把圈丢了（该退回世界坐标 ✓）✗")
+        if m4 is not None:
+            _cx4, _cy4 = t.world_to_canvas(float(vx) + 2.0, float(vy) + 3.0)
+            check(abs(float(m4[0]) - _cx4 * _z) < 1e-6,
+                  "面板外的黄点像素也被当成真位置了（圈会画到图外 ✗）：%r" % ((m4[0], m4[1]),))
+        # 接线：`LAST_POS` 里要真的带黄点像素（只改绘制端 = 白改 ✗）
+        _src = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
+        check('"dot_px": (loc or {}).get("px")' in _src,
+              "实时回路没把「黄点像素」写进 LAST_POS ⇒ 绘制端永远拿不到（白写 ✗）")
+    finally:
+        rp.update_live = _real_update
+        mapdata.load_calib = _real_calib
+        if _agent_mod is not None:
+            _agent_mod.LAST_POS = _real_last
+
+
+def t_view_peak_continuity():
+    """⭐⭐⭐⭐ 响应图上"同一档的峰"必须挑**离先验最近**的那个（用户 2026-10-20：
+    "**地形图里的小地图匹配不断从三楼往底层闪烁**"✗）。
+
+    病（写下来，省得下次又从头猜 ✓）：这张图的响应面是**平的** —— 相邻峰间距
+    **12~13 个底图像素**、高差只有 **0.005**（宽一点的局面能到 **0.04** ✓）。而
+    `_nearest_peak` 的容差原来是 **0.02** ⇒ 真峰只要低 0.03 就被踢出"同一档" ⇒
+    于是拿**全局最大那个**（隔壁那一层）⇒ `view` 在两层之间 A→B→A→B 来回跳 ✓。
+    这张图 1 底图像素 ≈ 15 世界像素 ⇒ 13 px ≈ **190 世界像素 = 一层** ⇒ 现场看到的就是
+    "从三楼往底层闪烁" ✓（`pos.y` 实测 1818 ↔ 2009 ✓）。
+
+    钉五条：
+      ① 先验附近那个峰（低 0.03）在 `PEAK_TIE` 下**必须被选中** ✓；
+      ② 旧容差 0.02 会选**远的那个**（把病因钉在用例里，别再改回去 ✗）；
+      ③ **平台连成一片**时也得挑对（老实现"阈值 + 连通域质心"会挑到整片区域的中心 ✗
+         —— 所以这一版必须用**局部极大** ✓）；
+      ④ `PEAK_TIE` 不许小于实测峰间高差（0.04）✓；
+      ⑤ 接线：`_match` 里那次调用**不传小于 PEAK_TIE 的 tie** ✓。
+    """
+    from perception import minimap as mm
+
+    # ① / ② 两个峰：先验旁 (10,10)=0.80、远一点 (10,23)=0.83
+    res = np.zeros((40, 40), np.float32)
+    for (sx, sy, sc) in ((10, 10, 0.80), (10, 23, 0.83)):
+        res[sy - 1:sy + 2, sx - 1:sx + 2] = sc
+        res[sy, sx] = sc
+    pick = mm._nearest_peak(res, 0.83, (10.0, 10.0))
+    check(pick is not None and abs(pick[0] - 10.0) <= 2.0 and abs(pick[1] - 10.0) <= 2.0,
+          "同一档里没挑**离先验最近**的那个峰（挑到 %r ⇒ 位置直接跳一层 ✗）" % (pick,))
+    old = mm._nearest_peak(res, 0.83, (10.0, 10.0), tie=0.02)
+    check(old is not None and abs(old[1] - 10.0) > 2.0,
+          "旧容差 0.02 居然也能挑中近峰 ⇒ 这条用例就没钉住病因（实测峰间高差 0.04 > 0.02 ✗）：%r"
+          % (old,))
+
+    # ③ 平台连成一片（一整块 0.85 的高台）+ 先验处一个 0.86 的峰
+    res2 = np.zeros((60, 60), np.float32)
+    res2[30:50, 30:50] = 0.85                    # 一大片"平"的高分（阈值一放宽就连成一块）
+    res2[8:11, 8:11] = 0.86                      # 先验旁边的真峰
+    pick2 = mm._nearest_peak(res2, 0.86, (9.0, 9.0))
+    check(pick2 is not None and abs(pick2[0] - 9.0) <= 2.0 and abs(pick2[1] - 9.0) <= 2.0,
+          "高台连成一块时挑到了**整片区域的中心**（老实现就是这么错的 ✗）：%r" % (pick2,))
+
+    # ④ 容差下限
+    check(float(mm.PEAK_TIE) >= 0.04,
+          "`PEAK_TIE` 比实测的峰间高差（0.04）还小 ⇒ 真峰又会被踢出同一档 ✗：%r"
+          % (mm.PEAK_TIE,))
+
+    # ⑤ 接线：`_match` 那次调用用默认容差（不许再写死一个小 tie ✗）
+    _src = (ROOT / "perception" / "minimap.py").read_text(encoding="utf-8")
+    _seg = _src[_src.index('"near",\n'):][:400] if '"near",\n' in _src else ""
+    check('_nearest_peak(res, mx,' in _src,
+          "`_match` 里的近峰选择没了（又回到全局最大 ⇒ 平台之间来回跳 ✗）")
+    check("prior=(ax, ay))" in _src and "tie=0.02" not in _src,
+          "① 近峰选择没拿到先验 / ② 容差又被写死成 0.02（那正是这次的病因 ✗）")
+    _ = _seg
+
+
+def t_crop_view_mask_verify():
+    """⭐⭐⭐⭐ 局部小地图**跟出来的 `view` 要过「地形掩码复核」**（用户 2026-10-19
+    "森林迷宫_珠缨 局部小地图的匹配完全错误"✓）。
+
+    现场（`behavior.log` 2026-10-19 01:18，105040303）：
+    ```text
+    pos   sets=三楼  x=239.7  y=568.9      ← 三楼的地面在 y=915（差 ~350）
+    pos   sets=三楼  x=669.7  y=912.4      ← 偶尔又是对的
+    ```
+    两种值交替 ⇒ 根子在「局部小地图」这一拍**跟到的 view** 上。量出来的原因：
+      · 这张图底图是**重绘的小地图**、面板是客户端渲染 ⇒ 逐像素相关**几乎是平的**
+        （沿 view.y 从 80 扫到 175，分数只有 0.70~0.73，峰间距 12~13px、高差 0.005）✗
+        ⇒ 跟出来的位置等于**随机**；
+      · 同一帧换成**地形掩码**量：跟到的 0.095 / 标定那份 0.265 / 重拟的 0.438 ✓
+        ⇒ 只有掩码这把尺子分得开。
+    ⇒ `map_locator.crop_view_trusted()`：跟到的**明显比标定那份差**就不用（退回标定、
+      并标成"没跟住"）✓；判不了就**不拦** ✓。
+
+    钉四条：
+      ① 跟上同一个位置 ⇒ 采信 ✓；
+      ② 横向/纵向偏 30+ px（= 平顶峰里随手挑一个）⇒ **拒**（用户看到的就是这个）✗；
+      ③ 判不了（没画面 / 没几何）⇒ 不拦 ✓（别把没证据的事判死）；
+      ④ **接线**：`PlayerLocator.update` 里必须真的调用了它（只写函数不接 = 白写）。
+    """
+    # 合成底图：三条带纹理的平台（掩码靠梯度 ⇒ 平台边缘 / 纹理都算地形 ✓）
+    cv_img = np.zeros((200, 90, 3), np.uint8)
+    rng = np.random.RandomState(7)
+    for y0 in (30, 90, 150):
+        cv_img[y0:y0 + 12, :, :] = rng.randint(70, 200, (12, 90, 3))
+    cal = {"mode": map_const.MODE_CROP, "scale": 1.0, "offset": [5, 5],
+           "view": [-6.0, 70.0]}
+    panel = cv2.warpAffine(cv_img, map_calib.canvas_to_panel_matrix(cal), (109, 114))
+
+    ok, a, b = map_locator.crop_view_trusted(panel, cv_img, cal, [-6.0, 70.0])
+    check(ok and a >= b - 1e-9,
+          "跟到的就是标定那个位置，却被拒了（复核太严 ✗）：ok=%s iou=%s/%s" % (ok, a, b))
+
+    for name, view in (("纵向偏 34px", [-6.0, 70.0 - 34.0]),
+                       ("横向偏 12px", [-6.0 + 12.0, 70.0])):
+        ok2, a2, b2 = map_locator.crop_view_trusted(panel, cv_img, cal, view)
+        check(not ok2,
+              "%s 还采信了 ⇒ 用户看到的就是「匹配完全错误」（地形重合 %.3f vs 标定 %.3f）✗"
+              % (name, a2, b2))
+
+    ok3, _, _ = map_locator.crop_view_trusted(None, cv_img, cal, [0.0, 0.0])
+    ok4, _, _ = map_locator.crop_view_trusted(panel, None, cal, [0.0, 0.0])
+    check(ok3 and ok4, "判不了的时候把这一拍拦死了（没画面 / 没底图 ⇒ 该原样放过 ✗）")
+
+    # ---- ⑤ **严格版**：没过 `TRUST_SCORE` 的结果（放宽档 / 帧间位移）必须"明显更好" ----
+    #   用户 2026-10-20 ✓ 原话："现在会**乱飞乱抖**，匹配的完全不对"✗ ——
+    #   宽判据（允许差 0.06）挡不住"差一个峰"的假跟住（实测错峰那份就在 0.06 以内 ✓）。
+    ok_w, a_w, b_w = map_locator.crop_view_trusted(panel, cv_img, cal, [-6.0, 69.0])
+    ok_s2, a_s2, _ = map_locator.crop_view_trusted(panel, cv_img, cal, [-6.0, 69.0],
+                                                   strict=True)
+    check(not ok_s2,
+          "严格版把「只差 1px」的结果也采信了（宽判据 0.06 就是这么放过错峰的 ✗）：%.3f/%.3f"
+          % (a_s2, b_w))
+    #   真值明显更好（标定偏 10px ⇒ 0.961 vs 0.278）⇒ 严格版**必须过** ✓
+    _cal_off = dict(cal, view=[-6.0, 60.0])
+    ok_g, a_g, b_g = map_locator.crop_view_trusted(panel, cv_img, _cal_off, [-6.0, 70.0],
+                                                   strict=True)
+    check(ok_g and a_g > b_g + 0.06,
+          "真位置明显更好（%.3f vs %.3f）却被严格版拦了 ⇒ 那就永远纠不回来 ✗" % (a_g, b_g))
+    #   接线：只有"没过 TRUST_SCORE 那档"才走严格版
+    _src = (ROOT / "perception" / "map_locator.py").read_text(encoding="utf-8")
+    check("strict=not _vt.get(\"trust\")" in _src,
+          "复核没按「可信 / 不可信」分两档 ⇒ 放宽档照样能凭 0.06 的宽判据混过去 ✗")
+    check("_view_track.reject(" in _src,
+          "复核没过却没让跟踪器撤回错位置 ⇒ 下一拍接着错、错上 30 拍再跳一下 ✗")
+
+    # ④ 接线（只写函数不接 = 白写）
+    src = (ROOT / "perception" / "map_locator.py").read_text(encoding="utf-8")
+    i_up = src.find("    def update(self, panel, src=None, calib=None, terrain=None")
+    check(i_up > 0 and "crop_view_trusted(" in src[i_up:],
+          "`PlayerLocator.update` 里没调用 `crop_view_trusted` ⇒ 复核形同虚设 ✗")
+
+
+def t_crop_view_brake_unlocks():
+    """⭐⭐⭐⭐ **放弃帧间位移之后必须「解锁」**，否则这张图永远锁不回来
+    （用户 2026-10-20 ✓ 原话："森林迷宫_珠缨项目，**L9 完全找错了**"✗ 见日志 510）。
+
+    病根：`tracked=True` 时"附近找"的门槛被抬到 `TRUST_SCORE`（**0.8** ✓），
+    而 105040303（重绘底图）逐像素相关的**天花板只有 ~0.55** ✗ ⇒ 一旦丢了锚，
+    **每一拍都会因为够不着 0.8 而失败** ⇒ 刹车之后 `view` 冻在标定那份
+    （现场连丢 **18397 拍**，一路用标定那个位置 ⇒ 一换层就差一整层 ✓）。
+
+    钉三条：
+      ① 刹车那一拍：`ok=False` ✓（这一拍确实不敢用 ✓）；
+      ② **同时 `tracked` 被清掉** ✓（不清 ⇒ 下一拍还是 0.8 的门槛 ⇒ 永远回不来 ✗）；
+      ③ 下一拍能自己锁回来 ✓（合成底图分数很高 ⇒ 锁不上就说明 ② 没接上 ✓）。
+    """
+    mid, canvas = pick_map()
+    if mid is None:
+        print("      （没有可用的底图，跳过）")
+        return
+    ch, cw = canvas.shape[:2]
+    w, h = min(60, cw - 5), min(100, ch - 5)
+    x, y = min(20, max(0, cw - w)), min(20, max(0, ch - h))
+    panel = synth_crop_panel(canvas, x, y, w, h)
+    cal = {"mode": "crop", "scale": 1.0, "offset": [0.0, 0.0],
+           "view": [float(x), float(y)], "panel": [w, h]}
+
+    # ⚠ 第一拍要**真的找不到**才走得到刹车：给一张"对不上底图"的面板
+    #   （噪声 ✓ 逐像素与底图无关 ⇒ 0.8 的门槛必然过不去 ✓ 这就是现场那张图的处境 ✓）
+    bad = np.random.RandomState(7).randint(0, 255, (h, w, 3)).astype(np.uint8)
+
+    tr = mm.CropViewTracker()
+    tr.tracked = True                       # 假装之前锁上过
+    tr.view = (float(x) + 3.0, float(y) + 7.0)   # 现在这个已经歪了
+    tr.abs_miss = tr.FLOW_MAX_ABS_MISS + 1  # 已经连续丢锚超限
+    a = tr.update(bad, canvas, cal)
+    check(a.get("ok") is False, "刹车那一拍还报「跟住了」（不敢用的时候说能用 ✗）：%r" % (a,))
+    check(getattr(tr, "tracked", True) is False,
+          "刹车之后 `tracked` 没清 ⇒ 下一拍还是 0.8 的门槛 ⇒ 这张图（天花板 0.55）"
+          "**永远锁不回来** ⇒ view 冻在标定那份 ⇒ 用户看到的「L9 找错了」✗")
+
+    b = tr.update(panel, canvas, cal)
+    check(bool(b.get("ok")) and b.get("view") is not None,
+          "解锁之后下一拍还是锁不上（那就等于没修 ✗）：ok=%r why=%r"
+          % (b.get("ok"), str(b.get("why"))[:60]))
+    if b.get("view"):
+        check(abs(float(b["view"][0]) - x) <= 3 and abs(float(b["view"][1]) - y) <= 3,
+              "锁回来的位置不对（该在真值 (%d,%d) 附近 ✓）：%r" % (x, y, tuple(b["view"])))
+
+
+def t_apply_to_player_view_stable():
+    """⭐⭐⭐⭐ 「局部地图稳没稳」由**感知层一处**算好、执行器只读
+    （用户 2026-10-20 ✓ 原话："在局部地图滚动时，寻路任务的执行需要推迟直至其稳定"）。
+
+    为什么要这个信号：显示区在滚的时候**世界坐标是逐拍变的** ⇒ 这一拍算出来的 dx /
+    "到没到" / "离绳多远" 下一拍就作废 ⇒ 按它按键就是来回抖（日志 511 现场：y 两秒跨
+    整张图、集合在 二楼/三楼 之间乱跳 ⇒ 一路"下跳" ✓）。
+
+    钉五条：
+      ① **第一拍没有参照 ⇒ 稳** ✓（开局就判不稳 = 一上来就卡住 ✗）；
+      ② 世界坐标一拍跳 300 像素（0.2 秒 ⇒ 1500 像素/秒）⇒ **不稳**，且 `world_why`
+         要说清跳了多远 ✓；
+      ③ 静不够 `VIEW_SETTLE_S` ⇒ 还是不稳 ✓；静够了 ⇒ 稳 ✓（否则永远不动 ✗）；
+      ④ **正常行走**（每拍 40 世界像素 ⇒ 200 像素/秒）⇒ **一直稳** ✓
+         —— 判据取"像素/秒"而不是"拍了多少像素"，就是为了不把走路判成滚
+         （1:1 比例的小地图上，取固定像素门槛会让人**再也走不动** ✗ 死锁）；
+      ⑤ 没有世界坐标 ⇒ 恒稳 ✓（这条判据没得判 ✓，缺坐标另有它自己那道闸 ✓）。
+    """
+    from perception.world.world_state import Player
+
+    p = Player()
+    mm.apply_to_player(p, {"world_x": 500.0, "world_y": 900.0}, now=100.0)
+    check(p.world_stable is True, "第一拍没有参照就判不稳（一上来就卡住 ✗）")
+
+    mm.apply_to_player(p, {"world_x": 800.0, "world_y": 900.0}, now=100.2)
+    check(p.world_stable is False, "位置一拍跳 300 像素还判稳（坐标正在变 ✗）")
+    check("跳了 300" in str(p.world_why or ""),
+          "没说清跳了多远（复盘看不出当时发生了什么 ✗）：%r" % (p.world_why,))
+
+    mm.apply_to_player(p, {"world_x": 800.0, "world_y": 900.0}, now=100.5)
+    check(p.world_stable is False,
+          "静了 0.5 秒（< %.1f）就判稳了（那一拍坐标还没对齐 ✗）" % mm.VIEW_SETTLE_S)
+
+    mm.apply_to_player(p, {"world_x": 800.0, "world_y": 900.0}, now=101.0)
+    check(p.world_stable is True,
+          "静够 %.1f 秒还没判稳 ⇒ 人就永远不动了（死锁 ✗）" % mm.VIEW_SETTLE_S)
+
+    p2 = Player()                            # 正常行走：每拍 40 像素、0.2 秒 ⇒ 200 像素/秒
+    for i in range(10):
+        mm.apply_to_player(p2, {"world_x": 500.0 + 40.0 * i, "world_y": 900.0},
+                           now=200.0 + 0.2 * i)
+    check(p2.world_stable is True,
+          "正常行走（200 像素/秒）也判不稳 ⇒ **人再也走不动**（死锁 ✗）：%r"
+          % (p2.world_why,))
+
+    p3 = Player()
+    mm.apply_to_player(p3, {"world_x": None, "world_y": None}, now=300.0)
+    check(p3.world_stable is True and not p3.world_why,
+          "没有世界坐标还判不稳（缺坐标另有它自己那道闸，这里别重复拦 ✗）")
+
+
+def t_crop_view_park_no_drift():
+    """⭐⭐⭐⭐ 刹车之后必须「**停车**」：不许再靠帧间位移漂、也不许按放宽档乱锁
+    （用户 2026-10-20 第二轮 ✓ 原话："**现在会一直认不准 导致一直下跳**"✗）。
+
+    现场（`behavior.log` 12:12:54~12:13:01，`pos` 那些行）：
+      ```text
+      12:12:54  sets=二楼  y=1337      12:12:58  sets=三楼  y=2290
+      12:12:56  sets=二楼  y=1438      12:13:01  sets=三楼  y=2289
+      ```
+      两秒内 y 跨了**整张图** ⇒ 集合在 二楼/三楼 之间乱跳 ⇒ 决策层一路"下跳" ✓。
+      原因不是"认不出"，而是**每拍都换一个位置**：刹车之后"解锁重找"在那张**逐像素
+      平掉**的图上锁回来的是**随机**位置，而每锁上一次都会把 `abs_miss` 归零
+      ⇒ 帧间位移又重新放行 30 拍 ⇒ 一路漂 ✓。
+
+    钉四条：
+      ① 刹车那一拍 ⇒ `parked=True` ✓；
+      ② **停车期间**再喂几拍"对不上"的面板 ⇒ `view` **一格都不许动**、
+         且**绝不走 `flow`**（走了就是漂 ✗）；
+      ③ 真的跨图匹配上 ⇒ `parked` 解开 ✓（正常图不受影响 ✓）；
+      ④ 帧间位移**单拍位移离谱**（> `FLOW_MAX_STEP`）⇒ 这拍不许采纳 ✓
+         （现场那种"一拍挪 100+ 底图像素"的就是换层/面板突变 ✗）。
+    """
+    mid, canvas = pick_map()
+    if mid is None:
+        print("      （没有可用的底图，跳过）")
+        return
+    ch, cw = canvas.shape[:2]
+    w, h = min(60, cw - 5), min(100, ch - 5)
+    x, y = min(20, max(0, cw - w)), min(20, max(0, ch - h))
+    panel = synth_crop_panel(canvas, x, y, w, h)
+    cal = {"mode": "crop", "scale": 1.0, "offset": [0.0, 0.0],
+           "view": [float(x), float(y)], "panel": [w, h]}
+    bad = np.random.RandomState(11).randint(0, 255, (h, w, 3)).astype(np.uint8)
+
+    tr = mm.CropViewTracker()
+    tr.tracked = True
+    tr.view = (float(x) + 3.0, float(y) + 7.0)
+    tr.abs_miss = tr.FLOW_MAX_ABS_MISS + 1
+    a = tr.update(bad, canvas, cal)
+    check(a.get("ok") is False, "刹车那一拍还报跟住了：%r" % (a,))
+    check(getattr(tr, "parked", False) is True,
+          "刹车之后没「停车」⇒ 下一拍又会按放宽档锁个随机位置 / 帧间位移接着漂 ✗")
+    v_park = tr.view
+    for _ in range(3):
+        r = tr.update(bad, canvas, cal)
+        check(r.get("ok") is False, "停车期间还说跟住了（拿的是猜的位置 ✗）：%r" % (r,))
+        check(str(r.get("where") or "") != "flow",
+              "停车期间还在走**帧间位移**（这条正是「一直下跳」的成因 ✗）：%r"
+              % (r.get("where"),))
+        check(tr.view == v_park,
+              "停车期间 `view` 还在动 ⇒ 世界坐标一拍拍乱跳 ✗：%r → %r" % (v_park, tr.view))
+
+    c = tr.update(panel, canvas, cal)
+    check(bool(c.get("ok")) and tr.parked is False,
+          "真的跨图匹配上了却没解开「停车」（正常图会被拖慢 ✗）：ok=%r parked=%r"
+          % (c.get("ok"), tr.parked))
+    if c.get("view"):
+        check(abs(float(c["view"][0]) - x) <= 2 and abs(float(c["view"][1]) - y) <= 2,
+              "解开之后的位置不对（该回到真值 (%d,%d) ✓）：%r" % (x, y, tuple(c["view"])))
+
+    # ④ 单拍位移离谱 ⇒ 不许采纳（拿一张"分数必然够不着"的噪声面板 + 假的 `_flow`）
+    tr2 = mm.CropViewTracker(min_score=0.99)
+    tr2.view = (float(x), float(y))
+    tr2.tracked = False
+    tr2.parked = False
+    tr2._flow = lambda *a, **k: ((float(x) + 50.0, float(y)), 0.99)   # 一拍挪 50 像素 ✗
+    r4 = tr2.update(bad, canvas, cal)
+    check(r4.get("ok") is False and tuple(tr2.view) == (float(x), float(y)),
+          "单拍 50 个底图像素的「位移」也采纳了 ⇒ 世界坐标一次跳一层 ✗：%r" % (r4,))
+
+
+def t_relock_view_by_mask():
+    """⭐⭐⭐⭐ 跟不住时**按地形掩码**把 `view` 找回来（用户 2026-10-20 ✓
+    "森林迷宫_珠缨项目，**L9 完全找错了**"✗ 见日志 510）。
+
+    为什么非它不可：那张图**逐像素相关是平的**（天花板 0.55 ⇒ 谁当头都对 ✗），
+    实测"像素分 0.547 的那份 view"离真值差 **60 个底图像素 ≈ 一整层** ✗；
+    而**地形掩码**分得开（错的 0.157 / 标定 0.251 / 真值 0.376 ✓）。
+
+    钉五条：
+      ① 偏 (+3,+7) ⇒ 找回到真值附近 ✓；
+      ② 偏 (-4,-6) ⇒ **也**找回到真值 ✓（**符号**钉死：`view -= shift` ✓
+         写成 `view += shift` 会跑到反方向 ✗ —— 这个错比不做还坏 ✓）；
+      ③ 本来就在真值 ⇒ **不挪**（gain 不够 ⇒ None ✓ 别在原地抖 ✗）；
+      ④ 空白面板（掩码没内容）⇒ None ✓（没证据就别挪 ✗）；
+      ⑤ 接线：`map_locator` 跟不住那一支真的调了它 ✓（只写函数不接 = 白写）。
+    """
+    mid, canvas = pick_map()
+    if mid is None:
+        print("      （没有可用的底图，跳过）")
+        return
+    ch, cw = canvas.shape[:2]
+    w, h = 60, 100
+    if cw < w + 4 or ch < h + 4:
+        print("      （底图太小，跳过）")
+        return
+    x, y = (cw - w) // 2, (ch - h) // 2
+    panel = synth_crop_panel(canvas, x, y, w, h)
+
+    def _try(ddx, ddy):
+        cal = {"mode": "crop", "scale": 1.0, "offset": [0.0, 0.0],
+               "view": [float(x + ddx), float(y + ddy)], "panel": [w, h]}
+        return map_calib.relock_view(panel, canvas, cal)
+
+    for ddx, ddy in ((3, 7), (-4, -6)):
+        view, info = _try(ddx, ddy)
+        check(view is not None,
+              "偏 (%+d,%+d) 就找不回来（那张图就永远冻在标定位置 ✗）：%r"
+              % (ddx, ddy, info.get("why")))
+        if view is not None:
+            check(abs(float(view[0]) - x) <= 2 and abs(float(view[1]) - y) <= 2,
+                  "偏 (%+d,%+d) 找回的位置是 %r、真值是 (%d,%d) ⇒ "
+                  "**符号反了 / 找错了**（`view -= shift` ✓）" % (ddx, ddy, view, x, y))
+
+    view0, info0 = _try(0, 0)
+    check(view0 is None, "本来就在真值上还挪 ⇒ 平地上来回抖 ✗：%r" % (view0,))
+    check("没有明显更好" in str(info0.get("why") or ""),
+          "不挪的理由没说清是「没有明显更好」（人以为程序没干活 ✗）：%r"
+          % (info0.get("why"),))
+
+    blank = np.full((h, w, 3), 250, np.uint8)
+    cal_b = {"mode": "crop", "scale": 1.0, "offset": [0.0, 0.0],
+             "view": [float(x + 3), float(y + 7)], "panel": [w, h]}
+    view_b, _info_b = map_calib.relock_view(blank, canvas, cal_b)
+    check(view_b is None, "面板上没有地形也照样挪（没证据就猜 ✗）：%r" % (view_b,))
+
+    src = (ROOT / "perception" / "map_locator.py").read_text(encoding="utf-8")
+    check("relock_view(" in src,
+          "`map_locator` 没接掩码找回 ⇒ 跟不住时还是冻在标定那份（白写 ✗）")
+
+
 TESTS = (
+    ("⭐⭐⭐⭐ 「爬不动」的窗口与执行器**同一处换算**（用户 2026-10-21「天空 3→2 在 L1 上"
+     "不按 ↑ 了」）：慢爬不许误报 · 真停住要报 · 0.5 秒下限 · 源码钉",
+     t_climb_stall_window_matches_jobs),
+    ("⭐⭐⭐⭐ 「三楼↔底层闪烁」= 近峰容差太窄（0.02 < 实测 0.04）+ 连通域质心："
+     "同一档挑离先验最近的峰 · 旧容差会挑远的（钉住病因）· 高台连成块也挑对 · "
+     "PEAK_TIE ≥ 0.04 · 接线", t_view_peak_continuity),
+    ("⭐⭐⭐⭐ 地形图的「玩家圈」要画在**贴图上黄点所在的位置**（用户 2026-10-20"
+     "「它就应该标在实时小地图你认为黄点所在的位置上」）："
+     "落在贴图同一套映射上 · 不等于世界坐标那条 · 没黄点退回世界 · 面板外也退回",
+     t_live_mark_on_dot),
+    ("⭐⭐⭐⭐ 「显示区稳没稳」由感知层一处算（用户 2026-10-20「局部地图滚动时寻路要推迟」）："
+     "首拍稳 · 跳变不稳且说清挪多少 · 静够才稳 · 匀着挪恒稳（防死锁）· 没 view 恒稳",
+     t_apply_to_player_view_stable),
+    ("⭐⭐⭐⭐ 刹车之后必须「停车」：不许再靠帧间位移漂、也不许按放宽档乱锁"
+     "（用户 2026-10-20「一直认不准 导致一直下跳」）：停车期间 view 一格不动 · "
+     "真匹配上才解开 · 单拍位移离谱不许采纳", t_crop_view_park_no_drift),
+    ("⭐⭐⭐⭐ 跟不住时按「地形掩码」把 view 找回来（用户 2026-10-20「L9 完全找错了」）："
+     "偏了能找回 · 符号不许反 · 在真值上不挪 · 空白面板不挪 · 接线", t_relock_view_by_mask),
+    ("⭐⭐⭐⭐ 丢锚刹车之后必须解锁（否则这张图永远锁不回来，view 冻在标定 ⇒ 换层就认错）："
+     "刹车那一拍 ok=False · tracked 被清 · 下一拍能锁回来", t_crop_view_brake_unlocks),
+    ("⭐⭐⭐⭐ 局部小地图跟出来的 view 要过「地形掩码复核」（用户 2026-10-19 "
+     "森林迷宫匹配完全错误）：对上就采信 · 偏 30px 拒 · 判不了不拦 · 接线必须真的调",
+     t_crop_view_mask_verify),
     ("⭐⭐ 缺哪条来源的标定就自动补哪条（用户 2026-10-11「为什么要我补标定」）：沿用已选方式 ·"
      "只补这一条不碰别的 · 没选过方式就拒绝 · 对不上不落盘", t_autofit_fills_missing_source),
     ("⭐⭐ 叠图不许每帧抖（用户 2026-10-17「推流过来的小地图在疯狂抖动」）："
@@ -9408,6 +10358,16 @@ TESTS = (
      t_wrong_mode_fails),
     ("局部小地图：运行时跟踪显示区（跟不住不许猜）",
      t_crop_view_track),
+    ("⭐⭐⭐ 局部小地图：跨图匹配失败时用**帧间位移**继续跟住（用户 2026-10-18 选的 A）",
+     t_crop_flow_when_basemap_mismatch),
+    ("⭐⭐⭐ 平台等间距重复：峰要挑离先验最近的那个（不跳平台）",
+     t_nearest_peak_picks_continuity),
+    ("⭐⭐⭐ 帧间位移的刹车：连续没锚上就停手（不许一路漂到别的楼层）",
+     t_flow_brakes_when_no_anchor),
+    ("⭐⭐⭐ 小面板（97 宽）上 6×7 的真点要能进候选（天空项目认不出黄点）",
+     t_dot_small_panel_6x7_dot),
+    ("⭐⭐ 「坐标系偏移」要能填小数（用户 2026-10-18：怎么不能设置小数？）",
+     t_world_offset_is_decimal),
     ("局部小地图：定位真的用了跟出来的显示区",
      t_crop_view_locator_wiring),
     ("局部小地图：叠图取的源矩形 = 当前面板显示的那块地图（折算不许动 view）",
@@ -9631,6 +10591,10 @@ TESTS = (
      t_osd_shows_ladder_top),
     ("标定窗方向键只挪底图（滑条/数字框不许抢）",
      t_calib_arrows_move_overlay),
+     ("⭐⭐⭐⭐ 「空中态」：离脚下平台超过阈值不算站上去（治\"半空就开始计时\"✓）",
+      t_air_gap_state),
+     ("⭐⭐⭐ 绳梯上不许判成空中（用户 2026-10-18：绳上不是半空）",
+      t_ladder_is_not_airborne),
 )
 
 

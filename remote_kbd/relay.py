@@ -150,6 +150,25 @@ def _push_to_client(text):
     _QWAKE.set()
 
 
+def _push_line(conn, text):
+    """**直发**一行日志给客户端（不走队列 ✓ 只用在"这条连接正在收尾"的时候）。
+
+    为什么不用 `_push_to_client`：那条走队列 + 独立发送线程，而收尾时 `_LOG_SINK`
+    已经清空 ⇒ 排进去也会被丢掉 ✗。可**断开原因恰恰是最该到 B 的一句话**：
+    B 那边只会写"连接被对端关闭"（`kbd_client._drain` ✓），根本看不出为什么 ✗
+    （2026-10-20 现场：A 十分钟报了 6 次，一条原因都没留下 ✓）。
+
+    ⚠ **这里不许改 `conn` 的超时** ✗（本仓库栽过：多线程改同一个 socket 的超时会打乱
+      正在进行的收发，TLS 层尤其敏感 ✓ 见 `kbd_client.__init__` 那段）。这条是收尾用的，
+      最多被 `_SEND_LOCK` 拖 5 秒，可接受 —— 反正这条连接马上就要关了 ✓。
+    """
+    try:
+        with _SEND_LOCK:
+            conn.sendall(("#LOG %s %s\n" % (_ts(), text)).encode("utf-8", "replace"))
+    except Exception:                        # noqa: BLE001 —— 发不出去就算了，正在收尾 ✓
+        pass
+
+
 def _ts():
     """日志时间戳：**到毫秒**（2026-10-03 ✓）。
 
@@ -529,7 +548,7 @@ def _take_done():
 #: 用户原话："**这个过程不能每次都发现错然后跑命令吧 太麻烦了 不能自动吗？**" ✓
 #:   ⇒ 鼠标是经 relay 打到 **A 机**的 ✓ ⇒ B 机**看不见 A 机的光标** ✗ ⇒ 标定只能人手工量 ✓。
 #:   有了这一条，B 就能自己动一小步、读前后位置、把「一单位走多少像素」**自己算出来** ✓
-#:   ⇒ 帧尺寸变了**自己量一次** ✓（`decision/mouse_aim.auto_measure` ✓）。
+#:   ⇒ 帧尺寸变了**自己量一次** ✓（`execution/mouse_aim.auto_measure` ✓）。
 #: ⚠ 固件**不认识**这条 ✗（写进串口只会换回一个 `ERR` ✓ 还会污染 `DONE/ERR` 回执计数 ✓）
 #:   ⇒ 在**转发之前**挑出来 ✓、由 relay 直接回 ✓（见 `bridge` 里那一步 ✓）。
 #: ⚠ 客户端要**单独发**这一条 ✓（一条 `sendall` 走到底 ✓）：这边按"整包里包含它"来挑 ✓
@@ -661,7 +680,7 @@ def _capture_region_size():
 
     ⚠ 为什么它必须有：B 机要拿它把「一单位走多少**屏幕**像素」（它能量到 ✓）折成
       「一单位走多少**帧**像素」（它真正要的 ✓）—— 折算比 = `推流分辨率 ÷ 抓的区域尺寸` ✓
-      ⇒ 抓的区域缺了就只能猜 ✓（拿猜当准是本仓库明令禁止的 ✓ 见 `decision/mouse_aim`
+      ⇒ 抓的区域缺了就只能猜 ✓（拿猜当准是本仓库明令禁止的 ✓ 见 `execution/mouse_aim`
       的 `auto_measure` / `gain_mismatch` ✓）。
     判据（读 A 机自己的 `config/deploy.json` ✓ 不猜 ✓）：
       · `push.capture` 以 **`ddagrab`** 开头（桌面复制 ✓ —— 本机现在用的就是它 ✓）
@@ -786,7 +805,7 @@ def bridge_observer(conn):
 
 
 def bridge(conn, link):
-    """双向桥：TCP -> 串口，串口 -> TCP。
+    """双向桥：TCP -> 串口，串口 -> TCP。返回**本连接的结局**（一句人能读懂的话 ✓）。
 
     **两个写方向都设了超时，这是必须的。** 以前没有超时：只要有一头对方不读，
     写就会**永久阻塞**在那个线程里 —— 串口->TCP 卡住后这个线程再也不读串口，
@@ -796,6 +815,15 @@ def bridge(conn, link):
 
     设了超时之后：写卡住 → 抛异常 → 退出桥循环 → 关连接等下一个客户端，
     链自己恢复（断开时还会补一条 RELEASEALL 松开卡住的键）。
+
+    ⭐⭐ 2026-10-20（用户现场：**A 机 10 分钟里报 6 次 `client disconnected`** ✗）：
+      这条桥原来有**三条静默出口**（`select` 抛异常 / `recv` 抛非超时异常 /
+      `ser_to_tcp` 的 `sendall` 超时）—— 全是光秃秃一个 `break` ✗ ⇒ 连接断了，
+      可**为什么断**在日志里一个字都没有 ✓ 于是只能看到 A 一直刷"断了"、B 一直写
+      "连接被对端关闭"，两边都指不出原因 ✗。
+      ⇒ 现在每条出口都过 `_end(原因)`：**写明结局**、`stop.set()`、并且**主动关连接**
+        （不用 B 干等 5 秒才靠静默判死 ✓）；收尾时把原因**直发**给 B（`_push_line` ✓）
+        并打进 A 的 `relay_trace.log`。
     """
     stop = threading.Event()
     conn.settimeout(5.0)          # 客户端不读时别永久阻塞
@@ -811,6 +839,35 @@ def bridge(conn, link):
     global _LOG_SINK, _DONE_PENDING
     _LOG_SINK = conn
     _DONE_PENDING = 0
+    #: 本连接的**结局**（谁先断 / 为什么）—— 只由 `_end()` 第一次写入 ✓（先到的原因为准）
+    _why = {"text": ""}
+    #: **串口那半边**出过错吗（写超时 / 读失败）—— 只有它出过错才值得复位板子 ✗ 见 finally
+    _serial_dead = {"yes": False}
+
+    #: 原因已经告诉过 B 了吗（`_end` 先发后关 ✓ 收尾时别再发一遍 ✗）
+    _told = {"yes": False}
+
+    def _end(text, serial=False):
+        """记下结局 ⇒ **先告诉 B 为什么**、再主动关连接（别让它干等 5 秒才发现 ✗）。
+
+        ⚠ 顺序不能反：关完再发就发不出去了（实测：`_end` 里先 `close()` 的话，
+          那条 `#LOG … client disconnected: …` **一条都到不了 B** ✓）——
+          而"原因"恰恰是这次断链**唯一**能带走的信息 ✓。
+        ⚠ 关 `conn` 是**故意**的：主循环和 `ser_to_tcp` 都可能卡在"对端不读"上，
+          只有把 socket 关掉才能让两边立刻退出 ✓（各自那个 `except` 会接住 ✓）。
+        """
+        if not _why["text"]:
+            _why["text"] = text
+        if serial:
+            _serial_dead["yes"] = True
+        stop.set()
+        if not _told["yes"]:
+            _told["yes"] = True
+            _push_line(conn, "client disconnected: %s" % _why["text"])
+        try:
+            conn.close()
+        except Exception:                        # noqa: BLE001 —— 本来就收尾了 ✓
+            pass
 
     def ser_to_tcp():
         global _DONE_PENDING
@@ -819,6 +876,7 @@ def bridge(conn, link):
                 data = link.read(256)
             except Exception as e:
                 trace("serial->tcp 读失败，结束本连接: %s" % e)
+                _end("串口读失败（板子掉了 / 串口被占）: %r" % (e,), serial=True)
                 break
             if data:
                 # ⭐ **固件的完成率**（`KbdStats` 要它）：回程这批里数 `DONE/ERR` ⇒ 暂存整数，
@@ -832,7 +890,11 @@ def bridge(conn, link):
                     #   同一把锁 ✗（TLS 记录交错 = 整条链烂掉 ✓ 见 `_SEND_LOCK`）
                     with _SEND_LOCK:
                         conn.sendall(data)
-                except Exception:
+                except Exception as e:
+                    # ⚠ 这条原来是光秃秃的 `break` ✗ ⇒ 串口→TCP 方向**悄悄死掉**、
+                    #   而 TCP 连接还活着 ⇒ B 收不到 `DONE` ⇒ 5 秒后判"链路卡死"⇒ 重连 ✓
+                    #   （2026-10-20：这正是"断开原因查不到"的其中一条 ✓）
+                    _end("回执写不出去（B 没在读这块 socket）: %r" % (e,))
                     break
             else:
                 # 没数据：让出 CPU（read 现在是非阻塞的，不然这里会空转满核）
@@ -850,7 +912,8 @@ def bridge(conn, link):
             # select 只等「有数据可读」，空闲时直接回头继续，不打断任何记录。
             try:
                 ready, _, _ = select.select([conn], [], [], 5.0)
-            except Exception:
+            except Exception as e:
+                _end("select 失败（socket 已失效）: %r" % (e,))
                 break
             if not ready:
                 continue          # 空闲：自动打怪停下时本来就没键要发
@@ -858,7 +921,12 @@ def bridge(conn, link):
                 data = conn.recv(4096)
             except socket.timeout:
                 continue
+            except Exception as e:
+                # ⚠ 原样同上：静默 `break` ⇒ 查不到原因 ✗（TLS 层出问题时最常走这条 ✓）
+                _end("recv 失败（TLS 层作废 / 连接被重置）: %r" % (e,))
+                break
             if not data:
+                _end("客户端主动断开（B 关的 / B 在重连）")
                 break
             # ⭐ 两个"问一下"的查询（`CURSOR?` / `WINDOW?`）**就地答掉** ✓
             #   —— 与"只读客户端"共用**一处实现** ✓（见 `_answer_queries` ✓）
@@ -893,27 +961,41 @@ def bridge(conn, link):
                 pass
     except Exception as e:
         trace("tcp->serial 写失败，结束本连接: %s" % e)
+        _end("串口写失败（固件忙 / 串口缓冲满）: %r" % (e,), serial=True)
     finally:
         stop.set()
         # 客户端走了 ⇒ 日志回传口一起清掉 ✓（下一个连上来时再设 ✓）
         _LOG_SINK = None
-        # ⭐⭐ 连接断开时**清空串口缓冲 + 重开句柄**（2026-10-02 ✓ —— 用户报
-        #   "必须断开 ProMicro 才拯救"）：光发 RELEASEALL 不够 —— 它只清固件侧
-        #   held 表，但**积压在 OS 串口驱动缓冲里的命令还在**（固件不读时 write
-        #   照样成功返回 ✗）⇒ B 机重连后 relay 又把积压的写出去 ⇒ 还是卡 ✗。
-        #   reopen 关掉旧句柄重开 ⇒ OS 缓冲清空 ⇒ 积压的命令全丢 ✓（客户端都
-        #   断开了，丢积压是对的 —— 本来就是异常退出 ✓）。然后在干净的新句柄
-        #   上发 RELEASEALL，让固件回到空状态。
-        link.reopen("client disconnect")
+        if not _why["text"]:
+            _why["text"] = "未知（桥循环自己退出）"
+        # ⭐⭐ 2026-10-02 的老规矩：断开时**清空串口缓冲 + 重开句柄**（用户报"必须断开
+        #   ProMicro 才拯救"）：光发 RELEASEALL 不够 —— 它只清固件侧 held 表，但积压在
+        #   OS 串口驱动缓冲里的命令还在（固件不读时 write 照样成功返回 ✗）⇒ B 机重连后
+        #   relay 又把积压的写出去 ⇒ 还是卡 ✗。reopen 关旧句柄重开 ⇒ OS 缓冲清空 ✓。
+        # ⚠⚠ 但它有个**很贵的副作用**（2026-10-20 查"10 分钟断 6 次"时看出来的 ✗）：
+        #   32U4 打开串口会拉低 DTR ⇒ **板子复位**，复位后 1~2 秒不处理任何指令 ✗
+        #   ⇒ B 刚重连就又是 5 秒静默（`REPLY_SILENCE_LIMIT`）⇒ 又判死链 ⇒ 又重连
+        #   ⇒ **自己喂自己的自激循环**，A 端就一行行刷 `client disconnected` ✓。
+        #   ⇒ 现在**只在串口那半边真出过错时才 reopen**（写超时 / 读失败 —— 那才是老规矩
+        #     要治的病 ✓）；客户端自己走了（B 重连 / 关界面 / 换实例）⇒ 串口是好的，
+        #     **别动它** ✓（少一次无谓复位 = 少一轮自激 ✓）。
+        if _serial_dead["yes"]:
+            link.reopen("serial dead: %s" % _why["text"][:60])
         try:
             link.write(b"RELEASEALL\n")
         except Exception:
             pass
-        trace("client disconnected")
+        trace("client disconnected: %s" % _why["text"])
+        # ⚠ 原因必须**直发**给 B（`_LOG_SINK` 上面已经清空 ⇒ 走队列那一路会被丢掉 ✗）；
+        #   正常出口在 `_end()` 里已经发过了 ⇒ 这儿只兜"没走 `_end` 的那种收尾" ✓
+        if not _told["yes"]:
+            _told["yes"] = True
+            _push_line(conn, "client disconnected: %s" % _why["text"])
         try:
             conn.close()
         except Exception:
             pass
+    return _why["text"]
 
 
 def ping(link, timeout=2.0):
@@ -1015,12 +1097,15 @@ def main():
                 return
             print(f"[relay] client {addr[0]} connected（控制端）")
             trace("client %s connected" % addr[0])
+            _why = ""
             try:
-                bridge(tls, link)
+                _why = bridge(tls, link) or ""
             finally:
                 with _ctl_lock:
                     _ctl["conn"] = None
-                print("[relay] client disconnected（控制端）")
+                # ⭐ 2026-10-20：**把结局打出来**。以前只有光秃秃一句 "disconnected" ✗
+                #   —— 用户看到的就是它，可谁也说不清为什么断（三条静默出口 ✓ 见 `bridge`）。
+                print("[relay] client disconnected（控制端）：%s" % (_why or "未知"))
         finally:
             try:
                 conn.close()

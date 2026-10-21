@@ -73,17 +73,18 @@ def _try_move():
     ⚠ 走 240 单位（≈ 一两百像素 ✓）—— 够看出动没动 ✓、又不至于跑出屏幕 ✓。
     ⚠ 用**相对**位移对消（不依赖增益 ✓）⇒ 不需要先知道 gain ✓。
     """
-    from decision import mouse_aim as ma
-    p0 = ma._probe_cursor()
+    from execution import aim_convert as ma_c
+    from execution import mouse_aim as ma
+    p0 = ma_c._probe_cursor()
     if p0 is None:
         print("  ❌ **连光标都读不到** ⇒ 通路/relay 那侧的事 ✓（重启 A 机 relay + 拔插 ProMicro ✓）")
         return
-    ma.corner_zero()
-    p1 = ma._probe_cursor()
+    ma_c.corner_zero()
+    p1 = ma_c._probe_cursor()
     ma.dinput.mouse_move(240, 240)
-    p2 = ma._probe_cursor()
+    p2 = ma_c._probe_cursor()
     ma.dinput.mouse_move(-240, -240)             # ⚠ 挪回来 ✓
-    p3 = ma._probe_cursor()
+    p3 = ma_c._probe_cursor()
     print("  撞角后 =", p1, " 走(+240,+240) 后 =", p2, " 挪回后 =", p3)
     if p1 and p2 and (p2[0] != p1[0] or p2[1] != p1[1]):
         print("  ✅ **光标动了** ⇒ 鼠标通路是好的 ✓")
@@ -103,8 +104,10 @@ def main():
     a = ap.parse_args()
 
     from core.config import load_live
-    from decision import input as dinput
-    from decision import mouse_aim as ma
+    from execution import input as dinput
+    from execution import remote as _remote_mod
+    from execution import aim_convert as ma_c
+    from execution import mouse_aim as ma
     from perception import minimap as mm
 
     live = load_live()
@@ -121,19 +124,19 @@ def main():
     else:
         h, w = shape
         print("  帧尺寸 = %dx%d" % (w, h))
-        g = ma.load_gain((h, w, 3))
+        g = ma_c.load_gain((h, w, 3))
         print("  这个尺寸的标定 = %s" % (("%.4f / %.4f" % g) if g else "**没有** ✗"))
-        print("  已经量过的尺寸 = %s" % (ma.gain_sizes() or "（一个都没有）"))
+        print("  已经量过的尺寸 = %s" % (ma_c.gain_sizes() or "（一个都没有）"))
         if not g:
             print("  ⇒ ★ 新代码在这里是「**故意不点**」✓（宁可不点，也别点歪 ✓）")
             print("     这**就是**「鼠标没被操控」最常见的原因 ✓ ⇒ 量一次就好：")
             print("     python -X utf8 -m tools.mouse_aim_calib --source %s" % src)
     print()
     print("② 看得见光标吗")
-    print("  input.cursor_probe() = %s" % (dinput.cursor_probe(),))
+    print("  input.cursor_probe() = %s" % (_remote_mod.cursor_probe(),))
     print("  自动量开关 = %s（默认关 ✓ 要开在 config/mouse_gain.json 写 \"auto_measure\": true ✓）"
-          % ma.auto_measure_enabled())
-    print("  忙标记 _auto_busy() = %s（False = 没有东西挡着鼠标 ✓）" % ma._auto_busy())
+          % ma_c.auto_measure_enabled())
+    print("  忙标记 _auto_busy() = %s（False = 没有东西挡着鼠标 ✓）" % ma_c._auto_busy())
     if a.move:
         print()
         print("③ 真走一小步")

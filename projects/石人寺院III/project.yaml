@@ -94,7 +94,7 @@ decision:
   target_cd:
   - 1000
   - 2500
-  input_device: local
+  input_device: serial
   attack_cd: 1000
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 400
@@ -127,7 +127,13 @@ decision:
   - - 79
     - 82
     - 255
-  mp_color: null
+  mp_color:
+  - - 144
+    - 76
+    - 0
+  - - 255
+    - 196
+    - 69
   hp_threshold: 39
   mp_threshold: 7
   pot_cd: 1000
@@ -321,10 +327,10 @@ decision:
     ratio: 100.0
   multi_leave_wait_enabled: true
   multi_leave_delay_s: 0.5
-  reconnect_server_x: 0.3635
-  reconnect_server_y: 0.2074
-  reconnect_channel_x: 0.4104
-  reconnect_channel_y: 0.5093
+  reconnect_server_x: 0.3309
+  reconnect_server_y: 0.2135
+  reconnect_channel_x: 0.4071
+  reconnect_channel_y: 0.4922
   reconnect_channel: 43
   jump_attack_enabled: false
   jump_attack_height: 90.0
@@ -401,14 +407,20 @@ train:
   resume: false
 live:
   weights: E:\MyPrograms\playerSimu\projects\石人寺院III\models\detect_v8_960.engine
-  capture_source: stream
+  capture_source: window
   rect:
-  - 1184
-  - 617
+  - 0
+  - 31
   - 1366
   - 768
-  rect_rel: null
-  rect_win: null
+  rect_rel:
+  - 0.000731
+  - 0.03875
+  - 0.998538
+  - 0.96
+  rect_win:
+  - 2231388
+  - 冒险岛怀旧服
   url: udp://0.0.0.0:5000
   conf_mob: 0.15
   conf_player: 0.75

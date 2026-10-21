@@ -47,6 +47,9 @@
 * 时间一律用 **`time.monotonic()`**（与定位同源 ✓）；**别**混用 `perf_counter` ✗。
 * 容差/时长**只用现成的两个设置**：`align_tol_px`（「坐标对齐误差范围」✓，默认 10）与
   `move_retry_ms`（「移动操作尝试间隔」✓，默认 3000）—— **不新造常数** ✓。
+  ⚠ 把 `move_retry_ms` 换成**秒**必须走 `core.timing.stall_s_from_retry_ms()`（含 0.5 秒下限，
+  **与执行器同一处实现** ✓ 2026-10-21）—— 别再自己除 1000 ✗（那样窗口会短一截 ⇒ 广播抢在
+  执行器前面报"爬不动" ⇒ 松 ↑ 掉下绳 ✓ 见下面 `retain = ...` 那段）。
 * 几何**只在机器里算一次** ✓：执行器/决策层要"我脚下这块平台多宽""我在不在绳段里"，
   一律读这里的广播 ✗（**别再自己比一遍** ✗ —— 那是 2026-09-27 连踩两次的根因 ✓）。
 """
@@ -54,6 +57,11 @@ from __future__ import annotations
 
 import dataclasses
 import time
+
+#: 「移动操作尝试间隔(ms) → 秒（含 0.5 下限）」—— **与执行器同一处实现**（`core.timing` ✓）。
+#: ⚠ 别在这儿再写一遍 `ms / 1000` ✗（2026-10-21 就是这么把"爬不动"的窗口算短了、
+#:   害得 3→2 在 L1 上不按 ↑ ✓ 见下面 `retain = ...` 那段）。
+from core.timing import stall_s_from_retry_ms
 
 #: 「到顶 / 到底」判据里"不再沿绳移动"要观察多久 —— **就是「移动操作尝试间隔」**，不新造 ✓。
 #: （见 `update` 的说明：用户原话"y 在『移动操作尝试间隔」时间内不再变变小，则判定到顶" ✓）
@@ -298,7 +306,17 @@ class PositionStateMachine:
             self._best_bot = {}
         if list(self._moved) != [lid]:
             self._moved = {}
-        retain = max(0.0, float(move_retry_ms or 0.0)) / 1000.0
+        # ⚠⚠⚠ 2026-10-21（用户现场：「**天空项目 3→2 在 L1 上不按 ↑ 了**」✗）：
+        #   `retain` 原来就写 `move_retry_ms / 1000` —— **自己又算了一遍**，而且**没有下限** ✗；
+        #   执行器那侧用的是 `stall_s_from_retry_ms()`（**含 0.5 秒下限** ✓）⇒ 同一个设置、
+        #   两处算出不同窗口 ✓。天空 `move_retry_ms` = 350 ⇒ 这里 0.35 秒、那边 0.5 秒
+        #   ⇒ **广播先报「爬不动」**（`climb_stalled` ✓）⇒ `ClimbJob` 走失败逻辑 ⇒ **松 ↑**
+        #   ⇒ 人往下滑 ⇒ 重来 ⇒ 现场看到的就是"在 L1 上不按 ↑"✓✓
+        #   （旁证：`behavior.log` 01:41:23.040 / 01:41:24.188 连着两次
+        #     `route_phase … 爬不动了 … prev=climb to=failed`，而 `climb_y` 从 -1091 一路
+        #     在往 -1212 爬 —— **判失败的时候人其实在上升** ✗）。
+        #   ⇒ 兜底口径收成 `core.timing` 那一处（执行器 / 实时线程 / 面板都走它 ✓）。
+        retain = stall_s_from_retry_ms(move_retry_ms)
         # ③a 上端：⭐ **只看"够不够高"**（用户 2026-09-28 ✓ 原话："移除这一项『y 在「移动操作
         #   尝试间隔」内不再变小』，用『广播"到顶"之后还会再按住 ↑ 250ms』**仅此一项**兜底"）
         #   ⇒ 从这里**删掉**了原来的 `(now - b[1]) >= retain` —— 那一项要**干等**
@@ -443,7 +461,7 @@ class PositionStateMachine:
     def _span_of_sets(self, span_of):
         """脚下这些集合的 **x 范围**（`(左, 右)`）：每个集合问 `span_of`、取包络 ✓。
 
-        ⚠ 口径来自调用方给的解析器（`gui.live_thread` 那条 = `route.set_span` ✓，
+        ⚠ 口径来自调用方给的解析器（`gui.live_thread` 那条 = `pathing.set_span` ✓，
           "集合里有哪些**非墙** foothold"只此一处 ✓）—— 这里**不自己再算一遍** ✗。
         """
         if not span_of or not self.here_sets:
@@ -464,7 +482,7 @@ class PositionStateMachine:
     def _ground_y(self, terrain, fid):
         """**脚下那块面的 y**：在这块 foothold 上、按**玩家 x** 取的面 y ✓。
 
-        ⚠ 与 `route._set_spans` 的"面 y"**不是同一件事**（那里取的是 foothold 中点的 y ✓，
+        ⚠ 与 `pathing._set_spans` 的"面 y"**不是同一件事**（那里取的是 foothold 中点的 y ✓，
           给"这块平台多宽/多高"用 ✓）；这里是"**我脚下这一点**"的面 y ⇒ 下爬判"落到
           目标平台的面"要靠它 ✓（斜坡上两者会差，取玩家 x 才对得上脚底 ✓）。
         判不出来（没读数 / 这块 id 不在地形里）⇒ `None` ✓（**别拿 0 骗人** ✗）。

@@ -94,7 +94,7 @@ def _one_run(frames_dir, did, sample, out_root, thresh, dist, peaks, scale,
     ⇒ **按帧归因**靠它 ✓，不用另写一套匹配 ✗）。
     """
     from core import wzexport
-    from perception.classes import CLASS_DROP
+    from perception.detect.classes import CLASS_DROP
     from tools.detect_mobs import run_detect
 
     key = did if not sel else "%s__%s" % (did, sel)

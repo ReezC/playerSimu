@@ -35,7 +35,7 @@ def main():
         return 2
     src, url = _open_stream()
     print("[2] 已开流：%s" % url)
-    from decision import input as dinput
+    from execution import input as dinput
     frames = []
     try:
         dinput.mouse_move(-4000, -4000)          # 撞角（老固件会被截断 ⇒ 不指望它 ✓）

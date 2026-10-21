@@ -1,0 +1,28 @@
+{
+  "when": "2026-10-17 22:32:30",
+  "build": "2026-10-10b",
+  "frames_dir": "E:\\MyPrograms\\playerSimu\\projects\\天空\\frames",
+  "out": "E:\\MyPrograms\\playerSimu\\projects\\天空\\labels_auto",
+  "weights": "E:\\MyPrograms\\playerSimu\\projects\\地铁二号线\\models\\detect_v3.pt",
+  "mode": "player",
+  "frames": 160,
+  "boxes_added": 144,
+  "frames_merged": 112,
+  "skipped": 0,
+  "skipped_names": [],
+  "first_inputs": [
+    "frame_00000.png",
+    "frame_00001.png",
+    "frame_00002.png",
+    "frame_00003.png",
+    "frame_00004.png"
+  ],
+  "first_returned": [
+    "image0.jpg",
+    "image1.jpg",
+    "image2.jpg"
+  ],
+  "order_mapped": 160,
+  "seconds": 26.6,
+  "canceled": false
+}

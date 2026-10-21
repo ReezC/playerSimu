@@ -22,8 +22,8 @@ from pathlib import Path
 import cv2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from perception.lie_controller import LieMouseController  # noqa: E402
-from perception.lie_tracker import LieTracker  # noqa: E402
+from liedetect.lie_controller import LieMouseController  # noqa: E402
+from liedetect.lie_tracker import LieTracker  # noqa: E402
 from tools.lie_replay import _MIN_RADIUS, load_cycles  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent

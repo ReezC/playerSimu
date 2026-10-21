@@ -460,7 +460,18 @@ def _push_cmd(p, num):
     else:
         # ⭐ ddagrab 的 `video_size` / `offset_x` / `offset_y` = **只抓屏幕上一块** ✓
         #   （不写就是整屏 ⇒ 老行为一字不变 ✓）。两个缩放分支共用这一段的构造 ✓。
-        _dag = "ddagrab=framerate=%d" % fps
+        #
+        # ⭐⭐⭐ **`draw_mouse=1` 必须显式写死**（用户 2026-10-19 现场 ✓ 原话：
+        #   "在B机数据工作台看不到A机的鼠标了" ⇒ 用 `tools/mouse_aim_calib.py` 里那套
+        #   30 秒判别法一量：**A 屏上指针动了、B 的实时画面里没有** ⇒ 定死是"推流没画指针"）✗
+        #   · ddagrab 的 `draw_mouse` **默认值是 1**，但**别指望默认值**：现场就是这么丢的
+        #     （交接-5 §10-1a 2026-10-07 记过同款："同样指令、10 分钟前还看得见"）；
+        #   · 这一段本来就要求 ffmpeg ≥5.0（`video_size/offset_x` 是同一版才有的 ✓）
+        #     ⇒ 显式写上去**不降低兼容性** ✓；
+        #   · 显式写 = 以后换 ffmpeg 版本、换采集方式时，"光标看不见"不会再来一次 ✗
+        #     （工具里那条纪律：`draw_mouse=1`，**别换采集方式** ✓）。
+        #   ⚠ `gdigrab` 那条不用加：它默认就画（`-draw_mouse` 默认 1 ✓ 见上面分支）。
+        _dag = "ddagrab=framerate=%d:draw_mouse=1" % fps
         if _region:
             _dag += (":video_size=%dx%d:offset_x=%d:offset_y=%d"
                      % (cap_w, cap_h, rx, ry))

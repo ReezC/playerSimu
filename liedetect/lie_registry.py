@@ -37,7 +37,7 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from perception import geom          # ⭐ 重叠尺统一在 `perception/geom.py`（用户 2026-10-03 ✓）
+from core import geom          # ⭐ 重叠尺统一在 `core/geom.py`（用户 2026-10-03 ✓）
 
 #: 归算后「两个检出算同一块砖」的门（px ✓）。
 #: ⚠⚠⚠ **必须小于"真目标相对群体的一帧位移"** ✗✗（自检 `③` 与合成台判决性验证都钉着 ✓）：
@@ -484,7 +484,7 @@ class ShapeRegistry:
         **不存在无限养大**的说法（前提是**该检出框判定为砖**：判定条件是与**旧砖重叠率**的
         参数符合条件 **&& 不与绿圆相交**）" ✓）共用它 ✓。
         """
-        # ⭐ 算法统一在 `perception/geom.py`（用户 2026-10-03 ✓ 原话："我认为我们很多判定都可以
+        # ⭐ 算法统一在 `core/geom.py`（用户 2026-10-03 ✓ 原话："我认为我们很多判定都可以
         #   换成这个算法" ✓）⇒ 这里只**委托** ✓；⚠ 本处**必须**是"交集 ÷ 较小面积"（`overlap_min` ✓
         #   —— 用户 2026-10-02 选定 ✓ "小框叠在大砖上"要接近 1.0 ✓）；**不许**换成 `iou` ✗
         #   （IoU ≈ 小/大 ⇒ 拦不住"旧砖被重复往上叠" ✗ 见 `geom` 模块头 ✓）。

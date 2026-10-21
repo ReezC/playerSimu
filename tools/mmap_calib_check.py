@@ -36,7 +36,9 @@ import numpy as np                                         # noqa: E402
 
 from core import mapdata                                   # noqa: E402
 from gui.project import last_opened                        # noqa: E402
+from perception import map_const
 from perception import minimap as mm                       # noqa: E402
+from perception import map_calib
 from core.config import load_live                         # noqa: E402
 from tools.mmap_dot_probe import grab_live, grab_stream     # noqa: E402
 
@@ -71,7 +73,7 @@ def _report(tag, frame, terrain, calib, mode=None):
     if not r["trust"]:
         print("         ⚠ 尺子匹配分只有 %.2f（< %.2f）⇒ 上面这个数**只能当参考**："
               "画面里小地图没框全 / 被游戏 UI 挡住 / 显示方式选错"
-              % (r["score"], mm.TRUST_SCORE))
+              % (r["score"], map_const.TRUST_SCORE))
     return float(r["err_world"])
 
 
@@ -108,19 +110,19 @@ def main():
         print("地图 %s 没有底图（先在「路线识别」里生成地形图）" % mid)
         return 2
 
-    src = mm.SRC_STREAM if a.src == "stream" else mm.SRC_LIVE
+    src = map_const.SRC_STREAM if a.src == "stream" else map_const.SRC_LIVE
     calib = mapdata.load_calib(mid, src)
     print("地图 %s（底图 %s，1 底图像素 = %.3f 世界像素）"
           % (mid, t.canvas.shape[:2], t.px_per_world))
-    print("来源 %s　标定 %s" % (mm.SRC_LABEL.get(src, src),
-                              "有" if mm.has_geometry(calib) else "**没有**（先标一次）"))
-    if not mm.has_geometry(calib):
+    print("来源 %s　标定 %s" % (map_const.SRC_LABEL.get(src, src),
+                              "有" if map_calib.has_geometry(calib) else "**没有**（先标一次）"))
+    if not map_calib.has_geometry(calib):
         print("  标定还没有几何 —— 「路线识别 → 寻路配置 → 标定…」或双点标定一次再来量 ✓")
         return 1
 
     print("标定几何：mode=%s scale=%.4f/%s offset=%s view=%s"
           % (calib.get("mode"), calib.get("scale"),
-             round(float(mm.scales_of(calib)[1]), 4), calib.get("offset"),
+             round(float(map_calib.scales_of(calib)[1]), 4), calib.get("offset"),
              calib.get("view")))
     errs = []
     if a.image:

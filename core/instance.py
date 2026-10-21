@@ -227,6 +227,74 @@ def claim_port(port, host="0.0.0.0"):
     return True, ""
 
 
+def _read_lock(path):
+    """读一份占位文件 → `{}`（读不出来当"没有主人" ✓ 同 `claim_port` 的口径）。"""
+    info = {}
+    try:
+        for ln in Path(path).read_text(encoding="utf-8").splitlines():
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                info[k.strip()] = v.strip()
+    except Exception:                      # noqa: BLE001
+        pass
+    return info
+
+
+def release_port(port):
+    """放掉「这个 UDP 端口归我收」—— **只删自己那份** ✓（`True` = 真删掉了）。
+
+    ⚠ 为什么要显式放（2026-10-21 用户：「**窗口关掉但是实例清不掉**」✓）：
+      以前**没有任何释放路径** ⇒ 全指望"下次启动时发现主人 PID 已经死了 ⇒ 接管" ✓。
+      可进程要是**没死成**（当时的现场：窗口关了、`pythonw` 还挂着 ✅ 见
+      `gui/app.py::_hard_exit` 里的栈），锁就一直被一个**活着**的 PID 占着
+      ⇒ 下次启动只会说"UDP 端口已被另一个工作台实例占用" ✗ —— 也就是用户说的"实例清不掉" ✓。
+    ⇒ 退出前由 `gui/app.py` 调 `release_my_ports()` 统一放 ✓（`os._exit` 不走 atexit ✗）。
+    """
+    try:
+        port = int(port or 0)
+    except (TypeError, ValueError):
+        return False
+    if port <= 0:
+        return False
+    p = LOCK_DIR / ("udp_%d.lock" % port)
+    try:
+        if not p.exists():
+            return False
+        if str(_read_lock(p).get("pid", "")) != str(os.getpid()):
+            return False                   # 别人的 ⇒ 一个字都不许动 ✗
+        p.unlink()
+        return True
+    except Exception:                      # noqa: BLE001
+        return False
+
+
+def release_my_ports():
+    """把**本进程**占着的 UDP 端口全放掉 ⇒ 返回放掉的端口列表 ✓（`os._exit` 之前调 ✓）。
+
+    扫整份锁目录、只删 `pid` 是自己的那些 ✓ —— 别的实例那份**绝不动** ✗（多实例 ✓）。
+    """
+    out = []
+    try:
+        if not LOCK_DIR.exists():
+            return out
+        for p in list(LOCK_DIR.glob("udp_*.lock")):
+            if str(_read_lock(p).get("pid", "")) != str(os.getpid()):
+                continue
+            try:
+                port = int(p.stem.split("_", 1)[1])
+            except (IndexError, ValueError):
+                port = 0
+            try:
+                p.unlink()
+                if port:
+                    out.append(port)
+            except Exception:              # noqa: BLE001
+                pass
+    except Exception:                      # noqa: BLE001
+        pass
+    return out
+
+
 def record_dir(base=None):
     """录像目录（具名实例落在 `data/recordings/<n>/` ✓ 两个实例的录像不混 ✓）。"""
     d = Path(base) if base else (DATA_DIR / "recordings")

@@ -27,9 +27,9 @@ from pathlib import Path
 
 from core.context import ConsoleContext, TaskContext
 from core.imgio import imread, imwrite
-from perception import classes
+from perception.detect import classes
 
-# 类别表在 perception/classes.py 统一定义；这里用「按 id 索引的英文名列表」，
+# 类别表在 perception/detect/classes.py 统一定义；这里用「按 id 索引的英文名列表」，
 # 并且**整份写进 data.yaml**（含暂时没数据的类别，理由见下面「座位号」那段）。
 CLASS_NAMES = classes.EN_LIST
 
@@ -37,7 +37,7 @@ CLASS_NAMES = classes.EN_LIST
 def _cls_names(ids):
     """类别号 → 能直接看懂的文字，例如 `1 怪物、4 其他玩家`（给日志用）。
 
-    只打数字（[2, 3]）没人看得懂 —— 类别表在 perception/classes.py，这里不另抄
+    只打数字（[2, 3]）没人看得懂 —— 类别表在 perception/detect/classes.py，这里不另抄
     一份名字，直接问它要。
     """
     got = ["%s %s" % (c, classes.label(c)) for c in sorted(ids)]
@@ -255,7 +255,7 @@ def run_dataset(params, ctx=None):
     # **类别 id 不重映射**：data.yaml 固定声明类别表里的**全部**类别（含暂时没有
     # 数据的），标注行里的 id 原样保留。
     # 类别号是**座位号**，不是「这次有哪几类就排哪几号」：
-    #     0 玩家 / 1 怪物 / 2 掉落 / 3 NPC / 4 其他玩家   （表在 perception/classes.py）
+    #     0 玩家 / 1 怪物 / 2 掉落 / 3 NPC / 4 其他玩家   （表在 perception/detect/classes.py）
     #
     # 程序里到处按号认类：实时识别、自动标注、迭代自训练都写着「1 号 = 怪物」这种
     # 判断。所以哪怕「掉落」「NPC」这次一个框都没有，它们的号也必须留着 ——
@@ -384,7 +384,7 @@ def run_dataset(params, ctx=None):
     # 同时落一份机器可读的类别表（id ↔ 英文名 ↔ 中文名）：给人工排查、给「运行时
     # 按名字对齐类别」用。**顺序必须与 data.yaml 的 names 一致**（同一份来源）。
     (out / "classes.json").write_text(
-        json.dumps({"source": "perception/classes.py",
+        json.dumps({"source": "perception/detect/classes.py",
                     "classes": [{"id": c[0], "en": c[1], "zh": c[2]}
                                 for c in classes.CLASSES]},
                    ensure_ascii=False, indent=2) + "\n",

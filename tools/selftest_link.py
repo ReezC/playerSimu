@@ -12,7 +12,7 @@
 收到回执」—— 这比「TCP 发成功」可靠得多：relay 卡在串口写、或者 B 机对着一条
 已经死掉的连接发，两种情况发送都不报错，但永远等不到回执。
 
-链路健康度用的是 `decision.input.link_health()`（界面那行状态字用的同一套）。
+链路健康度用的是 `execution.input.link_health()`（界面那行状态字用的同一套）。
 跑之前最好**先停自动**：它会占用 relay 那唯一的客户端位几秒钟。
 """
 
@@ -23,7 +23,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from decision import input as dinput      # noqa: E402
+from execution import input as dinput      # noqa: E402
+from execution import remote as _remote_mod
 from core.config import get              # noqa: E402
 
 
@@ -44,7 +45,7 @@ def main() -> int:
     # ---- 1. 建连接 ----
     t0 = time.perf_counter()
     try:
-        dinput.use_network(host, port, cert)
+        _remote_mod.use_network(host, port, cert)
     except Exception as e:
         print("[X] 连不上：%s: %s" % (type(e).__name__, e))
         print("    按顺序查：")
@@ -55,10 +56,10 @@ def main() -> int:
     print("[1/3] 已连上（%.2f 秒）" % (time.perf_counter() - t0))
 
     # ---- 2. 发一条无副作用指令 ----
-    dinput.release_all_remote()          # 先松键，避免上次留下的卡键
+    _remote_mod.release_all_remote()          # 先松键，避免上次留下的卡键
     time.sleep(0.2)
     dinput.mouse_move(0, 0)              # 位移 0：等于没动，但固件会回 DONE
-    h0 = dinput.link_health()
+    h0 = _remote_mod.link_health()
     print("[2/3] 已发出探测指令（后端=%s）" % h0.get("backend"))
 
     # ---- 3. 等回执 ----
@@ -66,7 +67,7 @@ def main() -> int:
     h = None
     while time.time() < deadline:
         time.sleep(0.1)
-        h = dinput.link_health()
+        h = _remote_mod.link_health()
         if not h.get("silent"):          # silent 归零 = 最后一条有回执
             break
     silent = float((h or {}).get("silent") or 0.0)
@@ -89,7 +90,7 @@ def main() -> int:
         print("  2. A 机 relay_trace.log：最后几行在做什么（有没有 serial write/read error）")
         print("  3. A 机 relay_trace.log 里有没有 tcp->serial 行 —— 没有说明指令根本没到 relay")
         print("  4. 板子还在吗：A 机部署台「环境自检」看串口列不列得出来")
-    dinput.shutdown()
+    _remote_mod.shutdown()
     return 0 if ok else 1
 
 

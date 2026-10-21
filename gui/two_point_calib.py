@@ -33,7 +33,10 @@ from core import mapdata
 from gui import theme                  # 弹窗几何按客户端存（config/ui.yaml）✓
 from gui.widgets import NoWheelComboBox, NoWheelSpinBox
 from gui.worker import safe_slot                # 槽里抛异常 = 整个工作台 abort（见 worker.py）
+from perception import map_const
+from perception import map_calib
 from perception import minimap as mm
+from perception import map_dot
 
 #: 表格里那两列的顺序（离线在前、实时在后）—— `_build` 与 `_uv` 共用一份：
 #: 顺序写两遍就会"填进去的和读出来的不是同一列"，而那种错**看着像标定不准** ✗。
@@ -65,7 +68,7 @@ class TwoPointCalibDialog(QDialog):
         #   出现"我在普通标定里存的，双点标定里看不见"（用户 2026-09-27 说的"应该引用的
         #   是一套数据"）。调用方（路线识别）本来就会显式传 src ✓，这里只是把兜底对齐 ✓。
         from core.config import load_live
-        self.src = src or (load_live().get("mmap_src") or mm.SRC_STREAM)
+        self.src = src or (load_live().get("mmap_src") or map_const.SRC_STREAM)
         #: 「保存标定」成功过 → 调用方拿它决定要不要立刻刷新状态行（同 `MinimapCalibDialog`）
         self.saved = False
         #: 现在这份标定：保存时保留 mode / alpha / ref / world_offset … 这些字段。
@@ -76,7 +79,7 @@ class TwoPointCalibDialog(QDialog):
         if mode:
             self._cal["mode"] = mode
         elif not self._cal.get("mode"):
-            self._cal["mode"] = mm.MODE_FIT
+            self._cal["mode"] = map_const.MODE_FIT
         self._result = None                 # 最近一次「算一算」的结果
         self._frame = None                  # 实时小地图那一帧（认黄点要用）
         #: 地形/底图：换"世界坐标 ↔ 底图像素"要用它（拿不到就老实说，别给个"填了没用"的入口）
@@ -110,7 +113,7 @@ class TwoPointCalibDialog(QDialog):
 
         self.lbl_where = QLabel(
             "地图 %s　来源：%s" % (self.map_id or "（未选）",
-                                mm.SRC_LABEL.get(self.src, self.src)))
+                                map_const.SRC_LABEL.get(self.src, self.src)))
         root.addWidget(self.lbl_where)
         self.lbl_now = QLabel()
         self.lbl_now.setWordWrap(True)
@@ -226,7 +229,7 @@ class TwoPointCalibDialog(QDialog):
                 "实时画面：还没收到（%s）"
                 % (getattr(self.client, "hint", None)
                    or ("A 机的「小地图推流」启动了吗？"
-                       if self.src == mm.SRC_STREAM else "先到「实时」页开始预览")))
+                       if self.src == map_const.SRC_STREAM else "先到「实时」页开始预览")))
             return
         self._frame = frame
         self.lbl_live.setText("实时画面：%d×%d" % (frame.shape[1], frame.shape[0]))
@@ -266,19 +269,20 @@ class TwoPointCalibDialog(QDialog):
         在哪" —— 让人拿鼠标去描一个 2~5 像素的点，既是白费功夫也是误差来源 ✗。
         几何优先用**刚解出来的**那份（ROI/底图相减都更准），没有就用文件里那份。
         """
+        from perception import map_dot
         if self._frame is None:
             self._say("还没有实时画面 —— 先让「实时画面」那行显示出尺寸再认。", bad=True)
             return
         cal = self._cal
         if self._result and self._result.get("ok"):
-            cal = mm.calib_from_two_point(self._cal, self._result)
-        r = mm.find_player_dot(self._frame, cal, self._terrain)
+            cal = map_calib.calib_from_two_point(self._cal, self._result)
+        r = map_dot.find_player_dot(self._frame, cal, self._terrain)
         if not r["ok"]:
             self._dot = None
             self._say("黄点没认出来：%s" % r.get("reason", ""), bad=True)
             return
         self._dot = r
-        x, y = mm.dot_feet(r)               # 口径只有一处（`perception.minimap.dot_feet`）
+        x, y = map_dot.dot_feet(r)               # 口径只有一处（`perception.minimap.dot_feet`）
         sp = self._samp_row(i)
         # 采样格是**整数**框 ⇒ 在这里取整（`round` 到最近，别 `int()` 截断）——
         # `dot_feet` 给的是**亚像素**（2026-09-27 起读数那条路直接用小数 ✓）
@@ -325,7 +329,7 @@ class TwoPointCalibDialog(QDialog):
     def _on_calc(self):
         cA, pA = self._uv("A", "off"), self._uv("A", "live")
         cB, pB = self._uv("B", "off"), self._uv("B", "live")
-        r = mm.solve_two_point(cA, pA, cB, pB)
+        r = map_calib.solve_two_point(cA, pA, cB, pB)
         # ⚠ 下面的 `cA…pB` 与上面同一份（解与跨度都要用）；别删上面那两行 ——
         #   解退化输入之前就得有值（`solve_two_point` 拿的就是它们）。
         if not r["ok"]:
@@ -371,7 +375,7 @@ class TwoPointCalibDialog(QDialog):
         if self._result is None or not self._result.get("ok"):
             self._say("先「算一算」，算出几何了才能保存。")
             return
-        cal = mm.calib_from_two_point(self._cal, self._result)
+        cal = map_calib.calib_from_two_point(self._cal, self._result)
         try:
             mapdata.save_calib(self.map_id, cal, self.src)
         except Exception as e:                      # noqa: BLE001
@@ -379,12 +383,12 @@ class TwoPointCalibDialog(QDialog):
             return
         self.saved = True
         self._cal = cal
-        sx, sy = mm.scales_of(cal)
+        sx, sy = map_calib.scales_of(cal)
         self._say("已保存到 %s（来源：%s）：缩放 x %.4f / y %.4f，偏移 %s。\n"
                   "「路线识别」那页会立刻重读这份几何（这扇窗是非模态的，你可以在那边"
                   "继续操作）。"
                   % (mapdata.calib_path(self.map_id),
-                     mm.SRC_LABEL.get(self.src, self.src), sx, sy, cal.get("offset")))
+                     map_const.SRC_LABEL.get(self.src, self.src), sx, sy, cal.get("offset")))
         self._refresh_now()
         # 非模态 ⇒ 调用方拿不到返回值，只能靠信号知道"存过了"（它据此刷状态行/叠图）
         self.saved_now.emit()
@@ -392,12 +396,12 @@ class TwoPointCalibDialog(QDialog):
     def _refresh_now(self):
         """顶部那行：这份标定现在长什么样（**两轴不同要分开写**，别只报一个数）。"""
         cal = mapdata.load_calib(self.map_id, self.src) or {}
-        if not mm.has_geometry(cal):
+        if not map_calib.has_geometry(cal):
             self.lbl_now.setText("现在这份：这张图在「%s」下还没标定过。"
-                                 % mm.SRC_LABEL.get(self.src, self.src))
+                                 % map_const.SRC_LABEL.get(self.src, self.src))
             self.lbl_now.setStyleSheet("color:#b06000;")
             return
-        sx, sy = mm.scales_of(cal)
+        sx, sy = map_calib.scales_of(cal)
         src_tag = cal.get("src")
         if src_tag == "manual":
             how = "人眼对齐"
@@ -409,7 +413,7 @@ class TwoPointCalibDialog(QDialog):
             how = "没记来源"
         self.lbl_now.setText(
             "现在这份：%s　缩放 %s　偏移 %s　（%s）"
-            % (mm.SRC_LABEL.get(self.src, self.src),
+            % (map_const.SRC_LABEL.get(self.src, self.src),
                ("x %.3f / y %.3f" % (sx, sy)) if abs(sy - sx) > 1e-9 else "%.3f" % sx,
                cal.get("offset"), how))
         self.lbl_now.setStyleSheet("color:#3c4043;")

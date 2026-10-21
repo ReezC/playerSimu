@@ -27,8 +27,8 @@ from pathlib import Path
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from core import behavior                  # 「查怪结果」打点（`mob_fh` ✓ 见 `_make_mob_sets_resolver`）
-from perception import screen_state        # 界面状态（测谎弹窗）检测 —— M1「测谎报警」✓
-from perception import ui_state            # 掉线/登录系界面判别（重连素材锚点 ✓）
+from perception.screen import screen_state  # 界面状态（测谎弹窗）检测 —— M1「测谎报警」✓
+from perception.screen import ui_state  # 掉线/登录系界面判别（重连素材锚点 ✓）
 from core.config import get, load_live
 
 # 探针解码：**必须模块级**。原来它是在 `_run()` 里局部 import 的，那会让
@@ -44,10 +44,17 @@ except Exception:                     # pragma: no cover - 正常环境不会走
     decode_ms = resolve_delay_ms = None
 
 from gui import theme
-from perception.pos_state import PositionStateMachine
+from perception.world.pos_state import PositionStateMachine
 #: ⭐ 运行时编排层（阶段 1「编排收口」✓ 2026-10-15）：一帧的**调度**逻辑归它 ✓ ——
 #:   本文件只留**胶水**（取帧 / Qt / 画框 / 模型）✓。层号 `runtime`(2) < `gui`(3) ✓ 方向没问题 ✓。
-from runtime.pipeline import FrameCtx, HeavyGate
+from runtime import (frame_infer, frame_locate, frame_pic, frame_probe,
+                     frame_reconnect, frame_ui, frame_vis, frame_vt)
+#: ⚠ `_det_crop_for` / `_det_off_xyxy` 已搬进 `runtime/frame_infer.py`（2026-10-20 ✓
+#:   它们只被"一次推理"用 ✓）—— 这里**再导入一份**是为了自检/外部照旧能取到 ✓
+#:   （真身只有一处 ✓ 别在这里再写一份实现 ✗）。
+from runtime.frame_infer import _det_crop_for, _det_off_xyxy  # noqa: F401
+from runtime.pipeline import (FrameCtx, HeavyGate, lie_hold_until,
+                              vt_lie_active, vt_should_feed, vt_yield_pipe_fps)
 
 #: 那句"`half` 已弃用"只静音一次（幂等 ✓ 见 `mute_half_deprecation`）
 _HALF_WARN_MUTED = False
@@ -197,6 +204,11 @@ LIE_SESSION_MAX_S = 60.0
 #:     录屏按 `LIE_REC_HOLD_S`=5 秒宽限收尾 ✓）—— 30 秒是**上限**，不是必须录满 ✓。
 #:   ⚠ 依据：真测谎实测 **≈25 秒**（`lie_warn` ⇒ 小游戏 ~18s ⇒ 成功弹窗 ✓）⇒ 30 秒盖得住 ✓。
 LIE_REC_WINDOW_S = 30.0
+#: ⭐⭐⭐ **这一场"画面断了"累计超过这么多秒 ⇒ 判定记「不确定」，不判失败**（用户 2026-10-20 ✓）：
+#:   现场 14:09:44 起抓屏全黑 8 秒（`cam_*` 8 秒不变、`mmap_pick` 断流、`link-dead`、`player_dead` ✓）
+#:   ⇒ 窗口到点照旧判"失败" ✗ —— 那是**什么都没看见**，跟"没操作"是两件事 ✗。
+#:   取 2 秒：比一次眨眼长、比"断了一下又回来"短 ✓（断一下不影响判定 ✓）。
+LIE_PIC_DEAD_JUDGE_S = 2.0
 #: ⭐⭐⭐⭐⭐ **C（保险）：没见到成功弹窗 ⇒ 最长录这么久就收** ✗✗（秒 ✓ 用户 2026-10-08 ✓ 原话：
 #:   "**进 lie_* 后若一直没见到 lie_warn/lie_success、且 lie_game 分数贴着门槛 ⇒ 到点就停，
 #:   别录满 5 分钟**" ✓✓ 见 `_screen_beat` ✓）—— ⚠ 真测谎 **≈25 秒**就出成功弹窗 ✓ ⇒ 90 秒
@@ -210,17 +222,21 @@ LIE_REC_SOFT_S = 90.0
 #:   ⚠⚠ **必须把 `lie_warn` 那一拍的分排除在外** ✗（`lie_warn` 是"触发器"、不是"这场测谎真在
 #:     进行"的证据 ✓ —— 它一响就 0.857 ✓ 拿它算 ⇒ 这条保险**永远不生效** ✗）。
 LIE_REC_STRONG = float(screen_state.MATCH_THRESHOLD) + 0.05
-from perception.classes import (CLASS_DROP, CLASS_MOB, CLASS_OTHER_PLAYER,
+from perception.detect.classes import (CLASS_DROP, CLASS_MOB, CLASS_OTHER_PLAYER,
                                 CLASS_PLAYER, EN_NAMES as CLASS_EN,
                                 ZH_NAMES as CLASS_NAMES)
 #: ⭐ 两档低分档的比例（2026-10-11 ✓）：`split_dets` 在**模块级**用（它是模块级函数 ✓
 #: `run()` 里那个函数内导入够不着它 ✗ —— 2026-10-11 实测踩到"undefined name"✓）。
 #: ⚠ 玩家那一档的**使用前提比怪多两条**（见 `PlayerTracker.update` ✓）—— 这里只管分档 ✓。
-from perception.tracker import MOB_LOW_CONF_RATIO, PLAYER_LOW_CONF_RATIO
+from perception.track.tracker import MOB_LOW_CONF_RATIO, PLAYER_LOW_CONF_RATIO
+from perception import map_dot
+from perception import map_locator
+from decision import jobs as jobmod
+from decision import pathing
 
 # player_id → YOLO class id 映射（玩家也走 YOLO，每个玩家独占一个类）。
 # 当前单玩家固定 class 0；未来多玩家时扩展成 {"角色A": 0, "角色B": 4, ...}
-# （4 是「其他玩家」类，见 perception/classes.py —— 别再拿 2，那是 drop）。
+# （4 是「其他玩家」类，见 perception/detect/classes.py —— 别再拿 2，那是 drop）。
 PLAYER_CLASS_MAP = {"": CLASS_PLAYER}
 
 #: 积压锁死的判据：端到端延迟中位超过 LAG_WARN_MS 且持续 LAG_WARN_SEC 秒不回落
@@ -267,11 +283,11 @@ def split_dets(xyxy, cfs, clss, mob_class, player_class, conf_mob, conf_player):
       `run()` 的主回路里 ✗ ⇒ 只能靠读代码确认 ✓。抽出来之后，用例可以拿**6 个类别**喂它、
       **当场**证明"掉落/宠物一个都进不来" ✓（见 `selftest_decision.t_drop_pet_never_enter_decision`）。
 
-    规矩（改这条要连 `perception/classes.py` 的座位号与用例一起想 ✓）：
+    规矩（改这条要连 `perception/detect/classes.py` 的座位号与用例一起想 ✓）：
       · **只有 `mob_class`（= 1 ✓）进 `mob_dets`** ✓（喂 `MobTracker` ⇒ `ws.mobs` ⇒ 决策）；
       · **只有 `player_class`（= 0 ✓）进 `player_cands`** ✓（喂 `PlayerTracker` ⇒ `ws.player`）；
       · ⛔ **掉落（2）/ NPC（3）/ 其他玩家（4）/ 宠物（5）一律不进** ✗ ——
-        `perception/classes.py` 里那两条注释就是它（宠物："**不进决策**，标它只为让模型
+        `perception/detect/classes.py` 里那两条注释就是它（宠物："**不进决策**，标它只为让模型
         学会区分宠物 vs 怪" ✓）。⚠ "其他玩家"混进 `mobs` 会**去打人**、混进玩家候选会
         **认错自己** ✓（所以它必须被拦住 ✓ 见那段老注释 ✓）；宠物同理（它是"障碍物"，
         标它是为了让**被宠物挡住的怪**也能检出、以及宠物不被误检成怪 ✓）。
@@ -606,7 +622,7 @@ def limit_reason(recv_fps, proc_fps, infer_ms, gap_ms):
 LOAD_WATCH_SEC = 10.0
 
 # 类别 → 框颜色（BGR）。**每个类别的颜色都能在设置里改**（theme.class_colors
-# 统一从 config/ui.yaml 的 vis 段读）；类别清单本身在 perception/classes.py 定义。
+# 统一从 config/ui.yaml 的 vis 段读）；类别清单本身在 perception/detect/classes.py 定义。
 def _box_colors():
     return theme.class_colors()
 
@@ -843,7 +859,7 @@ def draw_key_caps(dst, agent):
     · 拿不到 settings / keys（自检替身 ✓）⇒ 什么都不画 ✓。
     """
     import cv2
-    from decision.input import display_name
+    from execution.keys import display_name
     km = getattr(getattr(agent, "settings", None), "keymap", None)
     ks = getattr(agent, "keys", None)
     if not km or ks is None or not hasattr(ks, "pressed"):
@@ -985,42 +1001,6 @@ def _vision_box_for(vis, player_box, s):
     return left, top, right, bottom
 
 
-def _det_crop_for(vis, vision_box, enabled):
-    """⭐⭐ 「**只检测视野框**」（用户 2026-10-15 ✓）⇒ 返回 `(要喂给模型的图, 坐标偏移)`。
-
-    · `enabled` 关 ⇒ **原图 + `(0, 0)`** ✓（老行为一字不变 —— 检测走整帧 ✓）；
-    · 开 ⇒ 把 `vision_box` 那一块剪出来 + 偏移 `(left, top)` ✓。
-      ⚠ 剪出来的是 **numpy 视图**（`vis[y0:y1, x0:x1]` 不拷内存 ✓ 每帧白拷 1 MB 没必要 ✗；
-      `model.predict` 自己会做前处理 ✓）。
-    · ⚠⚠ **调用方必须把偏移加回所有框坐标** ✗ —— 模型看到的是"剪裁块"自己的坐标系，
-      而下游（追踪 / 决策 / 画框 / 掉落拾取）用的**全是全画面坐标** ✓。
-    · ⚠ **退化框**（宽或高 ≤ 0）⇒ **退回原图** ✓：`vision_*` 是用户可填的，
-      `left == right` 完全可能 ✓ —— 宁可多算一点，也**不许**把空图喂给模型 ✗
-      （空数组会一路崩在 ultralytics 里，报错还看不出跟设置有关 ✗）。
-    """
-    if not enabled or vision_box is None:
-        return vis, (0, 0)
-    left, top, right, bottom = vision_box
-    if right <= left or bottom <= top:
-        return vis, (0, 0)
-    return vis[top:bottom, left:right], (int(left), int(top))
-
-
-def _det_off_xyxy(xyxy, det_off):
-    """把剪裁推理的偏移**加回框坐标** ⇒ 交出去的永远是**全画面坐标** ✓。
-
-    ⚠⚠ **全回路只许在这一处加** ✗（调用点唯一 ✓ 用例钉着 ✓）：模型给的是"剪裁块自己的
-    坐标系"（原点在块左上角 ✓），而下游（`split_dets` / `extra_class_dets` / `_drop_boxes`
-    / MobTracker / PlayerTracker / 画框）用的**全是全画面坐标** ✓ —— 加两处就**多偏一次** ✗、
-    忘了加就**整体偏一块** ✗，两种都"能跑、不报错"✓ 最难查 ✓。
-
-    `det_off == (0, 0)`（没剪裁 / 退回原图 ✓）⇒ **原样返回、不碰数组** ✓（省一次逐元素加法 ✓）。
-    """
-    if det_off == (0, 0):
-        return xyxy
-    return xyxy + (det_off[0], det_off[1], det_off[0], det_off[1])
-
-
 def _limit_cpu_threads():
     """把 **torch / OpenCV 的线程池按死在 1**（用户 2026-09-29 链路提效 ✓）。
 
@@ -1157,6 +1137,20 @@ class _DrawWorker:
         self._evt.set()
 
 
+def _attr(obj, name, default=None):
+    """读一个属性，**缺了也返回默认值** ✓。
+
+    ⚠ 看着多余，其实必须（`QThread` 子类用 `__new__` 造出来的对象取没设过的属性会抛
+      `RuntimeError`（PyQt 的 `__getattr__` ✓）而不是 `AttributeError` ✗）⇒ 自检里的
+      `SimpleNamespace` / `__new__` 替身会当场崩在"取属性"上，看着像功能坏了 ✓。
+    ⚠ 只给**可选状态**用（画面看门狗那几个 ✓）；真业务字段该硬读就硬读 ✗。
+    """
+    try:
+        return getattr(obj, name, default)
+    except Exception:                                    # noqa: BLE001
+        return default
+
+
 class LiveThread(QThread):
     #: **原生帧**（numpy BGR）：从流里解出来、**一个字都没画**的那份。
     #: 它专供**取帧做测量**的功能 —— 探针标定、HP/MP 条框选、小地图框选、
@@ -1192,6 +1186,10 @@ class LiveThread(QThread):
         # 本机负载告警的 (文本, 明细)：由 _load_watch 线程整体重绑定、主回路只读。
         # 用元组整份替换而不是分别写两个键，读的一侧就不会拿到「一半新一半旧」。
         self._load = ("", "")
+        #: ⭐ 本线程**占着**的 UDP 端口（`claim_port` 成功才写 ✓ 0 = 没占 ✓）。
+        #:   为什么要记：见 `_release_udp_port()` —— 开流失败 / 线程收尾都要**立刻放掉** ✗
+        #:   （只等进程退出才放 ⇒ 失败后锁还挂着，用户那边看起来就是"端口被占"✓ 2026-10-21）。
+        self._udp_port = 0
 
         # ---- 小地图定位（S3）：把玩家的**世界坐标 / 所在段**写进 WorldState ----
         # 决策层以后寻路要用它回答"我在哪块平台上"。三样东西随时会被改（切项目、
@@ -1210,6 +1208,10 @@ class LiveThread(QThread):
         #:       ⇒ 那就该**按比例把框也跟着缩** ✓ —— 和 `rect_rel` 同一个道理 ✓。
         #:   ⚠ 记在内存里（重开工作台后第一帧尺寸通常和框选时一样 ✓ 会重新学到 ✓）。
         self._mmap_crop_frame = None
+        #: ⭐ **这一帧（整帧）的尺寸** `(W, H)`，**每拍都刷**（不是"框选那一刻"那份 ✓）——
+        #:   定位时要把它交给 `PlayerLocator.update(frame_wh=…)`，好让"面板像素变了、但框选
+        #:   区域没变"这种情况**按比例救回来、不用重标**（用户 2026-10-20 方案 A ✓ 日志 507）。
+        self._mmap_frame_wh = None
         #: 裁不出来时**说清楚是哪一条断的** ✓（帧尺寸 / 越界 ✓ 别只说"重框一次" ✗）
         self._mmap_crop_note = ""
         #: ⭐⭐ **这一拍刚从实时帧上裁下来的小地图面板**（只对来源=「从实时画面」有意义 ✓）。
@@ -1262,6 +1264,24 @@ class LiveThread(QThread):
         #:   口径：`src_lag`（= 本机持续跟不上源 ✓）成立期间**不喂帧**（省下推理 ✓），
         #:   恢复后自动接着喂 ✓ —— 测谎是"顺手做的事"，**不能反过来拖垮实时** ✗。
         self._vt_yield = False
+        #: 当前"让路档位"（0 = 没让路 ✓）。只用来说一次话，别每秒刷屏 ✗
+        self._vt_yield_note = 0.0
+        # ---- ⭐ B 语义：**先嗅探，测谎窗口出现才跑跟踪**（用户 2026-10-17 ✓）----
+        #: `"screen"` = 只在 `_screen_state` 变成 `lie_*` 时喂帧（默认 ✓ 省 GPU ✓）；
+        #: `"off"` = 老语义 A（勾上就一直喂 ✓ 2026-10-09 之前的做法 ✓）
+        self._vt_gate = "screen"
+        #: 窗口"有效期"（`lie_hold_until` ✓ 每拍推 ✓ 窗口消失后还留一小段宽限 ✓）
+        self._vt_hold_until = 0.0
+        self._vt_hold_s = 1.5
+        #: **长预算**：进过一次 `lie_*` 就给足 `_vt_arm_s` 秒（默认 25 ✓）。
+        #: ⚠ 为什么必需（2026-10-17 现场 ✓）：`screen_state` 认不出**小游戏那个窗口**
+        #:   （`lie_game` 实测 0.653 < 0.75、`lie_success` 0.745 < 0.80）⇒ 它回落 `combat`
+        #:   ⇒ 门在 **3.5 秒**后就关了，而 SDK 那才刚 `MATCHED`（title 0.944 ✓ 定位没问题 ✗）
+        #:   ⇒ 真正要跟的那一段**一帧都没喂到** ✗。见 `runtime.pipeline.vt_lie_active` ✓。
+        self._vt_arm_until = 0.0
+        self._vt_arm_s = 25.0
+        #: 上一拍"在不在测谎"（进/出沿只说一次话 + 进沿重开一轮 ✓）
+        self._vt_gate_was = False
         #: 上一次真喂给 SDK 的时刻（限速用 ✓ 见 `vt_max_fps` / `VT_FPS_UNDER_LAG` ✓）
         self._vt_fed_at = 0.0
         #: ⭐⭐ **重活闸：每秒最多跑多少拍「推理＋追踪＋决策＋画框」**（用户 2026-10-10 ✓
@@ -1326,7 +1346,7 @@ class LiveThread(QThread):
         #: 定位没输出时都清成空（别留旧值骗解析器 ✗，见 `_fill_route_ctx`）。
         self._player_here = []
         self._player_at = None
-        #: ⭐ **位置状态机**（`perception/pos_state.py` ✓）—— 用户 2026-09-27 定：
+        #: ⭐ **位置状态机**（`perception/world/pos_state.py` ✓）—— 用户 2026-09-27 定：
         #: "所有的位置状态更新由**位置状态机**自治" ⇒ `_fill_route_ctx` 只喂读数与按键事实，
         #: 由它把 `here_sets` / `ladder_id` / `at_ladder_top` 算好、广播到 `Player` ✓。
         #: 它**有状态**（跨帧记"y 到过的最小值" ✓）⇒ 和本线程同寿命，别按帧重建 ✗。
@@ -1399,6 +1419,20 @@ class LiveThread(QThread):
         self._lie_last_verdict_at = 0.0
         self._lie_last_verdict_s = 0.0
         self._lie_rec_top_game = 0.0
+        #: ⭐⭐ 「源画面连续全黑」的计时/记账状态（`{"t0": float, "logged": bool}` ✓）——
+        #:   2026-10-17 现场：两份同时录的录像**结尾都有一段全黑**（`183245` 帧 487–604、
+        #:   `183248` 帧 455–**到片尾** ✓）而**叠加层还在画** ✓ ⇒ 录制器没停 ✗，
+        #:   是**送进来的帧本身全黑** ✓（抓屏/推流断了：窗口最小化、切桌面、游戏关了 ✓）。
+        #:   ⚠ 以前这种事故**一句日志都没有** ✗ ⇒ 用户只会说"没看到录屏"✓
+        #:   ⇒ 见 `_src_black_step` + `_lie_rec_write` ✓。
+        self._lie_rec_black = {"t0": 0.0, "logged": False}
+        #: ⭐⭐⭐ **画面还在不在**（用户 2026-10-20 ✓）：`_pic_black_t0` = 这一段"全黑"的起点，
+        #:   **`-1.0` = 这一段还没开始**（哨兵，别用 0.0 ✗ 见 `_pic_watch` ✓）；
+        #:   `_pic_dead` = 已经认定断了；`_lie_pic_dead_s` = **这一场测谎里画面断掉的累计秒数**
+        #:   （判定要用 ✓ 断了就不能判"失败" ✗ 见 `_lie_window_over` ✓）。
+        self._pic_black_t0 = -1.0
+        self._pic_dead = False
+        self._lie_pic_dead_s = 0.0
 
     def set_stream_rect(self, rel):
         """部署台「**游戏窗口区域**」（**比例** `[nx, ny, nw, nh]`，相对 A 机推来的整帧 ✓）。
@@ -1417,6 +1451,31 @@ class LiveThread(QThread):
         self._stream_roi = None
         self._stream_full = None
 
+    def _release_udp_port(self):
+        """放掉「这个 UDP 端口归我收」—— **只放自己的那份** ✓（`core.instance.release_port` ✓）。
+
+        ⭐ 2026-10-21（用户：「**窗口关掉但是实例清不掉**」顺藤摸出来的另一半）：
+
+        以前**只有进程退出**那条路会放（`core/appexit.hard_exit` ✓），而**开流失败**时
+        （`PyAVSource.open()` 超时 / 端口已被占 / 用户点停止）线程直接 `return` ⇒
+        锁留在盘上、写着一个**活着的** pid ⇒ 系统里却没有任何 socket 绑 5000 ✓
+        —— 现场表现：`data/locks/udp_5000.lock` 有、`Get-NetUDPEndpoint` 空、
+        "开始"按下去没反应，只能靠重启工作台 ✓。
+
+        ⚠ 顺序**不能反**：必须**先关源、再放锁** ✗ —— 反过来的话，别人可以抢先 bind
+          （ffmpeg 带 `SO_REUSEADDR`，两边都能 bind、包只落一边 ⇒ 帧率一半/花屏 ✓
+          正是 `core/instance.py` 那段要防的事 ✓ 见 6545 行那条实测记录 ✓）。
+        """
+        port = int(getattr(self, "_udp_port", 0) or 0)
+        if not port:
+            return
+        self._udp_port = 0                   # 先清字段：放两次也只动一次 ✓
+        try:
+            from core import instance as _inst
+            _inst.release_port(port)
+        except Exception:                    # noqa: BLE001 —— 放不掉不该炸收尾 ✓
+            pass
+
     def _stream_roi_now(self, shape):
         """按 `stream_rect_rel` 现算**这一帧**里的游戏区域 `(x, y, w, h)` ✓ / `None` ✓。
 
@@ -1434,8 +1493,9 @@ class LiveThread(QThread):
             self._stream_roi, self._stream_full = None, None
             return None
         try:
+            from perception import map_calib
             from perception import minimap as _mm
-            roi = _mm.crop_from_rel(rel, (H, W))       # 折算 + **夹回边界** ✓
+            roi = map_calib.crop_from_rel(rel, (H, W))       # 折算 + **夹回边界** ✓
         except Exception:                              # noqa: BLE001
             roi = None
         self._stream_roi = tuple(roi) if roi else None
@@ -1447,7 +1507,7 @@ class LiveThread(QThread):
 
         ⚠ `full_shape` 必须是**整帧**（标定表是按整帧量的 ✓）；`roi` 是那块在整帧里的
           位置 ✓ ⇒ 比例先落到"看到的这块"，再 + `roi` 原点 = **整帧像素** ✓
-          （一处实现：`mouse_aim.roi_px` ✓）—— 断线重连 / 自动测谎全走这条 ✓。
+          （一处实现：`mouse_aim_c.roi_px` ✓）—— 断线重连 / 自动测谎全走这条 ✓。
         """
         if str(getattr(self, "_source", "") or "") != "stream":
             return None, None
@@ -1491,8 +1551,9 @@ class LiveThread(QThread):
         """
         while not self._stop.is_set():
             try:
-                from decision import input as _di
-                r = _di.window_probe()
+                from execution import input as _di
+                from execution import remote as _remote_mod
+                r = _remote_mod.window_probe()
                 if r:
                     x, y, w, h = (int(v) for v in r)
                     if w > 0 and h > 0:
@@ -1523,9 +1584,10 @@ class LiveThread(QThread):
         """
         while not self._stop.is_set():
             try:
-                from decision import input as _di
-                from decision import mouse_aim as _ma
-                p = _di.cursor_probe()
+                from execution import input as _di
+                from execution import remote as _remote_mod
+                from execution import mouse_aim as _ma
+                p = _remote_mod.cursor_probe()
                 if p:
                     _ma.set_cursor_screen(p[0], p[1], p[2], p[3])
             except Exception:                    # noqa: BLE001 —— 问不到就不更新 ✓
@@ -1544,11 +1606,14 @@ class LiveThread(QThread):
         问不到窗口（旧 relay / 本地后端 / 没开跟随窗口）⇒ 原样返回调用方给的 `origin` ✓
           一字不变 ✓。
         """
-        from decision import mouse_aim as _ma    # ⚠ 局部导入（本文件惯例 ✓）
+        from execution import mouse_aim as _ma    # ⚠ 局部导入（本文件惯例 ✓）
+        # ⚠⚠ 2026-10-18：load_gain 已搬到 xecution/aim_convert ⇒ **两半都要 import** ✓
+        #   只补半边就是现场那条 AttributeError: module 'execution.mouse_aim' has no attribute 'load_gain' ✗
+        from execution import aim_convert as _ma_c
         roi, full = self._mouse_roi()
         worg, wshape = self._mouse_win()
         if wshape:
-            gain = _ma.load_gain(frame.shape)
+            gain = _ma_c.load_gain(frame.shape)
             if gain:
                 # ⭐ 窗口**变了**就留一笔（窗口挪一下只写一行 ✓ 不是每拍都写 ✗）——
                 #   现场"又点歪"时，先看这行就知道是不是它挪了 ✓ 不用再猜 ✓
@@ -1596,15 +1661,17 @@ class LiveThread(QThread):
         if not crop:
             return None
         H, W = frame.shape[:2]
+        self._mmap_frame_wh = (int(W), int(H))      # 每拍刷（定位要用 ✓ 见它的说明）
         # ⭐⭐⭐ **帧尺寸变了 ⇒ 按比例把框跟着缩**（用户 2026-10-17 ✓「移动窗口后为什么要
         #   重新框选？」✗）：框是**相对帧**的 ✓，那么帧尺寸一变就该等比折算 ✓，
         #   而不是让它越界/错位 ⇒ 逼用户重框 ✗。
         #   ⚠ 只在"之前成功裁过一次、记下了旧尺寸"时才折算 ✓（没记过 ⇒ 老行为 ✓ 不猜 ✗）。
         _fw, _fh = (self._mmap_crop_frame or (0, 0))
         if _fw and _fh and (int(_fw) != int(W) or int(_fh) != int(H)):
+            from perception import map_calib
             from perception import minimap as _mm
-            _rel = _mm.crop_rel_of(crop, (int(_fh), int(_fw)))
-            _c2 = _mm.crop_from_rel(_rel, (H, W)) if _rel else None
+            _rel = map_calib.crop_rel_of(crop, (int(_fh), int(_fw)))
+            _c2 = map_calib.crop_from_rel(_rel, (H, W)) if _rel else None
             if _c2:
                 crop = list(_c2)
                 self._mmap_crop_note = (
@@ -1657,7 +1724,11 @@ class LiveThread(QThread):
         ⚠ 开销：`find_path` 是 BFS（毫秒级），`mapdata.load` 走 `_route_ctx` 的 **2 秒缓存**
         —— 一次休息最多解析两三次，**不在帧循环里** ✗（别把它挂进每拍）。
         """
+        from decision import pathing
+        from decision import jobs as jobmod
         def resolve(dst_set):
+            from decision import pathing
+            from decision import jobs as jobmod
             mid = str(getattr(self, "_mmap_mid", "") or "")
             if not mid:
                 return {"jobs": [], "why": "还不知道当前是哪个项目 / 地图", "here": False}
@@ -1666,24 +1737,23 @@ class LiveThread(QThread):
                 return {"jobs": [], "here": False,
                         "why": "读不到地形 / 集合数据（先在「路线识别」里生成地形图）"}
             src = next((n for n in (getattr(self, "_player_here", None) or [])
-                        if n in z.sets), "")
+                        if n in z.zones), "")
             if not src:
                 src = str(getattr(stg, "route_goto_set", "") or "")
             if not src:
                 return {"jobs": [], "here": False,
                         "why": "你现在站的这块没圈进任何集合 ⇒ 解析不出路线"}
-            from decision import route as route_mod
             try:
-                return route_mod.plan_jobs(
+                return pathing.plan_jobs(
                     t, z, src, dst_set,
                     tol_px=int(getattr(stg, "align_tol_px", 6) or 6),
                     hold_ms=int(getattr(stg, "align_hold_ms", 250) or 0),
                     # 「多久没进展算卡住」（爬不动 / 等落地 / **跳跃没落到** 三处共用 ✓）：
                     # **统一**取「移动操作尝试间隔(ms)」换算成秒 ✓（2026-09-27 用户要求：
                     # "移除卡住判定时长(s)，统一采用移动操作尝试间隔(ms)" ✓；下限 0.5 秒与
-                    # 任务里的钳法一致 ✓。⚠ **走不吃它** —— 走照旧用 `route.STALL_S` 常量 +
-                    # 「寻路超时时间」兜底 ✓，见 `route.job_for_edge`）
-                    stall_s=route_mod.stall_s_from_retry_ms(
+                    # 任务里的钳法一致 ✓。⚠ **走不吃它** —— 走照旧用 `jobs.STALL_S` 常量 +
+                    # 「寻路超时时间」兜底 ✓，见 `pathing.job_for_edge`）
+                    stall_s=jobmod.stall_s_from_retry_ms(
                         getattr(stg, "move_retry_ms", 3000)),
                     # 「起跳距离(px)」：「跳」那条边用的**临时参数** ✓
                     # ⚠ 面板（`route_panel._command_first_step`）也传了同一个值 ——
@@ -1741,7 +1811,7 @@ class LiveThread(QThread):
             #   （鞋底阴影 / 披风 / 特效会让框多出一截 ✗）⇒ 用它补正 ✓。
             #   ⚠ 读的是 `world_state` 里的**镜像值**（`live_thread` 每帧灌 ✓）—— 这边**不能**
             #     反过来 import decision（会绕成循环依赖 ✗ 见 world_state 那段说明 ✓）。
-            from perception import world_state as _ws_mod
+            from perception.world import world_state as _ws_mod
             _cy_raw = float(_wy0) - (float(_bt0) + float(_ws_mod.FOOT_OFFSET_PX))
             # ⭐⭐ **优先用「可信相机」**（用户 2026-09-29 任务 2 ✓）：上面那两份是**每拍现算**
             #   的（玩家框抖 Δ ⇒ 每只怪的世界坐标同量平移 Δ ✗）；`PlayerTracker` 已经把
@@ -2080,13 +2150,15 @@ class LiveThread(QThread):
 
         用途：人在一块**不能打**的平台上时，要挑一块**代价最低的可战斗区**
         （见 `decision/agent._pick_battle_zone` ✓）。口径与 `mob_cost_of` **完全同一套**
-        （`route.path_cost` ✓ 一处实现 ✓），只是"目标"从**一只怪**换成**一个集合** ✓。
+        （`pathing.path_cost` ✓ 一处实现 ✓），只是"目标"从**一只怪**换成**一个集合** ✓。
 
         回值：`float | None`；**算不出给 `None`** ⇒ 调用方退回"回第一条"的老行为 ✓（不猜 ✗）。
         ⚠ 与 `mob_cost_of` 同款签名（**收 `player`** ✓）—— 起点集合要从 `player.here_sets` 拿 ✓
         （agent 不持有地形/集合，这份换算只能在这儿做 ✓）。
         """
+        from decision import pathing
         def resolve(player, dst_sets):
+            from decision import pathing
             mid = getattr(self, "_mmap_mid", None)
             if not mid:
                 return None
@@ -2096,9 +2168,8 @@ class LiveThread(QThread):
                 return None
             if t is None or z is None:
                 return None
-            from decision import route as route_mod
 
-            return route_mod.path_cost(
+            return pathing.path_cost(
                 t, z, getattr(player, "here_sets", None), list(dst_sets or []),
                 getattr(self, "_player_at", None))
 
@@ -2112,14 +2183,16 @@ class LiveThread(QThread):
 
         入参 `sets_of` = `mob_sets_of` 那个解析器（**共用同一次"画面→世界 + 落在哪块面"换算** ✓，
         一处实现 ✓）。回值：`{"cost": float|None, "sets": [...], "why": ""}`
-        —— `cost` = 从**我站的集合**到**怪站的集合**的寻路距离（世界像素，`route.path_cost` 一处口径 ✓）；
+        —— `cost` = 从**我站的集合**到**怪站的集合**的寻路距离（世界像素，`pathing.path_cost` 一处口径 ✓）；
         算不出来给 `None`（**不猜** ✓，调用方退回绝对距离 ✓）。
 
         ⚠ **只在"要挑目标"那一刻调用**（`agent._nearest`，锁定过期才走 ⇒ 500~1000ms 一次 ✓），
           而且是对**当时候选的怪**；一次 `path_cost` = 一次 BFS + 每段一次 `pick_edge`（偏重 ✗）
           ⇒ **绝不挂进每拍、也别对全屏幕的怪都算** ✗（同 `route_plan` 的纪律 ✓）。
         """
+        from decision import pathing
         def resolve(player, mob):
+            from decision import pathing
             mid = str(getattr(self, "_mmap_mid", "") or "")
             if not mid:
                 return {"cost": None, "sets": [], "why": "还不知道当前是哪个项目 / 地图"}
@@ -2132,9 +2205,8 @@ class LiveThread(QThread):
             if not names:
                 return {"cost": None, "sets": [],
                         "why": info.get("why") or "怪站的 foothold 没圈进任何集合"}
-            from decision import route as route_mod
             try:
-                cost = route_mod.path_cost(
+                cost = pathing.path_cost(
                     t, z, getattr(player, "here_sets", None), names,
                     getattr(self, "_player_at", None))
             except Exception as ex:              # noqa: BLE001
@@ -2150,20 +2222,21 @@ class LiveThread(QThread):
         用户原话："…且其框底边与角色玩家当前 foothold 集合的 x 范围有交集，那么就不需要下达
         寻路任务了可以直接锁" —— 要回答"我这块平台横着占多宽" ✓。
 
-        回值：`(左, 右) | None`（世界像素；底层是 `route.set_span` ✓ —— 它复用 `_set_spans`，
+        回值：`(左, 右) | None`（世界像素；底层是 `pathing.set_span` ✓ —— 它复用 `_set_spans`，
         一处实现 ✓）。agent 不持有地形/集合 ⇒ 和 `route_plan` / `mob_sets_of` 一样由这里给 ✓，
         共用同一份 `_route_ctx` 2 秒缓存 ✓。
         """
+        from decision import pathing
         def resolve(name):
+            from decision import pathing
             mid = str(getattr(self, "_mmap_mid", "") or "")
             if not mid:
                 return None
             t, z = self._route_ctx(mid)
             if t is None or z is None:
                 return None
-            from decision import route as route_mod
             try:
-                return route_mod.set_span(t, z, str(name))
+                return pathing.set_span(t, z, str(name))
             except Exception:                    # noqa: BLE001
                 return None
 
@@ -2188,7 +2261,9 @@ class LiveThread(QThread):
           · 取**沿方向最近**的那个 ✓（`dy > 0` ⇒ 比 `y0`、否则比 `y1`）。
         ⚠ `|dy|` 太小（怪和我在同一高度 ✓）⇒ 返回 `None` ✓ —— 那是"纯水平"，不该上下跑 ✓。
         """
+        from decision import pathing
         def resolve(player, mob):
+            from decision import pathing
             mid = str(getattr(self, "_mmap_mid", "") or "")
             if not mid:
                 return None
@@ -2196,7 +2271,6 @@ class LiveThread(QThread):
             if t is None or z is None:
                 return None
             from perception import minimap as mm
-            from decision import route as route_mod
 
             sy = float(getattr(mob, "y", 0.0) or 0.0) + float(getattr(mob, "h", 0.0) or 0.0) / 2.0
             w = mm.screen_to_world(player, float(getattr(mob, "x", 0.0) or 0.0), sy)
@@ -2211,7 +2285,7 @@ class LiveThread(QThread):
             here = set(str(s) for s in (getattr(player, "here_sets", None) or []))
             lo_x, hi_x = min(px, float(w[0])), max(px, float(w[0]))
             best, best_d = None, None
-            for name in (z.sets or {}):
+            for name in (z.zones or {}):
                 nm = str(name)
                 if nm in here:
                     continue                    # 排除自己脚下 ✓
@@ -2221,9 +2295,9 @@ class LiveThread(QThread):
                 #    **从上线起一次都没成功过** ✓；异常又被 `agent._mob_goto_towards` 的
                 #    `except` 吞掉 ⇒ **一条痕迹都没有** ✗ —— 现场现象 = "怪判不出集合时
                 #    原地卡住、也不下任务"（用户："**没找到也没根据向量下达寻路任务**"✓）。
-                #   ⇒ 用 `route.set_box`（集合的**包围盒** = 左/右 + 上y/下y ✓ 同一份
+                #   ⇒ 用 `pathing.set_box`（集合的**包围盒** = 左/右 + 上y/下y ✓ 同一份
                 #     `_set_spans` ✓）。
-                box = route_mod.set_box(t, z, nm)
+                box = pathing.set_box(t, z, nm)
                 if not box:
                     continue
                 x0, x1, y0, y1 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
@@ -2284,7 +2358,7 @@ class LiveThread(QThread):
 
         回答"这个地点在世界上是什么"：
           · `span` = 它的 **x 范围** `(左, 右)`（判不出 ⇒ `None` ✓）—— 集合走
-            `route.set_span`（**同一份口径** ✓）、其余三类走 `core.zones.element_span`
+            `pathing.set_span`（**同一份口径** ✓）、其余三类走 `core.zones.element_span`
             （单 foothold 用它自己的左右、绳梯/传送门取那个点的 x ✓）；
           · `set` = **能用寻路走到的集合名**（走执行器只认集合 ✓；判不出 ⇒ `None` ✓）：
             集合 = 它自己；单 foothold = `zones.set_of(fid)` 第一个；绳梯 / 传送门 =
@@ -2296,6 +2370,7 @@ class LiveThread(QThread):
           `element_label`）**全在 `core.zones`**（一处实现 ✓）⇒ 这里只做"决策语义"那一层
           （集合名、span 分派）✓，别在两边各写一份"怎么找"✗。
         """
+        from decision import pathing
         from core import zones as zones_mod
 
         def _owning_set(t, z, spot):
@@ -2310,7 +2385,7 @@ class LiveThread(QThread):
                    else zones_mod.find_portal(t, spot))
             if obj is None:
                 return None
-            for name, s in (z.sets or {}).items():
+            for name, s in (z.zones or {}).items():
                 ids = (s or {}).get("footholds") or []
                 try:
                     members = (zones_mod.ladders_of(t, ids) if kind == "ladder"
@@ -2322,6 +2397,7 @@ class LiveThread(QThread):
             return None
 
         def resolve(spot):
+            from decision import pathing
             if not isinstance(spot, dict) or not spot:
                 return None
             mid = str(getattr(self, "_mmap_mid", "") or "")
@@ -2330,7 +2406,6 @@ class LiveThread(QThread):
             t, z = self._route_ctx(mid)
             if t is None:
                 return {"span": None, "set": None, "why": "地形没加载出来"}
-            from decision import route as route_mod
             kind = str(spot.get("kind") or "")
             try:
                 if kind == "set":
@@ -2338,7 +2413,7 @@ class LiveThread(QThread):
                     if not name:
                         return {"span": None, "set": None, "why": "集合名为空"}
                     try:
-                        span = route_mod.set_span(t, z, name)
+                        span = pathing.set_span(t, z, name)
                     except Exception:            # noqa: BLE001
                         span = None
                     if span is None:
@@ -2385,7 +2460,7 @@ class LiveThread(QThread):
             卡住不走"；2026-09-28 诉求 1：这个"按住 ↑/↓"改由执行器通知（`climbing_vertical`），
             不再是本机按键状态 ✓）；
           · `at_ladder_top` = 上爬的**到达**判据（y ≤ 绳上端 + 「坐标对齐误差范围」且 y 在
-            「移动操作尝试间隔」内没再变小 ✓，判据原文在 `perception/pos_state.py` ✓）。
+            「移动操作尝试间隔」内没再变小 ✓，判据原文在 `perception/world/pos_state.py` ✓）。
         定位没输出时**一律清空**（空 = 判不出来，别拿旧值骗执行器 ✗）。
         """
         x, y = getattr(player, "world_x", None), getattr(player, "world_y", None)
@@ -2471,7 +2546,7 @@ class LiveThread(QThread):
             align_tol_px=float(getattr(_stg, "align_tol_px", 10) or 10),
             move_retry_ms=float(getattr(_stg, "move_retry_ms", 3000) or 0),
             # "集合名 → (左, 右)"的查询：**机器在感知层，不 import 决策层** ✗ ⇒ 由这边
-            # 把自己那个闭包喂进去（`route.set_span` = "集合里有哪些非墙 foothold"的
+            # 把自己那个闭包喂进去（`pathing.set_span` = "集合里有哪些非墙 foothold"的
             # **唯一**口径 ✓，见 `_make_set_span_resolver` ✓）。
             # ⚠ `getattr` 兜底：用例里有时候拿个替身线程跑这一路（没有那个方法 ✓），
             #   宁可"这拍没有平台宽度"也不要当场 AttributeError 把整条链弄掉 ✗。
@@ -2505,6 +2580,15 @@ class LiveThread(QThread):
                 "map_id": mid, "src": str(getattr(self, "_mmap_src", "") or ""),
                 "world_x": getattr(player, "world_x", None),
                 "world_y": getattr(player, "world_y", None),
+                # ⭐⭐ **黄点在面板里的像素位置**（用户 2026-10-20 ✓ 原话："玩家是黄点，
+                #   它就应该标在**实时小地图你认为黄点所在的位置**上"✓）：
+                #   · 来源 = 定位器这一拍认出来的 `px/py` ✓（**同一份**，不再另算 ✗）；
+                #   · 用途 = 地形图页签把"玩家圈"画在**面板贴图上黄点该在的地方** ✓
+                #     （以前是按世界坐标换算 ⇒ 圈画在地形图的坐标里，看着没压在黄点上 ✓
+                #       而用户要看的就是"你认的那个点"✓）。
+                #   · `None` = 这一拍没认出来 / 不是局部小地图 ⇒ 绘制端退回世界坐标 ✓。
+                "dot_px": (loc or {}).get("px"), "dot_py": (loc or {}).get("py"),
+                "dot_layer": str((loc or {}).get("dot_layer") or ""),
                 "sets": tuple(_snap.here_sets), "span": _snap.here_span,
                 "foothold_id": (loc or {}).get("foothold_id"),
                 "segment_id": getattr(player, "segment_id", None),
@@ -2526,7 +2610,7 @@ class LiveThread(QThread):
         if not getattr(self._pos_state, "here_sticky", False):
             self._player_here = list(player.here_sets)
         # 玩家世界坐标也留一份：**择路**要用它（"到目标集合有多条绳 ⇒ 挑最近的"，
-        # 见 `decision.route.pick_edge` ✓）。解析器是闭包、拿不到每一帧的 WorldState，
+        # 见 `decision.pathing.pick_edge` ✓）。解析器是闭包、拿不到每一帧的 WorldState，
         # 所以和 `_player_here` 一样存在线程上（都是"最近一次的定位结果" ✓）。
         self._player_at = (float(x), float(y))
 
@@ -2659,7 +2743,7 @@ class LiveThread(QThread):
         #     —— 抽方法时必须把 `_run` 局部 import 的符号**逐个核对**，不能靠静态检查兜底 ✗。
         from core import perf
         from perception import minimap as mm
-        from perception.world_state import WorldState
+        from perception.world.world_state import WorldState
         ws = WorldState(frame_id=f.frame_id, ts=f.t_recv_mono,
                         width=vis.shape[1], height=vis.shape[0])
         ws.e2e_ms = float(e2e_ref[0])   # 上绳对齐的保持窗口要用（见下）
@@ -2786,7 +2870,7 @@ class LiveThread(QThread):
         # 小地图定位（S3）：写进 WorldState 的**玩家世界坐标 + 所在段**。
         # 「命令前往」要它才知道"我在哪块平台上"（`_fh_seen` 的读数就是它）。
         # 算不出来时写 None（**不是 0**，0 是地图西北角这个合法坐标，
-        # 见 perception/world_state.py）。
+        # 见 perception/world/world_state.py）。
         # （`loc` 上面已经算过了 —— 它得先算，才能辅助挑玩家框 ✓）
         if loc is not None:
             mm.apply_to_player(ws.player, loc)
@@ -2952,13 +3036,15 @@ class LiveThread(QThread):
         `panel` 是 `_mmap_panel_from_frame` 给的（来源=从实时画面）；来源=收流时
         这里自己去小地图推流那一路取最新帧（断线由 `MiniMapClient` 自己重连）。
         """
+        from perception import map_locator
+        from perception import map_dot
         mid = self._mmap_mid
         if not mid:
             return None
         from perception import minimap as mm
         if self._locator is None:
-            self._locator = mm.PlayerLocator(
-                mid, track=mm.tracker_kwargs(self._mmap_track or {}))
+            self._locator = map_locator.PlayerLocator(
+                mid, track=map_dot.tracker_kwargs(self._mmap_track or {}))
             self._track_applied = dict(self._mmap_track or {})
         elif self._locator.map_id != mid:
             self._locator.load(mid)
@@ -3024,13 +3110,32 @@ class LiveThread(QThread):
         from decision.agent import settings as decision_settings
         loc = self._locator.update(
             panel, src=src,
-            fh_xtol=int(getattr(decision_settings, "align_tol_px", 0) or 0))
+            fh_xtol=int(getattr(decision_settings, "align_tol_px", 0) or 0),
+            # ⭐ **空中态**（用户 2026-10-18 ✓）：离脚下平台 >「空中判定」⇒ 不算站上去 ✓
+            #   （不然跳过去的半空中就到了 ⇒ idle 计时 / 到达 / 战斗区归属全提前成立 ✗）
+            air_gap_px=int(getattr(decision_settings, "air_gap_px", 0) or 0),
+            # ⭐⭐ **整帧尺寸**（用户 2026-10-20 方案 A ✓）：只有"从实时画面框选"这条来源
+            #   有"帧"这回事（面板是本地裁的 ✓）⇒ 帧尺寸一变，面板像素跟着变，靠它按比例
+            #   救回标定、不用重标 ✓。收流那条是 A 机推来的成品面板 ⇒ 没有帧尺寸（None ✓）。
+            frame_wh=(self._mmap_frame_wh if src == "live" else None))
         # ⭐ 局部小地图（crop）的 view 跟踪成败**打点**（用户 2026-09-29 任务 1 ✓）：
         #   它不是 crop 时是 `None`（没这回事，不打点 ✓）。"跟不住"占比高 ⇒ 面板被挡 /
         #   方式选错 / 标定不对 ⇒ 那一拍的世界坐标是拿标定里那个位置算的（可能整体偏 ✗）。
         if loc.get("view_ok") is not None:
             from core import perf
             perf.count("crop_view_ok" if loc.get("view_ok") else "crop_view_miss")
+        # ⭐⭐ **"面板像素变了、但框选区域没变 ⇒ 几何已按比例换算"要留一笔** ✓
+        #   （用户 2026-10-20 方案 A / 日志 507）：只在说明**变了**时写一次（不刷屏 ✓）。
+        #   ⚠ 读 self 属性一律 `__dict__.get`（QThread 子类，替身壳会当场炸 ✗ 见 `_locate_latest` 说明）。
+        if loc.get("panel_adapted"):
+            _kw = str(loc.get("panel_adapt_note") or "")
+            if _kw != self.__dict__.get("_mmap_adapt_last"):
+                self._mmap_adapt_last = _kw
+                try:
+                    from core import behavior as _bh
+                    _bh.event("mmap_adapted", note=_kw)
+                except Exception:                # noqa: BLE001 —— 打点坏了别影响回路 ✓
+                    pass
         return loc
 
     def _locate_latest(self):
@@ -3399,7 +3504,7 @@ class LiveThread(QThread):
             _pb_arrow = _last_player[0]
             if _al > 0 and _pb_arrow is not None and len(_pb_arrow) >= 6:
                 try:
-                    from perception.world_state import hex_to_bgr
+                    from perception.world.world_state import hex_to_bgr
                     # 两根箭头**同一个颜色**（用户 2026-09-28："x 箭头和 y 箭头应该是
                     # 一个颜色"✓）；粗细也是同一个值 ✓（可配 ✓）。
                     _acol = hex_to_bgr(str(
@@ -3750,7 +3855,8 @@ class LiveThread(QThread):
         self._vt_aim_logged = False
         # ⭐ 新的一轮 ⇒ 忘掉"鼠标上次在哪"（下一拍会先归零一次建原点 ✓ 见 `mouse_aim.aim_tick`）
         try:
-            from decision import mouse_aim
+            from execution import aim_convert as mouse_aim_c
+            from execution import mouse_aim
             mouse_aim.aim_reset()
         except Exception:                    # noqa: BLE001
             pass
@@ -3792,16 +3898,31 @@ class LiveThread(QThread):
                 if item is None:
                     time.sleep(0.005)
                     continue
+                # ⭐⭐ **B 语义的门**（用户 2026-10-17 ✓）：没在测谎 ⇒ **不喂帧** ✓
+                #   （模型已经预热着 ✓ 这一步只是不推理 ⇒ 第二套 YOLO 空转不占算力 ✓）
+                #   ⚠ 别在这里卸模型 / `close()` ✗ —— 触发时再加载要 7~10 秒，
+                #     小游戏早开始了 ✗（B 的全部价值就在"模型热着、算力省着"✓）
+                if not self._vt_should_feed():
+                    time.sleep(0.02)
+                    continue
                 # ⭐⭐ **限速 + 积压降速**（用户 2026-10-10 ✓）：测谎自带**第二套 YOLO** ⇒ 按
                 #   `vt_max_fps`（默认 10 ✓ 判谎够用 ✓ 不必跟着 40fps 跑 ✓）喂；
                 #   本机持续跟不上源（`src_lag` ✓）⇒ 再退到 `VT_FPS_UNDER_LAG`(2fps) ✓ ——
                 #   ⚠ **是降速、不是停掉** ✗（用户明确"不能关"✓）：它还在判，只是让出 GPU/CPU ✓。
                 _want = float(self._vt_cfg.get("max_fps", 10.0) or 10.0)
-                if self._vt_yield:
-                    _want = min(_want, VT_FPS_UNDER_LAG)
-                    self._vt_note("测谎：本机积压 ⇒ 降速到 %.0ffps 让路（会自己恢复 ✓）" % _want)
+                # ⭐⭐ **-1 = 不限制**（用户 2026-10-18 ✓ 原话：「配 -1 则不限制」）：
+                #   每来一帧就推理 ✓ —— 这里既不按上限丢帧、**也不做积压降速** ✓
+                #   （人明确说了不限制，再偷偷降到 2fps 就是"配了不生效"✗）。
+                #   ⚠ 沿用原来的"限速"写法（只在**有限制**时才比时间差 ✓）⇒ -1 那条路零开销 ✓。
+                _unlimited = _want < 0
+                _gap = 0.0
+                if not _unlimited:
+                    if self._vt_yield:
+                        _want = min(_want, VT_FPS_UNDER_LAG)
+                        self._vt_note("测谎：本机积压 ⇒ 降速到 %.0ffps 让路（会自己恢复 ✓）" % _want)
+                    _gap = 1.0 / max(0.5, _want)
                 _nowm = time.monotonic()
-                if _nowm - self._vt_fed_at < 1.0 / max(0.5, _want):
+                if (not _unlimited) and (_nowm - self._vt_fed_at) < _gap:
                     time.sleep(0.005)
                     continue
                 self._vt_fed_at = _nowm
@@ -3823,14 +3944,51 @@ class LiveThread(QThread):
         if _failed:
             self._vt_note("测谎：不可用 —— %s" % _failed[:100])
 
+    def _vt_lie_active(self):
+        """测谎窗口**现在算不算在场**（含 `_vt_hold_s` 宽限 ✓）。
+
+        ⚠ 它和"勾选框勾着"是两件事 ✗：勾着只是**允许**（模型预热）；这条才是**触发** ✓。
+        """
+        return vt_lie_active(
+            self.__dict__.get("_vt_hold_until", 0.0),
+            self.__dict__.get("_vt_arm_until", 0.0),
+            time.monotonic())
+
+    def _vt_should_feed(self):
+        """这一刻要不要喂帧（B 语义 ✓ 见 `runtime.pipeline.vt_should_feed` ✓）。"""
+        return vt_should_feed(self.__dict__.get("_vt_gate", "screen"),
+                              self._vt_lie_active())
+
     def _vt_beat(self, frame, origin_x, origin_y):
         """主回路这一拍的"测谎拍"：**投递最新帧** + 消费结果（都不阻塞 ✓）。
 
         投递（只留最新一份 ⇒ 自然丢帧、永不积压 ✓）；
         消费（阶段变了才发状态/打点；`SUCCESS*` ⇒ 找「确定」按钮 ⇒ **鼠标点一下** ✓）。
+
+        ⭐ **B 语义**（用户 2026-10-17 ✓）：`_vt_gate="screen"` 时只在测谎窗口出现时才真喂帧
+          ⇒ 没小游戏时第二套 YOLO **不占算力**（模型仍预热着 ✓ 触发时不用等 7~10 秒 ✓）。
+          进沿顺手 `reset()` 一轮（清掉上一场的身份/轨迹 ✓ 不然会在旧目标上续命 ✗）。
         """
+        _on = self._vt_should_feed()
+        if _on != self._vt_gate_was:
+            self._vt_gate_was = _on
+            # ⚠ 只在**功能真的开着**时才播报（没启用测谎却弹"开始跟踪"就是噪音 ✗）
+            if _on:
+                if self._vt_gate == "screen" and self._vt_on:
+                    self._vt_cmd = "reset"
+                    self._vt_note("测谎窗口出现 ⇒ 开始跟踪（战斗检测已暂停 ✓）")
+            elif self._vt_gate == "screen" and self._vt_on:
+                self._vt_note("测谎窗口消失 ⇒ 战斗检测恢复 ✓")
         self._vt_ensure(self._vt_want)
         if not self._vt_on or self._vt is None:
+            return
+        # ⭐⭐⭐ **画面断了就别瞄也别点**（用户 2026-10-20 ✓ 原话："鼠标没有跟上准心的位置"✓）：
+        #   全黑的时候**什么也看不见** ⇒ 还按老目标挪鼠标就是**盲着乱撞**（而且会把
+        #   "画面断了"表现成"瞄准不准" ✗，两条完全不同的病因混成一个 ✓ 见 `_pic_watch`）。
+        #   ⇒ 这一拍直接返回：不喂帧（省算力 ✓）、不消费结果、不动鼠标 ✓。
+        #   ⚠ 亮回来之后**不影响**：`_pic_dead` 会在 `_pic_watch` 里清掉 ✓，
+        #     下一拍照常喂帧（`_vt_frame` 只留最新一份 ⇒ 不会补一堆旧帧 ✓）。
+        if bool(_attr(self, "_pic_dead", False)):
             return
         if self._vt.ready:
             # ⚠ 传的是 `raw` 的**引用**（不是拷贝）：喂帧线程读它时，主回路可能已经走到
@@ -3857,6 +4015,12 @@ class LiveThread(QThread):
             self.vt_status.emit("测谎：%s%s" % (phase, "" if aim is None else
                                                "  瞄点(%d,%d)" % (round(aim[0]),
                                                                   round(aim[1]))))
+        # ⭐ **这一场结束了就立刻收预算**（见 `_vt_arm_until` 的注释 ✓）：
+        #   不收的话，`vt_arm_s`（25 秒）会把**战斗检测白停**在那儿 ✗
+        #   （用户要的是"暂停到测谎窗口消失"，不是"暂停 25 秒" ✓）。
+        if phase in ("SUCCESS", "SUCCESS_PENDING", "ENDED") \
+                and self.__dict__.get("_vt_arm_until"):
+            self._vt_arm_until = 0.0
         # ⚠⚠ **ENDED 要自己重开一轮**（2026-10-09 现场 ✓ 日志里 `phase=ENDED why=timeout` ✓）：
         #   SDK 有 `max_duration_s`（默认 **120 秒** ✓）—— 到点给 `ENDED` ⇒ 之后**一个字都不再
         #   输出** ✗ ⇒ 现场就是"跑了 2 分钟它就不动了" ✓（人还得自己去关一下再开 ✗）。
@@ -3881,7 +4045,8 @@ class LiveThread(QThread):
             self._vt_reset_at = time.monotonic() + max(
                 1.0, float(self._vt_cfg.get("cool_s", 3.0)))
             try:
-                from decision import mouse_aim
+                from execution import aim_convert as mouse_aim_c
+                from execution import mouse_aim
                 mouse_aim.aim_reset()       # 成功界面 ⇒ **别再追**那个点（见 `aim_tick` 的 TTL ✓）
             except Exception:               # noqa: BLE001
                 pass
@@ -3903,11 +4068,14 @@ class LiveThread(QThread):
     def _vt_confirm_click(self, frame, roi, origin_x=0, origin_y=0):
         """成功后点「确定」：定位确认按钮 ⇒ **走现成的鼠标口径**点一下 ✓。
 
-        ⚠ 换算与发指令**只有 `decision.mouse_aim` 一处**（同断线重连那条 ✓ 别各写一套 ✗）；
+        ⚠ 换算与发指令**只有 `execution.mouse_aim` 一处**（同断线重连那条 ✓ 别各写一套 ✗）；
         ⚠ 找不到按钮 ⇒ **不点**（点错比不点糟 ✗）并留痕 ✓。
         """
         from core import perf               # ⚠ 同 `_run`：本文件里这两个都是**局部导入** ✓
-        from decision import mouse_aim      #   （模块级名会被那套静态自检当场抓住 ✗）
+        from execution import mouse_aim      #   （模块级名会被那套静态自检当场抓住 ✗）
+        # ⚠ 2026-10-18：换算那半在 xecution/aim_convert ✓（本文件一律局部导入 ✓）
+        #   漏了这句就是现场那条 NameError: name 'mouse_aim_c' is not defined ✗
+        from execution import aim_convert as mouse_aim_c
         from perception.vt_sdk import CONFIRM_MATCH_THR
         pt = None
         try:
@@ -3920,13 +4088,13 @@ class LiveThread(QThread):
                           % CONFIRM_MATCH_THR)
             return
         # ⚠ 它返回的是 **`(ok, why)`**（同 `_vt_act` 那处 ✓）：当布尔用就**永远拦不住** ✗。
-        _ok, _why = mouse_aim.aim_available()
+        _ok, _why = mouse_aim_c.aim_available()
         if not _ok:
             behavior.event("vt_confirm_skip", why=str(_why)[:60])
             self._vt_note("测谎：鼠标用不了 ⇒ 没点「确定」—— %s" % _why)
             return
         _h, _w = frame.shape[:2]
-        # ⚠ 把**这一帧在屏幕上的原点**一起递进去（见 `mouse_aim.to_screen` ✓）——
+        # ⚠ 把**这一帧在屏幕上的原点**一起递进去（见 `mouse_aim_c.to_screen` ✓）——
         #   窗口挪到副屏（x<0 ✓）时，帧像素与屏幕像素差的就是它 ✓（用户 2026-10-10 ✓
         #   "我可能会把游戏窗口随意拖动，并且游戏窗口可能会被拖到副显示屏" ✓）。
         # ⭐ **部署台框了游戏区域 ⇒ 比例要折回整帧**（用户 2026-10-17 ✓「自动测谎的鼠标适配」✓）：
@@ -3962,7 +4130,7 @@ class LiveThread(QThread):
         # ⚠⚠ **不要按"来源"拦**（2026-10-09 现场纠错 ✗）：我原来加了一道"来源不是本机窗口
         #   就直接返回"⇒ 用户这套（**收流**：工作台看游戏机那一屏 ✓）**一帧鼠标都没发** ✗✗。
         #   为什么不该拦：`mouse_aim` 那一层的意思就是"**鼠标指令经 relay 打到游戏机**"
-        #   （见 `mouse_aim.aim_available` 的说明 ✓）—— 跟"画面从哪来"无关 ✓；而且
+        #   （见 `mouse_aim_c.aim_available` 的说明 ✓）—— 跟"画面从哪来"无关 ✓；而且
         #   `mouse_gain.json` 里记的就是 `source: stream`（**就是在收流画面下标定的** ✓）
         #   ⇒ 只要"流看到的那一屏"和"标定时那一屏"是同一个几何，比例就是对的 ✓。
         #   ⚠ 反过来说：若哪天把流做成**缩放 / 只截一角**，这条就不成立了 ✗（那时得按
@@ -3975,11 +4143,12 @@ class LiveThread(QThread):
         age = time.monotonic() - ts
         if not (0.0 <= age <= 0.2):
             return                              # 不新鲜 ⇒ 不补发 ✓（SDK 同款闸 ✓）
-        from decision import mouse_aim
+        from execution import aim_convert as mouse_aim_c
+        from execution import mouse_aim
         # ⚠⚠ `aim_available()` 返回的是 **`(ok, why)` 元组** ✗ —— 写成 `if not aim_available():`
         #   永远是假（非空元组恒真 ⇒ `not` 恒假）✗ ⇒ 那道闸**从来没拦过**，而且"为什么不能用"
         #   也永远不报出来 ✓（2026-10-09 现场：用户报"没有控制 A 机鼠标"，这一步必须留下人话 ✓）。
-        _ok, _why = mouse_aim.aim_available()
+        _ok, _why = mouse_aim_c.aim_available()
         if not _ok:
             self._vt_note("测谎：鼠标用不了 —— %s" % _why)
             return
@@ -4017,9 +4186,62 @@ class LiveThread(QThread):
         ⚠ 目标过期（>0.25 秒没刷新）/ 已经到点 ⇒ `aim_tick` 自己停手 ✓（见那边的 TTL ✓）。
         """
         from core import perf              # ⚠ 本文件里 `perf` 一直是局部导入（见 `_run` ✓）
-        from decision import mouse_aim
+        from execution import aim_convert as mouse_aim_c
+        from execution import mouse_aim
+        _link_ok, _link_why = True, ""
+        _link_at = 0.0
+        _hold_logged = False
+        _homes_seen = -1
+        _home_at = 0.0
         while self._vt_on and not self._stop.is_set():
             _ms = max(4.0, float(self._vt_cfg.get("aim_ms", 16.0)))
+            _now = time.monotonic()
+            # ⭐⭐⭐ **输入链路不可用 ⇒ 这一拍别走位**（用户 2026-10-20 ✓ 这套是**远程**：
+            #   画面收流、键鼠走 relay ✓）。现场 14:09:47 `link_auto_reset … why=link-dead`：
+            #   relay 断了之后到角色死亡那 4 秒里，走位线程还在**每 16ms 发一条永远到不了的指令** ✗
+            #   ⇒ 光标当然"跟不上准心"✓，而且每一发都在等一个死连接（回路也跟着钝 ✓）。
+            #   ⚠ 一秒问一次（`link_health` 是纯本地读 ✓ 但没必要每 16ms 读 ✗）。
+            if _now - _link_at >= 1.0:
+                _link_at = _now
+                try:
+                    from execution import remote as _remote_mod
+                    _h = _remote_mod.link_health()
+                    _link_ok = bool(_h.get("ok", True))
+                    _link_why = str(_h.get("err") or "")
+                except Exception:                        # noqa: BLE001 —— 问不到就当好的 ✓
+                    _link_ok, _link_why = True, ""
+                if not _link_ok and not _hold_logged:
+                    _hold_logged = True
+                    try:
+                        behavior.event("vt_aim_hold", ok=False,
+                                       why=(_link_why or "输入链路不可用（backend=remote）")[:90],
+                                       note="relay 不可用 ⇒ 暂停走位（指令发不出去）")
+                    except Exception:                    # noqa: BLE001
+                        pass
+                elif _link_ok and _hold_logged:
+                    _hold_logged = False
+                    try:
+                        behavior.event("vt_aim_resume", ok=True, why="输入链路恢复 ⇒ 继续走位")
+                    except Exception:                    # noqa: BLE001
+                        pass
+            # ⭐ **撞角记账**（远程这套"光标看不见"，基准全靠 `CURSOR?` 采样 ✓）：
+            #   撞角 = 光标先飞左上角再走回来 ⇒ 涨得快就是"看着没跟上准心"✓。
+            #   一秒最多记一条（别把日志刷满 ✓），并把原因带出来 ✓ 见 `mouse_aim.aim_health` ✓。
+            if _now - _home_at >= 1.0:
+                _home_at = _now
+                try:
+                    _ah = mouse_aim.aim_health()
+                    _n_home = int(_ah.get("homes") or 0)
+                    if _homes_seen >= 0 and _n_home > _homes_seen:
+                        behavior.event("vt_aim_home", ok=False, n=_n_home - _homes_seen,
+                                       total=_n_home, cur_age=_ah.get("cur_age"),
+                                       why=str(_ah.get("home_why") or "")[:90])
+                    _homes_seen = _n_home
+                except Exception:                        # noqa: BLE001
+                    pass
+            if not _link_ok:
+                self._stop.wait(_ms / 1000.0)            # 等一小会再看链路（别空转烧 CPU ✓）
+                continue
             try:
                 if mouse_aim.aim_tick(tick_ms=_ms):
                     perf.count("vt_aim")
@@ -4094,6 +4316,28 @@ class LiveThread(QThread):
             if _ui:
                 st = _ui
                 det = {"name": _ui}
+        # ⭐⭐ **测谎窗口的有效期**（用户 2026-10-17 ✓「直到测谎窗口消失」✓）：
+        #   ⚠ 必须放在"每拍都会走到"的地方（这里 ✓）—— 挪进 `_screen_on_transition`
+        #     就又成了"状态不变时永远不评估"✗（同类坑踩过三次 ✓ 见 `_screen_every_tick` ✓）。
+        #   ⚠ 一律走 `self.__dict__.get(...)`（**别用 `getattr`** ✗）：
+        #     自检里有 `LiveThread.__new__()` 造的假对象（没跑 `__init__`）✓ ——
+        #     对那种对象读属性会 `RuntimeError: super-class __init__() … was never called` ✗
+        #     （本仓早就用 `self.__dict__.get("_takeover_st")` 躲这个坑 ✓ 同一条理由 ✓）。
+        _d = self.__dict__
+        _now = time.monotonic()
+        _lie_now = str(st).startswith("lie")
+        self._vt_hold_until = lie_hold_until(
+            _d.get("_vt_hold_until", 0.0), _lie_now, _now, _d.get("_vt_hold_s", 1.5))
+        # ⭐ **长预算**（见 `_vt_arm_until` 的注释 ✓）：进过一次 `lie_*` 就押 `vt_arm_s` 秒，
+        #   到期后才重新押（不每拍续 ⇒ 不会因为"一直认不出"而无限延期 ✓）。
+        #   ⚠ 只在**测谎功能开着**时押 —— 没开就维持老行为（只看界面状态 ✓ 不白停战斗 ✗）。
+        if _lie_now and _d.get("_vt_on"):
+            _arm = float(_d.get("_vt_arm_until", 0.0) or 0.0)
+            if _now >= _arm:
+                self._vt_arm_until = _now + float(_d.get("_vt_arm_s", 25.0) or 0.0)
+                self._vt_note("测谎窗口出现 ⇒ 喂帧预算 %.0f 秒"
+                              "（界面状态认不出小游戏窗口也算 ✓）"
+                              % float(_d.get("_vt_arm_s", 25.0) or 0.0))
         if self._screen_every_tick(raw, st, det):
             self._screen_on_transition(raw, st, det)
 
@@ -4138,6 +4382,8 @@ class LiveThread(QThread):
                 self._lie_sess_t0 = _now
                 self._lie_rec_top_game = 0.0
                 self._lie_seen_game = False           # 新的一场 ⇒ 重新数 ✓
+                # 新的一场 ⇒ "画面断掉的累计"也归零 ✓（判定只看这一场 ✓ 见 `_lie_window_over`）
+                self._lie_pic_dead_s = 0.0
             self._lie_warn_at = _now
         elif st == "lie_success":
             self._lie_warn_at = 0.0                   # 这场完了 ⇒ 关掉 ✓（再来的没 warn ⇒ 不认 ✓）
@@ -4404,9 +4650,38 @@ class LiveThread(QThread):
         self._lie_rec_err = ""
         return True
 
+    def _rec_tag(self):
+        """录像文件名里的**来源标签**（`实例名_来源` ✓ 见 `_rec_path` 的 `tag` ✓）。
+
+        来源从 live 配置推：`capture_source` 优先（`stream` / `window` / `file` ✓），
+        没写就看 url 协议（`udp://` `rtsp://` `http` ⇒ `stream` ✓）。
+        ⚠ 推不出来 ⇒ 空串 ✓（名字退回老样子 ✓ 绝不因为标签把录制弄坏 ✗）。
+        ⚠⚠ 这里**每个属性都要单独 try** ✗：`LiveThread` 是 `QThread` 子类，
+          用 `__new__` 造出来（用例里就这么干 ✓）时，**取不存在的属性会抛
+          `RuntimeError` 而不是 `AttributeError`** ✓ —— 一次兜不住整段都会炸 ✗。
+        """
+        src = ""
+        try:
+            src = str(self._p.get("capture_source") or "").strip()
+        except Exception:                      # noqa: BLE001
+            src = ""
+        if not src:
+            try:
+                _u = str(self._p.get("url") or "").lower()
+            except Exception:                  # noqa: BLE001
+                _u = ""
+            if _u.startswith(("udp://", "rtsp://", "http://", "https://")):
+                src = "stream"
+        try:
+            from core import instance as _inst_mod
+            inst = _inst_mod.slug()
+        except Exception:                      # noqa: BLE001
+            inst = ""
+        return "_".join([x for x in (inst, src) if x])
+
     @staticmethod
-    def _rec_path(_d, kind):
-        """占一个**独占**的录像文件名 ⇒ `str` ✓（同一毫秒也绝不重名 ✓）。
+    def _rec_path(_d, kind, tag=""):
+        """占一个**独占**的录像文件名 ⇒ `str` ✓（同一毫秒也绝不重名 ✓，且**带来源标签** ✓）。
 
         ⭐⭐⭐ 为什么必须独占（用户 2026-10-17 ✓ 现场那份 `lie_20261017_162813.mp4`）：
           · 老写法 `"%s_%Y%m%d_%H%M%S.mp4"` **只到秒** ✗；
@@ -4417,10 +4692,19 @@ class LiveThread(QThread):
           · ⇒ ① 名字带**毫秒** ✓；② 用 `open(path, "xb")` **原子占位** ✓
             —— 已存在就抛 `FileExistsError` ⇒ 换下一个后缀 ✓
             （只靠毫秒不够 ✗：两路在同一毫秒起也是可能的 ✓）。
+
+        ⭐ `tag` = **来源标签**（`remote_stream` / `local_window` …✓ 用户 2026-10-17 ✓
+          原话：「**没有看到A机的录屏**」✓ —— 两份其实都在 ✓，可名字一模一样、
+          还都落在同一个目录 ⇒ **分不清哪份是 A 机的** ✗）。
+          ⇒ 名字前面挂上"实例 + 采集来源" ✓ ⇒ 一眼就知道这份是**收流**来的还是**本地抓屏**的 ✓
+          （`stream` = A 机推来的 ✓ / `window` = 本机窗口 ✓ / `file` = 回放文件 ✓）。
+        ⚠ 空 `tag` ⇒ 名字与以前**一字不差** ✓（老调用/老日志还能对上 ✓）。
         """
         ts = time.strftime("%Y%m%d_%H%M%S")
         ms = int((time.time() % 1.0) * 1000)
-        stem = "%s_%s_%03d" % (kind, ts, ms)
+        _tag = str(tag or "").strip().replace(" ", "_")
+        stem = ("%s_%s_%s_%03d" % (kind, _tag, ts, ms)) if _tag \
+            else ("%s_%s_%03d" % (kind, ts, ms))
         for i in range(50):
             p = str(_d / ("%s.mp4" % (stem if i == 0 else "%s_%d" % (stem, i))))
             try:
@@ -4485,7 +4769,9 @@ class LiveThread(QThread):
             #   ⇒ **两个 VideoWriter 写同一个文件** ✗ ⇒ 两路帧交织 ⇒ 播放时"半屏一路、
             #   半屏马赛克"✓ = 用户看到的"两份画面混在一起"✓。
             #   ⇒ 见 `_rec_path`（毫秒 + 原子占位 ✓）。
-            _p = self._rec_path(_d, self._rec_kind or "lie")
+            # ⭐ 名字带**来源标签**（`remote_stream` / `local_window` ✓ 见 `_rec_tag`）——
+            #   用户 2026-10-17 ✓「没有看到A机的录屏」：两份都在、可名字一模一样 ⇒ 分不清 ✗
+            _p = self._rec_path(_d, self._rec_kind or "lie", self._rec_tag())
             _h, _w = int(raw.shape[0]), int(raw.shape[1])
             # ⭐ **优先 H.264**（见 `_rec_writer` 的说明：`mp4v` 在 Windows 自带播放器里
             #   就是"花屏"✓ 用户 2026-10-17 ✓）；打不开才退回老编码 ✓
@@ -4503,6 +4789,119 @@ class LiveThread(QThread):
         # ⚠ `codec` 也要写：下次"放不出来/花屏"时，看一眼就知道这份是 h264 还是 mp4v ✓
         behavior.event("lie_rec", ok=True, path=_p, size=(_w, _h), codec=_codec,
                        fps=LIE_REC_FPS, st=self._screen_state)
+        return True
+
+    #: 「源画面全黑」的判定阈值/时长（用户 2026-10-17 ✓ 现场两段全黑都在片尾 ✓）。
+    #: ⚠ 阈值要**低**（`< 12` = 基本纯黑 ✓）：正常的暗场景（地牢、夜晚）也在 30~60 ✓
+    #:   ⇒ 定高了会把"游戏本身很暗"误报成断流 ✗。
+    LIE_REC_BLACK_MEAN = 12.0
+    LIE_REC_BLACK_S = 2.0
+
+    @classmethod
+    def _src_black_step(cls, st, now, mean):
+        """维护\"源画面连续全黑\"的状态 ⇒ 返回 `"start"` / `"report"` / `None` ✓。
+
+        `st` = `{"t0": 起始时间, "logged": 这段是否已记账}`（原地改 ✓ 别新建字典 ✗，
+        不然调用方那份不会更新 ✓）。
+          · 这一帧黑 ⇒ 第一次黑时记 `t0` ✓；黑够 `LIE_REC_BLACK_S` 秒且**还没记账**
+            ⇒ 返回 `"report"`（**每段只记一条** ✓ 不然一秒一条把日志刷满 ✗）；
+          · 这一帧不黑 ⇒ 复位（下一段重新算 ✓ 一次录制里断三次就该有大三条 ✓）。
+        """
+        if float(mean) < float(cls.LIE_REC_BLACK_MEAN):
+            if not st.get("t0"):
+                st["t0"] = float(now)
+                st["logged"] = False
+                return "start"
+            if not st.get("logged") and (float(now) - float(st["t0"])) >= cls.LIE_REC_BLACK_S:
+                st["logged"] = True
+                return "report"
+            return None
+        if st.get("t0"):
+            st["t0"] = 0.0
+            st["logged"] = False
+        return None
+
+    #: **整幅全黑多久算"画面断了"**（用户 2026-10-20 ✓）：
+    #:   · 阈值沿用 `LIE_REC_BLACK_MEAN`（`< 12` = 基本纯黑 ✓ 正常暗场景 30~60 不误报 ✓）；
+    #:   · 时长取 `0.8` 秒（比录制那边报的 2 秒更急 ✓）：画面一没，
+    #:     **测谎瞄准就只能在黑屏上瞎撞**（用户："鼠标没有跟上准心"✗）⇒ 越早认定越安全 ✓。
+    PIC_DEAD_S = 0.8
+
+    def _pic_watch(self, raw, now):
+        """这一拍的**画面还在不在**（整幅全黑 ⇒ 抓屏/推流断了）—— 断了就**停录 + 记账**。
+
+        为什么必须有（2026-10-20 14:09 现场，四个症状一条根 ✓）：
+          ```text
+          14:09:31  测谎起，录像开始（lie_rec ok path=…140931_116.mp4）
+          14:09:44  抓屏**全黑**（那一刻起 cam_* 数值 8 秒不变、mmap_pick 断流 ✓）
+          14:09:47  link_auto_reset … why=link-dead（输入链路也断了 ✓）
+          14:09:51  player_dead（盲了 7 秒，测谎没人操作 ⇒ 死 ✓）
+          14:09:52  lie_rec_src_black frames=463（**只有这一句**，还埋在日志里 ✗）
+          ```
+          ① 录像**后 8 秒是纯黑**（实测 ROI 均值 0.19）⇒ 用户："**也没有录屏**"✗
+             （文件在，但打开就是黑的 ✓）；
+          ② 画面没了 ⇒ 准心跟踪 / 位置更新全停 ⇒ 鼠标自然"**没跟上准心**"✗；
+          ③ 30 秒窗口照旧到点 ⇒ 判"**失败**"（其实什么都没看见 ✗ 见 `_lie_window_over` ✓）。
+        ⇒ 现在：黑够 `PIC_DEAD_S` ⇒ 记一条 `pic_dead`（**每段一条** ✓）＋ **停录**
+          （不写 30 秒黑片子 ✓）；亮回来记 `pic_alive` ✓ 并把断的时长累加到
+          `_lie_pic_dead_s`（判定要减掉这段 ✓）。
+
+        ⚠ 这是**只读旁路**：不改 `raw`、不拦帧 ✓（拦帧等于把"画面断了"变成"循环卡死" ✗）。
+        """
+        if raw is None:
+            return None
+        try:
+            _m = float(raw[::24, ::24].mean())          # 57×32 个采样点 ⇒ 30fps 也不心疼 ✓
+        except Exception:                                # noqa: BLE001
+            return None
+        _dead = _m < float(self.LIE_REC_BLACK_MEAN)
+        # ⚠ 用 **-1.0 = 这一段还没开始** 当哨兵（别用 0.0 ✗：`monotonic()` 理论上可以是 0，
+        #   而用例里就是从 0.0 开始喂的 ⇒ 0.0 当哨兵会一直"重新起算"、永远报不出来 ✓）。
+        #   顺带把 `getattr` 包住：`QThread` 子类用 `__new__` 造的对象取没设过的属性会抛
+        #   `RuntimeError`（不是 AttributeError ✗）⇒ 用例/替身不该被这个卡死 ✓。
+        try:
+            _t0 = float(getattr(self, "_pic_black_t0", -1.0))
+        except Exception:                                # noqa: BLE001
+            _t0 = -1.0
+        try:
+            _was = bool(getattr(self, "_pic_dead", False))
+        except Exception:                                # noqa: BLE001
+            _was = False
+        if not _dead:
+            if _was:
+                _d = max(0.0, float(now) - _t0) if _t0 >= 0.0 else 0.0
+                try:
+                    _acc = float(getattr(self, "_lie_pic_dead_s", 0.0) or 0.0)
+                except Exception:                        # noqa: BLE001
+                    _acc = 0.0
+                self._lie_pic_dead_s = _acc + _d
+                try:
+                    behavior.event("pic_alive", ok=True, dead_s=round(_d, 1), mean=round(_m, 1))
+                except Exception:                        # noqa: BLE001
+                    pass
+            self._pic_black_t0 = -1.0
+            self._pic_dead = False
+            return False
+        if _t0 < 0.0:
+            self._pic_black_t0 = float(now)
+            return False
+        if not _was and (float(now) - _t0) >= float(self.PIC_DEAD_S):
+            self._pic_dead = True
+            try:
+                behavior.event(
+                    "pic_dead", ok=False, mean=round(_m, 1),
+                    s=round(float(now) - _t0, 1),
+                    why="抓屏/推流断了（整幅全黑）：窗口最小化 / 切了桌面 / 游戏关了？"
+                        "⇒ 画面没有 ⇒ 瞄准和位置更新都会停 ✓")
+            except Exception:                            # noqa: BLE001
+                pass
+            # 画面都没了 ⇒ 录下去只有黑片子（用户 2026-10-20："也没有录屏"✗）
+            try:
+                if (getattr(self, "_lie_rec", None) is not None
+                        or float(getattr(self, "_lie_rec_pending", 0.0) or 0.0) > 0.0):
+                    self._lie_rec_stop(why="画面断了（抓屏/推流全黑）⇒ 不录黑片子")
+            except Exception:                            # noqa: BLE001 —— 停录失败不许带崩回路 ✓
+                pass
         return True
 
     def _lie_rec_write(self, raw, now):
@@ -4531,6 +4930,26 @@ class LiveThread(QThread):
                         (255, 255, 255), 1, cv2.LINE_AA)
             self._lie_rec[0].write(_f)
             self._lie_rec_n += 1
+            # ⭐⭐ **源画面全黑**要说话（用户 2026-10-17 ✓ 现场两份录像结尾都有一段全黑 ✓）：
+            #   ⚠ 注意区分两件事 ✗：`录制器停了`（文件里根本没有帧 ✓）vs
+            #     **`源断了`**（帧照写，但画面全黑、叠加层还在画 ✓）= 本次现场 ✓。
+            #   采样算均值（每 24 像素取一个 ⇒ 1366×768 只有 57×32 个点 ✓ 30fps 也不心疼 ✓），
+            #   纯黑判定阈值见 `LIE_REC_BLACK_MEAN`（定高了会把暗场景误报 ✗）。
+            try:
+                _st = getattr(self, "_lie_rec_black", None)
+                if not isinstance(_st, dict):
+                    _st = {"t0": 0.0, "logged": False}
+                    self._lie_rec_black = _st
+                _sm = float(raw[::24, ::24].mean())
+                if self._src_black_step(_st, now, _sm) == "report":
+                    behavior.event(
+                        "lie_rec_src_black", ok=False, path=self._lie_rec_path,
+                        frames=int(self._lie_rec_n),
+                        s=round(float(now - float(_st["t0"])), 1),
+                        why="送进来的画面已经全黑（录制器没停 ⇒ 抓屏/推流断了："
+                            "窗口最小化 / 切了桌面 / 游戏关了？）")
+            except Exception:                      # noqa: BLE001 —— 记账失败不许影响录制 ✓
+                pass
         except Exception as e:                         # noqa: BLE001
             self._lie_rec_err = "%s" % e
             self._lie_rec_stop(why="写失败")
@@ -4539,16 +4958,19 @@ class LiveThread(QThread):
             self._lie_rec_stop(why="超时保护（%d 秒）" % int(LIE_REC_MAX_S))
 
     def _lie_verdict(self, ok, elapsed=0.0, why=""):
-        """**这一场测谎的判定**：成功 / 失败（用户 2026-10-17 ✓ 原话：
+        """**这一场测谎的判定**：成功 / 失败 / 不确定（用户 2026-10-17 ✓ 原话：
         「**测谎触发后录屏最多30秒，超过后需要停止相关逻辑，然后判定是测谎成功还是失败**」✓）。
 
-        只有两个出口（**唯一两处** ✓，别在别处再判 ✗）：
+        出口（**唯一两处** ✓，别在别处再判 ✗）：
           · 见到成功弹窗（`lie_success`）⇒ **成功** ✓（当场判，不等满 30 秒 ✓）；
           · 30 秒窗口到点（`LIE_REC_WINDOW_S` ✓）⇒ 见过算成功、**没见过算失败** ✓。
+        ⭐ `ok=None` ⇒ **不确定**（`"unknown"`）：这一场**画面断过**（见 `_pic_watch` ✓）⇒
+          "没看见"不等于"没操作" ✗ —— 用户 2026-10-20 现场就是这样被冤枉成"失败"的 ✓。
         出口：`behavior.log` 一条 `lie_verdict` ✓（事后核对用 ✓）+ 状态行喊一声 ✓。
         """
-        _ok = bool(ok)
-        self._lie_last_verdict = "success" if _ok else "fail"
+        _ok = None if ok is None else bool(ok)
+        self._lie_last_verdict = ("unknown" if _ok is None
+                                  else ("success" if _ok else "fail"))
         self._lie_last_verdict_at = time.monotonic()
         self._lie_last_verdict_s = float(elapsed or 0.0)
         try:
@@ -4561,7 +4983,7 @@ class LiveThread(QThread):
             pass
         try:
             self.vt_status.emit("测谎判定：**%s**（%s%s）" % (
-                "成功 ✓" if _ok else "失败 ✗",
+                "不确定 ?" if _ok is None else ("成功 ✓" if _ok else "失败 ✗"),
                 ("用时 %.1f 秒" % float(elapsed or 0.0)) if elapsed else "",
                 ("，" + why) if why else ""))
         except Exception:                          # noqa: BLE001
@@ -4593,8 +5015,24 @@ class LiveThread(QThread):
         self._lie_rec_stop_at = 0.0
         self._lie_rec_last_lie = 0.0
         # ③ 判定 ✓
-        self._lie_verdict(_saw, elapsed,
-                          "30 秒窗口到点" if not _saw else "窗口到点前已见到成功弹窗")
+        # ⭐⭐ **画面断过 ⇒ 不判失败**（用户 2026-10-20 ✓ 现场 14:09:44 起全黑 8 秒 ⇒ 判出的
+        #   "失败"其实是"什么都看不见"✗ 与"没操作"是两回事 ✓）：
+        #   · 断够 `LIE_PIC_DEAD_JUDGE_S` ⇒ 判 **`unknown`**（"不确定"，不冤枉也不放过 ✓）；
+        #   · 断的时间还要**从用时里减掉**（不然"用时 30 秒"会让人以为它真等了 30 秒 ✓）。
+        _dead_s = float(_attr(self, "_lie_pic_dead_s", 0.0) or 0.0)
+        if bool(_attr(self, "_pic_dead", False)):
+            _b0 = float(_attr(self, "_pic_black_t0", -1.0) or -1.0)
+            if _b0 >= 0.0:
+                _dead_s += max(0.0, time.monotonic() - _b0)   # 还在断 ⇒ 这段也算上 ✓
+        if _saw:
+            self._lie_verdict(True, elapsed, "窗口到点前已见到成功弹窗")
+        elif _dead_s >= float(LIE_PIC_DEAD_JUDGE_S):
+            self._lie_verdict(None, max(0.0, float(elapsed or 0.0) - _dead_s),
+                              "这一场有 %.1f 秒画面是黑的（抓屏/推流断了）⇒ 不判失败"
+                              % _dead_s)
+        else:
+            self._lie_verdict(False, elapsed, "30 秒窗口到点")
+        self._lie_pic_dead_s = 0.0
         self._lie_rec_saw_success = False
 
     def _lie_rec_stop(self, why="离开测谎"):
@@ -4688,6 +5126,9 @@ class LiveThread(QThread):
 
     def _run(self):
         import cv2
+        # ⚠ 2026-10-18：换算那半（`note_frame_shape` 等）在 `execution/aim_convert` ✓
+        #   本文件一律**局部导入**（模块级名会被静态自检当场抓住 ✗）⇒ 这条必须写在这里 ✓
+        from execution import aim_convert as mouse_aim_c
 
         # ⭐ 开机就把"问 A 机窗口在哪"那条**后台线程**拉起来 ✓（用户 2026-10-17 ✓）：
         #   等到第一次要点击/瞄准才启动的话，那一刻缓存还是空的 ⇒ 退回老口径 ⇒
@@ -4756,7 +5197,7 @@ class LiveThread(QThread):
         #: 收流帧里「游戏窗口区域」的**像素位置** `(x, y, w, h)` 与**整帧尺寸** `(H, W)` ✓
         #:   —— 由 `_stream_roi_now()` 按 `stream_rect_rel`（比例 ✓）现算 ✓
         #:   鼠标换算要用它把"我们看到的这块"折回整帧（见 `_mouse_roi` ✓ 与
-        #:   `mouse_aim.roi_px` ✓）—— 断线重连 / 自动测谎都走这条 ✓。
+        #:   `mouse_aim_c.roi_px` ✓）—— 断线重连 / 自动测谎都走这条 ✓。
         if not hasattr(self, "_stream_roi"):
             self._stream_roi = None
         if not hasattr(self, "_stream_full"):
@@ -4778,11 +5219,11 @@ class LiveThread(QThread):
         # 因 relay 暂时不可达把已建好的连接回退成本地。
         from decision.agent import CombatAgent, settings as decision_settings
         from decision import agent as agent_mod
-        from decision.input import tap as _tap
+        from execution.input import tap as _tap
         from decision.reconnect import Reconnector
-        from decision import mouse_aim      # 断线重连「点服务器 / 点频道」的鼠标绝对定位
-        from perception.tracker import MobTracker, PlayerTracker
-        from perception.world_state import WorldState
+        from execution import mouse_aim      # 断线重连「点服务器 / 点频道」的鼠标绝对定位
+        from perception.track.tracker import MobTracker, PlayerTracker
+        from perception.world.world_state import WorldState
         from perception import minimap as mm     # 小地图定位（S3）：apply_to_player 等
 
         agent = CombatAgent(decision_settings)
@@ -4809,11 +5250,11 @@ class LiveThread(QThread):
         agent.mob_sets_of = self._make_mob_sets_resolver()
         # 再装一个「**走过去要多少寻路距离**」的解析器（用户 2026-09-27："锁定目标优先级要按
         # 「寻路距离」最近，而不是旧的应该是绝对距离"）—— 它**复用上面那一个**做"画面→世界 +
-        # 落在哪块面"（一次换算 ✓），只多一步 `route.path_cost`（择路同一套口径 ✓）。
+        # 落在哪块面"（一次换算 ✓），只多一步 `pathing.path_cost`（择路同一套口径 ✓）。
         agent.mob_cost_of = self._make_mob_cost_resolver(agent.mob_sets_of)
         # ⭐ **再装一个「集合 → 集合」的代价**（用户 2026-09-28 ✓）：人在**不能打**的平台时，
         #   要挑一块**代价最低的可战斗区**（`agent._pick_battle_zone` ✓）。底层是**同一个**
-        #   `route.path_cost`（口径一处 ✓）。没装 ⇒ 那边退回"回第一条"的老行为 ✓（不猜 ✗）。
+        #   `pathing.path_cost`（口径一处 ✓）。没装 ⇒ 那边退回"回第一条"的老行为 ✓（不猜 ✗）。
         agent.set_cost_of = self._make_set_cost_resolver()
         # ⭐ 再装一个「**这条 foothold 的世界中心 x**」的解析器（用户 2026-09-28：「idle 回归」
         #    要"位于本集合时**水平走**向 `idle_foothold` 的中心" ✓）—— agent 同样不持有地形 ✓
@@ -4835,11 +5276,13 @@ class LiveThread(QThread):
         # （`agent.set_span_of`），让 `_reachable_without_path` **自己**算平台宽度 ——
         # 2026-09-27 用户要求**收编**（"同一件事两处算"是当天连踩两次的根因 ✗）⇒ **已删** ✗：
         # 这份查询现在喂给**位置状态机**（`_fill_route_ctx` 里的 `span_of=` ✓），
-        # 决策层一律读广播的 `player.here_span` ✓（解析器本身仍是 `route.set_span` 那一份 ✓）。
+        # 决策层一律读广播的 `player.here_span` ✓（解析器本身仍是 `pathing.set_span` 那一份 ✓）。
         mob_tracker = MobTracker()   # 给怪稳定 id，供目标锁定 CD 跨帧匹配
         player_tracker = PlayerTracker()   # 跟住「我」：位置连续性，别把别人认成自己
-        # 断线重连状态机（判界面 → 停自动 → 按 Enter/点鼠标走回游戏）
-        reconnector = Reconnector(decision_settings)
+        #: 断线重连状态机（判界面 → 停自动 → 按 Enter/点鼠标走回游戏）——
+        #: ⚠ 它是**跨帧**对象 ⇒ 用户 2026-10-20 选的 B：挂在 `self` 上 ✓
+        #:   （2026-10-20 起动作分发在 `runtime/frame_reconnect.py` ✓ 那边只借用 ✓）
+        self._reconnector = Reconnector(decision_settings)
 
         # 玩家也走 YOLO（不再是模板匹配）。每个玩家独占一个 YOLO 类，实时
         # 只取当前 player_id 对应的类；当前固定 class 0，多玩家时扩展
@@ -4847,7 +5290,7 @@ class LiveThread(QThread):
         _pid = self._p.get("player_id") or ""
         _player_class = int(self._p.get("player_class",
                                         PLAYER_CLASS_MAP.get(_pid, 0)) or 0)
-        # 怪物类 id：默认按类别表（perception/classes.py）；模型加载后会改成以
+        # 怪物类 id：默认按类别表（perception/detect/classes.py）；模型加载后会改成以
         # **模型自己声明的类别名**为准，见下面 YOLO(weights) 那一段。
         _mob_class = CLASS_MOB
         #: ⭐⭐ **其余类别**（掉落 / NPC / 其他玩家 / 宠物 ✓ 用户 2026-10-06 ✓："为何没看到
@@ -4856,7 +5299,7 @@ class LiveThread(QThread):
         #:   · 缺省 = **按类别表的号**（与 `_mob_class` 同一口径 ✓ 老权重多半就是这套 ✓）；
         #:   · 模型加载后**按名字重对齐**（权重可能是别处训的 ⇒ 号不一样 ✓ 见下面那段 ✓）——
         #:     ⚠ 那时**只认模型真声明过的类**：没声明的**画不出来**（它就吐不出这个类 ✓），
-        #:     别拿类别表的号去硬认 ✗（那是"张冠李戴"—— `perception/classes.py` 开头那段
+        #:     别拿类别表的号去硬认 ✗（那是"张冠李戴"—— `perception/detect/classes.py` 开头那段
         #:     专门讲过它的代价 ✓）。
         #:   ⛔ 这一份**绝不进决策**（决策那边只有 `split_dets` 一个出口 ✓ 见那儿 ✓）。
         _extra_map = {int(cid): int(cid) for cid, en in CLASS_EN.items()
@@ -4879,6 +5322,11 @@ class LiveThread(QThread):
         #: 视野矩形 (left, top, right, bottom) —— **每帧现算** ✓（见收流循环里那段说明：
         #: 2026-09-27 用户报"视野范围更新太慢"，根因就是它原来是**每 3 秒**才算一次 ✗）。
         _vision_box = [None]
+
+        #: **推理参数**热读的闸（`conf_mob` / `iou_mob` / `max_det` / 测谎那几格 ✓ 见 `_run`）。
+        #: ⚠ 它原来和「可视化配置」**共用一把闸**（同一个 `if` 里）—— 2026-10-20 拆开各管各的
+        #:   （两边都还是"1 秒内生效" ✓ 见 `_run` 那段说明 ✓；可视化那一半现在在 `runtime/frame_vis.py` ✓）。
+        _inf_refresh_last = 0.0
 
         # 可视化配置：定期重读（颜色改了实时生效，不用重开实时预览）
         # ⚠ 这几个"框/线"的颜色都走 `hex_to_bgra`（**可能带透明度** ✓，2026-09-27 起
@@ -4904,7 +5352,6 @@ class LiveThread(QThread):
         # ⭐ 「跳跃攻击范围框」的显示开关（用户 2026-10-12 ✓ 真画了 ✓；关掉 = 不画 ✓）
         _on_jump_attack = bool(_vis_cfg.get("jump_attack_on", True))
         _on_vision = bool(_vis_cfg.get("vision_on", True))
-        _vis_refresh_last = 0.0
 
         # 读线程独立于推理：它拼命读，积压的旧帧在槽位里被直接覆盖丢掉。
         # 这样无论推理多慢，看到的都是最新画面，延迟不会累积。
@@ -5178,12 +5625,20 @@ class LiveThread(QThread):
                         "要么把它的「来源」改成**本地窗口**。"
                         % (_uport, _who))
                     return
+                #: ⭐ 占上了才记（失败那条路**不是我们占的** ⇒ 更不能去放 ✓ 放错就把
+                #:   别人的锁删了 ✓ 见 `core.instance.release_port` 的"只动自己的"✓）
+                self._udp_port = _uport
             src = PyAVSource(url, decode_format="bgr24",
                              container_format=self._p.get("format"),
                              keep_check=_want_frame)
             try:
                 src.open()
             except Exception as e:
+                # ⚠ 开流失败 ⇒ **当场把端口锁放掉** ✓（2026-10-21）：
+                #   以前这里直接 `return`，锁留着、写着一个活着的 pid，而系统里没有任何
+                #   socket 绑这个端口 ⇒ 用户看到"盘上有锁、收不到流、重试也说不清"✗
+                #   （现场：`udp_5000.lock` 在、`Get-NetUDPEndpoint` 空 ✓）。
+                self._release_udp_port()
                 if self._stop.is_set():
                     return
                 self.stream_status.emit("no_stream")
@@ -5300,11 +5755,12 @@ class LiveThread(QThread):
             return probe_px
         offset_ms = float(self._p.get("clock_offset_ms", 0.0) or 0.0)
 
-        delays = []
-        probe_miss = 0           # 解码失败（连码都解不出来）
-        probe_invalid = 0        # 解出来了、但值是**不可能的**（≥ 一天）＝几何错了
-        probe_ok = 0             # 解出了合法值（含下面被丢弃的）
-        probe_reject = 0         # 值合法、但**算不出延迟** —— 双机时钟没对齐
+        #: ⭐ 探针的**跨帧账本**（四类计数 / 延迟窗口 / 几何键 / 单调性判据 ✓
+        #:   见 `runtime/frame_probe.py`）—— 按用户 2026-10-20 选的 B 挂在这边 ✓
+        #:   （跨帧的东西不进 `FrameCtx` ✗ 判据：「下一帧还会用吗？」✓）。
+        #:   `probe_vd` 单独留着：状态行要**直接读**它的字段（`mono` / `value_ok` /
+        #:   `step_med` / `ts_hist` ✓），所以它由这里建、交给账本引用 ✓。
+        _probe = frame_probe.ProbeState()
         #: 跨帧单调性判据：判「这份几何可不可信」。**与 tools/probe_tune 共用一份
         #: 实现**（probe_codec.Verdict）—— 各写一份必然漂移，而漂移会造出"工具说
         #: OK、工作台说不对"这种最难查的分歧。
@@ -5314,9 +5770,7 @@ class LiveThread(QThread):
         #: 窗口里的值完全可能。实测（2026-09-25）：link.yaml 的几何比实际画的小
         #: 2.8px/块、42 块累积偏 118px，低位全错，解出的却"看着合法"，于是延迟被
         #: 报成一坨乱数（p95 4.7s，紧贴自己的 --max-delay 上限）。
-        probe_vd = probe_codec.Verdict()
-        probe_jumpy = 0          # 判据判成「乱跳」的帧数（>0 就是几何可疑）
-        _geom_key = [None]       # 上一次用的几何；变了就重置判据（见下）
+        probe_vd = _probe.vd     # = `probe_codec.Verdict()` ✓ 状态行直接读它 ✓
         #: [上次重读时刻, 当前偏移毫秒] —— `_clock_ms()` 用。**别删**：上面那次
         #: 加判据的编辑曾把它整行吃掉，现象是开预览就 `NameError: name '_clock'
         #: is not defined`（pyflakes 一跑就能看见）。
@@ -5410,94 +5864,54 @@ class LiveThread(QThread):
                     continue                   # 被限速闸跳过（它已经喂过时间拍了 ✓）
                 vis = ctx.vis
                 _t_pipe = ctx.t_pipe
-                # **再留一份原生帧**（`raw_frame_ready` 发出去的那份）：下面会往 `vis`
-                # 上**就地**画玩家蓝框/怪物绿框/攻击线/**视野虚线**，而取帧做测量的那几个
-                # 功能（探针标定、HP/MP 条框选、小地图框选、标定弹窗、叠图核对）量的都是
-                # **像素**，被画过就全毁 —— 用户 2026-09-27 现场正是这么撞上的
-                #（"框选小地图时把视野灰色虚线一起框进去了"）。
-                # ⚠ 为什么是"先拷再画"而不是"不画"：cv2 的绘制是**原地**改数组，
-                #   `vis` 一旦画过，原始像素就找不回来了（下面 `_mmap_panel_from_frame`
-                #   那条注释记的是同一个坑，只是它只护住了小地图那一小块）。
-                # ⚠ 只在**真要画**的时候拷：本文件里所有 `cv2.*(vis, …)` 都在下面
-                #   `if self._infer.is_set():` 那一块里 ⇒ 收画面阶段零开销 ✓
-                #   （用例 `t_raw_frame_before_draw` 钉着这条，加绘制时顺手看它一眼）。
-                # 代价：一次全帧 memcpy（1920×1080 ≈ 0.5 ms），在**收流/标注线程**里，
-                # 不在决策那一条链上 ✓。
-                raw = vis.copy() if self._infer.is_set() else vis
-                # 小地图那块面板**趁现在裁**（复制一份）：下面会往 vis 上就地画
-                # 玩家蓝框/攻击线，画过的像素会串进黄点识别里。见
-                # _mmap_panel_from_frame 的说明。来源=收流时这里是 None（那一帧
-                # 来自 A 机单独那一路，和主画面无关）。
-                _mmap_panel = self._mmap_panel_from_frame(vis)
-                # ⭐⭐ **存下来给定位那一路**（2026-10-09 修 ✗）：以前算出来就扔了 ✗
-                #   ⇒ 来源=「从实时画面」时定位那边**永远拿到 None** ⇒ 每拍都回
-                #   「没有可裁的小地图区域 —— 先框选小地图 / 框选区超出当前画面…」✗
-                #   （用户现场："本地来源的自动定位不好使、认不出黄点" ✓，而标定弹窗里
-                #    对得好好的 ✓ —— 那条路是自己取帧的 ✓ 所以看不出这个洞 ✗）。
-                self._mmap_panel_cur = _mmap_panel
+                # ⭐⭐ **阶段 0 / 1 已搬进 `runtime/`**（2026-10-20，阶段 1「编排收口」第二刀 ✓
+                #   用户："开始"✓ —— **行为零改动** ✓）：
+                #   · `frame_pic.step` = 先留一份**原生帧**（画框之前 ✓）+ 趁现在把小地图面板裁一份；
+                #     为什么"先拷再画"、为什么只在推理门里拷 ⇒ 见 `runtime/frame_pic.py` 开头 ✓
+                #   · `frame_ui.step`   = 界面状态检测拍（限流 1 秒 ✓ 喂**原生帧** ✓）
+                #     ⇒ 见 `runtime/frame_ui.py` ✓
+                #   ⚠ **顺序不许换**：留像素 → 判界面 → 喂测谎 → 决策 → 画框
+                #     （⚠ 画框在**决策之后** ✓ 画的是"决策完了的那一帧" ✓ 别按直觉挪到前面 ✗
+                #      判据 `selftest_live_panel::t_frame_stage_order` 钉着整条顺序 ✓）。
+                _mmap_panel = frame_pic.step(self, ctx)
+                raw = ctx.raw
+                frame_ui.step(self, raw)
 
-                # ---- 界面状态检测（测谎弹窗，M1「测谎报警」✓）：**原生帧**（画框之前 ✓）、
-                #      限流 1s —— 弹窗报警不需要帧级延迟，1s 足够 ✓（匹配本身 ~0.1s，
-                #      见 screen_state 的性能账 ✓）。状态切换时打点/报警/存帧三件事 ✓。
-                if time.monotonic() - self._screen_last >= 1.0:
-                    self._screen_last = time.monotonic()
-                    self._screen_beat(raw)
+                # ---- ⭐⭐ 第 2 段：**给自动测谎投一帧**（`runtime/frame_vt.py` ✓ 2026-10-20 搬出）----
+                #   ⚠ 喂进去的必须是 `raw`（画框之前那份 ✓ SDK 要求输入不能带人为绘制的框 ✗）；
+                #     原点优先"跟着窗口走"的那份 ✓、开关关掉那一下也要走到（收线程 ✓）
+                #     ⇒ 为什么、怎么判，全写在 `runtime/frame_vt.py` 开头 ✓
+                frame_vt.step(self, raw, origin_ref, (origin_x, origin_y))
 
-                # ---- ⭐⭐ 自动测谎（visual_tracking SDK）：投递**原生帧** + 消费结果 ----
-                #   ⚠ 必须是 `raw`（画框之前那份 ✓ —— SDK 要求"输入图不能包含人为绘制的
-                #     检测框"，`docs/INTEGRATION.md:28` ✓）；`vis` 上已经画了蓝框/绿框 ✗。
-                #   ⚠ 真正的推理在 `_vt_loop` 那条线程里（实测单帧最慢 2232ms ✗ ⇒ 放这条
-                #     回路里就是画面卡住两秒 ✓）。
-                #   ⚠ **不按拍节流**：喂帧线程只留最新一帧（自己丢帧 ✓）⇒ 这里每拍不过是
-                #     一次引用赋值 ✓。后半句 `or self._vt_on` 是为了"**关掉开关**"那一下
-                #     也能走到 `_vt_beat` ⇒ `_vt_ensure(False)` 才会把线程收掉 ✓。
-                if self._vt_want or self._vt_on:
-                    # ⚠ 窗口模式那条路的原点会**跟着窗口**走（`origin_ref` ✓）⇒ 优先读它 ✓
-                    #   （⚠ 这句调用**必须保持 `self._vt_beat(raw, …)` 这一行原样** ✗ ——
-                    #    自检里有一条源码钉在数它 ✓ 见 `selftest_live_panel` 那条"喂原生帧"✓）
-                    _ox = origin_ref[0] if origin_ref else origin_x
-                    _oy = origin_ref[1] if origin_ref else origin_y
-                    self._vt_beat(raw, _ox, _oy)
+                # ---- 第 3 段：**可视化配置热读**（`runtime/frame_vis.py` ✓ 2026-10-20 搬出）----
+                #   · 值挂在**线程**上（`th._vis_ui` / `th._vis_refresh_last` ✓ 用户选的 B ✓）：
+                #     它们**跨帧活着**（1 秒重读一次、中间每拍用上一份 ✓）⇒ 按 `FrameCtx` 自己的
+                #     判据"下一帧还会用吗？"⇒ 会 ⇒ **不进盒子** ✗（见 `FrameCtx` 的说明 ✓）
+                #   · `theme` 由**这里**传（`gui.theme` 在 gui 层 ✓ `runtime` 不许 import gui ✗）
+                #   · 下面这一列是**本拍的别名**：绘制端照旧读这些短名字 ⇒ 行为零改动 ✓
+                #     （以后可以逐步换成 `_vu.xxx` ✓ 一次动几十处反而容易漏 ✓）。
+                _vu = frame_vis.step(self, _player_class, _mob_class, theme)
+                _vis_cfg, _cls_colors = _vu.cfg, _vu.cls_colors
+                _p_color, _m_color = _vu.p_color, _vu.m_color
+                _p_label, _m_label = _vu.p_label, _vu.m_label
+                _lock_color, _attack_color = _vu.lock_color, _vu.attack_color
+                _min_attack_color = _vu.min_attack_color
+                _chase_jump_color = _vu.chase_jump_color
+                _jump_attack_color = _vu.jump_attack_color
+                _vision_color, _vision_width = _vu.vision_color, _vu.vision_width
+                _lock_width, _attack_width = _vu.lock_width, _vu.attack_width
+                _min_attack_width = _vu.min_attack_width
+                _jump_attack_width = _vu.jump_attack_width
+                _chase_jump_width = _vu.chase_jump_width
+                _on_lock, _on_attack = _vu.on_lock, _vu.on_attack
+                _on_blind, _on_chase = _vu.on_blind, _vu.on_chase
+                _on_jump_attack, _on_vision = _vu.on_jump_attack, _vu.on_vision
 
-                # 定期重读可视化配置：标记颜色/线宽改了实时生效
-                if time.perf_counter() - _vis_refresh_last >= 1.0:
-                    _vis_refresh_last = time.perf_counter()
-                    _vis_cfg = theme.load_vis()
-                    _cls_colors = theme.class_colors()
-                    # 画框/标签按**实际解析出来的**类 id 取（权重可能在别处训、
-                    # 顺序和我们不同），取不到就回退到类别表里的默认项。
-                    _p_color = _cls_colors.get(_player_class,
-                                               _cls_colors[CLASS_PLAYER])
-                    _m_color = _cls_colors.get(_mob_class,
-                                               _cls_colors[CLASS_MOB])
-                    _p_label = CLASS_NAMES.get(_player_class,
-                                               CLASS_NAMES[CLASS_PLAYER])
-                    _m_label = CLASS_NAMES.get(_mob_class,
-                                               CLASS_NAMES[CLASS_MOB])
-                    _lock_color = theme.hex_to_bgr(_vis_cfg["lock_color"])
-                    _attack_color = theme.hex_to_bgra(_vis_cfg["attack_color"])
-                    _min_attack_color = theme.hex_to_bgra(_vis_cfg["min_attack_color"])
-                    _chase_jump_color = theme.hex_to_bgra(_vis_cfg["chase_jump_color"])
-                    # ⭐ 「跳跃攻击范围框」（用户 2026-10-12 ✓ 见上面那处说明 ✓）
-                    _jump_attack_color = theme.hex_to_bgra(
-                        _vis_cfg["jump_attack_color"])
-                    _vision_color = theme.hex_to_bgra(_vis_cfg["vision_color"])
-                    _vision_width = int(_vis_cfg["vision_width"])
-                    # ⭐⭐ **各框线宽**（用户 2026-09-28 ✓"给其他的粗细也加配置"）—— 就在
-                    #   「界面 → 辅助线与标记」里**色块右边那一格**调 ✓；⚠ **默认值 = 原来
-                    #   在下面写死的那个数**（锁定框 3、其余 2 ✓ 观感一字不变 ✓）。
-                    _lock_width = int(_vis_cfg.get("lock_width", 3) or 3)
-                    _attack_width = int(_vis_cfg.get("attack_width", 2) or 2)
-                    _min_attack_width = int(_vis_cfg.get("min_attack_width", 2) or 2)
-                    _jump_attack_width = int(_vis_cfg.get("jump_attack_width", 2) or 2)
-                    _chase_jump_width = int(_vis_cfg.get("chase_jump_width", 2) or 2)
-                    _on_lock = bool(_vis_cfg.get("lock_on", True))
-                    _on_attack = bool(_vis_cfg.get("attack_on", True))
-                    _on_blind = bool(_vis_cfg.get("min_attack_on", True))
-                    _on_chase = bool(_vis_cfg.get("chase_jump_on", True))
-                    _on_jump_attack = bool(
-                        _vis_cfg.get("jump_attack_on", True))
-                    _on_vision = bool(_vis_cfg.get("vision_on", True))
+                # 定期重读**推理参数**（`conf_mob` / `iou_mob` / `max_det` / 测谎那几格 ✓
+                #   ⚠ 原来它和"可视化配置"共用一个 1 秒闸（都在同一个 `if` 里）⇒ 拆开后各管各的：
+                #     最多差零点几秒，两边都还是"改完 1 秒内生效" ✓ 用户要的就是这个 ✓）。
+                if time.perf_counter() - _inf_refresh_last >= 1.0:
+                    _inf_refresh_last = time.perf_counter()
                     # conf 也实时生效：重读 config/live.yaml（UI 改动会即时写入）
                     try:
                         _live = load_live()
@@ -5520,6 +5934,15 @@ class LiveThread(QThread):
                                 max_det = 30000
                         if "agnostic_nms" in _live:
                             agnostic_nms = bool(_live["agnostic_nms"])
+                        # ⚠⚠ **复核时修（2026-10-20 ✓ 原有代码，与这轮搬家无关）**：
+                        #   这两行原来**缩进在 `agnostic_nms` 那个 `if` 里面** ✗ ⇒
+                        #   ① yaml 里没有 `agnostic_nms` 时，**玩家置信度永远不热读**（改了不起作用 ✓）；
+                        #   ② 更糟的是那句 `_live["conf_player"]` 是**直接下标** ⇒ 缺键会抛 KeyError，
+                        #      而外层是 `except Exception: pass` ⇒ **这一拍后面所有热读全被跳过**
+                        #      （`vt_*` / `pipe_fps` / 让路档位 ✓ 而且每秒都跳 ⇒ 现象是"改了没反应"，
+                        #       一句日志都没有 ✗）。
+                        #   ⇒ 拆成两个独立判断、一律 `in` 判键 ✓（它们本来就是两件事 ✓）。
+                        if "conf_player" in _live:
                             conf_player = float(_live["conf_player"])
                             # ⚠⚠⚠ **这里必须和建会话那一处同一口径** ✗（2026-10-13 实测踩到）：
                             #   原来这里又写回 `min(conf_mob, conf_player)` ✗ ⇒ 我改好的
@@ -5563,82 +5986,71 @@ class LiveThread(QThread):
                                 pass
                         # ⭐ **喂帧速率上限**（用户 2026-10-10 ✓）：热读 ⇒ 改完最多 1 秒生效 ✓
                         #   （判谎用不到 40fps ✓；这条就是"测谎不许把实时拖垮"的那道闸 ✓）
-                        self._vt_cfg["max_fps"] = max(
-                            1.0, float(_live.get("vt_max_fps", 10) or 10))
+                        # ⭐⭐ **-1 = 不限制**（用户 2026-10-18 ✓）：原样存负数 ✓ 别折成默认值 ✗
+                        #   （折了就等于"界面上写了不限制、实际还限着"✗）。0 或 0.3 这种
+                        #   "看着像卡死"的小值 ⇒ 抬到 1fps ✓（那是笔误，不是本意 ✓）。
+                        try:
+                            _fps = float(_live.get("vt_max_fps", 10))
+                        except (TypeError, ValueError):
+                            _fps = 10.0
+                        self._vt_cfg["max_fps"] = -1.0 if _fps < 0 else max(1.0, _fps)
+                        # ⭐ **B 语义的开关**（用户 2026-10-17 ✓）：`screen` = 只在测谎窗口
+                        #   出现时喂帧；`off` = 老行为（勾上就一直喂 ✓ 能一键退回 ✓）
+                        self._vt_gate = str(_live.get("vt_gate", "screen") or "screen").lower()
+                        try:
+                            self._vt_hold_s = max(
+                                0.0, float(_live.get("vt_hold_s", 1.5) or 0.0))
+                        except (TypeError, ValueError):
+                            self._vt_hold_s = 1.5
+                        # 长预算（见 `_vt_arm_until` ✓ 治"界面状态认不出小游戏窗口"✗）
+                        try:
+                            self._vt_arm_s = max(
+                                1.0, float(_live.get("vt_arm_s", 25.0) or 25.0))
+                        except (TypeError, ValueError):
+                            self._vt_arm_s = 25.0
                         # ⭐⭐ **重活闸**（同 1 秒热读 ✓ 见 `self._pipe_fps` 那段说明 ✓）：
                         #   `0` = 不限制（默认 ✓ 老行为一字不变 ✓）
                         try:
-                            self._pipe_fps = max(0.0, float(_live.get("pipe_fps", 0) or 0))
+                            _base = max(0.0, float(_live.get("pipe_fps", 0) or 0))
                         except (TypeError, ValueError):
-                            self._pipe_fps = 0.0
+                            _base = 0.0
+                        # ⭐⭐ **测谎优先 ⇒ 主回路主动让路**（用户 2026-10-17 ✓ 原话：
+                        #   「同一窗口实例的测谎和怪物识别是不能同时进行的」✗）——
+                        #   老做法是"先全速跑、积压了再把测谎降到 2fps"（事后刹车 ✗），
+                        #   现在改成"测谎一开始喂帧，主回路就先降到 `vt_yield_pipe_fps`"✓
+                        #   ⚠ 判据用 `self._vt_on`（**线程真在喂帧** ✓），不是勾选框 ✗ ——
+                        #     勾着但模型没加载起来（或定位一直失败）时不该让路 ✓。
+                        try:
+                            _yield = float(_live.get("vt_yield_pipe_fps", 0) or 0)
+                        except (TypeError, ValueError):
+                            _yield = 0.0
+                        self._pipe_fps = vt_yield_pipe_fps(_base, self._vt_on, _yield)
+                        # 只在"真的改变了档位"时说一句（别每秒刷屏 ✗）
+                        if self._vt_on and _yield > 0 and self._pipe_fps != _base:
+                            if self._vt_yield_note != self._pipe_fps:
+                                self._vt_yield_note = self._pipe_fps
+                                self._vt_note(
+                                    "测谎在跑 ⇒ 怪物识别让路到 %.0ffps"
+                                    "（关掉测谎会自动恢复 ✓）" % self._pipe_fps)
+                        elif self._vt_yield_note:
+                            self._vt_note("测谎已停 ⇒ 怪物识别恢复原速 ✓")
+                            self._vt_yield_note = 0.0
                         # ⭐ 写进 perf 段头（事后翻日志能看出"那一段是不是限过速" ✓）
                         perf.note("pipe_fps", round(self._pipe_fps) or "不限")
                     except Exception:
                         pass
 
-                if probe_on:
-                    # f.image 是 BGR，转灰度解码
-                    gray = cv2.cvtColor(vis, cv2.COLOR_BGR2GRAY)
-                    # 几何每帧现算：人工标定是比例，要按当前画面尺寸换算
-                    # （read_bits 支持浮点 cell，所以不必取整）
-                    px, py, cell, gap = _probe_geom(gray.shape)
-                    # 几何一变（刚标完 / 换了项目）就重置判据：换标定那一刻时间戳
-                    # 必然跳一次，不该被算成"乱跳"—— 否则刚存完就报"几何可疑"，
-                    # 人会被自己刚做的事吓到。
-                    _key = (round(px, 2), round(py, 2), round(cell, 2),
-                            round(gap, 2))
-                    if _key != _geom_key[0]:
-                        _geom_key[0] = _key
-                        probe_vd.reset()
-                    ts_a = decode_ms(gray, px, py, cell, gap, bits)
-                    if ts_a is None:
-                        probe_miss += 1
-                        # 探针解不出来也要留痕：端到端延迟是「控制质量的真指标」，
-                        # 但它一旦解码失败，日志里只剩少数样本，读出来会**偏小**，
-                        # 看着像「延迟变好了」—— 那是假象（实测踩过：段内样本
-                        # 1433→161，中位同步从 35ms 掉到 12ms）。把 miss/ok 记下来，
-                        # 报告里一比就知道这个数能不能信。
-                        perf.count("probe_miss")
-                    elif not (0 <= ts_a < probe_codec.DAY_MS):
-                        # 解出来了、但值不可能（≥ 一天）＝**几何错了**（采样点没落在
-                        # 方块上），不是时钟问题。混进「时钟对不上」会把人引错方向
-                        # （实测：解出 306001920ms ≈ 85 小时，界面却提示去对时）。
-                        probe_invalid += 1
-                        perf.count("probe_invalid")
-                    else:
-                        probe_ok += 1
-                        perf.count("probe_ok")
-                        # 跨帧单调性（只在这里记，结论交给界面）—— 判据没过时界面
-                        # **不许显示延迟数**：报一个假延迟比不报糟得多。
-                        # 步长上限用显示帧周期算（判据自己会乘一个宽松倍数）。
-                        _t_recv_ms = (f.t_recv_wall + _clock_ms() / 1000.0) * 1000.0
-                        # 原始差也喂进判据：单调但**整片平移**的解（错位采样的另一种
-                        # 形态）只有它能识破，否则界面会把它误报成"时钟对不上，去对时"。
-                        probe_vd.add(ts_a, 1000.0 / max(1.0, float(
-                            self._p.get("show_fps", 30.0) or 30.0)),
-                            delay_raw_ms=_t_recv_ms - (probe_codec.day_start_ms() + ts_a))
-                        if not probe_vd.mono:
-                            probe_jumpy += 1
-                            perf.count("probe_jumpy")
-                        if not probe_vd.value_ok:
-                            perf.count("probe_value_off")
-                        d = resolve_delay_ms(_t_recv_ms, ts_a)
-                        # 超过 5 秒视为解码错误（而不是真的有 5 秒延迟）
-                        if d is not None and d < 5000:
-                            delays.append(d)
-                            _e2e_ref[0] = d      # 给世界状态用（上绳对齐的保持窗口）
-                            if len(delays) > 120:
-                                del delays[0]
-                            # 端到端延迟（A 机屏幕时间码 → 本机解码）才是最该盯的
-                            # 性能指标，以前只在界面显示中位数、不进日志。
-                            perf.sample("e2e_probe_ms", d)
-                        else:
-                            # 解出来了但算不出延迟：多半是双机时钟没对齐（也可能是
-                            # 解错了一位数字）。**和「解码失败」是两回事**，界面上要
-                            # 分开显示 —— 以前混成一句「未解出」，框选明明说解出了，
-                            # 这里却显示未解出，看着像 bug。
-                            probe_reject += 1
-                            perf.count("probe_reject")
+                # ---- 第 4 段：**探针解码**（`runtime/frame_probe.py` ✓ 2026-10-20 搬出）----
+                #   · 跨帧账本 = `_probe`（B ✓）；关掉探针时整段不跑（连灰度都不转 ✓ 零开销）；
+                #   · 为什么四类计数要分开（miss / invalid / reject / jumpy）⇒ 见那个文件 ✓
+                frame_probe.step(_probe, probe_on, vis, f, _probe_geom, decode_ms,
+                                 _clock_ms, bits, self._p.get("show_fps", 30.0))
+                # 本拍别名（状态行照旧读这些短名字 ⇒ 行为零改动 ✓）
+                delays, probe_vd = _probe.delays, _probe.vd
+                probe_ok, probe_miss = _probe.ok, _probe.miss
+                probe_invalid, probe_reject = _probe.invalid, _probe.reject
+                probe_jumpy = _probe.jumpy
+                _e2e_ref[0] = _probe.e2e_ms    # 给世界状态用（上绳对齐的保持窗口 ✓）
 
                 # ⚠⚠ **这三个名字必须在块外先给默认值**（用户 2026-10-05 ✓ 现场：以别的权重
                 #   「开始收流」⇒ `失败: UnboundLocalError: local variable '_ploc_fo' referenced
@@ -5675,8 +6087,12 @@ class LiveThread(QThread):
                 # ⚠ 判据用 **`_takeover_st`**（留住接管后的那份 ✓ 用户 2026-10-10 ✓）—— 用原生
                 #   `_screen_state` 的话，小游戏那段（匹配不上 ⇒ 回落 `combat` ✓）会**每几秒
                 #   松一下** ⇒ 又在那张糊满弹窗的图上白跑 YOLO ✗（正是这条要停的东西 ✓）。
-                _lie_mode = str(getattr(self, "_takeover_st", None)
-                                or getattr(self, "_screen_state", "")).startswith("lie")
+                _lie_mode = (str(getattr(self, "_takeover_st", None)
+                                 or getattr(self, "_screen_state", "")).startswith("lie")
+                             # ⭐ 再加上"窗口有效期"：`_takeover_st` 有它自己的宽限，
+                             #   但用户要的是**直到那个窗口真的消失** ✓（用户 2026-10-17 ✓）
+                             #   ⇒ 两条任一成立就停战斗检测/逻辑 ✓（多停一拍无害 ✓）
+                             or self._vt_lie_active())
 
                 # ---- 推理（由「开始推理」开关控制）----
                 if self._infer.is_set():
@@ -5822,384 +6238,41 @@ class LiveThread(QThread):
                     _vision_box[0] = _vision_box_for(vis, _last_player[0],
                                                      decision_settings)
 
-                    # ---- 一次推理（整帧 / 或只视野框 ✓）：玩家（class 0）+ 怪（class 1）----
-                    t0 = time.perf_counter()
-                    if _lie_mode:
-                        # ⭐ 测谎中 ⇒ **不推理**（见上面那段 ✓）。下面那句
-                        #   `boxes = getattr(res, "boxes", None)` 对 `None` 是**防御式**的
-                        #   （`getattr(None, "boxes", None)` = None ✓）⇒ 这一拍 `mob_dets` /
-                        #   `player_cands` / `_cls_dets` 全空 ⇒ **战斗框自然不画** ✓，
-                        #   而"显示那一帧 / 画 VT 的描边"都照旧 ✓（画框段不受影响 ✓）。
-                        res = None
-                        _det_off = (0, 0)       # 没推理 ⇒ 无偏移 ✓（下面加回偏移要用它 ✓）
-                    else:
-                        # ⭐⭐ 「只检测视野框」（用户 2026-10-15 ✓ 见
-                        #   `DecisionSettings.vision_detect_only` ✓）：打开时只喂
-                        #   `_vision_box[0]` 那一块 ✓。**每帧现读**设置 ⇒ 面板上勾一下当场生效 ✓。
-                        #   ⚠ 它**不省推理时间** ✗：输入尺寸由 `imgsz` 定死（喂整帧 / 喂剪裁块，
-                        #     网络里跑的都是同一个 `imgsz` ✓）—— 换到的是**分辨率** ✓
-                        #     （见那个勾选框的 tooltip ✓）；想省时间得**同时**调小 `imgsz` ✓。
-                        #   ⚠ 偏移**必须**在下面加回 `xyxy`（只那一处 ✓），否则所有框整体位移 ✗。
-                        # ⭐⭐⭐ 2026-10-16 **用"上一拍记的账"决定这一拍剪不剪**（用户原话：
-                        #   "**现在不认玩家框了**"✓ + "**开启只检测视野框后，玩家检出框很容易
-                        #   永久定住不动**"✓）—— **剪裁块里没认出玩家 ⇒ 这一拍直接整帧检** ✓。
-                        #   · 病根同上（见上面那段 ⏳ 注释 ✓）：`vision_detect_only` 只把**视野框
-                        #     那一块**喂给模型 ✓，而**玩家也是 class 0** ✓ ⇒ 玩家一走出那一块
-                        #     ⇒ **一拍都检不到玩家** ✓；
-                        #   · ⚠⚠ **不加第二个推理口** ✗（主循环里那个口**只许一个** ✓
-                        #     两条既有源码钉钉着 ✓）⇒ 只能**拿上一拍的结论**当这一拍的依据 ✓
-                        #     （`_vision_player_miss` ✓ 在下面"玩家候选定稿"那一处写 ✓）；
-                        #   · 代价只在"接着几拍都没认出"的时候 ✓，**不是**每拍两次推理 ✗。
-                        _crop_on = bool(
-                            getattr(decision_settings, "vision_detect_only", False)) \
-                            and not getattr(self, "_vision_player_miss", False)
-                        _det_src, _det_off = _det_crop_for(
-                            vis, _vision_box[0], _crop_on)
-                        # ⭐⭐ **漏检三旋钮接进推理**（用户 2026-10-16 ✓ 见上面那段说明 ✓）：
-                        #   · 去重门槛 = `iou_mob` ✓（默认 0.70 = 老行为一字不变 ✓；
-                        #     调大 ⇒ 挨得近的怪不被误去重 ⇒ 漏检少 ✓）；
-                        #   · 一帧上限 = `max_det` ✓（默认 300 = 框架默认 ✓；怪多时调 600 ✓）；
-                        #   · `agnostic_nms` = 类别互不压制 ✓（默认关 ✓ 也保持老行为 ✓）。
-                        #   ⚠ 三个都**热读** ⇒ 界面上改完当场生效 ✓（不用重开实时 ✓）。
-                        res = model.predict(_det_src, conf=conf, imgsz=imgsz,
-                                            device=device, verbose=False,
-                                            iou=iou_mob, max_det=max_det,
-                                            agnostic_nms=agnostic_nms,
-                                            **_half_kw)[0]
-                        # ⏳ **① 待做（"视野框里没检出玩家 ⇒ 退回整帧"）的正确形状**（2026-10-16 ✓）：
-                        #   ⛔ 我第一版在下面**又加了一处推理调用** ✗ ⇒ 当场被两条既有源码钉按住：
-                        #      · 「主循环那次推理**不止一处了** ✗」
-                        #      · 「两处推理不是都走了那个**半精度开关**」 ✗（开关名别抄进来 ✗）
-                        #   ⇒ 这条路上**只许有一个推理口** ✓（`imgsz` 那条比较、弃用告警静音那条钉，
-                        #     都是靠"只有一处"才成立的 ✓）。
-                        #   ⭐ 正确形状 = **用"上一拍记的账"决定这一拍剪不剪** ✓（不加第二个推理口 ✓）：
-                        #     · 记一个 `self._vision_player_miss`（这一拍**剪裁块里有没有认出玩家** ✓
-                        #       在下面玩家候选定稿那处写 ✓）；
-                        #     · 下一拍：`_crop_on = 只检测视野框 and not 上一拍没认出玩家` ✓
-                        #       ⇒ 没认出就**这一拍直接整帧检** ✓（代价只在"接着没认出"的那几拍 ✓
-                        #       而不是"每拍两次推理" ✗）；
-                        #     · `det_crop_player_miss` 照打 ✓（让人一眼看出为什么退了整帧 ✓）。
-                        #   ⚠⚠ **写这条注释时我自己踩了仓库明文写过的那个坑** ✗：这两条钉是
-                        #     **按出现次数数源码文本**的 ✓ ⇒ 注释里原样抄一遍调用名就多一次、当场假红 ✓
-                        #     （`seq_editor.py` 里就留着同一条教训 ✓ 见开发日志 341/342 ✓）⇒ 本注释
-                        #     **不写那个调用名** ✓。
-                        # ⭐ 打个点，好让人在 `perf.log` 里**一眼看出**这一拍走的是哪条路 ✓
-                        #   （用户口径：改完要能自证生效 ✓；同 `crop_view_ok/miss` 那种写法 ✓）
-                        perf.count("det_crop" if _det_off != (0, 0) else "det_full")
-                        infer_ms.append((time.perf_counter() - t0) * 1000.0)
-                        perf.ms("infer_ms", t0)
-                        if len(infer_ms) > 60:
-                            del infer_ms[0]
-
-                    k = 0
-                    mob_dets = []       # [(x1, y1, x2, y2, conf), ...] 给 MobTracker
-                    player_cands = []   # [(x1, y1, x2, y2, conf), ...] 交给 PlayerTracker
-                    #: ⭐ 两档低分档（2026-10-11 ✓）：只给 tracker 续命用 ✓ 这一拍没推理 ⇒ 空的 ✓
-                    mob_low = []
-                    player_low = []
-                    #: ⭐⭐ **掉落物框**（只给「自动拾取」算"接没接触"用 ✓ 用户 2026-10-06 ✓）——
-                    #:   原始检出 ✓ 不过 tracker ✓ 不进 `ws.mobs` ✓（见 `drop_touch` ✓）。
-                    #:   ⚠ 每帧都要先给默认（下面 `if boxes` 不成立时它就是空的 ✓）。
-                    _drop_boxes = []
-                    boxes = getattr(res, "boxes", None)
-                    if boxes is not None and len(boxes):
-                        xyxy = boxes.xyxy.cpu().numpy()
-                        # ⭐⭐ 剪裁推理 ⇒ 把偏移**加回坐标**（**只在这一处** ✓ 用户 2026-10-15 ✓）：
-                        #   模型看到的是"剪裁块"自己的坐标系（原点在块左上角 ✓），而下游
-                        #   ——`split_dets` / `extra_class_dets` / `_drop_boxes`（自动拾取）/
-                        #   MobTracker / PlayerTracker / 画框——用的**全是全画面坐标** ✓
-                        #   ⇒ 就在"刚从 GPU 拿回来"这一步一次性挪回全画面坐标 ✓，
-                        #     后面谁都不用知道剪裁这件事 ✓。
-                        #   ⚠ 漏了这一步的形态是"**看着能跑、所有框整体偏一块**"✗（最难查的那种 ✓）。
-                        #   ⚠ **全回路只此一处** ✗（见 `_det_off_xyxy` 自己的说明 ✓）。
-                        xyxy = _det_off_xyxy(xyxy, _det_off)
-                        cfs = boxes.conf.cpu().numpy()
-                        try:
-                            clss = boxes.cls.cpu().numpy().astype(int)
-                        except Exception:
-                            clss = [1] * len(cfs)
-                        # ⭐⭐ **谁进决策**这条规矩在 `split_dets`（**唯一出口** ✓）
-                        #   —— 用户 2026-10-04 ✓ 要求："确认一下 Agent 认不认掉落、宠物类，
-                        #   或者说确认 Agent 没有将他们认成其他的"：
-                        #   **只有 `mob` / `player` 两类进得来** ✓，掉落 / NPC / 其他玩家 /
-                        #   宠物**一律不进** ✗ —— 而且 `WorldState` 里也只有 `mobs` 和
-                        #   `player` 两个字段 ⇒ 它们**根本没有通道** ✓（用例拿 6 个类别
-                        #   当场跑过 ✓ 见 `selftest_decision.t_drop_pet_never_enter_decision`）。
-                        # ⚠ 返回值是**三个**（2026-10-11 起 ✓ 多了 `mob_low` 低分档 ✓
-                        #   见 `split_dets` 那段说明 ✓）—— 它**只喂 tracker 续命** ✓
-                        #   **不进 `k`**（`k` 是"这一帧检出几只怪"的计数 ✓ 低分档不算 ✓）。
-                        # ⚠ 返回值是**四个**（2026-10-11 起 ✓ 两档低分档：怪 `mob_low` /
-                        #   玩家 `player_low` ✓ 见 `split_dets` ✓）—— 它们**只喂 tracker 续命** ✓
-                        #   **不进 `k`**（`k` 是"这一帧检出几只怪"✓ 低分档不算 ✓）。
-                        mob_dets, player_cands, mob_low, player_low = split_dets(
-                            xyxy, cfs, clss, _mob_class, _player_class,
-                            conf_mob, conf_player)
-                        k = len(mob_dets)      # = 原来的 `k += 1`（怪框计数 ✓ 等价 ✓）
-                        # ⭐⭐ **记下"这一拍剪裁块里到底有没有认出玩家"** —— 供**下一拍**决定
-                        #   剪不剪（用户 2026-10-16 ✓ 见上面 `_crop_on` 那段 ✓）。
-                        #   ⚠ 只认"**这一帧真检出**"（`player_cands` 非空 ✓）—— **不看
-                        #     tracker 最后有没有框** ✗：那份会被"低分维护"顶住（框定住不动 ✓
-                        #     就是那个毛病的另一半 ✓）⇒ 也算成"认出来了" ⇒ 视野框里其实没人
-                        #     却不退回整帧 ✗。
-                        self._vision_player_miss = not player_cands
-                        # ⭐⭐ **同一批原始框里另外那几类**（掉落 / NPC / 其他玩家 / 宠物 ✓
-                        #   用户 2026-10-06 ✓"为何没看到掉落物、宠物的检出框？"）—— 给
-                        #   **绘制层**（`_draw_show_frame` ✓ 每一类一个勾，见设置→界面→
-                        #   检测框颜色 ✓）。
-                        #   ⛔ 它**不喂任何 tracker** ✗：`ws.mobs` 仍旧只由 `mob_dets` 喂 ✓
-                        #     （"谁进决策"只有 `split_dets` 那一个出口 ✓ 用例钉着 ✓）。
-                        #   ⚠ `clss` 读不出来时那一段走的是 `clss = [1] * len(cfs)`（歪打正着：
-                        #     全当怪 ✓）⇒ 这里自然也只会挑出"怪"、不会凭空多出别的类 ✓。
-                        _cls_dets = extra_class_dets(xyxy, cfs, clss, _extra_map)
-                        # ⭐⭐ **掉落物那一类单独留一份**（用户 2026-10-06 ✓ 自动拾取）——
-                        #   ⚠ 只挑**掉落**（`CLASS_DROP` ✓）：宠物/NPC/其他玩家**不参与**
-                        #     拾取判定（它们本来就只是"画出来给人看"✓ 见上面那批 ✓）。
-                        #   ⚠ 用 `_extra_map`（模型类号 → 我们的类号 ✓）判 = **按名字对齐**过
-                        #     的那套 ✓（权重换过类的号也不会张冠李戴 ✓）。
-                        _drop_boxes = [(float(_x1), float(_y1), float(_x2), float(_y2))
-                                       for (_x1, _y1, _x2, _y2), _c, _cls
-                                       in zip(xyxy, cfs, clss)
-                                       if _extra_map.get(int(_cls)) == CLASS_DROP]
-
-                    # ---- 玩家定位：YOLO 候选 → PlayerTracker 跟住「我」 ----
-                    # 用位置连续性（离预测位置最近）挑出操作者的框，避免「画面里多个
-                    # 玩家时取置信度最高的、把别人当成自己」；漏检用速度外推补框，
-                    # 连续跟丢才解锁重锁。max_jump 就是「玩家追踪阈值」参数。
-                    # ---- 小地图定位**先算一遍**（在挑玩家框之前）----
-                    # 用户 2026-09-27 提的："用小地图的玩家世界坐标辅助玩家框防抖" ⇒ 黄点是
-                    # **独立于 YOLO 的第二个传感器**（一个认画面、一个读小地图 ✓）⇒ 挑框时
-                    # 可以拿"**本帧我到底在哪**"当尺子 ✓（`PlayerTracker.update(world=…)` ✓）。
-                    # ⚠ 必须"**本帧黄点 + 上一帧的框/相机**"才成立：同一帧的 world 与 box 相减
-                    #   会退化成"离上一帧框多远"（= 老判据），等于没加 ✗ —— 所以定位得先跑 ✓。
-                    # 算不出来时 `_world_now` 就是 None ⇒ 追踪器**自动退回老判据** ✓（不猜 ✗）。
-                    # ---- ⭐⭐ **「玩家位置」组：每帧现读**（用户 2026-09-28 ✓）----
-                    #   ① **脚底偏移**灌进 `world_state` 的镜像（那边不做反向 import，说明在
-                    #      `perception/world_state.py` 的 `FOOT_OFFSET_PX` 上 ✓）；
-                    _ploc_fo = float(getattr(decision_settings,
-                                             "player_foot_offset_px", 0) or 0)
-                    try:
-                        from perception import world_state as _ws_mod
-                        _ws_mod.FOOT_OFFSET_PX = _ploc_fo
-                    except Exception:
-                        pass
-                    #   ②③④ **框面积闸**（用户原话："当前框面积 ≤ 近期滚动基线 × (1 − 容差%)
-                    #      ⇒ 这一拍推迟 / 不做查询 ✓（**拦在查询之前**，而不是靠放宽挑面 ✗）"）。
-                    #      ⚠ 只能拿**上一拍锁定的框**说事：本帧的框要等 `_locate_mmap` 的出参才
-                    #        挑得出来（黄点是"辅助挑框"的尺子 ✓ 见上面那段）⇒ 这一拍先判、再查 ✓。
-                    #      ⚠ 两个"关"的口子：**容差 0** / **基线还没攒够 3 拍** ⇒ 照常查询 ✓
-                    #        （老行为一字不变 ✓）；**框面积最小占比 0** ⇒ 那条也关 ✓。
-                    _gate_closed = False
-                    _area_prev = 0.0
-                    _pb_prev = _last_player[0]
-                    if _pb_prev is not None and len(_pb_prev) >= 6:
-                        _area_prev = float(_pb_prev[4]) * float(_pb_prev[5])
-                    if _area_prev > 0.0:
-                        # ⭐⭐ **基线窗口改成"过去 N 秒"**（用户 2026-09-28 ✓ 原话："『面积基线
-                        #   窗口』，这个『拍』是什么？是多久？**需要可量化的描述**"✓）——
-                        #   存 `(时刻, 面积)` 并按**时间窗**筛 ✓：**拍数依赖帧率** ✗
-                        #   （30 拍在 30fps 是 1 秒、在 15fps 是 2 秒 ⇒ 说不清多久 ✗），秒才可量化 ✓。
-                        _t_now = time.monotonic()
-                        _area_hist.append((_t_now, _area_prev))
-                        if len(_area_hist) > 2000:      # 只当内存上限（真筛选靠时间窗 ✓）
-                            del _area_hist[:1000]
-                        _pm = float(getattr(decision_settings,
-                                            "player_box_min_area_pct", 0.0) or 0.0)
-                        _pt = float(getattr(decision_settings,
-                                            "player_box_area_tol_pct", 0.0) or 0.0)
-                        _bs = max(0.5, float(getattr(
-                            decision_settings, "player_box_area_base_s", 3.0) or 3.0))
-                        _win = [_a for _t, _a in _area_hist if _t_now - _t <= _bs]
-                        _base = (sum(_win) / float(len(_win))) if _win else 0.0
-                        # ⭐⭐ **「框面积最小占比」改成"占基线"**（用户 2026-09-28 ✓ 原话：
-                        #   "『框面积最小占比』应该是占**过去 n 秒内平均面积**的比例"✓）——
-                        #   原来跟**画面面积**比 ✗（不同地图 / 分辨率下人物框本来就不一样大 ⇒
-                        #   跟画面比**没有可比性** ✗）。
-                        if _pm > 0.0 and _base > 0.0:
-                            if _area_prev < _base * _pm / 100.0:
-                                _gate_closed = True      # 比基线小太多 ⇒ 这一帧**检测无效** ✓
-                                perf.count("player_box_too_small")
-                        if not _gate_closed and _pt > 0.0 and len(_win) >= 3:
-                            if _base > 0.0 and _area_prev <= _base * (1.0 - _pt / 100.0):
-                                _gate_closed = True      # 比近期基线小 ⇒ 这一拍不查
-                                perf.count("player_area_below_base")
-                    #      ⚠ 拦住时 `_loc = None` ⇒ 下面 `apply_to_player` 不跑 ⇒ **世界坐标沿
-                    #        用上一拍** = 这一拍"**不定位**"✓（而不是"定到错的地方"✗）。
-                    # ⭐⭐ **高频定位回路**（用户 2026-10-03 ✓ 原话："小地图作为权威世界坐标，
-                    #   应该尽可能用较高的帧率去更新"）：来源=收流 时才起 —— 它**每收到一帧
-                    #   小地图就定位一次**，主回路只**取最新一份**（见 `_mmap_loc_loop` ✓）。
-                    #   以前定位绑在**推理拍**上（≈30 次/秒）⇒ A 机推 60fps 也有一半被丢 ✗；
-                    #   定位只要 ~0.5ms ⇒ 现在更新率 = 推流帧率 ✓。
-                    if (self._mmap_src != "live" and self._mmap_mid
-                            and self._loc_thread is None):
-                        self._loc_thread = threading.Thread(
-                            target=self._mmap_loc_loop, daemon=True, name="mmap-locate")
-                        self._loc_thread.start()
-                        perf.note("mmap_loc_loop", "on")
-                    # ⚠ `_gate_closed`（框面积闸）**照旧拦住这一拍的消费** ✓ 行为一字不变 ✓：
-                    #   那条闸说的是"**这一拍检测无效**"（框太小 ⇒ 别拿它挑框 ✗），不是
-                    #   "小地图不可信" ⇒ 拦住的这一拍不取用；**但回路照旧在跑** ✓ ⇒ 下一拍
-                    #   拿到的坐标只会更新鲜 ✓（收益就在这儿 ✓）。
-                    if _gate_closed:
-                        _loc = None
-                    elif self._mmap_src == "live" or self._loc_thread is None:
-                        _loc = self._locate_latest()      # 没有独立帧源 ⇒ 照旧每拍现算 ✓
-                    else:
-                        _loc = self._loc_slot_take()      # ⭐ 回路给的最新一份 ✓
-                    _world_now = None
-                    if _loc is not None:
-                        _wx0, _wy0 = _loc.get("world_x"), _loc.get("world_y")
-                        if _wx0 is not None and _wy0 is not None:
-                            _world_now = (float(_wx0), float(_wy0))
-
-                    player_tracker.max_jump = max(
-                        1.0, float(decision_settings.player_track_jump))
-                    # ⭐ **把"此刻按着哪个方向"喂给追踪器**（用户 2026-10-01 ✓
-                    #   「输入感知的运动预测」）：角色是被按键驱动的 ⇒ 漏检那几帧照着
-                    #   **意图**推演（按着右就在加速、松手就在地面摩擦下减速），比"拿上一帧
-                    #   位移线性外推"准得多 —— 玩家中途变向 / 停住时，老口径会朝错的方向
-                    #   一路跑 ⇒ 挑候选挑错、补出来的框也错 ✗（两处共用同一个预测位置）。
-                    #   模型与它的边界（"意图 ≠ 事实"）都写在 `PlayerTracker.set_input` ✓。
-                    # ⚠ 取的是**按键名快照**：`keys.pressed()` 返回 set 拷贝、跨线程读安全 ✓
-                    #   （画按键帽那处也是这么取的 ✓）。拿不到（替身 / 老环境）⇒ 不喂
-                    #   ⇒ 追踪器 `_input_aware` 保持假 ⇒ **老口径一字不变** ✓。
-                    # ⚠ 键名是**映射后的名字**（`keymap` 里就是 left/right/up/down ✓）。
-                    try:
-                        _pk = agent.keys.pressed()
-                    except Exception:                       # noqa: BLE001
-                        _pk = ()
-                    player_tracker.set_input(
-                        1 if "right" in _pk else (-1 if "left" in _pk else 0),
-                        1 if "up" in _pk else (-1 if "down" in _pk else 0))
-                    _t_trk = time.perf_counter()
-                    # ⭐ `player_low` = 玩家的**低分档**（2026-10-11 ✓）：它能不能被用由
-                    #   tracker 说了算（**必须已锁定 + 黄点对得上** ✓ 见 `PlayerTracker.update` ✓
-                    #   —— 玩家低分框很可能是**别人** ✗ 所以比怪多两道前提 ✓）。
-                    player_box = player_tracker.update(player_cands, world=_world_now,
-                                                      low=player_low)
-                    # ⭐ **追踪+相机对账阶段耗时**（同上：`pipe_ms` 减掉 `infer_ms`/`agent_ms`
-                    #   和这一段，剩下的才是"候选整理 + 状态机填充"那种零碎）
-                    perf.ms("track_ms", _t_trk)
-                    # ⭐ **可信相机**（用户 2026-09-29 任务 2 ✓）：追踪器拿黄点的**权威世界
-                    #   坐标**核对过玩家框，只把"对得上"那几拍采纳成相机 ✓ ⇒ 下游所有
-                    #   "画面 → 世界"都用它（`screen_to_world` / 怪的集合解析器 ✓），
-                    #   玩家框抖 Δ 时不再把 Δ 原样灌进每只怪的世界坐标 ✓。
-                    #   ⚠ `None` = 还没建立 ⇒ 下游退回老口径现算，行为一字不变 ✓（不许当 0 ✗）。
-                    _cam_now = player_tracker.camera()
-                    # ⭐ **质量指标**（参考 Maple_xfeat 的 `valid_camera_fraction`）：耗时低
-                    #   ≠ 质量好。每帧记 1.0/0.0 ⇒ `perf.log` 的分位数天然就是"有效比例" ✓。
-                    #   · `cam_valid`    = 这一拍有没有可信相机（p50 = 有效比例）
-                    #   · `cam_rejected` = 这一拍"框与黄点对不上"（p50 = 拒绝比例）
-                    perf.sample("cam_valid", 1.0 if _cam_now is not None else 0.0)
-                    perf.sample("cam_rejected", 1.0 if player_tracker.cam_rejected else 0.0)
-                    if _cam_now is not None and _first_cam_t[0] is None:
-                        _first_cam_t[0] = time.perf_counter()
-                        perf.note("first_cam_s", round(_first_cam_t[0] - t_start, 2))
-                    if player_tracker.cam_rejected:
-                        # 这一拍"框与黄点对不上" ⇒ 相机冻着用旧的（**打点**，排查要用：
-                        # 一直涨说明玩家框锁错了 / 标定偏了 / 黄点在骗人 ✓）
-                        perf.count("cam_reject")
-                    # ⭐ 相机与"两个传感器差多少"也写进**行为日志**（用户 2026-09-29 任务 2）：
-                    #   `cam_resid`（世界像素）是"玩家框那一路稳不稳"唯一的数；"世界坐标
-                    #   整体偏"那类排查要看的就是它（差几十像素 ⇒ 就是它把怪推了一层 ✓）。
-                    if _cam_now is not None:
-                        behavior.sample("cam_x", float(_cam_now[0]), min_gap=1.0)
-                        behavior.sample("cam_y", float(_cam_now[1]), min_gap=1.0)
-                    if player_tracker.cam_resid is not None:
-                        behavior.sample("cam_resid", float(player_tracker.cam_resid),
-                                        min_gap=1.0)
+                    # ---- 第 6 段：**一次推理 + 谁进决策**（`runtime/frame_infer.py` ✓ 2026-10-20 搬出）----
+                    #   ⚠ 主循环那次推理**只许一处** ✗（`imgsz` 对齐、弃用告警静音两条钉都靠"只有一处"）
+                    #   ⚠ 剪裁 / 偏移加回 / 分流 / 掉落单留，全在里面 ✓ 见那个文件开头
+                    #   ⚠ 测谎中（`_lie_mode`）⇒ 不推理 ⇒ 四路产物全空 ⇒ 战斗框自然不画 ✓
+                    _inf = frame_infer.step(
+                        self, vis, model,
+                        {"conf": conf, "imgsz": imgsz, "device": device,
+                         "iou": iou_mob, "max_det": max_det,
+                         "agnostic_nms": agnostic_nms, "half_kw": _half_kw},
+                        _mob_class, _player_class, _extra_map,
+                        conf_mob, conf_player, _lie_mode, _vision_box[0],
+                        decision_settings, infer_ms,
+                        split_dets, extra_class_dets)
+                    # 本拍别名（下游照旧读这些短名字 ⇒ 行为零改动 ✓）
+                    mob_dets, player_cands = _inf.mob, _inf.player
+                    mob_low, player_low = _inf.mob_low, _inf.player_low
+                    _cls_dets, _drop_boxes, k = _inf.cls_dets, _inf.drop, _inf.k
+                    # ---- 第 7 段：**玩家定位**（`runtime/frame_locate.py` ✓ 2026-10-20 搬出）----
+                    #   · 先灌脚底偏移、判框面积闸、取小地图那份世界坐标（`_loc` ✓）
+                    #   · 再 `PlayerTracker.update(player_cands, world=…, low=player_low)`
+                    #   ⚠ **顺序不许换**：要"本帧黄点 + 上一帧的框"才成立（同一帧相减 = 老判据 ✗）
+                    #   ⚠ 面积闸拦住 ⇒ 这一拍**不取**世界坐标 ⇒ 沿上一拍（不是"定到错的地方"✓）
+                    _loc_out = frame_locate.step(
+                        self, player_tracker, player_cands, player_low,
+                        decision_settings, agent, _last_player, _area_hist,
+                        _first_cam_t, t_start)
+                    player_box, _cam_now, _loc = (
+                        _loc_out.player_box, _loc_out.cam_now, _loc_out.loc)
+                    _ploc_fo = _loc_out.foot_off       # 画「玩家位置」箭头要用 ✓
                     n_boxes = k
-
-                    # ---- 断线判断 / 自动重连 ----
-                    # 必须放在**画框之前**：此刻 vis 还是干净帧。下面会往 vis 上
-                    # 画玩家蓝框、平台线……画过的帧会干扰 UI 模板匹配。
-                    # 注意 player_found 要用追踪器刚返回的结果，不能用下面那个
-                    # 「跟丢时拿上一帧兜底」的 player_box —— 那玩意永远不为 None。
-                    #   ⭐ `ui_hint` = 本帧的**画面状态广播**（`_screen_state` ✓ 同样走
-                    #     `ui_state.detect` ✓ 还带那套限流+留住 ✓）—— **只用来立"选角 ⇒ 还欠一次
-                    #     Enter"那份待办** ✓（2026-10-12 用户"现在就上"✓）：状态机自己那一帧万一
-                    #     没认出来 / 认成别的 ✗ 也不至于把「按 Enter 进游戏」那一步整个吞掉 ✓。
-                    #     ⚠ 状态机那边的判定口径**没变** ✗（它照旧自己 detect ✓ 见 `update` 的说明 ✓）。
-                    _act = reconnector.update(vis, player_box is not None,
-                                              time.perf_counter(),
-                                              self._screen_state)
-                    if _act and _act.get("act") == "tap":
-                        _tap(_act["key"])
-                    elif _act and _act.get("act") == "home":
-                        # ⭐⭐⭐ **只撞角归零、这一拍不点**（用户 2026-10-17 ✓ 原话：
-                        #   「**地铁二号线 无法选中频道**」✗）。
-                        #   ⛔ 收流那条路读不到光标 ⇒ 只能"撞角 + 绝对走位"✓，而老写法
-                        #     **同一拍**把两条发出去 ✗ —— 撞角 `-4000,-4000` 固件要分块发完
-                        #     （~34 块/轴 ✓）⇒ 走位紧跟着排上去 ⇒ **起点不是角** ⇒ 点歪 ✓
-                        #     （`remote_kbd/A_relay_trace.log` 实证：两条 `MOVE` 同一毫秒 ✓）。
-                        #   ⇒ 同 `scroll` 的"**一格一拍**"✓：这一拍只归零 ✓，下一拍状态机再出
-                        #     `click`（带 `homed` ✓）⇒ 那时角早就到位了 ✓。
-                        #   ⚠ 这里**不 sleep** ✗（实时回路硬规矩 ✓ 等生效靠"下一拍" ✓）。
-                        _ok, _why = mouse_aim.corner_only(vis.shape)
-                        reconnector.feedback(_ok, _why)
-
-                    elif _act and _act.get("act") == "click":
-                        # ⭐ 「点服务器 / 点频道」（2026-10-06 ✓）：比例 → 撞角归零 →
-                        #   走位 → 左键，**换算与发指令只有 `decision.mouse_aim` 一处** ✓。
-                        #   ⚠ 比例是相对**这一帧**算的（`vis.shape` = 我们看到的画面 ✓）——
-                        #     状态机给的比例与画面同源，别拿别的尺寸换算 ✗。
-                        #   ⚠ 结果要**回填**给状态机（成败只有发完才知道 ✓）：否则界面上
-                        #     只剩"准备点…"，点没点上没人知道 ✗。
-                        # ⚠ 帧原点一起递（窗口模式那条路会**跟着窗口**走 ✓ 见 `origin_ref` ✓；
-                        #   收流那条路用 `origin_x/y` ✓ = 老行为 ✓）—— 窗口拖到副屏（x<0 ✓）
-                        #   全靠这一步才点得中 ✓（用户 2026-10-10 ✓）。
-                        _org = ((origin_ref[0], origin_ref[1]) if origin_ref
-                                else (origin_x, origin_y))
-                        # ⭐⭐ **断线重连的点击也要折回整帧**（用户 2026-10-17 ✓ 原话提醒：
-                        #   「注意**断线重连**、自动测谎的鼠标适配」✓）—— 状态机给的比例是
-                        #   相对**我们看到的这块**（框了游戏区域之后 ✓）⇒ 不折就整块偏 ✓
-                        #   （\"点服务器/点频道\"那种格点尤其致命 ✗ 差一格就点到别的频道 ✓）。
-                        # ⭐⭐⭐ **A 机游戏窗口会移动**（用户 2026-10-17 ✓「你保证你的方案
-                        #   能适配吗？」✓）⇒ `_aim_geo` 会先问窗口在哪：
-                        #     屏幕坐标 = 窗口原点 + 比例 × 窗口尺寸 ✓
-                        #   ⇒ 窗口挪/缩放/重启、换分辨率**全自动跟上** ✓
-                        #     （问不到 ⇒ 退回 `origin_ref`/`origin_x` 那条老路 ✓ 不会更糟 ✓）
-                        _org, _mroi, _mfull, _gain = self._aim_geo(vis, _org)
-                        _ok, _why = mouse_aim.click_ratio(vis.shape, _act["x"], _act["y"],
-                                                          gain=_gain,
-                                                          origin=_org,
-                                                          roi=_mroi, full_shape=_mfull,
-                                                          # ⭐ 上一拍已经**只归零**过（`act="home"`
-                                                          # ✓ 2026-10-17）⇒ 这一拍**别再撞角** ✗
-                                                          # （撞角与走位分拍 ⇒ 起点才是真的角 ✓）
-                                                          homed=bool(_act.get("homed")))
-                        reconnector.feedback(_ok, _why)
-
-                    elif _act and _act.get("act") == "click2":
-                        # ⭐⭐ 「双击」的第二下（2026-10-07 ✓ 真机验出来：**频道面板单击只是
-                        #   "选中"** ✗，必须双击才进 ✓）。⚠ 这一下**不重新走位** —— 光标还在
-                        #   原地（第一下之后我们没动过它 ✓）⇒ 只补一条左键 ✓。
-                        #   ⚠ 间隔由**状态机**控（`reconnect.DOUBLE_CLICK_GAP` ✓ 120ms ✓）：
-                        #   实时回路这条线程**不许 sleep** ✗（睡一下就是丢帧 / 积压 ✓）。
-                        _ok, _why = mouse_aim.repeat_click()
-                        reconnector.feedback(_ok, _why)
-
-                    elif _act and _act.get("act") == "scroll":
-                        # ⭐⭐ 「先滚到顶、再往下滚 N 格」（第 21~60 个频道 ✓ 见
-                        #   `reconnect.CHANNEL_TOTAL` ✓）。两条滚动**连着发** ✓（正数向上 ✓）；
-                        #   ⚠ 滚完**这一拍不点** ✗ —— 由状态机**下一拍**再出点击动作 ✓
-                        #   （实时回路这条线程**不许 sleep** ✗ 等滚动生效要靠"下一拍" ✓）。
-                        _up = int(_act.get("up") or 0)
-                        _down = int(_act.get("down") or 0)
-                        # ⚠ 走 `mouse_aim.scroll` ✓ 别在这儿直接摸输入层 ✗
-                        #   （这条线程里**没有** `dinput` 这个名字 ✓ 摸它会当场 NameError ✓
-                        #    2026-10-08 真栽过、被 live_panel 的 pyflakes 静态检查逮住 ✓）。
-                        # ⚠⚠ **坐标要一起递进去**（2026-10-09 ✓）：滚轮只作用在光标底下的
-                        #   控件上 ✗ ⇒ 不带坐标就是"在画面上方滚" ⇒ 列表一格没滚 ⇒
-                        #   接着点第一屏第 2 格 ⇒ 进错频道（用户："选 22、去了 2" ✓）。
-                        # ⚠ `_org` **不跨分支借用** ✗（那两条 elif 各自独立 ⇒ 谁先跑没保证 ✓）：
-                        #   这里自己算一份 ✓（就是同一句 `origin_ref` 优先的写法 ✓）。
-                        _org_s = ((origin_ref[0], origin_ref[1]) if origin_ref
-                                  else (origin_x, origin_y))
-                        _ok, _why = mouse_aim.scroll(_up, _down, vis.shape,
-                                                     _act.get("x"), _act.get("y"),
-                                                     origin=_org_s)
-                        reconnector.feedback(_ok, _why)
-
+                    # ---- 断线判断 / 自动重连（`runtime/frame_reconnect.py` ✓ 2026-10-20 搬出）----
+                    #   ⚠ 必须排在**画框之前**（此刻 `vis` 还是干净帧 ✓ 画过的帧会干扰 UI 模板匹配 ✗）；
+                    #   ⚠ `player_box` 传**追踪器刚返回**的那个（跟丢兜底版永远不为 None ✗ 状态机会以为人还在）
+                    frame_reconnect.step(self, vis, player_box,
+                                         origin_ref, origin_x, origin_y, _tap)
                     # ---- 决策：找怪打 ----
                     if player_box is not None:
                         _last_player[0] = player_box
@@ -6283,6 +6356,10 @@ class LiveThread(QThread):
                 # 那一帧 —— 显示限流只该影响"画面上多久刷一次"，不该影响"取帧拿到多新"
                 #（面板那边只存个引用，几微秒，不画 ✓）。同一个线程发的两个队列信号按
                 # 发射顺序到达 ⇒ 面板先收到原生帧、再收到显示帧 ✓。
+                # ⭐⭐ **画面还在不在**（用户 2026-10-20 ✓ "鼠标没跟上准心 + 也没有录屏"✓）：
+                #   整幅全黑 ⇒ 记 `pic_dead` + **停录**（别写 30 秒黑片子 ✓）；
+                #   排在录制前面：断了这一拍就别再往里写 ✓（顺序见 `_pic_watch` ✓）。
+                self._pic_watch(raw, now)
                 self._lie_rec_write(raw, now)   # ⭐ 测谎录屏（没在录 ⇒ 一次判空就过 ✓）
                 self.raw_frame_ready.emit(raw)
 
@@ -6395,9 +6472,9 @@ class LiveThread(QThread):
                     #   设置里「立即量一次」要拿它当尺寸 ✓ —— 原来它问的是"设置对话框所属
                     #   那一台工作台的 `live_panel._last_stats`" ✗，开两个工作台时可能问错台
                     #   ⇒ 现场连着两次 `size=[0, 0]` ✗ ⇒ 一个字节都没发（= 用户说的"点了没反应"✓）。
-                    #   ⚠ 与"哪台工作台"无关 ✓；`mouse_aim.note_frame_shape` 只认有效尺寸 ✓
+                    #   ⚠ 与"哪台工作台"无关 ✓；`mouse_aim_c.note_frame_shape` 只认有效尺寸 ✓
                     #     （没帧的那几拍不会把上一次抹掉 ✓）。
-                    mouse_aim.note_frame_shape(size_ref[0])
+                    mouse_aim_c.note_frame_shape(size_ref[0])
                     self.stats_ready.emit({
                         # 读线程真正收到的帧率 —— 这是链路能给的输入速度
                         "recv_fps": slot.put_count / el if el > 0 else 0.0,
@@ -6516,3 +6593,7 @@ class LiveThread(QThread):
                     src.close()
                 except Exception:
                     pass
+            # ⭐ **源真关掉之后**才放端口锁（顺序见 `_release_udp_port` 的说明 ✗ 反过来
+            #   别人能抢着 bind ⇒ 两边都 bind、包只落一边 ✓）。2026-10-21：以前这里只
+            #   管"关源"，锁一直要等**进程退出**才放 ⇒ 预览停止/开流失败后锁还挂着 ✓。
+            self._release_udp_port()

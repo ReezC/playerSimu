@@ -74,6 +74,78 @@ class HeavyGate:
         return False
 
 
+#: 测谎**真在跑**时，主回路（怪物识别）默认让路到多少 fps。
+#: ⚠ 默认不用它（配置里 `vt_yield_pipe_fps: 0` = 不让路 ✓ 老行为一字不变 ✓）——
+#:   因为"定位一直失败"时测谎照样吃 GPU，这时让路等于白降主检测的帧率 ✗。
+VT_YIELD_PIPE_FPS_DEFAULT = 8.0
+
+
+def vt_yield_pipe_fps(base_fps, vt_on, yield_fps):
+    """主回路这一刻该用多少 fps（测谎优先时**主动降速**，不是等积压再降 ✗）。
+
+    为什么要有它（用户 2026-10-17 ✓ 原话：「同一窗口实例的测谎和怪物识别是不能同时进行的」✓）：
+      测谎自带**第二套 YOLO**，和怪物识别抢同一块 GPU。老做法是"先全速跑，积压了再把
+      测谎降到 2fps"（`VT_FPS_UNDER_LAG` ✓）—— 顺序反了：**先过度供给、再事后刹车**，
+      中间那一段两边都慢。这条把顺序反过来：测谎一开始跑，主回路就先降到 `yield_fps`。
+
+    :param base_fps: 用户配的 `pipe_fps`（`0` = 不限 ✓）
+    :param vt_on: 测谎**线程真的在喂帧**（`LiveThread._vt_on` ✓ 不是"勾选框勾着"✗）
+    :param yield_fps: 让路档位（`0` = 不让路 ✓ 原样返回）
+    :return: 主回路该设的 `fps_limit`
+
+    ⚠ `base_fps = 0`（不限）时**不能**直接 `min(0, y)`（会得到 0 = 又变回不限 ✗）——
+      这种情况让路档位就是上限 ✓。
+    """
+    base = max(0.0, float(base_fps or 0.0))
+    y = max(0.0, float(yield_fps or 0.0))
+    if not vt_on or y <= 0.0:
+        return base
+    if base <= 0.0:
+        return y
+    return min(base, y)
+
+
+def lie_hold_until(prev_until, lie_now, now, hold_s):
+    """测谎窗口的"有效期"（用户 2026-10-17 ✓「**直到测谎窗口消失**」✓）。
+
+    窗口还在（`lie_now` ✓）⇒ 每拍把截止时间往后推 `hold_s`；
+    窗口不在了 ⇒ **原样保留**（宽限期还在走 ✓ 抖动不会立刻把测谎切成两段 ✓）。
+    """
+    if lie_now:
+        return float(now) + max(0.0, float(hold_s or 0.0))
+    return float(prev_until or 0.0)
+
+
+def vt_lie_active(hold_until, arm_until, now):
+    """测谎这一刻算不算"在场"（**两段时间窗取大** ✓）。
+
+    · `hold_until`：**短窗**（`lie_hold_s`，默认 1.5 秒）——每拍看界面状态，窗口还在就往后推 ✓
+      （`lie_hold_until` ✓）；
+    · `arm_until`：**长预算**——一旦进过一次 `lie_*` 就给足 `vt_arm_s`（默认 25 秒）✓。
+
+    为什么需要长预算（用户 2026-10-17 现场 ✓ 这条是**实测逼出来的**）：
+      21:29:48.877 测谎窗口出现 ⇒ 开始喂帧；21:29:52.394 **窗口消失** ⇒ 停喂。
+      **只有 3.5 秒**，而 SDK 那才刚 `MATCHED`（title 0.944 ✓ 定位其实是好的 ✗）。
+      根因：`perception/screen_state` 认不出**小游戏那个窗口**——现场那一帧实测
+      `lie_game` 只有 **0.653**（门槛 0.75）、`lie_success` 0.745（门槛 0.80）
+      ⇒ 它回落 `combat` ⇒ 门一关，真正的跟踪段一帧都没喂到 ✗。
+    ⇒ 所以"喂不喂"不能**只看**界面状态那一条证据 ✓（它会漏），要有预算兜住 ✓。
+    ⚠ 预算**只在小游戏那一段成立**：`SUCCESS/ENDED` 一到就清零（见 `live_thread._vt_beat`）✗
+      不许按 25 秒把战斗检测白停在那儿 ✗。
+    """
+    return float(now) < max(float(hold_until or 0.0), float(arm_until or 0.0))
+
+
+def vt_should_feed(gate, lie_active):
+    """这一刻要不要把画面喂给测谎跟踪（B 语义：**先嗅探，触发才跑**）。
+
+    :param gate: `"screen"` = 只在小游戏窗口出现时喂（默认 ✓ 省 GPU ✓）；
+                 `"off"` = 老行为（勾上就一直喂 ✓ 2026-10-09 之前的语义 ✓）
+    :param lie_active: 窗口现在算不算"在场"（含宽限 ✓ 见 `lie_hold_until`）
+    """
+    return str(gate or "screen").lower() != "screen" or bool(lie_active)
+
+
 class FrameCtx:
     """**一帧的上下文**：阶段之间唯一的"传递物"（口径 B ✓ 用户 2026-10-15 拍板 ✓）。
 
@@ -118,7 +190,7 @@ class FrameCtx:
         self.t_take = t_take
         #: 「收到这一帧 → 决策完」那段计时的**起点** ✓
         self.t_pipe = t_pipe
-        #: 喂 Agent 的那份世界快照（**冻结过的** ✓ 见 `perception/world_state.py` 的 `_freeze` ✓）
+        #: 喂 Agent 的那份世界快照（**冻结过的** ✓ 见 `perception/world/world_state.py` 的 `_freeze` ✓）
         self.ws = ws
 
     def __repr__(self):

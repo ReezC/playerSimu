@@ -29,8 +29,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from decision import input as dinput          # noqa: E402
-from decision import mouse_aim as ma          # noqa: E402
+from execution import input as dinput          # noqa: E402
+from execution import mouse_aim as ma          # noqa: E402
 
 
 def _numbers(text, default):
@@ -43,6 +43,7 @@ def _numbers(text, default):
 
 
 def main(argv=None) -> int:
+    from execution import aim_convert as ma_c   # 2026-10-18：换算那半拆出去了 ✓
     ap = argparse.ArgumentParser(description="鼠标绝对定位实测探针（撞角 → 走固定步数）")
     ap.add_argument("--counts", default="500,500", help="走多少指令单位，默认 500,500")
     ap.add_argument("--click", action="store_true", help="走完顺便点一下左键（默认只走不点）")
@@ -53,11 +54,11 @@ def main(argv=None) -> int:
     print(" 鼠标定位探针（走完**请你报**光标实际在屏幕的哪个位置）")
     print("=" * 62)
 
-    ok, why = ma.aim_available()
+    ok, why = ma_c.aim_available()
     print("① 可用性：%s%s" % ("✓" if ok else "✗", ("　" + why) if why else ""))
     if not ok:
         return 2
-    gain = ma.load_gain()
+    gain = ma_c.load_gain()
     print("② 当前增益（文件）：%r px/单位" % (gain,))
     try:
         vx, vy = ma._virtual_origin()

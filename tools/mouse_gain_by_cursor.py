@@ -36,13 +36,15 @@ TOL = 0.15
 
 def _probe():
     """读一次 A 机光标 + 桌面 ⇒ `(x, y, vx, vy, vw, vh, cap)`；问不到 ⇒ `None` ✓。"""
-    from decision import input as dinput
-    return dinput.cursor_probe()
+    from execution import input as dinput
+    from execution import remote as _remote_mod
+    return _remote_mod.cursor_probe()
 
 
 def measure():
     """⇒ `(每档的表, gain_screen, 人话)`；量不了 ⇒ 抛 `RuntimeError(人话)` ✓。"""
-    from decision import mouse_aim as ma
+    from execution import aim_convert as ma_c
+    from execution import mouse_aim as ma
     p = _probe()
     if p is None:
         raise RuntimeError(
@@ -50,7 +52,7 @@ def measure():
             "也可能是 relay 连不上（先看能不能 telnet 到 9000 ✓）")
     vx, vy, vw, vh, cap = p[2], p[3], p[4], p[5], p[6]
     rows = []
-    ma.corner_zero()                     # 撞到 A 机桌面左上角（已知原点 ✓）
+    ma_c.corner_zero()                     # 撞到 A 机桌面左上角（已知原点 ✓）
     time.sleep(0.25)
     for u in STEPS:
         a = _probe()
@@ -81,7 +83,9 @@ def main():
     ap.add_argument("--frame", default=None, help="手工给帧尺寸，如 1366x768（流抓不到时用 ✓）")
     a = ap.parse_args()
 
-    from decision import mouse_aim as ma
+    from execution import aim_convert as ma_c
+
+    from execution import mouse_aim as ma
     from tools.mouse_aim_calib import _connect_input, _grab, _open_stream
 
     print("[1/4] 连输入通道…")
@@ -148,13 +152,13 @@ def main():
     if not (0.01 <= gx <= 50.0 and 0.01 <= gy <= 50.0):
         print("[X] 算出来的数不像话 ⇒ **不写盘** ✓")
         return 2
-    ma.save_gain(gx, gy, frame_shape=frame_wh,
+    ma_c.save_gain(gx, gy, frame_shape=frame_wh,
                  extra={"probe": {"source": "relay-cursorpos", "by": "cursor",
                                   "screen_px_per_unit": [round(gx_s, 6), round(gy_s, 6)],
                                   "scale": [round(sx, 6), round(sy, 6)],
                                   "worst_rel": round(worst, 4)}})
     print("已写 %s 的 **%dx%d** 那一份 ✓（别的尺寸那份不动 ✓）"
-          % (ma.GAIN_PATH, frame_wh[1], frame_wh[0]))
+          % (ma_c.GAIN_PATH, frame_wh[1], frame_wh[0]))
     return 0
 
 

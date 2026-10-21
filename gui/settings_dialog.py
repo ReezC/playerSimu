@@ -36,7 +36,7 @@ from core import mapdata, perf, winperf
 from decision.agent import settings
 from gui import theme
 from gui.project import last_opened
-from perception import classes
+from perception.detect import classes
 from perception import minimap as mm
 # NoWheel* 必须模块级导入：控件在 __init__ 里建，方法里的懒导入到不了那儿。
 # （详见 docs/UI规范.md：滚轮不许改参数）
@@ -884,6 +884,17 @@ class SettingsDialog(QDialog):
             "离平台左边界 7px，而这里填的是 10px ⇒ 现在能认出来 ✓）。\n"
             "⚠ 只影响**原本找不到**的情形 ⇒ 已经判对的结果一个都不会变 ✓。")
 
+        # ①' ⭐ 空中判定(px)（用户 2026-10-18 ✓：离下方 foothold 超过 200 不算到达）
+        self.sp_air_gap = NoWheelSpinBox()
+        self.sp_air_gap.setRange(0, 2000)
+        self.sp_air_gap.setSingleStep(10)
+        self.sp_air_gap.setValue(int(getattr(settings, "air_gap_px", 200) or 0))
+        row("空中判定(px)", self.sp_air_gap,
+            "**离脚下那块平台多高还算「站在上面」**（世界像素）。超过它 ⇒ 判「**空中**」（界面"
+            "「fh：空中」）⇒ 该拍**不算站上平台**：到达不成立 / idle·站桩计时不开始 / 不算在战斗区域里。\n\n"
+            "为什么：跳过去时人还在半空，脚下读到的却仍是**下面那块平台** ⇒ 老判据当场判「到了」⇒ idle 从"
+            "半空就开始算、任务提前收工 ✗。\n\n默认 200；调大 ⇒ 更容易判「落地」；调小 ⇒ 更严；0 = 关（老行为）。")
+
         # ② 坐标对齐误差时间
         self.sp_align_hold = NoWheelSpinBox()
         self.sp_align_hold.setRange(0, 5000)
@@ -939,7 +950,7 @@ class SettingsDialog(QDialog):
         #   原话："移除卡住判定时长(s)，**统一采用移动操作尝试间隔(ms)**" ✓。
         #   那些"多久没进展就算卡住"的判据现在统一读 **「移动操作尝试间隔(ms)」**
         #   （在「路线识别 → 寻路配置」组里 ✓，一处配置、多处判据 ✓）；
-        #   走（`WalkJob`）照旧用 `route.STALL_S` 常量 + 「寻路超时时间」兜底 ✓。
+        #   走（`WalkJob`）照旧用 `jobs.STALL_S` 常量 + 「寻路超时时间」兜底 ✓。
 
         # ⚠ 这里**曾经**摆过一个「走的方向」下拉（2026-09-26 用户明确删掉）：
         # 走只有一种走法 —— 朝目标集合的 x 中点；设置是**全局参数**，
@@ -1400,6 +1411,11 @@ class SettingsDialog(QDialog):
         at = int(self.sp_align_tol.value())
         if at != settings.align_tol_px:
             settings.align_tol_px = at
+            settings.save()
+        # ⭐ 空中判定（2026-10-18 用户 ✓）：回填 / 写回是**两件事**，缺一不可 ✓（见上面那段教训）
+        _ag = int(self.sp_air_gap.value())
+        if _ag != int(getattr(settings, "air_gap_px", -1)):
+            settings.air_gap_px = _ag
             settings.save()
         ah = int(self.sp_align_hold.value())
         if ah != settings.align_hold_ms:

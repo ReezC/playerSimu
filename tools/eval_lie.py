@@ -25,8 +25,8 @@ import cv2
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from perception.lie_group import GroupMotion  # noqa: E402
-from perception.lie_tracker import LieTracker  # noqa: E402
+from liedetect.lie_group import GroupMotion  # noqa: E402
+from liedetect.lie_tracker import LieTracker  # noqa: E402
 from tools.synth_lie import make_case  # noqa: E402
 
 

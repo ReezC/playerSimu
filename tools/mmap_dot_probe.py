@@ -42,8 +42,12 @@ import numpy as np                                          # noqa: E402
 
 from core import mapdata                                    # noqa: E402
 from core.imgio import imread, imwrite                      # noqa: E402
+from perception import map_const
 from perception import minimap as mm                        # noqa: E402
+from perception import map_calib
 from core import config                                    # noqa: E402
+from perception import map_dot
+from perception import map_locator
 
 OUT_DEFAULT = ROOT / "data" / "dot_probe"
 
@@ -152,13 +156,15 @@ def grab_image(path, box):
 
 def measure(panels, terrain, calib, tag, out_dir, track=True, roi=None):
     """逐帧跑识别器（多帧时带跨帧跟踪）→ 统计 dict。"""
+    from perception import map_locator
+    from perception import map_dot
     if track:
-        tr = mm.PlayerDotTracker()
+        tr = map_locator.PlayerDotTracker()
         rows = [tr.update(p, calib=calib, terrain=terrain, roi=roi)
                 for p in panels]
     else:
         # 离线单帧：**不跨帧**（一拍谈不上"连续确认"），直接给单帧结论
-        rows = [dict(mm.find_player_dot(p, calib=calib, terrain=terrain, roi=roi),
+        rows = [dict(map_dot.find_player_dot(p, calib=calib, terrain=terrain, roi=roi),
                      confirmed=False) for p in panels]
 
     def med(key, pred=None):
@@ -205,7 +211,7 @@ def measure(panels, terrain, calib, tag, out_dir, track=True, roi=None):
                     stat["conf_frames"]))
         f1 = out_dir / ("%s_panel.png" % tag)
         imwrite(f1, vis)
-        m = mm.dot_mask(p)
+        m = map_dot.dot_mask(p)
         mvis = cv2_resize(np.dstack([m * 255] * 3), z)
         f2 = out_dir / ("%s_mask.png" % tag)
         imwrite(f2, mvis)
@@ -358,12 +364,12 @@ def main():
         if not panels:
             continue
         # 标定**按来源分开存**（两条来源的面板尺寸差 5.6 倍）：量哪条来源就用哪份
-        cal_src = tag if tag in (mm.SRC_STREAM, mm.SRC_LIVE) else None
+        cal_src = tag if tag in (map_const.SRC_STREAM, map_const.SRC_LIVE) else None
         calib = mapdata.load_calib(a.map_id, cal_src) if a.map_id else None
         if a.map_id:
             print("   标定（%s）：%s"
-                  % (mm.SRC_LABEL.get(cal_src, cal_src or "不限"),
-                     "有" if mm.has_geometry(calib) else "没有"))
+                  % (map_const.SRC_LABEL.get(cal_src, cal_src or "不限"),
+                     "有" if map_calib.has_geometry(calib) else "没有"))
         s = measure(panels, terrain, calib, tag, out_dir,
                     track=not offline, roi=roi)
         show(s)

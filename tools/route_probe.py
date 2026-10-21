@@ -4,7 +4,7 @@
 用户 2026-09-27 要求："可以拿**石人寺院**地图测试寻路" ✓。
 
 为什么要有它：`selftest_*` 钉的是"**某一处判据**对不对" ✓；而"**这张图到底能不能走过去**"要把
-地形 + 集合 + 边 + **执行器参数**串起来看才知道 ✓ —— 这个串法**只有一处**：`route.plan_jobs`
+地形 + 集合 + 边 + **执行器参数**串起来看才知道 ✓ —— 这个串法**只有一处**：`pathing.plan_jobs`
 （面板「命令前往」与 agent 的路径解析器都走它 ✓）。这里就把它的结果摆出来 + 做几项体检 ✓。
 
 用法：
@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import sys
+from decision import jobs as jobmod
+from decision import pathing
 
 #: 默认那张图 —— **石人寺院III**（`projects/石人寺院III/project.yaml` ✓）：地形 + 集合都齐 ✓
 DEFAULT_MAP = "106010105"
@@ -27,9 +29,10 @@ DEFAULT_SRC, DEFAULT_DST = "一楼", "顶层"
 
 def probe(map_id, src, dst, out=print):
     """解析 `src → dst` 并体检 → `[(ok, 说明), …]`（**纯函数**：用例直接调它 ✓）。"""
+    from decision import pathing
+    from decision import jobs as jobmod
     from core import mapdata
     from core import zones as zmod
-    from decision import route
 
     checks = []
     t = mapdata.load(map_id)
@@ -37,16 +40,16 @@ def probe(map_id, src, dst, out=print):
     if t is None or z is None:
         return [(False, "地形/集合读不到（%s）：terrain=%s zones=%s"
                  % (map_id, t is not None, z is not None))]
-    names = sorted(z.sets)
+    names = sorted(z.zones)
     out("地图 %s：集合 %d 个（%s）　边 %d 条"
         % (map_id, len(names), "、".join(names), len(z.edges)))
     for name in (src, dst):
-        checks.append((name in z.sets,
+        checks.append((name in z.zones,
                        "集合「%s」在这张图里圈过" % name))
     if not all(ok for ok, _ in checks):
         return checks
 
-    plan = route.plan_jobs(t, z, src, dst, tol_px=route.ALIGN_TOL_PX, hold_ms=250)
+    plan = pathing.plan_jobs(t, z, src, dst, tol_px=jobmod.ALIGN_TOL_PX, hold_ms=250)
     path = list(plan.get("path") or [])
     jobs = list(plan.get("jobs") or [])
     checks.append((bool(jobs), "解析出 %d 步：%s"
@@ -59,7 +62,7 @@ def probe(map_id, src, dst, out=print):
     ladders = set(str(v) for v in zmod.ladder_ids(t).values())
     out("步骤：")
     for i, j in enumerate(jobs):
-        kind = route.JOB_KINDS.get(type(j).__name__, type(j).__name__)
+        kind = jobmod.JOB_KINDS.get(type(j).__name__, type(j).__name__)
         label = zmod.kind_label(kind) if kind in zmod.EDGE_KINDS else type(j).__name__
         bits = ["第 %d 步 %s" % (i + 1, label)]
         lid = getattr(j, "ladder_id", None)
@@ -76,7 +79,7 @@ def probe(map_id, src, dst, out=print):
             v = str(getattr(j, attr, "") or "")
             if v:
                 bits.append("%s=%s" % (cn, v))
-                checks.append((v in z.sets, "第 %d 步的%s「%s」存在" % (i + 1, cn, v)))
+                checks.append((v in z.zones, "第 %d 步的%s「%s」存在" % (i + 1, cn, v)))
         for attr, cn in (("dst_x", "目标 x"), ("dst_y", "目标面 y")):
             v = getattr(j, attr, None)
             if v is not None:
@@ -87,20 +90,21 @@ def probe(map_id, src, dst, out=print):
 
 def probe_all(map_id, out=print):
     """该图**所有集合两两**可达性体检 → `[(ok, 说明), …]`（看"缺哪条边"最直观 ✓）。"""
+    from decision import pathing
+    from decision import jobs as jobmod
     from core import mapdata
     from core import zones as zmod
-    from decision import route
 
     t, z = mapdata.load(map_id), zmod.load(map_id)
     if t is None or z is None:
         return [(False, "地形/集合读不到：%s" % map_id)]
-    names = sorted(z.sets)
+    names = sorted(z.zones)
     bad = []
     for a in names:
         for b in names:
             if a == b:
                 continue
-            plan = route.plan_jobs(t, z, a, b, tol_px=route.ALIGN_TOL_PX, hold_ms=250)
+            plan = pathing.plan_jobs(t, z, a, b, tol_px=jobmod.ALIGN_TOL_PX, hold_ms=250)
             if not plan.get("jobs"):
                 bad.append((a, b, str(plan.get("why") or "").strip()))
     total = len(names) * (len(names) - 1)

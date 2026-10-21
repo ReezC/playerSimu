@@ -1,0 +1,13 @@
+{
+  "frames": 280,
+  "boxes": 683,
+  "from_model": 249,
+  "boxes_from_model": 598,
+  "protected": 0,
+  "kept_orig": 27,
+  "boxes_kept": 85,
+  "cleared": 4,
+  "median_boxes": 2.0,
+  "conf_thr": 0.6,
+  "weights": "E:\\MyPrograms\\playerSimu\\projects\\鳄鱼潭1\\models\\detect_v3.pt"
+}

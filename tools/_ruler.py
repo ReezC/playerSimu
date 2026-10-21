@@ -35,7 +35,7 @@ def main():
         return 2
     src, url = _open_stream()
     print("[2] 已开流：%s" % url)
-    from decision import input as dinput
+    from execution import input as dinput
     try:
         dinput.mouse_move(-4000, -4000)          # 撞角归零（已验证会落到 (0,0) ✓）
         time.sleep(0.8)

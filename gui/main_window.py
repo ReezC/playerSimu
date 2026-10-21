@@ -1286,7 +1286,7 @@ class MainWindow(QMainWindow):
         """
         from decision import hotkey as _hotkey
         from decision.agent import settings
-        from decision.input import resolve_vk
+        from execution.keys import resolve_vk
         key_name = settings.keymap.get("auto", "f11")
         vk = resolve_vk(key_name)
         if vk is None:

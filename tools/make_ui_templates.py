@@ -1,6 +1,6 @@
 """从素材视频裁出界面锚点模板图（perception/ui_templates/*.png）。
 
-锚点的裁剪坐标记在 perception/ui_state.py 的 ANCHORS 表里 —— 要加新界面
+锚点的裁剪坐标记在 perception/screen/ui_state.py 的 ANCHORS 表里 —— 要加新界面
 （选频道 / 选角 …）先在那边登记，再跑本脚本生成图，不用手裁。
 
 用法：
@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from perception import ui_state
+from perception.screen import ui_state
 
 
 def frame_at(video, ts):

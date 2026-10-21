@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 os.chdir(str(ROOT))
 sys.path.insert(0, str(ROOT))
 
-from decision import input as dinput                                # noqa: E402
+from execution import input as dinput                                # noqa: E402
 from tools.mouse_aim_calib import (_connect_input, _grab, _open_stream,   # noqa: E402
                                    park_below_band, probe_band_rect)
 from tools.mouse_gain_calib import _cursor_delta                    # noqa: E402

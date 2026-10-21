@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 import cv2                                            # noqa: E402
 
-from decision import input as dinput                  # noqa: E402
+from execution import input as dinput                  # noqa: E402
 from tools.mouse_aim_calib import _connect_input, _grab, _open_stream  # noqa: E402
 
 OUT = Path("data/_probe_corner_dump")

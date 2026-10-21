@@ -14,9 +14,9 @@
   上下跳的目标**两头不靠** ✓（现场：同一只怪的框一闪一闪、甚至整拍消失 ✓）。
 
 **现在两层，职责分开**：
-  · `perception/bytetrack.py::ByteTracker` —— ByteTrack 内核：两阶段关联（高分 / 低分）✔
+  · `perception/track/bytetrack.py::ByteTracker` —— ByteTrack 内核：两阶段关联（高分 / 低分）✔
     卡尔曼 **8 维匀速**平滑 ✔ **失联帧长**缓冲 ✔ 确认闸 ✔ 每轨记账（历史/平均置信/存活）✔
-  · `perception/tracker.py::MobTracker` —— 只做业务适配：相机（角色）位移补偿 ✓、
+  · `perception/track/tracker.py::MobTracker` —— 只做业务适配：相机（角色）位移补偿 ✓、
     `Track → Mob` 转换 ✓、保持对外接口（`update` / `kill` / `drain_flick` / `diag`）✓
 
 对外接口（**一个字没改** ✓）：
@@ -31,8 +31,8 @@
 """
 import time
 
-from perception.bytetrack import CONFIRM_FRAMES, TRACK_BUFFER_MS, ByteTracker
-from perception.world_state import Mob
+from perception.track.bytetrack import CONFIRM_FRAMES, TRACK_BUFFER_MS, ByteTracker
+from perception.world.world_state import Mob
 
 #: ⭐⭐ 确认闸（2026-10-11 ✓ 治"框疯狂闪烁"✓ 借 OC-SORT 的 `lock_confirmations` 思路 ✓）：
 #:  · `CONFIRM_HITS` —— 一条新轨迹**连续被看到几拍**才有资格显示；
@@ -126,7 +126,7 @@ def _iou(a, b):
 
 
 class MobTracker:
-    """怪物追踪器（**2026-10-17 换内核**：`perception.bytetrack` ✓ 见模块文档）。
+    """怪物追踪器（**2026-10-17 换内核**：`perception.track.bytetrack` ✓ 见模块文档）。
 
     ⚠ 对外契约**一个字没改**：
       · `update(detections, low_detections=(), player_world=None) -> [Mob]`；
@@ -331,6 +331,10 @@ PLAYER_CONFIRM_MS = 60.0
 #: 的框**只允许续命** ✓（见 `PlayerTracker.update` 的"两个前提" ✓）—— 而且玩家这边
 #: 比怪**多一条**前提（黄点必须对得上 ✓）：玩家低分框很可能是**别人** ✗。
 PLAYER_LOW_CONF_RATIO = 0.5
+#: ⭐⭐ **单拍框位移上限**（画面像素 ✓）：5 fps 下 48 px ≈ 240 px/秒，比最快的人还快一点 ✓
+#:   —— 超过它就**不许当速度用**（否则幽灵外推会照着这个"速度"一路飞出去 ✗）。
+#:   （用户 2026-10-20 "**玩家检出框在不停的往上快速飞出屏幕**"✗ 见 `update` 里那段 ✓）
+MAX_BOX_STEP = 48.0
 
 
 class PlayerTracker:
@@ -450,7 +454,7 @@ class PlayerTracker:
         if world is None:
             return None
         try:
-            from perception import world_state as _ws
+            from perception.world import world_state as _ws
             return (float(world[0]) - float(cx),
                     float(world[1]) - (float(bottom) + float(_ws.FOOT_OFFSET_PX)))
         except (TypeError, ValueError):
@@ -538,7 +542,7 @@ class PlayerTracker:
             cam_x = float(self._last_world[0]) - float(self._last_box[0])
             # ⭐ 脚底偏移（用户 2026-09-28 ✓）—— 与 `screen_to_world` **同一份口径** ✓
             #   （读 `world_state` 的镜像 ✓ 那边不做反向 import ✓）。
-            from perception import world_state as _ws
+            from perception.world import world_state as _ws
             cam_y = (float(self._last_world[1])
                      - (float(self._last_box[2]) + float(_ws.FOOT_OFFSET_PX)))
             dx = (float(cx) + cam_x) - float(world[0])
@@ -1002,6 +1006,12 @@ class PlayerTracker:
             #     干等 ✓（`max_missed` 是 10 拍 ⇒ 一寸一寸挪回来太慢 ✓）。
             if accept is None:
                 self._tele_miss += 1
+                if teleport:
+                    # 读数"跳"了、屏幕上却**没人在那儿** ⇒ 多半是**黄点读数在跳**
+                    # （换层 / 掩码找回 / 帧间位移漂 ✓ 见 `minimap`）——
+                    # 记一笔，现场一眼能分出"是读数抖"还是"YOLO 丢了"✓
+                    self.diag["world_jump"] = self.diag.get("world_jump", 0) + 1
+                    self._note("world_jump", dw=dw, box=self._box)
                 if self._tele_miss >= TELEPORT_HOLD_MAX:
                     self._box = None
                     self._vx = self._vy = 0.0
@@ -1020,8 +1030,18 @@ class PlayerTracker:
             # ⚠ 这一拍是**低分档续命**来的吗？（`scored` 的元组是 5 项 ✓ 低分档是 6 项 ✓）
             _is_low = len(accept) > 5 and bool(accept[5])
             a = self.smooth
-            self._vx = a * self._vx + (1 - a) * (nb[0] - self._box[0])
-            self._vy = a * self._vy + (1 - a) * (nb[1] - self._box[1])
+            # ⭐⭐ **单拍位移不许直接当速度**（`MAX_BOX_STEP` ✓）：认错人 / 框跳一下之后，
+            #   这个"速度"会被幽灵外推**每拍重复施加** ⇒ 框一路飞出去（用户 2026-10-20
+            #   "玩家检出框在不停的往上快速飞出屏幕"✗ 的另一半成因 ✓）。
+            _dvx = nb[0] - self._box[0]
+            _dvy = nb[1] - self._box[1]
+            if abs(_dvx) > MAX_BOX_STEP or abs(_dvy) > MAX_BOX_STEP:
+                self.diag["box_jump"] = self.diag.get("box_jump", 0) + 1
+                self._note("box_jump", d=(round(_dvx, 1), round(_dvy, 1)))
+                _dvx = max(-MAX_BOX_STEP, min(MAX_BOX_STEP, _dvx))
+                _dvy = max(-MAX_BOX_STEP, min(MAX_BOX_STEP, _dvy))
+            self._vx = a * self._vx + (1 - a) * _dvx
+            self._vy = a * self._vy + (1 - a) * _dvy
             self._box = nb
             self._last_box = nb         # 相机那一份也更新（下一帧要用它 ✓）
             self._missed = 0
@@ -1050,12 +1070,19 @@ class PlayerTracker:
             self._born, self._hits, self._confirmed = None, 0, False
             return None
         cx, cy, bottom, conf, bw, bh = self._box
-        # ⚠⚠ **幽灵外推只吃"有界的"那条预测**（`px0/py0` ✓），**除非**这一拍是**武装过的
-        #   真传送**（`teleport` ✓ 那是有证据的大位移 ✓）：
-        #   2026-10-11 实测踩到 —— 大位移一改预测，幽灵也跟着跳 ⇒ **报出去的框自己飞过去** ✓
-        #   （用户原话："**隔这么远直接飞过去锁别人**"✗）。⇒ 挑候选用 `px/py` ✓、
-        #   外推用 `px0/py0` ✓（步长永远只有"走路那么大"✓ 绝不飞 ✓）。
-        _gx, _gy = (px, py) if teleport else (px0, py0)
+        # ⚠⚠⚠ **幽灵外推只吃"有界的"那条预测**（`px0/py0` ✓）—— **没有例外** ✗。
+        #   2026-10-11 实测踩到：大位移一改预测，幽灵也跟着跳 ⇒ **报出去的框自己飞过去** ✓
+        #   （用户原话："**隔这么远直接飞过去锁别人**"✗）⇒ 当时只把"没武装的大位移"挡了，
+        #   **武装过的传送那一支还留着** ✗。
+        #   ⭐⭐⭐ 2026-10-20 用户："**玩家检出框在不停的往上快速飞出屏幕**"✗ —— 就是这一支 ✓：
+        #     小地图一抖（换层 / 掩码找回 / 帧间位移漂 ✓）⇒ 读数"相邻两拍"跳 ±600~1000 ✓
+        #     ⇒ **武装成立**（它不是假传送：读数确实在跳 ✓ 判据拦不住 ✗）⇒ 这一拍 **没匹配到
+        #     任何人** ⇒ 走到这里 ⇒ 老代码拿 `px/py` 外推 ⇒ **框每拍跳 dw、连续 N 拍就飞出屏幕**✓
+        #   ⇒ 现在**只认检出**：位置只能在"**真的匹配到一个候选**"那一支（上面 `accept`）里
+        #     大幅挪动 ✓（那才是"屏幕上确实有个人在那儿"✓）；外推一律按走路步长 ✓ 绝不飞 ✓。
+        #     ⚠ 代价：真传送而**没检出**的那几拍框会停在原地 ⇒ `_tele_miss` 3 拍后解锁重锁 ✓
+        #       （宁可慢 3 拍，也不许"一个坏读数把框送出屏幕"✗ —— 同一个取舍 ✓）。
+        _gx, _gy = px0, py0
         self._box = (_gx, _gy, bottom + (_gy - cy), conf, bw, bh)
         self._last_box = self._box    # 外推的这一份也是"我最好的估计" ⇒ 相机照它算 ✓
         # ⭐ 角标用：这一拍是**外推**来的（位置不是实测 ✓ 见 live_thread 那个 `*` ✓）

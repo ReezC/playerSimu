@@ -1,4 +1,4 @@
-"""A 层（`perception/lie_group.py`）自检：**合成场景**钉住三条契约。
+"""A 层（`liedetect/lie_group.py`）自检：**合成场景**钉住三条契约。
 
 约定与 `tools/selftest_lie_tracker.py` 一致：打印 `[OK]/[NG]`，全绿 `exit=0` ✓。
 
@@ -18,7 +18,7 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from perception.lie_group import GroupMotion  # noqa: E402
+from liedetect.lie_group import GroupMotion  # noqa: E402
 
 _FAIL = []
 _RNG = np.random.RandomState(20260930)

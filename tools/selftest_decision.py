@@ -14,6 +14,7 @@
     · 界面层只读配置、不改任何值。
 """
 
+from execution import aim_convert as ma_c
 import os
 import sys
 import time
@@ -57,9 +58,10 @@ from PyQt5.QtWidgets import QApplication as _QApp              # noqa: E402
 _APP = _QApp.instance() or _QApp([])                           # noqa: F841
 
 import decision.agent as ag                                    # noqa: E402
-import decision.input as dinput                                # noqa: E402
+import execution.input as dinput                                # noqa: E402
+from execution import remote as _remote_mod
 from decision.agent import CombatAgent                         # noqa: E402
-from perception.world_state import Mob, Player, WorldState      # noqa: E402
+from perception.world.world_state import Mob, Player, WorldState      # noqa: E402
 
 # --------------------------------------------------------------- 自检不许改用户文件
 # ⛔ `config/ui.yaml` 是**用户的**文件（窗口几何 / 字号 / 颜色）⇒ 自检**绝不许**写它 ✗
@@ -71,6 +73,8 @@ from perception.world_state import Mob, Player, WorldState      # noqa: E402
 import tempfile as _tempfile                                   # noqa: E402
 
 from gui import theme as _theme                                # noqa: E402
+from decision import jobs as jobmod
+from decision import pathing
 
 _theme.CFG = Path(_tempfile.mkdtemp(prefix="psimu_ui_")) / "ui.yaml"
 
@@ -114,9 +118,9 @@ class Harness:
         #   ✓（⚠ 不设的话"追击下前往"那条链会**早退在 `here_sets` 空**上 ⇒ 开关到底有没有用
         #   就**测不出来**了 ✗ —— 反向验证时正是这么被蒙过去的 ✓）。
         self.ws_hook = None
-        #: ⭐ **链路体检的返回值**（2026-10-11 补 ✓）：`_patched()` 会把它贴成 `dinput.link_health`
+        #: ⭐ **链路体检的返回值**（2026-10-11 补 ✓）：`_patched()` 会把它贴成 `_remote_mod.link_health`
         #:   ✓ —— 用例要摆"本地(仅测试)后端 / 通道坏了"这类局面时**改这个 dict** ✓
-        #:   （⚠ 别在外面再 `patch.object(dinput, "link_health", ...)` ✗：那个 patch 在**外层**
+        #:   （⚠ 别在外面再 `patch.object(_remote_mod, "link_health", ...)` ✗：那个 patch 在**外层**
         #:     ✓ 会被 `_patched()` 里这条**内层**盖掉 ⇒ 用例假绿 ✓ 我这一版就踩了 ✓）。
         self.link_health = {"ok": True}
 
@@ -156,14 +160,14 @@ class Harness:
     def _patched(self):
         # **三条按键路径都要挡**：
         #   ① agent 自己发序列用的 key_down/key_up（在 ag 命名空间）；
-        #   ② KeyState（移动键）走的是 decision.input 里的那两个；
+        #   ② KeyState（移动键）走的是 execution.input 里的那两个；
         #   ③ `tap`（点按类：追击起跳 / 规避跳 / 喝药）—— 它**直接调
         #      `_send`**，既不过①②，也不进 KeyState。漏掉这条，用例会真的往
         #      本机发键（往当前窗口打字）。
         # 前两条记成 down/up（presses/gaps 靠它），第三条单独记成 tap —— 点按
         # 是「按下+松开」，塞进 down/up 会打乱那些按对配平的用例。
         # ⚠ ③' **`dinput.tap` 也要挡**（2026-10-11 补 ✓）：定时清键 / 重置通道前的
-        #   "补按一遍方向键 ←/→/↓"（`decision/input.tap_directions` ✓）走的是**它** ✓；
+        #   "补按一遍方向键 ←/→/↓"（`execution/input.tap_directions` ✓）走的是**它** ✓；
         #   漏掉这条 ⇒ 每个用例都真的往本机发 3 下方向键（往当前窗口打字 ✗✗）——
         #   同第 ③ 条那个坑，只是入口不同 ✓（实测：改完那一刻要是没补，跑一次就中招 ✓）。
         with patch.object(ag.time, "monotonic", self.clock), \
@@ -173,8 +177,8 @@ class Harness:
              patch.object(dinput, "key_down", self._rec("down")), \
              patch.object(dinput, "key_up", self._rec("up")), \
              patch.object(dinput, "tap", self._rec("tap")), \
-             patch.object(dinput, "release_all_remote", self._rec("RELEASEALL")), \
-             patch.object(dinput, "link_health",
+             patch.object(_remote_mod, "release_all_remote", self._rec("RELEASEALL")), \
+             patch.object(_remote_mod, "link_health",
                          lambda: dict(self.link_health)):
             yield
 
@@ -555,7 +559,7 @@ def t_periodic_reset_channel():
     #    留下"这个方向键还按着"（角色一直走 ✓），只有补一个「按下 → 松开」才刷得回来 ✓。
     #    手动那个按钮一直有这一步 ✓（2026-10-01 ✓），**自动这条以前漏了** ✗ ⇒ 本次补上 ✓。
     #    ⛔ **↑ 必须排除**：它在这游戏里是**抓绳/上梯** ⇒ 补按它会把角色挂到绳上 ✗
-    #      （清键动作反倒造出一个新卡点 ✓ 见 `decision/input.DIRECTION_KEYS` ✓）。
+    #      （清键动作反倒造出一个新卡点 ✓ 见 `execution/input.DIRECTION_KEYS` ✓）。
     s6 = fresh_settings(resetall_interval=1)
     # ⚠ 2026-10-15 起**第一次清键要等满一个周期**（"从初始开始计时"✓ 见 ④ ✓）
     #   ⇒ 跑到 1 秒之后才见得到那一下 ✗（原来 `run(0.5)` 是在"第一拍抢跑"那版下写的 ✓）。
@@ -606,7 +610,7 @@ def t_periodic_reset_local_backend():
 
     远程/串口模式下 relay 那条 RELEASEALL 直接把固件侧按键清空，本地只需同步
     **记录**（KeyState.clear，故意不发 up）；但「本地(仅测试)」后端根本没有固件 ——
-    `dinput.release_all_remote()` 是空操作（`if _remote is not None`），
+    `_remote_mod.release_all_remote()` 是空操作（`if _remote is not None`），
     这时若也只清记录，本机那个键就永远按着了：后面 keys.set 里它已经被忘掉，
     再也不会补发 up。
     """
@@ -619,8 +623,8 @@ def t_periodic_reset_local_backend():
          patch.object(ag, "key_up", h._rec("up")), \
          patch.object(dinput, "key_down", h._rec("down")), \
          patch.object(dinput, "key_up", h._rec("up")), \
-         patch.object(dinput, "release_all_remote", lambda: None), \
-         patch.object(dinput, "link_health",
+         patch.object(_remote_mod, "release_all_remote", lambda: None), \
+         patch.object(_remote_mod, "link_health",
                       lambda: {"ok": True, "backend": "local"}):
         h.agent.keys.set({"left"})                 # 手上正按着左键
         check(("down", "left") in [(k, v) for _t, k, v in h.log],
@@ -659,14 +663,14 @@ def t_link_health_watch():
     events = []
 
     with patch.object(ag.time, "monotonic", h.clock), \
-         patch.object(dinput, "link_health", lambda: dict(state)), \
-         patch.object(dinput, "reconnect_remote",
+         patch.object(_remote_mod, "link_health", lambda: dict(state)), \
+         patch.object(_remote_mod, "reconnect_remote",
                       lambda *a, **k: (reconnected.append(1), True)[1]), \
          patch.object(ag.behavior, "event",
                       lambda name, **kw: events.append((name, kw))), \
          patch.object(ag, "key_down", h._rec("down")), \
          patch.object(ag, "key_up", h._rec("up")), \
-         patch.object(dinput, "release_all_remote", h._rec("RELEASEALL")):
+         patch.object(_remote_mod, "release_all_remote", h._rec("RELEASEALL")):
         # 体检是 10 秒一次，所以第一拍（t≈0）不看；推到 11 秒才该看第一次
         h.clock.t += 11.0
         h.agent.tick(h.ws(True))
@@ -1295,13 +1299,13 @@ def t_rest_manual_request():
 
 
 def t_class_table_single_source():
-    """类别表只在 perception/classes.py 定义：别处不许再抄一份。
+    """类别表只在 perception/detect/classes.py 定义：别处不许再抄一份。
 
     抄一份的后果是「加类别时漏改一处」，表现是框颜色/名字对不上、或者标注写成
     别的类 —— 这类错很安静（不报错、看起来也像对的），所以用文本扫描钉住它。
     """
     import re
-    from perception import classes
+    from perception.detect import classes
     root = Path(__file__).resolve().parent.parent
     pat = re.compile(r"CLASS_NAMES\s*=\s*[\{\[]")
     bad = []
@@ -1312,7 +1316,7 @@ def t_class_table_single_source():
             for i, ln in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
                 if pat.search(ln) and "import" not in ln:
                     bad.append("  %s:%d  %s" % (f.relative_to(root), i, ln.strip()))
-    check(not bad, "类别表被抄了第二份（应只从 perception/classes.py 取）：\n"
+    check(not bad, "类别表被抄了第二份（应只从 perception/detect/classes.py 取）：\n"
                    + "\n".join(bad))
     check(classes.ORDER == list(range(len(classes.ORDER))),
           "类别 id 不是从 0 连续：%s" % classes.ORDER)
@@ -1427,11 +1431,11 @@ def t_no_random_input_delay():
 def t_input_local_only():
     """F10~F12 是本机操作键：三条发送路径都不发，其它键照发。"""
     sent = []
-    real_send, real_remote, real_blocked = dinput._send, dinput._send_remote, dinput._blocked
+    real_send, real_remote, real_blocked = dinput._send, _remote_mod._send_remote, _remote_mod._blocked
     dinput._send = lambda vk, up: sent.append(("local", vk, up))
-    dinput._send_remote = lambda cmd: sent.append(("remote", cmd))
-    dinput._remote = object()          # 假装连着远程通道（最容易漏发的路径）
-    dinput._blocked = False
+    _remote_mod._send_remote = lambda cmd: sent.append(("remote", cmd))
+    _remote_mod._remote = object()          # 假装连着远程通道（最容易漏发的路径）
+    _remote_mod._blocked = False
     try:
         for name in ("f10", "f11", "f12", "F10"):
             sent.clear()
@@ -1444,8 +1448,8 @@ def t_input_local_only():
             dinput.key_down(name)
             check(len(sent) == 1, "普通键 %s 没发出去" % name)
     finally:
-        dinput._send, dinput._send_remote = real_send, real_remote
-        dinput._remote, dinput._blocked = None, real_blocked
+        dinput._send, _remote_mod._send_remote = real_send, real_remote
+        _remote_mod._remote, _remote_mod._blocked = None, real_blocked
 
     from decision import manual_input
     from pynput import keyboard
@@ -1478,7 +1482,7 @@ def t_attack_box():
          0 = 不限时画到画面边 ✓；参数三边同步 + 老文件兜底 0 ✓。
     """
     from decision import agent as ag_mod
-    from perception.world_state import Mob
+    from perception.world.world_state import Mob
 
     s = fresh_settings(attack_dist=80.0, min_attack_dist=0)
     h = Harness(s)
@@ -1878,7 +1882,7 @@ def t_chase_hop_when_stuck():
     ⚠ 判据用的是**世界坐标 x**（`ws.player.world_x`）—— 不是画面 x（镜头跟着人走，
     画面 x 不动说明不了什么 ✗）。所以下面 ② 反例也必须摆 `world_x`，摆画面 x 测不到。
     """
-    from decision import route
+    from decision import jobs as jobmod
     base = dict(strategy="chase", attack_dist=80.0, chase_jump_enabled=False,
                 move_retry_ms=500, align_tol_px=10, jump_random_prob=0.0)
 
@@ -1947,14 +1951,14 @@ def t_chase_hop_when_stuck():
           "站桩输出（attack）时也跳了 —— 这条逻辑只管 chase")
 
     # ---- ④' **挂着寻路任务（state=climb）时也不跳** ----
-    #      任务自己有"走不动 ⇒ 单点跳"（`route.WalkJob._hop_or_fail` ✓ 发的是 KeyState 的
+    #      任务自己有"走不动 ⇒ 单点跳"（`jobmod.WalkJob._hop_or_fail` ✓ 发的是 KeyState 的
     #      按住键、不是 `tap` ⇒ 不会混进 `h.taps` ✓），这里再跳就是两处打架。
     #      ⭐ **这条专门钉 `state != "chase"` 那道闸**：任务那一拍 `keys` 里**有方向键**
     #      （`_climb_tick` 自己加的 ✓）⇒ 没有那道闸，它在追击之外也照跳 ✗（反向验证
     #      把那道闸改成 `if False` 时，抓住它的正是这一条 ✓）。
     s7 = fresh_settings(**base)
     h7 = Harness(s7)
-    job = route.WalkJob("乙平台", [(900.0, 850.0, 950.0, 60.0, "1")],
+    job = jobmod.WalkJob("乙平台", [(900.0, 850.0, 950.0, 60.0, "1")],
                         tol_px=10, hold_ms=0, stall_s=99.0)
     with h7._patched():
         # ⚠ 不走 `run()` ⇒ 记录器的时间基准（`clock0`，只在 `run()` 里设）要自己摆 ✗
@@ -2032,7 +2036,7 @@ def t_chase_hop_when_stuck():
     h9 = Harness(s9)
     h9.mobs_fn = lambda _t: [Mob(id=1, x=690.0, y=500.0, w=40.0, h=40.0, conf=0.9)]
     # ⚠ 摆的是位置状态机给的那份（`on_rope_align` ✓ = 在绳段里 ✓ **且** x 对齐 ✓）；
-    #   它由 `perception/pos_state.py` 从 `terrain.ladder_at` + `align_tol_px` 算出来 ✓
+    #   它由 `perception/world/pos_state.py` 从 `terrain.ladder_at` + `align_tol_px` 算出来 ✓
     #   （计算本身在 `selftest_minimap` 里另有钉子 ✓）；这里只管 agent 怎么**用**它 ✓。
     h9.ws_hook = lambda w: setattr(w.player, "on_rope_align", True)
     h9.run(2.1)
@@ -2145,32 +2149,32 @@ def t_walk_only_center():
 
     集合里两条 foothold：x=600 与 x=800 ⇒ 中点 = 700。
     """
+    from decision import jobs as jobmod
     from PyQt5.QtWidgets import QApplication
 
-    from decision import route
 
     spots = [(600.0, 590.0, 610.0, -208.0, "1"),
              (800.0, 790.0, 810.0, -208.0, "2")]
     # ① **反向钉**：走的方向参数必须**不在**
-    check(not hasattr(route.WalkJob, "MODE_CENTER"),
+    check(not hasattr(jobmod.WalkJob, "MODE_CENTER"),
           "`WalkJob` 里又出现了 MODE_CENTER（走只有一种走法，用户 2026-09-26 明确删掉）")
-    check("mode" not in route.WalkJob("乙平台", spots).__dict__,
+    check("mode" not in jobmod.WalkJob("乙平台", spots).__dict__,
           "`WalkJob` 里又出现了 `mode`（走只有朝中点一种，方向不该来设置）")
     # ② 朝中点：站 500 → 往右；站 900 → 往左；站 705（中点附近、容差内）→ 站住等判到达
-    check(route.WalkJob("乙平台", spots).update(0.0, px=500.0)["move"] == 1,
+    check(jobmod.WalkJob("乙平台", spots).update(0.0, px=500.0)["move"] == 1,
           "朝中点：在中点左边该往右走")
-    check(route.WalkJob("乙平台", spots).update(0.0, px=900.0)["move"] == -1,
+    check(jobmod.WalkJob("乙平台", spots).update(0.0, px=900.0)["move"] == -1,
           "朝中点：在中点右边该往左走")
-    o = route.WalkJob("乙平台", spots).update(0.0, px=620.0)
+    o = jobmod.WalkJob("乙平台", spots).update(0.0, px=620.0)
     check(o["move"] == 1 and "集合中心 x=700" in o["note"],
           "朝中点：还没到该继续走、并说清目标是集合中点：%s" % o)
-    o = route.WalkJob("乙平台", spots).update(0.0, px=705.0)
+    o = jobmod.WalkJob("乙平台", spots).update(0.0, px=705.0)
     check(not o["move"] and "站住" in o["note"],
           "朝中点：到中点附近（差 5 px ≤ 容差）该站住等判到达：%s" % o)
     # ③ 到位判据：站在目标 foothold 上就算到（走是唯一"站上去就算到"的任务）
     # ⚠ 位置要放在**真的 foothold 区间里**（800 属于第二条 790~810）：700 是两条之间的
     # 空隙，站在那儿判"没到位"是对的 —— 朝中点走时会**经过** foothold，经过那一拍就判到 ✓
-    job = route.WalkJob("乙平台", spots)
+    job = jobmod.WalkJob("乙平台", spots)
     job.update(0.0, px=100.0)
     o = job.update(0.1, px=800.0, py=-208.0)
     check(o["done"] and "到达" in o["note"],
@@ -2188,8 +2192,8 @@ def t_walk_only_center():
     #    这正是用户现场那条「左上平台 →(走 仅向左)→ 左上」：目标是整片「左上」（x −387~657、
     #    中点 135），人站在平台上（x 2~87）⇒ 中点还在**右边** ⇒ 老代码一路按 →（用户原话
     #    "根本没向左"），而且"到集合区间的距离"恒为 0 ⇒ 3 秒后判「走不动了」= 卡住 ✗。
-    _L = route.WalkJob("乙平台", spots, walk_dir="left")
-    _R = route.WalkJob("乙平台", spots, walk_dir="right")
+    _L = jobmod.WalkJob("乙平台", spots, walk_dir="left")
+    _R = jobmod.WalkJob("乙平台", spots, walk_dir="right")
     o = _L.update(0.0, px=500.0)
     check(int(o["move"]) == -1,
           "配了「仅向左」，人却往右走（又回去看中点了）：%s" % o)
@@ -2199,12 +2203,12 @@ def t_walk_only_center():
     check("仅向左" in _L.note,
           "配了「仅向左」却没在提示里说清（人会以为它按中点走）：%r" % _L.note)
     # 到位判据照旧（站上目标集合的 foothold 就算到 ✓）—— `dir` 只管"怎么走"，不管"到没到"
-    _j = route.WalkJob("乙平台", spots, walk_dir="left")
+    _j = jobmod.WalkJob("乙平台", spots, walk_dir="left")
     _j.update(0.0, px=100.0)
     check(_j.update(0.1, px=800.0, py=-208.0)["done"],
           "「仅向左」时站在目标 foothold 上没判到达")
     # 方向不对（一直按左、x 却不再变小）⇒ `stall_s` 后失败，并说清是这条边的方向有问题
-    _j = route.WalkJob("乙平台", spots, walk_dir="left", stall_s=1.0, timeout_s=60.0)
+    _j = jobmod.WalkJob("乙平台", spots, walk_dir="left", stall_s=1.0, timeout_s=60.0)
     _j.update(0.0, px=500.0)
     o = None
     for _i in range(1, 40):
@@ -2214,7 +2218,7 @@ def t_walk_only_center():
     check(o is not None and o["failed"] and "仅向左" in o["note"] and "500" in o["note"],
           "「仅向左」卡住时没说清原因：%r" % (o or {}).get("note"))
     # 认不出的值 ⇒ 退回默认（朝中点），不许瞎按
-    _bad = route.WalkJob("乙平台", spots, walk_dir="up")
+    _bad = jobmod.WalkJob("乙平台", spots, walk_dir="up")
     check(_bad.walk_dir == "" and int(_bad.update(0.0, px=500.0)["move"]) == 1,
           "认不出的 `dir` 没退回默认走法：%r / %s" % (_bad.walk_dir,
                                                      _bad.update(0.0, px=500.0)))
@@ -2444,7 +2448,7 @@ def t_station_turn_every_three():
     ⚠ **补朝向"什么时候按"不归这条管**（那是 2026-10-06 定的"只能在两次输出之间" ✓）
       ⇒ 见 `t_station_turn_between_outputs` ✓。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     def dir_segments(hh, ss):
         """方向键的「按住段」列表 `[(起, 止)]`（相对 `hh.clock0` ✓）。"""
@@ -2505,7 +2509,7 @@ def t_station_turn_every_three():
     h2 = Harness(s2)
     h2.clock0 = h2.clock.t
     h2.mobs_fn = lambda t: [Mob(id=1, x=430.0, y=500.0, w=40.0, h=40.0, conf=0.9)]
-    job2 = route.ClimbJob(ladder_id="L2", x=500.0, y1=-9999.0, y2=9999.0,
+    job2 = jobmod.ClimbJob(ladder_id="L2", x=500.0, y1=-9999.0, y2=9999.0,
                           direction=1, dst_set="乙平台", src_set="甲平台",
                           tol_px=6, hold_ms=0)
     with h2._patched():
@@ -2714,10 +2718,10 @@ def build_panel():
     app = QApplication.instance() or QApplication([])
     from gui.widgets import install_wheel_guard
     install_wheel_guard(app)
-    with patch.object(dinput, "use_network", lambda *a, **k: None), \
-         patch.object(dinput, "use_serial", lambda *a, **k: None), \
-         patch.object(dinput, "use_local", lambda *a, **k: None), \
-         patch.object(dinput, "reconnect_remote", lambda *a, **k: True):
+    with patch.object(_remote_mod, "use_network", lambda *a, **k: None), \
+         patch.object(_remote_mod, "use_serial", lambda *a, **k: None), \
+         patch.object(_remote_mod, "use_local", lambda *a, **k: None), \
+         patch.object(_remote_mod, "reconnect_remote", lambda *a, **k: True):
         from gui.player_panel import PlayerPanel
         p = PlayerPanel()
     p.resize(760, 620)
@@ -2924,11 +2928,11 @@ def t_reset_link_taps_directions():
     try:
         with patch.object(dinput, "tap",
                           lambda k, *a, **kw: log.append(("tap", k))), \
-             patch.object(dinput, "reconnect_remote",
+             patch.object(_remote_mod, "reconnect_remote",
                           lambda *a, **kw: (log.append(("reconnect",)) or True)), \
-             patch.object(dinput, "release_all_remote",
+             patch.object(_remote_mod, "release_all_remote",
                           lambda *a, **kw: log.append(("releaseall",))), \
-             patch.object(dinput, "link_health",
+             patch.object(_remote_mod, "link_health",
                           lambda *a, **kw: {"backend": "remote", "ok": True}), \
              patch.object(dinput, "key_up", lambda *a, **kw: None):
             settings.input_resync = False
@@ -3011,14 +3015,14 @@ def t_multi_step_route():
       · 全走完 ⇒ 任务清空 + 一句"整条路径走完"；
       · 任何一步失败 ⇒ **整条停掉**，并说清断在第几步（不许硬着头皮往下走 ✗）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings()
     s.enabled = True
     h = Harness(s)
     # 落点就摆在玩家附近（x≈520）：到位判据 = 脚下集合已经是目标
-    a = route.WalkJob("甲集合", [(520.0, 510.0, 530.0, -208.0, "1")])
-    b = route.WalkJob("乙集合", [(520.0, 510.0, 530.0, -208.0, "2")])
+    a = jobmod.WalkJob("甲集合", [(520.0, 510.0, 530.0, -208.0, "1")])
+    b = jobmod.WalkJob("乙集合", [(520.0, 510.0, 530.0, -208.0, "2")])
     with h._patched():
         check(h.agent.start_route([a, b], why="用例：两步"),
               "多步路径没起跑")
@@ -3043,8 +3047,8 @@ def t_multi_step_route():
         # ⚠ 2026-09-27 起**执行器不再"最多试几次"**（用户："那个 1/3 尝试要去掉，我们现在
         #    都走「寻路超时时间」"）⇒ 这一步的"停"靠**agent 那把钟**（下面 `goto_timeout_s`），
         #    不再靠"试满几次就放弃" ✗。
-        a2 = route.WalkJob("丙集合", [(520.0, 510.0, 530.0, -208.0, "3")])
-        b2 = route.WalkJob("丁集合", [(520.0, 510.0, 530.0, -208.0, "4")])
+        a2 = jobmod.WalkJob("丙集合", [(520.0, 510.0, 530.0, -208.0, "3")])
+        b2 = jobmod.WalkJob("丁集合", [(520.0, 510.0, 530.0, -208.0, "4")])
         # ⚠ 2026-09-29 晚口径：「寻路超时时间」对所有任务生效 ⇒ 这条用例**不带签注也行** ✓；
         #   带上它顺带钉"追击路径同样吃这道闸" ✓（"中途失败"就是用那把钟造出来的 ✓）。
         h.agent.start_route([a2, b2], why="用例：中途失败", origin=dict(CHASE_ORIGIN))
@@ -3123,9 +3127,9 @@ def t_drop_flow():
          (`retry_ms`) **补按跳**（用户 2026-09-28 ✓："下落过程中也按照『移动操作尝试间隔』
          补按 按住 ↓ + 跳"）；落进目标集合才松手 ⇒ 落地即成功。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
-    C = route.DropJob
+    C = jobmod.DropJob
     #: 两个可下跳的点：(中心 x, 左, 右, foothold id) —— **老的 4 元组**（面 y 缺 ⇒ 不参与
     #: y 校验 ✓ 见 `DropJob.__init__`；新口径的五元组形状见 `t_drop_align_layer_guards` ✓）
     spots = [(300.0, 260.0, 340.0, "fhA"), (100.0, 80.0, 120.0, "fhB")]
@@ -3157,7 +3161,7 @@ def t_drop_flow():
     check(j.phase == C.DROP and o["dir"] == -1 and o["jump"],
           "该按住 ↓ 并按下跳（点按开始）：%s（phase=%s）" % (o, j.phase))
     # 点按超过 TAP_ON_S ⇒ 松跳，↓ 还在按
-    o = j.update(0.55 + route.TAP_ON_S + 0.01, px=265.0, py=0.0)
+    o = j.update(0.55 + jobmod.TAP_ON_S + 0.01, px=265.0, py=0.0)
     check(j.phase == C.DROP and not o["jump"] and o["dir"] == -1,
           "点按跳该在 TAP_ON_S 后松开、而 ↓ 继续按着：%s" % o)
 
@@ -3179,7 +3183,7 @@ def t_drop_flow():
     check("↓ 一路按着" in j.note and "补按跳" in j.note,
           "那句话没写清「↓ 一路按着 + 按尝试间隔补按跳」：%r" % j.note)
     # 这一下按满 `TAP_ON_S` 就**松开跳**（↓ 还在按 ✓ —— 别退化成"一直按住跳"✗）
-    o = j.update(1.00 + route.TAP_ON_S + 0.01, px=265.0, py=25.0)
+    o = j.update(1.00 + jobmod.TAP_ON_S + 0.01, px=265.0, py=25.0)
     check(not o["jump"] and o["dir"] == -1,
           "下落中这一下跳该在 `TAP_ON_S` 后松开（一直按住跳会被当成还挂在上面 ✗）：%s" % o)
     # 还没到一个「移动操作尝试间隔」（`retry_ms`=3000ms）⇒ **不按下一跳**（不是键盘风暴 ✗）
@@ -3218,8 +3222,9 @@ def t_drop_align_layer_guards():
       `spots` 全部来自起跳集合 ⇒ 换层之后重挑出来的还是同层的点 ⇒ 朝它走也走不到 ✗ ⇒
       那种情况交给 ④/⑤ 那两条**集合判据**收口 ✓（只有集合说得清"人在哪一层" ✓）。
     """
+    from decision import pathing
+    from decision import jobs as jobmod
     from core import mapdata, zones
-    from decision import route
 
     # ---------- 真数据：105080000 的「上层 --下跳--> 中层」，spots 是真面 y ✓ ----------
     t = mapdata.load("105080000")
@@ -3231,8 +3236,8 @@ def t_drop_align_layer_guards():
     box = {str(f.fid): f for f in t.footholds}
     _ys = [float(box[str(fid)].y_at((float(box[str(fid)].left)
                                      + float(box[str(fid)].right)) / 2.0))
-           for fid in z.sets["上层"]["footholds"] if str(fid) in box]
-    job = route.drop_job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
+           for fid in z.zones["上层"]["footholds"] if str(fid) in box]
+    job = pathing.drop_job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
     check(all(len(s) == 5 and s[3] is not None for s in job.spots),
           "真数据造出来的可下跳点不是五元组（面 y 丢了 ⇒ 「站在这块面上」判不了 ✗）：%r"
           % (job.spots[:2],))
@@ -3246,9 +3251,9 @@ def t_drop_align_layer_guards():
 
     # ① x 命中、但脚下那块面**不是它**（广播给 `ground_y=855.5`，这块面在 ~311）
     #   ⇒ **不许** ARMED（在错的层 / 空中按 ↓+跳毫无意义 ✗）；集合判不出来 ⇒ 也不许判失败
-    j1 = route.drop_job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
+    j1 = pathing.drop_job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
     o = j1.update(0.0, px=_cx, py=855.5, here_sets=[], ground_y=855.5)
-    check(j1.phase == route.DropJob.ALIGN and not o["jump"] and not o["done"]
+    check(j1.phase == jobmod.DropJob.ALIGN and not o["jump"] and not o["done"]
           and not o["failed"],
           "x 命中但脚下那块面离它有 540 px（人不在那块面上）却还照旧进 ARMED ⇒ 会从错误的"
           "层按 ↓+跳 ✗：%s（phase=%s）" % (o, j1.phase))
@@ -3256,29 +3261,29 @@ def t_drop_align_layer_guards():
           "不该宣称「已经在可下跳的 fh 上」（脚下那块面明明不是它 ✗）：%r" % (o["note"],))
 
     # ② 对照：同一 x、脚下就是这块面那一层 ⇒ 照旧 ARMED ✓
-    j2 = route.drop_job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
+    j2 = pathing.drop_job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
     o = j2.update(0.0, px=_cx, py=_fy, here_sets=["上层"], ground_y=_fy)
-    check(j2.phase == route.DropJob.ARMED and o["dir"] == -1,
+    check(j2.phase == jobmod.DropJob.ARMED and o["dir"] == -1,
           "人就站在那块下跳面上却没进「按住 ↓」（y 那把尺误伤了 ✓ 它在正路上）：%s"
           % (o,))
 
     # ③ 对照：`ground_y` 判不出来（None）⇒ 退回只看 x ⇒ 照旧 ARMED ✓（老行为一字不变）
-    j3 = route.drop_job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
+    j3 = pathing.drop_job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
     o = j3.update(0.0, px=_cx, py=855.5, here_sets=["上层"])
-    check(j3.phase == route.DropJob.ARMED,
+    check(j3.phase == jobmod.DropJob.ARMED,
           "拿不到 `ground_y`（判不出来）就把人拦住了 —— 该退回只看 x ✗：%s" % (o["note"],))
 
     # ④ 已经到目标层 ⇒ 当拍收工（掉下来正好落到目标 = "到" ✓）
-    j4 = route.drop_job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
+    j4 = pathing.drop_job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
     o = j4.update(0.0, px=_cx, py=600.0, here_sets=["中层"], ground_y=600.0)
-    check(o["done"] and j4.phase == route.DropJob.DONE and "到达" in str(o["note"]),
+    check(o["done"] and j4.phase == jobmod.DropJob.DONE and "到达" in str(o["note"]),
           "人在 ALIGN 相就已经站在「中层」上了，却没当拍收工（会继续朝上层的点走 ✗）：%s"
           % (o,))
 
     # ⑤ 换层（既不是起跳的「上层」、也不是目标「中层」）⇒ 如实失败 ✓
-    j5 = route.drop_job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
+    j5 = pathing.drop_job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
     o = j5.update(0.0, px=456.7, py=855.5, here_sets=["二楼"], ground_y=855.5)
-    check(o["failed"] and j5.phase == route.DropJob.FAILED,
+    check(o["failed"] and j5.phase == jobmod.DropJob.FAILED,
           "人掉到「二楼」（既不在上层、也不在中层）还在硬做这条下跳 ✗（该失败让上层"
           "重算）：%s" % (o,))
     check("交给上层" in str(o["note"]) and "二楼" in str(o["note"]),
@@ -3286,17 +3291,17 @@ def t_drop_align_layer_guards():
 
     # ⑥ 脚下**没圈进任何集合**、也没有 `ground_y`（半空中 / 老调用方没喂）⇒ **不拦也不失败** ✓
     #   （判不出来就不拦 —— 这是全项目同一条口径 ✓；换层那条闸只在"脚下明确是别的集合"时才拦 ✓）
-    j6 = route.drop_job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
+    j6 = pathing.drop_job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
     o = j6.update(0.0, px=_cx, py=855.5, here_sets=[])
-    check(not o["failed"] and j6.phase == route.DropJob.ARMED,
+    check(not o["failed"] and j6.phase == jobmod.DropJob.ARMED,
           "判不出来（没集合、没 ground_y）时该退回只看 x（照旧 ARMED）✗：%s" % (o,))
 
     # ⑦ 形状：老的 4 元组仍收（面 y 记 None ⇒ 不参与 y 校验 ✓）；别的形状报错 ✓
-    j7 = route.DropJob("甲", "乙", [(700.0, 660.0, 740.0, "41")])
+    j7 = jobmod.DropJob("甲", "乙", [(700.0, 660.0, 740.0, "41")])
     check(j7.spots[0][3] is None and j7.spots[0][-1] == "41",
           "老的 4 元组没被兼容成「面 y=None」（老用例/老调用方会当场炸 ✗）：%r" % (j7.spots,))
     try:
-        route.DropJob("甲", "乙", [(700.0, 660.0, "41")])
+        jobmod.DropJob("甲", "乙", [(700.0, 660.0, "41")])
     except ValueError:
         pass
     else:
@@ -3320,21 +3325,22 @@ def t_drop_restart_after_attack():
       ④ 打断**很短**（< `PAUSE_MIN_S` ✓ = 正常拍间隔那种）⇒ **不算打断** ⇒ 不回头 ✓
          （不然每拍都回入口 ⇒ 人原地不动 ✗）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
-    C = route.DropJob
+    C = jobmod.DropJob
     spots = [(100.0, 80.0, 120.0, "fhB")]
 
     def _to_drop(j, t=0.0):
+        from decision import jobs as jobmod
         j.update(t, px=100.0, py=0.0)
         j.update(t, px=100.0, py=0.0)
-        return j.update(t + route.ARM_HOLD_S + 0.01, px=100.0, py=0.0)
+        return j.update(t + jobmod.ARM_HOLD_S + 0.01, px=100.0, py=0.0)
 
     j = C("上平台", "下平台", spots, tol_px=10, hold_ms=0, y_tol_px=10,
           retry_ms=0, stall_s=1.0)
     o = _to_drop(j)
     check(j.phase == C.DROP, "① 前置：该已经进到「按住 ↓ + 点按跳」：%s" % o)
-    t = route.ARM_HOLD_S + 0.01
+    t = jobmod.ARM_HOLD_S + 0.01
 
     # ④ 先验"短打断不算打断"（正常拍间隔那种）
     j.interrupted(t + 0.01)
@@ -3379,29 +3385,30 @@ def t_drop_retry_gap():
          ④ 回入口之后**重新按住 ↓ + 再点按一次跳**（新的一次尝试 ✓）；
       ⑤ `retry_ms=0` ⇒ **不回头**（老行为：一路按住 ↓ 连按，交给「寻路超时」✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
-    C = route.DropJob
+    C = jobmod.DropJob
     spots = [(100.0, 80.0, 120.0, "fhB")]
 
     def _to_drop(j, t=0.0):
         """推到"按住 ↓ + 点按跳"那一拍（`hold_ms=0` ⇒ 从 ALIGN 直接过）。"""
+        from decision import jobs as jobmod
         j.update(t, px=100.0, py=0.0)              # ALIGN → ARMED（同一拍里过）
         j.update(t, px=100.0, py=0.0)
-        return j.update(t + route.ARM_HOLD_S + 0.01, px=100.0, py=0.0)   # → DROP（按跳）
+        return j.update(t + jobmod.ARM_HOLD_S + 0.01, px=100.0, py=0.0)   # → DROP（按跳）
 
     j = C("上平台", "下平台", spots, tol_px=10, hold_ms=0, y_tol_px=10,
           retry_ms=500, stall_s=1.0)
     o = _to_drop(j)
     check(j.phase == C.DROP and o["jump"], "没进「按住 ↓ + 连按跳」：%s" % o)
-    t = route.ARM_HOLD_S + 0.01
+    t = jobmod.ARM_HOLD_S + 0.01
     # ① 这一下按完了、窗口没到 ⇒ ↓ 还按着（不重试）
-    o = j.update(t + route.TAP_ON_S + 0.01, px=100.0, py=0.0)
+    o = j.update(t + jobmod.TAP_ON_S + 0.01, px=100.0, py=0.0)
     check(not o["jump"] and o["dir"] == -1,
           "点按结束后 ↓ 该继续按着（窗口还没到）：%s" % o)
     # ①' ⚠ **连按**（用户 2026-09-27 口径："按住↓，下一拍再按跳，可以用「卡住判定时长」连按"
     #     ＋"按住↓就会趴，可能还没趴你就按跳所以无效"）⇒ 到「点按周期」必须**再按一下** ✓
-    o = j.update(t + route.TAP_PERIOD_S + 0.01, px=100.0, py=0.0)
+    o = j.update(t + jobmod.TAP_PERIOD_S + 0.01, px=100.0, py=0.0)
     check(o["jump"] and o["dir"] == -1,
           "只按了一次跳、没有连按（那一下按早了就白按 ⇒ 现场就是「趴着不跳」✗）：%s" % o)
     # ② ⭐⭐ **2026-10-06 改口径**：「移动操作尝试间隔」`retry_ms`(500ms) 到点、Y 还没动 ⇒
@@ -3422,7 +3429,7 @@ def t_drop_retry_gap():
     o = j.update(t + 1.06, px=100.0, py=0.0)
     check(j.phase == C.ARMED and o["dir"] == -1,
           "回入口之后没重新按住 ↓（流程图：是 ⇒ 通知位置状态 ⇒ 按住 ↓ + 跳 ✗）：%s" % o)
-    o = j.update(t + 1.06 + float(route.ARM_HOLD_S) + 0.01, px=100.0, py=0.0)
+    o = j.update(t + 1.06 + float(jobmod.ARM_HOLD_S) + 0.01, px=100.0, py=0.0)
     check(j.phase == C.DROP and o["jump"] is True and o["dir"] == -1,
           "回入口之后没重新「按住 ↓ + 点按跳」：%s（phase=%s）" % (o, j.phase))
 
@@ -3430,8 +3437,8 @@ def t_drop_retry_gap():
     j2 = C("上平台", "下平台", spots, tol_px=10, hold_ms=0, y_tol_px=10, retry_ms=0)
     _to_drop(j2)
     released = []
-    tt = route.ARM_HOLD_S + 0.01
-    while tt < route.ARM_HOLD_S + 6.0:
+    tt = jobmod.ARM_HOLD_S + 0.01
+    while tt < jobmod.ARM_HOLD_S + 6.0:
         oo = j2.update(tt, px=100.0, py=0.0)
         if oo["dir"] == 0 and not oo["jump"]:
             released.append(round(tt, 2))
@@ -3444,7 +3451,7 @@ def t_drop_retry_gap():
     #    操作尝试间隔」**补按跳**（用户 2026-09-28 ✓），直到**落进目标集合**才松手 ✓
     j3 = C("上平台", "下平台", spots, tol_px=10, hold_ms=0, y_tol_px=10, retry_ms=500)
     _to_drop(j3)
-    t3 = route.ARM_HOLD_S + 0.01
+    t3 = jobmod.ARM_HOLD_S + 0.01
     o = j3.update(t3 + 0.01, px=100.0, py=20.0)          # Y 掉了 20
     check(o["dir"] == -1 and o["jump"] and j3.phase == C.DROP,
           "Y 掉了却把 ↓ 松开了 / 没按「尝试间隔」补按跳（该一路按着 ↓ + 补按跳 ✓）：%s" % o)
@@ -3459,10 +3466,10 @@ def t_drop_retry_gap():
     j4 = C("上平台", "下平台", spots, tol_px=10, hold_ms=0, y_tol_px=10, retry_ms=500)
     j4.update(0.0, px=100.0, py=None)                    # ALIGN（站在该 fh 上）→ ARMED
     j4.update(0.0, px=100.0, py=None)
-    o = j4.update(route.ARM_HOLD_S + 0.01, px=100.0, py=None)
+    o = j4.update(jobmod.ARM_HOLD_S + 0.01, px=100.0, py=None)
     check(not o["jump"] and o["dir"] == -1,
           "拿不到 y 读数却按了跳（没有基准 ⇒ 判不出下落，只能一路按到超时 ✗）：%s" % o)
-    o = j4.update(route.ARM_HOLD_S + 0.02, px=100.0, py=0.0)   # 读数来了 ⇒ 才按跳
+    o = j4.update(jobmod.ARM_HOLD_S + 0.02, px=100.0, py=0.0)   # 读数来了 ⇒ 才按跳
     check(o["jump"], "y 读数来了之后该按跳了：%s" % o)
 
 
@@ -3476,6 +3483,7 @@ def t_align_params():
       · 存读一致（`to_dict`/`from_dict` 都带上，否则改完重开就丢）；
       · 设置弹窗里真的有一个能改它们的页签。
     """
+    from decision import jobs as jobmod
     from PyQt5.QtWidgets import QApplication
 
     from decision.agent import settings      # 模块级没有这个名字，函数里取（同别的用例）
@@ -3498,10 +3506,9 @@ def t_align_params():
     check(hasattr(settings, "climb_retry_delay_s")
           and hasattr(settings, "climb_retry_delay_inc_s"),
           "决策设置里没有「攀爬失败后延迟激活时间 / 延迟增量」")
-    from decision import route as _route
     check(int(getattr(ag.DecisionSettings(), "climb_align_gap_ms", -1))
-          == int(_route.TAP_PERIOD_S * 1000),
-          "「对齐绳梯移动延迟(ms)」默认值不是 `route.TAP_PERIOD_S`（两处各写一个数会分叉）：%r"
+          == int(jobmod.TAP_PERIOD_S * 1000),
+          "「对齐绳梯移动延迟(ms)」默认值不是 `jobmod.TAP_PERIOD_S`（两处各写一个数会分叉）：%r"
           % getattr(settings, "climb_align_gap_ms", None))
     # 「**移动操作尝试间隔(ms)**」（2026-09-27 用户要求：由「爬不动时先补按 ↑ 观察(s)」
     # **改名** + **搬出「攀爬参数」组**、放到外面的「寻路配置」组 + 单位**秒 → 毫秒**）：
@@ -3968,14 +3975,16 @@ def t_climb_job():
     会被抖动骗（小地图世界坐标本身就有几像素抖），所以"进误差范围后还要保持 N 毫秒"
     这段逻辑错一点，表现就是"老是跳不上去/来回蹭"。
     """
+    from decision import pathing
+    from decision import jobs as jobmod
     from core import mapdata, zones
-    from decision import route
 
     def mk(**kw):
+        from decision import jobs as jobmod
         a = dict(ladder_id="L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
                  dst_set="乙平台", tol_px=6, hold_ms=200)
         a.update(kw)
-        return route.ClimbJob(**a)
+        return jobmod.ClimbJob(**a)
 
     # ① 没对齐 ⇒ 往目标那侧挪，不跳
     job = mk()
@@ -4003,10 +4012,10 @@ def t_climb_job():
     check(o["move"] == -1 and not o["jump"],
           "站住等时该**继续朝绳按着方向**（用户 2026-10-17 ✓），不能马上跳：%s" % o)
     o = job.update(0.12, px=703.0)         # 距站住才 100ms < 200ms
-    check(o["phase"] == route.ClimbJob.ALIGN and not o["jump"],
+    check(o["phase"] == jobmod.ClimbJob.ALIGN and not o["jump"],
           "保持时间没到就跳了：%s" % o)
     o = job.update(0.25, px=703.0)         # 站住 230ms ≥ 200 ⇒ 上绳
-    check(o["phase"] == route.ClimbJob.CLIMB and o["jump"],
+    check(o["phase"] == jobmod.ClimbJob.CLIMB and o["jump"],
           "保持够了该按住跳：%s" % o)
     # ⭐⭐ 用户 2026-10-17 ✓ 明确推翻了「向上爬时该按↑、且**不再左右挪**」✗：
     #   「**现在需要调方向是持续的，跳时也需要调方向**」✓ ⇒ 按跳那一拍要**同时**给
@@ -4046,7 +4055,7 @@ def t_climb_job():
     # ④a **执行器只看广播**：广播说没到就是没到（哪怕 y 已经越过绳上端 ✗）；
     #     广播说到了就到了（哪怕 y 还在绳下端 ✓，见 ④c ①）。
     #     ⚠ "y 差 1px 算不算到顶"那条**边界**现在归**位置状态机**（判据原文在
-    #       `perception/pos_state.py` ✓，用例 `selftest_minimap.t_pos_state_machine`
+    #       `perception/world/pos_state.py` ✓，用例 `selftest_minimap.t_pos_state_machine`
     #       钉着 ✓）—— 这里只钉"执行器不再自己比坐标" ✓。
     job = mk(dst_y=-208.0)                 # 平台面 -208：旧口径会在这儿就判到达
     job.update(0.0, px=700.0)
@@ -4146,7 +4155,7 @@ def t_climb_job():
     check(o["dir"] == -1 and not o["jump"] and not o["done"],
           "下爬：已上绳该松开跳、按住 ↓ 稳住（还没到松手那一刻）：%s" % o)
     o = job.update(0.70, px=700.0, py=-80.0, ladder_id="L2")     # 300ms ≥ hold_ms=200
-    check(o["phase"] == route.ClimbJob.JUMP_DOWN and o["dir"] == 0,
+    check(o["phase"] == jobmod.ClimbJob.JUMP_DOWN and o["dir"] == 0,
           "下爬：稳够误差时间该松 ↓、进「跳下绳梯」相：%s" % o)
     o = job.update(1.00, px=700.0, py=-60.0)                     # 落体中（已离开绳）
     check(not o["done"] and not o["failed"], "刚跳下去就说到了/说失败了：%s" % o)
@@ -4186,13 +4195,13 @@ def t_climb_job():
     check(not o["failed"], "才偏一下就判失败：%s" % o)
     o = job.update(1.60, px=760.0)               # 一直偏着 1.3s（老判据早该炸）⇒ 现在不许
     check(not o["failed"], "「偏离绳梯」判据又回来了（用户 2026-09-26 明确删掉）：%s" % o)
-    check(not hasattr(route, "OFF_X_PX"),
-          "路由模块里又出现 `OFF_X_PX`（偏离判据的阈值，用户明确删掉）")
+    check(not any(hasattr(m, "OFF_X_PX") for m in (jobmod, pathing)),
+          "执行器/规划模块里又出现 `OFF_X_PX`（偏离判据的阈值，用户明确删掉）")
 
     # ⑧c **重新激活**：失败后 retry() 回到第一步重来，次数累加（到上限由 agent 放弃）
     check(job.attempt == 1, "一开始 attempt 该是 1：%s" % job.attempt)
     o = job.retry()
-    check(job.attempt == 2 and o["phase"] == route.ClimbJob.ALIGN and not o["jump"],
+    check(job.attempt == 2 and o["phase"] == jobmod.ClimbJob.ALIGN and not o["jump"],
           "retry 没回到对齐阶段：%s / attempt=%s" % (o, job.attempt))
     check(job._t0 is None, "retry 没把计时清干净（超时会立刻又炸）：%r" % (job._t0,))
 
@@ -4209,7 +4218,7 @@ def t_climb_job():
     edge = next((e for e in z.edges if e.get("kind") == "climb"
                  and e.get("from") == "右下" and e.get("to") == "上下过渡平台"), None)
     check(edge is not None, "用户数据里那条「右下 → 上下过渡平台」的爬边不见了")
-    j2 = route.job_for_edge(t, z, edge, tol_px=6, hold_ms=250)
+    j2 = pathing.job_for_edge(t, z, edge, tol_px=6, hold_ms=250)
     check(j2.dir == 1 and j2.dst_set == "上下过渡平台"
           and j2.ladder_id == "L2" and abs(j2.x - 701.0) < 1e-6,
           "从真实边造出来的任务不对：dir=%s x=%s dst=%s"
@@ -4225,7 +4234,7 @@ def t_climb_job():
     _L = next(x for x in t.ladders if _lids.get(id(x)) == edge.get("ladder"))
     check(abs(j2.x - _L.x) < 1e-6,
           "任务的 x 不是绳的地形 x（不许给它加偏移）：%s vs %s" % (j2.x, _L.x))
-    check(j2.dst_y == route.dst_surface_y(t, z, edge.get("to"), _L, j2.dir),
+    check(j2.dst_y == pathing.dst_surface_y(t, z, edge.get("to"), _L, j2.dir),
           "任务的 dst_y 不是地形 foothold 的面本身（不许加偏移）：%s" % j2.dst_y)
 
     # ⚠ 「走」不再列在这儿了（2026-09-26）：它有执行器了，`job_for_edge` 会正常
@@ -4234,7 +4243,7 @@ def t_climb_job():
                  "ladder": "L9"},
                 {"kind": "climb", "from": "右下", "to": "左上", "ladder": "L2"}):
         try:
-            route.job_for_edge(t, z, bad)
+            pathing.job_for_edge(t, z, bad)
             raise AssertionError("构造不该成功（会往反方向爬）：%s" % bad)
         except ValueError:
             pass          # 正是期望的：说不清就抛，**不许猜**
@@ -4242,9 +4251,9 @@ def t_climb_job():
     # ⚠ 要挑**目标集合里有 foothold** 的走边：没有落点的走边本来就该抛 ValueError
     #（那是 `walk_job_for_edge` 的"不许猜"，不是分发漏了）。
     _w_e = next((e for e in z.edges if e.get("kind") == "walk"
-                 and (z.sets.get(e.get("to")) or {}).get("footholds")), None)
+                 and (z.zones.get(e.get("to")) or {}).get("footholds")), None)
     if _w_e is not None:
-        check(isinstance(route.job_for_edge(t, z, _w_e), route.WalkJob),
+        check(isinstance(pathing.job_for_edge(t, z, _w_e), jobmod.WalkJob),
               "job_for_edge 没按类型分发（走边该出 WalkJob）")
     else:
         print("      （用户数据里没有可用的「走」边，分发这条跳过）")
@@ -4255,14 +4264,14 @@ def t_climb_job():
     #    老口径（2026-09-28：\"人已在绳上 ⇒ 按流程图没有失败这个出口，只补发 ↑、真爬不上去
     #    由「寻路超时时间」兜底\"）**作废** ✗ —— 现场就是它把爬绳卡死 20 秒
     #    （`climb_reassert` 每秒一条连刷 ✓ 用户当场报的 ✓）。
-    #    ⚠ 新判据三道门（都在 `route.ClimbJob.update` 里 ✓）：**CLIMB 相**（不是对齐 ✓
+    #    ⚠ 新判据三道门（都在 `jobmod.ClimbJob.update` 里 ✓）：**CLIMB 相**（不是对齐 ✓
     #      —— 广播那份\"爬不动\"**在对齐相也真** ✗ 2026-10-13 当天踩过 ✓）＋ **真在绳上**
     #      （`ladder_id` ✓ 老用例名就叫「只在「已经在绳上」时判」✓）＋ **不是刚挨打回来**
     #      （`not _paused` ✓ 用户 2026-09-26\"挨打的时间不算\"✓）。
     job = mk(dst_y=-208.0, y1=-205.0)
     job.update(0.0, px=701.0, py=-150.0, ladder_id="L2")
     job.update(0.25, px=701.0, py=-150.0, ladder_id="L2")
-    check(job.phase == route.ClimbJob.CLIMB, "没进上绳阶段：%s" % job.note)
+    check(job.phase == jobmod.ClimbJob.CLIMB, "没进上绳阶段：%s" % job.note)
     o = job.update(0.35, px=701.0, py=-170.0, ladder_id="L2", climb_stalled=True)
     check(bool(o["failed"]) and "爬不动了" in str(o["note"]),
           "广播说爬不动 ⇒ 该**走攀爬失败逻辑、从头再判** ✓（用户 2026-10-13 ✓ "
@@ -4278,7 +4287,7 @@ def t_climb_job():
     for k in range(40):
         _py = -100.0 - (k + 1) * 5.0
         # ⭐ 到达只认广播（2026-09-27 收编 ✓）：这里**替位置状态机**说一句"够到绳上端了"
-        #   （真机上由 `perception/pos_state.py` 判：y ≤ 绳上端 + 「坐标对齐误差范围」✓）
+        #   （真机上由 `perception/world/pos_state.py` 判：y ≤ 绳上端 + 「坐标对齐误差范围」✓）
         o = job.update(0.35 + k * 0.1, px=701.0, py=_py, ladder_id="L2",
                        at_top=("L2" if _py <= -205.0 else ""))
         if o["done"]:
@@ -4316,7 +4325,7 @@ def t_climb_job():
     #    它和上绳/下跳**同一套对外形状**（`update` 纯函数 + retry/cancel）⇒ agent 里
     #    "任务优先 / 有怪先打 / 失败延迟重来 / 结束原因挂画面" 一行都不用改 ✓。
     #    注意动作：走**不按跳、不按上下**，只有左右。
-    job = route.WalkJob("乙平台", [(700.0, 690.0, 710.0, -208.0, "52")])
+    job = jobmod.WalkJob("乙平台", [(700.0, 690.0, 710.0, -208.0, "52")])
     job.update(0.0, px=600.0)
     o = job.update(0.1, px=600.0)
     check(o["move"] == 1 and not o["jump"] and o["dir"] == 0,
@@ -4328,19 +4337,19 @@ def t_climb_job():
     o = job.update(0.4, px=705.0, py=-208.0)
     check(o["done"] and "到达" in o["note"], "站在目标 foothold 上却没判到达：%s" % o)
     # 集合判据优先（走是唯一"站上去就算到"的任务）
-    job = route.WalkJob("乙平台", [(700.0, 690.0, 710.0, -208.0, "52")])
+    job = jobmod.WalkJob("乙平台", [(700.0, 690.0, 710.0, -208.0, "52")])
     job.update(0.0, px=-500.0)
     o = job.update(0.1, px=-500.0, here_sets=["乙平台"])
     check(o["done"] and not o["move"], "脚下已是目标集合却没判到达：%s" % o)
     # x 对了但人其实在另一层（y 差太多）⇒ **不算到达**（几何兜底要有高度带）
-    job = route.WalkJob("乙平台", [(700.0, 690.0, 710.0, -208.0, "52")])
+    job = jobmod.WalkJob("乙平台", [(700.0, 690.0, 710.0, -208.0, "52")])
     job.update(0.0, px=700.0)
     o = job.update(0.1, px=700.0, py=-120.0)
     check(not o["done"], "x 对了但高度差很远也判到达了（换层了）：%s" % o)
     # ⭐⭐ 「**走不动按跳**」**关掉** ⇒ 走不动**直接判失败**、**不跳**（用户 2026-10-06 ✓ 原话：
     #    "现在走路走不动会跳一下，能做成开关放到战斗参数里吗「走不动按跳」，放在「追击起跳」上面"）。
     #    关掉 = **加这个单点跳之前的老行为** ✓（所以那句原因也该一字不变 ✓）。
-    _j0 = route.WalkJob("乙平台", [(900.0, 890.0, 910.0, -208.0, "7")],
+    _j0 = jobmod.WalkJob("乙平台", [(900.0, 890.0, 910.0, -208.0, "7")],
                         timeout_s=60.0, stall_s=0.3, stall_jump=False)
     _j0.update(0.0, px=100.0)
     _o0 = None
@@ -4355,7 +4364,7 @@ def t_climb_job():
           "关掉后那句原因变了（老行为该一字不变 ✓ —— 不许再提「跳」）：%r" % (_o0.get("note"),))
 
     # 走不动（x 卡住）⇒ **先单点跳一下**（用户 2026-09-28），跳过还走不动才失败并说清卡在哪
-    job = route.WalkJob("乙平台", [(900.0, 890.0, 910.0, -208.0, "7")],
+    job = jobmod.WalkJob("乙平台", [(900.0, 890.0, 910.0, -208.0, "7")],
                         timeout_s=60.0)
     job.update(0.0, px=100.0)
     # ⚠ 计时变量**别叫 `t`**：这个函数里 `t` 是地形对象（上面 ⑩ 载入的），
@@ -4388,19 +4397,19 @@ def t_climb_job():
     check("跳了一下" in o["note"],
           "失败原因没写清「跳了一下还是没过去」：%r" % o["note"])
     # 超时要报警（和上绳一样：不许无限等）
-    job = route.WalkJob("乙平台", [(900.0, 890.0, 910.0, -208.0, "7")], timeout_s=1.0)
+    job = jobmod.WalkJob("乙平台", [(900.0, 890.0, 910.0, -208.0, "7")], timeout_s=1.0)
     job.update(0.0, px=100.0)
     check(job.update(2.0, px=101.0)["failed"], "走：超时没报警")
     # 拿不到世界坐标 ⇒ 不许乱走（往哪边走都可能是错的）
-    job = route.WalkJob("乙平台", [(900.0, 890.0, 910.0, -208.0, "7")])
+    job = jobmod.WalkJob("乙平台", [(900.0, 890.0, 910.0, -208.0, "7")])
     job.update(0.0, px=None)
     check(not job.update(0.1, px=None)["move"], "拿不到坐标还在走：%s" % job.note)
     # 从**真实边**造任务：落点必须来自目标集合的 foothold，说不清就抛（不许猜）
     _w = next((e for e in z.edges if e.get("kind") == "walk"
-               and (z.sets.get(e.get("to")) or {}).get("footholds")), None)
+               and (z.zones.get(e.get("to")) or {}).get("footholds")), None)
     check(_w is not None, "用户数据里没有可用的「走」边，这条测不了")
-    _wj = route.walk_job_for_edge(t, z, _w)
-    check(isinstance(_wj, route.WalkJob) and _wj.spots
+    _wj = pathing.walk_job_for_edge(t, z, _w)
+    check(isinstance(_wj, jobmod.WalkJob) and _wj.spots
           and _wj.dst_set == _w.get("to"),
           "从真实「走」边造出来的任务不对：%s" % (_wj,))
     # ⚠ 逐边的 `dir`（仅向左/仅向右）必须**从边灌进任务**：灌不进去的话，配了「仅向左」
@@ -4410,11 +4419,11 @@ def t_climb_job():
     for _e in z.edges:
         if _e.get("kind") != "walk" or not zones_mod.walk_dir(_e):
             continue
-        _wj = route.walk_job_for_edge(t, z, _e)
+        _wj = pathing.walk_job_for_edge(t, z, _e)
         check(_wj.walk_dir == zones_mod.walk_dir(_e),
               "这条边的 `dir` 没灌进任务（配了也不会按那个方向走）：%s" % (_e,))
         _want = -1 if zones_mod.walk_dir(_e) == "left" else 1
-        for _fid in ((z.sets.get(_e.get("from")) or {}).get("footholds") or []):
+        for _fid in ((z.zones.get(_e.get("from")) or {}).get("footholds") or []):
             _f = next((q for q in t.footholds if str(q.fid) == str(_fid)), None)
             if _f is None or _f.is_wall:
                 continue
@@ -4430,7 +4439,7 @@ def t_climb_job():
     for bad in ({"kind": "climb", "from": "甲", "to": "乙"},
                 {"kind": "walk", "from": "甲", "to": "（不存在的集合）"}):
         try:
-            route.walk_job_for_edge(t, z, bad)
+            pathing.walk_job_for_edge(t, z, bad)
             raise AssertionError("构造不该成功（会下一条不知道往哪走的命令）：%s" % bad)
         except ValueError:
             pass          # 正是期望的：说不清就抛
@@ -4467,11 +4476,12 @@ def t_climb_mid_jump():
       ⑥ 落地后 **再按住 ↑ 「移动操作尝试间隔」才松**（用户那句"返回成功或失败后…再经过…
          松开"✓），之后 `DONE` 全松 ✓。
     """
-    from decision import route as R
+    from decision import jobs as jobmod
 
     def mk(**kw):
         # 上爬：绳 x=100，上端 y=-205（靠上）/ 下端 y=56；目标集合中心 x=300
-        return R.ClimbJob("L1", 100.0, -205.0, 56.0, 1, dst_set="顶层", src_set="一楼",
+        from decision import jobs as jobmod
+        return jobmod.ClimbJob("L1", 100.0, -205.0, 56.0, 1, dst_set="顶层", src_set="一楼",
                           dst_x=300.0, dst_y=-208.0, hold_ms=0, **kw)
 
     def _drive(j, px, py, lid):
@@ -4621,10 +4631,11 @@ def t_climb_down_jump_off():
       ⑧ 用**用户那条真边**（105090600：左上平台 →(爬 L1)→ 左上）跑一遍，钉住
          `dst_x` / `dst_y` 那套口径。
     """
+    from decision import pathing
+    from decision import jobs as jobmod
     from core import mapdata, zones
-    from decision import route
 
-    C = route.ClimbJob
+    C = jobmod.ClimbJob
 
     def mk(**kw):
         # 绳 x=56；目标集合中心 x=142（在**右边**）；目标平台面 dst_y=100。
@@ -4666,9 +4677,9 @@ def t_climb_down_jump_off():
     o = job.update(0.60, px=56.0, py=-205.0)
     check(o["jump"] and o["move"] == 1 and o["dir"] == 0,
           "该按跳了（且不许带 ↓）：%s" % o)
-    o = job.update(0.60 + route.TAP_ON_S * 0.5, px=56.0, py=-205.0)
+    o = job.update(0.60 + jobmod.TAP_ON_S * 0.5, px=56.0, py=-205.0)
     check(o["jump"], "点按窗口还没到就松了跳：%s" % o)
-    o = job.update(0.60 + route.TAP_ON_S + 0.01, px=56.0, py=-205.0)
+    o = job.update(0.60 + jobmod.TAP_ON_S + 0.01, px=56.0, py=-205.0)
     check(not o["jump"] and o["move"] == 1 and o["dir"] == 0,
           "点按窗口过了该松开跳、方向继续按着：%s" % o)
     check("等落地" in o["note"], "没说清在等落地：%r" % o["note"])
@@ -4703,7 +4714,7 @@ def t_climb_down_jump_off():
     job.update(0.60, px=56.0, py=-205.0)
     o = job.update(1.20, px=56.0, py=-20.0)
     check(not o["done"], "刚开始落就说落地了：%s" % o)
-    o = job.update(1.20 + route.STALL_S + 0.05, px=56.0, py=-20.0)   # y 3 秒没动过
+    o = job.update(1.20 + jobmod.STALL_S + 0.05, px=56.0, py=-20.0)   # y 3 秒没动过
     check(o["done"] and "稳定" in o["note"], "y 稳定没算落地（⑧）：%s" % o)
     # ---- ⑨ 方向三态：dst_x - px 的符号（向量运算）----
     def _hop(px_at_hop, dst_x):
@@ -4741,18 +4752,18 @@ def t_climb_down_jump_off():
     #   一条**（地形、绳 L1、两个集合全是真的，只补这一条边）✓。
     edge = {"from": "左上平台", "to": "左上", "kind": "climb", "ladder": "L1",
             "why": "用例现造的（用户数据里这一对已改成「下跳 + 走(仅向左)」）"}
-    jd = route.job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
+    jd = pathing.job_for_edge(t, z, edge, tol_px=10, hold_ms=250)
     check(jd.dir == -1, "这条边该判成**向下**（climb_direction）：dir=%s" % jd.dir)
-    check(jd.dst_x == route.dst_center_x(t, z, "左上"),
+    check(jd.dst_x == pathing.dst_center_x(t, z, "左上"),
           "dst_x 不是「目标集合所有非墙 foothold 的 x 中点」：%s" % jd.dst_x)
     check(abs(jd.dst_x - 142.0) < 1.0,
           "「左上」的 x 中点变了（实测 142；口径 = (min+max)/2）：%s" % jd.dst_x)
     check(abs(jd.dst_y - 100.0) < 1.0,
           "「左上」的目标平台面变了（实测 100）：%s" % jd.dst_y)
     #    算不出中心时**返回 None**（让执行器如实说，不许猜一个方向）
-    check(route.dst_center_x(t, z, "这个集合不存在") is None,
+    check(pathing.dst_center_x(t, z, "这个集合不存在") is None,
           "目标集合圈不到 foothold 时该返回 None，而不是编一个中心：%s"
-          % route.dst_center_x(t, z, "这个集合不存在"))
+          % pathing.dst_center_x(t, z, "这个集合不存在"))
     #    整条路走一遍：贴绳 ⇒ 稳 250ms ⇒ 朝 142（右边）按住 → ⇒ 按跳 ⇒ 落到 100
     jd.update(0.0, px=56.0, py=-205.0)
     jd.update(0.30, px=56.0, py=-205.0)
@@ -4766,7 +4777,7 @@ def t_climb_down_jump_off():
     o = jd.update(1.20, px=56.0, py=-50.0)
     check(not o["done"] and o["move"] == 1 and o["dir"] == 0,
           "真边：落体中该只按住 →：%s" % o)
-    # ⭐ 落地面读广播 `ground_y`（= 脚下那块面的 y ✓，口径在 `perception/pos_state.py` ✓）
+    # ⭐ 落地面读广播 `ground_y`（= 脚下那块面的 y ✓，口径在 `perception/world/pos_state.py` ✓）
     o = jd.update(1.60, px=58.0, py=100.0, ground_y=100.0)
     check(o["done"] and o["move"] == 0, "真边：到目标面没收工：%s" % o)
 
@@ -4789,9 +4800,9 @@ def t_climb_align_each_round_presses():
       ④ **跳失败回对齐**（`_retry_back_to_align`）⇒ 重新武装 ⇒ 下一轮进容差**又要点一次** ✓
          （哪怕 x 已经在容差内 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
-    C = route.ClimbJob
+    C = jobmod.ClimbJob
 
     def mk(**kw):
         a = dict(ladder_id="L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
@@ -4847,9 +4858,9 @@ def t_climb_stall_only_on_ladder():
          都发生在"人已在绳上"⇒ 没有失败这个出口 ✓；在绳上按左右=松手 ✗ 所以也不回对齐；
          x 偏出爬起来会自己居中；真爬不上去由「寻路超时时间」兜底 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
-    C = route.ClimbJob
+    C = jobmod.ClimbJob
 
     def mk():
         return C("L2", x=700.0, y1=-115.0, y2=231.0, direction=1, dst_set="平台",
@@ -4905,13 +4916,13 @@ def t_climb_reassert_log_rate_limited():
     钉两件：① 1 秒内连拍 6 拍 ⇒ 只记 1 条 ✓；② 过了 1 秒再拍 ⇒ 记第 2 条 ✓
     （限流不是掐死 ✓）。
     """
+    from decision import jobs as jobmod
     import decision.agent as _am
-    from decision import route
 
     s = fresh_settings(goto_timeout_s=0.0)
     s.enabled = True
     h = Harness(s)
-    job = route.ClimbJob("L2", x=700.0, y1=-115.0, y2=231.0, direction=1,
+    job = jobmod.ClimbJob("L2", x=700.0, y1=-115.0, y2=231.0, direction=1,
                          dst_set="平台", dst_y=-208.0, tol_px=6, hold_ms=0,
                          timeout_s=600.0)
     evs = []
@@ -4946,14 +4957,14 @@ def t_job_interrupt_by_fight():
     用户 2026-09-26 报的状态机问题："attack 会强制打断其他状态 ⇒ climb 被打断时跳可能被吞了"。
     根因：任务内部全是**绝对时刻**锚点（`_best_at` / `_off_since` / `_in_tol_since`），而
     打架那几拍 `update()` 根本不被调用（`now` 却一直在走）⇒ 回来就把"站着挨打"当成
-    "不动了" ✗ / 超时 ✗。修法见 `route._PausableJob`：agent 每拍叫一声 `interrupted()`，
+    "不动了" ✗ / 超时 ✗。修法见 `jobmod._PausableJob`：agent 每拍叫一声 `interrupted()`，
     任务回来把那些锚点整体往后挪，并**重新走一遍上绳流程**（`phase` 回 `ALIGN`）：
     没上绳 ⇒ 重新对齐→再跳；**在绳上** ⇒ ALIGN 那一步自己跳过横向对齐、接着按住 ↑
     （用户 2026-09-27 要求 ③；细节与"在绳上不许横移"那条见 `t_climb_flow_rules` ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
-    C = route.ClimbJob
+    C = jobmod.ClimbJob
     # ① 没上绳被打断 ⇒ 回来必须**重新对齐**（这就是用户说的"跳被吞了"要治的那一拍）
     job = C("L2", x=701.0, y1=-115.0, y2=231.0, direction=1, dst_set="平台",
             tol_px=6, hold_ms=250, timeout_s=600.0)
@@ -5033,14 +5044,14 @@ def t_job_interrupt_by_fight():
     # ⑥ **「走」那一步同一套规矩**（用户说的是"寻路过程中"，不是只有爬绳 ✓）：
     #    走路被怪打断 ⇒ ① 超时重新计时 ② 回来不许当场报"走不动了"（挨打不算走不动 ✓）。
     spots = [(700.0, 690.0, 710.0, "1")]
-    j7 = route.WalkJob("乙平台", spots, tol_px=6, timeout_s=1.0)
+    j7 = jobmod.WalkJob("乙平台", spots, tol_px=6, timeout_s=1.0)
     j7.update(0.0, px=600.0)                  # _t0 = 0.0，朝右走
     j7.interrupted(0.5)                       # 0.5s 进战斗 ⇒ 超时从这一刻重算
     o = j7.update(1.2, px=600.0)              # 距重算 0.7s、位置没动 ⇒ 两条都不许报
     check(not o["failed"],
           "走路被怪打断后回来就判失败（超时没重算 / 『走不动了』把挨打算进去了）：%s" % o)
     # 对照：同样时序、没进过战斗 ⇒ 1.2s > 1.0s ⇒ 照旧判超时
-    j8 = route.WalkJob("乙平台", spots, tol_px=6, timeout_s=1.0)
+    j8 = jobmod.WalkJob("乙平台", spots, tol_px=6, timeout_s=1.0)
     j8.update(0.0, px=600.0)
     o = j8.update(1.2, px=600.0)
     check(o["failed"] and "超时" in str(o["note"]),
@@ -5073,15 +5084,16 @@ def t_portal_reassert_uses_move_retry():
       ② 过了它 ⇒ agent **真补按 ↑**（`h.log` 里看得见那次 PRESS ✓ 不只看任务回值 ✗）；
       ③ 没到点**不许**补（否则就是键盘风暴 ✗）。
     """
+    from decision import jobs as jobmod
     from types import SimpleNamespace
 
-    from decision import route
 
     def _run(retry_ms):
+        from decision import jobs as jobmod
         s = fresh_settings(move_retry_ms=retry_ms)
         h = Harness(s)
         pn = SimpleNamespace(pn="h009", x=500.0, y=500.0)   # 门就在人站的位置 ⇒ 一步进点按 ✓
-        job = route.PortalJob("上平台", pn, None, tol_px=50)
+        job = jobmod.PortalJob("上平台", pn, None, tol_px=50)
         up = s.keymap["up"]
         got = []
         with h._patched():
@@ -5823,7 +5835,7 @@ def t_battle_zone_restriction():
       · 不在区域里 + 有怪 ⇒ **一下都不打**，并且**真的下了「前往」**（去第一个配置的集合 ✓）；
       · 拿不到 `here_sets`（定位没输出）也算"不在"⇒ 先回去（不许瞎打 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings(attack_dist=120.0)
     s.enabled = True
@@ -5834,7 +5846,7 @@ def t_battle_zone_restriction():
     with h._patched():
         a = h.agent
         h.clock0 = h.clock.t          # ⚠ 夹具要它才记日志（不设 ⇒ 后面读 h.log 全空 ✗）
-        a.route_plan = lambda dst: {"jobs": [route.WalkJob("甲平台",
+        a.route_plan = lambda dst: {"jobs": [jobmod.WalkJob("甲平台",
                                                            [(520.0, 510.0, 530.0,
                                                              -208.0, "1")])],
                                     "path": ["乙平台", "甲平台"], "why": "",
@@ -6076,9 +6088,10 @@ def t_zone_rule_under_no_chase_path():
          （那正是当初加那道闸门要避免的副作用 ✓ 两头都要保住 ✓）；
       ③ 开关**关着** ⇒ 老行为**一字不变** ✓（"不在战斗区域，先回去" + 不打 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     def _run(no_chase):
+        from decision import jobs as jobmod
         s = fresh_settings(attack_dist=120.0)
         s.enabled = True
         s.battle_zone_sets = ["甲平台"]
@@ -6093,8 +6106,9 @@ def t_zone_rule_under_no_chase_path():
             h.clock.t = 4.0                 # ⚠ 越过「区域查询CD(s)」默认 3s，否则不下任务 ✗
 
             def _plan(dst):
+                from decision import jobs as jobmod
                 plans.append(dst)
-                return {"jobs": [route.WalkJob("甲平台",
+                return {"jobs": [jobmod.WalkJob("甲平台",
                                                [(520.0, 510.0, 530.0, -208.0, "1")])],
                         "path": ["乙平台", "甲平台"], "why": "", "here": False}
             a.route_plan = _plan
@@ -6135,7 +6149,7 @@ def t_zone_rule_yields_to_goto():
       · 命令**收工之后**回到正常回路 ⇒ 区域规则**照旧生效**（不在区域 ⇒ 先回去 + 下
         前往第一个配置的集合）—— 这条专门防"为了修上面把原规则弄没了"✗。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings(attack_dist=120.0)
     s.strategy = "patrol"
@@ -6158,7 +6172,7 @@ def t_zone_rule_yields_to_goto():
         a = h.agent
         a.route_plan = _plan
         # 「命令前往：左上平台」——夹具玩家 world_x=500，那一步的落点中心 150 ⇒ 该按 ←
-        a.start_route([route.WalkJob("左上平台",
+        a.start_route([jobmod.WalkJob("左上平台",
                                      [(150.0, 130.0, 170.0, -208.0, "44")])],
                       why="命令前往：左上平台")
         # ① 命令途中 + 不在区域 + 范围内有怪 ⇒ 打（原来漏掉的正是这一拍）
@@ -6233,7 +6247,7 @@ def t_zone_back_when_idle():
       否则节流也会让 `plans` 是空的 ⇒ 用例测不到真东西 ✗（同 `t_zone_rule_under_no_chase_path`
       里那句 `h.clock.t = 4.0` 的教训 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings(attack_dist=120.0)
     s.strategy = "patrol"
@@ -6246,9 +6260,10 @@ def t_zone_back_when_idle():
     plans = []
 
     def _plan(dst):
+        from decision import jobs as jobmod
         plans.append(dst)
         # 真给一步（世界 x 150~170，夹具玩家 world_x=500 ⇒ 该按 ← ✓ 证明"真的在走"）
-        return {"jobs": [route.WalkJob("甲平台", [(150.0, 130.0, 170.0, -208.0, "44")])],
+        return {"jobs": [jobmod.WalkJob("甲平台", [(150.0, 130.0, 170.0, -208.0, "44")])],
                 "path": ["乙平台", "甲平台"], "why": "", "here": False}
 
     with h._patched():
@@ -6318,7 +6333,7 @@ def t_zone_back_when_idle():
         a._temp_fight = False
 
         # ④′ 手里还有任务 ⇒ 让路（本支正常到不了，同上直接调助手钉住 ✓）
-        a.start_route([route.WalkJob("甲平台", [(150.0, 130.0, 170.0, -208.0, "44")])],
+        a.start_route([jobmod.WalkJob("甲平台", [(150.0, 130.0, 170.0, -208.0, "44")])],
                       why="用例：占着手")
         plans.clear()
         _k2 = set()
@@ -6361,7 +6376,7 @@ def t_zone_rule_yields_to_spot_strategies():
 
     反向验证（本次做过 ✓）：把 `_spot_strategy` 那半句去掉 ⇒ ①② 当场红 ✓。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     for _strat in ("multi", "platform"):
         s = fresh_settings(attack_dist=120.0)
@@ -6376,8 +6391,9 @@ def t_zone_rule_yields_to_spot_strategies():
             h.clock0 = h.clock.t
 
             def _plan(dst, _p=plans):
+                from decision import jobs as jobmod
                 _p.append(dst)
-                return {"jobs": [route.WalkJob(
+                return {"jobs": [jobmod.WalkJob(
                     "甲平台", [(520.0, 510.0, 530.0, -208.0, "1")])],
                     "path": ["乙平台", "甲平台"], "why": "", "here": False}
 
@@ -6519,10 +6535,11 @@ def t_task_report_on_skip():
       ③ 进战斗（对照组，行为不许变）⇒ 恢复后不背锅；
       ④ 时序拍**不参与**结算（否则 `_climb_started` 每 10ms 重打 ⇒ 寻路超时永不触发 ✗）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     def group(kind):
         """跑一组：任务先跑 2 拍 ⇒ 按 kind 挡一段 ⇒ 恢复一拍。返回 (agent, harness)。"""
+        from decision import jobs as jobmod
         s = fresh_settings(attack_dist=120.0)
         s.strategy = "patrol"
         h = Harness(s)
@@ -6530,7 +6547,7 @@ def t_task_report_on_skip():
         h.mobs_fn = lambda t: []
         with h._patched():
             a = h.agent
-            a.start_route([route.WalkJob("左上平台",
+            a.start_route([jobmod.WalkJob("左上平台",
                                          [(150.0, 130.0, 170.0, -208.0, "44")])],
                           why="命令前往：左上平台")
 
@@ -6604,9 +6621,9 @@ def t_end_route_clears_plan():
          每拍只报"不在战斗区域，先回去" ✗。
       ③ **反向（别矫枉过正）**：任务**正在跑**时，不许再插一条"回去"的命令。
     """
+    from decision import jobs as jobmod
     import types
 
-    from decision import route
     from gui.route_panel import RoutePanel
 
     def fresh_route(with_jobs=False):
@@ -6615,6 +6632,7 @@ def t_end_route_clears_plan():
         `with_jobs=True` 时那个假解析器会**真的返回一条任务**（去「右下」）——
         用来验证"命令确实下出去了、任务确实挂上了"。
         """
+        from decision import jobs as jobmod
         s = fresh_settings(attack_dist=120.0)
         s.strategy = "patrol"
         s.battle_zone_sets = ["右下"]        # ← 用户项目 寺院通道2 的实配
@@ -6626,17 +6644,18 @@ def t_end_route_clears_plan():
         plans = []
 
         def _plan(dst):
+            from decision import jobs as jobmod
             plans.append(dst)
-            jobs = ([route.WalkJob("右下", [(300.0, 280.0, 320.0, -150.0, "9")])]
+            jobs = ([jobmod.WalkJob("右下", [(300.0, 280.0, 320.0, -150.0, "9")])]
                     if with_jobs else [])
             return {"jobs": jobs, "path": [dst] if jobs else [],
                     "why": "" if jobs else "用例：不真走", "here": False}
 
         a = h.agent
         a.route_plan = _plan
-        a.start_route([route.WalkJob("甲", [(300.0, 280.0, 320.0, -150.0, "1")]),
-                       route.WalkJob("乙", [(400.0, 380.0, 420.0, -150.0, "2")]),
-                       route.WalkJob("左上平台", [(150.0, 130.0, 170.0, -208.0, "3")])],
+        a.start_route([jobmod.WalkJob("甲", [(300.0, 280.0, 320.0, -150.0, "1")]),
+                       jobmod.WalkJob("乙", [(400.0, 380.0, 420.0, -150.0, "2")]),
+                       jobmod.WalkJob("左上平台", [(150.0, 130.0, 170.0, -208.0, "3")])],
                       why="命令前往：左上平台")
         return h, a, plans
 
@@ -6698,16 +6717,16 @@ def t_climb_align_tap_releases_any_fps():
     这条钉**帧率无关**：同样一段对齐，15fps（一帧 67ms）与 34fps（一帧 29ms）
     都必须出现"按一下、松一下"，且松开时刻落在 `TAP_ON_S` 附近（≤ TAP_ON_S + 一帧）✓。
     """
-    from decision import route
-    C = route.ClimbJob
+    from decision import jobs as jobmod
+    C = jobmod.ClimbJob
     # ⭐⭐ **把"点按按住多久"这个数本身钉住**（用户 2026-10-06 ✓ 原话："**直接做成 30ms**"✓，
     #   起因：现场观察到"对齐过程中方向键按住的时间有点长"✓）—— 谁改回去当场红 ✓。
     #   ⚠ 它是**全局一个数**（爬绳 / 下跳点按跳 / 走不动单点跳 / 中途跳下 / 脱离跳 / 走路微调 /
     #     传送点点按 ↑ ✓ 全都在用 ✓ 见 `route.py` 那个常量的说明 ✓）。
-    #   ⚠ 下面那两档只钉"**按时长算、与帧率无关**"✓ —— 它们都用 `route.TAP_ON_S` 现算 ✓
+    #   ⚠ 下面那两档只钉"**按时长算、与帧率无关**"✓ —— 它们都用 `jobmod.TAP_ON_S` 现算 ✓
     #     （所以单靠它们**抓不住**"有人把 30ms 又改掉"这种事 ✗ 必须有上面这条 ✓）。
-    check(abs(route.TAP_ON_S - 0.03) < 1e-9,
-          "「点按按住时长」被动过了（用户 2026-10-06 定的是 30ms ✓）：%r" % (route.TAP_ON_S,))
+    check(abs(jobmod.TAP_ON_S - 0.03) < 1e-9,
+          "「点按按住时长」被动过了（用户 2026-10-06 定的是 30ms ✓）：%r" % (jobmod.TAP_ON_S,))
 
     for _fps in (15.0, 34.0):
         dt = 1.0 / _fps
@@ -6716,7 +6735,7 @@ def t_climb_align_tap_releases_any_fps():
         o = job.update(0.0, px=660.0)              # 差 40px ≤ near ⇒ 进点按区，先按下去
         check(int(o["move"]) != 0, "%.0ffps：该先按下去：%s" % (_fps, o))
         _released, _t = None, 0.0
-        for _i in range(int((route.TAP_ON_S + dt) / dt) + 2):
+        for _i in range(int((jobmod.TAP_ON_S + dt) / dt) + 2):
             _t += dt
             o = job.update(_t, px=660.0)
             if int(o["move"]) == 0:
@@ -6725,10 +6744,10 @@ def t_climb_align_tap_releases_any_fps():
         check(_released is not None,
               "%.0ffps：进了点按区却**一直按住不松**（一帧 %.0fms < TAP_ON_S %.0fms 时"
               "旧写法就会这样 ⇒ 用户报的「按了很久」）：%s"
-              % (_fps, dt * 1000, route.TAP_ON_S * 1000, o))
-        check(_released <= route.TAP_ON_S + dt + 1e-9,
+              % (_fps, dt * 1000, jobmod.TAP_ON_S * 1000, o))
+        check(_released <= jobmod.TAP_ON_S + dt + 1e-9,
               "%.0ffps：松开得太晚（%.3fs，该 ≤ TAP_ON_S %.3fs + 一帧 %.3fs）"
-              % (_fps, _released, route.TAP_ON_S, dt))
+              % (_fps, _released, jobmod.TAP_ON_S, dt))
 
 
 def t_tolerance_above_read_noise():
@@ -6742,75 +6761,76 @@ def t_tolerance_above_read_noise():
       （现场观感就是"对齐时来回抖、按很久"，以及对"还在爬"的误判 ✗）。
 
     钉三件（谁改回去谁红）：
-      ① 「坐标对齐误差范围」默认 **10**（`route.ALIGN_TOL_PX`）——
+      ① 「坐标对齐误差范围」默认 **10**（`jobmod.ALIGN_TOL_PX`）——
          `ClimbJob` / `plan_jobs` / `DecisionSettings`（含老文件 `from_dict` 兜底）**四处一致**；
-      ② `route.STALL_GAIN_PX`（判"y 还在往上爬"）**必须大于**半个面板像素对应的世界距离；
+      ② `jobmod.STALL_GAIN_PX`（判"y 还在往上爬"）**必须大于**半个面板像素对应的世界距离；
       ③ 本来就够大的那几个（走位 / 靠近 / 下跳兜底）**不许被顺手改小** ✗。
     """
+    from decision import pathing
+    from decision import jobs as jobmod
     import inspect
 
-    from decision import route
 
     noise = 8.5 / 2.0                       # ±0.5 面板像素 ⇒ ±4.25 世界像素
 
     # ① 四处一致（各写一个数迟早分叉 ✗）
-    check(route.ALIGN_TOL_PX == 10.0,
-          "对齐容差默认值被动过（依据见用例说明）：%r" % route.ALIGN_TOL_PX)
-    check(int(ag.DecisionSettings().align_tol_px) == int(route.ALIGN_TOL_PX),
-          "设置的默认「坐标对齐误差范围」与 `route.ALIGN_TOL_PX` 不一致：%r vs %r"
-          % (ag.DecisionSettings().align_tol_px, route.ALIGN_TOL_PX))
-    check(route.ClimbJob("L2", x=700.0, y1=-100.0, y2=200.0, direction=1).tol_px
-          == route.ALIGN_TOL_PX,
-          "`ClimbJob` 的默认容差不是 `route.ALIGN_TOL_PX`（老调用方会跑到另一个数上 ✗）")
-    check(inspect.signature(route.plan_jobs).parameters["tol_px"].default
-          == route.ALIGN_TOL_PX,
+    check(jobmod.ALIGN_TOL_PX == 10.0,
+          "对齐容差默认值被动过（依据见用例说明）：%r" % jobmod.ALIGN_TOL_PX)
+    check(int(ag.DecisionSettings().align_tol_px) == int(jobmod.ALIGN_TOL_PX),
+          "设置的默认「坐标对齐误差范围」与 `jobmod.ALIGN_TOL_PX` 不一致：%r vs %r"
+          % (ag.DecisionSettings().align_tol_px, jobmod.ALIGN_TOL_PX))
+    check(jobmod.ClimbJob("L2", x=700.0, y1=-100.0, y2=200.0, direction=1).tol_px
+          == jobmod.ALIGN_TOL_PX,
+          "`ClimbJob` 的默认容差不是 `jobmod.ALIGN_TOL_PX`（老调用方会跑到另一个数上 ✗）")
+    check(inspect.signature(pathing.plan_jobs).parameters["tol_px"].default
+          == jobmod.ALIGN_TOL_PX,
           "`plan_jobs` 的默认容差没跟上常量（面板下命令会拿到另一个数 ✗）")
     s = ag.DecisionSettings()
     s.from_dict({})                          # 老项目文件里没这个键
-    check(int(s.align_tol_px) == int(route.ALIGN_TOL_PX),
+    check(int(s.align_tol_px) == int(jobmod.ALIGN_TOL_PX),
           "老项目文件没退回**新的**默认值（还退回 6 = 噪声里 ✗）：%r" % s.align_tol_px)
 
     # ② 「还在往上爬」的增益要盖过读数噪声，否则 STALL_S 一到就误报「爬不动了」
-    check(route.STALL_GAIN_PX > noise,
+    check(jobmod.STALL_GAIN_PX > noise,
           "`STALL_GAIN_PX`=%r 小于读数噪声(±%.1f 世界像素) ⇒ 永远判成「爬不动了」✗"
-          % (route.STALL_GAIN_PX, noise))
-    check(route.STALL_GAIN_PX <= 20.0,
-          "`STALL_GAIN_PX`=%r 太大 ⇒ 真卡住要等很久才判得出来 ✗" % route.STALL_GAIN_PX)
+          % (jobmod.STALL_GAIN_PX, noise))
+    check(jobmod.STALL_GAIN_PX <= 20.0,
+          "`STALL_GAIN_PX`=%r 太大 ⇒ 真卡住要等很久才判得出来 ✗" % jobmod.STALL_GAIN_PX)
 
     # ③ 反例：本来就大于噪声的那几个，别被"顺手统一"改小 ✗
     #    ⚠ `DROP_DY_PX`（下跳"掉了 40px 就算落地"）2026-09-28 **用户要求整个删掉** ✗ ——
     #    下跳的到达判据已换成「**脚下这块面 == 目标面**」（见 `DropJob._arrived` ✓）
     #    ⇒ 它不在这个名单里了 ✓，而且**不许回来** ✗。
-    for name, v in (("WALK_TOL_PX", route.WALK_TOL_PX),
-                    ("NEAR_PX", route.NEAR_PX)):
+    for name, v in (("WALK_TOL_PX", jobmod.WALK_TOL_PX),
+                    ("NEAR_PX", jobmod.NEAR_PX)):
         check(v > noise, "%s=%r 也被改到噪声以下了（它本来够大 ✗）" % (name, v))
-    check(not hasattr(route, "DROP_DY_PX"),
+    check(not any(hasattr(m, "DROP_DY_PX") for m in (jobmod, pathing)),
           "`DROP_DY_PX` 又回来了 —— 下跳的到达判据已经是「脚下这块面 == 目标面」"
           "（用户 2026-09-28 ✓），别再拿「掉了多少像素」凑一个数 ✗")
 
 
 def t_climb_align_near_px():
     """「开始对齐绳梯x的距离(px)」（用户 2026-09-27 要求）：比它远 ⇒ **一口气按住**；
-    ≤ 它 ⇒ 改成**点按**（一下一下）。原来是**写死**的 `route.NEAR_PX` = 20px，
+    ≤ 它 ⇒ 改成**点按**（一下一下）。原来是**写死**的 `jobmod.NEAR_PX` = 20px，
     用户实测"太近了"（精细那一段来得太晚）⇒ 抽成「攀爬参数」里的一格。
 
     钉四件：
-      ① 默认值 = `route.NEAR_PX`（老行为一点不变 ✓，两处不许各写一个数）；
+      ① 默认值 = `jobmod.NEAR_PX`（老行为一点不变 ✓，两处不许各写一个数）；
       ② 决策设置三处同步（`__init__` / `to_dict` / `from_dict`），老项目文件缺这个键
          时退回 20，0/负数兜到 1（"永远按住"没意义）；
       ③ **行为**（这条才是用户要的）：差 40px 时，默认（20）**按住不放**；配成 60 ⇒ 第二拍
          就**松开**（点按）—— 也就是"精细对齐从更远就开始"；
       ④ 这个参数**只归上绳**（`ClimbJob`）—— 走（`WalkJob`）那份还是常量，别顺手改了 ✗。
     """
-    from decision import route
-    C = route.ClimbJob
+    from decision import jobs as jobmod
+    C = jobmod.ClimbJob
 
     # ① 默认值就是那个常量
-    check(int(getattr(ag.DecisionSettings(), "climb_align_near_px", -1)) == int(route.NEAR_PX),
-          "默认「开始对齐绳梯x的距离(px)」不是 `route.NEAR_PX`：%r vs %r"
-          % (getattr(ag.settings, "climb_align_near_px", None), route.NEAR_PX))
-    check(C("L2", x=700.0, y1=-100.0, y2=200.0, direction=1).near_px == route.NEAR_PX,
-          "`ClimbJob` 自己的默认不是 `route.NEAR_PX`（老调用方行为会变 ✗）")
+    check(int(getattr(ag.DecisionSettings(), "climb_align_near_px", -1)) == int(jobmod.NEAR_PX),
+          "默认「开始对齐绳梯x的距离(px)」不是 `jobmod.NEAR_PX`：%r vs %r"
+          % (getattr(ag.settings, "climb_align_near_px", None), jobmod.NEAR_PX))
+    check(C("L2", x=700.0, y1=-100.0, y2=200.0, direction=1).near_px == jobmod.NEAR_PX,
+          "`ClimbJob` 自己的默认不是 `jobmod.NEAR_PX`（老调用方行为会变 ✗）")
 
     # ② 存 / 读一致 + 老文件退回默认 + 坏值兜住
     s = ag.DecisionSettings()
@@ -6854,10 +6874,10 @@ def t_climb_align_near_px():
           "点按要「按一下、松一下」：%s → %s" % (o1["move"], o2["move"]))
 
     # ④ 走那条路不受影响（用户只要求上绳那份可配）：常量还在 20，`WalkJob` 也不接这个设置
-    check(float(route.NEAR_PX) == 20.0,
-          "`route.NEAR_PX` 被改了 —— 走那边会跟着变（用户只要求上绳那份可配）✗：%r"
-          % route.NEAR_PX)
-    check(not hasattr(route.WalkJob("乙平台", []), "near_px"),
+    check(float(jobmod.NEAR_PX) == 20.0,
+          "`jobmod.NEAR_PX` 被改了 —— 走那边会跟着变（用户只要求上绳那份可配）✗：%r"
+          % jobmod.NEAR_PX)
+    check(not hasattr(jobmod.WalkJob("乙平台", []), "near_px"),
           "「走」也接上了 `near_px`（用户没要求配走那一份）")
     # ⑤ 界面上真有这一格（在「攀爬参数」组里，标签就是用户要的那句话）
     _src_rp = (Path(__file__).resolve().parent.parent / "gui" / "route_panel.py"
@@ -6877,10 +6897,10 @@ def t_behavior_task_events():
     `stop_route`）来钉"接线接上了没"；模块本身的格式/健壮性在
     `tools/selftest_behavior.py` ✓（那边不碰 agent，两边分工不重叠 ✓）。
     """
+    from decision import jobs as jobmod
     import tempfile
 
     from core import behavior
-    from decision import route
 
     logf = Path(tempfile.mkdtemp(prefix="behavior_task_")) / "behavior.log"
     old_log, old_en = behavior.LOG, behavior.ENABLED
@@ -6894,8 +6914,8 @@ def t_behavior_task_events():
             ok, _why = a.plan_and_start_route("左上平台", why="命令前往：左上平台")
             check(not ok, "前提不成立：没注入解析器却起跑了")
             # ② 两步路线 ⇒ task_start
-            j1 = route.WalkJob("乙平台", [(700.0, 600.0, 800.0, 560.0, "1")])
-            j2 = route.WalkJob("丙平台", [(700.0, 600.0, 800.0, 560.0, "2")])
+            j1 = jobmod.WalkJob("乙平台", [(700.0, 600.0, 800.0, 560.0, "1")])
+            j2 = jobmod.WalkJob("丙平台", [(700.0, 600.0, 800.0, 560.0, "2")])
             check(a.start_route([j1, j2], why="命令前往：丙平台"), "两步路线没起跑")
             # ③ 第一步到 ⇒ task_step（`_task_finished` 是"这一步收工"的唯一出口 ✓）
             check(a._task_finished() is False, "第一步收工后该接着走下一步")
@@ -6947,11 +6967,11 @@ def t_behavior_route_events():
     这里**直接喂 `agent._mark_route_change(job)`**（打点本体，它的真实调用点在
     `_climb_tick` 的 `job.update` 之后，那一处也一起钉源码 ✓）。
     """
+    from decision import jobs as jobmod
     import inspect
     import tempfile
 
     from core import behavior
-    from decision import route
     from decision.agent import CombatAgent
 
     logf = Path(tempfile.mkdtemp(prefix="behavior_route_")) / "behavior.log"
@@ -6959,7 +6979,7 @@ def t_behavior_route_events():
     try:
         behavior.configure(True, log=logf)
         a = CombatAgent(fresh_settings())
-        C = route.ClimbJob
+        C = jobmod.ClimbJob
         j = C(ladder_id="L2", x=600.0, y1=100.0, y2=300.0, direction=1,
               dst_set="上", src_set="下", tol_px=10, hold_ms=0, near_px=20,
               jump_start_px=120)
@@ -7004,14 +7024,14 @@ def t_climbing_vertical_notify():
     ③ **drop（下跳）任务按 ↓ 也发通知**（用户 2026-09-28 追加："drop 按 ↓ 时也发通知，直到
     drop 收工再关上"）✓；④ 感知层喂位置状态机用的是 `climbing_vertical`（不再是 `holding_vertical`）。
     """
+    from decision import jobs as jobmod
     import inspect
 
-    from decision import route
     from decision.agent import CombatAgent
 
     a = CombatAgent(fresh_settings())
     check(not a.climbing_vertical(), "没任务时 climbing_vertical 该 False")
-    j = route.ClimbJob("L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
+    j = jobmod.ClimbJob("L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
                        dst_set="乙", src_set="甲", tol_px=6, hold_ms=200)
     a._climb = j
     check(not a.climbing_vertical(), "刚挂上还没发 ↑/↓ 该 False")
@@ -7021,11 +7041,11 @@ def t_climbing_vertical_notify():
     check(a.climbing_vertical(), "上一拍发了 ↓ 该 True")
     j._last_vert = 0
     check(not a.climbing_vertical(), "上一拍没发 ↑/↓ 该 False")
-    a._climb = route.WalkJob("乙", [(700.0, 690.0, 710.0, -208.0, "1")])
+    a._climb = jobmod.WalkJob("乙", [(700.0, 690.0, 710.0, -208.0, "1")])
     check(not a.climbing_vertical(), "走任务不算「爬绳通知」")
     # ③ drop（下跳）任务按 ↓ 也发通知 —— ⭐ **真跑**（不再手摆一个 `_last_vert` 进去 ✗：
     #   那等于"替实现写期望"，测不出"实现会不会自己写这个字段" ✓ 教训同 SKILL 273 ✓）
-    d = route.DropJob("甲", "乙", [(700.0, 690.0, 710.0, "1")], tol_px=6, hold_ms=0)
+    d = jobmod.DropJob("甲", "乙", [(700.0, 690.0, 710.0, "1")], tol_px=6, hold_ms=0)
     a._climb = d
     # ⭐⭐⭐ **2026-10-10 改口径**（用户原话："**drop 刚开始时就需要让位置状态允许能判定上绳梯，
     #   现在貌似没有走这一步判定**"✗）：下跳**整段都开**这口许可 ✓
@@ -7051,7 +7071,7 @@ def t_climbing_vertical_notify():
     #   "drop 按 ↓ 同时有没有通知位置状态开上绳梯的口"✓）：那几拍 `agent.tick` 根本没跑任务
     #   ⇒ **一个键都没发** ✗，可 `_last_vert` 还留着 ↓ ⇒ 位置状态会继续把人判成"在绳梯上"
     #   （口关不上 ✗）⇒ "卡在 L5 绳梯上"这一类卡住就有它一份 ✓。
-    d2 = route.DropJob("甲", "乙", [(700.0, 690.0, 710.0, "1")], tol_px=6, hold_ms=0)
+    d2 = jobmod.DropJob("甲", "乙", [(700.0, 690.0, 710.0, "1")], tol_px=6, hold_ms=0)
     a._climb = d2
     d2.update(0.0, px=700.0)
     d2.update(0.5, px=700.0)                    # 已经按住 ↓ ⇒ 通知开着 ✓
@@ -7081,18 +7101,28 @@ def t_climb_hold_up_not_preempted():
     钉两件：① `ClimbJob.holding_up()` 在"判到达后、还没 DONE"的几拍 = True，其余 = False；
     ② 那条提前收工带上了 `holding_up`（源码级：避开这个阶段）。
     """
+    from decision import jobs as jobmod
     import inspect
 
-    from decision import route
     from decision.agent import CombatAgent
 
-    C = route.ClimbJob
+    C = jobmod.ClimbJob
     j = C("L3", x=1189.0, y1=68.0, y2=-83.0, direction=1, dst_set="二楼", src_set="一楼",
           tol_px=10, hold_ms=250)
     j.update(0.0, px=1189.0, py=0.0, ladder_id="L3", here_sets=["一楼"])
     check(not j.holding_up(), "还没判到达，不该 holding_up")
     o = j.update(0.5, px=1189.0, py=-85.0, ladder_id="L3", here_sets=["一楼"], at_top="L3")
     check(not o["done"] and j.holding_up(), "判到达后、还没 DONE 的几拍该 holding_up")
+    # ⭐⭐ 2026-10-18 现场：到顶后这几拍要按满「坐标对齐误差时间」（现场 3000ms）—— 这期间
+    #   只要对面把键丢了（relay 重连会 RELEASEALL），`KeyState` 只在键集**变化**时发键 ⇒
+    #   这一整段**一个键都不会再发** ⇒ 表现就是"额外按住 ↑ 不生效"（用户报的 ✓）。
+    #   ⇒ 必须带 `reassert`（每拍补一次 PRESS ✓ 与"爬不动 ⇒ 按住 ↑ + 补按"同一套）。
+    #   ⚠ 注意**判到达那一拍本身走的是 CLIMB 相**（到达是在那支里登记 `_arrived_at` 的 ✓），
+    #     `_arrive_step` 的"再按住 ↑"从**下一拍**才开始 ⇒ 断言要打在那几拍上 ✗ 别打在到达拍 ✗。
+    o = j.update(0.55, px=1189.0, py=-85.0, ladder_id="L3", here_sets=["一楼"], at_top="L3")
+    check(not o["done"] and o.get("reassert") is True,
+          "「到顶后再按住 ↑」那几拍没带 `reassert` ⇒ 对面丢键后整段不补按 ✗"
+          "（用户 2026-10-18：「额外按 ↑ 坐标对齐误差时间不生效了」）")
     o = j.update(0.8, px=1189.0, py=-85.0, ladder_id=None, here_sets=["二楼"], at_top="L3")
     check(o["done"] and not j.holding_up(), "收工后不该再 holding_up")
     src = inspect.getsource(CombatAgent._climb_tick)
@@ -7105,19 +7135,20 @@ def t_stall_unified_to_retry():
 
     原话："移除卡住判定时长(s)，统一采用移动操作尝试间隔(ms)" ✓ —— 原来那件
     `DecisionSettings.stall_s` 删掉 ✓，那些"多久没进展算卡住"的判据（上爬「爬不动了」/
-    下爬「等落地」/ 跳跃「没落到」）统一由 `route.stall_s_from_retry_ms(move_retry_ms)` 换算 ✓。
+    下爬「等落地」/ 跳跃「没落到」）统一由 `jobmod.stall_s_from_retry_ms(move_retry_ms)` 换算 ✓。
 
     钉五件：
       ① 设置里**没有** `stall_s` 这格了；`to_dict` 也不再落盘它 ✓；
       ② 老配置里残留的 `stall_s` 键 ⇒ **读进来直接忽略**（不报错、不挂回设置 ✓）；
       ③ 换算**一处实现**：3000 ⇒ 3.0、5000 ⇒ 5.0、0 / 负数 / None / 坏值 ⇒ 钳到下限 0.5 ✓；
       ④ 三处调用方（面板 / 实时线程 / agent）都**通过它**取，不许各写一份 ✗（源码钉子 ✓）；
-      ⑤ 「走」照旧**不吃**它：`job_for_edge` 造出来的走任务 `stall_s` 仍是 `route.STALL_S` ✓。
+      ⑤ 「走」照旧**不吃**它：`job_for_edge` 造出来的走任务 `stall_s` 仍是 `jobmod.STALL_S` ✓。
     """
+    from decision import pathing
+    from decision import jobs as jobmod
     from pathlib import Path as _P
 
     from core import mapdata, zones
-    from decision import route
 
     # ① 设置里没这格了 + 不再落盘
     s0 = ag.DecisionSettings()
@@ -7130,10 +7161,10 @@ def t_stall_unified_to_retry():
     check(not hasattr(s1, "stall_s"), "老配置里的 `stall_s` 又被挂回设置上了 ✗")
 
     # ③ 换算：一处实现 + 下限
-    check(abs(route.stall_s_from_retry_ms(3000) - 3.0) < 1e-9, "3000ms 该换算出 3.0 秒")
-    check(abs(route.stall_s_from_retry_ms(5000) - 5.0) < 1e-9, "5000ms 该换算出 5.0 秒")
+    check(abs(jobmod.stall_s_from_retry_ms(3000) - 3.0) < 1e-9, "3000ms 该换算出 3.0 秒")
+    check(abs(jobmod.stall_s_from_retry_ms(5000) - 5.0) < 1e-9, "5000ms 该换算出 5.0 秒")
     for bad in (0, -5, None, "x"):
-        _got = route.stall_s_from_retry_ms(bad)
+        _got = jobmod.stall_s_from_retry_ms(bad)
         check(_got >= 0.5,
               "%r 没被钳到下限 0.5（那是「刚按一下就判卡住」✗）：%r" % (bad, _got))
 
@@ -7142,17 +7173,17 @@ def t_stall_unified_to_retry():
     for rel in ("gui/route_panel.py", "gui/live_thread.py", "decision/agent.py"):
         src = (root / rel).read_text(encoding="utf-8")
         check("stall_s_from_retry_ms" in src,
-              "%s 没走 `route.stall_s_from_retry_ms`（三处必须同一处实现 ✓）" % rel)
+              "%s 没走 `jobmod.stall_s_from_retry_ms`（三处必须同一处实现 ✓）" % rel)
 
     # ⑤ 「走」不吃它（照旧常量 + 寻路超时兜底 ✓）
     t = mapdata.load("105090600")
     z = zones.load("105090600")
     _walk = next((e for e in z.edges if e.get("kind") == "walk"), None)
     check(_walk is not None, "用户数据里没有「走」边，这条测不了")
-    _wj = route.job_for_edge(t, z, _walk, stall_s=1.5)
-    check(abs(float(getattr(_wj, "stall_s", -1)) - float(route.STALL_S)) < 1e-9,
+    _wj = pathing.job_for_edge(t, z, _walk, stall_s=1.5)
+    check(abs(float(getattr(_wj, "stall_s", -1)) - float(jobmod.STALL_S)) < 1e-9,
           "「走」竟然吃到了那件参数（该照旧用常量 %s）：%s"
-          % (route.STALL_S, getattr(_wj, "stall_s", None)))
+          % (jobmod.STALL_S, getattr(_wj, "stall_s", None)))
 def t_climb_flow_rules():
     """攀爬流程的两条新规矩（用户 2026-09-27 要求，落点在 `ClimbJob.update`）：
 
@@ -7167,20 +7198,21 @@ def t_climb_flow_rules():
     （① 「在绳上就不进 attack」是 agent 那一层的事，见
       `t_climb_attack_exception_agent`。）
     """
-    from decision import route
-    C = route.ClimbJob
+    from decision import jobs as jobmod
+    C = jobmod.ClimbJob
 
     def mk(**kw):
+        from decision import jobs as jobmod
         a = dict(ladder_id="L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
                  dst_set="乙平台", src_set="甲平台", tol_px=6, hold_ms=0,
                  timeout_s=600.0)
         a.update(kw)
-        return route.ClimbJob(**a)
+        return jobmod.ClimbJob(**a)
 
     # ---- ② 还没上绳、人还在起跳平台上 ⇒ **直接补按一次目标方向 → 回对齐**（用户 2026-10-01 ✓）----
     # ⭐ 2026-10-01 改：不再"先站住等 y 稳定 1 秒"—— `_in_src`（here_sets 广播含 src_set）
     #   本身 = 位置状态权威确认"人已站稳起跳平台"✓，原来 `_y_settled` 那个时间/几何兜底已删。
-    _P, _ON = route.TAP_PERIOD_S, route.TAP_ON_S        # 点按周期 / 按住时长（现成常数）
+    _P, _ON = jobmod.TAP_PERIOD_S, jobmod.TAP_ON_S        # 点按周期 / 按住时长（现成常数）
     job = mk(hold_ms=250)
     o = job.update(0.0, px=700.0, py=100.0, here_sets=["甲平台"])
     check(job.phase == C.ALIGN and not o["jump"],
@@ -7298,10 +7330,11 @@ def t_climb_replan_wrong_ladder():
       ② 在目标绳上 ⇒ 不 replan（正常上绳 ✓）；
       ③ 没在绳上（ladder_id=None）⇒ 不 replan（正常 align ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     def mk():
-        return route.ClimbJob("L7", x=521.0, y1=844.0, y2=1039.0,
+        from decision import jobs as jobmod
+        return jobmod.ClimbJob("L7", x=521.0, y1=844.0, y2=1039.0,
                               direction=1, dst_set="二楼", src_set="底层")
     now = 1000.0
     # ① 上了非目标绳 L1（目标 L7）⇒ replan=True ✓
@@ -7346,7 +7379,7 @@ def t_climb_attack_exception_agent():
       ⑤ ⭐ **上一拍已经是 attack** ⇒ 这一拍照旧 attack **且 ↑ 不断**（老口径那个"自锁"担心
         在新口径下**不存在**了 —— 不再需要"扳回 climb"✗，但"任务照推 ⇒ ↑ 不松"必须成立 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = ag.DecisionSettings()
     s.enabled = True
@@ -7357,10 +7390,11 @@ def t_climb_attack_exception_agent():
 
     def job(**kw):
         # x=500 = 夹具里玩家的 x（一拍对齐）；绳端放很远 ⇒ 别被"越过绳端"那条兜底判到达 ✓
+        from decision import jobs as jobmod
         a = dict(ladder_id="L2", x=500.0, y1=-9999.0, y2=9999.0, direction=1,
                  dst_set="乙平台", src_set="甲平台", tol_px=6, hold_ms=0)
         a.update(kw)
-        return route.ClimbJob(**a)
+        return jobmod.ClimbJob(**a)
 
     with h._patched():
         up, atk = s.keymap["up"], s.keymap["attack"]
@@ -7417,7 +7451,13 @@ def t_climb_attack_exception_agent():
         # ⚠ 摆回「**对齐 x 中**」（用户现场 `hold_ms`=1000ms ⇒ 对齐要持续好几拍；而这个用例
         #   的 `hold_ms=0` ⇒ 上面那拍一步就对好、进 `CLIMB` 了 ✗）—— 不摆回去，下面测的就
         #   不是"对齐期间"了 ✓（`_task_ran_at` 已经盖过章 ✓ 报信那套仍然有效 ✓）。
-        h.agent._climb.phase = route.ClimbJob.ALIGN
+        h.agent._climb.phase = jobmod.ClimbJob.ALIGN
+        # ⚠ **连"按过跳"的锚一起摆回未按**（2026-10-19 ✓）：上面那一拍 `hold_ms=0` 一步就对好
+        #   并**按过跳**了（`_jumped_once=True`）⇒ 只摆 `phase` 会造出一个**生产里不存在的组合**
+        #   （"对齐中 + 已按过跳" = 斜跳飞行，那一段用户 2026-09-27 要求**不进 attack** ✓）。
+        #   生产里"跳失败退回对齐"走的是 `_reset_round(clear_jump=True)` ⇒ 这两个锚是一起清的 ✓。
+        h.agent._climb._jumped_once = False
+        h.agent._climb._diag_flying = False
         h.clock.t += 0.1
         ws4 = h.ws(with_mob=True)
         ws4.player.ladder_id = None       # 感知：还没报"在绳上"（带按键许可 ✗）
@@ -7450,7 +7490,7 @@ def t_climb_attack_exception_agent():
               "打完（怪清空）把攀爬任务丢了（该接着爬 ✓）：%r" % (h.agent._climb,))
 
         # ②' 对照：**绳在别处**（人还没走到它的范围里）⇒ 照旧先打（例外不许无限宽 ✗）
-        far = route.ClimbJob(ladder_id="L9", x=900.0, y1=-9999.0, y2=9999.0,
+        far = jobmod.ClimbJob(ladder_id="L9", x=900.0, y1=-9999.0, y2=9999.0,
                              direction=1, dst_set="乙平台", src_set="甲平台",
                              tol_px=6, hold_ms=0)
         h.agent.start_climb(far)
@@ -7464,7 +7504,7 @@ def t_climb_attack_exception_agent():
 
         # ③ 对照：**走路任务** + 感知说"在绳上"⇒ 照旧先打（改路线路过绳的 x 很常见）
         spots = [(500.0, 480.0, 520.0, "1")]
-        h.agent.start_climb(route.WalkJob("乙平台", spots, tol_px=6, hold_ms=0))
+        h.agent.start_climb(jobmod.WalkJob("乙平台", spots, tol_px=6, hold_ms=0))
         h.clock.t += 0.1
         ws5 = h.ws(with_mob=True)
         ws5.player.ladder_id = "L2"       # 走路任务没有 ladder_id ⇒ 不该豁免 ✓
@@ -7515,7 +7555,7 @@ def t_climb_hold_up_keeps_up_when_attack():
       ② 同一拍 **↑ 必须还在** ✓（断了 = 攀爬被打断 ✗）；
       ③ 后续每一拍也得按着 ↑ ✓（`KeyState` **只在键集变化时发键** ⇒ 少推一拍 = 松手 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings(strategy="patrol", attack_dist=80.0)
     h = Harness(s)
@@ -7527,7 +7567,7 @@ def t_climb_hold_up_keeps_up_when_attack():
         ws = h.ws(with_mob=True)               # 默认那只怪在 x=560（距角色中心 40 < 80 ✓ 范围内）
         ws.player.here_sets = ["乙平台"]         # 脚下**不是**目的地（"顶层"）⇒ 不触发"已在目的地"收工 ✓
         ws.player.at_ladder_top = "L1"          # 位置状态：已到 L1 上端 ⇒ **到达** ✓
-        j = route.ClimbJob(ladder_id="L1", x=700.0, y1=-182.0, y2=-353.0,
+        j = jobmod.ClimbJob(ladder_id="L1", x=700.0, y1=-182.0, y2=-353.0,
                            direction=1, dst_set="顶层", src_set="乙平台",
                            tol_px=10, hold_ms=300)
         j.phase = j.CLIMB                       # 摆成"正在爬"（同 `t_climb_arrive_face_target` ✓）
@@ -7567,7 +7607,7 @@ def t_climb_align_gap():
     **两次按下方向键之间至少要隔这么久**。
 
     钉四件：
-      ① 默认值 180 **就是** `route.TAP_PERIOD_S`（那本来是写死的点按周期；两处各写一个数
+      ① 默认值 180 **就是** `jobmod.TAP_PERIOD_S`（那本来是写死的点按周期；两处各写一个数
          迟早分叉 ⇒ 这里直接断言它俩相等 ✓）；
       ② 决策设置三处同步（`__init__` / `to_dict` / `from_dict`），且老项目文件缺这个键时
          退回 180（= 老行为 ✓）；
@@ -7575,14 +7615,14 @@ def t_climb_align_gap():
          一样**（过冲之后往回按也走这条 ⇒ 治的就是「在绳两边来回抖」）；
       ④ 设 0 = 不限制；远距离（>`NEAR_PX`）仍然**一口气按住走**（同方向连续按算一次按下 ✓）。
     """
-    from decision import route
-    C = route.ClimbJob
+    from decision import jobs as jobmod
+    C = jobmod.ClimbJob
 
     # ① 默认值 = 那个常量（毫秒）
     check(int(getattr(ag.DecisionSettings(), "climb_align_gap_ms", -1))
-          == int(route.TAP_PERIOD_S * 1000),
-          "默认「对齐绳梯移动延迟」不是 `route.TAP_PERIOD_S` 的毫秒值：%r vs %r"
-          % (getattr(ag.settings, "climb_align_gap_ms", None), route.TAP_PERIOD_S))
+          == int(jobmod.TAP_PERIOD_S * 1000),
+          "默认「对齐绳梯移动延迟」不是 `jobmod.TAP_PERIOD_S` 的毫秒值：%r vs %r"
+          % (getattr(ag.settings, "climb_align_gap_ms", None), jobmod.TAP_PERIOD_S))
     check(C("L2", x=700.0, y1=-100.0, y2=200.0, direction=1).align_gap_ms == 180,
           "`ClimbJob` 自己的默认值不是 180（老调用方的行为会变 ✗）")
 
@@ -7655,8 +7695,8 @@ def t_climb_up_key_starts_at_jump():
       ⑤ 下爬：跳之前**也不按 ↑**（它的 ALIGN 本来就不发 ↓ ✓），按跳那一拍照旧 ↑ ✓
          —— 这条钉在 `t_climb_diagonal_jump` ⑫ ✓（这里不重复摆）。
     """
-    from decision import route
-    C = route.ClimbJob
+    from decision import jobs as jobmod
+    C = jobmod.ClimbJob
 
     def mk(**kw):
         a = dict(ladder_id="L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
@@ -7720,7 +7760,7 @@ def t_climb_wiring():
     有怪还是会进 attack"。这里**不额外写仲裁** —— 靠 tick 里 `if in_range:` 排在
     `else:` 之前天然成立；这条用例就是证明它真的成立（而不是我以为成立）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = ag.DecisionSettings()
     s.enabled = True
@@ -7735,10 +7775,11 @@ def t_climb_wiring():
 
     def job(**kw):
         # x=500 ＝ 夹具里玩家的 x ⇒ 一拍就对齐（hold_ms=0），方便看"该不该按跳"
+        from decision import jobs as jobmod
         a = dict(ladder_id="L2", x=500.0, y1=-100.0, y2=200.0, direction=1,
                  dst_set="乙平台", tol_px=6, hold_ms=0)
         a.update(kw)
-        return route.ClimbJob(**a)
+        return jobmod.ClimbJob(**a)
 
     def downs():
         return {k for _t, kind, k in h.log if kind == "down"}
@@ -7912,12 +7953,12 @@ def t_climb_wiring():
             #   ⚠ 这一支钉的仍是"**挨打那条延迟不适用于它**" ✓（下面用**刹车**推进时间 ✓，
             #     而不是用 `climb_retry_delay_s`(1.0) ✗ —— 那正是本条要区分的两种延迟 ✓）。
             from decision import agent as _ag
-            check(jf.attempt == 1 and jf.phase == route.ClimbJob.FAILED,
+            check(jf.attempt == 1 and jf.phase == jobmod.ClimbJob.FAILED,
                   "「没挨打」这一支该先按刹车等一拍（不许每帧重来 ✗）："
                   "attempt=%s phase=%s" % (jf.attempt, jf.phase))
             h.agent._climb_tick(_ag.CLIMB_RETRY_MIN_S + 0.05, 500.0, set(),
                                 h.ws(with_mob=False))
-            check(jf.attempt == 2 and jf.phase == route.ClimbJob.ALIGN,
+            check(jf.attempt == 2 and jf.phase == jobmod.ClimbJob.ALIGN,
                   "「**没挨打**」的失败该**隔一个刹车就重来**（用户 2026-09-28：延迟只给"
                   "挨打那种 ✗；用户 2026-10-17：但也别每帧一次 ✗）："
                   "attempt=%s phase=%s" % (jf.attempt, jf.phase))
@@ -7937,7 +7978,7 @@ def t_climb_wiring():
             obj._fail("用例：按跳后挨打")
             h.log.clear()
             done = h.agent._climb_tick(0.0, 500.0, set(), h.ws(with_mob=False))
-            check(j.attempt == 1 and j.phase == route.ClimbJob.FAILED,
+            check(j.attempt == 1 and j.phase == jobmod.ClimbJob.FAILED,
                   "「**按跳后挨过打**」的失败没等延迟（用户要求这一种才等 ✗）："
                   "attempt=%s phase=%s" % (j.attempt, j.phase))
             check(jump not in downs(), "等待期间还在按跳（该站着等）：%s" % h.log)
@@ -7950,7 +7991,7 @@ def t_climb_wiring():
             check(j.attempt == 1, "延迟没到就重新激活了：attempt=%s" % j.attempt)
             # 到点 ⇒ 重新对齐（attempt +1）
             h.agent._climb_tick(1.1, 500.0, set(), h.ws(with_mob=False))
-            check(j.attempt == 2 and j.phase == route.ClimbJob.ALIGN,
+            check(j.attempt == 2 and j.phase == jobmod.ClimbJob.ALIGN,
                   "延迟到了却没重新激活：attempt=%s phase=%s" % (j.attempt, j.phase))
             # **失败多少次都不放弃**（原来这条钉的是"到上限就放弃" ✗ 2026-09-27 反过来了）
             for _k in range(6):
@@ -8055,7 +8096,7 @@ def t_climb_wiring():
         s.goto_timeout_s = was_cap
 
         # ⑤c 下跳：**先按住 ↓ 那一拍不许按跳**（agent 那层也得对 —— 这是新加的分支）
-        dj = route.DropJob("甲平台", "乙平台", [(500.0, 470.0, 530.0, "41")],
+        dj = jobmod.DropJob("甲平台", "乙平台", [(500.0, 470.0, 530.0, "41")],
                            tol_px=6, hold_ms=0)
         h.agent.start_climb(dj)
         h.log.clear()
@@ -8090,16 +8131,17 @@ def t_climb_world_x_and_tap():
     ③ **保持窗口 = 设置里的保持时间 + 当前端到端延迟**（`ws.e2e_ms`）：定位读数是
        "过去某一刻"的位置，延迟越大越不能拿单帧当真。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = ag.settings
     h = Harness(s)
 
     def job(**kw):
+        from decision import jobs as jobmod
         a = dict(ladder_id="L1", x=140.0, y1=-100.0, y2=200.0, direction=1,
                  dst_set="乙平台", tol_px=6, hold_ms=0)
         a.update(kw)
-        return route.ClimbJob(**a)
+        return jobmod.ClimbJob(**a)
 
     s.enabled = True          # 同 t_climb_wiring：别靠别的用例把开关打开
 
@@ -8169,11 +8211,12 @@ def t_drop_job():
       · **到达**：先认集合；认不出集合 ⇒ 用「**脚下这块面就是目标平台的面**」兜底
         （读位置状态广播的 `ground_y` ✓；用户 2026-09-28 换掉了旧的"y 掉 40px" ✗）。
     """
+    from decision import pathing
+    from decision import jobs as jobmod
     from core import mapdata, zones
-    from decision import route
 
     spots = [(700.0, 660.0, 740.0, "41"), (1250.0, 1210.0, 1290.0, "72")]
-    job = route.DropJob("甲平台", "乙平台", spots, tol_px=6, hold_ms=0)
+    job = jobmod.DropJob("甲平台", "乙平台", spots, tol_px=6, hold_ms=0)
 
     # ① 就近挑：站在 x=1200 ⇒ 挑 fh 72（不是 700 那个）
     o = job.update(0.0, px=1200.0)
@@ -8181,14 +8224,14 @@ def t_drop_job():
     check(o["move"] == 1 and not o["jump"], "该往右挪：%s" % o)
     # ② 平齐后 ⇒ **先按住 ↓**：这一拍有 ↓、没有跳
     o = job.update(0.5, px=1250.0)
-    check(o["phase"] == route.DropJob.ARMED and not o["jump"],
+    check(o["phase"] == jobmod.DropJob.ARMED and not o["jump"],
           "对齐好了该先进 ARMED（按住↓）阶段：%s" % o)
     check(o["dir"] == -1, "ARMED 阶段就该按住 ↓：%s" % o)
     # ③ 按住一小会儿 ⇒ 补跳
     # ⚠ 这里必须**带 py**（2026-09-27 起："没有 y 读数就不按跳" —— 基准拿不到就判不出
     #   "开始下落"，按了也只能一路按到超时 ✗，见 `t_drop_retry_gap` ⑦）
     o = job.update(0.8, px=1250.0, py=0.0)
-    check(o["phase"] == route.DropJob.DROP and o["jump"] and o["dir"] == -1,
+    check(o["phase"] == jobmod.DropJob.DROP and o["jump"] and o["dir"] == -1,
           "该「↓ + 跳」了：%s" % o)
     # ④ 到达：先认集合
     o = job.update(0.9, px=1250.0, py=0.0, here_sets=["甲平台"])
@@ -8200,7 +8243,7 @@ def t_drop_job():
     #    现在是「**脚下这块面就是目标平台的面**」（读位置状态广播的 `ground_y` ✓），
     #    **不再**是"y 比出发时增大 40px" ✗（那条太松：往下掉 40px 就报"到了"，
     #    人可能还在半空、或者落到了别的平台上 ✗）。
-    job = route.DropJob("甲平台", "乙平台", spots, tol_px=6, hold_ms=0,
+    job = jobmod.DropJob("甲平台", "乙平台", spots, tol_px=6, hold_ms=0,
                         dst_ys=[120.0])           # 目标平台的面 y = 120
     job.update(0.0, px=700.0)
     o = job.update(0.5, px=700.0, py=-300.0)      # 进 ARMED → DROP
@@ -8208,7 +8251,7 @@ def t_drop_job():
           "该在下跳（按住 ↓ + 点按跳）：%s" % o)
     # ⚠ 2026-09-27 起跳是**点按**（`TAP_ON_S` 之后松开跳，↓ 继续按着）——
     #   老版本是"一路按住跳"✗（用户 2026-09-27 的口径是"按住 ↓ + **点按**跳"）
-    o = job.update(0.5 + route.TAP_ON_S + 0.01, px=700.0, py=-300.0)
+    o = job.update(0.5 + jobmod.TAP_ON_S + 0.01, px=700.0, py=-300.0)
     check(not o["jump"] and o["dir"] == -1,
           "点按跳该在 TAP_ON_S 后松开、而 ↓ 继续按着：%s" % o)
     # ⚠ **"y 掉了很多"不算到了**（旧判据就是这么误报的 ✗）：脚下那块面不是目标面 ⇒ 不 done
@@ -8221,20 +8264,20 @@ def t_drop_job():
     check(o["done"], "脚下那块面就是目标面（120±容差）却没判到达：%s" % o)
     # ⚠ 目标面不知道（老调用方 / 没给 `dst_ys`）⇒ 退回**只看集合** ✓
     #   —— **绝不许**再拿"掉了多少像素"凑一个数 ✗
-    job2 = route.DropJob("甲平台", "乙平台", spots, tol_px=6, hold_ms=0)
+    job2 = jobmod.DropJob("甲平台", "乙平台", spots, tol_px=6, hold_ms=0)
     job2.update(0.0, px=700.0)
     job2.update(0.5, px=700.0, py=-300.0)
     o = job2.update(1.0, px=700.0, py=-200.0, ground_y=-200.0)   # 掉了 100，但没有集合
     check(not o["done"], "没给目标面却拿「掉了多少像素」判到了（旧毛病 ✗）：%s" % o)
 
     # ⑥ 超时 + 失败后重新激活（和上绳同一套保护，用户要求）
-    job = route.DropJob("甲平台", "乙平台", spots, tol_px=6, hold_ms=0,
+    job = jobmod.DropJob("甲平台", "乙平台", spots, tol_px=6, hold_ms=0,
                         timeout_s=1.0)
     check(job.update(0.0, px=700.0)["failed"] is False, "刚开始就说超时")
     o = job.update(2.0, px=700.0)
     check(o["failed"] and not o["jump"], "超时了还在按键：%s" % o)
     o = job.retry()
-    check(job.attempt == 2 and o["phase"] == route.DropJob.ALIGN and not o["jump"],
+    check(job.attempt == 2 and o["phase"] == jobmod.DropJob.ALIGN and not o["jump"],
           "retry 没回到对齐阶段：%s" % o)
 
     # ⑦ 从**真实边**造任务（用户那条 左传送门平台 → 左1），并按类型分发
@@ -8242,18 +8285,18 @@ def t_drop_job():
     z = zones.load("105090600")
     edge = next((e for e in z.edges if e.get("kind") == "drop"), None)
     check(edge is not None, "用户数据里没有下跳边，这条测不了")
-    j2 = route.job_for_edge(t, z, edge, tol_px=6, hold_ms=250)
-    check(isinstance(j2, route.DropJob) and j2.spots
+    j2 = pathing.job_for_edge(t, z, edge, tol_px=6, hold_ms=250)
+    check(isinstance(j2, jobmod.DropJob) and j2.spots
           and j2.dst_set == edge.get("to"),
           "从真实边造出来的下跳任务不对：%r" % (j2.spots,))
     cl = next((e for e in z.edges if e.get("kind") == "climb"), None)
-    check(isinstance(route.job_for_edge(t, z, cl), route.ClimbJob),
+    check(isinstance(pathing.job_for_edge(t, z, cl), jobmod.ClimbJob),
           "job_for_edge 没按类型分发（爬边该出 ClimbJob）")
     for bad, why in (({"kind": "portal", "from": "甲", "to": "乙"}, "别的通行方式"),
                      ({"kind": "drop", "from": "甲", "to": "乙",
                        "footholds": []}, "一个可下跳的都没有")):
         try:
-            route.job_for_edge(t, z, bad)
+            pathing.job_for_edge(t, z, bad)
             raise AssertionError("%s 该抛 ValueError（不许猜）" % why)
         except ValueError:
             pass
@@ -8284,10 +8327,11 @@ def t_jump_job():
         不能松开，要等成功或超时判定才能松"）：起跳前在走的方向**一直按到**"到了"（成功 ✓）
         或「卡住判定」到点（回入口 ✓）为止；本来没在走（人已在目标 fh 范围里）⇒ 不硬塞 ✓。
     """
-    from decision import route
+    from decision import pathing
+    from decision import jobs as jobmod
     from core import mapdata, zones
 
-    C = route.JumpJob
+    C = jobmod.JumpJob
     spots = [(600.0, 700.0, "11"), (1200.0, 1300.0, "12")]
 
     # ① 已经在目标 fh 范围里 ⇒ 直接按跳（点按：TAP_ON_S 之后就松）
@@ -8296,7 +8340,7 @@ def t_jump_job():
     check(o["jump"] and o["move"] == 0 and o["dir"] == 0,
           "x 已经在目标 foothold 范围里，却没「直接按跳」（跳也不该带 ↑/↓）：%s" % o)
     check("直接按跳" in j.note, "那句 note 没说清是「直接按跳」：%r" % j.note)
-    o = j.update(route.TAP_ON_S + 0.01, px=650.0)
+    o = j.update(jobmod.TAP_ON_S + 0.01, px=650.0)
     check(not o["jump"], "跳该是**点按**（TAP_ON_S 之后松手）：%s" % o)
 
     # ② 不在范围里 ⇒ 先走（方向对）；**没进起跳距离不许跳** ✗
@@ -8355,7 +8399,7 @@ def t_jump_job():
     o = j.update(0.0, px=740.0)                  # 离 fh11 右端（700）差 40 ≤ 50 ⇒ 起跳
     check(o["jump"] and o["move"] == -1,
           "进起跳距离那一拍该「按跳 + 保持方向」（人在右、目标在左 ⇒ ←）：%s" % o)
-    o = j.update(route.TAP_ON_S + 0.01, px=720.0)
+    o = j.update(jobmod.TAP_ON_S + 0.01, px=720.0)
     check(not o["jump"] and o["move"] == -1,
           "点按一跳完就把方向键松了（用户要的是**按到成功/超时判定**）：%s" % o)
     check("方向键继续按着" in j.note, "那句 note 没说清方向键还按着：%r" % j.note)
@@ -8382,7 +8426,7 @@ def t_jump_job():
     z = zones.load("105090600")
     je = next((e for e in z.edges if e.get("kind") == "jump"), None)
     check(je is not None, "用户数据里没有「跳」边，这条测不了")
-    jj = route.job_for_edge(t, z, je, tol_px=6, hold_ms=250, stall_s=3.0,
+    jj = pathing.job_for_edge(t, z, je, tol_px=6, hold_ms=250, stall_s=3.0,
                             jump_start_px=0)
     check(isinstance(jj, C) and jj.spots and jj.dst_set == je.get("to"),
           "从真实「跳」边造出来的任务不对：%r" % (jj.spots[:3] if jj.spots else None,))
@@ -8391,7 +8435,7 @@ def t_jump_job():
     for bad, why in (({"kind": "portal", "from": "甲", "to": "乙"},
                       "传送门的执行器还没做（不许猜、不许半途停半空）"),):
         try:
-            route.job_for_edge(t, z, bad)
+            pathing.job_for_edge(t, z, bad)
             raise AssertionError("%s 该抛 ValueError" % why)
         except ValueError:
             pass
@@ -8709,9 +8753,9 @@ def t_player_loc_params():
     """
     import inspect
     from decision.agent import DecisionSettings
-    from perception import world_state as ws_mod
+    from perception.world import world_state as ws_mod
     from perception import minimap as mm_mod
-    from perception import tracker as tk_mod
+    from perception.track import tracker as tk_mod
 
     # ⭐⭐ **这一组该挂在「设置 → 判定参数页」**（用户 2026-09-28 原话："「玩家位置」也应该在
     #   设置 → 判定参数页签"✓）—— 判据见 `docs/UI规范.md` §4 那张"三条去向"表：
@@ -8864,16 +8908,24 @@ def t_player_loc_params():
     #     （`_mmap_loc_loop` ✓），主回路这一拍只**取用**（`_loc_slot_take` ✓ / `live` 来源照旧
     #     现算 ✓）⇒ 那几个字面量跟着变了 ✓，但**口径一个字没改**：闸拦住 ⇒ **这一拍不取用**
     #     （世界坐标沿用上一拍 ✓），而且判定必须在取用**之前** ✓。
+    # ⚠ 2026-10-20：**这一段已搬进 `runtime/frame_locate.py`**（阶段 1 第二刀 ✓）
+    #   ⇒ 口径一个字没变，只是**源码在另一个文件里**（拆块老坑：只读 `live_thread` 必假红 ✗）
+    from pathlib import Path as _P
+    src = (_P(__file__).resolve().parent.parent
+           / "runtime" / "frame_locate.py").read_text(encoding="utf-8")
     _i_gate = src.find("if _gate_closed:")
-    _i_slot = src.find("_loc = self._loc_slot_take()")
-    _i_live = src.find("_loc = self._locate_latest()")
+    _i_slot = src.find("_loc = th._loc_slot_take()")
+    _i_live = src.find("_loc = th._locate_latest()")
     check(_i_gate > 0 and (_i_slot > _i_gate or _i_live > _i_gate),
           "框面积闸没拦在「定位取用」之前（用户明确：**拦在查询之前**，不是靠放宽挑面 ✗）："
           "gate@%s / slot@%s / live@%s" % (_i_gate, _i_slot, _i_live))
-    check("if _gate_closed:\n                        _loc = None" in src,
+    #   ⚠ 判"拦住 ⇒ `_loc = None`"用**正则**、别钉缩进（搬一次缩进就变，钉死=假红 ✗）
+    import re as _re
+    check(_re.search(r"if _gate_closed:\s*\n\s+_loc = None", src) is not None,
           "拦住时不是「这一拍不取用」（该 `_loc = None` ⇒ 世界坐标沿用上一拍 ✓）："
           "拦住却照样取用 = 白拦 ✗")
-    check("_locate_mmap" in src and "player_box_area_tol_pct" in src
+    # `_locate_mmap` 本体还在 `live_thread`（`th._locate_latest` 里调 ✓）⇒ 两处一起看
+    check("_locate_mmap" in inspect.getsource(lt) and "player_box_area_tol_pct" in src
           and "player_box_min_area_pct" in src,
           "面积闸那两条判据没接上设置里的参数（闸就是死的 ✗）")
 
@@ -8913,8 +8965,10 @@ def t_player_loc_params():
     _d5.from_dict({"player_track_jump": 200})              # 两个键都没有 ✓
     check(abs(float(_d5.player_box_area_base_s) - 3.0) < 1e-9,
           "老配置（两个键都没有）该兜底 **3.0 秒**：%r" % (_d5.player_box_area_base_s,))
-    # ⭐ **源码级**（那两段是 `live_thread.run()` 里的内联代码 ⇒ 只能这么钉 ✓）：
-    _lt_src = inspect.getsource(lt)
+    # ⭐ **源码级**（那两段是内联代码 ⇒ 只能这么钉 ✓）
+    #   ⚠ 2026-10-20：**已搬进 `runtime/frame_locate.py`**（阶段 1 第二刀 ✓）⇒ 读那个文件 ✓
+    _lt_src = (Path(__file__).resolve().parent.parent
+               / "runtime" / "frame_locate.py").read_text(encoding="utf-8")
     check("_t_now - _t <= _bs" in _lt_src,
           "基线没按**时间窗**筛（按「最后 N 个」切片依赖帧率 ⇒ 不可量化 ✗ 用户要的是「秒」✓）")
     check("player_box_area_base_s" in _lt_src,
@@ -9099,12 +9153,12 @@ def t_drop_detach_dir():
       ⑤ ⭐ **源码级**：`agent` 真的把 `_target_dir` 注入给下跳任务 ✓、而且**每拍重挂**
          （锁定目标会换 ⇒ 不许建任务时定死 ✗）。
     """
+    from decision import jobs as jobmod
     import inspect
 
     from decision import agent as agent_mod
-    from decision import route
 
-    j = route.DropJob("上", "下", [(550.0, 500.0, 600.0, "42")],
+    j = jobmod.DropJob("上", "下", [(550.0, 500.0, 600.0, "42")],
                       tol_px=10, hold_ms=0, y_tol_px=10, retry_ms=2000, stall_s=3.0)
     j._pick = (550.0, 500.0, 600.0, "42")
     # ① 有锁定目标 ⇒ 朝它（哪怕背离中心 ✓）
@@ -9689,7 +9743,7 @@ def t_afk_spot_rest():
 
     另外钉**失败路径**：解析不出来 / 半路断了 ⇒ 如实说 + 回战斗（**不许硬走、不许静默** ✗）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings(anti_afk_enabled=True, anti_afk_type="spot_rest",
                        anti_afk_spot_set="乙平台", anti_afk_spot_after="丙平台",
@@ -9702,14 +9756,15 @@ def t_afk_spot_rest():
     seen = []                       # 解析器被问过哪些目的地
 
     def resolver(dst):
+        from decision import jobs as jobmod
         seen.append(dst)
         if dst == "乙平台":
             return {"path": ["甲平台", "乙平台"],
-                    "jobs": [route.WalkJob("乙平台",
+                    "jobs": [jobmod.WalkJob("乙平台",
                                            [(500.0, 490.0, 510.0, -208.0, "1")])],
                     "why": "", "here": False}
         return {"path": ["乙平台", "丙平台"],
-                "jobs": [route.WalkJob("丙平台",
+                "jobs": [jobmod.WalkJob("丙平台",
                                        [(520.0, 510.0, 530.0, -208.0, "2")])],
                 "why": "", "here": False}
 
@@ -9808,7 +9863,7 @@ def t_afk_spot_rest():
         a3 = h3.agent
         a3.route_plan = lambda dst: {
             "path": ["甲平台", dst],
-            "jobs": [route.WalkJob(dst, [(500.0, 490.0, 510.0, -208.0, "1")])],
+            "jobs": [jobmod.WalkJob(dst, [(500.0, 490.0, 510.0, -208.0, "1")])],
             "why": "", "here": False}
         a3._begin_rest(0.0)
         a3._run_rest(0.0, ws3)
@@ -9840,7 +9895,7 @@ def t_afk_spot_rest():
         a4 = h4.agent
         a4.route_plan = lambda dst: {
             "path": ["甲平台", dst],
-            "jobs": [route.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
+            "jobs": [jobmod.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
             "why": "", "here": False}
         a4._begin_rest(0.0)
         a4._run_rest(0.0, ws4)
@@ -10035,7 +10090,7 @@ def t_rest_contract():
       ③ **只收自己那条路线**：休息结束要收掉"定点休息走过去"的任务，但
          **不许**连坐用户自己下的「命令前往」✗。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     # ① 契约表：字段齐全 + 派生元组确实是从表里来的
     spec = ag.REST_STATE_SPEC
@@ -10082,14 +10137,14 @@ def t_rest_contract():
               "收尾没松开序列按着的键（会卡键 ✗）：%s" % h.log)
 
         # ③ 归属判定：休息自己的路线要收掉
-        a.start_route([route.WalkJob("乙平台", [(500.0, 490.0, 510.0, -208.0, "1")])],
+        a.start_route([jobmod.WalkJob("乙平台", [(500.0, 490.0, 510.0, -208.0, "1")])],
                       why="定点休息：去「乙平台」")
         check(a._climb is not None, "没挂上路线（这条测不了）")
         a._finish_rest(2.0)
         check(a._climb is None and not a._route,
               "休息结束没把「去休息点」那条路线收掉 ✗")
         # ③b **用户自己下的「命令前往」不许被连坐** ✗
-        a.start_route([route.WalkJob("丙平台", [(500.0, 490.0, 510.0, -208.0, "2")])],
+        a.start_route([jobmod.WalkJob("丙平台", [(500.0, 490.0, 510.0, -208.0, "2")])],
                       why="命令前往：丙平台")
         a._finish_rest(3.0)
         check(a._climb is not None,
@@ -10110,15 +10165,16 @@ def t_retry_notes_have_no_denominator():
     配套（在别的用例里钉着）：不放弃的那一侧见 `t_climb_flow_rules` ⑤b（失败 6 次还在重来）、
     收口那一侧见 `t_goto_timeout_all_job_kinds`（四种任务都由「寻路超时时间」切 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
+    from decision import pathing
 
     jobs = [
-        ("爬", route.ClimbJob("L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
+        ("爬", jobmod.ClimbJob("L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
                               dst_set="乙平台", src_set="甲平台", tol_px=6, hold_ms=0)),
-        ("下跳", route.DropJob("甲平台", "乙平台", [(700.0, 660.0, 740.0, "41")],
+        ("下跳", jobmod.DropJob("甲平台", "乙平台", [(700.0, 660.0, 740.0, "41")],
                                tol_px=6, hold_ms=0)),
-        ("走", route.WalkJob("乙平台", [(700.0, 660.0, 740.0, -208.0, "41")])),
-        ("跳", route.JumpJob("乙平台", [(600.0, 700.0, "11")])),
+        ("走", jobmod.WalkJob("乙平台", [(700.0, 660.0, 740.0, -208.0, "41")])),
+        ("跳", jobmod.JumpJob("乙平台", [(600.0, 700.0, "11")])),
     ]
     for name, j in jobs:
         check(not hasattr(j, "max_attempts"),
@@ -10128,8 +10184,8 @@ def t_retry_notes_have_no_denominator():
         check("/" not in str(j.note) and "次尝试" in str(j.note),
               "「%s」的重试说明里还带着分母（那个「1/3」就是这么来的 ✗）：%r"
               % (name, j.note))
-    check(not hasattr(route, "DEFAULT_MAX_ATTEMPTS"),
-          "`route.DEFAULT_MAX_ATTEMPTS` 还在 —— 常量也该一起删干净 ✓")
+    check(not any(hasattr(m, "DEFAULT_MAX_ATTEMPTS") for m in (jobmod, pathing)),
+          "`DEFAULT_MAX_ATTEMPTS` 还在 —— 常量也该一起删干净 ✓")
 
 def t_climb_jump_gate():
     """**按跳的许可条件 = 只有「x 对齐」这一条**（用户 2026-09-27 明确，原话：
@@ -10152,12 +10208,13 @@ def t_climb_jump_gate():
       ⑤ `job_for_edge` 造出来的爬任务**不再带 `entry_span`**、`__init__` 也没有这个参数
         （那道门整套拆了，死数据/死参数别留 ✗）。
     """
+    from decision import pathing
+    from decision import jobs as jobmod
     import inspect
 
     from core import mapdata, zones
-    from decision import route
 
-    C = route.ClimbJob
+    C = jobmod.ClimbJob
     # 绳：x=550，y 从 300（下端）到 100（上端）
     base = dict(ladder_id="L1", x=550.0, y1=300.0, y2=100.0, direction=1,
                 dst_set="上", src_set="下", tol_px=10, hold_ms=250)
@@ -10200,7 +10257,7 @@ def t_climb_jump_gate():
     z = zones.load("105090600")
     ce = next((e for e in z.edges if e.get("kind") == "climb"), None)
     check(ce is not None, "用户数据里没有「爬」边，这条测不了")
-    jj = route.job_for_edge(t, z, ce, tol_px=6, hold_ms=0, stall_s=3.0)
+    jj = pathing.job_for_edge(t, z, ce, tol_px=6, hold_ms=0, stall_s=3.0)
     check(not hasattr(jj, "entry_span"),
           "爬任务还挂着 `entry_span`（那道门整套拆了，死数据别留 ✗）：%r"
           % (getattr(jj, "entry_span", None),))
@@ -10233,10 +10290,11 @@ def t_climb_diagonal_jump():
       ⑧ 真实数据：`job_for_edge` 造的爬任务**真的把「起跳距离」传进去了**（以前被
          `kw.pop` 扔掉 ✗）。
     """
-    from decision import route
+    from decision import pathing
+    from decision import jobs as jobmod
     from core import mapdata, zones
 
-    C = route.ClimbJob
+    C = jobmod.ClimbJob
     # 绳：x=550，y 从 300（下端）到 100（上端）；入绳端那块面：x 0..600、面 y=300（平的 ✓）
     base = dict(ladder_id="L1", x=550.0, y1=300.0, y2=100.0, direction=1,
                 dst_set="上", src_set="下", tol_px=10, hold_ms=250,
@@ -10409,7 +10467,7 @@ def t_climb_diagonal_jump():
     z = zones.load("105090600")
     ce = next((e for e in z.edges if e.get("kind") == "climb"), None)
     check(ce is not None, "用户数据里没有「爬」边，这条测不了")
-    jj = route.job_for_edge(t, z, ce, tol_px=6, hold_ms=0, stall_s=3.0,
+    jj = pathing.job_for_edge(t, z, ce, tol_px=6, hold_ms=0, stall_s=3.0,
                             jump_start_px=90)
     check(float(getattr(jj, "jump_start_px", 0)) == 90.0,
           "爬任务没拿到「起跳距离」（以前 `kw.pop` 把它扔了 ✗）：%r"
@@ -10438,7 +10496,7 @@ def t_chase_goto_other_foothold():
       ⑤ 没有解析器 / 解析不出集合（老环境 / 没定位）⇒ **退回照旧追**（绝不站着不动 ✗）；
       ⑥ 重下有间隔（`ZONE_GOTO_RETRY_S` 内不再下第二条 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
     from decision.agent import ZONE_GOTO_RETRY_S    # 和「限制战斗区域」共用同一件参数 ✓
 
     s = fresh_settings(attack_dist=40.0)        # 攻击距离小 ⇒ 怪必在范围外 ⇒ 走 chase ✓
@@ -10447,9 +10505,10 @@ def t_chase_goto_other_foothold():
     h.mobs_fn = lambda t: [Mob(id=1, x=580.0, y=500.0, w=40.0, h=40.0, conf=0.9)]
 
     def _plan(dst):
+        from decision import jobs as jobmod
         if dst == "丙平台":
             return {"jobs": [], "path": [], "why": "没有可走的路（用例）", "here": False}
-        return {"jobs": [route.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
+        return {"jobs": [jobmod.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
                 "path": ["乙平台", dst], "why": "", "here": False}
 
     with h._patched():
@@ -10506,7 +10565,7 @@ def t_chase_goto_other_foothold():
         #      `climb`（`_climb_tick` 那条路 ✓）⇒ **压根不进 `chase` 这一段** ⇒ 断言会**假过**
         #      （"dst 还是丁平台" 在"没进这段"时也成立 ✗ —— 第一版就这么写的 ✓）。
         a.stop_route("用例：④准备")
-        a.start_route([route.WalkJob("丁平台", [(520.0, 510.0, 530.0, -208.0, "1")])],
+        a.start_route([jobmod.WalkJob("丁平台", [(520.0, 510.0, 530.0, -208.0, "1")])],
                       "用例：先在走的任务")
         _mob1 = Mob(id=1, x=580.0, y=500.0, w=40.0, h=40.0, conf=0.9)
         a.mob_sets_of = lambda pl, mob: {"world": (600.0, -300.0),
@@ -10559,7 +10618,7 @@ def t_chase_goto_respects_can_fight():
     钉三件：目的地不在 `battle_zone_sets` 里 ⇒ 主路径**跳过改试下一个** / 降级路径**放弃** ✓；
     名单空（哪都能打）时一字不变 ✓。
     """
-    from decision import route
+    from decision import jobs as jobmod
     from decision.agent import ZONE_GOTO_RETRY_S
 
     s = fresh_settings(attack_dist=40.0)
@@ -10568,7 +10627,8 @@ def t_chase_goto_respects_can_fight():
     h.mobs_fn = lambda t: [Mob(id=1, x=580.0, y=500.0, w=40.0, h=40.0, conf=0.9)]
 
     def _plan(dst):
-        return {"jobs": [route.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
+        from decision import jobs as jobmod
+        return {"jobs": [jobmod.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
                 "path": ["乙平台", dst], "why": "", "here": False}
 
     with h._patched():
@@ -10641,16 +10701,17 @@ def t_drop_avoid_spot_that_grabbed_rope():
       ② **全都被记过** ⇒ 回来用 ✓（不许挑不到点 ✗）；
       ③ 没被吸过 ⇒ **一字不变**（仍然挑最近那个 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
-    C = route.DropJob
+    C = jobmod.DropJob
     # 两个点**都在 tol 窗口里**（px=100 ✓）⇒ 挑谁只看"有没有被记过" ✓
     spots = [(100.0, 80.0, 120.0, "fhA"), (110.0, 92.0, 130.0, "fhB")]
 
     def _to_drop(j, px=100.0):
+        from decision import jobs as jobmod
         j.update(0.0, px=px, py=0.0, ground_y=0.0)
         j.update(0.0, px=px, py=0.0, ground_y=0.0)
-        j.update(route.ARM_HOLD_S + 0.01, px=px, py=0.0, ground_y=0.0)
+        j.update(jobmod.ARM_HOLD_S + 0.01, px=px, py=0.0, ground_y=0.0)
         return j
 
     # ① 在 fhA 上被吸住（在绳段里 + 悬空 ⇒ ①档 ✓）
@@ -10658,7 +10719,7 @@ def t_drop_avoid_spot_that_grabbed_rope():
     _to_drop(j, px=100.0)
     check(j._pick is not None and str(j._pick[-1]) == "fhA",
           "前置不成立（该挑到最近那个 fhA）：%r" % (j._pick,))
-    j.update(route.ARM_HOLD_S + 0.02, px=100.0, py=-60.0, ground_y=None,
+    j.update(jobmod.ARM_HOLD_S + 0.02, px=100.0, py=-60.0, ground_y=None,
              on_rope_pos="L1")
     check(j.phase == C.DETACH, "被吸住却没转「脱离」：%s" % j.phase)
     check("fhA" in j._bad_spots, "被吸过的点没记账 ⇒ 下次还会挑回它 ✗")
@@ -10666,7 +10727,7 @@ def t_drop_avoid_spot_that_grabbed_rope():
     # 脱绳（出了绳段）⇒ 回入口重走 ⇒ **这次必须挑 fhB**
     #   ⚠ **同一拍里就会从 DETACH 转出去并重判**（可能直接进 ARMED ✓ 不一定停在 ALIGN ✗
     #     —— 本用例第一版把这条写死成 ALIGN，当场红了 ✓ 所以这里只钉"挑的是哪个点" ✓）
-    j.update(route.ARM_HOLD_S + 1.0, px=100.0, py=0.0, ground_y=0.0)
+    j.update(jobmod.ARM_HOLD_S + 1.0, px=100.0, py=0.0, ground_y=0.0)
     check(j._pick is not None and str(j._pick[-1]) == "fhB",
           "⭐⭐ 被吸过的点还照挑 ⇒ 就是用户那个「每次都被卡在绳子上」的死循环 ✗：%r"
           % (j._pick,))
@@ -10689,7 +10750,7 @@ def t_drop_opens_ladder_permission_whole_job():
     """⭐⭐⭐ **下跳（`DropJob`）整段都开着"能判在绳梯上"的许可**（用户 2026-10-10 ✓ 原话：
     "**drop 刚开始时就需要让位置状态允许能判定上绳梯，现在貌似没有走这一步判定**"✗）。
 
-    机制（`perception/pos_state.py` ✓）：
+    机制（`perception/world/pos_state.py` ✓）：
         `ladder_id = _lid_of(terrain, lad_pos if hold_vert else None)` ✓
       ⇒ **`ladder_id` 要 `hold_vert`**（= `agent.climbing_vertical()` ✓ 执行器通知 ✓）；
         `on_rope_pos` 不看许可 ✓（只看位置 ✓）。
@@ -10708,7 +10769,7 @@ def t_drop_opens_ladder_permission_whole_job():
          （用户 2026-09-27 那条防线："除非按住了 ↑ 或 ↓，不能主动判定为在绳梯上"✓ ——
          放开就会"路过绳边被粘住"✓）；真发了 ↑/↓ ⇒ True ✓。
     """
-    from decision import route
+    from decision import jobs as jobmod
     from decision.agent import CombatAgent
 
     class _F:
@@ -10720,7 +10781,7 @@ def t_drop_opens_ladder_permission_whole_job():
         return CombatAgent.climbing_vertical(f)
 
     spots = [(100.0, 80.0, 120.0, "fhA")]
-    j = route.DropJob("上平台", "下平台", spots, tol_px=10, hold_ms=0)
+    j = jobmod.DropJob("上平台", "下平台", spots, tol_px=10, hold_ms=0)
     check(_cv(j) is True,
           "① `DropJob` 刚建好（还没发任何竖直键）时许可**没开** ⇒ 位置状态判不出在绳梯上 ✗"
           "（用户 2026-10-10 报的就是这个 ✓）")
@@ -10733,7 +10794,7 @@ def t_drop_opens_ladder_permission_whole_job():
           "用户 2026-10-06 ✓）")
     j._paused_at = None
 
-    c = route.ClimbJob("L1", x=100.0, y1=0.0, y2=200.0, direction=1, dst_set="上平台",
+    c = jobmod.ClimbJob("L1", x=100.0, y1=0.0, y2=200.0, direction=1, dst_set="上平台",
                        src_set="下平台", tol_px=10, hold_ms=0, timeout_s=600.0)
     check(_cv(c) is False,
           "④ `ClimbJob` 在水平相位（还没发 ↑/↓）许可就开了 ⇒ 路过绳边会被判成在绳上 ✗"
@@ -10757,18 +10818,18 @@ def t_drop_detach_jump_down_two_step():
       ② **第二拍**：才按跳（方向继续按着 ✓）；
       ③ 全程**绝不按 ↓**（竖直恒 0 ✓ —— 老口径一字不许改 ✗）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
-    C = route.DropJob
+    C = jobmod.DropJob
     spots = [(100.0, 80.0, 120.0, "fhA")]
     j = C("上平台", "下平台", spots, tol_px=10, hold_ms=0)
     j.update(0.0, px=100.0, py=0.0, ground_y=0.0)
     j.update(0.0, px=100.0, py=0.0, ground_y=0.0)
-    j.update(route.ARM_HOLD_S + 0.01, px=100.0, py=0.0, ground_y=0.0)
+    j.update(jobmod.ARM_HOLD_S + 0.01, px=100.0, py=0.0, ground_y=0.0)
     check(j.phase == C.DROP, "前置不成立（该在「按压跳」那一相）：%s" % j.phase)
 
     # ① 被绳吸住 ⇒ 第一拍**只按方向**
-    o1 = j.update(route.ARM_HOLD_S + 0.02, px=100.0, py=-60.0, ground_y=None,
+    o1 = j.update(jobmod.ARM_HOLD_S + 0.02, px=100.0, py=-60.0, ground_y=None,
                   on_rope_pos="L1")
     check(j.phase == C.DETACH, "被吸住却没进「脱离」相：%s" % j.phase)
     check(o1.get("jump") is False and o1.get("dir") == 0,
@@ -10778,7 +10839,7 @@ def t_drop_detach_jump_down_two_step():
           "第一拍该**只按水平方向**（人得先松手离开绳 ✓）：%r" % (o1,))
 
     # ② 第二拍**才按跳**（方向继续按着 ✓）
-    o2 = j.update(route.ARM_HOLD_S + 0.20, px=100.0, py=-60.0, ground_y=None,
+    o2 = j.update(jobmod.ARM_HOLD_S + 0.20, px=100.0, py=-60.0, ground_y=None,
                   on_rope_pos="L1")
     check(o2.get("jump") is True and o2.get("dir") == 0,
           "⭐ 第二拍没按跳（或误按了 ↓ ✗）：%r" % (o2,))
@@ -10817,16 +10878,17 @@ def t_drop_detach_ladder():
       ⑧ `phase_code()` / `align_target_x()`：日志要能一眼看出**卡在哪一相、离下跳点多远**
          （2026-09-28 加 ✓ —— 那次现场就是因为"看不到相"才拖了很久 ✗）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
-    C = route.DropJob
+    C = jobmod.DropJob
     spots = [(100.0, 80.0, 120.0, "fhB")]
 
     def _to_drop(j, t=0.0):
         """推到"按住 ↓ + 连按跳"那一拍（`hold_ms=0` ⇒ 从 ALIGN 直接过 ✓）。"""
+        from decision import jobs as jobmod
         j.update(t, px=100.0, py=0.0)
         j.update(t, px=100.0, py=0.0)
-        return j.update(t + route.ARM_HOLD_S + 0.01, px=100.0, py=0.0)
+        return j.update(t + jobmod.ARM_HOLD_S + 0.01, px=100.0, py=0.0)
 
     # ① 下跳途中被吸住 ⇒ 立刻转脱离
     #    ⚠ `ladder_id`（带许可）故意给 `None`：现场"真被吸住"时 `ALIGN`/`DETACH` 相
@@ -10852,11 +10914,11 @@ def t_drop_detach_ladder():
     o2 = j.update(0.31, px=100.0, py=0.0, on_rope_pos="L7", ground_y=None)
     check(o2["jump"] and o2["move"] != 0 and o2["dir"] == 0,
           "⭐ 第二拍该「按住方向 + 按跳」（跳下绳那一下 ✓）：%s" % o2)
-    o2b = j.update(0.31 + route.TAP_ON_S + 0.01, px=100.0, py=0.0,
+    o2b = j.update(0.31 + jobmod.TAP_ON_S + 0.01, px=100.0, py=0.0,
                    on_rope_pos="L7", ground_y=None)
     check(not o2b["jump"] and o2b["dir"] == 0,
           "脱离时跳该是**点按**（一下一下，不是一路按住 ✗）：%s" % o2b)
-    o3 = j.update(0.31 + route.TAP_PERIOD_S + 0.01, px=100.0, py=0.0,
+    o3 = j.update(0.31 + jobmod.TAP_PERIOD_S + 0.01, px=100.0, py=0.0,
                   on_rope_pos="L7", ground_y=None)
     check(o3["jump"], "脱离时跳没「连按」（那一下可能还没起效 ⇒ 要一遍遍按 ✓）：%s" % o3)
     # ④ 方向：背离下跳点中心（中心 x=100、人在 130 ⇒ 该往左）
@@ -10902,14 +10964,14 @@ def t_drop_detach_ladder():
     j4 = C("上平台", "下平台", spots, tol_px=10, hold_ms=0)
     j4.update(0.0, px=100.0, py=0.0)
     j4.update(0.0, px=100.0, py=0.0)
-    o9 = j4.update(route.ARM_HOLD_S + 0.01, px=100.0, py=0.0)      # 进 DROP ⇒ 第 1 下跳
+    o9 = j4.update(jobmod.ARM_HOLD_S + 0.01, px=100.0, py=0.0)      # 进 DROP ⇒ 第 1 下跳
     check(o9["jump"] and j4.tap_count() == 1,
           "第 1 下跳没计上（`drop_taps` 会一直显示 0，看不出跳发没发 ✗）：%r" % (j4.tap_count(),))
-    o10 = j4.update(route.ARM_HOLD_S + 0.01 + route.TAP_ON_S + 0.01, px=100.0, py=0.0)
+    o10 = j4.update(jobmod.ARM_HOLD_S + 0.01 + jobmod.TAP_ON_S + 0.01, px=100.0, py=0.0)
     check(not o10["jump"] and j4.tap_count() == 1,
           "「松窗」（`TAP_ON_S` 之后、`TAP_PERIOD_S` 之前）该**松开跳**、也不该加计数："
           "jump=%s taps=%r" % (o10["jump"], j4.tap_count()))
-    o11 = j4.update(route.ARM_HOLD_S + 0.01 + route.TAP_PERIOD_S + 0.01, px=100.0, py=0.0)
+    o11 = j4.update(jobmod.ARM_HOLD_S + 0.01 + jobmod.TAP_PERIOD_S + 0.01, px=100.0, py=0.0)
     check(o11["jump"] and j4.tap_count() == 2,
           "第 2 下跳没计上（`TAP_PERIOD_S` 到点该再按一下 ✓）：jump=%s taps=%r"
           % (o11["jump"], j4.tap_count()))
@@ -10946,7 +11008,7 @@ def t_drop_detach_ladder():
     j5 = C("上平台", "下平台", spots, tol_px=10, hold_ms=0)
     j5.update(0.0, px=100.0, py=0.0)
     j5.update(0.0, px=100.0, py=0.0)
-    t5 = route.ARM_HOLD_S + 0.01
+    t5 = jobmod.ARM_HOLD_S + 0.01
     seen = []
     for _i in range(8):                     # **每拍 200 ms**（慢拍 ✓ 仍必须有点按 ✓）
         seen.append(bool(j5.update(t5, px=100.0, py=0.0)["jump"]))
@@ -10975,11 +11037,11 @@ def t_lock_target_by_path_cost():
       ④ 脚下 `here_sets` 空 ⇒ 老口径（不知道我在哪个集合 ⇒ 没法算路 ✓）；
       ⑤ 返回的那个距离**仍是画面距离**（下游「追击起跳」区间 / 打点用的就是它 ✓）；
       ⑥ ⚠ **攻击判定的口径一个字没动**：`_center_dist` 还是老样子（挑谁 ≠ 打得到谁 ✓）；
-      ⑦ 真实数据：`route.path_cost` 同集合 = 0、跨集合 > 0（或算不出给 `None`，**绝不能是 0** ✓）。
+      ⑦ 真实数据：`pathing.path_cost` 同集合 = 0、跨集合 > 0（或算不出给 `None`，**绝不能是 0** ✓）。
     """
-    from decision import route
+    from decision import pathing
     from decision.agent import CombatAgent
-    from perception.world_state import Mob, Player, WorldState
+    from perception.world.world_state import Mob, Player, WorldState
 
     a = CombatAgent(fresh_settings())
     p = Player(x=500.0, y=300.0, bottom=340.0)
@@ -11034,14 +11096,14 @@ def t_lock_target_by_path_cost():
     # ⑦ 真实数据：同集合 = 0、跨集合 > 0（或 None ✓）
     from core import mapdata, zones
     t, z = mapdata.load("105090600"), zones.load("105090600")
-    names = sorted(z.sets)
+    names = sorted(z.zones)
     check(len(names) >= 2, "地图里的集合太少，这条测不了")
-    c0 = route.path_cost(t, z, [names[0]], [names[0]], at=None)
+    c0 = pathing.path_cost(t, z, [names[0]], [names[0]], at=None)
     check(c0 == 0.0, "同一个集合的寻路距离该是 0：%r" % (c0,))
-    c1 = route.path_cost(t, z, [names[0]], [names[-1]], at=(0.0, 0.0))
+    c1 = pathing.path_cost(t, z, [names[0]], [names[-1]], at=(0.0, 0.0))
     check(c1 is None or c1 > 0.0,
           "跨集合的寻路距离该是正数（或算不出给 None，**绝不能是 0** ✗）：%r" % (c1,))
-    check(route.path_cost(t, z, [], ["甲"], at=(0.0, 0.0)) is None,
+    check(pathing.path_cost(t, z, [], ["甲"], at=(0.0, 0.0)) is None,
           "没有来源集合时该给 None（不猜 ✓）")
 
 
@@ -11062,7 +11124,7 @@ def t_big_mob_priority():
       ④ 尺寸都差不多 ⇒ 没有"大怪"，不优先 ✓（相对判定的自适应 ✓）。
     """
     from decision.agent import CombatAgent
-    from perception.world_state import Mob, Player, WorldState
+    from perception.world.world_state import Mob, Player, WorldState
 
     a = CombatAgent(fresh_settings())
     p = Player(x=500.0, y=300.0, bottom=340.0)
@@ -11143,7 +11205,7 @@ def t_big_mob_baseline_min_avg():
       ⑤ **开关关着也照记账、但池恒空**（开启那一刻账就是热的 ✓）+ 倍数 ≤1 / 半径 ≤0 ⇒ 关 ✓。
     """
     from decision.agent import MOB_H_BASELINE_S, CombatAgent
-    from perception.world_state import Mob, Player, WorldState
+    from perception.world.world_state import Mob, Player, WorldState
 
     a = CombatAgent(fresh_settings())
     p = Player(x=500.0, y=300.0, bottom=340.0)
@@ -11246,7 +11308,7 @@ def t_battle_zone_mob_filter():
       ⑥ **攻击链不受影响**：`_in_range_all` 吃的是原始 `mobs` ⇒ 区域外、够得着的怪**照打** ✓。
     """
     from decision.agent import CombatAgent, ZONE_GOTO_RETRY_S
-    from perception.world_state import Mob, Player, WorldState
+    from perception.world.world_state import Mob, Player, WorldState
 
     a = CombatAgent(fresh_settings())
     a.settings.battle_zone_sets = ["右"]
@@ -11330,9 +11392,10 @@ def t_reach_skip_goto():
       ③ 怪框底边 x 范围**不与我这块集合相交** ⇒ 老路（下前往 ✓）；
       ④ **判不了就照旧**：广播没给出平台宽度（`here_span` = `None` ✓）/ 拿不到怪的世界脚点 ⇒ 下前往 ✓；
       ⑤ 老判据**优先级更高**：同一块集合 ⇒ 直接照旧追，跟这两件无关 ✓；
-      ⑥ 真数据：`route.set_span` = 该集合非墙 foothold 的 x 包络（同集合 ⇒ 同一个包络 ✓）。
+      ⑥ 真数据：`pathing.set_span` = 该集合非墙 foothold 的 x 包络（同集合 ⇒ 同一个包络 ✓）。
     """
-    from decision import route
+    from decision import pathing
+    from decision import jobs as jobmod
     from decision.agent import ZONE_GOTO_RETRY_S
 
     s = fresh_settings(attack_dist=40.0)        # 攻击距离小 ⇒ 怪（60px）本在范围外 ⇒ 走 chase ✓
@@ -11342,7 +11405,8 @@ def t_reach_skip_goto():
     h.mobs_fn = lambda t: [Mob(id=1, x=580.0, y=500.0, w=40.0, h=40.0, conf=0.9)]
 
     def _plan(dst):
-        return {"jobs": [route.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
+        from decision import jobs as jobmod
+        return {"jobs": [jobmod.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
                 "path": ["乙平台", dst], "why": "", "here": False}
 
     with h._patched():
@@ -11439,19 +11503,19 @@ def t_reach_skip_goto():
     # ⑥ 真数据：`set_span` = 该集合非墙 foothold 的 x 包络
     from core import mapdata, zones
     t, z = mapdata.load("105090600"), zones.load("105090600")
-    names = sorted(z.sets)
+    names = sorted(z.zones)
     check(names, "地图里没有集合，这条测不了")
-    sp = route.set_span(t, z, names[0])
-    spans = route._set_spans(t, z, names[0])
+    sp = pathing.set_span(t, z, names[0])
+    spans = pathing._set_spans(t, z, names[0])
     check(spans and sp == (min(x[0] for x in spans), max(x[1] for x in spans)),
           "`set_span` 不是「该集合非墙 foothold 的 x 包络」：%r / %r" % (sp, spans))
-    check(route.set_span(t, z, "不存在的集合") is None,
+    check(pathing.set_span(t, z, "不存在的集合") is None,
           "集合不存在时该给 None（不猜 ✓）")
     # ⑦ ⛔ **`set_box`：集合的包围盒**（2026-09-28 现场修 ✗ —— `live_thread` 那条"朝
     #    『玩家 → 怪』方向最近集合"的**降级**原来拿 `set_span` 的**二元组**当**四元组**
     #    解包（`sp[2]`）⇒ `IndexError` ⇒ 那条降级**从上线起一次都没成功过** ✗
     #    （异常还被 `agent._mob_goto_towards` 吞了 ⇒ **一条痕迹都没有** ✗））。
-    box = route.set_box(t, z, names[0])
+    box = pathing.set_box(t, z, names[0])
     check(box is not None and len(box) == 4,
           "`set_box` 该给**四元组**（左, 右, 上y, 下y）—— 降级解析器就按四元组解包 ✗：%r"
           % (box,))
@@ -11464,7 +11528,7 @@ def t_reach_skip_goto():
           % (box, sp))
     check(box[2] <= box[3],
           "`set_box` 的上下界反了（世界 y **越小越靠上** ⇒ 上界在前 ✓）：%r" % (box,))
-    check(route.set_box(t, z, "不存在的集合") is None,
+    check(pathing.set_box(t, z, "不存在的集合") is None,
           "`set_box` 集合不存在时该给 None（不猜 ✓）")
 
 
@@ -11484,33 +11548,34 @@ def t_job_label_text():
       ④ `agent.current_goto_text()` 没 job 时**退回** `current_goto_note()`（任务结束后还挂一会儿
          的那句 ✓ 老行为不变 ✓）。
     """
+    from decision import pathing
+    from decision import jobs as jobmod
     from core import zones
-    from decision import route
     from decision.agent import CombatAgent
 
     # ① 攀爬：名字 + note
-    j = route.ClimbJob(ladder_id="L1", x=550.0, y1=300.0, y2=100.0, direction=1,
+    j = jobmod.ClimbJob(ladder_id="L1", x=550.0, y1=300.0, y2=100.0, direction=1,
                        dst_set="上", src_set="下", tol_px=10, hold_ms=250)
     j.note = "对齐好了，但人没站在绳下端那一层上（现在 y=366）"
-    got = route.job_label(j)
+    got = pathing.job_label(j)
     check(got.startswith(zones.kind_label("climb") + ":"),
           "攀爬那行的开头不是「爬（绳梯）(climb):」：%r" % got)
     check("人没站在绳下端那一层上" in got, "那行没带上 job 的 note：%r" % got)
 
     # ② note 空 ⇒ 退回 phase（不许空串）
     j.note = ""
-    j.phase = route.ClimbJob.ALIGN
-    got2 = route.job_label(j)
-    check(got2.endswith(str(route.ClimbJob.ALIGN)) and len(got2) > len(str(route.ClimbJob.ALIGN)),
+    j.phase = jobmod.ClimbJob.ALIGN
+    got2 = pathing.job_label(j)
+    check(got2.endswith(str(jobmod.ClimbJob.ALIGN)) and len(got2) > len(str(jobmod.ClimbJob.ALIGN)),
           "note 为空时没退回相位（那行会变成光秃秃一个名字 ✗）：%r" % got2)
 
     # ③ 没有 job ⇒ 空串
-    check(route.job_label(None) == "", "没有 job 时该给空串：%r" % route.job_label(None))
+    check(pathing.job_label(None) == "", "没有 job 时该给空串：%r" % pathing.job_label(None))
 
     # ①′ 四种执行器都要映射到 `zones.EDGE_KINDS` 里那四个键（**中文名只此一处** ✓）
-    for cls, kind in ((route.WalkJob, "walk"), (route.ClimbJob, "climb"),
-                      (route.DropJob, "drop"), (route.JumpJob, "jump")):
-        check(route.JOB_KINDS.get(cls.__name__) == kind,
+    for cls, kind in ((jobmod.WalkJob, "walk"), (jobmod.ClimbJob, "climb"),
+                      (jobmod.DropJob, "drop"), (jobmod.JumpJob, "jump")):
+        check(jobmod.JOB_KINDS.get(cls.__name__) == kind,
               "%s 没映射到 %r（界面会退回类名 ✗）" % (cls.__name__, kind))
         check(kind in zones.EDGE_KINDS,
               "映射出来的 %r 不是通行方式（`zones.EDGE_KINDS` 那份口径 ✗）" % (kind,))
@@ -11521,7 +11586,7 @@ def t_job_label_text():
           "没任务时执行器那行不该有内容（画面会多一行 ✗）：%r" % (a.current_goto_text(),))
     a._climb = j
     check(a.current_goto_text().startswith(zones.kind_label("climb")),
-          "agent 那层没走 `route.job_label`：%r" % (a.current_goto_text(),))
+          "agent 那层没走 `pathing.job_label`：%r" % (a.current_goto_text(),))
 
 
 def t_route_goal_already_reached():
@@ -11548,7 +11613,7 @@ def t_route_goal_already_reached():
         而它恰好属于这趟的目的地集合 ⇒ 被"脚下集合"这条判成功 ✗
         ⇒ 判据加一件：**人不在绳上**（广播 `ladder_id` 为空 ✓）才允许这么收 ✓。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings()
     s.enabled = True
@@ -11556,7 +11621,8 @@ def t_route_goal_already_reached():
     h.mobs_fn = lambda t: []                    # 别有怪来抢分支 ✓
 
     def _plan(dst):
-        return {"jobs": [route.ClimbJob(ladder_id="L1", x=550.0, y1=-182.0, y2=-353.0,
+        from decision import jobs as jobmod
+        return {"jobs": [jobmod.ClimbJob(ladder_id="L1", x=550.0, y1=-182.0, y2=-353.0,
                                         direction=1, dst_set=dst, src_set="三楼",
                                         tol_px=10, hold_ms=0)],
                 "path": ["三楼", dst], "why": "", "here": False}
@@ -11627,7 +11693,7 @@ def t_route_probe_stone_temple():
 
     为什么单开一条：别的用例钉的是"**某一处判据**对不对" ✓；而"**这张图到底能不能走过去**"
     要把 地形 + 集合 + 边 + **执行器参数** 串起来看 ✓ —— 这个串法**只有一处**
-    （`route.plan_jobs` ✓，面板「命令前往」与 agent 的路径解析器都走它 ✓），所以这里直接调
+    （`pathing.plan_jobs` ✓，面板「命令前往」与 agent 的路径解析器都走它 ✓），所以这里直接调
     `tools.route_probe.probe`（**它的体检项就是这条链的自检** ✓）。
 
     钉三件：
@@ -11637,6 +11703,8 @@ def t_route_probe_stone_temple():
          （用户现场走的就是最后那段「三楼 → 顶层」✓）；
       ③ 该图**所有集合两两**都能解析出任务 ✓（少一条边就会在这儿红 ✓）。
     """
+    from decision import pathing
+    from decision import jobs as jobmod
     from tools.route_probe import probe, probe_all
 
     checks = probe("106010105", "一楼", "顶层", out=lambda *_a: None)
@@ -11645,15 +11713,14 @@ def t_route_probe_stone_temple():
 
     from core import mapdata
     from core import zones as zmod
-    from decision import route
 
     t, z = mapdata.load("106010105"), zmod.load("106010105")
-    plan = route.plan_jobs(t, z, "一楼", "顶层", tol_px=route.ALIGN_TOL_PX, hold_ms=250)
+    plan = pathing.plan_jobs(t, z, "一楼", "顶层", tol_px=jobmod.ALIGN_TOL_PX, hold_ms=250)
     path = list(plan.get("path") or [])
     jobs = list(plan.get("jobs") or [])
     check(path == ["一楼", "二楼", "三楼", "顶层"],
           "这条路的集合序列变了（现场是 一楼→二楼→三楼→顶层）：%r" % (path,))
-    kinds = [route.JOB_KINDS.get(type(j).__name__, "") for j in jobs]
+    kinds = [jobmod.JOB_KINDS.get(type(j).__name__, "") for j in jobs]
     check(kinds.count("climb") == 2 and kinds.count("jump") == 1,
           "三步该是「爬 → 跳 → 爬」：%r" % (kinds,))
     climbs = [j for j in jobs if getattr(j, "ladder_id", None)]
@@ -11690,7 +11757,7 @@ def t_climb_recheck_cheaper_mob():
       ⑨ **来源沿路线透传**：`_maybe_replan` 重算时**不丢**来源 ✓（丢了就"走得越久越复核不了"✗）
          + 收工之后清掉 ✓。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings()
     s.enabled = True
@@ -11712,7 +11779,8 @@ def t_climb_recheck_cheaper_mob():
     def _job(dst="顶层"):
         # ⚠ 用走任务就够（复核与执行器种类无关 ✓）；`dst_set` 取**目的外地名** ⇒ 不会命中
         #   `_climb_tick` 开头那条"人已经站在目的地里 ⇒ 收工"（那会盖掉复核 ✓ 踩过 ✗）。
-        return route.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])
+        from decision import jobs as jobmod
+        return jobmod.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])
 
     t = 2000.0
 
@@ -11874,7 +11942,7 @@ def t_climb_arrive_face_target():
          **同一条任务**的下一拍方向就跟着换 ✓（不是建任务时定死 ✓）；
       ⑥ 走完整 `tick`：**交接到 chase 那一拍方向不翻**（climb 给 right ⇒ chase 也给 right ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings()
     s.enabled = True
@@ -11886,7 +11954,8 @@ def t_climb_arrive_face_target():
     ws.player.at_ladder_top = "L1"
 
     def _job(hold_ms=300):
-        return route.ClimbJob(ladder_id="L1", x=700.0, y1=-182.0, y2=-353.0,
+        from decision import jobs as jobmod
+        return jobmod.ClimbJob(ladder_id="L1", x=700.0, y1=-182.0, y2=-353.0,
                               direction=1, dst_set="顶层", src_set="乙平台",
                               tol_px=10, hold_ms=hold_ms)
 
@@ -12053,12 +12122,12 @@ def t_climb_recheck_walk_platform():
       ⑤ **来源怪不在**候选里 ⇒ 不掐（保守 ✓，同 `_climb_recheck` ④ ✓）；
       ⑥ **只有「追击」来源参与**（命令前往 / 任务队列那种 ⇒ 天然豁免 ✓）；
       ⑦ **不在这一档就不查**：`|dx| ≤ 起跳距离` / 按过跳 / 人在绳上 / 斜跳飞行中 ✓
-         （判据全在 `route.ClimbJob.walking_to_ladder()` ✓ **一处口径** ✓）；
+         （判据全在 `jobmod.ClimbJob.walking_to_ladder()` ✓ **一处口径** ✓）；
       ⑧ `_last_dx` 由 `_align_step` **一处记账**，`walking_to_ladder()` 只读它 ✓（不自己再算 ✗）。
     """
+    from decision import jobs as jobmod
     import inspect
 
-    from decision import route
 
     s = fresh_settings()
     s.enabled = True
@@ -12077,7 +12146,8 @@ def t_climb_recheck_walk_platform():
         # 绳梯在**世界 x = 700**（玩家在 500 ⇒ 离绳 200px ⇒ **起跳距离外** ✓）；
         # `dst_set="顶层"` = 目的外地名（不会命中 `_climb_tick` 开头那条"人已经站在目的地里 ⇒
         # 收工" ✓ —— 那会盖掉复核 ✓ 同 `t_climb_recheck_cheaper_mob` 的踩坑说明 ✓）。
-        return route.ClimbJob(ladder_id="L1", x=700.0, y1=-182.0, y2=-353.0,
+        from decision import jobs as jobmod
+        return jobmod.ClimbJob(ladder_id="L1", x=700.0, y1=-182.0, y2=-353.0,
                               direction=1, dst_set="顶层", src_set="乙平台",
                               tol_px=10, hold_ms=0, jump_start_px=jump_start_px)
 
@@ -12169,7 +12239,7 @@ def t_climb_recheck_walk_platform():
           "不许被动 ✗）")
     a.stop_route("用例⑥")
 
-    # ⑦ 不在这一档就不查（判据全在 `route.ClimbJob.walking_to_ladder()` ✓ 一处口径 ✓）
+    # ⑦ 不在这一档就不查（判据全在 `jobmod.ClimbJob.walking_to_ladder()` ✓ 一处口径 ✓）
     #    ⚠ **每条用新任务**：同一个任务连喂几拍会**推进相位**（对齐 → 按跳 → …）⇒ 后面几条会被
     #      "相位已经不是 ALIGN / 已经按过跳"蒙过去 ⇒ **假绿** ✗（反向验证时正是这么踩到的 ✓）。
     def _fresh(px=500.0, **kw):
@@ -12202,7 +12272,7 @@ def t_climb_recheck_walk_platform():
     check(_fresh(jump_start_px=250).walking_to_ladder() is False,
           "|dx|（200）已经进了**起跳距离**（250）以内，却还算「起跳距离外」✗")
     # ⑧ `_last_dx` 由 `_align_step` **一处记账**（源码级：那两处 `self.x - float(px)` 都改读它 ✓）
-    _rt = inspect.getsource(route.ClimbJob)
+    _rt = inspect.getsource(jobmod.ClimbJob)
     check(_rt.count("self.x - float(px)") == 1,
           "`离绳距离`在 `ClimbJob` 里被算了 %d 处（该**只有 `_align_step` 开头那一处**记账 ⇒ "
           "两处口径迟早打架 ✗）" % _rt.count("self.x - float(px)"))
@@ -12232,10 +12302,11 @@ def t_no_chase_path_no_path_tasks():
          ✓（2026-10-06 用户澄清：开关**只**管「因追击发生的寻路」✗ 见 SKILL **271** ✓）；
       ④ **关着开关**时 ③ 那条照旧（不打架 + 先回去 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     def _plan(dst):
-        return {"jobs": [route.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
+        from decision import jobs as jobmod
+        return {"jobs": [jobmod.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
                 "path": ["底层", dst], "why": "", "here": False}
 
     # ①② 「战斗时长到点换地方」
@@ -12431,7 +12502,7 @@ def t_zone_params_need_can_fight():
       ④ ⭐ **打架权限那一半一个字没动**：`battle_zone_sets` 仍是"勾了的那些" ✓、**空名单 = 不限制** ✓
          （不许因为这条改动变成"哪儿都不打" ✗）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings()
     s.enabled = True
@@ -12447,7 +12518,7 @@ def t_zone_params_need_can_fight():
     ws.player.world_x = 500.0
     plan = []
     a.route_plan = lambda dst: (plan.append(dst) or
-                                {"jobs": [route.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
+                                {"jobs": [jobmod.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
                                  "path": ["底层", dst], "why": "", "here": False})
     t = 5000.0
 
@@ -12520,9 +12591,9 @@ def t_disable_chase_pathfinding():
          绘制段一行都不用动 ✓）—— 源码级钉 ✓；
       ⑤ 存读往返（`to_dict` / `from_dict`）+ **有界面控件** ⇒ 另见 `t_align_params` ✓。
     """
+    from decision import jobs as jobmod
     from pathlib import Path
 
-    from decision import route
 
     s = fresh_settings(attack_dist=100.0, attack_up_dist=10.0, attack_down_dist=10.0)
     s.enabled = True
@@ -12538,7 +12609,7 @@ def t_disable_chase_pathfinding():
     planned, cost_calls, sets_calls = [], [], []
     a.route_plan = lambda dst: (
         planned.append(dst) or
-        {"jobs": [route.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
+        {"jobs": [jobmod.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
          "path": ["乙平台", dst], "why": "", "here": False})
     a.mob_sets_of = lambda pl, m: (sets_calls.append(m.id) or
                                    {"world": (600.0, -300.0), "sets": ["顶层"], "why": ""})
@@ -12749,7 +12820,7 @@ def t_mob_goto_towards():
       ⑤ 没注入 `nearest_set_towards` / 它解不出 ⇒ **不动** ✓（宁缺勿错 ✓）；
       ⑥ 只在节流放行时才动（共用 `_mob_goto_at` ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings(attack_dist=100.0, attack_up_dist=10.0, attack_down_dist=10.0)
     s.enabled = True
@@ -12758,7 +12829,7 @@ def t_mob_goto_towards():
     _planned = []
     a.route_plan = lambda dst: (
         _planned.append(dst) or
-        {"jobs": [route.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
+        {"jobs": [jobmod.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
          "path": ["乙平台", dst], "why": "", "here": False})
     ws = h.ws(with_mob=False)
     ws.player.here_sets = ["乙平台"]
@@ -12927,7 +12998,7 @@ def t_mob_goto_towards_no_self_loop():
       ③ 规划器回 `here=True`（那种"成功但没起跑"）⇒ **不许当成成功** ✓；
       ④ 真的起跑了 ⇒ 照旧 True ✓（老行为一字不变 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings(attack_dist=100.0, attack_up_dist=10.0, attack_down_dist=10.0)
     s.enabled = True
@@ -12944,7 +13015,8 @@ def t_mob_goto_towards_no_self_loop():
         return {"jobs": [], "path": [dst], "why": "已经在「%s」上了" % dst, "here": True}
 
     def _plan_walk(dst):
-        return {"jobs": [route.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
+        from decision import jobs as jobmod
+        return {"jobs": [jobmod.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
                 "path": ["乙平台", dst], "why": "", "here": False}
 
     t = 2000.0
@@ -13062,7 +13134,7 @@ def t_fight_min_clock_and_gate():
         （返回 False、`_climb` 保持 None ✓ —— 这就是"到点之前不追别的 foothold 集合的怪"✓）；
       ③ 累计**到了** ⇒ 照旧下前往、去怪那个集合 ✓（老行为恢复 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
     from decision.agent import ZONE_GOTO_RETRY_S
 
     s = fresh_settings(attack_dist=40.0)
@@ -13071,7 +13143,8 @@ def t_fight_min_clock_and_gate():
     h.mobs_fn = lambda t: [Mob(id=1, x=580.0, y=500.0, w=40.0, h=40.0, conf=0.9)]
 
     def _plan(dst):
-        return {"jobs": [route.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
+        from decision import jobs as jobmod
+        return {"jobs": [jobmod.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
                 "path": ["甲平台", dst], "why": "", "here": False}
 
     with h._patched():
@@ -13149,7 +13222,7 @@ def t_zone_pick_cheapest_and_rename():
       ④ **算不出代价 ⇒ 退回 `zones[0]`**（老行为 ✓ 绝不猜一块 ✗）；
       ⑤ **代价只在节流放行那一刻算**（这函数**每拍**都会进 ✗ ⇒ 每拍算一轮会压垮帧 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings()
     s.enabled = True
@@ -13194,7 +13267,7 @@ def t_zone_pick_cheapest_and_rename():
     _planned = []
     a.route_plan = lambda dst: (
         _planned.append(dst) or
-        {"jobs": [route.WalkJob(dst, [(500.0, 510.0, 520.0, -208.0, "1")])],
+        {"jobs": [jobmod.WalkJob(dst, [(500.0, 510.0, 520.0, -208.0, "1")])],
          "path": ["丙", dst], "why": "", "here": False})
     s.battle_zones = [{"set": "甲", "can_fight": True},
                       {"set": "乙", "can_fight": True},
@@ -13462,10 +13535,10 @@ def t_battle_zone_idle_picker():
     z = zones.load(MID)
     check(t is not None and z is not None, "那张真地图读不出来（前提不成立）")
     _sys.stderr.write("[D] c 集合 ok\n"); _sys.stderr.flush()
-    names = sorted(str(n) for n in (z.sets or {}))
+    names = sorted(str(n) for n in (z.zones or {}))
     check(names, "那张图没有集合（前提不成立）")
     # 挑一个**foothold 最多**的集合（点选才有得点 ✓）
-    best = max(names, key=lambda n: len((z.sets.get(n) or {}).get("footholds") or []))
+    best = max(names, key=lambda n: len((z.zones.get(n) or {}).get("footholds") or []))
 
     # ⚠⚠ **本套件里用替身视图**（不建真 `FootholdPicker` —— 它内含 `QGraphicsView`）：
     #   实测**这个套件里连空的 `QGraphicsView()` 都建不出来**（进程原生崩溃 `0xC0000409` ✗），
@@ -13553,9 +13626,9 @@ def t_foothold_picker_logic():
     MID = "106010105"
     t, z = mapdata.load(MID, with_canvas=True), zones.load(MID)
     check(t is not None and z is not None, "那张真地图读不出来（前提不成立）")
-    names = sorted(str(n) for n in (z.sets or {}))
+    names = sorted(str(n) for n in (z.zones or {}))
     check(names, "那张图没有集合（前提不成立）")
-    best = max(names, key=lambda n: len((z.sets.get(n) or {}).get("footholds") or []))
+    best = max(names, key=lambda n: len((z.zones.get(n) or {}).get("footholds") or []))
     # ① 只认本集合
     fids = fp.set_fids(z, best)
     fs = fp.footholds_of(t, z, best)
@@ -13608,7 +13681,7 @@ def t_battle_zone_item_behaviors():
         原来到**中心**才停 ✗）；
       ③ 没注入解析器 / 没配 ⇒ 不按键（**老行为一字不变** ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings(attack_dist=40.0)
     s.enabled = True
@@ -13617,7 +13690,7 @@ def t_battle_zone_item_behaviors():
     _planned = []
     a.route_plan = lambda dst: (
         _planned.append(dst) or
-        {"jobs": [route.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
+        {"jobs": [jobmod.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
          "path": ["乙平台", dst], "why": "", "here": False})
     ws = h.ws(with_mob=False)
     ws.player.here_sets = ["乙平台"]
@@ -14023,7 +14096,7 @@ def t_sweep_idle_switch_and_walk_priority():
       ④ **前面站着怪 ⇒ 不切平台**（扫平台只锁背后 back_range 内的怪 ⇒ 光看 `target is None`
          会把「前面有怪」当成没人 ✗ ⇒ 判据显式要「视野里一只怪都没有」✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings(strategy="sweep", attack_dist=40.0)
     s.sweep_turn_cd = 600000                # 别让「换朝向延迟」在这条用例里翻方向 ✓
@@ -14033,7 +14106,7 @@ def t_sweep_idle_switch_and_walk_priority():
     _planned = []
     a.route_plan = lambda dst: (
         _planned.append(dst) or
-        {"jobs": [route.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
+        {"jobs": [jobmod.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
          "path": ["乙平台", dst], "why": "", "here": False})
     # idle 回归点故意配在**左边**（150~250），而巡逻主方向是**右**（`_patrol_dir` 默认 +1）
     # ⇒ 两边的方向键诉求**相反** ⇒ 谁赢一眼可见 ✓
@@ -14112,7 +14185,7 @@ def t_zone_cd_setting():
     """
     from PyQt5.QtWidgets import QApplication
 
-    from perception.world_state import Mob, Player, WorldState
+    from perception.world.world_state import Mob, Player, WorldState
 
     ZONE_GOTO_RETRY_S = ag.ZONE_GOTO_RETRY_S
     CombatAgent = ag.CombatAgent
@@ -14253,12 +14326,12 @@ def t_drop_no_reaction_back_to_entry():
       ⑥ **源码级**：`DropJob` 身上不许再出现 `_hold_reassert` / `reassert` ✗
          （爬绳 `ClimbJob` 的「补按 ↑」**照旧在** ✓ —— 只删下跳这份 ✓）。
     """
+    from decision import jobs as jobmod
     import inspect
 
-    from decision import route
 
     kw = dict(tol_px=10, hold_ms=0, y_tol_px=10, retry_ms=2000, stall_s=3.0)
-    j = route.DropJob("三楼", "一楼", [(550.0, 500.0, 600.0, "42")], **kw)
+    j = jobmod.DropJob("三楼", "一楼", [(550.0, 500.0, 600.0, "42")], **kw)
 
     # ① 站在那条可下跳 foothold 上 ⇒ 立刻「按住 ↓」（还没跳；**补按那套已经没了** ✓）
     o = j.update(0.0, 550.0, py=-166.0)
@@ -14268,16 +14341,16 @@ def t_drop_no_reaction_back_to_entry():
           "下跳还在发「补按」那个键（用户 2026-10-06 要求**移除** ✗）：%r" % o)
 
     # ② ARM_HOLD_S 过了 ⇒ 按住 ↓ + 点按跳（↓ 不能丢）
-    o = j.update(float(route.ARM_HOLD_S) + 0.01, 550.0, py=-166.0)
+    o = j.update(float(jobmod.ARM_HOLD_S) + 0.01, 550.0, py=-166.0)
     check(o["jump"] is True and o["dir"] == -1,
           "点按跳那一拍丢了 ↓（跳会变成原地跳 ✗）：%s" % o)
 
     # ③ 到「移动操作尝试间隔」、Y 一直没动 ⇒ **回入口**（重新判"当前 fh 还能不能下跳"）
-    o = j.update(float(route.ARM_HOLD_S) + 1.0, 550.0, py=-166.0)
+    o = j.update(float(jobmod.ARM_HOLD_S) + 1.0, 550.0, py=-166.0)
     check(o["dir"] == -1 and not o["jump"],
           "间隔没到就先动手了（该继续按住 ↓、等那个间隔 ✓）：%s" % o)
-    o = j.update(float(route.ARM_HOLD_S) + 2.2, 550.0, py=-166.0)
-    check(j.phase == route.DropJob.ALIGN and o["dir"] == 0 and not o["jump"],
+    o = j.update(float(jobmod.ARM_HOLD_S) + 2.2, 550.0, py=-166.0)
+    check(j.phase == jobmod.DropJob.ALIGN and o["dir"] == 0 and not o["jump"],
           "「移动操作尝试间隔」内没反应却没**回入口**（该回 ALIGN 重新判"
           "「当前 foothold 是否可下跳」✗）：%s（phase=%s）" % (o, j.phase))
     check("回入口" in o["note"] and "没下落" in o["note"],
@@ -14286,12 +14359,12 @@ def t_drop_no_reaction_back_to_entry():
     # ④ 下一拍：**重新从入口判** —— 还站在那块可下跳面上 ⇒ 直接 ARMED ⇒ **重新按住 ↓**
     #    ⚠ 这一下是**真正的新一次按下**（上一拍键集是空的 ✓）：`KeyState` 只在键集变化时
     #      才发键 ⇒ 回入口那一拍"一个键都不按"正是为了这个 ✓（不松就永远不趴 ✗）。
-    o = j.update(float(route.ARM_HOLD_S) + 2.3, 550.0, py=-166.0)
-    check(j.phase == route.DropJob.ARMED and o["dir"] == -1,
+    o = j.update(float(jobmod.ARM_HOLD_S) + 2.3, 550.0, py=-166.0)
+    check(j.phase == jobmod.DropJob.ARMED and o["dir"] == -1,
           "回入口之后没重新按住 ↓（流程图：是 ⇒ 通知位置状态 ⇒ 按住 ↓ + 跳 ✗）：%s" % o)
-    o = j.update(float(route.ARM_HOLD_S) + 2.3 + float(route.ARM_HOLD_S) + 0.01,
+    o = j.update(float(jobmod.ARM_HOLD_S) + 2.3 + float(jobmod.ARM_HOLD_S) + 0.01,
                  550.0, py=-166.0)
-    check(j.phase == route.DropJob.DROP and o["jump"] is True and o["dir"] == -1,
+    check(j.phase == jobmod.DropJob.DROP and o["jump"] is True and o["dir"] == -1,
           "回入口之后没重新「按住 ↓ + 点按跳」：%s（phase=%s）" % (o, j.phase))
     check(j.attempt >= 2,
           "回入口没算成「又一次尝试」（日志里看不出回头过 ✗）：attempt=%d" % j.attempt)
@@ -14299,10 +14372,10 @@ def t_drop_no_reaction_back_to_entry():
     # ⑤ retry_ms = 0（不回头）⇒ 一路按住 ↓ 连按（老行为 ✓，交给「寻路超时」兜底 ✓）
     kw0 = dict(kw)
     kw0["retry_ms"] = 0
-    j0 = route.DropJob("三楼", "一楼", [(550.0, 500.0, 600.0, "42")], **kw0)
+    j0 = jobmod.DropJob("三楼", "一楼", [(550.0, 500.0, 600.0, "42")], **kw0)
     j0.update(0.0, 550.0, py=-166.0)
-    o = j0.update(float(route.ARM_HOLD_S) + 9.0, 550.0, py=-166.0)
-    check(j0.phase == route.DropJob.DROP and o["dir"] == -1,
+    o = j0.update(float(jobmod.ARM_HOLD_S) + 9.0, 550.0, py=-166.0)
+    check(j0.phase == jobmod.DropJob.DROP and o["dir"] == -1,
           "把「移动操作尝试间隔」设成 0 却回入口了（老行为是一路按住 ↓ 连按 ✗）：%s" % o)
 
     # ⑥ 源码级：下跳这份**补按**删干净了（`ClimbJob` 那份照旧 ✓）
@@ -14310,7 +14383,7 @@ def t_drop_no_reaction_back_to_entry():
     #      "⛔ 曾经有 `_hold_reassert`…" 的说明是**故意留着**的（告诉后来的人为什么没有它 ✓）
     #      而行号/注释/文档字符串里都写着这个名字 ⇒ 拿光秃秃的名字去找，**说明文字会被判红** ✗
     #      ⇒ 只找 `self.xxx` 与 `def xxx` 这两种**真代码**形态 ✓（先滤掉注释行，双保险 ✓）。
-    src = "\n".join(_l for _l in inspect.getsource(route.DropJob).splitlines()
+    src = "\n".join(_l for _l in inspect.getsource(jobmod.DropJob).splitlines()
                     if not _l.lstrip().startswith("#"))
     for bad in ("self._hold_reassert", "self._reassert_at", "self._reassert_n",
                 "def reassert_count"):
@@ -14318,8 +14391,8 @@ def t_drop_no_reaction_back_to_entry():
               "`DropJob` 里还留着补按那套（%s）—— 用户要求移除 ✗" % bad)
     check("reassert=True" not in src and "reassert=reassert" not in src,
           "`DropJob` 还在往 `_out` 传 `reassert`（补按那套的入口 ✗）")
-    check("_hold_reassert" in inspect.getsource(route.ClimbJob)
-          or "reassert=True" in inspect.getsource(route.ClimbJob),
+    check("_hold_reassert" in inspect.getsource(jobmod.ClimbJob)
+          or "reassert=True" in inspect.getsource(jobmod.ClimbJob),
           "爬绳的「补按 ↑」被一起删掉了（那是**另一条口径**，只该删下跳这份 ✗）")
 
 
@@ -14346,9 +14419,9 @@ def t_drop_stray_fh_back_to_entry():
       ⑥ 对照：**ALIGN 相不管**这个（它自己有那两条 ✓）⇒ 走「如实失败」✓
          （别抢它的活 ⇒ 否则「回入口 ⇒ 又回入口」死循环 ✗）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
-    C = route.DropJob
+    C = jobmod.DropJob
     kw = dict(tol_px=6, hold_ms=0, y_tol_px=10, retry_ms=2000, stall_s=3.0)
     # 下跳点：x∈[480,520]、面 y=0；起跳「二楼」、目标「一楼」
     #   ⚠ `dst_ys` 不填 ⇒ 目标只认集合 ✓（几何兜底那条另有它自己的用例 ✓）
@@ -14356,19 +14429,20 @@ def t_drop_stray_fh_back_to_entry():
 
     def _to_drop(j):
         """推到 `DROP` 相（ALIGN ⇒ ARMED ⇒ DROP ✓），全程只报「二楼 / 面 y=0」✓。"""
+        from decision import jobs as jobmod
         j.update(0.0, px=500.0, py=0.0, here_sets=["二楼"], ground_y=0.0)
         j.update(0.0, px=500.0, py=0.0, here_sets=["二楼"], ground_y=0.0)
-        j.update(float(route.ARM_HOLD_S) + 0.01, px=500.0, py=0.0,
+        j.update(float(jobmod.ARM_HOLD_S) + 0.01, px=500.0, py=0.0,
                  here_sets=["二楼"], ground_y=0.0)
         return j
 
     # ---- ① 半路落到别的层（底层）⇒ 回入口 ----
     j = _to_drop(C("二楼", "一楼", spots, **kw))
-    check(j.phase == route.DropJob.DROP,
+    check(j.phase == jobmod.DropJob.DROP,
           "前置不成立（该在「按住 ↓ + 跳」那一相）：%s" % j.phase)
-    o = j.update(float(route.ARM_HOLD_S) + 0.20, px=500.0, py=300.0,
+    o = j.update(float(jobmod.ARM_HOLD_S) + 0.20, px=500.0, py=300.0,
                  here_sets=["底层"], ground_y=300.0)
-    check(j.phase == route.DropJob.ALIGN,
+    check(j.phase == jobmod.DropJob.ALIGN,
           "位置状态说人已经站在「底层」上了，却没**回执行器入口**"
           "（用户 2026-10-11 要求从入口重启 ✗）：phase=%s" % j.phase)
     check(o["dir"] == 0 and not o["jump"],
@@ -14377,9 +14451,9 @@ def t_drop_stray_fh_back_to_entry():
           "那句原因没说清「站在哪块别的集合上」（事后看不出为什么回头 ✗）：%r" % o["note"])
 
     # ---- ② 回入口之后 ⇒ 落进既有的「换层 ⇒ 如实失败」那条（不 是又回入口 ⇒ 不死循环）----
-    o = j.update(float(route.ARM_HOLD_S) + 0.30, px=500.0, py=300.0,
+    o = j.update(float(jobmod.ARM_HOLD_S) + 0.30, px=500.0, py=300.0,
                  here_sets=["底层"], ground_y=300.0)
-    check(j.phase == route.DropJob.FAILED,
+    check(j.phase == jobmod.DropJob.FAILED,
           "回入口之后没落进 2026-10-02 那条「人在别的集合 ⇒ 如实失败让上层重算」"
           "（那会变成「回入口 ⇒ 又回入口」的死循环 ✗）：phase=%s" % j.phase)
     check("不在起跳" in o["note"] or "做不了" in o["note"],
@@ -14387,39 +14461,39 @@ def t_drop_stray_fh_back_to_entry():
 
     # ---- ③ 对照：正常落到**目标层** ⇒ 不许回入口（该 DONE ✓）----
     j2 = _to_drop(C("二楼", "一楼", spots, **kw))
-    o2 = j2.update(float(route.ARM_HOLD_S) + 0.20, px=500.0, py=300.0,
+    o2 = j2.update(float(jobmod.ARM_HOLD_S) + 0.20, px=500.0, py=300.0,
                    here_sets=["一楼"], ground_y=300.0)
-    check(j2.phase == route.DropJob.DONE,
+    check(j2.phase == jobmod.DropJob.DONE,
           "落到目标层却没判「到了」（该由 `_arrived` 一处判 ✓）：phase=%s / %r"
           % (j2.phase, o2["note"]))
 
     # ---- ④ 对照：**悬空路过**别的层 ⇒ 不许回入口（防误报的要害 ✗）----
     j3 = _to_drop(C("二楼", "一楼", spots, **kw))
-    o3 = j3.update(float(route.ARM_HOLD_S) + 0.20, px=500.0, py=0.0,
+    o3 = j3.update(float(jobmod.ARM_HOLD_S) + 0.20, px=500.0, py=0.0,
                    here_sets=["底层"], ground_y=300.0)   # 那块面在脚底 300px 之下 ⇒ 悬空 ✓
-    check(j3.phase == route.DropJob.DROP,
+    check(j3.phase == jobmod.DropJob.DROP,
           "只是**悬空路过**那层（面离脚底 300px）就被判成「跑到别处了」⇒ "
           "正常的 2→1 下落会被自己打断 ✗：phase=%s" % j3.phase)
     check(o3["dir"] == -1, "这一拍该照旧按住 ↓（等落到目标）：%s" % o3)
 
     # ---- ⑤ 对照：判不出来 ⇒ 不拦 ✓（老行为 / 老调用方一字不变）----
     j4 = _to_drop(C("二楼", "一楼", spots, **kw))
-    j4.update(float(route.ARM_HOLD_S) + 0.20, px=500.0, py=300.0,
+    j4.update(float(jobmod.ARM_HOLD_S) + 0.20, px=500.0, py=300.0,
               here_sets=[], ground_y=300.0)
-    check(j4.phase == route.DropJob.DROP,
+    check(j4.phase == jobmod.DropJob.DROP,
           "集合读不到（判不出来）却回入口了（老口径是「判不出来不拦」✗）：phase=%s"
           % j4.phase)
     j5 = _to_drop(C("", "一楼", spots, **kw))
-    j5.update(float(route.ARM_HOLD_S) + 0.20, px=500.0, py=300.0,
+    j5.update(float(jobmod.ARM_HOLD_S) + 0.20, px=500.0, py=300.0,
               here_sets=["底层"], ground_y=300.0)
-    check(j5.phase == route.DropJob.DROP,
+    check(j5.phase == jobmod.DropJob.DROP,
           "没填起跳集合（手工任务）却回入口了（老调用方行为该一字不变 ✗）：phase=%s"
           % j5.phase)
 
     # ---- ⑥ 对照：**ALIGN 相不管**这个（它有自己的「换层 ⇒ 如实失败」✓）----
     j6 = C("二楼", "一楼", spots, **kw)
     o6 = j6.update(0.0, px=500.0, py=300.0, here_sets=["底层"], ground_y=300.0)
-    check(j6.phase == route.DropJob.FAILED,
+    check(j6.phase == jobmod.DropJob.FAILED,
           "ALIGN 相该走它自己那条「人在别的集合 ⇒ 如实失败」，别被新守卫抢成「回入口」"
           "（那会死循环 ✗）：phase=%s / %r" % (j6.phase, o6["note"]))
 
@@ -14490,7 +14564,7 @@ def t_goto_queue():
       ⑦ 队列是**运行时状态**：不进 `to_dict`（不许存进项目文件 / 跨会话复活 ✗）；
       ⑧ 顺序**就是排的顺序**（先排先走，不许重排 —— 用户按顺序排出来的是有意义的 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings()
     s.enabled = True
@@ -14500,12 +14574,13 @@ def t_goto_queue():
 
     def _plan(dst):
         """假的路径解析器：除了「丙平台」都能走 ✓。"""
+        from decision import jobs as jobmod
         if dst == "丙平台":
             return {"jobs": [], "why": "没有可走的路（用例）", "here": False, "path": []}
         if dst == "现在就在这":
             return {"jobs": [], "why": "已经在「%s」上了" % dst, "here": True,
                     "path": [dst]}
-        return {"jobs": [route.WalkJob(dst, spots)], "why": "", "here": False,
+        return {"jobs": [jobmod.WalkJob(dst, spots)], "why": "", "here": False,
                 "path": ["起点", dst]}
 
     a.route_plan = _plan
@@ -14517,7 +14592,7 @@ def t_goto_queue():
         check(a.goto_queue() == ["甲", "乙"], "队列内容不对：%r" % (a.goto_queue(),))
 
         # ② 一条路线整条走完 ⇒ 自动接下一条
-        a.start_route([route.WalkJob("起点", spots)], why="用例：第一条")
+        a.start_route([jobmod.WalkJob("起点", spots)], why="用例：第一条")
         check(a._task_finished() is False,
               "整条走完该**接队列里的下一条**（`False` = 还没完事）")
         check(a.current_goto_set() == "甲", "接的不是队列里的第一条：%r"
@@ -14530,7 +14605,7 @@ def t_goto_queue():
         # ③ 队列里有"已经站在上面"的那一条 ⇒ 跳过它，接着下一条
         a.queue_goto("现在就在这")
         a.queue_goto("乙")
-        a.start_route([route.WalkJob("起点", spots)], why="用例：跳过")
+        a.start_route([jobmod.WalkJob("起点", spots)], why="用例：跳过")
         check(a._task_finished() is False, "该跳过「现在就在这」、接着走「乙」")
         check(a.current_goto_set() == "乙",
               "没跳过「已经在上面了」的那一条：%r" % a.current_goto_set())
@@ -14539,7 +14614,7 @@ def t_goto_queue():
         # ④ 某一条下不去 ⇒ 停整个队列 + 说清（后面几个一并取消）
         a.queue_goto("丙平台")
         a.queue_goto("乙")
-        a.start_route([route.WalkJob("起点", spots)], why="用例：走不通")
+        a.start_route([jobmod.WalkJob("起点", spots)], why="用例：走不通")
         check(a._task_finished() is True, "队列里有下不去的，该**停整个队列**（True）")
         check(a.goto_queue() == [], "停下来之后队列该清空：%r" % (a.goto_queue(),))
         check("丙平台" in a.current_goto_note() and "取消" in a.current_goto_note(),
@@ -14547,14 +14622,14 @@ def t_goto_queue():
 
         # ⑤ 「结束当前寻路」⇒ 队列一起清掉
         a.queue_goto("甲")
-        a.start_route([route.WalkJob("起点", spots)], why="用例：叫停")
+        a.start_route([jobmod.WalkJob("起点", spots)], why="用例：叫停")
         a.stop_route("用例：叫停")
         check(a.goto_queue() == [],
               "「结束当前寻路」没把队列一起清掉（下一拍又会派一条 ✗）：%r" % (a.goto_queue(),))
 
         # ⑥ 寻路失败 ⇒ 队列也清掉
         a.queue_goto("甲")
-        a.start_route([route.WalkJob("起点", spots)], why="用例：失败")
+        a.start_route([jobmod.WalkJob("起点", spots)], why="用例：失败")
         check(a._task_finished(failed=True, why="用例：卡住了") is True, "失败该收掉")
         check(a.goto_queue() == [], "失败之后队列该清空：%r" % (a.goto_queue(),))
         check("队列已清空" in a.current_goto_note(),
@@ -14587,7 +14662,7 @@ def t_queue_starts_itself():
       那套" ⇒ 顺序**没动**（`in_range` 那支还在寻路之前）⇒ 见 `t_job_interrupt_by_fight`
       与 `_climb_interrupted` ✓。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings()
     s.enabled = True
@@ -14600,12 +14675,13 @@ def t_queue_starts_itself():
 
     def _plan(dst):
         """假的路径解析器：除了「丙平台」都能走 ✓（同 `t_goto_queue`）。"""
+        from decision import jobs as jobmod
         if dst == "丙平台":
             return {"jobs": [], "why": "没有可走的路（用例）", "here": False, "path": []}
         if dst == "现在就在这":
             return {"jobs": [], "why": "已经在「%s」上了" % dst, "here": True,
                     "path": [dst]}
-        return {"jobs": [route.WalkJob(dst, spots)], "why": "", "here": False,
+        return {"jobs": [jobmod.WalkJob(dst, spots)], "why": "", "here": False,
                 "path": ["起点", dst]}
 
     a.route_plan = _plan
@@ -14781,17 +14857,17 @@ def t_replan_on_resume_after_attack():
     ⇒ **回来那一拍强制重算** ✓，而且问的是**这条路线最终要去哪**（`_route_final_dst` ✓）。
 
     钉五件：
-      ① ⭐ 打断够久（≥ `route.PAUSE_MIN_S` ✓）回来 ⇒ **当拍**就按当前位置重算 ✓、
+      ① ⭐ 打断够久（≥ `jobmod.PAUSE_MIN_S` ✓）回来 ⇒ **当拍**就按当前位置重算 ✓、
          问的是**最终目的地** ✓（"连目的地也重新算"✓）、并**按新计划起跑** ✓；
       ② **位置状态一模一样**也照样重算 ✓ —— 这就是本条与"位置变了才重算"的**分界** ✓；
       ③ ⚠ **短打断不算**（< `PAUSE_MIN_S` ✓ = 正常拍间隔 ✓）⇒ **一下都不重算** ✓
          （否则每拍重算 ⇒ 来回抖 ✗）；
-      ④ ⚠ 阈值**一处口径**：`route._PausableJob.PAUSE_MIN_S == route.PAUSE_MIN_S` ✓
+      ④ ⚠ 阈值**一处口径**：`jobmod._PausableJob.PAUSE_MIN_S == jobmod.PAUSE_MIN_S` ✓
          （agent 读的是**执行器身上那个** ✓ 不许在 agent 里抄一个数 ✗）；
       ⑤ 源码钉：强制那段必须排在 `_maybe_replan` **之前** ✓（排后面 ⇒ 晚一拍、还白走一拍 ✗）。
     """
+    from decision import jobs as jobmod
     from pathlib import Path
-    from decision import route
 
     s = fresh_settings()
     s.enabled = True
@@ -14802,15 +14878,16 @@ def t_replan_on_resume_after_attack():
     asked = []
 
     def _plan(dst):
+        from decision import jobs
         asked.append(dst)
-        return {"jobs": [route.WalkJob(dst, spots)], "why": "", "here": False,
+        return {"jobs": [jobmod.WalkJob(dst, spots)], "why": "", "here": False,
                 "path": ["起点", dst]}
 
     a.route_plan = _plan
     ws = h.ws(with_mob=False)
     ws.player.here_sets = ["甲"]
     with h._patched():
-        a.start_route([route.WalkJob("乙", spots), route.WalkJob("丙", spots)],
+        a.start_route([jobmod.WalkJob("乙", spots), jobmod.WalkJob("丙", spots)],
                       why="用例：打断后重算")
         a._climb_tick(0.0, 500.0, set(), ws)          # 第一眼：只记不算 ✓
         asked.clear()
@@ -14822,7 +14899,7 @@ def t_replan_on_resume_after_attack():
               "③ 正常拍间隔（< PAUSE_MIN_S）也被当成打断 ⇒ 每拍重算、来回抖 ✗：%r" % (asked,))
 
         # ①② 真打断，而且**位置状态一个字都没变** ⇒ 照样重算、且问最终目的地
-        a._climb._paused_at = 1.0 - (float(route.PAUSE_MIN_S) + 0.5)
+        a._climb._paused_at = 1.0 - (float(jobmod.PAUSE_MIN_S) + 0.5)
         asked.clear()
         a._climb_tick(1.0, 500.0, set(), ws)
         check(asked == ["丙"],
@@ -14833,7 +14910,7 @@ def t_replan_on_resume_after_attack():
               % (a.current_goto_set(),))
 
     # ④ 阈值一处口径（agent 读的是执行器身上那个 ✓）
-    check(float(route._PausableJob.PAUSE_MIN_S) == float(route.PAUSE_MIN_S),
+    check(float(jobmod._PausableJob.PAUSE_MIN_S) == float(jobmod.PAUSE_MIN_S),
           "`_PausableJob.PAUSE_MIN_S` 与模块常量 `PAUSE_MIN_S` 不是一个值 ⇒ 两处分叉 ✗")
 
     # ⑤ 源码钉：强制那段排在 `_maybe_replan` 之前
@@ -14862,13 +14939,13 @@ def t_replan_on_location_change():
       ② 位置变成**计划外**的集合 ⇒ 重新解析（问的是**最终目的地** ✓）并按新计划起跑 ✓；
       ③ 变到的**就是这一步要去的那块**（正常到站）⇒ **不重算**（交给收工那套 ✓）；
       ④ 人**贴在绳梯上**（`ladder_id` 非空）⇒ 不重算，而且**状态不记** ⇒ 离绳那一拍补上 ✓；
-      ⑤ 这一步正处在"**空中**"的相位（`climb`/`jump`/`drop`…＝ `route.INFLIGHT_PHASES`）
+      ⑤ 这一步正处在"**空中**"的相位（`climb`/`jump`/`drop`…＝ `jobmod.INFLIGHT_PHASES`）
         ⇒ 同样先不动，落地再补 ✓；
       ⑥ 重新解析**失败**（脚下没圈进任何集合）⇒ **保持现状** + 说清原因（别把好端端的路线
         砍掉 ✗；留痕走 `perf.log` / `behavior.log` / `_last_goto_note` ✓）；
       ⑦ 没有解析器 ⇒ 静默不动（不炸、也不动现状 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings()
     s.enabled = True
@@ -14880,15 +14957,16 @@ def t_replan_on_location_change():
 
     def _plan(dst):
         """假的解析器：记下被问过的目的地，回一条"一步就到"的路线 ✓。"""
+        from decision import jobs
         asked.append(dst)
-        return {"jobs": [route.WalkJob(dst, spots)], "why": "", "here": False,
+        return {"jobs": [jobmod.WalkJob(dst, spots)], "why": "", "here": False,
                 "path": ["起点", dst]}
 
     a.route_plan = _plan
     ws = h.ws(with_mob=False)
     ws.player.here_sets = ["甲"]
     with h._patched():
-        a.start_route([route.WalkJob("乙", spots), route.WalkJob("丙", spots)],
+        a.start_route([jobmod.WalkJob("乙", spots), jobmod.WalkJob("丙", spots)],
                       why="用例：多步")
         # ① 第一眼只记，不重算
         a._climb_tick(0.0, 500.0, set(), ws)
@@ -14915,7 +14993,7 @@ def t_replan_on_location_change():
         check(asked == ["丙"], "正常到站却重算了（会来回抖 ✗）：%r" % (asked,))
         check(a._climb is None, "到站了该收工（重算会把它当成又一次'位置变了'）")
         # ④ 再起一条：人**贴在绳梯上**时位置变了 ⇒ 先不动；离绳那一拍补上 ✓
-        a.start_route([route.WalkJob("丙", spots)], why="用例：绳上")
+        a.start_route([jobmod.WalkJob("丙", spots)], why="用例：绳上")
         ws.player.here_sets = ["甲"]
         a._climb_tick(0.25, 500.0, set(), ws)        # 第一眼：只记 ✓
         asked.clear()
@@ -14972,8 +15050,9 @@ def t_keystate_momentary():
       ③ 决策还按着的键，`momentary_up` **不许发松开** ✓（只摘账 ✓）。
     ⚠ 测试里 monkeypatch 输入层（**绝不许真发键** ✗ SendInput 会打到真机 ✓）。
     """
-    import decision.input as inp
-    from decision.input import KeyState
+    import execution.input as inp
+    from execution import remote as _remote_mod
+    from execution.input import KeyState
 
     sent = []
     orig = (inp.key_down, inp.key_up)
@@ -15018,14 +15097,15 @@ def t_reconnect_stop_auto():
           见 `reconnect.py::_finish` ✓）。
     """
     import numpy as np
-    import perception.ui_state as ui_state
+    import perception.screen.ui_state as ui_state
     from decision.reconnect import Reconnector
 
     frame = np.full((8, 8, 3), 128, np.uint8)   # 非黑（2026-10-17 ✓ 见 ⑦ 段说明：黑屏判据上了之后纯黑帧一个回车都不按）
     _orig_detect = ui_state.detect
     ui_state.detect = lambda f: ui_state.UI_LOGIN_ERR   # 恒判到断线提示框 ✓
     sent = []
-    import decision.input as _dinput
+    import execution.input as _dinput
+    from execution import remote as _remote_mod
     _orig = (_dinput.key_down, _dinput.key_up)
     _dinput.key_down = lambda n: sent.append(("d", n))
     _dinput.key_up = lambda n: sent.append(("u", n))
@@ -15086,7 +15166,7 @@ def t_chase_rope_detach_two_beats():
     判据（源码钉 ✓ —— 那个分支在一个几万行的函数里、运行期状态太多 ✗
       ⇒ 钉「顺序 + 常量 + 不按 ↓」最实在 ✓）：
       ① 两个日志串都在：**先让方向单独留一拍** ✓ / **按住方向 + 连按跳** ✓；
-      ② 连按跳的周期用的是 **`route.TAP_PERIOD_S`** ✓（**同一份常量** ✓ 不许自己造数 ✗）；
+      ② 连按跳的周期用的是 **`jobmod.TAP_PERIOD_S`** ✓（**同一份常量** ✓ 不许自己造数 ✗）；
       ③ 这一档里**不许按 ↓** ✗（`down` 不许出现 ✓）；
       ④ 判据与开关口径一个字不改：仍是 `on_rope_align` ✓、
         **不在绳上 ⇒ 照旧完全听** `walk_stall_jump` ✓。
@@ -15106,7 +15186,7 @@ def t_chase_rope_detach_two_beats():
           "① 该有「两拍」：先让方向单独一拍、再连按跳 ✗（少了就退回"
           "「方向和跳同拍发」那条老路 ⇒ 人一直挂在绳上 ✓）")
     check("TAP_PERIOD_S" in _blk,
-          "② 连按跳的周期该用 `route.TAP_PERIOD_S` ✗（**同一份常量** ✓ 不许自己造数 ✗）")
+          "② 连按跳的周期该用 `jobmod.TAP_PERIOD_S` ✗（**同一份常量** ✓ 不许自己造数 ✗）")
     check("down" not in _blk,
           "③ 这一档里**不许按 ↓** ✗（在绳上按 ↓ 在游戏里是「还挂在绳上」✓ "
           "同 `DropJob._detach_step` ✓）")
@@ -15141,21 +15221,22 @@ def t_click_corner_alone_one_tick():
     """
     from pathlib import Path
 
-    from decision import mouse_aim as ma
 
+
+    from execution import mouse_aim as ma
     sent = []
     _omove, _oclick = ma.dinput.mouse_move, ma.dinput.mouse_click
     _oavail, _ocur = ma.dinput.mouse_available, ma._own_cursor
-    _oauto = ma._auto_busy
+    _oauto = ma_c._auto_busy
     ma.dinput.mouse_move = lambda dx, dy: sent.append(("move", int(dx), int(dy)))
     ma.dinput.mouse_click = lambda btn="left": sent.append(("click", btn))
     ma.dinput.mouse_available = lambda: True
-    ma._auto_busy = lambda: False
+    ma_c._auto_busy = lambda: False
     try:
         # ---- ① 只归零：一条撞角、零点击 ----
         ok, why = ma.corner_only()
         check(ok is True, "① `corner_only` 该成功 ✓：%r" % (why,))
-        check(sent == [("move", -ma.CORNER_STEP, -ma.CORNER_STEP)],
+        check(sent == [("move", -ma_c.CORNER_STEP, -ma_c.CORNER_STEP)],
               "① 只归零那一拍**只许发撞角那一条 MOVE** ✗（多一个字节都不行 ✗）：%r" % (sent,))
         check(not [s for s in sent if s[0] == "click"],
               "① 只归零那一拍**一个点击都不许发** ✗：%r" % (sent,))
@@ -15163,11 +15244,11 @@ def t_click_corner_alone_one_tick():
         # ---- ② homed=True（读不到光标那道）⇒ 不再撞角，只走位 + 点 ----
         sent.clear()
         ma._own_cursor = lambda: None                 # 收流那种：读不到 ✓
-        _vx, _vy = ma._virtual_origin()
+        _vx, _vy = ma_c._virtual_origin()
         ok2, why2 = ma.click_ratio((768, 1366, 3), 0.5, 0.5, gain=(1.0, 1.0),
                                    origin=(15, 44), homed=True)
         check(ok2 is True, "② 该照常点（不许因为 homed 就不点 ✓）：%r" % (why2,))
-        check(("move", -ma.CORNER_STEP, -ma.CORNER_STEP) not in sent,
+        check(("move", -ma_c.CORNER_STEP, -ma_c.CORNER_STEP) not in sent,
               "② `homed=True` ⇒ **不许再撞角** ✗（撞角与走位必须分拍 ✓ 2026-10-17 ✓）：%r"
               % (sent,))
         check(("click", "left") in sent,
@@ -15177,7 +15258,7 @@ def t_click_corner_alone_one_tick():
     finally:
         ma.dinput.mouse_move, ma.dinput.mouse_click = _omove, _oclick
         ma.dinput.mouse_available, ma._own_cursor = _oavail, _ocur
-        ma._auto_busy = _oauto
+        ma_c._auto_busy = _oauto
     src = (Path(__file__).resolve().parent.parent
            / "decision" / "reconnect.py").read_text(encoding="utf-8")
     _i = src.index('"act": "home"')
@@ -15199,8 +15280,11 @@ def t_click_corner_alone_one_tick():
     check("self._homed = False" in src,
           "④ 滚完那一拍必须**重新归零** ✓（`scroll` 带坐标发 ⇒ 光标被挪到列表上了 ✗ "
           "⇒ 角不再可信 ✓）")
-    _lt = (Path(__file__).resolve().parent.parent
-           / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    _root2 = Path(__file__).resolve().parent.parent
+    # ⚠ 2026-10-20：**动作分发已搬进 `runtime/frame_reconnect.py`**（阶段 1 第二刀 ✓）
+    #   ⇒ 源码钉必须**两个文件一起看** ✗ 只读 `live_thread.py` 会假红 ⇒ 假红会逼人把钉子删掉 ✗✓
+    _lt = ((_root2 / "gui" / "live_thread.py").read_text(encoding="utf-8")
+           + (_root2 / "runtime" / "frame_reconnect.py").read_text(encoding="utf-8"))
     check("homed=bool(_act.get(\"homed\"))" in _lt and 'corner_only(' in _lt,
           "④ `live_thread` 要递 `homed` 下去、并且有 `home` 那一支 ✓（没接上 = 修法等于没上 ✓）")
 
@@ -15224,8 +15308,8 @@ def t_aim_cur_synced_to_real_cursor():
     """
     from pathlib import Path
 
-    from decision import mouse_aim as ma
 
+    from execution import mouse_aim as ma
     shape = (768, 1366, 3)
     sent = []
     _omove, _oavail = ma.dinput.mouse_move, ma.dinput.mouse_available
@@ -15236,10 +15320,10 @@ def t_aim_cur_synced_to_real_cursor():
     ma.dinput.mouse_move = lambda dx, dy: sent.append(("move", int(dx), int(dy)))
     ma.dinput.mouse_available = lambda: True
     try:
-        vx, vy = ma._virtual_origin()
-        gxs, gys = ma.screen_gain((1.0, 1.0), shape)
+        vx, vy = ma_c._virtual_origin()
+        gxs, gys = ma_c.screen_gain((1.0, 1.0), shape)
         # ---- ① 本地：同步成真光标 ----
-        ma.dinput._remote = None                 # 本地（`SerialKbd` 那种：没有 `cursor()` ✓）
+        ma._remote_mod._remote = None                 # 本地（`SerialKbd` 那种：没有 `cursor()` ✓）
         ma._own_cursor = lambda: (1863, 496)     # 现场那种：光标偏右 ✗
         ma._AIM_CUR = None
         ok, why = ma.aim_to(shape, 0.5, 0.5, gain=(1.0, 1.0), origin=(15, 44))
@@ -15256,7 +15340,7 @@ def t_aim_cur_synced_to_real_cursor():
         class _Relay:
             cursor = None                        # ⚠ 判据是 `hasattr(_remote, "cursor")` ✓
         ma._own_cursor = _oown                   # ⚠ 先把①里那个桩**还回来** ✗ ——
-        ma.dinput._remote = _Relay()             #   桩会把 relay 那层判断整个绕过去 ✓
+        ma._remote_mod._remote = _Relay()             #   桩会把 relay 那层判断整个绕过去 ✓
         _before = ma._AIM_CUR
         check(ma._sync_aim_cur(shape, (1.0, 1.0), (15, 44)) is False,
               "② relay ⇒ 本机读到的不是要指挥的那只 ⇒ 该**什么都不做** ✗")
@@ -15265,7 +15349,7 @@ def t_aim_cur_synced_to_real_cursor():
 
         # ---- ③ 源码钉 ----
         src = (Path(__file__).resolve().parent.parent
-               / "decision" / "mouse_aim.py").read_text(encoding="utf-8")
+               / "execution" / "mouse_aim.py").read_text(encoding="utf-8")
         _i = src.index("def aim_to")
         _j = src.index("\ndef ", _i + 5)
         check("_sync_aim_cur(" in src[_i:_j],
@@ -15279,7 +15363,7 @@ def t_aim_cur_synced_to_real_cursor():
         ma._own_cursor = _oown
         ma._AIM_CUR, ma._AIM_AT = _oc, _oat
         ma._AIM_TGT, ma._AIM_TGT_AT = _otgt, _otgt_at
-        ma.dinput._remote = _oremote
+        ma._remote_mod._remote = _oremote
 
 
 def t_click_ratio_verify_corner_first():
@@ -15306,10 +15390,10 @@ def t_click_ratio_verify_corner_first():
     """
     from pathlib import Path
 
-    from decision import mouse_aim as ma
 
+    from execution import mouse_aim as ma
     src = (Path(__file__).resolve().parent.parent
-           / "decision" / "mouse_aim.py").read_text(encoding="utf-8")
+           / "execution" / "mouse_aim.py").read_text(encoding="utf-8")
     sent = []
     _omove, _oclick = ma.dinput.mouse_move, ma.dinput.mouse_click
     _ocur, _oremote = ma._cursor_pos, getattr(ma.dinput, "_remote", None)
@@ -15317,10 +15401,10 @@ def t_click_ratio_verify_corner_first():
     ma.dinput.mouse_move = lambda dx, dy: sent.append(("move", int(dx), int(dy)))
     ma.dinput.mouse_click = lambda btn="left": sent.append(("click", btn))
     ma.dinput.mouse_available = lambda: True
-    _vx, _vy = ma._virtual_origin()
+    _vx, _vy = ma_c._virtual_origin()
     try:
         # ---- ① 读得到光标（本地后端 ✓）⇒ 只发差量、**一条撞角都不发** ----
-        ma.dinput._remote = None                 # 本地（`SerialKbd` 那种：没有 `cursor()` ✓）
+        ma._remote_mod._remote = None                 # 本地（`SerialKbd` 那种：没有 `cursor()` ✓）
         ma._cursor_pos = lambda: (2559, 496)     # 现场那种：停在主屏最右 ✗
         ok, why = ma.click_ratio((768, 1366, 3), 0.3635, 0.2074,
                                  gain=(1.0, 1.0), origin=(15, 44))
@@ -15328,7 +15412,7 @@ def t_click_ratio_verify_corner_first():
         check(ok is True, "① 读得到光标 ⇒ 该照常点（不许退化成不点 ✓）：%r" % (why,))
         check(("move", _exp[0], _exp[1]) in sent and ("click", "left") in sent,
               "① 该发**差量** %r + 左键 ✓：%r" % (_exp, sent))
-        check(("move", -ma.CORNER_STEP, -ma.CORNER_STEP) not in sent,
+        check(("move", -ma_c.CORNER_STEP, -ma_c.CORNER_STEP) not in sent,
               "① **一条撞角都不许发** ✗（发了就是把光标撞到角上 = 用户 2026-10-17 报的"
               "「停在左上角一动不动」✓）：%r" % (sent,))
 
@@ -15337,16 +15421,16 @@ def t_click_ratio_verify_corner_first():
 
         class _Relay:
             cursor = None                        # ⚠ 判据是 `hasattr(_remote, "cursor")` ✓
-        ma.dinput._remote = _Relay()
+        ma._remote_mod._remote = _Relay()
         ok2, _w2 = ma.click_ratio((768, 1366, 3), 0.3635, 0.2074,
                                   gain=(1.0, 1.0), origin=(15, 44))
-        check(ok2 is True and sent[0] == ("move", -ma.CORNER_STEP, -ma.CORNER_STEP)
+        check(ok2 is True and sent[0] == ("move", -ma_c.CORNER_STEP, -ma_c.CORNER_STEP)
               and ("move", 512 - _vx, 203 - _vy) in sent,
               "② relay ⇒ 该走老路（撞角 → 绝对量 → 点 ✓）：%r" % (sent,))
 
         # ---- ③ 读不到光标 ⇒ 也走老路 ✓（不许永远不点 ✗）----
         sent.clear()
-        ma.dinput._remote = None
+        ma._remote_mod._remote = None
         ma._cursor_pos = lambda: None
         ok3, _w3 = ma.click_ratio((768, 1366, 3), 0.3635, 0.2074,
                                   gain=(1.0, 1.0), origin=(15, 44))
@@ -15372,7 +15456,7 @@ def t_click_ratio_verify_corner_first():
         ma.dinput.mouse_click = _oclick
         ma.dinput.mouse_available = _oavail
         ma._cursor_pos = _ocur
-        ma.dinput._remote = _oremote
+        ma._remote_mod._remote = _oremote
 
 
 def t_climb_align_first_switch():
@@ -15385,13 +15469,13 @@ def t_climb_align_first_switch():
     ②站住/按跳/上爬三处源码都带方向；③关掉后容差取 0 + 太近先走开；
     ④参数落地（route_cfg / agent 默认+存读 / 界面勾选框 + 延迟置灰）。
     """
+    from decision import jobs as jobmod
     from pathlib import Path
 
-    from decision import route as rt
 
     root = Path(__file__).resolve().parent.parent
-    src = (root / "decision" / "route.py").read_text(encoding="utf-8")
-    job = rt.ClimbJob("L4", 661.0, -475.0, 56.0, +1, dst_set="顶层")
+    src = (root / "decision" / "jobs" / "climb.py").read_text(encoding="utf-8")
+    job = jobmod.ClimbJob("L4", 661.0, -475.0, 56.0, +1, dst_set="顶层")
 
     check(job.align_first is True, "① 默认必须是「对齐上绳梯」= **开** ✗（老项目行为不许变 ✓）")
     for _dx, _want in ((5.0, 1), (-5.0, -1), (0.0, 0), (0.9, 0), (8.1, 1)):
@@ -15450,10 +15534,12 @@ def t_climb_jump_carries_align_dir():
     """
     from pathlib import Path
 
-    from decision import route as rt
 
-    src = (Path(__file__).resolve().parent.parent
-           / "decision" / "route.py").read_text(encoding="utf-8")
+    # ⚠ 2026-10-18 拆包：对齐那一段（「微调：差 … px」）现在在 `jobs/align.py`（爬与
+    #   传送门共用）⇒ 两个文件拼起来判，别只盯 climb.py。
+    _jobs_dir = Path(__file__).resolve().parent.parent / "decision" / "jobs"
+    src = "\n".join((_jobs_dir / _f).read_text(encoding="utf-8")
+                    for _f in ("climb.py", "align.py", "drop.py"))
 
     # ---- ① 对齐时必须真的发点按 ----
     check("微调：差" in src,
@@ -15520,7 +15606,7 @@ def t_stall_hop_carry_and_ladder_permit():
     from pathlib import Path
 
     from decision.agent import CombatAgent
-    from decision.route import WalkJob
+    from decision.jobs import WalkJob
 
     root = Path(__file__).resolve().parent.parent
     src = (root / "decision" / "agent.py").read_text(encoding="utf-8")
@@ -15548,7 +15634,9 @@ def t_stall_hop_carry_and_ladder_permit():
 
     # ---- ①' 源码钉：重算之后真的调了它 ----
     _rep = src.index("self._maybe_replan(p)")
-    check("_carry_stall(job, _new)" in src[_rep:_rep + 900],
+    # ⚠ 只钉**前缀**（`_carry_stall(job, _new` ✓）—— 2026-10-18 给爬绳那半边也补了
+    #   "扣掉暂停时间"，调用多带了 `now` 参数 ⇒ 钉整串会把**正确的新写法**判成红 ✗
+    check("_carry_stall(job, _new" in src[_rep:_rep + 900],
           "① 重算换了对象之后**必须**调 `_carry_stall` ✗（源码里没接上 = 这个修法等于没上 ✓）")
 
     # ---- ② 跳跃 CD 命中 ⇒ 撤回"跳过一次"的记号 ----
@@ -15596,16 +15684,16 @@ def t_reconnect_in_game_no_enter():
          （防我把 2026-10-12 那条「该按不按」又犯回来 ✗）。
     """
     import numpy as np
-    from decision import mouse_aim
+    from execution import mouse_aim
     from decision.reconnect import Reconnector
-    from perception import ui_state
+    from perception.screen import ui_state
 
     frame = np.full((8, 8, 3), 128, np.uint8)        # 非黑 ✓（黑屏另有闸 ✓ 见 ⑦ 段）
     cur = {"ui": ui_state.UI_CHAR_SELECT}
     _odetect = ui_state.detect
-    _oavail = mouse_aim.aim_available
+    _oavail = ma_c.aim_available
     ui_state.detect = lambda f: cur["ui"]
-    mouse_aim.aim_available = lambda: (True, "")
+    ma_c.aim_available = lambda: (True, "")
     try:
         # ---- ① 照现场那条链走：黑屏期（闸拦住 ✓）→ 黑屏过后（已经是游戏世界 ✓）----
         black = np.zeros((8, 8, 3), np.uint8)      # 加载中那种黑屏 ✓
@@ -15649,7 +15737,7 @@ def t_reconnect_in_game_no_enter():
         check(r2.active is True, "⑧② 广播还说是选角 ⇒ **不许收工** ✗")
     finally:
         ui_state.detect = _odetect
-        mouse_aim.aim_available = _oavail
+        ma_c.aim_available = _oavail
 
 
 def t_mouse_aim_frame_rect():
@@ -15670,20 +15758,20 @@ def t_mouse_aim_frame_rect():
     import tempfile
     from pathlib import Path
 
-    from decision import mouse_aim as ma
 
-    old = ma.GAIN_PATH                        # ⚠ 替身配置文件 ⇒ **绝不碰真的**那份 ✓
+    from execution import mouse_aim as ma
+    old = ma_c.GAIN_PATH                        # ⚠ 替身配置文件 ⇒ **绝不碰真的**那份 ✓
     tmp = Path(tempfile.mkdtemp()) / "mouse_gain.json"
     try:
-        ma.GAIN_PATH = tmp
+        ma_c.GAIN_PATH = tmp
         # ---- ① 没量过 ⇒ 老行为一字不变 ✓ ----
-        check(ma.frame_rect((768, 1366, 3)) is None, "① 没量过时 frame_rect 该是 None ✓")
-        check(ma.to_screen(100, 50) == (100.0, 50.0), "① 没量过时 to_screen 该原样返回 ✓")
-        check(ma.to_screen(100, 50, (-2400, 120)) == (-2300.0, 170.0),
+        check(ma_c.frame_rect((768, 1366, 3)) is None, "① 没量过时 frame_rect 该是 None ✓")
+        check(ma_c.to_screen(100, 50) == (100.0, 50.0), "① 没量过时 to_screen 该原样返回 ✓")
+        check(ma_c.to_screen(100, 50, (-2400, 120)) == (-2300.0, 170.0),
               "① 显式给 origin 时走老行为（只加原点、不折算 ✓）：%r"
-              % (ma.to_screen(100, 50, (-2400, 120)),))
-        check(ma.screen_gain((0.5, 0.25)) == (0.5, 0.25),
-              "① 没量过时 gain 该原样返回 ✓：%r" % (ma.screen_gain((0.5, 0.25)),))
+              % (ma_c.to_screen(100, 50, (-2400, 120)),))
+        check(ma_c.screen_gain((0.5, 0.25)) == (0.5, 0.25),
+              "① 没量过时 gain 该原样返回 ✓：%r" % (ma_c.screen_gain((0.5, 0.25)),))
 
         # ---- ②③ 量过（拿本机那套真值：抓取 1920×1080 ✓ 帧 1366×768 ✓）----
         _entry = {"gain_x": 0.711458, "gain_y": 0.711111, "ref_w": 1366, "ref_h": 768,
@@ -15691,15 +15779,15 @@ def t_mouse_aim_frame_rect():
         tmp.write_text(json.dumps({"gain_x": 0.711458, "gain_y": 0.711111,
                                    "ref_w": 1366, "ref_h": 768, "v": 2,
                                    "by_frame": {"1366x768": _entry}}), encoding="utf-8")
-        check(ma.frame_rect((768, 1366, 3)) == (0, 0, 1920, 1080),
-              "② frame_rect 该读得出来：%r" % (ma.frame_rect((768, 1366, 3)),))
+        check(ma_c.frame_rect((768, 1366, 3)) == (0, 0, 1920, 1080),
+              "② frame_rect 该读得出来：%r" % (ma_c.frame_rect((768, 1366, 3)),))
         _kx = 1920.0 / 1366.0
         _ky = 1080.0 / 768.0
-        sx, sy = ma.to_screen(497.0, 159.0, None, (768, 1366, 3))
+        sx, sy = ma_c.to_screen(497.0, 159.0, None, (768, 1366, 3))
         check(abs(sx - 497.0 * _kx) < 0.001 and abs(sy - 159.0 * _ky) < 0.001,
               "② to_screen 少了**比例**（现场就栽在这儿 ✗）：%r（该 %.1f / %.1f）"
               % ((sx, sy), 497.0 * _kx, 159.0 * _ky))
-        gx, gy = ma.screen_gain((0.711458, 0.711111), (768, 1366, 3))
+        gx, gy = ma_c.screen_gain((0.711458, 0.711111), (768, 1366, 3))
         check(abs(gx - 1.0) < 0.01 and abs(gy - 1.0) < 0.01,
               "③ 「帧像素/单位」折过来该是 **1.0**（= 探针量到的「1 单位走 1 屏幕像素」✓）：%r"
               % ((gx, gy),))
@@ -15707,16 +15795,16 @@ def t_mouse_aim_frame_rect():
         # ---- ④ 离谱记录 ⇒ 当没量过 ✓ ----
         _bad = dict(_entry, frame_rect=[0, 0, 90000, 100])          # 比例 66 ✗
         tmp.write_text(json.dumps({"by_frame": {"1366x768": _bad}}), encoding="utf-8")
-        check(ma.frame_rect((768, 1366, 3)) is None,
+        check(ma_c.frame_rect((768, 1366, 3)) is None,
               "④ 比例离谱的记录该当没量过（按它点就是飞 ✗）")
         _bad2 = dict(_entry, frame_rect=[0, 0, "x", 1080])          # 四个数不对 ✗
         tmp.write_text(json.dumps({"by_frame": {"1366x768": _bad2}}), encoding="utf-8")
-        check(ma.frame_rect((768, 1366, 3)) is None, "④ 四个数不对该当没量过 ✓")
+        check(ma_c.frame_rect((768, 1366, 3)) is None, "④ 四个数不对该当没量过 ✓")
         _bad3 = dict(_entry, frame_rect=[0, 0, -5, 1080])           # 负数 ✗
         tmp.write_text(json.dumps({"by_frame": {"1366x768": _bad3}}), encoding="utf-8")
-        check(ma.frame_rect((768, 1366, 3)) is None, "④ 尺寸非正该当没量过 ✓")
+        check(ma_c.frame_rect((768, 1366, 3)) is None, "④ 尺寸非正该当没量过 ✓")
     finally:
-        ma.GAIN_PATH = old
+        ma_c.GAIN_PATH = old
 
     # ---- ⑤ **"只折一边"必须不许再出现**（用户 2026-10-17 ✓ 实机反证：
     #        「**偏右下，差一整块（越过了目标）**」✗）----
@@ -15725,10 +15813,10 @@ def t_mouse_aim_frame_rect():
     #   ⚠ 要折就**两边同时折**（目标 ×k 且 增益 ×k，落点不变 ✓）；只折一边 ⇒ 偏 k 倍 ✓。
     check(not hasattr(ma, "cfg_frame_scale"),
           "⑤ 别再加「按配置折目标像素」那一套 ✗ —— 它只折一边 ⇒ 实测**偏右下越过** ✓")
-    check(ma.to_screen(497.0, 159.0, (0, 0), (768, 1366, 3)) == (497.0, 159.0),
+    check(ma_c.to_screen(497.0, 159.0, (0, 0), (768, 1366, 3)) == (497.0, 159.0),
           "⑤ 没实测 `frame_rect` 时目标像素**不许**折（两边都不折才是自洽的 ✓）")
-    _d, _ = ma.counts_for(*ma.to_screen(497.0, 159.0, (0, 0), (768, 1366, 3)),
-                          *ma.screen_gain((1.0, 1.0), (768, 1366, 3)))
+    _d, _ = ma_c.counts_for(*ma_c.to_screen(497.0, 159.0, (0, 0), (768, 1366, 3)),
+                          *ma_c.screen_gain((1.0, 1.0), (768, 1366, 3)))
     check(_d == (497, 159),
           "⑤ 目标不折 + 增益不折 ⇒ 指令数必须还是 (497, 159)（一边折一边不折就翻车 ✓）：%r"
           % (_d,))
@@ -15769,12 +15857,17 @@ def t_window_probe_aim():
     check("_client_rect" in _relay and "ClientToScreen" in _relay,
           "④ 报的必须是窗口**客户区**的屏幕坐标（`GetClientRect`+`ClientToScreen` ✓）")
     _lt = (_root / "gui" / "live_thread.py").read_text(encoding="utf-8")
-    check(_lt.count("self._aim_geo(") >= 3 and "self._mouse_win()" in _lt,
+    # ⚠ 2026-10-20：**断线重连那处分发搬进 `runtime/frame_reconnect.py`**（那边写 `th._aim_geo(` ✓）
+    #   ⇒ 三处要跨**两个文件**数 ✓ 只数 `live_thread` 会假红（拆块老坑 ✓）。
+    _rc_src = (_root / "runtime" / "frame_reconnect.py").read_text(encoding="utf-8")
+    _n_aim_geo = _lt.count("self._aim_geo(") + _rc_src.count("th._aim_geo(")
+    check(_n_aim_geo >= 3 and "self._mouse_win()" in _lt,
           "④ 断线重连点击 / 测谎「确定」/ 测谎瞄准**三处**都要走 `_aim_geo`（问窗口在哪 ✗）"
-          "—— 实测 %d 处 ✓" % (_lt.count("self._aim_geo("),))
+          "—— 实测 %d 处 ✓" % (_n_aim_geo,))
 
-    from decision import input as _di
-    check(_di.window_probe() is None,
+    from execution import input as _di
+    from execution import remote as _remote_mod
+    check(_remote_mod.window_probe() is None,
           "⑤ 没有 relay（本地后端）时 `window_probe()` 该安静返回 None ✓ 不许抛 ✗")
 
     # ---- ⑥ **实时回路不许等网络 / 不许每帧读盘**（用户 2026-10-17 ✓ 原话：
@@ -15792,30 +15885,31 @@ def t_window_probe_aim():
     check("window_probe" in _ltsrc[_ltsrc.index("def _mwin_loop"):][:900],
           "⑥ 后台线程 `_mwin_loop` 里才问 `window_probe` ✓")
 
-    from decision import mouse_aim as ma
+
+    from execution import mouse_aim as ma
     import json as _json
     import os as _os
     import tempfile
-    _old_path, _old_cache = ma.GAIN_PATH, dict(ma._GAIN_CACHE)
+    _old_path, _old_cache = ma_c.GAIN_PATH, dict(ma_c._GAIN_CACHE)
     try:
         _fd, _tmp = tempfile.mkstemp(suffix=".json")
         _os.close(_fd)
         with open(_tmp, "w", encoding="utf-8") as _f:
             _json.dump({"by_frame": {"1366x768": {"gain_x": 1.0, "gain_y": 1.0}}}, _f)
-        ma.GAIN_PATH = Path(_tmp)
-        ma._GAIN_CACHE["key"] = None
-        check(ma.load_gain((768, 1366, 3)) == (1.0, 1.0),
+        ma_c.GAIN_PATH = Path(_tmp)
+        ma_c._GAIN_CACHE["key"] = None
+        check(ma_c.load_gain((768, 1366, 3)) == (1.0, 1.0),
               "⑥ 增益缓存第一次该读到 1.0 ✓")
-        check(ma._GAIN_CACHE["key"] is not None,
+        check(ma_c._GAIN_CACHE["key"] is not None,
               "⑥ 增益文件读完要**记下文件状态**（否则每帧都在读盘 ✗）")
         with open(_tmp, "w", encoding="utf-8") as _f:
             _json.dump({"by_frame": {"1366x768": {"gain_x": 2.0, "gain_y": 2.0}}}, _f)
         _os.utime(_tmp, (1e9, 1e9))          # 显式把 mtime 挪开（文件系统精度可能不够 ✓）
-        check(ma.load_gain((768, 1366, 3)) == (2.0, 2.0),
+        check(ma_c.load_gain((768, 1366, 3)) == (2.0, 2.0),
               "⑥ 文件改了必须**立刻生效**（缓存按 mtime+大小失效 ✓ 别按时间过期 ✗）")
     finally:
-        ma.GAIN_PATH = _old_path
-        ma._GAIN_CACHE.update(_old_cache)
+        ma_c.GAIN_PATH = _old_path
+        ma_c._GAIN_CACHE.update(_old_cache)
         try:
             _os.remove(_tmp)
         except Exception:                    # noqa: BLE001
@@ -15829,25 +15923,26 @@ def t_window_probe_aim():
     #   ⚠ 三重判据缺一不用（宁可不点，也不能按错位置点 ✗）：
     #     ① 有采样 ✓；② 采样**比上次移动更新** ✓；③ 采样不超 `CUR_HINT_FRESH_S` ✓。
     import time as _t2
-    from decision import input as _di3
+    from execution import input as _di3
+    from execution import remote as _remote_mod
     _sav = {}
     for _n in ("mouse_available", "mouse_move"):
         _sav[_n] = getattr(_di3, _n)
     _sav_own = ma._own_cursor
-    _sav_corner, _sav_gain, _sav_rect = ma.corner_zero, ma.load_gain, ma.frame_rect
+    _sav_corner, _sav_gain, _sav_rect = ma_c.corner_zero, ma_c.load_gain, ma_c.frame_rect
     _sav_hint = (ma._CUR_SCREEN, ma._CUR_SCREEN_AT, ma._CUR_HINT, ma._CUR_HINT_AT,
                  ma._AIM_CUR, ma._AIM_AT, ma._AIM_TGT)
     try:
         _di3.mouse_available = lambda: True
         _di3.mouse_move = lambda dx, dy: None
         ma._own_cursor = lambda: None          # 收流：本机读不到那只光标 ✓
-        ma.load_gain = lambda *a, **k: (1.0, 1.0)
-        ma.frame_rect = lambda *a, **k: None
+        ma_c.load_gain = lambda *a, **k: (1.0, 1.0)
+        ma_c.frame_rect = lambda *a, **k: None
 
         def _run_aim(_prep):
             """→ 这一拍有没有撞角 ✓（`_calls` 里有没有 "home"）。"""
             _calls = []
-            ma.corner_zero = lambda: _calls.append("home")
+            ma_c.corner_zero = lambda: _calls.append("home")
             ma.aim_reset()
             ma.set_cursor_screen(0, 0, 0, 0, now=0.0)
             ma._CUR_SCREEN, ma._CUR_SCREEN_AT = None, 0.0   # 先清掉，别让 aim_to 刷新
@@ -15890,13 +15985,13 @@ def t_window_probe_aim():
         for _n, _v in _sav.items():
             setattr(_di3, _n, _v)
         ma._own_cursor = _sav_own
-        ma.corner_zero, ma.load_gain, ma.frame_rect = _sav_corner, _sav_gain, _sav_rect
+        ma_c.corner_zero, ma_c.load_gain, ma_c.frame_rect = _sav_corner, _sav_gain, _sav_rect
         (ma._CUR_SCREEN, ma._CUR_SCREEN_AT, ma._CUR_HINT, ma._CUR_HINT_AT,
          ma._AIM_CUR, ma._AIM_AT, ma._AIM_TGT) = _sav_hint
 
 
 def t_mouse_aim_math():
-    """鼠标**绝对定位**那一层（`decision/mouse_aim.py` ✓ 2026-10-06 加）：换算 + 发指令顺序。
+    """鼠标**绝对定位**那一层（`execution/mouse_aim.py` ✓ 2026-10-06 加）：换算 + 发指令顺序。
 
     为什么单钉这一层：断线重连「点服务器 / 点频道」全靠它（鼠标只有相对位移 ⇒
     只能"撞角归零 → 走位 → 点"✓）。这里出错的后果是**点到别的地方**
@@ -15912,21 +16007,22 @@ def t_mouse_aim_math():
          退回 1.0 就是拿一个错的换算去点，比不点糟得多）。
     """
     import tempfile
-    from decision import mouse_aim as ma
-    from decision import input as _di
+    from execution import mouse_aim as ma
+    from execution import input as _di
+    from execution import remote as _remote_mod
 
     # ---- ① 纯换算（不碰硬件）----
-    px, why = ma.target_px(1920, 1080, 0.3635, 0.2269)
+    px, why = ma_c.target_px(1920, 1080, 0.3635, 0.2269)
     check(px is not None, "① 合法比例算不出像素：%s" % why)
     check(abs(px[0] - 697.92) < 0.05 and abs(px[1] - 245.05) < 0.05,
           "① 比例 → 像素算错了：%r（该 697.92 / 245.05）" % (px,))
-    check(ma.target_px(1920, 1080, 1.5, 0.2)[0] is None,
+    check(ma_c.target_px(1920, 1080, 1.5, 0.2)[0] is None,
           "① 比例越界该判不出来（**夹到边上就是点错地方** ✗）")
-    check(ma.target_px(1920, 1080, -0.01, 0.2)[0] is None, "① 负比例该判不出来")
-    check(ma.target_px(0, 1080, 0.2, 0.2)[0] is None, "① 拿不到画面尺寸该判不出来")
-    check(ma.counts_for(100.0, 50.0, 0.5, 0.25)[0] == (200, 200),
-          "① 像素 → 指令单位换算错了：%r" % (ma.counts_for(100.0, 50.0, 0.5, 0.25),))
-    check(ma.counts_for(100.0, 50.0, 0.0, 1.0)[0] is None, "① 增益为 0 该判不出来")
+    check(ma_c.target_px(1920, 1080, -0.01, 0.2)[0] is None, "① 负比例该判不出来")
+    check(ma_c.target_px(0, 1080, 0.2, 0.2)[0] is None, "① 拿不到画面尺寸该判不出来")
+    check(ma_c.counts_for(100.0, 50.0, 0.5, 0.25)[0] == (200, 200),
+          "① 像素 → 指令单位换算错了：%r" % (ma_c.counts_for(100.0, 50.0, 0.5, 0.25),))
+    check(ma_c.counts_for(100.0, 50.0, 0.0, 1.0)[0] is None, "① 增益为 0 该判不出来")
 
     # ---- ②③④ 发指令的顺序（替身输入层 ⇒ 绝不发真键/真鼠标 ✓）----
     sent = []
@@ -15949,7 +16045,7 @@ def t_mouse_aim_math():
         ok, why = ma.click_ratio((1080, 1920, 3), 0.5, 0.5, gain=(0.5, 0.5))
         check(ok, "② 正常一条点击该成功：%s" % why)
         check(len(sent) == 3, "③ 发出去的指令条数不对：%r" % (sent,))
-        check(sent[0] == ("move", -ma.CORNER_STEP, -ma.CORNER_STEP),
+        check(sent[0] == ("move", -ma_c.CORNER_STEP, -ma_c.CORNER_STEP),
               "② 第一条指令不是**撞角归零**（那样就不是绝对定位了 ✗）：%r" % (sent,))
         check(sent[1] == ("move", 1920, 1080),
               "③ 走位那条算错了（该 0.5×1920÷0.5=1920 / 0.5×1080÷0.5=1080）：%r"
@@ -15971,17 +16067,17 @@ def t_mouse_aim_math():
 
     # ---- ⑤ load_gain：缺文件 / 坏值 / 非正 ⇒ None（不许退回 1.0 ✗）----
     tmp = Path(tempfile.mkdtemp(prefix="psimu_gain_")) / "mouse_gain.json"
-    with patch.object(ma, "GAIN_PATH", tmp):
-        check(ma.load_gain() is None,
+    with patch.object(ma_c, "GAIN_PATH", tmp):
+        check(ma_c.load_gain() is None,
               "⑤ 没标定文件时该回 None（**退回 1.0 = 拿错换算去点** ✗）")
         tmp.write_text('{"gain_x": 0.5336, "gain_y": 0.5336}', encoding="utf-8")
-        check(ma.load_gain() == (0.5336, 0.5336), "⑤ 正常标定文件该读得出来")
+        check(ma_c.load_gain() == (0.5336, 0.5336), "⑤ 正常标定文件该读得出来")
         tmp.write_text('{"gain_x": 0, "gain_y": 0.5}', encoding="utf-8")
-        check(ma.load_gain() is None, "⑤ 增益为 0 该当没标定过")
+        check(ma_c.load_gain() is None, "⑤ 增益为 0 该当没标定过")
         tmp.write_text('{"gain_x": -1, "gain_y": 0.5}', encoding="utf-8")
-        check(ma.load_gain() is None, "⑤ 增益为负该当没标定过")
+        check(ma_c.load_gain() is None, "⑤ 增益为负该当没标定过")
         tmp.write_text("{ 这不是 json", encoding="utf-8")
-        check(ma.load_gain() is None, "⑤ 坏文件该当没标定过")
+        check(ma_c.load_gain() is None, "⑤ 坏文件该当没标定过")
 
 
 def t_reconnect_fake_player_box():
@@ -16008,15 +16104,15 @@ def t_reconnect_fake_player_box():
          而**已经按过**之后广播还挂着选角 ⇒ **不许**再按 ✗（进了游戏还按 Enter = 开聊天 ✗）。
     """
     import numpy as np
-    import perception.ui_state as ui_state
-    from decision import mouse_aim
+    import perception.screen.ui_state as ui_state
+    from execution import mouse_aim
     from decision.reconnect import Reconnector
 
     frame = np.full((8, 8, 3), 128, np.uint8)   # 非黑（2026-10-17 ✓ 见 ⑦ 段说明：黑屏判据上了之后纯黑帧一个回车都不按）
-    _orig_detect, _orig_avail = ui_state.detect, mouse_aim.aim_available
+    _orig_detect, _orig_avail = ui_state.detect, ma_c.aim_available
     cur = {"ui": ui_state.UI_CHAR_SELECT}
     ui_state.detect = lambda f: cur["ui"]
-    mouse_aim.aim_available = lambda: (True, "")
+    ma_c.aim_available = lambda: (True, "")
     try:
         s = fresh_settings(reconnect_enabled=True, reconnect_probe_after_lost_sec=0.0)
         s.enabled = True
@@ -16153,7 +16249,7 @@ def t_reconnect_fake_player_box():
               "（进了游戏还按 Enter = 开聊天 ✗）")
     finally:
         ui_state.detect = _orig_detect
-        mouse_aim.aim_available = _orig_avail
+        ma_c.aim_available = _orig_avail
 
     # ④ 源码钉
     from pathlib import Path
@@ -16187,17 +16283,17 @@ def t_reconnect_channel_num():
     """
     import numpy as np
     from pathlib import Path
-    import perception.ui_state as ui_state
-    from decision import mouse_aim
+    import perception.screen.ui_state as ui_state
+    from execution import mouse_aim
     import decision.reconnect as rc                        # ⑦ 里要查「回顶常数没了」✓
     from decision.reconnect import (Reconnector, CHANNEL_GRID_DX, CHANNEL_GRID_DY,
                                     CHANNEL_TOTAL)
 
     frame = np.full((8, 8, 3), 128, np.uint8)   # 非黑（2026-10-17 ✓ 见 ⑦ 段说明：黑屏判据上了之后纯黑帧一个回车都不按）
-    _orig_detect, _orig_avail = ui_state.detect, mouse_aim.aim_available
+    _orig_detect, _orig_avail = ui_state.detect, ma_c.aim_available
     cur = {"ui": ui_state.UI_CHANNEL_PANEL}
     ui_state.detect = lambda f: cur["ui"]
-    mouse_aim.aim_available = lambda: (True, "")
+    ma_c.aim_available = lambda: (True, "")
     try:
         def click_with(ch):
             """跑一拍，返回 `(reconnector, 动作)`。"""
@@ -16209,7 +16305,11 @@ def t_reconnect_channel_num():
             r.update(frame, True, 100.0)
             return r, r.update(frame, False, 101.0)
 
-        base_x, base_y = 0.4104, 0.5093
+        # ⚠ 基准取**设置里的默认值**（别写死数字 ✗ —— 锚点会随客户端改版重量 ✓
+        #   2026-10-20 就重测过一次 ✓ 见日志 508 ✓；写死等于每改一次就被拦一次 ✗）
+        _d0 = fresh_settings(reconnect_enabled=True, reconnect_probe_after_lost_sec=0.0)
+        base_x = float(_d0.reconnect_channel_x)
+        base_y = float(_d0.reconnect_channel_y)
         r1, o1 = click_with(1)
         check(o1 is not None and o1.get("act") == "click",
               "① 「频道=1」该照旧出点击：%r" % (o1,))
@@ -16391,7 +16491,7 @@ def t_reconnect_channel_num():
               "⑥ 老项目（没这一格）该兜底 1（= 老行为 ✓）：%r" % (s6.reconnect_channel,))
     finally:
         ui_state.detect = _orig_detect
-        mouse_aim.aim_available = _orig_avail
+        ma_c.aim_available = _orig_avail
 
     # ---- ⑦ 源码钉：控件在**主窗口「挂机保护」页**里（用户 2026-10-07 纠正过位置 ✓）----
     #   ⚠ 这一条必须钉 ✗：一开始做进了**设置弹窗** ⇒ 用户回"加错地方了，是数据工作台
@@ -16459,16 +16559,16 @@ def t_reconnect_double_click():
     """
     import numpy as np
     from pathlib import Path
-    import perception.ui_state as ui_state
-    from decision import mouse_aim
+    import perception.screen.ui_state as ui_state
+    from execution import mouse_aim
     from decision.reconnect import Reconnector, DOUBLE_CLICK_GAP, DOUBLE_CLICK_UIS
 
     frame = np.full((8, 8, 3), 128, np.uint8)   # 非黑（2026-10-17 ✓ 见 ⑦ 段说明：黑屏判据上了之后纯黑帧一个回车都不按）
     _orig_detect = ui_state.detect
-    _orig_avail = mouse_aim.aim_available
+    _orig_avail = ma_c.aim_available
     cur = {"ui": ui_state.UI_CHANNEL_PANEL}
     ui_state.detect = lambda f: cur["ui"]
-    mouse_aim.aim_available = lambda: (True, "")
+    ma_c.aim_available = lambda: (True, "")
     try:
         # ---- ①②③④ 频道面板：双击 ----
         s = fresh_settings(reconnect_enabled=True, reconnect_probe_after_lost_sec=0.0)
@@ -16513,7 +16613,7 @@ def t_reconnect_double_click():
               "⑤ 「要双击」的名单里该有频道面板（删/改错了 ✗）：%r" % (DOUBLE_CLICK_UIS,))
     finally:
         ui_state.detect = _orig_detect
-        mouse_aim.aim_available = _orig_avail
+        ma_c.aim_available = _orig_avail
 
     # ---- ⑥ 源码钉 ----
     root = Path(__file__).resolve().parent.parent
@@ -16523,7 +16623,8 @@ def t_reconnect_double_click():
     check(".sleep(" not in _rc,
           "`reconnect.py` 里出现了 `.sleep(` ✗ —— 双击的间隔要交给**下一拍** ✓"
           "（睡=卡住整条实时回路 ✓）")
-    _ma = (root / "decision" / "mouse_aim.py").read_text(encoding="utf-8")
+    _ma = ((root / "execution" / "mouse_aim.py").read_text(encoding="utf-8")
+                  + (root / "execution" / "aim_convert.py").read_text(encoding="utf-8"))
     # ⚠⚠⚠ 2026-10-15 **这条钉收窄了一次**（原来是"整份文件不许 `.sleep(`" ✗ 一刀切 ✓）：
     #   · 钉的**本意**（一字未改 ✓）："**不许在实时回路那条路上睡觉**" ✓
     #     —— 睡 = 卡住整条实时回路 ✓（瞄准 / 点击 / 撞角这些都跑在那一拍里 ✓）。
@@ -16550,7 +16651,9 @@ def t_reconnect_double_click():
     check(_i0 is not None and any(".sleep(" in _l for _l in _lines[_i0:_i1]),
           "`auto_measure` 里那句「**等它真的走过去再读**」的等待不见了 ✗ ⇒ 会退回「发完就读」"
           "⇒ 读到旧位置 ⇒ `Δ=0` ⇒ 报「光标没动」✗（2026-10-15 现场 ✓ 用户看着鼠标明明动了 ✓）")
-    _lt = (root / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    _lt = ((root / "gui" / "live_thread.py").read_text(encoding="utf-8")
+           # ⚠ 2026-10-20：分发搬进 `runtime/frame_reconnect.py` ✓ 两边一起看 ✓
+           + (root / "runtime" / "frame_reconnect.py").read_text(encoding="utf-8"))
     check('"click2"' in _lt or "'click2'" in _lt,
           "`live_thread` 没处理 `click2` ⇒ 状态机出了动作也没人补第二下 ✗"
           "（**光有动作没接上 = 没有** ✓ 本仓库栽过多次 ✓）")
@@ -16574,17 +16677,17 @@ def t_reconnect_click_steps():
          而且**同一句话不许重复记**（`_say` 每拍都被调 ⇒ 不判变化就是刷屏 ✗）。
     """
     import numpy as np
-    import perception.ui_state as ui_state
-    from decision import mouse_aim
+    import perception.screen.ui_state as ui_state
+    from execution import mouse_aim
     from decision.reconnect import Reconnector
 
     frame = np.full((8, 8, 3), 128, np.uint8)   # 非黑（2026-10-17 ✓ 见 ⑦ 段说明：黑屏判据上了之后纯黑帧一个回车都不按）
     _orig_detect = ui_state.detect
-    _orig_avail = mouse_aim.aim_available
+    _orig_avail = ma_c.aim_available
     cur = {"ui": ui_state.UI_CHANNEL_LIST}
     avail = {"ok": True, "why": ""}
     ui_state.detect = lambda f: cur["ui"]
-    mouse_aim.aim_available = lambda: (avail["ok"], avail["why"])
+    ma_c.aim_available = lambda: (avail["ok"], avail["why"])
     try:
         # ---- ① 服务器那一步 ----
         s = fresh_settings(reconnect_enabled=True,
@@ -16696,7 +16799,7 @@ def t_reconnect_click_steps():
                   "⑥ 失败那条没记下原因 ✗：%r" % (got,))
     finally:
         ui_state.detect = _orig_detect
-        mouse_aim.aim_available = _orig_avail
+        ma_c.aim_available = _orig_avail
 
 
 def t_reconnect_idle_reasons():
@@ -16716,19 +16819,19 @@ def t_reconnect_idle_reasons():
       ④ 同一句**只记一次**（每拍都记 = 拿日志刷屏 ✗）；认出来接上手之后**不许**再记 ✓。
     """
     import numpy as np
-    import perception.ui_state as ui_state
-    import decision.mouse_aim as ma
+    import perception.screen.ui_state as ui_state
+    import execution.mouse_aim as ma
     import decision.reconnect as rc
     from decision.reconnect import Reconnector
 
     frame = np.full((8, 8, 3), 128, np.uint8)   # 非黑（2026-10-17 ✓ 见 ⑦ 段说明：黑屏判据上了之后纯黑帧一个回车都不按）
     _orig_detect = ui_state.detect
-    _orig_avail = ma.aim_available
+    _orig_avail = ma_c.aim_available
     cur = {"ui": None}
     ui_state.detect = lambda f: cur["ui"]
     # ① 走的是"判到界面 ⇒ 出手点频道"那条路 ⇒ 鼠标那一层得先通 ✓
     #   （本机自检没有硬件鼠标通道 ✓ 不 patch 就会停在「暂时不动手」✗ 看着像没接手 ✓）
-    ma.aim_available = lambda: (True, "")
+    ma_c.aim_available = lambda: (True, "")
     evs = []
     try:
         with patch.object(rc.behavior, "event",
@@ -16818,7 +16921,7 @@ def t_reconnect_idle_reasons():
                   "⑥ 自动本来是关的，回来却请求开自动（越权 ✗）：resume_pending 应为假")
     finally:
         ui_state.detect = _orig_detect
-        ma.aim_available = _orig_avail
+        ma_c.aim_available = _orig_avail
 
 
 def t_reconnect_scroll_needs_position():
@@ -16841,21 +16944,21 @@ def t_reconnect_scroll_needs_position():
     import inspect
 
     import numpy as np
-    import perception.ui_state as ui_state
-    import decision.mouse_aim as ma
+    import perception.screen.ui_state as ui_state
+    import execution.mouse_aim as ma
     import decision.reconnect as rc
     from decision.reconnect import Reconnector
 
     frame = np.full((8, 8, 3), 128, np.uint8)   # 非黑（2026-10-17 ✓ 见 ⑦ 段说明：黑屏判据上了之后纯黑帧一个回车都不按）
-    _od, _oa = ui_state.detect, ma.aim_available
+    _od, _oa = ui_state.detect, ma_c.aim_available
     ui_state.detect = lambda f: ui_state.UI_CHANNEL_PANEL
-    ma.aim_available = lambda: (True, "")
+    ma_c.aim_available = lambda: (True, "")
     # ⚠ 这条用例**不验标定口径** ✓，而它用的是 8×8 / 100 宽这种合成小帧 ✗ ⇒
     #   "帧尺寸与标定不符 ⇒ 不点"那条守卫（`gain_mismatch_block` ✓ 2026-10-10 加 ✓）
     #   会拿本机那份真标定的 `ref_w`（1918 ✓）来比 ⇒ **假红** ✗ ⇒ 这里把守卫钉掉 ✓
     #   （守卫自己由 `t_mouse_gain_frame_mismatch` 专门验 ✓）。
-    _oblk = ma.gain_mismatch_block
-    ma.gain_mismatch_block = lambda _w: (False, "")
+    _oblk = ma_c.gain_mismatch_block
+    ma_c.gain_mismatch_block = lambda _w: (False, "")
     try:
         # ---- ① 动作必须带坐标 ----
         s = fresh_settings(reconnect_enabled=True, reconnect_probe_after_lost_sec=0.0)
@@ -16868,8 +16971,11 @@ def t_reconnect_scroll_needs_position():
               "频道 22 的第一步该是「先滚再点」：%r" % (out,))
         # ⭐ 22 ⇒ 第 6 行（0 起 5）⇒ **只往下滚 1 行**、落在**屏上最下面一行（第 5 行）** ✓
         #   （用户 2026-10-10 口径 ✓："22 频道也是滚轮滚一下后的最下面一行" ✓）
-        _x_want = 0.4104 + 1 * (131.0 / 1920.0)          # 第 2 列 ✓
-        _y_want = 0.5093 + 4 * (43.0 / 1080.0)           # 屏上第 5 行 ✓
+        # ⚠ 这里**别写死数字** ✗：落点的锚点会随"客户端改版"重测（2026-10-20 就重测过一次 ✓
+        #   见日志 508）⇒ 写死就等于每次真改动都被拦一次 ✓ 用设置里那份 + 模块里的格距 ✓
+        from decision import reconnect as _rc
+        _x_want = float(s.reconnect_channel_x) + 1 * _rc.CHANNEL_GRID_DX   # 第 2 列 ✓
+        _y_want = float(s.reconnect_channel_y) + 4 * _rc.CHANNEL_GRID_DY   # 屏上第 5 行 ✓
         check(abs(float(out.get("x") or 0) - _x_want) < 1e-6
               and abs(float(out.get("y") or 0) - _y_want) < 1e-6,
               "滚动动作**没带坐标**（或落点没按「最下面一行」算）⇒ 滚轮会打在上一步光标停的"
@@ -16886,20 +16992,26 @@ def t_reconnect_scroll_needs_position():
 
         # ---- ③ 接线：live_thread 得把画面尺寸与坐标递进去 ----
         import gui.live_thread as lt
-        _lts = inspect.getsource(lt)
+        from runtime import frame_reconnect as _frc      # ⚠ 2026-10-20：分发搬过去了 ✓
+        _lts = inspect.getsource(lt) + inspect.getsource(_frc)
         check("mouse_aim.scroll(_up, _down, vis.shape," in _lts,
               "`live_thread` 没把「画面尺寸 + 坐标」递给滚动 ⇒ 「选 22 去 2」那个 bug 会回来 ✗")
 
-        # ---- ④ 行为级：带坐标 = 撞角 → 走位 → 滚；不带 = 只滚 ----
-        def _run(*args):
+        # ---- ④ 行为级：光标问不到（relay）= 撞角 → 走位 → 滚；光标问得到 = **只走差量** ----
+        #   ⭐ 用户 2026-10-20 ✓ 原话："**选频道界面鼠标乱飞**"✗ ——
+        #   老版**每一格**都撞角（频道 54 要 9 格 ⇒ 9 次横穿全屏 3000+ 指令单位 ✓），
+        #   而且只要有一次没落到列表上，那一格滚轮就白滚（面板截图逐像素相同 ✓）。
+        def _run(*args, cur=None):
             ev = []
             with patch.object(ma.dinput, "mouse_available", lambda: True), \
-                 patch.object(ma, "load_gain", lambda *a, **k: (1.0, 1.0)), \
+                 patch.object(ma_c, "load_gain", lambda *a, **k: (1.0, 1.0)), \
+                 patch.object(ma, "_own_cursor", lambda: cur), \
+                 patch.object(ma_c, "_virtual_origin", lambda: (0, 0)), \
                  patch.object(ma.dinput, "mouse_scroll",
                               lambda n: ev.append(("scroll", n))), \
                  patch.object(ma.dinput, "mouse_move",
                               lambda x, y: ev.append(("move", x, y))), \
-                 patch.object(ma, "corner_zero", lambda: ev.append(("corner",))):
+                 patch.object(ma_c, "corner_zero", lambda: ev.append(("corner",))):
                 ok, why = ma.scroll(*args)
             return ok, ev, why
 
@@ -16911,10 +17023,23 @@ def t_reconnect_scroll_needs_position():
         _shape = np.zeros((100, 100, 3), np.uint8).shape
         ok2, ev2, why2 = _run(20, 5, _shape, 0.5, 0.5)
         check(ok2 and ev2 == [("corner",), ("move", 50, 50), ("scroll", 20), ("scroll", -5)],
-              "带坐标时的顺序该是「撞角 → 走位 → 滚」：%r（%s）" % (ev2, why2))
+              "光标问不到（relay）时的顺序该是「撞角 → 走位 → 滚」：%r（%s）" % (ev2, why2))
         check("撞角归零" in why2 and "先往上滚 20 格" in why2,
               "回填的人话里没说清「先把它挪到那儿、再滚」（复盘看不出发生过什么 ✗）：%r"
               % (why2,))
+
+        # ⭐⭐⭐ 光标问得到 ⇒ **绝不撞角**（这就是"乱飞"那一条 ✓ 用户 2026-10-20 ✓）
+        ok3, ev3, why3 = _run(0, 1, _shape, 0.5, 0.5, cur=(10, 10))
+        check("corner" not in [e[0] for e in ev3],
+              "光标位置问得到还去撞角 ⇒ 每滚一格都横穿全屏一次 = **鼠标乱飞** ✗：%r" % (ev3,))
+        check(ok3 and ev3 == [("move", 40, 40), ("scroll", -1)],
+              "该从**现在的位置**走差量到列表上再滚（(10,10)→(50,50) ⇒ 差分 40,40）：%r" % (ev3,))
+        # ⭐ 第 2 格：光标已经在列表上了 ⇒ **一条移动都不许发**（只发滚轮 ✓）
+        ok4, ev4, why4 = _run(0, 1, _shape, 0.5, 0.5, cur=(50, 50))
+        check(ok4 and ev4 == [("scroll", -1)],
+              "光标已经在列表上还发移动 ⇒ 9 格 = 9 次抖动（用户说的\"乱飞\"✗）：%r" % (ev4,))
+        check("按现在光标" in why4,
+              "回填的人话里没说清\"从现光标走差量\"（复盘分不清是老路还是新路 ✗）：%r" % (why4,))
 
         # ---- ⑤ 用户 2026-10-09 真机口述**量掉**的那两个数（钉住，别再退回"猜" ✗）----
         #   原话："频道选择界面，**一页 5 行 4 列**，**滚轮往下滑一下会往下滚动一行**" ✓
@@ -16931,8 +17056,8 @@ def t_reconnect_scroll_needs_position():
               "60 个频道 = 15 行（1~60 参数上限 + 一页 20 格 ⇒ 三页 ✓）：%r / %r"
               % (rc.CHANNEL_TOTAL, rc.CHANNEL_TOTAL_ROWS))
     finally:
-        ui_state.detect, ma.aim_available = _od, _oa
-        ma.gain_mismatch_block = _oblk
+        ui_state.detect, ma_c.aim_available = _od, _oa
+        ma_c.gain_mismatch_block = _oblk
 
 
 def t_corner_zero_multimonitor():
@@ -16956,10 +17081,11 @@ def t_corner_zero_multimonitor():
          老行为一字不变 ✓）。
     """
     import core.wincap as wc
-    import decision.input as di
-    import decision.mouse_aim as ma
+    import execution.input as di
+    from execution import remote as _remote_mod
+    import execution.mouse_aim as ma
 
-    _o_move, _o_vs, _o_remote = ma.dinput.mouse_move, wc.virtual_screen, di._remote
+    _o_move, _o_vs, _o_remote = ma.dinput.mouse_move, wc.virtual_screen, _remote_mod._remote
     ev = []
     try:
         ma.dinput.mouse_move = lambda dx, dy: ev.append((int(dx), int(dy)))
@@ -16968,8 +17094,8 @@ def t_corner_zero_multimonitor():
         for _layout in ((0, 0, 1920, 1080), (-2560, 0, 5120, 1440), (0, -1400, 2560, 2840)):
             wc.virtual_screen = lambda: _layout
             ev.clear()
-            ma.corner_zero()
-            check(ev == [(-ma.CORNER_STEP, -ma.CORNER_STEP)],
+            ma_c.corner_zero()
+            check(ev == [(-ma_c.CORNER_STEP, -ma_c.CORNER_STEP)],
                   "撞角归零多发了指令 ✗ —— 补到主屏 (0,0) 会让**副屏够不着** ✓"
                   "（用户 2026-10-10：\"窗口可能会被拖到副显示屏\" ✓）：%r" % (ev,))
 
@@ -16977,33 +17103,33 @@ def t_corner_zero_multimonitor():
         class SerialKbd:                    # ⚠ 类名必须就叫这个 ✓（`_virtual_origin` 按类名认 ✓）
             pass
 
-        di._remote = SerialKbd()
+        _remote_mod._remote = SerialKbd()
         wc.virtual_screen = lambda: (-2560, 0, 5120, 1440)
-        d, _why = ma.counts_for(700, 220, 1.0, 1.0)
+        d, _why = ma_c.counts_for(700, 220, 1.0, 1.0)
         check(d == (3260, 220),
               "主屏目标该从撞角落点算 ⇒ (3260, 220)（本机 vx=−2560 ✓）：%r" % (d,))
-        d2, _why2 = ma.counts_for(-1200, 300, 1.0, 1.0)
+        d2, _why2 = ma_c.counts_for(-1200, 300, 1.0, 1.0)
         check(d2 == (1360, 300) and d2[0] >= 0,
               "**副屏（x<0）**的目标算出来不是非负指令 ⇒ 光标根本走不过去 ✗"
               "（老算式按 (0,0) 算 ✓ 就是用户说的\"窗口拖到副屏点不中\"✓）：%r" % (d2,))
 
         # ---- ③ `to_screen`：帧像素 + 帧原点 ⇒ 屏幕像素 ✓ ----
-        check(ma.to_screen(100, 50, (-2400, 120)) == (-2300.0, 170.0),
+        check(ma_c.to_screen(100, 50, (-2400, 120)) == (-2300.0, 170.0),
               "帧像素没折成屏幕像素 ✗（帧是从框选区域裁的 ⇒ 差一个原点 ✓ "
-              "副屏上差的就是它 ✓）：%r" % (ma.to_screen(100, 50, (-2400, 120)),))
-        check(ma.to_screen(100, 50) == (100.0, 50.0),
+              "副屏上差的就是它 ✓）：%r" % (ma_c.to_screen(100, 50, (-2400, 120)),))
+        check(ma_c.to_screen(100, 50) == (100.0, 50.0),
               "不给 origin 时结果变了 ⇒ 老调用方（帧就在主屏原点 ✓）被改坏了 ✗")
 
         # ---- ④ 只有本机 ProMicro 才用本机虚拟屏原点 ✓ ----
-        di._remote = None                   # 网络 relay（被控机）/ 没有后端 ⇒ 老行为 ✓
-        d3, _ = ma.counts_for(700, 220, 1.0, 1.0)
+        _remote_mod._remote = None                   # 网络 relay（被控机）/ 没有后端 ⇒ 老行为 ✓
+        d3, _ = ma_c.counts_for(700, 220, 1.0, 1.0)
         check(d3 == (700, 220),
               "没有「本机串口」后端时却按本机虚拟屏折算 ✗（被控机那台的屏幕布局这台机器"
               "**问不到** ✓ 别硬猜 ✓ 老行为必须不变 ✓）：%r" % (d3,))
     finally:
         ma.dinput.mouse_move = _o_move
         wc.virtual_screen = _o_vs
-        di._remote = _o_remote
+        _remote_mod._remote = _o_remote
 
 
 def t_reconnect_click_wired():
@@ -17019,11 +17145,14 @@ def t_reconnect_click_wired():
          "准备点…"，点没点上没人知道 ✗）。
     """
     import re
-    src = (Path(__file__).resolve().parent.parent
-           / "gui" / "live_thread.py").read_text(encoding="utf-8")
+    _root3 = Path(__file__).resolve().parent.parent
+    # ⚠ 2026-10-20：**动作分发搬进 `runtime/frame_reconnect.py`**（那边状态机变量叫 `rc` ✓）
+    #   ⇒ 源码钉两个文件一起看 ✓；`reconnector.feedback` 那条正则也放开成 `rc` ✓
+    src = ((_root3 / "gui" / "live_thread.py").read_text(encoding="utf-8")
+           + (_root3 / "runtime" / "frame_reconnect.py").read_text(encoding="utf-8"))
     check(re.search(r"mouse_aim\.click_ratio\(vis\.shape", src),
           "① 实时回路没把「点击动作」接到 mouse_aim.click_ratio(vis.shape ...)（接线断了 ✗）")
-    check(re.search(r"^\s+reconnector\.feedback\(", src, re.M),
+    check(re.search(r"^\s+(?:reconnector|rc)\.feedback\(", src, re.M),
           "② 点击结果没回填给状态机（界面上看不到点没点上 ✗）")
     check(re.search(r'if _act and _act\.get\("act"\) == "tap"', src)
           and re.search(r'elif _act and _act\.get\("act"\) == "click"', src),
@@ -17051,18 +17180,19 @@ def t_goto_timeout_all_job_kinds():
       逻辑之前）⇒ 四种通行方式**一视同仁** ✓；**每段一把钟**（`t_goto_timeout_per_hop` ✓）
       —— "长路线跑两分钟很正常"不受影响：每完成一段就重新计时 ✓。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     def _mk_jobs():
         """四种任务各一个（都喂"永远到不了"的状态 ✓）。"""
+        from decision import jobs as jobmod
         return [
-            ("走", route.WalkJob("甲集合", [(520.0, 510.0, 530.0, -208.0, "1")])),
-            ("爬", route.ClimbJob("L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
+            ("走", jobmod.WalkJob("甲集合", [(520.0, 510.0, 530.0, -208.0, "1")])),
+            ("爬", jobmod.ClimbJob("L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
                                   dst_set="乙平台", src_set="甲平台", dst_y=100.0,
                                   tol_px=6, hold_ms=0)),
-            ("下跳", route.DropJob("甲平台", "乙平台",
+            ("下跳", jobmod.DropJob("甲平台", "乙平台",
                                    [(700.0, 660.0, 740.0, "41")], tol_px=6, hold_ms=0)),
-            ("跳", route.JumpJob("乙平台", [(600.0, 700.0, "11")],
+            ("跳", jobmod.JumpJob("乙平台", [(600.0, 700.0, "11")],
                                  src_set="甲平台", jump_start_px=0)),
         ]
 
@@ -17145,12 +17275,13 @@ def t_goto_timeout_survives_same_step_restart():
       ③ **手工取消之后** ⇒ 签名清掉 ⇒ 再挂"同名同目标"的也当**新任务**重新计时 ✓
          （否则"走→爬→走"那种集合名凑巧一样的会把新任务一上来就判超时 ✗）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     spots = [(700.0, 660.0, 740.0, "41")]
 
     def _drop(dst):
-        return route.DropJob("甲平台", dst, spots, tol_px=6, hold_ms=0)
+        from decision import jobs as jobmod
+        return jobmod.DropJob("甲平台", dst, spots, tol_px=6, hold_ms=0)
 
     def _h():
         s = fresh_settings(goto_timeout_s=10.0)
@@ -17212,7 +17343,7 @@ def t_goto_timeout_key():
       ③ 留一条 `behavior.event("goto_timeout_key")` ✓（下次翻日志能知道发没发 ✓）；
       ④ **没超时的时候一发都不发** ✓（把超时掐掉 ⇒ `taps` 必须还是空 ✓ —— 防"顺手提前发" ✗）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings(goto_timeout_s=10.0)
     s.enabled = True
@@ -17220,7 +17351,8 @@ def t_goto_timeout_key():
     spots = [(700.0, 660.0, 740.0, "41")]
 
     def _drop(dst):
-        return route.DropJob("甲平台", dst, spots, tol_px=6, hold_ms=0)
+        from decision import jobs as jobmod
+        return jobmod.DropJob("甲平台", dst, spots, tol_px=6, hold_ms=0)
 
     taps = []
     _orig = ag.tap
@@ -17429,16 +17561,17 @@ def t_chase_clock_attack_vs_segment():
       ④ 源码级：两处 attack 下发都带 `keep_clock=True` ✓，而 `_task_finished` 接下一段
          那次 `start_climb(...)` **不带** ✓（"单段成功 ⇒ 刷新"那一侧 ✓）。
     """
+    from decision import jobs as jobmod
     import inspect
 
-    from decision import route
 
     s = fresh_settings()
     h = Harness(s)
     a = h.agent
     with h._patched():
         def _drop(dst):
-            return route.DropJob("甲平台", dst, [(500.0, 480.0, 520.0, "1")],
+            from decision import jobs as jobmod
+            return jobmod.DropJob("甲平台", dst, [(500.0, 480.0, 520.0, "1")],
                                  tol_px=10, hold_ms=250)
 
         # ① attack 重下：目的地换了，钟**不许动**
@@ -17495,7 +17628,7 @@ def t_no_wx_grace():
     ③ 超过间隔 ⇒ 如实 `climb_giveup` + 任务收掉 ✓（`waited` 也记进打点 ✓）；
     ④ 中途读数回来 ⇒ **宽限锚清掉**（下一次漏读从头算 ✓ 不许把几次散漏累加 ✗）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings()
     s.move_retry_ms = 1000                       # 用例里把间隔改小，跑得快一点 ✓
@@ -17504,7 +17637,8 @@ def t_no_wx_grace():
     ws = h.ws(with_mob=False)
 
     def _mk():
-        return route.WalkJob("乙平台", [(700.0, 690.0, 710.0, -208.0, "1")])
+        from decision import jobs as jobmod
+        return jobmod.WalkJob("乙平台", [(700.0, 690.0, 710.0, -208.0, "1")])
 
     a._route_origin = dict(CHASE_ORIGIN)
     a.start_climb(_mk())
@@ -17555,19 +17689,19 @@ def t_drop_detach_when_hanging_low():
       ③ ⚠ **缺口**：脚下那块面很近时的"挂在绳上"**现在判不出来**，而且会被判**到达**（+ 收工 ✓）
          ⇒ 现场"然后就不动了" ✓。**谁要改它，先想清"怎么分辨"** ✗ 别直接加相位判据 ✗。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
-    j = route.DropJob("甲", "乙", [(700.0, 690.0, 710.0, "41")], tol_px=6, hold_ms=0)
+    j = jobmod.DropJob("甲", "乙", [(700.0, 690.0, 710.0, "41")], tol_px=6, hold_ms=0)
     j.update(0.0, px=700.0)
     o = j.update(0.5, px=700.0, py=0.0)              # 站到点上 ⇒ ARMED/DROP（按住 ↓）
-    check(o["phase"] in (route.DropJob.ARMED, route.DropJob.DROP),
+    check(o["phase"] in (jobmod.DropJob.ARMED, jobmod.DropJob.DROP),
           "前提不成立：没进「按住 ↓」那两相：%s" % (o,))
     # ① 站在下跳点上：脚下有面（差 5px）、`on_rope_pos` 真（下跳点贴着绳底 ✓）、
     #   `ladder_id` **也报得出来**（那几拍正按着 ↓ ⇒ 许可开着 ✓）⇒ **不许**判被吸住 ✗
     #   （⚠ 这条就是"两个信号都分不出"的直接证据 ✓ 也是我第一版被按住的同一件事 ✓）。
     o = j.update(0.8, px=700.0, py=0.0, ground_y=5.0, on_rope_pos="L5",
                  ladder_id="L5", here_sets=["乙"])
-    check(o["phase"] != route.DropJob.DETACH,
+    check(o["phase"] != jobmod.DropJob.DETACH,
           "站在下跳点上却被判成「被绳吸住」⇒ 自己按的 ↓ 把自己判死 ✗"
           "（下跳点本来就贴着绳底 ✓）：%s" % (o,))
     # ③ ⚠⚠ **缺口就钉在这儿**：同一拍，位置状态说"脚下就是目标集合「乙」" ⇒ `DropJob` 判**到达** ✓
@@ -17581,10 +17715,10 @@ def t_drop_detach_when_hanging_low():
     #   ⇒ 要钉它得在 agent 那一层摆一个"人在绳段里 + 脚下是目标集合"的现场 ✗（本用例只到执行器
     #   这一层 ✓ 别硬凑 ✗）。**结论仍然是上面那条**：先得有能分辨的信号 ✓。
     # ② 真悬空（脚下**没有面**）⇒ 老那档照样进 DETACH ✓ 且**绝不按 ↓** ✓（在绳上按 ↓ = 还挂着 ✗）
-    k = route.DropJob("甲", "乙", [(700.0, 690.0, 710.0, "41")], tol_px=6, hold_ms=0)
+    k = jobmod.DropJob("甲", "乙", [(700.0, 690.0, 710.0, "41")], tol_px=6, hold_ms=0)
     k.update(0.0, px=700.0)
     o2 = k.update(0.5, px=700.0, py=0.0, ground_y=None, on_rope_pos="L5")
-    check(k.phase == route.DropJob.DETACH and int(o2["dir"]) == 0,
+    check(k.phase == jobmod.DropJob.DETACH and int(o2["dir"]) == 0,
           "真悬空（脚下没面）却没进 DETACH / 或按了 ↓：%s" % (o2,))
 
 
@@ -17610,7 +17744,7 @@ def t_goto_timeout_reset_after_finish():
          别弄丢 ✗）；
       ③ 收工后换**另一步**（起终点不同）⇒ 照旧重打 ✓（老行为 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings()
     h = Harness(s)
@@ -17618,7 +17752,8 @@ def t_goto_timeout_reset_after_finish():
 
     def _job(dst="二楼", src="三楼"):
         # ⚠ 起终点 + 执行器类就是"同一步"的**全部**判据（见 `start_climb` 里的 `_sig` ✓）
-        return route.DropJob(src, dst, [(500.0, 480.0, 520.0, "1")], tol_px=10, hold_ms=250)
+        from decision import jobs as jobmod
+        return jobmod.DropJob(src, dst, [(500.0, 480.0, 520.0, "1")], tol_px=10, hold_ms=250)
 
     # ⚠⚠ **必须用假钟**（`h._patched()` 把 `ag.time.monotonic` 换成 `h.clock` ✓）——
     #   这条原来用**真实时钟**：`time.sleep(0.003)` 之后断言"钟变了" ✗ ⇒ **偶发红** ✗：
@@ -17671,13 +17806,13 @@ def t_goto_timeout_per_hop():
       · 两段各 9 秒、上限 10 秒（累计 18 秒）⇒ **不许**被切断；
       · 单独一段 11 秒、上限 10 秒 ⇒ 必须切断，并说清"这一段"跑了多久。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings(goto_timeout_s=10.0)
     s.enabled = True
     h = Harness(s)
-    a = route.WalkJob("甲集合", [(520.0, 510.0, 530.0, -208.0, "1")])
-    b = route.WalkJob("乙集合", [(520.0, 510.0, 530.0, -208.0, "2")])
+    a = jobmod.WalkJob("甲集合", [(520.0, 510.0, 530.0, -208.0, "1")])
+    b = jobmod.WalkJob("乙集合", [(520.0, 510.0, 530.0, -208.0, "2")])
     with h._patched():
         h.agent.start_route([a, b], why="用例：两段", origin=dict(CHASE_ORIGIN))
         ws = h.ws(with_mob=False)
@@ -17696,7 +17831,7 @@ def t_goto_timeout_per_hop():
               "两段都没超却报了超时：%r" % h.agent.current_goto_note())
 
         # ③ 单独一段超过上限 ⇒ 必须切，并说清是"这一段"
-        c = route.WalkJob("丙集合", [(520.0, 510.0, 530.0, -208.0, "3")],
+        c = jobmod.WalkJob("丙集合", [(520.0, 510.0, 530.0, -208.0, "3")],
                           timeout_s=600.0)
         h.agent._route_origin = dict(CHASE_ORIGIN)   # 追击签注 ✓（2026-09-29 起只有它吃超时）
         h.agent.start_climb(c)
@@ -17756,7 +17891,7 @@ def t_climb_on_rope_by_broadcast():
       · **上爬（`dir > 0`）**：**广播说不在绳上就是不在** ✓ —— 不留记忆、不用位置兜底 ✗
         （我们不松键 ⇒ 广播绝不会因为我们自己而变空 ✓，"绝对权威"才能这么用 ✓）；
       · **下爬（`dir < 0`）**：那几下**是我们自己松 ↓ 造成的** ⇒ 仍用"**广播说位置还在绳段里**"
-        （`on_rope_pos` ✓，与按键许可无关 ✓，几何只在 `perception/pos_state.py` 算一次 ✓）
+        （`on_rope_pos` ✓，与按键许可无关 ✓，几何只在 `perception/world/pos_state.py` 算一次 ✓）
         把记忆**留住** ✓；广播连位置都给不出来 ⇒ 才清 ✓。
 
     钉六件：
@@ -17769,9 +17904,9 @@ def t_climb_on_rope_by_broadcast():
       ⑤ ⚠ **对齐相里不许跳过横向对齐**（`t_climb_flow_rules` / `t_climb_diagonal_jump` 钉着 ✓）；
       ⑥ 广播**当场**说在绳上 ⇒ 照旧认 ✓。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
-    C = route.ClimbJob
+    C = jobmod.ClimbJob
     base = dict(ladder_id="L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
                 dst_set="上", src_set="下", tol_px=10, hold_ms=0, stall_s=3.0)
 
@@ -17822,7 +17957,7 @@ def t_climb_on_rope_by_broadcast():
 
     # ② 广播说**位置不在这根绳的绳段里了** ⇒ 记忆清掉、照旧「还没上绳」✓
     #    ⚠ 三种"给不出绳号"的情况在广播那边是**同一件事**（`on_rope_pos=None` ✓：
-    #      x 偏出容差 / y 出绳段 / 这一拍没有读数 —— 判据原文在 `perception/pos_state.py` ✓），
+    #      x 偏出容差 / y 出绳段 / 这一拍没有读数 —— 判据原文在 `perception/world/pos_state.py` ✓），
     #      这里逐个摆一遍，确认执行器**只读广播、不自己比坐标** ✗。
     for px, py, why in ((711.0, 0.0, "x 偏出容差"),
                         (700.0, 400.0, "y 出绳段（400 > 绳底 200 + 10）"),
@@ -17873,18 +18008,19 @@ def t_interrupt_by_origin():
          当场抛 ValueError ⇒ 新路线起不来、而旧任务已被停掉 ⇒ **原地站着** ✗ 现场
          `climb_replan_err` 就是它 ✓）。
     """
+    from decision import jobs as jobmod
     import inspect
     import re as _re
 
     import decision.agent as _am
-    from decision import route as _route
 
     s = fresh_settings()
     h = Harness(s)
     a = h.agent
 
     def mk_job():
-        return _route.ClimbJob("L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
+        from decision import jobs as jobmod
+        return jobmod.ClimbJob("L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
                                dst_set="乙平台", src_set="甲平台", tol_px=6, hold_ms=0)
 
     def drive(kind, t):
@@ -18102,7 +18238,7 @@ def t_cancel_clears_runtime():
     做法：`cancel()` = **复用 `retry()` 的清理**（一处清单 ✓）+ 盖成 `FAILED` + 原因 ✓
     ⇒ 用例就钉"**cancel 后的字段状态 == retry 的**"（不用手抄字段清单 ✓ 加字段自动覆盖 ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     def cmp_fields(a, b, fields):
         """两两比字段（**对象显式传** ✓ —— 写死闭包变量会在下一段比较里比错对象 ✗ 踩过）。"""
@@ -18111,7 +18247,8 @@ def t_cancel_clears_runtime():
 
     # ① ClimbJob：驱动到"跳过了 / 斜跳飞过 / 有记忆"那种脏状态
     def mk_climb():
-        return route.ClimbJob("L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
+        from decision import jobs as jobmod
+        return jobmod.ClimbJob("L2", x=700.0, y1=-100.0, y2=200.0, direction=1,
                               dst_set="乙平台", src_set="甲平台", tol_px=6, hold_ms=250,
                               near_px=20, jump_start_px=120)
     j_c, j_r = mk_climb(), mk_climb()
@@ -18128,14 +18265,15 @@ def t_cancel_clears_runtime():
               "_press_dir", "_press_at", "_dir_tap_at", "_retrying", "_align_pressed")
     bad = cmp_fields(j_c, j_r, fields)
     check(not bad, "`ClimbJob.cancel()` 没把运行时字段收干净（与 retry 不一致 ✗）：%r" % (bad,))
-    check(j_c.phase == route.ClimbJob.FAILED and j_c.note == "用例：取消",
+    check(j_c.phase == jobmod.ClimbJob.FAILED and j_c.note == "用例：取消",
           "cancel 没盖成 FAILED / 没写原因：%r / %r" % (j_c.phase, j_c.note))
 
     # ② DropJob（它自己的锚：`_falling` / `_attempt_at` / `_jump_reassert_at` …）
     #    ⚠ `_reassert_at` / `_reassert_n` **2026-10-06 随"补按"一起删了** ✗（见
     #      `t_drop_no_reaction_back_to_entry` ✓）—— 别再往这张表里加回来 ✓。
     def mk_drop():
-        return route.DropJob("甲平台", "乙平台", [(500.0, 470.0, 530.0, 0.0, "41")],
+        from decision import jobs as jobmod
+        return jobmod.DropJob("甲平台", "乙平台", [(500.0, 470.0, 530.0, 0.0, "41")],
                              tol_px=6, hold_ms=0, retry_ms=500, stall_s=1.0)
     j_c, j_r = mk_drop(), mk_drop()
     for j in (j_c, j_r):
@@ -18150,12 +18288,12 @@ def t_cancel_clears_runtime():
               "_y0", "_jump_reassert_at")
     bad = cmp_fields(j_c, j_r, fields)
     check(not bad, "`DropJob.cancel()` 没把运行时字段收干净 ✗：%r" % (bad,))
-    check(j_c.phase == route.DropJob.FAILED and j_c.note == "用例：取消",
+    check(j_c.phase == jobmod.DropJob.FAILED and j_c.note == "用例：取消",
           "`DropJob.cancel()` 没盖成 FAILED / 没写原因：%r / %r" % (j_c.phase, j_c.note))
 
     # ③ WalkJob / JumpJob（字段少，一起钉）
-    w_c = route.WalkJob("乙平台", [(700.0, 690.0, 710.0, -208.0, "52")])
-    w_r = route.WalkJob("乙平台", [(700.0, 690.0, 710.0, -208.0, "52")])
+    w_c = jobmod.WalkJob("乙平台", [(700.0, 690.0, 710.0, -208.0, "52")])
+    w_r = jobmod.WalkJob("乙平台", [(700.0, 690.0, 710.0, -208.0, "52")])
     for w in (w_c, w_r):
         w.update(0.0, px=600.0)
         w.update(1.0, px=600.0)
@@ -18168,7 +18306,8 @@ def t_cancel_clears_runtime():
     # ④ JumpJob（`_jump_at` / `_jump_dir`）
     def mk_jump():
         # ⚠ 跳的落点是**三元组** `(左, 右, id)`（`jump_job_for_edge` 的形状 ✓ 别抄走/爬的五元组 ✗）
-        return route.JumpJob("乙平台", [(690.0, 710.0, "52")], src_set="甲平台")
+        from decision import jobs as jobmod
+        return jobmod.JumpJob("乙平台", [(690.0, 710.0, "52")], src_set="甲平台")
     p_c, p_r = mk_jump(), mk_jump()
     for p in (p_c, p_r):
         p.update(0.0, px=600.0)
@@ -18318,15 +18457,22 @@ def t_link_eff_guards_and_probes():
     # ⭐ **分阶段 + 质量打点**（用户 2026-10-01 ✓，参考 Maple_xfeat 的 `stage_ms` /
     #   `valid_camera_fraction`）：`pipe_ms` 是一锅粥 ⇒ 分不出"定位 / 追踪"各占多少；
     #   而且耗时低 ≠ 质量好 ⇒ 还要量"有效比例"。
+    # ⚠ 2026-10-20：`track_ms` / `cam_valid` / `cam_rejected` / `first_cam_s` 随「玩家定位」段
+    #   搬进 `runtime/frame_locate.py`；`locate_ms` 仍在 `live_thread`（`_locate_latest` 那边 ✓）
+    #   ⇒ 打点这类判据**两个文件一起看** ✓（判的东西没变 ✓）
+    from pathlib import Path as _P2
+    _loc_src2 = (_P2(__file__).resolve().parent.parent
+                 / "runtime" / "frame_locate.py").read_text(encoding="utf-8")
+    _both = _src + _loc_src2
     for _name in ("locate_ms", "track_ms"):
-        check(('perf.ms("%s"' % _name) in _src,
+        check(('perf.ms("%s"' % _name) in _both,
               "`live_thread` 里没有 `%s` 打点 ⇒ `pipe_ms` 拆不开，哪段是瓶颈看不出来 ✗"
               % _name)
     for _name in ("cam_valid", "cam_rejected"):
-        check(('perf.sample("%s"' % _name) in _src,
+        check(('perf.sample("%s"' % _name) in _both,
               "`live_thread` 里没有 `%s` 打点 ⇒ 只量耗时、不量有效比例（耗时低≠质量好 ✗）"
               % _name)
-    check("first_cam_s" in _src,
+    check("first_cam_s" in _both,
           "`live_thread` 里没有 `first_cam_s`（冷启动到可用多久仍然是个谜 ✗）")
 
 
@@ -18355,7 +18501,7 @@ def t_attack_fan_deg():
     import math as _m
 
     from decision import agent as ag_mod
-    from perception.world_state import Mob
+    from perception.world.world_state import Mob
 
     s = fresh_settings(attack_dist=100.0, min_attack_dist=40)
     s.attack_up_dist, s.attack_down_dist = 20, 20
@@ -18466,7 +18612,7 @@ def t_link_silence_judgement():
          没有未回执 / 一条没发过 ⇒ 0 ✓（空闲期不许误判 ✗）；
       ② 空壳 `KbdClient`：**刚发过指令**（`last_send_at` = 现在 ✓ 老的错判据在这个形状下恒 0 ✗）
          但最老那条已等 6 秒 ⇒ `silent_for()` ≥5 ✓；回执到齐 ⇒ 0 ✓；
-      ③ ⭐ **端到端**：把它挂进 `decision.input._remote` ⇒ `link_health()["ok"]` **必须是假**、
+      ③ ⭐ **端到端**：把它挂进 `execution.input._remote` ⇒ `link_health()["ok"]` **必须是假**、
          `err` 说得清 —— 这正是 `_link_beat` 判 `link-dead` 的输入 ✓（钉到"重连会被触发"
          这一层，别只钉函数 ✗）；
       ④ 直连那条（`SerialKbd`）走**同一份**判据 ✓（它原来自己抄了一份**一样的错的** ✗）；
@@ -18474,7 +18620,8 @@ def t_link_silence_judgement():
     """
     import time as _t2
 
-    from decision import input as dinput
+    from execution import input as dinput
+    from execution import remote as _remote_mod
     from remote_kbd import kbd_client as kc
     from remote_kbd import serial_kbd as sk
 
@@ -18482,7 +18629,7 @@ def t_link_silence_judgement():
     # ① 纯判据
     check(kc.silence_seconds(3, now - 6.0, now) >= 5.0,
           "有未回执的指令、已经等了 6 秒，却没判成死链（阈值 %s 秒 ✗）"
-          % (dinput.REPLY_SILENCE_LIMIT,))
+          % (_remote_mod.REPLY_SILENCE_LIMIT,))
     check(kc.silence_seconds(3, None, now) == 0.0,
           "没有在等回执的指令却报了静默（空闲期会被误判成死链 ✗）")
     check(kc.silence_seconds(0, now - 99.0, now) == 0.0,
@@ -18500,19 +18647,19 @@ def t_link_silence_judgement():
     check(o.silent_for() == 0.0, "回执到齐了还报静默 ✗")
 
     # ③ 端到端：`link_health()` 必须因此判"不健康"（`_link_beat` 的重连就靠它 ✓）
-    _old_remote, _old_cfg = dinput._remote, dinput._cfg
+    _old_remote, _old_cfg = _remote_mod._remote, _remote_mod._cfg
     try:
         o.sent, o._pending, o._rtt_t0 = 3, 3, now - 6.0
         o.ok, o.fails, o.last_err = True, 0, ""
-        dinput._remote, dinput._cfg = o, ("remote", "127.0.0.1", 9000, "cert")
-        h = dinput.link_health()
+        _remote_mod._remote, _remote_mod._cfg = o, ("remote", "127.0.0.1", 9000, "cert")
+        h = _remote_mod.link_health()
         check(h["ok"] is False,
               "`link_health()['ok']` 还是真 ⇒ `_link_beat` 不会重连 ⇒ 卡住的键没人解 ✗：%r"
               % (h,))
         check("没收到固件回执" in str(h.get("err") or ""),
               "判了不健康、却没说清原因（界面上看不出来 ✗）：%r" % (h.get("err"),))
     finally:
-        dinput._remote, dinput._cfg = _old_remote, _old_cfg
+        _remote_mod._remote, _remote_mod._cfg = _old_remote, _old_cfg
 
     # ④ 直连那条（SerialKbd）必须走**同一份**判据
     s = object.__new__(sk.SerialKbd)
@@ -18820,7 +18967,7 @@ def t_drop_pet_never_enter_decision():
     ⇒ 只能靠读代码确认（这正是用户这次要的那句 ✓）⇒ 现在抽成纯函数，这里拿 6 个类别**当场跑** ✓。
     """
     from gui import live_thread as lt
-    from perception import classes as pc
+    from perception.detect import classes as pc
 
     root = Path(__file__).resolve().parent.parent
 
@@ -18912,9 +19059,12 @@ def t_drop_pet_never_enter_decision():
     check("CLASS_PET" not in _lt_txt,
           "实时回路引用了**宠物**类别 —— 宠物那条红线没变（一个都不进决策 ✗）")
     # ⚠ 数的是**实际用法**（`== CLASS_DROP` ✓）：import 那一行与注释里出现名字不算 ✗
-    check(_lt_txt.count("== CLASS_DROP") == 1,
+    # ⚠ 2026-10-20：掉落框那几行搬进 `runtime/frame_infer.py` ⇒ 跨两文件数 ✓
+    _drop_src = ((root / "gui" / "live_thread.py").read_text(encoding="utf-8")
+                 + (root / "runtime" / "frame_infer.py").read_text(encoding="utf-8"))
+    check(_drop_src.count("== CLASS_DROP") == 1,
           "**掉落**类别在实时回路里该只有**一处**用（给「自动拾取」算「接触」那一下 ✓）：%d 处"
-          % _lt_txt.count("== CLASS_DROP"))
+          % _drop_src.count("== CLASS_DROP"))
     _ag_txt = (root / "decision" / "agent.py").read_text(encoding="utf-8")
     check("CLASS_PET" not in _ag_txt and "CLASS_DROP" not in _ag_txt,
           "决策层引用了宠物/掉落**类别号** ⇒ 它开始自己认类别了（跨层 ✗ 该只读 WorldState ✓）")
@@ -18923,8 +19073,12 @@ def t_drop_pet_never_enter_decision():
 
     # ⑥ 源码钉：实时回路**真的走那个唯一出口** ✓（谁再另写一条 append 旁路就红 ✓）
     ltx = (root / "gui/live_thread.py").read_text(encoding="utf-8")
+    # ⚠ 2026-10-20：**"一次推理 + 分流"已搬进 `runtime/frame_infer.py`**（阶段 1 第二刀 ✓）
+    #   ⇒ 调用点那几条源码钉要读**那个文件** ✓（`split_dets` / `extra_class_dets` **本体**
+    #   仍在 `live_thread.py` —— 用例直接调 `lt.split_dets(...)` 那条路不受影响 ✓）。
+    _inf_src = (root / "runtime" / "frame_infer.py").read_text(encoding="utf-8")
     # ⚠ 2026-10-11 起是**四个**返回值（两档低分档 ✓）⇒ 钉的写法跟着改 ✓
-    check("mob_dets, player_cands, mob_low, player_low = split_dets(" in ltx,
+    check("mob_dets, player_cands, mob_low, player_low = split_dets(" in _inf_src,
           "实时回路没走 `split_dets`（\"谁进决策\"的规矩又散回内联了 ✗）")
     check(ltx.count("mob_dets.append(") == 1 and ltx.count("player_cands.append(") == 1,
           "`mob_dets`/`player_cands` 的 append 不止一处 ⇒ 有旁路能绕过过滤 ✗")
@@ -18938,8 +19092,10 @@ def t_drop_pet_never_enter_decision():
           "相对速度」✓ 少了它 ⇒ 相机一动同一只怪就换 id ✗）")
     #   ⚠ 这一条**分两半查**散文式长串容易因为缩进变化假红 ✗
     #     （2026-10-11 教训：钉长串 = 钉格式 ✓ 不如钉两个稳定片段 ✓）
-    check("player_tracker.update(player_cands, world=_world_now" in ltx
-          and "low=player_low)" in ltx,
+    # ⚠ 2026-10-20：这一句随「玩家定位」段搬进 `runtime/frame_locate.py` ⇒ 两个文件一起看 ✓
+    _loc_txt = (root / "runtime" / "frame_locate.py").read_text(encoding="utf-8")
+    check("player_tracker.update(player_cands, world=_world_now" in (ltx + _loc_txt)
+          and "low=player_low)" in (ltx + _loc_txt),
           "玩家的低分档没喂给 `PlayerTracker.update(..., low=...)` ⇒ 白分档 ✗")
 
     # ⑦ ⭐⭐ **2026-10-06：那几类现在"要画"了，但仍旧"不进决策"**（用户："为何没看到掉落物、
@@ -18947,7 +19103,7 @@ def t_drop_pet_never_enter_decision():
     #   决策那条照旧只认 mob/player ✓；画框那条（`extra_class_dets` ⇒ `_cls_dets`）**只许**
     #   交给绘制层 ✓。⚠ 这条钉子就是防"为了画得出来，顺手把它们塞进了 tracker" ✗
     #   （那正是用户 2026-10-04 明确否掉的事 ✓）。
-    check("extra_class_dets(xyxy, cfs, clss, _extra_map)" in ltx,
+    check("extra_class_dets(xyxy, cfs, clss, _extra_map)" in _inf_src,
           "没有那条「只给画框」的分流（那几类又被整批丢了 ⇒ 画面上还是看不到 ✗）")
     # ⚠ 2026-10-11 起多一个**低分档** `mob_low`（只给怪续命 ✓ 见 `split_dets` ✓）
     #   ⇒ 钉的写法跟着改 ✓ 但要害没变：**画框那份（`_cls_dets`）一个都不许进 tracker** ✗
@@ -18980,7 +19136,7 @@ def t_auto_pickup():
          写回 ✓、**回填** ✓（约定 121：两种症状都叫"改了没用"，得各测一遍 ✓）。
     """
     from PyQt5.QtCore import QPoint
-    from decision.input import DEFAULT_KEYMAP
+    from execution.keys import DEFAULT_KEYMAP
     import gui.player_panel as ppm
 
     # ---- ① 默认 / 存取 / 老配置兜底 ----
@@ -19109,6 +19265,7 @@ def t_out_cd_turn_defer():
          **4 个发键点（`self.keys.set(`）每一个都过了那道门** ✓（这是"所有"两个字的落点 ✗）、
          `attack_cd = 0` 那条"整套等于没开"的兜底还在 ✓。
     """
+    from decision import jobs as jobmod
     _mob = lambda x, i=1: Mob(id=i, x=x, y=500.0, w=40.0, h=40.0, conf=0.9)
     _DIRS = ("left", "right")
 
@@ -19318,10 +19475,10 @@ def t_out_cd_turn_defer():
     #        ② 那次转身的**意图要接回来**（CD 那几百毫秒里「目标切换CD」常常正好过期 ⇒
     #           下一拍 lock 换了人 ⇒ 不记的话就丢了 ⇒ CD 一过照直走巡逻 ✗
     #           ⇒ 修法 = `_turn_deferred_id` + `_turn_resume_target` ✓）。
-    from decision import route as _route6
 
     def _task_turn(ticks=20):
         """多点巡逻**正走着**（有走位任务 ✓）+ 背后 40px 有怪 + 正在输出CD —— 真跑 tick。"""
+        from decision import jobs as jobmod
         s6 = fresh_settings(attack_dist=120.0)
         s6.attack_cd = 500
         s6.min_turn_hold_ms = 300          # ⇒ cap = TURN_TAP_S(0.15) ⇒ 实际按 0.15s ✓
@@ -19337,7 +19494,7 @@ def t_out_cd_turn_defer():
             h6.clock0 = h6.clock.t
             a6.set_facing(1)
             a6._last_output = h6.clock.t            # 刚输出过 ⇒ 从「输出CD」里起跑 ✓
-            a6.start_climb(_route6.WalkJob(
+            a6.start_climb(jobmod.WalkJob(
                 "乙平台", [(300.0, 510.0, 700.0, -208.0, "1")]))   # 走位任务在跑 ✓
             for _ in range(ticks):
                 # ⚠ 记在 **tick 之后**（记之前的话，`dirs`/`out` 都晚一拍 ⇒ 会假红 ✓ 踩过 ✓）
@@ -19435,11 +19592,15 @@ def t_out_cd_turn_defer():
     check(len(_set_idx) == 4,
           "发键点（`self.keys.set(`）数量变了（该 **4** 处：休息赶路 / 回区 / idle / 正常 ✓）：%d 处"
           % len(_set_idx))
-    # ⚠ 往回看 **12 行**（不是 1~2 行）：中间常夹着几句注释（"必须紧跟一次 keys.set"那条 ✓）
+    # ⚠ 往回看 **20 行**（不是 1~2 行）：中间常夹着几句注释（"必须紧跟一次 keys.set"那条 ✓）
     #   ⇒ 窗口开小会假红（实测：idle 那处就隔了 7 行 ✓）。
+    #   ⭐ 2026-10-19 从 12 放到 20：正常路径那处在"门"和 `keys.set` 之间又插了
+    #   **平台防落**（`_edge_guard_beat` ✓ 见那边的纪律：它**必须**紧挨发键 —— 它摘的是
+    #   "这一拍真发出去"的方向键 ✓）⇒ 门到发键之间多了 4 行注释 + 1 行调用（= 15 行 ✗）。
+    #   ⚠ 这条钉的**语义**没变：每个发键点**必须过那道门** ✓（顺序：门 → 防落 → 发键 ✓）。
     _miss = [i + 1 for i in _set_idx
              if not any("_gate_turn_keys(" in _lines[_j]
-                        for _j in range(max(0, i - 12), i))]
+                        for _j in range(max(0, i - 20), i))]
     check(not _miss,
           "这几个发键点**没过那道门** ⇒ 那几路的左右键在输出行为CD 里照样会按下去"
           "（用户：「扩**所有**转向」✗）：行 %r" % (_miss,))
@@ -19465,7 +19626,7 @@ def t_zone_dst_must_be_can_fight():
     钉三件：① idle 切平台（用户报的 ✓）；② 中性平台放行（别误杀 ✓）；③ 「到点去哪」同一条规矩 ✓
       （同一类漏，一起堵 ✓）；另加一条**勾上就照旧**的对照 ✓（别把功能删了 ✗）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     s = fresh_settings()
     s.enabled = True
@@ -19475,8 +19636,9 @@ def t_zone_dst_must_be_can_fight():
     planned = []
 
     def _plan(dst):
+        from decision import jobs as jobmod
         planned.append(dst)
-        return {"jobs": [route.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
+        return {"jobs": [jobmod.WalkJob(dst, [(520.0, 510.0, 530.0, -208.0, "1")])],
                 "path": ["乙平台", dst], "why": "", "here": False}
 
     a.route_plan = _plan
@@ -19616,9 +19778,9 @@ def t_spot_manual_end_goes_to_after():
     钉三件：① 手动结束（演到达行为阶段）⇒ **去「结束后前往」** ✓；② 对照：`after` 空 ⇒
     照旧直接回战斗 ✓（别把功能改坏 ✗）；③ 「正在歇」阶段的手动结束照旧能去 ✓（原有那条不能丢 ✓）。
     """
+    from decision import jobs as jobmod
     import tempfile
     from core import behavior
-    from decision import route
 
     # ⚠ 把行为日志指到临时文件（自检**绝不许**写用户的 `behavior.log` ✓ 同 `t_rest_cut_is_accounted` ✓）
     _old_log, _old_en = behavior.LOG, behavior.ENABLED
@@ -19636,9 +19798,10 @@ def t_spot_manual_end_goes_to_after():
     seen = []
 
     def resolver(dst):
+        from decision import jobs as jobmod
         seen.append(dst)
         return {"path": ["甲平台", dst],
-                "jobs": [route.WalkJob(dst, [(500.0, 490.0, 510.0, -208.0, "1")])],
+                "jobs": [jobmod.WalkJob(dst, [(500.0, 490.0, 510.0, -208.0, "1")])],
                 "why": "", "here": False}
 
     ws = h.ws(with_mob=False)
@@ -20463,9 +20626,10 @@ def t_platform_pickup_round():
 
     另钉两条**不生效**：开关没勾 / 时间区间最大 <= 0 ✓（用户："配<=0不生效" ✓）。
     """
-    from decision import route
+    from decision import jobs as jobmod
 
     def _harness(enabled=True, lo=0.2, hi=0.2):
+        from decision import jobs as jobmod
         s = fresh_settings(strategy="platform", jump_random_prob=0.0)
         s.station_spot = {"kind": "set", "name": "甲"}
         s.station_pickup_enabled = enabled
@@ -20480,7 +20644,7 @@ def t_platform_pickup_round():
         _planned = []
         a.route_plan = lambda dst: (
             _planned.append(dst)
-            or {"jobs": [route.WalkJob(dst, [(500.0, 490.0, 510.0, 500.0, "1")])],
+            or {"jobs": [jobmod.WalkJob(dst, [(500.0, 490.0, 510.0, 500.0, "1")])],
                 "path": ["甲", dst], "why": "", "here": False})
         h.ws_hook = lambda w: (setattr(w.player, "here_sets", ["甲"]),
                                setattr(w.player, "world_x", 500.0))
@@ -20525,12 +20689,12 @@ def t_pickup_restart_after_cut():
       ⑤ **不限时**：整轮**没有**专属时限 —— 切断只来自那道「寻路超时时间」总闸 ✓
          （所以这里就是把它拨到超时来复现 ✓ 不另造参数 ✓）。
     """
+    from decision import jobs as jobmod
     import tempfile
     from pathlib import Path as _Path
 
     import core.behavior as _bh
 
-    from decision import route
 
     s = fresh_settings(strategy="platform", jump_random_prob=0.0)
     s.station_spot = {"kind": "set", "name": "甲"}
@@ -20548,7 +20712,7 @@ def t_pickup_restart_after_cut():
     #   —— 不然（落点就在脚下 ✓）它会**当拍就到达** ⇒ 抓不到"被切断"那一刻 ✗（第一版就栽在这儿 ✓）。
     a.route_plan = lambda dst: (
         planned.append(dst)
-        or {"jobs": [route.WalkJob(dst, [(5000.0, 4990.0, 5010.0, 500.0, "1")])],
+        or {"jobs": [jobmod.WalkJob(dst, [(5000.0, 4990.0, 5010.0, 500.0, "1")])],
             "path": ["甲", dst], "why": "", "here": False})
     h.ws_hook = lambda w: (setattr(w.player, "here_sets", ["甲"]),
                            setattr(w.player, "world_x", 500.0))
@@ -21005,11 +21169,11 @@ def t_rest_resume_after_interrupt():
       ⑥ 别的出口（手动结束 / 走不到）⇒ **不许**留下存量（人为摆 9 秒也必须被清 ✓）；
       ⑦ 「隐身休息」那一型共用同一处取用口 ⇒ 同样接着歇 ✓。
     """
+    from decision import jobs as jobmod
     import tempfile
     from pathlib import Path as _P
 
     from core import behavior
-    from decision import route
 
     # ⚠ 行为日志指到临时文件（自检**绝不许**写用户的 `behavior.log` ✓ 同 `t_rest_cut_is_accounted`）
     _ol, _oe = behavior.LOG, behavior.ENABLED
@@ -21042,7 +21206,7 @@ def t_rest_resume_after_interrupt():
             ag = h.agent
             ag.route_plan = lambda dst: {
                 "path": ["甲平台", dst],
-                "jobs": [route.WalkJob(dst, [(500.0, 490.0, 510.0, -208.0, "1")])],
+                "jobs": [jobmod.WalkJob(dst, [(500.0, 490.0, 510.0, -208.0, "1")])],
                 "why": "", "here": False}
 
             def to_rest(t):
@@ -21268,7 +21432,8 @@ def t_serial_connect_fail_says_why():
     import sys as _sys
     import types
 
-    import decision.input as din
+    import execution.input as din
+    from execution import remote as _remote_mod
 
     _REAL = "could not open port 'COM8': PermissionError(13, '拒绝访问。', None, 5)"   # 现场原文 ✓
 
@@ -21295,65 +21460,65 @@ def t_serial_connect_fail_says_why():
         return mod
 
     _o_mod = _sys.modules.get("remote_kbd.serial_kbd")
-    _o = (din.net_allowed, din._remote, din._cfg, din._blocked, din._connect_err)
+    _o = (_remote_mod.net_allowed, _remote_mod._remote, _remote_mod._cfg, _remote_mod._blocked, _remote_mod._connect_err)
     try:
-        din.net_allowed = lambda: True
+        _remote_mod.net_allowed = lambda: True
 
         # ---- ① 被占用（现场那一种 ✓）----
-        din._remote, din._cfg, din._blocked, din._connect_err = None, None, False, ""
+        _remote_mod._remote, _remote_mod._cfg, _remote_mod._blocked, _remote_mod._connect_err = None, None, False, ""
         _sys.modules["remote_kbd.serial_kbd"] = _stub(_FakeSerialError(_REAL), "COM8")
         _msg = ""
         try:
-            din.use_serial("COM8")
+            _remote_mod.use_serial("COM8")
         except Exception as e:                 # noqa: BLE001 —— 这里**就该抛** ✓
             _msg = str(e)
         check("占用" in _msg and "另一个工作台" in _msg,
               "串口被占用时没说\"关掉另一个工作台\" ✗（用户的现场就是这种 ✓）：%r" % _msg)
         check("拔插" not in _msg,
               "被占用却建议\"拔插 USB\" ✗ —— 两种病建议相反 ✓（\"插都没插\"是另一种 ✓）：%r" % _msg)
-        check(("PermissionError" in din.last_connect_err()
-               or "拒绝访问" in din.last_connect_err()),
+        check(("PermissionError" in _remote_mod.last_connect_err()
+               or "拒绝访问" in _remote_mod.last_connect_err()),
               "没留下**第一手异常**（`PermissionError(13, 拒绝访问)` ✓）⇒ 事后查不出真因 ✗：%r"
-              % din.last_connect_err())
-        check(bool(din.link_health().get("err")),
+              % _remote_mod.last_connect_err())
+        check(bool(_remote_mod.link_health().get("err")),
               "`link_health()[\"err\"]` 里没带出失败原因 ⇒ 界面 / 日志拿不到话 ✗（原来就是空串 ✓）")
 
         # ---- ② 插都没插（配的那个口打不开 + 自动找口也找不到 ✓）----
-        din._remote, din._cfg, din._connect_err = None, None, ""
+        _remote_mod._remote, _remote_mod._cfg, _remote_mod._connect_err = None, None, ""
         _sys.modules["remote_kbd.serial_kbd"] = _stub(_FakeSerialError(_REAL), None)
         _msg2 = ""
         try:
-            din.use_serial("COM9")
+            _remote_mod.use_serial("COM9")
         except Exception as e:                 # noqa: BLE001
             _msg2 = str(e)
         check("找不到" in _msg2, "查不到设备时该说\"找不到 Pro Micro 串口\"：%r" % _msg2)
 
         # ---- ③ 连上 ⇒ 清掉旧原因 ✓ ----
-        din._connect_err = "上次的老错误"
+        _remote_mod._connect_err = "上次的老错误"
         _sys.modules["remote_kbd.serial_kbd"] = _stub(None, "COM8")
-        din.use_serial("COM8")
-        check(din.last_connect_err() == "",
-              "连上了却还挂着上次的失败原因 ⇒ 界面会一直显示假错误 ✗：%r" % din.last_connect_err())
+        _remote_mod.use_serial("COM8")
+        check(_remote_mod.last_connect_err() == "",
+              "连上了却还挂着上次的失败原因 ⇒ 界面会一直显示假错误 ✗：%r" % _remote_mod.last_connect_err())
 
         # ---- ④ `connect_async` 失败也要留痕（不许静默 ✗）----
-        din._remote, din._cfg, din._connect_err = None, None, ""
+        _remote_mod._remote, _remote_mod._cfg, _remote_mod._connect_err = None, None, ""
         _sys.modules["remote_kbd.serial_kbd"] = _stub(_FakeSerialError(_REAL), "COM8")
         _got = []
-        din.connect_async("serial", _got.append, port="COM8")
+        _remote_mod.connect_async("serial", _got.append, port="COM8")
         for _ in range(300):                   # 等后台连接线程回报（最多 3 秒 ✓）
             if _got:
                 break
             time.sleep(0.01)
         check(_got == ["fail"], "连不上该回报 fail：%r" % (_got,))
-        check(bool(din.last_connect_err()),
+        check(bool(_remote_mod.last_connect_err()),
               "`connect_async` 失败了却**没留下原因** ✗ —— 原来就是这里把异常整个吞掉的 ✓"
-              "（界面只剩\"连接失败\"四个字 ✓ 用户现场 ✓）：%r" % din.last_connect_err())
+              "（界面只剩\"连接失败\"四个字 ✓ 用户现场 ✓）：%r" % _remote_mod.last_connect_err())
     finally:
         if _o_mod is None:
             _sys.modules.pop("remote_kbd.serial_kbd", None)
         else:
             _sys.modules["remote_kbd.serial_kbd"] = _o_mod
-        (din.net_allowed, din._remote, din._cfg, din._blocked, din._connect_err) = _o
+        (_remote_mod.net_allowed, _remote_mod._remote, _remote_mod._cfg, _remote_mod._blocked, _remote_mod._connect_err) = _o
 
 
 def t_mouse_gain_frame_mismatch():
@@ -21379,17 +21544,17 @@ def t_mouse_gain_frame_mismatch():
     import tempfile
     from pathlib import Path
 
-    import decision.mouse_aim as ma
+    import execution.mouse_aim as ma
 
     _tmp = Path(tempfile.mkdtemp()) / "mouse_gain.json"
-    _o = (ma.GAIN_PATH, ma._MISMATCH_SAID)
+    _o = (ma_c.GAIN_PATH, ma_c._MISMATCH_SAID)
     try:
-        ma.GAIN_PATH = _tmp
-        ma._MISMATCH_SAID = False
+        ma_c.GAIN_PATH = _tmp
+        ma_c._MISMATCH_SAID = False
 
         # ---- ① 两份不同尺寸 ⇒ **都在**（本次的根 ✓）----
-        ma.save_gain(1.0, 1.0, frame_shape=(1079, 1918))          # 本地窗口那条 ✓
-        ma.save_gain(0.53, 0.53, frame_shape=(768, 1366))         # 收流那条 ✓
+        ma_c.save_gain(1.0, 1.0, frame_shape=(1079, 1918))          # 本地窗口那条 ✓
+        ma_c.save_gain(0.53, 0.53, frame_shape=(768, 1366))         # 收流那条 ✓
         _d = json.loads(_tmp.read_text(encoding="utf-8"))
         _by = _d.get("by_frame") or {}
         check("1918x1079" in _by and "1366x768" in _by,
@@ -21397,8 +21562,8 @@ def t_mouse_gain_frame_mismatch():
               "%r" % (list(_by),))
 
         # ---- ② 各取各的 ----
-        g1 = ma.load_gain((1079, 1918, 3))
-        g2 = ma.load_gain((768, 1366, 3))
+        g1 = ma_c.load_gain((1079, 1918, 3))
+        g2 = ma_c.load_gain((768, 1366, 3))
         check(g1 and abs(g1[0] - 1.0) < 1e-6, "1918 那份取错了：%r" % (g1,))
         check(g2 and abs(g2[0] - 0.53) < 1e-6, "1366 那份取错了：%r" % (g2,))
 
@@ -21407,20 +21572,20 @@ def t_mouse_gain_frame_mismatch():
         #   （量过的是 1918×1079 ✓）⇒ **同一路画面、差 2 个像素** ✓ 被判成"没量过"
         #   ⇒ 一个字节都不点 ⇒ 用户看到「**本地的断线重连不选频道了**」✓
         #   ⇒ 判据改成"最接近的一份 + 两轴都在 `GAIN_SIZE_TOL` 内"✓（精确相等优先 ✓）。
-        _g_live = ma.load_gain((1080, 1920, 3))
+        _g_live = ma_c.load_gain((1080, 1920, 3))
         check(_g_live is not None,
               "差两个像素的同一路画面被判成「没量过」✗ ⇒ **一个字节都不点**"
               "（用户 2026-10-11：「本地的断线重连不选频道了」✓）")
         check(abs(_g_live[0] - 1.0) < 1e-6,
               "容差命中的该是 **1918×1079** 那份（1.0 ✓），不是别的：%r" % (_g_live,))
         # ⚠⚠ 但**绝不许"就近乱取"**：1366×768 离 1920×1080 差 28% ⇒ 仍必须判"没有" ✓
-        check(ma.load_gain((600, 3000, 3)) is None,
+        check(ma_c.load_gain((600, 3000, 3)) is None,
               "尺寸差一大截还命中 ⇒ 会拿**别的来源**的几何去点 ✗（本仓库明令禁止的猜 ✓）")
-        check(abs(ma.load_gain((769, 1367, 3))[0] - 0.53) < 1e-6,
-              "收流那份差一个像素也该命中（同一路画面 ✓）：%r" % (ma.load_gain((769, 1367, 3)),))
+        check(abs(ma_c.load_gain((769, 1367, 3))[0] - 0.53) < 1e-6,
+              "收流那份差一个像素也该命中（同一路画面 ✓）：%r" % (ma_c.load_gain((769, 1367, 3)),))
 
         # ---- ③ 没量过的尺寸 ⇒ 不点 + 说清（含"量过哪些"与"怎么量"）----
-        _bad, _why = ma.gain_mismatch_block((600, 800, 3))
+        _bad, _why = ma_c.gain_mismatch_block((600, 800, 3))
         check(_bad is True, "没量过的尺寸却敢点 ✗：%r" % (_why,))
         check("1918" in _why or "1366" in _why,
               "没说清**这台量过哪些尺寸** ⇒ 人不知道自己量过什么 ✗：%r" % (_why,))
@@ -21430,15 +21595,15 @@ def t_mouse_gain_frame_mismatch():
               "没说明\"**量一次就够**\"（用户问的正是这个 ✓）：%r" % (_why,))
 
         # ---- ④ 量过的尺寸 ⇒ 照常点（别误拦 ✓）----
-        _bad2, _why2 = ma.gain_mismatch_block((768, 1366, 3))
+        _bad2, _why2 = ma_c.gain_mismatch_block((768, 1366, 3))
         check(_bad2 is False and not _why2, "量过的尺寸被拦了 ✗：%r" % (_why2,))
 
         # ---- ⑤ **绝不退 1.0** ✗ ----
-        check(ma.load_gain((500, 700, 3)) is None,
+        check(ma_c.load_gain((500, 700, 3)) is None,
               "没这份却返回了一个数 ⇒ 会**照着它点歪** ✗（本仓库明令 ✓）：%r"
-              % (ma.load_gain((500, 700, 3)),))
+              % (ma_c.load_gain((500, 700, 3)),))
 
-        # ---- ⑥ 平铺那层要跟着**最新那份**（`perception.lie_controller` 只认它 ✓）----
+        # ---- ⑥ 平铺那层要跟着**最新那份**（`liedetect.lie_controller` 只认它 ✓）----
         check(abs(float(_d["gain_x"]) - 0.53) < 1e-6
               and abs(float(_d["gain_y"]) - 0.53) < 1e-6,
               "平铺层没跟着最新那份 ⇒ 测谎闭环那个读者拿到的是旧的 ✗：%r" % (_d,))
@@ -21446,7 +21611,7 @@ def t_mouse_gain_frame_mismatch():
               "平铺层的 `ref_w`/`ref_h` 没更新 ✗（老读者靠它判「在哪个尺寸上量的」✓）：%r"
               % (_d,))
     finally:
-        ma.GAIN_PATH, ma._MISMATCH_SAID = _o
+        ma_c.GAIN_PATH, ma_c._MISMATCH_SAID = _o
 
 
 def t_cursor_protocol_both_sides():
@@ -21546,10 +21711,10 @@ def t_auto_measure_selfcalib():
     import tempfile
     from pathlib import Path
 
-    import decision.mouse_aim as ma
+    import execution.mouse_aim as ma
 
     _tmp = Path(tempfile.mkdtemp()) / "gain.json"
-    _o = (ma.GAIN_PATH, ma.dinput, ma._AUTO_LAST, ma.corner_zero)
+    _o = (ma_c.GAIN_PATH, ma.dinput, ma_c._AUTO_LAST, ma_c.corner_zero)
     _cmds = []
 
     class _Fake:
@@ -21575,35 +21740,38 @@ def t_auto_measure_selfcalib():
             return (_Fake.pos[0], _Fake.pos[1], 0, 0, 1920, 1080, _Fake.cap)
 
     try:
-        ma.GAIN_PATH = _tmp
-        ma._AUTO_LAST = {}
-        ma.dinput = _Fake
-        ma.corner_zero = lambda: (_Fake.pos.__setitem__(0, 0),
+        ma_c.GAIN_PATH = _tmp
+        ma_c._AUTO_LAST = {}
+        ma.dinput = ma_c.dinput = _Fake
+        # ⚠ 2026-10-17：`cursor_probe` 随链路搬到 `execution/remote.py` ✓ ⇒ 桩也要打到那儿 ✓
+        _ocp = _remote_mod.cursor_probe
+        _remote_mod.cursor_probe = _Fake.cursor_probe
+        ma_c.corner_zero = lambda: (_Fake.pos.__setitem__(0, 0),
                                   _Fake.pos.__setitem__(1, 0))
 
         # ---- ① 帧 960×540 = 抓取区(1920×1080) 的一半 ⇒ 期望 2 × 0.5 = 1.0 ----
-        _ok, _why = ma.auto_measure((540, 960, 3), force=True)
+        _ok, _why = ma_c.auto_measure((540, 960, 3), force=True)
         check(_ok, "自动量失败了：%s" % (_why,))
-        _g = ma.load_gain((540, 960, 3))
+        _g = ma_c.load_gain((540, 960, 3))
         check(_g and abs(_g[0] - 1.0) < 1e-6 and abs(_g[1] - 1.0) < 1e-6,
               "量出来的不对（该是 2 屏幕px/单位 × 0.5 折算 = 1.0 帧px/单位 ✓）：%r" % (_g,))
         # ---- ② 只写这一份 ----
-        check(ma.load_gain((1079, 1918, 3)) is None, "写错尺寸那份了 ✗（别的尺寸不许被动 ✓）")
+        check(ma_c.load_gain((1079, 1918, 3)) is None, "写错尺寸那份了 ✗（别的尺寸不许被动 ✓）")
         # ---- ⑤ 挪回去 ----
-        check(_cmds and _cmds[-1] == (-ma.AUTO_STEP, -ma.AUTO_STEP),
+        check(_cmds and _cmds[-1] == (-ma_c.AUTO_STEP, -ma_c.AUTO_STEP),
               "走完没把光标挪回去 ✗：%r" % (_cmds[-2:],))
 
         # ---- ③ 看不见光标 ⇒ 不写 + 说清 ----
         _Fake.enabled = False
         _tmp.unlink()
-        _ok3, _why3 = ma.auto_measure((540, 960, 3), force=True)
+        _ok3, _why3 = ma_c.auto_measure((540, 960, 3), force=True)
         check(_ok3 is False and "relay" in _why3,
               "看不见光标时该说清（要 A 机 relay 回 `CURSOR?` ✓）：%r" % (_why3,))
         check(not _tmp.exists(), "量不成却写盘了 ✗")
 
         # ---- ④ 折算比算不出 ⇒ **不猜** ----
         _Fake.enabled, _Fake.cap = True, None        # relay 没报抓取区 ✓
-        _ok4, _why4 = ma.auto_measure((900, 1600, 3), force=True)   # 1600 ≠ 1920 ⇒ 非 1:1
+        _ok4, _why4 = ma_c.auto_measure((900, 1600, 3), force=True)   # 1600 ≠ 1920 ⇒ 非 1:1
         check(_ok4 is False and "不猜" in _why4,
               "折算比算不出时该**拒绝**（不许猜 ✓）：%r" % (_why4,))
         check(not _tmp.exists(), "算不出折算比却写盘了 ✗（那就是拿猜当准 ✓）")
@@ -21611,16 +21779,16 @@ def t_auto_measure_selfcalib():
         # ---- 1:1（帧 == 屏幕）⇒ 能算：2.0 ----
         _Fake.enabled, _Fake.cap = True, None
         _Fake.pos = [0, 0]
-        _ok5, _why5 = ma.auto_measure((1080, 1920, 3), force=True)
+        _ok5, _why5 = ma_c.auto_measure((1080, 1920, 3), force=True)
         check(_ok5, "帧与屏幕 1:1 时该能量出来：%s" % (_why5,))
-        _g5 = ma.load_gain((1080, 1920, 3))
+        _g5 = ma_c.load_gain((1080, 1920, 3))
         check(_g5 and abs(_g5[0] - 2.0) < 1e-6,
               "1:1 时该是 2.0（一单位走 2 屏幕像素 ✓）：%r" % (_g5,))
 
         # ---- ⑥ 量完要**放回撞角之前那儿**（不然它就停在左上角 ✓ 用户 2026-10-10 正是看到这个 ✓）----
         _Fake.pos = [500, 400]           # 撞角之前光标在 (500,400)（**屏幕像素** ✓）
         _cmds.clear()
-        _ok6, _why6 = ma.auto_measure((1080, 1920, 3), force=True)
+        _ok6, _why6 = ma_c.auto_measure((1080, 1920, 3), force=True)
         check(_ok6, "又一次自动量失败了：%s" % (_why6,))
         check(_Fake.pos == [500, 400],
               "量完**没把光标放回原处** ⇒ 它就停在左上角（用户看到的正是这个 ✓）：%r"
@@ -21629,7 +21797,8 @@ def t_auto_measure_selfcalib():
               "送回的位移没**除以屏幕增益**（500/2=250、400/2=200 ✓ ⇒ 直接拿像素当单位会跑过头 ✓）："
               "%r" % (_cmds,))
     finally:
-        (ma.GAIN_PATH, ma.dinput, ma._AUTO_LAST, ma.corner_zero) = _o
+        (ma_c.GAIN_PATH, ma.dinput, ma_c._AUTO_LAST, ma_c.corner_zero) = _o
+        _remote_mod.cursor_probe = _ocp
 
 
 def t_auto_measure_async_no_block():
@@ -21653,7 +21822,7 @@ def t_auto_measure_async_no_block():
     """
     import inspect
 
-    import decision.mouse_aim as ma
+    import execution.mouse_aim as ma
 
     # ---- ①③ 源码级 ----
     for _fn in (ma.click_ratio, ma.aim_to, ma.scroll):
@@ -21669,11 +21838,11 @@ def t_auto_measure_async_no_block():
               "`%s` 没查「正在后台量」✗ ⇒ 会跟量那个动作插在一起（量出来的数是错的 ✓）"
               "（⚠ 走 `_auto_busy()` ✓ —— 它带**超时自愈** ✓ 见那条 ✓）" % _fn.__name__)
     # ⭐ 共用兜底自己**必须**走后台版 ✗（阻塞版一次最多 1.6 秒 ⇒ 实时回路被卡住 ✓）
-    _gsrc = inspect.getsource(ma._gain_or_why)
+    _gsrc = inspect.getsource(ma_c._gain_or_why)
     check("auto_measure_async" in _gsrc
           and "auto_measure(" not in _gsrc.replace("auto_measure_async(", ""),
           "`_gain_or_why` 必须走**后台版** `auto_measure_async` ✗ —— 阻塞版会把实时回路卡住 ✓")
-    _asrc = inspect.getsource(ma.auto_measure_async)
+    _asrc = inspect.getsource(ma_c.auto_measure_async)
     check("threading.Thread(" in _asrc and "_AUTO_LOCK" in _asrc,
           "`auto_measure_async` 没起线程 / 没串行锁 ⇒ 还是卡回路（或两条量打架 ✓）")
     check("_AUTO_BUSY = True" in _asrc and "_AUTO_BUSY = False" in _asrc,
@@ -21687,7 +21856,8 @@ def t_auto_measure_async_no_block():
     check("_AUTO_FAIL" in _asrc and "AUTO_MAX_TRIES" in _asrc,
           "失败了**没记住** ✗ ⇒ 每一拍都会再起一条（= 每 100ms 撞一次角 ⇒ "
           "用户看到的「A 机鼠标停在左上角不动了」✓）")
-    _src_all = inspect.getsource(ma)
+    # ⚠ 2026-10-17：自动量那半搬到 `execution/aim_convert.py` ⇒ 两半一起看 ✓
+    _src_all = inspect.getsource(ma) + inspect.getsource(ma_c)
     check("_AUTO_FAIL[key] = " in _src_all and "AUTO_RETRY_S" in _asrc,
           "失败既没记时间也没冷却 ✗ ⇒ 会一直重试 ✓")
     check("手工量一次" in _asrc,
@@ -21709,11 +21879,11 @@ def t_auto_measure_async_no_block():
         def cursor_probe():
             return (0, 0, 0, 0, 1920, 1080, (1920, 1080))
 
-    _o = (ma.dinput, ma._AUTO_BUSY, ma._AUTO_BUSY_AT)
+    _o = (ma.dinput, ma_c._AUTO_BUSY, ma_c._AUTO_BUSY_AT)
     try:
-        ma.dinput = _Fake
-        ma._AUTO_BUSY = True
-        ma._AUTO_BUSY_AT = time.monotonic()          # ⚠ 忙标记要带**时刻**（见下面自愈那条 ✓）
+        ma.dinput = ma_c.dinput = _Fake
+        ma_c._AUTO_BUSY = True
+        ma_c._AUTO_BUSY_AT = time.monotonic()          # ⚠ 忙标记要带**时刻**（见下面自愈那条 ✓）
         for _call in (lambda: ma.click_ratio((540, 960, 3), 0.5, 0.5),
                       lambda: ma.aim_to((540, 960, 3), 0.5, 0.5),
                       lambda: ma.scroll(0, 1, (540, 960, 3), 0.5, 0.5)):
@@ -21724,25 +21894,25 @@ def t_auto_measure_async_no_block():
 
         # ---- ⑥ ⭐⭐ **忙标记不许把鼠标永久锁死**（2026-10-10 ✓ 用户："进入选频道界面后
         #      A 机的鼠标**没有被操控**" ✓ —— 忙标记万一卡住 ⇒ 三个出口全被挡 ⇒ 正是这一幕 ✓）----
-        ma._AUTO_BUSY = True
-        ma._AUTO_BUSY_AT = time.monotonic() - (ma.AUTO_BUSY_MAX_S + 5.0)   # 早就超时了 ✓
-        check(ma._auto_busy() is False,
+        ma_c._AUTO_BUSY = True
+        ma_c._AUTO_BUSY_AT = time.monotonic() - (ma_c.AUTO_BUSY_MAX_S + 5.0)   # 早就超时了 ✓
+        check(ma_c._auto_busy() is False,
               "忙标记超时了还算「在忙」✗ ⇒ 鼠标会被**永久锁死**（用户看到的就是这个 ✓）")
-        ma._AUTO_BUSY = False
+        ma_c._AUTO_BUSY = False
 
         # ---- ⑤ ⭐⭐⭐ **总开关默认必须是【关】**（2026-10-10 ✓ 同一句症状报了三次之后定的 ✓）----
         import json
         import tempfile
         from pathlib import Path
         _tmp = Path(tempfile.mkdtemp()) / "gain.json"
-        _o2 = (ma.GAIN_PATH, ma._AUTO_BUSY)
+        _o2 = (ma_c.GAIN_PATH, ma_c._AUTO_BUSY)
         try:
-            ma.GAIN_PATH = _tmp
-            ma._AUTO_BUSY = False
-            check(ma.auto_measure_enabled() is False,
+            ma_c.GAIN_PATH = _tmp
+            ma_c._AUTO_BUSY = False
+            check(ma_c.auto_measure_enabled() is False,
                   "文件都没有 ⇒ 自动量必须是**关**的（安全的一侧做默认 ✓）")
-            _ok, _why = ma.auto_measure_async((540, 960, 3))
-            check(_ok is False and ma._AUTO_BUSY is False,
+            _ok, _why = ma_c.auto_measure_async((540, 960, 3))
+            check(_ok is False and ma_c._AUTO_BUSY is False,
                   "**关着的时候**还起了量 ✗ ⇒ 它会在后台动鼠标（用户三次报的就是这个 ✓）：%r"
                   % (_why,))
             check("关" in _why and "mouse_aim_calib" in _why,
@@ -21750,23 +21920,23 @@ def t_auto_measure_async_no_block():
             # 文件里显式写 true ⇒ 这才允许起
             _tmp.write_text(json.dumps({"auto_measure": True, "gain_x": 1.0, "gain_y": 1.0}),
                             encoding="utf-8")
-            check(ma.auto_measure_enabled() is True, "写了 true 却还判成关 ✗")
-            _o3 = ma.auto_measure
-            ma.auto_measure = lambda *_a, **_k: (False, "替身：不在用例里真动鼠标")
+            check(ma_c.auto_measure_enabled() is True, "写了 true 却还判成关 ✗")
+            _o3 = ma_c.auto_measure
+            ma_c.auto_measure = lambda *_a, **_k: (False, "替身：不在用例里真动鼠标")
             try:
-                _ok2, _why2 = ma.auto_measure_async((540, 960, 3))
+                _ok2, _why2 = ma_c.auto_measure_async((540, 960, 3))
                 check(_ok2 is True, "开了 true 却不起量 ✗：%r" % (_why2,))
                 for _ in range(100):                 # 等那条后台线程收干净（最多 1 秒 ✓）
-                    if not ma._AUTO_BUSY:
+                    if not ma_c._AUTO_BUSY:
                         break
                     time.sleep(0.01)
-                check(not ma._AUTO_BUSY, "后台那条线程跑完了却没收掉忙标记 ✗")
+                check(not ma_c._AUTO_BUSY, "后台那条线程跑完了却没收掉忙标记 ✗")
             finally:
-                ma.auto_measure = _o3
+                ma_c.auto_measure = _o3
         finally:
-            ma.GAIN_PATH, ma._AUTO_BUSY = _o2
+            ma_c.GAIN_PATH, ma_c._AUTO_BUSY = _o2
     finally:
-        ma.dinput, ma._AUTO_BUSY, ma._AUTO_BUSY_AT = _o
+        ma.dinput, ma_c._AUTO_BUSY, ma_c._AUTO_BUSY_AT = _o
 
 
 def t_mouse_path_check_tool():
@@ -21823,15 +21993,16 @@ def t_mouse_path_check_tool():
           "没说清「帧 ÷ 桌面 = 缩放」这一步 ✗（那正是 0.8 的来处 ✓）")
 
     # ⚠ 顺手：`_AUTO_BUSY` 的"自愈"（见 `AUTO_BUSY_MAX_S`）—— 忙标记卡住不许永久锁鼠标 ✓
-    from decision import mouse_aim as ma
-    check(hasattr(ma, "_auto_busy") and hasattr(ma, "AUTO_BUSY_MAX_S"),
-          "忙标记没有超时自愈 ✗ ⇒ 一旦卡住 ⇒ **鼠标永久没被操控**（用户看到的就是这个 ✓）")
-    _o = (ma._AUTO_BUSY, ma._AUTO_BUSY_AT)
+    from execution import mouse_aim as ma
+    check(hasattr(ma_c, "_auto_busy") and hasattr(ma_c, "AUTO_BUSY_MAX_S"),
+          "忙标记没有超时自愈 ✗ ⇒ 一旦卡住 ⇒ **鼠标永久没被操控**（用户看到的就是这个 ✓）"
+          "  ⚠ 2026-10-17 起它在 `execution/aim_convert.py` ✓")
+    _o = (ma_c._AUTO_BUSY, ma_c._AUTO_BUSY_AT)
     try:
-        ma._AUTO_BUSY, ma._AUTO_BUSY_AT = True, time.monotonic() - 9999.0
-        check(ma._auto_busy() is False, "忙标记放了很久还算「在忙」✗ ⇒ 鼠标会被永久锁死 ✓")
+        ma_c._AUTO_BUSY, ma_c._AUTO_BUSY_AT = True, time.monotonic() - 9999.0
+        check(ma_c._auto_busy() is False, "忙标记放了很久还算「在忙」✗ ⇒ 鼠标会被永久锁死 ✓")
     finally:
-        ma._AUTO_BUSY, ma._AUTO_BUSY_AT = _o
+        ma_c._AUTO_BUSY, ma_c._AUTO_BUSY_AT = _o
 
 
 def t_multi_leave_delay():
@@ -22712,11 +22883,11 @@ def t_jump_cd():
          `job.defer_jump(now)` ✓（"第 2 段只是推迟、不是判失败"✓）；
       ④ 推迟：`_jump_wait_until` 没到时 `_climb_tick` **直接返回 False 且一个键都不按** ✓
          （= 站着等 CD ✓ 同 `_climb_retry_at` 那套 ✓）；
-      ⑤ `route.JumpJob.NEEDS_JUMP is True`、基类 `False` ✓（agent 靠它"打字"✓ **不 import route** ✓）。
+      ⑤ `jobmod.JumpJob.NEEDS_JUMP is True`、基类 `False` ✓（agent 靠它"打字"✓ **不 import route** ✓）。
     """
+    from decision import jobs as jobmod
     import time as _time
 
-    from decision import route as rt
     from decision.agent import jump_air_s
 
     # ---- ① 口径 ----
@@ -22763,7 +22934,12 @@ def t_jump_cd():
     from pathlib import Path
     _root = Path(__file__).resolve().parents[1]
     _ag = (_root / "decision" / "agent.py").read_text(encoding="utf-8")
-    _rt = (_root / "decision" / "route.py").read_text(encoding="utf-8")
+    # ⚠ 2026-10-18 拆包：这些钉子原先读 `decision/route.py`，现在分散在 `decision/jobs/`
+    #   五个执行器里 ⇒ 拼起来一起判（判的是"别把这个钩子弄丢"，不在乎它在哪个文件 ✓）。
+    _rt = "\n".join(
+        (_root / "decision" / "jobs" / _f).read_text(encoding="utf-8")
+        for _f in ("base.py", "align.py", "climb.py", "drop.py", "jump.py",
+                   "portal.py", "walk.py"))
     check("defer_jump" in _ag and "defer_jump" in _rt,
           "路线跳那一下没有 defer_jump 钩子 ✗ ⇒ 「等 CD」会被 `stall_s` 判成**失败** ✗"
           "（用户要的是**推迟** ✓）")
@@ -22781,7 +22957,7 @@ def t_jump_cd():
               "等 CD 那一拍该**返回 False 且一个键都不按**（站着等 ✓）：%r / %r"
               % (_r, sorted(_keys)))
         a._jump_wait_until = 0.0
-    check(rt.JumpJob.NEEDS_JUMP is True and rt._PausableJob.NEEDS_JUMP is False,
+    check(jobmod.JumpJob.NEEDS_JUMP is True and jobmod._PausableJob.NEEDS_JUMP is False,
           "`JumpJob` 该标 `NEEDS_JUMP = True` ✓、基类 `False` ✓")
 
 
@@ -22805,7 +22981,7 @@ def t_track_buffer_setting():
     from pathlib import Path
 
     from decision.agent import DecisionSettings
-    from perception.tracker import MobTracker
+    from perception.track.tracker import MobTracker
 
     S = DecisionSettings()
     check(not hasattr(S, "debounce_conf") and not hasattr(S, "debounce_ms"),
@@ -22926,8 +23102,8 @@ def t_mouse_gain_visible():
     import tempfile
     from unittest import mock
 
-    from decision import mouse_aim as ma
 
+    from execution import mouse_aim as ma
     _tmp = pathlib.Path(tempfile.mkdtemp(prefix="psimu_gv_")) / "mouse_gain.json"
     _tmp.write_text(json.dumps({
         "auto_measure": True,
@@ -22938,13 +23114,13 @@ def t_mouse_gain_visible():
                       "cap": [1707, 960]}}},
     }, ensure_ascii=False), encoding="utf-8")
 
-    with mock.patch.object(ma, "GAIN_PATH", _tmp):
+    with mock.patch.object(ma_c, "GAIN_PATH", _tmp):
         # ① 留痕：**成功也要记** ✓（四件真数一个都不许少 ✗）
         _evts = []
         with mock.patch("core.behavior.event",
                         lambda name, **kw: _evts.append((name, kw))), \
-             mock.patch.object(ma, "_raw_auto_measure", lambda s, force=False: (True, "量好了 ✓")):
-            _ok, _why = ma.auto_measure((768, 1366))
+             mock.patch.object(ma_c, "_raw_auto_measure", lambda s, force=False: (True, "量好了 ✓")):
+            _ok, _why = ma_c.auto_measure((768, 1366))
         check(_ok and _evts and _evts[-1][0] == "mouse_gain_probe",
               "① 量成功了却**没留痕** ✗（`behavior.log` 里该有一条 `mouse_gain_probe` ✓ —— "
               "留痕自己炸了可以不影响测量 ✓ 但**不许没有** ✗）：实得 %r" % (_evts,))
@@ -22962,9 +23138,9 @@ def t_mouse_gain_visible():
         _evts2 = []
         with mock.patch("core.behavior.event",
                         lambda name, **kw: _evts2.append((name, kw))), \
-             mock.patch.object(ma, "_raw_auto_measure",
+             mock.patch.object(ma_c, "_raw_auto_measure",
                                lambda s, force=False: (False, "拿不到画面尺寸 ✓")):
-            _ok2, _why2 = ma.auto_measure((768, 1366))
+            _ok2, _why2 = ma_c.auto_measure((768, 1366))
         check((not _ok2) and _evts2 and _evts2[-1][1].get("ok") is False,
               "① **失败的那次没留痕** ✗✗ —— 这一条正是现场缺的那条（失败原因只活在对话框里 ✗ "
               "关掉就没了 ✓）：实得 %r" % (_evts2,))
@@ -22972,16 +23148,16 @@ def t_mouse_gain_visible():
               "① 留痕里没带上**人话原因** ✗：%r" % (_evts2[-1][1].get("why"),))
 
         # ② 状态行：折算比 / 屏幕 / 抓取区域都要写出来 ✓
-        _st = ma.calib_status()
+        _st = ma_c.calib_status()
         check("0.8002" in _st and "1707" in _st,
               "② 状态行**没写折算比 / 几何** ✗ ⇒ 用户没法一眼看出「这份标定是按什么算的」✓"
               "（现场：0.8002 与 1366÷1920=0.7115 对不上 ⇒ 一眼就知道 relay 报错了 ✓）：%r" % _st)
         check("1366x768" in _st, "② 状态行没报出**哪个尺寸** ✗：%r" % _st)
 
     # ③ 只读嘴脸：问不到就回 None ✓（不许编一份出来 ✗）；而且包装必须还在 ✓
-    check(ma.gain_record((4321, 8765)) is None,
+    check(ma_c.gain_record((4321, 8765)) is None,
           "③ `gain_record` 对**没量过的尺寸**编了一份出来 ✗（该回 None ✓）")
-    check(ma.auto_measure is not ma._raw_auto_measure,
+    check(ma_c.auto_measure is not ma_c._raw_auto_measure,
           "③ `auto_measure` 不再是那层留痕包装 ✗ ⇒ 留痕又断了 ✗（有人把它直接指回原函数了？）")
 
 
@@ -22998,8 +23174,7 @@ def t_mouse_aim_measure_settle():
 
     桩：`_probe_cursor` 模拟**慢 relay**（读到的总是 3 次之前的位置 ✓）⇒ 老写法在这根桩上必红 ✓。
     """
-    from decision import mouse_aim as ma
-
+    from execution import mouse_aim as ma
     true = {"p": (900, 700)}
     hist = []
 
@@ -23015,26 +23190,26 @@ def t_mouse_aim_measure_settle():
     def _move(dx, dy):
         true["p"] = (true["p"][0] + int(dx), true["p"][1] + int(dy))
 
-    saved = (ma._probe_cursor, ma.corner_zero, ma._restore_cursor, ma.save_gain,
-             ma._log_probe, ma.dinput.mouse_available, ma.dinput.mouse_move)
+    saved = (ma_c._probe_cursor, ma_c.corner_zero, ma_c._restore_cursor, ma_c.save_gain,
+             ma_c._log_probe, ma.dinput.mouse_available, ma.dinput.mouse_move)
     got = []
 
     def _save(gx, gy, frame_shape=None, extra=None):
         got.append((gx, gy, frame_shape, extra))
 
-    ma._probe_cursor = _probe
-    ma.corner_zero = _corner
-    ma._restore_cursor = lambda *a, **k: None
-    ma.save_gain = _save
-    ma._log_probe = lambda *a, **k: None       # ⚠ 别把桩里的假数写进真日志 ✗
+    ma_c._probe_cursor = _probe
+    ma_c.corner_zero = _corner
+    ma_c._restore_cursor = lambda *a, **k: None
+    ma_c.save_gain = _save
+    ma_c._log_probe = lambda *a, **k: None       # ⚠ 别把桩里的假数写进真日志 ✗
     ma.dinput.mouse_available = lambda: True
     ma.dinput.mouse_move = _move
-    ma._AUTO_LAST.clear()
+    ma_c._AUTO_LAST.clear()
     try:
-        ok, why = ma.auto_measure((768, 1366), force=True)
+        ok, why = ma_c.auto_measure((768, 1366), force=True)
     finally:
-        (ma._probe_cursor, ma.corner_zero, ma._restore_cursor, ma.save_gain,
-         ma._log_probe, ma.dinput.mouse_available, ma.dinput.mouse_move) = saved
+        (ma_c._probe_cursor, ma_c.corner_zero, ma_c._restore_cursor, ma_c.save_gain,
+         ma_c._log_probe, ma.dinput.mouse_available, ma.dinput.mouse_move) = saved
 
     check(ok and got,
           "量位移在**慢 relay** 的桩上没量成 ✗（要等光标停住再读 ✓ 见本用例 docstring 那两半 ✓）："
@@ -23048,9 +23223,9 @@ def t_mouse_aim_measure_settle():
               "`Δ=-600,-502` ✓）：gain=%r/%r why=%r" % (_gx, _gy, why))
         # ⚠ 传的是**形状**（不是字符串键 ✓ 字符串是 `save_gain` 自己归一出来的 ✓）⇒
         #   按**口径**判：`gain_frame_key` 收 `(h, w)`、归一出 `"1366x768"` ✓。
-        check(ma.gain_frame_key(_key) == "1366x768",
+        check(ma_c.gain_frame_key(_key) == "1366x768",
               "存下去的帧尺寸不对（该按 `(h, w)` 传 ✓ 归一出来是 `1366x768` ✓）：%r"
-              "（归一后 = %r）" % (_key, ma.gain_frame_key(_key)))
+              "（归一后 = %r）" % (_key, ma_c.gain_frame_key(_key)))
 
 
 def t_climb_align_stall_hop():
@@ -23069,10 +23244,11 @@ def t_climb_align_stall_hop():
         （否则 2×卡住判定时长后误判「按跳之后 y 没上升」⇒ 任务失败 ✓ 第一版实测就这样 ✓）；
       ④ 人一旦**走近了**⇒ 不再跳 ✓；设置里关掉 ⇒ 一次都不跳 ✓。
     """
-    import decision.route as route
+    from decision import jobs as jobmod
 
     def _run(px_seq, stall_jump=True):
-        job = route.ClimbJob("L13", 210.0, 0.0, -500.0, 1, stall_s=1.0, jump_start_px=0)
+        from decision import jobs as jobmod
+        job = jobmod.ClimbJob("L13", 210.0, 0.0, -500.0, 1, stall_s=1.0, jump_start_px=0)
         job.stall_jump = stall_jump
         now, hops = 0.0, []
         for px in px_seq:
@@ -23151,7 +23327,623 @@ def t_mmap_cfg_pushed_without_tab():
           "（少 `crop` 就裁不出小地图 ✓）：%r" % (sorted(got),))
 
 
+def t_plan_fail_cooldown():
+    """⭐⭐⭐⭐ 「规划失败」同一个目的地 5 秒内只记一条（2026-10-18 用户现场 ✓）。
+
+    现场：天空 `3 →(爬 L1)→ 2` 那条边建不出任务 ⇒ idle 切平台**每拍**重试 ⇒
+    `task_plan_fail` **每秒刷 25 条**（把线索全淹了，还白算 25 次路径 ✗）。
+
+    钉四条：
+      ① 第一次失败**要**留痕；② 冷却期内再失败**不再**留痕（但返回值不变 ✓）；
+      ③ `plan_fail_cooling()` 能查到"还在冷却"（调用方据此不重算 ✓）；
+      ④ 冷却过了**恢复**留痕（不是"永久放弃"✗ —— 用户修好数据就该立刻能用 ✓）。
+    """
+    import tempfile
+
+    from core import behavior
+
+    logf = Path(tempfile.mkdtemp(prefix="planfail_")) / "behavior.log"
+    old_log, old_en = behavior.LOG, behavior.ENABLED
+    try:
+        behavior.configure(True, log=logf)
+        s_ = fresh_settings()
+        h = Harness(s_)
+        with h._patched():
+            a = h.agent
+            ok1, why1 = a._plan_fail("2", "3 → 2 之间没有一条能走的边")
+            check(ok1 is False and why1, "`_plan_fail` 的返回值变了（调用方靠它说话 ✗）")
+            ok2, why2 = a._plan_fail("2", "同上")
+            check(ok2 is False and why2 == "同上", "冷却期内的返回值也被改掉了 ✗")
+            check(a.plan_fail_cooling("2"), "冷却期内 `plan_fail_cooling()` 没报出来 ✗")
+            check(not a.plan_fail_cooling("别的平台"),
+                  "没失败过的目的地也报\"冷却中\" ⇒ 会连正常前往一起挡住 ✗")
+            n1 = logf.read_text(encoding="utf-8").count("task_plan_fail")
+            check(n1 == 1,
+                  "两次连续失败留了 %d 条痕（该只留 1 条 ✓ 不然现场每秒 25 条 ✗）" % n1)
+            # ⑤ 冷却过了 ⇒ 恢复留痕（把上次时间往前拨 ✓ 直接改时间戳最稳）
+            a._plan_fail_at["2"] = a._plan_fail_at["2"] - (ag.PLAN_FAIL_QUIET_S + 1.0)
+            check(not a.plan_fail_cooling("2"), "冷却过了仍报\"冷却中\" ⇒ 永远不会再试 ✗")
+            a._plan_fail("2", "还是不行")
+            n2 = logf.read_text(encoding="utf-8").count("task_plan_fail")
+            check(n2 == 2, "冷却过后没恢复留痕（%d 条）⇒ 修好数据也看不到反馈 ✗" % n2)
+    finally:
+        behavior.configure(old_en)
+
+
+def t_carry_stall_climb():
+    """⭐⭐⭐⭐ 重算换对象时，**爬绳任务的对齐停滞记账也要搬**（2026-10-18 天空现场 ✓）。
+
+    现场：在 `底层` 上往 2 爬，被战斗打断 ≥0.25s ⇒ 「连目的地一起重算」**每秒一次**
+    （日志 `replan_on_resume v=0.9` 连刷）⇒ 每次都新建 `ClimbJob` ✗ ⇒
+    `_align_best / _align_best_at / _align_hops` 全清零 ✗ ⇒ 对齐相"3 秒没靠近"永远攒不满
+    ⇒ 用户看到的就是「**一直按着方向键，走不动跳一下从来没触发**」✗。
+
+    钉五条：
+      ① 同一根绳 + 同一个目的地 ⇒ 搬（`True`）；
+      ② `_align_best` / `_align_hops` 原样搬过去（不然"跳一下"和刹车都失效 ✗）；
+      ③ `_align_best_at` **要扣掉被暂停的那段**（被打断时人没在走，不算"卡住"✓）；
+      ④ 换了绳 ⇒ 不搬（新任务重新起算 ✓）；
+      ⑤ 换了目的地 ⇒ 不搬（别把上一段路的卡住记到新目标头上 ✓）。
+    """
+    from decision import jobs as jobmod
+
+    s_ = fresh_settings()
+    h = Harness(s_)
+    with h._patched():
+        a = h.agent
+        J = jobmod.ClimbJob
+
+        def _job(ladder="L1", dst="2"):
+            return J(ladder, x=300.0, y1=-1200.0, y2=200.0, direction=1, dst_set=dst)
+
+        old = _job()
+        old._align_best = 40.0
+        old._align_best_at = 100.0
+        old._align_hops = 2
+        old._paused_at = 101.0            # 被战斗打断了 1 秒 ✓
+
+        new = _job()
+        check(a._carry_stall(old, new, 102.0) is True,
+              "同一根绳 + 同一个目的地却没搬记账 ⇒ 对齐停滞钟每次重算都清零 ✗（现场就是这条）")
+        check(new._align_best == 40.0 and new._align_hops == 2,
+              "`_align_best` / `_align_hops` 没搬过去 ⇒ 「走不动跳一下」和它的刹车都失效 ✗")
+        check(new._align_best_at is not None
+              and abs(float(new._align_best_at) - 101.0) < 1e-6,
+              "`_align_best_at` 没扣掉暂停的那 1 秒（%.1f）⇒ 被打断的次数会被算成\"卡住\" ✗"
+              % (float(new._align_best_at or 0)))
+
+        check(a._carry_stall(old, _job(ladder="L2"), 102.0) is False,
+              "换了绳也照搬 ⇒ 上一根绳的\"卡住\"会冤枉新绳 ✗")
+        check(a._carry_stall(old, _job(dst="3"), 102.0) is False,
+              "换了目的地也照搬 ⇒ 上一段路的卡住记到新目标头上 ✗")
+
+
+def t_climb_jump_window_and_mid_land():
+    """⭐⭐⭐ 「上绳梯不按跳」+「半路莫名跳下来」两条现场（用户 2026-10-19，天空 200010302）✓
+
+    ① **不按跳**：绳不在起始层的 x 范围里（集合 3 的边到绳 **103px**、集合 2 是 **87px**）
+       ⇒ 只能**斜跳**过去抓绳 ✓；可设置里「起跳距离」只有 **65** ⇒ 斜跳窗口
+       `near_px(20) < |dx| ≤ jump_start_px(65)` **永远含不住**人站在平台边那个距离 ✗
+       ⇒ 只会一直"走"、一次都不跳（用户原话："**上绳梯时没有按跳**"✓）。
+       ⇒ `plan.job_for_edge` 现在把 `jump_start_px` 抬到**数据算出来的 reach + 6**（绳不在
+       起始层范围时）✓ —— 设置给得更大就照用（不往下压 ✓）。
+
+    ② **半路跳下来**：那两条边配 `mid_y=-1024`，而这张图 **y∈[-1100,-950] 一条 foothold 都没有**
+       （最近的在 -697 / -1237，差 327 / 213）⇒ 一跳就**直接掉回底层** ✗
+       （用户："从底层去 3，在爬 L1 去入口时莫名其妙会跳下来"✓）。
+       ⇒ `plan._mid_land` 核落点：没有平台就不启用中途跳（照常爬完整根绳），原因挂 `mid_warn` ✓。
+    """
+    from core import mapdata
+    from core import zones
+    from decision.pathing import plan as pathing
+
+    MID = "200010302"
+    t = mapdata.load(MID)
+    z = zones.load(MID)
+    # ⚠ **边用这里现造的，不读用户盘上的**（2026-10-19 ✓ 用户随后把那两条错边删了 ⇒
+    #   钉在用户数据上的用例会跟着红 ✗）。地形/绳是**数据里现成的**（L1 x=307）✓。
+    E_32 = {"kind": "climb", "from": "3", "to": "2", "ladder": "L1",
+            "mid_dir": "left", "mid_y": -1024}          # 现场那条（高度是错的）
+    E_32_OK = dict(E_32, mid_y=-517)                    # 高度改成 2 层的面 ✓
+    E_23_OK = {"kind": "climb", "from": "2", "to": "3", "ladder": "L1",
+               "mid_dir": "right", "mid_y": -697}       # 落 #28（x410~490）✓
+
+    # ① 两条"绳在平台外"的边：jump_start_px 必须抬到能含住平台边那个距离
+    for edge, dist in ((E_32, 103.0), (E_23_OK, 87.0)):
+        job = pathing.job_for_edge(t, z, edge, jump_start_px=65, near_px=20)
+        check(float(job.jump_start_px) >= dist,
+              "%s→%s 的斜跳窗口上界只有 %.0f，比\"平台边到绳\"的 %.0f 还小 "
+              "⇒ 站在平台边永远进不了窗口、**一次都不按跳** ✗"
+              % (edge["from"], edge["to"], float(job.jump_start_px), dist))
+
+    # ② 中途跳下的落点核查：-1024 是空的、-697 有平台
+    L = next((l for l in t.ladders if abs(float(l.x) - 307.0) < 2.0), None)
+    check(L is not None, "找不到 x=307 那根绳（L1），这条测不了")
+    ok_bad, why_bad = pathing._mid_land(t, L, -1024.0, "right")
+    check(not ok_bad and "没有" in why_bad,
+          "`mid_y=-1024` 那个高度**没有平台**，核落点却没拦下来 ⇒ 跳下去必掉底层 ✗（%r）" % (why_bad,))
+    ok_good, _why_good = pathing._mid_land(t, L, -697.0, "right")
+    check(ok_good, "`mid_y=-697` 朝右**有**平台（#28 在 x410~490），核落点却判没有 ✗")
+
+    # ③ 原样的错高度：造出来的任务里"中途跳"必须已被核掉，并且把原因说出来
+    job = pathing.job_for_edge(t, z, E_32, jump_start_px=65, near_px=20)
+    check(job.mid_dir == "" and job.mid_y is None,
+          "「高度」上没有平台却仍启用了中途跳 ⇒ 爬到那儿会跳进虚空 ✗")
+    check(bool(job.mid_warn) and "没启用" in job.mid_warn,
+          "核掉中途跳却**没说原因** ⇒ 人只会觉得它没照配置执行 ✗（%r）" % (job.mid_warn,))
+
+    # ④ ⭐⭐ **上绳一律 ↑，上绳之后才按 `mid_y` 定 ↑/↓**（用户 2026-10-19 ✓ 原话：
+    #   「3→2 不管方向朝哪里，只要是需要先上绳梯，那就要跳上绳梯；
+    #    上了之后再根据 `mid_y` 看是按 ↑ 还是 ↓」✓）
+    job = pathing.job_for_edge(t, z, E_32_OK, jump_start_px=65, near_px=20)
+    check(bool(getattr(job, "dir_by_mid", False)) and job.dir > 0,
+          "配了「中途跳下」的边，上绳阶段没改成\"一律 ↑\"（抓绳只认 ↑）✗")
+    # 上绳那一刻人在 3 层（y=-697），高度是 2 层（-517，更**低** ⇒ y 更大）⇒ 该 ↓
+    job.update(0.0, px=307.0, py=-697.0, ladder_id="L1")
+    check(job.dir < 0 and getattr(job, "_mid_descend", False),
+          "上了绳、人在「高度」上方 ⇒ 方向该判成 ↓（沿绳往下退），实际 dir=%+d ✗" % job.dir)
+    # 顺着绳退到高度（-517）⇒ 触发「中途跳下」
+    o = job.update(0.5, px=307.0, py=-517.0, ladder_id="L1")
+    check(bool(getattr(job, "_mid_jumped", False)) or job.phase == job.MID_JUMP,
+          "已经退到「高度」却没触发中途跳下 ✗（phase=%r note=%r）"
+          % (job.phase, (o.get("note") or "")[:60]))
+
+    # 反方向：2→3 在 2 层（-517）上绳、高度是 3 层（-697，更**高** ⇒ y 更小）⇒ 该 ↑
+    job2 = pathing.job_for_edge(t, z, E_23_OK, jump_start_px=65, near_px=20)
+    job2.update(0.0, px=307.0, py=-517.0, ladder_id="L1")
+    check(job2.dir > 0, "人在「高度」下方 ⇒ 方向该判成 ↑，实际 dir=%+d ✗" % job2.dir)
+
+
+def t_climb_never_attack_after_jump():
+    """⭐⭐⭐ 爬绳「**按跳之后**」与「**上爬相**」都不许被怪抢进 attack（用户 2026-10-19 ✓）。
+
+    现场（`behavior.log` 2026-10-19 00:30）：
+    ```
+    20.387  斜跳上绳：离绳 53 px ⇒ 按跳          ← 已经按跳了
+    20.520  battle_state climb → attack          ← 怪进来了
+    20.650  act keys=left move=1 task=align      ← **打架朝左走位**（人就在这时吸上绳）
+    20.651  climb_on_ladder v=1                  ← 吸上了
+    20.694  climb_phase = CLIMB
+    21.321  climb_on_ladder v=0                  ← 又掉了
+    21.656  pos x=430 y=76 sets=底层              ← 掉回底层
+    ```
+    用户看到的就是"**底层→入口莫名其妙跳下绳梯**"✓（其实是被打架的横键带离绳，
+    横键在绳上 = **松手** ✗）。
+
+    钉四条：
+      ① **按跳之后**（斜跳飞行 / 还在吸绳）⇒ 有怪也**不进 attack** ✓
+         （用户 2026-09-27 原话："从「按下跳」到「攀爬成功」期间都不应该进 attack"✓）；
+      ② 那几拍**必须按着 ↑**（不然吸不上去 ✓）；
+      ③ **上爬相（CLIMB）而广播丢了绳**（drift 出 `LADDER_DX`）⇒ 也不进 attack ✓
+         —— 这是"粘滞"要治的那条：广播一假就同时丢了"打架豁免"和"不按横键"两道保护 ✗；
+      ④ 对照：**对齐中、还没按跳** ⇒ 照旧先打（用户 2026-09-28 那条不许丢 ✓）。
+    """
+    from decision import jobs as jobmod
+
+    s = ag.DecisionSettings()
+    s.enabled = True
+    s.strategy = "patrol"
+    h = Harness(s)
+    h.clock0 = h.clock.t
+
+    def job():
+        return jobmod.ClimbJob(ladder_id="L2", x=500.0, y1=-9999.0, y2=9999.0, direction=1,
+                               dst_set="乙平台", src_set="甲平台", tol_px=6, hold_ms=0)
+
+    with h._patched():
+        up = s.keymap["up"]
+
+        # ① 按跳之后（斜跳飞行 / 吸绳那几拍）⇒ 不进 attack，且 ↑ 按着
+        h.agent.start_climb(job())
+        h.agent.tick(h.ws(with_mob=False))          # 先真跑一拍（任务跑过才记账 ✓）
+        j = h.agent._climb
+        j._jumped_once = True                       # 摆成"刚按过跳、还在吸绳"
+        j._diag_flying = True
+        j.phase = jobmod.ClimbJob.ALIGN
+        h.clock.t += 0.1
+        ws = h.ws(with_mob=True)
+        ws.player.ladder_id = None                  # 还没吸上（广播不认）
+        ws.player.on_rope_pos = "L2"
+        act = h.agent.tick(ws)
+        check(h.agent.state != "attack",
+              "按下跳、还在吸绳那几拍进了 attack ⇒ 打架一走位就把人从绳边带走 ✗"
+              "（用户 2026-10-19「莫名其妙跳下绳梯」）：%s" % h.agent.state)
+        check(up in set(act.get("keys") or []),
+              "按跳之后没按住 ↑（吸不上绳）✗：%s" % sorted(act.get("keys") or []))
+
+        # ③ 上爬相 + 广播丢了绳（drift 出去 25px）⇒ 也不进 attack，且 ↑ 不断
+        j._diag_flying = False
+        j.phase = jobmod.ClimbJob.CLIMB
+        h.clock.t += 0.1
+        ws3 = h.ws(with_mob=True)
+        ws3.player.ladder_id = None                 # 人漂出 LADDER_DX ⇒ 广播说"不在绳上"
+        ws3.player.on_rope_pos = None
+        act3 = h.agent.tick(ws3)
+        check(h.agent.state != "attack",
+              "上爬相里广播一丢绳就进 attack ⇒ 没人按 ↑ ⇒ **从绳上掉下来** ✗"
+              "（这正是现场那 0.6 秒）：%s" % h.agent.state)
+        check(up in set(act3.get("keys") or []),
+              "上爬相里 ↑ 断了（人会往下滑 / 掉）✗：%s" % sorted(act3.get("keys") or []))
+
+        # ④ 对照：对齐中、**还没按跳** ⇒ 照旧先打（2026-09-28 那条不许丢）
+        h.agent.start_climb(job())
+        h.agent.tick(h.ws(with_mob=False))
+        j2 = h.agent._climb
+        j2.phase = jobmod.ClimbJob.ALIGN
+        j2._jumped_once = False
+        j2._diag_flying = False
+        h.clock.t += 0.1
+        ws4 = h.ws(with_mob=True)
+        ws4.player.ladder_id = None
+        ws4.player.on_rope_pos = "L2"
+        h.agent.tick(ws4)
+        check(h.agent.state == "attack",
+              "站在平台上对齐绳、攻击范围内有怪却不打（「不打」的范围放太宽了 ✗）：%s"
+              % h.agent.state)
+
+
+def t_edge_guard_beat():
+    """⭐⭐⭐ 「**平台防落距离**」（用户 2026-10-19 ✓ 原话："在区域内时，如果角色距离区域
+    边缘小于这个距离，那就会**屏蔽所有的因战斗下达的方向**，并且**持续按区域边缘的反方向**；
+    直到进入防落距离之外或者**被其他寻路任务打断**"✓）。
+
+    钉九条：
+      ① `0` = 关 ⇒ 一个键都不动（老配置一字不变 ✓）；
+      ② 贴左边缘 ⇒ 摘掉全部方向键、只留**右**，**攻击键保留**（只摘方向 ✓）；
+      ③ 贴右边缘 ⇒ 只留**左**；
+      ④ 两边都宽裕 ⇒ 原样（不干预 ✓）；
+      ⑤ **不在战斗区域** ⇒ 原样（"在区域内"才管 ✓）；
+      ⑥ **寻路任务在跑** ⇒ 原样（用户："被其他寻路任务打断"✓）；
+      ⑥' **路线没走完**（`_route_total > 0`，但 `_climb`/`_route` 都空的那几拍）⇒ 原样
+          （用户 2026-10-21：「**平台防掉落 在执行去其他地区的寻路任务时不应该生效**」✓
+            —— 老判据会在"一步收工、下一步还没起手"那 1 拍插一脚 ✗）；
+      ⑥'' **排队中的前往**（`_goto_queue` 非空）⇒ 原样（还是"在路上" ✓）；
+      ⑦ 判不出来（没 `here_span` / 没定位）⇒ 原样（**不猜** ✗）。
+    """
+    import types
+
+    s = ag.DecisionSettings()
+    s.zone_edge_guard_px = 60
+    s.battle_zones = [{"set": "甲", "can_fight": True}]
+    km = s.keymap
+    L, R, U = km["left"], km["right"], km["up"]
+    ATK = km.get("alt") or "alt"
+
+    class _A:
+        """只借用 agent 的那三个纯方法（判据全在它们身上 ✓ 不拉整套 Harness ✓）。"""
+
+        _zone_enabled = ag.CombatAgent._zone_enabled
+        _zone_of_sets = ag.CombatAgent._zone_of_sets
+        _route_in_flight = ag.CombatAgent._route_in_flight
+        _edge_guard_beat = ag.CombatAgent._edge_guard_beat
+
+        def __init__(self, st):
+            self.settings = st
+            self._climb = None
+            self._route = []
+            self._route_total = 0
+            self._goto_queue = []
+            self._edge_guard_away = 0
+
+    def ws(px, span, sets=("甲",)):
+        return types.SimpleNamespace(player=types.SimpleNamespace(
+            world_x=px, here_span=span, here_sets=list(sets)))
+
+    a = _A(s)
+
+    # ⑥' 2026-10-21 新口径：**整趟没走完都让开**（用户：「平台防掉落 在执行去其他地区的
+    #     寻路任务时不应该生效」✓）—— 步与步之间那几拍 `_climb` / `_route` **同时为空**，
+    #     老判据会在那儿插一脚（现场 `behavior.log` 01:50:12：`route_goal_reached` 之后
+    #     1 ms 就有一条 `zone_edge_guard gap=27.8` ✗）。
+    a._climb = None
+    a._route = []
+    a._route_total = 2                      # ← 这一趟两步、才走完一步 ✓
+    k6b = {L, ATK}
+    check(a._edge_guard_beat(set(k6b), ws(105.0, (100.0, 500.0))) == k6b,
+          "**路线没走完**（只是这一步收工、下一步还没起手）就被防落改方向 ⇒ "
+          "跨地区那条路走不过去 ✗（用户 2026-10-21）")
+    a._route_total = 0
+    # ⑥'' 排队中的跨地区前往（`_goto_queue` 非空）同样算"在路上"
+    a._goto_queue = ["入口"]
+    check(a._edge_guard_beat(set(k6b), ws(105.0, (100.0, 500.0))) == k6b,
+          "**排队下发的寻路任务**（`_goto_queue` 非空）还在被防落改方向 ✗")
+    a._goto_queue = []
+
+    # ① 关
+    s.zone_edge_guard_px = 0
+    k0 = {L, ATK}
+    check(a._edge_guard_beat(set(k0), ws(105.0, (100.0, 500.0))) == k0,
+          "「平台防落距离 = 0」还在动手脚（老配置必须一字不变 ✗）")
+
+    s.zone_edge_guard_px = 60
+    # ② 贴左边缘（距左 5px）
+    out = a._edge_guard_beat({L, ATK}, ws(105.0, (100.0, 500.0)))
+    check(out == {R, ATK},
+          "贴着**左**边缘没被推开（该只剩「右」+ 攻击键，实际 %r）✗" % (out,))
+    # ③ 贴右边缘（距右 10px）
+    out = a._edge_guard_beat({R, ATK}, ws(490.0, (100.0, 500.0)))
+    check(out == {L, ATK},
+          "贴着**右**边缘没被推开（该只剩「左」+ 攻击键，实际 %r）✗" % (out,))
+    # ④ 两边都宽裕
+    k4 = {L, R}
+    check(a._edge_guard_beat(set(k4), ws(300.0, (100.0, 500.0))) == k4,
+          "离两边都 > 防落距离还在摘方向键（不该干预 ✗）")
+    # ⑤ 不在战斗区域
+    k5 = {L}
+    check(a._edge_guard_beat(set(k5), ws(105.0, (100.0, 500.0), sets=())) == k5,
+          "**不在战斗区域**里也在防落（用户口径是「在区域内时」✗）")
+    # ⑥ 寻路任务在跑
+    a._climb = object()
+    k6 = {L, U}
+    check(a._edge_guard_beat(set(k6), ws(105.0, (100.0, 500.0))) == k6,
+          "**寻路任务在跑**还被防落改写方向（用户：「被其他寻路任务打断」✗）")
+    a._climb = None
+    # ⑦ 判不出来
+    k7 = {L}
+    check(a._edge_guard_beat(set(k7), ws(105.0, None)) == k7,
+          "没有 `here_span` 还硬猜了一侧（判不出来就该原样返回 ✗）")
+
+
+def t_rope_no_horizontal_keys():
+    """⭐⭐⭐⭐ 绳上**绝不许带横向键**（左/右 = 松手掉下去）—— 发键前最后一道铁律。
+
+    用户 2026-10-19 **两次**现场（"底层→入口 莫名其妙跳下绳梯" / "会莫名其妙松开 ↑，
+    永远到不了入口"✓），日志里同一副样子：
+    ```
+    pos x=286.8 y=-34.6  st=climb
+    act keys=left,up  move=-1  task=climb      ← 正在爬绳，却带了 **left**
+    ```
+    横键来源不止一处（换向补键 / 站桩补朝向 / 打架走位 / 以后新加的分支）⇒ **收口守一次**：
+    `_rope_key_guard` 在四处 `self.keys.set(...)` 之前统一摘左右 ✓。
+
+    钉四条：
+      ① 在绳上（`_in_rope_now`）⇒ 左右**一律摘掉**，↑/↓ 一个不动（用户 2026-09-28：
+         "绳上绝不按左右"反过来说也成立 —— **绝不动 ↑/↓** ✓）；
+      ② **「中途跳下」相例外**：那一相**必须**带方向才能跳离绳 ⇒ 放行 ✓；
+      ③ 不在绳上（对齐阶段还没跳 / 站在平台）⇒ **原样**（那时要按方向走过去 ✓）；
+      ④ 端到端：上爬相 + 怪在旁边（会补朝向键）⇒ `act` 的键里**没有左右**、**有 ↑** ✓。
+    """
+    from decision import jobs as jobmod
+
+    s = ag.DecisionSettings()
+    s.enabled = True
+    s.strategy = "patrol"
+    km = s.keymap
+    L, R, U, D = km["left"], km["right"], km["up"], km["down"]
+
+    class _A:
+        _rope_key_guard = ag.CombatAgent._rope_key_guard
+
+        def __init__(self):
+            self.settings = s
+            self._in_rope_now = True
+            self._climb = None
+
+    a = _A()
+    # ① 在绳上 ⇒ 摘左右、↑↓ 不动
+    out = a._rope_key_guard({L, U})
+    check(out == {U}, "在绳上还留着横键（左/右 = 松手掉下去 ✗）：%r" % (out,))
+    out = a._rope_key_guard({R, D})
+    check(out == {D}, "在绳上还留着横键（往下爬时同样不许带左右 ✗）：%r" % (out,))
+
+    # ② 「中途跳下」相必须放行（要方向才能跳离绳）
+    a._climb = jobmod.ClimbJob(ladder_id="L1", x=307.0, y1=-1235.0, y2=75.0, direction=1,
+                               dst_set="乙", src_set="甲", tol_px=6, hold_ms=0,
+                               mid_dir="left", mid_y=-517.0)
+    a._climb.phase = jobmod.ClimbJob.MID_JUMP
+    k = {L, U}
+    check(a._rope_key_guard(set(k)) == k,
+          "「中途跳下」相把方向键摘了 ⇒ 跳不离绳、落回原处 ✗")
+
+    # ③ 不在绳上 ⇒ 原样（对齐阶段要按方向走过去 ✓）
+    a._in_rope_now = False
+    check(a._rope_key_guard({L, U}) == {L, U},
+          "不在绳上也在摘横键（对齐/站平台上就走不过去了 ✗）")
+    a._in_rope_now = True
+    a._climb = None
+
+    # ④ 端到端：上爬相 + 怪在旁边（`_hold_turn` 会补朝向）⇒ 键里没有左右、有 ↑
+    h = Harness(s)
+    h.clock0 = h.clock.t                        # 手动推进时钟（记录器要用它 ✓ 见 Harness._rec）
+    with h._patched():
+        h.agent.start_climb(jobmod.ClimbJob(
+            ladder_id="L2", x=500.0, y1=-9999.0, y2=9999.0, direction=1,
+            dst_set="乙平台", src_set="甲平台", tol_px=6, hold_ms=0))
+        h.agent.tick(h.ws(with_mob=False))          # 先真跑一拍
+        j = h.agent._climb
+        j.phase = jobmod.ClimbJob.CLIMB
+        j._jumped_once = True
+        h.clock.t += 0.1
+        ws = h.ws(with_mob=True)
+        ws.player.ladder_id = "L2"
+        ws.player.on_rope_pos = "L2"
+        act = h.agent.tick(ws)
+        ks = set(act.get("keys") or [])
+        check(not ({L, R} & ks),
+              "上爬相这一拍把横键发出去了 ⇒ 人当场从绳上松手掉下去 ✗：%s" % sorted(ks))
+        check(U in ks, "上爬相这一拍没按 ↑（爬不上去）✗：%s" % sorted(ks))
+
+
+def t_reconnect_click_anchors_inside_cells():
+    """⭐⭐⭐⭐ 「点服务器 / 点频道」的落点必须落在**格子里面**（用户 2026-10-20 ✓
+    原话："森林迷宫_珠缨 选区服 鼠标点不中"）。
+
+    现场（`behavior.log` 2026-10-20 08:45:52，1366×768）：
+    ```text
+    点服务器：画面比例 (0.363, 0.207) ⇒ 画面 (497, 159)
+    点频道  ：频道 54 滚 9 行后 ⇒ 画面 (654, 513)
+    ```
+    · 服务器第 1 格木条 x **407~497**、y 153~175 ⇒ 497 = **正好压在右沿上** ✗；
+    · 频道第 5 行彩条 y ≈ 501（行带 493~510）⇒ **513 掉在列表下面的空地** ✗
+    ⇒ 两次都"点了没反应"；而 `reconnect_click ok=True` 只说明**指令发出去了** ✗
+    （见 `Reconnector.feedback` 那段说明 ✓）⇒ 界面上看就是"鼠标点不中" ✓。
+
+    量测口径（`datasets/lie/captures/channel_list_20261020_084552.png` /
+    `channel_panel_20261020_084609.png`，均 1366×768，取**条的中心** ✓）：
+      · 服务器第 1 格 木条 **x 407~497 / y 153~175** ⇒ 中心 (452, 164)
+      · 频道彩条 4 根 **x 512~600 / 606~694 / 702~790 / 799~887**、
+        行中心 **378 / 408 / 440 / 470 / ≈501** ⇒ 列距 ≈95.7px、行距 ≈30.7px
+
+    钉两条（都留 3px 余量，宁可宽松也别在边界上晃 ✗）：
+      ① 服务器那一下在**木条里面**（不是右沿）✓；
+      ② 「频道 54」算出来的落点在**第 2 列 / 屏上第 5 行**里面 ✓
+        （这一条会随 `CHANNEL_GRID_*` 或锚点漂移而红 ✓）。
+    """
+    from decision import reconnect as rc
+
+    s = ag.DecisionSettings()
+    W, H = 1366.0, 768.0
+
+    sx, sy = s.reconnect_server_x * W, s.reconnect_server_y * H
+    check(410.0 <= sx <= 494.0,
+          "点服务器横向落在木条外 / 压在右沿（木条 407~497，落点 %.0f）："
+          "客户端改版后要**重量格子中心**，别只改一点点 ✗" % sx)
+    check(156.0 <= sy <= 172.0,
+          "点服务器纵向落在木条外（木条 153~175，落点 %.0f）✗" % sy)
+
+    n = 54                                    # 用户这个项目要进的频道（现场 ✓）
+    col = (n - 1) % rc.CHANNEL_GRID_COLS
+    row = (n - 1) // rc.CHANNEL_GRID_COLS
+    need = max(0, row - (rc.CHANNEL_GRID_ROWS - 1))
+    on_screen = row - need
+    cx = (s.reconnect_channel_x + col * rc.CHANNEL_GRID_DX) * W
+    cy = (s.reconnect_channel_y + on_screen * rc.CHANNEL_GRID_DY) * H
+    check(609.0 <= cx <= 691.0,
+          "频道 %d 的横向落点不在第 %d 根彩条里（彩条 606~694，落点 %.0f）✗"
+          % (n, col + 1, cx))
+    check(494.0 <= cy <= 508.0,
+          "频道 %d 的纵向落点不在屏上第 %d 行里（行带 493~510，落点 %.0f）"
+          "⇒ 会点在第 5 行**下面的空地**上，界面毫无反应 ✗" % (n, on_screen + 1, cy))
+
+
+def t_reconnect_scroll_not_timeout():
+    """⭐⭐⭐⭐ 滚轮这一轮**不许被「这一步超时」打断**（用户 2026-10-20 ✓
+    原话："**选频道界面鼠标乱飞**"）。
+
+    现场（`behavior.log` 08:57:43.8 → 08:57:46.8）算一遍就明白：
+    ```text
+    频道 54 ⇒ 要往下滚 9 格（一格一拍 ✓ `SCROLL_SETTLE` = 0.35s）
+    9 × 0.35 ≈ 3.1 秒  >  reconnect_step_timeout_ms = 3.0 秒
+    ⇒ 滚到第 7 格就被判「这一步超时」⇒ 从头再来 ⇒ 又滚 9 格 ⇒ …
+    ⇒ 永远走不到"点"那一下 ⇒ 界面上就是「砸左上角 → 横穿全屏飞回来」一轮又一轮 ✓
+    ```
+    ⚠ 这条和 `mouse_aim.scroll` 那条"每格都撞角"是**两个独立原因**，缺一不可 ✓：
+      前者让**流程卡死**，后者让**光标乱飞**。
+
+    钉三条：
+      ① 9 格滚完 ⇒ 出 `click` ✓（老版是回去再滚 9 格 ✗）；
+      ② `scroll` 动作**正好 9 个**（多一个 = 又从头滚了一轮 ✗）；
+      ③ 全程 `_tries == 0`（滚动是我们自己的进度，不是"重试失败" ✗）。
+    """
+    import numpy as np
+    import perception.screen.ui_state as ui_state
+    from decision.reconnect import Reconnector
+    from execution import mouse_aim as ma
+
+    frame = np.full((8, 8, 3), 128, np.uint8)
+    _orig_detect, _orig_avail = ui_state.detect, ma_c.aim_available
+    _orig_vis = ma.cursor_visible
+    ui_state.detect = lambda f: ui_state.UI_CHANNEL_PANEL
+    ma_c.aim_available = lambda: (True, "")
+    ma.cursor_visible = lambda: True          # 光标看得见 ⇒ 不走"先归零"那一拍 ✓
+    try:
+        s = fresh_settings(reconnect_enabled=True, reconnect_probe_after_lost_sec=0.0)
+        s.enabled = True
+        s.reconnect_channel = 54
+        s.reconnect_step_timeout_ms = 3000    # 现场的默认值（3 秒 ✓）
+        r = Reconnector(s)
+        r.update(frame, True, 100.0)
+        now, acts = 101.0, []
+        out = r.update(frame, False, now)     # 第 1 拍（可能先吃一次"上一步超时"⇒ 起滚 ✓）
+        if out:
+            acts.append(out.get("act"))
+        _base_tries = int(r._tries)           # ⚠ 起滚那一刻的账 = 基准（不许在滚动期间再涨 ✓）
+        for _ in range(60):                   # 5 fps × 12 秒 ✓ 够滚完 + 点
+            now += 0.2
+            out = r.update(frame, False, now)
+            if out:
+                acts.append(out.get("act"))
+            if "click" in acts:
+                break
+        _n_scroll = acts.count("scroll")
+        check("click" in acts,
+              "滚完 9 格**没走到点击**（被「这一步超时」打回重滚 ⇒ 永远进不了频道 ✗）：%r"
+              % (acts,))
+        check(_n_scroll == 9,
+              "滚轮动作该正好 9 个（多出来的都是从头上路重滚一轮 ⇒ 鼠标乱飞 ✓）：%d 个 %r"
+              % (_n_scroll, acts))
+        check(int(r._tries) == _base_tries,
+              "滚动期间又吃了「重试」（3 秒超时插进来 ⇒ 会一路耗到放弃 ✗）：%d → %d"
+              % (_base_tries, int(r._tries)))
+    finally:
+        ui_state.detect, ma_c.aim_available = _orig_detect, _orig_avail
+        ma.cursor_visible = _orig_vis
+
+
+def t_route_defers_while_minimap_scrolling():
+    """⭐⭐⭐⭐ 局部地图在滚的时候**这一步推迟**，一个键都不许按
+    （用户 2026-10-20 ✓ 原话："在局部地图滚动时，寻路任务的执行需要推迟直至其稳定"）。
+
+    为什么要推迟（日志 511 的现场）：显示区在滚 ⇒ **世界坐标逐拍在变** ⇒ 这一拍算出来的
+    dx / "到没到" / "离绳多远" 下一拍就作废 ⇒ 按它按键就是来回抖
+    （实测 y 两秒跨整张图、集合在 二楼/三楼 之间乱跳 ⇒ 一路"下跳" ✓）。
+
+    钉四条：
+      ① `world_stable=False` ⇒ `_climb_tick` 返回 False（= 这一步**没跑** ✓
+         不许当成"跑完了"去接下一步 ✗）；
+      ② **一个键都不许按**（`keys` 空、也没有真的 down/tap ✓）；
+      ③ 状态行说清"等局部地图稳住"（静默不动最难查 ✓）；
+      ④ 稳了之后**照常跑**（闸不能做成死锁 ✓）。
+    """
+    from decision import jobs as jobmod
+
+    s = fresh_settings()
+    s.enabled = True
+    h = Harness(s)
+    a = jobmod.WalkJob("甲集合", [(520.0, 510.0, 530.0, -208.0, "1")])
+    with h._patched():
+        check(h.agent.start_route([a], why="用例：局部地图在滚"), "没起跑")
+        ws = h.ws(with_mob=False)
+        ws.player.here_sets = []
+        ws.player.world_stable = False
+        ws.player.world_why = "小地图显示区刚挪了 37 像素（还在滚）"
+        keys = set()
+        r = h.agent._climb_tick(1.0, 500.0, keys, ws)
+        check(r is False,
+              "地图还在滚，这一拍却当成跑完了（会去接下一步 / 吃寻路超时 ✗）")
+        check(not keys, "地图还在滚却按了键（坐标下一秒就变 ⇒ 角色来回抖 ✗）：%r" % (keys,))
+        check(not [e for e in h.log if e[1] in ("down", "tap")],
+              "地图还在滚却真的发出了按键：%r" % (h.log,))
+        check("等局部地图稳住" in str(h.agent.current_goto_note() or ""),
+              "没说清为什么不动（现场只能看到人站着，查不出来 ✗）：%r"
+              % (h.agent.current_goto_note(),))
+
+        # ④ 稳了 ⇒ 照旧跑（闸不是死锁 ✓）
+        ws.player.world_stable = True
+        ws.player.world_why = ""
+        ws.player.here_sets = ["甲集合"]
+        h.agent._climb_tick(2.0, 500.0, keys, ws)
+        check("等局部地图稳住" not in str(h.agent.current_goto_note() or ""),
+              "地图都稳了还在说「等」（说明那一拍根本没走到 job.update ✗）")
+
+
 CHECKS = [
+    ("⭐⭐⭐⭐ 局部地图在滚 ⇒ 寻路这一步推迟、一个键都不按（用户 2026-10-20"
+     "「在局部地图滚动时，寻路任务的执行需要推迟直至其稳定」）："
+     "返回 False · 不按键 · 说清原因 · 稳了照常跑", t_route_defers_while_minimap_scrolling),
+    ("⭐⭐⭐⭐ 滚轮这一轮不许被「这一步超时」打断（用户 2026-10-20「选频道界面鼠标乱飞」）："
+     "9 格滚完就点 · 滚动动作正好 9 个 · 不算重试", t_reconnect_scroll_not_timeout),
+    ("⭐⭐⭐⭐ 「点服务器 / 点频道」落点必须在格子里（用户 2026-10-20「选区服 鼠标点不中」）："
+     "服务器在木条里 · 频道 54 在第 2 列第 5 行里", t_reconnect_click_anchors_inside_cells),
+    ("⭐⭐⭐⭐ 绳上绝不许带横键（左/右=松手）：发键前统一摘掉 · 中途跳下相放行 · "
+     "不在绳上原样 · 上爬相+怪 ⇒ 无横键且有 ↑（用户 2026-10-19 两次现场）",
+     t_rope_no_horizontal_keys),
+    ("⭐⭐⭐ 「平台防落距离」：区域内贴边 ⇒ 屏蔽战斗方向并往外走（用户 2026-10-19）；"
+     "0=关 · 攻击键保留 · 不在区域/有寻路任务/判不出 ⇒ 不干预",
+     t_edge_guard_beat),
+    ("⭐⭐⭐ 爬绳「按跳之后 / 上爬相」不被怪抢进 attack（用户 2026-10-19：底层→入口"
+     "莫名其妙跳下绳梯 = 打架横键把人从绳上带走）+ 对齐中仍照旧先打",
+     t_climb_never_attack_after_jump),
     ("⭐⭐⭐ 「攻击目标数量」：0 = 不启用 / -1 = 不限制 / N = 同时最多 N 只在 CD"
      "（用户 2026-10-06 第二轮）",
      t_mob_atk_count),
@@ -23348,7 +24140,7 @@ CHECKS = [
      t_link_health_watch),
     ("定时重置：本地后端也要真的松开按键（没有固件兜底）",
      t_periodic_reset_local_backend),
-    ("类别表：只在 perception/classes.py 定义",
+    ("类别表：只在 perception/detect/classes.py 定义",
      t_class_table_single_source),
     ("时序拍：next_deadline 报的是序列到点时刻",
      t_next_deadline),
@@ -23574,6 +24366,9 @@ CHECKS = [
     ("⭐⭐ 传送点补按的节拍 = 「移动操作尝试间隔」（用户 2026-10-06 追问）：`start_climb` 真灌进"
      "传送点任务 / 过了它 agent 真补按 ↑ / 没到点不许补 / 配 0 一个都不补",
      t_portal_reassert_uses_move_retry),
+    ("⭐⭐⭐ 绳在平台外时斜跳窗口要够长（治\"上绳梯不按跳\"）+ 中途跳下要核落点"
+     "（治\"爬到半路莫名跳下来\"）—— 用户 2026-10-19 天空两条现场",
+     t_climb_jump_window_and_mid_land),
     ("⭐⭐ 「多点巡逻」/「平台站桩」：**背后攻击范围内有怪 ⇒ 转身打它**（用户 2026-10-06 报"
      "「好像没生效」✗ —— 那两支把「够得着但方向不对」的怪一起吃掉、还排在追击之前 ✗）",
      t_multi_turn_to_behind_mob),
@@ -23591,6 +24386,10 @@ CHECKS = [
      t_climb_align_near_px),
     ("玩家行为打点（初版：**只有任务**）—— 六个事件要真的落到 `behavior.log` 里。",
      t_behavior_task_events),
+    ("⭐⭐⭐⭐ 规划失败同目的地 5 秒只记一条（治\"每秒刷 25 条\"✓）",
+     t_plan_fail_cooldown),
+    ("⭐⭐⭐⭐ 重算换对象时爬绳的对齐停滞记账也要搬（治\"走不动不跳\"✓）",
+     t_carry_stall_climb),
     ("寻路的**任务内部变化**也进 behavior.log（相切换 / 斜跳 / 失败重来，用户 2026-09-28 要求）。",
      t_behavior_route_events),
     ("ladder_id 许可改成「climb 执行器按住 ↑ 后发起通知」（诉求 1，用户 2026-09-28）。",
@@ -23792,7 +24591,7 @@ def main():
                 #   `recv` 里 ⇒ **`0xC0000005`** ✗（实测崩栈停在 `minimap._recv_exact` ✓，而且
                 #   "崩在第几条"每次都不一样 ✓ = 时机性 ✓）。⇒ 一条一条收干净 ✓
                 try:
-                    from perception.minimap import stop_all_clients
+                    from perception.map_client import stop_all_clients
                     stop_all_clients()
                 except Exception:                  # noqa: BLE001 —— 收尾不该改判结果 ✓
                     pass
@@ -23811,7 +24610,7 @@ def main():
         #   —— 表现就是"跑到最后不清不楚地崩掉、**连失败清单都不打**" ✗（用户报的正是它 ✓）。
         #   ⚠ 必须赶在**进程退出之前** ✓（`sys.exit(main())` 之后就没机会了 ✗）。
         try:
-            from perception.minimap import stop_all_clients
+            from perception.map_client import stop_all_clients
             stop_all_clients()
         except Exception:                       # noqa: BLE001 —— 收尾失败不该改判结果 ✓
             pass

@@ -173,7 +173,7 @@ class KbdClient:
         #:   ⚠ 同机多实例时**只有第一个连上的是控制端** ✓（见 `remote_kbd/relay.py`）——
         #:   只读端发指令会被 `ERR busy` 挡掉 ✓，但光看 `ERR` 分不清"固件不认"还是
         #:   "控制位被占"✗ ⇒ relay 在握手后先发一条 `ROLE …` ✓ 这里记下来 ✓
-        #:   ⇒ `decision/input.link_health()` 才能如实说"本实例只读"✓
+        #:   ⇒ `execution/input.link_health()` 才能如实说"本实例只读"✓
         self.role = ""
         # 回执计数：固件对每条指令都会回 DONE/ERR。靠它判断「TCP 发得出去、
         # 但固件根本没在处理」这种更隐蔽的卡死（relay 卡在串口写上时就是这样，

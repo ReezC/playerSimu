@@ -32,7 +32,7 @@ from collections import deque
 
 import numpy as np
 
-from perception.assign import BIG, hungarian
+from perception.track.assign import BIG, hungarian
 
 # ---- 轨迹状态 ----
 NEW = 0
@@ -62,7 +62,7 @@ LOST_KEEP = 300
 
 
 def iou_xyxy(a, b):
-    """两个 `xyxy` 框的 IoU（`perception.tracker._iou` 同一口径 ✓ 这里自留一份不互相 import ✓）。"""
+    """两个 `xyxy` 框的 IoU（`perception.track.tracker._iou` 同一口径 ✓ 这里自留一份不互相 import ✓）。"""
     ax1, ay1, ax2, ay2 = float(a[0]), float(a[1]), float(a[2]), float(a[3])
     bx1, by1, bx2, by2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
     iw = min(ax2, bx2) - max(ax1, bx1)
@@ -289,7 +289,7 @@ class ByteTracker:
     # ---------------- 关联 ----------------
     @staticmethod
     def _associate(tracks, dets, iou_thresh):
-        """IoU 关联（**全局最优** ✓ 走 `perception.assign.hungarian` ✓ 不新造轮子 ✓）。
+        """IoU 关联（**全局最优** ✓ 走 `perception.track.assign.hungarian` ✓ 不新造轮子 ✓）。
 
         返回 `[(tracks 下标, dets 下标), ...]`；低于阈值的一律**不进代价图**（`BIG` ✓）。
         """

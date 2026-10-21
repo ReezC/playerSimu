@@ -1,4 +1,4 @@
-"""离线校验界面判别：把整段重连素材喂给 perception.ui_state.detect()，逐段打印判到的界面。
+"""离线校验界面判别：把整段重连素材喂给 perception.screen.ui_state.detect()，逐段打印判到的界面。
 
 **为什么要有这个脚本**：锚点（`ui_state.ANCHORS` 里的矩形）是照着录像量出来的，
 一旦改了矩形、换了模板图、或者游戏 UI 版本更新，都可能悄悄失准 —— 失准的后果是
@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from perception import ui_state
+from perception.screen import ui_state
 
 # 素材里的真实时间轴：(起, 止, 期望界面)。改锚点后如果这里开始报不符，就是退化了。
 EXPECT = [

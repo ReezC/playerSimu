@@ -1,6 +1,6 @@
 """玩家状态读取：位置（模板匹配）+ HP/MP（UI 条颜色占比）。
 
-玩家定位走模板匹配（不走 YOLO 训练），复用 perception/player_locator.py。
+玩家定位走模板匹配（不走 YOLO 训练），复用 perception/world/player_locator.py。
 HP/MP 读屏幕 UI 条：在条区域里数「条颜色」像素占比，不用 OCR。
 
 定位策略（按用户「初始化 → 追踪」的思路）：
@@ -23,8 +23,8 @@ UI 条配置（ui 参数）结构：
 import cv2
 import numpy as np
 
-from perception.player_locator import PlayerLocator
-from perception.world_state import Player
+from perception.world.player_locator import PlayerLocator
+from perception.world.world_state import Player
 
 
 class PlayerStateReader:

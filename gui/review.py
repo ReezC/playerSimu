@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QLi
 
 from gui import labelio, theme
 from gui.canvas import MIN_SIZE, MODE_LABEL, MODE_REGION, MODE_SELECT, ImageCanvas
-from perception import region as region_mod        # ⭐ 框选区域一处口径 ✓（见 `region.py` ✓）
+from perception.world import region as region_mod        # ⭐ 框选区域一处口径 ✓（见 `region.py` ✓）
 from gui.widgets import NoWheelComboBox, NoWheelSlider
 
 
@@ -281,7 +281,7 @@ class ReviewPanel(QWidget):
                #   "**挑出标过掉落物的帧**" —— 复核/补漏掉落物标注时用得上 ✓。
                ("只看有掉落物", "has_drop"),
                # ⭐ 「只看有宠物」（用户 2026-10-05 ✓）：宠物是**干扰类**（class 5 ✓ 见
-               #   `perception/classes.py` ✓）—— 自动标注**会**产它（`tools/label_pets` ✓ 模板匹配
+               #   `perception/detect/classes.py` ✓）—— 自动标注**会**产它（`tools/label_pets` ✓ 模板匹配
                #   或 YOLO 补框 ✓），所以这条既是"挑出标过宠物的帧"、也是**复核宠物框**的入口 ✓
                #   （宠物最烦的错误是"把宠物误检成怪"⇒ 逐帧看一遍那几帧就够了 ✓）。
                ("只看有宠物", "has_pet"),
@@ -437,10 +437,10 @@ class ReviewPanel(QWidget):
         self.cmb_cls = NoWheelComboBox()
         # 顺序按常用度：怪物最常用（自动标注也产它），玩家次之 —— 而**按住 Ctrl
         # 拖出来的一律是玩家框**（不用来回切下拉框，见下面那行提示）。
-        # 「其他玩家」只人工标（自动标注不产这个类，见 perception/classes.py）。
+        # 「其他玩家」只人工标（自动标注不产这个类，见 perception/detect/classes.py）。
         # ⭐ **掉落物**（用户 2026-10-04 ✓ 第 1 条："质检台现在需要能手动标注掉落物类"）——
         #   排第二：自动标注产的是 玩家/怪物（见 `tools/label_drops` ✓），而**掉落物全靠人工补**
-        #   ⇒ 它和怪物一样常用 ✓（`CLASS_DROP = 2` 见 `perception/classes.py` ✓ 颜色/名字都在那儿 ✓）。
+        #   ⇒ 它和怪物一样常用 ✓（`CLASS_DROP = 2` 见 `perception/detect/classes.py` ✓ 颜色/名字都在那儿 ✓）。
         for _cls in (labelio.CLASS_MOB, labelio.CLASS_DROP, labelio.CLASS_PLAYER,
                      labelio.CLASS_OTHER_PLAYER, labelio.CLASS_PET):
             self.cmb_cls.addItem(labelio.label(_cls), _cls)

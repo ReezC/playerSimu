@@ -16,7 +16,7 @@ import cv2
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from perception import ui_state                        # noqa: E402
+from perception.screen import ui_state  # noqa: E402
 
 VIDEO = ROOT / "datasets" / "records" / "断线重连素材.mp4"
 

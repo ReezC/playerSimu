@@ -1096,7 +1096,7 @@ class ZoneEditorDialog(QDialog):
             raise RuntimeError("没有 %s 的地形数据 —— 先在「路线识别」里点「生成地形图」"
                                % self.map_id)
         self._zones_path = Path(zones_path) if zones_path else zones.zones_path(self.map_id)
-        self.zones = self._load_zones()
+        self.zone_map = self._load_zones()
         self._sel = set()                   # 当前选中的 foothold id（字符串）
         #: 「**点选着的绳梯**」（存 `Ladder` 对象本身；`None` = 没选）——
         #: 用户 2026-09-27 要求："foothold 编辑器希望能**点选绳梯**（为了快速查看它的信息），
@@ -1148,7 +1148,7 @@ class ZoneEditorDialog(QDialog):
 
     def _snapshot(self):
         """改动**之前**拍一张（集合文件很小，整份存最省心）。"""
-        return json.dumps(self.zones.to_dict(), ensure_ascii=False)
+        return json.dumps(self.zone_map.to_dict(), ensure_ascii=False)
 
     def _commit(self, snap):
         """一次改动**成功之后**才登记撤销点。
@@ -1166,15 +1166,15 @@ class ZoneEditorDialog(QDialog):
     def undo(self):
         if not self._undo:
             return
-        self._redo.append(json.dumps(self.zones.to_dict(), ensure_ascii=False))
-        self.zones = zones.Zones.from_dict(json.loads(self._undo.pop()))
+        self._redo.append(json.dumps(self.zone_map.to_dict(), ensure_ascii=False))
+        self.zone_map = zones.Zones.from_dict(json.loads(self._undo.pop()))
         self._after_change()
 
     def redo(self):
         if not self._redo:
             return
-        self._undo.append(json.dumps(self.zones.to_dict(), ensure_ascii=False))
-        self.zones = zones.Zones.from_dict(json.loads(self._redo.pop()))
+        self._undo.append(json.dumps(self.zone_map.to_dict(), ensure_ascii=False))
+        self.zone_map = zones.Zones.from_dict(json.loads(self._redo.pop()))
         self._after_change()
 
     def _after_change(self):
@@ -1201,7 +1201,7 @@ class ZoneEditorDialog(QDialog):
         if not self._sel:
             raise ValueError("先在地图上选中 foothold（点选或框选）")
         snap = self._snapshot()
-        out = self.zones.add_set(name, sorted(self._sel))   # 失败会抛，此时 zones 没动
+        out = self.zone_map.add_set(name, sorted(self._sel))   # 失败会抛，此时 zones 没动
         # **先记高亮，再 _commit**：_commit 里会重建场景，晚设等于"刚注册完看不见高亮"，
         # 得再去点一下列表才亮（实测就是这么别扭）。
         self._highlight = out
@@ -1219,7 +1219,7 @@ class ZoneEditorDialog(QDialog):
 
     def delete_set(self, name):
         snap = self._snapshot()
-        gone = self.zones.remove_set(name)
+        gone = self.zone_map.remove_set(name)
         if self._highlight == name:
             self._highlight = None
         self._commit(snap)
@@ -1227,7 +1227,7 @@ class ZoneEditorDialog(QDialog):
 
     def rename(self, old, new):
         snap = self._snapshot()
-        out = self.zones.rename_set(old, new)
+        out = self.zone_map.rename_set(old, new)
         self._highlight = out          # 同上：必须在 _commit（会重建场景）之前
         self._commit(snap)
         return out
@@ -1238,8 +1238,8 @@ class ZoneEditorDialog(QDialog):
                              "注意：点集合会清掉视窗里的选择，所以若是「先选 foothold "
                              "再点集合」的顺序，选择已经没了 —— 按住 Shift 再选就不会清。")
         snap = self._snapshot()
-        self.zones.sets[name]["footholds"] = sorted(
-            set(self.zones.sets[name]["footholds"]) | set(self._sel))
+        self.zone_map.zones[name]["footholds"] = sorted(
+            set(self.zone_map.zones[name]["footholds"]) | set(self._sel))
         self._commit(snap)
 
     def remove_from_set(self, name):
@@ -1248,18 +1248,18 @@ class ZoneEditorDialog(QDialog):
                              "注意：点集合会清掉视窗里的选择，所以若是「先选 foothold "
                              "再点集合」的顺序，选择已经没了 —— 按住 Shift 再选就不会清。")
         snap = self._snapshot()
-        self.zones.sets[name]["footholds"] = sorted(
-            set(self.zones.sets[name]["footholds"]) - set(self._sel))
+        self.zone_map.zones[name]["footholds"] = sorted(
+            set(self.zone_map.zones[name]["footholds"]) - set(self._sel))
         self._commit(snap)
 
     def save(self):
         """校验后落盘 → (路径, 问题列表)。有问题**不挡着保存**，但要人知道。"""
-        probs = self.zones.validate(self.terrain)
+        probs = self.zone_map.validate(self.terrain)
         self._zones_path.parent.mkdir(parents=True, exist_ok=True)
-        self.zones.save(self._zones_path)
+        self.zone_map.save(self._zones_path)
         self.saved = True
         # 通知外面（面板据此更新提示）—— 非模态下调用方拿不到返回值
-        self.saved_now.emit(self.map_id, len(self.zones.sets))
+        self.saved_now.emit(self.map_id, len(self.zone_map.zones))
         return self._zones_path, probs
 
     # ---------------- 界面 ----------------
@@ -1718,8 +1718,8 @@ class ZoneEditorDialog(QDialog):
         # **临时预览**（「增加可达」里选中"可下跳 foothold"那一行，2026-09-26 要求）：
         # 取消**外面所有**呼吸高亮，只让那一条呼吸 —— 重点在于"看的是这一条"。
         pv = self._preview_fid
-        if not pv and self._highlight and self._highlight in self.zones.sets:
-            in_hl = set(self.zones.sets[self._highlight]["footholds"])
+        if not pv and self._highlight and self._highlight in self.zone_map.zones:
+            in_hl = set(self.zone_map.zones[self._highlight]["footholds"])
         # 集合"涉及"的绳梯/传送门：**数据层算**（core/zones.py，与将来做边用同一判据）
         hl_lad = (set() if pv else
                   (set(zones.ladders_of(self.terrain, in_hl)) if in_hl else set()))
@@ -1813,7 +1813,7 @@ class ZoneEditorDialog(QDialog):
         # 为什么标在包围盒上方而不是质心：质心常常正落在平台上，字会压住线
         # （要求 1：像地形叠加图那样把注册名标上去）。
         self._labels = {}
-        for name, s in self.zones.sets.items():
+        for name, s in self.zone_map.zones.items():
             sp = zones.set_span(self.terrain, s.get("footholds") or [])
             if sp is None:
                 continue
@@ -1830,9 +1830,9 @@ class ZoneEditorDialog(QDialog):
         # ---- 边（箭头）：从起点集合的包围盒顶边中点 → 终点集合的顶边中点 ----
         # 有向图两条反向边会**完全重叠**，所以按名字顺序给一个垂直偏移把两条分开。
         self._arrow_items = []              # 重建后 item 是新的 ⇒ 三个高亮状态一起重记
-        for e in self.zones.edges:
-            sa = self.zones.sets.get(e.get("from"))
-            sb = self.zones.sets.get(e.get("to"))
+        for e in self.zone_map.edges:
+            sa = self.zone_map.zones.get(e.get("from"))
+            sb = self.zone_map.zones.get(e.get("to"))
             if sa is None or sb is None:
                 continue                    # 悬空边不画（边列表里标红）
             sp_a = zones.set_span(self.terrain, sa.get("footholds") or [])
@@ -2264,7 +2264,7 @@ class ZoneEditorDialog(QDialog):
                 if _e is None:
                     _lt.append("  %s：**没压到任何 foothold**（该补数据了）" % _tag)
                     continue
-                _sets = self.zones.set_of(str(_e.fid))
+                _sets = self.zone_map.set_of(str(_e.fid))
                 _lt.append("  %s：fh #%s　y=%d　集合：%s"
                            % (_tag, _e.fid, round(_e.y_at((_e.left + _e.right) / 2.0)),
                               "、".join(_sets) if _sets else "（没圈进任何集合）"))
@@ -2272,7 +2272,7 @@ class ZoneEditorDialog(QDialog):
         self.lbl_status.setText(
             "已选 %d 条 foothold%s%s　｜　鼠标 (%.0f, %.0f)　｜　集合 %d 个"
             % (n, "（点「注册为集合…」给它起名）" if n else "", where,
-               hx, hy, len(self.zones.sets)))
+               hx, hy, len(self.zone_map.zones)))
         self.lbl_status.setToolTip(tip)
 
     # ---------------- 边 ----------------
@@ -2281,7 +2281,7 @@ class ZoneEditorDialog(QDialog):
                  walk_dir=None, mid_dir=None, mid_y=None, why="", portal=None):
         """加一条边（走撤销栈）。失败**不登记撤销点**（见 _commit 的说明）。"""
         snap = self._snapshot()
-        e = self.zones.add_edge(src, dst, kind, ladder=ladder,
+        e = self.zone_map.add_edge(src, dst, kind, ladder=ladder,
                                 footholds=footholds, walk_dir=walk_dir,
                                 mid_dir=mid_dir, mid_y=mid_y, why=why,
                                 portal=portal)
@@ -2298,7 +2298,7 @@ class ZoneEditorDialog(QDialog):
         """
         snap = self._snapshot()
         key = self._edge_key(edge)
-        self.zones.edges = [e for e in self.zones.edges if self._edge_key(e) != key]
+        self.zone_map.edges = [e for e in self.zone_map.edges if self._edge_key(e) != key]
         self._commit(snap)
 
     @staticmethod
@@ -2318,10 +2318,10 @@ class ZoneEditorDialog(QDialog):
     def rev_edge(self, edge):
         """反向复制一条边 → 新边（已经有了就返回 None）。"""
         src, dst = edge.get("to"), edge.get("from")
-        if src not in self.zones.sets or dst not in self.zones.sets:
+        if src not in self.zone_map.zones or dst not in self.zone_map.zones:
             return None
         snap = self._snapshot()
-        e = self.zones.add_edge(src, dst, edge.get("kind"),
+        e = self.zone_map.add_edge(src, dst, edge.get("kind"),
                                 ladder=edge.get("ladder"),
                                 # ⭐ 传送点反向复制时**哪扇门也要跟着** ✗ —— 漏了它，
                                 #   反向那条边就没指名门 ⇒ 保存时校验会拦（说"没指定哪扇门"）
@@ -2346,18 +2346,18 @@ class ZoneEditorDialog(QDialog):
         snap = self._snapshot()
         key = self._edge_key(edge)
         hit = None
-        for e in self.zones.edges:
+        for e in self.zone_map.edges:
             if self._edge_key(e) == key:
                 hit = e
                 break
         if hit is None:
             raise ValueError("那条可达已经不在了（可能被删掉、或被改过名）—— "
                              "刷新一下再看看。")
-        if dst not in self.zones.sets:
+        if dst not in self.zone_map.zones:
             raise ValueError("终点集合不存在：%s" % dst)
         if dst == hit.get("from"):
             raise ValueError("终点不能是起点自己（那就成了自环）。")
-        for e in self.zones.edges:
+        for e in self.zone_map.edges:
             if e is hit:
                 continue
             # 「改成和另一条一模一样」才算重复：**绳号/门不同不算**（那是两条不同的边 ✓）
@@ -2425,8 +2425,8 @@ class ZoneEditorDialog(QDialog):
         zh, _color = zones.EDGE_LABELS.get(kind, (kind, "#9aa0a6"))
         cond = zones.edge_cond(e)
         tail = "[%s]%s" % (zh, "（%s）" % cond if cond else "")
-        bad = (e.get("from") not in self.zones.sets
-               or e.get("to") not in self.zones.sets)
+        bad = (e.get("from") not in self.zone_map.zones
+               or e.get("to") not in self.zone_map.zones)
         warn = "　⚠ 悬空" if bad else ""
         head = "" if first else EDGE_INDENT          # 同组后续行：缩进、不重复写名字 ✓
         if first:
@@ -2474,9 +2474,9 @@ class ZoneEditorDialog(QDialog):
             lst.blockSignals(True)
             lst.clear()
         out_edges, in_edges = [], []
-        for e in self.zones.edges:
-            bad = (e.get("from") not in self.zones.sets
-                   or e.get("to") not in self.zones.sets)
+        for e in self.zone_map.edges:
+            bad = (e.get("from") not in self.zone_map.zones
+                   or e.get("to") not in self.zone_map.zones)
             if (not focus) or bad or e.get("from") == focus:
                 out_edges.append(e)
             if (not focus) or (not bad and e.get("to") == focus):
@@ -2523,7 +2523,7 @@ class ZoneEditorDialog(QDialog):
             self._edge_hl = None
             self._restore_edge_hl()
         # 收窄了就**说出来**（静悄悄少几条是最难查的那种"东西不见了"）
-        n_all = len(self.zones.edges)
+        n_all = len(self.zone_map.edges)
         if not focus:
             self.lbl_e_note.setText("")
             self.lbl_in_note.setText("")
@@ -2553,13 +2553,13 @@ class ZoneEditorDialog(QDialog):
         """建议队列：算一遍候选边，**由人逐条采纳**（自动只产建议，边不会自动可用）。"""
         # ⚠ 2026-09-27：「传送门」这种通行方式连同 `portal_suggestions()` 一起**移除**了
         # ⇒ 建议只剩两种「走」和「爬」（四种通行方式里，跳/下跳都给不出可信建议 ✓）。
-        sug = list(zones.walk_suggestions(self.zones, self.terrain))
-        sug += zones.climb_suggestions(self.zones, self.terrain)
+        sug = list(zones.walk_suggestions(self.zone_map, self.terrain))
+        sug += zones.climb_suggestions(self.zone_map, self.terrain)
         # ⚠ 判"有没有采纳过"的判据要和 `core.zones.add_edge` **同一套**
         #（from/to/kind/ladder）：少了**绳号**，"同一对集合、另一根绳"的建议会被
         # 当成"已经采纳过了"吞掉 ✗（爬边尤其 —— 一张图上两根绳接同一对平台很常见）。
         have = {(e.get("from"), e.get("to"), e.get("kind"),
-                 str(e.get("ladder") or "")) for e in self.zones.edges}
+                 str(e.get("ladder") or "")) for e in self.zone_map.edges}
         sug = [s for s in sug
                if s.get("to") is None or (s["from"], s["to"], s["kind"],
                                           str(s.get("ladder") or "")) not in have]
@@ -2616,7 +2616,7 @@ class ZoneEditorDialog(QDialog):
                  % (lids.get(id(L), "?"), L.x, min(L.y1, L.y2), max(L.y1, L.y2),
                     "绳子" if L.l else "梯子"))
                 for L in zones.ladders_touching(self.terrain,
-                                                self.zones.sets[src]["footholds"])]
+                                                self.zone_map.zones[src]["footholds"])]
 
     def _all_ladder_choices(self):
         """**本图全部**绳 → `[(绳号, 那行字)]`（用户 2026-10-06 ✓ "加全部勾选" 用 ✓）。
@@ -2658,7 +2658,7 @@ class ZoneEditorDialog(QDialog):
         """
         return [(str(p.pn), self._portal_row(p))
                 for p in zones.portals_of(self.terrain,
-                                          self.zones.sets[src]["footholds"])]
+                                          self.zone_map.zones[src]["footholds"])]
 
     def _all_portal_choices(self):
         """**本图全部**门 → `[(门名, 那行字)]`（"全部"勾选用 ✓ 用户 2026-10-06 ✓）。"""
@@ -2719,7 +2719,7 @@ class ZoneEditorDialog(QDialog):
                                    #   就等于"编辑时把门弄丢了"（保存后校验会拦 ✓ 但人会觉得莫名 ✓）。
                                    portal=r.get("portal"))
             else:
-                n0 = len(self.zones.edges)
+                n0 = len(self.zone_map.edges)
                 e = self.add_edge(dlg.src, r["dst"], r["kind"], ladder=r["ladder"],
                                   footholds=r.get("footholds"),
                                   walk_dir=r.get("dir"),
@@ -2727,7 +2727,7 @@ class ZoneEditorDialog(QDialog):
                                   mid_y=r.get("mid_y"),
                                   portal=r.get("portal"),
                                   why="手工加的（%s → %s）" % (dlg.src, r["dst"]))
-                if len(self.zones.edges) == n0:
+                if len(self.zone_map.edges) == n0:
                     extra = str(e.get("ladder") or e.get("portal") or "")
                     QMessageBox.information(
                         self, "这一条已经有了",
@@ -2766,7 +2766,7 @@ class ZoneEditorDialog(QDialog):
         就无从谈起（要加别的地方，先把那块地形圈进这个集合）。
         """
         out, order = [], {}
-        for fid in (self.zones.sets.get(src) or {}).get("footholds") or []:
+        for fid in (self.zone_map.zones.get(src) or {}).get("footholds") or []:
             f = next((x for x in self.terrain.footholds
                       if str(x.fid) == str(fid)), None)
             if f is None:
@@ -2798,7 +2798,7 @@ class ZoneEditorDialog(QDialog):
                                     "先在右边列表里点一个集合（或在视窗里选一段 "
                                     "foothold）当**起点**。")
             return
-        others = [n for n in self.zones.sets if n != src]
+        others = [n for n in self.zone_map.zones if n != src]
         if not others:
             QMessageBox.information(self, "只有一个集合",
                                     "至少要两个集合才谈得上可达。")
@@ -2848,13 +2848,13 @@ class ZoneEditorDialog(QDialog):
         if e is None:
             return
         src = e.get("from")
-        if src not in self.zones.sets:
+        if src not in self.zone_map.zones:
             QMessageBox.information(
                 self, "这条边悬空",
                 "起点集合「%s」已经不在（被删掉或改过名）—— 先把集合名改回来，"
                 "或者把这条边删掉。" % src)
             return
-        others = [n for n in self.zones.sets if n != src]
+        others = [n for n in self.zone_map.zones if n != src]
         lads = self._reach_ladder_choices(src)
         dlg = AddReachDialog(self, src, others, self._related_sets(src),
                              ladders=lads,
@@ -2879,7 +2879,7 @@ class ZoneEditorDialog(QDialog):
     def _refresh_list(self):
         self.lst.blockSignals(True)
         self.lst.clear()
-        for name, s in self.zones.sets.items():
+        for name, s in self.zone_map.zones.items():
             it = QListWidgetItem("%s  (%d)" % (name, len(s["footholds"])))
             it.setData(Qt.UserRole, name)
             # **只有名字是蓝字**，(14) 那个条数是正常黑字（用户 2026-09-26 的规矩）
@@ -2916,7 +2916,7 @@ class ZoneEditorDialog(QDialog):
             return self._highlight
         owners = []
         for fid in sorted(self._sel):
-            for n in self.zones.set_of(fid):
+            for n in self.zone_map.set_of(fid):
                 if n not in owners:
                     owners.append(n)
         return owners[0] if len(owners) == 1 else None
@@ -2930,20 +2930,20 @@ class ZoneEditorDialog(QDialog):
         out = []
 
         def add(n):
-            if n and n != name and n in self.zones.sets and n not in out:
+            if n and n != name and n in self.zone_map.zones and n not in out:
                 out.append(n)
 
         have = {(e.get("from"), e.get("to"), e.get("kind"))
-                for e in self.zones.edges}
-        for s in (zones.walk_suggestions(self.zones, self.terrain)
-                  + zones.climb_suggestions(self.zones, self.terrain)):
+                for e in self.zone_map.edges}
+        for s in (zones.walk_suggestions(self.zone_map, self.terrain)
+                  + zones.climb_suggestions(self.zone_map, self.terrain)):
             if not s.get("to") or (s["from"], s["to"], s["kind"]) in have:
                 continue            # 「另一端没圈」不是边；已采纳的也不用再列
             if s["from"] == name:
                 add(s["to"])
             elif s["to"] == name:
                 add(s["from"])
-        for e in self.zones.edges:
+        for e in self.zone_map.edges:
             if e.get("from") == name:
                 add(e.get("to"))
             elif e.get("to") == name:
@@ -2968,7 +2968,7 @@ class ZoneEditorDialog(QDialog):
         self._refresh_status()
         self._refresh_edges()       # 焦点变了 ⇒ 可达列表跟着收窄/放开
         if name:
-            self.focus_ids(self.zones.sets[name]["footholds"])
+            self.focus_ids(self.zone_map.zones[name]["footholds"])
 
     def _on_register(self):
         if not self._sel:
@@ -2993,7 +2993,7 @@ class ZoneEditorDialog(QDialog):
             ① 先在视窗里选 foothold → 「加入集合…」→ 直接回车（默认就是刚才那个集合）
             ② 先点集合看清它圈了什么 → 按住 Shift 在视窗里加选 → 「加入集合…」→ 回车
         """
-        names = list(self.zones.sets)
+        names = list(self.zone_map.zones)
         if not names:
             QMessageBox.information(self, "还没有集合",
                                     "先用「注册为集合…」建一个。")

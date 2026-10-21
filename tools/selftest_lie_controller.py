@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from perception.lie_controller import LieMouseController  # noqa: E402
+from liedetect.lie_controller import LieMouseController  # noqa: E402
 
 _FAILED = []
 
@@ -227,7 +227,7 @@ def t_follow_gain():
           "⑥ 0 ⇒ 夹到 0.01（= 光标几乎不动 ⇒ 无意义但要可复现 ✓ 不崩 ✗）")
     check(LieMouseController(follow_gain=99.0).follow_gain == 5.0,
           "⑥ 上界 5（防手输离谱值 ✓）")
-    import perception.lie_controller as _LC
+    import liedetect.lie_controller as _LC
     # ⚠ **默认值 2026-10-04 由 1.0 改成 0.6** ✗（**实测**：1.0 = "一拍全量贴上去" ⇒ 下一拍
     #   目标一动就反向修正 ⇒ 鼠标那条相对轨迹**折角多**（夹角 90% 分位 57° ✗）；
     #   0.6 ⇒ **23°** ✓ 而**命中率仍是 100%** ✓ 见 `lie_controller._FOLLOW_GAIN` ✓）。

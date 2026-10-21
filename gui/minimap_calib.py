@@ -37,8 +37,11 @@ from gui import theme                  # 弹窗几何按客户端存（config/ui
 from gui.canvas import ZoomPanView    # 看图交互在几个窗口里是同一份
 from gui.widgets import NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSlider
 from gui.worker import safe_slot      # 槽里抛异常 = 整个工作台 abort（见 worker.py）
+from perception import map_const
+from perception import map_calib
 from perception import minimap as mm
 from core.config import load_live
+from perception import map_overlay
 
 #: 版面：一行里"参数名"那格与"单位"那格的**统一宽度** ⇒ 各行的拖动条/数字框能对齐 ✓
 #: （对齐是"读起来像一张表"的关键 —— 参差的行让人没法竖着比对两轴 ✓）。
@@ -140,7 +143,7 @@ class MinimapCalibDialog(QDialog):
       ③ 方向键的单位 = **1 个面板像素**（≈ 0.2 个底图像素）—— 原来 1 个**底图像素**
          太粗（这张图 1 底图像素 ≈ 7~16 世界像素 ✗）；
       ④ 「锁定 xy 缩放」勾上后两轴一起改 ✓；
-      ⑤ crop 的评分**按重叠区算**（`mm.align_score` 一处实现）—— 原来报的是
+      ⑤ crop 的评分**按重叠区算**（`map_overlay.align_score` 一处实现）—— 原来报的是
          "整张面板 vs 整张底图"，crop 下那个数没有意义 ✗；
       ⑥ 自动定位旁的「不改缩放」：只改位移、保留当前缩放 ✓。
     """
@@ -155,7 +158,7 @@ class MinimapCalibDialog(QDialog):
         #: **这份标定是给哪条来源量的**。标定按来源分开存（见 mapdata.calib_path）：
         #: 两条来源的面板尺寸差 5.6 倍，一份几何只对一条成立。外层（路线识别）知道
         #: 自己喂的是哪条来源，会显式传进来；没传就按配置里的当前来源算。
-        self.src = src or (load_live().get("mmap_src") or mm.SRC_STREAM)
+        self.src = src or (load_live().get("mmap_src") or map_const.SRC_STREAM)
 
         self.map_id = str(map_id)
         self.terrain = mapdata.load(self.map_id, with_canvas=True)
@@ -169,7 +172,7 @@ class MinimapCalibDialog(QDialog):
         self._own_client = client is None
 
         cal = mapdata.load_calib(self.map_id, self.src) or {}
-        self.mode = mode or cal.get("mode") or mm.MODE_FIT
+        self.mode = mode or cal.get("mode") or map_const.MODE_FIT
         #: 文件里那份几何是**另一种显示方式**量的吗（下面 `__init__` 末尾会说一句）
         self._mode_note = ""
         if mode and cal.get("mode") and str(cal.get("mode")) != str(mode):
@@ -189,7 +192,7 @@ class MinimapCalibDialog(QDialog):
         #   ⚠ 这扇窗的拖动/缩放只会**等比**改整体大小（`_ratio` 保留载入时的两轴比例）
         #     —— 要改两轴**比例**仍然只能用「双点标定」重量一次 ✓。
         self.scale = float(cal.get("scale") or 1.0)
-        self.scale_y = float(mm.scales_of(cal)[1])
+        self.scale_y = float(map_calib.scales_of(cal)[1])
         self._two_axis_note = ""
         if abs(self.scale_y - self.scale) > 1e-9:
             self._two_axis_note = (
@@ -216,7 +219,7 @@ class MinimapCalibDialog(QDialog):
         # —— 那样存下去的东西会比人工对齐差 inset 个底图像素（在
         # px_per_world≈16 的图上是 63 世界单位，现场就是被这个坑到）。
         # 归一化放这里：从文件读来的这个值不可信，唯一可信的是 inset 本身。
-        if self.mode == mm.MODE_CROP:
+        if self.mode == map_const.MODE_CROP:
             self.offset = [self.inset, self.inset]
         #: 叠加层透明度（%）。对齐时要能同时看清「面板」和「底图」，全靠它。
         # ⚠ 别写 `cal.get("alpha") or 55`：**0 是 falsy** ⇒ 存着 0（完全看不见）也会
@@ -231,14 +234,14 @@ class MinimapCalibDialog(QDialog):
         self._ref_zoom = 1                 # 参照图 1 像素 = 多少底图像素
         self._frame = None
         self._scene_wh = None
-        #: 这一拍按**重叠区**算出来的贴合分（`mm.align_score` 的返回值；没画面时 None ✓）。
+        #: 这一拍按**重叠区**算出来的贴合分（`map_overlay.align_score` 的返回值；没画面时 None ✓）。
         #: 判据那行显示它、保存前的提醒也用它 —— `self.score` 是"载入/自动定位那次"的分，
         #: 在 crop 下说明不了"你对齐了没有" ✗（见 `_refresh_judge` ✓）。
         self._live_score = None
         # 有旧标定就别再自己摆 —— 判「**有没有几何**」而不是「有没有分数」：
         # 手工对齐的 score=0，拿分数判会把刚存好的几何覆盖成粗略猜测，
         # 这正是现场「点了保存、重开又变回去」的直接原因。
-        self._geom_ready = mm.has_geometry(cal)
+        self._geom_ready = map_calib.has_geometry(cal)
         #: 当前几何是**人眼对齐**的还是自动量出来的（存进标定的 src 字段）
         self.manual = (cal.get("src") == "manual")
         self._prev_anchor = None           # 上一拍的锚点（看位移用）
@@ -467,7 +470,7 @@ class MinimapCalibDialog(QDialog):
         row_sc.setSpacing(6)
         row_sc.addWidget(QLabel("滚动方向"))
         self.cmb_scroll = NoWheelComboBox()
-        for _key, _txt in mm.SCROLL_LABEL:
+        for _key, _txt in map_const.SCROLL_LABEL:
             self.cmb_scroll.addItem(_txt, _key)
         _i = self.cmb_scroll.findData(self.scroll)
         self.cmb_scroll.setCurrentIndex(_i if _i >= 0 else 0)
@@ -607,8 +610,8 @@ class MinimapCalibDialog(QDialog):
         p = mapdata.calib_path(self.map_id)
         # **只读这条来源的那一份**：两条来源的面板尺寸差 5.6 倍，串了就是错的几何
         cal = mapdata.load_calib(self.map_id, self.src) or {}
-        label = mm.SRC_LABEL.get(self.src, self.src)
-        if mm.has_geometry(cal):
+        label = map_const.SRC_LABEL.get(self.src, self.src)
+        if map_calib.has_geometry(cal):
             when = ""
             try:                        # 文件时间＝"上次标定是什么时候"最直接的证据
                 when = time.strftime("　存于 %m-%d %H:%M",
@@ -619,7 +622,7 @@ class MinimapCalibDialog(QDialog):
             if _src == "two_point":
                 # 双点标定的几何是**两轴**的（而且没有匹配分）—— 只报一个数会让人以为
                 # 这份是等比的、或者以为它是自动匹配出来的 ✗（2026-09-27 修）
-                how = "双点标定（两轴 x %.4f / y %.4f）" % mm.scales_of(cal)
+                how = "双点标定（两轴 x %.4f / y %.4f）" % map_calib.scales_of(cal)
             elif _src == "manual":
                 how = "手工对齐"
             else:
@@ -672,7 +675,7 @@ class MinimapCalibDialog(QDialog):
         c = self.calib()
         return (c.get("mode"),
                 round(float(c.get("scale") or 0.0), 4),
-                round(float(mm.scales_of(c)[1]), 4),
+                round(float(map_calib.scales_of(c)[1]), 4),
                 tuple(off_store(v) for v in (c.get("offset") or [0, 0])),
                 tuple(off_store(v) for v in (c.get("view") or [0, 0])))
 
@@ -713,7 +716,7 @@ class MinimapCalibDialog(QDialog):
             # 直接给 1.0 的话，底图比面板大时人一上来就看不见全貌（crop 常见）。
             cw, ch = self.canvas.shape[1], self.canvas.shape[0]
             fit = min(w / float(cw), h / float(ch))
-            if self.mode == mm.MODE_CROP:
+            if self.mode == map_const.MODE_CROP:
                 self.scale = 1.0
                 self.block = [(cw - w) // 2, (ch - h) // 2]
             else:
@@ -752,13 +755,13 @@ class MinimapCalibDialog(QDialog):
         ⚠ **下次搜索就生效**（`calib()` 里带着它 ✓）：所以这里不用立刻重跑自动定位 ——
         人要是想立刻看效果，点一下「自动定位」即可 ✓。
         """
-        self.scroll = self.cmb_scroll.currentData() or mm.SCROLL_XY
-        if self.scroll == mm.SCROLL_XY:
+        self.scroll = self.cmb_scroll.currentData() or map_const.SCROLL_XY
+        if self.scroll == map_const.SCROLL_XY:
             self.lbl_scroll.setText(
                 "「双轴」：两轴都会搜（和以前一样 ✓）。图上只往一个方向滚的话，"
                 "选「仅 X / 仅 Y」会快好几倍 ✓")
         else:
-            _zh = "左右" if self.scroll == mm.SCROLL_X else "上下"
+            _zh = "左右" if self.scroll == map_const.SCROLL_X else "上下"
             self.lbl_scroll.setText(
                 "「仅 %s」（只%s滚）：实时匹配只在那一根轴上搜 ✓ 更快，"
                 "另一根轴一个字都不改（防漂 ✓）"
@@ -779,7 +782,7 @@ class MinimapCalibDialog(QDialog):
         `src=two_point` 降级成 `manual`、还给没有匹配分的几何安上 `score: 0` ✗。
         """
         # fit 的 offset 走 `off_store`（**不许取整**，见那儿）；crop 的 offset 是 inset 整数 ✓
-        off = ([int(self.inset), int(self.inset)] if self.mode == mm.MODE_CROP
+        off = ([int(self.inset), int(self.inset)] if self.mode == map_const.MODE_CROP
                else [off_store(self.offset[0]), off_store(self.offset[1])])
         out = {"mode": self.mode,
                "offset": off,
@@ -792,13 +795,13 @@ class MinimapCalibDialog(QDialog):
         # ⭐ **滚动方向**（用户 2026-09-29 ✓）：只在**不是默认**（双轴）时写进文件 ——
         #   老文件里没有这个键 ⇒ 一律按双轴算 ✓（和 `with_scales` 两轴相同时不写一个道理：
         #   别给老标定塞它本来没有的字段 ✓）。
-        if self.scroll != mm.SCROLL_XY:
+        if self.scroll != map_const.SCROLL_XY:
             out["scroll"] = self.scroll
         if self._untouched():
             # 几何一个字没动 ⇒ 两个数**照抄载入的那份**（别再 `round(…, 4)` 把双点标定
             # 量出来的 1.880076 改成 1.8801："看一眼再保存"不该改数据 ✗）
             out["scale"] = float(self.scale)
-            out = mm.with_scales(out, float(self.scale), float(self.scale_y))
+            out = map_calib.with_scales(out, float(self.scale), float(self.scale_y))
             # 来源/分数照抄载入的那份：`two_point` 的几何**没有** `score` 这个键，
             # 别给它安一个 0（那会让人以为它是自动匹配出来的 ✗）
             out["src"] = self._src_loaded or ("manual" if self.manual else "auto")
@@ -806,7 +809,7 @@ class MinimapCalibDialog(QDialog):
                 out["score"] = self._score_loaded
         else:
             out["scale"] = round(float(self.scale), 6)
-            out = mm.with_scales(out, round(float(self.scale), 6),
+            out = map_calib.with_scales(out, round(float(self.scale), 6),
                                  round(float(self.scale_y), 6))
             out["score"] = round(float(self.score), 6)
             # 这份几何是**量出来的**还是**人眼对齐的**：手工对齐没有匹配分，
@@ -816,6 +819,7 @@ class MinimapCalibDialog(QDialog):
 
     def _load_ref(self):
         """按 self.ref 选叠加参照图。返回是否用上了期望的那张。"""
+        from perception import map_overlay
         self._ref_pix, self._ref_zoom = None, 1
         if self.ref == "terrain" and self.canvas is not None:
             p = mapdata.map_dir() / ("%s_overlay.png" % self.map_id)
@@ -823,7 +827,7 @@ class MinimapCalibDialog(QDialog):
             if not pm.isNull():
                 self._ref_pix = pm
                 # 叠加图是把底图放大 overlay_zoom 倍画的（见 tools/map_terrain_view）
-                self._ref_zoom = mm.overlay_zoom(self.canvas.shape[1])
+                self._ref_zoom = map_overlay.overlay_zoom(self.canvas.shape[1])
             else:
                 self.ref = "canvas"        # 没有叠加图 → 退回底图（下拉也跟着回）
         if self._ref_pix is None and self.canvas is not None:
@@ -863,7 +867,7 @@ class MinimapCalibDialog(QDialog):
         kx = float(self.scale) / max(1, self._ref_zoom)
         ky = float(self.scale_y) / max(1, self._ref_zoom)
         self._ov_item.setTransform(QTransform().scale(kx, ky))
-        if self.mode == mm.MODE_CROP:
+        if self.mode == map_const.MODE_CROP:
             # crop = 面板显示底图的**一块**，而这一块可能被放大了 scale 倍
             # （小底图被客户端放大，实测能到 9~10 倍）。所以叠加层也跟着缩放：
             # 让「底图坐标 block」那一点正好落在面板的 (inset, inset) 上。
@@ -885,7 +889,7 @@ class MinimapCalibDialog(QDialog):
         """
         self.manual = True            # 人调的 → 存进标定时记 src=manual
         pos = self._ov_item.pos()
-        if self.mode == mm.MODE_CROP:
+        if self.mode == map_const.MODE_CROP:
             s = max(1e-6, float(self.scale))
             self.block = [off_store((self.inset - pos.x()) / s),
                           off_store((self.inset - pos.y()) / s)]
@@ -1087,7 +1091,7 @@ class MinimapCalibDialog(QDialog):
         crop 的"偏移"是 `view`（现在显示的是底图哪一块），而 fit 的是 `offset`
         （底图从面板哪个像素开始摆）。
         """
-        return "底图像素" if self.mode == mm.MODE_CROP else "面板像素"
+        return "底图像素" if self.mode == map_const.MODE_CROP else "面板像素"
 
     def _off_label(self, axis):
         """那一轴的偏移标签（**不含单位** —— 单位单独放控件右边那格 ✓，
@@ -1097,7 +1101,7 @@ class MinimapCalibDialog(QDialog):
 
     def _off_get(self, axis):
         """现在这一轴的偏移（**模式对应的那个字段**，float ✓）。"""
-        v = (self.block if self.mode == mm.MODE_CROP else self.offset)[axis]
+        v = (self.block if self.mode == map_const.MODE_CROP else self.offset)[axis]
         return float(v)
 
     def _offset_cell(self, grid, r, c, axis):
@@ -1110,7 +1114,7 @@ class MinimapCalibDialog(QDialog):
             v = float(v)
         except (TypeError, ValueError):
             return
-        if self.mode == mm.MODE_CROP:
+        if self.mode == map_const.MODE_CROP:
             self.block[axis] = off_store(v)
         else:
             self.offset[axis] = off_store(v)
@@ -1164,12 +1168,12 @@ class MinimapCalibDialog(QDialog):
             #   ⚠ **节流**：整体搜索在大面板上要几秒 ✗ ⇒ 距上次整体搜索不足
             #     `FULL_SEARCH_GAP_S` 就这一拍先算了（否则跟丢时每拍卡一下 = 观感"卡死"✗）。
             if ((loc is None or float(loc.get("score") or 0.0) < SCORE_WARN)
-                    and self.mode == mm.MODE_FIT
+                    and self.mode == map_const.MODE_FIT
                     and (now - float(getattr(self, "_full_at", 0.0))) >= FULL_SEARCH_GAP_S):
                 self._full_at = now
                 _full = True
                 loc = mm.locate(self._frame, self.canvas, self.mode)
-        elif self.mode == mm.MODE_CROP:
+        elif self.mode == map_const.MODE_CROP:
             # ⭐ crop 两条路都**拿手上这套几何当种子**（用户 2026-09-29："我已经手工对得
             #   很好了"✓ —— 手工那份离答案最近，从它开始量又准又省 ✓）：
             #     · 「不改缩放」⇒ 只按**当前缩放**把位移抠好（`refine_crop(move_scale=False)`
@@ -1194,7 +1198,7 @@ class MinimapCalibDialog(QDialog):
         if loc is None:
             self._say_fail()
             return
-        anchor = loc.get("view") if self.mode == mm.MODE_CROP else loc.get("offset")
+        anchor = loc.get("view") if self.mode == map_const.MODE_CROP else loc.get("offset")
         move = ""
         if auto and self._prev_anchor is not None and anchor is not None:
             move = "　位移 (%+d, %+d)" % (anchor[0] - self._prev_anchor[0],
@@ -1207,10 +1211,10 @@ class MinimapCalibDialog(QDialog):
             #   `mm.panel_to_canvas` 这个**唯一口径** ✓ —— 再解出**我们这套缩放下的**偏移。
             #   fit：`底图 = (面板 − offset) / scale`  ⇒  offset = −底图(0,0) × scale
             #   crop：`底图 = (面板 − inset) / scale + view` ⇒ view = 底图(0,0) + inset/scale
-            bx, by = mm.panel_to_canvas(0.0, 0.0, loc)
+            bx, by = map_calib.panel_to_canvas(0.0, 0.0, loc)
             sx = max(1e-6, float(self.scale))
             sy = max(1e-6, float(self.scale_y))
-            if self.mode == mm.MODE_CROP:
+            if self.mode == map_const.MODE_CROP:
                 self.block = [off_store(bx + self.inset / sx),
                               off_store(by + self.inset / sy)]
             else:
@@ -1248,7 +1252,7 @@ class MinimapCalibDialog(QDialog):
         大面板上全搜索要几十秒，手动点一下根本等不到，看着就是"没反应"。
         crop 不用这个（locate_crop 自己搜放大倍数，且每个候选都很便宜）。
         """
-        if self.mode != mm.MODE_FIT or not (self.scale > 0):
+        if self.mode != map_const.MODE_FIT or not (self.scale > 0):
             return None
         out = [round(self.scale * f, 4) for f in (0.90, 0.95, 1.0, 1.05, 1.10)]
         return [s for s in out if 0.25 <= s <= 12.0] or None
@@ -1282,13 +1286,13 @@ class MinimapCalibDialog(QDialog):
                        #   在"面板比底图宽"的图上常常直接归零，给不出任何线索 ✗
                        ("局部小地图", (mm.locate_crop(self._frame, self.canvas,
                                                      seed=self.calib())
-                                       if self.mode == mm.MODE_CROP
+                                       if self.mode == map_const.MODE_CROP
                                        else mm.locate_crop(self._frame, self.canvas)))):
             bits.append("%s%s" % (tag, "没对上" if r is None else "%.3f" % r["score"]))
         extra = ""
         h, w = self._frame.shape[:2]
         cw, ch = self.canvas.shape[1], self.canvas.shape[0]
-        if self.mode == mm.MODE_CROP and (w > cw or h > ch):
+        if self.mode == map_const.MODE_CROP and (w > cw or h > ch):
             extra = ("\n底图只有 %dx%d、面板 %dx%d 更大 —— 面板装不下整张底图，"
                      "所以不可能是「局部小地图」，多半是「全局小地图」"
                      "（去「路线识别」里换，这里不替你改）。" % (cw, ch, w, h))
@@ -1300,9 +1304,9 @@ class MinimapCalibDialog(QDialog):
         #   模板匹配在本图天生够不着门槛 ✗（底图重绘、面板带图标 ✓），重合率才是
         #   回答"我标得准不准"的那条路 ✓；它说"重合良好"时**不许把整行染红** ✗。
         try:
-            _ov = mm.calib_overlap(self._frame, self.canvas, self.calib())
-            _ov_txt = mm.overlap_verdict(_ov)
-            _ok = bool(_ov) and float(_ov.get("iou") or 0.0) >= mm.OVERLAP_OK
+            _ov = map_calib.calib_overlap(self._frame, self.canvas, self.calib())
+            _ov_txt = map_calib.overlap_verdict(_ov)
+            _ok = bool(_ov) and float(_ov.get("iou") or 0.0) >= map_const.OVERLAP_OK
         except Exception:                            # noqa: BLE001 —— 诊断不许把界面弄崩 ✓
             _ov, _ov_txt, _ok = None, "", False
         _dir = mm.dump_diag(self._frame, self.canvas, self.calib(), tag="locate",
@@ -1321,7 +1325,7 @@ class MinimapCalibDialog(QDialog):
                   "⚠ **这不等于你的手工对齐错了** ✗：手工对齐看的是叠图重合 ✓、"
                   "这里比的是像素像不像 ✓，两件事可以不一致（手工那份本来就没有匹配分 ✓）。\n"
                   "现场已存 data/mmap_diag/（panel / canvas / overlay / diff）⇒ 看图最直接 ✓%s"
-                  % ("、".join(bits), mm.LOCATE_MIN_SCORE,
+                  % ("、".join(bits), map_const.LOCATE_MIN_SCORE,
                      _ov_txt or "（重合率也算不出来：面板/底图缺 ✓）", extra),
                   bad=not _ok)
 
@@ -1351,19 +1355,20 @@ class MinimapCalibDialog(QDialog):
                                   % (getattr(self.client, "fps", 0.0) or 0.0))
 
     def _refresh_judge(self):
+        from perception import map_overlay
         if self.canvas is None or self._frame is None or self.terrain is None:
             self.lbl_judge.setText("")
             return
         h, w = self._frame.shape[:2]
         c = self.calib()
         try:
-            lx, ly = mm.panel_to_world(0, 0, c, self.terrain)
-            rx, ry = mm.panel_to_world(w, h, c, self.terrain)
+            lx, ly = map_calib.panel_to_world(0, 0, c, self.terrain)
+            rx, ry = map_calib.panel_to_world(w, h, c, self.terrain)
         except Exception as e:
             self.lbl_judge.setText("换算失败：%s" % e)
             return
         b = self.terrain.bounds
-        if self.mode == mm.MODE_CROP:
+        if self.mode == map_const.MODE_CROP:
             # 局部小地图只显示底图的**一块**：判据是「这一块落在世界范围内」，
             # 而不是「四角贴住世界范围的四角」—— 后者在 crop 下永远不成立，
             # 于是标得再准那行也是橙的，人就开始怀疑自己标错了。
@@ -1375,13 +1380,13 @@ class MinimapCalibDialog(QDialog):
                   and abs(rx - b[2]) < 80 and abs(ry - b[3]) < 80)
         # ⭐ **贴合分：按"面板与该块底图的重叠区"算**（用户 2026-09-29 第 ⑤ 条 ✓）——
         #   载入/自动定位那个 `self.score` 在 crop 下是"整张面板 vs 整张底图"，跟你手上
-        #   这套几何对不对**没关系** ✗（手工对齐的干脆没有分）。`mm.align_score` 一处实现 ✓
+        #   这套几何对不对**没关系** ✗（手工对齐的干脆没有分）。`map_overlay.align_score` 一处实现 ✓
         #   （它自己算重叠范围，不需要人去框一块 ✓）。
         # ⭐⭐ `near=True` **必须开**（用户 2026-09-29："我已经手工对的很好了匹配分还是很低！"✗）：
         #   **绝对分不是通用的尺** —— 有的图客户端小地图的画法与底图不同源，对得再准也只有
         #   0.3~0.5 ✗；光看"0.42 低于 0.55"会让人以为没对齐，于是把**对的**几何改坏 ✗✗。
         #   低不低只能和**它自己**比：附近一圈里有没有明显更贴的一档 ✓（有 ⇒ 该往哪挪 ✓）
-        sc = mm.align_score(self._frame, self.terrain, c, near=True)
+        sc = map_overlay.align_score(self._frame, self.terrain, c, near=True)
         self._live_score = sc
         nb = sc.get("near") if sc.get("ok") else None
         better = bool(nb is not None
@@ -1393,7 +1398,7 @@ class MinimapCalibDialog(QDialog):
                     nb["dx"], nb["dy"], nb["score"])
             else:
                 head += "　已在这一档最好"
-            good = sc["score"] >= mm.TRUST_SCORE
+            good = sc["score"] >= map_const.TRUST_SCORE
         else:
             head = "贴合分：算不出来（%s）" % (sc.get("why") or "说不清")
             good = False
@@ -1438,6 +1443,7 @@ class MinimapCalibDialog(QDialog):
         再点一下回到"面板 + 半透明底图"的标定视图 —— 这样调标定和看结果
         不用来回找窗口。
         """
+        from perception import map_overlay
         if self._ov_img_item.isVisible():
             self._show_overlay_view(False)
             return
@@ -1464,16 +1470,16 @@ class MinimapCalibDialog(QDialog):
                 h, w = self._frame.shape[:2]
                 cw, ch = self.canvas.shape[1], self.canvas.shape[0]
                 c = self.calib()
-                if self.mode == mm.MODE_CROP:
-                    _rc, rect_o = mm.view_rects(c, (w, h), (cw, ch))
+                if self.mode == map_const.MODE_CROP:
+                    _rc, rect_o = map_overlay.view_rects(c, (w, h), (cw, ch))
                 else:
-                    z = mm.overlay_zoom(cw)
+                    z = map_overlay.overlay_zoom(cw)
                     ox, oy = c["offset"]
-                    _sx, _sy = mm.scales_of(c)      # 两轴各自（这份 dict 来自 calib() 是等比，
+                    _sx, _sy = map_calib.scales_of(c)      # 两轴各自（这份 dict 来自 calib() 是等比，
                     rect_o = (ox * z, oy * z,        # 但别在这儿写死一个 scale：那是"两处
                               (ox + cw * _sx) * z,   # 各判一次"的老毛病，迟早分叉 ✗）
                               (oy + ch * _sy) * z)
-                p = mm.draw_on_overlay(self.map_id, rect_o)
+                p = map_overlay.draw_on_overlay(self.map_id, rect_o)
                 if p is None:
                     self._say("还没有 %s_overlay.png —— 先在「路线识别」里点"
                               "「生成地形图」" % self.map_id, bad=True)
@@ -1568,14 +1574,17 @@ class MinimapCalibDialog(QDialog):
         # ⚠ 先把遗留的「坐标系偏移」清掉（`mm.drop_stale_world_offset`）：锚点换成下沿之后
         #   它该是 (0, 0)，而老的 (7, 33) 是**重心口径**的 —— 不清就会被原样带进新几何，
         #   读数凭空偏 33 个世界像素（≈4 个面板像素，看着像标定没量准 ✗）。
-        cal = mm.drop_stale_world_offset(mapdata.load_calib(self.map_id, self.src))
+        cal = map_calib.drop_stale_world_offset(mapdata.load_calib(self.map_id, self.src))
         # ⭐ **先把旧的几何键清掉再 update**（2026-09-28 修，用户报："标定改完没生效 / 两种
         #   标定法数据不一样"）：`self.calib()` 在两轴相同时**不写 `scale_y`**（`with_scales`
         #   抹掉 ✓），而 `dict.update` **不删旧键** ⇒ 旧的双点标定 `scale_y` 会**残留**下来
         #   ⇒ 世界坐标 y 轴按**错的缩放**算（实测 106010105：自动定位后 scale=1.874 等比，
         #   却残留 scale_y=1.940285539…，两轴差 3.5%，正是用户看到的"两种标定法数据不一样" ✗）。
         #   同理 `src`/`score` 也该被这次的几何口径整体接管，别让旧值糊着 ✓。
-        for _k in ("scale", "scale_y", "offset", "view", "src", "score", "panel"):
+        # ⚠ `panel_rel` / `frame_wh` 也在清掉之列：它们是**跟着这块面板**记的 ✓，
+        #   这次重新标定若拿不到帧尺寸，就得让它们空着（留着旧的 = 拿错比例去救 ✗）。
+        for _k in ("scale", "scale_y", "offset", "view", "src", "score", "panel",
+                   "panel_rel", "frame_wh"):
             cal.pop(_k, None)
         # 只更新量出来的几何 + 方式：显示方式仍算「你在界面里选的」
         cal.update(self.calib())
@@ -1593,6 +1602,21 @@ class MinimapCalibDialog(QDialog):
         if self._frame is not None:
             _h, _w = self._frame.shape[:2]
             cal["panel"] = [int(_w), int(_h)]
+            # ⭐⭐⭐ **再记一份「面板占这一帧的多少」**（用户 2026-10-20 ✓ 方案 A / 日志 507）：
+            #   只记像素尺寸的话，帧一变（改推流分辨率 / 挪窗口 ⇒ 框按比例缩 ⇒ 面板像素变）
+            #   这份标定就**整份被拒**，而症状看起来是"认不出黄点" ✗。
+            #   记下比例之后，运行时能反推"区域没变的话面板该多大" ⇒ 对得上就**按比例换算
+            #   几何继续用** ✓（= 不用重标 ✓）；对不上（真重框了）⇒ 照旧拒用 ✓。
+            #   ⚠ 「整帧多大」只有**从实时画面框选**那条来源拿得到（`LiveFrameRegionClient.src_wh` ✓）；
+            #     收流那条来源的面板是 A 机推过来的成品（没有"帧"这回事）⇒ 不记 ✓（老行为 ✓）。
+            _swh = getattr(self.client, "src_wh", None)
+            try:
+                _fw, _fh = int(_swh[0]), int(_swh[1])
+            except (TypeError, ValueError, IndexError):
+                _fw = _fh = 0
+            if _fw > 0 and _fh > 0:
+                cal["panel_rel"] = [round(float(_w) / _fw, 6), round(float(_h) / _fh, 6)]
+                cal["frame_wh"] = [_fw, _fh]
         cal.pop("legacy", None)         # 老格式的标记不写回文件（见 mapdata.save_calib）
         # 写文件这步**必须自己兜住异常**：这个槽外面还包着 safe_slot，而它只
         # `traceback.print_exc()` —— 正常启动走的是 pythonw（没有控制台），

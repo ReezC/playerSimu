@@ -25,12 +25,12 @@ from pathlib import Path
 
 from core.context import ConsoleContext, TaskContext
 
-CLASS_MOB = 1       # 类别表见 perception/classes.py（id 固定，别在本地另立一份）
+CLASS_MOB = 1       # 类别表见 perception/detect/classes.py（id 固定，别在本地另立一份）
 CLASS_PLAYER = 0
-#: ⭐ 掉落物（用户 2026-10-04 ✓）：**照 `perception/classes.py` 导入**（别在本地另立一份 ✗ ——
+#: ⭐ 掉落物（用户 2026-10-04 ✓）：**照 `perception/detect/classes.py` 导入**（别在本地另立一份 ✗ ——
 #:   上面那两个是历史遗留的本地副本 ✓ 新的一律从类别表拿 ✓）。
-from perception.classes import CLASS_DROP, CLASS_PET               # noqa: E402
-from perception import region as region_mod                         # ⭐ 框选区域一处口径 ✓
+from perception.detect.classes import CLASS_DROP, CLASS_PET               # noqa: E402
+from perception.world import region as region_mod                         # ⭐ 框选区域一处口径 ✓
 #: 每个 mode 只合并**这一类**，`summary` 里用哪个中文名 —— **一处口径** ✓
 #: （加一类只改这张表 ✓ 别在下面各处再写 `if mode == ...` ✗）。
 MODE_CLASS = {"mob": CLASS_MOB, "player": CLASS_PLAYER, "drop": CLASS_DROP,
@@ -173,7 +173,7 @@ def _roi_from_box(x1, y1, x2, y2, shape, margin=0.5, min_side=64.0):
     """玩家框 → 模板匹配的搜索区域（自然外扩一圈再裁到图内）。
 
     margin 是相对框**长边**的外扩比例。**必须留足余量**：`player_locator` 会跳过
-    「比搜索区还大」的模板（`perception/player_locator.py:122`），区域贴着模板大小
+    「比搜索区还大」的模板（`perception/world/player_locator.py:122`），区域贴着模板大小
     时稍有偏差就整帧白跑 —— 那等于白丢召回。
 
     shape: (h, w)。返回 (x, y, w, h)；框无效/太小返回 None。
@@ -308,7 +308,7 @@ def run_yolo_augment(params, ctx=None):
     # ⭐⭐ **只在框选区域内标注**（用户 2026-10-11 ✓ 原话："点击各个标注按钮，只会在当前帧
     #   框选的**区域内**进行自动标注"✓）：YOLO 这条跟模板匹配那条**不一样** ✗ ——
     #   那边 `detect_mobs.run_detect` 本来就能"只在区域里**搜**"✓；这里是**整幅推理完再筛** ✓
-    #   （推理本身不挑地方 ✓）⇒ 判据用同一处口径：**中心点在不在区域里** ✓ 见 `perception/region.py` ✓。
+    #   （推理本身不挑地方 ✓）⇒ 判据用同一处口径：**中心点在不在区域里** ✓ 见 `perception/world/region.py` ✓。
     #   ⚠ 不传 / 空 ⇒ 不筛 ✓（= 老行为一字不变 ✓）。
     region = region_mod.parse(params.get("region"))
     if region:
@@ -352,7 +352,7 @@ def run_yolo_augment(params, ctx=None):
         ctx.log("置信度 %.2f   只合并 class %d（掉落物）" % (conf, CLASS_DROP))
     elif mode == "pet":
         # ⭐ 宠物（用户 2026-10-04 ✓ 方案 C ✓）：同上，类别号 **class 5（宠物）** ✓
-        #   —— 它是"干扰类"（标它只为让模型学会区分宠物 vs 怪 ✓ 见 `perception/classes.py` ✓）。
+        #   —— 它是"干扰类"（标它只为让模型学会区分宠物 vs 怪 ✓ 见 `perception/detect/classes.py` ✓）。
         allowed = {CLASS_PET}
         ctx.log("置信度 %.2f   只合并 class %d（宠物）" % (conf, CLASS_PET))
     else:
@@ -449,7 +449,7 @@ def run_yolo_augment(params, ctx=None):
             for c, (cx, cy, w, h) in zip(cls, xywhn):
                 if int(c) not in allowed:
                     continue
-                # ⭐⭐ **区域外的预测一律丢掉** ✓（同一处判据 ✓ 见 `perception/region.py` ✓）
+                # ⭐⭐ **区域外的预测一律丢掉** ✓（同一处判据 ✓ 见 `perception/world/region.py` ✓）
                 if region and not region_mod.center_inside(
                         region, float(cx) * _fw, float(cy) * _fh):
                     n_outside += 1

@@ -29,29 +29,30 @@ sys.path.insert(0, str(ROOT))
 import cv2                                            # noqa: E402
 
 from decision import agent as ag                      # noqa: E402
-from decision import input as dinput                  # noqa: E402
-from decision import mouse_aim as ma                  # noqa: E402
-from perception import ui_state as us                 # noqa: E402
+from execution import input as dinput                  # noqa: E402
+from execution import mouse_aim as ma                  # noqa: E402
+from perception.screen import ui_state as us                 # noqa: E402
 from tools.mouse_aim_calib import _connect_input, _grab, _open_stream   # noqa: E402
 
 OUT = Path("data")
 
 
 def aim(shape, xr, yr, click, double=False):
+    from execution import aim_convert as ma_c   # 2026-10-18：拆包后补的 import ✓
     """撞角归零 → 一条指令走到目标（`click=True` 才左键 ✓），返回 `(ok, why, counts)`。"""
     h, w = shape[:2]
-    px, why = ma.target_px(w, h, xr, yr)
+    px, why = ma_c.target_px(w, h, xr, yr)
     if px is None:
         return False, why, None
-    gain = ma.load_gain()
+    gain = ma_c.load_gain()
     if not gain:
         return False, "没标定", None
-    d, why = ma.counts_for(px[0], px[1], *gain)
+    d, why = ma_c.counts_for(px[0], px[1], *gain)
     if d is None:
         return False, why, None
     if not dinput.mouse_available():
         return False, "鼠标通道不可用", None
-    ma.corner_zero()
+    ma_c.corner_zero()
     dinput.mouse_move(d[0], d[1])
     if click:
         dinput.mouse_click("left")

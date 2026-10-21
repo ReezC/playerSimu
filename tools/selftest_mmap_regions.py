@@ -446,6 +446,7 @@ def t_blackout_detection():
     import numpy as np
 
     import perception.minimap as mm
+    import perception.map_client as mm_client   # 收流客户端已独立（2026-10-18 ✓）
 
     black = np.zeros((60, 80, 3), dtype=np.uint8)
     check(mm.is_blackout(black) is True, "全黑的一帧没判成黑屏 ✗")
@@ -477,7 +478,8 @@ def t_protocol_is_single_sourced():
     失败时那句"它可能还没支持 MAP 命令"，那就是照着这种难查的样子写的）。
     """
     push = (ROOT / "tools" / "minimap_push.py").read_text(encoding="utf-8")
-    mm = (ROOT / "perception" / "minimap.py").read_text(encoding="utf-8")
+    # ⚠ 2026-10-18：收流客户端已拆到 `perception/map_client.py` ⇒ 握手那半读新文件 ✓
+    mm = (ROOT / "perception" / "map_client.py").read_text(encoding="utf-8")
 
     check("mmap_regions.CTL_HELLO" in push, "A 机侧的握手魔数没走共用那一份 ✗")
     check("mmap_regions.CTL_HELLO" in mm, "B 机侧的握手魔数没走共用那一份 ✗")
@@ -653,6 +655,7 @@ def t_ctl_roundtrip_end_to_end():
     import threading
 
     import perception.minimap as mm
+    import perception.map_client as mm_client   # 收流客户端已独立（2026-10-18 ✓）
 
     _fresh()
     mmap_regions.save("111", 10, 20, 200, 150, zoom=3)
@@ -691,7 +694,7 @@ def t_ctl_roundtrip_end_to_end():
     th = threading.Thread(target=_fake_a, daemon=True)
     th.start()
     try:
-        cli = mm.MiniMapClient("127.0.0.1", port=port)
+        cli = mm_client.MiniMapClient("127.0.0.1", port=port)
         ok, info = cli.switch_map("111", timeout=2.0)
         check(ok is True,
               "端到端换图失败（B 一口气发 `HELLO`+`MAP`，A 必须**当场**处理 ✓）：%r" % (info,))
@@ -714,7 +717,7 @@ def t_ctl_roundtrip_end_to_end():
             pass
 
     # ④ B 侧：一次 `sendall` 发出去（合成只为让"一段 = 一条完整命令"更确定 ✓）
-    _mm = (ROOT / "perception" / "minimap.py").read_text(encoding="utf-8")
+    _mm = (ROOT / "perception" / "map_client.py").read_text(encoding="utf-8")
     check("s.sendall(mmap_regions.CTL_HELLO\n" in _mm,
           "`switch_map` 没把 `HELLO` 与 `MAP` 合成一次 `sendall`（见那儿注释 ✓）")
     check('s.sendall(("%s %s\\n"' not in _mm,

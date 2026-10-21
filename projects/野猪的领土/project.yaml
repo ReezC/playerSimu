@@ -243,10 +243,10 @@ decision:
   station_pickup_max_s: 0.0
   station_pickup_spots: []
   multi_spots: []
-  reconnect_server_x: 0.3635
-  reconnect_server_y: 0.2074
-  reconnect_channel_x: 0.4104
-  reconnect_channel_y: 0.5093
+  reconnect_server_x: 0.3309
+  reconnect_server_y: 0.2135
+  reconnect_channel_x: 0.4071
+  reconnect_channel_y: 0.4922
   reconnect_channel: 1
   jump_attack_enabled: true
   jump_attack_height: 80.0

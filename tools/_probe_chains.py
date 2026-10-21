@@ -16,14 +16,17 @@ sys.path.insert(0, str(ROOT / "tools"))
 from core import mapdata                                       # noqa: E402
 from core import zones as Z                                    # noqa: E402
 from perception import minimap as mm                           # noqa: E402
+from perception import map_calib
 import mmap_dot_probe as P                                     # noqa: E402
+from perception import map_dot
+from perception import map_locator
 
 MID = "110040000"
 cal = mapdata.load_calib(MID, "stream") or {}
 t = mapdata.load(MID, with_canvas=True)
-imp = mm.implied_panel(cal, (t.canvas.shape[1], t.canvas.shape[0])) if t.canvas is not None else None
+imp = map_calib.implied_panel(cal, (t.canvas.shape[1], t.canvas.shape[0])) if t.canvas is not None else None
 print("标定[stream] mode=%s scale=%s src=%s 记的panel=%s" % (
-    cal.get("mode"), cal.get("scale"), cal.get("src"), mm.panel_of(cal)))
+    cal.get("mode"), cal.get("scale"), cal.get("src"), map_calib.panel_of(cal)))
 print("底图 PNG = %s   反推「整张底图要多大面板」= %s" % (
     None if t.canvas is None else (t.canvas.shape[1], t.canvas.shape[0]),
     tuple(round(v) for v in imp) if imp else None))
@@ -34,7 +37,7 @@ panels, note = P.grab_stream(5, 8.0)
 print("取帧:", note)
 if not panels:
     raise SystemExit("没取到推流帧")
-loc = mm.PlayerLocator(MID)
+loc = map_locator.PlayerLocator(MID)
 for i, f in enumerate(panels):
     r = loc.update(f, src="stream", terrain=t, fh_xtol=12)
     wx, wy = r.get("world_x"), r.get("world_y")

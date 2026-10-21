@@ -2477,4 +2477,8 @@ if __name__ == "__main__":
     except Exception:
         _report_startup_error()
         raise
-    sys.exit(code)
+    # ⭐⭐⭐ 2026-10-21（用户：「**窗口关掉但是实例清不掉**」）：**硬退**，别回解释器收尾 ✓
+    #   `sys.exit(code)` ⇒ 解释器收尾时销毁最后一个 QWidget ⇒ 撞 Windows TSF/IME 那条死等
+    #   （原生栈见 `core/appexit.py` 的说明 ✓）⇒ 进程不散、UDP 端口锁被一个活着的 pid 占着 ✓。
+    from core.appexit import hard_exit
+    hard_exit(code)

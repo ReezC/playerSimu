@@ -122,7 +122,7 @@ def check_input(s):
     """① 输入通道：**面板设的**输入设备（`input_device` ✓）+ 中继应答（**按需**探 ✓）。
 
     ⚠ 两个坑都是 2026-10-07 踩出来的 ✓：
-      · ⛔ **别用 `mouse_aim.aim_available()` 判**：它读的是**本进程**的后端 ✗ —— 本工具
+      · ⛔ **别用 `mouse_aim_c.aim_available()` 判**：它读的是**本进程**的后端 ✗ —— 本工具
         **不连** relay（故意的：不该抢那唯一一个客户端位 ✓）⇒ 那句永远是"本地 SendInput
         模式" ✗，**哪怕面板已经切到 ProMicro 也会误报** ✓。改成读 `settings.input_device`
         （面板那个格子的值 ✓ 随项目存 ✓）。
@@ -155,8 +155,9 @@ def check_input(s):
 def check_gain():
     """② 标定（`config/mouse_gain.json` ✓）。返回 `(ok, 人话)`。"""
     try:
-        from decision import mouse_aim
-        g = mouse_aim.load_gain()
+        from execution import aim_convert as mouse_aim_c
+        from execution import mouse_aim
+        g = mouse_aim_c.load_gain()
     except Exception as e:                                 # noqa: BLE001
         return False, "读不到标定：%s" % e
     if not g:
@@ -171,9 +172,9 @@ def check_gain():
 def check_templates():
     """③ 界面模板齐不齐。返回 `(ok, 人话)`。"""
     try:
-        from perception import ui_state
+        from perception.screen import ui_state
     except Exception as e:                                 # noqa: BLE001
-        return False, "import 不了 perception.ui_state：%s" % e
+        return False, "import 不了 perception.screen.ui_state：%s" % e
     miss = ui_state.missing_templates()
     if miss:
         return False, ("缺 %d 张模板图 ⇒ 判别器用不了 ✗：%s\n"
@@ -191,7 +192,7 @@ def check_live_frame(show_scores=False):
       （见设计文档 §6.3："判不出"与"在游戏里"要靠玩家框区分 ✓）。所以这里报的是
       **"最高分的锚点是哪个、多少分"**，那才是"锚点准不准"的证据 ✓。
     """
-    from perception import ui_state
+    from perception.screen import ui_state
     try:
         from tools.mouse_aim_calib import _grab, _open_stream
     except Exception as e:                                 # noqa: BLE001

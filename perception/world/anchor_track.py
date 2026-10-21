@@ -57,7 +57,7 @@ ANCHOR_NAME = "锚定追踪"
 #:   · `pick_white` = **白块认定**（用户 2026-10-05 ✓ "任何时候出现白色图形都需要认真目标" ✓✓
 #:     ＋ 它那两道去抖门 `_WHITE_STREAK` / `_WHITE_STEP` ✓）；
 #:   · `_POS_STEP_MAX` = **报出位置的每拍上限**（用户 2026-10-04 ✓）✓。
-from perception.lie_motion import (pick_white as _pick_white,     # noqa: E402
+from liedetect.lie_motion import (pick_white as _pick_white,     # noqa: E402
                                    _blobs as _white_blobs,
                                    _WHITE_STREAK as _WHITE_STREAK,
                                    _WHITE_STEP as _WHITE_STEP,
@@ -1623,7 +1623,7 @@ class AnchorTracker:
 # 壳（**只换底盘** ✓ 与 `VelocityRunner` 同一个套路 ✓）
 # ══════════════════════════════════════════════════════════════════════════
 
-from perception.lie_motion import MotionRunner                    # noqa: E402
+from liedetect.lie_motion import MotionRunner                    # noqa: E402
 
 
 class AnchorRunner(MotionRunner):

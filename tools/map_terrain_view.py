@@ -161,7 +161,7 @@ def render(t, out_path, use_canvas=True, target_w=1280, k=None, dx=0, dy=0,
     if zones is not None:
         # 集合版：成员按集合色画粗，没圈的画暗灰 —— 一眼看出"还差哪块地形没圈"
         owner = {}
-        for name, s in zones.sets.items():
+        for name, s in zones.zones.items():
             col = hex_bgr(s.get("color") or zones_mod.PALETTE[0])
             for fid in (s.get("footholds") or []):
                 owner.setdefault(str(fid), (col, name))
@@ -175,7 +175,7 @@ def render(t, out_path, use_canvas=True, target_w=1280, k=None, dx=0, dy=0,
             cv2.line(vis, P(f.x1, f.y1), P(f.x2, f.y2), col,
                      4 if nm is not None else 1)
         # 集合名标在**包围盒上边中点**：不压住平台本身（标在质心会盖住线）
-        for name, s in zones.sets.items():
+        for name, s in zones.zones.items():
             sp = zones_mod.set_span(t, s.get("footholds") or [])
             if sp is None:
                 continue
@@ -270,7 +270,7 @@ def render(t, out_path, use_canvas=True, target_w=1280, k=None, dx=0, dy=0,
     lines = [
         "%s   canvas %dx%d  (x%d)" % (t.id, w, h, z),
         ("集合 %d 个（名字标在平台上方）— 颜色 = 该集合"
-         "   gray: 还没圈进任何集合" % len(zones.sets)) if zones is not None else
+         "   gray: 还没圈进任何集合" % len(zones.zones)) if zones is not None else
         ("green/blue/...: foothold segments (%d) — 数字 = 段号"
          "（状态行里的「第 N 段」）" % len(t.segments)),
         "red: walls   cyan: ladderRope (%d)" % len(t.ladders),

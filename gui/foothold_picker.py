@@ -69,7 +69,7 @@ FOCUS_SCALE = 2.2
 def set_fids(zones, set_name):
     """集合 `set_name` 里有哪几条 foothold（**id 是字符串** ✓ 见 `core/zones` 的 `sets` 结构 ✓）。"""
     try:
-        s = (zones.sets or {}).get(str(set_name or "")) or {}
+        s = (zones.zones or {}).get(str(set_name or "")) or {}
         return [str(x) for x in (s.get("footholds") or [])]
     except Exception:                       # noqa: BLE001 —— 数据坏了当空集合（别炸弹窗 ✗）
         return []
@@ -151,7 +151,7 @@ class FootholdPicker(ZoomPanView):
     def __init__(self, terrain, zones, set_name, current="", parent=None):
         super().__init__(parent)
         self.terrain = terrain
-        self.zones = zones
+        self.zone_map = zones
         self.set_name = str(set_name or "")
         self._cur = str(current or "")
         #: ⭐ 要**呼吸高亮的另一个集合**名（用户 2026-10-02 ✓ —— "切换平台"模式下高亮
@@ -199,11 +199,11 @@ class FootholdPicker(ZoomPanView):
 
     def _fids(self):
         """本集合里的 foothold id（转调模块级纯函数 ✓ —— 那几件判据要能脱离 Qt 测 ✓）。"""
-        return set_fids(self.zones, self.set_name)
+        return set_fids(self.zone_map, self.set_name)
 
     def footholds(self):
         """本集合的 foothold 对象（顺序 = 地形里的顺序 ✓）—— 只读 ✓。"""
-        return footholds_of(self.terrain, self.zones, self.set_name)
+        return footholds_of(self.terrain, self.zone_map, self.set_name)
 
     def current(self):
         """当前选中的 foothold id（`""` = 没选 ✓）。"""
@@ -211,7 +211,7 @@ class FootholdPicker(ZoomPanView):
 
     def info(self, fid):
         """一条 foothold 的**参数**一行字（转调纯函数 ✓ 口径见它 ✓）。"""
-        return fid_info(self.terrain, self.zones, self.set_name, fid)
+        return fid_info(self.terrain, self.zone_map, self.set_name, fid)
 
     # ---------------- 选 ----------------
 
@@ -303,7 +303,7 @@ class FootholdPicker(ZoomPanView):
         #   也进呼吸表（**不改基准色** ✓ —— 和"选中的那条"区别开：那个改色压顶，这个只呼吸）。
         #   用途："切换平台"模式下让用户**一眼看到「idle 去哪」选的那块平台在地图哪里** ✓。
         if self._highlight_set:
-            _hl_fids = set(set_fids(self.zones, self._highlight_set))
+            _hl_fids = set(set_fids(self.zone_map, self._highlight_set))
             _hl_items = set(self._items[fid] for fid in _hl_fids if fid in self._items)
             self._lines = [(i, b, s_, (hl or (i in _hl_items)))
                            for i, b, s_, hl in self._lines]
@@ -359,7 +359,7 @@ class FootholdPicker(ZoomPanView):
         from PyQt5.QtGui import QBrush, QFont
         from PyQt5.QtWidgets import QGraphicsSimpleTextItem
 
-        for name, s in (self.zones.sets or {}).items():
+        for name, s in (self.zone_map.zones or {}).items():
             xs, ys = [], []
             fids = set(str(x) for x in ((s or {}).get("footholds") or []))
             for f in (self.terrain.footholds or []):
@@ -550,7 +550,7 @@ class FootholdPicker(ZoomPanView):
             except Exception:               # noqa: BLE001
                 k = 1.0
             tol = PICK_SCREEN_PX / k
-        self.set_current(pick_fid(self.terrain, self.zones, self.set_name, x, y, tol))
+        self.set_current(pick_fid(self.terrain, self.zone_map, self.set_name, x, y, tol))
         self.picked.emit(self._cur)
         return self._cur
 

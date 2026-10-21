@@ -7,7 +7,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import cv2  # noqa: E402
 
 from core.imgio import imread  # noqa: E402
-from perception.player_locator import PlayerLocator  # noqa: E402
+from perception.world.player_locator import PlayerLocator  # noqa: E402
 
 
 def p(*a):

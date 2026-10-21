@@ -1,6 +1,6 @@
 """手动输入：捕获本机键盘，实时转发到游戏。
 
-开启后，本机按下的每个「游戏支持」的键，都会通过 decision.input 的
+开启后，本机按下的每个「游戏支持」的键，都会通过 execution.input 的
 后端（本地 SendInput 或远程 Pro Micro）转发到游戏，实现玩家手动接管控制。
 
 **可以和自动打怪同时开着**（不需要先关自动）。代价是两边可能抢同一个键：
@@ -25,7 +25,7 @@
 import queue
 import threading
 
-from decision import input as dinput
+from execution import input as dinput
 from pynput import keyboard
 
 # pynput 特殊键 → input.py 键名
@@ -69,7 +69,7 @@ def _key_name(key):
             if name in ("`", "~"):
                 name = "grave"
     # 本机操作键（F10 触控板开关 / F11 开关自动 / F12）不转发。真正拦住它们的是
-    # decision/input.py 的 LOCAL_ONLY，这里先挡一道是为了少一次无谓的
+    # execution/input.py 的 LOCAL_ONLY，这里先挡一道是为了少一次无谓的
     # 「按键状态重同步」—— 那会让决策层白清一次按键状态。
     if name and not dinput.is_local_only(name) and dinput.resolve_vk(name) is not None:
         return name

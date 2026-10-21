@@ -1,0 +1,13 @@
+{
+  "frames": 219,
+  "boxes": 677,
+  "from_model": 218,
+  "boxes_from_model": 677,
+  "protected": 0,
+  "kept_orig": 0,
+  "boxes_kept": 0,
+  "cleared": 1,
+  "median_boxes": 3.0,
+  "conf_thr": 0.2,
+  "weights": "E:\\MyPrograms\\playerSimu\\projects\\森林迷宫_珠缨\\models\\detect_v1.pt"
+}

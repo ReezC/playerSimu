@@ -30,15 +30,15 @@ import cv2
 
 from core.context import ConsoleContext, TaskContext, cancelable
 from core.imgio import imread, imwrite
-# ⭐⭐ 「框到可见部分」的两个默认值（与怪物/宠物/掉落**同一份** ✓ 见 `perception/visible_box.py` ✓）
-from perception import region as region_mod         # ⭐ 框选区域的一处口径 ✓（见 `region.py` ✓）
-from perception.visible_box import VISIBLE_KEEP, VISIBLE_TOL
+# ⭐⭐ 「框到可见部分」的两个默认值（与怪物/宠物/掉落**同一份** ✓ 见 `perception/detect/visible_box.py` ✓）
+from perception.world import region as region_mod         # ⭐ 框选区域的一处口径 ✓（见 `region.py` ✓）
+from perception.detect.visible_box import VISIBLE_KEEP, VISIBLE_TOL
 
 
 def keep_old_player_lines(existing, region, w, h, cls=None):
     """玩家链写盘前该保留的旧行 ⇒「别的类」+「**区域外**的旧玩家框」✓（2026-10-17 事故修 ✓）。
 
-    ⚠ 与 `detect_mobs.merge_class_lines` **同一套判据** ✓（`perception.region.center_inside`
+    ⚠ 与 `detect_mobs.merge_class_lines` **同一套判据** ✓（`perception.world.region.center_inside`
       ✓ **中心点**在不在区域里 ✓ 归一化坐标乘回画面像素 ✓），但**语义不同** ✗：
         · 那边：**区域内**的本类旧框参与"覆盖 / 0 检出保命"✓；
         · 这边：**区域内**的旧玩家框**一律不保留** ✓ —— 玩家那条**有意整帧重写 class 0** ✓
@@ -74,12 +74,12 @@ def keep_old_player_lines(existing, region, w, h, cls=None):
 # 可视化框颜色跟「设置 → 可视化」走（gui.theme 不 import PyQt5，子进程可用）
 from gui.theme import class_color
 
-CLASS_PLAYER = 0    # 类别表见 perception/classes.py（id 固定，别在本地另立一份）
+CLASS_PLAYER = 0    # 类别表见 perception/detect/classes.py（id 固定，别在本地另立一份）
 _W = {}
 
 
 def init_worker(cfg):
-    from perception.player_locator import PlayerLocator
+    from perception.world.player_locator import PlayerLocator
     cv2.setNumThreads(1)
     _W["cfg"] = cfg
     _W["loc"] = PlayerLocator(
@@ -129,7 +129,7 @@ def work(fp_str):
     #   老写法 `keep` 把**所有** class 0 行都剔掉 ✗ ⇒ **区域模式**（这一趟只搜了框选那块 ✓）
     #   下会把**区域外的玩家框一并丢掉** ✗✗ = 真丢数据 ✓。
     #   ⇒ 现在按区域**分两桶** ✓（判据与 `detect_mobs.merge_class_lines` **同一套** ✓
-    #     `perception.region.center_inside` ✓ 中心点 ✓ 归一化乘回像素 ✓）：
+    #     `perception.world.region.center_inside` ✓ 中心点 ✓ 归一化乘回像素 ✓）：
     #       · **区域内**的旧玩家框 ⇒ 照旧**不保留** ✓（这一趟的新结果会替掉它 ✓
     #         = "只重标这一块"该有的语义 ✓）；
     #       · **区域外**的旧玩家框 ⇒ **保留** ✓（与怪物框同等对待 ✓ 本次修的就是它 ✓）。
@@ -142,7 +142,7 @@ def work(fp_str):
     score = None
     if r is not None:
         cx, cy, bw, bh, score, _name = r
-        # ⭐⭐ **只标框选区域内的**（用户 2026-10-11 ✓ 见 `perception/region.py` ✓）——
+        # ⭐⭐ **只标框选区域内的**（用户 2026-10-11 ✓ 见 `perception/world/region.py` ✓）——
         #   判据是"**中心点在不在区域里**"✓（跨边界的框只要主要在区域内就算 ✓ 见那边说明 ✓）。
         #   ⚠ 没框选（`region` 为空 ✓）⇒ 一律 True ✓ ⇒ **老行为一字不变** ✓。
         if not region_mod.center_inside(cfg.get("region"), cx, cy):
@@ -221,7 +221,7 @@ def run_detect_player(params, ctx=None):
         #   ⚠⚠ **默认值全部 = 老行为**（老项目 / 老调用方一字不变 ✓）：
         #     `per_mob=0` ⇒ 模板帧不截断 ✓；`min_distinct=0.0` ⇒ 不设"最佳/次佳差距"闸 ✓；
         #     `max_peaks=1` ⇒ 每模板只取一个峰 ✓；`downscale=1.0` ⇒ 不缩 ✓。
-        #   语义见 `perception/player_locator.py` 里那两段说明（尤其"区分度"对玩家是
+        #   语义见 `perception/world/player_locator.py` 里那两段说明（尤其"区分度"对玩家是
         #   **可信度闸**而不是去重闸 ✓）—— 改默认值前先读那两段 ✗。
         "per_mob": int(params.get("per_mob", 0) or 0),
         "min_distinct": float(params.get("min_distinct", 0.0) or 0.0),
@@ -245,9 +245,9 @@ def run_detect_player(params, ctx=None):
         #   参数**"）—— 玩家这条链 2026-10-06 才补上（之前只有 阈值/尺度 + 那 5 个 ✓）。
         #   ⚠ **默认关** ✗（改的是**标注语义**、不是修 bug ✓ ⇒ 老项目 / 老调用方一字不变 ✓）；
         #     要开就按项目显式开（设置里那个勾 ✓）；开了之后同一帧的框会变小 ⇒ 要重跑标注 ✓。
-        #   ⚠ 实现是 `perception/visible_box.py`（与怪物/宠物/掉落**共用那一份** ✓）。
+        #   ⚠ 实现是 `perception/detect/visible_box.py`（与怪物/宠物/掉落**共用那一份** ✓）。
         # ⭐⭐ **只在框选区域内标注**（用户 2026-10-11 ✓ 原话："点击各个标注按钮，只会在
-        #   当前帧框选的**区域内**进行自动标注"✓）—— 口径见 `perception/region.py` ✓。
+        #   当前帧框选的**区域内**进行自动标注"✓）—— 口径见 `perception/world/region.py` ✓。
         #   ⚠ 不传 / 空 ⇒ `None` ⇒ **整幅画面都算** ✓（= 老行为一字不变 ✓）。
         "region": params.get("region"),
         "visible": bool(params.get("visible", False)),
@@ -275,7 +275,7 @@ def run_detect_player(params, ctx=None):
 
     # 主进程先验一次模板能不能加载，避免开了几十个进程才发现模板空
     ctx.progress(0, 0, "加载玩家模板…")
-    from perception.player_locator import PlayerLocator
+    from perception.world.player_locator import PlayerLocator
     # ⭐⭐ **边加载边看取消**（用户 2026-10-05 ✓ 原话："能不等他返回吗？"）—— 逐张 `imread`
     #   原来是个整块动作 ✗ ⇒ 点了取消得干等它读完 ✓；传 `ctx.canceled` 就能几百毫秒内收工 ✓
     #   （与怪物那条**同一份口径** ✓ 见 `perception/player_locator.PlayerLocator.__init__` ✓）。

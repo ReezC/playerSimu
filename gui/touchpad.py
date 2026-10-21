@@ -18,7 +18,7 @@
     Ctrl 是默认的攻击键，而「开启手动输入」会把本机按键实时转发给游戏 ——
     按住 Ctrl 用触控板时，这个 Ctrl 本身就是一次攻击，游戏里会跟着出手。
     改成 F10 开关：本地一个键、只走本窗口的按键事件，不经过任何转发路径
-    （F10 也在 `decision/input.py` 的「本机操作键」名单里，永不发给游戏）。
+    （F10 也在 `execution/input.py` 的「本机操作键」名单里，永不发给游戏）。
 
 实现要点 —— **位移由跟踪线程按固定节拍产生**：
     ⭐⭐ 2026-10-05（用户原话："B机F10控制A机鼠标，A机的鼠标移动不连续" ⇒ 选"直接②" ✓）：
@@ -26,7 +26,7 @@
     主回路拖住，Qt 就把连续移动**合并**成一次 ⇒ 实测（`perf.log` 18:40 那段）
     `move_gap_ms` 最大 **467 ms**、`move_px` 最大 **514** ⇒ "停一下、猛跳一下" ✓
     （而同一段 `send_ms` 中位才 **0.15 ms** ⇒ 瓶颈不在发送 ✓）。
-    现在：`decision/input.py::PointerTracker` 起一条**独立线程**，按固定节拍
+    现在：`execution/input.py::PointerTracker` 起一条**独立线程**，按固定节拍
     （`TRACK_INTERVAL_S` ✓）`GetCursorPos` 算位移、再把指针 `SetCursorPos` 拨回钉点
     ⇒ 节拍只受"线程能不能被调度"影响，与 GUI 卡不卡无关 ✓。
 
@@ -92,7 +92,7 @@ class TouchPad(QWidget):
         self._ref = None          # 光标钉点（**物理像素** ✓ 由 GetCursorPos 读回 ✓ 见 _start_track）
         self._wheel_rem = 0       # 滚轮余数：触摸板会给出不足一格（120）的增量
         # ⭐⭐ 位移的**产生**：跟踪线程 + 它的实时出口（用户 2026-10-05 ✓ "直接②" ✓ 见模块文档）
-        self._tracker = None      # `decision.input.PointerTracker`（没进触控模式时为 None ✓）
+        self._tracker = None      # `execution.input.PointerTracker`（没进触控模式时为 None ✓）
         self._delta_sink = None   # 面板接的出口（**在跟踪线程里被调** ✓ 只许线程安全的事 ✓）
         self._track_fail = False  # 跟踪线程起不来（界面会说清 ✓ 别静默 ✗）
         # 拖拽状态：按下先不发，滑动超过 HOLD_PX 那一刻才补发 PRESS
@@ -200,13 +200,14 @@ class TouchPad(QWidget):
           （位移由 `PointerTracker` 按 `scale=devicePixelRatio` 除回逻辑像素 ✓）；
           起不来就 `_track_fail`（界面会说清 ✓ 别静默 —— 静默的后果是"板子像坏的"✗）。
         """
-        from decision import input as dinput
+        from execution import input as dinput      # noqa: F401 —— 发键仍走这里 ✓
+        from execution import pointer as dptr
 
         self._stop_track()                          # 幂等（重复激活不会漏掉旧线程 ✓）
-        pos = dinput.pointer_pos()
+        pos = dptr.pointer_pos()
         t = None
         if pos is not None:
-            t = dinput.PointerTracker(
+            t = dptr.PointerTracker(
                 pos, self._on_tracked,
                 scale=max(1e-6, float(self.devicePixelRatioF() or 1.0)))
             if not t.start():

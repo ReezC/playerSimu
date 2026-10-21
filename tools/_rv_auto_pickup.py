@@ -11,7 +11,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 AG = ROOT / "decision" / "agent.py"
 LT = ROOT / "gui" / "live_thread.py"
-INP = ROOT / "decision" / "input.py"
+INP = ROOT / "execution" / "input.py"
 PP = ROOT / "gui" / "player_panel.py"
 
 _PRE = ("import sys; sys.path.insert(0, '.'); "

@@ -117,9 +117,17 @@ def t_release_keys_covers_both_backends():
         只清记录的话那个键在本机就**永远按着** ✗（实测只看得见 down、没有 up）。
     """
     src = (ROOT / "decision" / "agent.py").read_text(encoding="utf-8")
-    _i = src.find("def _release_keys_now(self):")
-    check(_i >= 0, "找不到 `_release_keys_now`（松键的唯一写法被拆散了？）✗")
-    _seg = src[_i:_i + 2200]
+    # ⚠ 按**函数体**取，不按"往后 2200 字"取 ✗（那个窗口随注释变动就失准 ——
+    #   2026-10-17 拆 remote 时它正好卡在边界上，红得莫名其妙 ✓）
+    import ast as _ast
+
+    _fn = None
+    for n in _ast.walk(_ast.parse(src)):
+        if isinstance(n, _ast.FunctionDef) and n.name == "_release_keys_now":
+            _fn = n
+            break
+    check(_fn is not None, "找不到 `_release_keys_now`（松键的唯一写法被拆散了？）✗")
+    _seg = _ast.get_source_segment(src, _fn) or ""
     check('== "local"' in _seg, "没按后端分岔 —— 两种后端会被当成一种 ✗")
     check("keys.release_all()" in _seg, "本地后端那条路没了 ⇒ 键在本机永远按着 ✗")
     check("release_all_remote()" in _seg and "keys.clear()" in _seg,
@@ -167,7 +175,8 @@ def t_mouse_move_is_instrumented():
     import tempfile
     import time as _time
     from core import perf
-    from decision import input as dinput
+    from execution import input as dinput
+    from execution import remote as _remote_mod
 
     class _R:
         def __init__(self):
@@ -178,11 +187,11 @@ def t_mouse_move_is_instrumented():
             return True
 
     logf = Path(tempfile.mkdtemp(prefix="perf_mouse_")) / "perf.log"
-    old_en, old_log, old_r = perf.ENABLED, perf.LOG, dinput._remote
+    old_en, old_log, old_r = perf.ENABLED, perf.LOG, _remote_mod._remote
     try:
         perf.configure(True, log=logf)
         r = _R()
-        dinput._remote = r
+        _remote_mod._remote = r
         dinput._last_move_t = None
         for dx, dy in ((3, 0), (1, 1), (0, -2)):
             dinput.mouse_move(dx, dy)
@@ -190,7 +199,7 @@ def t_mouse_move_is_instrumented():
         perf.flush(force=True)
         got = logf.read_text(encoding="utf-8")
     finally:
-        dinput._remote = old_r
+        _remote_mod._remote = old_r
         dinput._last_move_t = None
         perf.configure(old_en)
         perf.LOG = old_log
@@ -360,7 +369,7 @@ def t_pad_delta_from_tracker():
         `move_px`                             **最大 514**（一次跳半个屏幕 ✓）
     ⇒ A 机"停一下、猛跳一下" ✓；而同一段 `send_ms` 中位 **0.15 ms**、`kbd_pending` ≤ 4
     ⇒ **瓶颈不在链路也不在发送，在位移的产生** ✓。
-    方子（用户挑的"直接②"）：产生挪进 `decision/input.py::PointerTracker` 那条独立线程
+    方子（用户挑的"直接②"）：产生挪进 `execution/input.py::PointerTracker` 那条独立线程
     （固定节拍 `GetCursorPos` ✓ + `SetCursorPos` 拨回钉点 ✓），出口**直接**喂 `_PadSender`
     （不经 Qt 事件循环 ✓）。
 
@@ -380,16 +389,20 @@ def t_pad_delta_from_tracker():
     import time as _t
     from types import SimpleNamespace
 
-    from decision import input as dinput
+    from execution import input as dinput
+    from execution import remote as _remote_mod
+    # ⚠ 指针已独立成 `execution/pointer.py`（2026-10-17 ✓ 第 1 波）⇒
+    #   打桩要打在**它自己的模块属性**上 ✓（打 `dinput.pointer_*` 已经打不着了 ✗）
+    from execution import pointer as dptr
     from gui import player_panel as _pp
 
     # ⑥ 真 Win32：`GetCursorPos` 读得到 ✓；`SetCursorPos` **只钉契约**（不抛异常 + 回布尔 ✓）
     #   ⚠ **不许**断言"拨得动"：锁屏 / 非交互桌面下 `SetCursorPos` 返回 0、指针纹丝不动、
-    #     `GetLastError` 还是 0（本机 2026-10-05 实测 ✓ 见 `decision/input.py::pointer_warp` ✓）
+    #     `GetLastError` 还是 0（本机 2026-10-05 实测 ✓ 见 `execution/pointer.py::pointer_warp` ✓）
     #     ⇒ 那样会让用例随"屏幕锁没锁"红绿 ✗。真拨动/拨不动两条路都在 ④ 用假指针钉住了 ✓。
-    _p0 = dinput.pointer_pos()
+    _p0 = dptr.pointer_pos()
     check(_p0 is not None, "`GetCursorPos` 读不到（真 Win32 这条路 ✗）")
-    _r = dinput.pointer_warp(_p0[0], _p0[1])
+    _r = dptr.pointer_warp(_p0[0], _p0[1])
     check(isinstance(_r, bool),
           "`pointer_warp` 没回布尔（拨不动时上层没法判断 / 留痕 ✗）：%r" % (_r,))
 
@@ -397,8 +410,8 @@ def t_pad_delta_from_tracker():
     warps = []
     got = []                            # 每条回调：(dx, dy, 线程名)
     warp_ok = [True]
-    _op, _ow = dinput.pointer_pos, dinput.pointer_warp
-    dinput.pointer_pos = lambda: (pos[0], pos[1])
+    _op, _ow = dptr.pointer_pos, dptr.pointer_warp
+    dptr.pointer_pos = lambda: (pos[0], pos[1])
 
     def _fake_warp(x, y):
         warps.append((x, y))
@@ -406,7 +419,7 @@ def t_pad_delta_from_tracker():
             pos[0], pos[1] = int(x), int(y)
         return warp_ok[0]               # ⚠ 拨不动就如实回 False（真 Windows 就这样 ✓）
 
-    dinput.pointer_warp = _fake_warp
+    dptr.pointer_warp = _fake_warp
 
     def _wait(n, seq, tmo=2.0):
         """等 `seq` 攒够 n 条：位置由测试摆好，线程下一拍就会看到 ✓
@@ -419,7 +432,7 @@ def t_pad_delta_from_tracker():
         while len(seq) < n and _t.perf_counter() - t0 < tmo:
             _t.sleep(0.002)
 
-    t = dinput.PointerTracker(
+    t = dptr.PointerTracker(
         (100, 100),
         lambda dx, dy: got.append((dx, dy, _thr.current_thread().name)),
         scale=2.0, interval=0.003)
@@ -486,7 +499,7 @@ def t_pad_delta_from_tracker():
         check(len(got) == _n_stop, "`stop()` 之后还在产生位移 ✗")
     finally:
         t.stop()                        # 幂等（已经停过就什么都不做 ✓）
-        dinput.pointer_pos, dinput.pointer_warp = _op, _ow
+        dptr.pointer_pos, dptr.pointer_warp = _op, _ow
 
     # ⑦ 面板出口：跟踪线程的原始位移 ⇒ 乘灵敏度 ⇒ **浮点**交给发送器（小数不许截 ✗）
     class _S:
@@ -532,19 +545,21 @@ def t_pad_delta_from_tracker():
     check("timeBeginPeriod" not in _code_calls(tp),
           "`gui/touchpad.py` 里调了 `timeBeginPeriod` —— 定时器精度只该 `core/winperf.py` 一处 ✓")
 
-    inp = (ROOT / "decision" / "input.py").read_text(encoding="utf-8")
-    _ptr = inp.split("def pointer_pos", 1)[1].split("class PointerTracker", 1)[0]
+    # ⚠ 指针已独立成 `execution/pointer.py`（2026-10-17 ✓ 第 1 波）⇒
+    #   源码钉要读**新文件** ✓（读老文件会 IndexError：那两段代码已经不在那儿了 ✗）
+    ptr = (ROOT / "execution" / "pointer.py").read_text(encoding="utf-8")
+    _ptr = ptr.split("def pointer_pos", 1)[1].split("class PointerTracker", 1)[0]
     check("GetCursorPos" in _ptr and "SetCursorPos" in _ptr,
           "指针读写没走 Win32（`GetCursorPos` / `SetCursorPos` ✓ 那是唯一能在非 GUI 线程跑的 ✓）")
     check("QCursor" not in _ptr, "指针读写那里碰了 Qt（它要在非 GUI 线程里跑 ✗）")
-    _trk_calls = _code_calls(inp, "PointerTracker")
+    _trk_calls = _code_calls(ptr, "PointerTracker")
     check("QCursor" not in _trk_calls,
           "跟踪线程里**真的**碰了 Qt（非 GUI 线程调 `QCursor` 会偶发崩 ✗）")
-    check("timeBeginPeriod" not in _code_calls(inp),
-          "`decision/input.py` 里调了 `timeBeginPeriod` —— 定时器精度只该 `core/winperf.py` 一处 ✓")
-    check("pos[0] - last[0]" in inp,
+    check("timeBeginPeriod" not in _code_calls(ptr),
+          "`execution/pointer.py` 里调了 `timeBeginPeriod` —— 定时器精度只该 `core/winperf.py` 一处 ✓")
+    check("pos[0] - last[0]" in ptr,
           "位移不是 `pos - 上一次`（拨回失败会一次跳一大截 ✗）")
-    check("pad_warp_fail" in inp,
+    check("pad_warp_fail" in ptr,
           "拨回失败没留痕（真出问题时「指针为什么跑掉了」会查不出来 ✗）")
 
     pp = (ROOT / "gui" / "player_panel.py").read_text(encoding="utf-8")
@@ -789,7 +804,8 @@ def t_pad_sender_off_gui_thread():
     import time as _t
 
     from gui.player_panel import _PadSender
-    from decision import input as dinput
+    from execution import input as dinput
+    from execution import remote as _remote_mod
 
     sent = []
     _old = dinput.mouse_move
@@ -818,8 +834,289 @@ def t_pad_sender_off_gui_thread():
         s.stop()
 
 
+def t_execution_split():
+    """⭐⭐⭐ 执行层拆成四块后**不许再黏回去**（2026-10-17 第 1 波 ✓）。
+
+    拆分前：`execution/input.py` 983 行同时管"键位表 + 发键 + 指针 + 远端链路"✗
+    ⇒ 改一张键位表要动传输文件 ✗ 指针模块还得反向依赖传输模块 ✗。
+    拆完：`keys.py`(纯数据) / `win32.py`(ctypes 胶水) / `pointer.py`(指针) /
+          `input.py`(发键 + 远端)，各自**一处实现** ✓。
+
+    钉五条：① `keys.py` **零依赖**（连 `core` 都不许 ✓ 得能被随便谁安全导入 ✓）；
+            ② `pointer.py` **不许** import `execution.input`（那是反向依赖 ✗）；
+            ③ `user32` 只有 `win32.py` **定义一次**（两边都 import 它 ✓ 不许各定义一份 ✗）；
+            ④ `input.py` 里**不再有** `def pointer_pos` / `DEFAULT_KEYMAP =`
+               （有 = 又复制了一份 ✗ 那就有两条路 ✗）；
+            ⑤ 三块都真的存在（防止"拆了又合"✗）。
+    """
+    import ast
+
+    paths = {n: ROOT / "execution" / ("%s.py" % n)
+             for n in ("keys", "win32", "pointer", "input", "mouse_aim", "remote")}
+    for n, p in paths.items():
+        check(p.is_file(), "`execution/%s.py` 不见了（拆出去的那块被合回去了 ✗）" % n)
+
+    kt = ast.parse(paths["keys"].read_text(encoding="utf-8"))
+    mods = set()
+    for n in ast.walk(kt):
+        if isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+            mods.add(n.module.split(".")[0])
+        elif isinstance(n, ast.Import):
+            mods |= {a.name.split(".")[0] for a in n.names}
+    check(not (mods & {"core", "link", "perception", "execution", "decision",
+                       "gui", "tools", "runtime", "liedetect"}),
+          "`execution/keys.py` 开始 import 本仓模块了 %s ⇒ 纯数据件不该有依赖 ✗" % (mods,))
+
+    pt = paths["pointer"].read_text(encoding="utf-8")
+    check("from execution.input import" not in pt and "execution.input" not in pt,
+          "`pointer.py` 反向依赖了 `execution.input` ⇒ 又黏回去了 ✗（应该两个都往下用 `win32.py` ✓）")
+    check("from execution.win32 import" in pt,
+          "`pointer.py` 没从 `win32.py` 拿 `user32` ⇒ 自己又定义了一份 ✗")
+
+    it = paths["input"].read_text(encoding="utf-8")
+    check("def pointer_pos" not in it and "DEFAULT_KEYMAP =" not in it,
+          "`input.py` 里又出现了指针/键位表 ⇒ 同一件事有两个实现 ✗")
+    check("from execution.win32 import" in it,
+          "`input.py` 没从 `win32.py` 拿结构体 ⇒ `SendInput` 那段会 `NameError` ✗")
+
+    wt = paths["win32"].read_text(encoding="utf-8")
+    check(wt.count("ctypes.windll.user32") == 1,
+          "`user32` 定义次数不是 1 ⇒ 又多了一份句柄 ✗")
+
+    # ---- 第四块：瞄准也拆成"换算"与"动作"两半（2026-10-17 第 2 刀 ✓）----
+    conv = ROOT / "execution" / "aim_convert.py"
+    check(conv.is_file(), "`execution/aim_convert.py` 不见了（换算那半被合回去了 ✗）")
+    ct = conv.read_text(encoding="utf-8")
+    check("execution.mouse_aim" not in ct and "execution import mouse_aim" not in ct,
+          "`aim_convert.py` 反向依赖了 `mouse_aim` ⇒ 成环 ✗（方向只能是动作 → 换算 ✓）")
+    check("conv." not in ct, "`aim_convert.py` 里出现 `conv.` ⇒ 拿到动作那半的引用了 ✗")
+
+    at = paths["mouse_aim"].read_text(encoding="utf-8")
+    for nm in ("def to_screen", "def load_gain", "def auto_measure", "def roi_px"):
+        check(nm not in at,
+              "`mouse_aim.py` 里又出现 `%s` ⇒ 换算那半被复制回来了 ✗（同一件事两个实现 ✗）"
+              % nm)
+    check("from execution import aim_convert as conv" in at,
+          "`mouse_aim.py` 不是**模块限定**调用换算（`conv.xxx`）⇒ 打桩会打在没人用的名字上 ✗")
+
+    # ---- 第五块：链路独立成 `remote.py`（2026-10-17 第 3 刀 ✓）----
+    rt = paths["remote"].read_text(encoding="utf-8")
+    check("execution.input" not in rt and "from execution import input" not in rt,
+          "`remote.py` 反向依赖了 `input` ⇒ 成环 ✗（方向只能是 发键 → 链路 ✓）")
+    for nm in ("def link_health", "def use_network", "def connect_async",
+               "def reconnect_remote", "def release_all_remote", "def use_serial"):
+        check(nm not in it,
+              "`input.py` 里又出现 `%s` ⇒ 链路那半被复制回来了 ✗" % nm)
+    check("from execution import remote as _link" in it,
+          "`input.py` 不是模块限定访问链路（`_link.`）⇒ `_remote` 会成快照，重连后立刻过期 ✗")
+
+
+def t_local_send_gate():
+    """⭐⭐⭐⭐⭐ 离屏（自检 / 冒烟）**绝不许**把键发到操作员桌面上（用户 2026-10-17 现场 ✓）。
+
+    现场：用户问"**为什么你跑某些进程时会动到我的方向键？**"
+    根因：`net_allowed()` 只封"连不连被控机"✓，**本地 `SendInput` 那条路它不管** ✗
+    ⇒ 自检在 `QT_QPA_PLATFORM=offscreen` 下 `_remote=None`、`_blocked=False`
+    ⇒ `key_down("left")` 真的 `SendInput` 进**当前置顶窗口**（IDE / 游戏 ✓）。
+    用计数器版跑 `selftest_decision` 实测：`left/right/up/down` 共 **47 次**、
+    `ctrl`/`enter`/`z` 各 1 次 —— 正好对上"方向键自己在动" ✓。
+
+    钉六条：① 离屏 ⇒ 不许；② `PSIMU_ALLOW_LOCAL=1` ⇒ 许（显式要真发的场合 ✓）；
+            ③ 真闸生效：离屏下 `key_down` **一次都不许**到 `SendInput` ✓；
+            ④ 允许时照旧能发（闸不许把真功能一起关掉 ✗）；
+            ⑤ `_send` 里必须调 `local_allowed()`（不然闸是死代码 ✗）；
+            ⑥ 与 `net_allowed()` **各管一件事**（两个都得在 ✓）。
+    """
+    import os
+    from unittest import mock
+
+    from execution import input as di
+    from execution import remote as _remote_mod
+
+    class _FakeUser32:
+        def __init__(self):
+            self.calls = []
+
+        def __getattr__(self, name):
+            def _f(*a, **kw):
+                self.calls.append(name)
+                return 1
+            return _f
+
+    _om, _ob = _remote_mod._remote, _remote_mod._blocked
+    _ou = di._user32
+    try:
+        _remote_mod._remote, _remote_mod._blocked = None, False
+        rec = _FakeUser32()
+        di._user32 = rec
+
+        with mock.patch.dict(os.environ, {"QT_QPA_PLATFORM": "offscreen"},
+                             clear=False):
+            os.environ.pop("PSIMU_ALLOW_LOCAL", None)
+            check(di.local_allowed() is False,
+                  "离屏时 `local_allowed()` 还是 True ⇒ 自检会往你桌面上发键 ✗")
+            rec.calls.clear()
+            di.key_down("left")
+            di.key_up("left")
+            di.tap("right", 0.0)
+            check(not [c for c in rec.calls if c == "SendInput"],
+                  "离屏下 `key_down/key_up/tap` 真的调了 `SendInput`（%s）⇒ "
+                  "你的方向键会被按 ✗" % (rec.calls,))
+
+        with mock.patch.dict(os.environ, {"PSIMU_ALLOW_LOCAL": "1"},
+                             clear=False):
+            check(di.local_allowed() is True,
+                  "`PSIMU_ALLOW_LOCAL=1` 也不允许 ⇒ 真要发的地方（链路自检）没法发 ✗")
+            rec.calls.clear()
+            di.key_down("left")
+            di.key_up("left")
+            check([c for c in rec.calls if c == "SendInput"],
+                  "允许时也发不出去 ⇒ 闸把真功能一起关掉了 ✗")
+    finally:
+        _remote_mod._remote, _remote_mod._blocked = _om, _ob
+        di._user32 = _ou
+
+    src = (ROOT / "execution" / "input.py").read_text(encoding="utf-8")
+    check("def local_allowed(" in src, "没有 `local_allowed()` ⇒ 这个闸不存在 ✗")
+    seg = src.split("def _send(", 1)[1].split("def key_down", 1)[0]
+    check("local_allowed()" in seg,
+          "`_send` 没调 `local_allowed()` ⇒ 闸是死代码，键照样发得出去 ✗")
+    # ⚠ 2026-10-17：`net_allowed()` 随链路那半搬到 `execution/remote.py` ✓
+    rsrc = (ROOT / "execution" / "remote.py").read_text(encoding="utf-8")
+    check("def net_allowed(" in rsrc,
+          "`net_allowed()`（管连不连被控机）没了 ⇒ 两件事只剩一件 ✓")
+
+
+def t_bridge_reports_why_and_skips_reset():
+    """⭐⭐⭐⭐ 桥断开必须留下**原因**；而且只有**串口真坏**才复位板子（2026-10-20 ✓）。
+
+    现场（用户 2026-10-20：「A 机经常报 键盘 relay disconnected」）：A 十分钟报了 6 次 ✗，
+    而 B 侧每一条只写「连接被对端关闭」—— **两边都指不出原因**。根因两件：
+
+      ① `bridge()` 有**三条静默出口**（`select` 抛异常 / `recv` 抛非超时异常 /
+         `ser_to_tcp` 的 `sendall` 超时），全是光秃秃一个 `break` ✗ ⇒ 断了也没痕迹；
+      ② 收尾**无条件** `link.reopen()` ⇒ 32U4 拉低 DTR **复位板子**，复位后 1~2 秒不处理
+         指令 ⇒ B 刚重连就又是 5 秒静默（`REPLY_SILENCE_LIMIT`）⇒ 又判死链 ⇒ 又重连
+         ⇒ **自己喂自己的自激循环**，A 那边就一行行刷 disconnected ✓。
+
+    这条钉四件：
+      ① B 主动断开 ⇒ 原因写着"客户端主动断开"，且 **reopen 一次都不许有** ✓；
+      ② 串口读失败 ⇒ 原因写着"串口读失败"、**要 reopen**（这才是老规矩治的病 ✓）；
+      ③ 串口坏时原因**必须直发给 B**（`#LOG … client disconnected: …`）——
+         没这句，B 的界面永远只有「连接被对端关闭」✓；
+      ④ B 不读（回执写不出去）⇒ 也留原因，但**不许**因此复位板子 ✓。
+    """
+    import socket
+    import threading
+    import time
+
+    from remote_kbd import relay as rl
+
+    class _Link:
+        """串口替身：能按需"读失败"，并记下写了什么 / 有没有被 reopen ✓。"""
+
+        def __init__(self, data=b"", read_exc=None):
+            self.data = data
+            self.read_exc = read_exc
+            self.writes = []
+            self.reopens = []
+
+        def read(self, n):
+            if self.read_exc is not None:
+                raise self.read_exc
+            if not self.data:
+                time.sleep(0.002)
+                return b""
+            d, self.data = self.data, b""
+            return d
+
+        def write(self, b):
+            self.writes.append(bytes(b))
+            return len(b)
+
+        def reopen(self, why="", **_kw):
+            self.reopens.append(why)
+
+    def _go(link, act, timeout=6.0):
+        """开一条**真 socketpair** 跑 bridge（`select`/`recv`/`sendall` 都用真的 ✓）。"""
+        a, b = socket.socketpair()
+        box = {}
+
+        def _worker():
+            try:
+                box["why"] = rl.bridge(a, link)
+            except Exception as e:                   # noqa: BLE001 —— 用例要看到它 ✓
+                box["err"] = e
+            finally:
+                try:
+                    a.close()
+                except OSError:
+                    pass
+
+        th = threading.Thread(target=_worker, daemon=True)
+        th.start()
+        try:
+            act(b)
+        finally:
+            th.join(timeout)
+            try:
+                b.close()
+            except OSError:
+                pass
+        return box
+
+    _ls, _dp = rl._LOG_SINK, rl._DONE_PENDING
+    try:
+        # ① B 主动断开 ⇒ 有原因、**不复位板子**
+        link = _Link()
+        box = _go(link, lambda s: (time.sleep(0.15),
+                                   s.shutdown(socket.SHUT_RDWR)))
+        check("客户端主动断开" in str(box.get("why") or ""),
+              "B 主动断开时没写下原因（又变成光秃秃一句 disconnected ✗）：%r" % (box,))
+        check(not link.reopens,
+              "B 只是重连，却把板子复位了（32U4 一复位 1~2 秒不收指令 ⇒ B 又判死链 "
+              "⇒ 自激循环 ✗）：%r" % (link.reopens,))
+        check(any(b"RELEASEALL" in w for w in link.writes),
+              "断开时没补 RELEASEALL（卡住的键松不掉 ✗）")
+
+        # ② 串口读失败 ⇒ 有原因、**要复位**；③ 原因要直发给 B
+        link = _Link(read_exc=OSError("COM3 掉了"))
+        got = []
+        box = _go(link, lambda s: got.append(s.recv(4096)))
+        check("串口读失败" in str(box.get("why") or ""),
+              "串口读失败时没写原因（这条原来是静默 `break` ✗）：%r" % (box,))
+        check(len(link.reopens) == 1,
+              "串口坏了却不 reopen（OS 缓冲里积压的旧命令会继续灌给固件 ✗）：%r"
+              % (link.reopens,))
+        check(got and b"#LOG" in got[0]
+              and "client disconnected".encode() in got[0]
+              and "串口读失败".encode() in got[0],
+              "断开原因没直发给 B（B 那边永远只有「连接被对端关闭」✗）：%r" % (got,))
+
+        # ④ B 不读 ⇒ 回执写不出去：留原因，但不复位板子
+        link = _Link(data=b"DONE\n")
+        box = _go(link, lambda s: (s.shutdown(socket.SHUT_RD), time.sleep(0.5)))
+        check(str(box.get("why") or "") != "",
+              "B 不读导致的收尾没留下原因（还是静默退出 ✗）：%r" % (box,))
+        check(not link.reopens,
+              "纯粹是 B 不读（客户端侧的事）也复位板子 ⇒ 白白打断固件 ✗：%r"
+              % (link.reopens,))
+    finally:
+        rl._LOG_SINK, rl._DONE_PENDING = _ls, _dp
+        try:
+            with rl._QLOCK:
+                rl._QUEUE.clear()
+        except Exception:                            # noqa: BLE001
+            pass
+
+
 TESTS = (
     ("停自动要真的松干净（下降沿 + 不许把键按回去）", t_stop_automation_releases_keys),
+    ("⭐⭐⭐⭐ 桥断开必须留原因；只有串口真坏才复位板子（别自己喂自己的重连循环）",
+     t_bridge_reports_why_and_skips_reset),
+    ("⭐⭐⭐ 执行层四块（keys/win32/pointer/input）不许再黏回去", t_execution_split),
+    ("⭐⭐⭐⭐⭐ 离屏自检**绝不许**把键发到你的桌面上（方向键自己动的根因）",
+     t_local_send_gate),
     ("⭐⭐⭐ 收摊不许把「手动输入正按着的键」一起松掉（用户 2026-10-13）",
      t_release_keeps_manual_held),
     ("松键那条唯一写法同时认两种后端", t_release_keys_covers_both_backends),

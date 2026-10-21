@@ -320,10 +320,10 @@ decision:
   multi_spots: []
   multi_leave_wait_enabled: false
   multi_leave_delay_s: 0.0
-  reconnect_server_x: 0.3635
-  reconnect_server_y: 0.2074
-  reconnect_channel_x: 0.4104
-  reconnect_channel_y: 0.5093
+  reconnect_server_x: 0.3309
+  reconnect_server_y: 0.2135
+  reconnect_channel_x: 0.4071
+  reconnect_channel_y: 0.4922
   reconnect_channel: 16
   vision_detect_only: false
 notes: ''

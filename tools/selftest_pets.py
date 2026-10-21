@@ -474,7 +474,7 @@ def t_label_pets_dispatch():
     """
     import types
 
-    from perception.classes import CLASS_PET
+    from perception.detect.classes import CLASS_PET
     from tools import label_pets
 
     got = {}

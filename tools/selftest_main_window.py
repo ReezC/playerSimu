@@ -51,26 +51,27 @@ def _win():
     """建主窗口（离屏）。**只碰界面**：不打开项目、不连流 ✓、**也不连远端键盘** ✓。
 
     ⭐⭐ 2026-10-05（用户："**从源头彻底封死**"✓）—— **本函数不再打桩** ✗：
-      原来那两条 monkeypatch（`decision.input.use_network` / `PlayerPanel._apply_input_device`）
+      原来那两条 monkeypatch（`execution.input.use_network` / `PlayerPanel._apply_input_device`）
       只护住了**本套件** ✗，而 `gui_smoke` / `selftest_minimap` / `selftest_screen_state` /
       `selftest_decision` 里那几个 `PlayerPanel()` **都没打** ✗ ⇒ 只要项目配置是
       `input_device: remote`（`config/decision.json` 与好几个项目就是 ✓）就照样起那条
       **后台连被控机**的线程 ✗ ⇒ 它几秒后才超时返回，而那时用例早跑完、Qt 对象已销毁 ⇒
       **偶发原生段错误 `0xC0000005`** ✗（时机性 ⇒ "多跑几次"不算验证 ✗）。
-      ⇒ 现在闸在**真源**：`decision/input.py::net_allowed` ＋ 线程的**唯一出生地**
+      ⇒ 现在闸在**真源**：`execution/input.py::net_allowed` ＋ 线程的**唯一出生地**
       `input.connect_async` ✓ ⇒ 离屏（`QT_QPA_PLATFORM=offscreen`）**连线程都不起** ✓。
       本套件**不再打桩**（打桩反而会掩盖"闸到底有没有生效" ✗），改成**当场断言闸关着** ✓。
     """
     from PyQt5.QtWidgets import QApplication
 
-    from decision import input as _dinput
+    from execution import input as _dinput
+    from execution import remote as _remote_mod
     from gui import main_window as _mw
     from gui.main_window import MainWindow
     from gui.player_panel import PlayerPanel as _PP
 
     app = QApplication.instance() or QApplication([])
     # ⚠⚠ **当场自检闸**（不打桩了就得靠它 ✓ 免得哪天判据被改坏、又偷偷去连被控机 ✗）
-    assert not _dinput.net_allowed(), \
+    assert not _remote_mod.net_allowed(), \
         "离屏（offscreen）下闸没关 ⇒ 会起那条连被控机的线程（= 段错误 0xC0000005 的真凶 ✗）"
     assert _PP._apply_input_device.__name__ == "_apply_input_device", \
         "面板那条起线程的路又被打了桩（本套件不再打桩 ✓ 打桩会掩盖闸有没有生效 ✗）"
@@ -600,7 +601,7 @@ def t_offscreen_never_connects_device():
     **后台线程**去 TCP 连被控机，而它**几秒后**才超时返回 —— 那时用例早跑完、Qt 对象已销毁
     ⇒ 线程回来碰它 ⇒ **偶发原生段错误** ✗（时机性 ⇒ "多跑几次"不算验证 ✗）。
     原来只在**本套件**用例里打桩 ✗ ⇒ `gui_smoke` / `minimap` / `screen_state` / `decision`
-    里那几个 `PlayerPanel()` 照样连 ✗ ⇒ 现在闸放在 `decision/input.py::net_allowed`
+    里那几个 `PlayerPanel()` 照样连 ✗ ⇒ 现在闸放在 `execution/input.py::net_allowed`
     （唯一真源 ✓）＋ 线程的唯一出生地 `connect_async` ✓。
 
     钉四件：
@@ -622,30 +623,31 @@ def t_offscreen_never_connects_device():
     import tempfile
     import unittest.mock as mock
 
-    from decision import input as dinput
+    from execution import input as dinput
+    from execution import remote as _remote_mod
 
     _saved_allow = os.environ.pop("PSIMU_ALLOW_NET", None)
     try:
         # ① 判据三条（**每次都读环境** ⇒ 当场摆得动 ✓）
         with mock.patch.dict(os.environ, {"QT_QPA_PLATFORM": "offscreen"}):
-            check(dinput.net_allowed() is False,
+            check(_remote_mod.net_allowed() is False,
                   "offscreen 下闸没关（会去连被控机 ⇒ 段错误 0xC0000005 ✗）")
             os.environ["PSIMU_ALLOW_NET"] = "1"
-            check(dinput.net_allowed() is True,
+            check(_remote_mod.net_allowed() is True,
                   "显式 `PSIMU_ALLOW_NET=1` 没放开（`tools/selftest_link.py` 那种要连的会连不上 ✗）")
             del os.environ["PSIMU_ALLOW_NET"]
             os.environ["QT_QPA_PLATFORM"] = "windows"
-            check(dinput.net_allowed() is True, "真平台（windows）下也不许连设备了 ✗")
+            check(_remote_mod.net_allowed() is True, "真平台（windows）下也不许连设备了 ✗")
             os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
             # ② 运行时：闸关着 ⇒ 一个 socket 都不建（真建了这条 canary 会炸 ⇒ 用例红 ✓）
             with mock.patch.object(socket, "create_connection",
                                    side_effect=AssertionError("闸关着还去建连接 ✗")):
-                dinput.use_network("127.0.0.1", 9, "不存在的证书.pem")
-                dinput.use_serial("COM_不存在")
-                check(dinput.reconnect_remote() is False,
+                _remote_mod.use_network("127.0.0.1", 9, "不存在的证书.pem")
+                _remote_mod.use_serial("COM_不存在")
+                check(_remote_mod.reconnect_remote() is False,
                       "闸关着重连却回了 True（对上层说谎：通道其实不可用 ✗）")
-            _h = dinput.link_health()
+            _h = _remote_mod.link_health()
             check(_h.get("backend") == "blocked",
                   "闸关着却没进「什么都不发」（会退化成把按键打到控制机上 ✗）：%r" % _h)
 
@@ -665,10 +667,11 @@ def t_offscreen_never_connects_device():
                 "from gui import theme, main_window as _mw\n"
                 "theme.CFG = Path(tempfile.mkdtemp(prefix='probe_ui_')) / 'ui.yaml'\n"
                 "_mw.last_opened = lambda: None\n"          # 别去开用户的真项目 ✓
-                "from decision import input as dinput\n"
+                "from execution import input as dinput\n"
+                "from execution import remote as _remote_mod\n"
                 "from PyQt5.QtWidgets import QApplication\n"
                 "app = QApplication.instance() or QApplication([])\n"
-                "print('ALLOWED=%%d' %% int(dinput.net_allowed()))\n"
+                "print('ALLOWED=%%d' %% int(_remote_mod.net_allowed()))\n"
                 "from gui.main_window import MainWindow\n"
                 "from gui.player_panel import settings as _ps\n"
                 "w = MainWindow()\n"
@@ -718,7 +721,9 @@ def t_offscreen_never_connects_device():
               "gui/ 里还有文件直接调 use_network / use_serial"
               "（该走 `input.connect_async` = 唯一出生地 ✗）：%s" % _bad)
 
-        _src = (ROOT / "decision" / "input.py").read_text(encoding="utf-8")
+        # ⚠ 2026-10-17：链路那半（`connect_async` / `use_*` / `reconnect_remote`）搬到
+        #   `execution/remote.py` ✓ ⇒ 源码钉读新文件 ✓（读 input.py 会 `ValueError` ✗）
+        _src = (ROOT / "execution" / "remote.py").read_text(encoding="utf-8")
 
         def _body(fn):
             i = _src.index("def %s(" % fn)
@@ -1111,28 +1116,32 @@ def t_remote_group_measure_click():
     #   重建第二个会崩 ✗ 见文件头那段说明 ✓）
     app = QApplication.instance() or QApplication([])
 
-    from decision import mouse_aim as ma
+    from execution import aim_convert as ma_c
+
+    from execution import aim_convert as ma_c
+
+    from execution import mouse_aim as ma
     from gui.settings_dialog import SettingsDialog
 
     # ---- ⑤ 后端：写「自动量」开关**只改这一个键** ----
     _tmp = pathlib.Path(tempfile.mkdtemp(prefix="psimu_am_")) / "mouse_gain.json"
-    with mock.patch.object(ma, "GAIN_PATH", _tmp):
-        _ok, _why = ma.set_auto_measure(True)        # 文件还不存在 ⇒ 也要能写 ✓
-        check(_ok and ma.auto_measure_enabled() is True,
+    with mock.patch.object(ma_c, "GAIN_PATH", _tmp):
+        _ok, _why = ma_c.set_auto_measure(True)        # 文件还不存在 ⇒ 也要能写 ✓
+        check(_ok and ma_c.auto_measure_enabled() is True,
               "⑤ 文件不存在时写「自动量」开关失败 / 读不回来：%s" % _why)
         _tmp.write_text(json.dumps(
             {"auto_measure": True,
              "by_frame": {"1366x768": {"gain_x": 0.8, "gain_y": 0.8},
                           "1918x1079": {"gain_x": 1.0, "gain_y": 1.0}}},
             ensure_ascii=False), encoding="utf-8")
-        _ok, _why = ma.set_auto_measure(False)
+        _ok, _why = ma_c.set_auto_measure(False)
         _d = json.loads(_tmp.read_text(encoding="utf-8"))
         check(_ok and _d["auto_measure"] is False, "⑤ 关掉开关没写进去：%s" % _why)
         check(set(_d.get("by_frame") or {}) == {"1366x768", "1918x1079"},
               "⑤ 写「自动量」开关把 `by_frame` 里的标定**抹掉了** ✗✗（那份是「一种尺寸量一次」"
               "攒下来的 ⇒ 抹了就得每种尺寸重量一次 ✓）—— 实得 %r"
               % (sorted(_d.get("by_frame") or {}),))
-        _st = ma.calib_status()
+        _st = ma_c.calib_status()
         check("1366x768" in _st and "1918x1079" in _st,
               "⑤ 状态行没报出**已量过哪些尺寸** ✗（「没量过」和「量过哪些」是两件事 ✗）：%r" % _st)
 
@@ -1154,10 +1163,10 @@ def t_remote_group_measure_click():
         calls.append(("async", shp))
         return True, "（假）已起后台量"
 
-    with mock.patch.object(ma, "GAIN_PATH", _tmp2), \
-         mock.patch.object(ma, "load_gain", lambda shp: {"gain_x": 1.0, "gain_y": 1.0}), \
-         mock.patch.object(ma, "auto_measure_async", _fake_async), \
-         mock.patch.object(ma, "auto_measure", _fake_measure):
+    with mock.patch.object(ma_c, "GAIN_PATH", _tmp2), \
+         mock.patch.object(ma_c, "load_gain", lambda shp: {"gain_x": 1.0, "gain_y": 1.0}), \
+         mock.patch.object(ma_c, "auto_measure_async", _fake_async), \
+         mock.patch.object(ma_c, "auto_measure", _fake_measure):
         dlg = SettingsDialog(mw)
         box = dlg.remote_box
 
@@ -1203,11 +1212,11 @@ def t_remote_group_measure_click():
     #   就是"**点了没反应**" ✓（三轮才抓到 ✓）。
     #   ⇒ 必须回落到"**实时回路自己报上来的那一帧**"（`mouse_aim.note_frame_shape` ✓：
     #     谁在收帧谁就报 ✓ 与"哪台的设置对话框"无关 ✓）。
-    with mock.patch.object(ma, "GAIN_PATH", _tmp2), \
-         mock.patch.object(ma, "load_gain", lambda shp: {"gain_x": 1.0, "gain_y": 1.0}), \
-         mock.patch.object(ma, "auto_measure", _fake_measure), \
+    with mock.patch.object(ma_c, "GAIN_PATH", _tmp2), \
+         mock.patch.object(ma_c, "load_gain", lambda shp: {"gain_x": 1.0, "gain_y": 1.0}), \
+         mock.patch.object(ma_c, "auto_measure", _fake_measure), \
          mock.patch("core.behavior.event", lambda name, **kw: None):
-        ma.note_frame_shape((768, 1366))          # 实时回路报上来的那一帧 ✓
+        ma_c.note_frame_shape((768, 1366))          # 实时回路报上来的那一帧 ✓
         calls.clear()
         mw2 = QWidget()
         mw2.live_panel = types.SimpleNamespace(_last_stats={})    # ⚠ 空统计 = 现场形态 ✓

@@ -344,7 +344,7 @@ def _mk_project(td, frames):
 def t_pet_filter():
     """⭐⭐ 筛选「只看有宠物」（用户 2026-10-05 ✓ 原话："增加质检台筛选策略『只看有宠物』"）。
 
-    宠物是**干扰类**（class 5 ✓ 见 `perception/classes.py`）—— 它最烦的错误是"宠物被误检成怪 /
+    宠物是**干扰类**（class 5 ✓ 见 `perception/detect/classes.py`）—— 它最烦的错误是"宠物被误检成怪 /
     怪被误检成宠物" ✓ ⇒ 质检台要能一键把"标过宠物的帧"挑出来**逐帧核对** ✓（不用在几百帧里翻 ✓）。
     这条与「只看有掉落物」（用户 2026-10-04 ✓）**同款** ✓。
 
@@ -967,7 +967,7 @@ def t_region_forwarded_in_chains():
           "`detect_player.work()` 没按区域筛玩家框 ✗")
 
     # ---- ④ 内核纯函数（一处口径 ✓）----
-    from perception import region as R
+    from perception.world import region as R
 
     check(R.to_spec((10, 20, 300, 200)) == "10,20,300,200", "`to_spec` 元组形态不对 ✓")
     check(R.to_spec(None) == "" and R.to_spec((0, 0, 0, 0)) == "",
@@ -1034,7 +1034,93 @@ def t_region_merge_keeps_outside_boxes():
           "没框区域时玩家那条不再是「整帧重写 class 0」✗（那是**有意**的语义 ✓ 不许变 ✓）")
 
 
+def t_marks_keep_screen_size():
+    """⭐⭐⭐ 地形图上的标记（准心 / 圈）**不随缩放变小**（2026-10-18 用户现场 ✓）。
+
+    用户原话：「地形图里的准心现在特别小 根本看不清」✓ ——
+    地形图 1312×3488 缩到窗口里只有 **0.14 倍**；标记原来按**画布单位**画（r=14 画布像素）
+    ⇒ 屏幕上只剩 **2 px** ✗。改成 `ItemIgnoresTransformations` 之后
+    设备变换矩阵恒为 1 ⇒ 屏幕上恒是 2r 像素 ✓（位置仍跟地形走 ✓，那是 `setPos` 的事）。
+    """
+    from PyQt5.QtGui import QPixmap
+    from PyQt5.QtWidgets import QApplication
+
+    from gui.canvas import ImageCanvas
+
+    app = QApplication.instance() or QApplication([])      # noqa: F841
+    c = ImageCanvas()
+    c.load(QPixmap(1312, 3488), [], editable=False, fit=False)
+    n = c.set_markers([(656.0, 1744.0, "玩家 世界(0, 0)", "#ffd400", 14.0)])
+    check(n == 1, "标记没画上去（%d 个）" % n)
+
+    grp = c._mark_items[0]
+    check(bool(grp.flags() & grp.ItemIgnoresTransformations),
+          "标记没有「忽略缩放」⇒ 地形图一缩小就变成 2px、根本看不见 ✗（用户 2026-10-18）")
+    check(abs(grp.pos().x() - 656.0) < 1e-6 and abs(grp.pos().y() - 1744.0) < 1e-6,
+          "标记的位置没落在画布坐标上（%r）—— 忽略缩放只该管**大小**、不许挪位置 ✗"
+          % (grp.pos(),))
+
+    c.scale(0.14, 0.14)                                    # 现场那个缩放
+    dev = grp.deviceTransform(c.viewportTransform())
+    check(abs(dev.m11() - 1.0) < 1e-6 and abs(dev.m22() - 1.0) < 1e-6,
+          "缩到 0.14 倍后标记还是被缩了（设备变换 %r）⇒ 屏幕上依旧看不清 ✗" % (dev.m11(),))
+
+
+def t_preview_box_is_dashed():
+    """⭐⭐ **辅助预览框必须是虚线**（用户 2026-10-17 ✓ 原话：
+    「地形图里有一个粉色的框，这是哪里来的？能不能去掉？」+「一直框住了左下鳄鱼平台
+    整个 foothold 集合，像是一种选中框」✗）。
+
+    ⚠ 那根本不是检出框、也不是我们画错 —— 是**「选择平台」选中的那个集合的预览框**
+      （`route_panel._preview_boxes` ✓）。它原来走通用 `BBoxItem`：
+      **实线 + 类别色**（`cls=1` ⇒ 品红）+ 标签只写平台名
+      ⇒ 跟"检出结果"**长得一模一样** ✓ 谁都认错 ✓
+      （2026-10-06 还因为标签写着"怪物"被当成检出框问过一次 ✓ 同一个根因 ✓）。
+
+    钉四条：
+      ① `preview=True` ⇒ 虚线 + 青蓝（不是类别色）✓；
+      ② 普通检出框**仍是实线** ✓（别把检出语义改坏 ✗）；
+      ③ `route_panel` 真给 `load` 传了 `preview=True` ✓（只在 canvas 加参数没人用 = 白改 ✗）；
+      ④ 预览框标签带「平台：」前缀 ✓（只写名字跟类名同一种长相 ✗）。
+    """
+    from PyQt5.QtCore import Qt as _Qt
+    from PyQt5.QtGui import QPixmap
+
+    from gui.canvas import ImageCanvas, PREVIEW_BOX_COLOR
+
+    app = QApplication.instance() or QApplication([])      # noqa: F841
+    pm = QPixmap(200, 100)
+    pm.fill(_Qt.black)
+
+    cv = ImageCanvas()
+    cv.load(pm, [(1, 20, 20, 80, 20, False)], editable=False, fit=False,
+            preview=True)
+    check(len(cv.boxes) == 1, "预览框没建出来（%d 个）" % len(cv.boxes))
+    _pen = cv.boxes[0].pen()
+    check(_pen.style() == _Qt.DashLine,
+          "预览框还是**实线** ⇒ 跟检出框分不开（用户 2026-10-17 就是这么认错的 ✗）")
+    check(_pen.color().name().lower() == PREVIEW_BOX_COLOR.lower(),
+          "预览框没用青蓝（还在用类别色 ⇒ 看着像一个品红检出框 ✗）：%s"
+          % (_pen.color().name(),))
+
+    cv2 = ImageCanvas()
+    cv2.load(pm, [(1, 20, 20, 80, 20, False)], editable=False, fit=False)
+    check(cv2.boxes[0].pen().style() == _Qt.SolidLine,
+          "**普通检出框**被改成虚线了 ✗（虚线在这套 UI 里专指辅助层 ✓）")
+
+    src = (Path(__file__).resolve().parent.parent / "gui" / "route_panel.py"
+           ).read_text(encoding="utf-8")
+    check("preview=bool(_pv)" in src,
+          "`route_panel` 没给 `load` 传 `preview=True` ⇒ 预览框还是实线品红 ✗")
+    check('"平台：%s"' in src,
+          "预览框标签没带「平台：」前缀 ⇒ 跟检出框的类名同一种长相 ✗")
+
+
 TESTS = (
+    ("⭐⭐⭐ 地形图标记（准心）尺寸**不随缩放**（用户 2026-10-18：缩到 0.14 倍只剩 2px）",
+     t_marks_keep_screen_size),
+    ("⭐⭐ 辅助预览框（「选择平台」那块）必须是青蓝虚线、标签带「平台：」"
+     "（用户 2026-10-17 认成检出框/选中框）", t_preview_box_is_dashed),
     ("⭐⭐⭐ 区域模式只许改区域内：**区域外的旧框必须留住**（怪物/掉落/宠物/玩家 四条链 ✓）",
      t_region_merge_keeps_outside_boxes),
     ("⭐⭐⭐ 「区域自动标注」模式：框一块 ⇒ 弹窗（模态）；太小/没帧 ⇒ 只写状态、不弹窗"

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import yaml
 
-from perception import classes   # 类别表（唯一定义处）：框颜色按它生成
+from perception.detect import classes  # 类别表（唯一定义处）：框颜色按它生成
 
 #: 「**入口按钮**」样式：点了会**打开一个干活的地方**（不是"运行任务"，也不是"查看结果" ✓）。
 #: 现在用它的是：**「寻路编辑器」**（gui/route_panel.py）、**「打开质检台」**（⑤ 卡片，
@@ -117,7 +117,7 @@ def clamp(v):
 
 # ---- 框颜色：**每个类别一条**，键名 = 类别英文名 + "_color" ----
 #
-# 直接从类别表（perception/classes.py）生成，所以「设置里能改的颜色」永远等于
+# 直接从类别表（perception/detect/classes.py）生成，所以「设置里能改的颜色」永远等于
 # 「存在的类别」—— 以后加一个类别，设置里自动多一行，不会漏掉某一类的框色。
 CLASS_COLOR_KEYS = tuple(c[1] + "_color" for c in classes.CLASSES)
 
@@ -127,7 +127,7 @@ CLASS_COLOR_KEYS = tuple(c[1] + "_color" for c in classes.CLASSES)
 #:   / `pet_on` ✓）。
 #:
 #: ⚠ 与颜色**同一个来源**（类别表 ✓）：以后加一个类别，颜色 + 开关**自动各多一条**
-#:   —— 加类别时只改 `perception/classes.py` 一处就够 ✓（这正是用户当初要的"按类别表
+#:   —— 加类别时只改 `perception/detect/classes.py` 一处就够 ✓（这正是用户当初要的"按类别表
 #:   生成"那个口径 ✓ 别在这儿手写一份清单 ✗）。
 #: ⚠ 语义**只管画**（实时预览里那一类的框画不画 ✓）—— **一律不影响决策** ✗
 #:   （决策那条链的入口是 `live_thread.split_dets` ✓，它根本不认这几个键 ✓）：
@@ -136,7 +136,7 @@ CLASS_ON_KEYS = tuple("%s_on" % c[1] for c in classes.CLASSES)
 
 
 def _class_color_defaults():
-    """类别框颜色的默认值（RGB hex）—— 就是类别表（perception/classes.py）的最后一列。"""
+    """类别框颜色的默认值（RGB hex）—— 就是类别表（perception/detect/classes.py）的最后一列。"""
     return {en: classes.bgr_to_hex(bgr)
             for _cid, en, _zh, bgr in classes.CLASSES if bgr}
 

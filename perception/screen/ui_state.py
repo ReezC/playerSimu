@@ -42,8 +42,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent.parent
-TEMPLATE_DIR = Path(__file__).resolve().parent / "ui_templates"
+# ⚠ 2026-10-17：本文件搬进 `perception/screen/`（深了一层 ✓）⇒
+#   根目录往上三层 ✓、模板目录仍在 `perception/ui_templates/`（往上两层 ✓）
+ROOT = Path(__file__).resolve().parents[2]
+TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "ui_templates"
 
 # 素材视频（模板的来源）。gitignore 里，所以模板图必须单独存。
 SOURCE_VIDEO = ROOT / "datasets" / "records" / "断线重连素材.mp4"

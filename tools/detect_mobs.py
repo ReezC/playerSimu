@@ -33,7 +33,7 @@ from core.imgio import imread, imwrite
 # 不 import PyQt5，所以子进程里 import 它也不会拖进 Qt）
 from gui.theme import class_color
 
-CLASS_MOB = 1   # 类别表见 perception/classes.py（id 固定，别在本地另立一份）
+CLASS_MOB = 1   # 类别表见 perception/detect/classes.py（id 固定，别在本地另立一份）
 _W = {}
 
 
@@ -309,7 +309,7 @@ def merge_class_lines(existing, new_lines, cls, region, fw, fh):
       · 现在按区域**分开算** ✓：**区域内的**本类旧框参与"覆盖/保命"✓；**区域外的**一律
         归到"保留"那一边 ✓（与别的类同等对待 ✓）⇒ 区域模式变成"**只重标这一块**"✓
         （正是"区域自动标注"该有的语义 ✓）。
-      · 判据用**同一套**：`perception.region.center_inside` ✓ —— **中心点在不在区域内** ✓
+      · 判据用**同一套**：`perception.world.region.center_inside` ✓ —— **中心点在不在区域内** ✓
         （与四条链共用一处口径 ✓ 不然四个按钮四种边界行为 ✓）。**归一化坐标乘回画面
         像素**再比 ✓（`fw/fh` = 那一帧的宽高 ✓）。
       · ⚠ **没给区域**（`region=None` / 坏）⇒ **一个字都不改** ✓（= 老行为 ✓ 零回归 ✓）。
@@ -321,7 +321,7 @@ def merge_class_lines(existing, new_lines, cls, region, fw, fh):
                 if ln.split() and ln.split()[0] == str(cls)]
 
     if region and old_mine:
-        from perception import region as region_mod
+        from perception.world import region as region_mod
         mine_in, mine_out = [], []
         for ln in old_mine:
             p = ln.split()
@@ -370,18 +370,18 @@ def _masked_energy(gray, mask_bool, x, y):
 
 
 # ══════════════════════════════════════════════════════════════
-# ⭐⭐ 框到**可见部分**（用户 2026-10-05 ✓）—— **实现已搬去 `perception/visible_box.py`** ✓
+# ⭐⭐ 框到**可见部分**（用户 2026-10-05 ✓）—— **实现已搬去 `perception/detect/visible_box.py`** ✓
 # ══════════════════════════════════════════════════════════════
 # ⭐ 2026-10-06 搬迁（用户："**所有的匹配都需要「框到可见部分」参数**"✓）：这条判据要被
 #   **两条内核**共用 —— 本文件（怪物 / 宠物 / 掉落 ✓）与 `perception/player_locator`
 #   （玩家 ✓）。而 `perception` **不能**反向 import `tools/detect_mobs` ✗（本模块头上有
 #   `from gui.theme import class_color` ⇒ 会把 gui 拖进运行时依赖 ✓）⇒ 搬到中性层 ✓。
 #   ⚠ **"为什么这么做"那段说明（用户原话 + 判据 + 天花板）随实现一起搬过去了** ✓（在
-#   `perception/visible_box.py` 的模块头 ✓）—— 本文件只留**用它的地方**（`work` ✓）与
+#   `perception/detect/visible_box.py` 的模块头 ✓）—— 本文件只留**用它的地方**（`work` ✓）与
 #   那两个默认值（`VISIBLE_TOL` / `VISIBLE_KEEP` 得从那边 import ✓，见下面 ✓）。
 # ══════════════════════════════════════════════════════════════
-# ⭐ 实现搬去 `perception/visible_box.py`（见上面那段说明 ✓）—— 两条内核共用**那一份** ✓
-from perception.visible_box import VISIBLE_KEEP, VISIBLE_TOL, visible_box
+# ⭐ 实现搬去 `perception/detect/visible_box.py`（见上面那段说明 ✓）—— 两条内核共用**那一份** ✓
+from perception.detect.visible_box import VISIBLE_KEEP, VISIBLE_TOL, visible_box
 
 
 def nms(dets):
@@ -499,7 +499,7 @@ def work(fp_str):
     # 而黑区里几个杂散亮像素的能量比通常只有几个百分点。
     min_ratio = float(cfg.get("min_energy_ratio", 0.35))
 
-    # ⭐⭐ **框到可见部分**（用户 2026-10-05 ✓ **原话与判据见 `perception/visible_box.py` 头部** ✓）
+    # ⭐⭐ **框到可见部分**（用户 2026-10-05 ✓ **原话与判据见 `perception/detect/visible_box.py` 头部** ✓）
     #   —— **默认关** ✓（老项目 / 老调用方一字不变 ✓）；开了 ⇒ 被挡掉的像素不进框 ✓。
     want_visible = bool(cfg.get("visible", False))
     vis_tol = float(cfg.get("visible_tol", VISIBLE_TOL))
@@ -593,7 +593,7 @@ def work(fp_str):
                     r[y, x] = 0.0
                     continue
 
-            # ⭐⭐ 写出去的框 = **可见部分**（开了才收 ✓ 见 `perception/visible_box.py` ✓）。
+            # ⭐⭐ 写出去的框 = **可见部分**（开了才收 ✓ 见 `perception/detect/visible_box.py` ✓）。
             #   ⚠ 位置（峰值 x,y）与"抹掉邻域"用的 w/h **一律不动** ✗ —— 那些是**模板尺寸**的事 ✓
             #     （收小了去抹 ⇒ 同一只怪会被反复计入 ✓）。
             vx, vy, vw, vh = x, y, w, h
@@ -791,7 +791,7 @@ def run_detect(params, ctx=None):
         raise FileNotFoundError("精灵库不存在：%s" % sprites)
 
     # ⭐ 写进标注文件的**类别号**（`cls` ✓ 默认 class 1 怪物 ⇒ 老调用方一个字都不用改 ✓；
-    #   掉落物 = class 2，见 `perception/classes.py` ✓ 用户 2026-10-04 ✓）。
+    #   掉落物 = class 2，见 `perception/detect/classes.py` ✓ 用户 2026-10-04 ✓）。
     cls = int(params.get("cls", CLASS_MOB) or CLASS_MOB)
     # ⭐⭐ **这一趟算哪一类标注**（= 台账那个 key ✓；用户 2026-10-04 ✓）：`"mob"`（默认 ✓ 老行为
     #   一字不变 ✓）/ `"drop"` / `"pet"` … —— 决定**记进哪本台账**（`labelio.mark_processed` ✓）。
@@ -882,7 +882,7 @@ def run_detect(params, ctx=None):
         "min_energy_ratio": min_energy_ratio,
         "coarse": coarse,                                   # ⭐ 粗筛开关 ✓ 见 `coarse_gate` ✓
         "coarse_min": float(params.get("coarse_min", COARSE_MIN_SCORE)),
-        # ⭐⭐ **框到可见部分**（用户 2026-10-05 ✓ 见 `perception/visible_box.py` ✓）—— **默认关** ✗
+        # ⭐⭐ **框到可见部分**（用户 2026-10-05 ✓ 见 `perception/detect/visible_box.py` ✓）—— **默认关** ✗
         #   ⇒ 老项目 / 老调用方一字不变 ✓（这是改"标注语义"⇒ 要开就按项目显式开 ✓）。
         "visible": bool(params.get("visible", False)),
         "visible_tol": float(params.get("visible_tol", VISIBLE_TOL)),
@@ -1020,7 +1020,7 @@ def run_detect(params, ctx=None):
     #   "检出 0 框" 与 "每帧框数 中位 4" 并存的怪象 ✓（实测那个项目：793 框 = 玩家 133 +
     #   怪 288 + 宠物 372 ✓）。现在把**口径写在字面上** ✓，谁也别猜 ✓。
     try:
-        from perception.classes import ZH_NAMES as _ZH
+        from perception.detect.classes import ZH_NAMES as _ZH
     except Exception:                       # noqa: BLE001 —— 名字取不到也不能耽误写日志 ✗
         _ZH = {}
 

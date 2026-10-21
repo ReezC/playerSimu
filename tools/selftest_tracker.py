@@ -17,7 +17,7 @@
 ⭐⭐ 2026-10-11 起本套件覆盖两条**新链条**（用户原话："**角色使用传送点后被其他玩家抢检出框**"＋
    "**防抖置信度+防抖时间的配置 基本无效，同个怪物的检出框疯狂闪烁**"✓）：
     · 怪：**确认才输出**（`CONFIRM_HITS` / `CONFIRM_MS` ✓）+ **低分框只续命**（BYTE ✓）
-      + **全局最优认领**（`perception/assign.py` ✓ 与暴力解对拍 ✓）；
+      + **全局最优认领**（`perception/track/assign.py` ✓ 与暴力解对拍 ✓）；
     · 玩家：**黄点权威关 / 竞争者余量 / 跳变隔离 / 传送武装**（见类上面那组常量 ✓）。
 """
 import itertools
@@ -29,9 +29,9 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import perception.assign as asg                                 # noqa: E402
-import perception.bytetrack as btk                               # noqa: E402
-import perception.tracker as trk                                # noqa: E402
+import perception.track.assign as asg                                 # noqa: E402
+import perception.track.bytetrack as btk                               # noqa: E402
+import perception.track.tracker as trk                                # noqa: E402
 
 FRAME_MS = 1000.0 / 15.0     # 主循环节拍（capture_fps=15），时序都量化到这个粒度
 BOX_W, BOX_H = 40.0, 60.0
@@ -957,7 +957,7 @@ def t_rel_anchor_keeps_id():
       ③ 锚**跳得离谱**（> `CAM_MAX_STEP` = 传送 / 换图 ✓）⇒ 不挪、只重锚 ✓；
       ④ 锚是 `None`（没定位）⇒ 不挪（老行为 ✓ 宁缺勿错 ✓）。
     """
-    from perception.tracker import CAM_MAX_STEP, MobTracker
+    from perception.track.tracker import CAM_MAX_STEP, MobTracker
 
     def _feed(tr, x1, anchor):
         return tr.update([(x1, 100.0, x1 + 40.0, 150.0, 0.9)], [], player_world=anchor)
@@ -1082,6 +1082,60 @@ def t_kalman_smooths_jitter():
         lag = (_x - 10.0) - out[0].x
         check(abs(lag) < 3.0,
               "平滑把匀速移动拖慢了（滞后 %.1f px）—— 那就不是「轻量」了 ✗" % lag)
+
+
+def t_player_world_jump_no_fly():
+    """⭐⭐⭐⭐ 黄点读数在"跳"的时候，玩家框**不许跟着飞走**
+    （用户 2026-10-20 ✓ 原话："**玩家检出框在不停的往上快速飞出屏幕**"✗）。
+
+    现场机理（写下来，省得下次又从头猜 ✗）：小地图一抖（换层 / 掩码找回 / 帧间位移漂 ✓）
+    ⇒ `dw` 一下 **±600~1000** ⇒ `_big` 成立 ⇒ **`teleport` 武装**（两次读数确实"相邻"，
+    那条判据拦不住 ✗）⇒ ① 挑候选的预测变成"旧框 + dw"（**在屏幕外** ✓）；
+    ② 幽灵外推那一支也吃它 ⇒ 报出去的框**每一拍按 dw 往上跳** ✓
+    ⇒ 界面上就是"检出框不停往上快速飞出屏幕"✓。
+
+    钉三条：
+      ① 读数狂跳 8 拍，报出来的框**每拍位移 ≤ `MAX_BOX_STEP`** ✓（不许飞 ✗）；
+      ② `diag["world_jump"]` 有记账 ✓（现场能直接看出是"黄点在跳"，不用去查 YOLO ✓）；
+      ③ 读数**稳**下来之后照常跟 ✓（别把这条做成"以后都不认黄点"✗）。
+    """
+    with PFeed() as f:
+        _w = [1000.0, 5000.0]
+        box = None
+        for _ in range(3):                      # 预热：锁定 + 过确认闸（2 拍 ✓）
+            box = f.step(det(300.0, 300.0), world=(_w[0], _w[1]))
+        check(box is not None, "预热都没锁上（用例前提不成立 ✗）")
+
+        prev_y = float(box[1])
+        max_step = 0.0
+        _n_jump = 0
+        for i in range(8):
+            _w[1] += 900.0 if i % 2 == 0 else -1100.0    # 读数每拍跳 ±1000 世界像素 ✓
+            b = f.step(det(300.0, 300.0), world=(_w[0], _w[1]))
+            _n_jump += int(f.t.diag.get("world_jump", 0) or 0)   # 每拍的账，跨拍累计 ✓
+            if b is None:
+                continue
+            max_step = max(max_step, abs(float(b[1]) - prev_y))
+            prev_y = float(b[1])
+        check(max_step <= trk.MAX_BOX_STEP + 1.0,
+              "黄点读数在跳，玩家框却跟着飞（一拍挪了 %.0f 像素 > 上限 %.0f）"
+              "⇒ 用户看到的就是「检出框一直往上飞出屏幕」✗"
+              % (max_step, trk.MAX_BOX_STEP))
+        check(_n_jump > 0,
+              "没记账 ⇒ 现场只能看到「框飞了」，看不出是「黄点在跳」⇒ 又去查 YOLO ✗")
+
+        _w = [1000.0, 5000.0]                   # ③ 读数稳了 ⇒ 照常跟回去 ✓
+        box = None
+        for _ in range(6):
+            box = f.step(det(300.0, 300.0), world=(_w[0], _w[1]))
+        check(box is not None and abs(float(box[1]) - 300.0) < 30.0,
+              "读数稳下来之后没跟回去（这条闸把人永久带偏了 ✗）：%r" % (box,))
+
+
+TESTS = TESTS + (
+    ("⭐⭐⭐⭐ 黄点读数在跳 ⇒ 玩家框不许跟着飞（用户 2026-10-20「检出框不停往上飞出屏幕」）："
+     "每拍位移 ≤ MAX_BOX_STEP · 记账 world_jump · 稳下来照常跟", t_player_world_jump_no_fly),
+)
 
 
 def main() -> int:

@@ -21,14 +21,16 @@ import numpy as np                                             # noqa: E402
 
 from core import mapdata                                       # noqa: E402
 from perception import minimap as mm                           # noqa: E402
+from perception import map_calib
 from tools import mmap_dot_probe as P                          # noqa: E402
+from perception import map_dot
 
 MID = "110040000"
 t = mapdata.load(MID, with_canvas=True)
 cal = mapdata.load_calib(MID, "stream") or {}
 assert t is not None and t.canvas is not None, "没有地形/底图"
 cw, ch = t.canvas.shape[1], t.canvas.shape[0]
-sx, sy = mm.scales_of(cal)
+sx, sy = map_calib.scales_of(cal)
 ox, oy = (list(cal.get("offset") or (0, 0)) + [0, 0])[:2]
 ppw = float(t.px_per_world)
 cx0 = float(t.mini.get("centerX") or 0)
@@ -56,19 +58,19 @@ def cand_xy(c):
 panels, note = P.grab_stream(3, 8.0)
 print("取帧:", note)
 for i, panel in enumerate(panels):
-    m0 = mm.dot_mask(panel, "yellow")
-    m_bm = mm._basemap_extra_mask(panel, cal, t, m0, "yellow")
+    m0 = map_dot.dot_mask(panel, "yellow")
+    m_bm = map_dot._basemap_extra_mask(panel, cal, t, m0, "yellow")
     print("\n帧%d 面板=%dx%d  黄族像素: 颜色层 %d / 相减层 %d"
           % (i, panel.shape[1], panel.shape[0], int(m0.sum()), int(m_bm.sum())))
     for tag, m in (("color ", m0), ("basemap", m_bm)):
-        cands, dense = mm._dot_candidates(m, panel.shape[1])
+        cands, dense = map_dot._dot_candidates(m, panel.shape[1])
         print("  [%s] 候选 %d 个，成片 %d 像素" % (tag, len(cands), dense))
         for c in cands:
             px, py = cand_xy(c)
             if px is None:
                 print("      ? %r" % (c,))
                 continue
-            core = bool(mm._blob_looks_core(panel, m, c))
+            core = bool(map_dot._blob_looks_core(panel, m, c))
             # 面板 → 底图 → 世界（口径同 `map_terrain_view.image_xy` 的反向 ✓）
             gx = (px - ox) / sx
             gy = (py - oy) / sy

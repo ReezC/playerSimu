@@ -16,13 +16,13 @@ REPL = [
     ('check(int(getattr(settings, "climb_align_gap_ms", -1))',
      'check(int(getattr(ag.DecisionSettings(), "climb_align_gap_ms", -1))'),
     # ② t_climb_align_near_px
-    ('check(int(getattr(ag.settings, "climb_align_near_px", -1)) == int(route.NEAR_PX),',
-     'check(int(getattr(ag.DecisionSettings(), "climb_align_near_px", -1)) == int(route.NEAR_PX),'),
+    ('check(int(getattr(ag.settings, "climb_align_near_px", -1)) == int(jobs.NEAR_PX),',
+     'check(int(getattr(ag.DecisionSettings(), "climb_align_near_px", -1)) == int(jobs.NEAR_PX),'),
     # ③ t_climb_align_gap
     ('check(int(getattr(ag.settings, "climb_align_gap_ms", -1))\n'
-     '          == int(route.TAP_PERIOD_S * 1000),',
+     '          == int(jobs.TAP_PERIOD_S * 1000),',
      'check(int(getattr(ag.DecisionSettings(), "climb_align_gap_ms", -1))\n'
-     '          == int(route.TAP_PERIOD_S * 1000),'),
+     '          == int(jobs.TAP_PERIOD_S * 1000),'),
 ]
 
 for i, (old, new) in enumerate(REPL, 1):

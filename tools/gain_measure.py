@@ -3,7 +3,7 @@
 
 和 `tools/mouse_aim_calib.py` 的区别（两条都留着 ✓ 各有各的用处）：
     · `mouse_aim_calib` 用**画面差分**量（要流、要光标在画面里可见、要画面不动）；
-    · 本工具用 relay 的 `CURSOR?`（`decision/input.cursor_probe` ✓）**直接读坐标**
+    · 本工具用 relay 的 `CURSOR?`（`execution/input.cursor_probe` ✓）**直接读坐标**
       ⇒ 不依赖画面、不依赖光标可见、几秒钟出数 ✓。
     ⚠ 前提：**relay 那一端支持 `CURSOR?`**（`remote_kbd/relay.py:537` ✓）；不支持 ⇒ 直接报错，
       不打哑谜（那时请用 `mouse_aim_calib` 的可视化那条 ✓）。
@@ -36,19 +36,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.config import get                     # noqa: E402
-from decision import input as dinput            # noqa: E402
-from decision import mouse_aim as ma            # noqa: E402
+from execution import input as dinput            # noqa: E402
+from execution import remote as _remote_mod
+from execution import mouse_aim as ma            # noqa: E402
 
 
 def _connect():
     """输入通道：已就绪就用；否则按 `link.yaml [kbd]` 连 relay ✓。"""
     if dinput.mouse_available():
-        return True, "输入通道已就绪（%s）" % (dinput.link_health().get("backend"),)
+        return True, "输入通道已就绪（%s）" % (_remote_mod.link_health().get("backend"),)
     host = get("kbd", "host")
     port = int(get("kbd", "port", 9000) or 9000)
     cert = get("kbd", "cert", "remote_kbd/certs/cert.pem")
     try:
-        dinput.use_network(host, port, cert)
+        _remote_mod.use_network(host, port, cert)
     except Exception as e:                       # noqa: BLE001
         return False, ("连不上被控机 %s:%d（%s: %s）—— relay 在跑吗？"
                        "工作台是不是还占着那条连接（同一时刻只服务一个客户端）？"
@@ -60,7 +61,7 @@ def _connect():
 
 def _pos():
     """问一次光标真实坐标（relay 的 `CURSOR?` ✓）。"""
-    p = dinput.cursor_probe()
+    p = _remote_mod.cursor_probe()
     return None if not p else (int(p[0]), int(p[1]))
 
 
@@ -70,6 +71,7 @@ def _move(dx, dy, wait=0.45):
 
 
 def main(argv=None) -> int:
+    from execution import aim_convert as ma_c   # 2026-10-18：换算那半拆出去了 ✓
     ap = argparse.ArgumentParser(description="闭环量鼠标增益（撞角 → 走步 → 读回坐标）")
     ap.add_argument("--step", default="600,400", help="x,y 各走多少单位，默认 600,400")
     ap.add_argument("--write", action="store_true", help="量完写回 config/mouse_gain.json")
@@ -139,10 +141,10 @@ def main(argv=None) -> int:
                  "　✓ 线性" if abs(err) <= 8.0 else "　✗ **非线性**（A 机指针加速还开着？）"))
         _move(-big, 0)
 
-    old = ma.load_gain()
+    old = ma_c.load_gain()
     print("\n⑦ 文件里的现值：%r；这次量到：(%.4f, %.4f)" % (old, gx, gy))
     if args.write:
-        ma.save_gain(gx, gy, frame_shape=(768, 1366, 3))
+        ma_c.save_gain(gx, gy, frame_shape=(768, 1366, 3))
         print("   ✅ 已写回 config/mouse_gain.json（重启工作台生效 ✓）")
     else:
         print("   （没写文件 ✓ 想写就加 --write）")

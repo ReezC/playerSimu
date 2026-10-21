@@ -16,6 +16,7 @@ import cv2                                              # noqa: E402
 
 from core import mapdata                                # noqa: E402
 from perception import minimap as mm                    # noqa: E402
+from perception import map_calib
 
 MID = "110040000"
 t = mapdata.load(MID, with_canvas=True)
@@ -23,19 +24,22 @@ cal = mapdata.load_calib(MID, "stream") or {}
 _src = ROOT / "data" / "dot_probe" / "app_panel.png"
 _snap = ROOT / "data" / "dot_probe" / "_snap_app_panel.png"
 import shutil                                           # noqa: E402
+from perception import map_dot
+from perception import map_locator
+from perception import map_overlay
 shutil.copyfile(str(_src), str(_snap))                  # ⭐ 先快照：App 每 10 秒覆盖它 ✓
 panel = cv2.imread(str(_snap))
 print("面板(快照):", None if panel is None else panel.shape,
       " 源文件改于", _src.stat().st_mtime)
 if panel is not None:
-    _vis, _info = mm.diff_panel_vs_canvas(panel, t.canvas, cal)
+    _vis, _info = map_overlay.diff_panel_vs_canvas(panel, t.canvas, cal)
     print("差分 at =", _info.get("at"), " floor/peak =",
           _info.get("floor"), _info.get("peak"))
-    print("核心色掩码像素 =", int(mm.dot_core_mask(panel).sum()))
-    _dc, _dd, _di = mm.dot_candidates_diff(panel, cal, t)
+    print("核心色掩码像素 =", int(map_dot.dot_core_mask(panel).sum()))
+    _dc, _dd, _di = map_dot.dot_candidates_diff(panel, cal, t)
     print("差分层候选 %d 个:" % len(_dc))
     for _c in _dc:
-        _wx, _wy = mm.panel_to_world(_c["x"], _c["y"], cal, t)
+        _wx, _wy = map_calib.panel_to_world(_c["x"], _c["y"], cal, t)
         print("   (%.1f,%.1f) %sx%s 面积%d 世界≈(%.0f,%.0f)"
               % (_c["x"], _c["y"], _c["w"], _c["h"], _c["area"], _wx, _wy))
 
@@ -43,7 +47,7 @@ for lock in ((993.2, 487.8), (955.0, 371.6), (910.3, 311.8), (856.5, 501.8)):
     print("--- 假锁 (%.1f, %.1f) ---" % lock)
     # ① 直接问跟踪器（改的就是它 ✓）
     try:
-        tr = mm.PlayerDotTracker()
+        tr = map_locator.PlayerDotTracker()
         try:
             tr._last = {"x": lock[0], "y": lock[1]}
         except Exception:                               # noqa: BLE001
@@ -54,7 +58,7 @@ for lock in ((993.2, 487.8), (955.0, 371.6), (910.3, 311.8), (856.5, 501.8)):
         _ms = (time.perf_counter() - _t0) * 1000.0
         wx, wy = (None, None)
         if r.get("x") is not None:
-            wx, wy = mm.panel_to_world(float(r["x"]), float(r["y"]), cal, t)
+            wx, wy = map_calib.panel_to_world(float(r["x"]), float(r["y"]), cal, t)
         print("   跟踪器: ok=%s layer=%s px=(%.1f,%.1f) 世界≈(%s,%s)  **耗时 %.2f ms**"
               % (r.get("ok"), r.get("layer"), r.get("x") or 0, r.get("y") or 0,
                  None if wx is None else round(wx, 1),
@@ -62,10 +66,10 @@ for lock in ((993.2, 487.8), (955.0, 371.6), (910.3, 311.8), (856.5, 501.8)):
     except Exception as e:                              # noqa: BLE001
         print("   跟踪器: 调用失败 %s: %s" % (type(e).__name__, e))
     # ② 对照：不带 roi 的全画面（我前几轮验过的那条 ✓）
-    r2 = mm.find_player_dot(panel, calib=cal, terrain=t, near=lock)
+    r2 = map_dot.find_player_dot(panel, calib=cal, terrain=t, near=lock)
     wx2, wy2 = (None, None)
     if r2.get("x") is not None:
-        wx2, wy2 = mm.panel_to_world(float(r2["x"]), float(r2["y"]), cal, t)
+        wx2, wy2 = map_calib.panel_to_world(float(r2["x"]), float(r2["y"]), cal, t)
     print("   全画面: ok=%s layer=%s px=(%.1f,%.1f) 世界≈(%s,%s)"
           % (r2.get("ok"), r2.get("layer"), r2.get("x") or 0, r2.get("y") or 0,
              None if wx2 is None else round(wx2, 1),

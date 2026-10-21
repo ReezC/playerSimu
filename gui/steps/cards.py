@@ -1102,7 +1102,7 @@ class LabelCard(StepCard):
         #: ⭐⭐ **只在这个矩形里标**（`"x,y,w,h"` 或 None ✓）—— 用户 2026-10-11 的「区域自动标注」
         #:   用它（质检台里框选一块 ⇒ 弹窗 ⇒ 点按钮只标那一块 ✓ 见 `gui/region_label_dialog.py` ✓）。
         #:   ⚠ 默认 `None` ⇒ **整幅画面都算** ✓ ⇒ 老流程（本页那四个按钮）**一字不变** ✗。
-        #:   口径见 `perception/region.py`（四条链共用同一套判定 ✓）。
+        #:   口径见 `perception/world/region.py`（四条链共用同一套判定 ✓）。
         self._region = None
 
         # 通用「运行」按钮隐藏 —— 活交给**四段各自那两个按钮**（`模板匹配标注{类}` /
@@ -1711,7 +1711,7 @@ class LabelCard(StepCard):
                        "⚠ 上面「玩家 scale」是 ③ 标定自动测出来的，别手填（这一行只读）。")
         # ⭐⭐ **玩家这一段自己的另外四个参数**（用户 2026-10-05 ✓ 原话："4类按照统一的格式整理…
         #   匹配阈值 / 区分度 / 最大模板帧 / 每帧最多几个框 / 降采样" + "缺功能的就补功能"）——
-        #   它们的**能力**是本轮先在 `perception/player_locator.py` 里补出来的 ✓
+        #   它们的**能力**是本轮先在 `perception/world/player_locator.py` 里补出来的 ✓
         #   （原来玩家这条链只有 阈值 / 尺度 ✗ 见 `tools/detect_player.py` ✓）。
         #   ⚠⚠ 这几个的默认值**故意与怪物不同** ✗：
         #     · 「区分度」对玩家是**可信度闸**（最佳 vs 次佳分差 ✓）而不是去重闸 ✓
@@ -1754,7 +1754,7 @@ class LabelCard(StepCard):
         #      「标注掉落物」，勾选后下面增加列表区，可以增删项目（根据 id、名称搜索 wz 中的图），
         #      再下面就是按钮「模板匹配标注」、「YOLO标注」"）----
         #   勾选 ⇒ 卡片**最下面**出现那一块（列表 + 两个按钮 ✓ 见 `__init__` 里 `drop_box` ✓）。
-        #   ⚠ 类别号用类别表里的 **class 2 = drop**（`perception/classes.py` ✓ 早就在表里 ✓）。
+        #   ⚠ 类别号用类别表里的 **class 2 = drop**（`perception/detect/classes.py` ✓ 早就在表里 ✓）。
         # ⚠ **不许再 `v.addLayout(_plform)`** ✗（同上：那会把它挪到这儿 ⇒ 参数跑到窗格下面 ✓）
         # ⭐⭐ **双击某个角色 ⇒ 选模板帧**（用户 2026-10-05 ✓「四块窗格各接一行双击选模板帧」）——
         #   与掉落物 / 宠物那两块**同一行** ✓（`IconGrid.activated_id` = 双击或回车都会发 ✓）。
@@ -1885,7 +1885,7 @@ class LabelCard(StepCard):
         # ⭐⭐⭐ **默认改成「开」**（用户 2026-10-16 ✓ 原话：「**所有的类别都需要「框到可见部分」
         #   勾选，且默认勾选**」✓）：原来是**默认关** ✗（见下一条注释的由来 ✓）。
         #   ⚠ 这是**改标注语义**的默认值 ✓（框会从"模板尺寸"缩到"真正露出来的那部分" ✓
-        #   见 `perception/visible_box.py` ✓）—— 用户**明确要求**默认开 ✓，故改 ✓。
+        #   见 `perception/detect/visible_box.py` ✓）—— 用户**明确要求**默认开 ✓，故改 ✓。
         #   ⚠ 老项目文件里**没有这个键** ⇒ 走这里的默认值 ✓ ⇒ 也变成开 ✓
         #   （正是用户要的"**默认勾选**"✓；要关掉在界面上取消勾选即可 ✓）。
         # ⭐⭐⭐ **每类各自一格**（用户 2026-10-16 ✓ 原话：「**每类各自一格**」✓）：
@@ -1908,9 +1908,9 @@ class LabelCard(StepCard):
                        "     这功能救的是「分够、但框包满」那种适度遮挡 ✓ 两件事别混 ✗；\n"
                        "  ③ 判据靠纹理/边缘 ⇒ **大片纯色的精灵判不了**（那里一律回退完整尺寸 ✓\n"
                        "     故意保守 ✓）。\n\n"
-                       "⚠ 玩家那一段走的是另一套定位（`perception/player_locator.py`）——\n"
+                       "⚠ 玩家那一段走的是另一套定位（`perception/world/player_locator.py`）——\n"
                        "   ⭐ **2026-10-06 起它也吃这一格了** ✓（判据是**同一份**实现：\n"
-                       "   `perception/visible_box.py` ✓ ⇒ 四段现在**一致** ✓）。\n"
+                       "   `perception/detect/visible_box.py` ✓ ⇒ 四段现在**一致** ✓）。\n"
                        "   ⚠ 它只在**标注**那条链生效（实时定位那条不传 ✓ 看的是「人在哪」、\n"
                        "   不是「露出来多少」✓）。")
         self.field(_mform, "visible_keep", "最小保留比例", "float", 0.2,
@@ -2765,7 +2765,7 @@ class LabelCard(StepCard):
         return float(p.get("scale") or 1.12)     # 1.12 = 怪物那条一直用的兜底 ✓ 别改 ✗
 
     def _visible_params(self, sec, target=None):
-        """⭐ **框到可见部分**那两个参数（用户 2026-10-05 ✓ 实现见 `perception/visible_box.py` ✓）。
+        """⭐ **框到可见部分**那两个参数（用户 2026-10-05 ✓ 实现见 `perception/detect/visible_box.py` ✓）。
 
         ⚠ **一处口径** ✓：怪物 / 掉落物 / 宠物 **/** 玩家**四段都从这儿取 ✓ —— 免得哪个 cfg
           漏了它、界面上勾了却没生效 ✗（"界面能选、管线收不到"这种已经栽过一次 ✓）。
@@ -2950,12 +2950,12 @@ class LabelCard(StepCard):
                     #   ⚠ 玩家这条是**最后一段补上的** ✗：原来它走 `player_locator`（另一套定位 ✓）
                     #   ⇒ 这一格在它上面**一直没接**（卡片没传 → `run_detect_player` 没转发 →
                     #   `PlayerLocator` 连能力都没有 ✓ 2026-10-06 三段一起补 ✓）。
-                    #   ⚠ **与怪物/宠物/掉落共用同一份实现**（`perception/visible_box.py` ✓）
+                    #   ⚠ **与怪物/宠物/掉落共用同一份实现**（`perception/detect/visible_box.py` ✓）
                     #   和**同一个设置值**（`_visible_params` 一处口径 ✓）。
                     #   ⭐ 2026-10-16 ⇒ **本类自己的键** ✓（用户「每类各自一格」✓）：玩家那格只管玩家 ✓
                     **self._visible_params(sec, "player"),
                     # ⭐ 2026-10-05：玩家这一段自己的另外 4 个（用户："缺功能的就补功能" ✓）——
-                    #   能力先在 `perception/player_locator.py` 里补出来的 ✓
+                    #   能力先在 `perception/world/player_locator.py` 里补出来的 ✓
                     #   ⚠ 默认值**故意与怪物不同**（区分度 0 ✓ 最大模板帧 0 = 不截 ✓
                     #     每帧最多几个框 1 ✓ 降采样 1 ✓ 见 `build_params` 里那段说明 ✓）。
                     "min_distinct": float(sec.get("player_min_distinct", 0.0) or 0.0),
@@ -3288,7 +3288,7 @@ def _ver_label(path):
     """权重路径 → 版本名：`models/detect_v3.pt` 和
     `runs/detect_v3/weights/best.pt` 都得到 `detect_v3`。
 
-    （production 侧同规则的 `_wlabel` 在 perception/predict.py —— 那边写历史、
+    （production 侧同规则的 `_wlabel` 在 perception/detect/predict.py —— 那边写历史、
     这边读产物，各自留一份免得让界面去 import 推理模块。）
     """
     p = Path(str(path or ""))
@@ -3758,7 +3758,7 @@ class VerifyCard(StepCard):
 
     @staticmethod
     def _history(p):
-        """历次验证记录（perception/predict.py 每跑一次追加一条）。"""
+        """历次验证记录（perception/detect/predict.py 每跑一次追加一条）。"""
         if p is None:
             return []
         got = _read_json(p.dir_of("verify") / "history.json")
@@ -3850,7 +3850,7 @@ class VerifyCard(StepCard):
         return True, ""
 
     def make_task(self, p):
-        from perception.predict import run_predict
+        from perception.detect.predict import run_predict
 
         w = self._weights(p)
         if not w:

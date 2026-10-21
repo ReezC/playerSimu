@@ -22,10 +22,10 @@ import json
 import time
 from pathlib import Path
 
-# 类别表的唯一定义处是 perception/classes.py（id / 英文名 / 中文名 / 颜色都在那），
+# 类别表的唯一定义处是 perception/detect/classes.py（id / 英文名 / 中文名 / 颜色都在那），
 # 这里只转发，保持既有的名字 —— 别处（质检台、实时预览、验证、数据集导出）都从
 # 这里或那里取，加类别时只用改那一个文件。
-from perception.classes import (CLASS_DROP, CLASS_MOB, CLASS_NPC,
+from perception.detect.classes import (CLASS_DROP, CLASS_MOB, CLASS_NPC,
                                 CLASS_OTHER_PLAYER, CLASS_PET, CLASS_PLAYER,
                                 EN_NAMES as CLASS_NAMES, ORDER, ZH_NAMES,
                                 id_of_name, label, zh_of_name)

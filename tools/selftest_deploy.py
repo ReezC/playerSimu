@@ -908,6 +908,17 @@ def t_push_region_button():
           "④ 框了区域该带 `video_size=WxH:offset_x:X:offset_y:Y` ✗ 且**奇数抹成偶数** ✓：%s"
           % reg)
 
+    # ---- ⑥ 光标：`draw_mouse=1` 必须显式写死 ----
+    #   用户 2026-10-19 现场 ✓："在B机数据工作台看不到A机的鼠标了"——
+    #   30 秒判别法（`tools/mouse_aim_calib.py`）量出来是"**A 屏上动了、B 画面里没有**"
+    #   ⇒ 推流没画指针 ✗。ddagrab 的默认值是 1，但现场就是丢过（交接-5 §10-1a 2026-10-07）。
+    #   ⚠ 只钉**显式存在**：以后谁把参数删了、或者换了采集方式，这条会当场红 ✓。
+    check("draw_mouse=1" in full,
+          "⑥ 整屏时 ddagrab 没带 `draw_mouse=1` ⇒ 画面里没有鼠标指针（用户现场 ✗）：%s"
+          % full)
+    check("draw_mouse=1" in reg,
+          "⑥ 框了区域时那条也得带 `draw_mouse=1` ✗：%s" % reg)
+
     gdi = " ".join(services.build_cmd(
         "push", dict(base, capture="gdigrab",
                      region_x=100, region_y=50, region_w=800, region_h=600)))
@@ -1379,6 +1390,56 @@ def t_card_uses_whole_config():
         w.deleteLater()
 
 
+def t_stale_push_sweep():
+    """⭐⭐⭐⭐⭐ 启停都要清「同一端口上的残留推流」（2026-10-17 花屏的真凶 ✓）。
+
+    现场：A 机两条 ffmpeg 同时往 5000 推（18.1 Mbps + 11.4 Mbps）——
+    两条 TS 交错在**同一个 PID 256** 上 ⇒ 解码器一会儿用 A 的帧、一会儿用 B 的
+    ⇒ 花屏/抖动/扭曲 ✓（B 机抓包：两个来源端口、PAT/PMT 20/s、CC 又跳前又回退 ✓）。
+    而「停止」只 kill 自己记着的那个 PID（`runner.stop`）⇒ 孤儿杀不到 ⇒
+    再点「启动」就变两条流 ✗。
+
+    钉六条：
+      ① `udp_target` 能从 `udp://host:port?pkt_size=…` 取端口（带 query ✓）；
+      ② 端口不同 ⇒ 不认（别把推 5001 的那条杀了 ✗）；
+      ③ **不碰非推流 ffmpeg**（没有 `mpegts` 的录制/转码 ✗）；
+      ④ `port=None` ⇒ 恒 False（拿不到端口就绝不动手 ✓ 宁可漏杀 ✓）；
+      ⑤ 接线：`start` 和 `stop` **都**清（stop 那条专治"点过停止、孤儿还在发"✗）；
+      ⑥ `stale` 必须**局部导入**（模块级 `from deploy import …` 会和 services 循环导入 ✗）。
+    """
+    import ast
+
+    from deploy import stale
+
+    push = ["ffmpeg", "-f", "mpegts", "udp://192.168.1.2:5000?pkt_size=1316"]
+    check(stale.udp_target(push) == 5000, "没从 `udp://…:5000?pkt_size=…` 解析出端口 ✗")
+    check(stale.udp_target("ffmpeg -f mpegts udp://0.0.0.0:9000") == 9000,
+          "字符串形式的命令行解析失败 ✗")
+    check(stale.udp_target(["ffmpeg", "-f", "mpegts", "udp://h:abc"]) is None,
+          "端口不是数字时该返回 None（不许抛 ✗）")
+    check(stale.is_push_to(push, 5000) is True, "正样本没认出来 ⇒ 清残留永远清不到 ✗")
+    check(stale.is_push_to(push, 5001) is False,
+          "端口不同也认了 ⇒ 会误杀另一条推流（多实例就靠端口区分 ✗）")
+    check(stale.is_push_to(push, None) is False, "端口未知还敢动手 ⇒ 太危险 ✗")
+    check(stale.is_push_to(["ffmpeg", "-i", "a.mp4", "-c", "copy", "b.ts"], 5000) is False,
+          "没有 `mpegts` 的 ffmpeg 也认了 ⇒ 会误杀录制/转码 ✗")
+
+    src = (ROOT / "deploy" / "runner.py").read_text(encoding="utf-8")
+    check("from deploy import stale" in src and "stale.sweep(" in src,
+          "`runner` 没导入并调用 `stale.sweep` ⇒ 清残留是一段死代码 ✗")
+    check(src.count("self._sweep_stale()") >= 2,
+          "`start`/`stop` 没有**都**清残留 ⇒「点过停止、孤儿还在推」治不了 ✗")
+
+    tree = ast.parse(src)
+    check(not any(isinstance(n, ast.ImportFrom) and (n.module or "").startswith("deploy")
+                  for n in tree.body),
+          "模块级 `from deploy import …` 会循环导入（services ↔ runner）✗ 必须写在函数里")
+
+    svc = (ROOT / "deploy" / "services.py").read_text(encoding="utf-8")
+    check('"-f", "mpegts", "udp://' in svc,
+          "推流命令不是 `-f mpegts udp://…` ⇒ 匹配器对不上（永远找不到残留 ✗）")
+
+
 TESTS = (
     ("服务表（标题/参数/命令行）完整", t_service_table),
     ("小地图推流的命令行（按「当前是哪张图」传 --map-id）", t_mmap_cmd),
@@ -1409,6 +1470,7 @@ TESTS = (
     ("⭐⭐⭐⭐ 部署台不依赖 opencv（没有 cv2 也能列窗口）", t_deploy_needs_no_cv2),
     ("⭐⭐⭐⭐ 没有 pywin32 也要能列窗口（ctypes 兜底 ＋ 几何）", t_wincap_without_pywin32),
     ("⭐⭐⭐⭐ 卡片必须从主窗口拿整份配置（否则 KeyError: push / 写残 deploy.json）", t_card_uses_whole_config),
+    ("⭐⭐⭐⭐⭐ 启停都要清「同端口上的残留推流」（两条流交错 = 花屏真凶）", t_stale_push_sweep),
 )
 
 

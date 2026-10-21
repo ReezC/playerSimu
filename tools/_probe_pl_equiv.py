@@ -1,8 +1,8 @@
 """只读探针：`PlayerLocator` 加了「框到可见部分」之后，**默认关**时与 HEAD 那版**逐帧比**。
 
-为什么要有它：改的是**运行时也要 import 的那个类**（`perception/player_state.py` 拿它定位 ✓）
+为什么要有它：改的是**运行时也要 import 的那个类**（`perception/world/player_state.py` 拿它定位 ✓）
 ⇒ "默认关 ⇒ 一字不差"这句话必须**量过**才能说 ✓（本仓库的老规矩：改了没变化 ⇒ 先采样 ✓）。
-比法：`git show HEAD:perception/player_locator.py` 落成临时模块 ⇒ 两边在**同一批真帧**上
+比法：`git show HEAD:perception/world/player_locator.py` 落成临时模块 ⇒ 两边在**同一批真帧**上
 各 `locate()` 一遍 ⇒ 六元组必须**完全一致** ✓。
 """
 import importlib.util
@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 import cv2  # noqa: E402
 
 from core.imgio import imread  # noqa: E402
-from perception.player_locator import PlayerLocator  # noqa: E402
+from perception.world.player_locator import PlayerLocator  # noqa: E402
 
 # 找一个真有玩家模板的项目（挑第一个能建起来的 ✓）
 spr = ROOT / "datasets" / "sprites" / "player"
@@ -38,7 +38,7 @@ if frames_dir is None:
 frames = sorted(frames_dir.glob("*.png"))[:6]
 print("真帧：%s（%d 张）" % (frames_dir, len(frames)))
 
-src = subprocess.run(["git", "show", "HEAD:perception/player_locator.py"],
+src = subprocess.run(["git", "show", "HEAD:perception/world/player_locator.py"],
                      cwd=str(ROOT), capture_output=True, text=True)
 if src.returncode != 0 or not src.stdout.strip():
     print("拿不到 HEAD 那版（%s）⇒ 跳过" % src.stderr.strip()[:80])

@@ -21,7 +21,7 @@ import numpy as np
 
 from core.imgio import imread
 # ⭐⭐ 「框到可见部分」——**两条内核共用那一份实现** ✓（怪物/宠物/掉落走 `tools/detect_mobs` ✓）
-from perception.visible_box import VISIBLE_KEEP, VISIBLE_TOL, visible_box
+from perception.detect.visible_box import VISIBLE_KEEP, VISIBLE_TOL, visible_box
 
 DEFAULT_ROOT = Path("datasets/sprites/player")
 
@@ -73,7 +73,7 @@ class PlayerLocator:
         self.stopped = False       # 加载过程里被叫停过 ✓
         self._templates = []       # [(name, bgr, mask), ...]
         #: ⭐⭐ **框到可见部分**（用户 2026-10-06 ✓ 原话："**所有的匹配都需要「框到可见部分」
-        #:   参数**"）：开了之后 `locate()` 交出去的框会按 `perception/visible_box.py` 收到
+        #:   参数**"）：开了之后 `locate()` 交出去的框会按 `perception/detect/visible_box.py` 收到
         #:   "目标**真的露出来的那一块**"（被挡住的部分不进框 ✓）。
         #:   ⚠⚠ **默认关** ✓（这是改**标注语义**、不是修 bug ✗ —— 老调用方一字不变 ✓；
         #:     实时定位那条路（`gui/live_thread`）**永远不传它** ⇒ 行为与以前完全一致 ✓）。
@@ -167,7 +167,7 @@ class PlayerLocator:
         返回 (cx, cy, w, h, score, name) —— cx/cy 是框中心（**画面坐标**，
         即使限定区域也会加回偏移），w/h 是框尺寸；找不到返回 None。
         ⭐ `visible=True`（构造时给 ✓ 默认关 ✓）时 w/h 与 cx/cy 是**可见部分**那一块
-          （被挡住的部分不进框 ✓ 见 `perception/visible_box.py`）—— 标注那条链要它 ✓，
+          （被挡住的部分不进框 ✓ 见 `perception/detect/visible_box.py`）—— 标注那条链要它 ✓，
           实时定位那条链**别开**（看的是"人在哪"、不是"露出来多少" ✓）。
         ⚠ 两种"返回 None"要分清：**真的没找到**（分数不过阈值 ✓）／**判为存疑**
           （最佳与次佳的差距 < `min_distinct` ✓ 见下面那段说明 ✓）—— 后者是本轮
@@ -245,7 +245,7 @@ class PlayerLocator:
                 return None
         score, x, y, tw, th, name = best
         # ⭐⭐ **框到可见部分**（用户 2026-10-06 ✓ "**所有的匹配都需要「框到可见部分」参数**"
-        #   —— 与怪物/宠物/掉落走的是**同一份实现**：`perception/visible_box.py` ✓）。
+        #   —— 与怪物/宠物/掉落走的是**同一份实现**：`perception/detect/visible_box.py` ✓）。
         #   ⚠ `visible=False`（默认）⇒ 这一段**一点都不跑** ✓：连灰度图都不建 ✓
         #     （实时定位那条路每帧都要 `locate` ⇒ 白建就是白花钱 ✗）。
         #   ⚠ 算出来的框是**canvas 尺度**的（匹配若在缩略图上做 ✓）⇒ 最后还是统一乘回 ✓

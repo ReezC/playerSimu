@@ -30,11 +30,12 @@ import numpy as np                                             # noqa: E402
 from core import mapdata                                       # noqa: E402
 from core import zones as Z                                    # noqa: E402
 from perception import minimap as mm                           # noqa: E402
+from perception import map_calib
 from tools import map_terrain_view as MTV                      # noqa: E402
 
 OUT_DIR = ROOT / "data" / "diff_terrain"
 TARGET_W = 1600
-#: 差分阈值（灰阶）：超过它才算"底图上没有的东西"（同 `mm.DIFF_FLOOR_WARN` 的量级 ✓）
+#: 差分阈值（灰阶）：超过它才算"底图上没有的东西"（同 `perception.map_const.DIFF_FLOOR_WARN` 的量级 ✓）
 DIFF_MIN = 40
 
 
@@ -62,16 +63,16 @@ def main() -> int:
         print("没拿到面板画面")
         return 2
     cal = mapdata.load_calib(a.map_id, a.src) or {}
-    if not mm.has_geometry(cal):
+    if not map_calib.has_geometry(cal):
         print("这份标定没有几何（先在「路线识别 → 小地图定位」标定一次）")
         return 2
-    ok, why = mm.panel_mismatch(cal, panel, (t.canvas.shape[1], t.canvas.shape[0]))
+    ok, why = map_calib.panel_mismatch(cal, panel, (t.canvas.shape[1], t.canvas.shape[0]))
     if not ok:
         print(why)
         return 3
 
     cw, ch = t.canvas.shape[1], t.canvas.shape[0]
-    sx, sy = mm.scales_of(cal)
+    sx, sy = map_calib.scales_of(cal)
     ox, oy = (list(cal.get("offset") or (0, 0)) + [0, 0])[:2]
     z = max(1, int(round(float(TARGET_W) / max(1, cw))))
 

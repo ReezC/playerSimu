@@ -5,7 +5,7 @@
 （替身：玩家框全程"丢"✓），打印**开箱时应该看到的那串动作与状态文字**，
 并核对「点服务器 / 点频道」的落点在素材里是不是**格子的正中央**。
 
-⛔ **零输入** ✓：`decision.input.tap/mouse_move/mouse_click` 全换成记录器 ——
+⛔ **零输入** ✓：`execution.input.tap/mouse_move/mouse_click` 全换成记录器 ——
    只打印"本来会发什么"，**一个字节都不发** ✓。
 """
 import sys
@@ -20,11 +20,12 @@ sys.path.insert(0, str(ROOT))
 VIDEO = ROOT / "datasets" / "records" / "断线重连素材.mp4"
 OUT_PNG = ROOT / "data" / "_click_check.png"
 
-from decision import input as dinput                       # noqa: E402
-from decision import mouse_aim                             # noqa: E402
+from execution import input as dinput                       # noqa: E402
+from execution import mouse_aim                             # noqa: E402
+from execution import aim_convert as mouse_aim_c              # noqa: E402
 from decision.agent import DecisionSettings, set_save_hook  # noqa: E402
 from decision.reconnect import Reconnector                 # noqa: E402
-from perception import ui_state                            # noqa: E402
+from perception.screen import ui_state  # noqa: E402
 
 #: 素材里量出来的格子中心（设计文档 §6.1 那张表 ✓）—— 用来判"落点在不在格子里" ✓
 SRV_CENTERS = [698, 849, 999, 1149, 1300]
@@ -53,13 +54,13 @@ def _which(px, py):
 def main():
     sent = []
     orig = (dinput.tap, dinput.mouse_move, dinput.mouse_click,
-            mouse_aim.load_gain, mouse_aim.aim_available)
+            mouse_aim_c.load_gain, mouse_aim_c.aim_available)
     dinput.tap = lambda k: sent.append(("tap", k))
     dinput.mouse_move = lambda dx, dy: sent.append(("move", dx, dy))
     dinput.mouse_click = lambda *a, **k: sent.append(("click",))
     # 演练假定"通道已连 + 已标定" ✓（真机那两条待做 ✓ 见 §11）
-    mouse_aim.load_gain = lambda: (1.0, 1.0)
-    mouse_aim.aim_available = lambda: (True, "演练（假定已连）")
+    mouse_aim_c.load_gain = lambda: (1.0, 1.0)
+    mouse_aim_c.aim_available = lambda: (True, "演练（假定已连）")
     set_save_hook(None)
 
     s = DecisionSettings()
@@ -97,7 +98,7 @@ def main():
                 dinput.tap(act["key"])
                 what = "→ 按 %s（%s）" % (act["key"], act.get("desc", ""))
             elif act and act.get("act") == "click":
-                px = mouse_aim.target_px(fr.shape[1], fr.shape[0], act["x"], act["y"])
+                px = mouse_aim_c.target_px(fr.shape[1], fr.shape[0], act["x"], act["y"])
                 # ⚠ 真回路这里会 `mouse_aim.click_ratio(...)`（真发指令 ✗）——
                 #   演练只算落点，不动手 ✓
                 dinput.mouse_move(-4000, -4000)
@@ -131,7 +132,7 @@ def _overlay():
         cap.release()
         if not ok:
             continue
-        px = mouse_aim.target_px(fr.shape[1], fr.shape[0],
+        px = mouse_aim_c.target_px(fr.shape[1], fr.shape[0],
                                  *((0.3635, 0.2269) if t < 13 else (0.4104, 0.5093)))[0]
         x, y = int(round(px[0])), int(round(px[1]))
         img = fr.copy()

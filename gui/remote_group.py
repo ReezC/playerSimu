@@ -8,7 +8,7 @@
 `link.yaml`** ✗（它写的是 `config/mouse_gain.json` ✓）⇒ 它本来就不属于那一页的数据驱动表格 ✓
 （见 `_page_link` 里那段"为什么不塞进字段表"✓）。
 
-⚠ 这里**只管界面** ✓：读写在 `decision/mouse_aim.py`（`calib_status` / `set_auto_measure` /
+⚠ 这里**只管界面** ✓：读写在 `execution/mouse_aim.py`（`calib_status` / `set_auto_measure` /
 `auto_measure_async` ✓），而且**唯一写者**是它 ✓ —— 界面自己 `json.dump` 会把 `by_frame` 里
 那几份标定**抹掉** ✗（抹了就得每种尺寸重量一次 ✓）。
 """
@@ -17,7 +17,11 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (QCheckBox, QFormLayout, QGroupBox, QLabel,
                              QPushButton)
 
-from decision import mouse_aim as ma
+from execution import aim_convert as ma_c
+
+from execution import aim_convert as ma_c
+
+from execution import mouse_aim as ma
 from gui.widgets import title_label
 
 
@@ -72,11 +76,11 @@ class RemoteControlBox(QGroupBox):
     def refresh(self):
         """把 `config/mouse_gain.json` 的**现状**灌进这一组 ✓（建组时 + 露头时 ✓）。"""
         try:
-            self.status.setText(ma.calib_status())
+            self.status.setText(ma_c.calib_status())
         except Exception as e:            # noqa: BLE001 —— 状态行读不出来也不许把设置页弄崩 ✗
             self.status.setText("读标定状态失败：%s" % e)
         try:
-            _on = bool(ma.auto_measure_enabled())
+            _on = bool(ma_c.auto_measure_enabled())
         except Exception:                 # noqa: BLE001
             _on = False
         self.auto.blockSignals(True)      # ⚠ 灌值**不许**触发写回 ✗（设置对话框的既有规矩 ✓）
@@ -85,7 +89,7 @@ class RemoteControlBox(QGroupBox):
 
     def _on_auto(self, on):
         """勾选框 ⇒ 写 `mouse_gain.json` 的 `auto_measure` ✓（**只改这一个键** ✓）。"""
-        ok, why = ma.set_auto_measure(bool(on))
+        ok, why = ma_c.set_auto_measure(bool(on))
         if not ok:
             # ⚠ 写不进 ⇒ 把勾**退回去** ✗（别让界面显示一个没落盘的开关 ✓）
             self.auto.blockSignals(True)
@@ -93,7 +97,7 @@ class RemoteControlBox(QGroupBox):
             self.auto.blockSignals(False)
             self.status.setText(why)
             return
-        self.status.setText("%s　｜　%s" % (ma.calib_status(), why))
+        self.status.setText("%s　｜　%s" % (ma_c.calib_status(), why))
 
     def _on_measure(self):
         """**立即量一次**：尺寸取"实时回路正收到的那一帧" ✓ ⇒ **后台**量 ✓（不卡界面 / 不卡回路 ✓）。
@@ -118,7 +122,7 @@ class RemoteControlBox(QGroupBox):
         #   ⇒ 兜底问**实时回路自己报上来的那一份** ✓（`mouse_aim.note_frame_shape` ✓：
         #     谁在收帧谁就报 ✓ 与"哪台工作台的设置对话框"无关 ✓）。
         if not (_w and _h):
-            _fs = ma.last_frame_shape()
+            _fs = ma_c.last_frame_shape()
             if _fs:
                 _h, _w = int(_fs[0]), int(_fs[1])
         # ⭐⭐ **点一下必须留下痕**（2026-10-15 ✓ 用户连着报了三轮"点了没反应"之后加的 ✗）：
@@ -149,17 +153,17 @@ class RemoteControlBox(QGroupBox):
             return
         # ⚠ 形状按 `(h, w)` 传 ✓ —— `mouse_aim.gain_frame_key` 收的就是这个口径 ✓
         _shape = (int(_h), int(_w))
-        if not ma.auto_measure_enabled():
+        if not ma_c.auto_measure_enabled():
             # ⚠⚠ **不许静静地什么都不做** ✗（那最容易让人以为"按钮坏了" ✓）：
             #   这一下没发指令的**真正原因**是上面那格没勾 ✓ ⇒ 明说 ✓。
             self.status.setText("⚠ 上面那格「自动量」**没勾** ⇒ 这一下不发指令 ✓"
                                 "（那格的真正含义就是「允许它动鼠标」✓）"
                                 "—— 想现在量：先勾上，再点这个按钮 ✓")
             return
-        if ma.load_gain(_shape):
+        if ma_c.load_gain(_shape):
             self._start_force(_shape)      # 已经量过 ⇒ **强制重量一次** ✓（见 docstring ② ✓）
             return
-        _started, why = ma.auto_measure_async(_shape)
+        _started, why = ma_c.auto_measure_async(_shape)
         if _started:
             self.btn.setEnabled(False)
             self.btn.setText("量中…")
@@ -180,7 +184,7 @@ class RemoteControlBox(QGroupBox):
     def _on_forced(self, ok, why):
         self.btn.setEnabled(True)
         self.btn.setText("立即量一次")
-        self.status.setText("%s　｜　%s" % (why, ma.calib_status()))
+        self.status.setText("%s　｜　%s" % (why, ma_c.calib_status()))
 
 
 class _ForceMeasure(QThread):
@@ -199,7 +203,7 @@ class _ForceMeasure(QThread):
 
     def run(self):
         try:
-            ok, why = ma.auto_measure(self._shape, force=True)
+            ok, why = ma_c.auto_measure(self._shape, force=True)
         except Exception as e:            # noqa: BLE001 —— 量炸了也要把按钮放回来 ✓
             ok, why = False, "量的时候抛异常：%s: %s" % (type(e).__name__, e)
         self.done.emit(bool(ok), str(why))

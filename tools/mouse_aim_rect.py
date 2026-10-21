@@ -3,7 +3,7 @@
 
 **为什么非要它**（2026-10-17 ✓ 用户现场两句话：「**选频道界面鼠标操作完全歪了**」✗ ＋
   「**刚跑了标定 还是没用**」✗）：
-  · `decision/mouse_aim.to_screen()` 老版本**只加原点、不折算比例** ✗ —— 而帧是**推流**来的、
+  · `execution/mouse_aim.to_screen()` 老版本**只加原点、不折算比例** ✗ —— 而帧是**推流**来的、
     被缩过 ✗（本机实测：抓取区域 **1920×1080** ✓ 而帧 **1366×768** ✓ ⇒ 比例 **k = 1.4054** ✗）
     ⇒ 目标点整体偏 k 倍 ✓；再叠上桌面 **5120×1440** / 虚拟原点 **(−2560, 0)** 的原点折返 ✓
     ⇒ 现场算出 **4317** 单位（正确约 **700** ✓）⇒ 差 6 倍 = "完全歪了" ✓。
@@ -49,7 +49,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from decision import input as dinput                        # noqa: E402
+from execution import input as dinput                        # noqa: E402
+from execution import remote as _remote_mod
 from tools.mouse_aim_calib import _cursor_pos, _grab, _open_stream  # noqa: E402
 from tools.mouse_gain_calib import _cursor_delta            # noqa: E402
 
@@ -72,7 +73,7 @@ def _local_mouse():
     """鼠标是不是**打本机**（只有这样才读得到"光标在屏幕哪" ✓）⇒ `(ok, why)` ✓。"""
     if not dinput.mouse_available():
         return False, "鼠标通道不可用（本地 SendInput 模式没有硬件鼠标）"
-    name = type(getattr(dinput, "_remote", None)).__name__
+    name = type(getattr(_remote_mod, "_remote", None)).__name__
     if name != "SerialKbd":
         return False, ("鼠标后端是 **%s** ⇒ 指令打到**另一台**机器上 ✗，那台的屏幕坐标这边"
                        "问不到 ⇒ 量不了（**不猜** ✓）。要么让鼠标走本机 ProMicro，"
@@ -176,13 +177,13 @@ def main(argv=None):
     # ⚠⚠ **输入闸**（`input.net_allowed` ✓）：带 `QT_QPA_PLATFORM=offscreen` 又没设
     #   `PSIMU_ALLOW_NET=1` 时 ⇒ `use_serial` **一个串口都不开** ✗（只转"什么都不发"✓）
     #   ⇒ 那样跑会报成"鼠标通道不可用"✗ = **假失败** ✓ ⇒ 先把它说清 ✓（别让人以为串口坏了 ✓）。
-    if not dinput.net_allowed():
+    if not _remote_mod.net_allowed():
         print("[X] 输入闸关着（`QT_QPA_PLATFORM=offscreen` 且没设 `PSIMU_ALLOW_NET=1` ✗）"
               "⇒ 本工具**不会**去开串口 ✓")
         print("    ⇒ 在**正常桌面**上跑（别带 offscreen ✓），或先设 `PSIMU_ALLOW_NET=1` ✓")
         return 2
     try:
-        dinput.use_serial(port)
+        _remote_mod.use_serial(port)
     except Exception as e:                      # noqa: BLE001 —— 那句报错本身就是给人看的 ✓
         print("[X] %s" % e)
         print("    ⚠ 若是\"被占用\"⇒ 先**停掉实时预览 / 关掉工作台**再跑 ✓（它握着同一路流 ✓）")
@@ -193,7 +194,7 @@ def main(argv=None):
         return 2
     print("[1/3] 输入通道：本地直连 %s（SerialKbd ✓）" % port)
 
-    kbd, src = dinput._remote, None             # ⚠ 复用 `use_serial` 开出来的那一个 ✓
+    kbd, src = _remote_mod._remote, None             # ⚠ 复用 `use_serial` 开出来的那一个 ✓
     try:
         try:
             src, url = _open_stream()
@@ -225,7 +226,7 @@ def main(argv=None):
             return 2
     finally:
         try:
-            dinput.use_local()                   # 关掉串口 / socket（不泄漏 ✓ 见它说明 ✓）
+            _remote_mod.use_local()                   # 关掉串口 / socket（不泄漏 ✓ 见它说明 ✓）
         except Exception:                        # noqa: BLE001
             pass
         if src is not None:
@@ -258,13 +259,14 @@ def main(argv=None):
         print("（--dry-run ⇒ 不写 config/mouse_gain.json ✓）")
         return 0
 
-    import decision.mouse_aim as _ma
-    g = _ma.load_gain((fh, fw))
+    import execution.mouse_aim as _ma
+    import execution.aim_convert as _mc   # 2026-10-18：换算那半拆出去了 ✓
+    g = _mc.load_gain((fh, fw))
     if not g:
         print("[X] 这个帧尺寸（%dx%d）**还没标定过** ⇒ 先跑 `tools/mouse_aim_calib.py` ✓"
               "（`frame_rect` 是补在那份记录上的 ✓）" % (fw, fh))
         return 2
-    p = _ma.save_gain(g[0], g[1], frame_shape=(fh, fw),
+    p = _mc.save_gain(g[0], g[1], frame_shape=(fh, fw),
                       extra={"frame_rect": rect,
                              "frame_rect_probe": {
                                  "pts": list(PTS), "nudge": NUDGE,

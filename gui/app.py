@@ -177,11 +177,55 @@ def _arm_watchdog(seconds, tag, done, code):
                          % int(code))
         except Exception:                            # noqa: BLE001 —— 留不下证据也要退 ✗
             pass
+        # ⭐ 2026-10-21：强制退出这条路上**也要把自己占的 UDP 端口锁放掉** ✓
+        #   （不然"看门狗兜住了退出"与"下次启动说端口被占"会同时发生 ✗ —— 用户报的
+        #     「窗口关掉但是实例清不掉」正是这个组合 ✓）。
+        try:
+            from core import instance as _inst
+            _inst.release_my_ports()
+        except Exception:                            # noqa: BLE001
+            pass
         os._exit(int(code))
 
     th = threading.Thread(target=_fire, name="watchdog-%s" % tag, daemon=True)
     th.start()
     return th
+
+
+def _hard_exit(code=0):
+    """清完该清的 ⇒ **`os._exit(code)` 直接走**，绝不回到解释器收尾 ✓。
+
+    ⭐⭐⭐⭐ 2026-10-21（用户：「**窗口关掉但是实例清不掉**」）
+
+    **现场**（这台机器上现在就能复现，PID 23124 = `pythonw -m gui.app`）：
+      窗口早就没了、进程还挂着（72 条线程）、`data/locks/udp_5000.lock` 里还写着它的 pid
+      ⇒ 下次启动只会说"UDP 端口已被另一个工作台实例占用" ⇒ 用户看到的就是**清不掉** ✓。
+
+    **卡在哪**（`py-spy dump --native` 抓的原生栈 ✓ 不是猜的）：
+    ```
+    <module> (gui/app.py:339)                 ← `sys.exit(main())`，main 已经返回了
+    Py_Main → Py_RunMain → Py_PreInitialize   ← **解释器收尾**（不是我们的清理 ✗）
+    QWidget::~QWidget (Qt5Widgets)            ← 收尾时销毁最后一个 QWidget
+    QWindowPrivate::destroy / qwindows.dll
+    NtUserDestroyWindow → PostMessageW → MSCTF/TSF（输入法）CtfImeDestroyThreadMgr
+     → CtfImmCoUninitialize → CoreMessaging.dll → ZwAlpcSendWaitReceivePort  ← **永远等下去**
+    ```
+    ⇒ Windows 上 TSF/IME 收尾卡死是出了名的（`pythonw` 无控制台、远程桌面断开时更容易撞 ✓），
+      而且它发生在**我们的清理之后**（那段有 `WATCHDOG_EXIT_S` 看门狗兜着，`_exit_done` 也早置上了 ✓）
+      ⇒ 看门狗救不到 ✗。
+    ⇒ 和 `_arm_watchdog` 同一条口径：**收尾卡住就是元凶 ⇒ 绕开它** ✓
+      （`os._exit` 不跑 atexit、不析构 Qt、不碰 IME ✓）。
+
+    ⚠ 走之前要做的两件（`os._exit` 之后都做不了 ✗）：
+      · `stdout/stderr` 刷一下（`_ensure_std_streams` 可能给了缓冲 ✓）；
+      · **放掉本进程占着的 UDP 端口锁**（`core.instance.release_my_ports` ✓）——
+        窗口关了、进程却还活着的时候，正是这把锁让"实例清不掉" ✓。
+        行为日志不用管：`core/behavior._write` 是**逐行 open/close** ✓，没有跨行缓冲 ✓。
+
+    **实现只有一处**：`core/appexit.py::hard_exit`（部署台也走它 ✓ 别在这儿再写一份 ✗）。
+    """
+    from core.appexit import hard_exit
+    hard_exit(code)
 
 
 def main():
@@ -332,7 +376,11 @@ def main():
     # 名额不放 —— 在高精度定时器是稀缺资源的系统上，别的程序会吃不到。
     _wp.release()
     _exit_done.set()                 # ⭐ 收尾看门狗收工（正常路径绝不被误杀 ✓）
-    return rc
+    # ⭐⭐⭐⭐ 2026-10-21（用户：「**窗口关掉但是实例清不掉**」）：**到这里就硬退** ✓
+    #   `return rc` ⇒ 回到 `sys.exit(main())` ⇒ 解释器收尾 ⇒ Qt 销毁最后一个 QWidget
+    #   ⇒ 撞上 Windows TSF/IME 那条死等（原生栈见 `_hard_exit` 的说明 ✓）
+    #   ⇒ 进程永远不散、UDP 端口锁一直被一个"活着的 pid"占着 ⇒ 下次启动被挡 ✓。
+    _hard_exit(rc)
 
 
 if __name__ == "__main__":

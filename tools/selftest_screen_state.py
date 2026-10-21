@@ -12,7 +12,8 @@ from unittest import mock
 import cv2
 import numpy as np
 
-from perception import screen_state
+from perception.screen import screen_state
+from decision import jobs as jobmod
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -102,7 +103,7 @@ def t_ui_variants_score_best():
 
     from core.imgio import imread
 
-    from perception import ui_state
+    from perception.screen import ui_state
 
     _old_dir = ui_state.TEMPLATE_DIR
     _old_anchors = dict(ui_state.ANCHORS)
@@ -175,7 +176,7 @@ def t_login_banner_is_optional():
     """
     from core.imgio import imread
 
-    from perception import ui_state
+    from perception.screen import ui_state
 
     check("login_agree" in ui_state.OPTIONAL_ANCHORS,
           "`login_agree`（底部通用健康忠告横幅）该是**可选**锚点 —— 它内容会变、别处也有 ✗ "
@@ -219,6 +220,7 @@ def t_missing_templates():
 
 def t_agent_takeover():
     """agent 接管：测谎弹窗期间**停发一切键**、任务保留并打打断点、结束恢复。"""
+    from decision import jobs as jobmod
     import tempfile as _tf
 
     from core import behavior
@@ -232,8 +234,7 @@ def t_agent_takeover():
         s = fresh_settings()
         s.enabled = True
         h = Harness(s)
-        from decision import route
-        job = route.ClimbJob("L2", x=700.0, y1=100.0, y2=300.0, direction=1,
+        job = jobmod.ClimbJob("L2", x=700.0, y1=100.0, y2=300.0, direction=1,
                              dst_set="上", src_set="下", tol_px=10, hold_ms=0,
                              timeout_s=600.0)
         h.agent.start_climb(job)
@@ -275,10 +276,15 @@ def t_agent_takeover():
 def t_wiring_source_pins():
     """接线钉子（源码级）：检测拍 / 两路 ws / 状态行载荷 / 打点报警存帧 / agent 接管。"""
     lt = (ROOT / "gui" / "live_thread.py").read_text(encoding="utf-8")
-    check("self._screen_beat(raw)" in lt,
+    # ⚠ 2026-10-20：**"检测拍"那一小段已搬进 `runtime/frame_ui.py`**（阶段 1 第二刀 ✓）⇒
+    #   这两条接线钉子得连**那个文件**一起看（只读 `live_thread.py` 必假红 ✓ 拆块老坑）。
+    _ui = (ROOT / "runtime" / "frame_ui.py").read_text(encoding="utf-8")
+    check("th._screen_beat(raw)" in _ui,
           "没把**原生帧**喂进界面状态检测拍（喂显示帧会被画框污染 ✗）")
-    check(lt.count("self._screen_last") >= 3,
+    check((lt + _ui).count("_screen_last") >= 3,
           "检测没限流（整帧匹配 ~0.1s，每帧都跑会吃掉推理预算 ✗）")
+    check("frame_ui.step(self, raw)" in lt,
+          "`_run` 里没调 `frame_ui.step(self, raw)`（那段搬完没接上 ⇒ 界面状态永远不判 ✗）")
     # ⭐⭐⭐⭐⭐ **两路 ws 都要带"接管版"界面状态**（用户 2026-10-10 ✓ 本行 2026-10-10 改口径 ✓）：
     #   原来钉的是 `ws.screen = self._screen_state`（**原生识别结果** ✓）——那条被现场否掉 ✗：
     #   测谎**小游戏那段画面匹配不上任何模板**（`live_thread` 自己的实测写着"是常态"✓）
@@ -329,7 +335,7 @@ def t_screen_beat_bridge():
     from core import behavior
 
     from gui import live_thread as _lt
-    from perception import ui_state
+    from perception.screen import ui_state
 
     logf = Path(_tf.mkdtemp(prefix="lie_bridge_")) / "behavior.log"
     old_log, old_en = behavior.LOG, behavior.ENABLED
@@ -392,7 +398,8 @@ def t_lie_game_threshold_widened():
     check(thr <= 0.78 and thr >= 0.70,
           "`lie_game` 门限取 %g：要**低于实测真分 0.783**（否则还是认不出 ✗）又不该低到没边"
           "（滥用会淹掉 A 规则那道闸 ✓）" % thr)
-    src = (ROOT / "perception" / "screen_state.py").read_text(encoding="utf-8")
+    # ⚠ 2026-10-17：`perception/` 拆成 detect/track/world/screen ⇒ 路径也跟着深一层 ✓
+    src = (ROOT / "perception" / "screen" / "screen_state.py").read_text(encoding="utf-8")
     check("MATCH_THRESHOLD_BY.get(best_name, threshold)" in src,
           "`check_frame` 没查每模板门限（白设了 ✗）")
     # ② 显式 threshold 必须照旧是"字面值"（用例/调试靠它 ✓）
@@ -420,24 +427,29 @@ def t_stream_region_mouse_fit():
     """
     from pathlib import Path
 
-    from decision import mouse_aim as ma
+    from execution import aim_convert as ma_c
+
+    from execution import aim_convert as ma_c
+
+    from execution import mouse_aim as ma
     from gui import live_thread as lt
 
     root = Path(__file__).resolve().parent.parent
 
     # ---- ① 换算 ----
-    px, _w = ma.roi_px((200, 300, 100, 50), (50, 100, 3), 0.5, 0.5)
+    px, _w = ma_c.roi_px((200, 300, 100, 50), (50, 100, 3), 0.5, 0.5)
     check(px == (250.0, 325.0),
           "① (0.5, 0.5) 在 roi(200,300,100,50) 里该折成整帧 (250, 325) ✗：%r" % (px,))
-    px0, _ = ma.roi_px((200, 300, 100, 50), (50, 100, 3), 0.0, 0.0)
+    px0, _ = ma_c.roi_px((200, 300, 100, 50), (50, 100, 3), 0.0, 0.0)
     check(px0 == (200.0, 300.0), "① 比例 0,0 该正好落在 roi 原点 ✗：%r" % (px0,))
-    bad, why = ma.roi_px((200, 300, 100, 50), (50, 100, 3), 1.5, 0.5)
+    bad, why = ma_c.roi_px((200, 300, 100, 50), (50, 100, 3), 1.5, 0.5)
     check(bad is None and why, "① 比例越界必须**报错不夹取** ✗（点歪比不点危险 ✓）")
-    check(ma.roi_px((0, 0, 0, 10), (50, 100, 3), 0.5, 0.5)[0] is None,
+    check(ma_c.roi_px((0, 0, 0, 10), (50, 100, 3), 0.5, 0.5)[0] is None,
           "① 坏 roi（宽 0）该给 None ✓（宁可不动 ✗）")
 
     # ---- ② 两处换算都接上 ----
-    src = (root / "decision" / "mouse_aim.py").read_text(encoding="utf-8")
+    src = ((ROOT / "execution" / "mouse_aim.py").read_text(encoding="utf-8")
+                  + (ROOT / "execution" / "aim_convert.py").read_text(encoding="utf-8"))
     check(src.count("roi_px(roi, frame_shape, xr, yr)") >= 2,
           "② `aim_to` **和** `click_ratio` 都要走 roi 折算 ✗ —— 只改点击 ⇒ 光标先停在偏一块的地方"
           "再点 ✓（测谎/重连更歪 ✗）")
@@ -449,8 +461,18 @@ def t_stream_region_mouse_fit():
     lt_src = (root / "gui" / "live_thread.py").read_text(encoding="utf-8")
     check("def set_stream_rect" in lt_src and "def _mouse_roi" in lt_src,
           "② 实时线程该有 `set_stream_rect` / `_mouse_roi`（框完要能**立即生效** ✓）")
-    check(lt_src.count("self._mouse_roi()") >= 3,
-          "② 测谎点击 / 测谎走位 / 断线重连点击 **三处**都要折回整帧 ✗（漏一处就那一处点歪 ✓）")
+    # ⚠ 判据改过（2026-10-20 ✓）：`_mouse_roi()` 现在是**一处算清**（`_aim_geo` ✓ 见它那段说明），
+    #   三个调用点拿的是它返回的 `roi/full_shape` ⇒ 数 `self._mouse_roi()` 出现次数已经没意义 ✗
+    #   （旧写法 ≥3 会一直红，看着像"漏了一处"✓ 其实一处都没漏 ✓）。
+    #   现在钉的是：**唯一那个漏斗还在**、**三个调用点都真的从它拿** ✓。
+    # ⚠ 2026-10-20：**断线重连那处已搬进 `runtime/frame_reconnect.py`**（那边写 `th._aim_geo(` ✓）
+    #   ⇒ 三处跨**两个文件**数 ✓（只数 `live_thread` 会假红 ⇒ 假红会逼人删钉子 ✗）
+    _rc_src2 = (root / "runtime" / "frame_reconnect.py").read_text(encoding="utf-8")
+    _n_geo2 = lt_src.count("self._aim_geo(") + _rc_src2.count("th._aim_geo(")
+    check("roi, full = self._mouse_roi()" in lt_src and _n_geo2 >= 3,
+          "② 测谎点击 / 测谎走位 / 断线重连点击 **三处**都要折回整帧 ✗（漏一处就那一处点歪 ✓）"
+          "：`_mouse_roi()` 的漏斗=%r，走 `_aim_geo` 的调用点=%d 处"
+          % ("roi, full = self._mouse_roi()" in lt_src, _n_geo2))
     check('getattr(self, "_source", "")' in lt_src and "_stream_roi_now" in lt_src,
           "② 收流帧该在 `_stage_frame_ready` 按框裁 ✗（不裁 ⇒ 小地图/辨认还对着整帧 ✓）；"
           "且读来源要 `getattr` 兜底（自检替身没有这个字段 ✓）")
@@ -580,7 +602,7 @@ def t_lie_needs_warn():
     from core import behavior
 
     from gui import live_thread as _lt
-    from perception import ui_state
+    from perception.screen import ui_state
 
     _NOW = [1000.0]
     frame = np.full((768, 1366, 3), 60, np.uint8)
@@ -770,6 +792,119 @@ def t_protection_page():
         _kill_qt(page)
 
 
+def t_stream_rect_by_project():
+    """⭐⭐⭐⭐ 「B机换了项目后，没有正常显示上次该地图A机推流的框选区域」（2026-10-21 用户）。
+
+    **两处真病**（都不在"框选"那次操作上，而在**存/显示**上 ✗）：
+
+      ① `_save_project_params()` 里 `p` 在**下面几十行**才 `p = self.project`，上面却先用它
+         ⇒ 每次都是 `UnboundLocalError`、被同一个 `except` 吞掉 ⇒ `_sec` **恒为空** ⇒
+         "别拿空值抹盘"那道闸**从来没生效过** ✗。于是：换到一个没框过的项目、随便改个参数
+         ⇒ 把该项目盘上的 `stream_rect_rel` 写成 `None` ⇒ 切回来变成**整帧**（看着像"丢了"✓）。
+         （同一道闸当年是为 `mmap_crop` 加的 —— 现场症状是"黄点永远认不出来"✓）
+      ② 那行摘要 `_refresh_rect_label()` **只认本地窗口那条路的 `_rect`**，而收流模式还被
+         `_refresh_source_ui()` **整行藏起来** ⇒ 部署台换完项目，盘上明明存着「游戏区域」，
+         界面一个字都不显示 ✗。
+
+    钉五件（真 `Project` + 面板替身，绝不碰用户的 `projects/` 与 `config/live.yaml`）：
+      ① 本会话**没框过**（`None`）⇒ 盘上那份**一个字都不许动**；
+      ② 真框过 ⇒ 当场写进项目（换回来才看得见 ✓）；
+      ③ 换到**没框过的项目**保存 ⇒ 不会把别的项目那份牵连掉；
+      ④ 回填完要**送到正在跑的线程**（`set_stream_rect` ✓ 否则预览还按上一个项目的框裁）；
+      ⑤ 界面：收流模式那行摘要要显示「游戏区域」，且**不许**再跟着来源藏起来。
+    """
+    import shutil
+
+    from gui import live_panel as lp
+    from gui.project import Project
+
+    tmp = Path(tempfile.mkdtemp(prefix="rectproj_"))
+    real_update = lp.update_live
+
+    class _P:
+        """面板替身：只给 `_save_project_params` 要读的那几样（`_dead` / `_built` / `_live_params`）✓"""
+
+        def __init__(self, proj, stream_rect):
+            self.project = proj
+            self._sr = stream_rect
+            #: ⚠ 必须是**实例属性**：那道守卫读的是 `self.__dict__.get("_built")`（类属性读不到 ✗
+            #:   读到 None ⇒ 直接 `return` ⇒ 用例会"什么都没发生"地假绿 ✓）
+            self._built = True
+
+        def _dead(self):
+            return False
+
+        def _live_params(self):
+            #: 只留会被"空值抹盘"判到的那两个键（其余键与本用例无关 ✓）
+            return {"stream_rect_rel": self._sr, "conf_mob": 0.3}
+
+    def _save(proj, rect):
+        lp.LivePanel._save_project_params(_P(proj, rect))
+
+    def _rect_on_disk(root):
+        return (Project.open(root).sec("live") or {}).get("stream_rect_rel")
+
+    try:
+        a_root, b_root = tmp / "A", tmp / "B"
+        pa = Project.create(a_root, name="A", map_id="200010302")
+        pa.sec("live").update({"stream_rect_rel": [0.1, 0.2, 0.5, 0.4]})
+        pa.save()
+        pb = Project.create(b_root, name="B", map_id="105040303")
+        pb.sec("live").update({"stream_rect_rel": None})
+        pb.save()
+
+        lp.update_live = lambda **kw: None        # ⚠ 别真去写仓库里的 config/live.yaml ✓
+        try:
+            # ① 没框过 ⇒ 不许抹盘
+            _save(Project.open(a_root), None)
+            check(_rect_on_disk(a_root) == [0.1, 0.2, 0.5, 0.4],
+                  "本会话没框过就把项目里存的「游戏区域」写成空了 ✗（用户现场：换项目后"
+                  "整帧、像丢了 ✓）：%r" % (_rect_on_disk(a_root),))
+            # ② 真框过 ⇒ 要写进去
+            _save(Project.open(a_root), [0.0, 0.0, 0.25, 0.25])
+            check(_rect_on_disk(a_root) == [0.0, 0.0, 0.25, 0.25],
+                  "刚框的游戏区域没存进项目 ✗：%r" % (_rect_on_disk(a_root),))
+            # ③ 换到没框过的项目 ⇒ 只影响它自己
+            _save(Project.open(b_root), None)
+            check((Project.open(b_root).sec("live") or {}).get("stream_rect_rel") in (None, []),
+                  "没框过的项目不该凭空多出一个框 ✗")
+            check(_rect_on_disk(a_root) == [0.0, 0.0, 0.25, 0.25],
+                  "给 B 项目保存时把 A 项目那份牵连改了 ✗：%r" % (_rect_on_disk(a_root),))
+        finally:
+            lp.update_live = real_update
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ⑤' **再框一次不许叠加**：预览帧是**已裁过**的（`live_thread._stage_frame_ready` ✓）
+    #    ⇒ 在它上面框出来的坐标必须折回**整帧**（不然框两遍越框越小 ✓ 2026-10-21）
+    rel0 = lp.stream_rel_from_display((10, 20, 100, 50), (100, 200))
+    check(rel0 == [0.05, 0.2, 0.5, 0.5],
+          "没裁剪时该就是\"框 ÷ 画面\"：%r" % (rel0,))
+    rel1 = lp.stream_rel_from_display((0, 0, 200, 100), (200, 400),
+                                     roi=(100, 50, 400, 200), full=(400, 800))
+    check(rel1 == [0.125, 0.125, 0.25, 0.25],
+          "画面已经是「整帧里 (100,50) 起的 400×200」⇒ 框左上 200×100 该折成 "
+          "[0.125,0.125,0.25,0.25]，现在算成 %r（叠加了上一份框 ✗）" % (rel1,))
+    rel2 = lp.stream_rel_from_display((350, 150, 200, 100), (200, 400),
+                                     roi=(100, 50, 400, 200), full=(400, 800))
+    check(rel2[0] + rel2[2] <= 1.0 and rel2[1] + rel2[3] <= 1.0,
+          "框到画面外时比例该**夹在整帧内**（不许 >1 ⇒ 线程会切出界 ✗）：%r" % (rel2,))
+    check(lp.stream_rel_from_display((0, 0, 10, 10), (0, 0)) is None,
+          "画面尺寸为 0 该给 None（宁可不动 ✗）")
+
+    ui = (ROOT / "gui" / "live_panel.py").read_text(encoding="utf-8")
+    # ④ 回填后送到线程
+    check("th.set_stream_rect(self._stream_rect_rel)" in ui,
+          "换项目回填完没把「游戏区域」送到正在跑的线程 ⇒ 预览还按上一个项目的框裁 ✗")
+    check("stream_rel_from_display(" in ui,
+          "`_pick_stream_rect` 没走那个折回整帧的纯函数 ⇒ 框第二次会叠加 ✗")
+    # ⑤ 摘要行：收流模式要看得见
+    check("游戏区域：整帧" in ui and "相对推流帧" in ui,
+          "收流模式那行摘要不显示「游戏区域」⇒ 换项目后看不见盘上存着什么 ✗")
+    check("self.lbl_rect.setVisible(is_win)" not in ui,
+          "摘要行又跟着来源被藏起来了 ✗（收流模式它就看不见「游戏区域」了 ✓ 2026-10-21 现场）")
+
+
 TESTS = [
     ("三张弹窗模板贴帧 ⇒ 判对；空画布 ⇒ combat", t_detect_synthetic),
     ("阈值反向：拉满必不命中", t_threshold_reverse),
@@ -782,6 +917,9 @@ TESTS = [
      t_lie_window_30s),
     ("⭐⭐⭐ 部署台框「游戏窗口区域」+ 鼠标折回整帧（重连/测谎三处都接）",
      t_stream_region_mouse_fit),
+    ("⭐⭐⭐⭐ 部署台框的「游戏区域」按项目存/回填：不许被空值抹掉 + 回填要送到线程 + 换项目后"
+     "那行摘要要看得见（用户 2026-10-21「B机换了项目后没正常显示上次该地图A机推流的框选区域」）",
+     t_stream_rect_by_project),
     ("⭐⭐⭐⭐ 「`lie_game` 单独放宽门限」（用户 2026-10-10）：真录像实测 0.783~0.785 低于基础"
      "门限 ⇒ 小游戏认不出来 ⇒ Agent 在测谎里还在按移动/跳跃；放宽 + 保留 A 规则才是完整口径",
      t_lie_game_threshold_widened),

@@ -7,7 +7,7 @@
     · 键盘映射（7 个键）
 
 F10 / F11 / F12 是**本机操作键**：只在本窗口起作用，永不转发给游戏
-（见 decision/input.py 的 LOCAL_ONLY）。
+（见 execution/input.py 的 LOCAL_ONLY）。
 
 所有改动直接写进 settings 单例（decision.agent.settings），实时线程每帧读到
 最新值，无需重启。**这份参数只按项目存**：主窗口打开项目时注册保存钩子，每次
@@ -31,7 +31,9 @@ from core import instance as inst_mod   # 多实例：输入设备按实例记�
 from core import zones as zones_mod
 # ⭐ 「自动测谎（视觉追踪）」组的参数落 `config/live.yaml`（本机偏好 ✓ 2026-10-09）
 from core.config import load_live, update_live
-from decision import input as dinput
+from execution import input as dinput
+from execution import remote as _remote_mod
+from execution import keys as dkeys
 from decision.agent import (ANTI_AFK_TYPES, ZONE_GOTO_RETRY_S, load_rect,
                             settings)
 from gui import theme
@@ -114,6 +116,24 @@ def _sample_bar_color(img):
     low = tuple(np.clip(mean - tol, 0, 255).astype(np.uint8).tolist())
     high = tuple(np.clip(mean + tol, 0, 255).astype(np.uint8).tolist())
     return [list(low), list(high)]
+
+
+def big_mob_ui_state(settings):
+    """「大怪优先」三个控件该显示成什么 ⇒ `{"enabled", "ratio", "range_px"}`。
+
+    ⭐⭐ **建界面与"打开项目回填"共用这一处**（用户 2026-10-19 ✓ 原话：
+      「大怪优先配置项失效了」）—— 病根就是回填时**只回填了两个数字、漏了勾选框**
+      ⇒ 界面上勾着、`settings.big_mob_enabled` 却是 `false`（那个项目的真值）
+      ⇒ "看到的不是用的" ✗，用户只能得出"配置项失效"这个结论 ✓。
+
+    ⚠ `getattr` 兜底（老 settings 对象没有这几个字段 ⇒ 默认 True / 1.5 / 600，
+      老行为一字不变 ✓ 同 `_big_mob_pool` 里的兜底 ✓）。
+    """
+    return {
+        "enabled": bool(getattr(settings, "big_mob_enabled", True)),
+        "ratio": float(getattr(settings, "big_mob_ratio", 1.5) or 1.5),
+        "range_px": float(getattr(settings, "big_mob_range_px", 600) or 600),
+    }
 
 
 class BattleZoneListDialog(QDialog):
@@ -850,7 +870,7 @@ class _PadSender:
     "B机F10控制A机鼠标，A机的鼠标移动不连续"）。
 
     它在整条链里的位置（三段各自解耦 ✓，缺一段就会"一顿一顿" ✗）：
-      ① **产生**位移：`decision/input.py::PointerTracker` 独立线程按固定节拍轮询指针 ✓
+      ① **产生**位移：`execution/input.py::PointerTracker` 独立线程按固定节拍轮询指针 ✓
          （挂在 Qt move 事件上的老写法会让节拍跟着 GUI 卡 ✗）；
       ② **入队**（本类的 `push()`）：跟踪线程直接调 ⇒ 只加法 + 置事件 ✓（不碰网络 ✓）；
       ③ **发送**（本类的线程）：真去 `dinput.mouse_move` ⇒ **要阻塞就阻塞在这里** ✓。
@@ -1551,7 +1571,7 @@ class PlayerPanel(QWidget):
 
         # ⭐⭐ **「走不动按跳」**（用户 2026-10-06 ✓ 原话："现在走路走不动会跳一下，能做成开关
         #   放到战斗参数里吗「走不动按跳」，放在「追击起跳」上面"）—— 就摆在**追击起跳上面** ✓。
-        #   它管的是**走执行器**（`route.WalkJob` ✓）：判定"走不动了"之后先**单点跳一下**
+        #   它管的是**走执行器**（`jobs.WalkJob` ✓）：判定"走不动了"之后先**单点跳一下**
         #   （跳过小台阶 ✓ 2026-09-28 加 ✓；跳过还走不动才判失败 ✓）。
         #   ⚠ **默认勾上** = **现在正在跑的行为** ✓（要的是"能关掉" ✓ 不是"默认关" ✗）。
         self.ck_walk_hop = QCheckBox("走不动时跳一下")
@@ -1719,7 +1739,8 @@ class PlayerPanel(QWidget):
         #   2026-10-01 再要求：加**总开关**「大怪优先」勾选框 —— 不勾 = 逻辑不启用、
         #   下面「大怪判定倍数」「大怪优先半径」两个参数也**灰掉不可配** ✓。
         self.ck_big_mob = QCheckBox("大怪优先")
-        self.ck_big_mob.setChecked(bool(getattr(settings, "big_mob_enabled", True)))
+        # ⚠ 初值也走 `big_mob_ui_state`（和"打开项目回填"同一处 ✓ 见那个函数 ✓）
+        self.ck_big_mob.setChecked(bool(big_mob_ui_state(settings)["enabled"]))
         self.ck_big_mob.setToolTip(
             "**总开关**：勾上才启用「大怪优先」（锁定目标时优先明显更高的大怪 ✓）。\n"
             "不勾 = 逻辑不启用、下面「大怪判定倍数」「大怪优先半径」也**不可配** ✓。")
@@ -1880,7 +1901,7 @@ class PlayerPanel(QWidget):
         #   **防抖置信度**和**防抖时间**的配置和逻辑，现在完全不对；接 ByteTrack，
         #   新参数『**失联帧长**』（track_buffer）代替以前的『防抖时间』，**默认 1000ms**"✓）
         #   ⛔ 原来那两格（防抖置信度 / 防抖时间）**已删** ✗ —— 它们把"这一拍显不显示"
-        #     和"消失后还留多久"混成一对旋钮 ⇒ 调它救不了"框闪" ✓（见 `perception/bytetrack.py` 抬头 ✓）。
+        #     和"消失后还留多久"混成一对旋钮 ⇒ 调它救不了"框闪" ✓（见 `perception/track/bytetrack.py` 抬头 ✓）。
         self.sp_track_buffer = self._spin(0, 10000, 1000, 0)
         self.sp_track_buffer.setToolTip(
             "**失联帧长**（ByteTrack 的 track_buffer）：怪框丢掉后，这条轨迹还活多久。\n"
@@ -2663,6 +2684,8 @@ class PlayerPanel(QWidget):
             return probs
         try:
             from core import mapdata
+            from perception import map_const
+            from perception import map_calib
             from perception import minimap as mm
             # ⚠⚠ 来源必须与**路线识别页**同一处口径（`mm.source_for_map` ✓）——
             #   2026-10-10 用户现场："**为什么我标定过了还显示这个**" ✗：
@@ -2678,25 +2701,25 @@ class PlayerPanel(QWidget):
                 calib = mapdata.load_calib(mid, _src)
             except Exception:
                 calib = None
-            if not mm.has_geometry(calib or {}):
+            if not map_calib.has_geometry(calib or {}):
                 # ⭐⭐ **另一条来源下量过就直接点名** ✓（别让人对着"没标定"发呆 ✓）：
                 #   这是本次现场最费解的一点 —— 人刚在「从实时画面」下量完，提示却说
                 #   当前来源没量 ✗ ⇒ 把"你这张图在**哪条来源**下是量过的"写在同一条提示里 ✓。
                 _others = []
                 try:
                     for _s, _c in (mapdata.load_calibs(mid) or {}).items():
-                        if _s and _s != _src and mm.has_geometry(_c or {}):
-                            _others.append("「%s」" % mm.SRC_LABEL.get(_s, _s))
+                        if _s and _s != _src and map_calib.has_geometry(_c or {}):
+                            _others.append("「%s」" % map_const.SRC_LABEL.get(_s, _s))
                 except Exception:              # noqa: BLE001 —— 这条只是加个提示，别弄坏体检 ✗
                     _others = []
                 _hint = ("\n  ⚠ 这张图在 %s 下**是量过的** ✓ ⇒ 要么把「小地图来源」切到那条"
                          "（路线识别页那个下拉 ✓），要么就按当前来源「%s」重量一次 ✓"
-                         % ("、".join(_others), mm.SRC_LABEL.get(_src, _src))) if _others else ""
+                         % ("、".join(_others), map_const.SRC_LABEL.get(_src, _src))) if _others else ""
                 probs.append(
                     "· **地图「%s」在来源「%s」下还没标定**（缺「面板 → 底图」换算）\n"
                     "  ⇒ 玩家坐标会一直是空的 ⇒ 开一会儿自动自己就会停掉\n"
                     "  → 去「路线识别」页点「标定…」量一次并**保存**。%s"
-                    % (mid, mm.SRC_LABEL.get(_src, _src), _hint))
+                    % (mid, map_const.SRC_LABEL.get(_src, _src), _hint))
             # ② 地形 / 底图：`canvas is None` = 没生成过地形图（同 route_panel 的口径 ✓）
             try:
                 t = mapdata.load(mid, with_canvas=True)
@@ -2930,7 +2953,7 @@ class PlayerPanel(QWidget):
         """触控板位移 → 乘灵敏度 → 交给发送器（**在指针跟踪线程里被调** ✗⏰ 用户 2026-10-05 ✓）。
 
         为什么是它、而不是 Qt 信号（用户选的"直接2" ✓）：位移的**产生**已经挪进
-        `decision/input.py::PointerTracker` 那条独立线程（固定节拍轮询系统指针 ✓），
+        `execution/input.py::PointerTracker` 那条独立线程（固定节拍轮询系统指针 ✓），
         它的 `on_delta` 回调就直接落到这里 ⇒ 从"手指动"到"进发送队列"这条路上
         **没有任何 Qt 事件循环** ✓✓（原来两段都挂在 GUI 线程上 ⇒ 一卡就成撮 ✓）。
         位移的**发送**也早就在独立线程里（`_PadSender` ✓）⇒ 现在整条链只剩"链路本身"的
@@ -2986,7 +3009,8 @@ class PlayerPanel(QWidget):
 
     def _reset_link(self):
         """手动重置指令通道：卡键 / 发不出指令时的逃生口（见按钮 tooltip）。"""
-        from decision import input as dinput
+        from execution import input as dinput
+        from execution import remote as _remote_mod
         # ⭐ **先把所有方向键点按一遍，再重置**（用户 2026-10-01 ✓）：
         #   重连 / RELEASEALL 只能清掉**固件侧**按住的键；但若一条 RELEASE 在链路里
         #   丢了，**游戏侧**会一直以为某个方向键还按着（角色往一个方向一直走、按啥
@@ -2996,7 +3020,7 @@ class PlayerPanel(QWidget):
         #   刷干净；随后 RELEASEALL / 重连再清固件侧，两边就都不留卡键 ✓。
         #   ⚠ 通道死了这几下会静默失败（`_send_remote` 吞掉、不抛 ✗）⇒ 无副作用，
         #   后面的重连照走 ✓。
-        # ⚠ 段实现**只有一处** ✓（`decision/input.tap_directions` ✓）—— 2026-10-11 收口：
+        # ⚠ 段实现**只有一处** ✓（`execution/input.tap_directions` ✓）—— 2026-10-11 收口：
         #   定时清键 / 通道自愈走的是**同一个函数** ✓（用户当天正是问"这两处有没有先按一遍"✓）。
         #   ⚠ 这里**不加** `only_hardware` ✓：手动按钮是人明确点的 ⇒ 本地(仅测试)也照发 ✓
         #     （只有**自动**那两条会跳过 ✗ 见 `tap_directions` 的说明 ✓）。
@@ -3004,7 +3028,7 @@ class PlayerPanel(QWidget):
             dinput.tap_directions(settings.keymap)
         except Exception:                           # noqa: BLE001
             pass
-        h = dinput.link_health()
+        h = _remote_mod.link_health()
         backend = h.get("backend")
         reconnected = False
         if backend in ("remote", "serial"):
@@ -3016,10 +3040,10 @@ class PlayerPanel(QWidget):
             QApplication.processEvents()          # 先把上面这句画出来，重连会阻塞一下
             # 无条件重连：链路「看起来正常」但实际已经冻住的情况（relay 卡在串口
             # 写上）只有断开这一下能解，断开时 relay 会给固件发 RELEASEALL。
-            reconnected = dinput.reconnect_remote()
+            reconnected = _remote_mod.reconnect_remote()
         self._force_release_all()
         settings.input_resync = True              # 让决策层也清掉本地按键状态
-        h2 = dinput.link_health()
+        h2 = _remote_mod.link_health()
         if h2.get("ok", True):
             self.lbl_device_state.setText("已重连通道并释放按键" if reconnected
                                           else "已释放所有按键")
@@ -3037,7 +3061,8 @@ class PlayerPanel(QWidget):
         实时线程卡住没走到 release_all，键会卡在按下状态。这里兜底强制释放所有
         映射键；对未按下的键发 RELEASE 无害（固件/SendInput 都忽略）。
         """
-        from decision import input as dinput
+        from execution import input as dinput
+        from execution import remote as _remote_mod
         # ⭐⭐⭐ **2026-10-13：手动输入开着 ⇒ 不许发 RELEASEALL、不许动人手正按着的键**
         #   （用户原话："**关闭自动情况下，开启手动输入按住的键会被断掉**，什么情况？"✓）
         #   为什么：`RELEASEALL` 让固件**整张表清空** ✗ ⇒ 手动通道正转发着的人手按键一起没 ✗
@@ -3056,7 +3081,7 @@ class PlayerPanel(QWidget):
             # 远程模式：发一条 RELEASEALL 让固件清空所有按键，比逐键 RELEASE 可靠，
             # 能救回「RELEASE 丢失导致卡键」的情况
             # ⚠ 只有**没有手动输入**时才敢用它 ✓（它不分是谁按的 ✗）
-            dinput.release_all_remote()
+            _remote_mod.release_all_remote()
         # 逐键兜底（本地 SendInput + 远程补充）—— 手动正按着的那些**跳过** ✓
         keys = (set(settings.keymap.values())
                 | set(settings.custom_keys.values())) - _man
@@ -3087,7 +3112,7 @@ class PlayerPanel(QWidget):
 
     def _refresh_auto_ui(self):
         on = settings.enabled
-        hotkey = dinput.display_name(settings.keymap.get("auto", "f11"))
+        hotkey = dkeys.display_name(settings.keymap.get("auto", "f11"))
         self.btn_auto.setChecked(on)
         self.btn_auto.setText("停止自动（%s）" % hotkey if on else "开启自动（%s）" % hotkey)
         self.btn_auto.setStyleSheet(self._BTN_AUTO_ON if on else self._BTN_AUTO_OFF)
@@ -3144,19 +3169,19 @@ class PlayerPanel(QWidget):
         「已连接 ProMicro(远程)」，而实际上一条指令都发不出去。
         现在每 500ms 对一次账，不正常就标红说明原因。
 
-        判据来自 `dinput.link_health()`：既看「发送有没有报错」，也看
+        判据来自 `_remote_mod.link_health()`：既看「发送有没有报错」，也看
         「发出去后 5 秒内有没有固件回执」—— 后者能抓到「发送看着成功、
         实际谁也没收到」的情况。恢复动作不在这里做（重连会阻塞、也可能
         和实时线程抢连接），界面上点「重置指令通道」即可。
         """
-        h = dinput.link_health()
+        h = _remote_mod.link_health()
         backend, ok = h.get("backend"), bool(h.get("ok", True))
         # 坏着就**持续**重试（节流在 _auto_reconnect_link 里，5 秒一次）。
         # **不能只在「状态变化」那一下试一次**：第一次赶巧失败（relay 正忙、
         # 板子还在重枚举）就再也不试了 —— 界面永远红着、指令一条都发不出去，
         # 表现就是「远程输出全无效」。这是我上一版写错的地方。
         if backend in ("remote", "serial") and not ok:
-            self._auto_reconnect_link()
+            self._auto_reconnect_link(h.get("role"))
         key = (backend, ok, str(h.get("err") or ""))
         if key == getattr(self, "_link_key", None):
             return                      # 状态没变就别每 500ms 重写控件
@@ -3181,21 +3206,29 @@ class PlayerPanel(QWidget):
             self.lbl_device_state.setText("本地键盘")
             self.lbl_device_state.setStyleSheet("color: #80868b;")
 
-    def _auto_reconnect_link(self):
-        """链路坏了自动重连：后台线程做，最多 5 秒一次。
+    def _auto_reconnect_link(self, role=""):
+        """链路坏了自动重连：后台线程做，最多 5 秒一次（**只读实例 30 秒一次** ✓）。
 
         **为什么现在敢自动做**：以前只有手动按钮 —— 结果是 relay 一崩或一重启，
         B 机就一直红着、什么都发不出去，得人去点一下（实测踩过：A 机 relay 挂掉后
         界面还写着「已连接」，现在它会变红并自己重连）。
 
         放后台线程是为了不卡界面；重连本身是安全的：断开那一下 relay 会补一条
-        RELEASEALL 松开按住的键（见 decision/input.py 的 reconnect_remote）。
+        RELEASEALL 松开按住的键（见 execution/input.py 的 reconnect_remote）。
         手动按钮保留 —— 自动重连失败时它还在。
+
+        ⭐ 2026-10-20：**只读实例别每 5 秒重连一遍** ✗（用户现场：A 机十分钟报 6 次
+          `client disconnected`，其中一条原因是"控制位被另一个工作台实例占用"✓）。
+          只读这个角色是**握手时定死的** ⇒ 它**永远**变不成控制端，5 秒一次只会：
+          ① 把 A 的日志刷满；② 每次都是新 TLS 握手（A 那边还要判一次控制位）✓
+          ⇒ 拉长到 30 秒。界面那行**已经写明**"控制位被另一个工作台实例占用…把其中一个
+             改成「本机」" ✓ 人看见了会自己处理 ✓ 不需要它自己狂试 ✗。
         """
         now = time.monotonic()
         if getattr(self, "_link_rc_busy", False):
             return
-        if now - getattr(self, "_link_rc_at", 0.0) < 5.0:
+        _iv = 30.0 if str(role or "") == "readonly" else 5.0
+        if now - getattr(self, "_link_rc_at", 0.0) < _iv:
             return
         self._link_rc_at = now
         self._link_rc_busy = True
@@ -3204,7 +3237,7 @@ class PlayerPanel(QWidget):
 
         def _do():
             try:
-                dinput.reconnect_remote()
+                _remote_mod.reconnect_remote()
             except Exception:
                 pass
             finally:
@@ -3925,10 +3958,20 @@ class PlayerPanel(QWidget):
             except Exception:                # noqa: BLE001 —— 连不上也不该让页面建不出来 ✓
                 pass
 
-        self.ck_vt = QCheckBox("启用（把实时画面交给 visual_tracking 跟踪）")
+        # ⚠ 文案必须跟**当前语义**一致（用户 2026-10-17 指出 ✓）：默认是
+        #   `vt_gate: screen`（B 语义）⇒ 勾上**不等于**一直在跟踪，只是
+        #   "允许 + 后台预热模型"，真正喂帧要等**测谎弹窗出现** ✓
+        #   （只有把 `vt_gate` 改成 `off` 才是老语义"勾上就一直跟踪" ✓ 见 tooltip）。
+        self.ck_vt = QCheckBox("启用（测谎弹窗出现时才跟踪）")
         self.ck_vt.setChecked(bool(_lv.get("vt_on", False)))
         self.ck_vt.setToolTip(
-            "勾上就把「实时画面」里**框选的那块窗口**（画框之前的原生帧 ✓）喂给外部视觉追踪包\n"
+            "勾上 = **允许**这套测谎跟踪工作（模型会在后台预热，约 10 秒）。\n\n"
+            "⭐ 真正开始跟踪的时机由 `vt_gate` 决定（默认 `screen`）：\n"
+            "  · **screen**（默认）—— 先嗅探画面，**测谎窗口出现时才喂帧跟踪** ✓\n"
+            "    平时不推理 ⇒ 不抢怪物识别的 GPU ✓；触发期间**战斗检测/决策全部暂停**，\n"
+            "    直到那个窗口消失（+`vt_hold_s` 宽限）才恢复 ✓\n"
+            "  · **off** —— 老语义：勾上就一直喂帧（费 GPU，但最简单 ✓ 出问题可一键退回）\n\n"
+            "把「实时画面」里**框选的那块窗口**（画框之前的原生帧 ✓）喂给外部视觉追踪包\n"
             "`visual_tracking_sdk_20260920`：它自己会在画面里找游戏弹窗、并跟踪那个目标。\n\n"
             "  · 它**只检测、不点击**（`INTEGRATION.md:105` ✓）—— 报成功之后点不点「确定」\n"
             "    由下面那一格决定 ✓；\n"
@@ -4033,6 +4076,32 @@ class PlayerPanel(QWidget):
         self.sp_vt_conf.valueChanged.connect(self._on_vt_changed)
         f.addRow("检测置信度", self.sp_vt_conf)
 
+        # ⭐⭐⭐ **帧率限制(fps)**（用户 2026-10-18 ✓ 原话：「把 vt_max_fps 做成配置"帧率限制"
+        #   加在自动测谎组里；配 **-1 则不限制**」）——
+        #   限的是**喂给 SDK 的推理速度**（第二套 YOLO ✓），**不是**游戏/实时画面的帧率 ✗。
+        #   · 默认 20（`live.yaml` 现值 ✓ 判谎够用又省算力 ✓）；
+        #   · **-1 = 不限制**（每来一帧就推理 ✓ 代价是 GPU/CPU 全被第二套 YOLO 占着 ✗）；
+        #   · 本机积压时那道"降到 2fps 让路"**只在有限制时才生效** ✓（人说不限制就不偷偷降 ✓）。
+        try:
+            _fps0 = int(float(_lv.get("vt_max_fps", 20)))
+        except (TypeError, ValueError):
+            _fps0 = 20
+        self.sp_vt_fps = NoWheelSpinBox()
+        self.sp_vt_fps.setRange(-1, 120)
+        self.sp_vt_fps.setSingleStep(5)
+        self.sp_vt_fps.setSpecialValueText("不限制")     # -1 时直接显示这四个字 ✓（不用记数字 ✓）
+        self.sp_vt_fps.setValue(_fps0)
+        self.sp_vt_fps.setToolTip(
+            "**每秒最多喂多少帧给测谎 SDK**（默认 **20**）。它自带第二套 YOLO ⇒ 这格是**算力闸**。\n\n"
+            "  · **-1 = 不限制**：来一帧推一帧（最跟手，但 GPU/CPU 会被测谎吃掉一大块 ✗）；\n"
+            "  · 20 左右：判谎够用，实时画面基本不受影响 ✓；\n"
+            "  · 调太小（< 5）：判定会「慢半拍」，目标动快了容易跟丢 ✗。\n\n"
+            "⚠ 配 -1 时，本机积压那道「降到 2fps 让路」**不会再生效**（不限制就是真不限 ✓）。\n"
+            "⚠ 它只影响**喂帧速度**，不动游戏帧率、也不动实时画面的解码。\n"
+            "改完**最多 1 秒生效**（不用重开预览 ✓）。")
+        self.sp_vt_fps.valueChanged.connect(self._on_vt_changed)
+        f.addRow("帧率限制(fps)", self.sp_vt_fps)
+
         self.cmb_vt_region = NoWheelComboBox()
         self.cmb_vt_region.addItem("国服（CN）", "CN")
         self.cmb_vt_region.addItem("繁中（TW）", "TW")
@@ -4098,6 +4167,9 @@ class PlayerPanel(QWidget):
                         vt_region=str(self.cmb_vt_region.currentData() or "CN"),
                         vt_cool_s=float(self.sp_vt_cool.value()),
                         vt_aim_ms=int(self.sp_vt_aim_ms.value()),
+                        # ⭐ **帧率限制**（用户 2026-10-18 ✓）：**-1 = 不限制** ✓ 原样存 -1 ✓
+                        #   （别在这儿把 -1 折成 20 之类的默认值 ✗ —— 那就等于"配了没生效"✗）
+                        vt_max_fps=int(self.sp_vt_fps.value()),
                         # ⭐ **瞄准平滑强度**（0 = 直跟 ✓ 用户 2026-10-16 ✓ 见 `_build_vt_group` ✓）
                         vt_smooth=int(self.sp_vt_smooth.value()))
         except Exception as e:                # noqa: BLE001 —— 存不上不该炸面板 ✓
@@ -4284,7 +4356,7 @@ class PlayerPanel(QWidget):
         f.addRow("频道 Y 比例", self.sp_rc_chan_y)
 
         # ---- ⑤ 「鼠标标定」现状（**只读** ✓）：它是"能不能点"的另一半 ——
-        #   比例再准，没标定也**一个字节都不会发**（`decision/mouse_aim.py` ✓）。
+        #   比例再准，没标定也**一个字节都不会发**（`execution/mouse_aim.py` ✓）。
         #   放一行在这儿，是为了让"它为什么不点"**在界面上就能看见** ✓（否则只能去翻日志 ✗）。
         self.lbl_rc_gain = QLabel()
         self.lbl_rc_gain.setWordWrap(True)
@@ -4373,13 +4445,14 @@ class PlayerPanel(QWidget):
     def _refresh_rc_gain(self):
         """把「鼠标标定」现状写进那一行（**只读** ✓）。
 
-        判据只有一处：`decision.mouse_aim` 的**文件在不在 + 两个分量是不是正数** ✓
+        判据只有一处：`execution.mouse_aim` 的**文件在不在 + 两个分量是不是正数** ✓
         （与真正点击时读的是同一份 ✓）—— 这里**不许自己再读一遍那份 json** ✗
         （两处口径迟早分叉，本仓库踩过 ✓）。
         """
         try:
-            from decision import mouse_aim
-            g = mouse_aim.load_gain()
+            from execution import aim_convert as mouse_aim_c
+            from execution import mouse_aim
+            g = mouse_aim_c.load_gain()
             if g:
                 self.lbl_rc_gain.setText("已标定：%.4f / %.4f 画面像素每指令单位 ✓"
                                          % (float(g[0]), float(g[1])))
@@ -5122,20 +5195,21 @@ class PlayerPanel(QWidget):
         """切换输入设备：本地 SendInput / 远程 Pro Micro / 本地 Pro Micro（后台异步连接）。
 
         ⭐⭐ 2026-10-05（用户"**从源头彻底封死**"✓）：**"起线程去连被控机"这件事挪进了
-          `decision.input.connect_async`** —— 那儿是**唯一**去连被控机的地方，也是**闸**
+          `execution.input.connect_async`** —— 那儿是**唯一**去连被控机的地方，也是**闸**
           （`input.net_allowed` ✓）所在 ⇒ 谁调都绕不过去 ✓。
           原来两个 `threading.Thread(...)` 就写在本方法里 ✗ ⇒ 只有**记得打桩的那个套件**
           （`selftest_main_window` ✓）才不连，`gui_smoke` / `minimap` / `screen_state` /
           `decision` 里那几个 `PlayerPanel()` 都照样连 ✗ ⇒ 那条线程回来碰已销毁的对象 ⇒
-          **偶发原生崩 `0xC0000005`** ✗（病根与判据见 `decision/input.py::net_allowed` ✓）。
+          **偶发原生崩 `0xC0000005`** ✗（病根与判据见 `execution/input.py::net_allowed` ✓）。
         """
-        from decision import input as dinput
-        if dev in ("remote", "serial") and not dinput.net_allowed():
+        from execution import input as dinput
+        from execution import remote as _remote_mod
+        if dev in ("remote", "serial") and not _remote_mod.net_allowed():
             # ⭐ 离屏自检 / 显式关闸：**连线程都不起**、也不发（`use_blocked` ✓ 什么都不发）。
             # ⚠ 这里**绝不 emit("fail")**：`_on_device_connected` 收到非 ok 会把
             #   `settings.input_device` 写回 `local` 并 `save()` ✗（自检写脏用户配置 ✗），
             #   而且那会把"离屏跳过"说成"连接失败"—— 两件事不一样 ✓。
-            dinput.use_blocked(dev)
+            _remote_mod.use_blocked(dev)
             self.lbl_device_state.setText("已跳过：离屏运行，不连被控机")
             self._refresh_mouse_ui()
             return
@@ -5145,15 +5219,15 @@ class PlayerPanel(QWidget):
             port = int(get("kbd", "port", 9000))
             cert = get("kbd", "cert", "remote_kbd/certs/cert.pem")
             self.lbl_device_state.setText("正在连接 ProMicro(远程)…")
-            dinput.connect_async("remote", self._on_device_link_result,
+            _remote_mod.connect_async("remote", self._on_device_link_result,
                                  host=host, port=port, cert=cert)
         elif dev == "serial":
             from core.config import get
             ser_port = get("kbd", "serial_local", "COM5")
             self.lbl_device_state.setText("正在连接 ProMicro(本地)…")
-            dinput.connect_async("serial", self._on_device_link_result, port=ser_port)
+            _remote_mod.connect_async("serial", self._on_device_link_result, port=ser_port)
         else:
-            dinput.use_local()
+            _remote_mod.use_local()
             self.lbl_device_state.setText("本地键盘")
         self._refresh_mouse_ui()
 
@@ -5173,9 +5247,10 @@ class PlayerPanel(QWidget):
           （`status` 只有 `"ok"` / `"fail"`：`"skip"`（离屏不连）在 `_apply_input_device`
           里就返回了、**不走这条** ✓）。
         """
-        from decision import input as dinput
+        from execution import input as dinput
+        from execution import remote as _remote_mod
         if status != "ok":
-            dinput.use_local()          # 连不上 ⇒ 回退本地（老口径一字不变 ✓）
+            _remote_mod.use_local()          # 连不上 ⇒ 回退本地（老口径一字不变 ✓）
         try:
             self.device_connected.emit(status)
         except RuntimeError:
@@ -5186,14 +5261,35 @@ class PlayerPanel(QWidget):
         if result == "ok":
             if settings.input_device == "serial":
                 self.lbl_device_state.setText("已连接 ProMicro(本地)")
+                # ⭐⭐⭐⭐ **远程桌面会话里，硬件键盘打不到本会话**（用户 2026-10-19 现场 ✓
+                #   原话："C机远程控制B机环境下 B机的本地ProMicro操作失效了"✓）——
+                #   串口/固件/链路**全都正常**，只是 HID 只进**物理控制台**那个会话 ⇒
+                #   游戏（在本会话里）一个键都收不到 ✓ 判据与实测见 `core/session.py` ✓。
+                #   ⚠ 只对**本机 ProMicro** 提示（"远程"那个打的是被控机的会话 ✓ 与这儿无关 ✗）。
+                _why = ""
+                try:
+                    from core import session as _sess
+                    _why = _sess.warning_text()
+                except Exception:                  # noqa: BLE001 —— 判不了不吓人 ✓
+                    _why = ""
+                if _why:
+                    self.lbl_device_state.setText(
+                        "已连接 ProMicro(本地) —— ⚠ 远程桌面会话里收不到硬件按键")
+                    self.lbl_device_state.setToolTip(_why)
+                    try:
+                        from core import behavior as _bhv
+                        _bhv.event("hid_session_warn", level="warn", why=_why)
+                    except Exception:              # noqa: BLE001
+                        pass
             else:
                 self.lbl_device_state.setText("已连接 ProMicro(远程)")
         else:
             # ⚠⚠ **把原因一起说出来** ✗（2026-10-10 ✓ 用户现场："本地ProMicro连接失败" ✗
             #   而真正原因是**串口被另一个工作台占着** ✓ —— 界面只有八个字，等于没说 ✓
-            #   见 `decision.input.last_connect_err` 的说明 ✓）。
-            from decision import input as _din
-            _why = str(_din.last_connect_err() or "").strip()
+            #   见 `execution.input.last_connect_err` 的说明 ✓）。
+            from execution import input as _din
+            from execution import remote as _remote_mod
+            _why = str(_remote_mod.last_connect_err() or "").strip()
             settings.input_device = "local"
             settings.save()
             self.lbl_device_state.setText(
@@ -5213,7 +5309,7 @@ class PlayerPanel(QWidget):
         """按 settings.keymap 刷新所有键按钮的文字。"""
         for key, btn in self._key_buttons.items():
             k = settings.keymap.get(key)
-            btn.setText(dinput.display_name(k) if k else "无")
+            btn.setText(dkeys.display_name(k) if k else "无")
 
     def _start_listen(self, key):
         """进入监听：下一个按键作为新映射，Esc 取消。"""
@@ -5303,7 +5399,7 @@ class PlayerPanel(QWidget):
             if self._listening_custom == name:
                 btn.setText("请按键…")
             else:
-                btn.setText(dinput.display_name(k) if k else "无")
+                btn.setText(dkeys.display_name(k) if k else "无")
             btn.clicked.connect(lambda _c, n=name: self._start_listen_custom(n))
             rm = QPushButton("删除")
             rm.setFixedWidth(48)
@@ -5637,9 +5733,27 @@ class PlayerPanel(QWidget):
         self.sp_track_buffer.setValue(int(getattr(settings, "track_buffer_ms", 1000)))
         self.sp_track_buffer.blockSignals(False)
 
+        # ⭐⭐⭐ **「大怪优先」三个控件一起回填**（用户 2026-10-19 现场 ✓ 原话：
+        #   "大怪优先配置项失效了"）
+        #   ⚠⚠ 病根：这里原来**只回填了两个数字**（倍数 / 半径）✗ —— **勾选框没回填**，
+        #     也没重跑 `_apply_big_mob_enabled()` ⇒ 打开 / 切换项目之后：
+        #       · 界面上的「大怪优先」还是**上一个项目**（或建界面那一刻）的状态 ✓
+        #       · 而逻辑吃的是 `settings.big_mob_enabled`（这个项目那份 ✓）
+        #     ⇒ **看到的不是用的** ✗：现场就是"界面勾着、`project.yaml` 里是
+        #       `big_mob_enabled: false`" ⇒ 用户说"配置项失效了"✓（一模一样）。
+        #   ⇒ 三个控件的值只从 `big_mob_ui_state()` 一个地方来（建界面也用它 ✓ 一处口径 ✓）。
+        _bm = big_mob_ui_state(settings)
+        self.ck_big_mob.blockSignals(True)
+        self.ck_big_mob.setChecked(bool(_bm["enabled"]))
+        self.ck_big_mob.blockSignals(False)
         self.sp_big_mob_ratio.blockSignals(True)
-        self.sp_big_mob_ratio.setValue(getattr(settings, "big_mob_ratio", 1.5))
+        self.sp_big_mob_ratio.setValue(_bm["ratio"])
         self.sp_big_mob_ratio.blockSignals(False)
+        self.sp_big_mob_range_px.blockSignals(True)
+        self.sp_big_mob_range_px.setValue(_bm["range_px"])
+        self.sp_big_mob_range_px.blockSignals(False)
+        # ⚠ 摆完再刷一次"两个参数可不可配"（否则勾着却还是灰的 ✗）
+        self._apply_big_mob_enabled()
 
         # ⭐⭐ 「断线重连」整组（挂机保护页 → 断线重连 ✓）：打开项目时得**跟着项目值走** ✓
         #   （⚠ 不接这一步的后果很具体：界面上显示的还是上一个项目的数 / 默认值 ✗
@@ -5651,9 +5765,8 @@ class PlayerPanel(QWidget):
         #   （而控件建好之后它照旧会被同步 ✓ 见 `_build_reconnect_group` 里的初值 ✓）。
         self._sync_reconnect_group()
 
-        self.sp_big_mob_range_px.blockSignals(True)
-        self.sp_big_mob_range_px.setValue(getattr(settings, "big_mob_range_px", 600))
-        self.sp_big_mob_range_px.blockSignals(False)
+        # ⚠ 「大怪优先」的**半径**已经在上面那一块跟着勾选框一起回填了 ✓
+        #   （原来它单独在这里回填 ⇒ 勾选框漏了 —— 就是 2026-10-19 那次"失效"✓）
 
         # ⭐ 「平台站桩」三组（用户 2026-10-05 ✓）：拾取开关 / 时间区间 回填；
         #   **站桩地点与掉落地区是"结构体"**（不是控件自己存得下的）⇒ 由
@@ -5789,9 +5902,9 @@ class PlayerPanel(QWidget):
         # ⭐⭐ **顺手收掉小地图收流线程**（2026-10-09 ✓）：它们是 **daemon** ✓ 且常年阻塞在
         #   `recv` 上 ✗ —— 不显式停，解释器退出时脚下的 socket 缓冲会被拆 ⇒ 偶发
         #   **access violation（`0xC0000005`）** ✗（"关工作台时不清不楚地崩一下" ✓）。
-        #   一处出口统一收（同套件收尾那条 ✓ 见 `perception.minimap.stop_all_clients` ✓）。
+        #   一处出口统一收（同套件收尾那条 ✓ 见 `perception.map_client.stop_all_clients` ✓）。
         try:
-            from perception.minimap import stop_all_clients
+            from perception.map_client import stop_all_clients
             stop_all_clients()
         except Exception:                        # noqa: BLE001 —— 收尾不该拦住关窗 ✓
             pass
@@ -5810,8 +5923,9 @@ class PlayerPanel(QWidget):
             self._pad_sender = None
         # 释放所有按键 + 关闭远程键盘连接，停止指令传输
         self._force_release_all()
-        from decision import input as dinput
-        dinput.shutdown()
+        from execution import input as dinput
+        from execution import remote as _remote_mod
+        _remote_mod.shutdown()
         from decision import manual_input
         manual_input.stop()
         if self.thread is not None:

@@ -30,10 +30,11 @@ def main():
         return 2
     src, url = _open_stream()
     print("[2] 已开流：%s" % url)
-    from decision import input as dinput
+    from execution import input as dinput
     try:
-        from decision import mouse_aim
-        print("[3] load_gain() =", mouse_aim.load_gain())
+        from execution import aim_convert as mouse_aim_c
+        from execution import mouse_aim
+        print("[3] load_gain() =", mouse_aim_c.load_gain())
         dinput.mouse_move(-4000, -4000)
         import time as _t
         _t.sleep(0.6)

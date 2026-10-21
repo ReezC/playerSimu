@@ -46,7 +46,7 @@ mmap_crop:
 - 240
 - 79
 decision:
-  attack_dist: 70.0
+  attack_dist: 80.0
   min_attack_dist: 0
   attack_up_dist: 30
   attack_down_dist: 20
@@ -132,15 +132,15 @@ decision:
   - 0.120791
   - 0.018229
   probe_calib:
-    x_ratio: 0.03074670571010249
+    x_ratio: 0.015373352855051245
     y_ratio: 0.018229166666666668
-    cell_ratio: 0.010980966325036604
-    gap_ratio: 0.0013572474377745243
+    cell_ratio: 0.01171303074670571
+    gap_ratio: 0.0006068814055636896
     bits: 40
     frame:
     - 1366
     - 768
-    solved_at: '2026-10-17 18:05:12'
+    solved_at: '2026-10-18 14:49:20'
   hp_color:
   - - 0
     - 0
@@ -216,7 +216,7 @@ decision:
   - fid: '83'
     kind: foothold
     ratio: 100.0
-  route_goto_set: 左下鳄鱼
+  route_goto_set: ''
   align_tol_px: 12
   align_hold_ms: 1000
   climb_align_gap_ms: 180
@@ -227,7 +227,7 @@ decision:
   chase_goto_max_s: 5.0
   goto_timeout_key: 表情_无语
   disable_chase_pathfinding: true
-  jump_start_px: 70
+  jump_start_px: 75
   move_retry_ms: 500
   custom_timers:
   - name: 自动喂宠
@@ -336,10 +336,10 @@ decision:
   reconnect_queue_timeout_ms: 180000
   reconnect_max_retry: 3
   reconnect_resume_auto: true
-  reconnect_server_x: 0.3635
-  reconnect_server_y: 0.2074
-  reconnect_channel_x: 0.4104
-  reconnect_channel_y: 0.5093
+  reconnect_server_x: 0.3309
+  reconnect_server_y: 0.2135
+  reconnect_channel_x: 0.4071
+  reconnect_channel_y: 0.4922
   reconnect_channel: 16
   custom_keys:
     攻击药水: grave
@@ -355,9 +355,10 @@ decision:
   jump_attack_height: 50.0
   fall_speed_px_s: 600.0
   vision_detect_only: false
-  multi_leave_wait_enabled: false
+  multi_leave_wait_enabled: true
   multi_leave_delay_s: 1.0
   track_buffer_ms: 1000
+  air_gap_px: 200
 notes: ''
 capture:
   source: file
@@ -459,23 +460,23 @@ dataset:
 train:
   model: yolo26s.pt
   epochs: 160
-  imgsz: 960
+  imgsz: 640
   batch: 8
   device: '0'
   patience: 40
   resume: false
 live:
-  weights: E:\MyPrograms\playerSimu\projects\鳄鱼潭1\models\detect_v2_960.engine
+  weights: E:\MyPrograms\playerSimu\projects\鳄鱼潭1\models\detect_v3_640.engine
   capture_source: stream
   rect:
-  - 15
-  - 44
+  - 4
+  - 34
   - 1366
   - 768
   url: udp://0.0.0.0:5000
-  conf_mob: 0.22
+  conf_mob: 0.15
   conf_player: 0.75
-  imgsz: 960
+  imgsz: 640
   device: '0'
   capture_fps: 60
   draw: true
@@ -488,7 +489,7 @@ live:
   - 0.998538
   - 0.96
   rect_win:
-  - 2361700
+  - 4134094
   - 冒险岛怀旧服
   iou_mob: 0.85
   max_det: -1
@@ -496,7 +497,10 @@ live:
   stream_rect_rel: null
 player_id: 珠缨
 verify: {}
-iterate: {}
+iterate:
+  conf: 0.6
+  keep_empty: true
+  limit: 0
 mob_names:
 - 青蛇
 - 鳄鱼

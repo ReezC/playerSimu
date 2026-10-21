@@ -69,8 +69,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from perception import geom                       # ⭐ 重叠尺**全项目同一处**（见其模块头 ✓）
-from perception.lie_controller import LieMouseController
+from core import geom                       # ⭐ 重叠尺**全项目同一处**（见其模块头 ✓）
+from liedetect.lie_controller import LieMouseController
 
 # ---------------- 跟踪参数（前 5 个在界面上可调 ✓ 见 `lie_demo` 第 4 行 ✓）----------------
 #: **配对门限**（px ✓）：本拍框与轨迹预测位置超过它就配不上 ✓（相机一帧能走几十 px ⇒ 别太小 ✗）。
@@ -153,7 +153,7 @@ _CLAIM_DEV_K = 2.0
 #:   · **模拟框** = 该轨迹的**预测位置**（`pred` ✓ —— 它漏检在滑行时**照样在外推** ✓ 正是用户
 #:     那句"即使检出框消失了也能模拟出它所在的绝对位置" ✓）＋ 它**最后那格的尺寸**（`w,h` ✓
 #:     ≈ "大致的尺寸比例" ✓）；
-#:   · IoU 用 `perception.geom.iou` ✓（对称、"**是不是同一格**" ✓ 与全项目**同一把尺** ✓ 见其模块头 ✓）；
+#:   · IoU 用 `core.geom.iou` ✓（对称、"**是不是同一格**" ✓ 与全项目**同一把尺** ✓ 见其模块头 ✓）；
 #:   · ⚠⚠⚠ **门 2026-10-05 从 0.30 抬到 0.55** ✗✗（用户当天报的反例 ✓ 原话："**帧 45/70 …… 无编号：
 #:     新出现，或刚被挡住又出来 ｜ NO OWNER。这一拍是应该认领的，查问题**" ✓✓）——
 #:     实测（`10月3日 (2)` 帧 46 ✓）**0.30 太低** ✗：那格该被认领的新框（133×147 ✓，圆隙才 **56px**

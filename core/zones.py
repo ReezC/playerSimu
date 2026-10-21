@@ -55,7 +55,7 @@ ATTACH_PAD = 24
 #:   '传送点(portal)'供寻路编辑器→增加可达 弹窗里配置；选中后，可以选择传送点（例如黄金沙滩项目，
 #:   地形叠加图里的"h009"），操作方式是走到该点位按↑" ✓）。
 #:   ⚠ 2026-09-27 移除它的两条理由，这次都被堵上了 ✓：
-#:     · "**没有执行器**" ⇒ 现在有 `route.PortalJob` ✓（走到该点 ⇒ **点按一下 ↑** ✓ 用户定 ✓）；
+#:     · "**没有执行器**" ⇒ 现在有 `jobs.PortalJob` ✓（走到该点 ⇒ **点按一下 ↑** ✓ 用户定 ✓）；
 #:     · "**落点数据也没有**" ⇒ **同图**门的落点查得到 ✓：`Portal.tn` 就是**目标门名** ✓
 #:       在本图 `terrain.portals` 里一解析就拿到出口坐标 ✓（`portal_exit` ✓）。
 #:   ⚠ **跨图不支持**（用户 2026-10-06 明确 ✓）：`tm != 999999999` 的门在编辑器里**列出来但标灰**
@@ -69,15 +69,15 @@ EDGE_KINDS = ("walk", "climb", "drop", "jump", "portal")
 #: 界面上这一组叫「**通行方式**」（2026-09-26 用户定的术语，已写进 §12.3）——
 #: 问的是"从 A 到 B **怎么过去**"。**四种，都有执行器**：
 #:
-#:     walk  走         —— 走过去（同层、无缝）      → `route.WalkJob`
-#:     climb 爬（绳梯） —— 爬绳/梯子（要指名哪根绳）  → `route.ClimbJob`
-#:     drop  下跳       —— **按住 ↓ 再按跳**（穿到下一层）→ `route.DropJob`
-#:     jump  跳         —— **在 foothold 边缘按跳键**  → `route.JumpJob`
+#:     walk  走         —— 走过去（同层、无缝）      → `jobs.WalkJob`
+#:     climb 爬（绳梯） —— 爬绳/梯子（要指名哪根绳）  → `jobs.ClimbJob`
+#:     drop  下跳       —— **按住 ↓ 再按跳**（穿到下一层）→ `jobs.DropJob`
+#:     jump  跳         —— **在 foothold 边缘按跳键**  → `jobs.JumpJob`
 #:
 #: ⚠ 跳 vs 下跳是**两个不同类型**，别混（2026-09-26 用户专门澄清过）。它们的
 #: 按键不一样、落点也不一样：跳是"往前蹦"，下跳是"往下穿"。
 #: ⭐ **传送门 → 传送点**：2026-09-27 移除过 ✓、**2026-10-06 加回** ✓（用户点了名要它 ✓
-#:   执行器 `route.PortalJob` ✓ 落点靠同图门的 `tn` 解析 ✓ 见 `portal_exit` ✓）。
+#:   执行器 `jobs.PortalJob` ✓ 落点靠同图门的 `tn` 解析 ✓ 见 `portal_exit` ✓）。
 #:   ⚠ 「待确认（`unconfirmed`）」**仍然不是通行方式**（它是编辑器**建议边**的中转标记 ✗）——
 #:     老文件里若残留，`validate` 会如实报出来 ✓ 规划也不拿它当候选 ✓。
 EDGE_LABELS = {
@@ -345,7 +345,7 @@ def portals_of(terrain, ids):
 #     {"kind":"ladder",  "lid":"L2","x":1234}               绳梯（`lid` 供显示、`x` 供定位 ✓）
 #     {"kind":"portal",  "pn":"sp","x":100,"y":200}         传送门
 # ⚠ 这四件**只在"怎么找回来"这一层**（本模块）；"x 范围""该走哪个集合"那些**决策语义**
-#   分别在 `decision.route.set_span`（集合）与 `decision.agent` / `gui/live_thread` 里 ✓
+#   分别在 `decision.pathing.set_span`（集合）与 `decision.agent` / `gui/live_thread` 里 ✓
 #   —— 别把决策口径搬进 core（core 不许 import decision ✗ 见文件顶部的分层说明 ✓）。
 
 def find_foothold(terrain, fid):
@@ -420,7 +420,7 @@ def element_span(terrain, spot):
 
     判不出（地图里没这个元素 / 是墙 / 类型不对）⇒ `None` ✓（**不猜** ✓）。
     ⚠ **集合**那一类不在这里 —— 它的 x 范围要把集合的 foothold 并起来，口径在
-      `decision.route.set_span`（决策层）✓，调用方自己分派 ✓。
+      `decision.pathing.set_span`（决策层）✓，调用方自己分派 ✓。
     """
     kind = str((spot or {}).get("kind") or "")
     try:
@@ -453,7 +453,7 @@ def element_label(spot, terrain=None, zones=None):
     try:
         if kind == "set":
             name = str(spot.get("name") or "")
-            n = len(((zones.sets or {}).get(name) or {}).get("footholds") or []) \
+            n = len(((zones.zones or {}).get(name) or {}).get("footholds") or []) \
                 if zones is not None else 0
             return "集合「%s」%s" % (name, ("（%d 条）" % n) if n else "")
         if kind == "foothold":
@@ -512,19 +512,29 @@ def zones_path(map_id):
 class Zones:
     """一张图的集合 + 边 + 路径点。
 
-    `sets`   : {集合名: {"color": "#xxx", "footholds": ["2", "3", …]}}（**id 是字符串**，
-               与导出的 JSON 一致 —— 混用 int 会静默匹配不上）
+    `zones`  : {地区名: {"color": "#xxx", "footholds": ["2", "3", …]}}（**id 是字符串**，
+              与导出的 JSON 一致 —— 混用 int 会静默匹配不上）
     `edges`  : [{from, to, kind, ladder?, why?}]（**有向**）
     `points` : [{name, x, y, of}]（编辑器标注的路径点，如"绳 L3 入口"）
+
+    ⭐ **2026-10-18 起「集合」一律叫「地区 / Zone」**（用户拍板）：数据键、内存属性、
+      界面文案三者同一个词 ✓（原来是 `sets`，一词两义容易和 Python 的 `set()` 混）。
+      旧文件里的 `"sets"` 仍能读（见 `load`），但**只会写 `"zones"`**。
     """
 
     def __init__(self, map_id):
         self.map_id = str(map_id)
-        self.sets = {}
+        self.zones = {}
         self.edges = []
         self.points = []
         #: 上次见到盘上那份时的 `st_mtime_ns`（多实例冲突记账用 ✓ 见 `save` ✓）
         self._disk_mtime = None
+
+    def __getattr__(self, name):
+        """旧名字 `sets` 给一句人话（别让它变成光秃秃的 `AttributeError`）。"""
+        if name == "sets":
+            raise AttributeError("`Zones.sets` 已改名 `Zones.zones`（地区 / Zone，2026-10-18）")
+        raise AttributeError("`Zones` 没有属性 %r" % (name,))
 
     # ---------------- 集合 ----------------
 
@@ -533,19 +543,19 @@ class Zones:
         name = str(name).strip()
         if not name:
             raise ValueError("集合名不能为空")
-        if name in self.sets:
+        if name in self.zones:
             raise ValueError("集合名已存在：%s" % name)
         ids = [str(i) for i in foothold_ids]
         if not ids:
             raise ValueError("集合 %s 没有任何 foothold" % name)
         if color is None:
-            color = PALETTE[len(self.sets) % len(PALETTE)]
-        self.sets[name] = {"color": color, "footholds": ids}
+            color = PALETTE[len(self.zones) % len(PALETTE)]
+        self.zones[name] = {"color": color, "footholds": ids}
         return name
 
     def remove_set(self, name):
         """删集合 → 同时删掉**所有涉及它的边**（返回被删的边，便于撤销/提示）。"""
-        self.sets.pop(name, None)
+        self.zones.pop(name, None)
         gone = [e for e in self.edges if e.get("from") == name or e.get("to") == name]
         self.edges = [e for e in self.edges if e not in gone]
         self.points = [p for p in self.points if p.get("of") != name]
@@ -554,11 +564,11 @@ class Zones:
     def rename_set(self, old, new):
         """改名 → **级联改边与路径点**（边按名字指向，不改就成悬空边 ✗）。"""
         old, new = str(old).strip(), str(new).strip()
-        if old not in self.sets:
+        if old not in self.zones:
             raise ValueError("没有这个集合：%s" % old)
-        if not new or (new in self.sets and new != old):
+        if not new or (new in self.zones and new != old):
             raise ValueError("新名字不可用：%s" % new)
-        self.sets[new] = self.sets.pop(old)
+        self.zones[new] = self.zones.pop(old)
         for e in self.edges:
             if e.get("from") == old:
                 e["from"] = new
@@ -572,11 +582,11 @@ class Zones:
     def set_of(self, foothold_id):
         """这条 foothold 属于哪些集合 → [名字…]（**允许多归属**，顺序按注册顺序）。"""
         fid = str(foothold_id)
-        return [n for n, s in self.sets.items() if fid in s["footholds"]]
+        return [n for n, s in self.zones.items() if fid in s["footholds"]]
 
     def member_ids(self):
         out = set()
-        for s in self.sets.values():
+        for s in self.zones.values():
             out.update(s["footholds"])
         return out
 
@@ -596,7 +606,7 @@ class Zones:
           ⇒ **静默返回老那条**，界面上一点动静都没有，看着就像程序坏了 ✗。
           ⭐ **`portal` 与 `ladder` 同理**（2026-10-06 加回 ✓）：同一对集合、同是传送点、
           **不同门**（`h009` vs `h010`）也是**两条不同的边** ✓ —— 它们落点不同、
-          寻路代价也不同 ✓（用户 2026-10-06 定的代价口径见 `decision.route.PortalJob` ✓）。
+          寻路代价也不同 ✓（用户 2026-10-06 定的代价口径见 `decision.jobs.PortalJob` ✓）。
           ⚠ 2026-09-27 那一格随「传送门」一起移除过 ✓；加回来时**去重身份也必须一起加** ✗
             （只写进字典、不进去重判据 ⇒ 第二条门会被当成重复**静默丢掉** ✓ 又是那个老 bug ✓）。
         ⚠ 真·完全重复时**不报错**（幂等：调用方可能是"采纳建议"那种重放）⇒ 有没有真的
@@ -608,7 +618,7 @@ class Zones:
         if kind not in EDGE_KINDS:
             raise ValueError("未知的边类型：%s（可用：%s）" % (kind, "/".join(EDGE_KINDS)))
         for n in (src, dst):
-            if n not in self.sets:
+            if n not in self.zones:
                 raise ValueError("集合不存在：%s" % n)
         # ⚠ 校验要放在**去重之前**：已经有一条一样的边时，下面会直接返回那一条 ——
         # 乱填的方向类型就悄悄过去了（踩过）。
@@ -670,14 +680,14 @@ class Zones:
         out = []
         if terrain is not None:
             known = {str(f.fid) for f in terrain.footholds}
-            for name, s in self.sets.items():
+            for name, s in self.zones.items():
                 miss = [i for i in s["footholds"] if i not in known]
                 if miss:
                     out.append("集合「%s」引用了本图不存在的 foothold id：%s"
                                % (name, ", ".join(miss[:8]) + ("…" if len(miss) > 8 else "")))
         for e in self.edges:
             for k in ("from", "to"):
-                if e.get(k) not in self.sets:
+                if e.get(k) not in self.zones:
                     out.append("悬空边：%s → %s（%s 不存在）"
                                % (e.get("from"), e.get("to"), e.get(k)))
                     break
@@ -733,14 +743,15 @@ class Zones:
                            % (e.get("from"), e.get("to"), e.get("kind"),
                               " / ".join(EDGE_KINDS)))
         for p in self.points:
-            if p.get("of") and p["of"] not in self.sets:
+            if p.get("of") and p["of"] not in self.zones:
                 out.append("路径点「%s」指向不存在的集合：%s" % (p.get("name"), p["of"]))
         return out
 
     # ---------------- 存 / 读 ----------------
 
     def to_dict(self):
-        return {"map_id": self.map_id, "sets": self.sets,
+        # ⚠ 盘上只写 `"zones"`（2026-10-18 起；旧文件里的 `"sets"` 仍能读，见 `from_dict`）
+        return {"map_id": self.map_id, "zones": self.zones,
                 "edges": self.edges, "points": self.points}
 
     def save(self, path=None):
@@ -788,8 +799,9 @@ class Zones:
     @classmethod
     def from_dict(cls, d):
         z = cls(d.get("map_id") or "")
-        for name, s in (d.get("sets") or {}).items():
-            z.sets[str(name)] = {"color": s.get("color") or PALETTE[0],
+        # ⚠ 兼容读：`zones`（2026-10-18 起）优先，退回老键 `sets`（旧图 / A 机导出的旧文件 ✓）
+        for name, s in ((d.get("zones") or d.get("sets") or {})).items():
+            z.zones[str(name)] = {"color": s.get("color") or PALETTE[0],
                                  # 一律转成字符串：导出的 id 是字符串，混 int 会匹配不上
                                  "footholds": [str(i) for i in (s.get("footholds") or [])]}
         z.edges = [dict(e) for e in (d.get("edges") or [])]
@@ -819,7 +831,7 @@ def load(map_id):
 # ══════════════════════════════════════════
 
 #: 同一对集合有**多条边**时"取哪条"的优先级（`edges_between` / `edge_between` /
-#: `decision.route.pick_edge` **共用这一处**）：
+#: `decision.pathing.pick_edge` **共用这一处**）：
 #: **走 > 爬 > 下跳 > 跳 > 传送点**（`unconfirmed` 待确认 2026-09-27 移除 ✓）。
 #: 为什么"走"最优先：同层无缝走过去最廉价、也最不容易失败；爬 / 下跳要让执行器接管动作；
 #: 「跳」的落点还要靠**跳跃标定**（最不确定）⇒ 放最后 ✓。
@@ -828,7 +840,7 @@ def load(map_id):
 #: ⚠ 它现在只是**并列时的兜底**：正式口径见 `docs/寻路设计.md` 的「择路」一节
 #:   （逐步贪心按**纯距离**比，代价相同时才看这个优先级 ✓）。
 #: ⚠ 传送点的**正式代价**照用户 2026-10-06 定的口径算（当前 → 起点门 ＋ 出口门 → 目标 ✓
-#:   见 `decision.route.hop_cost` 的 `portal` 那一支 ✓）—— 所以正常情况**轮不到**这个优先级 ✓。
+#:   见 `decision.pathing.hop_cost` 的 `portal` 那一支 ✓）—— 所以正常情况**轮不到**这个优先级 ✓。
 KIND_PRIORITY = {"walk": 0, "climb": 1, "drop": 2, "jump": 9, "portal": 10}
 
 
@@ -836,7 +848,7 @@ def edges_between(zones, a, b):
     """a → b 之间的**全部**边，按类型优先级排（**同类型保持文件顺序** —— 稳定可预期 ✓）。
 
     为什么要"全部"：同一对集合可能有好几条边（走 + 爬、**两根不同的绳**……✓），而
-    "这一步到底走哪条"要看**玩家在哪** —— 那一步在 `decision.route.pick_edge`
+    "这一步到底走哪条"要看**玩家在哪** —— 那一步在 `decision.pathing.pick_edge`
     （这里没有位置，所以只能排序、不能选 ✓）。
     """
     hit = [e for e in zones.edges if e.get("from") == a and e.get("to") == b]
@@ -847,7 +859,7 @@ def edge_between(zones, a, b):
     """a → b 之间已有的边（多条时取"最可靠"的那条：走 > 爬 > 下跳 > 传送门）。
 
     ⚠ 这里**没有玩家位置** ⇒ 同类型的多条只能取**文件里先出现**的那条。
-      "哪根绳离我近"是规划时的事：`decision.route.pick_edge(terrain, z, a, b, at=(x, y))`
+      "哪根绳离我近"是规划时的事：`decision.pathing.pick_edge(terrain, z, a, b, at=(x, y))`
       ✓（`docs/寻路设计.md` 的「择路」一节）—— 显示那一步时也要用**选好的那条**，
       见 `edge_text(..., edge=…)` ✗ 别在这儿猜。
     """
@@ -862,7 +874,7 @@ def edge_text(zones, a, b, edge=None):
     「命令前往」那行显示的就是这个字符串，而用户 2026-09-27 卡住的原因正是**分不清
     "到底选的哪条边、它要往哪边走"**（同一对集合有 drop + walk 两条时尤其 ✗）。
 
-    `edge`：**规划已经选好的那条**（`route.pick_edge` 的结果 ✓）。同一对集合有两条绳、
+    `edge`：**规划已经选好的那条**（`pathing.pick_edge` 的结果 ✓）。同一对集合有两条绳、
     规划按"最近的"选了其中一条时，这行必须显示**它选的那条** —— 不传就按老口径
     （文件顺序）取，可能和实际执行的那条不一致 ✗。
     """
@@ -931,14 +943,14 @@ def find_path(zones, src, dst):
     """
     if not src or not dst:
         return None, "还没选平台"
-    if src not in zones.sets or dst not in zones.sets:
-        return None, "集合不存在：%s" % (src if src not in zones.sets else dst)
+    if src not in zones.zones or dst not in zones.zones:
+        return None, "集合不存在：%s" % (src if src not in zones.zones else dst)
     if src == dst:
         return [src], "已经在目标平台上"
     nbr = {}
     for e in zones.edges:
         a, b = e.get("from"), e.get("to")
-        if a in zones.sets and b in zones.sets:
+        if a in zones.zones and b in zones.zones:
             nbr.setdefault(a, []).append(b)
     prev, seen, q = {}, {src}, [src]
     while q:
@@ -1012,8 +1024,8 @@ def ladder_ids(terrain):
 #:   先能填能存"）⇒ 用户 2026-09-27 正是踩在这上面：配了「仅向左」，人却被按着 → 朝
 #:   集合中点走，而且"到集合区间的距离"恒为 0 ⇒ 3 秒后判「走不动了」✗
 #:  （现场是「左上平台 → 左上」：目标集合整片盖住人站的 x）。
-#:   现在 `decision.route.WalkJob.walk_dir` 真的按它发键（灌进口在
-#:   `route.walk_job_for_edge` ✓）。**它是逐边的东西** —— 全局设置里不许有这个参数
+#:   现在 `decision.jobs.WalkJob.walk_dir` 真的按它发键（灌进口在
+#:   `pathing.walk_job_for_edge` ✓）。**它是逐边的东西** —— 全局设置里不许有这个参数
 #:  （2026-09-26 用户明确否掉，见 `WalkJob` 的注释）。
 WALK_DIRS = ("", "left", "right")
 WALK_DIR_LABELS = {"": "默认方向（朝目标走）",
@@ -1075,7 +1087,7 @@ def drop_footholds(z, edge):
     """
     if "footholds" in edge:
         return [str(x) for x in (edge.get("footholds") or [])]
-    s = z.sets.get(edge.get("from")) or {}
+    s = z.zones.get(edge.get("from")) or {}
     return [str(x) for x in (s.get("footholds") or [])]
 
 
@@ -1128,7 +1140,7 @@ def ladder_over_set(terrain, z, ladder, name):
     """
     if ladder is None or z is None or terrain is None:
         return False
-    s = (z.sets.get(str(name)) or {}).get("footholds") or []
+    s = (z.zones.get(str(name)) or {}).get("footholds") or []
     return _over_span(set_span(terrain, s), ladder)
 
 
@@ -1141,7 +1153,7 @@ def climb_via_jump(terrain, z, ladder, name):
     """
     if ladder is None or z is None or terrain is None:
         return False
-    s = (z.sets.get(str(name)) or {}).get("footholds") or []
+    s = (z.zones.get(str(name)) or {}).get("footholds") or []
     sp = set_span(terrain, s)
     if sp is None:
         return False
@@ -1158,7 +1170,7 @@ def climb_jump_reach(terrain, z, ladder, name):
     """
     if ladder is None or z is None or terrain is None:
         return None
-    s = (z.sets.get(str(name)) or {}).get("footholds") or []
+    s = (z.zones.get(str(name)) or {}).get("footholds") or []
     sp = set_span(terrain, s)
     if sp is None:
         return None
@@ -1166,7 +1178,7 @@ def climb_jump_reach(terrain, z, ladder, name):
     return max(0.0, min(abs(x - float(sp[0])), abs(x - float(sp[1]))))
 
 
-def climb_direction(terrain, z, ladder, src, dst, mid_jump=False):
+def climb_direction(terrain, z, ladder, src, dst, mid_jump=False, mid_y=None):
     """「src →(爬这根绳)→ dst」是**向上**还是**向下** → +1 / -1 / None（说不清）。
 
     ⭐ **方向由"从哪端上绳"定**（用户 2026-09-28 定稿 ✓）—— 也就是看 **`src`
@@ -1225,7 +1237,32 @@ def climb_direction(terrain, z, ladder, src, dst, mid_jump=False):
         #   ⇒ 方向改看"**目标层贴着绳的哪一端**" ✓（起点压根不在任何一端 ✗ 没法当基准 ✓）。
         if not ladder_over_set(terrain, z, ladder, src):
             return None                # 绳压根不路过这一层 ⇒ 那是真够不着，不猜 ✗
-        b = set_span(terrain, (z.sets.get(str(dst)) or {}).get("footholds") or [])
+        # ⭐⭐⭐⭐⭐ 2026-10-18（用户定稿 ✓）：**只要配了「中途跳下」就执行，不再要求终点贴绳端。**
+        #   原话："去掉这个条件。只要我配了就执行：不是向上爬还是向下都需要先跳上绳梯，
+        #   上了绳梯之后我配的中途跳下坐标会告诉你向上爬还是向下爬"✓
+        #   ⇒ **方向由 `mid_y` 与起点层的相对位置定**（世界 y 越小越靠上 ✓）：
+        #     · `mid_y` 比起点层**高**（更小）⇒ 往上爬 `+1` ✓
+        #     · `mid_y` 比起点层**低**（更大）⇒ 往下爬 `-1` ✓
+        #   ⚠ 只跟**起点层**比，不跟终点层比 ✗ —— 用户的意图是"爬到这个高度就跳"，
+        #     跟落在哪一层无关（落点是 `mid_dir` 那边 ✓ 由 `climb_via_jump` / 侧跳负责 ✓）。
+        #   ⚠ `mid_y ≈ 起点层` 时（差不到 `ATTACH_PAD`）⇒ 退一步看**终点层**在起点之上还是之下 ✓
+        #     （现场 `3 → 2`：mid_y=-700、起点层 -697 ⇒ 差 3px ⇒ 按终点层 -517 判成"往下爬"✓
+        #       正好是用户要的方向 ✓）
+        if mid_jump and mid_y is not None:
+            a = set_span(terrain, (z.zones.get(str(src)) or {}).get("footholds") or [])
+            sy = None if a is None else (float(a[2]) + float(a[3])) / 2.0
+            if sy is not None:
+                my = float(mid_y)
+                if my < sy - ATTACH_PAD:
+                    return 1           # 中途跳点在起点层上方 ⇒ 往上爬 ✓
+                if my > sy + ATTACH_PAD:
+                    return -1          # 中途跳点在起点层下方 ⇒ 往下爬 ✓
+            b_ = set_span(terrain, (z.zones.get(str(dst)) or {}).get("footholds") or [])
+            by = None if b_ is None else (float(b_[2]) + float(b_[3])) / 2.0
+            if sy is None or by is None or abs(by - sy) <= ATTACH_PAD:
+                return None            # 连"往上还是往下"都没差 ⇒ 真的说不清，不猜 ✗
+            return -1 if by > sy else 1
+        b = set_span(terrain, (z.zones.get(str(dst)) or {}).get("footholds") or [])
         if b is None:
             return None
         top = min(float(ladder.y1), float(ladder.y2))
@@ -1313,17 +1350,17 @@ def walk_suggestions(zones, terrain, include_near=False):
     by_id = {}
     for f in terrain.footholds:
         by_id.setdefault(str(f.fid), f)
-    names = list(zones.sets)
+    names = list(zones.zones)
     out = []
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
             a, b = names[i], names[j]
             best = None
-            for fa_id in zones.sets[a]["footholds"]:
+            for fa_id in zones.zones[a]["footholds"]:
                 fa = by_id.get(fa_id)
                 if fa is None or fa.is_wall:
                     continue
-                for fb_id in zones.sets[b]["footholds"]:
+                for fb_id in zones.zones[b]["footholds"]:
                     fb = by_id.get(fb_id)
                     if fb is None or fb.is_wall:
                         continue

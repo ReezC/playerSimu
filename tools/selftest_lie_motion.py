@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""`perception/lie_motion.py`（**YOLO 候选 + 运动不合群** ✓）的自检 —— 离屏 ✓ 不弹窗 ✓。
+"""`liedetect/lie_motion.py`（**YOLO 候选 + 运动不合群** ✓）的自检 —— 离屏 ✓ 不弹窗 ✓。
 
 **这条路的要害只有量得出来**（都用**合成序列**钉住 ✓ 可复现 ✓ 不需要素材 ✓）：
   ① **认得出"异类"**：一群假目标**一起平移**（= 相机在动 ✓），真目标额外再多走一点
@@ -23,10 +23,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from perception.lie_motion import (MotionRunner, MotionTracker,  # noqa: E402
+from liedetect.lie_motion import (MotionRunner, MotionTracker,  # noqa: E402
                                    _gray, pick_white, _WHITE_MATCH,
                                    _M_OK, _M_SUS, _PAIR_GATE)
-import perception.lie_motion as _LM                            # noqa: E402
+import liedetect.lie_motion as _LM                            # noqa: E402
 
 # ⭐⭐⭐⭐⭐ **自检里默认**关掉「**拆框**」（用户 2026-10-05 ✓ 见 `_FUSE_SPLIT` ✓）——
 #   ⚠⚠ 它是**位置硬约束**（把圆按到"目标那一块"的正中 ✓ 见 `process` 那段 ✓）⇒ **谁量"指引 /
@@ -268,7 +268,7 @@ def test_runner_same_shape():
 #   整体移除**" ✓✓）—— 它原来钉的是"一直在动 ⇒ `persist` 高 ⇒ 分数明显更高" ✓；而
 #   `persist` / `score` 按持续性加权**都已拆掉** ✓ ⇒ 这条用例**没有被测对象了** ✓。
 #   ⇒ 判别"这格框算不算个真目标"现在钉在 `test_forced_claim_rule` 里 ✓（= "未被记录的干净框 ＋
-#     与圆距离在范围内" ✓ 见 `perception.lie_motion._forced_claim` ✓）。
+#     与圆距离在范围内" ✓ 见 `liedetect.lie_motion._forced_claim` ✓）。
 
 
 def test_fuse_guide_holds_through_gap():
@@ -1435,7 +1435,7 @@ def test_dup_detection():
       ③ **不许误杀**：相邻两个目标**部分重叠**（覆盖率 < 阈值 ✓）⇒ **两个都留** ✓
         （⚠ 阈值放大松 ⇒ 会把相邻目标当重复删掉 ⇒ ③ 立刻红 ✗）。
     """
-    import perception.lie_motion as _LM
+    import liedetect.lie_motion as _LM
 
     # ① 纯函数（口径一处 ✓）：小框 (271.6,357.3) 157×132 整个落在大框 (270,320) 162×208 里
     #   = **实测帧 23 那一对** ✓（被盖住 100% ✓ 面积比 0.61 ✓）
@@ -3274,7 +3274,7 @@ def test_fuse_pull_gate():
       **门控挡住 ⇒ 与关掉逐位一致**（`=0.15` 与 `=0` **一模一样** ✓ = 被短路 ✓）。
     ⚠ 造"融合框"= 目标框 **200×200**（/ 标准 150×150 = **1.78x** > `stuck_ratio` 1.4 ⇒ `st==1` ✓）。
     """
-    import perception.lie_motion as _LM
+    import liedetect.lie_motion as _LM
     # ⚠⚠⚠ **本用例测的是「门控」** ✗ ⇒ 全程**关掉"拆框"** ✓ —— 拆框是**位置硬约束**（会把圆按到
     #   目标那一块 ✓ 见 `process` 那段 ✓）⇒ 一开就**改了整条轨迹** ⇒ 那些"`=0.15` vs `=0` 差多少 px"
     #   的断言全跟着变 ✗✗（**实测**：一开就 6 条红 ✓ 而门控代码一个字没动 ✓）。
@@ -3566,7 +3566,7 @@ def test_pos_rel_is_group_relative():
          ⇒ 现在：**没贴墙的拍** ⇒ 与橙线末段**逐位一致** ✓；**贴墙的拍** ⇒ 等于"**约束前那一步**"
            （`MotionTracker._pos_intent` ✓）✓ **且不许瘪** ✓（模长 ≥ 1px ✓）。
     """
-    from perception.lie_motion import MotionRunner
+    from liedetect.lie_motion import MotionRunner
 
     def _seq_run():
         _fake0 = _frame(9)
@@ -3655,7 +3655,7 @@ def test_add_along_component():
       ③ **自限**：反复迭代**永不越过目标** ✓；④ **力度 0 ⇒ 逐位不变** ✓（⚠ 写成"`力度×(...)`
         不 `+v`" ⇒ 力度 0 会把速度**清零** ✗✗ 立刻红 ✓）。
     """
-    import perception.lie_motion as _LM
+    import liedetect.lie_motion as _LM
 
     # ① 加速：10 → 15（目标向量 (20,0)、力度 0.5 ✓）
     _a = _LM._pull_to((10.0, 0.0), (20.0, 0.0), 0.5)
@@ -3800,7 +3800,7 @@ def test_forced_claim_rule():
 
     ⚠⚠ **判据已换成用户 2026-10-05 的新口径** ✗（"**不需要持续门这种逻辑，整体移除**" ✓✓）：
       · **"未被记录"**：拿候选框 ↔ **每一格"别的"已记录目标**的**模拟框**（`pred` ＋ 它最后
-        那格的 `w,h` ✓）算 **IoU**（`perception.geom.iou` ✓）⇒ **全都 < `_CLAIM_UNREC_IOU`（0.30 ✓）**
+        那格的 `w,h` ✓）算 **IoU**（`core.geom.iou` ✓）⇒ **全都 < `_CLAIM_UNREC_IOU`（0.30 ✓）**
         才算"这儿本来不该有目标" ✓ ⇒ 才有资格当那个真目标 ✓（= "某个编号的假目标又出现了"那种
         会被 **IoU 高** 挡掉 ✓✓）；
       · **与圆心距离在一定范围内** ✓（"圆盘碰到框" ✓）；

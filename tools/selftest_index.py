@@ -75,22 +75,22 @@ AFFECTS = {
     # ---- 决策层 ----
     "decision/route.py": ("selftest_decision", "selftest_zones"),
     "decision/route_cfg.py": ("selftest_decision", "selftest_route_cfg"),
-    "decision/mouse_aim.py": ("selftest_decision",),
+    "execution/mouse_aim.py": ("selftest_decision",),
     "decision/reconnect.py": ("selftest_decision", "selftest_live_panel"),
     "decision/agent.py": ("selftest_decision", "selftest_arch"),
     "decision/engage.py": ("selftest_engage", "selftest_decision"),
     "decision/": ("selftest_decision",),
     # ---- 感知层 ----
     "perception/minimap.py": ("selftest_minimap", "selftest_screen_state"),
-    "perception/screen_state.py": ("selftest_screen_state",),
-    "perception/ui_state.py": ("selftest_screen_state",),
+    "perception/screen/screen_state.py": ("selftest_screen_state",),
+    "perception/screen/ui_state.py": ("selftest_screen_state",),
     "perception/vt_sdk.py": ("selftest_vt_sdk", "selftest_screen_state"),
-    "perception/lie_group.py": ("selftest_lie_group",),
-    "perception/lie_motion.py": ("selftest_lie_motion",),
-    "perception/lie_registry.py": ("selftest_lie_registry",),
-    "perception/lie_tracker.py": ("selftest_lie_tracker",),
-    "perception/tracker.py": ("selftest_tracker",),
-    "perception/anchor_track.py": ("selftest_anchor_track",),
+    "liedetect/lie_group.py": ("selftest_lie_group",),
+    "liedetect/lie_motion.py": ("selftest_lie_motion",),
+    "liedetect/lie_registry.py": ("selftest_lie_registry",),
+    "liedetect/lie_tracker.py": ("selftest_lie_tracker",),
+    "perception/track/tracker.py": ("selftest_tracker",),
+    "perception/world/anchor_track.py": ("selftest_anchor_track",),
     "perception/": ("selftest_minimap",),
     # ⚠ 测谎 SDK 是**外挂目录**（`visual_tracking_sdk_20260920/liescc` ✓）——
     #   改它就跑 `selftest_vt_sdk` ✓（2026-10-17 在这儿改过双锚点配对的右边容差 ✓）
@@ -112,6 +112,8 @@ AFFECTS = {
     "core/config.py": ("selftest_config_sync", "selftest_live_panel"),
     "core/zones.py": ("selftest_zones",),
     "core/perf.py": ("selftest_winperf", "selftest_live_panel"),
+    # 会话判定（硬件 HID 只进物理控制台会话 ✓ 见 `core/session.py`）：界面靠它提示 ✓
+    "core/session.py": ("selftest_live_panel",),
     "runtime/pipeline.py": ("selftest_live_panel",),
     "core/": ("selftest_review",),
     # ---- 共享底座（改了就得多跑几套 ✓ 但**不是全部** ✗）----

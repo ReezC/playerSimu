@@ -17,6 +17,9 @@ import numpy as np                                      # noqa: E402
 
 from core import mapdata                                # noqa: E402
 from perception import minimap as mm                    # noqa: E402
+from perception import map_calib
+from perception import map_dot
+from perception import map_overlay
 
 MID = "110040000"
 t = mapdata.load(MID, with_canvas=True)
@@ -39,27 +42,27 @@ def bench(tag, fn, n=5):
 
 
 print("=== ① 定位这条路的每一步 ===")
-bench("dot_mask(yellow)", lambda: mm.dot_mask(panel, "yellow"))
-bench("dot_core_mask", lambda: mm.dot_core_mask(panel))
-bench("_dot_candidates(全画面掩码)", lambda: mm._dot_candidates(
-    mm.dot_mask(panel, "yellow"), panel.shape[1]))
-bench("_basemap_extra_mask(warp+dilate)", lambda: mm._basemap_extra_mask(
-    panel, cal, t, mm.dot_mask(panel, "yellow"), "yellow"))
-bench("diff_panel_vs_canvas(整幅差分)", lambda: mm.diff_panel_vs_canvas(
+bench("dot_mask(yellow)", lambda: map_dot.dot_mask(panel, "yellow"))
+bench("dot_core_mask", lambda: map_dot.dot_core_mask(panel))
+bench("_dot_candidates(全画面掩码)", lambda: map_dot._dot_candidates(
+    map_dot.dot_mask(panel, "yellow"), panel.shape[1]))
+bench("_basemap_extra_mask(warp+dilate)", lambda: map_dot._basemap_extra_mask(
+    panel, cal, t, map_dot.dot_mask(panel, "yellow"), "yellow"))
+bench("diff_panel_vs_canvas(整幅差分)", lambda: map_overlay.diff_panel_vs_canvas(
     panel, t.canvas, cal))
-bench("dot_candidates_diff(整幅差分+连通域)", lambda: mm.dot_candidates_diff(
+bench("dot_candidates_diff(整幅差分+连通域)", lambda: map_dot.dot_candidates_diff(
     panel, cal, t))
-bench("find_player_dot(全画面)", lambda: mm.find_player_dot(
+bench("find_player_dot(全画面)", lambda: map_dot.find_player_dot(
     panel, calib=cal, terrain=t))
-bench("find_player_dot(带 roi=37x37 窗口)", lambda: mm.find_player_dot(
+bench("find_player_dot(带 roi=37x37 窗口)", lambda: map_dot.find_player_dot(
     panel, calib=cal, terrain=t,
-    roi=mm.roi_around((993.2, 487.8), panel.shape, 40), near=(993.2, 487.8)))
-bench("panel_to_world", lambda: mm.panel_to_world(1135.0, 478.0, cal, t))
+    roi=map_dot.roi_around((993.2, 487.8), panel.shape, 40), near=(993.2, 487.8)))
+bench("panel_to_world", lambda: map_calib.panel_to_world(1135.0, 478.0, cal, t))
 
 print("=== ② 小面板会不会便宜很多（局部搜的动机）===")
 sub = panel[460:520, 960:1030]
 print("  子图", sub.shape)
-bench("find_player_dot(70x60 子图)", lambda: mm.find_player_dot(sub), n=5)
+bench("find_player_dot(70x60 子图)", lambda: map_dot.find_player_dot(sub), n=5)
 
 print("=== ③ 推理/生态在不在 GPU 上 ===")
 try:

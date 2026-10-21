@@ -2,7 +2,7 @@
 
 **为什么要有它**
     这几样原来散在 6 个地方（gui/labelio.py、gui/live_thread.py ×2、gui/canvas.py、
-    perception/predict.py、perception/prepare_dataset.py），加一个类别要改 6 处、
+    perception/detect/predict.py、perception/prepare_dataset.py），加一个类别要改 6 处、
     漏一处就是「框颜色/名字对不上」或者「标注写成别的类」。现在都从这里 import。
 
 **id 是固定的（`ORDER` 就是权威顺序）—— 把它当成座位号**

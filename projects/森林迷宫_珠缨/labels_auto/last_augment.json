@@ -1,0 +1,22 @@
+{
+  "when": "2026-10-18 20:08:48",
+  "build": "2026-10-10b",
+  "frames_dir": "E:\\MyPrograms\\playerSimu\\projects\\森林迷宫_珠缨\\frames",
+  "out": "E:\\MyPrograms\\playerSimu\\projects\\森林迷宫_珠缨\\labels_auto",
+  "weights": "E:\\MyPrograms\\playerSimu\\projects\\森林迷宫_珠缨\\models\\detect_v1.pt",
+  "mode": "drop",
+  "frames": 1,
+  "boxes_added": 0,
+  "frames_merged": 0,
+  "skipped": 0,
+  "skipped_names": [],
+  "first_inputs": [
+    "frame_00243.png"
+  ],
+  "first_returned": [
+    "image0.jpg"
+  ],
+  "order_mapped": 1,
+  "seconds": 0.1,
+  "canceled": false
+}

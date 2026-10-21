@@ -16,8 +16,12 @@ import numpy as np                                      # noqa: E402
 
 from core import mapdata                                # noqa: E402
 from core.imgio import imwrite                          # noqa: E402
+from perception import map_const
 from perception import minimap as mm                    # noqa: E402
+from perception import map_calib
 from tools import mmap_dot_probe as P                   # noqa: E402
+from perception import map_dot
+from perception import map_overlay
 
 MID = "110040000"
 OUT = ROOT / "data" / "dot_probe"
@@ -29,29 +33,29 @@ print("取帧:", note)
 panel = panels[0]
 imwrite(str(OUT / "now_panel.png"), panel)
 
-vis, info = mm.diff_panel_vs_canvas(panel, t.canvas, cal)
+vis, info = map_overlay.diff_panel_vs_canvas(panel, t.canvas, cal)
 print("差分 info:", {k: info.get(k) for k in ("ok", "why", "floor", "peak",
                                              "raw_mean", "raw_peak", "at", "rect")})
 if vis is not None:
     imwrite(str(OUT / "now_diff.png"), vis)
-    m = (vis.max(axis=2) >= mm.DOT_DIFF_THR).astype(np.uint8)
+    m = (vis.max(axis=2) >= map_const.DOT_DIFF_THR).astype(np.uint8)
     imwrite(str(OUT / "now_diff_mask.png"), np.dstack([m * 255] * 3))
     print("差分二值掩码: %d 像素（%.2f%% 面板）" % (int(m.sum()),
                                                    100.0 * m.sum() / m.size))
     for tag, near in (("首次捕获 / 弃锁重捕（near=None）", None),
                       ("跟踪态（喂 App 那个假锁 856,501）", (856.5, 501.8))):
-        r = mm.find_player_dot(panel, calib=cal, terrain=t, near=near)
+        r = map_dot.find_player_dot(panel, calib=cal, terrain=t, near=near)
         if r.get("x") is not None:
-            wx, wy = mm.panel_to_world(float(r["x"]), float(r["y"]), cal, t)
+            wx, wy = map_calib.panel_to_world(float(r["x"]), float(r["y"]), cal, t)
         else:
             wx = wy = None
         print("  [%s] ok=%s layer=%s px=(%s,%s) 世界≈(%s,%s)"
               % (tag, r.get("ok"), r.get("layer"), r.get("x"), r.get("y"), wx, wy))
         print("      reason=%s" % str(r.get("reason"))[:140])
-    dc, dd, di = mm.dot_candidates_diff(panel, cal, t)
+    dc, dd, di = map_dot.dot_candidates_diff(panel, cal, t)
     print("差分层候选 %d 个（成片 %d）:" % (len(dc), dd))
     for c in dc:
-        wx, wy = mm.panel_to_world(c["x"], c["y"], cal, t)
+        wx, wy = map_calib.panel_to_world(c["x"], c["y"], cal, t)
         fh = t.foothold_below(wx, wy)
         print("   (%.1f,%.1f) %sx%s 面积%d  世界≈(%.0f,%.0f) 脚下=%s"
               % (c["x"], c["y"], c["w"], c["h"], c["area"], wx, wy,

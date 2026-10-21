@@ -1,7 +1,7 @@
 """**从一张现场截图裁出「本机渲染」的锚点变体** ⇒ `perception/ui_templates/<锚点>.<n>.png`。
 
 为什么需要它（2026-10-17 ✓ 用户原话：「**本机的游戏窗口分辨率是1366x768，按这个走**」✓）：
-  · `perception/ui_state.py` 的锚点表是按**基准分辨率 1920×1080** 量的 ✓，而判别前会把整帧
+  · `perception/screen/ui_state.py` 的锚点表是按**基准分辨率 1920×1080** 量的 ✓，而判别前会把整帧
     **硬缩到 960×540**（`prepare` ✓）⇒ 它**假设"游戏 UI 随帧尺寸等比缩放"** ✗ ——
     而这个客户端的木牌元素几乎是**固定像素**的 ✗ ⇒ 换个窗口尺寸，缩到基准之后大小就对不上 ✗
     （实测：1366×768 那帧里「连接」按钮比老模板**大 ~1.33 倍** ⇒ 老模板判 **0.40** ✗，
@@ -42,7 +42,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from perception import ui_state                      # noqa: E402
+from perception.screen import ui_state  # noqa: E402
 
 #: 默认要裁哪几块（⚠ 顺序 = 优先裁"必需锚点"✓：`login` 只要求 `login_connect` ✓，
 #:   `login_agree` 是可选的两行协议字 ✓ —— 见 `ANCHORS` 里的 required 标记 ✓）

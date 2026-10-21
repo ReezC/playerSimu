@@ -23,7 +23,7 @@
   · **只处理当前帧** ✗：把卡片的 `_pick_frames` 覆盖成"就这一帧" ✓（卡片那几个按钮本来会弹
     "选帧窗" ⇒ 这里不该弹 ✓ 用户要的是"当前帧框选的区域" ✓）；
   · **只标框选区域** ✗：把 `card._region` 设成这次的矩形 ✓（四条链各自读它 ✓ 见
-    `perception/region.py` ✓ 一处口径 ✓）；
+    `perception/world/region.py` ✓ 一处口径 ✓）；
   · **不许阻塞界面** ✗：跑标注走 `gui.worker.TaskThread` ✓（与主窗口同一套读条/日志/取消 ✓）。
 """
 
@@ -38,7 +38,7 @@ from PyQt5.QtWidgets import (QCheckBox, QDialog, QFrame, QHBoxLayout, QLabel,
 from gui.steps.cards import LabelCard
 from gui.widgets import scroll_page, title_label
 from gui.worker import TaskThread, safe_slot
-from perception import region as region_mod
+from perception.world import region as region_mod
 
 #: 四个勾选项（`(键, 中文, 那一块在卡片里的属性名 ✓)`）—— **一处口径** ✓
 #: ⚠ 顺序照用户给的那份（玩家 → 怪物 → 掉落物 → 宠物 ✓）。
@@ -72,7 +72,7 @@ class RegionLabelDialog(QDialog):
         self.setSizeGripEnabled(True)
         self.project = project
         self.frame_stem = str(frame_stem or "")
-        #: ⭐ 这一趟**只标这个矩形**（`"x,y,w,h"` ✓ 画面像素 ✓）—— 见 `perception/region.py` ✓
+        #: ⭐ 这一趟**只标这个矩形**（`"x,y,w,h"` ✓ 画面像素 ✓）—— 见 `perception/world/region.py` ✓
         self.region_spec = region_mod.to_spec(region)
         self.task = None
         self._done_once = False
@@ -240,7 +240,7 @@ class RegionLabelDialog(QDialog):
         _hint.setWordWrap(True)
         _hint.setFrameShape(QFrame.StyledPanel)
         _hint.setToolTip("区域外的目标**一个都不会标** ✓ —— 判据是「框的中心点在不在区域里」✓\n"
-                         "（见 `perception/region.py`：四条标注链共用同一套 ✓）")
+                         "（见 `perception/world/region.py`：四条标注链共用同一套 ✓）")
         outer.addWidget(_hint)
 
         # ---- YOLO 权重：**搬卡片那个下拉原件** ✓（选择结果卡片自己也读得到 ✓ 一处口径 ✓）----
@@ -395,7 +395,10 @@ class RegionLabelDialog(QDialog):
         if total > 0:
             self.progress.setRange(0, int(total))
             self.progress.setValue(int(cur))
-            self.progress.setFormat("%v/%m %p%%  %s" % (text or ""))
+            # ⚠ `%v/%m/%p` 是 **Qt 的占位符**，不能拿 Python `%` 去格式化 ✗
+            #   （`"%v/%m %p%%  %s" % x` 会报 `ValueError: unsupported format character 'v'` ✓
+            #    2026-10-18 现场 stderr 里刷了几十条 ✓）⇒ 只把后缀拼上去 ✓
+            self.progress.setFormat("%v/%m %p%%  " + (text or ""))
         else:
             self.progress.setRange(0, 0)
             self.progress.setFormat(text or "运行中…")

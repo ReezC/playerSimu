@@ -76,9 +76,10 @@ print("  silent_for() = %.2f 秒   （≥5 就会被判「链路卡死」✗）"
 print("  ok=%s  fails=%d  last_err=%r" % (k.ok, k.fails, k.last_err))
 
 try:
-    from decision import input as dinput
-    dinput._remote, dinput._cfg = k, ("serial", PORT)
-    print("  link_health() =", dinput.link_health())
+    from execution import input as dinput
+    from execution import remote as _remote_mod
+    _remote_mod._remote, _remote_mod._cfg = k, ("serial", PORT)
+    print("  link_health() =", _remote_mod.link_health())
 except Exception as e:
     print("  （link_health 没跑成：%s: %s）" % (type(e).__name__, e))
 

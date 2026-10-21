@@ -77,7 +77,7 @@ class Player:
     #: None = 没落在任何平台上（半空/墙里/没定位）。**寻路要的是这一个。**
     segment_id: int | None = None
     #: True = 这一拍没认出黄点，上面的坐标/段号是**沿用上一帧**的（防抖窗口内，
-    #: 口径同 `perception/tracker.py` 的幽灵框）。可以用，但别当新鲜观测。
+    #: 口径同 `perception/track/tracker.py` 的幽灵框）。可以用，但别当新鲜观测。
     world_held: bool = False
     # ---- 寻路执行器要的两样（由实时回路按世界坐标算好，2026-09-26 补）----
     #: 脚下这条 foothold 属于**哪些命名集合**（`core.zones.set_of` 的结果）。
@@ -89,12 +89,12 @@ class Player:
     ladder_id: str | None = None
     #: ⭐ **到没到某根绳的上端**（绳号 `"L2"`；`None` = 没到 / 判不出来）—— 上爬的**到达判据** ✓。
     #: 用户 2026-09-27 定的新架构："所有的位置状态更新由**位置状态机**自治"⇒ 这个字段由
-    #: `perception/pos_state.py::PositionStateMachine` 算好（判据原文在那里 ✓），
+    #: `perception/world/pos_state.py::PositionStateMachine` 算好（判据原文在那里 ✓），
     #: **执行器只读、不许自己比坐标** ✗（`ClimbJob._arrived` 已经改成读它 ✓）。
     at_ladder_top: str | None = None
     #: ⭐ **到没到某根绳的下端**（绳号 `"L2"`；`None` = 判不了）—— 下爬的**到达判据** ✓
     #: （与 `at_ladder_top` 对称：y ≥ 绳下端 − 「坐标对齐误差范围」且 y 在「移动操作尝试
-    #: 间隔」内**不再变大** ✓）。判据原文在 `perception/pos_state.py` ✓。
+    #: 间隔」内**不再变大** ✓）。判据原文在 `perception/world/pos_state.py` ✓。
     at_ladder_bottom: str | None = None
     #: ⭐ **只看位置**编出来的绳号（**不管按没按 ↑/↓** ✓；`None` = 位置不在任何绳段里）——
     #: 治的是那条**循环依赖**：`ladder_id` 带按键许可，而**执行器自己会松键** ⇒ 那几十
@@ -119,11 +119,21 @@ class Player:
     #: 请执行器补发按住 ↑ ✓（执行器**不再自己跟踪 y** ✗）。
     climb_stalled: bool = False
     #: ⭐ 上面这些字段就是**位置状态广播的全部内容**（机器每拍写 ✓）；要"整份快照"用
-    #: `perception/pos_state.py::PosSnapshot.of(player)` ✓ —— **拼装只那一处** ✓
+    #: `perception/world/pos_state.py::PosSnapshot.of(player)` ✓ —— **拼装只那一处** ✓
     #: （把以前散在 agent / 执行器里的 `getattr` 拆字段收成一处 ✓，用户 2026-09-27 要求
     #: "提高内聚、降低耦合" ✓）。⚠ 不再另存一份整快照（两份存储会不一致 ✗）。
     #: 没算出来 / 没落平台时的原因（一句话，给界面与日志；正常时是空串）
     world_note: str = ""
+    #: ⭐⭐ **局部地图稳住了吗**（用户 2026-10-20 ✓ 原话："在局部地图滚动时，寻路任务的执行
+    #:   需要推迟直至其稳定"）：
+    #:   · `False` = 小地图**显示区刚跳/刚滚过**（一拍挪 > `minimap.VIEW_JUMP_PX`）且还没静够
+    #:     `minimap.VIEW_SETTLE_S` ⇒ 这一拍的坐标**还在动** ⇒ 执行器**先别按** ✓；
+    #:   · 由感知层**一处**算好（`perception.minimap.apply_to_player` ✓）——执行器只读 ✗
+    #:     不许自己记"上一拍的显示区"（两处各存一份迟早不一致 ✗ 见 `PosSnapshot` 的教训 ✓）；
+    #:   · ⚠ 没有 `view`（fit 模式 / 没标定 / 不是局部小地图）⇒ 恒 `True` ✓（这条判据不适用 ✓）。
+    world_stable: bool = True
+    #: 判"不稳"的原因（人话，如"小地图显示区刚挪了 37 像素（还在滚）"；正常时是空串）
+    world_why: str = ""
     #: ⭐⭐ **可信相机** `(cam_x, cam_y)`：把**画面坐标**换算成**世界坐标**要加的那个量
     #: （`世界 = 画面 + 相机` ✓；口径同 `perception.minimap.screen_to_world`：x 用框中心、
     #: y 用**框底** + `FOOT_OFFSET_PX` ✓）。由 `perception/tracker.PlayerTracker` 给出 ——

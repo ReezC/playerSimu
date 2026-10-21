@@ -29,7 +29,10 @@ from pathlib import Path
 
 import cv2
 
-ROOT = Path(__file__).resolve().parent.parent
+# ⚠ 2026-10-17：本文件搬进 `perception/screen/`（深了一层 ✓）⇒ 根目录要往上 **三层** ✓
+#   原来写 `parent.parent` 时 ROOT 会算成 `perception/` ⇒ `datasets/lie/templates` 找不到 ✗
+#   （`selftest_screen_state` 当场 8 条"模板缺失：lie_warn" ✓ 就是这么露的 ✓）
+ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE_DIR = ROOT / "datasets" / "lie" / "templates"
 CAPTURE_DIR = ROOT / "datasets" / "lie" / "captures"
 MATCH_SCALE = 0.25          # 匹配前整体缩放（见 docstring 的性能账 ✓）

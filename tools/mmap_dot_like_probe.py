@@ -27,31 +27,35 @@ import cv2                                                       # noqa: E402
 import numpy as np                                              # noqa: E402
 
 from perception import minimap as mm                            # noqa: E402
+from perception import map_dot
 
 DEFAULT_DIR = "data/dot_probe"
 
 
 def _cands(panel):
     """这一块面板上的候选（**颜色层** ✓ 黄色族 ✓）—— 与实时那条链同一入口 ✓。"""
+    from perception import map_dot
     pw = int(panel.shape[1])
     out = {}
-    m = mm.dot_mask(panel, "yellow")
-    out["yellow"], _ = mm._dot_candidates(m, pw)
-    m2 = mm.dot_core_mask(panel)
-    out["core"], _ = mm._dot_candidates(m2, pw)
+    m = map_dot.dot_mask(panel, "yellow")
+    out["yellow"], _ = map_dot._dot_candidates(m, pw)
+    m2 = map_dot.dot_core_mask(panel)
+    out["core"], _ = map_dot._dot_candidates(m2, pw)
     return pw, out
 
 
 def _row(tag, pw, c):
+    from perception import map_dot
     side = 0.5 * (float(c["w"]) + float(c["h"]))
     rel = side / max(1.0, float(pw))
-    like = mm.dot_player_like(c, float(pw))
+    like = map_dot.dot_player_like(c, float(pw))
     return ("   %-7s %4d×%-4d  面积 %5d  短边占比 %6.3f%%  like %5.3f  @(%.1f, %.1f)"
             % (tag, int(c["w"]), int(c["h"]), int(c["area"]), rel * 100.0, like,
                float(c["x"]), float(c["y"])))
 
 
 def main(argv):
+    from perception import map_dot
     paths = []
     if len(argv) >= 2 and argv[0] == "--dir":
         paths = sorted(glob.glob(os.path.join(argv[1], "*.png")))
@@ -78,7 +82,7 @@ def main(argv):
             for c in cands[:6]:
                 print(_row(tag, pw, c))
                 rels.append(0.5 * (float(c["w"]) + float(c["h"])) / max(1.0, float(pw)))
-                likes.append(mm.dot_player_like(c, float(pw)))
+                likes.append(map_dot.dot_player_like(c, float(pw)))
         print("")
     if rels:
         rels = sorted(rels)
@@ -92,9 +96,9 @@ def main(argv):
         print("  like 分：min %.3f / p25 %.3f / 中位 %.3f / p75 %.3f / max %.3f"
               % (likes[0], _q(likes, .25), _q(likes, .5), _q(likes, .75), likes[-1]))
         print("  ⇒ 当前常量：DOT_PLAYER_SIDE_REL=%.3f  DOT_PLAYER_SIDE_HARD_REL=%.3f  "
-              "DOT_LIKE_MIN=%.2f" % (mm.DOT_PLAYER_SIDE_REL,
-                                     getattr(mm, "DOT_PLAYER_SIDE_HARD_REL", float("nan")),
-                                     getattr(mm, "DOT_LIKE_MIN", float("nan"))))
+              "DOT_LIKE_MIN=%.2f" % (map_dot.DOT_PLAYER_SIDE_REL,
+                                     getattr(map_dot, "DOT_PLAYER_SIDE_HARD_REL", float("nan")),
+                                     getattr(map_dot, "DOT_LIKE_MIN", float("nan"))))
     return 0
 
 

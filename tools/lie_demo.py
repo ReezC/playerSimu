@@ -49,32 +49,32 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from perception.lie_controller import LieMouseController  # noqa: E402
+from liedetect.lie_controller import LieMouseController  # noqa: E402
 #: ⭐⭐⭐ **鼠标跟随效率倍率**默认值（用户 2026-10-03 ✓ 原话："能否开放一个系数配置，调追踪器
 #: 跟上圆心的效率倍率？" + "**我不想影响位置计算**，只调追踪器（较大的白描边圈绿圆）" ✓
 #: 与控制器**同一处口径** ✓）：控制器每拍把"光标 → 目标点"的误差消掉这么多倍 ✓（1.0 = 全量 ✓）。
-from perception.lie_controller import _FOLLOW_GAIN as _FOLLOW_GAIN_DEFAULT  # noqa: E402
-#: ⭐⭐⭐ **新模式"运动分离"**（用户 2026-10-03 ✓ 见 `perception/lie_motion.py` 的模块头 ✓）：
+from liedetect.lie_controller import _FOLLOW_GAIN as _FOLLOW_GAIN_DEFAULT  # noqa: E402
+#: ⭐⭐⭐ **新模式"运动分离"**（用户 2026-10-03 ✓ 见 `liedetect/lie_motion.py` 的模块头 ✓）：
 #:   它和 `Runner` **同签名**（`step` 回同样的 6 元组 ✓）⇒ 演示窗只换构造 ✓ 别的零改动 ✓。
-from perception.lie_motion import MotionRunner                          # noqa: E402
+from liedetect.lie_motion import MotionRunner                          # noqa: E402
 #: ⭐⭐⭐ **速度跟踪档的壳**（用户 2026-10-07 ✓「**我们要重头开始**」✓ 见 `VelocityRenderer` 那一族 ✓）
 #:   —— ⚠ 它与 `MotionRunner` **同签名同返回** ✓（底盘换成 `VelocityTracker` ✓）⇒ 演示窗**只换构造** ✓（`warm_tick` / `draw` /
 #:   拖动 / 播放**一行都不用改** ✓）。
-from perception.lie_motion import VelocityRunner                        # noqa: E402
+from liedetect.lie_motion import VelocityRunner                        # noqa: E402
 #: ⭐⭐⭐ **速度跟踪那三个参量的默认值**（用户 2026-10-07 ✓ 他问的那三个 ✓）——
-#:   ⚠ 口径**只在 `perception/lie_motion.py` 一处** ✓（界面别抄数 ✗ 会漂 ✓）；
+#:   ⚠ 口径**只在 `liedetect/lie_motion.py` 一处** ✓（界面别抄数 ✗ 会漂 ✓）；
 #:   ⚠⚠ **判据本轮还没接** ⇒ 这三个值**先只落盘** ✓（见 `_rowV` 的 tooltip ✓）。
-from perception.lie_motion import (VEL_CATCH_DEF as _VEL_CATCH_DEFAULT,   # noqa: E402
+from liedetect.lie_motion import (VEL_CATCH_DEF as _VEL_CATCH_DEFAULT,   # noqa: E402
                                    VEL_DEV_DEF as _VEL_DEV_DEFAULT,
                                    VEL_HOLD_DEF as _VEL_HOLD_DEFAULT)
 #: ⭐⭐⭐⭐⭐ **"顶点偏离多少算异常"的比例的默认值**（用户 2026-10-08 ✓ 第 3 条："**把他做成配置**"
-#:   ✓✓）—— ⚠ 口径**只在 `perception/lie_motion.py` 一处** ✓（界面别抄数 ✗ 见 `_VGRP_SELF_K_DEF` ✓）。
-from perception.lie_motion import _VGRP_SELF_K_DEF as _VEL_VTXK_DEFAULT       # noqa: E402
+#:   ✓✓）—— ⚠ 口径**只在 `liedetect/lie_motion.py` 一处** ✓（界面别抄数 ✗ 见 `_VGRP_SELF_K_DEF` ✓）。
+from liedetect.lie_motion import _VGRP_SELF_K_DEF as _VEL_VTXK_DEFAULT       # noqa: E402
 #: ⭐⭐⭐⭐⭐ **第四档：锚定追踪**（用户 2026-10-08 ✓ 原话："**尽量抛弃旧的思路，把新的方案落地，
 #:   做成新的模式给我验收，你取名字**" ✓✓）—— 名字我取 **「锚定追踪」** ✗：这一档的骨架就是
 #:   "**拿一堆静止的同形片当锚**"（锚住相机 ✓ 锚住身份 ✓ 只有那一片在动 ✓ 见 `perception/
 #:   anchor_track.py` 的模块头 ✓）—— ⚠ 它与 `MotionRunner` **同签名同返回** ✓ ⇒ 演示窗**只换构造** ✓。
-from perception.anchor_track import (ANCHOR_MODE as _ANCHOR_MODE,           # noqa: E402
+from perception.world.anchor_track import (ANCHOR_MODE as _ANCHOR_MODE,           # noqa: E402
                                      ANCHOR_NAME as _ANCHOR_UI_NAME,
                                      AnchorRunner,
                                      #   ⚠ 那三条旋钮的**默认值**也只从后端那一处取 ✓
@@ -82,72 +82,72 @@ from perception.anchor_track import (ANCHOR_MODE as _ANCHOR_MODE,           # no
                                      _ANC_CAM_SMOOTH, _ANC_CAM_STEP_MAX,
                                      _ANC_WAVE_T, anc_angle_line)
 # ⭐⭐⭐ **速度跟踪（velocity）那三档状态码 + 那两个"等待上板"有关的常量**（用户 2026-10-07 ✓）——
-#   ⚠ 一律从 `perception/lie_motion.py` **同一处口径取** ✗ 别在界面里抄字符串 ✗（"merge" 之类
+#   ⚠ 一律从 `liedetect/lie_motion.py` **同一处口径取** ✗ 别在界面里抄字符串 ✗（"merge" 之类
 #     写错一个字 ⇒ 画面上就不洋红 ✓ 而且不留痕 ✓）；本文件只会用到这几个 ✓。
-from perception.lie_motion import (VEL_WAIT as _VEL_WAIT,            # noqa: E402
+from liedetect.lie_motion import (VEL_WAIT as _VEL_WAIT,            # noqa: E402
                                    VEL_MERGE as _VEL_MERGE)
 # ⭐⭐⭐ **运动分离那几个参数的默认值**（用户 2026-10-03 ✓ 原话："运动分离 **没有任何参数要配吗？**"
-#   ✓）—— 从 `perception/lie_motion.py` **同一处口径**取 ✓（界面别抄一份数 ✗ 会漂 ✓）。
-from perception.lie_motion import _DIR_N as _MOTION_DIRN_DEFAULT          # noqa: E402
-from perception.lie_motion import _KF_PRED_MAX as _MOTION_PREDMAX_DEFAULT  # noqa: E402
-from perception.lie_motion import _MIN_HITS as _MOTION_MINHITS_DEFAULT   # noqa: E402
-from perception.lie_motion import _PAIR_GATE as _MOTION_PAIRED_DEFAULT   # noqa: E402
-from perception.lie_motion import _Q_MIN as _MOTION_QMIN_DEFAULT         # noqa: E402
-from perception.lie_motion import _Q_NEED as _MOTION_QNEED_DEFAULT       # noqa: E402
-from perception.lie_motion import _SCORE_DECAY as _MOTION_SDECAY_DEFAULT  # noqa: E402
-from perception.lie_motion import _SMOOTH as _MOTION_SMOOTH_DEFAULT      # noqa: E402
-from perception.lie_motion import _STUCK_RATIO as _MOTION_STUCK_DEFAULT  # noqa: E402
-from perception.lie_motion import _SWITCH_MARGIN as _MOTION_MARGIN_DEFAULT  # noqa: E402
-from perception.lie_motion import _WHITE_W as _MOTION_WHITEW_DEFAULT     # noqa: E402
+#   ✓）—— 从 `liedetect/lie_motion.py` **同一处口径**取 ✓（界面别抄一份数 ✗ 会漂 ✓）。
+from liedetect.lie_motion import _DIR_N as _MOTION_DIRN_DEFAULT          # noqa: E402
+from liedetect.lie_motion import _KF_PRED_MAX as _MOTION_PREDMAX_DEFAULT  # noqa: E402
+from liedetect.lie_motion import _MIN_HITS as _MOTION_MINHITS_DEFAULT   # noqa: E402
+from liedetect.lie_motion import _PAIR_GATE as _MOTION_PAIRED_DEFAULT   # noqa: E402
+from liedetect.lie_motion import _Q_MIN as _MOTION_QMIN_DEFAULT         # noqa: E402
+from liedetect.lie_motion import _Q_NEED as _MOTION_QNEED_DEFAULT       # noqa: E402
+from liedetect.lie_motion import _SCORE_DECAY as _MOTION_SDECAY_DEFAULT  # noqa: E402
+from liedetect.lie_motion import _SMOOTH as _MOTION_SMOOTH_DEFAULT      # noqa: E402
+from liedetect.lie_motion import _STUCK_RATIO as _MOTION_STUCK_DEFAULT  # noqa: E402
+from liedetect.lie_motion import _SWITCH_MARGIN as _MOTION_MARGIN_DEFAULT  # noqa: E402
+from liedetect.lie_motion import _WHITE_W as _MOTION_WHITEW_DEFAULT     # noqa: E402
 # ⭐⭐ **框心指导的力度**默认值（用户 2026-10-04 ✓ 原话："我在哪里调控框心指导的力度？" ✓
 #    ⇒ 见 `_FUSE_PULL` ✓ —— 界面上就是「框心力度」那一项 ✓）
-from perception.lie_motion import _FUSE_PULL as _MOTION_FPULL_DEFAULT  # noqa: E402
+from liedetect.lie_motion import _FUSE_PULL as _MOTION_FPULL_DEFAULT  # noqa: E402
 #: ⭐⭐⭐⭐⭐ **「夹取增益」的默认值**（用户 2026-10-04 ✓ 原话："**位置被硬夹说明你要么快了要么
 #:   慢了，夹取也要算进速度平滑。因为夹取是修正你的预测误差，夹取是较准确的测量值**" ✓✓）
 #:   —— 见 `_CLAMP_GAIN` ✓；⚠ **不许界面另抄一份数** ✗（同「框心力度」那条纪律 ✓）。
-from perception.lie_motion import _CLAMP_GAIN as _MOTION_CGAIN_DEFAULT  # noqa: E402
+from liedetect.lie_motion import _CLAMP_GAIN as _MOTION_CGAIN_DEFAULT  # noqa: E402
 #: ⭐⭐⭐ **"顶点在群体坐标系里的坐标"那份口径**（用户 2026-10-08 ✓ 原话："**增加功能：点选检出框
 #:   时，显示 4 个顶点的群体坐标系坐标**" ✓✓）—— ⚠ **一处口径** ✗：与后端"顶点档案 /
 #:   「顶点异常波动」那条日志"**同一个函数** ✓（见 `pick_vtx_label` ✓）⇒ 用户能拿面板上的数
 #:   去核日志里的数 ✓ 各写一份就对不上了 ✗。
-from perception.lie_motion import vel_vtx_group                              # noqa: E402
-from perception.lie_tracker import LieTracker  # noqa: E402
+from liedetect.lie_motion import vel_vtx_group                              # noqa: E402
+from liedetect.lie_tracker import LieTracker  # noqa: E402
 # ⭐ 轨迹预测观察窗 / 融合框判定阈值的**默认值**（界面初值用它 ✓ 与追踪器同一处口径 ✓）
-# ⭐⭐ 重叠尺统一在 `perception/geom.py` ✓（用户 2026-10-03 ✓）：点选检出框时要按
+# ⭐⭐ 重叠尺统一在 `core/geom.py` ✓（用户 2026-10-03 ✓）：点选检出框时要按
 #   "**与哪块砖 IoU 最大**"显示 ⇒ 用**同一把尺**算 ✓（口径一处 ✓ 不自己写一份 ✗）。
-from perception import geom                                     # noqa: E402
-from perception.lie_tracker import _MERGE_IOU as _MERGE_IOU_DEFAULT  # noqa: E402
-from perception.lie_tracker import _MERGE_IOU_OUT as _MERGE_IOU_OUT_DEFAULT  # noqa: E402
+from core import geom                                     # noqa: E402
+from liedetect.lie_tracker import _MERGE_IOU as _MERGE_IOU_DEFAULT  # noqa: E402
+from liedetect.lie_tracker import _MERGE_IOU_OUT as _MERGE_IOU_OUT_DEFAULT  # noqa: E402
 # ⭐⭐⭐ **参数分档默认值**（用户 2026-10-03 ✓ 第 2/3 行 ✓ 与追踪器同一处口径 ✓）
-from perception.lie_tracker import _RING_COV_SEP as _RING_COV_SEP_DEFAULT  # noqa: E402
-from perception.lie_tracker import _BRICK_IOU_SEP as _BRICK_IOU_SEP_DEFAULT  # noqa: E402
-from perception.lie_tracker import _RING_COV_FUSE as _RING_COV_FUSE_DEFAULT  # noqa: E402
-from perception.lie_tracker import _BRICK_IOU_FUSE as _BRICK_IOU_FUSE_DEFAULT  # noqa: E402
+from liedetect.lie_tracker import _RING_COV_SEP as _RING_COV_SEP_DEFAULT  # noqa: E402
+from liedetect.lie_tracker import _BRICK_IOU_SEP as _BRICK_IOU_SEP_DEFAULT  # noqa: E402
+from liedetect.lie_tracker import _RING_COV_FUSE as _RING_COV_FUSE_DEFAULT  # noqa: E402
+from liedetect.lie_tracker import _BRICK_IOU_FUSE as _BRICK_IOU_FUSE_DEFAULT  # noqa: E402
 #: ⭐⭐⭐ **分离判定阈值**默认值（用户 2026-10-02 ✓ 与追踪器**同一处口径** ✓ 见 `lie_tracker`）：
 #: 分离信号第三条的 x —— 融合期框**最大面积 ≥ 最小面积 × 它** ✓。
-from perception.lie_tracker import _SEP_RATIO as _SEP_RATIO_DEFAULT  # noqa: E402
+from liedetect.lie_tracker import _SEP_RATIO as _SEP_RATIO_DEFAULT  # noqa: E402
 #: ⭐⭐⭐ **融合框继承距离限制**默认值（用户 2026-10-02 ✓ 口径修订 ✓ 与追踪器**同一处口径** ✓）：
 #: 融合框候选第一条闸 —— `圆心到框最近边的有符号垂距 ÷ 绿圈半径 > 它` ✓（0 = 圆心须在框内 ✓）。
-from perception.lie_tracker import _INHERIT_DIST as _INHERIT_DIST_DEFAULT  # noqa: E402
+from liedetect.lie_tracker import _INHERIT_DIST as _INHERIT_DIST_DEFAULT  # noqa: E402
 #: ⭐⭐⭐ **融合框挑选允许倒退距离(绿圆半径比例)** 默认值（用户 2026-10-02 ✓ 与追踪器同一处口径 ✓）：
 #: 第二条闸的容差 —— 落位位移在白箭头方向上的分量 ≥ `−它 × 绿圈半径` 才算"安全候选" ✓（0 = 一点不许 ✓）。
-from perception.lie_tracker import _ALLOW_BACK_RATIO as _ALLOW_BACK_RATIO_DEFAULT  # noqa: E402
+from liedetect.lie_tracker import _ALLOW_BACK_RATIO as _ALLOW_BACK_RATIO_DEFAULT  # noqa: E402
 #: ⭐⭐⭐ **砖最多拥有融合框边数量**默认值（用户 2026-10-02 ✓ 与追踪器**同一处口径** ✓）：
 #: 融合框四边的"边归属"里归砖的边**只留距离最近的这么条**（4 = 不截断 ✓）。
-from perception.lie_tracker import _EDGE_MAX as _EDGE_MAX_DEFAULT  # noqa: E402
+from liedetect.lie_tracker import _EDGE_MAX as _EDGE_MAX_DEFAULT  # noqa: E402
 #: ⭐⭐⭐ **真目标预测最大速度倍率**默认值（用户 2026-10-03 ✓ 与追踪器**同一处口径** ✓）：
 #: 分离期（红框丢失 = 淡粉接力框那段）白箭头模长上限 = `a × 当拍群体速度模长` ✓。
-from perception.lie_tracker import _SEP_VEL_MAX as _SEP_VEL_MAX_DEFAULT  # noqa: E402
-from perception.lie_tracker import _NOISE_TOL as _NOISE_TOL_DEFAULT      # noqa: E402
+from liedetect.lie_tracker import _SEP_VEL_MAX as _SEP_VEL_MAX_DEFAULT  # noqa: E402
+from liedetect.lie_tracker import _NOISE_TOL as _NOISE_TOL_DEFAULT      # noqa: E402
 #: ⭐⭐⭐ **"缩成砖判定 · 最小 IoU"默认值**（用户 2026-10-03 ✓ 原话："我才学到 IoU 这个算法，
 #: 我认为我们很多判定都可以换成这个算法（例如『噪声容差』改成『**噪声最小 IoU**』）" ✓
 #: 与追踪器**同一处口径** ✓）：给"框缩回砖大小/位置"补一把**尺度无关**的尺 ✓ ——
 #: 与"四条边都在噪声容差(px) 内"**并列 OR** ✓（0 = 关 ✓ 只用像素那条腿 ✓）。
-from perception.lie_tracker import _IOU_BRICK as _IOU_BRICK_DEFAULT      # noqa: E402
-from perception.lie_tracker import _PATH_MS as _PATH_MS_DEFAULT  # noqa: E402
-from perception.lie_registry import _BOARD_S_DEF as _BOARD_S_DEFAULT     # noqa: E402
+from liedetect.lie_tracker import _IOU_BRICK as _IOU_BRICK_DEFAULT      # noqa: E402
+from liedetect.lie_tracker import _PATH_MS as _PATH_MS_DEFAULT  # noqa: E402
+from liedetect.lie_registry import _BOARD_S_DEF as _BOARD_S_DEFAULT     # noqa: E402
 #: ⭐⭐ **上板防抖重叠率**默认值（用户 2026-10-02 ✓ 与登记表**同一处口径** ✓ 见 `lie_registry`）
-from perception.lie_registry import _BOARD_OVERLAP_DEF as _BOARD_OVERLAP_DEFAULT  # noqa: E402
+from liedetect.lie_registry import _BOARD_OVERLAP_DEF as _BOARD_OVERLAP_DEFAULT  # noqa: E402
 
 VIDEO_DIR = ROOT / "datasets" / "liedetectorVideo"
 GIF_DIR = ROOT / "datasets" / "liedetectorgifs"   # GIF 素材默认根（用户 2026-09-30 ✓）
@@ -2589,8 +2589,8 @@ def _code_stamp_now():
         import os as _os
         import time as _t
         _ps = [Path(__file__),
-               Path(__file__).resolve().parent.parent / "perception" / "lie_tracker.py",
-               Path(__file__).resolve().parent.parent / "perception" / "lie_registry.py"]
+               Path(__file__).resolve().parent.parent / "liedetect" / "lie_tracker.py",
+               Path(__file__).resolve().parent.parent / "liedetect" / "lie_registry.py"]
         _m = max(_os.path.getmtime(p) for p in _ps if p.exists())
         return _t.strftime("%m-%d %H:%M", _t.localtime(_m))
     except Exception:
@@ -3120,7 +3120,7 @@ def run_window(args):
             self.cmb_mode.addItem("速度跟踪", "velocity")
             # ⭐⭐⭐⭐⭐ **第四档：锚定追踪**（用户 2026-10-08 ✓ 原话："**尽量抛弃旧的思路，把新的
             #   方案落地，做成新的模式给我验收，你取名字**" ✓✓）—— 名字 = **「锚定追踪」** ✗
-            #   （骨架 = "拿一堆静止的同形片当锚" ✓ 见 `perception/anchor_track.py` 模块头 ✓）；
+            #   （骨架 = "拿一堆静止的同形片当锚" ✓ 见 `perception/world/anchor_track.py` 模块头 ✓）；
             #   ⚠⚠ **老两档（经典 / 运动分离 / 速度跟踪）一个字节都不许动** ✗✗（零污染 ✓）：新档
             #   只**多一条路** ✓；⚠ 它**不用**老底盘那批参数 ✓（配对 / 打分 / 融合 / 上板 ✓ 一条
             #   都不继承 ✓）⇒ 那几行整行收掉 ✓（见 `_on_mode_changed` ✓）。
@@ -3250,7 +3250,7 @@ def run_window(args):
             self.sp_inherit.setToolTip(
                 "⚠ **已屏蔽（2026-10-03）**：本项**不生效** —— 融合候选改由「分离前不许换内砖」\n"
                 "（内砖同一性）+「允许倒退距离」两道把关。要恢复本项，把追踪器里的\n"
-                "`perception/lie_tracker.py::_INHERIT_DIST_ON` 拨回 `True`。\n\n"
+                "`liedetect/lie_tracker.py::_INHERIT_DIST_ON` 拨回 `True`。\n\n"
                 "（以下为原口径说明，仅供回退参考）\n"
                 "融合框候选的第一条闸 = **允许圆心出框的倍数半径**。\n\n"
                 "· 圆心**在框内** ⇒ **直接允许**（不看本项）；\n"
@@ -3446,7 +3446,7 @@ def run_window(args):
             #   ⚠ **分两档给** ✗ 不一股脑全给 ✓：
             #     · **手感 / 权衡档**（跟得紧 ↔ 稳 ✓ 按素材调 ✓）⇒ **放这一行** ✓；
             #     · **物理契约档**（"什么算一个块"：**面积带** / **填充度** ✓ 见
-            #       `perception/lie_motion.py` 顶上 ✓）⇒ **不放** ✗ —— 那几个是按"本素材那个白星的
+            #       `liedetect/lie_motion.py` 顶上 ✓）⇒ **不放** ✗ —— 那几个是按"本素材那个白星的
             #       形状"定的 ✓ 调了会**认错东西** ✗（要换素材，改那几个常量 ✓ 比放界面上安全 ✓）。
             #   ⚠ 5 个**都是"点『应用』才生效"**（与其余参数同一个约定 ✓ 不自动重算 ✗ 免得卡界面 ✓）。
             cfgrowM = QHBoxLayout()
@@ -3507,7 +3507,7 @@ def run_window(args):
             # ---- ⭐⭐ **第 5 行：跟踪手感 / 自检那一档**（用户 2026-10-03 ✓ 原话："把一些需要
             #   频繁调整的参数做成配置，然后告诉我应该怎么调、看什么" ✓）--------------------------------
             #   ⚠ 只放**真会调**的 ✓；名字短 ✓ tip 只讲"调大调小会怎样" ✓（原理写在
-            #     `perception/lie_motion.py` 里 ✓ 这里不堆血泪史 ✗）。
+            #     `liedetect/lie_motion.py` 里 ✓ 这里不堆血泪史 ✗）。
             cfgrowQ = QHBoxLayout()
             cfgrowQ.setContentsMargins(6, 2, 6, 2)
             self._rowQ = cfgrowQ            # ⭐ 与第 4 行一样：**只在运动分离模式下显示** ✓
@@ -3797,7 +3797,7 @@ def run_window(args):
             #   ⚠ **只有这一处加 IoU** —— "覆盖率/是否包住砖"那些是**单向**"大框盖住小砖"（框多大
             #   不进分母 ✓）⇒ 换 IoU 反而会误判 ✗；登记表"上板防抖"要的是"小框叠大砖≈1"✓（IoU
             #   会偏小、拦不住 ✗）；"圆心±容差与框相交"是"离框边几像素"（点/边对区域 ✓）⇒ IoU
-            #   没有对应物 ✓（详见 `perception/geom.py` 模块头 ✓）。
+            #   没有对应物 ✓（详见 `core/geom.py` 模块头 ✓）。
             #   · **0.70（默认）**≈ 上面那条"四条边差 20px 上下" ✓；越接近 1 越严 ✓；
             #   · **0 = 关**（只剩像素那条腿 ✓ 老行为一字不变 ✓）。
             cfgrow.addWidget(QLabel("缩成砖最小 IoU"))
@@ -3954,7 +3954,7 @@ def run_window(args):
             self._rowV_head = _wV
             _cfgcol.addWidget(_wV)
             _cfgcol.addLayout(cfgrowV)
-            # ⭐⭐⭐⭐⭐ **锚定追踪专用那一行**（用户 2026-10-08 ✓ 见 `perception/anchor_track.py` ✓）——
+            # ⭐⭐⭐⭐⭐ **锚定追踪专用那一行**（用户 2026-10-08 ✓ 见 `perception/world/anchor_track.py` ✓）——
             #   ⚠⚠ 项目纪律："不得私自新增观测参数 / 图例条目 / 面板文字，要加先问用户" ✓ ——
             #   **新模式自己那一行**属于"这个模式要能调"的必要件 ✓（不给旋钮反而没法验收 ✓），
             #   所以先摆三条**这一档真会用到**的 ✓ 你点哪条要删我就删 ✓。
@@ -4716,7 +4716,7 @@ def run_window(args):
             conf 都与什么有关、每一项都是如何作用的**，建议**加个 `？` 写在里面**" ✓✓）。
 
             ⚠⚠ **这里只是"给人看的说明"** ✗ —— **真正算它的地方只有一处** ✓：
-            `perception/lie_motion.py` 的 `process` 打分段（搜 `匹配分` 就能跳过去 ✓）。
+            `liedetect/lie_motion.py` 的 `process` 打分段（搜 `匹配分` 就能跳过去 ✓）。
             改公式时**两边一起改** ✓。
             """
             QMessageBox.information(self, "匹配分（观测可信度）是怎么算出来的",
@@ -4839,7 +4839,7 @@ def run_window(args):
             ⚠ **只给"手感/权衡档"** ✗ —— "物理契约档"（面积带 `_AREA_LO/HI` / 填充度
               `_FILL_LO/HI` ✓ 见 `lie_motion` 顶上 ✓）**不给** ✓：那几个是"**什么算一个块**"的
               定义 ✓（按本素材那个白星的形状定的 ✓）⇒ 调了会认错东西 ✗（想用在别的素材上，
-              改 `perception/lie_motion.py` 顶上那几个常量 ✓ 比放界面上安全 ✓）。
+              改 `liedetect/lie_motion.py` 顶上那几个常量 ✓ 比放界面上安全 ✓）。
             ⚠⚠ **`_AREA_LO` 就是这条规矩的实例** ✓（用户 2026-10-05 ✓ 原话："**为什么找到了 明显
               属于假目标的检出框**" ✓✓）：它原来写 **300** ✗（画面 0.08% ⇒ 小亮斑也算白块 ⇒
               目标被劫持 ✓ 见 `lie_motion._AREA_LO` 那段实测 ✓）⇒ 已改成 **2000** ✓
@@ -4977,7 +4977,7 @@ def run_window(args):
             return self._mode() == "velocity"
 
         def _anchor(self):
-            """是不是**锚定追踪**档（用户 2026-10-08 ✓ 见 `perception/anchor_track.py` ✓）。
+            """是不是**锚定追踪**档（用户 2026-10-08 ✓ 见 `perception/world/anchor_track.py` ✓）。
 
             ⚠ 与 `_vel` **并列**、互斥 ✓（两个都做减法：老两档那批标记一律不画 ✓）；差别只在
               "各自读自己那套出口键" ✓（`cam_cum/wave/target_tid/theta` 是本档的 ✓）。
@@ -5331,7 +5331,7 @@ def run_window(args):
                 #   **一条"挑谁是真目标"的逻辑都没有** ✗ 见那里 ✓）⇒ 其余全沿用 ✓。
                 #   ⚠ 老底盘那批参数（第 4/5 行 ✓ `_motion_kw()`）在本档**已经被收掉** ✗
                 #     ⇒ **一个都不传** ✓（新底盘也不吃 ✓ 见 `VelocityTracker.__init__` ✓）。
-                # ⭐⭐⭐⭐⭐ **第四档：锚定追踪**（用户 2026-10-08 ✓ 见 `perception/anchor_track.py` ✓）
+                # ⭐⭐⭐⭐⭐ **第四档：锚定追踪**（用户 2026-10-08 ✓ 见 `perception/world/anchor_track.py` ✓）
                 #   —— 与速度跟踪**同一个套路** ✓：只换底盘 ✓ 老底盘那批参数**一个都不传** ✓
                 #   （本底盘一条都不吃 ✓ 见 `AnchorTracker.__init__` ✓），只传 `roi` ✓。
                 _rcls = (AnchorRunner if self._anchor()

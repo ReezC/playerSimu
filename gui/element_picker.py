@@ -71,7 +71,7 @@ def _entry(spot, terrain, zones):
     x, y = 0.0, 0.0
     try:
         if kind == "set":
-            sp = zones_mod.set_span(terrain, ((zones.sets or {}).get(
+            sp = zones_mod.set_span(terrain, ((zones.zones or {}).get(
                 str(spot.get("name") or "")) or {}).get("footholds") or [])
             if sp is not None:
                 x, y = (float(sp[0]) + float(sp[1])) / 2.0, (float(sp[2]) + float(sp[3])) / 2.0
@@ -107,7 +107,7 @@ def list_elements(terrain, zones, kinds=None):
         return []
     out = []
     if "set" in ks and zones is not None:
-        for name in (zones.sets or {}):
+        for name in (zones.zones or {}):
             out.extend([_entry({"kind": "set", "name": str(name)}, terrain, zones)])
         out.sort(key=lambda e: e["x"])
     if "foothold" in ks:
@@ -291,7 +291,7 @@ class ElementView(FootholdPicker):
         """
         kind = str((spot or {}).get("kind") or "")
         if kind == "set":
-            fids = set(str(x) for x in ((self.zones.sets or {}).get(
+            fids = set(str(x) for x in ((self.zone_map.zones or {}).get(
                 str(spot.get("name") or "")) or {}).get("footholds") or [])
             items = set(self._items[f] for f in fids if f in self._items)
             self._lines = [(i, b, s_, (i in items)) for i, b, s_, _ in self._lines]
@@ -325,7 +325,7 @@ class ElementView(FootholdPicker):
 
     def focus_spot(self, spot):
         """居中到某个地点（缩放**只往大调** ✓ —— 同父类 `focus_on` 的口径 ✓）。"""
-        ent = _entry(spot, self.terrain, self.zones)
+        ent = _entry(spot, self.terrain, self.zone_map)
         cx, cy = float(ent["x"]), float(ent["y"])
         try:
             k = max(1e-6, float(self.transform().m11()))
@@ -350,7 +350,7 @@ class ElementView(FootholdPicker):
                 return
             p = self.mapToScene(e.pos())
             tol = PICK_SCREEN_PX / max(1e-6, float(self._px()))
-            spot = nearest_element(self.terrain, self.zones, float(p.x()), float(p.y()), tol)
+            spot = nearest_element(self.terrain, self.zone_map, float(p.x()), float(p.y()), tol)
             # ⭐ **点中元素 ⇒ 聚焦 + 呼吸**（用户 2026-10-06 ✓ 原话："选中地图元素时视图区要
             #   **聚焦 + 呼吸高亮**"✓）。呼吸本来就有（`_mark_spot` 把那个图元换选中色并进
             #   呼吸表 ✓）；缺的是**聚焦**（`focus_spot` 居中 + 放大到 ≥2.2 倍 ✓ 早就写好了 ✓

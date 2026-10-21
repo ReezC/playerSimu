@@ -1,4 +1,4 @@
-"""**假目标登记表**自检（用户 2026-09-30 两条先验 ✓ 见 `perception/lie_registry.py` 模块头）。
+"""**假目标登记表**自检（用户 2026-09-30 两条先验 ✓ 见 `liedetect/lie_registry.py` 模块头）。
 
 钉三条契约（合成场景，真值已知 ✓）：
   ① **纯群体平移** ⇒ 每一块都该做实 ✓、没有任何"不在册" ✓（别把静止的砖判成目标 ✗）；
@@ -17,7 +17,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from perception.lie_registry import (ShapeRegistry,  # noqa: E402
+from liedetect.lie_registry import (ShapeRegistry,  # noqa: E402
                                      _CONFIRM_HITS, _MATCH_GATE)
 
 _FAIL = []
@@ -232,7 +232,7 @@ def test_bid_stable():
     画面坐标/砖位』命名" ✓）：`bid` = 出生砖位，跨参数稳定 ✗ 不是"第 N 个建出来"的序号 ✗
     （实测：同一块砖，阈值 1.2 下老实现是 `#019`、1.4 下是 `#043` ✗✗ ⇒ 用户按编号对不上 ✓）。
     """
-    from perception.lie_registry import Entry
+    from liedetect.lie_registry import Entry
     e = Entry((123.6, 88.4, 140.0, 140.0), ts=0.0)
     check(e.bid == (124, 88),
           "⑨ `bid` = 出生画面坐标取整（实际 %s ｜ 期望 (124,88) ✓）" % (e.bid,))
@@ -324,7 +324,7 @@ def test_board_overlap_dedup():
       · 命中 ⇒ **不新建** ✗ + 框取**更接近 `typ_area`** 的那个 ✓ + **位置一动不动** ✗；
       · `board_overlap = 0` ⇒ **关**（老行为：该新建就新建 ✓）；`typ_area` 还没定 ⇒ 不换框 ✓。
     """
-    from perception.lie_registry import Entry
+    from liedetect.lie_registry import Entry
 
     def _reg(board_overlap=0.5):
         """一间"旧砖偏离标准"的表：标准 140×140（19600 ✓）、旧砖 190×140（26600 ✓ = 被养大了 ✓）。"""
@@ -411,7 +411,7 @@ def test_board_overlap_dedup():
     #   (391.1,116.1) → (306.2,199.8)，而它自己的检出 (396.7,98.7) 就在 18px 外 ✓）。
     import pathlib as _p7
 
-    _src7 = (_p7.Path(__file__).resolve().parent.parent / "perception"
+    _src7 = (_p7.Path(__file__).resolve().parent.parent / "liedetect"
              / "lie_registry.py").read_text(encoding="utf-8")
     check("                    _claimed[id(_ded)] = (0.0, float(_ded.w),"
           " float(_ded.h)," in _src7,
@@ -432,7 +432,7 @@ def test_size_write_needs_brick():
         不算这块砖"，就不许把它写进登记尺寸 ✗ 那才会「越养越大」✗✗）；
       · 与绿圆外接矩形相交 ⇒ 也不写（既有纪律 ✓ 顺手钉住 ✓）。
     """
-    from perception.lie_registry import Entry
+    from liedetect.lie_registry import Entry
 
     def _reg(ov):
         r = ShapeRegistry(board_overlap=ov)

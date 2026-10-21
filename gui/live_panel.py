@@ -75,6 +75,41 @@ PROJ_LIVE_KEYS = ("capture_source", "rect", "rect_rel", "rect_win",
                   "window_capture")
 
 
+def stream_rel_from_display(rect, disp_shape, roi=None, full=None):
+    """「在**预览画面**上框的矩形」→ **相对整帧**的比例 `[nx, ny, nw, nh]` ✓（`None` = 尺寸不对 ✓）。
+
+    为什么不能直接 `rect / 画面宽高`（2026-10-21 现场 ✓）：部署台的预览帧是
+    **已经裁过**的（`live_thread._stage_frame_ready` 按现存的 `stream_rect_rel` 裁 ✓），
+    所以在它上面框出来的坐标是**相对裁剪区**的 ⇒ 再除以画面宽高 ⇒ 上一份框被**再叠一次** ✓
+    （框两遍越框越小，用户会以为"框不中"✗）。
+
+    · `roi`  = 现在这一帧的裁剪框（**整帧像素** `(x, y, w, h)`，`live_thread._stream_roi` ✓）；
+    · `full` = 整帧尺寸（`(H, W)`，`live_thread._stream_full` ✓）；
+    · 两者都没有 / 对不上 ⇒ 当"没裁"处理（老行为一字不差 ✓）。
+    """
+    H, W = int(disp_shape[0]), int(disp_shape[1])
+    if W <= 0 or H <= 0:
+        return None
+    x, y, w, h = (float(v) for v in list(rect)[:4])
+    fx, fy, fw, fh = 0.0, 0.0, float(W), float(H)
+    if roi and full:
+        try:
+            rx, ry, rw, rh = (float(v) for v in list(roi)[:4])
+            fh_full, fw_full = float(full[0]), float(full[1])
+            # ⚠ 只有"画的**就是**这个 roi"时才折（尺寸对得上、且整帧比它大 ✓）
+            if int(rw) == W and int(rh) == H and fw_full >= rw > 0 and fh_full >= rh > 0:
+                fx, fy, fw, fh = rx, ry, fw_full, fh_full
+        except (TypeError, ValueError, IndexError):
+            pass
+
+    def _cl(v):
+        return max(0.0, min(1.0, v))
+
+    nx, ny = _cl((fx + x) / fw), _cl((fy + y) / fh)
+    nw, nh = min(_cl(w / fw), 1.0 - nx), min(_cl(h / fh), 1.0 - ny)
+    return [round(nx, 6), round(ny, 6), round(nw, 6), round(nh, 6)]
+
+
 def _bgr_to_pixmap(img):
     """numpy BGR → QPixmap。
 
@@ -105,7 +140,7 @@ class LiveFrameRegionClient:
     **为什么要有它**：小地图标定要的只是"一张面板画面"，从哪来其实无所谓 ——
     以前只能等 A 机那条独立推流（清晰，但要多推一路、多一份 A 机开销）。这个
     适配器直接从**实时预览那一帧**上裁一块（工作台「小地图来源 = 从实时画面框选」，
-    实验做法）。接口和 `perception.minimap.MiniMapClient` 一致，所以标定弹窗
+    实验做法）。接口和 `perception.map_client.MiniMapClient` 一致，所以标定弹窗
     **一行都不用改** —— 换来源 = 换喂帧的人。
 
     ⚠ 为什么标"实验"：实时画面是 H.264 压过的，小地图黄点只有几个像素，能不能
@@ -129,6 +164,9 @@ class LiveFrameRegionClient:
         self._t = 0.0
         self._t0 = time.time()
         self._n0 = 0
+        #: ⭐ **这一帧（整帧）多大** ⇒ 标定保存时拿它记 `panel_rel`（面板占帧的比例 ✓ 日志 507）：
+        #:   帧尺寸一变，面板像素就跟着变 ⇒ 只有记了比例，运行时才能"按比例救回来、不用重标" ✓
+        self.src_wh = None
 
     def start(self):
         return self
@@ -149,6 +187,8 @@ class LiveFrameRegionClient:
             return None, 0.0
         x, y, w, h = self.region
         H, W = img.shape[:2]
+        # ⭐ 整帧尺寸（标定弹窗保存时用它算 `panel_rel` ✓ 见 `src_wh` 的说明 ✓）
+        self.src_wh = (int(W), int(H))
         if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > W or y + h > H:
             # 画面尺寸变了（换分辨率 / 改推流参数）→ 说清楚，别给一块错位的图
             self.err = ("框选的区域 %s 超出当前画面 %dx%d —— 重新框一次"
@@ -874,12 +914,17 @@ class LivePanel(QWidget):
         self.ed_url.setVisible(is_stream)
         self.btn_pick_rect.setVisible(is_win)
         self.btn_pick_win.setVisible(is_win)      # 「对准窗口」（自动框选 ✓）同进退 ✓
-        self.lbl_rect.setVisible(is_win)
+        # ⚠ 这一行**不再跟着来源藏** ✗（2026-10-21 用户："B机换了项目后，没有正常显示上次
+        #   该地图A机推流的框选区域"✓）：收流模式它就是**唯一**能看见「游戏区域」的地方
+        #   （`_refresh_rect_label` 那条路 ✓）—— 藏起来 = 换项目后看不见盘上存着什么 ✓
+        self.lbl_rect.setVisible(True)
         self.lbl_capfps.setVisible(is_win)
         self.sp_capfps.setVisible(is_win)
         # 「抓屏方式」只对本地窗口那条路有意义 ✓（收流时它不参与 ✓）
         self.lbl_wcap.setVisible(is_win)
         self.cmb_wcap.setVisible(is_win)
+        # 来源一变，那行摘要的口径就变（收流=相对推流帧的比例 / 窗口=绝对坐标 ✓）
+        self._refresh_rect_label()
 
     # ---------------- 探针几何（人工框选标定） ----------------
 
@@ -1212,13 +1257,18 @@ class LivePanel(QWidget):
         rect = select_region_on_image(img, self)
         if rect is None:
             return
-        H, W = img.shape[:2]
-        if W <= 0 or H <= 0:
-            return
-        rel = [round(float(rect[0]) / W, 6), round(float(rect[1]) / H, 6),
-               round(float(rect[2]) / W, 6), round(float(rect[3]) / H, 6)]
+        # ⚠⚠ 预览里那一帧是**已经裁过**的（`live_thread._stage_frame_ready` 按现存的
+        #   `stream_rect_rel` 裁 ✓）⇒ 在它上面框出来的坐标是**相对裁剪区**的 ✗，
+        #   直接除以画面宽高会把上一份框**再叠一次**（框两遍越框越小 ✓）。
+        #   ⇒ 一律折回**整帧**（现成的 `_stream_roi` / `_stream_full` ✓ 见那个纯函数 ✓）。
+        th = getattr(self, "thread", None)
+        rel = stream_rel_from_display(
+            rect, img.shape[:2],
+            roi=getattr(th, "_stream_roi", None) if th is not None else None,
+            full=getattr(th, "_stream_full", None) if th is not None else None)
         self._stream_rect_rel = rel
         self._save_project_params()          # 按项目存（`_live_params` 里带了它 ✓）
+        self._refresh_rect_label()           # 那行摘要当场刷新（换项目后也要看得见 ✓ 2026-10-21）
         # ⭐ **立即生效**：已经跑着的那条线程直接改参数 ✓（不用重启预览 ✓）
         th = getattr(self, "thread", None)
         try:
@@ -1328,8 +1378,43 @@ class LivePanel(QWidget):
         self.lbl_rect.setText("把鼠标移到**游戏窗口**上、停住不动…（还剩 %d 秒）"
                               % int(self._auto_left * self.AUTO_PICK_MS / 1000.0 + 0.5))
 
-    def _refresh_rect_label(self):
-        """那行框选摘要：**绝对坐标 + 相对谁**（比例 ✓）—— 让人一眼看出"挪了也不用重框" ✓。"""
+    def _refresh_rect_label(self, note=None):
+        """那行框选摘要（**两种来源各一份口径** ✓）—— 让人一眼看出"现在框的是哪块 / 上次存的是什么" ✓。
+
+        ⭐ 2026-10-21（用户："**B机换了项目后，没有正常显示上次该地图A机推流的框选区域**"）：
+          原来这行**只认本地窗口那条路**的 `_rect`，而收流模式还被 `_refresh_source_ui()`
+          **整行藏起来** ✗ ⇒ 部署台换项目之后，盘上明明存着「游戏区域」，界面上一个字都看不到 ✗
+          （看起来就像"没存上 / 丢了" ✓）。
+          ⇒ 现在：收流模式显示 `stream_rect_rel`（**A 机推来的整帧里的比例** ✓），
+            窗口模式照旧显示绝对坐标 + 相对谁 ✓；`note` 那一路（"把鼠标移到窗口上…"）不变 ✓。
+        """
+        if note:
+            self.lbl_rect.setText(note)
+            self.lbl_rect.setVisible(True)
+            return
+        try:
+            _is_stream = self.cmb_source.currentData() == "stream"
+        except Exception:                            # noqa: BLE001 —— 控件还没建好 ✓
+            _is_stream = True
+        if _is_stream:
+            sr = self._stream_rect_rel
+            if not sr:
+                self.lbl_rect.setText("游戏区域：整帧（还没框过 ⇒ 不裁 ✓）")
+                return
+            # 有画面就换算成**这一帧的像素**（人看着更准 ✓）；没有就退回报比例 ✓
+            px = ""
+            try:
+                img = self.panel.current_frame() if self.panel is not None else None
+                if img is not None:
+                    _H, _W = img.shape[:2]
+                    px = "　= %d,%d %d×%d" % (round(float(sr[0]) * _W), round(float(sr[1]) * _H),
+                                              round(float(sr[2]) * _W), round(float(sr[3]) * _H))
+            except Exception:                        # noqa: BLE001
+                px = ""
+            self.lbl_rect.setText("游戏区域 %.1f%%,%.1f%%  %.1f%%×%.1f%%%s（相对推流帧 ✓）"
+                                  % (float(sr[0]) * 100, float(sr[1]) * 100,
+                                     float(sr[2]) * 100, float(sr[3]) * 100, px))
+            return
         if not self._rect:
             self.lbl_rect.setText("（未选）")
             return
@@ -1425,11 +1510,31 @@ class LivePanel(QWidget):
         if self._dead() or not self.__dict__.get("_built"):
             return
         vals = self._live_params()
+        # ⚠⚠⚠ 2026-10-21：`p` 原来在**下面几十行**才 `p = self.project` —— 这里却先用它 ✗
+        #   ⇒ 每次都是 `UnboundLocalError`、被下面那个 `except` 吞掉 ⇒ `_sec` **恒为空** ⇒
+        #   这道"别拿空值抹盘"的闸**从来没生效过** ✓（下面的 `stream_rect_rel` 也就跟着中招 ✓）。
+        p = self.project
+        # ⚠⚠ **不许用空值把盘上已有的值抹掉**（2026-10-18 现场 ✓）：
+        #   本会话**没框过**时这些字段就是 `None`，而下面 `update` 会把它写成
+        #   `mmap_crop:` / `stream_rect_rel:`（空）⇒ **盘上那份框被静默抹掉** ✗ ——
+        #   小地图那条的现场症状是「黄点永远认不出来」（没有框 ⇒ 没画面给它认 ✓）。
+        #   ⇒ 只有"这一会话真的填过"才写；原来是空、这次也是空 ⇒ 无所谓 ✓。
+        #   ⭐ `stream_rect_rel`（2026-10-21 加 ✓）：用户现场「**B机换了项目后，没有正常显示
+        #     上次该地图A机推流的框选区域**」—— 换到没框过的项目再随便改个参数，就会把
+        #     那个项目盘上的「游戏区域」写成空 ⇒ 切回来时整帧 ✓（看着像"丢了"✓）。
+        try:
+            _sec = dict(p.sec("live") or {}) if p is not None else {}
+        except Exception:                             # noqa: BLE001
+            _sec = {}
+        if _sec:
+            vals = dict(vals)
+            for _k in ("mmap_crop", "mmap_track", "stream_rect_rel"):
+                if vals.get(_k) is None and _sec.get(_k):
+                    vals.pop(_k, None)               # 盘上那份留着 ✓
         try:
             update_live(**vals)
         except Exception as e:                       # noqa: BLE001
             print("⚠ 实时参数没写进 live.yaml（%s: %s）" % (type(e).__name__, e))
-        p = self.project
         if p is None:
             return
         try:
@@ -1532,6 +1637,16 @@ class LivePanel(QWidget):
             self._stream_rect_rel = [float(x) for x in sr] if sr else None
         except Exception:                           # noqa: BLE001
             self._stream_rect_rel = None
+        # ⭐ 2026-10-21：回填完**立刻送到正在跑的那条线程**（换项目时若预览还开着 ⇒ 当场切框 ✓）。
+        #   `bind()` 一般会先 `stop()`（所以主要靠下一次 `start()` 带进去 ✓），但这里**不能只指望
+        #   那一条**：`bind` 之外还有调用方（主窗口热重载项目 / 只改了参数没停预览 ✓）——
+        #   漏了这一句，线程还在按**上一个项目**的框裁 ✓（用户看到的就是"换了项目框没换"✗）。
+        try:
+            th = getattr(self, "thread", None)
+            if th is not None and hasattr(th, "set_stream_rect"):
+                th.set_stream_rect(self._stream_rect_rel)
+        except Exception as e:                      # noqa: BLE001
+            print("⚠ 游戏区域没回送到实时线程（%s: %s）" % (type(e).__name__, e))
         self._refresh_rect_label()
 
     def bind(self, project):
@@ -2418,7 +2533,7 @@ class LivePanel(QWidget):
         elif _scr != "combat":
             # 掉线/登录系（ui_state 的界面 id ⇒ 中文名 ✓）：重连开着时 reconnect_note
             # 会另报它在做哪一步，这里报的是"现在画面在哪个界面" ✓
-            from perception import ui_state as _uist
+            from perception.screen import ui_state as _uist
             head = "【界面：%s】 " % _uist.UI_NAMES.get(_scr, _scr) + head
         # ⭐⭐ **小地图权威坐标的"新鲜度"先算好**（用户 2026-10-03 ✓ 他问"我能在…看到验证
         #   结果吗"）：`mmap_age_ms` = 这份世界坐标背后的那一帧是**多久以前收到的** ⇒

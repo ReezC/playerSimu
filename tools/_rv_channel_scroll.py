@@ -5,7 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 RC = ROOT / "decision" / "reconnect.py"
-MA = ROOT / "decision" / "mouse_aim.py"
+MA = ROOT / "execution" / "mouse_aim.py"
 
 RUN = """
 import sys; sys.path.insert(0, '.')

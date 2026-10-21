@@ -19,7 +19,9 @@ sys.path.insert(0, str(ROOT))
 import cv2                                              # noqa: E402
 
 from core import mapdata                                # noqa: E402
+from perception import map_const
 from perception import minimap as mm                    # noqa: E402
+from perception import map_overlay
 
 MID = "110040000"
 t = mapdata.load(MID, with_canvas=True)
@@ -30,7 +32,7 @@ assert panel is not None
 
 ok = True
 for tag, src in (("整幅", panel), ("半幅（模拟 ROI 路径）", panel[:300, :600])):
-    vis, info = mm.diff_panel_vs_canvas(src, t.canvas, cal)
+    vis, info = map_overlay.diff_panel_vs_canvas(src, t.canvas, cal)
     if vis is None:
         print("[%s] 差分算不出来：%s" % (tag, info.get("why")))
         continue
@@ -38,8 +40,8 @@ for tag, src in (("整幅", panel), ("半幅（模拟 ROI 路径）", panel[:300
     a = np.array_equal(vis[:, :, 0], vis[:, :, 1]) and \
         np.array_equal(vis[:, :, 0], vis[:, :, 2])
     b = np.array_equal(g, vis[:, :, 0])
-    m_old = (vis.max(axis=2) >= mm.DOT_DIFF_THR)
-    m_new = (g >= mm.DOT_DIFF_THR)
+    m_old = (vis.max(axis=2) >= map_const.DOT_DIFF_THR)
+    m_new = (g >= map_const.DOT_DIFF_THR)
     c = np.array_equal(m_old, m_new)
     ay, ax = np.unravel_index(int(g.argmax()), g.shape)
     d = (info["at"] == (int(ax), int(ay)))

@@ -275,8 +275,8 @@ def t_dialog_register_undo_save():
               "墙被选进了选择集")
         # ② 注册（名字重复要报错，不能静默覆盖）
         dlg.register("A平台")
-        check("A平台" in dlg.zones.sets, "注册没生效")
-        check(len(dlg.zones.sets["A平台"]["footholds"]) == len(walkable),
+        check("A平台" in dlg.zone_map.zones, "注册没生效")
+        check(len(dlg.zone_map.zones["A平台"]["footholds"]) == len(walkable),
               "注册进的条数不对")
         try:
             dlg.register("A平台")
@@ -285,20 +285,20 @@ def t_dialog_register_undo_save():
             pass
         # ③ 撤销 / 重做
         dlg.undo()
-        check("A平台" not in dlg.zones.sets, "撤销没生效")
+        check("A平台" not in dlg.zone_map.zones, "撤销没生效")
         dlg.redo()
-        check("A平台" in dlg.zones.sets, "重做没生效")
+        check("A平台" in dlg.zone_map.zones, "重做没生效")
         # ④ 改名级联 + 成员增删
         dlg.rename("A平台", "战斗区")
-        check("战斗区" in dlg.zones.sets and "A平台" not in dlg.zones.sets,
+        check("战斗区" in dlg.zone_map.zones and "A平台" not in dlg.zone_map.zones,
               "改名没生效")
         keep = walkable[:2]
         dlg.select(keep)
         dlg.remove_from_set("战斗区")
-        check(set(dlg.zones.sets["战斗区"]["footholds"]) == set(walkable) - set(keep),
+        check(set(dlg.zone_map.zones["战斗区"]["footholds"]) == set(walkable) - set(keep),
               "移出成员没生效")
         dlg.add_to_set("战斗区")
-        check(set(dlg.zones.sets["战斗区"]["footholds"]) == set(walkable),
+        check(set(dlg.zone_map.zones["战斗区"]["footholds"]) == set(walkable),
               "加入成员没生效")
         # ⑤ 保存 → 文件真的落盘、且能被读回来（id 是字符串）
         path, probs = dlg.save()
@@ -307,11 +307,11 @@ def t_dialog_register_undo_save():
         from core import zones as zmod
         back = zmod.Zones.from_dict(__import__("json").loads(
             path.read_text(encoding="utf-8")))
-        check(back.sets == dlg.zones.sets, "存读不一致")
+        check(back.zones == dlg.zone_map.zones, "存读不一致")
         # ⑥ 删集合（连带清掉引用）后保存，文件里也不该再有它
         gone = dlg.delete_set("战斗区")
         check(gone == [] or isinstance(gone, list), "删集合的返回值不对")
-        check("战斗区" not in dlg.zones.sets, "删集合没生效")
+        check("战斗区" not in dlg.zone_map.zones, "删集合没生效")
         dlg.close()
     finally:
         import shutil
@@ -573,7 +573,7 @@ def t_selection_and_set_are_exclusive():
         dlg.view.resetTransform()
         dlg.view.scale(1.5, 1.5)
         s0 = dlg.view.transform().m11()
-        ids = dlg.zones.sets["A平台"]["footholds"]
+        ids = dlg.zone_map.zones["A平台"]["footholds"]
         dlg.focus_ids(ids)
         app.processEvents()
         s1 = dlg.view.transform().m11()
@@ -620,11 +620,11 @@ def t_set_names_on_canvas():
         it = dlg._labels["A平台"]
         check(isinstance(it, ze.QGraphicsSimpleTextItem), "名字不是文字 item")
         # 颜色 = 该集合自己的颜色（和列表里那个色块一致）
-        want = QColor(dlg.zones.sets["A平台"]["color"]).name()
+        want = QColor(dlg.zone_map.zones["A平台"]["color"]).name()
         check(it.brush().color().name() == want,
               "名字没用集合颜色：%s vs %s" % (it.brush().color().name(), want))
         # 位置：在集合**水平中间**、且**在平台上方**（压住平台就挡住线了）
-        x0, x1, y0, _y1 = zones.set_span(t, dlg.zones.sets["A平台"]["footholds"])
+        x0, x1, y0, _y1 = zones.set_span(t, dlg.zone_map.zones["A平台"]["footholds"])
         b = it.sceneBoundingRect()
         check(abs(b.center().x() - (x0 + x1) / 2.0) < 80,
               "名字没标在集合水平中间：%.0f vs %.0f" % (b.center().x(), (x0 + x1) / 2.0))
@@ -639,7 +639,7 @@ def t_set_names_on_canvas():
 
         # 选中某个集合的**成员**（没有高亮别的集合）⇒ 它的名字也要呼吸
         dlg._highlight = None
-        dlg.select(dlg.zones.sets["A平台"]["footholds"][:2])
+        dlg.select(dlg.zone_map.zones["A平台"]["footholds"][:2])
         hl_text2 = [x for x, _c in dlg._hl_items
                     if isinstance(x, ze.QGraphicsSimpleTextItem)]
         check(dlg._labels["A平台"] in hl_text2,
@@ -740,7 +740,7 @@ def t_edges_in_editor():
             return len([i for i in dlg.scene.items() if i.zValue() == 7])
 
         dlg.add_edge("A平台", "B平台", "walk", why="测试用")
-        check(len(dlg.zones.edges) == 1, "加边没生效")
+        check(len(dlg.zone_map.edges) == 1, "加边没生效")
         # 焦点此时在「B平台」（刚注册完它）⇒ A→B 是**进来的**边：不该出现在「可到达」，
         # 要去下面「可被到达」栏（2026-09-26 要求 1、2；2026-09-27 一度放宽、当天又改回 ✓）
         check(dlg.lst_e.count() == 0,
@@ -789,7 +789,7 @@ def t_edges_in_editor():
         # （反向两条只差一个方向、本来就重叠着画）—— 点亮它才知道"改的是哪条"。
         dlg.lst_e.setCurrentRow(0)
         # ⚠ 比**值**不比身份：列表里那份是 Qt 转换过的 dict 副本（踩过）
-        check(dlg._edge_hl == dlg.zones.edges[0],
+        check(dlg._edge_hl == dlg.zone_map.edges[0],
               "选中那行没记下来是哪条边：%r" % (dlg._edge_hl,))
         dlg._on_pulse()                    # 手动跑一拍（自检里不等 60ms 的计时器）
         # 比**色相**不比精确值：呼吸每拍会改明度（实测拍到的可能是 #a98c34 这种压暗相位）
@@ -802,7 +802,7 @@ def t_edges_in_editor():
               "箭头三角没跟着亮：%s" % [i.brush().color().name() for i in heads])
         # 列表重填（点 foothold、换焦点都会走到）**不许把正在看的那条边丢掉**
         dlg._refresh_edges()
-        check(dlg._edge_hl == dlg.zones.edges[0],
+        check(dlg._edge_hl == dlg.zone_map.edges[0],
               "重填列表把选中的那条边丢了（画布上的呼吸会跟着停）")
         check(dlg.lst_e.currentItem() is not None, "重填后没把那行选回来")
         # 取消选中 ⇒ 恢复黑细虚线 + 类型色三角
@@ -821,7 +821,7 @@ def t_edges_in_editor():
               % dlg.lst_in.count())
         # 在「可被到达」栏里选中，箭头一样点亮（两栏共用同一个槽）
         dlg.lst_in.setCurrentRow(0)
-        check(dlg._edge_hl == dlg.zones.edges[0],
+        check(dlg._edge_hl == dlg.zone_map.edges[0],
               "在「可被到达」里选中没点亮箭头：%r" % (dlg._edge_hl,))
         check(dlg.lst_e.currentItem() is None,
               "两栏同时选中了（会让人以为指向同一条）")
@@ -832,8 +832,8 @@ def t_edges_in_editor():
         # 反向复制：有向图（爬上去和爬下来要两条）。**它属于对面那个集合** ——
         # 所以不会在「A平台」的可到达里冒出来（用户报的就是这条："点反向多出一个
         # 不该出现在窗口里的项目"）
-        dlg.rev_edge(dlg.zones.edges[0])
-        check(len(dlg.zones.edges) == 2, "反向复制没生效")
+        dlg.rev_edge(dlg.zone_map.edges[0])
+        check(len(dlg.zone_map.edges) == 2, "反向复制没生效")
         check(arrows() == 4, "反向边没画出来：%d" % arrows())
         check(dlg.lst_e.count() == 1,
               "反向边（B→A）跑到「A平台」的可到达里去了（它属于 B）：%d 行"
@@ -842,14 +842,14 @@ def t_edges_in_editor():
               "反向边没出现在「可被到达」里：%d 行" % dlg.lst_in.count())
 
         # 删边：删掉 A→B，剩下的是 B→A ⇒ 在「可被到达」里，不在「可到达」里
-        dlg.del_edge(dlg.zones.edges[0])
-        check(len(dlg.zones.edges) == 1, "删边没生效：%s" % dlg.zones.edges)
+        dlg.del_edge(dlg.zone_map.edges[0])
+        check(len(dlg.zone_map.edges) == 1, "删边没生效：%s" % dlg.zone_map.edges)
         check(dlg.lst_e.count() == 0 and dlg.lst_in.count() == 1,
               "删边后两栏没跟上：可到达 %d 行 / 可被到达 %d 行"
               % (dlg.lst_e.count(), dlg.lst_in.count()))
 
         # 悬空边：指向一个不存在的集合 ⇒ 列表里必须**标红**（真断链路只有跑起来才发现）
-        dlg.zones.edges.append({"from": "A平台", "to": "幽灵", "kind": "walk"})
+        dlg.zone_map.edges.append({"from": "A平台", "to": "幽灵", "kind": "walk"})
         dlg._refresh_edges()
         bad = [dlg.lst_e.item(i) for i in range(dlg.lst_e.count())
                if "悬空" in dlg.lst_e.item(i).text()]
@@ -865,11 +865,11 @@ def t_edges_in_editor():
         check(arrows() == 2, "悬空边也被画到画布上了：%d" % arrows())
 
         # 撤销能回退加边（不然改错了只能靠手改文件）
-        n0 = len(dlg.zones.edges)
+        n0 = len(dlg.zone_map.edges)
         dlg.add_edge("B平台", "A平台", "drop", why="撤销用")
-        check(len(dlg.zones.edges) == n0 + 1, "又加了一条边失败")
+        check(len(dlg.zone_map.edges) == n0 + 1, "又加了一条边失败")
         dlg.undo()
-        check(len(dlg.zones.edges) == n0, "撤销没回退加边：%s" % dlg.zones.edges)
+        check(len(dlg.zone_map.edges) == n0, "撤销没回退加边：%s" % dlg.zone_map.edges)
 
         # 建议那行字：真边 ↔「待圈地形」要一眼分得开（后者不是边，是缺集合的提示）
         s_edge = {"from": "A", "to": "B", "kind": "climb", "ladder": "L2", "why": "x"}
@@ -1530,8 +1530,8 @@ def t_two_ladders_same_pair():
             # ① 换一根绳 ⇒ **真的加进去**（用户要的就是这一下）
             dlg._apply_reach({"dst": "三楼", "kind": "climb", "ladder": "L7",
                               "portal": None, "footholds": None, "dir": None})
-            check(len(dlg.zones.edges) == 2,
-                  "换一根绳没加进去（用户报的就是这一下）：%s" % dlg.zones.edges)
+            check(len(dlg.zone_map.edges) == 2,
+                  "换一根绳没加进去（用户报的就是这一下）：%s" % dlg.zone_map.edges)
             rows = [dlg.lst_e.item(i).text() for i in range(dlg.lst_e.count())]
             # ⚠ 2026-09-27 起同一对集合**合成一组**（组头 + 缩进行）⇒ "两条都列着"要看
             #   **组里有没有这两条**（两个绳号都在 ✓），而不是数两行组头 ✗
@@ -1547,24 +1547,24 @@ def t_two_ladders_same_pair():
             said.clear()
             dlg._apply_reach({"dst": "三楼", "kind": "climb", "ladder": "L7",
                               "portal": None, "footholds": None, "dir": None})
-            check(len(dlg.zones.edges) == 2,
-                  "重复加居然多了一条：%s" % dlg.zones.edges)
+            check(len(dlg.zone_map.edges) == 2,
+                  "重复加居然多了一条：%s" % dlg.zone_map.edges)
             check(said and "已经有一条" in said[0] and "没有重复加" in said[0],
                   "完全重复时没说话（原来就是这里静默 ✗）：%r" % said)
 
         # ④ 删 L7 ⇒ L3 还在（绳号进了判据，不连坐）
-        e7 = [e for e in dlg.zones.edges if e.get("ladder") == "L7"][0]
+        e7 = [e for e in dlg.zone_map.edges if e.get("ladder") == "L7"][0]
         dlg.del_edge(dict(e7))
-        check([e.get("ladder") for e in dlg.zones.edges] == ["L3"],
-              "删一条把另一条也删了 / 删错了：%s" % dlg.zones.edges)
+        check([e.get("ladder") for e in dlg.zone_map.edges] == ["L3"],
+              "删一条把另一条也删了 / 删错了：%s" % dlg.zone_map.edges)
         # ⑤ 改绳号只动那一条；改成"和另一条一模一样"要拦住
         dlg.add_edge("二楼", "三楼", "climb", ladder="L9")
-        dlg.edit_edge(dict(dlg.zones.edges[0]), "三楼", "climb", ladder="L7")
-        check(sorted(e.get("ladder") for e in dlg.zones.edges) == ["L7", "L9"],
-              "改绳号改错了对象：%s" % [e.get("ladder") for e in dlg.zones.edges])
+        dlg.edit_edge(dict(dlg.zone_map.edges[0]), "三楼", "climb", ladder="L7")
+        check(sorted(e.get("ladder") for e in dlg.zone_map.edges) == ["L7", "L9"],
+              "改绳号改错了对象：%s" % [e.get("ladder") for e in dlg.zone_map.edges])
         try:
             dlg.edit_edge(
-                dict([e for e in dlg.zones.edges if e.get("ladder") == "L7"][0]),
+                dict([e for e in dlg.zone_map.edges if e.get("ladder") == "L7"][0]),
                 "三楼", "climb", ladder="L9")
             raise AssertionError("改成和另一条一模一样的（同终点同类型同绳）该拦住")
         except ValueError:
@@ -1604,10 +1604,10 @@ def t_edit_edge_by_double_click():
         check(dlg.lst_e.count() == 2, "A 的可到达该有 2 条：%d" % dlg.lst_e.count())
 
         # ① 编辑模式的弹窗：预填当前值、按钮写「保存」（不再写「增加」）
-        names = list(dlg.zones.sets)
+        names = list(dlg.zone_map.zones)
         d = ze.AddReachDialog(dlg, "A平台", names, names,
                               ladders=[("L1", "L1 x=0")],
-                              init=dlg.zones.edges[1])
+                              init=dlg.zone_map.edges[1])
         check(d.cmb_dst.currentData() == "C平台",
               "编辑模式没预填终点：%s" % d.cmb_dst.currentData())
         check(d.cmb_kind.currentData() == "climb",
@@ -1631,7 +1631,7 @@ def t_edit_edge_by_double_click():
         check(rd is not None, "双击没打开编辑窗口")
         check(not rd.isModal(),
               "编辑窗口是模态的 —— 那就没法缩放细看编辑器那张图了")
-        check(rd.mode == "edit" and rd.edge == dlg.zones.edges[1],
+        check(rd.mode == "edit" and rd.edge == dlg.zone_map.edges[1],
               # ⚠ 比**值**不比身份：双击拿到的边是 Qt 转过来的副本
               "编辑窗口没绑到那条边上：mode=%r edge=%r" % (rd.mode, rd.edge))
         check(rd.cmb_dst.currentData() == "C平台"
@@ -1653,7 +1653,7 @@ def t_edit_edge_by_double_click():
         rd.cmb_dst.setCurrentIndex(rd.cmb_dst.findData("B平台"))
         rd.cmb_kind.setCurrentIndex(rd.cmb_kind.findData("drop"))
         rd._accept()
-        e = dlg.zones.edges[1]
+        e = dlg.zone_map.edges[1]
         check(e.get("to") == "B平台" and e.get("kind") == "drop",
               "编辑窗口点确定之后没落盘：%s" % e)
         check("ladder" not in e,
@@ -1661,17 +1661,17 @@ def t_edit_edge_by_double_click():
         check(e.get("why") == "爬的那条", "改边把原来写的理由弄丢了：%s" % e)
         # ③ 撤销能回退（改错了不用手改文件）
         dlg.undo()
-        check(dlg.zones.edges[1].get("kind") == "climb"
-              and dlg.zones.edges[1].get("ladder") == "L1",
-              "撤销没把这条边改回去：%s" % dlg.zones.edges[1])
+        check(dlg.zone_map.edges[1].get("kind") == "climb"
+              and dlg.zone_map.edges[1].get("ladder") == "L1",
+              "撤销没把这条边改回去：%s" % dlg.zone_map.edges[1])
 
         # ④ 「可被到达」那栏**不接编辑**（它是只读的）：往里双击不该动任何东西
         dlg._highlight = "B平台"
         dlg._refresh_edges()
-        before = [dict(x) for x in dlg.zones.edges]
+        before = [dict(x) for x in dlg.zone_map.edges]
         if dlg.lst_in.count():
             dlg.lst_in.itemDoubleClicked.emit(dlg.lst_in.item(0))
-            check([dict(x) for x in dlg.zones.edges] == before
+            check([dict(x) for x in dlg.zone_map.edges] == before
                   and dlg._reach_dlg is None,
                   "「可被到达」那栏双击也开了窗口/改了东西（它该是只读的）")
 
@@ -1681,13 +1681,13 @@ def t_edit_edge_by_double_click():
                 (0, "A平台", "终点 = 起点（自环）该拦住"),
                 (1, "B平台", "把「爬」改成和「走」那条一模一样该拦住")):
             try:
-                dlg.edit_edge(dlg.zones.edges[idx], dst, "walk")
+                dlg.edit_edge(dlg.zone_map.edges[idx], dst, "walk")
                 raise AssertionError(why)
             except ValueError:
                 pass          # 正是期望的
-        check(len(dlg.zones.edges) == 2
-              and dlg.zones.edges[1].get("kind") == "climb",
-              "被拦下之后边反倒被改坏了：%s" % dlg.zones.edges)
+        check(len(dlg.zone_map.edges) == 2
+              and dlg.zone_map.edges[1].get("kind") == "climb",
+              "被拦下之后边反倒被改坏了：%s" % dlg.zone_map.edges)
         dlg.close()
     finally:
         import shutil
@@ -2099,9 +2099,9 @@ def t_edge_rows_merged():
             dlg.select([str(f.fid) for f in sl])
             dlg.register(name)
         # 同一对集合：跳 + 走（仅向左）；另一对只有一条
-        dlg.zones.add_edge("甲平台", "乙平台", "jump")
-        dlg.zones.add_edge("甲平台", "乙平台", "walk", walk_dir="left")
-        dlg.zones.add_edge("甲平台", "丙平台", "jump")
+        dlg.zone_map.add_edge("甲平台", "乙平台", "jump")
+        dlg.zone_map.add_edge("甲平台", "乙平台", "walk", walk_dir="left")
+        dlg.zone_map.add_edge("甲平台", "丙平台", "jump")
 
         def texts(lst):
             return [lst.item(i).text() for i in range(lst.count())]
@@ -2206,10 +2206,10 @@ def t_edge_rows_sorted():
             `out` = 「可到达」栏：只列**从焦点集合出去**的（+ 悬空边）；
             `in` = 「可被到达」栏：只列"能到焦点"的。两栏都按 `edge_row_key` 排。
             """
-            es = [e for e in dlg.zones.edges
+            es = [e for e in dlg.zone_map.edges
                   if (e.get("from") == focus if side == "out"
                       else (e.get("to") == focus
-                            and e.get("from") in dlg.zones.sets))]
+                            and e.get("from") in dlg.zone_map.zones))]
             es.sort(key=lambda e: ze.edge_row_key(e, focus))
             return ["%s → %s" % (e.get("from"), e.get("to")) for e in es]
 
@@ -2238,7 +2238,7 @@ def t_edge_rows_sorted():
         # **编辑之后位置跟着重排**（不是原地不动）：甲→丁 改成 甲→戊
         # （戊 的码点排在 丁 后面 ⇒ 那行该挪到最下面；若只是"原地不动"就会露馅。
         # 别改成甲→乙：那已经有一条一样的（会被去重拦住，正是该有的行为））
-        dlg.edit_edge(dlg.zones.edges[0], "戊平台", "walk")
+        dlg.edit_edge(dlg.zone_map.edges[0], "戊平台", "walk")
         dlg._refresh_edges()
         got2 = rows(dlg.lst_e)
         check(got2 == want_rows(), "改完终点没重排：%s vs %s" % (got2, want_rows()))
@@ -2268,11 +2268,11 @@ def t_edge_rows_sorted():
 
         # 「可下跳 foothold」那张表：**按地图上的上下顺序**（y 小在上）
         real = zones.load("105090600")
-        name = next((n for n, s in real.sets.items()
+        name = next((n for n, s in real.zones.items()
                      if len(s["footholds"]) >= 3), None)
         check(name, "真实数据里没有够大的集合，这条测不了")
-        dlg.zones.sets["大平台"] = {"color": "#4a8f4a",
-                                    "footholds": list(real.sets[name]["footholds"])}
+        dlg.zone_map.zones["大平台"] = {"color": "#4a8f4a",
+                                    "footholds": list(real.zones[name]["footholds"])}
         drops = dlg._drop_choices("大平台")
         y_of = {}
         for fid, _txt in drops:
@@ -2336,10 +2336,10 @@ def t_foothold_picker_readonly():
     t = mapdata.load(MAP_ID, with_canvas=True)
     z = zones.load(MAP_ID)
     assert t is not None and z is not None, "那张真地图读不出来（前提不成立）"
-    names = sorted(str(n) for n in (z.sets or {}))
+    names = sorted(str(n) for n in (z.zones or {}))
     assert names, "那张图没有集合（前提不成立）"
     # 挑一个 **foothold 最多**的集合（点选才有得点 ✓）
-    best = max(names, key=lambda n: len((z.sets.get(n) or {}).get("footholds") or []))
+    best = max(names, key=lambda n: len((z.zones.get(n) or {}).get("footholds") or []))
     import sys as _s
     _s.stderr.write("[D2] a 建 picker 前\n"); _s.stderr.flush()
     p = fp.FootholdPicker(t, z, best, current="")

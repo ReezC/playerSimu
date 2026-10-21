@@ -5,7 +5,7 @@
   · `template` —— **模板匹配**：复用 `tools/detect_mobs.run_detect`（与怪物/掉落**同一条算法** ✓），
     模板来自**组合外观**（`petlib.compose_pet(pet, equips)` 现算 ✓ ⇒
     `datasets/sprites/pet_combo/<宠物>__<装备+装备>/stand0_*.png` ✓），写出去的类别号是
-    **class 5（宠物）** ✓ —— 见 `perception/classes.py`（宠物是**干扰类**：标它只为让模型
+    **class 5（宠物）** ✓ —— 见 `perception/detect/classes.py`（宠物是**干扰类**：标它只为让模型
     学会区分"宠物 vs 怪"✓）。
   · `yolo`     —— **模型补框**：复用 `tools/yolo_augment.run_yolo_augment(mode="pet")` ✓
     （同一套"只补不覆盖"逻辑 ✓ 只是类别号不同 ✓）。
@@ -102,7 +102,7 @@ def run_label_pets(params, ctx=None):
         w = str(params.get("weights") or "")
         if not w:
             raise ValueError("还没选 YOLO 权重 —— 先在卡片的「YOLO 权重」里选一个模型 ✓")
-        from perception.classes import CLASS_PET
+        from perception.detect.classes import CLASS_PET
         from tools.yolo_augment import run_yolo_augment
         ctx.log("宠物：YOLO 补框（class %d）· %d 条" % (CLASS_PET, len(pets)))
         return run_yolo_augment({
@@ -117,15 +117,15 @@ def run_label_pets(params, ctx=None):
             "device": str(params.get("device", "0")),
             "only": only,
             # ⭐⭐ **只在框选区域内标注**（用户 2026-10-11 ✓ "点击各个标注按钮，只会在当前帧
-            #   框选的**区域内**进行自动标注"✓）—— 口径见 `perception/region.py` ✓；
+            #   框选的**区域内**进行自动标注"✓）—— 口径见 `perception/world/region.py` ✓；
             #   ⚠ 不传 / 空 ⇒ 整幅画面 ✓（= 老行为一字不变 ✓）。
             "region": params.get("region"),
         }, ctx)
 
-    from perception.classes import CLASS_PET
+    from perception.detect.classes import CLASS_PET
     from tools.detect_mobs import run_detect
-    # ⭐ 「框到可见部分」的两个默认值从**实现那边**拿（一处口径 ✓ 见 `perception/visible_box.py` ✓）
-    from perception.visible_box import VISIBLE_KEEP, VISIBLE_TOL
+    # ⭐ 「框到可见部分」的两个默认值从**实现那边**拿（一处口径 ✓ 见 `perception/detect/visible_box.py` ✓）
+    from perception.detect.visible_box import VISIBLE_KEEP, VISIBLE_TOL
     ctx.log("宠物：模板匹配（class %d）· %d 条组合外观" % (CLASS_PET, len(combos)))
     return run_detect({
         # ⚠ 这里的 `mobs` 就是"模板目录名"（`<sprites>/<名>/*.png` ✓）—— 组合目录名当模板名用 ✓
@@ -145,7 +145,7 @@ def run_label_pets(params, ctx=None):
         #   ⚠ **默认关** ✗：实测检出完全一致、但**没省时间**（同一只宠物的模板彼此太像 ✓）
         "coarse": bool(params.get("coarse", False)),
         "coarse_min": float(params.get("coarse_min", 0.25)),
-        # ⭐⭐ 框到**可见部分**（用户 2026-10-05 ✓ 见 `perception/visible_box.py` ✓）—— 原样转发 ✓
+        # ⭐⭐ 框到**可见部分**（用户 2026-10-05 ✓ 见 `perception/detect/visible_box.py` ✓）—— 原样转发 ✓
         #   ⚠ 默认**关** ✓（改的是标注语义 ⇒ 要开就按项目显式开 ✓）
         #   ⚠ 两个默认值**从实现那边 import**（一处口径 ✓ 别在这儿再写一遍 26.0/0.2 ✗）
         "visible": bool(params.get("visible", False)),

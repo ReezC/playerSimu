@@ -24,10 +24,10 @@ import math
 import cv2
 import numpy as np
 
-from perception import geom
-from perception.kf import KF4
-from perception.lie_group import GroupMotion
-from perception.lie_registry import ShapeRegistry, _BOARD_OVERLAP_DEF
+from core import geom
+from core.kf import KF4
+from liedetect.lie_group import GroupMotion
+from liedetect.lie_registry import ShapeRegistry, _BOARD_OVERLAP_DEF
 
 # ---- 参数（全部集中在头部，回放迭代就在这里调 ✗ 别散进函数体）----
 _SCALE = 0.5              # 跟踪阶段的工作分辨率（0.5 = 半分辨率，噪声/算力折中 ✓）
@@ -202,7 +202,7 @@ _IOU_BRICK = 0.7          # ⭐⭐⭐ **「缩成砖判定 · 最小 IoU」默�
                           #       选定 ✓ IoU 会偏小、**拦不住** ✗）；
                           #     · "圆心 ± 容差 与框相交"量的是"离框边几像素"（点/边 vs 区域 ✓）
                           #       ⇒ IoU **无对应物** ✗。
-                          #   详见 `perception/geom.py` 模块头（三把尺的分工 ✓）。
+                          #   详见 `core/geom.py` 模块头（三把尺的分工 ✓）。
 _MERGE_FIRST_NEAREST = False   # ⭐⭐⭐ **融合框「生成」那一拍是否走「就近内接」**（用户 2026-10-03 ✓
                                #   原话："**先屏蔽『就近内接』逻辑，都按边归属算**" ✓）：
                                #   · `True` = 老口径（用户 2026-10-02 ✓）：生成拍看"**融合前圆心**
@@ -720,7 +720,7 @@ class LieTracker:
         #   可视化的配置用户界面不需要），新增「**显示 KF 预测**」的开关" ✓）：
         #   ⚠ 它**不是"位置估计算法分支"** ✗（那名字会让人以为会改位置 ✗）—— 它是**可视化开关** ✓：
         #   · `False`（默认 ✓）= **不跑 KF、画面不画** ⇒ **零开销、零污染** ✓；
-        #   · `True` = 跑 KF（`perception/kf.py` ✓ 把经典链条每拍算出的位置当**观测** ✓）
+        #   · `True` = 跑 KF（`core/kf.py` ✓ 把经典链条每拍算出的位置当**观测** ✓）
         #     ＋ 演示窗画**青线/青点/青箭头** ✓ —— **只记录** ✗ **绝不动 `out["pos"]`** ✓✓。
         #   它的产出：① "KF 比现状好在哪"有数据可答 ✓；② **新息统计直接给出观测噪声 σ 该取多大** ✓。
         self.show_kf = bool(show_kf)
@@ -1688,7 +1688,7 @@ class LieTracker:
         `box` / `e` 缺失、砖面积 ≤ 0 ⇒ `0.0` ✓。"""
         if box is None or e is None:
             return 0.0
-        # ⭐ 算法在 `perception/geom.py`（`cover_ratio` = **单向**：交集 ÷ 砖面积 ✓ —— 框多大
+        # ⭐ 算法在 `core/geom.py`（`cover_ratio` = **单向**：交集 ÷ 砖面积 ✓ —— 框多大
         #   不进分母 ✓ 所以**不能**用 IoU 代替 ✗ 见该模块头 ✓）。
         return geom.cover_ratio(box, (float(e.x), float(e.y), float(e.w), float(e.h)))
 
@@ -2750,7 +2750,7 @@ class LieTracker:
         """
         if a is None or b is None:
             return 0.0
-        # ⭐ 算法统一放在 `perception/geom.py`（用户 2026-10-03 ✓ 原话："我认为我们很多判定都可以
+        # ⭐ 算法统一放在 `core/geom.py`（用户 2026-10-03 ✓ 原话："我认为我们很多判定都可以
         #   换成这个算法" ✓）⇒ 这里只**委托** ✓（实现一份 ✓ 不再各自写 ✗）。
         return geom.iou(a, b)
 
@@ -2762,7 +2762,7 @@ class LieTracker:
         """
         if a is None or b is None:
             return 0.0
-        # ⭐ 同上：算法在 `perception/geom.py` ✓（登记表那份也走同一个 ✓ 口径一处 ✓）。
+        # ⭐ 同上：算法在 `core/geom.py` ✓（登记表那份也走同一个 ✓ 口径一处 ✓）。
         return geom.overlap_min(a, b)
 
     def _inner_edge_dist_ratio(self, box):
@@ -4839,14 +4839,14 @@ class LieTracker:
                    [(float(b[0]), float(b[1]), float(b[2]), float(b[3])) for b in _dets_l])
         ev = self._group.estimate(None, _gboxes, self._typ_area,
                                   cur_gray=self._gray_full)   # 灰度已在 process 转好 ✓
-        # ⭐⭐⭐ **假目标登记表**（用户 2026-09-30 两条先验 ✓ 见 `perception/lie_registry.py`）：
+        # ⭐⭐⭐ **假目标登记表**（用户 2026-09-30 两条先验 ✓ 见 `liedetect/lie_registry.py`）：
         #   每拍喂一次（检出 + 群体平移 `T` ✓）⇒ 攒出"在册的假目标" ✓。
         #   ⚠ 目前**只登记、还没参与判位** ✓（先把登记结果画给用户看对不对 ✓ 用户原话：
         #     "将登记的框做个标记显示出来我看看你登记的对不对" ✓）。
         if ev.get("t") is not None:
             self._t_hist.append((ev["t"][0], ev["t"][1]))
             self._t_hist = self._t_hist[-_BUF_N:]     # 只留缓冲长度（`_diff` 最多跨这么多 ✓）
-        # ⭐⭐⭐ **假目标登记表**（用户 2026-09-30 ✓ 见 `perception/lie_registry.py` 模块头）：每拍喂
+        # ⭐⭐⭐ **假目标登记表**（用户 2026-09-30 ✓ 见 `liedetect/lie_registry.py` 模块头）：每拍喂
         #   一次（检出 + 群体平移 `T` + 追踪器位置 `pos` ✓）⇒ 攒出"在册的假目标" ✓，
         #   ⚠⚠ 用户 2026-09-30 纠正 ✓："**红框不是『被判真目标』，而是『在这个区域里』**" ✗——
         #     红框是**约束区**（融合期它里面**同时有真目标和假砖** ✓），**不能**拿它当"这格是目标"

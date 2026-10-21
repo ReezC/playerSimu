@@ -1,7 +1,7 @@
 """用训练好的权重推理，输出带框的图和统计。
 
 CLI:
-    python -m perception.predict --weights projects/x/models/mob_v1.pt ^
+    python -m perception.detect.predict --weights projects/x/models/mob_v1.pt ^
         --source data/new_frames --out data/pred --conf 0.3
 
 GUI:
@@ -28,9 +28,9 @@ import numpy as np
 
 from core.context import ConsoleContext, TaskContext
 from core.imgio import imread, imwrite
-from perception.classes import ZH_NAMES
+from perception.detect.classes import ZH_NAMES
 
-# 类别名来自 perception/classes.py；颜色来自可视化设置（与实时预览、质检台同一份）
+# 类别名来自 perception/detect/classes.py；颜色来自可视化设置（与实时预览、质检台同一份）
 CLASS_NAMES = ZH_NAMES
 
 

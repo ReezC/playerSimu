@@ -31,7 +31,7 @@ import tools.lie_demo as D                          # noqa: E402
 #:   就会往**用户那份日志**里塞测试行 ✗（实测四条"帧 -" ✓）⇒ **自检一个字节都不许落到用户日志里** ✓。
 #:   ⚠ 专门验日志那一条（`selftest_lie_motion.test_velocity_log_lost_and_found` ✓）在自己内部
 #:     把路径指到**临时目录** ✓ 验完还原 ✓ —— 那是"量日志"，与"别污染用户日志"不冲突 ✓。
-import perception.lie_motion as _lm                 # noqa: E402
+import liedetect.lie_motion as _lm                 # noqa: E402
 
 _lm.set_vel_log_path(None)
 
@@ -203,9 +203,9 @@ def test_merge_ratio_switch():
       · 面积 ≥ 阈值 × 登记面积 **且圈压着框**（规则① 2026-10-02 定稿 ✓）⇒ `_tbox_merged`
         为真 ✓（阈值越大 ⇒ 越难判融合 ✓）。
     """
-    from perception.lie_registry import Entry as _Entry
-    from perception.lie_registry import ShapeRegistry as _Reg
-    from perception.lie_tracker import LieTracker as _LK
+    from liedetect.lie_registry import Entry as _Entry
+    from liedetect.lie_registry import ShapeRegistry as _Reg
+    from liedetect.lie_tracker import LieTracker as _LK
     _a = _LK(merge_iou=0.6)          # ⚠ 2026-10-03：这项已换成 **IoU**（0~1 ✓ 不是面积比 ✗）
     _b = _LK(merge_iou=0.9)
     check(abs(_a.merge_iou - 0.6) < 1e-9 and abs(_b.merge_iou - 0.9) < 1e-9,
@@ -847,7 +847,7 @@ def test_roi_wiring_in_demo():
 def test_anchor_mode_wiring():
     """⭐⭐⭐⭐⭐ **第四档「锚定追踪」在演示窗里的接线** ✗✗（用户 2026-10-08 ✓ 原话："**尽量抛弃旧的
     思路，把新的方案落地，做成新的模式给我验收，你取名字**" ✓✓ —— 名字 = **「锚定追踪」** ✓
-    见 `perception/anchor_track.py` ✓）。
+    见 `perception/world/anchor_track.py` ✓）。
 
     ⚠ 与 `test_roi_wiring_in_demo` 同一个写法 ✓（**只钉接线** ✓ 不钉语义）：语义由
       `selftest_anchor_track`（20 条 ✓）钉死 ✓；这里只防"**有人把线拆了**"这种静默失效 ✓：
@@ -1462,7 +1462,7 @@ def test_velocity_roi_reaches_tracker():
         ③ 底盘自己：`VelocityTracker.roi` 认 4 元组（坏值当没给 ✓）。
     """
     import inspect
-    from perception import lie_motion as _lm
+    from liedetect import lie_motion as _lm
     _src = Path(D.__file__).read_text(encoding="utf-8")
     _mk = inspect.getsource(D.VelocityRunner._make_tracker)
     check('_vel_kw["roi"] = getattr(self, "roi", None)' in _src

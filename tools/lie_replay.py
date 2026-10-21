@@ -22,7 +22,7 @@ from pathlib import Path
 import cv2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from perception.lie_tracker import LieTracker  # noqa: E402
+from liedetect.lie_tracker import LieTracker  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 CAP = ROOT / "datasets" / "liedetectorphotos"

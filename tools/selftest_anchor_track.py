@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""`perception/anchor_track.py`（**锚定追踪** ✓）的自检 —— 离屏 ✓ 不弹窗 ✓ 不需要素材 ✓。
+"""`perception/world/anchor_track.py`（**锚定追踪** ✓）的自检 —— 离屏 ✓ 不弹窗 ✓ 不需要素材 ✓。
 
 要钉的就是这一档**凭什么成立**（用户 2026-10-08 ✓ 他口述的场景 ✓）：
   ① **纯函数那把尺**：中位位移 / 波浪分 / 滑行 / 选"在动的那片" / 旋转角 / 角度线；
@@ -17,8 +17,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import perception.anchor_track as _AT                              # noqa: E402
-from perception.anchor_track import (AnchorRunner, AnchorTracker,  # noqa: E402
+import perception.world.anchor_track as _AT                              # noqa: E402
+from perception.world.anchor_track import (AnchorRunner, AnchorTracker,  # noqa: E402
                                      anc_angle_line, anc_coast, anc_median2,
                                      anc_patch_dtheta, anc_patch_match,
                                      anc_white_cands,

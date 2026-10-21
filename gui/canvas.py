@@ -14,13 +14,13 @@ from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt5.QtGui import (QBrush, QColor, QKeySequence, QPainter, QPainterPath,
                          QPen, QTransform)
 from PyQt5.QtWidgets import (QGraphicsEllipseItem, QGraphicsItem,
-                             QGraphicsLineItem, QGraphicsPathItem,
-                             QGraphicsPixmapItem, QGraphicsRectItem,
-                             QGraphicsScene, QGraphicsSimpleTextItem,
-                             QGraphicsView)
+                             QGraphicsItemGroup, QGraphicsLineItem,
+                             QGraphicsPathItem, QGraphicsPixmapItem,
+                             QGraphicsRectItem, QGraphicsScene,
+                             QGraphicsSimpleTextItem, QGraphicsView)
 
 from gui import theme
-from perception.classes import (CLASS_MOB, CLASS_PLAYER, ZH_NAMES, bgr_to_hex,
+from perception.detect.classes import (CLASS_MOB, CLASS_PLAYER, ZH_NAMES, bgr_to_hex,
                                 bgr_to_rgb)
 
 HANDLE = 10        # 控制点判定半径（图片像素）
@@ -41,7 +41,16 @@ SELECT_BAND_COLOR = "#000000"
 #: 「区域自动标注」那根橡皮筋的颜色（**青色实线** ✓ —— 跟选择模式的**黑虚线**一眼分得开 ✓）
 REGION_BAND_COLOR = "#00bcd4"
 
-# 类别名/颜色都来自 perception/classes.py（唯一定义处）—— 类别清单只在那里维护
+#: **辅助预览框**的颜色（`load(..., preview=True)` ✓）。
+#: ⚠ 为什么不用类别色（用户 2026-10-17 ✓ 原话："地形图里有一个粉色的框…像是一种选中框"✗）：
+#:   地形图上有一种框**不是检出结果**，是「选择平台」选中的那个集合的**预览框**
+#:   （`route_panel._preview_boxes` ✓）—— 它原来走通用 `BBoxItem` ⇒ **实线 + 类别色**
+#:   （`cls=1` ⇒ 品红 ✓）⇒ 跟"检出框"**一模一样** ✓ 谁都认错 ✓
+#:   （2026-10-06 还因为标签写着"怪物"被当成检出框问过一次 ✓）。
+#: ⇒ 预览一律**青蓝 + 虚线** ✓：检出=实线、辅助=虚线，这套 UI 里从此有明确含义 ✓。
+PREVIEW_BOX_COLOR = "#00bcd4"
+
+# 类别名/颜色都来自 perception/detect/classes.py（唯一定义处）—— 类别清单只在那里维护
 CLASS_NAMES = ZH_NAMES
 
 
@@ -58,7 +67,7 @@ class BBoxItem(QGraphicsRectItem):
     """一个可移动 / 可缩放的标注框。"""
 
     def __init__(self, x, y, w, h, cls=1, manual=False, colors=None,
-                 names=None):
+                 names=None, dashed=False):
         super().__init__(0, 0, w, h)
         self.setPos(x, y)
         self.cls = cls
@@ -67,7 +76,15 @@ class BBoxItem(QGraphicsRectItem):
 
         hex_, rgb = self._colors.get(cls, self._colors[1])
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
-        self.setPen(QPen(QColor(hex_), 3 if manual else 2))
+        # ⭐ `dashed` = **虚线框**（用户 2026-10-17 ✓ 现场把「选择平台」的预览框当成了
+        #   "选中框/检出框"来问 ✓）—— 实线框在这套 UI 里**等于"检出结果"** ✓
+        #   ⇒ 预览/辅助类框一律走虚线 ✓ 一眼能分开 ✓（检出框仍是实线 ✓ 语义不变 ✓）。
+        _pen = QPen(QColor(hex_), 3 if manual else 2)
+        if dashed:
+            # ⚠ **只设 style，别碰 setDashPattern** ✗：`setDashPattern` 会把 style 改成
+            #   `CustomDashLine` ✓ ⇒ 用例/别处按 `DashLine` 判断就成了假红 ✓（踩过一次 ✓）
+            _pen.setStyle(Qt.DashLine)
+        self.setPen(_pen)
         # ⭐ **只有描边、不填充**（2026-09-29 用户要求 ✓）：填充会让框中间蒙上一层色，
         #    看"框和目标对不对"反而费眼 ✗ —— 描边已足够标出边界 ✓。
         self.setBrush(QBrush(Qt.NoBrush))
@@ -465,7 +482,13 @@ class ImageCanvas(ZoomPanView):
 
     # ---------------- 载入 ----------------
 
-    def load(self, pixmap, boxes=(), editable=True, fit=True):
+    def load(self, pixmap, boxes=(), editable=True, fit=True, preview=False):
+        """把一张图 + 一组框铺到画布上。
+
+        ⭐ `preview=True` ⇒ 这批框是**辅助预览**（不是检出结果 ✓ 用户 2026-10-17✓）：
+          统一画成**青蓝虚线** ✓ —— 现场有人把「选择平台」那块预览框当成了
+          "检出框/选中框"来问 ✗（它原来跟检出框**长得一模一样**：实线 + 类别色 ✓）。
+        """
         self.scene_.clear()
         self.boxes = []
         self.pix_item = None
@@ -516,10 +539,16 @@ class ImageCanvas(ZoomPanView):
 
         self.editable = editable
         self._colors = _box_colors()   # 读一次可视化配置，所有框共用
+        _colors, _dashed = self._colors, False
+        if preview:
+            # 预览框**不跟着类别颜色走**（类别色 = 检出语义 ✗）⇒ 统一青蓝 + 虚线 ✓
+            _colors = dict(self._colors)
+            _colors.update({i: (PREVIEW_BOX_COLOR, (0, 188, 212)) for i in range(0, 64)})
+            _dashed = True
         for box in boxes:
             cls, x, y, bw, bh = box[0], box[1], box[2], box[3], box[4]
             manual = box[5] if len(box) > 5 else False
-            self.add_box(x, y, bw, bh, cls, manual, self._colors)
+            self.add_box(x, y, bw, bh, cls, manual, _colors, dashed=_dashed)
 
         self._apply_mask()            # 载入即铺（框里的画面不蒙灰 ✓）
 
@@ -626,34 +655,55 @@ class ImageCanvas(ZoomPanView):
                 continue
             pen = QPen(color)
             pen.setWidthF(2.0)
-            ring = QGraphicsEllipseItem(x - r, y - r, 2 * r, 2 * r)
+            # ⭐ 线宽**不随缩放**（视觉稿线）：不然缩小时只剩一条细丝 ✓
+            pen.setCosmetic(True)
+            # ⭐⭐⭐ **圈的半径按当前视图缩放折算成"屏幕像素"**（2026-10-19 现场 ✓：
+            #   用户"**路线识别页签→地形图里看不到准心了**"✗ ——
+            #   上一版把这一组标了 `ItemIgnoresTransformations`（想让它不随缩放变小 ✓），
+            #   实测**整组根本不渲染**（无头渲染同一位置：黄色像素 **0** ✓；组的
+            #   `sceneBoundingRect` 还落在 (-24,-28) 这种错地方 ✗）。
+            #   ⇒ 回到"**画在场景坐标里、但按视图缩放折算大小**"：`r / s` 画布单位
+            #     在屏幕上正好 r 像素 ✓（缩放变了要重画，见 `_marks_follow_zoom` ✓）。
+            s = float(self.transform().m11()) or 1.0
+            s = max(1e-3, abs(s))
+            rc = r / s
+            grp = QGraphicsItemGroup()
+            grp.setZValue(12)                       # 压住贴图层（10）✓
+            # ⚠⚠⚠ **`setPos` 必须放在所有 `addToGroup` 之后**（2026-10-19 现场 ✓：
+            #   用户贴图指出"**准心跑到画面左上角**"✗）——
+            #   `QGraphicsItemGroup::addToGroup` 会**把子件挪到"场景位置保持不变"**的地方
+            #   （即 `local = scene - group.pos()`）✗ ⇒ 先 `setPos(x, y)` 再加子件，
+            #   等于让每个子件**反向平移 (x, y)** ⇒ 整组落回场景的 (0,0) 附近 ✓
+            #   （实测：`pos=(600,900)`、组 `boundingRect=(-646,-953,…)`、`sceneBoundingRect=(-46,-53,…)`）
+            #   ⇒ 先加子件（都在**组内原点附近**），最后再摆位置 ✓。
+            ring = QGraphicsEllipseItem(-rc, -rc, 2 * rc, 2 * rc)
             ring.setPen(pen)
             ring.setBrush(QBrush(Qt.NoBrush))       # 空心圈 ✓（PyQt 只收 QBrush/QColor ✓）
-            ring.setZValue(12)                      # 压住贴图层（10）✓
-            self._tag_helper(ring)
-            self.scene_.addItem(ring)
-            self._mark_items.append(ring)
+            grp.addToGroup(ring)
             # 十字：圆心那一下更醒目（放大到看不清圈时也有个准心 ✓）
-            for x1, y1, x2, y2 in ((x - r * 1.7, y, x - r * 0.5, y),
-                                   (x + r * 0.5, y, x + r * 1.7, y),
-                                   (x, y - r * 1.7, x, y - r * 0.5),
-                                   (x, y + r * 0.5, x, y + r * 1.7)):
+            for x1, y1, x2, y2 in ((-rc * 1.7, 0, -rc * 0.5, 0),
+                                   (rc * 0.5, 0, rc * 1.7, 0),
+                                   (0, -rc * 1.7, 0, -rc * 0.5),
+                                   (0, rc * 0.5, 0, rc * 1.7)):
                 ln = QGraphicsLineItem(x1, y1, x2, y2)
                 ln.setPen(pen)
-                ln.setZValue(12)
-                self._tag_helper(ln)
-                self.scene_.addItem(ln)
-                self._mark_items.append(ln)
+                grp.addToGroup(ln)
             if label and bool(getattr(self, "_text_on", True)):
                 # ⭐ 文字总开关关着 ⇒ **新画的那行字也不显示** ✓（用户 2026-10-16 ✓
                 #   见 `set_text_visible` ✓）—— 只在"创建时"守一道，就不用每拍重扫场景 ✓
                 txt = QGraphicsSimpleTextItem(label)
                 txt.setBrush(QBrush(color))
-                txt.setZValue(13)
-                txt.setPos(x + r * 0.8, y - r * 2.0)
-                self._tag_helper(txt)
-                self.scene_.addItem(txt)
-                self._mark_items.append(txt)
+                txt.setPos(rc * 0.8, -rc * 2.0)
+                txt.setScale(1.0 / s)               # 字也固定屏幕大小 ✓
+                grp.addToGroup(txt)
+            # ⚠⚠ **摆位置放在"子件全加完"之后**（见上面那段：`addToGroup` 会补偿坐标 ✗）
+            grp.setPos(x, y)
+            # ⚠ 子件也要各自标一遍（Qt 命中的是**子件**，组上的 NoButton 不一定兜得住 ✗）
+            self._tag_helper(grp)
+            for _child in grp.childItems():
+                self._tag_helper(_child)
+            self.scene_.addItem(grp)
+            self._mark_items.append(grp)
 
     # ---------------- ⭐ 文字总开关（用户 2026-10-16）----------------
 
@@ -690,9 +740,10 @@ class ImageCanvas(ZoomPanView):
 
     # ---------------- 框操作 ----------------
 
-    def add_box(self, x, y, w, h, cls=1, manual=False, colors=None):
+    def add_box(self, x, y, w, h, cls=1, manual=False, colors=None,
+                dashed=False):
         it = BBoxItem(x, y, w, h, cls, manual, colors or self._colors,
-                      self.class_names)
+                      self.class_names, dashed=dashed)
         it.setEnabled(self.editable)
         # ⭐ 文字总开关关着 ⇒ 框上那个类名**也不显示** ✓（用户 2026-10-16 ✓ 见
         #   `set_text_visible` ✓）—— `load()` 重建框时同样吃这条 ✓（开关是**持久**的 ✓
@@ -768,6 +819,31 @@ class ImageCanvas(ZoomPanView):
         # 基准就是图片本身（sceneRect 在 load 里按图片尺寸设）；
         # 空画布那一下由 ZoomPanView.fit 直接返回（见那里的崩溃说明）。
         super().fit()
+        self._marks_follow_zoom()
+
+    # ---------------- 标记层：缩放后按屏幕像素重算大小（2026-10-19 ✓）----------------
+
+    def _marks_follow_zoom(self):
+        """视图缩放/尺寸变了 ⇒ **按新缩放重画标记**（圈的大小是"屏幕像素"，见 `_draw_marks`）。
+
+        ⚠ 为什么必须重画：圈半径是 `r / 缩放` 画布单位 —— 缩放一变，同一段画布单位在屏幕上
+        就变了大小 ✗（缩到 0.3 倍时圈会变成 4px、等于看不见 ✓ 那正是用户报的那件事）。
+        没有标记时**什么都不做**（每拍都被 resize/滚轮触发，别白扫一遍场景 ✓）。
+        """
+        if not self._mark_items and not self._marks:
+            return
+        try:
+            self._draw_marks()
+        except Exception:                       # noqa: BLE001 —— 重画失败不许把画布弄崩 ✓
+            pass
+
+    def wheelEvent(self, e):
+        super().wheelEvent(e)
+        self._marks_follow_zoom()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._marks_follow_zoom()
 
     # ---------------- 事件 ----------------
     # 中键平移 / 滚轮缩放 / 双击适应窗口 都在 ZoomPanView 里，这里只管左键：

@@ -21,21 +21,22 @@ sys.path.insert(0, str(ROOT))
 import cv2                                            # noqa: E402
 
 from decision import agent as ag                      # noqa: E402
-from decision import mouse_aim as ma                  # noqa: E402
-from perception import ui_state as us                 # noqa: E402
+from execution import mouse_aim as ma                  # noqa: E402
+from perception.screen import ui_state as us                 # noqa: E402
 from tools.mouse_aim_calib import _connect_input, _grab, _open_stream   # noqa: E402
 
 OUT = Path("data")
 
 
 def main():
+    from execution import aim_convert as ma_c   # 2026-10-18：换算那半拆出去了 ✓
     s = ag.settings
     sx, sy = float(s.reconnect_server_x), float(s.reconnect_server_y)
     # 允许从命令行给一对比例（人眼闭环校正出来的那一对 ✓ 不影响配置文件 ✓）
     if len(sys.argv) >= 3:
         sx, sy = float(sys.argv[1]), float(sys.argv[2])
     print("[0] 配置里的「第 1 个服务器」比例：x=%.4f y=%.4f" % (sx, sy))
-    print("    gain = %s（没标定就不点 ✓）" % (ma.load_gain(),))
+    print("    gain = %s（没标定就不点 ✓）" % (ma_c.load_gain(),))
 
     ok, why = _connect_input()
     print("[1] %s" % why)

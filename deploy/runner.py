@@ -73,6 +73,12 @@ class Proc:
             if self.running():
                 return False, "已经在运行了"
 
+            # ⭐⭐ **启动前清残留**（用户 2026-10-17 ✓ 现场：A 机两条流同时推到
+            #   5000 ⇒ 花屏 ✓ 见 `deploy/stale.py`）——「停止」只 kill_tree 自己
+            #   记着的 PID，孤儿杀不到 ⇒ 再启动就变两条 ✓。
+            #   ⚠ 只在**推流**（`mpegts + udp://`）时动手 ✓ 别的服务一律不碰 ✗。
+            self._sweep_stale()
+
             env = dict(os.environ)
             # Python 服务不缓冲输出：否则日志要等缓冲区满才刷出来，
             # 看起来就像「启动了但什么都没发生」。
@@ -123,8 +129,12 @@ class Proc:
         """停止。返回 (ok, 说明文字)。硬停 —— 理由见模块文档。"""
         with self._lock:
             if not self.running():
+                # ⚠ 我们记着的进程没了 ≠ 真的没在推：**孤儿可能还在发** ✗
+                #   （2026-10-17 现场就是这么来的：点过停止、旧 ffmpeg 还活着 ✓）
+                self._sweep_stale()
                 return False, "没在运行"
 
+            ok, why = False, ""
             for how in ("terminate", "kill"):
                 try:
                     getattr(self.proc, how)()
@@ -132,7 +142,22 @@ class Proc:
                     pass
                 try:
                     self.proc.wait(timeout=1.5)
-                    return True, "已停止"
+                    ok, why = True, "已停止"
+                    break
                 except subprocess.TimeoutExpired:
                     continue
-            return False, "停不下来，进程可能已经僵死（PID %d）" % self.pid()
+            if not ok:
+                why = "停不下来，进程可能已经僵死（PID %d）" % self.pid()
+            self._sweep_stale()
+            return ok, why
+
+    def _sweep_stale(self):
+        """把**同一个 udp 端口**上的残留推流清掉（清不到也不抛 ✓ 见 `deploy/stale.py`）。"""
+        try:
+            from deploy import stale
+            _port = stale.udp_target(self.cmd)
+            if _port:
+                stale.sweep(_port, skip_pids=(self.pid(),),
+                            log=lambda msg: self.on_line("[清理] " + msg))
+        except Exception:                 # noqa: BLE001
+            pass
