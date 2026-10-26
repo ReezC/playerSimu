@@ -219,10 +219,15 @@ class MobTracker:
         self.cam_dx, self.cam_dy = dcx, dcy
 
     # ---------------- 主循环 ----------------
-    def update(self, detections, low_detections=(), player_world=None):
-        """这一帧：位移补偿 → ByteTrack（关联 / 卡尔曼融合 / 失联缓冲）→ `[Mob]` ✓。"""
+    def update(self, detections, low_detections=(), player_world=None, occluders=()):
+        """这一帧：位移补偿 → ByteTrack（关联 / 卡尔曼融合 / 失联缓冲）→ `[Mob]` ✓。
+
+        `occluders` = **遮挡物框**（宠物 ✓ 2026-10-22）：用户现场"靠近怪物时，跟随玩家的
+          宠物会把怪挡住导致检测框丢失"⇒ 被挡住的那几拍**不算漏检** ✓（见 `ByteTracker._occluded`）。
+          ⚠ 它不产生任何 `Mob`、也不改 `ws.mobs` 的成员 ✓ —— 只是"别急着判它死了" ✓。
+        """
         self._shift_anchor(player_world)
-        res = self.bt.update(detections, low_detections)
+        res = self.bt.update(detections, low_detections, occluders=occluders)
         d = res["diag"]
         # 老名字照旧给（日志/界面按它们看读数 ✓ 新名字括号里 ✓）
         self.diag = {
@@ -232,6 +237,7 @@ class MobTracker:
             "low": d["low"],                    # 低分档续命数
             "dropped_young": d["removed"],      # 这一帧被移除的轨迹数
             "unconfirmed": d["flick"],          # 没攒够确认帧就没了（= 闪一下 ✓）
+            "occluded": d.get("occluded", 0),   # 被遮挡物挡住、这一拍没算漏检的轨迹数 ✓
             "tracks": d["tracks"],              # 这一帧输出的轨迹数
             "buffer": d["buffer"],              # 失联帧长换算出来的**帧数**（读数 ✓）
         }

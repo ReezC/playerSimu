@@ -25,6 +25,47 @@ from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,
 from .base import StepCard
 
 
+#: ⑥ 卡「外来项目类别处理」的两种方式（用户 2026-10-24：这两件事**不该**让人配两格 ✗）
+CLASS_MODE_DROP = "丢弃勾选的类"
+CLASS_MODE_KEEP = "只取勾选的类"
+
+
+def _safe_ids(raw, dflt):
+    """存盘值是啥都行（列表 / "0,4" / 乱写）⇒ 一律转成 id 列表，**转不了就用默认值** ✓。
+
+    ⚠ 这里**不抛**：它跑在"打开项目"那条路上（`load_from_project` ✓），盘上有脏数据
+      不该把整个界面卡住 ✗（而 `make_task` 那条路照旧会抛 ✓ 见 `parse_drop` ✓）。
+    """
+    if raw is None:
+        return list(dflt)
+    try:
+        return _parse_drop(raw)
+    except Exception:                          # noqa: BLE001
+        return list(dflt)
+
+
+def _class_choices():
+    """类别下拉的选项：`[(0, "0 玩家"), …]` —— **值 = 类 id**、显示带中文名 ✓。
+
+    ⚠ 值必须是 id（不是显示文字）✗：显示文字以后可能改（加个括号说明之类 ✓），
+      存进 `project.yaml` 的东西不能跟着变 ✓（见 `MultiCheckCombo` 的说明 ✓）。
+    """
+    from perception.detect.classes import CLASSES
+    return [(int(c[0]), "%d %s" % (int(c[0]), c[2])) for c in CLASSES]
+
+
+def _parse_projects(v):
+    """「并入其他项目」的值 → 名字列表（列表/字符串两种都吃 ✓ 2026-10-24）。"""
+    from perception.merge_projects import parse_projects
+    return parse_projects(v)
+
+
+def _parse_drop(v):
+    """「只取/丢弃这些类」的值 → id 列表（列表/字符串两种都吃 ✓）。"""
+    from perception.merge_projects import parse_drop
+    return parse_drop(v)
+
+
 def _latest_mtime(paths):
     """一组路径（文件或目录）的最新修改时间（秒），无则 0。
 
@@ -3123,14 +3164,83 @@ class DatasetCard(StepCard):
             "默认 1：空帧不算负样本 —— 因为空帧很可能是漏检，\n"
             "留着等于教模型「这里没有怪」。\n"
             "改成 0 则保留空帧当负样本。")
+        # ⭐⭐⭐⭐ **把其他项目的素材并进来**（用户 2026-10-24："**能否做成 gui 里的功能？
+        #   适合加在哪个卡片？**"）—— 属于**同一件事**：都是"这一步产出训练集"✓
+        #   （并素材 → 剔类 → 划分 train/val → 写 data.yaml ✓ 一条链 ✓）。
+        #   ⚠ 单独开一张卡会让人以为"要按顺序各点一次"✗ —— 数据集的**产物**只有一个 ✓。
+        self.field(form, "from_projects", "并入其他项目", "checks", [], choices=[])
+        self.tip("from_projects",
+                 "要**并进来一起训练**的其他项目 —— 点开勾选，可多选，留空 = 只用本项目。\n"
+                 "留空时行为和以前完全一样（本项目自己的 frames + labels）。\n"
+                 "勾了就先把各项目的帧和标注汇到 data/_merge_<本项目>/，"
+                 "再和本项目的一起构建数据集。\n"
+                 "外来项目的帧名自动加 p01__ 前缀 —— 各项目的帧都叫 frame_00000.png，"
+                 "不分开会张冠李戴（框画到别人的画面上）。\n"
+                 "只并**标注过**的帧；来源记账写在 data/_merge_<本项目>/sources.json。")
+        # ⭐⭐⭐ **"只取" 和 "丢弃" 合成一对**（用户 2026-10-24 追问："**为什么需要同时配置
+        #   「外来项目只取这些类」「外来项目丢弃类」**"）—— 问得对：**不需要** ✗。
+        #   那两格是**增量加上去**的（先有"丢弃类"黑名单 ✓ 后来又要"只取怪物"白名单 ✓）
+        #   ⇒ 两格并存 + 一条"谁优先"的暗规则 ✗：同一件事要人记两条，还很容易只填一条 ✓。
+        #   现在只有一种读法：**先选方式（丢 / 只取），再勾哪些类** ✓。
+        self.field(form, "class_mode", "外来项目类别处理", "choice",
+                   CLASS_MODE_DROP, choices=[CLASS_MODE_DROP, CLASS_MODE_KEEP])
+        self.tip("class_mode",
+                 "「丢弃勾选的类」= **黑名单**：勾中的不要（默认：别的项目里那个角色\n"
+                 "  和你的不一样，认它反而干扰）。\n"
+                 "「只取勾选的类」= **白名单**：只留勾中的，其余类一律不要\n"
+                 "  （别的项目只标了怪物 ⇒ 用这个、只勾「怪物」）。\n"
+                 "⚠ 只作用在**外来项目**上，本项目自己的标注原样保留。")
+        self.field(form, "class_ids", "勾选哪些类", "checks", [0],
+                   choices=_class_choices())
+        self.tip("class_ids",
+                 "跟着上面那个「方式」读：\n"
+                 "  · 丢弃勾选的类 ⇒ **勾中的删掉**，没勾的留着（一个都不勾 = 一个都不丢）；\n"
+                 "  · 只取勾选的类 ⇒ **只留勾中的**，其余全删（一个都不勾 = 外来项目一类都不要）。\n"
+                 "⚠ 过滤完**变空**的那帧整帧不收（否则等于教模型「这里什么都没有」）。\n"
+                 "⚠ 只过滤**标注行**：画面里如果有没标过的宠物/掉落，模型会把它们当背景\n"
+                 "   ⇒ 想让新模型认宠物/掉落，就别拿这些帧当负样本（补标或换素材）。")
 
     def load_from_project(self, p):
         sec = p.sec("dataset")
         for k in ("val_ratio", "min_boxes"):
             self.set_value(k, sec.get(k))
 
+        # ⭐⭐ **候选项目 = 本项目以外的兄弟目录**（用户 2026-10-24："**能弄下列表选项吗？
+        #   反正都是有限的**"）—— 每次打开项目都重填一遍：新建/删除项目后选项跟着变 ✓。
+        #   ⚠ 值就是**项目名**（目录名 ✓）：`merge_projects` 按 `projects/<名字>` 找 ✓。
+        try:
+            peers = [(d.name, d.name) for d in sorted(p.root.parent.iterdir())
+                     if (d / "project.yaml").is_file() and d.name != p.root.name]
+        except Exception:                      # noqa: BLE001 —— 目录读不了就别炸界面 ✓
+            peers = []
+        _w = self.widgets.get("from_projects", (None, None))[0]
+        if _w is not None:
+            _w.set_items(peers)                # ⚠ 它会**保住已勾的**（见 `set_items` ✓）
+        self.set_value("from_projects",
+                       _parse_projects(sec.get("from_projects") or []))
+
+        # 类：新口径 `class_mode` + `class_ids` ✓；**老项目**（557/558 那两版）存的是
+        # `keep_classes` / `drop_classes` ⇒ **迁过来**（白名单优先 ✓ 它本来就是更窄的那个），
+        # 迁完 `sync()` 会把老键删掉 ✓（留着会让人以为还在用 ✗）。
+        mode = str(sec.get("class_mode") or "").strip()
+        if mode in (CLASS_MODE_DROP, CLASS_MODE_KEEP):
+            ids = _safe_ids(sec.get("class_ids"), [0])
+        elif _safe_ids(sec.get("keep_classes"), []):
+            mode = CLASS_MODE_KEEP
+            ids = _safe_ids(sec.get("keep_classes"), [])
+        else:
+            mode = CLASS_MODE_DROP
+            ids = _safe_ids(sec.get("drop_classes"), [0])
+        self.set_value("class_mode", mode)
+        self.set_value("class_ids", ids)
+
     def sync(self, p):
-        p.sec("dataset").update(self.values(["val_ratio", "min_boxes"]))
+        sec = p.sec("dataset")
+        sec.update(self.values(["val_ratio", "min_boxes", "from_projects",
+                                "class_mode", "class_ids"]))
+        # 老的两格删掉（`Project.save` 支持删键 ✓ 见 `_merge_disk` 里 `_DELETED` 那段）
+        for old in ("keep_classes", "drop_classes"):
+            sec.pop(old, None)
 
     def summarize(self, p):
         y = p.dataset / "data.yaml"
@@ -3155,14 +3265,50 @@ class DatasetCard(StepCard):
 
     def check_deps(self, p):
         snap = p.snapshot()
-        if snap["labels_auto"] == 0 and snap["labels"] == 0:
+        # ⚠ `_parse_projects` 内部才导入 `merge_projects`（本文件老规矩：别拖慢启动 ✓）
+        if (snap["labels_auto"] == 0 and snap["labels"] == 0
+                and not _parse_projects(self.value("from_projects"))):
+            # ⚠ 勾了「并入其他项目」就不拦：那几份标注**也是**训练素材 ✓
             return False, "还没有标注，请先完成 ④ 自动标注"
         return True, ""
 
     def make_task(self, p):
+        sec = p.sec("dataset")
+        # ⭐⭐⭐ **有人要"并别人的素材"就换成合并那条路**（2026-10-24 ✓）：先汇到暂存目录
+        #   （外来帧加 `p01__` 前缀防重名、按 `drop_classes` 剔掉别人的玩家类 ✓），
+        #   再和本项目的一起 `run_dataset` ✓ —— 产物、备份、split.json 全走同一套 ✓。
+        #   ⚠ 一个都不勾时**一个字都不变**：还是原来那条 `run_dataset` ✓（老项目照旧 ✓）。
+        names = _parse_projects(self.value("from_projects"))
+        if names:
+            from perception.merge_projects import run_merge
+            # ⭐ **一种方式 + 一份勾选** ⇒ 折成 `keep` / `drop` 两份参数（底层两条路都留着 ✓
+            #   命令行 `--keep` / `--drop` 照旧能用 ✓ 2026-10-24）。
+            #   ⚠ 传 `[]` 和"不传"**不是一回事**：`stage()` 里"不传 drop"才默认丢玩家 ✓，
+            #     而"丢弃方式 + 一个都不勾"必须真的一个都不丢 ✗（见 `stage` 那段 ✓）。
+            _ids = _parse_drop(self.value("class_ids"))
+            if str(self.value("class_mode")) == CLASS_MODE_KEEP:
+                _keep = list(_ids)
+                # 白名单**一个都不勾** = 外来项目一类都不要 ⇒ 只能靠"全丢"表达 ✓
+                # （`stage()` 里 `keep=[]` 的含义是"不启用白名单" ✗ 别混 ✓）
+                _drop = [] if _ids else [i for i, _t in _class_choices()]
+            else:
+                _keep = []
+                _drop = list(_ids)
+            return run_merge, {
+                "into": str(p.root),
+                "from": names,
+                "keep": _keep,
+                "drop": _drop,
+                "build": True,
+                "val_ratio": sec.get("val_ratio", 0.2),
+                "min_boxes": sec.get("min_boxes", 1),
+                "quality": sec.get("quality", 92),
+                # 划分方式：默认"按采集段留尾"（随机抽帧会让 val 全是见过的画面 ✗）
+                "split_mode": sec.get("split_mode", "segment"),
+            }
+
         from perception.prepare_dataset import run_dataset
 
-        sec = p.sec("dataset")
         return run_dataset, {
             "frames": str(p.frames),
             # 顺序即优先级，从可信到不可信：
@@ -3177,6 +3323,8 @@ class DatasetCard(StepCard):
             "val_ratio": sec.get("val_ratio", 0.2),
             "min_boxes": sec.get("min_boxes", 1),
             "quality": sec.get("quality", 92),
+            # ⭐ 划分方式：默认"按采集段留尾"（见 `prepare_dataset._assign_split` ✓）
+            "split_mode": sec.get("split_mode", "segment"),
         }
 
 

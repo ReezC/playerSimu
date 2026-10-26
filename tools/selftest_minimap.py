@@ -10307,6 +10307,145 @@ def t_relock_view_by_mask():
           "`map_locator` 没接掩码找回 ⇒ 跟不住时还是冻在标定那份（白写 ✗）")
 
 
+def t_dot_at_panel_edge_still_found():
+    """⭐⭐⭐⭐ **黄点贴在小地图最边上**也必须认出来（2026-10-23 用户："**怎么没认出来**"）。
+
+    **现场**（用户截图 + `data/dot_probe/app_panel.png` ✓ 面板 **109×114**）：玩家走到地图
+    最右边，黄点就画在面板**最外那 2~3 px** 里 —— 而 `dot_mask` 会把边缘 `DOT_INSET(3)`
+    整圈挖掉（防面板描边被当成点 ✓）⇒ 掩码 **0 像素** ⇒ 颜色层没候选 ⇒ 退差分层
+    ⇒ 出口"颜色不像" ⇒ **认不出** ⇒ 界面上的圈退回旧位置（= 用户看到的"圈不在黄点上" ✗）。
+
+    **实测**（同一个 6×6 黄点，只挪 x，面板 109 宽）：
+      中心 103 ⇒ 掩码 36 ✓；105 ⇒ 24 ✓；106 ⇒ 18 ✓；**107 / 108 ⇒ 0** ✗
+      —— 边界正好是"最外 3 px"那一条 ✓。
+
+    钉四件：
+      ① 只占最外 3 px 的黄点（贴边被裁）⇒ **必须认得出**，且 `layer="edge"` ✓；
+      ② 认出来的位置要**贴在边上**（`x` 在 105~108 之间 ✓ 不冒充面板中间）；
+      ③ 结论里要**如实说"贴边"**（位置误差 ≤ 2 px ✓ 现场看得出这拍不如平时准 ✓）；
+      ④ 对照：面板描边那种**细长黄条** ⇒ **不许当点**（那是老规矩，别被这一档破掉 ✗）；
+      ⑤ 对照：中间的点照旧走**颜色层**（老路径一个字没动 ✓）。
+    """
+    from perception import map_dot
+
+    H, W = 114, 109
+
+    def _pan(x0, y0, w, h):
+        p = np.zeros((H, W, 3), np.uint8)
+        p[:, :] = (20, 20, 20)
+        p[y0:y0 + h, x0:x0 + w] = (65, 243, 245)      # 实测玩家点 BGR ✓
+        return p
+
+    # ① 只占最外 3 px（x=106..108）⇒ 挖边之后掩码为 0，必须靠"贴边档"
+    r = map_dot.find_player_dot(_pan(106, 50, 3, 6), calib=None, terrain=None)
+    check(bool(r.get("ok")),
+          "黄点贴着面板右边缘（x=106..108）就**认不出**了 ⇒ 界面上的圈会退回旧位置，"
+          "用户看到的就是\"圈不在黄点上\"✗：%s" % (r.get("reason"),))
+    check(str(r.get("layer")) == "edge",
+          "贴边那个点是从 `%r` 层认出来的（该是 `edge` ✓ 贴边档）" % (r.get("layer"),))
+    # ② 位置要贴在边上
+    check(105.0 <= float(r.get("x") or 0) <= 108.0,
+          "贴边点认出来的 x=%r 不像贴着边（该在 105~108 ✓）" % (r.get("x"),))
+    # ③ 如实说"贴边"
+    check("贴边" in str(r.get("reason") or ""),
+          "结论里没说明\"这个点贴边、被裁了一点\" ⇒ 现场会以为跟平时一样准 ✗：%r"
+          % (r.get("reason"),))
+
+    # ④ 对照：面板描边（细长黄条，3×40 贴着右边）⇒ **不许当点**
+    rb = map_dot.find_player_dot(_pan(106, 10, 3, 40), calib=None, terrain=None)
+    check(not rb.get("ok"),
+          "把面板**描边**（3×40 的黄条）当成玩家点了 ⇒ 满屏都是假坐标 ✗：%r"
+          % (rb.get("reason"),))
+
+    # ⑤ 对照：中间的点照旧走颜色层（老路径一字没动 ✓）
+    rm = map_dot.find_player_dot(_pan(50, 50, 6, 6), calib=None, terrain=None)
+    check(bool(rm.get("ok")) and str(rm.get("layer")) == "color",
+          "中间那个点不走颜色层了（layer=%r）⇒ 老路径被改动 ✗" % (rm.get("layer"),))
+    check(float(rm.get("x") or 0) < 60.0,
+          "中间那个点认出来的 x=%r 偏了（该 ≈52.5）✗" % (rm.get("x"),))
+
+
+def t_calib_borrow_same_panel():
+    """⭐⭐⭐⭐ **换来源、面板尺寸一样 ⇒ 直接沿用另一条来源的标定**，别再要人标（2026-10-23）。
+
+    **用户原话**："**森林迷宫-珠缨 我看地形图上的显示完好无损，为什么提示要人工标？？**"
+
+    **现场**（`behavior.log` 10:34:52 ✓）：
+      ```
+      mmap_pick why=还没量过这张图的「面板 → 底图」换算（来源「独立推流」下点「标定…」）；
+                 自动补标定：自动量了一次：这块面板和底图对不上（低于 0.55）⇒ 得人工标一次
+      ```
+      · `datasets/map/105040303.mapcalib.json` 里**只有 `live`**（manual / 0.727 / 109×114）；
+      · 两条来源的面板实测 **110×112（stream）vs 109×114（live）** —— 同一块 `mmap_crop`
+        裁出来的**同一块区域** ⇒ 换算本就是同一份 ✓；
+      · 可自动补标定在这张图上**注定失败**：底图是**重绘的小地图**，逐像素相关天花板 ≈0.55，
+        门槛 `LOCATE_MIN_SCORE` 也是 0.55（见日志 510 那段 ✓）⇒ 永远差一口气 ✗。
+
+    钉五件：
+      ① 另一条来源的面板**一样大** ⇒ 借得到，且 `panel` 记成**当前**尺寸、两端都按比例换算 ✓；
+      ② 借来的那份带 `picked_by="borrow"` + 一句人话（现场能看出"没人工量过 ✓"）；
+      ③ 借的时候**绝不写盘**（写下去会让 `any_mode_of` / 以后的人工标注以为这条来源量过 ✗）；
+      ④ 对照：另一条来源的面板**真差 5 倍**（1164×585 那种）⇒ **不许借**（那才是"分来源"要防的 ✗）；
+      ⑤ 源码顺序：`locate` 里**先借、再自动补标定**（反过来会先把"试过 3 次"刷掉 ✗）。
+    """
+    from unittest import mock
+
+    import numpy as np_list  # noqa: F401  （与套件里别处一致：用例内部按需取依赖 ✓）
+
+    from perception import map_locator
+    from core import mapdata
+    from perception import map_const
+
+    np = np_list
+    mid = "105040303"
+    live_c = {"mode": map_const.MODE_FIT, "scale": 1.0, "offset": [14.6, -103.0],
+              "panel": [109, 114], "src": "manual", "score": 0.727}
+    panel = np.zeros((112, 110, 3), np.uint8)      # 独立推流那块：110×112（实测 ✓）
+
+    def _boom(*_a, **_k):
+        raise AssertionError("借标定的时候**写盘**了 ✗（那会让程序以为这条来源被量过）")
+
+    with mock.patch.object(mapdata, "load_calibs", lambda _m: {map_const.SRC_LIVE: dict(live_c)}), \
+            mock.patch.object(mapdata, "save_calib", _boom), \
+            mock.patch.object(mapdata, "load", lambda *a, **k: None):
+        loc = map_locator.PlayerLocator(mid)
+        got = loc._borrow_calib(map_const.SRC_STREAM, panel, None)
+        check(got is not None,
+              "另一条来源有标定、面板还几乎一样大，却**借不到** ⇒ 又得让人去人工标 ✗")
+        check([int(v) for v in got.get("panel") or ()] == [110, 112],
+              "借来的那份没记成**当前**面板尺寸（还是别条的 109×114）⇒ 下一道 panel_mismatch "
+              "会把好不容易借到的又拒掉 ✗：%r" % (got.get("panel"),))
+        check(abs(float(got.get("scale") or 0) - 110 / 109.0) < 1e-6,
+              "几何没按面板比例换算（scale=%.4f，该是 %.4f）⇒ 差 1~2 个底图像素 ✗"
+              % (float(got.get("scale") or 0), 110 / 109.0))
+        check(abs(float((got.get("offset") or [0, 0])[0]) - 14.6 * 110 / 109.0) < 1e-3,
+              "偏移没跟着换算（offset=%r）⇒ 借来就偏 ✗" % (got.get("offset"),))
+        check(str(got.get("picked_by")) == "borrow" and "沿用" in str(got.get("note") or ""),
+              "借来的那份没留痕迹（`picked_by` / `note`）⇒ 现场看不出\"这是没人工确认的 ✓\"：%r"
+              % (got.get("note"),))
+        check((loc.borrow or {}).get("from") == map_const.SRC_LIVE,
+              "`loc.borrow` 里没记\"从哪条来源借的\" ⇒ 界面/日志说不清 ✓：%r" % (loc.borrow,))
+
+    # ④ 另一条来源的面板真差 5 倍 ⇒ 不许借（那正是"分来源"要防的事 ✓）
+    big = dict(live_c, panel=[1164, 585])
+    with mock.patch.object(mapdata, "load_calibs", lambda _m: {map_const.SRC_LIVE: big}), \
+            mock.patch.object(mapdata, "load", lambda *a, **k: None):
+        loc2 = map_locator.PlayerLocator(mid)
+        check(loc2._borrow_calib(map_const.SRC_STREAM, panel, None) is None,
+              "另一条来源的面板差了 5 倍（1164×585 vs 110×112）**也借**了 ⇒ 世界坐标会整倍数错 ✗"
+              "（用户 2026-09-27 那条「标定按来源分开存」就是为这个 ✓）")
+
+    # ⑤ 源码顺序：先借、再自动补标定
+    src = (map_locator.__file__)
+    with open(src, encoding="utf-8") as fh:
+        txt = fh.read()
+    i_b = txt.index("self._borrow_calib(src, panel, terrain)")
+    i_a = txt.index("_af = try_autofit(")
+    check(i_b < i_a,
+          "`locate` 里**先自动补标定、后借** ⇒ 在这张图上会白刷 3 次 `_AUTOFIT_STATE`、"
+          "以后提示变成\"已经试过 3 次\" ✗（借这条必须排在前面 ✓）")
+
+
 TESTS = (
     ("⭐⭐⭐⭐ 「爬不动」的窗口与执行器**同一处换算**（用户 2026-10-21「天空 3→2 在 L1 上"
      "不按 ↑ 了」）：慢爬不许误报 · 真停住要报 · 0.5 秒下限 · 源码钉",
@@ -10560,6 +10699,10 @@ TESTS = (
      t_calib_buttons_are_alive),
     ("标定按来源分开存",
      t_calib_per_source),
+    ("换来源但面板一样大 ⇒ 直接借用另一条来源的标定（别再要人标）",
+     t_calib_borrow_same_panel),
+    ("黄点**贴在小地图最边上**也得认出来（别再退回旧位置）",
+     t_dot_at_panel_edge_still_found),
     ("标定老格式仍读得出（升级不作废）",
      t_calib_legacy_readable),
     ("老格式必须在界面上说出来",

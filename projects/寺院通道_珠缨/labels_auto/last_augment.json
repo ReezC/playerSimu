@@ -1,0 +1,28 @@
+{
+  "when": "2026-10-24 04:00:34",
+  "build": "2026-10-10b",
+  "frames_dir": "E:\\MyPrograms\\playerSimu\\projects\\寺院通道_珠缨\\frames",
+  "out": "E:\\MyPrograms\\playerSimu\\projects\\寺院通道_珠缨\\labels_auto",
+  "weights": "E:\\MyPrograms\\playerSimu\\projects\\寺院通道_珠缨\\models\\detect_v1.pt",
+  "mode": "pet",
+  "frames": 60,
+  "boxes_added": 69,
+  "frames_merged": 52,
+  "skipped": 0,
+  "skipped_names": [],
+  "first_inputs": [
+    "frame_00227.png",
+    "frame_00228.png",
+    "frame_00229.png",
+    "frame_00230.png",
+    "frame_00231.png"
+  ],
+  "first_returned": [
+    "image0.jpg",
+    "image1.jpg",
+    "image2.jpg"
+  ],
+  "order_mapped": 60,
+  "seconds": 2.7,
+  "canceled": false
+}

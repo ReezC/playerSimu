@@ -30,8 +30,8 @@
 
 from pathlib import Path
 
-from PyQt5.QtCore import QEvent, QObject, Qt
-from PyQt5.QtGui import QValidator
+from PyQt5.QtCore import QEvent, QObject, Qt, QTimer
+from PyQt5.QtGui import QStandardItem, QStandardItemModel, QValidator
 from PyQt5.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
                              QAbstractSpinBox, QApplication, QComboBox,
                              QDoubleSpinBox, QFrame, QScrollArea, QScrollBar,
@@ -170,6 +170,181 @@ class NoWheelDoubleSpinBox(_NoWheel, QDoubleSpinBox):
 
 class NoWheelComboBox(_NoWheel, QComboBox):
     pass
+
+
+class MultiCheckCombo(NoWheelComboBox):
+    """**多选**下拉（勾选式）—— 选项**有限**、又必须能多选时用它。
+
+    用户 2026-10-24 原话："**你要我填的这些参数我都不知道填什么。能弄下列表选项吗？
+    反正都是有限的**" ✓ —— 让人手打项目名 / 类 id 是错的 ✗：打错一个字符就变成
+    另一份素材（或者一个都没选上），而且**看不出错** ✓。
+
+    **框里那行摘要怎么来的**（这块被现场折腾了三轮，结论记在这儿 ✗）：
+      · 一开始想用**可编辑**下拉 + 往 `QLineEdit` 里写摘要 —— 三个坑：
+        ① 文字区是子控件，**吃掉点击** ⇒ 用户"点选没反应" ✗（只好加点击穿透）；
+        ② 弹窗收起时 Qt 按 `currentIndex` 回填/清空那段字 ⇒ "**勾了还显示（未选）**" ✗
+          （只好加"被改了立刻写回"的自愈）；
+        ③ ⚠⚠ 更要命：`setEditable(True)` + 自带 model 的这套组合，
+          在**离屏主窗口自检里反复建/关窗口之后会原生崩溃**
+          （`0xC0000409`，`faulthandler` 里连 Python 栈都没有 ✗；二分定位到就是这一句 ✓）。
+      · ⇒ 现在**不用可编辑模式** ✗：模型第 0 行是一行**隐藏的"摘要行"**，
+        `setCurrentIndex(0)` ⇒ 非可编辑下拉自己把 `currentText()` 画出来 ✓ ——
+        字号/对齐都跟别的下拉一样，而且**没有 lineEdit 可以被清空/吃点击** ✓。
+      · 选项从第 1 行开始 ✓；弹出列表里把第 0 行**藏起来** ✓（`view().setRowHidden`）。
+
+    其它行为：
+      · 点开是勾选列表；**点一项不收起**（`showPopup()` 补一下 ✓ 否则选 3 项要点开 3 次 ✗）；
+      · **点框里任何地方都能展开**（`mousePressEvent` ✓ 用户现场："**点选没反应**"）；
+      · 摘要：`已选 2 项：森林迷宫_珠缨、鳄鱼潭1` / `（未选）` ✓（前 3 个 + `…`，全量在 tooltip）；
+      · `checked()` 返回**值**（`Qt.UserRole`），不是显示文字 ✓（显示文字会带中文说明 ✓）。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._popup_shown = False
+        self._suspend = False               # 自己改模型时别触发重算（防自激 ✓）
+        self._view_hooked = False
+        self._model = QStandardItemModel(0, 1, self)
+        self.setModel(self._model)
+        self.setEditable(False)             # ⚠ 千万别开（见类说明 ③：会原生崩溃 ✗）
+        self.setMaxVisibleItems(20)
+        self._summary = QStandardItem("（未选）")
+        self._summary.setFlags(Qt.NoItemFlags)      # 摘要行不可选、不可勾
+        self._suspend = True
+        self._model.appendRow(self._summary)
+        self._suspend = False
+        self._model.itemChanged.connect(self._on_model_changed)
+        self.currentIndexChanged.connect(self._on_index_changed)
+        self._refresh()
+
+    # ---------------- 摘要行 ----------------
+    def _refresh(self):
+        """把摘要写进第 0 行，并把当前项摆回它（非可编辑下拉靠 `currentText()` 显示 ✓）。"""
+        if self._suspend:
+            return
+        rows = self._checked_rows()
+        names = [t for _v, t in rows]
+        if not names:
+            txt = "（未选）"
+        else:
+            txt = "已选 %d 项：%s%s" % (len(names), "、".join(names[:3]),
+                                      "…" if len(names) > 3 else "")
+        self._suspend = True
+        try:
+            self._summary.setText(txt)
+            if self.currentIndex() != 0:
+                self.setCurrentIndex(0)
+        finally:
+            self._suspend = False
+        self.setToolTip("、".join(names) if names else "（未选）")
+
+    def _on_model_changed(self, *_a):
+        """任何一条的勾选状态变了 ⇒ 重算摘要 ✓（谁改的勾选都算数 ✓）。"""
+        self._refresh()
+
+    def _on_index_changed(self, _i):
+        # Qt 点了列表项之后会把 currentIndex 挪到那一行 ⇒ 立刻摆回摘要行（否则框里显示
+        # "1 怪物"这种选项文字，和摘要对不上 ✗）
+        self._refresh()
+
+    # ---------------- 展开 / 收起 ----------------
+    def _hook_view(self):
+        if self._view_hooked:
+            return
+        v = self.view()
+        v.pressed.connect(self._on_pressed)
+        v.setRowHidden(0, True)             # 摘要行不进下拉列表 ✓
+        self._view_hooked = True
+
+    def showPopup(self):
+        self._hook_view()
+        super().showPopup()
+        self._popup_shown = True
+        self._refresh()
+
+    def hidePopup(self):
+        self._popup_shown = False
+        super().hidePopup()
+        self._refresh()                     # 收起后把摘要摆回去（Qt 可能挪过 currentIndex ✓）
+
+    def mousePressEvent(self, ev):
+        """**点框里任何地方都能展开**（非可编辑下拉本来也大多这样，显式写死更稳 ✓）。
+
+        ⚠ 已经展开时交给基类：点箭头该收起，别把"点一下收起来"吃掉 ✗。
+        """
+        if not self._popup_shown:
+            self.showPopup()
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    # ---------------- 选项 ----------------
+    def set_items(self, items):
+        """填选项：`[(值, 显示名), …]` 或 `[值, …]`（值即显示名）。
+
+        ⚠ **保留已勾选的**（按 `str(值)` 比 ✓）：`set_items` 会在"换项目"时重填
+        （候选项目变了 ✓），这时候把用户已经勾好的清空就白点了 ✗。
+        """
+        keep = {str(v) for v in self.checked()}
+        self._suspend = True
+        try:
+            if self._model.rowCount() > 1:
+                self._model.removeRows(1, self._model.rowCount() - 1)
+            if self._model.rowCount() == 0:
+                self._model.appendRow(self._summary)
+            for it in (items or []):
+                if isinstance(it, (tuple, list)) and len(it) >= 2:
+                    val, text = it[0], str(it[1])
+                else:
+                    val, text = it, str(it)
+                row = QStandardItem(text)
+                row.setData(val, Qt.UserRole)
+                row.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                row.setCheckState(Qt.Checked if str(val) in keep else Qt.Unchecked)
+                self._model.appendRow(row)
+        finally:
+            self._suspend = False
+        if self._view_hooked:
+            self.view().setRowHidden(0, True)
+        self._refresh()
+
+    def _checked_rows(self):
+        """勾选的 `(值, 显示文字)`（按选项顺序 ✓；**跳过第 0 行摘要** ✓）。"""
+        out = []
+        for i in range(1, self._model.rowCount()):
+            it = self._model.item(i)
+            if it is not None and it.checkState() == Qt.Checked:
+                out.append((it.data(Qt.UserRole), it.text()))
+        return out
+
+    def checked(self):
+        """勾选的值（按选项顺序 ✓）。"""
+        return [v for v, _t in self._checked_rows()]
+
+    def set_checked(self, values):
+        """按值勾选（**不在列表里的值直接忽略** ✓ —— 老项目里存着一个已经删掉的项目名，
+        不该炸，也不该凭空多一行 ✗）。"""
+        want = {str(v) for v in (values or [])}
+        self._suspend = True
+        try:
+            for i in range(1, self._model.rowCount()):
+                it = self._model.item(i)
+                if it is not None:
+                    it.setCheckState(Qt.Checked if str(it.data(Qt.UserRole)) in want
+                                     else Qt.Unchecked)
+        finally:
+            self._suspend = False
+        self._refresh()
+
+    def _on_pressed(self, index):
+        if index.row() == 0:                # 摘要行（本来也藏着，双保险 ✓）
+            return
+        it = self._model.itemFromIndex(index)
+        if it is not None:
+            it.setCheckState(Qt.Unchecked if it.checkState() == Qt.Checked
+                             else Qt.Checked)
+            self._refresh()
+        self.showPopup()          # ⚠ 点一下别把列表收起来（多选要连着点 ✓）
 
 
 class NoWheelSlider(_NoWheel, QSlider):

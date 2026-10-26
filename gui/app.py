@@ -180,12 +180,11 @@ def _arm_watchdog(seconds, tag, done, code):
         # ⭐ 2026-10-21：强制退出这条路上**也要把自己占的 UDP 端口锁放掉** ✓
         #   （不然"看门狗兜住了退出"与"下次启动说端口被占"会同时发生 ✗ —— 用户报的
         #     「窗口关掉但是实例清不掉」正是这个组合 ✓）。
-        try:
-            from core import instance as _inst
-            _inst.release_my_ports()
-        except Exception:                            # noqa: BLE001
-            pass
-        os._exit(int(code))
+        # ⭐ 2026-10-23：这里原来是裸 `os._exit` ✗ —— 而 `crash.log` 已经证明
+        #   **`os._exit` 自己也会崩**（`Windows fatal exception: code 0xc000000d`，
+        #   `core/appexit.py` 里那段现场 ✓）⇒ 走 `hard_exit`（它有 `TerminateProcess` 兜底 ✓）。
+        from core.appexit import hard_exit as _he
+        _he(int(code))
 
     th = threading.Thread(target=_fire, name="watchdog-%s" % tag, daemon=True)
     th.start()

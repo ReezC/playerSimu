@@ -110,7 +110,7 @@ decision:
   - 2500
   atk_target_count: 0
   mob_atk_cd_ms: 2000
-  input_device: remote
+  input_device: serial
   attack_cd: 800
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 400
@@ -219,16 +219,16 @@ decision:
   route_goto_set: ''
   align_tol_px: 12
   align_hold_ms: 1000
-  climb_align_gap_ms: 180
-  climb_align_near_px: 5
+  climb_align_gap_ms: 200
+  climb_align_near_px: 30
   climb_retry_delay_s: 0.0
   climb_retry_delay_inc_s: 0.0
   goto_timeout_s: 15.0
   chase_goto_max_s: 5.0
   goto_timeout_key: 表情_无语
   disable_chase_pathfinding: true
-  jump_start_px: 75
-  move_retry_ms: 500
+  jump_start_px: 90
+  move_retry_ms: 1200
   custom_timers:
   - name: 自动喂宠
     seq:
@@ -359,6 +359,8 @@ decision:
   multi_leave_delay_s: 1.0
   track_buffer_ms: 1000
   air_gap_px: 200
+  climb_align_first: false
+  zone_edge_guard_px: 50
 notes: ''
 capture:
   source: file
@@ -467,10 +469,10 @@ train:
   resume: false
 live:
   weights: E:\MyPrograms\playerSimu\projects\鳄鱼潭1\models\detect_v3_640.engine
-  capture_source: stream
+  capture_source: window
   rect:
-  - 4
-  - 34
+  - 86
+  - 81
   - 1366
   - 768
   url: udp://0.0.0.0:5000
@@ -489,7 +491,7 @@ live:
   - 0.998538
   - 0.96
   rect_win:
-  - 4134094
+  - 6820374
   - 冒险岛怀旧服
   iou_mob: 0.85
   max_det: -1

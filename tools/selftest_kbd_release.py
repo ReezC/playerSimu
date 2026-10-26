@@ -401,10 +401,19 @@ def t_pad_delta_from_tracker():
     #     `GetLastError` 还是 0（本机 2026-10-05 实测 ✓ 见 `execution/pointer.py::pointer_warp` ✓）
     #     ⇒ 那样会让用例随"屏幕锁没锁"红绿 ✗。真拨动/拨不动两条路都在 ④ 用假指针钉住了 ✓。
     _p0 = dptr.pointer_pos()
-    check(_p0 is not None, "`GetCursorPos` 读不到（真 Win32 这条路 ✗）")
-    _r = dptr.pointer_warp(_p0[0], _p0[1])
-    check(isinstance(_r, bool),
-          "`pointer_warp` 没回布尔（拨不动时上层没法判断 / 留痕 ✗）：%r" % (_r,))
+    if _p0 is None:
+        # ⚠ 2026-10-23 本机实测：**锁屏 / 没有交互桌面**时 `GetCursorPos()` 直接失败
+        #   （`ok=0, x=0, y=0` ✓ 与 `pointer_warp` 那条同一个成因 ✓）。
+        #   这一段只是\"真 Win32 摸得着\"的冒烟；行为级的东西在 ④ 全用**假指针**钉住了 ✓
+        #   ⇒ 跳过时要**说出来**（别静默变绿 ✗），而且在真机上必须验 ✓。
+        print("   ⚠ 跳过本条：当前会话读不到光标（锁屏 / 无交互桌面 ✓ 用户 2026-10-23 "
+              "本机实测 `GetCursorPos` 回 0）—— 跟踪线程的前提就是这个，"
+              "**真机上必须验** ✓")
+        return
+    else:
+        _r = dptr.pointer_warp(_p0[0], _p0[1])
+        check(isinstance(_r, bool),
+              "`pointer_warp` 没回布尔（拨不动时上层没法判断 / 留痕 ✗）：%r" % (_r,))
 
     pos = [100, 100]                    # 假指针：位置由测试说了算 ✓
     warps = []
@@ -1110,6 +1119,202 @@ def t_bridge_reports_why_and_skips_reset():
             pass
 
 
+def t_kbd_socket_is_serialized():
+    """⭐⭐⭐⭐⭐ **同一个 SSL socket 不许被两条线程同时动**（2026-10-22 闪退的根因）。
+
+    **现场**：`Application Error` 2026-10-22 00:26:35、模块 **`libssl-3-x64.dll`**、
+    `0xc0000005`；`crash.log` 同一份栈里 —— 崩溃线程在
+
+        `agent.tick → input.release_all → key_up → _send_remote → kbd_client.send → ssl.sendall`
+
+    而**另一条线程**同时在 `kbd_client._drain → ssl.recv`。当时只有 `send` 拿锁 ✗：
+
+      · `_drain()` 的 `recv` 不持锁 ⇒ 读着被人写；
+      · `close()` 不持锁，而调用方是**后台重连线程**（`reset_link → _drop_remote`）⇒ 发送中被人关。
+
+    OpenSSL 的 `SSL*` 同一时刻只允许一个线程动 —— 违反了不是抛异常，是**整进程闪退** ✓。
+
+    钉两件：
+      ① 三条线程（1 读 + 3 发）＋ 中途 `close()` 挤在一起时，假 socket **一次重叠都没有**；
+      ② 源码级：`_drain` 的 `recv` 和 `close()` 都在锁里（防以后又被改回去 ✗）。
+    """
+    import socket as _socket
+    import threading as _th
+    import time as _t
+
+    from remote_kbd import kbd_client as kc
+
+    class _Sock:
+        """会记账的假 socket：**同时有两个人进来**就算一次重叠（真 SSL 上这就是崩溃 ✓）。"""
+
+        def __init__(self):
+            self.busy = 0
+            self.overlap = 0
+            self.guard = _th.Lock()
+            self.closed = False
+            self.n_send = 0
+
+        def _in(self):
+            with self.guard:
+                self.busy += 1
+                if self.busy > 1:
+                    self.overlap += 1
+
+        def _out(self):
+            with self.guard:
+                self.busy -= 1
+
+        def settimeout(self, _t0):
+            pass                       # 超时只有在锁里改才有意义 ⇒ 不算"动 socket"
+
+        def sendall(self, _data):
+            self._in()
+            try:
+                _t.sleep(0.0002)
+                self.n_send += 1
+            finally:
+                self._out()
+
+        def recv(self, _n):
+            self._in()
+            try:
+                _t.sleep(0.001)
+                if self.closed:
+                    raise OSError("socket closed")
+                raise _socket.timeout()
+            finally:
+                self._out()
+
+        def close(self):
+            self._in()
+            try:
+                self.closed = True
+            finally:
+                self._out()
+
+    sock = _Sock()
+    c = kc.KbdClient.__new__(kc.KbdClient)          # 不连网 ✓
+    c._sock = sock
+    c._lock = _th.Lock()
+    c._stop = _th.Event()
+    c._sending = 0
+    c._dirty = False
+    c.ok, c.fails, c.last_err, c.role = True, 0, "", ""
+    c.sent = c.replies = 0
+    c.last_send_at = c.last_reply_at = 0.0
+    c._pending, c._rtt_t0 = 0, None
+    c._log_carry, c.a_log_lines, c._a_log_banner = b"", 0, True
+    c._cur_ev, c._cur_box = _th.Event(), None
+    c._win_ev, c._win_box = _th.Event(), None
+    c._sample_pending = lambda: None               # 别往仓库的 perf.log 里写东西 ✓
+
+    reader = _th.Thread(target=c._drain, daemon=True)
+    reader.start()
+
+    def _spam():
+        for _i in range(120):
+            c.send("PRESS a")
+
+    senders = [_th.Thread(target=_spam, daemon=True) for _ in range(3)]
+    for _th0 in senders:
+        _th0.start()
+    _t.sleep(0.02)
+    c.close()                                       # ⚠ 就是重连线程干的那件事 ✓
+    for _th0 in senders:
+        _th0.join(6.0)
+    reader.join(3.0)
+
+    check(sock.overlap == 0,
+          "有 %d 次「两个线程同时在动同一个 socket」⇒ 真机上就是 libssl 访问违例闪退 ✗"
+          "（读线程的 recv 必须和前后的 sendall/close 互斥 ✓）" % sock.overlap)
+    check(sock.n_send > 0, "压力里一条都没发出去（用例本身没测到东西 ✗）")
+
+    src = (ROOT / "remote_kbd" / "kbd_client.py").read_text(encoding="utf-8")
+    _drain = src[src.index("def _drain(self):"):]
+    _drain = _drain[:_drain.index("def close(self):")]
+    check("with self._lock:" in _drain and "self._sock.recv(" in _drain,
+          "`_drain` 里的 `recv` 又不在锁里了 ⇒ 读着被人 sendall = libssl 闪退 ✗")
+    _close = src[src.index("def close(self):"):]
+    check("with self._lock:" in _close[:1200],
+          "`close()` 又没持锁了 ⇒ 后台重连线程能在 sendall 中途把 socket 关掉（闪退 ✗）")
+
+
+def t_serial_close_lets_reader_go():
+    """⭐⭐⭐⭐ **关串口必须先叫醒读线程、再关句柄**（2026-10-22 现场：空壳进程攥着 COM8）。
+
+    **现场**（用户原话："**本地ProMicro连不上了 进程好像没杀掉**"）：
+      · 新实例点「连接」⇒ `串口 COM8 被**别的进程占用**了（PermissionError(13, 拒绝访问)）`；
+      · 任务管理器里却找不到"另一个工作台" —— 只有一个 **0 线程、几十 KB、无窗口**的空壳 ✓；
+      · 那个空壳是 00:49 开的实例：窗口早就关了，**进程一直没退** ⇒ COM8 一直被它攥着 ✓。
+
+    **为什么退不掉**：`close()` 原来是"置停止位 ⇒ 直接 `self._ser.close()`" ✗，
+      而读线程正阻塞在 `self._ser.read(256)` 里 —— Windows 上有人读着的时候关句柄会**等**，
+      收尾就卡在那儿（和 531 那条"解释器收尾卡死"是同一个味道 ✓）。
+
+    **钉两件**：
+      ① 假串口的 `read()` 会一直阻塞（直到 `cancel_read()` 被调）⇒ `close()` 必须在
+         **1 秒内**返回，且**先 `cancel_read` 再 `close`**，读线程要真的退出；
+      ② 源码级：`close()` 里有 `cancel_read` 和 `join`（防以后又被改回去 ✗）。
+    """
+    import threading as _th
+    import time as _t
+
+    from remote_kbd import serial_kbd as sk
+
+    order = []
+
+    class _FakeSer:
+        """`read()` 阻塞到 `cancel_read()` —— 复刻 Windows 上"有人读着"的那个状态 ✓。"""
+
+        def __init__(self):
+            self.gate = _th.Event()
+            self.closed = False
+
+        def read(self, _n):
+            order.append("read")
+            self.gate.wait(5.0)
+            if self.closed:
+                raise OSError("port closed")
+            return b""
+
+        def cancel_read(self):
+            order.append("cancel_read")
+            self.gate.set()
+
+        def close(self):
+            order.append("close")
+            self.closed = True
+
+    obj = sk.SerialKbd.__new__(sk.SerialKbd)          # 不真开串口 ✓
+    obj._ser = _FakeSer()
+    obj._lock = _th.Lock()
+    obj._stop = _th.Event()
+    obj.ok, obj.fails, obj.last_err = True, 0, ""
+    obj.sent, obj.replies = 0, 0
+    obj.last_send_at = obj.last_reply_at = 0.0
+    obj._pending, obj._rtt_t0 = 0, None
+    obj._reader = _th.Thread(target=obj._drain, daemon=True)
+    obj._reader.start()
+    _t.sleep(0.05)                                   # 让它真的阻塞在 read 里 ✓
+
+    t0 = _t.time()
+    obj.close()
+    dt = _t.time() - t0
+
+    check(dt < 1.0,
+          "`close()` 花了 %.2f 秒 ⇒ 读线程还阻塞在 `read()` 里时就被关句柄 ✗ "
+          "（收尾会卡住、进程不散、串口一直攥在那个空壳手里 ✓ 用户 2026-10-22）" % dt)
+    check("cancel_read" in order, "`close()` 没调 `cancel_read()` ⇒ 阻塞的 read 叫不醒 ✗")
+    check(order.index("cancel_read") < order.index("close"),
+          "先关句柄再叫醒读线程 ⇒ 顺序反了（Windows 上关句柄会等那条 read）✗")
+    check(not obj._reader.is_alive(), "`close()` 之后读线程还活着 ✗（它还会去碰已经关掉的端口）")
+
+    src = (ROOT / "remote_kbd" / "serial_kbd.py").read_text(encoding="utf-8")
+    _close = src[src.index("def close(self):"):]
+    check("cancel_read" in _close and "join(" in _close,
+          "`serial_kbd.close()` 又变回\"置停止位就关句柄\"了 ⇒ 关不干净、串口被空壳攥住 ✗")
+
+
 TESTS = (
     ("停自动要真的松干净（下降沿 + 不许把键按回去）", t_stop_automation_releases_keys),
     ("⭐⭐⭐⭐ 桥断开必须留原因；只有串口真坏才复位板子（别自己喂自己的重连循环）",
@@ -1139,6 +1344,10 @@ TESTS = (
      t_trace_push_is_async_and_once),
     ("⭐ B 侧打点「还没等到回执的条数」（kbd_pending：积压最直接的量化）",
      t_kbd_pending_is_sampled),
+    ("⭐⭐⭐⭐⭐ 同一个 SSL socket 不许被两条线程同时动（读/写/关全互斥；2026-10-22 libssl 闪退）",
+     t_kbd_socket_is_serialized),
+    ("⭐⭐⭐⭐ 关串口要先叫醒读线程再关句柄（不然空壳进程攥着 COM8；用户 2026-10-22）",
+     t_serial_close_lets_reader_go),
 )
 
 

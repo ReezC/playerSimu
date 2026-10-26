@@ -2,12 +2,20 @@
   "attack_dist": 80.0,
   "min_attack_dist": 0,
   "attack_up_dist": 30,
-  "attack_down_dist": 20,
+  "attack_down_dist": 22,
+  "attack_fan_deg": 0.0,
+  "jump_attack_enabled": false,
+  "jump_attack_height": 50.0,
+  "fall_speed_px_s": 600.0,
+  "walk_stall_jump": false,
   "chase_jump_enabled": true,
   "chase_jump_min": -10,
-  "chase_jump_max": 8,
-  "chase_jump_dash_ms": 550,
-  "mouse_speed": 1.1999999999999995,
+  "chase_jump_max": 5,
+  "chase_jump_dash_ms": 300,
+  "chase_jump_edge_guard_enabled": true,
+  "chase_jump_edge_guard_px": 150,
+  "station_turn_interval_ms": 1000,
+  "mouse_speed": 0.9999999999999999,
   "evade_type": "jump",
   "jump_interval": 0,
   "jump_random_prob": 0.1,
@@ -73,10 +81,11 @@
     "right": "right",
     "up": "up",
     "down": "down",
-    "attack": "t",
+    "attack": "s",
     "jump": "D",
-    "hp_pot": "g",
-    "mp_pot": null,
+    "pickup": "space",
+    "hp_pot": "ctrl",
+    "mp_pot": "pageup",
     "feed_pet": "pagedown",
     "shop": null,
     "enter": "enter"
@@ -85,21 +94,24 @@
     1000,
     2500
   ],
+  "atk_target_count": 0,
+  "mob_atk_cd_ms": 0,
   "input_device": "remote",
-  "attack_cd": 300,
+  "attack_cd": 480,
   "attack_lock_debounce_ms": 1000,
-  "min_turn_hold_ms": 1000,
-  "turn_output_delay_ms": 500,
+  "min_turn_hold_ms": 500,
+  "turn_output_delay_ms": 0,
+  "auto_pickup": false,
   "player_track_jump": 200,
-  "player_foot_offset_px": 0,
+  "player_foot_offset_px": -25,
   "player_box_min_area_pct": 0.0,
-  "player_box_area_base_s": 3.0,
+  "player_box_area_base_s": 1.0,
   "player_box_area_tol_pct": 0.0,
   "hp_bar": [
     0.341142,
     0.973958,
-    0.120791,
-    0.018229
+    0.118594,
+    0.016927
   ],
   "mp_bar": [
     0.464129,
@@ -107,84 +119,90 @@
     0.120791,
     0.018229
   ],
-  "probe_calib": {},
+  "probe_calib": {
+    "x_ratio": 0.05197657393850659,
+    "y_ratio": 0.013020833333333334,
+    "cell_ratio": 0.010248901903367497,
+    "gap_ratio": 0.002053440702781845,
+    "bits": 40,
+    "frame": [
+      1366,
+      768
+    ],
+    "solved_at": "2026-10-23 13:04:20"
+  },
   "hp_color": [
     [
       0,
       0,
-      137
+      138
     ],
     [
-      77,
-      80,
+      75,
+      75,
       255
     ]
   ],
   "mp_color": [
     [
-      146,
-      79,
+      143,
+      74,
       0
     ],
     [
       255,
-      199,
-      79
+      194,
+      73
     ]
   ],
-  "hp_threshold": 63,
-  "mp_threshold": 7,
-  "pot_cd": 1001,
+  "hp_threshold": 39,
+  "mp_threshold": 3,
+  "pot_cd": 1000,
   "mob_sets_ttl_s": 3.0,
   "auto_hp_pot": true,
-  "auto_mp_pot": false,
+  "auto_mp_pot": true,
   "strategy": "patrol",
   "vision_top": 150,
-  "vision_bottom": 50,
+  "vision_bottom": 150,
   "vision_left": -1,
   "vision_right": -1,
   "vision_center": false,
   "vision_off_x": 0,
   "vision_off_y": 0,
+  "vision_detect_only": false,
+  "big_mob_enabled": true,
+  "big_mob_ratio": 1.5,
+  "big_mob_range_px": 1000.0,
   "sweep_turn_cd": 500,
   "back_range": 150,
-  "route_goto_set": "右下",
-  "align_tol_px": 10,
-  "align_hold_ms": 1000,
-  "climb_align_gap_ms": 180,
-  "climb_align_near_px": 20,
-  "climb_retry_delay_s": 1.0,
-  "climb_retry_delay_inc_s": 1.0,
-  "goto_timeout_s": 10.0,
-  "chase_goto_max_s": 0.0,
+  "sweep_edge_turn_px": 100,
+  "sweep_turn_cd_enabled": true,
+  "sweep_edge_turn_enabled": true,
+  "station_spot": {},
+  "station_pickup_enabled": false,
+  "station_pickup_min_s": 0.0,
+  "station_pickup_max_s": 0.0,
+  "station_pickup_spots": [],
+  "multi_spots": [],
+  "multi_leave_wait_enabled": false,
+  "multi_leave_delay_s": 0.0,
+  "route_goto_set": "二楼",
+  "align_tol_px": 12,
+  "align_hold_ms": 3000,
+  "air_gap_px": 200,
+  "climb_align_gap_ms": 200,
+  "climb_align_first": true,
+  "climb_align_near_px": 30,
+  "climb_retry_delay_s": 0.0,
+  "climb_retry_delay_inc_s": 0.0,
+  "goto_timeout_s": 15.0,
+  "chase_goto_max_s": 5.0,
   "goto_timeout_key": "表情_无语",
   "disable_chase_pathfinding": true,
-  "jump_start_px": 100,
-  "move_retry_ms": 1000,
-  "battle_zones": [
-    {
-      "set": "左上",
-      "cd_s": 3.5,
-      "idle_foothold": "",
-      "fight_max_s": 30.0,
-      "fight_dst": "右下",
-      "can_fight": true
-    },
-    {
-      "set": "右下",
-      "cd_s": 3.0,
-      "idle_foothold": "33",
-      "fight_max_s": 0.0,
-      "fight_dst": "左上",
-      "can_fight": true
-    }
-  ],
-  "battle_zone_sets": [
-    "左上",
-    "右下"
-  ],
-  "debounce_conf": 0.4,
-  "debounce_ms": 2000,
+  "jump_start_px": 75,
+  "move_retry_ms": 1200,
+  "zone_edge_guard_px": 40,
+  "track_buffer_ms": 2000,
   "custom_timers": [
     {
       "name": "自动喂宠",
@@ -199,8 +217,8 @@
         }
       ],
       "interval": [
-        8.0,
-        12.0
+        5.0,
+        10.0
       ],
       "pause_on_rest": false
     },
@@ -234,20 +252,39 @@
         }
       ],
       "interval": [
-        3.0,
-        5.0
+        5.0,
+        10.0
       ],
       "paused": true,
-      "paused_left": 179.95438051701058
+      "paused_left": 502.4470833913947
+    },
+    {
+      "name": "自动攻击药水",
+      "seq": [
+        {
+          "type": "down",
+          "key": "攻击药水"
+        },
+        {
+          "type": "up",
+          "key": "攻击药水"
+        }
+      ],
+      "interval": [
+        3.0,
+        3.0
+      ],
+      "paused": true,
+      "paused_left": 18.655999999988126
     }
   ],
   "facing_timeout_min": 0.0,
   "player_lost_timeout_min": 3.0,
   "resetall_interval": 30,
-  "anti_afk_enabled": true,
-  "anti_afk_type": "spot_rest",
+  "anti_afk_enabled": false,
+  "anti_afk_type": "hidden_rest",
   "anti_afk_min": 25.0,
-  "anti_afk_max": 28.0,
+  "anti_afk_max": 30.0,
   "anti_afk_enter_seq": [
     {
       "type": "down",
@@ -342,148 +379,36 @@
     {
       "type": "up",
       "key": "普攻"
-    },
-    {
-      "type": "delay",
-      "ms": 1000
-    },
-    {
-      "type": "down",
-      "key": "普攻"
-    },
-    {
-      "type": "up",
-      "key": "普攻"
     }
   ],
-  "anti_afk_rest_min": 3.0,
-  "anti_afk_rest_max": 5.0,
-  "anti_afk_spot_set": "右下休息平台",
-  "anti_afk_spot_seq": [
-    {
-      "type": "delay",
-      "ms": 4000
-    },
-    {
-      "type": "down",
-      "key": "椅子"
-    },
-    {
-      "type": "up",
-      "key": "椅子"
-    }
-  ],
-  "anti_afk_spot_after": "右下",
+  "anti_afk_rest_min": 3.5,
+  "anti_afk_rest_max": 5.5,
+  "anti_afk_spot_set": "",
+  "anti_afk_spot_seq": [],
+  "anti_afk_spot_after": "",
   "anti_afk_spot_loop": false,
-  "anti_afk_spot_loop_items": [
-    {
-      "name": "喊话1",
-      "seq": [
-        {
-          "type": "down",
-          "key": "enter"
-        },
-        {
-          "type": "up",
-          "key": "enter"
-        },
-        {
-          "type": "delay",
-          "ms": 500
-        },
-        {
-          "type": "down",
-          "key": "up"
-        },
-        {
-          "type": "up",
-          "key": "up"
-        },
-        {
-          "type": "delay",
-          "ms": 500
-        },
-        {
-          "type": "down",
-          "key": "enter"
-        },
-        {
-          "type": "up",
-          "key": "enter"
-        }
-      ]
-    },
-    {
-      "name": "喊话2",
-      "seq": [
-        {
-          "type": "delay",
-          "ms": 2000
-        },
-        {
-          "type": "down",
-          "key": "enter"
-        },
-        {
-          "type": "up",
-          "key": "enter"
-        },
-        {
-          "type": "delay",
-          "ms": 500
-        },
-        {
-          "type": "down",
-          "key": "up"
-        },
-        {
-          "type": "up",
-          "key": "up"
-        },
-        {
-          "type": "delay",
-          "ms": 500
-        },
-        {
-          "type": "down",
-          "key": "up"
-        },
-        {
-          "type": "up",
-          "key": "up"
-        },
-        {
-          "type": "delay",
-          "ms": 1000
-        },
-        {
-          "type": "down",
-          "key": "enter"
-        },
-        {
-          "type": "up",
-          "key": "enter"
-        }
-      ]
-    }
-  ],
+  "anti_afk_spot_loop_items": [],
   "anti_afk_spot_loop_min": 30.0,
-  "anti_afk_spot_loop_max": 120.5,
-  "anti_afk_spot_loop_hold": true,
+  "anti_afk_spot_loop_max": 60.0,
+  "anti_afk_spot_loop_hold": false,
   "anti_afk_retry_on_interrupt": true,
-  "anti_afk_retry_sec": 6.0,
-  "reconnect_enabled": false,
+  "anti_afk_retry_sec": 10.0,
+  "reconnect_enabled": true,
   "reconnect_probe_after_lost_sec": 0.0,
   "reconnect_step_timeout_ms": 3000,
   "reconnect_queue_timeout_ms": 180000,
   "reconnect_max_retry": 3,
   "reconnect_resume_auto": true,
+  "reconnect_server_x": 0.3309,
+  "reconnect_server_y": 0.2135,
+  "reconnect_channel_x": 0.4071,
+  "reconnect_channel_y": 0.4922,
+  "reconnect_channel": 17,
   "custom_keys": {
     "攻击药水": "grave",
     "回避药水": "5",
     "隐身术": "a",
     "普攻": "f",
-    "表情_无语": "f6",
-    "椅子": "x"
+    "表情_无语": "f6"
   }
 }

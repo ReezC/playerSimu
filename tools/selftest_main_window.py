@@ -552,7 +552,12 @@ def t_startup_opens_last_project_and_says_where_params_go():
         #   （只写内存的话，主窗口读到的是一份**没有 decision 段**的项目 ⇒ 参数落到默认 0 ✗
         #     —— 本轮就这么红过一次 ✓）
         proj.set("decision", {"chase_jump_enabled": True, "chase_jump_min": -10,
-                              "chase_jump_max": 5, "chase_jump_dash_ms": 137}, save=True)
+                              "chase_jump_max": 5, "chase_jump_dash_ms": 137,
+                              # ⭐ 「距离平台边缘禁用」那两个也一起验（用户 2026-10-23 现场：
+                              #   "**追击起跳的距离平台边缘禁用(px)参数，怎么每次打开都要重新
+                              #   设置？？**"）—— 值用 144 跟上面 137 区分开，免得串台 ✓。
+                              "chase_jump_edge_guard_enabled": True,
+                              "chase_jump_edge_guard_px": 144}, save=True)
         _mw.last_opened = lambda: Project.open(proj.root)
 
         # ① 启动就该把它打开 ✓（不打桩的话这里会是 None ✗ = 用户看到的"没保存"那套 ✓）
@@ -565,6 +570,28 @@ def t_startup_opens_last_project_and_says_where_params_go():
             sp = w.player_panel.sp_chase_dash
             check(int(sp.value()) == 137,
                   "启动打开项目后，冲刺时间控件没回填（该 137）：%r" % sp.value())
+            # ②' ⭐ 「距离平台边缘禁用(px)」也必须回填（用户 2026-10-23：**每次打开都要重设** ✗）
+            #     —— 它原来**只**在构造时读过一次 settings，而"打开项目 ⇒ 灌 settings"走
+            #     `_sync_from_settings`，那里**漏了它两个控件** ⇒ 存是存了、打开却是默认 100 ✓。
+            _ck = w.player_panel.ck_chase_edge_guard
+            _sp2 = w.player_panel.sp_chase_edge_px
+            check(bool(_ck.isChecked()),
+                  "「距离平台边缘禁用」的勾选状态没回填（项目里是开着的）⇒ 每次打开都要重勾 ✗")
+            check(int(_sp2.value()) == 144,
+                  "「距离平台边缘禁用(px)」没回填（该 144，实得 %r）⇒ 每次打开都要重填 ✗"
+                  % (_sp2.value(),))
+            # ③' ⭐⭐ **UI 规范**（用户 2026-10-23："**完全不符合UI规范，它应该是从属于
+            #   追击起跳勾选项的参数**"）：三个子参数必须挂在**缩进子块**里（同一处管的 ✓），
+            #   不能像原来那样各自 `addRow` 平铺成三个平级行 ✗。
+            _sub = w.player_panel._cj_sub
+            check(_sub is not None, "追击起跳的参数子块 `_cj_sub` 不见了 ✗（UI 规范那条丢了吧）")
+            check(_sub.layout().contentsMargins().left() >= 16,
+                  "子参数块没缩进（左内边距 %d，该 ≥ 16）⇒ 看着还是平级参数 ✗"
+                  % (_sub.layout().contentsMargins().left(),))
+            for _name in ("sp_chase_dash", "ck_chase_edge_guard", "sp_chase_edge_px"):
+                _w = getattr(w.player_panel, _name)
+                check(_w.parent() is _sub,
+                      "`%s` 不在追击起跳的子参数块里 ⇒ 又是平铺的平级参数 ✗" % _name)
 
             # ③ 顶部那行：有项目 ⇒ 说清"按项目保存 + 是哪个项目"✓
             lbl = w.player_panel.lbl_save_hint
@@ -776,8 +803,18 @@ def t_watchdog_guarantees_exit():
     check(_i_exec < _i_exit, "收尾看门狗没 arm 在 `app.exec_()` **之后** ✗")
     check("_boot_done.set()" in _main and "_exit_done.set()" in _main,
           "正常路径没有收工信号 ⇒ 会把好进程也杀掉 ✗")
-    check("os._exit(int(code))" in _src and "dump_traceback" in _src,
+    # ⚠ 2026-10-23 改口径：原来是钉 `os._exit(int(code))`，可 `crash.log` 已经证明
+    #   **`os._exit` 自己也会崩**（`Windows fatal exception: code 0xc000000d`，
+    #   函数还返回了 ⇒ 又掉回解释器收尾 ⇒ 空壳 ✗，用户："**进程又没杀掉 请根治**"）
+    #   ⇒ 看门狗也改走 `hard_exit`（`os._exit` + `TerminateProcess` 两层 ✓）。
+    #   钉的东西**更严**了：既要"先留栈"，又要"强退走 hard_exit"（不许裸 `os._exit` ✗）。
+    _fire_src = _src[_src.index("def _fire():"):
+                     _src.index("th = threading.Thread(target=_fire")]
+    check("dump_traceback" in _fire_src,
           "看门狗该「先留栈、再强退」（没栈 ⇒ 下次还是查不出来 ✗）")
+    check("hard_exit" in _fire_src and "os._exit(" not in _fire_src,
+          "看门狗还在裸调 `os._exit` ✗ —— 它自己会崩（`0xc000000d` 现场 ✓）⇒ "
+          "必须走 `hard_exit`（里面还有 `TerminateProcess` 兜底 ✓）")
 
     _dir = Path(tempfile.mkdtemp(prefix="watchdog_"))
     _child = _dir / "child.py"

@@ -12297,9 +12297,11 @@ def t_no_chase_path_no_path_tasks():
       ① 开着 + 在「底层」打够 30 秒 ⇒ ⭐ **照常**下「换去二楼」（2026-10-05 修正 ✓）
          且到点**收摊**（界面那行倒计时不留"剩余 0:00" ✓）；
       ② 关着开关 ⇒ 同一份配置照旧下 ✓（**对照组**：别把老行为弄丢 ✗）；
-      ③ 开着 + 人在能打区外 + 攻击范围内有怪 ⇒ **照常打**（⛔ 不许因为"不在战斗区域"就
-         这一拍不打架 —— 怪就在眼前却站着不动才是更严重的毛病 ✗），并且**回区任务照下**
-         ✓（2026-10-06 用户澄清：开关**只**管「因追击发生的寻路」✗ 见 SKILL **271** ✓）；
+      ③ 开着 + 人在能打区外 + 攻击范围内有怪，**且回区路线推出了按键** ⇒ ⭐ **这一拍不打**、
+         跟回区路线走 ✓（**2026-10-22 口径改**：用户原话"编辑战斗区域里都没开底层" ——
+         人在没勾的整层上就不该打；老口径"眼前有怪照打"见下面 ③b 的反证）；
+      ③b **连回区路线都下不出来**（`route_plan` 返回 None）⇒ 照常打 ✓ —— 否则"禁止追怪寻路"
+         会顺带变成"站在那儿挨打"（那正是 2026-10-06 那条要防的 ✓ 所以留这个兜底）；
       ④ **关着开关**时 ③ 那条照旧（不打架 + 先回去 ✓）。
     """
     from decision import jobs as jobmod
@@ -12367,11 +12369,24 @@ def t_no_chase_path_no_path_tasks():
         check(a2._climb is not None,
               "开着开关时**回区任务该照下**（用户 2026-10-06 澄清：开关只管"
               "「因追击发生的寻路」✗ 见 SKILL 271）：%r" % (a2._climb,))
-        check(act.get("state") in ("attack", "chase"),
-              "开着开关时因为「不在战斗区域」这一拍不打架了（怪就在眼前 ⇒ 该打/该追 ✗；"
-              "⛔ 这就是把闸加在函数里会留下的毛病 ✗）：%s" % (act,))
+        # ⭐⭐ **2026-10-22 口径再改**（用户原话："编辑战斗区域里都没开底层" ⇒ 人在没勾的
+        #   层上就不该打；底下 ③b 留了"下不出路线才照打"的兜底 ✓）。
+        check(act.get("state") not in ("attack", "chase")
+              and "不在战斗区域" in str(act.get("reason")),
+              "人在**没勾的层**上还在打（用户 2026-10-22：底层根本没勾选战斗区域 ✗ "
+              "⇒ 有回区路线时这一拍该跟路线走、不打）：%s" % (act,))
+        # ③b **连回区路线都下不出来** ⇒ 照打（别站桩挨打 ✓ 2026-10-06 那条要防的）
+        a2.stop_route("用例：③b 复位")
+        a2.route_plan = lambda dst: None
+        h2.clock.t += 4.0
+        h2.log.clear()
+        act3 = a2.tick(ws2)
+        check(act3.get("state") in ("attack", "chase"),
+              "**下不出回区路线**时也不打了 ⇒ 变成站着挨打（2026-10-06 那条要防的就是这个 ✗）："
+              "%s" % (act3,))
         # ④ 关掉 ⇒ 老行为：不打架 + 先回去 ✓
         a2.stop_route("用例：复位")
+        a2.route_plan = lambda dst: _plan("甲平台")
         s2.disable_chase_pathfinding = False
         # ⚠ **必须越过「区域查询CD(s)」**（默认 3 秒 ✓ 同 `t_zone_rule_under_no_chase_path`
         #   里那句 `h.clock.t = 4.0` ✓）：③ 刚下过一条任务 ⇒ 节流窗口还没过 ⇒ 这一拍**不会**
@@ -15496,8 +15511,10 @@ def t_climb_align_first_switch():
 
     check('not getattr(self, "align_first", True)' in src and "_tol = 0.0" in src,
           "③ 关掉后必须**只走斜跳**：容差取 0 ⇒ 永不判「已对齐」✗")
-    check("先朝 %s 走开几步" in src,
-          "③ 关掉后**太近**时该先走出去 ✗（斜跳窗口 near_px~jump_start_px ✓）")
+    check("先朝 %s 退到超过" in src,
+          "③ 关掉后**太近**时该先退到**超出「起跳距离」**再朝绳走 ✗"
+          "（用户 2026-10-23：\"≤ 30（太近）应该：先朝外走开到 > 90（起跳距离），"
+          "然后再朝绳走\"✓）")
 
     cfg = (root / "core" / "route_cfg.py").read_text(encoding="utf-8")
     check('"climb_align_first"' in cfg,
@@ -15505,11 +15522,90 @@ def t_climb_align_first_switch():
     ag = (root / "decision" / "agent.py").read_text(encoding="utf-8")
     check(ag.count('"climb_align_first"') >= 2 and "self.climb_align_first" in ag,
           "④ `agent.py` 该有默认值 + `to_dict` + `from_dict` ✗（少一个 ⇒ 重启就丢 ✓）")
+    # ⚠ 上面那条只数"出现过几次"——**数不出来"是哪一处"** ⇒ 2026-10-23 现场就是
+    #   `from_dict` 有、`to_dict` **漏了**，可这条照样绿 ✗（用户："我关了对齐上绳梯
+    #   怎么还在对齐" ⇒ 重启/换工程就变回勾上 ✓）。这里钉死**存盘那一格**。
+    _d0 = ag.index("def to_dict")
+    _d1 = ag.index('"climb_align_gap_ms"', _d0)
+    _dump = ag[_d1:ag.index("def ", _d0 + 10)]
+    check('"climb_align_first"' in _dump,
+          "④ `to_dict` 里**必须写 `climb_align_first`** ✗ —— 只读不写 ⇒ 关掉之后"
+          "重启/换工程又变回勾上（用户 2026-10-23 现场 ✓）")
     ui = (root / "gui" / "route_panel.py").read_text(encoding="utf-8")
     check("chk_align_first" in ui and "_sync_align_first" in ui,
           "④ 界面（攀爬参数组）该有「对齐上绳梯」勾选框 ✗")
     check("setEnabled(on)" in ui,
           "④ 关掉后「对齐绳梯移动延迟」必须**置灰不可配** ✗（用户明确要求 ✓）")
+
+
+def t_climb_align_off_window_empty():
+    """⭐⭐⭐⭐ **「对齐上绳梯」关掉了，可斜跳窗口是空的 ⇒ 那一关等于没关**（2026-10-23 现场）。
+
+    **用户原话**："**天空项目 我关了对齐上绳梯 怎么还在对齐**"。
+
+    **现场配置**（`projects/天空/project.yaml` 的 `decision` 段）：
+      `jump_start_px = 20`、`climb_align_near_px = 30`
+      ⇒ 斜跳窗口 `near_px < |dx| ≤ jump_start_px` = `30 < |dx| ≤ 20` ⇒ **空集** ✗
+      ⇒ `_align_step` 里那条"只斜跳"的 `if` 进不去 ⇒ 退回老行为（对齐）
+      ⇒ 而**界面和日志一个字都不说** ⇒ 人只能以为"开关坏了"✓。
+
+    钉三件：
+      ① 窗口为空时不静默：`note` 里必须写清"**不生效**"和该改哪一格 ✓；
+      ② 行为照旧是"对齐"（朝绳走 ✓ —— 不是站住、也不是往外走 ✗）；
+      ③ 窗口有效（把「起跳距离(px)」调到 120）⇒ **不许**再报这句（别误报 ✗）；
+      ④ `to_dict` / `from_dict` 往返保住 `False`（不然重启又变回勾上 ✓ 见 538 那条）。
+    """
+    from decision import jobs as jobmod
+    from decision.agent import DecisionSettings
+
+    C = jobmod.ClimbJob
+    base = dict(ladder_id="L1", x=550.0, y1=300.0, y2=100.0, direction=1,
+                dst_set="上", src_set="下", tol_px=10, hold_ms=250)
+
+    # ① + ② 天穹那份：窗口 20 / 近距 30 ⇒ 空
+    j = C(near_px=30, jump_start_px=20, **base)
+    j.align_first = False
+    o = j.update(0.10, 490.0, py=300.0, here_sets=["下"])
+    check("不生效" in str(j.note),
+          "关掉了、可斜跳窗口是空的，note 里却什么都不说 ⇒ 用户只能以为\"开关坏了\" ✗：%r"
+          % (j.note,))
+    check(o["move"] == 1,
+          "窗口为空时该走**老路对齐**（朝绳走 ✓），实际 move=%r" % (o["move"],))
+
+    # ③ 窗口有效（120 > 30）⇒ 不许报"不生效"（那会变成误报）
+    j2 = C(near_px=30, jump_start_px=120, **base)
+    j2.align_first = False
+    j2.update(0.10, 490.0, py=300.0, here_sets=["下"])
+    check("不生效" not in str(j2.note),
+          "斜跳窗口是有效的（120 > 30）却报「不生效」⇒ 误报 ✗：%r" % (j2.note,))
+
+    # ④ 存盘往返：关掉这个值必须**存得住**
+    s = DecisionSettings()
+    s.climb_align_first = False
+    d = s.to_dict()
+    check(d.get("climb_align_first") is False,
+          "`to_dict` 里没有 `climb_align_first` ⇒ 关掉之后重启/换工程又变回勾上 ✗"
+          "（用户 2026-10-23 现场 ✓）")
+    #   ⚠ `from_dict` 是**实例方法**（读进 self ✓）—— 不是构造参数（`__init__()` 不带 data ✗）
+    s2 = DecisionSettings()
+    s2.from_dict(d)
+    check(s2.climb_align_first is False,
+          "存下去又读回来变成 True ⇒ 这个开关等于永远关不掉 ✗")
+
+    # ⑤ 提示语里的**字段名必须是界面上真有的那一格**（2026-10-23 用户：
+    #    "**开始斜跳距离 在哪？我们不是用的「起跳距离」吗**" —— 上一版我自造了个
+    #    『开始斜跳距离』，界面上根本没这一格 ⇒ 人照着找不着 ✗）。
+    check("起跳距离" in str(j.note) and "开始斜跳距离" not in str(j.note),
+          "note 里让人去改的那一格**界面上不存在**（应写「起跳距离(px)」✓）：%r" % (j.note,))
+    root = Path(__file__).resolve().parent.parent
+    _txt = ((root / "decision" / "jobs" / "climb.py").read_text(encoding="utf-8")
+            + (root / "gui" / "route_panel.py").read_text(encoding="utf-8"))
+    #   ⚠ 钉的是**正向**（提示语里必须出现界面上真有的那两个标签 ✓），
+    #     而不是"禁止某个字符串"—— 注释里要留用户原话做现场记录（那是好事 ✓），
+    #     拿字符串全禁会把那份记录也一起禁掉 ✗。
+    check("起跳距离" in _txt and "开始对齐绳梯x的距离" in _txt,
+          "提示语/note 里必须用**界面真有的标签**（「起跳距离(px)」/「开始对齐绳梯x的距离"
+          "(px)」）⇒ 否则用户根本找不到该改哪一格 ✗")
 
 
 def t_climb_jump_carries_align_dir():
@@ -21635,13 +21731,25 @@ def t_cursor_protocol_both_sides():
     from remote_kbd import relay as rl
     from remote_kbd.kbd_client import parse_cursor_line
 
-    # ---- ① A 机那行的格式（真读本机光标 ✓ Windows 上一定能读 ✓）----
+    # ---- ① A 机那行的格式（真读本机光标 ✓）----
+    # ⚠ 2026-10-23 补一条环境分支（用户："**怎么上绳梯跳一下没上就发呆？**" 那次跑套件时踩的）：
+    #   **锁屏 / 没有交互桌面**时 `GetCursorPos()` 会**直接失败**（实测 `ok=0, x=0, y=0` ✓）
+    #   ⇒ relay 如实回 `CUR -` ✓ —— 那是**设计好的诚实回包**，不是 bug ✓。
+    #   原来这里硬要 `>=7 段`，锁屏就必然红（假警报 ✗）。⇒ 分两支钉：
+    #     读得到 ⇒ 格式/解析/虚拟屏尺寸全验 ✓；读不到 ⇒ 必须**正好**是 `CUR -` ✓
+    #     （偷偷回 `CUR 0 0 …` 反而要让 B 机去量一个不存在的光标 ✗）。
     _txt = rl.cursor_reply_text()
     check(_txt.startswith("CUR "), "relay 没回 `CUR …`：%r" % (_txt,))
-    check(len(_txt.split()) >= 7, "回包至少要有 x y vx vy vw vh：%r" % (_txt,))
     _p = parse_cursor_line(_txt)
-    check(_p is not None and len(_p) == 7, "B 机没解析出这一行：%r ⇒ %r" % (_txt, _p))
-    check(_p[4] > 0 and _p[5] > 0, "虚拟屏尺寸该是正数：%r" % (_p,))
+    if _txt.strip() == "CUR -":
+        check(_p is None,
+              "读不到本机光标时该如实回 `CUR -`（B 机才判得出\"量不了\"✓），可它却被解析成了 %r ✗"
+              % (_p,))
+    else:
+        check(len(_txt.split()) >= 7,
+              "回包至少要有 x y vx vy vw vh：%r（读不到光标时请回 `CUR -` ✓）" % (_txt,))
+        check(_p is not None and len(_p) == 7, "B 机没解析出这一行：%r ⇒ %r" % (_txt, _p))
+        check(_p[4] > 0 and _p[5] > 0, "虚拟屏尺寸该是正数：%r" % (_p,))
 
     # ---- ② 纯函数：几种形态都要对 ----
     check(parse_cursor_line("CUR -") is None, "`CUR -`（A 机自己也没问到）该判 None ✓")
@@ -23927,6 +24035,637 @@ def t_route_defers_while_minimap_scrolling():
               "地图都稳了还在说「等」（说明那一拍根本没走到 job.update ✗）")
 
 
+def t_climb_diag_retry_switches():
+    """⭐⭐⭐ **斜跳在同一个距离连着失败 ⇒ 换姿势**（2026-10-22 用户现场）。
+
+    **现场**（用户原话："斜跳上绳梯 **在位置状态回到原地后没有重试**"）：
+      25 分钟里 `route_diag` 上斜跳起手 87 次、按跳 248 次、L9 真爬上去 **1 次**；
+      期间 `climb_dx` **一直是 70~72 px**、`climb_on_ladder` 恒 0
+      ⇒ 姿势不变地重复同一个失败（每拍一跳、跳完落回原地、下一拍还从同一个距离再跳）✗。
+
+    钉三件：
+      ① 每次"落回起跳高度"都**记一笔**（`_diag_miss` 递增 ✓ —— 它不记就永远发现不了"在原地
+         重复" ✗）；
+      ② 同一个距离连跳 `DIAG_SAME_DX_MAX` 次都没吸上 ⇒ **这一拍不再斜跳**（不许出现
+         "斜跳上绳"的起手 note ✓），改走"朝绳走 / 点按对齐到近距再原地跳"那条老路 ✓
+         （**换姿势**，而不是把同一个失败再跳 200 遍 ✗）；
+      ③ 距离**变了**（真的挪动了）⇒ 斜跳恢复 ✓（不是一票否决 ✓ —— 用户 2026-09-28 定过
+         "只要满足条件就可以无限斜跳"✓，这里只改"什么时候换姿势"）。
+    """
+    from decision import jobs as jobmod
+
+    C = jobmod.ClimbJob
+    base = dict(ladder_id="L1", x=550.0, y1=300.0, y2=100.0, direction=1,
+                dst_set="上", src_set="下", tol_px=10, hold_ms=250,
+                near_px=20, jump_start_px=120)
+
+    def upd(j, px, py, now):
+        return j.update(now, px, py=py, here_sets=["下"])
+
+    j = C(**base)
+    # 一跳一轮：起手 → 按跳 → 在空中 → 落回起跳高度（= 没吸上 ✓）
+    #   ⚠ 落回那一拍**同一拍就会重新起手**（`_diag_arming` 在飞行结束后立刻设上 ✓）
+    #     所以下一拍的第一次调用就是"按跳"，不再有单独的"起手拍" ✓。
+    t = 0.10
+    upd(j, 470.0, 300.0, t)                      # 第 1 拍：只朝绳走（起手 ✓ 不按跳）
+    for i in range(3):
+        t += 0.05
+        o = upd(j, 470.0, 300.0, t)              # 按跳 ✓
+        check(o["jump"], "第 %d 轮没按跳（用例本身没跑起来 ✗）：%s" % (i + 1, o))
+        t += 0.05
+        upd(j, 500.0, 255.0, t)                  # 空中（离开起跳高度 ✓）
+        t += 0.05
+        upd(j, 470.0, 300.0, t)                  # 落回起跳高度 ⇒ 记一次"没吸上" ✓
+
+    check(j._diag_miss == 3,
+          "落回起跳高度 3 次却没记账（`_diag_miss=%r`）⇒ 「在原地重复」根本发现不了 ✗"
+          % (j._diag_miss,))
+
+    # ② 同一距离（-80 px）再走几拍 ⇒ **不许再斜跳**，改成朝绳走（点按对齐那条老路 ✓）
+    for k in range(3):
+        o = upd(j, 470.0, 300.0, 3.0 + 0.05 * k)
+        check(not o["jump"],
+              "同一个距离连着失败 3 次了还在按跳（那就是把同一个失败再跳 200 遍 ✗）：%s" % (o,))
+        check("斜跳上绳" not in str(j.note),
+              "同一个距离连着失败 3 次了还在起手斜跳（原话「跳下来又回到原地」就是它 ✗）：%r"
+              % (j.note,))
+        check(o["move"] == 1,
+              "没斜跳之后该**朝绳走**（换姿势：走近到近距再原地跳 ✓），实际：%s" % (o,))
+
+    # ③ 真的挪近了（dx 变了）⇒ 斜跳恢复 ✓（不是一票否决）
+    o = upd(j, 500.0, 300.0, 3.30)               # dx = -50（比 -80 近了 30 px ✓）
+    check("斜跳上绳" in str(j.note) and o["move"] == 1,
+          "距离已经变了（-80 → -50，真的在往前走）却还禁着斜跳 ⇒ 换姿势换过头了 ✗：%r / %s"
+          % (j.note, o))
+
+    # ④ 吸上绳 ⇒ 账清零（新的一轮不该带着旧账 ✓）
+    j2 = C(**base)
+    j2._diag_miss = 3
+    j2._diag_miss_dx = 80.0
+    j2._handoff_to_climb("用例：吸上了")
+    check(j2._diag_miss == 0 and j2._diag_miss_dx is None,
+          "吸上绳之后「连着没吸上」的账没清（下一轮会一上来就禁斜跳 ✗）：%r / %r"
+          % (j2._diag_miss, j2._diag_miss_dx))
+
+
+def t_climb_air_stale_allows_attack():
+    """⭐⭐⭐⭐ **「跳出去很久还没吸上绳」不许再屏蔽打架**（2026-10-22 用户现场）。
+
+    **用户原话**："**刚才没上绳梯 就不打怪了**"。
+
+    **现场**（`behavior.log` 2026-10-22 22:28~22:48，20 分钟）：
+      · `task_begin kind=ClimbJob` **81** 次、`replan` **62** 次、`task_done` **只有 6** 次；
+      · **爬绳相最长连续 15 秒**，那 15 秒里 `mob_zone_in` 17~21 次、`attack` **一次都没有**；
+      · 同期 `drink_hp` **3342** 次 ⇒ 人一直站在那儿**挨打喝药** ✓。
+
+    **根因**：屏蔽打架用的是 `ClimbJob.holds_player()` —— 判据是「**按过跳**」或「位置在绳跨度
+      里」；而 `_jumped_once` 只有在 `_rose_since_jump` 为假（y 完全没动）时才被清掉。
+      现场 y **确实在动**（111 → 47）⇒ 一跳空之后**一直**算"还在攀爬" ⇒ 攻击被无限期屏蔽 ✗
+      （用户 2026-09-27 定的那条只该覆盖"按下跳 → 吸上绳"那一小段 ✓）。
+
+    钉两件：
+      ① 刚按跳 + 还没吸上绳（0.1 秒）⇒ **照旧不许打** ✓（2026-10-19"吸上又掉"那条保护不丢）；
+      ② 按跳后超过 `CLIMB_AIR_MAX_S` 还**没吸上绳** ⇒ 当成**这一跳跳空** ⇒ **照常打** ✓
+         （打完由 `_task_settle` 让任务从入口重来 ✓ 老机制）。
+    """
+    from decision import jobs as jobmod
+
+    s = ag.DecisionSettings()
+    s.enabled = True
+    s.strategy = "patrol"
+    h = Harness(s)
+    h.clock0 = h.clock.t
+
+    def job():
+        return jobmod.ClimbJob(ladder_id="L2", x=500.0, y1=-9999.0, y2=9999.0, direction=1,
+                               dst_set="乙平台", src_set="甲平台", tol_px=6, hold_ms=0)
+
+    with h._patched():
+        h.agent.start_climb(job())
+        h.agent.tick(h.ws(with_mob=False))          # 先真跑一拍（任务跑过才记账 ✓）
+        j = h.agent._climb
+        j._jumped_once = True                       # "刚按过跳、还在吸绳"
+        j._diag_flying = True
+        j.phase = jobmod.ClimbJob.ALIGN
+        h.agent._climb_jump_at = h.clock.t          # 跳就是现在按的 ✓
+
+        # ① 刚跳出去 0.1 秒 ⇒ 保护还在（有怪也不许打 ✓）
+        h.clock.t += 0.1
+        ws = h.ws(with_mob=True)
+        ws.player.ladder_id = None                  # 还没吸上（广播不认）
+        # ⚠ **跳空** = 广播既不给 `ladder_id`、**也不给 `on_rope_pos`**（人不在绳跨度里 ✓）
+        #   —— 给了 `on_rope_pos` 就等于"人在绳上"，那条本来就允许打（2026-09-28 ✓），
+        #   拿它当场景就测不到这道闸 ✗（反证时被它蒙过去一次 ✓）。
+        ws.player.on_rope_pos = None
+        h.agent.tick(ws)
+        check(h.agent.state != "attack",
+              "刚按跳 0.1 秒就进 attack 了 ⇒ 打架走位会把人从绳边带走 ✗"
+              "（用户 2026-10-19「莫名其妙跳下绳梯」那条保护丢了）：%s" % h.agent.state)
+
+        # ② 判据本身（**纯函数直测** ✓）：刚按跳 / 在绳上 / 没按过跳 ⇒ 都不算跳空；
+        #    按过跳 + 不在绳上 + 超过 CLIMB_AIR_MAX_S ⇒ **算跳空**（⇒ 放开打架 ✓）
+        #  ⚠ 这里用**绝对秒数**（0.5 / 3.0）而不是按 `CLIMB_AIR_MAX_S` 算 ——
+        #    按常量算的话，改常量（反证）时用例会跟着"自适应"⇒ 永远绿 ✗（踩过一次 ✓）。
+        t0 = 1000.0
+        check(not ag.CombatAgent._climb_air_stale(t0 + 0.5, t0, True, False),
+              "刚按跳 0.5 秒就判成「跳空」⇒ 2026-10-19「吸上又掉」那条保护被短路 ✗")
+        check(not ag.CombatAgent._climb_air_stale(t0 + 3.0, t0, True, True),
+              "人在**绳上**（`in_rope`）还判成跳空 ⇒ 爬绳途中会被拉去打架 ✗"
+              "（用户 2026-09-28：爬绳途中照常打架那条是走另一个分支 ✓）")
+        check(not ag.CombatAgent._climb_air_stale(t0 + 99.0, 0.0, False, False),
+              "这一轮**还没按过跳**也判成跳空（对齐阶段本来就允许打 ✓ 别重复放开 ✗）")
+        check(ag.CombatAgent._climb_air_stale(t0 + 3.0, t0, True, False),
+              "按过跳、不在绳上、已经 3 秒 ⇒ 该判成**跳空**（否则人站在绳边挨打、"
+              "永远轮不到还手 ✓ 用户 2026-10-22）：没有 ✗（阈值 `CLIMB_AIR_MAX_S=%.1f`）"
+              % ag.CLIMB_AIR_MAX_S)
+
+        # ③ 端到端：跳空之后这一拍**真的**去打了（任务还活着，不是"任务结束了当然能打"）
+        h.agent._climb_jump_at = h.clock.t - (ag.CLIMB_AIR_MAX_S + 0.5)
+        h.clock.t += 0.1
+        ws2 = h.ws(with_mob=True)
+        ws2.player.ladder_id = None
+        ws2.player.on_rope_pos = None
+        h.agent.tick(ws2)
+        check(h.agent._climb is not None,
+              "任务已经结束了 ⇒ 这条用例没测到「跳空才放开」那道闸（场景摆坏了 ✗）")
+        check(h.agent.state in ("attack", "chase"),
+              "跳空之后这一拍没去打（任务还在、怪就在旁边）✗：%s" % h.agent.state)
+
+        # ④ ⭐⭐⭐⭐ **已经在「上爬相」（`ClimbJob.CLIMB`）时，再"跳空"也不许打**
+        #    （2026-10-23 用户现场："**3→2 怎么爬一半不爬了**"）。
+        #    现场实证（00:40:24~26）：
+        #      `climb_phase 1.0`(CLIMB) → `act keys=up,z`（**上爬相按了攻击键** ✗）
+        #      → `climb_phase 0.0`（被打断回 ALIGN）→ `task=failed`，y 卡在 -470.2 不动 ✓。
+        #    为什么 CLIMB 相里广播会掉：`ladder_id` 只在 `LADDER_DX=24px` 以内才算 ⇒
+        #      被怪挤两像素就掉 ⇒ 若还按"跳空"放开，就会**爬到一半去打怪** ✗。
+        j = h.agent._climb
+        j.phase = jobmod.ClimbJob.CLIMB       # 真的在往上爬
+        j._jumped_once = True
+        h.agent._climb_jump_at = h.clock.t - (ag.CLIMB_AIR_MAX_S + 0.5)   # 早就"过期"
+        h.clock.t += 0.1
+        ws3 = h.ws(with_mob=True)
+        ws3.player.ladder_id = None           # 广播掉了（现场常态 ✓）
+        ws3.player.on_rope_pos = None
+        h.agent.tick(ws3)
+        check(h.agent.state != "attack",
+              "**上爬相**（phase=CLIMB）被跳空判据放开了 ⇒ 爬到一半去打怪、被打断回对齐、"
+              "重跳失败（用户 2026-10-23「3→2 怎么爬一半不爬了」）：%s" % h.agent.state)
+
+
+def t_climb_far_from_ladder_restarts_align():
+    """⭐⭐⭐⭐ 已上绳、被挤得离绳 **> 40 px 连续 1 秒** ⇒ **退回 ALIGN 重来**（2026-10-23）。
+
+    用户原话："**加（只加\"这一轮没挂住 ⇒ 退回 ALIGN 重来\"，不判失败、不清任务）**"。
+
+    **为什么要它**：`CLIMB` 相原来**只听 y 动不动**（`climb_stalled` / 2×`stall_s`=6 秒），
+    横向**完全没人管**（`_last_dx` 只有 `_align_step` 在读）⇒ 人爬到一半被怪挤偏 30~50 px，
+    它照样一直按住 ↑，直到 y 停 6 秒报"上绳失败"、或者干脆烧完「寻路超时」15 秒 ✗
+    （2026-10-19 那条注释里就记着 `climb_dx` 从 17 涨到 50 没人管 ✓）。
+
+    钉四件：
+      ① 偏 60 px **不到 1 秒** ⇒ **不许**退（单帧抖动就会把人赶回去 ✗）；
+      ② 偏 60 px **超过 1 秒** ⇒ 退回 `ALIGN`，且**不是 failed**（用户："不判失败、不清任务"✓）；
+      ③ 退回时"**按过跳**"要解开（`_jumped_once=False`）—— 不解就还以为人在绳上 ⇒
+         对齐阶段发不出方向键、打架也被屏蔽 ✗；
+      ④ 反向对照：偏 20 px（< 40）⇒ 一直待在 `CLIMB`（别把正常爬升当"被挤走"✗）。
+    """
+    from decision import jobs as jobmod
+
+    C = jobmod.ClimbJob
+
+    def _job():
+        j = C(ladder_id="L1", x=500.0, y1=-9999.0, y2=9999.0, direction=1,
+              dst_set="2", src_set="3", tol_px=10, hold_ms=250,
+              near_px=20, jump_start_px=120)
+        j.phase = C.CLIMB
+        j._jumped_once = True          # 已经按过跳、正在往上爬 ✓
+        j._rose_since_jump = True      # y 真升过（所以"y 没上升"那条不会被误触发 ✓）
+        j._no_rise_since = None
+        return j
+
+    # ① + ② 偏 60 px：
+    j = _job()
+    j.update(0.10, 560.0, py=-100.0, here_sets=["2"])
+    check(str(j.phase).lower() == "climb",
+          "超限第一拍就退回对齐了 ⇒ 读数抖一下就把人赶回去 ✗：%r" % (j.note,))
+    j.update(0.60, 560.0, py=-100.0, here_sets=["2"])   # 0.5 秒，还没到 1 秒
+    check(str(j.phase).lower() == "climb",
+          "不到 %.1f 秒就退了（用户要的是\"连续\"超限 ✓）：%r"
+          % (jobmod.climb.CLIMB_OFF_HOLD_S, j.note))
+    j.update(1.30, 560.0, py=-100.0, here_sets=["2"])   # 累计 1.2 秒 ⇒ 该退了
+    check(str(j.phase).lower() == "align",
+          "被挤偏 60 px 超过 1 秒还赖在 CLIMB 相 ⇒ 一直按住 ↑ 白磨到超时 ✗：%r" % (j.note,))
+    check(str(j.phase).lower() != "failed",
+          "退回对齐的过程里**判了失败** ⇒ 用户明确要的是「不判失败、不清任务」✗")
+    check(j._jumped_once is False,
+          "退回对齐却没解开「按过跳」⇒ 对齐阶段发不出方向键、打架也被屏蔽 ✗")
+    check("退回对齐重来" in str(j.note),
+          "退回去了但 note 里没说原因 ⇒ 现场看不懂它为什么突然重新对齐 ✗：%r" % (j.note,))
+
+    # ④ 反向对照：偏 20 px ⇒ 一直待在 CLIMB
+    #   ⚠ `here_sets` 不能给 `src_set`（=「还站在起跳平台」）：那会走"补按 ↑ + 回对齐"
+    #     那一支、直接回 ALIGN ⇒ 测不到这道闸 ✗；也不能喂过 2 秒（那是"掉下来"那条 ✓）。
+    j2 = _job()
+    for _t in (0.1, 0.6, 1.3, 1.9):
+        j2.update(_t, 520.0, py=-100.0, here_sets=["2"])
+    check(str(j2.phase).lower() == "climb",
+          "只偏 20 px（< %.0f）也被判成\"被挤走\"⇒ 正常爬升会被打断 ✗：%r"
+          % (jobmod.climb.CLIMB_OFF_DX_PX, j2.note))
+    check(j2._far_since is None,
+          "没超限却留着「超限起点」⇒ 下一次真超限时会计到旧账上 ✗：%r" % (j2._far_since,))
+
+
+def t_climb_fail_requeues_same_dst():
+    """⭐⭐⭐⭐ **爬绳失败 ⇒ 立刻把同一条 `dst` 重新排上**（用户 2026-10-23 明确要求）。
+
+    **为什么**：现场（`3→2 爬一半不爬了`）40:36 判死之后，下一次 `task_begin dst=入口`
+    拖到 **41:40** —— **64 秒**里它一直在打怪（`target_steal` / `chase` / `drink_hp`）。
+    根因：`_task_finished(failed=True)` 把**整条路线 + 队列都清空**了，而"失败之后谁来重排"
+    **没人管** ⇒ 用户看到的就是"爬一半就不爬了"✓。
+
+    钉四件：
+      ① 上爬失败 ⇒ **当场**用同一个 dst 再 `plan_and_start_route` 一次，而且**真的起跑了** ✓；
+      ② 有 `climb_requeue` 打点（现场能看出重排有没有发生 ✓）；
+      ③ 同一个 dst **连续**失败到 `CLIMB_REQUEUE_MAX` ⇒ 停手（`climb_requeue_stop`）——
+         够不着的绳梯不许把它钉在原地转到天荒地老 ✗；
+      ④ **走任务**失败**不许**重排（用户要的是"爬绳失败" ✓，走/下跳不在此列 ✗）。
+    """
+    from decision import jobs as jobmod
+
+    s = ag.DecisionSettings()
+    s.enabled = True
+    s.strategy = "patrol"
+    h = Harness(s)
+    h.clock0 = h.clock.t
+    plans, evs = [], []
+
+    def _plan(dst):
+        plans.append(str(dst))
+        return {"jobs": [jobmod.ClimbJob(ladder_id="L1", x=500.0, y1=-9999.0, y2=9999.0,
+                                         direction=1, dst_set=str(dst), src_set="3",
+                                         tol_px=6, hold_ms=0)],
+                "path": ["3", str(dst)], "why": ""}
+
+    with h._patched(), \
+            patch.object(ag.behavior, "event", lambda name, **kw: evs.append((name, kw))), \
+            patch.object(ag.behavior, "task_settle", lambda *a, **k: None), \
+            patch.object(ag.behavior, "task_open", lambda *a, **k: None):
+        a = h.agent
+        a.route_plan = _plan
+        ok, msg = a.plan_and_start_route("2", why="用例：3→2")
+        check(ok and a._climb is not None, "用例没起跑（后面都不用看了 ✗）：%r" % (msg,))
+
+        # ① 失败一次 ⇒ 立刻重排同一条 "2"
+        n0 = len(plans)
+        a._task_finished(failed=True, why="上绳失败：用例")
+        check(plans[n0:] == ["2"],
+              "爬绳失败之后没把**同一条 dst** 立刻重排（用户 2026-10-23 ✗）：%r" % (plans,))
+        check(a._climb is not None, "重排了却没有真的起跑（等于什么都没干 ✗）")
+        # ② 打点
+        check(any(n == "climb_requeue" for n, _ in evs),
+              "重排没打 `climb_requeue` ⇒ 现场查不出\"它到底有没有重排\" ✗")
+
+        # ③ 连续失败到上限 ⇒ 停手
+        for _ in range(ag.CLIMB_REQUEUE_MAX + 2):
+            a._task_finished(failed=True, why="上绳失败：用例")
+        check(any(n == "climb_requeue_stop" for n, _ in evs),
+              "同一个 dst 连续失败到上限还在重排（够不着的绳梯会把它钉死 ✗）")
+
+        # ④ 走任务失败 ⇒ 不许重排（只有爬绳该重排）
+        n1 = len(plans)
+        a.start_climb(jobmod.WalkJob("2", []))
+        a._task_finished(failed=True, why="走不动")
+        check(len(plans) == n1,
+              "走任务失败也去重排了（用户只要求\"**爬绳**失败\"重排 ✗）：%r" % (plans[n1:],))
+
+
+def t_climb_too_near_steps_back_past_jump_start():
+    """⭐⭐⭐⭐ 太近 ⇒ **先退到超出「起跳距离」**，再朝绳走（用户 2026-10-23 明确要求）。
+
+    **用户原话**："**≤ 30（太近）应该：先朝外走开到 > 90（起跳距离），然后再朝绳走（横键）**"。
+
+    为什么老写法不行（现场 11:08 ✓）：原来只按当拍 `|dx| ≤ near_px(30)` 判"太近"⇒
+    **刚退到 31 px 就停** ⇒ 立刻在窗口边上原地斜跳 ⇒ `climb_dx 73 ⇒ 按跳 ⇒ 没上 ⇒
+    落回 88` 反复（斜跳本来是**助跑**跳，站定了再跳等于原地跳 ✗）。
+
+    钉五件：
+      ① 太近（10 px）⇒ **朝外走**（move 与朝绳相反），且不按跳 ✓；
+      ② 退到窗口里（40 px）⇒ **还在退**（记忆位在起作用 ✓ 老写法这里就转成"朝绳"了 ✗）；
+      ③ 退过「起跳距离」（95 px）⇒ 记忆位释放、**这一拍起朝绳走** ✓；
+      ④ 再进窗口（50 px）⇒ 恢复斜跳（先发方向、下一拍按跳 ✓）；
+      ⑤ 对照：`align_first=True` ⇒ 40 px 时**不许往外退**（老行为一字不变 ✓）。
+    """
+    from decision import jobs as jobmod
+
+    C = jobmod.ClimbJob
+
+    def _job(align_first=False):
+        j = C(ladder_id="L9", x=500.0, y1=-9999.0, y2=9999.0, direction=1,
+              dst_set="二楼", src_set="底层", tol_px=12, hold_ms=250,
+              near_px=30, jump_start_px=90)
+        j.align_first = bool(align_first)
+        return j
+
+    j = _job()
+    # ① 太近：dx = 500 - 510 = -10 ⇒ 朝外 = +1（远离绳）
+    r = j.update(0.10, 510.0, py=0.0, here_sets=["底层"])
+    check(j._step_back is True,
+          "太近（离绳 10 px ≤ 30）却没进「先退出去」⇒ 又会在窗口边上原地跳 ✗")
+    check(r["move"] > 0 and not r["jump"],
+          "太近时该**朝外走**（远离绳）且**不按跳** ✗：move=%r jump=%r note=%r"
+          % (r["move"], r["jump"], r["note"]))
+
+    # ② 退到窗口里（dx=-40：30 < 40 ≤ 90）⇒ 还要继续退（记忆位 ✓）
+    r = j.update(0.60, 540.0, py=0.0, here_sets=["底层"])
+    check(r["move"] > 0 and not r["jump"],
+          "退到斜跳窗口里（40 px）就停了 ⇒ 还没退过「起跳距离」就回头 ⇒ 又是原地斜跳 ✗："
+          "move=%r jump=%r note=%r" % (r["move"], r["jump"], r["note"]))
+
+    # ③ 退过起跳距离（dx=-95）⇒ 释放记忆位，这一拍起朝绳走（move 反向）
+    r = j.update(1.10, 595.0, py=0.0, here_sets=["底层"])
+    check(j._step_back is False,
+          "已经退过「起跳距离」90 px 了，记忆位却没释放 ⇒ 会一直往外走 ✗")
+    check(r["move"] < 0,
+          "退够了该**朝绳走**了（横键回绳）✗：move=%r note=%r" % (r["move"], r["note"]))
+
+    # ④ 再进窗口（dx=-50）⇒ 恢复斜跳（第一拍只发方向，第二拍按跳 ✓）
+    r2 = j.update(1.60, 550.0, py=0.0, here_sets=["底层"])
+    check(r2["move"] < 0 and not r2["jump"],
+          "进了窗口该先**朝绳走**（斜跳的起手拍）✗：move=%r jump=%r note=%r"
+          % (r2["move"], r2["jump"], r2["note"]))
+    r3 = j.update(1.70, 550.0, py=0.0, here_sets=["底层"])
+    check(bool(r3["jump"]),
+          "窗口里第二拍该**按跳**了（斜跳 ✓），却一直只走不跳 ✗：note=%r" % (r3["note"],))
+
+    # ⑤ 对照：勾着「对齐上绳梯」⇒ 40 px 时不许往外退（老行为一字不变 ✓）
+    j2 = _job(align_first=True)
+    r = j2.update(0.10, 540.0, py=0.0, here_sets=["底层"])
+    check(j2._step_back is False and r["move"] < 0,
+          "勾着「对齐上绳梯」却往外退 ⇒ 老行为被改了 ✗：move=%r note=%r"
+          % (r["move"], r["note"]))
+
+
+def t_climb_never_jumps_after_grab():
+    """⭐⭐⭐⭐ **吸上绳之后绝不许再按跳**（哪怕广播抖了一帧）—— 用户 2026-10-23：
+
+    "**天空项目 一上绳梯就跳下来**"。
+
+    **现场**（`behavior.log` 23:20:23.4~23.8，逐行）：
+    ```
+    23:20:23.405  climb_on_ladder v=1
+    23:20:23.406  route_phase … 斜跳吸上 L1 ⇒ 交给上爬（本拍只按住 ↑、不按跳 ✓）
+    23:20:23.666  climb_on_ladder v=0              ← **抖了一帧**（人还在绳上 ✓）
+    23:20:23.782  act keys=space,up task=climb     ← **按跳了** ⇒ 真的从绳上跳下来 ✗
+    ```
+
+    **根因**：上爬 `dir > 0` 那一支"**一律信广播**"（`_rope_seen` 当场清 ✓ 那是对的）⇒ 抖一帧
+    就落到"还没上绳"分支；而 `_handoff_to_climb()` 刚把 `_jump_tried` 清零（新一轮 ✓）+
+    **绳底就在起跳平台上**（`_in_src` 真 ✓）⇒ 正好走进"按跳 + 按住 ↑"那条重试 ⇒
+    **把人从绳上按下来** ✗。
+
+    钉四件：
+      ① 广播说在绳上 ⇒ 交给上爬（CLIMB）✓；
+      ② 之后**抖一帧** ⇒ **不许按跳**，且仍按住 ↑（松了就掉 ✗）；
+      ③ 连着抖 5 拍 ⇒ 照旧不跳；广播回来后**接着爬**（不跳 ✓）；
+      ④ 对照：**还没吸上过绳**（站在绳底、在斜跳窗口里）⇒ 照旧按跳（老流程一字不变 ✓）。
+    """
+    from decision import jobs as jobmod
+
+    C = jobmod.ClimbJob
+
+    def _job():
+        j = C(ladder_id="L1", x=300.0, y1=-9999.0, y2=9999.0, direction=1,
+              dst_set="入口", src_set="底层", tol_px=12, hold_ms=250,
+              near_px=30, jump_start_px=90)
+        j.align_first = False
+        return j
+
+    j = _job()
+    r1 = j.update(0.10, 300.0, py=90.0, ladder_id="L1", here_sets=["底层"])
+    check(str(j.phase) == C.CLIMB,
+          "广播说「在绳上」却没交给上爬（CLIMB）✗：phase=%r out=%r" % (j.phase, r1))
+
+    # ② 抖一帧：广播说不在绳上（人其实还在绳上，脚也还在底层平台上）
+    r2 = j.update(0.35, 300.0, py=88.0, ladder_id=None, here_sets=["底层"])
+    check(not r2["jump"],
+          "吸上绳之后广播抖了一帧就**按跳** ⇒ 人从绳上跳下来 ✗"
+          "（用户 2026-10-23：\"天空项目 一上绳梯就跳下来\"）：%r" % (r2,))
+    check(int(r2.get("dir") or 0) > 0,
+          "抖的那几拍必须**继续按住 ↑**（松手就掉了 ✗）：%r" % (r2,))
+    check("不按跳" in str(r2.get("note") or ""),
+          "现场备注该如实说\"不按跳\"（出问题好定位 ✓）：%r" % (r2.get("note"),))
+
+    # ③ 连抖 5 拍：一拍都不许跳
+    for k in range(5):
+        r = j.update(0.45 + 0.10 * k, 300.0, py=88.0, ladder_id=None,
+                     here_sets=["底层"])
+        check(not r["jump"],
+              "抖第 %d 拍又按跳了 ⇒ 又会被按下来 ✗：%r" % (k + 1, r))
+    # 广播回来 ⇒ 照常往上爬、仍然不跳
+    r3 = j.update(1.20, 300.0, py=60.0, ladder_id="L1", here_sets=["底层"])
+    check((not r3["jump"]) and str(j.phase) == C.CLIMB,
+          "广播回来之后该**接着往上爬**（不按跳 ✓）：phase=%r out=%r" % (j.phase, r3))
+
+    # ④ 对照：还没吸上过绳 ⇒ 斜跳照旧按跳（老流程一字不变 ✓）
+    j2 = _job()
+    j2.update(0.10, 250.0, py=90.0, ladder_id=None, here_sets=["底层"])   # dx=-50 ⇒ 先朝绳走
+    r4 = j2.update(0.20, 250.0, py=90.0, ladder_id=None, here_sets=["底层"])
+    check(bool(r4["jump"]),
+          "还没吸上绳时**斜跳该照旧按跳**（老流程被改坏了 ✗）：%r" % (r4,))
+
+
+def t_climb_failed_jump_can_still_align():
+    """⭐⭐⭐⭐ **跳一下没上 ⇒ 回对齐时**必须还能按左右键**（否则就是"站着发呆"）**。
+
+    **用户原话**："**怎么上绳梯跳一下没上就发呆？**"
+
+    **现场**（`behavior.log` 11:08:19~20，逐行）：
+    ```
+    task_begin dst=二楼 kind=ClimbJob ladder=L9     climb_dx v=107.4
+    act        keys=left move=-1 task=align         ← 还在走过去对齐 ✓
+    route_diag … 斜跳上绳：离绳 -73 px（区间 30~75）⇒ **按跳**
+    rope_no_horiz dropped=left phase=align
+                 why=人在绳上 ⇒ 横键=松手，发键前摘掉   ← ⚠ 同一拍 `climb_on_ladder v=0`
+    （之后 x 一直 ≈664、`act` 里再没有 left ⇒ **站着发呆** ✗）
+    ```
+
+    **根因**：`agent._in_climb_phase` 把 `_jumped_once`（**永不清** ✓ 屏蔽打架要用它）当成
+    "人挂在绳上" ⇒ 这一轮**按过跳之后每一拍**都摘掉 ←/→ ⇒ 落回起跳平台、正要走回去对齐
+    的那几拍**挪不动** ⇒ 发呆 ✓。
+
+    钉四件：
+      ① `phase=CLIMB` ⇒ 一律算"在绳上"（2026-10-19「吸上又掉」那条保护不能丢 ✗）；
+      ② 按过跳、**还在空中**（不在起跳平台）⇒ 也算（横键会把人带偏 ✗ 2026-10-19 现场 ✓）；
+      ③ 按过跳、**已落回起跳平台** ⇒ **不算**（那几拍横键就是"走过去"本身 ✓）；
+      ④ 端到端：这种情况发键口**必须留下左右键**（摘了就是发呆 ✗）。
+    """
+    from types import SimpleNamespace
+
+    from decision import jobs as jobmod
+
+    C = jobmod.ClimbJob
+    j = C(ladder_id="L9", x=500.0, y1=-9999.0, y2=9999.0, direction=1,
+          dst_set="二楼", src_set="底层", tol_px=10, hold_ms=250,
+          near_px=30, jump_start_px=75)
+    j._jumped_once = True                    # 这一轮已经按过跳了（永不清 ✓）
+    j.phase = C.ALIGN
+    j._in_src_now = False                    # 还在空中 / 飞行中
+    check(j.on_rope_sticky() is True,
+          "「刚按过跳、人还在空中」却判成不在绳上 ⇒ 横键会把人带偏、吸不上绳 "
+          "（2026-10-19 那条保护被拆了 ✗）")
+    j._in_src_now = True                     # 落回起跳平台了 ⇒ 该走回去对齐
+    check(j.on_rope_sticky() is False,
+          "**落回起跳平台**了还判成\"在绳上\" ⇒ 对齐那几拍横键被摘 ⇒ 站着发呆 "
+          "（用户 2026-10-23「跳一下没上就发呆」✗）")
+    j.phase = C.CLIMB
+    j._in_src_now = True                     # 真在爬时 `_in_src` 无关
+    check(j.on_rope_sticky() is True,
+          "**已经在爬（CLIMB 相）**却判成不在绳上 ⇒ 会按左右 ⇒ 松手掉下去 ✗")
+
+    # ④ 端到端：落回平台那一拍，发键口必须把 ← 留着
+    s = ag.DecisionSettings()
+    s.enabled = True
+    s.strategy = "patrol"
+    h = Harness(s)
+    with h._patched():
+        a = h.agent
+        j2 = C(ladder_id="L9", x=500.0, y1=-9999.0, y2=9999.0, direction=1,
+               dst_set="二楼", src_set="底层", tol_px=10, hold_ms=250,
+               near_px=30, jump_start_px=75)
+        j2._jumped_once = True
+        j2.phase = C.ALIGN
+        j2._in_src_now = True                # 落回起跳平台 ⇒ 要走去对齐
+        a._climb = j2
+        a._pos_now = SimpleNamespace(ladder_id=None)   # 广播：没挂在绳上 ✓
+        a._in_rope_now = bool(j2.on_rope_sticky())
+        out = a._rope_key_guard({s.keymap.get("left")})
+        check(s.keymap.get("left") in out,
+              "落回平台、要走去对齐的那一拍，← 被摘掉了 ⇒ **站着发呆** "
+              "（用户 2026-10-23：「怎么上绳梯跳一下没上就发呆？」）：%r" % (sorted(out),))
+        # 反向：还在空中 ⇒ 照样摘（保护不丢 ✓）
+        j2._in_src_now = False
+        a._in_rope_now = bool(j2.on_rope_sticky())
+        out2 = a._rope_key_guard({s.keymap.get("left")})
+        check(s.keymap.get("left") not in out2,
+              "**刚按跳、人还在空中**时把 ← 发出去了 ⇒ 会把人带偏、吸不上绳 ✗")
+
+
+def t_climb_retry_restarts_stall_clock():
+    """⭐⭐⭐⭐ 一轮没挂上 ⇒ `retry()` 必须**重新起算**「按跳后 y 没上升」那个钟（2026-10-23）。
+
+    现场（用户："**3→2 怎么爬一半不爬了**"）：
+      ```
+      :40:35.182 climb_retry attempt=20
+      :40:35.228 climb_retry attempt=21  note=按跳之后 11.8s 里 y 一次都没上升
+      :40:35.711 climb_retry attempt=22  note=… 12.3s …
+      :40:36.182 climb_retry attempt=23  note=… 12.8s …
+      :40:36.216 task_fail  寻路超时：15 秒   ← 整条 3→2 判死
+      ```
+      **1 秒里刷了 4 次**，每次都说"上一跳之后十来秒没上升"（时间还在涨）
+      ⇒ 钟没重起 ⇒ **根本没再真的跳一次**，空转到「寻路超时 15 秒」✓。
+
+    钉三件：
+      ① `retry()` 之后 `_no_rise_since` 必须为 None（钟重起 ✓）；
+      ② `_jumped_once` 必须归零 —— 留着它就被当成"已经跳出去了" ⇒ 发键口把 ←/→ 摘掉
+         ⇒ **对齐阶段挪不动** ⇒ 永远对不齐 ✗；
+      ③ retry 之后第一拍**不许**再判"y 一次都没上升"（那正是空转的样子 ✓）。
+    """
+    from decision import jobs as jobmod
+
+    C = jobmod.ClimbJob
+    j = C(ladder_id="L3", x=500.0, y1=-9999.0, y2=9999.0, direction=1,
+          dst_set="2", src_set="3", tol_px=10, hold_ms=250,
+          near_px=20, jump_start_px=120)
+    j.stall_s = 1.0                     # 判定窗口 = 2×stall_s = 2 秒（用例自己摆明 ✓）
+    # 上一轮：按过跳、y 一直没动 ⇒ 这一拍该判"上绳失败"
+    j._jumped_once = True
+    j._jump_y = 0.0
+    j._no_rise_since = 0.0
+    j.update(5.0, 500.0, py=0.0, here_sets=["3"])
+    check(str(j.phase).lower() == "failed" and "y 一次都没上升" in str(j.note),
+          "场景没摆成「一轮没挂上」（用例本身没跑起来 ✗）：phase=%r note=%r"
+          % (j.phase, j.note))
+
+    j.retry()
+    check(j._no_rise_since is None,
+          "`retry()` 没把「按跳后 y 没上升」的钟归零 ⇒ 下一拍立刻拿**旧锚**再判一次死，"
+          "重试变成空转（现场 1 秒刷 4 次 attempt ✗）：%r" % (j._no_rise_since,))
+    check(j._jumped_once is True,
+          "`retry()` 不该清 `_jumped_once`（用户 2026-10-02：按过跳之后回对齐，↑ 仍要按着 ✗）")
+
+    j.update(5.1, 500.0, py=0.0, here_sets=["3"])
+    check(str(j.phase).lower() != "failed" and "y 一次都没上升" not in str(j.note),
+          "retry 回来第一拍又立刻判\"上绳失败\" ⇒ 只在原地空转、根本不去跳 ✗：%r" % (j.note,))
+    check(j._no_rise_since is not None and abs(float(j._no_rise_since) - 5.1) < 1e-6,
+          "重试之后这个钟没有**从这一拍重起**（还是上一轮的旧锚）⇒ 几拍后又立刻判死 ✗：%r"
+          % (j._no_rise_since,))
+
+
+def t_rope_no_task_keeps_up():
+    """⭐⭐⭐⭐ **人挂在绳上、可这一拍没有爬绳任务 ⇒ 摘横键 + 按住 ↑**（2026-10-23 现场）。
+
+    **用户原话**："**为什么爬绳梯时候输出又松开↑了？之前不是修过吗**"
+
+    **为什么会复发**（`_rope_key_guard` 的判据全挂在"有爬绳任务"上）：
+      · 爬绳任务失败 / 被怪抢 ⇒ `self._climb` 变 `None`；
+      · 于是 `_in_rope = _pos.on_rope(_lid)` 里 `_lid = ""` ⇒ **恒 False**；
+      · `_in_climb_phase` 也要求 `self._climb is not None` ⇒ False；
+      ⇒ `_in_rope_now` 为假 ⇒ 这道守卫**整条失效** ⇒ 走位/追击任务照发 ←/→，
+        而"在绳上按左右 = 松手" ⇒ 人往下滑/掉，`↑` 当然也没了 ✓。
+
+    钉四件：
+      ① 挂在绳上（**许可广播** `ladder_id` 非空）+ 没有爬绳任务 ⇒ 横键摘掉、**补 ↑**；
+      ② 已经在按 ↓（下爬）⇒ 保留 ↓，**不许硬塞 ↑**（那会往上爬 ✗）；
+      ③ 对照：**对齐阶段站在绳底**（许可广播是空的）⇒ 一个键都不许动 ✗
+         （动了就永远对不齐 —— 这条是本次改动的**红线** ✓）；
+      ④ 对照：没横键要摘时不乱加键（`{up}` 进 ⇒ `{up}` 出 ✓）。
+    """
+    from types import SimpleNamespace
+
+    s = ag.DecisionSettings()
+    s.enabled = True
+    s.strategy = "patrol"
+    h = Harness(s)
+    _evs = []
+    with h._patched(), \
+            patch.object(ag.behavior, "event", lambda name, **kw: _evs.append(name)):
+        a = h.agent
+        km = s.keymap
+        up, dn = km.get("up"), km.get("down")
+        left, right = km.get("left"), km.get("right")
+
+        # ① 挂在绳上（许可广播）+ 没有爬绳任务
+        a._climb = None
+        a._in_rope_now = False
+        a._pos_now = SimpleNamespace(ladder_id="L1")
+        out = a._rope_key_guard({left})
+        check(left not in out,
+              "人挂在绳上、没有爬绳任务时还在发 ←（在绳上按左右 = **松手** ⇒ 会掉 ✗）：%r"
+              % (sorted(out),))
+        check(up in out,
+              "横键摘掉了却**没按住 ↑** ⇒ 人往下滑（用户 2026-10-23「松开 ↑ 了」）：%r"
+              % (sorted(out),))
+        check("rope_no_horiz" in _evs,
+              "摘了横键却没记账（`rope_no_horiz`）⇒ 现场查不出来 ✗：%r" % (_evs,))
+
+        # ② 已在按 ↓（下爬）⇒ 保 ↓，不硬塞 ↑
+        out2 = a._rope_key_guard({right, dn})
+        check(right not in out2 and dn in out2 and up not in out2,
+              "下爬那几拍该**保 ↓**、不许硬塞 ↑（那会往上爬 ✗）：%r" % (sorted(out2),))
+
+        # ③ 对照：对齐中、站在绳底（许可广播空）⇒ 一个键都不许动
+        a._pos_now = SimpleNamespace(ladder_id=None)
+        out3 = a._rope_key_guard({left})
+        check(out3 == {left},
+              "**不在绳上**（对齐阶段站在绳底）也被摘了横键 ⇒ 永远对不齐 ✗：%r" % (sorted(out3),))
+
+        # ④ 对照：没横键 ⇒ 原样返回（别乱加 ↑）
+        a._pos_now = SimpleNamespace(ladder_id="L1")
+        out4 = a._rope_key_guard({up})
+        check(out4 == {up},
+              "本来就只有 ↑，却被改成了别的键 ✗：%r" % (sorted(out4),))
+
+
 CHECKS = [
     ("⭐⭐⭐⭐ 局部地图在滚 ⇒ 寻路这一步推迟、一个键都不按（用户 2026-10-20"
      "「在局部地图滚动时，寻路任务的执行需要推迟直至其稳定」）："
@@ -24289,6 +25028,30 @@ CHECKS = [
      t_climb_retry_has_brake),
     ("⭐⭐⭐ 持续调方向（站住/按跳/上爬）+「对齐上绳梯」开关（关=只斜跳；延迟置灰）",
      t_climb_align_first_switch),
+    ("⭐⭐⭐⭐ 「对齐上绳梯」**关掉了却没生效**（斜跳窗口 `near_px < |dx| ≤ jump_start_px` 空了）"
+     "⇒ 必须写进 note + 界面提示，且这个勾选要**存得住**（用户 2026-10-23："
+     "\"天空项目 我关了对齐上绳梯 怎么还在对齐\"）", t_climb_align_off_window_empty),
+    ("⭐⭐⭐⭐ **挂在绳上但这一刻没有爬绳任务**（任务失败/被抢）⇒ 横键要摘、↑ 要按住"
+     "（用户 2026-10-23：\"为什么爬绳梯时候输出又松开↑了？之前不是修过吗\"）",
+     t_rope_no_task_keeps_up),
+    ("⭐⭐⭐⭐ 爬绳失败后 `retry()` 必须**重新起算**「按跳后 y 没上升」那个钟（否则 1 秒刷 4 次"
+     "attempt 空转到寻路超时——用户 2026-10-23「3→2 怎么爬一半不爬了」）",
+     t_climb_retry_restarts_stall_clock),
+    ("⭐⭐⭐⭐ **爬绳失败 ⇒ 立刻把同一条 dst 重新排上**（有上限、走任务不重排）"
+     "（用户 2026-10-23：\"加一条：爬绳失败 ⇒ 立刻把同一条 dst 重新排上\"）",
+     t_climb_fail_requeues_same_dst),
+    ("⭐⭐⭐⭐ 已上绳却**被挤得离绳 >40 px 连续 1 秒** ⇒ 退回 ALIGN 重来（**不判失败、不清任务**）"
+     "（用户 2026-10-23：\"加（只加'这一轮没挂住 ⇒ 退回 ALIGN 重来'，不判失败、不清任务）\"）",
+     t_climb_far_from_ladder_restarts_align),
+    ("⭐⭐⭐⭐ 跳一下没上 ⇒ **回对齐时必须还能按左右键**（否则摘掉横键 = 站着发呆）"
+     "（用户 2026-10-23：「怎么上绳梯跳一下没上就发呆？」）",
+     t_climb_failed_jump_can_still_align),
+    ("⭐⭐⭐⭐ 不勾「对齐上绳梯」时，太近 ⇒ **先退到超出起跳距离**再朝绳走"
+     "（用户 2026-10-23：「≤ 30（太近）应该：先朝外走开到 > 90，然后再朝绳走」）",
+     t_climb_too_near_steps_back_past_jump_start),
+    ("⭐⭐⭐⭐ 吸上绳之后**绝不许再按跳**（广播抖一帧也不行）"
+     "（用户 2026-10-23：「天空项目 一上绳梯就跳下来」）",
+     t_climb_never_jumps_after_grab),
     ("⭐⭐⭐ 对齐按跳必须带朝绳方向（「原地跳」第三次报的真根）",
      t_climb_jump_carries_align_dir),
     ("⭐⭐⭐ 量位移要**等光标停住**（慢 relay 的桩上：发完就读 ⇒ Δ=0；撞角后不等 ⇒ 基准是旧的 ⇒ "
@@ -24424,6 +25187,12 @@ CHECKS = [
      t_climb_jump_gate),
     ("「**斜跳上绳**」：离绳还远的时候**按住朝绳的方向 + 起跳**斜着过去，",
      t_climb_diagonal_jump),
+    ("⭐⭐⭐ 斜跳**在同一个距离连着失败 3 次 ⇒ 换姿势**（走近再跳），不是把同一个失败跳 200 遍"
+     "（用户 2026-10-22：\"斜跳上绳梯 在位置状态回到原地后没有重试\"）",
+     t_climb_diag_retry_switches),
+    ("⭐⭐⭐⭐ 爬绳**跳空超过 1.5 秒还没吸上绳 ⇒ 照常打怪**（用户 2026-10-22："
+     "\"刚才没上绳梯 就不打怪了\"；按跳那 0.1 秒的保护照旧 ✓）",
+     t_climb_air_stale_allows_attack),
     ("chase 前先判「**怪和我是不是同一块平台**」，不是 ⇒ **先下前往任务**（用户 2026-09-27）。",
      t_chase_goto_other_foothold),
     ("追击下前往的目的地也要在「可以战斗」白名单里：关掉二楼就真的不去了（用户 2026-10-01）",

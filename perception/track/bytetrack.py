@@ -60,6 +60,15 @@ FLICK_KEEP = 32
 #: 「刚丢的确认轨迹」现场留多少条（同 `FLICK_KEEP` 的上限思路 ✓ 防无限涨 ✗）
 LOST_KEEP = 300
 
+# ---- 遮挡记账（2026-10-22 ✓ 用户："靠近怪物时，跟随玩家的宠物会把怪挡住导致检测框丢失"）----
+#: 遮挡物（宠物框）盖住这条轨迹**多少比例**才算"它被挡住了"（按轨迹框面积算 ✓）。
+#: 取 0.45：宠物是**贴着怪走过去**的，通常只盖住大半只、很少盖满 ⇒ 门槛定太高等于没生效 ✗。
+OCCL_COVER = 0.45
+#: **最多认多久**（毫秒）：连续挡超过这么久 ⇒ 不再当"被挡住"，照老路当成真丢了 ✓。
+#: 为什么不无限认 ✗：怪被挡住之后**也可能已经死了**（刀砍在宠物后面那一下）⇒
+#:   无限认就会留一个打不死的幽灵框、把决策层钉在原地 ✓（现场"打空气"就是这么来的）。
+OCCL_MAX_MS = 1200.0
+
 
 def iou_xyxy(a, b):
     """两个 `xyxy` 框的 IoU（`perception.track.tracker._iou` 同一口径 ✓ 这里自留一份不互相 import ✓）。"""
@@ -178,7 +187,7 @@ class Track:
 
     __slots__ = ("tid", "state", "kf", "conf", "peak_conf", "_conf_sum", "_conf_n",
                  "hits", "hits_streak", "age", "missed", "born", "last_seen",
-                 "confirm_frames", "history", "_ever")
+                 "confirm_frames", "history", "_ever", "occl_since")
 
     def __init__(self, det, tid, now, confirm_frames=CONFIRM_FRAMES):
         self.tid = int(tid)
@@ -199,6 +208,9 @@ class Track:
         #: ⚠ 不能拿 `hits_streak` 现算 ✗：它漏一拍就归零 ⇒ 失联缓冲期里的幽灵框会
         #:   因为"没确认"被当场删掉 ⇒ **失联帧长形同虚设** ✓（第一版实测就是这样 ✗）。
         self._ever = False
+        #: ⭐ **这一条从什么时候起一直被挡着**（秒；`None` = 没被挡 ✓ 2026-10-22）——
+        #:   只用来给"宠物遮住"设个上限（挡太久就当真的没了 ✓ 见 `ByteTracker._occluded`）。
+        self.occl_since = None
         self.history = deque(maxlen=HISTORY_LEN)
         self.history.append(self.kf.box)
 
@@ -242,6 +254,7 @@ class Track:
         self.hits += 1
         self.hits_streak += 1
         self.missed = 0
+        self.occl_since = None         # 又看见了 ⇒ 遮挡计时清零 ✓（2026-10-22）
         self.state = TRACKED
         # 「连续 2~3 帧稳定」攒够 ⇒ **从此算认过**（只涨不落 ✓ 见 `_ever` 说明 ✓）
         if self.hits_streak >= self.confirm_frames:
@@ -269,6 +282,15 @@ class ByteTracker:
                  match_iou_high=MATCH_IOU_HIGH, match_iou_low=MATCH_IOU_LOW,
                  match_iou_unconf=MATCH_IOU_UNCONF):
         self.tracks = []
+        #: ⭐⭐⭐ **正式编号只发给"认下来的"轨迹**（2026-10-23 ✓ 用户："**怪框编号会无限增大？**"）。
+        #:
+        #: 原来是"**每建一条轨迹就发一个号**"（`created` 那一拍 `+= 1` ✓）——而实测（本机
+        #: `behavior.log` 12:36→13:33，**57 分钟**）编号已经涨到 **38949**（≈ **11 个/秒** ✗）。
+        #: 那些号绝大多数属于"**一闪就没、压根没认下来**"的碎轨迹（`diag.flick` ✓）——
+        #: 它们从来不会出现在界面上，却把号池吃掉 ⇒ 人看到的就是"编号大得离谱、还在飞涨"✓。
+        #: ⇒ 现在：新建时给 **-1**（= 还没有身份 ✓），**攒够确认帧那一刻**才从 `_next_id` 取号
+        #:   （见 `update` 第 7 步前那段 ✓）⇒ 涨速 = **真正认下来的怪**（每分钟几只 ✓）。
+        #: ⚠ `-1` 只在内部用：`Mob.id` 只会是正数（输出只含 `confirmed` ✓ 见 `_to_mob` ✓）。
         self._next_id = 1
         self.frame_id = 0
         #: **失联帧长**（毫秒 ✓ 用户定的新参数 ✓ 由设置灌 ✓）
@@ -319,6 +341,48 @@ class ByteTracker:
     def _buffer_frames(self):
         return max(1, int(round(self.track_buffer_ms / 1000.0 * float(self.fps))))
 
+    def _occluded(self, t, occluders, now):
+        """⭐ 这条轨迹**这一拍是不是被已知遮挡物（宠物）挡住了**（2026-10-22 ✓）。
+
+        用户现场原话："**靠近怪物时，跟随玩家的宠物会把怪物挡住导致检测框丢失**"。
+        宠物是**贴着角色走**的 ⇒ 近身那只怪常常正好在宠物后面 ⇒ 模型这一拍**看不见它**
+        ⇒ 老逻辑按"漏检"处理：`missed` 往上涨、涨过「失联帧长」就丢目标 / 换 id
+        ⇒ 决策层看到的是"怪没了" ⇒ 打到一半掉头、反复锁新目标 ✓。
+
+        判据：**遮挡物盖住这条轨迹框面积的比例 ≥ `OCCL_COVER`** ✓（静止的怪也照样算
+          —— 这里只问"看不看得见"，不问它动没动 ✓）。
+
+        返回 True = **别当漏检**（保持原样留着：不涨 `missed`、不记 `mob_lost`、id 不变 ✓）。
+        ⚠ **有上限**（`OCCL_MAX_MS`）：挡太久就照老路当真丢 —— 怪可能在宠物后面**已经被打死**
+          ⇒ 无限留 = 一个打不死的幽灵框把决策层钉在原地 ✗（现场"对着空气砍"就是这么来的）。
+        ⚠ 不用 `t.last_seen` 记时：那个是"最后被**看见**"，被挡住期间它不该动 ✓。
+        """
+        if not occluders:
+            t.occl_since = None
+            return False
+        try:
+            cx, cy, w, h = (float(v) for v in t.box)
+        except (TypeError, ValueError):
+            return False
+        x1, y1, x2, y2 = cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0
+        area = max(1.0, w * h)
+        cover = 0.0
+        for o in occluders:
+            try:
+                ox1, oy1, ox2, oy2 = (float(v) for v in o[:4])
+            except (TypeError, ValueError):
+                continue
+            ix = min(x2, ox2) - max(x1, ox1)
+            iy = min(y2, oy2) - max(y1, oy1)
+            if ix > 0 and iy > 0:
+                cover = max(cover, (ix * iy) / area)
+        if cover < OCCL_COVER:
+            t.occl_since = None           # 没挡住 ⇒ 计时清零（下一段重新起算 ✓）
+            return False
+        if t.occl_since is None:
+            t.occl_since = float(now)
+        return (float(now) - float(t.occl_since)) * 1000.0 <= OCCL_MAX_MS
+
     def _note_lost(self, t):
         """记一条「**认过的轨迹刚丢失**」（`missed` 0→1 的那一帧 ✓ 只记一次 ✓）。"""
         try:
@@ -343,7 +407,9 @@ class ByteTracker:
     def _note_flick(self, t):
         try:
             self.flick.append({
-                "id": int(t.tid),
+                # ⭐ 没认下来就没有正式编号（`-1` ✓ 2026-10-23）：日志里写 `-`，
+                #   免得人以为"这只怪叫 -1"（见 `ByteTracker._next_id` 那段 ✓）
+                "id": (int(t.tid) if int(t.tid) > 0 else "-"),
                 "age": int(t.age),
                 "conf": round(float(t.conf), 3),
                 "peak": round(float(t.peak_conf), 3),
@@ -356,7 +422,11 @@ class ByteTracker:
             pass
 
     # ---------------- 主循环 ----------------
-    def update(self, high, low=()):
+    def update(self, high, low=(), occluders=()):
+        """`occluders` = **遮挡物框**（`(x1, y1, x2, y2)`，宠物 ✓ 2026-10-22）——
+        不参与关联、不进输出，只用来回答"这条轨迹这一拍是**被挡住**还是**真没了**"✓
+        （见 `_occluded` ✓）。不给 ⇒ 与老行为**完全一致** ✓。
+        """
         now = time.monotonic()
         # 0) 帧率估计（EMA ✓ 只认"看得过去"的间隔 ✓）
         if self._last_ts is not None:
@@ -372,10 +442,11 @@ class ByteTracker:
         self.frame_id += 1
         high = [list(map(float, d[:5])) for d in (high or ())]
         low = [list(map(float, d[:5])) for d in (low or ())]
+        occ = [list(map(float, d[:4])) for d in (occluders or ())]
 
         diag = {"matched": 0, "low": 0, "created": 0, "lost": 0,
                 "removed": 0, "flick": 0, "buffer": self._buffer_frames(),
-                "tracks": 0}
+                "occluded": 0, "tracks": 0}
         # ⚠ `flick` **不在这里清** ✗ —— 清了的话"这一拍记的闪一下"当场就没了 ✓
         #   （外部是"每帧 update 完取一次"✓ 见 `drain_flick` ✓；没人取也有 `FLICK_KEEP` 上限 ✓）
 
@@ -420,8 +491,9 @@ class ByteTracker:
         for di, d in enumerate(high):
             if di in used_d:
                 continue
-            t = Track(d, self._next_id, now, self.confirm_frames)
-            self._next_id += 1
+            # ⚠ **不在这里发号** ✗（2026-10-23 ✓ 见 `_next_id` 那段：碎轨迹会白吃号池 ✓）。
+            #   先给 `-1`（= 还没认出身份 ✓），攒够确认帧再发（见下面第 7 步前 ✓）。
+            t = Track(d, -1, now, self.confirm_frames)
             self.tracks.append(t)
             # ⚠ 必须记成"这一帧认领过"✗ —— 否则下面第 6 步会把它当成"没配上"
             #   ⇒ **当拍就删** ⇒ 永远攒不到确认帧 ⇒ 一个框都出不来 ✓（第一版实测踩到 ✓）
@@ -433,6 +505,13 @@ class ByteTracker:
         keep, buf = [], self._buffer_frames()
         for t in self.tracks:
             if id(t) in used_t:
+                keep.append(t)
+                continue
+            # ⭐⭐ **被宠物挡住 ⇒ 这一拍不算"漏检"**（2026-10-22 ✓ 见 `_occluded`）：
+            #   保持原样留着（`missed` 不涨 ⇒ 不会被「失联帧长」判死 ✓、id 也不换 ✓、
+            #   不写 `mob_lost` ✓）—— 决策层照旧能对同一只怪接着打 ✓。
+            if self._occluded(t, occ, now):
+                diag["occluded"] += 1
                 keep.append(t)
                 continue
             t.mark_lost()
@@ -459,6 +538,13 @@ class ByteTracker:
         self.tracks = keep
 
         # 7) 输出：确认过的（含失联缓冲内的幽灵 ✓ `missed > 0` 即幽灵 ✓）
+        # ⭐⭐⭐ **发号就在这一刻**（2026-10-23 ✓ 见 `_next_id` 那段）：
+        #   顺序要紧 —— 必须在**移除/清理之后**、`out` 之前 ✓
+        #   （这一拍刚被删掉的未确认轨迹不该发号 ✗）。
+        for t in self.tracks:
+            if int(t.tid) <= 0 and t.confirmed:
+                t.tid = self._next_id
+                self._next_id += 1
         out = [t for t in self.tracks if t.confirmed]
         diag["tracks"] = len(out)
         self.diag = diag
@@ -471,8 +557,19 @@ class ByteTracker:
             t.kf.shift(dx, dy)
 
     def remove(self, tid):
-        """立即抹掉一条轨迹（幽灵框被攻击时调 ✓ 决策层 `kill` ✓）。"""
-        self.tracks = [t for t in self.tracks if t.tid != int(tid)]
+        """立即抹掉一条轨迹（幽灵框被攻击时调 ✓ 决策层 `kill` ✓）。
+
+        ⚠ **非正数一律不动**（2026-10-23 ✓）：没认下来的轨迹编号是 `-1`（见 `_next_id` 那段），
+          真按 `-1` 去删就等于"把这一拍所有还没认下来的轨迹全抹掉" ✗（`kill` 只会传正的 ✓，
+          但这条兜底得写在这儿，将来谁传个 0 / -1 进来也不会炸 ✓）。
+        """
+        try:
+            _tid = int(tid)
+        except (TypeError, ValueError):
+            return
+        if _tid <= 0:
+            return
+        self.tracks = [t for t in self.tracks if t.tid != _tid]
 
     def drain_flick(self):
         out, self.flick = self.flick, []

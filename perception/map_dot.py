@@ -541,6 +541,58 @@ def _dot_candidates(m, panel_w, exp_side=None):
     return (_big or _ok), dense
 
 
+def _dot_candidates_edge(panel, fam=None, ref_w=None, exp_side=None):
+    """黄点**贴着小地图边缘**时的那一档（2026-10-23 ✓ 用户："**怎么没认出来**"）。
+
+    **现场**（用户截图 + `data/dot_probe/app_panel.png` ✓ 面板 **109×114**）：玩家走到地图
+    最右边，游戏就把黄点**画在面板最外那 2~3 px 里** —— 而 `dot_mask` 会把边缘
+    `DOT_INSET(3)` 圈**整圈挖掉**（那是为了不让面板描边/边框被当成点 ✓）
+    ⇒ 掩码 **0 像素** ⇒ 颜色层没候选 ⇒ 退到差分层 ⇒ 出口"颜色不像" ⇒ **认不出** ✗
+    ⇒ 界面上的圈退回旧位置（用户看到的：**圈不在黄点上** ✓）。
+
+    **实测**（同一个黄点，只挪 x，面板 109 宽）：中心 103 ⇒ 掩码 36 px ✓；105 ⇒ 24 ✓；
+      106 ⇒ 18 ✓；**107 / 108 ⇒ 0** ✗ —— 边界正好落在"最外 3 px"那一条上 ✓。
+
+    ⇒ 这一档：**不挖边**再找一遍，只收**贴着最外 2 px** 的块，并且
+      · 边长照 `dot_side_max`（面板描边是**整条长线** ⇒ 过不去 ✓）；
+      · 短边 ≥ `DOT_SIDE_MIN`、面积 ≥ 8、实心度 ≥ 0.35
+        （贴边必然被裁掉一角 ⇒ 口径比常规松一档 ✓ 不然刚被裁就又不认了 ✗）。
+    ⚠ **只在常规两档（底图相减 / 颜色）都没结果时才用**（见 `find_player_dot` ✓）；
+      认到的点会带 `layer="edge"` + 一句"贴边（被裁了一点，位置差 ≤ 2 px）" ✓。
+    返回 `(候选列表, 掩码像素数)` ✓（空 = 这一档也没用 ✓）。
+    """
+    if panel is None or getattr(panel, "ndim", 0) != 3:
+        return [], 0
+    try:
+        H, W = int(panel.shape[0]), int(panel.shape[1])
+        m = dot_color(panel, fam).astype(np.uint8)
+    except Exception:                          # noqa: BLE001 —— 认不出就算了，绝不抛 ✓
+        return [], 0
+    total = int(m.sum())
+    if total <= 0:
+        return [], 0
+    side_max = dot_side_max(ref_w or W)
+    n, _lab, stats, cent = cv2.connectedComponentsWithStats(m, 8)
+    out = []
+    for i in range(1, n):
+        x, y, w, h, a = (int(t) for t in stats[i])
+        if max(w, h) > side_max:
+            continue                           # 整条描边 / 一大片 ⇒ 不是点 ✓
+        if min(w, h) < DOT_SIDE_MIN:
+            continue
+        if a < 8:
+            continue
+        fill = a / float(max(1, w * h))
+        if fill < 0.35:
+            continue
+        if not (x <= 1 or y <= 1 or x + w >= W - 1 or y + h >= H - 1):
+            continue                           # 只收**贴边**的（里面那些常规档已经找过了 ✓）
+        out.append({"x": float(cent[i][0]), "y": float(cent[i][1]),
+                    "w": w, "h": h, "area": a, "fill": round(fill, 2)})
+    out.sort(key=lambda c: (-c["area"], -c["fill"]))
+    return out, total
+
+
 def roi_around(center, shape, pad):
     """以 center 为中心、半边长 pad 的矩形（裁到画面内）→ (x0,y0,x1,y1) 或 None。
 
@@ -1062,6 +1114,21 @@ def find_player_dot(panel, calib=None, terrain=None, roi=None, near=None,
             diag.append("%s族/%s层：像点的块 %d 个、成片 %d 像素%s"
                         % ("黄" if fam == "yellow" else "青", layer, len(cands),
                            dense, "（被淹）" if flooded else ""))
+        # ⭐⭐⭐⭐ **贴边那一档**（2026-10-23 ✓ 用户："**怎么没认出来**"）：
+        #   常规两档都没结果时，用**不挖边**的颜色掩码再找一遍，只收贴着最外 2 px 的块 ✓
+        #   （病根见 `_dot_candidates_edge` 的说明：`DOT_INSET=3` 把贴边的黄点整圈挖掉了 ✓
+        #     实测同一个点：中心 x=106 ⇒ 认得出；107/108 ⇒ 掩码 0 ⇒ 认不出 ✗）。
+        #   ⚠ 放在这儿（**两档之后、差分层兜底之前**）：差分层不看颜色、假点风险更大 ✓；
+        #     而且这一档本身**就是按黄族颜色卡的** ✓ 比差分层可信 ✓。
+        if hit is None:
+            _ec, _etot = _dot_candidates_edge(panel, fam, ref_w or panel.shape[1], exp_side)
+            if _ec:
+                hit = {"family": fam, "layer": "edge", "mask_px": _etot,
+                       "dense_px": _etot, "candidates": len(_ec),
+                       "all": _ec, "flooded": False}
+                diag.append("%s族/贴边层：常规模板挖掉了边缘 3px ⇒ 这一档在**贴边**找到 %d 个"
+                            "（黄点走到地图最边上时就这样 ✓ 位置差 ≤ 2px ✓）"
+                            % ("黄" if fam == "yellow" else "青", len(_ec)))
         if hit is not None:
             break
 
@@ -1212,9 +1279,15 @@ def find_player_dot(panel, calib=None, terrain=None, roi=None, near=None,
         med = np.zeros(3, int)
     # ⚠ 差分层**没有"族"**（它不看颜色 ✓）：别写成"diff 族 / diff 层" ✗（日志里看着像坏了 ✓）。
     _who = ("差分层" if hit["layer"] == "diff"
-            else "%s 族 / %s 层" % (hit["family"], hit["layer"]))
+            else "%s 族 / %s 层" % (hit["family"],
+                                    "贴边" if hit["layer"] == "edge" else hit["layer"]))
     reason = ("找到玩家标记（%s）" % _who if len(cands) == 1 else
               "找到 %d 个候选（%s；跨帧跟踪会挑）" % (len(cands), _who))
+    if hit["layer"] == "edge":
+        # ⭐ **如实说"这个点贴边、被裁了一点"**（2026-10-23 ✓）：位置误差 ≤ 2 px
+        #   ⇒ 换到世界坐标是 ≤ 17 px（这张图 1 面板像素 ≈ 8.5 世界单位 ✓）
+        #   —— 现场/日志要看得见，别让人以为"和平时一样准" ✓。
+        reason += "·**贴边（被面板边缘裁掉一角，位置差 ≤ 2 px）**"
     out = dict(base, ok=True, x=c["x"], y=c["y"], w=c["w"], h=c["h"],
                area=c["area"], bgr=tuple(int(v) for v in med), reason=reason)
     out.update(hit)

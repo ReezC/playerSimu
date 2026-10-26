@@ -28,7 +28,7 @@ import time
 
 from core import perf
 #: 掉落类（只给「自动拾取」算"接没接触"用 ✓ 见文件开头那条"不进决策"✓）
-from perception.detect.classes import CLASS_DROP
+from perception.detect.classes import CLASS_DROP, CLASS_PET
 
 
 def _det_crop_for(vis, vision_box, enabled):
@@ -74,20 +74,27 @@ class InferOut:
     · `player` / `player_low`  玩家候选（同上 ✓ 交给 `PlayerTracker` 挑"我"）
     · `cls_dets`               其余类别（掉落 / NPC / 其他玩家 / 宠物）⇒ **只给画框** ✓
     · `drop`                   掉落物框（只给「自动拾取」算"接没接触"✓）
+    · `pets`                   ⭐ **宠物框**（只给**怪追踪的"遮挡"记账** ✓ 2026-10-22）——
+                               用户现场："靠近怪物时，跟随玩家的宠物会把怪挡住导致检测框丢失"。
+                               ⚠ 它**不是**一条"宠物进决策"的通道 ✗（`WorldState` 里没有、
+                                 `ws.mobs` 里也不会多出东西 ✓）；只用来回答"这条怪轨迹这一拍
+                                 是不是**被挡住了**、而不是**没了**" ✓（见 ByteTracker.update ✓）。
     · `k`                      这一帧检出几只怪（低分档不算 ✓ 状态行用）
     · `crop_off`               这一拍是整帧还是剪裁（`(0,0)` = 整帧 ✓ 打点 / 用例用）
     """
 
     __slots__ = ("mob", "mob_low", "player", "player_low", "cls_dets",
-                 "drop", "k", "crop_off")
+                 "drop", "pets", "k", "crop_off")
 
-    def __init__(self, mob, mob_low, player, player_low, cls_dets, drop, k, crop_off):
+    def __init__(self, mob, mob_low, player, player_low, cls_dets, drop, k, crop_off,
+                 pets=()):
         self.mob = mob
         self.mob_low = mob_low
         self.player = player
         self.player_low = player_low
         self.cls_dets = cls_dets
         self.drop = drop
+        self.pets = tuple(pets or ())
         self.k = k
         self.crop_off = crop_off
 
@@ -194,6 +201,10 @@ def step(th, vis, model, det, _mob_class, _player_class, _extra_map,
     #:   原始检出 ✓ 不过 tracker ✓ 不进 `ws.mobs` ✓（见 `drop_touch` ✓）。
     #:   ⚠ 每帧都要先给默认（下面 `if boxes` 不成立时它就是空的 ✓）。
     _drop_boxes = []
+    #: ⭐ **宠物框**（2026-10-22 ✓ 用户："靠近怪物时，跟随玩家的宠物会把怪挡住导致检测框丢失"）
+    #:   —— 只当**遮挡物**喂给怪追踪（"这条轨迹是**被挡住**、不是**没了**"✓ 见
+    #:   `ByteTracker.update(occluders=...)` ✓）；**不进** `ws.mobs` / `WorldState` ✓。
+    _pet_boxes = []
     boxes = getattr(res, "boxes", None)
     if boxes is not None and len(boxes):
             xyxy = boxes.xyxy.cpu().numpy()
@@ -253,7 +264,19 @@ def step(th, vis, model, det, _mob_class, _player_class, _extra_map,
                                           for (_x1, _y1, _x2, _y2), _c, _cls
                                           in zip(xyxy, cfs, clss)
                                           if _extra_map.get(int(_cls)) == CLASS_DROP]
+            # ⭐⭐ **宠物框另留一份当"遮挡物"**（2026-10-22 ✓ 用户现场：
+            #   "靠近怪物时，跟随玩家的宠物会把怪挡住导致检测框丢失"）。
+            #   宠物贴着角色走 ⇒ 近身那只怪常常正好在宠物后面 ⇒ 模型**这一拍看不见它** ✗
+            #   ⇒ 老的追踪只能按"漏检"处理：`missed` 往上涨、涨过「失联帧长」就换 id / 丢目标
+            #   ⇒ 决策层看到的是"怪没了" ⇒ 打到一半掉头 / 反复锁新目标 ✓。
+            #   ⚠ 只当**遮挡物**用：`ws.mobs` 仍旧只由 `mob_dets` 喂 ✓（宠物本身**永远不进
+            #     `mobs` / `WorldState`** ✓ 那条红线不动 ✓ 用例 `t_drop_pet_never_enter_decision` ✓）。
+            _pet_boxes = [(float(_x1), float(_y1), float(_x2), float(_y2))
+                                      for (_x1, _y1, _x2, _y2), _c, _cls
+                                      in zip(xyxy, cfs, clss)
+                                      if _extra_map.get(int(_cls)) == CLASS_PET]
 
     return InferOut(mob=mob_dets, mob_low=mob_low, player=player_cands,
                     player_low=player_low, cls_dets=_cls_dets,
-                    drop=_drop_boxes, k=k, crop_off=_det_off)
+                    drop=_drop_boxes, k=k, crop_off=_det_off,
+                    pets=_pet_boxes)

@@ -23,8 +23,8 @@ from PyQt5.QtWidgets import (QCheckBox, QFileDialog, QFormLayout, QFrame,
                              QHBoxLayout, QLabel, QLineEdit, QPushButton,
                              QVBoxLayout)
 
-from gui.widgets import (NoWheelComboBox, NoWheelDoubleSpinBox,   # noqa: F401
-                         NoWheelSpinBox, field_tip)
+from gui.widgets import (MultiCheckCombo, NoWheelComboBox,        # noqa: F401
+                         NoWheelDoubleSpinBox, NoWheelSpinBox, field_tip)
 
 CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩"
 
@@ -195,6 +195,18 @@ class StepCard(QFrame):
             form.addRow(label, w)
             self.widgets[key] = (w, kind)
             return _finish(w)
+        elif kind == "checks":
+            # ⭐⭐⭐ **多选下拉**（用户 2026-10-24："**能弄下列表选项吗？反正都是有限的**"）——
+            #   选项有限又要多选时用这个，别再让人手打一串名字/类 id ✗
+            #   （打错一个就静默变成"另一份素材"或"一个都没选"，看不出来 ✓）。
+            #   `choices` = `[(值, 显示名), …]` 或 `[值, …]`；值也可以事后用
+            #   `widget.set_items(...)` 重填（如"候选项目"随项目变 ✓）。
+            w = MultiCheckCombo()
+            w.set_items(kw.get("choices") or [])
+            w.set_checked(default or [])
+            form.addRow(label, w)
+            self.widgets[key] = (w, kind)
+            return _finish(w)
         elif kind == "path":
             w = QLineEdit(str(default or ""))
             w.setReadOnly(True)
@@ -291,6 +303,8 @@ class StepCard(QFrame):
             return w.currentText()
         if kind == "combo":
             return w.currentData()      # 显示文本给用户看，真正取值用 userData
+        if kind == "checks":
+            return w.checked()          # ⭐ 多选：返回**值**列表（不是显示文字 ✓）
         return w.text().strip()
 
     def set_value(self, key, val):
@@ -311,6 +325,13 @@ class StepCard(QFrame):
             i = w.findData(val)
             if i >= 0:
                 w.setCurrentIndex(i)
+        elif kind == "checks":
+            # ⚠ 老项目里存的是**字符串**（"0,4" / "珠缨；鳄鱼潭"），新存的是**列表** ✓
+            #   两种都得吃得下 —— 直接 `set_checked("0,4")` 会被当成字符序列 ✗。
+            if isinstance(val, (list, tuple, set)):
+                w.set_checked(list(val))
+            else:
+                w.set_checked([val])
         else:
             w.setText(str(val))
 

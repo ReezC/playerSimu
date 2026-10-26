@@ -152,6 +152,12 @@ def parse_window_line(line):
 
 
 class KbdClient:
+    #: 发一条指令最多等多久（秒）—— 局域网里发几字节，2 秒是"已经不正常"的量级 ✓
+    SEND_TIMEOUT_S = 2.0
+    #: 读线程**每次持锁**最多多久（秒）：50 ms ⇒ 发送方最坏也就等这么久 ✓
+    #: （再长就会在按键上感觉到迟滞；短于 20 ms 空转太勤也不划算 ✓）
+    RECV_TIMEOUT_S = 0.05
+
     def __init__(self, host, port, cafile, timeout=5.0):
         ctx = ssl.create_default_context(cafile=cafile)
         ctx.check_hostname = False          # 自签证书不校主机名
@@ -159,11 +165,26 @@ class KbdClient:
         # ⭐ **在包 TLS 之前设**（`setsockopt` 对 TLS 包装后的对象也能用，但放在这儿更直白 ✓）
         set_nodelay(raw)
         self._sock = ctx.wrap_socket(raw, server_hostname=host)
-        # **超时只在这里设一次**：原来 send() 每次都调 settimeout(2.0)，而读线程
-        # 同时在这个 socket 上 recv —— 多线程改同一个 socket 的超时会打乱正在进行的
-        # 收发（TLS 层尤其敏感）。收发都用 2 秒，读线程本来就把超时当「空闲」处理。
-        self._sock.settimeout(2.0)
+        # ⚠⚠⚠ **2026-10-22：超时改成"每次操作在自己的锁里重设"**（原来这里设一次就再不管 ✗）
+        #
+        #   为什么原来写"只设一次"：那时 `send()` 每次都调 `settimeout(2.0)`，而读线程**同时**
+        #   在同一个 socket 上 `recv` —— 两个线程改同一个 socket 的超时会把正在进行的收发打乱
+        #   （TLS 层尤其敏感 ✓）。那个判断对，但**根子不是超时、是并发** ✗。
+        #
+        #   现场（`Application Error` 2026-10-22 00:26:35 / `crash.log` 同一份栈）：
+        #     · 崩溃线程 = `send()` → `ssl.sendall`；
+        #     · 同时另一条线程 = `_drain()` → `ssl.recv`（**没拿锁**）；
+        #     · 而重连线程 `reset_link()` → `_drop_remote()` → `close()` 也**没拿锁**；
+        #     ⇒ 同一个 OpenSSL `SSL*` 被两三条线程同时动 / 发送中被人 close ⇒
+        #       `libssl-3-x64.dll +0x97916` **访问违例 0xc0000005**（不是抛异常，整进程闪退 ✓）。
+        #   ⇒ 现在**所有** socket 操作都在 `self._lock` 里、且**各自**把超时设成自己要的值
+        #     （读＝短超时让发送优先 ✓、写＝2 秒 ✓）；串行之后改超时就是安全的 ✓。
+        self._sock.settimeout(self.SEND_TIMEOUT_S)
+        #: ⭐ **所有** socket 操作（sendall / recv / close）都排在这把锁后面 ✓
         self._lock = threading.Lock()
+        #: 「现在有几个人在等发」——读线程看到 >0 就先让一让（不然它刚放锁又抢回去，
+        #: 发送方会被饿到 ✓）。只是个启发式，读错最坏是多等一拍 recv（50 ms）✓。
+        self._sending = 0
         self._stop = threading.Event()
         self._dirty = False      # 上一条可能只发出去半行（超时中断）→ 下一条要重新对齐
         self.ok = True           # 最近一次发送成功了吗（链路健康度）
@@ -210,6 +231,18 @@ class KbdClient:
         self._reader = threading.Thread(target=self._drain, daemon=True)
         self._reader.start()
 
+    def _sendall_locked(self, data):
+        """在**已持有 `self._lock`** 的前提下把 `data` 发出去。
+
+        ⚠ 为什么还要在锁里重设超时（2026-10-22）：读线程每次持锁只 recv
+          `RECV_TIMEOUT_S`（50 ms），它会把 socket 的超时临时改成 50 ms ✓
+          ⇒ 发送这头必须**自己**改回 `SEND_TIMEOUT_S`，否则一条指令只剩 50 ms 的
+          发送窗口（网络一抖就 `timed out` ⇒ 标记 dirty ⇒ 键位串行）✗。
+          串行之后"改超时"这件事就安全了 —— 同一时刻只有一个人碰这个 socket ✓。
+        """
+        self._sock.settimeout(self.SEND_TIMEOUT_S)
+        self._sock.sendall(data)
+
     def send(self, line):
         """发一条指令。返回 True = 已交给内核，False = 这次没发出去。
 
@@ -222,28 +255,34 @@ class KbdClient:
         还在那儿一直发 —— 表现就是「停自动没用、手动也没用，只能关 GUI」。
         """
         data = (line + "\n").encode()
-        with self._lock:
-            try:
-                if self._dirty:
-                    data = b"\n" + data     # 切掉对端残留的半行
-                self._sock.sendall(data)
-                self._dirty = False
-                self.ok = True
-                self.sent += 1
-                self.last_send_at = time.monotonic()
-                # RTT 起点：只记**最早那条还没对上回执的**（这样量到的就是窗口里最久的
-                # 那一条 ⇒ 天然偏保守 ✓，不会把"刚发出去"当成整段往返 ✗）
-                self._pending += 1
-                if self._rtt_t0 is None:
-                    self._rtt_t0 = time.perf_counter()
-                self._sample_pending()
-                return True
-            except Exception as e:
-                self._dirty = True
-                self.ok = False
-                self.fails += 1
-                self.last_err = "%s: %s" % (type(e).__name__, e)
-                return False
+        # ⭐ 先挂个"有人在等发"的牌子（读线程看到就少抢一拍 **50 ms** 的锁 ✓ 见 `_drain`）：
+        #   不挂的话，读线程刚放锁又会立刻抢回去 —— CPython 的 Lock 不保证公平 ✓
+        self._sending += 1
+        try:
+            with self._lock:
+                try:
+                    if self._dirty:
+                        data = b"\n" + data     # 切掉对端残留的半行
+                    self._sendall_locked(data)
+                    self._dirty = False
+                    self.ok = True
+                    self.sent += 1
+                    self.last_send_at = time.monotonic()
+                    # RTT 起点：只记**最早那条还没对上回执的**（这样量到的就是窗口里最久的
+                    # 那一条 ⇒ 天然偏保守 ✓，不会把"刚发出去"当成整段往返 ✗）
+                    self._pending += 1
+                    if self._rtt_t0 is None:
+                        self._rtt_t0 = time.perf_counter()
+                    self._sample_pending()
+                    return True
+                except Exception as e:
+                    self._dirty = True
+                    self.ok = False
+                    self.fails += 1
+                    self.last_err = "%s: %s" % (type(e).__name__, e)
+                    return False
+        finally:
+            self._sending -= 1
 
     def cursor(self, timeout=0.8):
         """问 **A 机光标在哪** ⇒ `(x, y, vx, vy, vw, vh, cap)`；问不到 ⇒ `None` ✓。
@@ -265,7 +304,7 @@ class KbdClient:
         #   ⇒ 这里**自己发**：只记 `sent` / `last_send_at`（诊断用 ✓），**不记 `_pending`** ✓。
         with self._lock:
             try:
-                self._sock.sendall(b"CURSOR?\n")
+                self._sendall_locked(b"CURSOR?\n")
                 self.sent += 1
                 self.last_send_at = time.monotonic()
                 self.ok = True
@@ -288,7 +327,7 @@ class KbdClient:
         self._win_ev.clear()
         with self._lock:
             try:
-                self._sock.sendall(b"WINDOW?\n")
+                self._sendall_locked(b"WINDOW?\n")
                 self.sent += 1
                 self.last_send_at = time.monotonic()
                 self.ok = True
@@ -428,53 +467,80 @@ class KbdClient:
         周期自检 / 手动重置按钮）知道要重连，而不是继续对着一条死链发命令。
         """
         while not self._stop.is_set():
+            # ⭐ 发送方优先（2026-10-22 那次闪退顺手加的）：有人在等锁就先让 1 ms —— 否则
+            #   读线程刚放锁又立刻抢回去（CPython 的 `Lock` 不保证公平 ✓），按键就被饿住 ✓。
+            if self._sending > 0:
+                time.sleep(0.001)
+                continue
+            # ⚠⚠⚠ **recv 也必须在锁里**（原来它**不持锁** ✗，2026-10-22 现场）：
+            #   OpenSSL 的 `SSL*` 同一时刻只能被一个线程动 —— 读着被人 `sendall` / `close()`
+            #   就是 `libssl-3-x64.dll` **访问违例 0xc0000005**（不是异常、是整个进程闪退 ✓）。
+            #   持锁时长由 `RECV_TIMEOUT_S`（50 ms）兜住 ⇒ 发送最坏等 50 ms ✓。
             try:
-                data = self._sock.recv(4096)
-                if not data:
-                    self.ok = False     # 连接被对端关闭
-                    self.last_err = "连接被对端关闭"
-                    break
-                # ⭐ **先把 A 机日志挑走**再数回执（2026-10-03 ✓ 见 `_take_a_logs`）——
-                #   挑走的行不许参与 `DONE`/`ERR` 计数 ✗（否则日志字眼会骗到 RTT / 死链判据 ✓）
-                data = self._take_a_logs(data)
-                # ⭐⭐ 「问 A 机光标」的回包（`CUR …` ✓ 由 relay 自己答的 ✓）——
-                #   ⚠ 它既不是 `DONE` 也不是 `ERR` ✗ ⇒ 天然不会被下面那句计数混进去 ✓
-                #   （2026-10-10 ✓ 见 `self._cur_ev` / `parse_cursor_line` ✓）。
-                if b"CUR " in data:
-                    for _ln in data.split(b"\n"):
-                        if _ln.lstrip().startswith(b"CUR "):
-                            self._cur_box = parse_cursor_line(_ln)
-                            self._cur_ev.set()
-                # ⭐⭐ 「问 A 机游戏窗口在哪」的回包（`WIN …` ✓ 同样 relay 自己答 ✓）
-                if b"WIN " in data:
-                    for _ln in data.split(b"\n"):
-                        if _ln.lstrip().startswith(b"WIN "):
-                            self._win_box = parse_window_line(_ln)
-                            self._win_ev.set()
-                # ⭐ relay 的**角色公告**（`ROLE control` / `ROLE readonly` ✓ 见 relay）——
-                #   ⚠ 必须在 `DONE/ERR` 计数**之前**挑走 ✗（老 relay 不发这条 ⇒ 收不到就是 ""✓）
-                if b"ROLE " in data:
-                    for _ln in data.split(b"\n"):
-                        if _ln.lstrip().startswith(b"ROLE "):
-                            try:
-                                self.role = _ln.split()[1].decode("ascii", "replace").lower()
-                            except Exception:      # noqa: BLE001
-                                pass
-                n = data.count(b"DONE") + data.count(b"ERR")
-                if n:
-                    self.replies += n
-                    self.last_reply_at = time.monotonic()
-                    self._take_rtt(n)
+                with self._lock:
+                    if self._stop.is_set():
+                        break
+                    self._sock.settimeout(self.RECV_TIMEOUT_S)
+                    data = self._sock.recv(4096)
             except socket.timeout:
                 continue                # 空闲超时：继续等，别退出
             except Exception as e:
                 self.ok = False
                 self.last_err = "读线程退出：%s: %s" % (type(e).__name__, e)
                 break
+            if not data:
+                self.ok = False         # 连接被对端关闭
+                self.last_err = "连接被对端关闭"
+                break
+            # ---- 下面全是解析：**不持 socket 锁** ✓（别让发送等我们数 DONE）----
+            # ⭐ **先把 A 机日志挑走**再数回执（2026-10-03 ✓ 见 `_take_a_logs`）——
+            #   挑走的行不许参与 `DONE`/`ERR` 计数 ✗（否则日志字眼会骗到 RTT / 死链判据 ✓）
+            data = self._take_a_logs(data)
+            # ⭐⭐ 「问 A 机光标」的回包（`CUR …` ✓ 由 relay 自己答的 ✓）——
+            #   ⚠ 它既不是 `DONE` 也不是 `ERR` ✗ ⇒ 天然不会被下面那句计数混进去 ✓
+            #   （2026-10-10 ✓ 见 `self._cur_ev` / `parse_cursor_line` ✓）。
+            if b"CUR " in data:
+                for _ln in data.split(b"\n"):
+                    if _ln.lstrip().startswith(b"CUR "):
+                        self._cur_box = parse_cursor_line(_ln)
+                        self._cur_ev.set()
+            # ⭐⭐ 「问 A 机游戏窗口在哪」的回包（`WIN …` ✓ 同样 relay 自己答 ✓）
+            if b"WIN " in data:
+                for _ln in data.split(b"\n"):
+                    if _ln.lstrip().startswith(b"WIN "):
+                        self._win_box = parse_window_line(_ln)
+                        self._win_ev.set()
+            # ⭐ relay 的**角色公告**（`ROLE control` / `ROLE readonly` ✓ 见 relay）——
+            #   ⚠ 必须在 `DONE/ERR` 计数**之前**挑走 ✗（老 relay 不发这条 ⇒ 收不到就是 ""✓）
+            if b"ROLE " in data:
+                for _ln in data.split(b"\n"):
+                    if _ln.lstrip().startswith(b"ROLE "):
+                        try:
+                            self.role = _ln.split()[1].decode("ascii", "replace").lower()
+                        except Exception:      # noqa: BLE001
+                            pass
+            n = data.count(b"DONE") + data.count(b"ERR")
+            if n:
+                self.replies += n
+                self.last_reply_at = time.monotonic()
+                self._take_rtt(n)
 
     def close(self):
+        """关掉连接 —— ⚠ **必须持锁**（2026-10-22 闪退那次改的）。
+
+        原来的写法是"置个停止位就直接 `self._sock.close()`" ✗ —— 而调用方是**后台重连线程**
+        （`agent._link_reset_bg` → `execution.remote.reset_link` → `_drop_remote`）：
+        它可能正好落在决策线程的 `sendall` 中间 ⇒ **发送中把 socket 关掉** ⇒
+        `libssl` 里就是 use-after-free（`0xc0000005`，整进程闪退 ✓ Windows 事件日志
+        2026-10-22 00:26:35 / 模块 `libssl-3-x64.dll` ✓）。
+
+        ⚠ 顺序：**先置停止位再抢锁** ✓ —— 读线程拿到锁后会先看 `_stop` 再 recv（见 `_drain`），
+          所以最多等它那一次 50 ms 的 recv 回来就走 ✓，不会卡在 2 秒的阻塞读上 ✓
+          （老代码给 socket 设的是 2 秒超时，那才是"关窗口/重连要等两秒"的来源 ✓）。
+        """
         self._stop.set()
-        try:
-            self._sock.close()
-        except Exception:
-            pass
+        with self._lock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass

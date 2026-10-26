@@ -331,6 +331,72 @@ def t_health_readonly():
         _remote_mod._remote, _remote_mod._cfg = old_remote, old_cfg
 
 
+def t_hard_exit_never_returns():
+    """⭐⭐⭐⭐ `hard_exit` 必须**真的把进程送走** —— 连 `os._exit` 自己炸了也不行（2026-10-23）。
+
+    **用户原话**："**进程又没杀掉 请根治**"。
+
+    **现场**（`crash.log` 里抓到的，`pythonw` 无控制台也照样写进去了 ✓）：
+    ```
+    Current thread 0x00008de0 (most recent call first):
+      File "core/appexit.py", line 73 in hard_exit      ← 就是 `os._exit(code)` 那一行
+      File "gui/app.py", line 228 in _hard_exit
+      File "gui/app.py", line 383 in main
+    Windows fatal exception: code 0xc000000d            ← STATUS_INVALID_PARAMETER
+    ```
+    ⇒ `os._exit()` **收尾时自己炸了、而且没退成**（函数返回了）⇒ 又掉回
+      `Py_Main → Py_RunMain` 那条解释器收尾 ⇒ 撞 Windows TSF/IME 死等
+      ⇒ **窗口没了、进程还挂着** ✓
+      （实测：`pid 64052` `pythonw -m gui.app`，**89 条线程**、2.8 GB、还攥着
+        `data/locks/udp_5000.lock` ⇒ 下次启动只会说"端口被另一个实例占用" ✗）。
+
+    ⇒ 所以"能退"这件事**不能只靠一条路**。这里用真进程量两件：
+      ① 正常路径：`hard_exit(0)` ⇒ 进程退出、码 0 ✓；
+      ② **现场那条**：把 `os._exit` 换成空函数（= 它没退成 ✓）⇒ 进程**仍然必须死**，
+        而且退出码就是传进去的那个（`TerminateProcess` 收的 ✓），
+         绝不能还在打印（= 掉回解释器收尾、又一个空壳 ✗）。
+    """
+    import subprocess
+
+    py = sys.executable
+    env = dict(os.environ)
+    env["PSIMU_INSTANCE"] = "selftest"          # ⚠ 让子进程的崩溃日志落到 crash_selftest.log
+    _crash = ROOT / "crash_selftest.log"        #   （别污染用户那份 crash.log ✓）
+    try:
+        # ① 正常路径：真的退、码 0
+        r = subprocess.run([py, "-c", "from core import appexit; appexit.hard_exit(0)"],
+                           cwd=str(ROOT), env=env, capture_output=True, text=True,
+                           timeout=60)
+        check(r.returncode == 0,
+              "`hard_exit(0)` 的退出码是 %r（该是 0）✗：%s"
+              % (r.returncode, (r.stderr or "")[-300:]))
+
+        # ② 现场那条：`os._exit` 没退成 ⇒ 仍然必须死（且码对）
+        code = ("import os\n"
+                "os._exit = lambda c=0: None\n"     # 模拟 0xc000000d：它抛了、返回了 ✗
+                "from core import appexit\n"
+                "appexit.hard_exit(7)\n"
+                "print('STILL-ALIVE')\n")
+        try:
+            r2 = subprocess.run([py, "-c", code], cwd=str(ROOT), env=env,
+                                capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            check(False,
+                  "`os._exit` 没退成之后进程**再也死不了**（60 秒还没走）⇒ 又回到"
+                  "「窗口关了、进程还挂着」那个空壳（用户 2026-10-23：「进程又没杀掉」✗）")
+            return
+        check("STILL-ALIVE" not in (r2.stdout or ""),
+              "`os._exit` 没退成之后**掉回解释器收尾**了（还能打印）⇒ 又要撞 TSF/IME 死等 ✗")
+        check(r2.returncode == 7,
+              "没退成之后是被别的东西收走的（退出码 %r，该是我们传的 7）✗" % (r2.returncode,))
+    finally:
+        try:
+            if _crash.exists():
+                _crash.unlink()                # 只是这次用例的痕迹 ✓
+        except Exception:                      # noqa: BLE001
+            pass
+
+
 TESTS = (
     ("① 空实例 ⇒ 配置/日志/会话/录像四条路径与老行为**一字不差**（单实例用户不受影响）",
      t_default_paths_unchanged),
@@ -344,6 +410,9 @@ TESTS = (
      t_source_pins),
     ("⑤b 只读端必须在 `link_health()` 里如实说是只读（不许报链路正常）",
      t_health_readonly),
+    ("⑥ ⭐⭐⭐⭐ `hard_exit` **必须真的把进程送走** —— 连 `os._exit` 自己炸了也不行"
+     "（用户 2026-10-23：\"进程又没杀掉 请根治\"；现场 `0xc000000d` 那个空壳 ✓）",
+     t_hard_exit_never_returns),
 )
 
 

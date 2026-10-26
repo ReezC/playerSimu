@@ -86,9 +86,10 @@ class Feed:
     def __exit__(self, *a):
         self.stop()
 
-    def step(self, *dets, ms=FRAME_MS, low=(), world=None):
+    def step(self, *dets, ms=FRAME_MS, low=(), world=None, occ=()):
         self.clock.tick(ms)
-        return self.t.update(list(dets), list(low), player_world=world)
+        return self.t.update(list(dets), list(low), player_world=world,
+                             occluders=tuple(occ))
 
     def warm(self, *dets, n=2, ms=FRAME_MS):
         """先喂 n 拍同一批框，把轨迹**确认**下来 ✓。
@@ -289,6 +290,57 @@ def t_low_conf_never_creates():
               "低分框居然建了轨迹：%d 条" % len(f.t.bt.tracks))
 
 
+def t_ids_only_for_confirmed():
+    """⭐⭐⭐ **正式编号只发给"认下来的"怪**（用户 2026-10-23："**怪框编号会无限增大？**"）。
+
+    **现场量的**（本机 `behavior.log`，12:36:48 → 13:33:55，**57 分钟**）：编号已经涨到
+    **38949**（≈ **11 个/秒** ✗）。可那些号绝大多数属于"**一闪就没、压根没认下来**"的碎轨迹
+    （`diag.flick` ✓）—— 它们**从来不会出现在界面上**，却把号池吃光了 ⇒ 人看到的就是
+    "编号大得离谱、还在飞涨"✓（`ByteTracker._next_id` 那段有完整说明 ✓）。
+
+    ⇒ 口径改成：新建时 `tid=-1`（**还没有身份**），**攒够确认帧那一刻**才发正式号 ✓。
+
+    钉四件：
+      ① 第一条真怪 = **1** ✓；
+      ② 中间那些"闪一下就没"的**不吃号**（`drain_flick()` 里的 id 是 `"-"` ✓ 不是数字）；
+      ③ 后面的真怪接着 **2、3…**（不复用、也不跳号 ✓）；
+      ④ 对外只看得到**正数**编号（`Mob.id` 绝不出现 `-1` ✓ —— 那是内部"还没认下来"的记号）。
+    """
+    with Feed() as f:
+        # ① 第一条：喂够确认帧 ⇒ 拿号 1
+        out = f.warm(det(500), n=4)
+        check(len(out) == 1, "第一条稳定目标该被认下来：%d 个" % len(out))
+        check(int(out[0].id) == 1,
+              "第一条被认下来的怪编号该是 1（实得 %r）✗" % (out[0].id,))
+
+        # ② 中间塞一串"闪一下就没"的框（只出现一拍 ⇒ 攒不到确认帧 ⇒ 碎轨迹）
+        for i in range(6):
+            f.step(det(100.0 + i * 40))       # 各自只出现一次
+            f.idle(2)                          # 空两拍 ⇒ 它们被当成 flick 丢掉
+        f.idle(30)                             # 让失联缓冲也过完
+        _flick = f.t.bt.drain_flick()
+        check(len(_flick) >= 3,
+              "用例没造出碎轨迹（flick=%d）⇒ 这一段什么都没验到 ✗" % len(_flick))
+        check(all(not isinstance(v.get("id"), int) or int(v["id"]) <= 0 for v in _flick),
+              "**闪一下就没的碎轨迹也吃了正式编号** ⇒ 编号飞涨（用户 2026-10-23 现场 ✓）：%r"
+              % ([v.get("id") for v in _flick],))
+
+        # ③ 再来一条真怪 ⇒ 编号必须是 **2**（碎轨迹一个号都没吃 ✓）
+        out2 = f.warm(det(900), n=4)
+        check(len(out2) == 1,
+              "第二条稳定目标该被认下来（第一条可能还在缓冲里）：%d 个" % len(out2))
+        _new = [m for m in out2 if int(m.id) != 1]
+        check(len(_new) == 1 and int(_new[0].id) == 2,
+              "第二条真怪的编号该是 **2**（碎轨迹不该占号）—— 实得 %r ✗"
+              % ([int(m.id) for m in out2],))
+
+        # ④ 对外永远只有正数
+        for m in list(out2):
+            check(int(m.id) > 0,
+                  "对外输出了非正数编号 %r ⇒ 界面/决策层会把 -1 当成一只真怪 ✗"
+                  % (m.id,))
+
+
 def t_avg_conf_and_history():
     """按 `track_id` 逐条记账：**平均置信 / 最近 N 帧位置 / 存活时间**（用户 2026-10-17 ✓）。
 
@@ -435,7 +487,9 @@ def t_flick_recorded():
         f.step(det(500))
         f.idle(8)                          # 熬过"防抖 + 500ms 缓冲" ⇒ 被清理
         got = f.t.drain_flick()
-        check(len(got) == 1 and got[0]["id"] == 1,
+        # ⚠ 2026-10-23 改口径：**没认下来就没有正式编号**（`-` ✓ 见 `_next_id` 那段）——
+        #   这里原来钉 `id == 1`，可那正是"碎轨迹白吃号池 ⇒ 编号飞涨"的来源 ✗。
+        check(len(got) == 1 and got[0]["id"] == "-",
               "闪一下没被记下来：%r" % (got,))
         for k in ("id", "age", "conf", "peak", "missed", "ms"):
             check(k in got[0], "现场缺 `%s`（打点要用它 ✓）：%r" % (k, got[0]))
@@ -910,6 +964,8 @@ TESTS = (
     ("⭐ 低分框永不新建身份（BYTE 第二阶段）", t_low_conf_never_creates),
     ("⭐ 逐轨记账：平均置信 / 最近 N 帧位置 / 存活时间（用户 2026-10-17）",
      t_avg_conf_and_history),
+    ("⭐⭐⭐ **正式编号只发给认下来的怪**（碎轨迹不占号；用户 2026-10-23「编号会无限增大？」）",
+     t_ids_only_for_confirmed),
     ("⭐ 幽灵框按**卡尔曼匀速模型**外推（不冻住、不乱飘）", t_kalman_extrapolates_ghost),
     ("kill 立即消除", t_kill),
     ("同一帧 id 唯一", t_ids_unique),
@@ -967,11 +1023,13 @@ def t_rel_anchor_keeps_id():
     #     直接丢掉 ✓（所以可能只剩 1 条，但**不是原来那条** ✓）。
     tr0 = MobTracker()
     _feed(tr0, 100.0, None)
-    _id0 = tr0._tracks[0]["id"]
+    # ⚠ 2026-10-23：**没认下来的轨迹没有正式编号**（`tid=-1` ✓ 见 `ByteTracker._next_id`）⇒
+    #   这里不能再拿 `id` 比"换没换"（两边都是 -1 ⇒ 恒等 ⇒ 用例会假红 ✓），改成**比对象** ✓。
+    _t0 = tr0.bt.tracks[0]
     _feed(tr0, 40.0, None)
-    check(all(t["id"] != _id0 for t in tr0._tracks),
-          "用例前提不成立：不喂锚时 60px 一跳该**认不上**（换 id ✓）：%r"
-          % ([t["id"] for t in tr0._tracks],))
+    check(all(t is not _t0 for t in tr0.bt.tracks),
+          "用例前提不成立：不喂锚时 60px 一跳该**认不上**（换轨迹 ✓）：%r"
+          % ([int(t.tid) for t in tr0.bt.tracks],))
 
     # ② 喂锚（角色世界 +60 ⇒ 静止的怪在画面上左移 60 ✓）⇒ 同一条续上
     tr1 = MobTracker()
@@ -1132,9 +1190,70 @@ def t_player_world_jump_no_fly():
               "读数稳下来之后没跟回去（这条闸把人永久带偏了 ✗）：%r" % (box,))
 
 
+def t_pet_occlusion_keeps_track():
+    """⭐⭐⭐ **宠物把怪挡住 ⇒ 这一拍不算"漏检"**（2026-10-22 用户现场）。
+
+    **现场**（用户原话："**靠近怪物时，跟随玩家的宠物会把怪物挡住导致检测框丢失**"）：
+    宠物是**贴着角色走**的 ⇒ 近身那只怪常常正好在宠物后面 ⇒ 模型这一拍看不见它
+    ⇒ 老逻辑按"漏检"处理（`missed` 往上涨、涨过「失联帧长」就丢目标 / 换 id）
+    ⇒ 决策层看到的是"怪没了" ⇒ 打到一半掉头、反复锁新目标 ✗。
+
+    钉四件：
+      ① 遮挡物（宠物框）盖住轨迹 ⇒ 轨迹**留着、id 不变**、`diag["occluded"]` 记账 ✓；
+      ② 遮挡消失、怪还在 ⇒ 照常一个框 ✓（不能因为记过账就卡住）；
+      ③ 遮挡物**根本没盖住它** ⇒ 照老路当漏检（不许乱认"被挡住" ✗）；
+      ④ 挡太久（> `OCCL_MAX_MS`）⇒ 不再认、照老路丢 ✓
+         —— 否则怪在宠物后面**已经被打死**时会留一个打不死的幽灵框 ✗。
+    """
+    pet = (300.0 - 30.0, 300.0 - 45.0, 300.0 + 30.0, 300.0 + 45.0)   # 把怪整个盖住 ✓
+
+    # ⚠ **失联帧长必须设 0**（= 一漏检就丢）——否则老逻辑靠「失联缓冲」也能留 3 拍，
+    #   用例就变成在测缓冲区、根本没测到"遮挡"这道闸 ✓（这个坑反证时踩过一次 ✗）。
+    with Feed(track_buffer_ms=0.0) as f:
+        f.warm(det(300.0))
+        o = f.step(det(300.0))
+        check(len(o) == 1, "用例本身没先确认出一条怪（后面都不用看了 ✗）：%r" % (o,))
+        tid = o[0].id
+
+        # ① 宠物贴上来，把它整个盖住
+        for k in range(3):
+            o = f.step(occ=[pet])
+            check(len(o) == 1 and o[0].id == tid,
+                  "第 %d 拍宠物挡住之后这条怪就没了 / 换了 id（决策层会当成\"怪没了\" "
+                  "⇒ 打到一半掉头 ✗）：%r" % (k + 1, o))
+            check(f.t.diag.get("occluded") == 1,
+                  "被挡住却没记账（`diag['occluded']=%r`）⇒ 现场根本查不出来 ✗"
+                  % (f.t.diag.get("occluded"),))
+
+        # ② 遮挡消失、怪还在 ⇒ 照常（id 也不许换 ✓）
+        o = f.step(det(300.0))
+        check(len(o) == 1 and o[0].id == tid,
+              "遮挡消失后怪回来了，id 却换了（重新锁目标 ⇒ 白打一轮 ✗）：%r" % (o,))
+
+        # ③ 遮挡框在很远的地方（**没盖住它**）⇒ 照老路当漏检
+        far = (900.0, 900.0, 960.0, 960.0)
+        for _ in range(4):
+            o = f.step(occ=[far])
+        check(len(o) == 0,
+              "遮挡框离得老远、根本没盖住它，却还被当成\"被挡住\"留着 ⇒ 只要画面里有宠物，"
+              "怪就永远不会被判定丢失 ✗：%r" % (o,))
+
+    # ④ 挡太久 ⇒ 不再认（每拍 1 秒，第 2 拍就超过 OCCL_MAX_MS=1200 ms ✓）
+    with Feed(track_buffer_ms=100.0) as f:
+        f.warm(det(300.0))
+        f.step(det(300.0))
+        seen = [len(f.step(occ=[pet], ms=1000.0)) for _ in range(5)]
+        check(seen[0] == 1, "刚挡住就丢 ✗（那这道闸等于没生效）：%r" % (seen,))
+        check(seen[-1] == 0,
+              "挡了 4 秒还留着 ⇒ 幽灵框（怪很可能在宠物后面**已经被打死**了 ⇒ 对着空气砍 ✗）：%r"
+              % (seen,))
+
+
 TESTS = TESTS + (
     ("⭐⭐⭐⭐ 黄点读数在跳 ⇒ 玩家框不许跟着飞（用户 2026-10-20「检出框不停往上飞出屏幕」）："
      "每拍位移 ≤ MAX_BOX_STEP · 记账 world_jump · 稳下来照常跟", t_player_world_jump_no_fly),
+    ("⭐⭐⭐ 宠物挡住怪 ⇒ 这一拍不算\"漏检\"（id 不换、不丢目标），但挡太久仍照老路丢"
+     "（用户 2026-10-22「宠物会把怪物挡住导致检测框丢失」）", t_pet_occlusion_keeps_track),
 )
 
 

@@ -113,7 +113,15 @@ QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
 QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {
     background: #f8f9fa; color: #9aa0a6;
 }
-QComboBox::drop-down { border: none; width: 20px; }
+/* ⚠⚠ **别给 `QComboBox::drop-down` 写样式**（用户 2026-10-24 现场："**点选没反应**" ✓）。
+   一旦写了这个子控件，Qt 就改走"样式表绘制"：**没写 `::down-arrow` = 箭头不画** ✗
+   ⇒ 全工作台的下拉框看着都像一个**普通输入框**（用户截图就是那样 ✓），
+   人根本不知道能点开 ⇒ 反馈成"点选没反应" ✓。
+   而 `::down-arrow` 也**没法用纯样式画** ✗：实测
+       `border-left/right: transparent + border-top: 5px solid`
+   在样式表里渲出来是一个**实心方块**（放大 8 倍看过 ✓），不是三角 ✗。
+   ⇒ 结论：这一对子控件**交给系统样式画**（原生箭头 ✓），别碰。
+   （`QComboBox QAbstractItemView` 那条只影响弹出列表，留着 ✓。） */
 QComboBox QAbstractItemView {
     background: #ffffff; border: 1px solid #dadce0;
     selection-background-color: #e8f0fe; selection-color: #202124;

@@ -4432,11 +4432,14 @@ class RoutePanel(QWidget):
         self.chk_align_first = QCheckBox("对齐上绳梯")
         self.chk_align_first.setChecked(
             bool(getattr(settings, "climb_align_first", True)))
-        self.chk_align_first.setToolTip(
+        # ⚠ 提示语**存一份**（`_tip_align_first` ✓）：`_sync_align_first` 要按
+        #   「关掉了但斜跳窗口是空的」再往上加一句告警（见那儿 ✓ 2026-10-23）。
+        self._tip_align_first = (
             "勾上（默认）= 先横向把 x 对齐到绳上，再站住一下、按跳上去（老行为 ✓）。\n\n"
             "取消 = **只准斜跳上绳**：角色会先走出「开始对齐绳梯x的距离」，\n"
             "进了斜跳区间（那个距离 ~ 斜跳起手距离）再斜跳上去。\n\n"
             "⚠ 取消后「对齐绳梯移动延迟(ms)」**不可配置**（那一项只对点按微调有意义 ✓）。")
+        self.chk_align_first.setToolTip(self._tip_align_first)
         # ⚠ **先 `setChecked` 再 `connect`** ✗ —— 反过来的话，构造时那一下
         #   `setChecked(True)` 就会触发 `_on_align_first` ⇒ `_sync_align_first`
         #   ⇒ 而 `sp_align_gap` **还没建出来** ✗ ⇒ 构造期 AttributeError ✓（真踩过 ✓）。
@@ -4446,15 +4449,41 @@ class RoutePanel(QWidget):
         return row
 
     def _sync_align_first(self):
-        """按「对齐上绳梯」的状态，决定「对齐绳梯移动延迟」能不能配（用户 2026-10-17 ✓）。"""
+        """按「对齐上绳梯」的状态，决定「对齐绳梯移动延迟」能不能配（用户 2026-10-17 ✓）。
+
+        ⭐⭐ 还要管一件事：**取消勾选后，斜跳窗口是不是空着的**（2026-10-23 用户现场：
+          "**我关了对齐上绳梯 怎么还在对齐**"）。窗口 = `near_px < |dx| ≤ jump_start_px`；
+          天穹那份是 `jump_start_px=20`、`climb_align_near_px=30` ⇒ **20 > 30 不成立**
+          ⇒ 窗口为空 ⇒ `ClimbJob` 里那条"只斜跳"的 `if` 根本进不去、退回老行为（对齐）✗
+          ⇒ 界面上必须有话说，否则人只会以为"开关坏了"✓。
+        """
         on = bool(self.chk_align_first.isChecked())
         _sp = getattr(self, "sp_align_gap", None)
         if _sp is None:
             return          # 构造期还没建出来 ⇒ 什么都不做（别炸 ✗ 见 `_build_align_first_row` ✓）
         _sp.setEnabled(on)
+        # 关掉了、可是斜跳窗口是空的 ⇒ 那一关**等于没关**（要人把「起跳距离」调大 ✓）
+        # ⚠ 名字**必须跟界面标签一模一样**（2026-10-23 用户："**开始斜跳距离 在哪？我们不是
+        #   用的「起跳距离」吗**" ⇒ 我上一版自造了个『开始斜跳距离』，界面根本没这一格 ✗）：
+        #   · `jump_start_px` → 「**起跳距离(px)**」（**物理参数**组 ✓）
+        #   · `climb_align_near_px` → 「**开始对齐绳梯x的距离(px)**」（**攀爬参数**组 ✓）
+        try:
+            _win = int(getattr(settings, "jump_start_px", 0) or 0)
+            _near = int(getattr(settings, "climb_align_near_px", 20) or 20)
+        except (TypeError, ValueError):
+            _win, _near = 0, 20
+        _bad = (not on) and not (_win > _near)
+        _warn = ("" if not _bad else
+                 "\n\n⚠ **这一关现在不生效**：斜跳窗口 `%d < 离绳距离 ≤ %d` 是**空的** ⇒ "
+                 "仍旧按老路对齐 ✓。\n"
+                 "要真正只斜跳：把「**起跳距离(px)**」（物理参数组，现在是 %d）改成 **大于** "
+                 "「**开始对齐绳梯x的距离(px)**」（攀爬参数组，现在是 %d），比如填 **120** ✓"
+                 % (_near, _win, _win, _near))
+        self.chk_align_first.setToolTip(self._tip_align_first + _warn)
         self.sp_align_gap.setToolTip(
             self._tip_align_gap + ("" if on else
-                                   "\n\n⚠ 「对齐上绳梯」已关闭 ⇒ 只走斜跳，这一项**不可配置** ✓"))
+                                   "\n\n⚠ 「对齐上绳梯」已关闭 ⇒ 只走斜跳，这一项**不可配置** ✓")
+            + _warn)
 
     def _on_align_first(self, on):
         """切换「对齐上绳梯」⇒ 写进配置（决策参数、跟着项目存 ✓）并联动置灰 ✓。"""
@@ -4472,6 +4501,8 @@ class RoutePanel(QWidget):
         """改了「开始对齐绳梯x的距离(px)」⇒ 写进配置（同样是决策参数、跟着项目存）。"""
         settings.climb_align_near_px = int(v)
         settings.save()
+        # ⭐ 「对齐近距」是斜跳窗口的**下界** ⇒ 同样要立刻重算那句告警（2026-10-23 ✓）
+        self._sync_align_first()
 
     def _on_retry_delay(self, v):
         """改了"失败后延迟激活时间" ⇒ 写进配置（它是决策参数，跟着项目存）。"""
@@ -4513,6 +4544,9 @@ class RoutePanel(QWidget):
         """
         settings.jump_start_px = max(0, int(v))
         settings.save()
+        # ⭐ 它决定"斜跳窗口"的上界 ⇒ 改了要立刻重算「对齐上绳梯」那句告警
+        #   （2026-10-23：`jump_start_px=20 ≤ 对齐近距=30` ⇒ 关了也没用，得当场提示 ✓）
+        self._sync_align_first()
 
     def _on_edge_guard(self, v):
         """改了「平台防落距离(px)」⇒ 写进 settings 并落盘（**按图**存 ✓ 见 `core.route_cfg`）。

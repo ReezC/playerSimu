@@ -434,6 +434,12 @@ class PlayerLocator:
         self.map_id = None
         self.terrain = None
         self._calib_cache = {}
+        #: ⭐⭐ **「借用另一条来源的标定」的缓存**（2026-10-23 ✓ 见 `_borrow_calib`）：
+        #:   `(来源, 面板宽, 面板高)` → calib / None ✓（`None` = 借过、借不到 ⇒ 别再读盘 ✓）。
+        #:   用户现场：\"森林迷宫-珠缨 我看地形图上的显示完好无损，为什么提示要人工标？？\"
+        self._borrow_cache = {}
+        #: 上一次借用的说明 `{"from": 来源, "why": 一句人话}`（给界面 / 日志看 ✓ 没借 = None ✓）
+        self.borrow = None
         #: 「坐标系偏移」缓存（见 _world_offset）：(时刻, (x, y))
         self._off_cache = None
         #: ⭐ **局部小地图（crop）的运行时 view 跟踪**（用户 2026-09-29 任务 1 ✓）——
@@ -476,6 +482,9 @@ class PlayerLocator:
         if map_id == self.map_id and self.terrain is not None:
             return self
         self.map_id = map_id
+        # 换图 ⇒ 借来的那份标定**也作废**（2026-10-23 ✓）：它是按 map_id 借的 ✗
+        self._borrow_cache = {}
+        self.borrow = None
         self.terrain = (mapdata.load(map_id, with_canvas=True)
                         if map_id else None)
         # 换图 → 位置不连续，别拿上一张图的点去跟踪（跳变判据会乱丢）。
@@ -531,7 +540,87 @@ class PlayerLocator:
         那条路上显式忘一次 ✓。别改成"每次都不缓存"：那是把 30 拍/秒的读盘成本还给实时回路。
         """
         self._calib_cache = {}
+        # 标定刚被改过 ⇒ 借来的那份同理作废（2026-10-23 ✓ 它就是从别的来源抄的 ✓）
+        self._borrow_cache = {}
         return self
+
+    def _borrow_calib(self, src, panel, terrain=None):
+        """``同图另一条来源有标定、且面板尺寸一样`` ⇒ **直接沿用那份几何**（2026-10-23 ✓）。
+
+        **用户现场**：\"**森林迷宫-珠缨 我看地形图上的显示完好无损，为什么提示要人工标？？**\"
+          · `datasets/map/105040303.mapcalib.json` 里只有 `live` 一条
+            （`src: manual`、`panel: 109×114`、`score 0.727` ✓）；
+          · 人切到「**独立推流**」⇒ 那条来源没标定 ⇒ 走自动补标定 ⇒ 又量不出来
+            （这张图底图是**重绘的小地图**，逐像素相关**天花板 ≈0.55**、门槛
+            `LOCATE_MIN_SCORE` 也是 0.55 ⇒ 永远差一口气 ✓ 见日志 510 那段 ✓）；
+          · ⇒ 界面上只剩\"得人工标一次\" ✗ —— 可**人什么都没改**，地形图也好好的 ✓。
+
+        **为什么"标定按来源分开存"这条在这里能让一步**（认真记一笔 ✓）：
+          · 分开存**本来是对的** —— 两条来源的面板几何可能差 5.6 倍（实测 1164×585 vs 240×79
+            ✓ 见 `mapdata.calib_path` 的说明 ✓），拿 A 的几何算 B 会让世界坐标**整倍数错** ✗；
+          · 但**这张图**上两条来源的面板实测 **110×112 vs 109×114** —— 同一块 `mmap_crop`
+            裁出来的**同一块区域** ⇒ 换算**就是同一份** ✓。
+        ⇒ 判据只用一道**现成的闸**：`map_calib.panel_mismatch(它, 这块面板)`（±5% / 至少 ±2px ✓）
+          过了才借 ✓；过不了（真差 5 倍那种）⇒ 不借，照旧走自动补 / 人工标 ✓。
+        ⚠ 尺寸差 >0（哪怕 1 px）都按 `scale_geometry` 等比换算到**当前**面板 ——
+          不硬套（差 2 px 在 `scale=1` 的图上就是 2 个世界像素 ✓）。
+        ⚠ 借来的这份**不写盘**：它是\"另一条来源的结论\"，写下去会让
+          `any_mode_of` / 以后的人工标注都以为\"这条来源被人量过\" ✗（只在内存里用 ✓）。
+
+        → 借到 = 一份可直接用的 calib（`src="borrow:<来源>"` ✓）；借不到 = `None` ✓（绝不抛 ✓）。
+        """
+        try:
+            pw, ph = int(panel.shape[1]), int(panel.shape[0])
+        except Exception:                              # noqa: BLE001
+            return None
+        key = (str(src or ""), pw, ph)
+        if key in self._borrow_cache:
+            return self._borrow_cache[key]
+        _cw = None
+        if terrain is not None and getattr(terrain, "canvas", None) is not None:
+            _cw = (terrain.canvas.shape[1], terrain.canvas.shape[0])
+        out = None
+        try:
+            calibs = mapdata.load_calibs(self.map_id) or {}
+            for _src, _cal in sorted(calibs.items()):
+                if not _src:
+                    # 老格式（整份平铺、没记来源）归在 `""` 下 ⇒ **不借**：
+                    # 不知道它当初是哪条来源量的，借过来等于"拿 A 的几何算 B" ✗
+                    # （那正是 `calib_path` 里那条规矩要防的 ✓）
+                    continue
+                if str(_src) == str(src or ""):
+                    continue
+                if not map_calib.has_geometry(_cal or {}):
+                    continue
+                _ok, _ = map_calib.panel_mismatch(_cal, panel, _cw)
+                if not _ok:
+                    continue        # 尺寸真不一样 ⇒ 不借（那正是"分来源"要防的事 ✓）
+                rec = list(map_calib.panel_of(_cal) or ())
+                kx = ky = 1.0
+                if len(rec) >= 2 and float(rec[0] or 0) > 0 and float(rec[1] or 0) > 0:
+                    kx, ky = pw / float(rec[0]), ph / float(rec[1])
+                if abs(kx - 1.0) > 1e-6 or abs(ky - 1.0) > 1e-6:
+                    got = map_calib.scale_geometry(_cal, kx, ky)
+                else:
+                    got = dict(_cal)
+                if got is None:
+                    continue
+                _from = map_const.SRC_LABEL.get(_src, str(_src))
+                got = dict(got, panel=[pw, ph], src="borrow:%s" % _src,
+                           picked_by="borrow",
+                           note=("沿用「%s」那条来源的标定：面板 %s×%s ↔ %d×%d 基本一样，"
+                                 "几何是同一份（未人工确认 ✓）"
+                                 % (_from, int(rec[0]) if len(rec) >= 2 else 0,
+                                    int(rec[1]) if len(rec) >= 2 else 0, pw, ph)))
+                self.borrow = {"from": str(_src), "why": got["note"]}
+                out = got
+                break
+        except Exception:                              # noqa: BLE001 —— 借不到就走老路 ✓
+            out = None
+        if out is None:
+            self.borrow = None
+        self._borrow_cache[key] = out
+        return out
 
     def _world_offset(self, calib):
         """「坐标系偏移」(x, y)：算出来的世界坐标**加上**它（用户 2026-09-26 要求）。
@@ -611,6 +700,20 @@ class PlayerLocator:
         _xt = max(0, int(fh_xtol or 0))
         if calib is None:
             calib = self.calib_for(src)
+        # ⭐⭐⭐⭐ **这条来源没标定、但另一条来源有、而且面板尺寸一样 ⇒ 直接沿用** ✓
+        #   （2026-10-23 用户：\"**森林迷宫-珠缨 我看地形图上的显示完好无损，为什么提示要人工标？？**\"）
+        #   现场：`105040303.mapcalib.json` 只有 `live`（manual / 0.727 / panel 109×114 ✓）；
+        #   切到「独立推流」⇒ 没标定 ⇒ 自动补又量不出来（这张**重绘底图**逐像素相关
+        #   天花板 ≈0.55，门槛 `LOCATE_MIN_SCORE` 也是 0.55 ⇒ 永远差一口气 ✗）
+        #   ⇒ 界面只剩\"得人工标一次\" ✗ —— 而两条来源的面板实测 **110×112 vs 109×114**，
+        #   同一块 `mmap_crop` 裁出来的同一块区域 ⇒ 几何本来就是同一份 ✓（见 `_borrow_calib` ✓）。
+        #   ⚠ **必须排在自动补标定之前**：自动那条在这张图上注定失败，
+        #     白试 3 次还会把 `_AUTOFIT_STATE` 刷成\"试过了\" ⇒ 以后连提示都变成
+        #     \"已经自动试过 3 次\" ✗（现场 10:34:52 那两行就是这么来的 ✓）。
+        if not map_calib.has_geometry(calib or {}):
+            _borrowed = self._borrow_calib(src, panel, terrain)
+            if _borrowed is not None:
+                calib = _borrowed
         # ⭐⭐⭐ **面板尺寸变了 ⇒ 能按比例救就救，救不了才拒**（用户 2026-10-20 ✓ 原话：
         #   "为什么经常出现这个问题" ⇒ 选了方案 A「让标定也跟着比例走」✓）
         #   · 病根：`mmap_crop` 有比例副本（帧尺寸变了自动跟着缩 ✓），可标定钉的是**像素**
@@ -762,6 +865,12 @@ class PlayerLocator:
         if _panel_adapted:
             out["panel_adapted"] = True
             out["panel_adapt_note"] = str(_panel_adapted.get("why") or "")
+        # ⭐ **这一拍用的是"借来的标定"就说出来**（2026-10-23 ✓）：现场/日志要能一眼看出
+        #   \"这条来源自己没量过、是沿用 `live` 那份\" —— 否则以后真出偏了没人知道该怀疑谁 ✓。
+        if str((calib or {}).get("picked_by") or "") == "borrow":
+            out["calib_borrow"] = {
+                "from": str((calib or {}).get("src") or "").replace("borrow:", ""),
+                "why": str((calib or {}).get("note") or "")}
         # ⭐⭐⭐ **用之前先问一句「这份标定对得上现在这块面板吗」**（用户 2026-10-06 ✓ 见
         #   `panel_mismatch` 里那段现场 ✓）—— 对不上就**拒用**：这时照用会让**世界坐标整倍数
         #   错**，而 `mmap_ok` 会一直是 1.00 ✗ ⇒ 决策层"**自信地往右怼墙**" ✓（现场那一场 ✓）。

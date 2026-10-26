@@ -2733,7 +2733,7 @@ class LiveThread(QThread):
     def _decide_frame_on_infer(self, f, vis, player_box, mob_dets, mob_low, loc,
                                cam_now, drop_boxes, pot_last, pot_vals, pot_zero,
                                last_player, e2e_ref, budget, agent, mob_tracker,
-                               player_tracker, settings, t_pipe):
+                               player_tracker, settings, t_pipe, pets=()):
         """凑齐 WorldState 快照 → 喂 Agent 决策（开推理那一帧 ✓）。
         抽自 `_run` 主循环（2026-10-13 阶段 1 编排收口 ✓ 行为零改动 ✓）。"""
         # ⚠⚠ 2026-10-13 补（用户报「开始推理失败：NameError: name 'WorldState' is not
@@ -2817,7 +2817,13 @@ class LiveThread(QThread):
                 _pw = (float(ws.player.world_x), float(ws.player.world_y))
             except (TypeError, ValueError):     # noqa: BLE001 —— 算不出就当没有 ✓
                 _pw = None
-        ws.mobs = tuple(mob_tracker.update(mob_dets, mob_low, player_world=_pw))
+        # ⭐⭐ **宠物框当"遮挡物"**（2026-10-22 ✓ 用户："靠近怪物时，跟随玩家的宠物会把怪
+        #   挡住导致检测框丢失"）—— 只影响**这条怪轨迹这一拍算不算漏检** ✓：
+        #   被挡住时不涨 `missed`（不会被「失联帧长」判死、id 也不换 ✓），决策层能对同一只怪
+        #   接着打 ✓。⚠ 宠物**不进** `ws.mobs` / `WorldState` ✓（红线不动 ✓ 用例
+        #   `t_drop_pet_never_enter_decision` 钉着 ✓）；这里只传一个"框在哪儿"的几何量 ✓。
+        ws.mobs = tuple(mob_tracker.update(mob_dets, mob_low,
+                                           player_world=_pw, occluders=pets))
         # ⭐⭐ **把"闪 / 抢框"的现场写进 behavior.log**（用户 2026-10-11 ✓
         #   原话："**同个怪物的检出框疯狂闪烁**"✓ / "**角色使用传送点后被其他
         #   玩家抢检出框**"✓）—— 这两种现象以前**只能靠肉眼看画面**✗
@@ -3134,6 +3140,21 @@ class LiveThread(QThread):
                 try:
                     from core import behavior as _bh
                     _bh.event("mmap_adapted", note=_kw)
+                except Exception:                # noqa: BLE001 —— 打点坏了别影响回路 ✓
+                    pass
+        # ⭐⭐ **"借了另一条来源的标定"也要留一笔**（2026-10-23 ✓ 用户："**我看地形图上的
+        #   显示完好无损，为什么提示要人工标？？**"）—— 只在这条借来的**换了**时写一次 ✓
+        #   （同一个理由反复借不刷屏 ✓）。有了它现场才看得出：这条来源自己**没量过** ✓，
+        #   是沿用另一条来源的几何（真出偏了才知道该怀疑谁 ✓）。
+        _cb = loc.get("calib_borrow") or None
+        if _cb:
+            _kw = "%s|%s" % (_cb.get("from"), _cb.get("why"))
+            if _kw != self.__dict__.get("_mmap_borrow_last"):
+                self._mmap_borrow_last = _kw
+                try:
+                    from core import behavior as _bh
+                    _bh.event("mmap_borrow", src=_cb.get("from"),
+                              why=str(_cb.get("why"))[:140])
                 except Exception:                # noqa: BLE001 —— 打点坏了别影响回路 ✓
                     pass
         return loc
@@ -6255,6 +6276,9 @@ class LiveThread(QThread):
                     mob_dets, player_cands = _inf.mob, _inf.player
                     mob_low, player_low = _inf.mob_low, _inf.player_low
                     _cls_dets, _drop_boxes, k = _inf.cls_dets, _inf.drop, _inf.k
+                    # ⭐ 宠物框（**只当遮挡物** ✓ 2026-10-22 ✓）：`frame_infer` 已经按类别挑好，
+                    #   这里只是转手 —— 见 `_decide_frame_on_infer(..., pets=)` ✓
+                    _pet_boxes = getattr(_inf, "pets", ())
                     # ---- 第 7 段：**玩家定位**（`runtime/frame_locate.py` ✓ 2026-10-20 搬出）----
                     #   · 先灌脚底偏移、判框面积闸、取小地图那份世界坐标（`_loc` ✓）
                     #   · 再 `PlayerTracker.update(player_cands, world=…, low=player_low)`
@@ -6317,7 +6341,7 @@ class LiveThread(QThread):
                         f, vis, player_box, mob_dets, mob_low, _loc, _cam_now,
                         _drop_boxes, _pot_last, _pot_vals, _pot_zero, _last_player,
                         _e2e_ref, budget, agent, mob_tracker, player_tracker,
-                        decision_settings, _t_pipe)
+                        decision_settings, _t_pipe, pets=_pet_boxes)
                 else:
                     # 纯画面：不推理、不画框、不做决策。ws 给个空壳供统计用。
                     ws = WorldState(frame_id=f.frame_id, ts=f.t_recv_mono,

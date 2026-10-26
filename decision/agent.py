@@ -191,6 +191,29 @@ JUMP_ATTACK_RETRY_S = 0.6
 #:   真觉得不够密/太密 ⇒ 说一声，加一格参数是一处的事 ✓。
 PICKUP_TAP_IV_S = 0.15
 
+#: ⭐⭐⭐ 「**按跳之后多久还没吸上绳就算"跳空了"**」（秒；2026-10-22 用户现场：
+#:   "**刚才没上绳梯 就不打怪了**"）。
+#:
+#: **它管什么**：爬绳任务**屏蔽打架**那一段，只该覆盖"按下跳 → 吸上绳"这一小段
+#:   （用户 2026-09-27 原话："从「按下跳」到「攀爬成功」期间都不应该进 attack"✓）。
+#:   可现场它被拉长成了**整段 15 秒**：`ClimbJob.holds_player()` 的判据是"**按过跳**"
+#:   或"位置在绳跨度里"，而 `_jumped_once` 只在"y 完全没动"时才被清 ⇒ 一跳空之后**一直**
+#:   算"还在攀爬" ⇒ 攻击被无限期屏蔽，人站在那儿挨打（20 分钟里 `drink_hp` 3342 次 ✓）。
+#: ⚠ 取值 = 一跳的滞空量级（≈ 1.5s：跳上去再落下来 + 一点余量）——
+#:   真的吸上了绳时不吃这条（那时广播的 `on_rope` 为真 ⇒ 本来就不屏蔽 ✓ 用户 2026-09-28
+#:   "爬绳途中照常打架"✓）。**只放开"跳空"这一类** ✓。
+CLIMB_AIR_MAX_S = 1.5
+
+#: ⭐⭐⭐ **爬绳失败之后，同一条 `dst` 立刻重排**（2026-10-23 用户明确要求 ✓）。
+#:
+#: **为什么**：现场（`3→2 爬一半不爬了`）40:36 判死之后，下一次 `task_begin dst=入口`
+#:   拖到 **41:40** —— **64 秒**里它一直在打怪（`target_steal` / `chase` / `drink_hp`），
+#:   因为 `_task_finished(failed=True)` 那条把整条路线 + 队列都清空了，
+#:   而"失败之后谁来重排"**没人管** ⇒ 用户看到的就是"爬一半就不爬了"✓。
+#: **上限**：同一个 dst **连续**重排这么多次还失败 ⇒ 放弃（打一条 `climb_requeue_stop`），
+#:   等下一次正常规划 —— 否则一个够不着的绳梯会把它钉在原地转到天荒地老 ✗。
+CLIMB_REQUEUE_MAX = 5
+
 # ⛔ **这里原来有个 `STATION_TURN_EVERY = 3`（"站桩时每 3 次 attack 补一个朝向键"）——
 #   2026-10-06 删掉** ✗。它 2026-10-02 就被「**站桩补朝向间隔(ms)**」取代了
 #   （用户原话："把『站桩 attack n 次后补朝向』改成『站桩补朝向间隔(ms)』…逻辑是**每站桩
@@ -1008,6 +1031,11 @@ class DecisionSettings:
                 "align_hold_ms": self.align_hold_ms,
                 "air_gap_px": self.air_gap_px,
                 "climb_align_gap_ms": self.climb_align_gap_ms,
+                # ⭐⭐ **「对齐上绳梯」这个开关必须跟着项目存**（2026-10-23 现场：
+                #   用户在天穹项目里取消勾选，重启/重载工程后它又变回勾上 ⇒ "**我关了对齐
+                #   上绳梯 怎么还在对齐**"✓）。原来 `to_dict` 里**漏了这一格** ✗ ——
+                #   `from_dict` 一直在读它（默认 True ✓），可存盘时没写回去 ⇒ 永远存不住 ✓。
+                "climb_align_first": bool(self.climb_align_first),
                 "climb_align_near_px": self.climb_align_near_px,
                 "climb_retry_delay_s": self.climb_retry_delay_s,
                 "climb_retry_delay_inc_s": self.climb_retry_delay_inc_s,
@@ -2280,6 +2308,13 @@ class CombatAgent:
         #:   那些是**人手安排 / 策略定的**，被自动掐掉会让人以为按钮没生效 ✗。
         #:   ⚠ 不传 `origin` 的调用点**天然豁免** ✓（不用在复核里逐个列白名单 ✓）。
         self._route_origin = None
+        #: ⭐⭐ **这一条路线要去的目的地**（`plan_and_start_route` 写下 ✓ 2026-10-23）——
+        #:   给"**爬绳失败 ⇒ 同一条 dst 立刻重排**"用（`_task_finished(failed=True)` ✓）：
+        #:   那会儿 `_route` / `_climb` 都被清空了，只有它还记着"本来要去哪儿"✓。
+        self._route_dst = ""
+        #: ⭐ 「爬绳失败重排」的账：同一个 `dst` **连续**重排了几次（`CLIMB_REQUEUE_MAX` 收口 ✓）
+        self._climb_requeue_n = 0
+        self._climb_requeue_dst = ""
         #: 「**这一步**」的来源签名（从 `_route_origin` 抄一份 ✓）—— 随 `_climb` 一起生灭 ✓
         #: （`start_climb` 写入 / `stop_climb` 与 `_task_finished` 清 ✓）。
         self._climb_origin = None
@@ -2595,6 +2630,10 @@ class CombatAgent:
         #: 两个地方要用：① 绳梯豁免的收窄（见 `tick` 里 `_on_rope` ✓）；
         #: ② **绳上绝不按左右**（按了在游戏里就是松手 ⇒ 会掉 ✗ 用户 2026-09-28 定 ✓）。
         self._in_rope_now = False
+        #: 这一拍的**位置状态广播**（`PosSnapshot` ✓ 2026-10-23）—— 给发键口那道
+        #: `_rope_key_guard` 用：**没有爬绳任务**时只有它能回答"人是不是还挂在绳上" ✓
+        #: （`_in_rope_now` 那套要 `self._climb` 才成立 ⇒ 任务一没就整条失效 ✗）。
+        self._pos_now = None
         #: 「该补朝向键的那一轮」的**开始时刻**（`time.monotonic()` 秒；None = 现在不欠）。
         #: ⭐ 2026-10-06 起它**不只是日志**：**补键那一段的下界**就是它 ✓（`now >= _turn_due_at`）
         #:   —— 因为 `_station_turn_begin` 会把窗口**推到「输出行为CD」到点之后**（用户原话：
@@ -3531,6 +3570,11 @@ class CombatAgent:
         self._route_step = self._route_total = 0
         # 整条路线都没了 ⇒ 「路线的来源签名」也清掉（用户 2026-09-28 ✓）
         self._route_origin = None
+        # ⚠ **人手工叫停 ⇒ 「爬绳失败重排」的账也清**（2026-10-23 ✓）：用户刚说"别走了"，
+        #   下一拍任务再自己重排同一条 dst ⇒ 看着就像按钮没生效 ✗（同 `_goto_queue` 那条口径 ✓）。
+        self._route_dst = ""
+        self._climb_requeue_n = 0
+        self._climb_requeue_dst = ""
         # 「结束当前寻路」= **停整条**（用户 2026-09-26 的口径 ✓）⇒ 任务队列也一起清掉 ✓
         # （不清的话，人刚说"别走了"，下一拍队列又给它派一条 ⇒ 看着像按钮没生效 ✗）。
         if self._goto_queue:
@@ -3680,6 +3724,9 @@ class CombatAgent:
         if not self.start_route(jobs, why=why or ("前往：%s" % dst),
                                 origin=origin, keep_clock=keep_clock):
             return self._plan_fail(dst, "路径是空的，没起跑")
+        # ⭐ **记下"这一趟要去哪儿"**（2026-10-23 ✓）：爬绳失败时 `_route` / `_climb` 都已清空，
+        #   只有它能回答"该把哪一条重新排上"（见 `_task_finished` 的 `climb_requeue` ✓）。
+        self._route_dst = dst
         return True, ("已出发：%s" % " → ".join(res.get("path") or [dst]))
 
     def _plan_fail(self, dst, why):
@@ -3797,6 +3844,35 @@ class CombatAgent:
                 if str(self.station_pickup_state) == "going":
                     return self._pickup_next(retry=True)
                 return self._pickup_back()        # 「回站桩」那一段被切 ⇒ 再发一次（同一口径 ✓）
+            # ⭐⭐⭐⭐ **爬绳失败 ⇒ 立刻把同一条 `dst` 重新排上**（用户 2026-10-23 明确要求 ✓）。
+            #   **现场**（`3→2 爬一半不爬了`）：40:36 判死之后，下一次 `task_begin dst=入口`
+            #   拖到 **41:40** —— **64 秒**里它一直在打怪（`target_steal` / `chase` / `drink_hp`），
+            #   因为上面那几条把**整条路线 + 队列都清空了**，而"失败之后谁来重排"**没人管** ✗。
+            #   ⇒ 这里当场重排同一条 dst（`plan_and_start_route` 会**从现在的位置**重新解析 ✓）。
+            #   ⚠ 只认**上爬**（`ClimbJob`）：`DropJob`（下跳）不是它，别一起重排（会来回跳 ✗）。
+            #   ⚠ **同一个 dst 连续**重排 `CLIMB_REQUEUE_MAX` 次还不行 ⇒ 放弃并打点
+            #     （够不着的绳梯不许把它钉在原地转到天荒地老 ✗）；换一条 dst / 成功一次 ⇒ 归零 ✓。
+            from decision import jobs as jobmod
+            if job is not None and isinstance(job, jobmod.ClimbJob) and self._route_dst:
+                _dst = str(self._route_dst)
+                if _dst == self._climb_requeue_dst:
+                    self._climb_requeue_n += 1
+                else:
+                    self._climb_requeue_dst = _dst
+                    self._climb_requeue_n = 1
+                if self._climb_requeue_n <= CLIMB_REQUEUE_MAX:
+                    ok, msg = self.plan_and_start_route(
+                        _dst, why="爬绳失败 ⇒ 立刻重排：%s（第 %d 次）"
+                                  % (_dst, self._climb_requeue_n),
+                        origin={"kind": "requeue", "n": self._climb_requeue_n})
+                    behavior.event("climb_requeue", dst=_dst, ok=bool(ok),
+                                   n=self._climb_requeue_n, why=str(msg)[:90])
+                    if ok and self._climb is not None:
+                        return False          # 已经重新跑起来了 ⇒ 这一趟**不算完事** ✓
+                else:
+                    behavior.event("climb_requeue_stop", dst=_dst, n=self._climb_requeue_n,
+                                   why="同一个目的地连续重排 %d 次仍失败 ⇒ 停手，等下一次正常规划"
+                                       % (self._climb_requeue_n - 1))
             return True
         if self._route:
             _done = self._route_step        # 刚走完的是第几步（下一行 `_route_step` 会 +1 ✓）
@@ -3819,6 +3895,11 @@ class CombatAgent:
         self._route_step = self._route_total = 0
         # 整条路线走完 ⇒ 「路线的来源签名」也清掉（用户 2026-09-28 ✓）
         self._route_origin = None
+        # ⭐ **走到了 ⇒ 「爬绳失败重排」的账归零**（用户 2026-10-23 ✓）：下一次去同一个地方
+        #   该重新拿到满额的重试次数（不然走通一次之后又被上一次的账拖住 ✗）。
+        self._route_dst = ""
+        self._climb_requeue_n = 0
+        self._climb_requeue_dst = ""
         # ⭐⭐ **「定时拾取掉落」巡回优先**（用户 2026-10-05 ✓）：这一趟走完的若正是拾取
         #   巡回的一段 ⇒ 接下一条（走完了 ⇒ 回站桩地点 ⇒ 收摊 + 重新起锚 ✓）；
         #   ⚠ **不走**用户那个手动「任务队列」✗ —— 两套队列互不干扰（拾取是内部临时活 ✓）。
@@ -4349,6 +4430,8 @@ class CombatAgent:
                 "queue": "任务队列",      # 「添加任务队列」排进去自己跑（`_goto_queue_next` ✓）
                 "station": "去站桩",      # 平台站桩：不在站点 ⇒ 先走过去（`_station_travel` ✓）
                 "pickup": "拾取掉落",     # 平台站桩：定时拾取巡回（`_pickup_next` / `_pickup_back` ✓）
+                # ⭐ **爬绳失败 ⇒ 同一条 dst 立刻重排**（用户 2026-10-23 ✓ 见 `_task_finished`）
+                "requeue": "重排攀爬",
                 }.get(k, "")
 
     def _origin_kind(self):
@@ -7261,6 +7344,28 @@ class CombatAgent:
         #     通道体检 ✓ 定时清键 ✓）。
         return getattr(p, "world_x", None) is not None
 
+    @staticmethod
+    def _climb_air_stale(now, jump_at, jumped, in_rope):
+        """「**这一跳已经跳空了**」吗 —— 攀爬屏蔽打架那条判据的一部分（2026-10-22 ✓）。
+
+        用户现场原话："**刚才没上绳梯 就不打怪了**"。
+
+        背景：`ClimbJob.holds_player()` 是「**按过跳**」或「位置在绳跨度里」，而
+          `_jumped_once` 只在"y 完全没动"时才被清 ⇒ 一跳空之后**一直**算"还在攀爬"
+          ⇒ 攻击被无限期屏蔽（20 分钟里 `drink_hp` 3342 次、爬绳相最长连续 15 秒不还手 ✗）。
+
+        口径：**按过跳** + **广播说不在绳上** + **距按跳 ≥ `CLIMB_AIR_MAX_S`** ⇒ True
+          （= 当成跳空 ⇒ 允许打架 ✓）。
+        ⚠ `in_rope` 为真时一律 False（真在绳上 ⇒ 攻击本来就不屏蔽 ✓ 用户 2026-09-28
+          "爬绳途中照常打架"✓）；`jump_at` 为 0（这一轮还没按过跳）⇒ False ✓。
+        """
+        try:
+            jt = float(jump_at or 0.0)
+            return bool(jumped and not in_rope and jt > 0.0
+                        and (float(now) - jt) >= CLIMB_AIR_MAX_S)
+        except (TypeError, ValueError):
+            return False
+
     def _in_battle_zone(self, ws):
         """这一拍**允许打架**吗 —— 「限制战斗区域」那条规则（空列表 = 不限制 ✓）。
 
@@ -8670,8 +8775,39 @@ class CombatAgent:
         ⚠ **「中途跳下」相例外**：那一相**必须**带方向才能跳离绳（`mid_dir` ✓）⇒ 放行 ✓。
         ⚠ 与"能不能打架"（`_on_rope`）无关 ✓ 这里只管"发出去的键" ✓。
         """
+        km = self.settings.keymap
         if not self._in_rope_now:
-            return keys
+            # ⭐⭐⭐⭐ **人挂在绳上、可这一拍没有爬绳任务**（2026-10-23 用户：
+            #   "**为什么爬绳梯时候输出又松开↑了？之前不是修过吗**"）。
+            #   现场链子：爬绳任务失败 / 被抢 ⇒ `self._climb` 变 `None` ⇒ 下面两件判据**全失效**：
+            #     · `_in_rope = _pos.on_rope(_lid)`，而没任务时 `_lid = ""` ⇒ **恒 False** ✗
+            #     · `_in_climb_phase` 也要求 `self._climb is not None` ⇒ False ✗
+            #   ⇒ `_in_rope_now` 为假 ⇒ 这道"绳上不许带横键"的守卫**整条失效**
+            #   ⇒ 走位/追击任务照发 ←/→ ⇒ 在绳上按横键 = **松手** ⇒ 人往下滑/掉，
+            #      同时"爬绳只有 ↑ 和补 ↑"那条铁律当场被破（用户看到的就是"又松开 ↑ 了"）✓。
+            #   ⇒ 判据只加一条**许可广播**（`_pos.ladder_id` ✓ = 执行器真按着 ↑/↓ 才有的那个）：
+            #     它在"对齐阶段站在绳底"时**是空的** ⇒ 不会误挡"对齐走过去" ✓（这条最要紧 ✗）。
+            _lid_now = getattr(getattr(self, "_pos_now", None), "ladder_id", None)
+            if self._climb is not None or not _lid_now:
+                return keys
+            lr0 = {km.get("left"), km.get("right")}
+            lr0.discard(None)
+            if not lr0.intersection(keys):
+                return keys
+            up0, dn0 = km.get("up"), km.get("down")
+            _kept = {k for k in keys if k not in lr0}
+            if not ({up0, dn0} & _kept):
+                # 松手就滑下去 ⇒ 竖直键没有就**补 ↑**（上爬是绝大多数 ✓；已有 ↓ 就保 ↓ ✓）
+                if up0:
+                    _kept.add(up0)
+            try:
+                behavior.event("rope_no_horiz",
+                               dropped="/".join(sorted(k for k in lr0 if k in keys)),
+                               phase="-",
+                               why="人挂在绳上（无爬绳任务）⇒ 横键=松手，摘掉并按住 ↑")
+            except Exception:              # noqa: BLE001
+                pass
+            return _kept
         j = self._climb
         if j is not None:
             ph = str(getattr(j, "phase", "") or "")
@@ -8684,15 +8820,15 @@ class CombatAgent:
             #   （`_arrive_step` 里那支 `_out(self._arrive_dir(), False, hold_dir=True)` ✓）。
             if getattr(j, "_arrived_at", None) is not None:
                 return keys
-        km = self.settings.keymap
         lr = {km.get("left"), km.get("right")}
         lr.discard(None)
         if not lr.intersection(keys):
             return keys
+        _ph = str(getattr(j, "phase", "") or "-")
         try:
             behavior.event("rope_no_horiz",
                            dropped="/".join(sorted(k for k in lr if k in keys)),
-                           phase=str(getattr(j, "phase", "") or "-"),
+                           phase=_ph,
                            why="人在绳上 ⇒ 横键=松手，发键前摘掉")
         except Exception:                  # noqa: BLE001
             pass
@@ -9922,6 +10058,10 @@ class CombatAgent:
         #     算一次 ✓（口径 = 感知那把尺：x 半宽 `mapdata.LADDER_DX`(**24**) + y 上下
         #     `LADDER_PAD`(**12**) ✓）。
         _pos = PosSnapshot.of(ws.player)        # 这一拍的位置状态广播（**一次拿走** ✓）
+        # ⭐ 留给发键口那道守卫（`_rope_key_guard` 2026-10-23 ✓）：**没有爬绳任务**时
+        #   `_lid` 是空串 ⇒ 拿不到"人挂在哪根绳上"；而 `_pos.ladder_id`（许可广播）
+        #   正是"人真的挂在绳上"的唯一证据 ✓（对齐站在绳底时它是空的 ✓ 不会误挡 ✓）。
+        self._pos_now = _pos
         _lid = str(getattr(self._climb, "ladder_id", "") or "")
         _climb_holds = bool(
             self._climb is not None
@@ -9954,10 +10094,19 @@ class CombatAgent:
         #     空中/绳边，**任何横键都会把人带偏**（吸不上 / 吸上又掉 ✗）—— 现场
         #     `keys=left` 就出现在"按跳之后、`on_ladder` 还没置 1"的那一拍 ✓。
         #     跳失败退回重来时 `_reset_round(clear_jump=True)` 会清掉它 ⇒ 自动解除 ✓。
+        #   ⚠⚠ **2026-10-23 收窄**（用户："**怎么上绳梯跳一下没上就发呆？**"）：
+        #     `_jumped_once` 是**永不清**的（屏蔽打架要用它 ✓）⇒ 拿它当"在绳上"就等于
+        #     "这一轮按过跳之后、**每一拍**都按绳上对待" ⇒ 落回起跳平台、正要走回去对齐的
+        #     那几拍会被摘掉 ←/→ ⇒ **对齐挪不动 = 发呆** ✗（现场 11:08:20 那串
+        #     `rope_no_horiz dropped=left phase=align`，而同一拍 `climb_on_ladder v=0` ✓）。
+        #     ⇒ 改问任务自己：`ClimbJob.on_rope_sticky()`（CLIMB 相 / 还在空中 ⇒ 真；
+        #       落回起跳平台 ⇒ 假 ✓ 见那边的说明 ✓）。
+        _sticky_fn = getattr(self._climb, "on_rope_sticky", None)
         _in_climb_phase = bool(
             self._climb is not None
-            and (str(getattr(self._climb, "phase", "")) == jobmod.ClimbJob.CLIMB
-                 or bool(getattr(self._climb, "_jumped_once", False))))
+            and (_sticky_fn() if callable(_sticky_fn) else
+                 (str(getattr(self._climb, "phase", "")) == jobmod.ClimbJob.CLIMB
+                  or bool(getattr(self._climb, "_jumped_once", False)))))
         self._in_rope_now = bool(_in_rope or _in_climb_phase)
         # ⭐⭐⭐⭐ 2026-10-13（用户："**只按 ↑+朝锁定目标** ＋ **照常输出**"✓）：**"到顶后再按住 ↑
         #   那几拍"也要照常输出** ✓ —— 它本该与"爬绳途中"同一条口径（用户 2026-09-28：
@@ -9986,8 +10135,34 @@ class CombatAgent:
         _jumped_now = bool(getattr(self._climb, "_jumped_once", False))
         _align_phase = (str(getattr(self._climb, "phase", "")) == jobmod.ClimbJob.ALIGN
                         and not _jumped_now)
+        # ⭐⭐⭐⭐ **「跳出去很久还没吸上绳」不许再屏蔽打架**（2026-10-22 用户现场：
+        #   "**刚才没上绳梯 就不打怪了**"）。
+        #   现场（20 分钟）：81 个 `ClimbJob`、62 次 `replan`、只有 6 次 `task_done`；
+        #   **爬绳相最长连续 15 秒**，那 15 秒里 `mob_zone_in` 17 次、`attack` **一次都没有**，
+        #   同期 `drink_hp` **3342** 次（= 一直站在那儿挨打喝药 ✓）。
+        #   根因：`holds_player()` 是「**按过跳**」或「位置在绳跨度里」；`_jumped_once` 只在
+        #   "y 完全没动"时才被 `_reset_round(clear_jump=True)` 清掉，而现场 y **确实在动**
+        #   （111 → 47）⇒ 一直算"还在攀爬" ⇒ 攻击被无限期屏蔽 ✗。
+        #   ⇒ 按跳后超过 `CLIMB_AIR_MAX_S` 还**没吸上绳**（`_in_rope` 假）⇒ **当成这一跳跳空**，
+        #     解除屏蔽、照常打 ✓（打完由 `_task_settle` → `_climb_interrupted` 让任务
+        #     **从入口重来** ✓ 老机制，不新造"打完继续爬"那套 ✗）。
+        #   ⚠ 真在绳上时不吃这条（那时 `_in_rope` 为真 ⇒ `_on_rope` 本来就 False ✓）。
+        #   ⚠⚠ **2026-10-23 补丁（用户："3→2 怎么爬一半不爬了"）**：`_air_stale` 只许在
+        #     "**按了跳、可一直没进上爬相**"时成立 —— 一旦任务**已经进了 `CLIMB`**（真的在往上
+        #     爬），广播的 `ladder_id` 掉成空**是常态**（`LADDER_DX=24px` 很窄，人一被怪挤两
+        #     像素就掉 ✗）⇒ 那时还按"跳空"处理就会**爬到一半去打怪** ⇒ `_climb_interrupted`
+        #     ⇒ 回 ALIGN 重来 ‼ 现场实证（00:40:24~26）：
+        #       `climb_phase 1.0`(CLIMB) → `act keys=up,z`（**上爬相按了攻击键 z** ✗）
+        #       → `climb_phase 0.0`（被打断回 ALIGN）→ `task=failed`，y 卡在 **-470.2** 不动 ✓。
+        #     判据用**任务自己的相**（不看广播 ✓）：`phase == CLIMB` ⇒ **不放开** ✓。
+        _climb_phase_now = bool(
+            self._climb is not None
+            and str(getattr(self._climb, "phase", "")) == jobmod.ClimbJob.CLIMB)
+        _air_stale = bool(
+            self._climb_air_stale(now, self._climb_jump_at, _jumped_now, _in_rope)
+            and not _climb_phase_now)
         _on_rope = bool(_climb_holds and not _in_rope and not _align_phase
-                        and not _hold_up_now)
+                        and not _hold_up_now and not _air_stale)
 
         # 「**添加任务队列**」刚排进来（`queue_goto` 拍的那面旗子）⇒ **这一拍就把第一条
         # 跑起来**（用户 2026-09-27："寻路任务队列要依次执行，现在我排队列都没反应" ——
@@ -10084,7 +10259,15 @@ class CombatAgent:
                 and not _spot_strategy):
             _zk = set()
             self._leave_battle_zone_tick(now, ws, _zk)
-            if not _no_chase_path:
+            # ⭐⭐ **「禁用杀怪寻路」只免掉"绕路追怪"，不免"该不该打"**（用户 2026-10-22 现场：
+            #   "编辑战斗区域里都没开底层" —— 底层不在白名单里，可它照样在底层打 ✗，
+            #   结果被怪磨死（8 分钟 35 次 `player_dead`）⇒ 永远走不到绳底 ✓）。
+            #   老口径（2026-10-05/06，SKILL 271）是"人在区外但怪就在眼前 ⇒ 照打"，
+            #   那条把**整道区域门**在开关开着时跳过了 ⇒ 人站在没勾的整层上照打 ✗。
+            #   现在拆开：**只要"回区"那条路真的推出了按键**（`_zk` 非空 = 有人在带人走），
+            #   就一律照它走、这一拍不打 ✓；只有**连回区路线都下不出来**（定位丢了 / 走不到）
+            #   时才保留老行为（站桩打）—— 否则会变成"站在那儿挨打"✗（那正是 271 要防的）。
+            if _zk or not _no_chase_path:
                 # ⭐ 同款（回区也是走位 ⇒ 同样过门 ✓ 见 `_gate_turn_keys` ✓）
                 _zk = self._gate_turn_keys(_zk, now)
                 _zk = self._rope_key_guard(_zk)      # 绳上不许带横键（见 `_rope_key_guard` ✓）
@@ -10093,8 +10276,8 @@ class CombatAgent:
                         "target": None, "dx": 0, "dist": 0, "keys": sorted(_zk),
                         "facing": self.facing,
                         "kill_mobs": self._take_kill_mobs()}
-            # ⚠ 禁用模式：**不 set `_zk`、不 return** ✓（这一拍的按键/状态交给下面的
-            #   attack 分支 ✓ 站桩打 ✓）。回区任务**已经**由 `_leave_battle_zone_tick`
+            # ⚠ 禁用模式 + **回区路线都下不出来**：**不 set `_zk`、不 return** ✓（这一拍交给
+            #   下面的 attack 分支 ✓ 站桩打 ✓）。回区任务**已经**由 `_leave_battle_zone_tick`
             #   推过一拍 ✓（内部要么 `plan_and_start_route` ✓ 要么 `_climb_tick` ✓）。
         if in_range and not _on_rope:
             # ⚠ 这一拍**任务跑不了**（被战斗占用了）⇒ 要告诉它一声：不报信的话，打架那几秒

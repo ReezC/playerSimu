@@ -106,12 +106,18 @@ class SerialKbd:
         return _silence_seconds(self.sent, self._rtt_t0, time.perf_counter())
 
     def _drain(self):
-        """持续读走固件回传，避免输入缓冲堆积；顺带统计回执（并推进 `silent_for` 的账 ✓）。"""
+        """持续读走固件回传，避免输入缓冲堆积；顺带统计回执（并推进 `silent_for` 的账 ✓）。
+
+        ⚠ **关的时候立刻收手**（2026-10-22 ✓ 见 `close()` 的说明）：`read` 一返回就先看停止位，
+          别再往下解析 —— 那会儿句柄可能已经被关掉了 ✓。
+        """
         while not self._stop.is_set():
             try:
                 data = self._ser.read(256)
             except Exception:
                 break
+            if self._stop.is_set():
+                break                       # 正在关：这一拍的数据不要了 ✓
             if data:
                 n = data.count(b"DONE") + data.count(b"ERR")
                 if n:
@@ -123,7 +129,30 @@ class SerialKbd:
                     self._rtt_t0 = time.perf_counter() if self._pending > 0 else None
 
     def close(self):
+        """关串口 —— ⚠ **先让读线程放手，再关句柄**（2026-10-22 现场）。
+
+        原来的写法是"置停止位 ⇒ 直接 `self._ser.close()`" ✗ —— 而读线程正阻塞在
+        `self._ser.read(256)` 里；Windows 上有人在读的时候 `CloseHandle` 会**等**它，
+        而且 pyserial 的 `close()` 也不保证叫醒那条 read ⇒ **收尾卡住**：
+
+          · 窗口先没了、进程还挂着（任务管理器里看是个"0 线程、几十 KB、无窗口"的空壳 ✓）；
+          · 那个空壳一直**攥着 COM8** ⇒ 新实例每次点「连接」都报
+            `串口 COM8 被**别的进程占用**了（PermissionError(13, 拒绝访问)）` ✗，
+            可界面提示让人"**关掉多余的另一个工作台**"——而那个空壳看着已经死了，
+            于是怎么关都关不掉 ✓（2026-10-22 用户原话："**本地ProMicro连不上了 进程好像没杀掉**"）。
+
+        ⇒ 顺序必须是：**置停止位 → `cancel_read()` 把阻塞的 read 叫醒 → 等读线程退（有上限）
+          → 才 `close()`** ✓。`cancel_read()` 是 pyserial 自带的（Windows 走 `CancelIoEx`），
+          比"关句柄把读线程崩出来"干净得多，也不会卡住收尾 ✓。
+        """
         self._stop.set()
+        try:
+            self._ser.cancel_read()          # 叫醒正阻塞的 read(256)
+        except Exception:
+            pass
+        th = getattr(self, "_reader", None)
+        if th is not None and th.is_alive():
+            th.join(0.6)                     # 有上限：读线程再赖也不许卡住收尾 ✓
         try:
             self._ser.close()
         except Exception:

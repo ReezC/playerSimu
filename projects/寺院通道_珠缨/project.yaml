@@ -1,0 +1,454 @@
+name: 寺院通道_珠缨
+map_id: '105090600'
+mobs:
+- '4230100'
+- '7130100'
+scale: 1.406
+mob_scales: {}
+scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
+calib:
+  min_scale: 0.4
+  max_scale: 2.4
+  step: 0.1
+  sample: 5
+bars:
+  hp:
+  - 0.341142
+  - 0.973958
+  - 0.120791
+  - 0.018229
+  hp_color:
+  - - 0
+    - 0
+    - 135
+  - - 74
+    - 77
+    - 255
+  mp:
+  - 0.464129
+  - 0.973958
+  - 0.120791
+  - 0.018229
+  mp_color:
+  - - 145
+    - 77
+    - 0
+  - - 255
+    - 197
+    - 70
+mmap_crop:
+- 6
+- 72
+- 134
+- 109
+decision:
+  attack_dist: 80.0
+  min_attack_dist: 0
+  attack_up_dist: 30
+  attack_down_dist: 22
+  attack_fan_deg: 0.0
+  jump_attack_enabled: false
+  jump_attack_height: 50.0
+  fall_speed_px_s: 600.0
+  walk_stall_jump: true
+  chase_jump_enabled: true
+  chase_jump_min: -10
+  chase_jump_max: 5
+  chase_jump_dash_ms: 300
+  chase_jump_edge_guard_enabled: true
+  chase_jump_edge_guard_px: 150
+  station_turn_interval_ms: 1000
+  mouse_speed: 0.9999999999999999
+  evade_type: jump
+  jump_interval: 0
+  jump_random_prob: 0.1
+  back_jump_seq:
+  - type: down
+    key: back
+  - type: delay
+    ms: 800
+  - type: down
+    key: jump
+  - type: delay
+    ms: 20
+  - type: up
+    key: back
+  - type: up
+    key: jump
+  - type: down
+    key: forward
+  - type: delay
+    ms: 150
+  - type: down
+    key: attack
+  - type: up
+    key: attack
+  - type: up
+    key: forward
+  output_seq:
+  - type: down
+    key: attack
+  - type: up
+    key: attack
+  keymap:
+    auto: f11
+    left: left
+    right: right
+    up: up
+    down: down
+    attack: s
+    jump: D
+    pickup: space
+    hp_pot: g
+    mp_pot: pageup
+    feed_pet: pagedown
+    shop: null
+    enter: enter
+  target_cd:
+  - 1000
+  - 2500
+  atk_target_count: 0
+  mob_atk_cd_ms: 0
+  input_device: remote
+  attack_cd: 400
+  attack_lock_debounce_ms: 1000
+  min_turn_hold_ms: 500
+  turn_output_delay_ms: 0
+  auto_pickup: false
+  player_track_jump: 200
+  player_foot_offset_px: -25
+  player_box_min_area_pct: 0.0
+  player_box_area_base_s: 1.0
+  player_box_area_tol_pct: 0.0
+  hp_bar:
+  - 0.341142
+  - 0.973958
+  - 0.120791
+  - 0.018229
+  mp_bar:
+  - 0.464129
+  - 0.973958
+  - 0.120791
+  - 0.018229
+  probe_calib:
+    x_ratio: 0.05197657393850659
+    y_ratio: 0.013020833333333334
+    cell_ratio: 0.010248901903367497
+    gap_ratio: 0.002053440702781845
+    bits: 40
+    frame:
+    - 1366
+    - 768
+    solved_at: '2026-10-23 13:04:20'
+  hp_color:
+  - - 0
+    - 0
+    - 135
+  - - 74
+    - 77
+    - 255
+  mp_color:
+  - - 145
+    - 77
+    - 0
+  - - 255
+    - 197
+    - 70
+  hp_threshold: 62
+  mp_threshold: 3
+  pot_cd: 600
+  mob_sets_ttl_s: 3.0
+  auto_hp_pot: true
+  auto_mp_pot: false
+  strategy: patrol
+  vision_top: 150
+  vision_bottom: 30
+  vision_left: -1
+  vision_right: -1
+  vision_center: false
+  vision_off_x: 0
+  vision_off_y: 0
+  vision_detect_only: false
+  big_mob_enabled: true
+  big_mob_ratio: 1.5
+  big_mob_range_px: 1000.0
+  sweep_turn_cd: 500
+  back_range: 150
+  sweep_edge_turn_px: 100
+  sweep_turn_cd_enabled: true
+  sweep_edge_turn_enabled: true
+  station_pickup_enabled: false
+  station_pickup_min_s: 0.0
+  station_pickup_max_s: 0.0
+  station_pickup_spots: []
+  multi_spots: []
+  multi_leave_wait_enabled: false
+  multi_leave_delay_s: 0.0
+  route_goto_set: 左上
+  align_tol_px: 12
+  align_hold_ms: 3000
+  air_gap_px: 200
+  climb_align_gap_ms: 200
+  climb_align_first: true
+  climb_align_near_px: 30
+  climb_retry_delay_s: 0.0
+  climb_retry_delay_inc_s: 0.0
+  goto_timeout_s: 15.0
+  chase_goto_max_s: 5.0
+  goto_timeout_key: 表情_无语
+  disable_chase_pathfinding: true
+  jump_start_px: 75
+  move_retry_ms: 1200
+  zone_edge_guard_px: 40
+  track_buffer_ms: 1000
+  custom_timers:
+  - name: 自动喂宠
+    seq:
+    - type: down
+      key: feed_pet
+    - type: up
+      key: feed_pet
+    interval:
+    - 5.0
+    - 10.0
+    pause_on_rest: false
+  - name: 自动回避药水
+    seq:
+    - type: down
+      key: 回避药水
+    - type: up
+      key: 回避药水
+    interval:
+    - 3.0
+    - 3.0
+  - name: 自动无语
+    seq:
+    - type: down
+      key: 表情_无语
+    - type: up
+      key: 表情_无语
+    interval:
+    - 5.0
+    - 10.0
+    paused: true
+    paused_left: 502.4470833913947
+  - name: 自动攻击药水
+    seq:
+    - type: down
+      key: 攻击药水
+    - type: up
+      key: 攻击药水
+    interval:
+    - 3.0
+    - 3.0
+    paused: true
+    paused_left: 18.655999999988126
+  facing_timeout_min: 0.0
+  player_lost_timeout_min: 3.0
+  resetall_interval: 30
+  anti_afk_enabled: false
+  anti_afk_type: hidden_rest
+  anti_afk_min: 25.0
+  anti_afk_max: 30.0
+  anti_afk_enter_seq:
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  - type: delay
+    ms: 1000
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  - type: delay
+    ms: 1000
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  - type: delay
+    ms: 160000
+  - type: down
+    key: 普攻
+  - type: up
+    key: 普攻
+  - type: delay
+    ms: 1000
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  - type: down
+    key: 隐身术
+  - type: up
+    key: 隐身术
+  anti_afk_exit_seq:
+  - type: down
+    key: 普攻
+  - type: up
+    key: 普攻
+  - type: delay
+    ms: 1000
+  - type: down
+    key: 普攻
+  - type: up
+    key: 普攻
+  anti_afk_rest_min: 3.5
+  anti_afk_rest_max: 5.5
+  anti_afk_spot_set: ''
+  anti_afk_spot_seq: []
+  anti_afk_spot_after: ''
+  anti_afk_spot_loop: false
+  anti_afk_spot_loop_items: []
+  anti_afk_spot_loop_min: 30.0
+  anti_afk_spot_loop_max: 60.0
+  anti_afk_spot_loop_hold: false
+  anti_afk_retry_on_interrupt: true
+  anti_afk_retry_sec: 10.0
+  reconnect_enabled: true
+  reconnect_probe_after_lost_sec: 0.0
+  reconnect_step_timeout_ms: 3000
+  reconnect_queue_timeout_ms: 180000
+  reconnect_max_retry: 3
+  reconnect_resume_auto: true
+  reconnect_server_x: 0.3309
+  reconnect_server_y: 0.2135
+  reconnect_channel_x: 0.4071
+  reconnect_channel_y: 0.4922
+  reconnect_channel: 17
+  custom_keys:
+    攻击药水: grave
+    回避药水: '5'
+    隐身术: a
+    普攻: f
+    表情_无语: f6
+notes: ''
+capture:
+  source: file
+  file: D:/Media/record/mxd/寺院通道-牛.mp4
+  url: udp://0.0.0.0:5000
+  fps: 5.0
+  stride: 45
+  seconds: 120.0
+  dedup: 0.01
+  limit: 0
+  clean: false
+label:
+  thresh: 0.15
+  min_distinct: 0.01
+  per_mob: 20
+  max_peaks: -1
+  downscale: 1
+  region: null
+  player_thresh: 0.3
+  player_min_distinct: 0.0
+  player_per_mob: 0
+  player_max_peaks: 1
+  player_downscale: 1
+  drop_min_distinct: 0.06
+  drop_per_mob: 20
+  drop_max_peaks: 3
+  pet_min_distinct: 0.03
+  pet_per_mob: 20
+  pet_max_peaks: -1
+  label_drops_on: true
+  drop_thresh: 0.9
+  drop_downscale: 1
+  label_pets_on: true
+  pet_thresh: 0.2
+  pet_downscale: 1
+  pets:
+  - pet: '5000042'
+    name: 花蘑菇仔
+    equips: []
+  - pet: '5000011'
+    name: 猴子
+    equips: []
+  drops:
+  - id: 09000000
+    name: ''
+  - id: 09000001
+    name: ''
+  - id: 09000002
+    name: ''
+  - id: 09000003
+    name: ''
+  - id: '04000023'
+    name: 冰独眼兽之尾
+  - id: 04000028
+    name: 月牙牛魔王的角
+dataset:
+  val_ratio: 0.2
+  min_boxes: 1
+  quality: 92
+  from_projects:
+  - 寺院通道2
+  class_mode: 只取勾选的类
+  class_ids:
+  - 1
+train:
+  model: E:\MyPrograms\playerSimu\projects\森林迷宫_珠缨\models\detect_v3.pt
+  epochs: 1000
+  imgsz: 640
+  batch: 8
+  device: '0'
+  patience: 40
+  resume: false
+live:
+  weights: E:\MyPrograms\playerSimu\projects\寺院通道_珠缨\models\detect_v2_640.engine
+  capture_source: stream
+  rect:
+  - 76
+  - 62
+  - 1366
+  - 768
+  rect_rel:
+  - 0.000731
+  - 0.03875
+  - 0.998538
+  - 0.96
+  rect_win:
+  - 23597292
+  - 冒险岛怀旧服
+  url: udp://0.0.0.0:5000
+  conf_mob: 0.15
+  iou_mob: 0.85
+  max_det: -1
+  agnostic_nms: false
+  conf_player: 0.65
+  imgsz: 640
+  device: '0'
+  capture_fps: 60
+  draw: true
+  half: true
+  show_fps: 50
+  window_capture: wgc
+  stream_rect_rel: null
+mob_names:
+- 冰独眼兽
+- 月牙牛魔王
+mobs_cleared: false
+player_scale: 1.406
+drop_scale: 1.406
+pet_scale: 1.406
+player_scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
+drop_scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
+pet_scale_at:
+  width: 1920
+  height: 1080
+  confidence: manual
+player_id: 珠缨

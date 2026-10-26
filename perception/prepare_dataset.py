@@ -21,6 +21,7 @@ GUI:
 import argparse
 import json
 import random
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -159,6 +160,11 @@ def _count_boxes(label_dirs, split):
 #     · 归属随数据集一起落盘，下次构建接着用。
 SPLIT_NAME = "split.json"
 
+#: 划分方式：`segment` = 按采集段留尾（**默认** ✓ 2026-10-24 改）；
+#: `random` = 老口径，按帧随机抽（会让 val 里全是"训练集见过的画面" ✗，只留作复现 ✓）。
+SPLIT_SEGMENT = "segment"
+SPLIT_RANDOM = "random"
+
 
 def _read_split(out_dir):
     """读上一次的划分 → {帧名: "train"/"val"}；文件不在或坏了都当空的。"""
@@ -173,18 +179,55 @@ def _read_split(out_dir):
     return got
 
 
-def _assign_split(stems, old, val_ratio, seed):
-    """决定哪些帧进 val：老帧原样不动，新帧按比例补。返回 val 的帧名集合。"""
-    val = {s for s in stems if old.get(s) == "val"}
-    fresh = [s for s in stems if s not in old]
-    n_val = int(round(len(stems) * float(val_ratio)))
-    # 至少留 1 张 val、1 张 train：ultralytics 对空 val 集只会给个难懂的报错
-    n_val = max(1, min(n_val, max(1, len(stems) - 1)))
-    need = max(0, n_val - len(val))
-    if need and fresh:
-        rnd = random.Random(seed)
-        rnd.shuffle(fresh)          # 只打乱新帧，老帧的归属不受影响
-        val.update(fresh[:need])
+def _stem_key(stem):
+    """帧名 → `(前缀, 帧号)`：`p01__frame_00042` → `("p01", 42)`，认不出就 `(stem, -1)`。"""
+    head, sep, tail = stem.rpartition("__")
+    prefix, num = (head, tail) if sep else ("", stem)
+    m = re.search(r"(\d+)$", num)
+    return (prefix, int(m.group(1)) if m else -1)
+
+
+def _assign_split(stems, old, val_ratio, seed, mode=SPLIT_SEGMENT):
+    """决定哪些帧进 val。返回 val 的帧名集合。
+
+    ⭐⭐⭐ **默认按"采集段"切，不按帧随机抽**（2026-10-24 ✓ 量出来的）：
+    现场（`寺院通道_珠缨`，split.json 实际内容 `val: frame_00002/00004/00005…`）
+    是**随机抽帧**——同一段录像里相邻帧几乎一模一样 ⇒ val 里全是"训练集见过的画面"
+    ⇒ 指标虚高、早停早停错地方 ✓。实测同一个模型：
+
+        训练集里训过的帧   召回 **99.0%**
+        val（随机抽的）    召回 **79.7%**
+        建完数据集后才拍的段 召回 **30.1%**   ← 这才是"实战"
+
+    ⇒ 现在按 `(前缀, 帧号)` 排序分块，**每块留尾部 `val_ratio` 做 val** ✓：
+      尾巴 = 最近的画面 ⇒ 最接近"以后实战会遇到的" ✓。
+    ⚠ `mode="random"` 保留（老数据集想复现旧划分时用 ✓），但**默认不再用它** ✗。
+    """
+    if mode == "random":
+        val = {s for s in stems if old.get(s) == "val"}
+        fresh = [s for s in stems if s not in old]
+        n_val = int(round(len(stems) * float(val_ratio)))
+        # 至少留 1 张 val、1 张 train：ultralytics 对空 val 集只会给个难懂的报错
+        n_val = max(1, min(n_val, max(1, len(stems) - 1)))
+        need = max(0, n_val - len(val))
+        if need and fresh:
+            rnd = random.Random(seed)
+            rnd.shuffle(fresh)          # 只打乱新帧，老帧的归属不受影响
+            val.update(fresh[:need])
+        return val
+
+    blocks = {}
+    for s in stems:
+        blocks.setdefault(_stem_key(s)[0], []).append((_stem_key(s)[1], s))
+    val = set()
+    for _prefix, items in blocks.items():
+        items.sort()
+        n = len(items)
+        if n < 2:
+            continue                    # 一块就 1 帧 ⇒ 留着训练 ✓（没法和自己分开）
+        k = int(round(n * float(val_ratio)))
+        k = max(1, min(k, n - 1))       # 至少 1 张 val、1 张 train ✓
+        val.update(s for _num, s in items[n - k:])
     return val
 
 
@@ -199,6 +242,8 @@ def run_dataset(params, ctx=None):
         min_boxes    少于这个框数的帧丢弃；0 = 保留空帧（当负样本）
         quality      jpg 质量
         seed         随机种子
+        split_mode   划分方式：`segment`（默认）= 每段录像留尾做 val ✓；
+                     `random` = 老口径按帧随机抽（相邻帧几乎重复 ⇒ val 虚高 ✗）
         class_names  类别名，默认 player/mob/drop/npc
 
     返回 dict，界面卡片读它渲染摘要。
@@ -281,20 +326,30 @@ def run_dataset(params, ctx=None):
         ctx.log("  （以后标了直接进数据集，不用重标旧数据、不用改任何设置；"
                 "模型要再训一次，那是因为多了新内容，不是因为号变了）")
 
-    # ---- train/val 划分：老帧沿用上次的边，新帧按比例补（见 SPLIT_NAME 那段说明）----
+    # ---- train/val 划分（默认**按采集段留尾** ✓ 见 `_assign_split` 的说明）----
     old_split = _read_split(out) if out.exists() else {}
     stems = [f.stem for f, _lines in pairs]
-    val_stems = _assign_split(stems, old_split, val_ratio, seed)
-    _kept = sum(1 for s in stems if s in old_split)
-    _fresh = len(stems) - _kept
-    if not _kept:
-        ctx.log("划分：首次构建，%d 张按 %.0f%% 随机分 train/val（之后会固定下来）"
-                % (_fresh, val_ratio * 100))
-    elif _fresh:
-        ctx.log("划分：旧帧 %d 张**沿用上次的边**，新帧 %d 张按 %.0f%% 补进 val"
-                % (_kept, _fresh, val_ratio * 100))
+    split_mode = str(params.get("split_mode") or SPLIT_SEGMENT)
+    val_stems = _assign_split(stems, old_split, val_ratio, seed, split_mode)
+    if split_mode == SPLIT_RANDOM:
+        _kept = sum(1 for s in stems if s in old_split)
+        _fresh = len(stems) - _kept
+        if not _kept:
+            ctx.log("划分：首次构建，%d 张按 %.0f%% 随机分 train/val（之后会固定下来）"
+                    % (_fresh, val_ratio * 100))
+        elif _fresh:
+            ctx.log("划分：旧帧 %d 张沿用上次的边，新帧 %d 张按 %.0f%% 补进 val"
+                    % (_kept, _fresh, val_ratio * 100))
+        else:
+            ctx.log("划分：沿用上次，%d 张的归属原样不变" % _kept)
     else:
-        ctx.log("划分：沿用上次，%d 张的归属原样不变" % _kept)
+        ctx.log("划分：按**采集段**留尾 —— 每段最后的 %.0f%% 进 val（%d 张 val）"
+                % (val_ratio * 100, len(val_stems)))
+        if old_split:
+            ctx.log("  ⚠ 这次**没有沿用**上次的划分：旧口径是随机抽帧 ⇒ val 里全是"
+                    "训练集见过的画面（相邻帧几乎一样）⇒ 指标虚高、早停也会停在错的地方",
+                    "warn")
+        ctx.log("  ⇒ val 衡量的是'这段录像靠后的画面'，比随机抽帧更接近实战 ✓")
 
     # 清掉上一次的产物。不清的话旧图会混进新数据集，而且是**静默的** ——
     # train 数量看起来变多了，实际混了过期样本，训练结果没法解释。

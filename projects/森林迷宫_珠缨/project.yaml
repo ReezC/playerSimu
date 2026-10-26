@@ -56,13 +56,13 @@ decision:
   jump_attack_enabled: false
   jump_attack_height: 50.0
   fall_speed_px_s: 600.0
-  walk_stall_jump: false
+  walk_stall_jump: true
   chase_jump_enabled: true
   chase_jump_min: -10
   chase_jump_max: 5
   chase_jump_dash_ms: 300
   chase_jump_edge_guard_enabled: true
-  chase_jump_edge_guard_px: 100
+  chase_jump_edge_guard_px: 150
   station_turn_interval_ms: 1000
   mouse_speed: 0.9999999999999999
   evade_type: jump
@@ -105,7 +105,7 @@ decision:
     attack: s
     jump: D
     pickup: space
-    hp_pot: g
+    hp_pot: ctrl
     mp_pot: pageup
     feed_pet: pagedown
     shop: null
@@ -115,12 +115,12 @@ decision:
   - 2500
   atk_target_count: 0
   mob_atk_cd_ms: 0
-  input_device: remote
+  input_device: serial
   attack_cd: 480
   attack_lock_debounce_ms: 1000
   min_turn_hold_ms: 500
   turn_output_delay_ms: 0
-  auto_pickup: false
+  auto_pickup: true
   player_track_jump: 200
   player_foot_offset_px: -25
   player_box_min_area_pct: 0.0
@@ -138,14 +138,14 @@ decision:
   - 0.018229
   probe_calib:
     x_ratio: 0.05197657393850659
-    y_ratio: 0.0078125
+    y_ratio: 0.013020833333333334
     cell_ratio: 0.010248901903367497
-    gap_ratio: 0.0020893118594436312
+    gap_ratio: 0.002053440702781845
     bits: 40
     frame:
     - 1366
     - 768
-    solved_at: '2026-10-20 22:07:22'
+    solved_at: '2026-10-23 13:04:20'
   hp_color:
   - - 0
     - 0
@@ -202,16 +202,16 @@ decision:
   chase_goto_max_s: 5.0
   goto_timeout_key: 表情_无语
   disable_chase_pathfinding: true
-  jump_start_px: 20
+  jump_start_px: 80
   move_retry_ms: 1200
   track_buffer_ms: 2000
   custom_timers:
   - name: 自动喂宠
     seq:
-    - key: feed_pet
-      type: down
-    - key: feed_pet
-      type: up
+    - type: down
+      key: feed_pet
+    - type: up
+      key: feed_pet
     interval:
     - 5.0
     - 10.0
@@ -225,8 +225,6 @@ decision:
     interval:
     - 3.0
     - 3.0
-    paused: true
-    paused_left: 13.202999999979511
   - name: 自动无语
     seq:
     - type: down
@@ -333,7 +331,8 @@ decision:
     隐身术: a
     普攻: f
     表情_无语: f6
-  zone_edge_guard_px: 40
+  zone_edge_guard_px: 50
+  climb_align_first: false
 notes: ''
 capture:
   source: file
@@ -414,7 +413,7 @@ dataset:
   min_boxes: 1
   quality: 92
 train:
-  model: E:\MyPrograms\playerSimu\projects\森林迷宫_珠缨\models\detect_v1.pt
+  model: E:\MyPrograms\playerSimu\projects\鳄鱼潭1\models\detect_v2.pt
   epochs: 1000
   imgsz: 640
   batch: 8
@@ -423,7 +422,7 @@ train:
   resume: false
 live:
   weights: E:\MyPrograms\playerSimu\projects\森林迷宫_珠缨\models\detect_v2.pt
-  capture_source: stream
+  capture_source: window
   rect:
   - 2
   - 32
@@ -438,7 +437,7 @@ live:
   - 988394
   - 冒险岛怀旧服
   url: udp://0.0.0.0:5000
-  conf_mob: 0.25
+  conf_mob: 0.15
   iou_mob: 0.85
   max_det: -1
   agnostic_nms: false

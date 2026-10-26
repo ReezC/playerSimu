@@ -1688,6 +1688,18 @@ class PlayerPanel(QWidget):
         cj_row.addStretch(1)
         af.addRow("追击起跳", cj_row)
 
+        # ⭐⭐⭐ **追击起跳的三个子参数统一"下方缩进"挂在它下面**（用户 2026-10-23 ✓ 原话：
+        #   "**完全不符合UI规范，它应该是从属于追击起跳勾选项的参数，并且随着项目储存**"）——
+        #   写法照「平台站桩 → 循环行为」那一组（`_spot_loop_box` ✓：子 QWidget +
+        #   `setContentsMargins(24, 0, 0, 0)` 缩进），父勾选框关掉时整块置灰 ✓
+        #   （见 `_refresh_chase_jump_ui` ✓）。
+        #   ⚠ 原来这三格各自 `af.addRow(...)` 平铺在战斗参数里 ⇒ 看着像三个**平级**开关 ✗
+        #     （"距离平台边缘禁用"那一行甚至自带勾选框，更像一个独立功能 ✓ 用户就是被这个误导的）。
+        self._cj_sub = QWidget()
+        _cjf = QFormLayout(self._cj_sub)
+        _cjf.setContentsMargins(24, 0, 0, 0)
+        _cjf.setSpacing(6)
+
         # 「追击起跳需要的冲刺时间(ms)」（用户 2026-09-26 要求）：放在它**下面一行**。
         # 含义 = `chase` 状态**连续**维持了这么久才准起跳（中途进别的状态就归零）：
         # 刚进追击 / 刚打完 / 刚转身那会儿就跳，常常是"为了跳而跳" —— 人还没冲起来，
@@ -1704,14 +1716,14 @@ class PlayerPanel(QWidget):
             "例：填 300 ⇒ 冲了 300ms 以上，进起跳区间那一拍才跳。\n"
             "0 = 不额外要求（老行为：一到区间就跳）。")
         self.sp_chase_dash.valueChanged.connect(self._on_chase_jump)
-        af.addRow("追击起跳需要的冲刺时间(ms)", self.sp_chase_dash)
+        _cjf.addRow("需要的冲刺时间(ms)", self.sp_chase_dash)
 
         # ⭐⭐ 「**距离平台边缘多远禁用(px)**」（用户 2026-10-02 ✓ 原话："追击起跳功能加个参数
         #   「距离平台边缘多远禁用(px)」（**不启用时不能配置**），代表如果距离 foothold 集边缘
         #   距离小于等于这个值即使满足条件也不按跳"）。
         #   样式**照「大怪优先」**（用户点名 ✓）：勾选框 + 一个 px 框；**不勾 ⇒ px 框灰掉不可配** ✓
         #   且这条闸**整个不启用** ✓（= 老行为 ✓）。
-        self.ck_chase_edge_guard = QCheckBox("距离平台边缘禁用")
+        self.ck_chase_edge_guard = QCheckBox("启用")
         self.ck_chase_edge_guard.setChecked(bool(
             getattr(settings, "chase_jump_edge_guard_enabled", False)))
         self.ck_chase_edge_guard.setToolTip(
@@ -1732,7 +1744,9 @@ class PlayerPanel(QWidget):
         eg_row.addWidget(self.ck_chase_edge_guard)
         eg_row.addWidget(self.sp_chase_edge_px)
         eg_row.addStretch(1)
-        af.addRow("距离平台边缘禁用(px)", eg_row)
+        _cjf.addRow("距离平台边缘禁用(px)", eg_row)
+        # ⭐ 三个子参数一起挂进去（**只加这一次** ✓ 别在别处再 `af.addRow` ✗）
+        af.addRow(self._cj_sub)
 
         # ③ **大怪优先**（用户 2026-10-01 ✓；当天又要求挪进「攻击」子组 ✓）：
         #   锁定目标时优先「明显更高」的大怪 —— 这是"**打谁**"这一件事 ⇒ 收进「攻击」✓。
@@ -3402,8 +3416,12 @@ class PlayerPanel(QWidget):
         self._refresh_chase_jump_ui()
 
     def _refresh_chase_jump_ui(self):
-        """开关关掉时把参数框灰掉（两个距离 + 冲刺时间）。"""
+        """开关关掉时把参数框灰掉（两个距离 + 冲刺时间 + 边缘禁用）。"""
         on = self.ck_chase_jump.isChecked()
+        # ⭐ **整个子参数块一起吃这个开关**（2026-10-23 ✓ 用户："它应该是**从属于**
+        #   追击起跳勾选项的参数"）—— 置灰父块 ⇒ 里面三个控件（连同它们的标签）一起灰 ✓。
+        if hasattr(self, "_cj_sub"):
+            self._cj_sub.setEnabled(on)
         # 冲刺时间也跟着灰：开关关着时改它没意义（用户要求"勾选追击起跳时才有这个参数"）。
         # `hasattr` 兜底：老配置文件/半初始化的面板里可能还没这个框。
         if hasattr(self, "sp_chase_dash"):
@@ -5580,6 +5598,23 @@ class PlayerPanel(QWidget):
             sp.blockSignals(True)
             sp.setValue(int(v))
             sp.blockSignals(False)
+        # ⭐⭐⭐ **「距离平台边缘禁用(px)」那两个控件也必须回填**（用户 2026-10-23 现场：
+        #   "**追击起跳的距离平台边缘禁用(px)参数，怎么每次打开都要重新设置？？**"）。
+        #   病根：它们**只**在构造时读过一次 `settings`（见 `_build_...` 那段 ✓），
+        #   而"打开项目 ⇒ 从 project.yaml 灌进 settings"走的是**这一个方法** ✗
+        #   ⇒ 值明明存了（`project.yaml` 的 `decision:` 段 ✓ `to_dict`/`from_dict` 都有 ✓）、
+        #     重启后控件却还是默认的 100 ⇒ 人只能再填一次 ✓。
+        #   ⚠ 必须 `blockSignals`：`setChecked` / `setValue` 会触发 `_on_chase_jump` ⇒
+        #     反手往盘上写一次（"打开面板就写盘"是一条老纪律 ✗ 见上面 `ck_jump_attack` 那段 ✓）。
+        if hasattr(self, "ck_chase_edge_guard") and hasattr(self, "sp_chase_edge_px"):
+            self.ck_chase_edge_guard.blockSignals(True)
+            self.ck_chase_edge_guard.setChecked(
+                bool(getattr(settings, "chase_jump_edge_guard_enabled", False)))
+            self.ck_chase_edge_guard.blockSignals(False)
+            self.sp_chase_edge_px.blockSignals(True)
+            self.sp_chase_edge_px.setValue(
+                int(getattr(settings, "chase_jump_edge_guard_px", 100) or 0))
+            self.sp_chase_edge_px.blockSignals(False)
         self._refresh_chase_jump_ui()
 
         self.cmb_evade.blockSignals(True)

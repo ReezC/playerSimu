@@ -34,7 +34,7 @@ mmap_crop:
 decision:
   attack_dist: 120.0
   min_attack_dist: 0
-  attack_up_dist: 40
+  attack_up_dist: 20
   attack_down_dist: 120
   attack_fan_deg: 0.0
   jump_attack_enabled: false
@@ -129,15 +129,15 @@ decision:
   - 0.015625
   mp_bar: null
   probe_calib:
-    x_ratio: 0.05197657393850659
-    y_ratio: 0.016927083333333332
-    cell_ratio: 0.010248901903367497
-    gap_ratio: 0.0020893118594436312
+    x_ratio: 0.050512445095168376
+    y_ratio: 0.013020833333333334
+    cell_ratio: 0.010980966325036604
+    gap_ratio: 0.0014641288433382138
     bits: 40
     frame:
     - 1366
     - 768
-    solved_at: '2026-10-18 01:12:58'
+    solved_at: '2026-10-25 19:30:28'
   hp_color:
   - - 0
     - 0
@@ -152,14 +152,14 @@ decision:
   - - 255
     - 194
     - 73
-  hp_threshold: 66
+  hp_threshold: 74
   mp_threshold: 7
   pot_cd: 0
   mob_sets_ttl_s: 3.0
   auto_hp_pot: true
   auto_mp_pot: false
   strategy: patrol
-  vision_top: 300
+  vision_top: 200
   vision_bottom: 200
   vision_left: 400
   vision_right: 400
@@ -196,7 +196,7 @@ decision:
   multi_leave_wait_enabled: true
   multi_leave_delay_s: 3.0
   route_goto_set: '3'
-  align_tol_px: 12
+  align_tol_px: 15
   align_hold_ms: 1000
   climb_align_gap_ms: 200
   climb_align_near_px: 30
@@ -206,7 +206,7 @@ decision:
   chase_goto_max_s: 5.0
   goto_timeout_key: 表情_无语
   disable_chase_pathfinding: true
-  jump_start_px: 75
+  jump_start_px: 80
   move_retry_ms: 1200
   track_buffer_ms: 1500
   custom_timers:
@@ -264,6 +264,12 @@ decision:
       key: 开花
     - type: delay
       ms: 200
+    - type: down
+      key: 开花
+    - type: up
+      key: 开花
+    - type: delay
+      ms: 500
     - type: down
       key: 开花
     - type: up
@@ -361,7 +367,7 @@ decision:
   reconnect_server_y: 0.2135
   reconnect_channel_x: 0.4071
   reconnect_channel_y: 0.4922
-  reconnect_channel: 16
+  reconnect_channel: 20
   custom_keys:
     攻击药水: grave
     回避药水: '5'
@@ -374,7 +380,8 @@ decision:
     瞬移: z
     开花: pageup
   air_gap_px: 200
-  zone_edge_guard_px: 40
+  zone_edge_guard_px: 50
+  climb_align_first: false
 notes: ''
 capture:
   source: file
